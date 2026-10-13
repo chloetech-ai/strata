@@ -1,13 +1,17 @@
 //! `engram hook <event>`: reads the hook payload on stdin, forwards it to the
 //! project's daemon, and prints what the daemon wants injected. It never
 //! fails the hook: on any error it prints nothing and exits 0.
+//!
+//! `engram hook --user <event>` is the same hook from the user settings; it
+//! does nothing in a project that installs Engram itself, whose own hook
+//! handles the event.
 
 use std::io::Read;
 use std::time::Duration;
 
 use serde_json::{json, Value as Json};
 
-use crate::{daemon, paths};
+use crate::{daemon, install, paths};
 
 /// How long each event may wait for the daemon (the first one may start it).
 fn budget(event: &str) -> Duration {
@@ -20,7 +24,7 @@ fn budget(event: &str) -> Duration {
     })
 }
 
-pub fn run(event: &str) -> i32 {
+pub fn run(event: &str, user: bool) -> i32 {
     if std::env::var("ENGRAM_DISABLE").map_or(false, |v| v == "1") {
         return 0;
     }
@@ -31,6 +35,9 @@ pub fn run(event: &str) -> i32 {
     let payload: Json = serde_json::from_str(&input).unwrap_or(Json::Null);
     let event = payload.get("hook_event_name").and_then(|v| v.as_str()).unwrap_or(event).to_string();
     let project = paths::project_dir(payload.get("cwd").and_then(|v| v.as_str()));
+    if user && install::project_has_hooks(&project) {
+        return 0;
+    }
     let dir = paths::store_dir(&project);
     let req = json!({"op": "hook", "event": event, "payload": payload});
     match daemon::request(&dir, &project.to_string_lossy(), &req, budget(&event)) {

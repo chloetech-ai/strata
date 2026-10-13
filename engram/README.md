@@ -50,6 +50,28 @@ target/release/engram install --project /path/to/your/project
 
 The store lives in `~/.local/share/engram/projects/<project>/`, outside the repository.
 
+### Every session
+
+```sh
+cargo install --path . --bin engram --root ~/.local   # a stable path for the hooks: ~/.local/bin/engram
+engram fetch-model
+engram install --user --distill-model haiku
+```
+
+`install --user` puts the hooks and the memory tools' permission into
+`~/.claude/settings.json` (saving the previous version next to it) and
+registers the MCP server at user scope with `claude mcp add-json`. Every
+Claude Code session then records into the store of its project directory,
+one Strata file per project, so sessions in the same project share memory
+and sessions in other projects never see it. Within a file each session
+keeps its own id. A project with its own `engram install` keeps using that
+one: the user-level hooks step aside there, so nothing is recorded twice.
+`--distill-model` sets `ENGRAM_DISTILL_MODEL` in the settings' `env`.
+
+`engram uninstall --user` removes all of it again and keeps the stores
+(`engram uninstall` does the same for a project install). `ENGRAM_DISABLE=1`
+in a session's environment switches Engram off for that session only.
+
 Optional: `cargo build --release --features bert` and `engram fetch-model bert`
 enable BGE-small vectors in the daemon (`"embedder": "bert"` in the store's
 `config.json`). They are better for paraphrased questions, but each record takes about 50 ms to embed on a CPU.
@@ -73,7 +95,10 @@ prompt's path; a small, fast model is enough (about $0.001 and 8 s per
 turn with one). Choose it with `ENGRAM_DISTILL_MODEL` or `"distill":
 {"model": ...}` in the store's `config.json`; without one, the CLI's
 default model is used. `ENGRAM_DISTILL=0` or `"distill": {"enabled":
-false}` turns it off.
+false}` turns it off. The call skips the user's settings and MCP servers
+(their plugins and tool definitions would add tens of thousands of tokens
+to each one); set `"distill": {"isolated": false}` when the CLI's
+credentials come from the user settings.
 
 ## Live inspector
 

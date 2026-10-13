@@ -212,6 +212,13 @@ target/release/engram fetch-model
 target/release/engram install --project /path/to/your/project   # --shared writes .claude/settings.json instead
 ```
 
+Or for every Claude Code session, one store per project directory (`engram uninstall --user` undoes it):
+
+```sh
+cargo install --path . --bin engram --root ~/.local
+engram install --user --distill-model haiku
+```
+
 ```sh
 engram search "why did the planner pick post-filtering"
 engram sql "SELECT ts, text FROM memory WHERE kind = 'error' AND MATCH(files, 'exec') ORDER BY ts DESC LIMIT 5"
