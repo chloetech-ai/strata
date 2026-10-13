@@ -31,6 +31,8 @@ For the short version, with the week-long Kestrel benchmark and its cost compari
 
 *A fresh Claude Code session, asked what storage was chosen earlier and why, answers from the briefing Engram injected at session start. Right: the records the hooks wrote and the knowledge a small model distilled from the previous session. See [the live inspector](engram/inspector.md).*
 
+[Try the inspector in your browser](demo/inspector.html){: .btn .btn-primary } It replays a recorded session, and every panel queries the recorded store with Strata's SQL, run by a JavaScript model of Strata.
+
 ## The system
 
 ```mermaid
