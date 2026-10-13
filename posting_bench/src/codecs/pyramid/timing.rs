@@ -1,13 +1,18 @@
-//! Timing experiments (ignored tests): bitmap extraction variants and a
-//! workload profiler. Not part of the codec.
+//! Timing experiments (ignored tests): bitmap extraction variants (x86),
+//! NEON kernels against their scalar twins (aarch64) and a workload
+//! profiler. Not part of the codec.
 #![allow(dead_code)]
 
 use super::simd::*;
 use rand::{rngs::StdRng, Rng, SeedableRng};
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::hint::black_box;
 use std::time::Instant;
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_words_compress(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let mut k = 0;
@@ -25,6 +30,7 @@ unsafe fn ext_words_compress(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     k
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_all16(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let pieces = w.as_ptr() as *const u16;
@@ -40,6 +46,7 @@ unsafe fn ext_all16(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     k
 }
 
+#[cfg(target_arch = "x86_64")]
 static LUT: [[u8; 8]; 256] = {
     let mut t = [[0u8; 8]; 256];
     let mut m = 0;
@@ -57,6 +64,7 @@ static LUT: [[u8; 8]; 256] = {
     t
 };
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_lut(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     let bytes = w.as_ptr() as *const u8;
     let mut k = 0;
@@ -72,6 +80,7 @@ unsafe fn ext_lut(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     k
 }
 
+#[cfg(target_arch = "x86_64")]
 static LUT32: [[u32; 8]; 256] = {
     let mut t = [[0u32; 8]; 256];
     let mut m = 0;
@@ -89,6 +98,7 @@ static LUT32: [[u32; 8]; 256] = {
     t
 };
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_lut32(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     let mut k = 0;
     let mut vb = _mm256_set1_epi32(base as i32);
@@ -107,6 +117,7 @@ unsafe fn ext_lut32(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     k
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_lut32_skip(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     let mut k = 0;
     for (i, &x) in w.iter().enumerate() {
@@ -128,6 +139,7 @@ unsafe fn ext_lut32_skip(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     k
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_kload(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     let v = _mm256_loadu_si256(w.as_ptr() as *const __m256i);
     let mut nz = _mm256_test_epi16_mask(v, v) as u32;
@@ -146,6 +158,7 @@ unsafe fn ext_kload(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     k
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_kload_all(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let pieces = w.as_ptr() as *const u16;
@@ -162,6 +175,7 @@ unsafe fn ext_kload_all(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     k
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_hybrid(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     let c: u32 = w.iter().map(|x| x.count_ones()).sum();
     if c <= 8 {
@@ -181,6 +195,7 @@ unsafe fn ext_hybrid(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn ext_vbmi2(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     #[cfg(target_feature = "avx512vbmi2")]
     {
@@ -191,6 +206,7 @@ unsafe fn ext_vbmi2(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
     extract256(w, base, dst)
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "timing only"]
 fn extract_timing() {
@@ -250,6 +266,381 @@ fn extract_timing() {
                 best = best.min(t.elapsed().as_secs_f64());
             }
             row += &format!(" {name} {:.2}", best * 1e9 / total as f64);
+        }
+        println!("{row}  (ns/value)");
+    }
+}
+
+/// [`extract256_neon`] with `T` unconditional writes for words of at most
+/// `T` bits (the kernel uses 4; 0: the byte table for every word).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ext_neon_hybrid<const T: u32>(w: &[u64; 4], base: u32, dst: *mut u32) -> usize {
+    let step = vdupq_n_u32(8);
+    let mut k = 0usize;
+    for (i, &x) in w.iter().enumerate() {
+        let b = base + 64 * i as u32;
+        let s = vget_lane_u64::<0>(vreinterpret_u64_u8(vcnt_u8(vcreate_u8(x)))).wrapping_mul(0x0101_0101_0101_0101);
+        let o = dst.add(k);
+        if (s >> 56) as u32 <= T {
+            let mut x = x;
+            for j in 0..T as usize {
+                o.add(j).write(b.wrapping_add(x.trailing_zeros()));
+                x &= x.wrapping_sub(1);
+            }
+        } else {
+            let off = s << 8;
+            let mut vb = vdupq_n_u32(b);
+            for j in 0..8 {
+                let pos = vmovl_u8(vld1_u8(BYTE_POS[(x >> (8 * j)) as u8 as usize].as_ptr()));
+                let q = o.add((off >> (8 * j)) as u8 as usize);
+                vst1q_u32(q, vaddw_u16(vb, vget_low_u16(pos)));
+                vst1q_u32(q.add(4), vaddw_high_u16(vb, pos));
+                vb = vaddq_u32(vb, step);
+            }
+        }
+        k += (s >> 56) as usize;
+    }
+    k
+}
+
+/// [`u16s_contain_neon`] with a loop over 8 values at a time (instead of
+/// eight clamped loads).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn u16s_contain_loop(p: *const u16, n: usize, x: u16) -> bool {
+    if n >= 8 {
+        let k = vdupq_n_u16(x);
+        let mut hit = vceqq_u16(vld1q_u16(p.add(n - 8)), k);
+        let mut i = 0;
+        while i + 8 < n {
+            hit = vorrq_u16(hit, vceqq_u16(vld1q_u16(p.add(i)), k));
+            i += 8;
+        }
+        vmaxvq_u16(hit) != 0
+    } else {
+        u16s_contain_neon(p, n, x)
+    }
+}
+
+/// NEON [`bytes_count_lt`] (not used: faster per call, but its callers,
+/// cursors, are latency-bound, where the scalar binary search wins): a
+/// byte compare of the zero-padded array (two loads, the second one
+/// shifted into place), restricted to the valid lanes, summed across lanes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bytes_count_lt_neon(p: *const u8, n: usize, x: u8) -> usize {
+    static IOTA: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let iota = vld1q_u8(IOTA.as_ptr());
+    let k = vdupq_n_u8(x);
+    if n > 16 {
+        // Lanes `j >= 32 - n` of the last 16 bytes are the bytes past 16.
+        let hi = vandq_u8(vcltq_u8(vld1q_u8(p.add(n - 16)), k), vcgeq_u8(iota, vdupq_n_u8((32 - n) as u8)));
+        let lo = vcltq_u8(vld1q_u8(p), k);
+        // Lanes are 0 or -1: negate the sum to count.
+        vaddvq_u8(vsubq_u8(vdupq_n_u8(0), vaddq_u8(lo, hi))) as usize
+    } else {
+        let lt = vandq_u8(vcltq_u8(load_le16(p, n), k), vcltq_u8(iota, vdupq_n_u8(n as u8)));
+        vaddvq_u8(vandq_u8(lt, vdupq_n_u8(1))) as usize
+    }
+}
+
+/// Picks `n` from `weights` (index = value).
+#[cfg(target_arch = "aarch64")]
+fn pick(rng: &mut StdRng, weights: &[u32]) -> usize {
+    let tot: u32 = weights.iter().sum();
+    let mut r = rng.gen_range(0..tot);
+    for (i, &w) in weights.iter().enumerate() {
+        if r < w {
+            return i;
+        }
+        r -= w;
+    }
+    unreachable!()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn sorted_bytes(rng: &mut StdRng, n: usize) -> Vec<u8> {
+    let mut v: Vec<u8> = (0..=255u8).collect();
+    for i in 0..n {
+        let j = rng.gen_range(i..256);
+        v.swap(i, j);
+    }
+    v.truncate(n);
+    v.sort_unstable();
+    v
+}
+
+/// Best of 9 runs of `f`, in ns per call (`calls` per run).
+#[cfg(target_arch = "aarch64")]
+fn ns_per_call(calls: usize, mut f: impl FnMut() -> u64) -> f64 {
+    let mut best = f64::MAX;
+    for _ in 0..9 {
+        let t = Instant::now();
+        black_box(f());
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    best * 1e9 / calls as f64
+}
+
+/// NEON kernels against their scalar twins on inputs shaped like the
+/// benchmark workloads' (sizes and densities as measured on the synthetic
+/// collections), in ns per call.
+///
+/// `cargo test --release neon_timing -- --ignored --nocapture`
+#[cfg(target_arch = "aarch64")]
+#[test]
+#[ignore = "timing only"]
+fn neon_timing() {
+    let mut rng = StdRng::seed_from_u64(1);
+    const N: usize = 1 << 14;
+    let report = |name: &str, ts: &[(&str, f64)]| {
+        let s: Vec<String> = ts.iter().map(|(l, t)| format!("{l} {t:.2}")).collect();
+        println!("{name:>24}: {}  (ns/call)", s.join(", "));
+    };
+
+    // Select in 64 bits of U (about one set bit in 4), k < SAMPLE.
+    let sel: Vec<(u64, u32)> = (0..N)
+        .map(|_| loop {
+            let w = rng.gen::<u64>() & rng.gen::<u64>();
+            let c = w.count_ones();
+            if c >= 9 {
+                break (w, rng.gen_range(0..8));
+            }
+        })
+        .collect();
+    let f = |g: fn(u64, u32) -> (u32, u32)| {
+        ns_per_call(N, || sel.iter().map(|&(w, k)| {
+            let (a, b) = g(black_box(w), k);
+            (a + b) as u64
+        }).sum())
+    };
+    report("select2", &[("scalar", f(select2_scalar)), ("neon", f(select2))]);
+    // Latency: each word depends on the previous result (as in cursors).
+    let f = |g: fn(u64, u32) -> (u32, u32)| {
+        ns_per_call(N, || {
+            let mut acc = 0u32;
+            for &(w, k) in &sel {
+                let (a, b) = g(w.rotate_left(acc & 1), k);
+                acc = acc.wrapping_add(a + b);
+            }
+            acc as u64
+        })
+    };
+    report("select2 (chained)", &[("scalar", f(select2_scalar)), ("neon", f(select2))]);
+
+    // Membership in sparse blocks' low bytes (n as probed by intersections).
+    let wn: [u32; 29] = [35, 15, 10, 8, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+    let mut buf = Vec::new();
+    let mut probes = Vec::new();
+    for _ in 0..N {
+        let n = pick(&mut rng, &wn);
+        let v = sorted_bytes(&mut rng, n);
+        let x = if n > 0 && rng.gen_bool(0.5) { v[rng.gen_range(0..n)] } else { rng.gen() };
+        probes.push((buf.len(), n, x));
+        buf.extend_from_slice(&v);
+    }
+    let f = |g: unsafe fn(*const u8, usize, u8) -> bool| {
+        ns_per_call(N, || probes.iter().map(|&(o, n, x)| unsafe { g(buf.as_ptr().add(o), n, black_box(x)) } as u64).sum())
+    };
+    report("bytes_contain", &[("scalar", f(bytes_contain_scalar)), ("neon", f(bytes_contain_neon))]);
+    for &(o, n, x) in &probes {
+        unsafe { assert_eq!(bytes_count_lt_neon(buf.as_ptr().add(o), n, x), bytes_count_lt_scalar(buf.as_ptr().add(o), n, x)) };
+    }
+    let f = |g: unsafe fn(*const u8, usize, u8) -> usize| {
+        ns_per_call(N, || probes.iter().map(|&(o, n, x)| unsafe { g(buf.as_ptr().add(o), n, black_box(x)) } as u64).sum())
+    };
+    report("bytes_count_lt", &[("scalar", f(bytes_count_lt_scalar)), ("neon", f(bytes_count_lt_neon))]);
+    let f = |g: unsafe fn(*const u8, usize, u8) -> usize| {
+        ns_per_call(N, || {
+            let mut acc = 0usize;
+            for &(o, n, x) in &probes {
+                acc += unsafe { g(buf.as_ptr().add(o), n, x ^ (acc & 1) as u8) };
+            }
+            acc as u64
+        })
+    };
+    report("bytes_count_lt (chained)", &[("scalar", f(bytes_count_lt_scalar)), ("neon", f(bytes_count_lt_neon))]);
+    let wl: [u32; 29] = [0, 31, 9, 4, 3, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2];
+    let loads: Vec<(usize, usize)> = (0..N)
+        .map(|_| {
+            let n = pick(&mut rng, &wl);
+            (rng.gen_range(0..buf.len() - n), n)
+        })
+        .collect();
+    let f = |g: unsafe fn(*const u8, usize) -> [u8; 32]| {
+        ns_per_call(N, || loads.iter().map(|&(o, n)| unsafe { black_box(g(buf.as_ptr().add(o), n)) }[1] as u64).sum())
+    };
+    report("load_bytes32", &[("scalar", f(load_bytes32_scalar)), ("neon", f(load_bytes32_neon))]);
+
+    // Small chunks: up to 48 sorted values.
+    let mut b16 = Vec::new();
+    let mut p16 = Vec::new();
+    for _ in 0..N {
+        let n = rng.gen_range(1..=48);
+        let mut v: Vec<u16> = (0..n).map(|_| rng.gen()).collect();
+        v.sort_unstable();
+        v.dedup();
+        let x = if rng.gen_bool(0.5) { v[rng.gen_range(0..v.len())] } else { rng.gen() };
+        p16.push((b16.len(), v.len(), x));
+        b16.extend_from_slice(&v);
+    }
+    let f = |g: unsafe fn(*const u16, usize, u16) -> bool| {
+        ns_per_call(N, || p16.iter().map(|&(o, n, x)| unsafe { g(b16.as_ptr().add(o), n, black_box(x)) } as u64).sum())
+    };
+    report("u16s_contain", &[("scalar", f(u16s_contain_scalar)), ("neon", f(u16s_contain_neon)), ("loop", f(u16s_contain_loop))]);
+
+    // Block filters: lows against bitmaps, against other lows.
+    let ds: Vec<[u8; 32]> = (0..N).map(|_| std::array::from_fn(|_| rng.gen())).collect();
+    let bms: Vec<[u64; 4]> = (0..N).map(|_| std::array::from_fn(|_| rng.gen())).collect();
+    let f = |g: unsafe fn(&[u8; 32], *const u64) -> u32| {
+        ns_per_call(N, || ds.iter().zip(&bms).map(|(d, b)| unsafe { g(black_box(d), b.as_ptr()) } as u64).sum())
+    };
+    report("test_bits", &[("scalar", f(test_bits_scalar)), ("neon", f(test_bits_neon))]);
+    let wd: [u32; 29] = [0, 48, 11, 3, 2, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+    let tb: Vec<([u8; 32], usize, usize, usize)> = (0..N)
+        .map(|_| {
+            let nd = pick(&mut rng, &wd);
+            let mut d = [0u8; 32];
+            d[..nd].copy_from_slice(&sorted_bytes(&mut rng, nd));
+            let n = rng.gen_range(1..=16);
+            let o = rng.gen_range(0..buf.len() - n);
+            (d, nd, o, n)
+        })
+        .collect();
+    let f = |g: unsafe fn(&[u8; 32], usize, *const u8, usize) -> u32| {
+        ns_per_call(N, || tb.iter().map(|(d, nd, o, n)| unsafe { g(black_box(d), *nd, buf.as_ptr().add(*o), *n) } as u64).sum())
+    };
+    report("test_bytes", &[("scalar", f(test_bytes_scalar)), ("neon", f(test_bytes_neon))]);
+
+    // Writing: lanes (few hits), widening, sparse expansion.
+    let mut out = vec![0u32; 1 << 22];
+    let wh: [u32; 13] = [0, 34, 16, 11, 9, 7, 5, 4, 3, 2, 2, 1, 1];
+    let lanes: Vec<([u8; 32], u32)> = (0..N)
+        .map(|_| {
+            let c = pick(&mut rng, &wh);
+            let mut h = 0u32;
+            while h.count_ones() < c as u32 {
+                h |= 1 << rng.gen_range(0..32);
+            }
+            (std::array::from_fn(|_| rng.gen()), h)
+        })
+        .collect();
+    let f = |g: unsafe fn(&[u8; 32], u32, u32, *mut u32) -> usize, out: &mut Vec<u32>| {
+        ns_per_call(N, || {
+            let mut k = 0;
+            for (i, (d, h)) in lanes.iter().enumerate() {
+                k += unsafe { g(d, *h, (i as u32) << 8, out.as_mut_ptr().add(k)) };
+            }
+            k as u64
+        })
+    };
+    report("emit_lanes", &[("scalar", f(emit_lanes_scalar, &mut out)), ("neon", f(emit_lanes_neon, &mut out))]);
+    let ww: [u32; 29] = [0, 18, 0, 0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 3, 3, 5, 4, 3, 5, 4, 3, 5, 4, 4, 4, 3, 5, 5, 0];
+    let wides: Vec<(usize, usize)> = (0..N)
+        .map(|_| {
+            let n = pick(&mut rng, &ww);
+            (rng.gen_range(0..buf.len() - n), n)
+        })
+        .collect();
+    let f = |g: unsafe fn(*const u8, usize, u32, *mut u32), out: &mut Vec<u32>| {
+        ns_per_call(N, || {
+            let mut k = 0;
+            for &(o, n) in &wides {
+                unsafe { g(buf.as_ptr().add(o), n, 7 << 16, out.as_mut_ptr().add(k)) };
+                k += n;
+            }
+            k as u64
+        })
+    };
+    report("widen_bytes", &[("scalar", f(widen_bytes_scalar, &mut out)), ("neon", f(widen_bytes_neon, &mut out))]);
+
+    // Sparse runs: blocks of 1..=28 values (singletons more likely), as
+    // decoded by unions (whole chunks) and by short runs.
+    for (label, nb_max) in [("expand_sparse short", 3usize), ("expand_sparse long", 40)] {
+        let mut cases = Vec::new();
+        let mut total = 0;
+        for _ in 0..N / 16 {
+            let nb = rng.gen_range(1..=nb_max);
+            let counts: Vec<usize> = (0..nb).map(|_| if rng.gen_bool(0.5) { 1 } else { rng.gen_range(1..=28) }).collect();
+            let n: usize = counts.iter().sum();
+            let lead = rng.gen_range(0..70);
+            let mut u = vec![0u64; (lead + n + 1).div_ceil(64) + 2];
+            u[0] |= 1;
+            let mut p = lead;
+            for &c in &counts {
+                u[p / 64] |= 1 << (p % 64);
+                p += c;
+            }
+            u[p / 64] |= 1 << (p % 64);
+            let lows: Vec<u8> = (0..n).map(|_| rng.gen()).collect();
+            let mut blk = vec![0u32; 1 + nb + 40];
+            for (i, b) in blk[1..1 + nb].iter_mut().enumerate() {
+                *b = (i * 255 / nb) as u32;
+            }
+            total += n;
+            cases.push((u, lead, n, lows, blk));
+        }
+        let f = |g: unsafe fn(*const u8, *const u64, u32, usize, *const u32, u32, *mut u32), out: &mut Vec<u32>| {
+            let ns = ns_per_call(cases.len(), || {
+                let mut k = 0;
+                for (u, lead, n, lows, blk) in &cases {
+                    unsafe { g(lows.as_ptr(), u.as_ptr(), *lead as u32, *n, blk.as_ptr().add(1), 5 << 16, out.as_mut_ptr().add(k)) };
+                    k += n;
+                }
+                k as u64
+            });
+            ns * cases.len() as f64 / total as f64
+        };
+        let (a, b) = (f(expand_sparse_scalar, &mut out), f(expand_sparse_neon, &mut out));
+        println!("{label:>24}: scalar {a:.2}, neon {b:.2}  (ns/value, {:.1} values/call)", total as f64 / cases.len() as f64);
+    }
+
+    // Bitmap extraction at several densities (ns per value).
+    let mix = |rng: &mut StdRng| -> f64 {
+        // As in unions: some empty and few-bit blocks, then denser ones.
+        match rng.gen_range(0..100) {
+            0..=7 => 0.0,
+            8..=47 => -(rng.gen_range(1..=9) as f64),
+            48..=74 => -(rng.gen_range(10..=60) as f64),
+            _ => -(rng.gen_range(60..=200) as f64),
+        }
+    };
+    for (label, dens) in [("1 bit", -1.0), ("3 bits", -3.0), ("p=0.05", 0.05), ("p=0.2", 0.2), ("p=0.5", 0.5), ("union mix", 2.0)] {
+        let blocks: Vec<[u64; 4]> = (0..8192)
+            .map(|_| {
+                let d = if dens == 2.0 { mix(&mut rng) } else { dens };
+                if d <= 0.0 {
+                    let mut w = [0u64; 4];
+                    while w.iter().map(|x| x.count_ones()).sum::<u32>() < (-d) as u32 {
+                        let b = rng.gen_range(0..256);
+                        w[b >> 6] |= 1 << (b & 63);
+                    }
+                    w
+                } else {
+                    std::array::from_fn(|_| (0..64).fold(0u64, |w, b| w | ((rng.gen_bool(d) as u64) << b)))
+                }
+            })
+            .collect();
+        let total: usize = blocks.iter().map(|w| w.iter().map(|x| x.count_ones() as usize).sum::<usize>()).sum();
+        type F = unsafe fn(&[u64; 4], u32, *mut u32) -> usize;
+        let fs: [(&str, F); 4] = [
+            ("scalar", extract256_scalar),
+            ("neon", extract256_neon),
+            ("lut", ext_neon_hybrid::<0>),
+            ("sparse8", ext_neon_hybrid::<8>),
+        ];
+        let mut row = format!("{label:>10} ({:5.1} bits/block):", total as f64 / blocks.len() as f64);
+        for (name, g) in fs {
+            let ns = ns_per_call(total, || {
+                let mut k = 0;
+                for (i, w) in blocks.iter().enumerate() {
+                    k += unsafe { g(w, (i as u32) << 8, out.as_mut_ptr().add(k)) };
+                }
+                assert_eq!(k, total);
+                k as u64
+            });
+            row += &format!(" {name} {ns:.2}");
         }
         println!("{row}  (ns/value)");
     }

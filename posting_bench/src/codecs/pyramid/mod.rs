@@ -7,7 +7,8 @@
 //! chunk takes the smallest of three forms (with a speed bias toward Flat):
 //!
 //! * **Small**: the sorted low 16 bits as `u16` (at most [`SMALL_MAX`]).
-//!   Probed with one or two masked AVX-512 compares.
+//!   Probed with one or two masked AVX-512 compares (NEON: compares of
+//!   overlapping loads).
 //! * **Tiered**: two 256-bit block masks and two leaf pools.
 //!   * `present`: block holds at least one value.
 //!   * `dense`: block is stored as a 256-bit bitmap (stored only when the
@@ -66,7 +67,8 @@
 //! * Decoding (and union runs) expand consecutive sparse blocks 16 values at
 //!   a time ([`simd::expand_sparse`]: block of each value from a prefix
 //!   popcount of `U`) and extract bitmaps with `vpcompressd` (`vpcompressb`
-//!   where AVX512-VBMI2 exists).
+//!   where AVX512-VBMI2 exists; on NEON, a table of each byte's set-bit
+//!   positions).
 //!
 //! Space ([`PostingList::size_bits`]) counts, per list, a 32-bit chunk
 //! count; per chunk a 64-bit header (16-bit key, 16-bit cardinality - 1,
@@ -84,10 +86,15 @@ mod or;
 pub mod simd;
 #[cfg(all(
     test,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vl"
+    any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
+        ),
+        target_arch = "aarch64"
+    )
 ))]
 mod timing;
 
@@ -126,7 +133,12 @@ fn prefetch<T>(p: *const T) {
     unsafe {
         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8);
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse")))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: prefetching never faults (`_prefetch` is unstable).
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "sse"), target_arch = "aarch64")))]
     let _ = p;
 }
 
