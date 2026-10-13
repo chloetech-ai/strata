@@ -116,7 +116,7 @@ def search_latency():
     strata_max = max(v for s, v in vals if s == "strata")
     sqlite_max = max(v for s, v in vals if s == "sqlite")
     bound = next(b for b in (0.5, 1, 2, 5, 10, 20, 50, 100) if strata_max < b)
-    worst = "a second" if 700 <= sqlite_max < 1500 else ms(sqlite_max) if sqlite_max < 700 else f"{sqlite_max / 1000:.1f} s"
+    worst = ms(sqlite_max) if sqlite_max < 700 else f"{sqlite_max / 1000:.1f} s"
     title = f"Strata answers every search in under {bound:g} ms; SQLite takes up to {worst}"
     lo = 10 ** math.floor(math.log10(min(v for _, v in vals)))
     hi = max(v for _, v in vals) * 1.6

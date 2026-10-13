@@ -180,7 +180,7 @@ In Strata, a row can link to other rows. A paper cites papers, a note is about a
 
 <sub>How a graph-assisted search runs in Strata</sub>
 
-To test whether links make search better, we held out 1,000 recent arXiv papers and asked each method to find the papers each one cites, using only its title and abstract. Searching by meaning and then following the citations of the two nearest papers **found twice as many references as vector search alone**, in 0.4 ms per query. The improvement is statistically solid (p < 0.0001).
+To test whether links make search better, we held out 1,000 recent arXiv papers and asked each method to find the papers each one cites, using only its title and abstract. Searching by meaning and then following the citations of the two nearest papers **found twice as many references as vector search alone**, in 0.2 ms per query. The improvement is statistically solid (p < 0.0001).
 
 ![Following citations doubles what vector search finds](showcase/citation-quality.png)
 

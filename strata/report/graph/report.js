@@ -174,7 +174,7 @@
 
   function meta() {
     const el = $("#meta-line");
-    if (el) el.textContent = `Generated ${D.generated} · ogbn-arxiv and a synthetic power-law graph · 4-core machine, warm cache · results in strata/results/graph`;
+    if (el) el.textContent = `Generated ${D.generated} · ogbn-arxiv and a synthetic power-law graph · Apple M2 MacBook Air, one thread, warm cache · results in strata/results/graph`;
   }
 
   meta();

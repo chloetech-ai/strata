@@ -179,11 +179,11 @@ $$
 
 ![Finding a paper's references on the 484 report papers: following the citations of the two nearest papers reaches nDCG@20 0.253, against 0.123 for vector search, 0.161 for BM25 and 0.160 for hybrid search](../assets/img/table-graph-quality.png)
 
-*Source: `strata/results/graph/quality_stats.json`. Times are from the quality runs, on the build before the speed changes above; the graph methods are faster now.*
+*Source: `strata/results/graph/quality_stats.json`. Times are from the quality runs on the M2, after one untimed pass per method.*
 
-**The graph doubles what vector search finds.** The best method is also the simplest: take the two papers nearest the query, follow their citations, and rank what they cite by similarity to the query. It reaches nDCG@20 0.253 against 0.123 for vector search (+0.130, 95% interval 0.111–0.149, p < 0.0001), 0.161 for BM25 and 0.160 for hybrid search, in 0.4 ms. Papers on the same topic cite the same work, and the nearest papers' reference lists are a better candidate set than the nearest papers themselves.
+**The graph doubles what vector search finds.** The best method is also the simplest: take the two papers nearest the query, follow their citations, and rank what they cite by similarity to the query. It reaches nDCG@20 0.253 against 0.123 for vector search (+0.130, 95% interval 0.111–0.149, p < 0.0001), 0.161 for BM25 and 0.160 for hybrid search, in 0.2 ms. Papers on the same topic cite the same work, and the nearest papers' reference lists are a better candidate set than the nearest papers themselves.
 
-PageRank from the same seeds reaches 0.211 at its best (from one seed), below the plain one-hop expansion: on this graph the papers two or three hops away dilute the direct citations. Fusing PageRank with the vector ranking lowers it to 0.188, because the vector ranking's own top results are mostly not references. Fusing BM25, vectors and PageRank from hybrid seeds also reaches 0.211, at the cost of BM25 over long queries (77 ms).
+PageRank from the same seeds reaches 0.211 at its best (from one seed), below the plain one-hop expansion: on this graph the papers two or three hops away dilute the direct citations. Fusing PageRank with the vector ranking lowers it to 0.179, because the vector ranking's own top results are mostly not references. Fusing BM25, vectors and PageRank from hybrid seeds also reaches 0.211, at the cost of BM25 over long queries (48 ms).
 
 ![nDCG@20 by number of vector seeds: the citation expansion peaks at two or three seeds and falls below vector search beyond 20](../assets/img/chart-graph-seeds.png)
 

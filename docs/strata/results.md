@@ -39,7 +39,7 @@ The design holds up. One file, with ACID commits and a SQL front end, serves ful
 
 ## Build time and size
 
-Strata builds every index of the table in one pass: text, structured, doc store, keys, float32 and 8-bit vectors, and an HNSW graph. That takes 0.5 s for SciFact and 153.1 s for Quora, against 0.3–30.7 s for SQLite and 0.4–9.3 s for Tantivy, neither of which builds a vector index. The graph is most of the difference: 13.3 s of FiQA's 14.2 s, 37 s of TREC-COVID's 40.6 s and 146 s of Quora's 153.1 s, on four threads. The rest of the load is 0.2–0.5× SQLite's time; with IVF instead of HNSW, TREC-COVID builds in 19.2 s and Quora in 60.1 s.
+Strata builds every index of the table in one pass: text, structured, doc store, keys, float32 and 8-bit vectors, and an HNSW graph. That takes 0.5 s for SciFact and 153.1 s for Quora, against 0.3–30.7 s for SQLite and 0.4–9.3 s for Tantivy, neither of which builds a vector index. The graph is most of the difference: 12.9 s of FiQA's 14.2 s, 37 s of TREC-COVID's 40.6 s and 146 s of Quora's 153.1 s, on four threads. The rest of the load is 0.2–0.5× SQLite's time; with IVF instead of HNSW, TREC-COVID builds in 19.2 s and Quora in 60.1 s.
 
 The Strata and SQLite files are close in size because both are dominated by float32 vectors, 4 KiB per document (83% of Strata's TREC-COVID file, 97% of Quora's). Without vectors, Strata's text index is the smallest of the three: with positions it takes 44.5 MiB on TREC-COVID against 60.0 MiB for Tantivy and 70.0 MiB for FTS5. A posting, with its docID and frequency, costs 12.2–12.7 bits.
 
@@ -109,11 +109,11 @@ The text index stores long lists (at least 512 documents) as [Loom](../posting-l
 
 ![Recall@10 against median latency on Quora: HNSW ef sweep, IVF nprobe sweep and the exact SQ8 scan with re-ranking](../assets/img/chart-strata-recall-latency.png)
 
-On Quora (522,931 vectors, 1,024 dimensions), HNSW reaches recall@10 0.961 at 0.035 ms and 0.990 at 0.086 ms (ef 64, the default). IVF needs 0.23 ms for 0.936 (nprobe 32) and 0.67 ms for 0.977. The exact scan of 8-bit codes with float32 re-ranking reaches 1.000 in 9.7 ms. HNSW took 146 s to build with four threads, IVF 53 s.
+On Quora (522,931 vectors, 1,024 dimensions), HNSW reaches recall@10 0.960 at 0.036 ms and 0.990 at 0.086 ms (ef 64, the default). IVF needs 0.22 ms for 0.936 (nprobe 32) and 0.67 ms for 0.977. The exact scan of 8-bit codes with float32 re-ranking reaches 1.000 in 9.7 ms. HNSW took 146 s to build with four threads, IVF 53 s.
 
 The quantised dot product costs 14 ns per vector with NEON `usdot` (9.8 ns when four rows are scored at once), against 70 ns in float32; on x86-64 the same kernel uses AVX-512 VNNI. Scoring on the codes alone already finds 99.8% of the exact top 10 over 100 sampled queries; float32 re-ranking settles the rest.
 
-Cold, access patterns decide. With the kernel's default read-ahead, one HNSW query reads 9,216 pages (128 ms). Advising the graph and its codes `MADV_RANDOM` cuts that to 4,608 pages (107 ms), and prefetching each hop's neighbours to 28 ms. IVF reads its clusters sequentially, so it is fastest with read-ahead: 28 ms, or 10 ms with prefetching.
+Cold, access patterns decide. With the kernel's default read-ahead, one HNSW query reads 9,672 pages (136 ms). Advising the graph and its codes `MADV_RANDOM` cuts that to 4,836 pages (113 ms), and prefetching each hop's neighbours to 28 ms. IVF reads its clusters sequentially, so it is fastest with read-ahead: 26 ms, or 10 ms with prefetching.
 
 ## Filtered vector search and the planner
 
