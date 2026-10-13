@@ -64,7 +64,7 @@
 //!   docID range straight from the decoder (the eight-block decoder's
 //!   interleaved output avoids read-modify-write stalls; on aarch64, two
 //!   four-block groups interleave), then the bitmap is extracted with
-//!   [`BitPos::extract`] (AVX-512 VBMI2 when available).
+//!   [`BitPos::extract`] (AVX-512 VBMI2 when available, NEON on aarch64).
 
 pub mod model;
 pub mod skip;
