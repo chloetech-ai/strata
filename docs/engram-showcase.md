@@ -4,7 +4,7 @@ October 13, 2026
 
 **Start every day with a fresh session and lose nothing.** In a week-long coding project with about 20 rules said once in chat, Claude Code with Engram solved **86%** of follow-up tasks from a brand-new session, against **71%** without it, at the same **$0.008 per task**.
 
-- **Quality:** Engram lifts the solve rate by 15 points in fresh sessions (71% → 86%) and by up to 19 points in long sessions that compact (74% → 93%, pending a regrade; see Fine print).
+- **Quality:** Engram lifts the solve rate by 15 points in fresh sessions (71% → 86%) and by 12 points in long sessions that compact (81% → 93%).
 - **Cost:** keeping the whole week in context reaches 93%, but at **$0.49 per task, about 60× the price** of a fresh session with Engram.
 - **Speed:** with Engram the agent needed **28% fewer steps** per task (8.8 → 6.3) and read **23% fewer tokens**, because it stopped searching the repository for decisions that were never written into it.
 - **Engine:** Engram stores memory in Strata, our single-file search database. It ran keyword search **110× faster than SQLite** and **2.7× faster than Tantivy** on 523,000 documents, ran vector search in 0.2 ms, and walked a citation graph up to 9× faster than SQLite.
@@ -39,7 +39,7 @@ Most tasks need several of those facts at once, so forgetting any one of them fa
 
 ## Quality: Engram recovers what sessions and summaries drop
 
-Engram raised the solve rate in both everyday workflows: **71% → 86%** with a fresh session each day, and **74% → 93%** with a long session that compacts. Compact + Engram tied keeping the entire week in context (93% each), with a slightly higher average grade (0.99 vs 0.97).
+Engram raised the solve rate in both everyday workflows: **71% → 86%** with a fresh session each day, and **81% → 93%** with a long session that compacts. Compact + Engram tied keeping the entire week in context (93% each), with a slightly higher average grade (0.99 vs 0.97).
 
 The gains come from the tasks that hinge on something said once in chat (runs solved out of 3):
 
@@ -60,7 +60,7 @@ A fresh session with Engram is the **cheapest way to a correct answer: $0.009 pe
 | --- | --- | --- | --- | --- | --- | --- |
 | Fresh | 71% | $0.008 | $0.012 | $0.77 | 8.8 | 288k |
 | **Fresh + Engram** | **86%** | **$0.008** | **$0.009** | **$0.88** | **6.3** | **221k** |
-| Compact | 74% | $0.176 | $0.238 | $10.43 | 6.4 | 248k |
+| Compact | 81% | $0.176 | $0.217 | $10.43 | 6.4 | 248k |
 | **Compact + Engram** | **93%** | $0.212 | $0.228 | $12.66 | 6.2 | 278k |
 | Full context | 93% | $0.492 | $0.530 | $25.11 | 3.5 | 517k |
 
@@ -200,8 +200,8 @@ Strata stores links compactly inside the file, at 27 bytes per citation on arXiv
 
 ## Fine print
 
-- **Regrade pending:** 7 of 210 runs scored 0 because the grader crashed rather than judging the code. All 3 Compact runs of the accountant's export renamed a field the grader expected, and a manual check shows they kept patient names out. Three Fresh pricing runs and one Fresh + Engram reminder run also crashed. A fixed grader is ready, and the runs will be regraded from their saved code. Compact may rise to about 81%, which would cut Engram's gain after compaction from 19 points to about 12.
-- **Sample size:** 42 runs per setup gives wide error bars. Fresh is 71% (95% CI 56–83%) and Fresh + Engram is 86% (72–93%); Compact is 74% (59–85%) and Compact + Engram and Full context are both 93% (81–98%). The direction is consistent across tasks, but these are not yet statistically separated.
+- **Regraded runs:** in 7 of 210 runs the grader first crashed instead of judging the code. After a grader fix, every one was regraded from its saved code. The 3 Compact export runs passed (they had renamed a field the grader expected), which moved Compact from 74% to 81%. The other 4 still fail on their merits: two Fresh pricing runs declined to write the function, one raised an error for card holders, and one Fresh + Engram reminder run crashed in its own code.
+- **Sample size:** 42 runs per setup gives wide error bars. Fresh is 71% (95% CI 56–83%) and Fresh + Engram is 86% (72–93%); Compact is 81% (67–90%) and Compact + Engram and Full context are both 93% (81–98%). The direction is consistent across tasks, but these are not yet statistically separated.
 - **Fair baseline:** every setup kept Claude Code's own built-in memory notes from the week. Memory, the repository and Engram's store were restored before every run, so no run could learn from another. No user plugins or extra tools were loaded.
 - **One model:** all runs used the same small, fast Claude model. Costs are list prices as reported by Claude Code.
 - **Hard by design:** one task, the booking-form check, was solved by no setup.
