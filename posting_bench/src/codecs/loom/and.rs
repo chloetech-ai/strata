@@ -9,8 +9,8 @@
 //!   run → keep, bitvector → branch-free bit test, EF → [`ef_filter`], which
 //!   picks per partition, from the number of candidates and of postings:
 //!   - *merge*: when the list has at most [`MERGE_RATIO`] postings per
-//!     candidate there, decode them and intersect with the AVX-512
-//!     block-merge kernel;
+//!     candidate there, decode them and intersect with the AVX-512 (NEON
+//!     on aarch64) block-merge kernel;
 //!   - *far probes*: when it has [`FAR_RATIO`] or more, locate each
 //!     candidate's bucket independently from the select samples, so the
 //!     probes (and their cache misses) overlap;
@@ -52,10 +52,35 @@ unsafe fn count_below(p: *const u32, v: u32) -> usize {
         let x = _mm256_loadu_si256(p.cast());
         _mm256_cmplt_epu32_mask(x, _mm256_set1_epi32(v as i32)).count_ones() as usize
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl")))]
+    #[cfg(target_arch = "aarch64")]
     {
-        (0..8).map(|j| (*p.add(j) < v) as usize).sum()
+        count_below_neon(p, v)
     }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"), target_arch = "aarch64")))]
+    {
+        count_below_scalar(p, v)
+    }
+}
+
+/// Portable [`count_below`].
+#[cfg_attr(
+    any(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"), target_arch = "aarch64"),
+    allow(dead_code)
+)]
+#[inline(always)]
+unsafe fn count_below_scalar(p: *const u32, v: u32) -> usize {
+    (0..8).map(|j| (*p.add(j) < v) as usize).sum()
+}
+
+/// NEON [`count_below`]: the two compare masks (all ones per lane below
+/// `v`) are added lane-wise and summed (`addv`), which gives minus the count.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn count_below_neon(p: *const u32, v: u32) -> usize {
+    use std::arch::aarch64::*;
+    let x = vld1q_u32_x2(p);
+    let vv = vdupq_n_u32(v);
+    vaddvq_u32(vaddq_u32(vcltq_u32(x.0, vv), vcltq_u32(x.1, vv))).wrapping_neg() as usize
 }
 
 /// Receiver of intersection results (in increasing order).
@@ -342,7 +367,8 @@ unsafe fn ef_streams<const S: usize>(p: &mut ef::EfProbe, base: u32, c: *mut u32
 /// Merge mode of [`ef_filter`]: decode the partition's postings from the
 /// first candidate to the last (`ef::EfCur::decode`, SIMD) and intersect
 /// them with the candidates with the crate's widest block-merge kernel
-/// (AVX-512 16 x 16 here). Returns `None` (nothing done) when there are
+/// (AVX-512 16 x 16 here, NEON 8 x 8 on aarch64). Returns `None` (nothing
+/// done) when there are
 /// more than about [`MERGE_RATIO`] times as many postings as candidates in
 /// that range (the caller only estimated it).
 #[inline(never)]
@@ -717,3 +743,53 @@ fn bulk<S: Sink>(d: &mut Driver, probes: &mut [Probe], sink: &mut S, s: &mut Scr
     }
 }
 
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    #[test]
+    fn neon_count_below_matches_scalar() {
+        let mut rng = StdRng::seed_from_u64(12);
+        for _ in 0..20_000 {
+            let mut c: Vec<u32> = (0..8).map(|_| rng.gen_range(0..64)).collect();
+            c.sort_unstable();
+            // Sentinels at the end, as after a batch's candidates.
+            for x in c.iter_mut().skip(rng.gen_range(0..=8)) {
+                *x = END;
+            }
+            for v in [0, 1, c[0], c[3], c[7], rng.gen_range(0..70), END - 1, END] {
+                unsafe { assert_eq!(count_below_neon(c.as_ptr(), v), count_below_scalar(c.as_ptr(), v), "{c:?} {v}") };
+            }
+        }
+    }
+
+    /// `cargo test --release count_below_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing only"]
+    fn count_below_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut c: Vec<u32> = (0..1 << 16).map(|_| rng.gen_range(0..1 << 24)).collect();
+        c.sort_unstable();
+        c.extend([END; PAD]);
+        let gaps: Vec<u32> = (0..1 << 16).map(|_| rng.gen_range(0..1 << 10)).collect();
+        // A skip_below-like chain: each step starts where the previous ended.
+        let time = |f: unsafe fn(*const u32, u32) -> usize| {
+            (0..7)
+                .map(|_| {
+                    let t = Instant::now();
+                    let mut i = 0usize;
+                    for &g in &gaps {
+                        let v = c[i] + g;
+                        i = (i + 1 + unsafe { f(c.as_ptr().add(i), v) }) & ((1 << 16) - 1);
+                    }
+                    black_box(i);
+                    t.elapsed().as_secs_f64() * 1e9 / gaps.len() as f64
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        println!("count_below chain: scalar {:.2} ns, neon {:.2} ns", time(count_below_scalar), time(count_below_neon));
+    }
+}

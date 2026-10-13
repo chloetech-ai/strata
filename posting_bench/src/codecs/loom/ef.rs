@@ -25,6 +25,11 @@ pub const MAX_N: u64 = 4096;
 /// Spare output slots [`EfCur::decode`] may write past its values.
 pub const DECODE_SLACK: usize = 16;
 
+/// Fewer values than this (one 16-value block) are decoded by the scalar
+/// loop on aarch64: the NEON decoder's fixed cost is about 14 scalar values.
+#[cfg(target_arch = "aarch64")]
+const NEON_MIN: usize = 16;
+
 /// `floor(log2(span / n))` for `span >= n >= 1`, branch-free.
 #[inline(always)]
 pub fn lower_bits(span: u64, n: u64) -> u32 {
@@ -254,7 +259,10 @@ impl EfCur {
     /// With AVX-512 VBMI and `l <= 25`, 16 values at a time: the high bits'
     /// one positions are extracted with `vpcompressd` (as bitmaps are), and
     /// the low fields unpacked with one `vpermb` (each lane gathers the four
-    /// bytes holding its field) and a variable shift.
+    /// bytes holding its field) and a variable shift. NEON (`l <= 25`, at
+    /// least [`NEON_MIN`] values) does the same with its bitmap extraction
+    /// and, per 4 values, one `tbl` over 16 bytes and a variable shift
+    /// (`ushl`).
     ///
     /// # Safety
     /// At least `count` values follow the current one; `out` has room for
@@ -266,11 +274,96 @@ impl EfCur {
         if self.l <= 25 {
             return self.decode_avx512(count, add, out);
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.l <= 25 && count >= NEON_MIN {
+            return self.decode_neon(count, add, out);
+        }
+        self.decode_scalar(count, add, out);
+    }
+
+    /// Portable [`EfCur::decode`].
+    #[inline(always)]
+    unsafe fn decode_scalar(&mut self, count: usize, add: u32, out: *mut u32) {
         let mut o = out;
         self.for_each_until(self.idx.wrapping_add(1) + count, |v| {
             o.write(add.wrapping_add(v as u32));
             o = o.add(1);
         });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    unsafe fn decode_neon(&mut self, count: usize, add: u32, out: *mut u32) {
+        use std::arch::aarch64::*;
+        const CH: usize = 256;
+        // Not zeroed (a 1.5 KiB memset per call): every slot read is
+        // written first, see below.
+        let mut buf = std::mem::MaybeUninit::<[u32; CH + 2 * super::simd::SLACK]>::uninit();
+        let pos = buf.as_mut_ptr().cast::<u32>();
+        let l = self.l;
+        let iota = vld1q_u32([0, 1, 2, 3].as_ptr());
+        let vl = vdupq_n_s32(l as i32);
+        let vmask = vdupq_n_u32(self.mask as u32);
+        let vadd = vdupq_n_u32(add);
+        let mut done = 0;
+        while done < count {
+            let m = (count - done).min(CH);
+            let idx0 = self.idx.wrapping_add(1);
+            // 1. Positions of the next m ones of the high bits.
+            let mut np = 0usize;
+            let mut wi = self.wi;
+            let mut w = self.buf;
+            loop {
+                np = super::simd::extract_word(w, (wi as u32).wrapping_mul(64), pos.add(np)).offset_from(pos) as usize;
+                if np >= m {
+                    break;
+                }
+                wi = wi.wrapping_add(1);
+                w = *self.high.add(wi);
+            }
+            // The blocks below read up to 15 slots past m <= np.
+            vst1q_u32_x4(pos.add(np), uint32x4x4_t(vdupq_n_u32(0), vdupq_n_u32(0), vdupq_n_u32(0), vdupq_n_u32(0)));
+            let plast = *pos.add(m - 1) as usize;
+            self.wi = plast / 64;
+            self.buf = *self.high.add(self.wi) & ((!0u64 << (plast % 64)) << 1);
+            // 2. Low fields, 16 values per block as in the AVX-512 decoder
+            // (a block starting at bit B reads from byte B / 8, B % 8 being
+            // the same for every block). Group g of a block (values 4g..4g+4)
+            // starts at bit s0 + 4gl of those bytes and reads the 16 bytes
+            // from byte gb[g] (enough for l <= 25); its lane j gathers with
+            // `tbl` the four bytes from bit r = (s0 + 4gl) % 8 + j * l of
+            // them and shifts right by r % 8.
+            let s0 = ((idx0 * l as usize) % 8) as u32;
+            let mut gb = [0usize; 4];
+            let mut perm = [vdupq_n_u8(0); 4];
+            let mut shift = [vdupq_n_s32(0); 4];
+            for g in 0..4 {
+                let start = s0 + 4 * g as u32 * l;
+                gb[g] = (start / 8) as usize;
+                let r = vmlaq_n_u32(vdupq_n_u32(start % 8), iota, l);
+                let byte = vshrq_n_u32::<3>(r);
+                perm[g] = vreinterpretq_u8_u32(vmlaq_n_u32(vdupq_n_u32(0x0302_0100), byte, 0x0101_0101));
+                shift[g] = vnegq_s32(vreinterpretq_s32_u32(vandq_u32(r, vdupq_n_u32(7))));
+            }
+            let mut t = 0;
+            while t < m {
+                let i = idx0 + t;
+                let low = self.low.add(i * l as usize / 8);
+                let mut ib = vaddq_u32(vdupq_n_u32(i as u32), iota);
+                for g in 0..4 {
+                    let data = vld1q_u8(low.add(gb[g]));
+                    let lo = vandq_u32(vshlq_u32(vreinterpretq_u32_u8(vqtbl1q_u8(data, perm[g])), shift[g]), vmask);
+                    let hi = vsubq_u32(vld1q_u32(pos.add(t + 4 * g)), ib);
+                    let v = vorrq_u32(vshlq_u32(hi, vl), lo);
+                    vst1q_u32(out.add(done + t + 4 * g), vaddq_u32(v, vadd));
+                    ib = vaddq_u32(ib, vdupq_n_u32(4));
+                }
+                t += 16;
+            }
+            self.idx = idx0 + m - 1;
+            done += m;
+            self.val = out.add(done - 1).read().wrapping_sub(add) as u64;
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
@@ -400,6 +493,9 @@ unsafe fn bucket_start(high: *const u64, samples: *const u16, start: usize, hb: 
 
 /// Position of the `k`-th set bit of `w` when `k < w.count_ones()`; some
 /// value in `0..=64` otherwise (never panics, for branch-free selection).
+/// On aarch64 the broadword select ([`crate::bits::select_in_word_neon`])
+/// runs without a branch and is clamped: 64 past the last set bit, as the
+/// fallback and `pdep` give.
 #[inline(always)]
 fn select_unchecked(w: u64, k: u64) -> usize {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
@@ -407,7 +503,11 @@ fn select_unchecked(w: u64, k: u64) -> usize {
         // SAFETY: guarded by the `bmi2` target feature.
         unsafe { core::arch::x86_64::_pdep_u64(1u64.wrapping_shl(k as u32), w).trailing_zeros() as usize }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::bits::select_in_word_neon(w, k.min(64) as u32).min(64) as usize
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64")))]
     {
         if k < w.count_ones() as u64 {
             select_in_word(w, k as u32) as usize
@@ -421,7 +521,9 @@ fn select_unchecked(w: u64, k: u64) -> usize {
 /// after bit `from`. With AVX-512 (VPOPCNTDQ) the zeros of the 8 words from
 /// `from` are counted at once and prefix-summed, so up to 8 words are
 /// searched without branches; further words (rare: at least 200-odd zeros
-/// lie in 8 words of an EF high bitvector) are scanned one by one.
+/// lie in 8 words of an EF high bitvector) are scanned one by one. NEON does
+/// the same with byte counts (`cnt`, pairwise-added to one byte per word)
+/// and a saturating byte prefix sum (`r < 256`).
 ///
 /// # Safety
 /// The zero must exist, and 8 words from `from / 64` must be readable.
@@ -447,12 +549,63 @@ unsafe fn select0_from(high: *const u64, from: usize, r: u64) -> usize {
         }
         bucket_start(high, std::ptr::null(), from, 0, r + 1) - 1
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq")))]
+    #[cfg(target_arch = "aarch64")]
     {
-        // `bucket_start` passes r + 1 zeros from `from` (never via samples
-        // here: r < SAMPLE).
-        bucket_start(high, std::ptr::null(), from, 0, r + 1) - 1
+        select0_from_neon(high, from, r)
     }
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"),
+        target_arch = "aarch64"
+    )))]
+    {
+        select0_from_scalar(high, from, r)
+    }
+}
+
+/// Portable [`select0_from`].
+#[cfg_attr(
+    any(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"), target_arch = "aarch64"),
+    allow(dead_code)
+)]
+#[inline(always)]
+unsafe fn select0_from_scalar(high: *const u64, from: usize, r: u64) -> usize {
+    // `bucket_start` passes r + 1 zeros from `from` (never via samples
+    // here: r < SAMPLE).
+    bucket_start(high, std::ptr::null(), from, 0, r + 1) - 1
+}
+
+/// NEON [`select0_from`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn select0_from_neon(high: *const u64, from: usize, r: u64) -> usize {
+    use std::arch::aarch64::*;
+    debug_assert!(r < SAMPLE);
+    let wi = from / 64;
+    let first = !0u64 << (from % 64);
+    let v = vld1q_u8_x4(high.add(wi).cast());
+    let z0 = vbicq_u8(vreinterpretq_u8_u64(vsetq_lane_u64::<0>(first, vdupq_n_u64(!0))), v.0);
+    // Zeros per word, one byte per word (at most 64).
+    let c = vpaddq_u8(
+        vpaddq_u8(vcntq_u8(z0), vcntq_u8(vmvnq_u8(v.1))),
+        vpaddq_u8(vcntq_u8(vmvnq_u8(v.2)), vcntq_u8(vmvnq_u8(v.3))),
+    );
+    let cnt = vget_low_u8(vpaddq_u8(c, c));
+    // Inclusive prefix sums, saturating: a lane that saturates holds 255 or
+    // more zeros, and r <= 255 falls through to the scan when it does.
+    let zero = vdup_n_u8(0);
+    let mut pre = vqadd_u8(cnt, vext_u8::<7>(zero, cnt));
+    pre = vqadd_u8(pre, vext_u8::<6>(zero, pre));
+    pre = vqadd_u8(pre, vext_u8::<4>(zero, pre));
+    let m = vget_lane_u64::<0>(vreinterpret_u64_u8(vcgt_u8(pre, vdup_n_u8(r as u8))));
+    if m != 0 {
+        let j = (m.trailing_zeros() / 8) as usize;
+        // Zeros before word j (exact: at most r).
+        let before = (vget_lane_u64::<0>(vreinterpret_u64_u8(pre)) << 8 >> (8 * j)) & 0xff;
+        let keep = if j == 0 { first } else { !0 };
+        let w = !*high.add(wi + j) & keep;
+        return (wi + j) * 64 + select_in_word(w, (r - before) as u32) as usize;
+    }
+    bucket_start(high, std::ptr::null(), from, 0, r + 1) - 1
 }
 
 /// Membership probe over an EF partition for non-decreasing targets.
@@ -600,6 +753,235 @@ mod tests {
                     assert_eq!(lower_bits(span, n), ef_lower_bits(span, n));
                 }
             }
+        }
+    }
+
+    /// An EF partition of `n` random values in `[0, span)` with list-like
+    /// padding, and the values.
+    #[cfg(target_arch = "aarch64")]
+    fn partition(rng: &mut StdRng, n: usize, span: u64) -> (Vec<u64>, Vec<u32>, Layout) {
+        // Dense draws are Bernoulli: about n values.
+        let mut vals = random_sorted(rng, n, span.min(u32::MAX as u64) as u32);
+        vals.truncate(MAX_N as usize);
+        if vals.is_empty() {
+            vals.push(0);
+        }
+        let mut words = Vec::new();
+        encode(&vals, 0, span, &mut words);
+        words.extend([0; 9]); // as the list padding (PAD_WORDS)
+        let lay = Layout::new(span, vals.len() as u64);
+        (words, vals, lay)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_matches_scalar() {
+        let mut rng = StdRng::seed_from_u64(78);
+        // Every l from 0 to 25 and beyond, single values, partial blocks.
+        let mut shapes: Vec<(usize, u64)> = vec![(1, 1), (1, 1000), (2, 2), (5, 5), (17, 17), (4096, 4096), (4096, 4097), (4096, 1 << 32)];
+        for l in 0..=31u32 {
+            for n in [1usize, 15, 16, 17, 255, 256, 257, 1000, 4096] {
+                // span / n in [2^l, 2^(l + 1)): l low bits.
+                let lo = (n as u64) << l;
+                if lo <= 1 << 32 {
+                    shapes.push((n, (lo + rng.gen_range(0..lo)).min(1 << 32)));
+                }
+            }
+        }
+        for (n, span) in shapes {
+            let (words, vals, lay) = partition(&mut rng, n, span);
+            let n = vals.len();
+            let mk = || unsafe { EfCur::new(words.as_ptr(), lay.l, lay.low_words, lay.high_words) };
+            for add in [0u32, 12345, u32::MAX - 7] {
+                // Pieces of various sizes from the start (piece 3: from
+                // mid-partition, after a next_geq); both decoders agree on
+                // output and cursor state.
+                for piece in [1usize, 3, 16, 33, 256, 300, 4096] {
+                    let (mut a, mut b) = (mk(), mk());
+                    let mut done = 0;
+                    if n > 2 && piece == 3 {
+                        // Start after a next_geq, mid-word.
+                        let t = vals[n / 3] as u64;
+                        unsafe {
+                            a.next_geq(t);
+                            b.next_geq(t);
+                        }
+                        done = a.idx + 1;
+                    }
+                    while done < n {
+                        let m = piece.min(n - done);
+                        let mut x = vec![0u32; m + DECODE_SLACK];
+                        let mut y = vec![0u32; m + DECODE_SLACK];
+                        unsafe {
+                            a.decode_scalar(m, add, x.as_mut_ptr());
+                            if lay.l <= 25 {
+                                b.decode_neon(m, add, y.as_mut_ptr());
+                            } else {
+                                b.decode(m, add, y.as_mut_ptr());
+                            }
+                        }
+                        assert_eq!(&x[..m], &y[..m], "n={n} span={span} l={} piece={piece} done={done}", lay.l);
+                        let exp: Vec<u32> = vals[done..done + m].iter().map(|&v| v.wrapping_add(add)).collect();
+                        assert_eq!(&x[..m], &exp[..]);
+                        assert_eq!((a.idx, a.val, a.wi, a.buf), (b.idx, b.val, b.wi, b.buf), "cursor state");
+                        done += m;
+                    }
+                    if n > 1 {
+                        // The cursors keep working after decoding.
+                        let (mut a, mut b) = (mk(), mk());
+                        unsafe {
+                            a.decode_scalar(n - 1, 0, vec![0u32; n + DECODE_SLACK].as_mut_ptr());
+                            b.decode(n - 1, 0, vec![0u32; n + DECODE_SLACK].as_mut_ptr());
+                            assert_eq!(a.next(), vals[n - 1] as u64);
+                            assert_eq!(b.next(), vals[n - 1] as u64);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_select_matches_scalar() {
+        let mut rng = StdRng::seed_from_u64(79);
+        // select_unchecked: every k up to past the end, and huge k.
+        let scalar = |w: u64, k: u64| {
+            if k < w.count_ones() as u64 {
+                crate::bits::select_in_word_scalar(w, k as u32) as usize
+            } else {
+                64
+            }
+        };
+        let mut words: Vec<u64> = vec![0, 1, 1 << 63, !0, 0xff, 0xff << 56, 0x5555_5555_5555_5555];
+        words.extend((0..1000).map(|_| rng.gen::<u64>() & rng.gen::<u64>()));
+        words.extend((0..1000).map(|_| rng.gen::<u64>() | rng.gen::<u64>()));
+        for &w in &words {
+            for k in (0..=70).chain([100, 1 << 32, u64::MAX - 1, u64::MAX]) {
+                assert_eq!(select_unchecked(w, k), scalar(w, k), "w={w:#x} k={k}");
+            }
+        }
+        // select0_from over high bitvectors (EF ones, and words with few or
+        // no zeros, so that the 8-word window can miss), from every bit of
+        // the first words, for every r < SAMPLE.
+        let mut highs: Vec<Vec<u64>> = Vec::new();
+        for (n, span) in [(4096usize, 8192u64), (4096, 4500), (1000, 1_000_000), (300, 300 * 3)] {
+            let (words, _, lay) = partition(&mut rng, n, span);
+            highs.push(words[lay.low_words..lay.low_words + lay.high_words].to_vec());
+        }
+        highs.push((0..40).map(|_| !(1u64 << rng.gen_range(0..64))).collect());
+        highs.push((0..40).map(|i| if i % 9 == 4 { 0 } else { !0 }).collect());
+        highs.push((0..40).map(|_| rng.gen::<u64>() | rng.gen::<u64>() | rng.gen::<u64>()).collect());
+        highs.push(vec![0; 16]);
+        for mut h in highs {
+            // Zeros after the end, as in a list (padding), and enough of them.
+            h.extend([0; 16]);
+            let zeros_from = |from: usize| -> u64 {
+                (from..h.len() * 64).filter(|&b| h[b / 64] >> (b % 64) & 1 == 0).count() as u64
+            };
+            for from in (0..200.min(h.len() * 64 - 8 * 64)).chain([511, 512, 513]) {
+                let avail = zeros_from(from).min(SAMPLE);
+                for r in 0..avail {
+                    let (x, y) = unsafe { (select0_from_scalar(h.as_ptr(), from, r), select0_from_neon(h.as_ptr(), from, r)) };
+                    assert_eq!(x, y, "from={from} r={r}");
+                }
+            }
+        }
+    }
+
+    /// NEON vs scalar decoding and probes:
+    /// `cargo test --release ef_neon_timing -- --ignored --nocapture`
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing only"]
+    fn ef_neon_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let best = |f: &mut dyn FnMut()| {
+            (0..7)
+                .map(|_| {
+                    let t = Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64()
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let mut rng = StdRng::seed_from_u64(5);
+        println!("decode, ns per value (64 partitions of 4096 values, decoded in pieces):");
+        for span in [8192u64, 65_536, 1 << 20, 1 << 24, 1 << 30] {
+            let parts: Vec<_> = (0..64).map(|_| partition(&mut rng, 4096, span)).collect();
+            let mut out = vec![0u32; 4096 + DECODE_SLACK];
+            let mut row = format!("  l={:>2}:", parts[0].2.l);
+            for piece in [1usize, 4, 16, 64, 256, 4096] {
+                for neon in [false, true] {
+                    let t = best(&mut || {
+                        for (w, _, lay) in &parts {
+                            let mut c = unsafe { EfCur::new(w.as_ptr(), lay.l, lay.low_words, lay.high_words) };
+                            let mut done = 0;
+                            while done < 4096 {
+                                let m = piece.min(4096 - done);
+                                unsafe {
+                                    if neon {
+                                        c.decode(m, 0, out.as_mut_ptr());
+                                    } else {
+                                        c.decode_scalar(m, 0, out.as_mut_ptr());
+                                    }
+                                }
+                                done += m;
+                            }
+                            black_box(&out);
+                        }
+                    });
+                    row += &format!(" {}{piece} {:.2}", if neon { "/" } else { " " }, t * 1e9 / (64.0 * 4096.0));
+                }
+            }
+            println!("{row}  (piece: scalar/dispatch)");
+        }
+        println!("probe_far (select0_from), ns per probe (4096 values, random targets):");
+        for span in [8192u64, 65_536, 1 << 20] {
+            let (w, vals, lay) = partition(&mut rng, 4096, span);
+            let c = unsafe { EfCur::new(w.as_ptr(), lay.l, lay.low_words, lay.high_words) };
+            let last = *vals.last().unwrap() as u64;
+            let ts: Vec<u64> = (0..1 << 16).map(|_| rng.gen_range(0..=last)).collect();
+            let p = EfProbe::new(&c);
+            let high = w[lay.low_words..].as_ptr();
+            let froms: Vec<(usize, u64)> = ts
+                .iter()
+                .map(|&t| {
+                    let z = (t >> lay.l).max(1) - 1;
+                    let si = (z / SAMPLE) as usize;
+                    let from = if si == 0 { 0 } else { unsafe { *p.samples.add(si - 1) as usize } };
+                    (from, z - si as u64 * SAMPLE)
+                })
+                .collect();
+            let t_scalar = best(&mut || {
+                let mut acc = 0;
+                for &(from, r) in &froms {
+                    acc += unsafe { select0_from_scalar(high, from, r) };
+                }
+                black_box(acc);
+            });
+            let t_neon = best(&mut || {
+                let mut acc = 0;
+                for &(from, r) in &froms {
+                    acc += unsafe { select0_from_neon(high, from, r) };
+                }
+                black_box(acc);
+            });
+            let t_probe = best(&mut || {
+                let mut hits = 0;
+                for &t in &ts {
+                    hits += unsafe { p.probe_far(t) }.0 as u32;
+                }
+                black_box(hits);
+            });
+            println!(
+                "  l={:>2}: select0_from scalar {:.2}, neon {:.2}; probe_far (dispatch) {:.2}",
+                lay.l,
+                t_scalar * 1e9 / ts.len() as f64,
+                t_neon * 1e9 / ts.len() as f64,
+                t_probe * 1e9 / ts.len() as f64
+            );
         }
     }
 

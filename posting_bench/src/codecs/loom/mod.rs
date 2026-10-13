@@ -30,7 +30,9 @@
 //!
 //! **Decoding** EF partitions is vectorised (`ef::EfCur::decode`): high
 //! bits are extracted with `vpcompressd` like bitmaps, low bits unpacked 16
-//! at a time with `vpermb` and a variable shift.
+//! at a time with `vpermb` and a variable shift (on aarch64, NEON: bitmaps
+//! are extracted a byte at a time from a table, low bits gathered with
+//! `tbl`).
 //!
 //! **Set algebra** (see the `and` and `or` modules for details):
 //! * AND: the shortest list is decoded in batches; every other list (rarest
@@ -44,7 +46,8 @@
 //!   by ANDing the other lists' aligned bitvector words.
 //! * OR: a 2^16-docID window accumulator; per window every list ORs its
 //!   bitvector words, fills its runs and sets its (SIMD-decoded) EF
-//!   postings, then the window is extracted (`vpcompressd`) and cleared.
+//!   postings, then the window is extracted (`vpcompressd`, or NEON) and
+//!   cleared.
 //! * [`Loom::and_count`] / [`Loom::or_count`] return cardinalities only.
 //!
 //! **Storage.** The arrays are [`Slice`]s: owned when built, zero-copy views

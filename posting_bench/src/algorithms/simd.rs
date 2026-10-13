@@ -13,11 +13,13 @@
 //!                   └─ == [b3 b0 b1 b2]      j += W if b3 <= a3
 //! ```
 //!
-//! Three widths are provided: SSE (W = 4, `pshufb` compaction), AVX2
+//! Three x86 widths are provided: SSE (W = 4, `pshufb` compaction), AVX2
 //! (W = 8, `vpermd` compaction) and AVX-512 (W = 16, `vpcompressd`, the
-//! software analogue of `VP2INTERSECT`). Each is compiled only when the
-//! target supports it; [`intersect`] picks the widest available and falls
-//! back to a scalar merge elsewhere.
+//! software analogue of `VP2INTERSECT`); on aarch64, NEON 4×4 and 8×8
+//! (`ext` rotations, `tbl` compaction of each 4-lane half). Each is
+//! compiled only when the target supports it; [`intersect`] picks the
+//! widest available (NEON 8×8 on aarch64) and falls back to a scalar merge
+//! elsewhere.
 
 use super::pairwise::PairwiseFn;
 
@@ -207,6 +209,110 @@ mod avx512 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use core::arch::aarch64::*;
+
+    /// For each 4-bit match mask, a `tbl` control moving matching lanes to
+    /// the front (out-of-range indices give zero bytes).
+    const fn lut4() -> [[u8; 16]; 16] {
+        let mut lut = [[0x80u8; 16]; 16];
+        let mut m = 0;
+        while m < 16 {
+            let (mut k, mut lane) = (0, 0);
+            while lane < 4 {
+                if m & (1 << lane) != 0 {
+                    let mut byte = 0;
+                    while byte < 4 {
+                        lut[m][4 * k + byte] = (4 * lane + byte) as u8;
+                        byte += 1;
+                    }
+                    k += 1;
+                }
+                lane += 1;
+            }
+            m += 1;
+        }
+        lut
+    }
+    static LUT4: [[u8; 16]; 16] = lut4();
+
+    /// Bit `i` set where lane `i` of `cmp` is all ones.
+    #[inline(always)]
+    unsafe fn mask4(cmp: uint32x4_t) -> usize {
+        vaddvq_u32(vandq_u32(cmp, vld1q_u32([1, 2, 4, 8].as_ptr()))) as usize
+    }
+
+    /// Popcount of a 4-bit mask (a nibble table in a constant).
+    #[inline(always)]
+    fn pop4(m: usize) -> usize {
+        (0x4332_3221_3221_2110u64 >> (4 * m)) as usize & 0xf
+    }
+
+    /// Store the lanes of `v` selected by `mask` at `dst`; returns how many.
+    #[inline(always)]
+    unsafe fn compact4(v: uint32x4_t, mask: usize, dst: *mut u32) -> usize {
+        let ctrl = vld1q_u8(LUT4.get_unchecked(mask).as_ptr());
+        vst1q_u32(dst, vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(v), ctrl)));
+        pop4(mask)
+    }
+
+    /// Lanes of `va` equal to some lane of `vb` (all four rotations).
+    #[inline(always)]
+    unsafe fn matches(va: uint32x4_t, vb: uint32x4_t) -> uint32x4_t {
+        vorrq_u32(
+            vorrq_u32(vceqq_u32(va, vb), vceqq_u32(va, vextq_u32::<1>(vb, vb))),
+            vorrq_u32(vceqq_u32(va, vextq_u32::<2>(vb, vb)), vceqq_u32(va, vextq_u32::<3>(vb, vb))),
+        )
+    }
+
+    pub fn intersect4(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+        let start = out.len();
+        out.reserve(a.len().min(b.len()) + 4);
+        // SAFETY: as in the SSE kernel.
+        unsafe {
+            let dst = out.as_mut_ptr().add(start);
+            let (mut i, mut j, mut k) = (0, 0, 0);
+            let (na4, nb4) = (a.len() & !3, b.len() & !3);
+            while i < na4 && j < nb4 {
+                let va = vld1q_u32(a.as_ptr().add(i));
+                let vb = vld1q_u32(b.as_ptr().add(j));
+                k += compact4(va, mask4(matches(va, vb)), dst.add(k));
+                let (amax, bmax) = (*a.get_unchecked(i + 3), *b.get_unchecked(j + 3));
+                i += if amax <= bmax { 4 } else { 0 };
+                j += if bmax <= amax { 4 } else { 0 };
+            }
+            k = super::merge_tail(a, b, i, j, dst, k);
+            out.set_len(start + k);
+        }
+    }
+
+    pub fn intersect8(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+        let start = out.len();
+        out.reserve(a.len().min(b.len()) + 8);
+        // SAFETY: as in the SSE kernel, with W = 8.
+        unsafe {
+            let dst = out.as_mut_ptr().add(start);
+            let (mut i, mut j, mut k) = (0, 0, 0);
+            let (na8, nb8) = (a.len() & !7, b.len() & !7);
+            while i < na8 && j < nb8 {
+                let va = vld1q_u32_x2(a.as_ptr().add(i));
+                let vb = vld1q_u32_x2(b.as_ptr().add(j));
+                // Each half of a against the rotations of both halves of b.
+                let m0 = mask4(vorrq_u32(matches(va.0, vb.0), matches(va.0, vb.1)));
+                let m1 = mask4(vorrq_u32(matches(va.1, vb.0), matches(va.1, vb.1)));
+                k += compact4(va.0, m0, dst.add(k));
+                k += compact4(va.1, m1, dst.add(k));
+                let (amax, bmax) = (*a.get_unchecked(i + 7), *b.get_unchecked(j + 7));
+                i += if amax <= bmax { 8 } else { 0 };
+                j += if bmax <= amax { 8 } else { 0 };
+            }
+            k = super::merge_tail(a, b, i, j, dst, k);
+            out.set_len(start + k);
+        }
+    }
+}
+
 /// Widest SIMD block-merge kernel available on this target (scalar merge
 /// if none).
 pub fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
@@ -216,6 +322,8 @@ pub fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     return avx2::intersect(a, b, out);
     #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", not(target_feature = "avx2")))]
     return sse::intersect(a, b, out);
+    #[cfg(target_arch = "aarch64")]
+    return neon::intersect8(a, b, out);
     #[allow(unreachable_code)]
     super::pairwise::merge(a, b, out)
 }
@@ -230,5 +338,38 @@ pub fn kernels() -> Vec<(&'static str, PairwiseFn)> {
     v.push(("SIMD AVX2 8x8", avx2::intersect));
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     v.push(("SIMD AVX-512 16x16", avx512::intersect));
+    #[cfg(target_arch = "aarch64")]
+    v.push(("SIMD NEON 4x4", neon::intersect4));
+    #[cfg(target_arch = "aarch64")]
+    v.push(("SIMD NEON 8x8", neon::intersect8));
     v
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar() {
+        use crate::algorithms::pairwise::{merge, tests::check_kernel};
+        check_kernel("NEON 4x4", super::neon::intersect4);
+        check_kernel("NEON 8x8", super::neon::intersect8);
+        check_kernel("dispatch", super::intersect);
+        // Block boundaries: every length pair around the block sizes, with
+        // all, some and no values in common.
+        for na in 0..20usize {
+            for nb in 0..20usize {
+                for (sa, sb) in [(1u32, 1u32), (1, 2), (3, 2), (2, 3)] {
+                    let a: Vec<u32> = (0..na as u32).map(|x| x * sa).collect();
+                    let b: Vec<u32> = (0..nb as u32).map(|x| x * sb + (sa == 3) as u32).collect();
+                    let mut want = Vec::new();
+                    merge(&a, &b, &mut want);
+                    for f in [super::neon::intersect4, super::neon::intersect8] {
+                        let mut out = vec![9];
+                        f(&a, &b, &mut out);
+                        assert_eq!(&out[1..], &want[..], "|a|={na} |b|={nb}");
+                    }
+                }
+            }
+        }
+    }
 }

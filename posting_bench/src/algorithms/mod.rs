@@ -2,7 +2,7 @@
 //!
 //! * [`pairwise`] — two sorted slices (merge, galloping, binary search,
 //!   Baeza-Yates, adaptive).
-//! * [`simd`] — SIMD block-merge kernels (SSE, AVX2, AVX-512).
+//! * [`simd`] — SIMD block-merge kernels (SSE, AVX2, AVX-512, NEON).
 //! * [`multiway`] — `k` sorted slices (SvS, Small Adaptive, Sequential).
 //! * [`union`] — `k` sorted slices (heap, fold, bitmap).
 //! * [`cursor`] — `k` compressed lists through skip-capable cursors

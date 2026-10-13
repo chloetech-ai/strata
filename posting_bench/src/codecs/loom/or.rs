@@ -12,10 +12,10 @@
 //!   decoder stops at the first posting at or after it (found with one
 //!   `next_geq`).
 //!
-//! Then the touched word range is extracted to docIDs (`vpcompressd`) and
-//! cleared. Windows with nothing in them are skipped: every list keeps the
-//! docID of its next unprocessed posting, and the next window starts at the
-//! smallest of them.
+//! Then the touched word range is extracted to docIDs (`vpcompressd`, or
+//! NEON byte tables) and cleared. Windows with nothing in them are skipped:
+//! every list keeps the docID of its next unprocessed posting, and the next
+//! window starts at the smallest of them.
 
 use super::{simd, Loom, Part, BV, RUN};
 use std::cell::RefCell;

@@ -20,14 +20,72 @@ pub fn select_in_word(w: u64, k: u32) -> u32 {
         // SAFETY: guarded by the `bmi2` target feature.
         unsafe { core::arch::x86_64::_pdep_u64(1u64 << k, w).trailing_zeros() }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    #[cfg(target_arch = "aarch64")]
     {
-        let mut w = w;
-        for _ in 0..k {
-            w &= w - 1;
-        }
-        w.trailing_zeros()
+        select_in_word_neon(w, k)
     }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64")))]
+    {
+        select_in_word_scalar(w, k)
+    }
+}
+
+/// Portable [`select_in_word`]: clear the `k` lowest set bits.
+#[cfg_attr(all(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64"), not(test)), allow(dead_code))]
+#[inline]
+pub fn select_in_word_scalar(w: u64, k: u32) -> u32 {
+    let mut w = w;
+    for _ in 0..k {
+        w &= w - 1;
+    }
+    w.trailing_zeros()
+}
+
+/// `SELECT_IN_BYTE[256 * k + b]`: position of the `k`-th set bit of the
+/// byte `b` (8 if it has no such bit).
+#[cfg(target_arch = "aarch64")]
+const fn select_in_byte() -> [u8; 2048] {
+    let mut t = [8u8; 2048];
+    let mut b = 0;
+    while b < 256 {
+        let (mut k, mut i) = (0, 0);
+        while i < 8 {
+            if b >> i & 1 == 1 {
+                t[256 * k + b] = i as u8;
+                k += 1;
+            }
+            i += 1;
+        }
+        b += 1;
+    }
+    t
+}
+#[cfg(target_arch = "aarch64")]
+static SELECT_IN_BYTE: [u8; 2048] = select_in_byte();
+
+/// Broadword [`select_in_word`] for aarch64 (no `pdep`): the byte popcounts
+/// (`cnt`) are prefix-summed with one multiply, the byte holding the bit is
+/// the first whose prefix exceeds `k` (compared bytewise with one add), and
+/// a table selects within it. For `k <= 64` at or past the last set bit
+/// it returns a value in `64..=72` (never panics).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn select_in_word_neon(w: u64, k: u32) -> u32 {
+    use core::arch::aarch64::*;
+    const L8: u64 = 0x0101_0101_0101_0101;
+    const H8: u64 = 0x8080_8080_8080_8080;
+    debug_assert!(k <= 64);
+    // SAFETY: NEON is baseline on aarch64.
+    let cnt = unsafe { vget_lane_u64::<0>(vreinterpret_u64_u8(vcnt_u8(vcreate_u8(w)))) };
+    // Byte j: set bits in bytes 0..=j (at most 64, so with 127 - k <= 127
+    // added no byte carries into the next).
+    let pre = cnt.wrapping_mul(L8);
+    let above = (pre + (127 - k as u64) * L8) & H8;
+    // 8 * (index of the first byte whose prefix exceeds k), or 64.
+    let b = (above >> 7).trailing_zeros();
+    let below = ((pre << 8).wrapping_shr(b) & 0xff) as u32;
+    let byte = (w.wrapping_shr(b) & 0xff) as usize;
+    b + SELECT_IN_BYTE[((k.wrapping_sub(below) & 7) as usize) << 8 | byte] as u32
 }
 
 /// Read `width` (<= 64) bits starting at bit `pos` of `words`.
@@ -449,6 +507,81 @@ mod tests {
             for (k, &p) in zeros.iter().enumerate() {
                 assert_eq!(rs.select0(k), p, "select0({k})");
             }
+        }
+    }
+
+    #[test]
+    fn select_in_word_matches_naive() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(8);
+        let mut words: Vec<u64> = vec![1, 1 << 63, !0, 0xff, 0xff << 56, 0x8000_0000_0000_0001, 0x5555_5555_5555_5555];
+        words.extend((0..64).flat_map(|b| [1u64 << b, !(1u64 << b)]));
+        words.extend((0..2000).map(|_| rng.gen::<u64>() & rng.gen::<u64>()));
+        words.extend((0..2000).map(|_| rng.gen::<u64>() | rng.gen::<u64>()));
+        for &w in &words {
+            let ones: Vec<u32> = (0..64).filter(|&b| w >> b & 1 == 1).collect();
+            for (k, &p) in ones.iter().enumerate() {
+                assert_eq!(select_in_word(w, k as u32), p, "w={w:#x} k={k}");
+                assert_eq!(select_in_word_scalar(w, k as u32), p, "scalar: w={w:#x} k={k}");
+                #[cfg(target_arch = "aarch64")]
+                assert_eq!(select_in_word_neon(w, k as u32), p, "neon: w={w:#x} k={k}");
+            }
+            // Past the last set bit (up to k = 64) the NEON select stays in 64..=72.
+            #[cfg(target_arch = "aarch64")]
+            for k in ones.len() as u32..=64 {
+                assert!((64..=72).contains(&select_in_word_neon(w, k)), "neon past the end: w={w:#x} k={k}");
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        assert!((64..=72).contains(&select_in_word_neon(0, 0)));
+    }
+
+    /// `cargo test --release select_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing only"]
+    fn select_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        // (word, k) pairs: k uniform below the popcount, or small.
+        for (label, kmax) in [("k < 4", 4u32), ("k < 16", 16), ("k uniform", 64)] {
+            let qs: Vec<(u64, u32)> = (0..1 << 16)
+                .map(|_| {
+                    let w = rng.gen::<u64>();
+                    (w, rng.gen_range(0..w.count_ones().min(kmax)))
+                })
+                .collect();
+            let time = |f: fn(u64, u32) -> u32| {
+                (0..7)
+                    .map(|_| {
+                        let t = Instant::now();
+                        // Independent selects (throughput) ...
+                        let mut acc = 0u32;
+                        for &(w, k) in &qs {
+                            acc = acc.wrapping_add(f(w, k));
+                        }
+                        black_box(acc);
+                        t.elapsed().as_secs_f64() * 1e9 / qs.len() as f64
+                    })
+                    .fold(f64::MAX, f64::min)
+            };
+            let chain = |f: fn(u64, u32) -> u32| {
+                (0..7)
+                    .map(|_| {
+                        let t = Instant::now();
+                        // ... and dependent ones (latency, plus a load).
+                        let mut acc = 0u32;
+                        for i in 0..qs.len() {
+                            let (w, k) = qs[(i + acc as usize) & (qs.len() - 1)];
+                            acc = f(w, k);
+                        }
+                        black_box(acc);
+                        t.elapsed().as_secs_f64() * 1e9 / qs.len() as f64
+                    })
+                    .fold(f64::MAX, f64::min)
+            };
+            let mut row = format!("{label:>10}: scalar {:.2} / {:.2} ns", time(select_in_word_scalar), chain(select_in_word_scalar));
+            row += &format!(", dispatch {:.2} / {:.2} ns", time(select_in_word), chain(select_in_word));
+            println!("{row} (throughput / latency)");
         }
     }
 
