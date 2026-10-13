@@ -1,25 +1,25 @@
 {
   "dataset": "fiqa",
   "experiment": "merge",
-  "loadavg_at_start": "1.02 1.05 1.22 2/106 21190",
+  "loadavg_at_start": "",
   "n_docs": 57638,
   "reps": 5,
   "results": [
     {
       "bytes_written": 214207207,
       "deleted_fraction": 0.1,
-      "docs_per_s": 16261.497315064857,
+      "docs_per_s": 48298.568289967545,
       "docs_per_segment": 5000,
-      "merge_ms": 2213.8182789999996,
+      "merge_ms": 745.3637090000001,
       "merge_ms_reps": [
-        3347.636168,
-        2086.759585,
-        2171.019036,
-        2408.543373,
-        2213.8182789999996
+        743.506125,
+        745.3637090000001,
+        746.165792,
+        756.878708,
+        744.141666
       ],
       "segments_in": 8
     }
   ],
-  "seconds": 23.75642639
+  "seconds": 8.05164025
 }

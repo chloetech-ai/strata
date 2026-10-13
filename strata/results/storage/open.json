@@ -1,74 +1,74 @@
 {
   "dataset": "fiqa",
   "experiment": "open",
-  "loadavg_at_start": "1.04 1.06 1.22 2/106 21190",
+  "loadavg_at_start": "",
   "n_docs": 57638,
   "reps": 5,
   "results": [
     {
       "cold": true,
-      "first_lookup_ms": 0.006684,
-      "first_snapshot_ms": 0.026054,
+      "first_lookup_ms": 0.30729100000000004,
+      "first_snapshot_ms": 0.0065,
       "kind": "segments",
-      "open_ms": 3.342892,
+      "open_ms": 6.7768749999999995,
       "segments": 10
     },
     {
       "cold": false,
-      "first_lookup_ms": 0.003923,
-      "first_snapshot_ms": 0.015460000000000002,
+      "first_lookup_ms": 0.00325,
+      "first_snapshot_ms": 0.00575,
       "kind": "segments",
-      "open_ms": 0.286729,
+      "open_ms": 0.136875,
       "segments": 10
     },
     {
       "cold": true,
-      "first_lookup_ms": 0.02211,
-      "first_snapshot_ms": 0.084599,
+      "first_lookup_ms": 0.006875,
+      "first_snapshot_ms": 0.061708,
       "kind": "segments",
-      "open_ms": 12.634405,
+      "open_ms": 40.475875,
       "segments": 100
     },
     {
       "cold": false,
-      "first_lookup_ms": 0.009314,
-      "first_snapshot_ms": 0.06658199999999999,
+      "first_lookup_ms": 0.001375,
+      "first_snapshot_ms": 0.053917,
       "kind": "segments",
-      "open_ms": 1.066225,
+      "open_ms": 0.760375,
       "segments": 100
     },
     {
       "cold": true,
-      "first_lookup_ms": 0.267331,
-      "first_snapshot_ms": 1.4234060000000002,
+      "first_lookup_ms": 0.06595799999999999,
+      "first_snapshot_ms": 0.800875,
       "kind": "segments",
-      "open_ms": 123.29008599999999,
+      "open_ms": 278.508834,
       "segments": 994
     },
     {
       "cold": false,
-      "first_lookup_ms": 0.14905,
-      "first_snapshot_ms": 0.604714,
+      "first_lookup_ms": 0.017583,
+      "first_snapshot_ms": 0.5535829999999999,
       "kind": "segments",
-      "open_ms": 8.040111000000001,
+      "open_ms": 6.086041000000001,
       "segments": 994
     },
     {
       "cold": true,
-      "first_snapshot_ms": 36.024899999999995,
+      "first_snapshot_ms": 20.146,
       "kind": "wal_replay",
-      "open_ms": 5.332795000000001,
+      "open_ms": 3.557666,
       "wal_bytes": 5698016,
       "wal_docs": 1000
     },
     {
       "cold": true,
-      "first_snapshot_ms": 369.110461,
+      "first_snapshot_ms": 206.510459,
       "kind": "wal_replay",
-      "open_ms": 62.90749399999999,
+      "open_ms": 34.4905,
       "wal_bytes": 57108144,
       "wal_docs": 10000
     }
   ],
-  "seconds": 14.275405313
+  "seconds": 8.204235
 }
