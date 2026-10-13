@@ -25,7 +25,7 @@ Underneath sits **Strata**, a single-file search database in the spirit of SQLit
 | Strata vector top-10 (HNSW, 1,024-d) | **0.09–0.20 ms**, recall@10 0.99 on Quora; SQLite's scan takes 12 ms to 1 s | [Strata results](docs/strata/results.md#vector-indexes) |
 | Filtered vector search planner | **1.5–5.3× faster** than the best fixed strategy, recall@10 0.992–0.998 | [Strata results](docs/strata/results.md#filtered-vector-search-and-the-planner) |
 | Graph expansion for citation search (arXiv) | nDCG@20 **0.123 → 0.253** over vector search alone (p < 0.0001) | [Strata graphs](docs/strata/graphs.md#does-the-graph-help-search) |
-| Loom posting lists vs partitioned Elias-Fano | same size, **1.9–2.2× faster AND**, 4.9–8.9× faster OR | [Posting lists](docs/posting-lists.md) |
+| Loom posting lists vs partitioned Elias-Fano | same size, **2.4–3.0× faster AND**, 3.8–7.7× faster OR | [Posting lists](docs/posting-lists.md) |
 
 All numbers come from the experiments in this repository; [Reproducing the results](docs/reproduce.md) says how each was produced, and which ones were re-run for this release.
 
