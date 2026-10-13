@@ -872,7 +872,10 @@ impl<'a> VersionWriter<'a> {
         let mut moved = 0;
         for (e, i, is_deletes) in extents {
             let Some(page) = self.fl.alloc_below(e.pages(), e.page) else { continue };
-            self.db.file.write_all_at(&map[e.range()], page * PAGE)?;
+            // Copy out of the mapping first: on macOS, a pwrite whose source
+            // is a mapping of the same file can deadlock in the kernel.
+            let bytes = map[e.range()].to_vec();
+            self.db.file.write_all_at(&bytes, page * PAGE)?;
             self.bytes_written += e.len;
             self.fl.defer(self.txn, e);
             let to = Extent { page, len: e.len };

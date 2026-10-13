@@ -59,14 +59,17 @@ pub fn resident_pages(path: &Path) -> io::Result<usize> {
         if p == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let pages = len.div_ceil(PAGE);
+        // mincore reports one byte per OS page (16 KiB on Apple silicon);
+        // the count is returned in PAGE units either way.
+        let os_page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let pages = len.div_ceil(os_page);
         let mut v = vec![0u8; pages];
         let r = libc::mincore(p, len, v.as_mut_ptr() as *mut _);
         libc::munmap(p, len);
         if r != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(v.iter().filter(|&&b| b & 1 == 1).count())
+        Ok(v.iter().filter(|&&b| b & 1 == 1).count() * os_page / PAGE)
     }
 }
 
