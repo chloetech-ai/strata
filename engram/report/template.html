@@ -162,7 +162,7 @@ td.sys { font-weight: 600; }
       <li><b>Systems:</b> latency and storage up to a million records.</li>
       <li><b>Live runs:</b> headless Claude Code sessions with Engram installed.</li>
     </ul>
-    <p>The default embedder is static (Model2Vec potion-retrieval-32M): a token lookup and a mean, 512 dimensions, about 10,000 records a second on four cores. BGE-small, a 33-million-parameter transformer, is the alternative; it took about 50 ms per short text on this CPU.</p>
+    <p>The default embedder is static (Model2Vec potion-retrieval-32M): a token lookup and a mean, 512 dimensions, about 50,000 records a second on an Apple M2 laptop. BGE-small, a 33-million-parameter transformer, is the alternative; it took about 50 ms per short text on the 4-core cloud VM where it was measured.</p>
   </div>
   <!--RESULTS-->
 </section>

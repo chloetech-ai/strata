@@ -34,7 +34,7 @@ Three requirements follow:
 ## 2. Architecture
 
 ```
- Claude Code ──hooks──▶ engram hook <event>  ─┐  (thin client, ~2 ms)
+ Claude Code ──hooks──▶ engram hook <event>  ─┐  (thin client, ~1 ms + process start)
      │                                         │ unix socket, JSON lines
      └──MCP (stdio)──▶ engram mcp ────────────┤
                                                ▼
@@ -123,8 +123,9 @@ result 0.3.
 
 ## 4. When to store
 
-Always. Storage is cheap (text compresses, a commit costs 0.3 ms), and a
-missed record cannot be recovered later. Each hook's payload is the source:
+Always. Storage is cheap (text compresses; a durable commit costs about 4 ms
+on macOS and 0.3 ms on the Linux VM, off the hook's path), and a missed record
+cannot be recovered later. Each hook's payload is the source:
 
 | hook | stored |
 |---|---|
@@ -269,14 +270,14 @@ differ.
 | path | target |
 |---|---|
 | `PostToolUse`, `Stop` client | < 10 ms (queued, embedded and committed in the background) |
-| `UserPromptSubmit` | < 100 ms p99 at 1M records (measured: 14.7 ms p50, 29.8 ms p99 as a hook process, with 1% knowledge records; the knowledge query runs beside the main search) |
+| `UserPromptSubmit` | < 100 ms p99 at 1M records (measured on an Apple M2: 24.9 ms p50, 38.6 ms p99 as a hook process, with 1% knowledge records; the knowledge query runs beside the main search; about 10 ms of it is process start) |
 | `SessionStart` | < 150 ms (daemon already up), < 1 s with daemon spawn |
 | background | after each write, the daemon rebuilds the in-memory segment (at most 256 records, no graph) so the next query does not |
 | ingest | > 1,000 records per second with the static embedder |
 
 The default embedder is static (Model2Vec potion-retrieval-32M: token
 lookup and mean, 512 dimensions, microseconds per record). BGE-small (384
-dimensions) is optional and roughly 50 ms per record on this CPU; it suits
+dimensions) is optional and roughly 50 ms per record on the cloud VM's CPU; it suits
 a background re-embedding pass, not the hook path.
 
 ## 7. Evaluation plan

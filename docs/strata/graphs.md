@@ -124,7 +124,7 @@ while some *r*(*u*) ≥ ε·deg(*u*). Each estimate is then within ε·deg(*u*) 
 
 ## Speed
 
-Two graphs, each queried from 200 random seeds on a warm cache, one thread, through SQL (parsing and planning included; `COUNT(*)`, so that no rows are fetched):
+Two graphs, each queried from 200 random seeds on a warm cache, on one thread of an Apple M2 MacBook Air, through SQL (parsing and planning included; `COUNT(*)`, so that no rows are fetched):
 
 - **arXiv:** 168,343 papers (ogbn-arxiv, less 1,000 held out) with 1,148,979 citations, in two segments.
 - **Synthetic:** a power-law graph of 1,000,000 rows and 9,998,469 edges, in four segments. Row *i* links to 10 earlier rows, each the target of a random earlier edge with probability ½ and a uniform earlier row otherwise.
@@ -138,22 +138,22 @@ The baselines answer the same queries, and the benchmark checks that every count
 
 *arXiv, 200 seeds per query. Source: `strata/results/graph/latency_arxiv.json`.*
 
-On the million-row graph (`strata/results/graph/synthetic_1000000.json`; loaded in 7.6 s into a 307 MB file, 27 bytes per edge):
+On the million-row graph (`strata/results/graph/synthetic_1000000.json`; loaded in 2.7 s into a 307 MB file, 27 bytes per edge):
 
 | query (200 seeds) | result | Strata p50 / p95 ms | SQLite p50 / p95 ms | CSR p50 / p95 ms |
 |---|---|---|---|---|
-| `REACHABLE`, 1 hop out | 10 rows | 0.023 / 0.033 | 0.022 / 0.031 | 0.002 / 0.002 |
-| `REACHABLE`, 2 hops out | 108 rows | 0.048 / 0.087 | 0.106 / 0.147 | 0.007 / 0.010 |
-| `REACHABLE`, 3 hops out | 890 rows | 0.166 / 0.289 | 1.03 / 1.24 | 0.050 / 0.072 |
-| `REACHABLE`, 1 hop in | 8 rows | 0.027 / 0.045 | 0.022 / 0.052 | 0.002 / 0.003 |
-| `REACHABLE`, 2 hops both ways | 1,586 rows | 0.172 / 0.704 | 0.823 / 5.44 | 0.034 / 0.150 |
-| `PATH` either way | 200 of 200 found | 0.134 / 0.250 | — | 0.041 / 0.110 |
-| `ppr`, ε = 10<sup>−4</sup> | 133 pushes | 5.81 / 7.23 | — | 1.27 / 1.69 |
-| `ppr`, ε = 10<sup>−5</sup> | 1,020 pushes | 44.6 / 62.0 | — | 9.95 / 13.8 |
+| `REACHABLE`, 1 hop out | 10 rows | 0.017 / 0.022 | 0.012 / 0.013 | 0.001 / 0.001 |
+| `REACHABLE`, 2 hops out | 108 rows | 0.032 / 0.045 | 0.061 / 0.066 | 0.004 / 0.005 |
+| `REACHABLE`, 3 hops out | 890 rows | 0.098 / 0.153 | 0.597 / 0.680 | 0.030 / 0.037 |
+| `REACHABLE`, 1 hop in | 8 rows | 0.014 / 0.019 | 0.010 / 0.017 | 0.001 / 0.001 |
+| `REACHABLE`, 2 hops both ways | 1,586 rows | 0.104 / 0.468 | 0.471 / 3.26 | 0.019 / 0.110 |
+| `PATH` either way | 200 of 200 found | 0.079 / 0.145 | — | 0.025 / 0.071 |
+| `ppr`, ε = 10<sup>−4</sup> | 133 pushes | 3.49 / 4.13 | — | 0.66 / 0.80 |
+| `ppr`, ε = 10<sup>−5</sup> | 1,020 pushes | 25.6 / 30.1 | — | 5.47 / 6.32 |
 
-**Against SQLite**, one-hop queries cost about the same, roughly 20 µs, mostly parsing and planning on both sides. From two hops on, the gap opens, and the tail is where it shows most: two hops both ways on arXiv touch 3,790 rows on average and up to tens of thousands, and their p95 is 2.6 ms in Strata against 24.5 ms in SQLite. The recursive CTE re-expands rows reached at several depths and joins through a B-tree per row, where Strata reads a CSR slice. Shortest paths and PageRank have no practical CTE form.
+**Against SQLite**, one-hop queries cost about the same, roughly 10–15 µs, mostly parsing and planning on both sides. From two hops on, the gap opens, and the tail is where it shows most: two hops both ways on arXiv touch 3,790 rows on average and up to tens of thousands, and their p95 is 1.6 ms in Strata against 14.8 ms in SQLite. The recursive CTE re-expands rows reached at several depths and joins through a B-tree per row, where Strata reads a CSR slice. Shortest paths and PageRank have no practical CTE form.
 
-**Against the CSR**, Strata pays two costs. About 20 µs of SQL per query dominates small traversals. Key resolution dominates large ones: PageRank takes 2.8 times the CSR's time on arXiv and 4.6 times on the million-row graph, because a target outside its own segment is a hash probe into each segment's primary-key index until found, a cache miss each. Three changes found by profiling cut PageRank on the million-row graph from 21.4 to 5.8 ms:
+**Against the CSR**, Strata pays two costs. About 10 µs of SQL per query dominates small traversals. Key resolution dominates large ones: PageRank takes 2.4 times the CSR's time on arXiv and 5.3 times on the million-row graph, because a target outside its own segment is a hash probe into each segment's primary-key index until found, a cache miss each. Three changes found by profiling on the Xeon VM that first ran these benchmarks cut PageRank on the million-row graph from 21.4 to 5.8 ms there (3.5 ms on the M2):
 
 1. reverse groups by key, with the sources stored inline;
 2. same-segment hints and a per-query memo;
@@ -189,7 +189,7 @@ PageRank from the same seeds reaches 0.211 at its best (from one seed), below th
 
 **Fewer seeds are better.** With more seeds, the citations of papers less similar to the query crowd out those of the nearest ones. In a first version of the experiment the seeds themselves stayed in the candidate set; ranked by similarity they took the top places, and from 20 seeds on the "graph" method returned exactly the vector search's results. Every graph method above removes the seeds with `NOT REACHABLE(cites, seeds, hops => 0, min_hops => 0)`.
 
-**A graph made of vectors adds nothing.** A `VECTOR` field can be traversed as a graph, each row's 10 most similar rows being its neighbours. On this task it returns what vector search already found when the seeds are kept (recall@20 0.112 against 0.111 at 10 seeds, on all queries), and is worse when they are removed (nDCG@20 0.079). A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows with vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in Strata for exploratory queries, at 0.23 ms per hop of 10 neighbours.
+**A graph made of vectors adds nothing.** A `VECTOR` field can be traversed as a graph, each row's 10 most similar rows being its neighbours. On this task it returns what vector search already found when the seeds are kept (recall@20 0.112 against 0.111 at 10 seeds, on all queries), and is worse when they are removed (nDCG@20 0.079). A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows with vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in Strata for exploratory queries, at 0.12 ms per hop of 10 neighbours.
 
 ## Limits and next steps
 

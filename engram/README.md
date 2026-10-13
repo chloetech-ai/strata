@@ -9,7 +9,7 @@ and it gives the model tools to search its history. Nothing depends on the
 model remembering to save. The design is in [DESIGN.md](DESIGN.md).
 
 ```
- Claude Code ──hooks──▶ engram hook <event> ─┐   (~10 ms per hook)
+ Claude Code ──hooks──▶ engram hook <event> ─┐   (~15 ms per hook)
      └──MCP (stdio)──▶ engram mcp ───────────┤   unix socket
                                               ▼
                          engram serve: one daemon per project, started on demand
@@ -52,7 +52,7 @@ The store lives in `~/.local/share/engram/projects/<project>/`, outside the repo
 
 Optional: `cargo build --release --features bert` and `engram fetch-model bert`
 enable BGE-small vectors in the daemon (`"embedder": "bert"` in the store's
-`config.json`). They are better for paraphrased questions, but each record takes about 50 ms to embed on a CPU.
+`config.json`). They are better for paraphrased questions, but each record took about 50 ms to embed on the 4-core cloud VM's CPU.
 
 ## Use by hand
 

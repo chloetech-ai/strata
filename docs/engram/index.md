@@ -36,7 +36,7 @@ Three requirements follow:
 
 Strata holds an exclusive lock on its file, and hooks are short-lived processes that run concurrently with the MCP server. So one daemon per project owns the database, and hooks and the MCP server are its clients over a Unix socket.
 
-- **Lazy start.** The first client to find no socket spawns the daemon under a spawn lock; the daemon exits after 30 idle minutes. Its first hook takes 85–108 ms, because the 129 MB embedding table is memory-mapped rather than read.
+- **Lazy start.** The first client to find no socket spawns the daemon under a spawn lock; the daemon exits after 30 idle minutes. Its first hook takes 50–72 ms, because the 129 MB embedding table is memory-mapped rather than read.
 - **Warm state.** The embedder, segment readers and the memtable stay in memory between hooks.
 - **Cheap writes.** A write makes the next query rebuild the last memtable chunk's in-memory segment. Chunks hold 256 records and scan their vectors instead of building an HNSW graph, so a query right after a tool call costs what any query costs.
 - **Never in the way.** A client that cannot reach the daemon within its deadline prints nothing and exits 0. A memory failure never blocks a prompt or a tool call.
@@ -78,7 +78,7 @@ The kind sets a salience prior ι: preference 1.0, decision 0.9, summary 0.8, pr
 
 ## When to store: always
 
-Storage is cheap (a commit costs 0.3 ms) and a missed record cannot be recovered later.
+Storage is cheap (a durable commit costs about 4 ms on a Mac, where it flushes the drive's write cache, and runs off the hook's path) and a missed record cannot be recovered later.
 
 | hook | stored |
 |---|---|
@@ -197,9 +197,9 @@ The weights come from a logistic fit on LongMemEval-S (`engram/scripts/fit_gate.
 | path | target | measured |
 |---|---|---|
 | `PostToolUse`, `Stop` client | < 10 ms | queued; embedded and committed in the background |
-| `UserPromptSubmit` | < 100 ms p99 at 1M records | 14.7 ms p50, 29.8 ms p99 as a hook process |
-| `SessionStart` | < 150 ms (daemon up), < 1 s with spawn | 85–108 ms including daemon start |
-| ingest | > 1,000 records/s | 9,500–11,000 records/s with the static embedder |
+| `UserPromptSubmit` | < 100 ms p99 at 1M records | 24.9 ms p50, 38.6 ms p99 as a hook process |
+| `SessionStart` | < 150 ms (daemon up), < 1 s with spawn | 50–72 ms including daemon start |
+| ingest | > 1,000 records/s | 48,000–52,000 records/s with the static embedder |
 
 The default embedder is static (Model2Vec potion-retrieval-32M: token lookup and mean, 512 dimensions, microseconds per record). BGE-small (384 dimensions) is optional (`--features bert`) and costs about 50 ms per record on a CPU.
 

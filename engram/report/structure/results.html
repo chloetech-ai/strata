@@ -102,29 +102,29 @@
 
 <div class="col" id="time">
   <h2>Execution time</h2>
-  <p>A prompt's recall is two index searches, and almost nothing else. Stores of 10,000, 100,000 and a million records were built from LongMemEval turns cut the new way, and timed on four cores with the static embedder.</p>
+  <p>A prompt's recall is two index searches, and almost nothing else. Stores of 10,000, 100,000 and a million records were built from LongMemEval turns cut the new way, and timed with the static embedder on an Apple M2 MacBook Air (4 performance and 4 efficiency cores). Figures for earlier designs that this run did not measure again are from the 4-core cloud VM these tests first ran on, and are marked as such.</p>
 </div>
 <div class="wide" id="phase-table"></div>
 <div class="col">
-  <p>BM25 and the vector search each take about half of the search (4.0 and 4.4 ms of 8.8 ms at a million records; 1.8 ms in all at 10,000). Embedding the prompt, fusing, and packing take a fraction of a millisecond. The gate's IDF lookup used to run one <code>COUNT</code> query per query term (1.1 ms at a million records). It now reads each segment's term dictionary (0.05 ms).</p>
+  <p>BM25 and the vector search take most of the search (3.6 and 1.3 ms of 4.8 ms at a million records; 0.94 ms in all at 10,000), about half the time the same search took on the cloud VM (8.8 and 1.8 ms). Embedding the prompt, fusing, and packing take a fraction of a millisecond. The gate's IDF lookup used to run one <code>COUNT</code> query per query term (0.49 ms at a million records). It now reads each segment's term dictionary (0.02 ms).</p>
   <h3>The stall after a write</h3>
-  <p>The largest cost was not in the search at all. A write adds records to the memtable, and the next query rebuilds the in-memory segment of its last chunk. That chunk held up to 1,024 records, and the rebuild built a full HNSW graph over them: 22–25 ms. A query right after a tool call stored its result waited for it. That is a <code>PreToolUse</code> before an edit, or the next prompt in a fast exchange.</p>
+  <p>The largest cost was not in the search at all. A write adds records to the memtable, and the next query rebuilds the in-memory segment of its last chunk. That chunk held up to 1,024 records, and the rebuild built a full HNSW graph over them: 12.2–12.5 ms. A query right after a tool call stored its result waited for it. That is a <code>PreToolUse</code> before an edit, or the next prompt in a fast exchange.</p>
 </div>
 <div class="wide" id="stall-table"></div>
 <div class="col">
-  <p>Strata now takes separate build options for memtable segments (<code>DbOptions::mem_build</code>), and Engram builds them without a graph: a scan of at most 256 vectors costs less than building one. Chunks hold 256 records. The rebuild fell from 22–25 ms to 1.4–1.5 ms. A query right after a write now costs what any query costs: 4.1 ms instead of 24 at 10,000 records, and 11.5 ms instead of 38 at a million (p99 34 instead of 110). Disk segments keep their HNSW graphs, and a new Strata test checks that flat memtable segments return the exact top ten.</p>
+  <p>Strata now takes separate build options for memtable segments (<code>DbOptions::mem_build</code>), and Engram builds them without a graph: a scan of at most 256 vectors costs less than building one. Chunks hold 256 records. The rebuild fell from 12.2–12.5 ms to 0.6–1.1 ms. A query right after a write now costs what any query costs: 3.3 ms instead of 13 at 10,000 records, and 6.4 ms instead of 18 at a million (p99 16 instead of 45). Disk segments keep their HNSW graphs, and a new Strata test checks that flat memtable segments return the exact top ten.</p>
   <h3>The hook itself</h3>
-  <p>Claude Code runs a command hook as a new process. Starting <code>engram hook</code>, reading the payload and connecting to the socket costs about 3 ms per event, at any store size, on top of the daemon's work. An event Engram ignores takes 3.3–3.5 ms that way, and 0.6 ms from a client that is already running.</p>
+  <p>Claude Code runs a command hook as a new process. Starting <code>engram hook</code>, reading the payload and connecting to the socket costs about 10 ms per event on macOS (about 3 ms on the Linux VM), at any store size, on top of the daemon's work. An event Engram ignores takes 9.7–10.4 ms that way, and 0.6 ms from a client that is already running.</p>
 </div>
 <div class="wide" id="hook-table"></div>
 <div class="wide" id="cold-table"></div>
 <div class="col">
-  <p>The daemon also wrote its whole session state to disk before answering each hook. It now writes it after the response, when the state has changed. That took storing a tool call from 1.6 to 0.7 ms inside the daemon, and the whole hook from 4.5 to 3.4 ms. A prompt's hook went from 17.1 to 14.2 ms at a million records.</p>
-  <p>What remains is mostly the process. Claude Code can also send hook events over HTTP to a URL for every event except <code>SessionStart</code>, with the same JSON both ways. A daemon listening on localhost would save the 3 ms of process start for every tool call. It needs a secret path and a <code>Host</code> check first, so that no web page can post into memory. That is the next step for time.</p>
+  <p>The daemon also wrote its whole session state to disk before answering each hook. It now writes it after the response, when the state has changed. On the cloud VM, that took storing a tool call from 1.6 to 0.7 ms inside the daemon, and the whole hook from 4.5 to 3.4 ms; a prompt's hook went from 17.1 to 14.2 ms at a million records. On the M2 the same three now take 0.7, 9.8–10.1 and 25.4 ms.</p>
+  <p>What remains is mostly the process. Claude Code can also send hook events over HTTP to a URL for every event except <code>SessionStart</code>, with the same JSON both ways. A daemon listening on localhost would save the process start, about 10 ms on macOS, for every tool call. It needs a secret path and a <code>Host</code> check first, so that no web page can post into memory. That is the next step for time.</p>
   <p>Two smaller changes:</p>
   <ul>
-    <li><b>Daemon start:</b> the embedding table (129 MB) is now memory-mapped instead of read and converted, which took 70–160 ms. The first hook of a session, which starts the daemon, now takes 85–108 ms (second table above) instead of about 300 ms.</li>
-    <li><b>Storage:</b> 400-byte records double the record count of a session, and so the file. This repository's session, up to where the probes are asked, goes from 1,835 records to 3,849. A million records (3.5 GB, mostly vectors) is now about 200 sessions of that size instead of 450.</li>
+    <li><b>Daemon start:</b> the embedding table (129 MB) is now memory-mapped instead of read and converted, which took 70–160 ms on the cloud VM. On the M2, reading it takes 24–50 ms, close to opening the mapped table (25–34 ms). The first hook of a session, which starts the daemon, takes 50–72 ms on the M2 (second table above); on the VM the change took it from about 300 ms to 85–108 ms.</li>
+    <li><b>Storage:</b> 400-byte records double the record count of a session, and so the file. This repository's session, up to where the probes are asked, goes from 1,835 records to 3,849. A million records (3.1 GB, mostly vectors) is now about 200 sessions of that size instead of 450.</li>
   </ul>
 </div>
 
@@ -188,7 +188,7 @@
   <p>The briefing did most of the work. It reached every Engram run, at its full 6,000 characters. The model called the memory tools in 9 of 100 runs, mostly for the two advice questions. The gate held back raw records on 4 of the 20 tasks, and all of those were still solved.</p>
   <p>Engram runs took fewer steps: 6.3 against 7.5, and 7.0 against 9.0. They also read 5–6% fewer input tokens, and cost about the same ($0.007–0.009 a run) at the same wall time.</p>
   <p>Distillation adds a small model call after every turn of real work. The table below covers the three histories, at about $0.0013 a turn. It never delays a prompt.</p>
-  <p>The knowledge query adds two filtered searches to every prompt. Run after the main search, they raised the prompt hook at a million records (1% of them knowledge) from 14.2 to 22.0 ms at the median, and from 32.0 to 43.0 ms at p99. They depend on nothing the main search computes, and only packing needs both results, so they now run side by side: 14.7 ms at the median and 29.8 ms at p99, the same as before within noise.</p>
+  <p>The knowledge query adds two filtered searches to every prompt. Run after the main search on the cloud VM, they raised the prompt hook at a million records (1% of them knowledge) from 14.2 to 22.0 ms at the median, and from 32.0 to 43.0 ms at p99. They depend on nothing the main search computes, and only packing needs both results, so they now run side by side. On the VM that brought the hook back to 14.7 ms at the median and 29.8 ms at p99, the same as without them within noise. On the M2, with the searches side by side, the prompt hook takes 24.9 ms at the median and 38.6 ms at p99, about 10 ms of it starting the process.</p>
 </div>
 <div class="wide" id="ab-distill"></div>
 <div class="col">

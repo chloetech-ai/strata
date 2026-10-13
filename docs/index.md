@@ -65,7 +65,7 @@ flowchart TB
 | After a compaction, do the lost details come back? | **13 of 15** automatically, 14 with one search. None were in the summary. |
 | Can a new session answer questions about a 26-hour history? | **8 of 8** with Engram, **0 of 4** without. |
 | How good is retrieval on a public benchmark? | LongMemEval-S: evidence in the top 10 for **90%** of questions; inside the default 4,000-character injection for 87%. |
-| What does it cost per prompt? | **9–17 ms** for a full hook at 10k–1M records; a million records take 3.5 GB. |
+| What does it cost per prompt? | **14–26 ms** for a full hook at 10k–1M records, most of it starting the hook process; a million records take 3.1 GB. |
 | Is Strata fast? | Warm BM25 **1.8–4.6×** faster than Tantivy; vector top-10 in **0.09–0.20 ms**; the filtered-vector planner **1.5–5.3×** faster than the best fixed strategy. |
 | Do graph edges help search? | Following the citations of the two nearest papers doubles nDCG@20 on arXiv (0.123 → 0.253). |
 
@@ -85,4 +85,4 @@ Each project also has a long-form report with interactive charts, formulas and e
 
 ## Where the numbers come from
 
-Every figure on these pages comes from the experiments committed in this repository (`*/results/`), run on a 4-core cloud VM with an Emerald Rapids Xeon. Some of them were run again for this release; [Reproducing the results](reproduce.md) lists which, and how to run the rest.
+Every figure on these pages comes from the experiments committed in this repository (`*/results/`). The timings were measured on a MacBook Air with an Apple M2 (8 cores, 24 GB), replacing earlier runs on a 4-core cloud VM; the runs that call a model are the original ones. [Reproducing the results](reproduce.md) compares the two machines and has the commands.
