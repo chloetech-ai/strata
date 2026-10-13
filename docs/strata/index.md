@@ -80,7 +80,7 @@ A torn meta write fails its checksum and the other slot still names the previous
 
 Small transactions would otherwise write a segment each. Instead, inserts and deletes append checksummed records to the `-wal` sidecar and `fsync` at commit (group commit); recovery ignores uncommitted records. The memtable holds the WAL's documents. A snapshot that needs them builds small in-memory segments, one per chunk of 1,024 documents, cached so that a write rebuilds only the last chunk. Queries therefore see committed writes at once, and the memtable needs no index code of its own. When it grows past a threshold it is flushed into a segment by a shadow-paging commit and the WAL is truncated. Bulk loads bypass the WAL.
 
-Every document has a primary key. Each segment has a primary-key index (sorted 64-bit key hashes with docIDs) and a delete set, stored as its own small extent and replaced copy-on-write. An update is a delete plus an insert. A snapshot is an immutable manifest version (segments, their delete sets, collection statistics) held by reference count: readers pin one, the writer publishes the next. Taking one costs 0.1–0.2 µs.
+Every document has a primary key. Each segment has a primary-key index (sorted 64-bit key hashes with docIDs) and a delete set, stored as its own small extent and replaced copy-on-write. An update is a delete plus an insert. A snapshot is an immutable manifest version (segments, their delete sets, collection statistics) held by reference count: readers pin one, the writer publishes the next. Taking one costs at most 0.13 µs.
 
 ### Merges
 
@@ -98,7 +98,7 @@ A segment is *n* documents with local docIDs `0..n`, stored as a header and a di
 
 - **Analyzer.** Unicode word split, lowercase, ASCII folding, an English stopword list and a light English stemmer; queries use the same analyzer.
 - **Term dictionary.** Sorted terms in front-coded blocks of 32, with a sparse in-memory index over block first-terms. Each entry gives the document frequency and the posting list's location.
-- **Postings.** DocIDs, term frequencies and per-block maximum scores, so that top-k can skip blocks. DocIDs of terms in at least 512 documents are [Loom](../posting-lists.md#loom) lists; rarer terms use BP128 blocks. Frequencies are bit-packed in 128-posting blocks addressed by posting rank. Against BP128 for every list, Loom is 2–4% smaller with 7.6–12× faster conjunctions.
+- **Postings.** DocIDs, term frequencies and per-block maximum scores, so that top-k can skip blocks. DocIDs of terms in at least 512 documents are [Loom](../posting-lists.md#loom) lists; rarer terms use BP128 blocks. Frequencies are bit-packed in 128-posting blocks addressed by posting rank. Against BP128 for every list, Loom is 2–4% smaller with 7.6–11× faster conjunctions.
 - **Top-k.** MaxScore by default; on the BEIR queries it beats Block-Max WAND by 1.9–2.6×. A filter either drives scoring (its members are scored directly) or is probed per candidate, by a fitted crossover.
 - **Positions** (optional per field) live in a separate stream, read only by phrase queries.
 
@@ -115,14 +115,14 @@ Document lengths are quantised to one byte. Ranked queries drop English function
 ### Structured fields
 
 - **Columns.** Integers and floats in 128-document blocks, frame-of-reference bit-packed, with min/max zone maps per block. Keywords are dictionary encoded with bit-packed codes. A column answers "value of document *d*" in O(1) and scans at memory bandwidth.
-- **Keyword postings.** Every keyword value also gets a docID list, so equality and `IN` become set operations. The encoding is [Pyramid](../posting-lists.md#pyramid) (plain sorted arrays below 64 documents), which has the fastest unions and count-only intersections for facet counts. Per-candidate probes use the code column and a bitset of accepted codes (6–9 ns), which beats probing the lists (9–24 ns).
+- **Keyword postings.** Every keyword value also gets a docID list, so equality and `IN` become set operations. The encoding is [Pyramid](../posting-lists.md#pyramid) (plain sorted arrays below 64 documents), which has the fastest unions and count-only intersections for facet counts. Per-candidate probes use the code column and a bitset of accepted codes (4–5 ns), which beats probing the lists (5–33 ns).
 - **Range postings.** Numeric fields get an equi-depth histogram of 64 buckets whose buckets are docID lists. A range is the union of the buckets it covers, plus the boundary buckets filtered through the column. The histogram doubles as the selectivity estimator.
 - **Doc store.** Rows in LZ4-compressed 16 KiB blocks with a block index; it serves projections and is the source for merges.
 - **Generated columns.** A TEXT field may be generated from other stored text fields (`body` = title + text in the evaluation table), indexed but not stored, and recomputed by merges.
 
 ### Vectors
 
-- **Forward vectors.** Every vector field stores float32 vectors for exact re-ranking and 8-bit scalar-quantised codes (SQ8, per-dimension min/max) for scanning: 4× less I/O, and with the query quantised too, integer dot products at about 12 ns per 1,024-dimension vector with AVX-512 VNNI.
+- **Forward vectors.** Every vector field stores float32 vectors for exact re-ranking and 8-bit scalar-quantised codes (SQ8, per-dimension min/max) for scanning: 4× less I/O, and with the query quantised too, integer dot products at about 14 ns per 1,024-dimension vector with NEON `usdot` on the M2 (AVX-512 VNNI on x86-64).
 - **Flat.** An exact scan of the codes plus float32 re-ranking: the right answer for small segments and very selective filters.
 - **IVF.** k-means centroids; each cluster's members are stored contiguously as a docID list followed by their codes. Probing a cluster is one sequential read, and a filter is applied by intersecting the cluster's list with the filter's, the same operation as a text conjunction.
 - **HNSW.** A navigable small-world graph with fixed-degree adjacency lists in the segment. Fastest in memory; random I/O on disk.
@@ -178,7 +178,7 @@ The plan the planner chose is visible: the `strata` shell's `--plan` flag prints
 
 ## Where it fits
 
-Strata is built for embedded retrieval: local search over documents with metadata and embeddings, such as retrieval for a model on a laptop, a desktop app's search box or an edge device, with SQL and one file to copy, back up or ship. It suits read-mostly corpora with steady writes: commits are cheap and visible at once, but merges rebuild every index of the segments they combine, and HNSW builds dominate load time (IVF builds 1.7–2.7× faster for write-heavy vector workloads). It is not meant for relational workloads with joins, high write concurrency, or corpora larger than one machine.
+Strata is built for embedded retrieval: local search over documents with metadata and embeddings, such as retrieval for a model on a laptop, a desktop app's search box or an edge device, with SQL and one file to copy, back up or ship. It suits read-mostly corpora with steady writes: commits are visible at once, and batching amortises their sync, but merges rebuild every index of the segments they combine, and HNSW builds dominate load time (IVF builds 2.1–2.5× faster for write-heavy vector workloads). It is not meant for relational workloads with joins, high write concurrency, or corpora larger than one machine.
 
 **Current limits.** SQL covers single-table `SELECT`; writes go through the Rust API (`Database::begin`, `WriteTxn::insert`, `delete`, `commit`). The multi-process writer lock is designed but not built. Queries are single-threaded.
 

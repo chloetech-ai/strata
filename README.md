@@ -21,9 +21,9 @@ Underneath sits **Strata**, a single-file search database in the spirit of SQLit
 | Live sessions asked about a 26-hour project history | **8 of 8** answered with Engram, **0 of 4** without | [Engram results](docs/engram/results.md#live-claude-code-runs) |
 | LongMemEval-S retrieval (115k-token histories) | **R@10 0.90**; the 4,000-character injection holds the evidence for 87% of questions | [Engram results](docs/engram/results.md#retrieval-on-long-conversation-benchmarks) |
 | Cost of a prompt hook | **14–26 ms** median from 10k to 1M records, mostly starting the hook process; 5.7 ms recall at a million records | [Engram results](docs/engram/results.md#scale-and-latency) |
-| Strata vs Tantivy, warm BM25 top-10 | **1.8–4.6× faster**; conjunctions 3.6–6.7× faster; 23 of 28 text and filter comparisons won | [Strata results](docs/strata/results.md#query-latency) |
-| Strata vector top-10 (HNSW, 1,024-d) | **0.09–0.20 ms**, recall@10 0.99 on Quora; SQLite's scan takes 12 ms to 1 s | [Strata results](docs/strata/results.md#vector-indexes) |
-| Filtered vector search planner | **1.5–5.3× faster** than the best fixed strategy, recall@10 0.992–0.998 | [Strata results](docs/strata/results.md#filtered-vector-search-and-the-planner) |
+| Strata vs Tantivy, warm BM25 top-10 | **1.7–3.2× faster**; conjunctions 2.7–4.1× faster; 24 of 28 text and filter comparisons won | [Strata results](docs/strata/results.md#query-latency) |
+| Strata vector top-10 (HNSW, 1,024-d) | **0.05–0.10 ms**, recall@10 0.99 on Quora; SQLite's scan takes 7.7 ms to 0.7 s | [Strata results](docs/strata/results.md#vector-indexes) |
+| Filtered vector search planner | **1.8–6.1× faster** than the best fixed strategy, recall@10 0.991–0.998 | [Strata results](docs/strata/results.md#filtered-vector-search-and-the-planner) |
 | Graph expansion for citation search (arXiv) | nDCG@20 **0.123 → 0.253** over vector search alone (p < 0.0001) | [Strata graphs](docs/strata/graphs.md#does-the-graph-help-search) |
 | Loom posting lists vs partitioned Elias-Fano | same size, **2.4–3.0× faster AND**, 3.8–7.7× faster OR | [Posting lists](docs/posting-lists.md) |
 

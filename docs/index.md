@@ -66,7 +66,7 @@ flowchart TB
 | Can a new session answer questions about a 26-hour history? | **8 of 8** with Engram, **0 of 4** without. |
 | How good is retrieval on a public benchmark? | LongMemEval-S: evidence in the top 10 for **90%** of questions; inside the default 4,000-character injection for 87%. |
 | What does it cost per prompt? | **14–26 ms** for a full hook at 10k–1M records, most of it starting the hook process; a million records take 3.1 GB. |
-| Is Strata fast? | Warm BM25 **1.8–4.6×** faster than Tantivy; vector top-10 in **0.09–0.20 ms**; the filtered-vector planner **1.5–5.3×** faster than the best fixed strategy. |
+| Is Strata fast? | Warm BM25 **1.7–3.2×** faster than Tantivy; vector top-10 in **0.05–0.10 ms**; the filtered-vector planner **1.8–6.1×** faster than the best fixed strategy. |
 | Do graph edges help search? | Following the citations of the two nearest papers doubles nDCG@20 on arXiv (0.123 → 0.253). |
 
 </div>

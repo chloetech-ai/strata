@@ -7,7 +7,7 @@ October 13, 2026
 - **Quality:** Engram lifts the solve rate by 15 points in fresh sessions (71% → 86%) and by 12 points in long sessions that compact (81% → 93%).
 - **Cost:** keeping the whole week in context reaches 93%, but at **$0.49 per task, about 60× the price** of a fresh session with Engram.
 - **Speed:** with Engram the agent needed **28% fewer steps** per task (8.8 → 6.3) and read **23% fewer tokens**, because it stopped searching the repository for decisions that were never written into it.
-- **Engine:** Engram stores memory in Strata, our single-file search database. It ran keyword search **110× faster than SQLite** and **2.7× faster than Tantivy** on 523,000 documents, ran vector search in 0.2 ms, and walked a citation graph up to 9× faster than SQLite.
+- **Engine:** Engram stores memory in Strata, our single-file search database. It ran keyword search **99× faster than SQLite** and **2.0× faster than Tantivy** on 523,000 documents, ran vector search in 0.1 ms, and walked a citation graph up to 9× faster than SQLite.
 
 ![Engram matches full-context quality at a fraction of the cost](showcase/quality-vs-cost.png)
 
@@ -153,7 +153,7 @@ Because all four indexes live in one Strata file, the planner combines them in a
 
 ## Under the hood: Strata, one file that beats specialist engines
 
-Engram's speed comes from **Strata**, a search database we built for this job. Like SQLite, it is one file with ACID transactions and SQL. Unlike SQLite, every table is indexed three ways at once: full-text, structured columns and vectors. One SQL statement can mix all three. In the kestrel benchmark, Engram's recall step took a median of **1.6–1.7 ms** (2.7 ms at p95), so remembering adds no wait you can notice.
+Engram's speed comes from **Strata**, a search database we built for this job. Like SQLite, it is one file with ACID transactions and SQL. Unlike SQLite, every table is indexed three ways at once: full-text, structured columns and vectors. One SQL statement can mix all three. In the kestrel benchmark, run on the cloud VM, Engram's recall step took a median of **1.6–1.7 ms** (2.7 ms at p95), so remembering adds no wait you can notice.
 
 ![Strata architecture](showcase/strata-architecture.png)
 
@@ -165,12 +165,12 @@ We measured Strata against two industry standards on four public BEIR collection
 
 <sub>Strata evaluation, strata/results: Quora, 523,000 documents, one thread, warm cache; SQLite 3.53 + FTS5 and Tantivy 0.26</sub>
 
-- **Faster without losing quality:** BM25 search was 1.8–4.6× faster than Tantivy and 45–213× faster than SQLite FTS5 across the four collections. Strata won 23 of 28 warm text and filter comparisons. Ranking quality matched both: nDCG@10 was within 0.02 of the baselines everywhere.
-- **Vectors in milliseconds:** HNSW search took 0.09–0.20 ms with recall@10 of 0.99. SQLite has no built-in vector index, so it scans every vector, which takes 12 ms to 1 s.
-- **One planner for mixed queries:** for vector search under a filter, Strata's cost-based planner was 1.5–5.3× faster than the best fixed strategy on the three larger collections.
-- **Safe and compact:** commits are durable in 0.27 ms, every crash test recovered cleanly, and the file is about the size of SQLite's.
+- **Faster without losing quality:** BM25 search was 1.7–3.2× faster than Tantivy and 43–200× faster than SQLite FTS5 across the four collections. Strata won 24 of 28 warm text and filter comparisons. Ranking quality matched both: nDCG@10 was within 0.02 of the baselines everywhere.
+- **Vectors in milliseconds:** HNSW search took 0.05–0.10 ms with recall@10 of 0.99. SQLite has no built-in vector index, so it scans every vector, which takes 7.7 ms to 0.7 s.
+- **One planner for mixed queries:** for vector search under a filter, Strata's cost-based planner was 1.8–6.1× faster than the best fixed strategy on the three larger collections.
+- **Safe and compact:** every commit is durable (about 4 ms on a Mac, which makes the drive flush its write cache), every crash test recovered cleanly, and the file is about the size of SQLite's.
 
-Where Strata is behind: loading is slower, because building the vector graph takes time (on Quora, 243 s against SQLite's 27 s). Tantivy counts facets 1.1–2.7× faster and is 1.8–2.9× faster on structured filters when the cache is cold. SQLite was tested without a vector extension such as sqlite-vec, so its vector numbers measure a scan, not a competing index. Dedicated vector stores such as FAISS or Qdrant were not part of the test. All runs used one thread on a 4-core cloud VM.
+Where Strata is behind: loading is slower, because building the vector graph takes time (on Quora, 153 s against SQLite's 31 s). Tantivy counts facets 1.1–2.1× faster on three of the four collections and is 1.4–3.4× faster on structured filters when the cache is cold. SQLite was tested without a vector extension such as sqlite-vec, so its vector numbers measure a scan, not a competing index. Dedicated vector stores such as FAISS or Qdrant were not part of the test. All runs used one thread on an Apple M2 MacBook Air.
 
 ## Graphs: search that follows connections
 
@@ -192,7 +192,7 @@ Strata stores links compactly inside the file, at 27 bytes per citation on arXiv
 
 <sub>Strata graph evaluation, strata/results/graph/latency\_arxiv.json: 200 random seeds, warm cache, one thread</sub>
 
-- **More than reachability:** shortest paths and personalized PageRank are built in. PageRank over a million rows and 10 million links takes 5.8 ms. SQLite has no practical way to express either.
+- **More than reachability:** shortest paths and personalized PageRank are built in. PageRank over a million rows and 10 million links takes 3.5 ms. SQLite has no practical way to express either.
 - **Links that never break:** links point at keys, not storage positions, so merges, updates and deletes never rewrite them. A link to a deleted row is skipped, like a foreign key without a constraint.
 - **Part of every query:** a traversal can start from any subquery, such as a vector search, a keyword search or a filter. Its result then combines with BM25, filters and vectors in the same plan.
 
