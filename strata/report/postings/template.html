@@ -171,10 +171,10 @@ footer { margin-top: 60px; color: var(--ink-3); font-size: 0.85rem; }
   <p class="lede">I implemented 13 posting-list representations and 20 intersection and union algorithms in Rust, built a testbed that checks every query result before it is timed, and ran them on synthetic and real collections. This page explains each technique with its formulas and layout, then reports what was measured.</p>
   <p class="meta" id="meta-line"></p>
   <div class="findings" id="findings">
-    <div class="finding"><div class="k">Fastest AND and OR</div><div class="v">Roaring</div><p>0.030 ms AND and 0.57 ms OR on the clustered collection, 1.5× and 5× faster than PEF, at 1.9× its size.</p></div>
-    <div class="finding"><div class="k">Best balance</div><div class="v">PEF · 4.9 bits</div><p>The smallest codec, or within 1% of it, on all three collections, and 1.5× Roaring's AND time on the clustered one.</p></div>
-    <div class="finding"><div class="k">Skip, don't decode</div><div class="v">4–18×</div><p>Rarest-first leapfrog with NextGEQ against decoding every list and intersecting arrays.</p></div>
-    <div class="finding"><div class="k">SIMD crossover</div><div class="v">≈ 1 : 24</div><p>SIMD block merge is 4.4× faster than a scalar merge on equal lists; galloping wins beyond this size ratio.</p></div>
+    <div class="finding"><div class="k">Fastest AND and OR</div><div class="v">Roaring</div><p>0.018 ms AND and 0.38 ms OR on the clustered collection, 2.0× and 5.8× faster than PEF, at 1.9× its size.</p></div>
+    <div class="finding"><div class="k">Best balance</div><div class="v">PEF · 4.9 bits</div><p>The smallest codec, or within 1% of it, on all three collections, and 2.0× Roaring's AND time on the clustered one.</p></div>
+    <div class="finding"><div class="k">Skip, don't decode</div><div class="v">3.7–17×</div><p>Rarest-first leapfrog with NextGEQ against decoding every list and intersecting arrays.</p></div>
+    <div class="finding"><div class="k">SIMD crossover</div><div class="v">≈ 1 : 35</div><p>The NEON 8×8 block merge is 6.8× faster than a scalar merge on equal lists; galloping wins beyond this size ratio.</p></div>
   </div>
   <ul class="toc">
     <li><a href="#problem">The problem</a></li>
@@ -306,7 +306,7 @@ flowchart LR
   <div class="math">\[ \text{array: } 16\,c \ \text{bits}, \qquad \text{bitmap: } 2^{16} \ \text{bits}, \qquad \text{run: } 16 + 32\,r \ \text{bits}, \]</div>
   <p>for \(c\) values in \(r\) runs; arrays switch to bitmaps at \(c = 4096\), where \(16c = 2^{16}\). Because every list uses the same chunk boundaries, AND and OR proceed chunk by chunk with container-pair kernels and need no <code>NextGEQ</code> per element:</p>
   <ul>
-    <li>array ∩ array: SSE4.2 <code>pcmpistrm</code> all-pairs compare (CRoaring's <code>intersect_vector16</code>), or galloping when one side is more than 64× larger;</li>
+    <li>array ∩ array: SSE4.2 <code>pcmpistrm</code> all-pairs compare (CRoaring's <code>intersect_vector16</code>; on NEON, an 8×8 compare against <code>ext</code> rotations with <code>tbl</code> compaction), or galloping when one side is more than 64× larger;</li>
     <li>bitmap ∩ bitmap: word AND with popcount;</li>
     <li>array ∩ bitmap: bit probes;</li>
     <li>union: a k-way merge over keys that ORs dense chunks into one bitmap and counts it once at the end.</li>
@@ -350,7 +350,7 @@ flowchart LR
     <dt>binary search</dt><dd>Search each element of the short list in the rest of the long list: \(m \log_2 n\).</dd>
     <dt>galloping</dt><dd>Exponential search from the last position, probing 1, 2, 4, … steps ahead, then a binary search: at most \(2 \sum_i \log_2(g_i + 1) \le 2m \log_2(n/m + 1)\) comparisons, which matches the lower bound up to a constant.</dd>
     <dt>Baeza-Yates</dt><dd>Binary-search the median of the short list in the long list, then recurse on both sides: \(O(m \log(n/m))\) on average.</dd>
-    <dt>SIMD block merge</dt><dd>Compare a block of \(W\) values from each list all-against-all with \(W\) vector compares against rotations of one block, compact the matches, and advance the block with the smaller maximum. Kernels for SSE (\(W = 4\)), AVX2 (\(W = 8\)) and AVX-512 (\(W = 16\), which emulates <code>VP2INTERSECT</code>).</dd>
+    <dt>SIMD block merge</dt><dd>Compare a block of \(W\) values from each list all-against-all with \(W\) vector compares against rotations of one block, compact the matches, and advance the block with the smaller maximum. Kernels for SSE (\(W = 4\)), AVX2 (\(W = 8\)) and AVX-512 (\(W = 16\), which emulates <code>VP2INTERSECT</code>), and for NEON (\(W = 4\), and \(W = 8\) with two 128-bit registers a side; <code>ext</code> rotations and <code>tbl</code> compaction). The timed kernels are the NEON ones.</dd>
     <dt>adaptive</dt><dd>SIMD block merge when \(n/m \le 64\), galloping beyond, which is CRoaring's switch point.</dd>
   </dl>
   <figure class="narrow">
@@ -359,7 +359,7 @@ flowchart LR
         <g id="simd-grid"></g>
       </svg>
     </div>
-    <figcaption><b>SSE 4×4 step.</b> Four compares cover all 16 pairs. The OR of the lane masks (<span class="mono">1001₂</span>) indexes a shuffle table that packs the matches into the output, and both pointers advance because \(a_3 = b_3\).</figcaption>
+    <figcaption><b>SSE 4×4 step.</b> Four compares cover all 16 pairs. The OR of the lane masks (<span class="mono">1001₂</span>) indexes a shuffle table that packs the matches into the output, and both pointers advance because \(a_3 = b_3\). NEON does the same with <code>ext</code> rotations and a <code>tbl</code> lookup.</figcaption>
   </figure>
 
   <h3>k lists</h3>

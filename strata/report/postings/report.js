@@ -549,6 +549,12 @@
 
   function init() {
     if (!DATA) return;
+    // This page covers the 13 existing representations; the bench now also
+    // runs Pyramid, Loom and Entropic by default, which have their own page.
+    const DESIGNS = ["Pyramid", "Loom", "Entropic"];
+    ["clustered", "uniform", "wikitext"].forEach((k) => {
+      if (DATA[k]) DATA[k].codecs = DATA[k].codecs.filter((c) => !DESIGNS.includes(c.codec));
+    });
     blockDiagram(); efDiagram(); pefDiagram(); roaringDiagram(); trieDiagram(); simdDiagram(); leapDiagram();
     codecCards();
     setupTable();
@@ -580,7 +586,9 @@
       chart("kernels", (el) => {
         const rows = DATA.kernels.rows;
         const ratios = [...new Set(rows.map((r) => r.ratio))];
-        const pick = ["merge", "merge (branchless)", "galloping", "binary search", "Baeza-Yates", "SIMD AVX-512 16x16", "adaptive (SIMD / gallop @64x)"];
+        // The widest block-merge kernel of the machine that produced the data
+        // (AVX-512 on x86-64, NEON 8x8 on aarch64); only one of them is present.
+        const pick = ["merge", "merge (branchless)", "galloping", "binary search", "Baeza-Yates", "SIMD AVX-512 16x16", "SIMD NEON 8x8", "adaptive (SIMD / gallop @64x)"];
         const cols = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
         const series = pick.filter((k) => rows.some((r) => r.kernel === k)).map((k, i) => ({
           name: k.replace(" (SIMD / gallop @64x)", " (SIMD ≤64×, else gallop)"), color: css(cols[i]),

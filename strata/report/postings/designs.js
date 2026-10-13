@@ -74,7 +74,7 @@
     });
     s("text", { x: X0 + 16.5 * W, y: 104, class: "tb", "text-anchor": "middle" }, g, "A ∧ B: 9 word ANDs, no shifts");
     s("text", { x: X0, y: 206, class: "ts" }, g, "bitvector bit i ↔ docID 64·⌊base/64⌋ + i, so every list's bitvectors share one word grid");
-    s("text", { x: X0, y: 226, class: "ts" }, g, "OR: per 2¹⁶-docID window, bitvectors OR word-wise, runs fill words, EF postings decode 16 at a time into bits");
+    s("text", { x: X0, y: 226, class: "ts" }, g, "OR: per 2¹⁶-docID window, bitvectors OR word-wise, runs fill words, EF postings are SIMD-decoded into bits");
     s("text", { x: X0, y: 246, class: "ts" }, g, "AND: per EF partition choose merge (ρ ≤ 12), forward probes, or far probes (ρ ≥ 64)");
   }
 

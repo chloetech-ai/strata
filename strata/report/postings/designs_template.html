@@ -57,7 +57,7 @@
   <p>A new <code>stats</code> command of <code>strata-posting-bench</code> measures the structure of each collection over the lists its queries actually touch. Three facts shaped the designs.</p>
   <ol>
     <li><b>Postings are bimodal.</b> On the clustered collection, 5.1% of the non-empty 256-docID blocks hold 32–255 postings and contain 69% of all postings. Two thirds of blocks hold exactly one, which is the topic-independent noise every term carries. WikiText is denser (12.4 postings per non-empty block on average), while uniform docIDs leave mostly singletons.</li>
-    <li><b>Queries are skewed.</b> The shortest list of a query has a median of 1,793 postings (288 on WikiText). The longest is a median 68–147× and a 90th percentile 965–2,705× larger. Conjunction cost is therefore set by probing a few thousand candidates against very long lists. Roaring spends about 10 ns per candidate.</li>
+    <li><b>Queries are skewed.</b> The shortest list of a query has a median of 1,793 postings (288 on WikiText). The longest is a median 68–147× and a 90th percentile 965–2,705× larger. Conjunction cost is therefore set by probing a few thousand candidates against very long lists.</li>
     <li><b>Entropy is left on the table.</b> A per-list zero-order code of each gap's bit width (plus its raw low bits) would need 4.43, 7.41 and 3.95 bits per posting on the three collections. That is 8–17% below the best existing codec (PEF or interpolative coding), and context modelling can go lower still.</li>
   </ol>
   <div class="table-wrap compact wrap-head">
@@ -78,7 +78,7 @@
 <section class="col" id="loom">
   <h2>Loom <span class="tag">balanced</span></h2>
   <p class="thesis">Keep PEF's size, but line dense partitions up on machine words and replace posting-by-posting cursor merging with partition-native algorithms.</p>
-  <p>PEF already chooses, per partition, whatever is smallest: a run, a bitvector or Elias-Fano. Its weakness is the query side. Every candidate costs a <code>NextGEQ</code> with a select, and a union merges cursors one posting at a time at 4.5–9 ns per output docID. Loom keeps the format and fixes both.</p>
+  <p>PEF already chooses, per partition, whatever is smallest: a run, a bitvector or Elias-Fano. Its weakness is the query side. Every candidate costs a <code>NextGEQ</code> with a select, and a union merges cursors one posting at a time at 3.2–6.2 ns per output docID. Loom keeps the format and fixes both.</p>
   <h3>Layout</h3>
   <ul>
     <li><b>Word-aligned bitvectors.</b> Bit \(i\) of a bitvector partition with base \(b\) is docID \(64\lfloor b/64\rfloor + i\). The bitvectors of any two lists then share the docID word grid, so they can be ANDed or ORed word by word without shifts. The padding of at most 63 bits is charged to the partition.</li>
@@ -92,7 +92,7 @@
         <g id="loom-grid"></g>
       </svg>
     </div>
-    <figcaption><b>Word alignment.</b> Ticks mark 64-docID words. Because both lists' bitvector partitions start on the grid, their overlap (highlighted) intersects with one AND per word. Runs fill words directly, and Elias-Fano partitions are decoded 16 values at a time with AVX-512.</figcaption>
+    <figcaption><b>Word alignment.</b> Ticks mark 64-docID words. Because both lists' bitvector partitions start on the grid, their overlap (highlighted) intersects with one AND per word. Runs fill words directly, and Elias-Fano partitions are decoded 16 values at a time with AVX-512, or with NEON through a byte-position table for the high bits and <code>tbl</code> for the low bits.</figcaption>
   </figure>
   <h3>Conjunction</h3>
   <p>The shortest list is decoded in batches of 256 candidates, and each other list filters the batch in place, rarest first, stopping early once the batch is empty. How a list filters depends on its partition under the candidates:</p>
@@ -101,10 +101,10 @@
     <li><b>Run:</b> a range check.</li>
     <li><b>Elias-Fano</b>, by the density ratio \(\rho\), the list's postings per candidate over the candidates' range:</li>
   </ul>
-  <div class="math">\[ \text{mode}(\rho) = \begin{cases} \text{merge: decode the range, SIMD 16}{\times}16\text{ block intersection} & \rho \le 12 \\ \text{far probes: independent select per candidate} & \rho \ge 64 \\ \text{forward probes: 2–4 interleaved branch-free streams} & \text{otherwise.} \end{cases} \]</div>
-  <p>A far probe finds its bucket from the nearest select sample with an 8-word AVX-512 popcount prefix sum, without depending on the previous probe, so the CPU overlaps them. Forward probes return a lower bound, which lets the driver leapfrog over the list's gaps. When a batch empties, the driver jumps straight to the other list's next posting.</p>
+  <div class="math">\[ \text{mode}(\rho) = \begin{cases} \text{merge: decode the range, SIMD 16}{\times}16\text{ (NEON 8}{\times}8\text{) block intersection} & \rho \le 12 \\ \text{far probes: independent select per candidate} & \rho \ge 64 \\ \text{forward probes: 2–4 interleaved branch-free streams} & \text{otherwise.} \end{cases} \]</div>
+  <p>A far probe finds its bucket from the nearest select sample with an 8-word popcount prefix sum (AVX-512, or NEON byte counts with a saturating byte prefix sum), without depending on the previous probe, so the CPU overlaps them. Forward probes return a lower bound, which lets the driver leapfrog over the list's gaps. When a batch empties, the driver jumps straight to the other list's next posting.</p>
   <h3>Union</h3>
-  <p>Unions walk the docID space in windows of \(2^{16}\) docIDs (a 1024-word thread-local accumulator) and skip empty windows. Every list contributes the partitions overlapping the window: bitvectors are ORed word-wise, runs fill words, and Elias-Fano postings are decoded with SIMD (high bits through <code>vpcompressd</code>, low bits through <code>vpermb</code> and <code>vpsrlvd</code>) and set as bits. The window is then extracted with masked non-zero-word scanning and <code>vpcompressd</code>. Writing the output is about 60% of the remaining union time, at about 0.5 ns per docID.</p>
+  <p>Unions walk the docID space in windows of \(2^{16}\) docIDs (a 1024-word thread-local accumulator) and skip empty windows. Every list contributes the partitions overlapping the window: bitvectors are ORed word-wise, runs fill words, and Elias-Fano postings are decoded with SIMD (high bits through <code>vpcompressd</code>, low bits through <code>vpermb</code> and <code>vpsrlvd</code>; on NEON, high bits through a 256×8 byte-position table, low bits through <code>tbl</code> and <code>ushl</code>) and set as bits. The window is then extracted with masked non-zero-word scanning and <code>vpcompressd</code>, or on NEON a byte at a time through the same table. In the profiling runs on the Xeon VM, writing the output was about 60% of the remaining union time, at about 0.5 ns per docID.</p>
 </section>
 
 <section class="col" id="entropic">
@@ -125,7 +125,7 @@
   </figure>
   <h3>Coder and models</h3>
   <ul>
-    <li><b>Context-switching tANS.</b> A decode step is one table lookup: the entry \((s, n_b, \beta)\) at the current state gives the token, the number of bits to read and the next state base, \(x \leftarrow \beta + \mathrm{bits}(n_b)\). Entries are 8 bytes and already point into the next context's table, so the critical path is one load, one <code>bzhi</code> and one <code>or</code>. State sizes of 7–10 bits are chosen per list.</li>
+    <li><b>Context-switching tANS.</b> A decode step is one table lookup: the entry \((s, n_b, \beta)\) at the current state gives the token, the number of bits to read and the next state base, \(x \leftarrow \beta + \mathrm{bits}(n_b)\). Entries are 8 bytes and already point into the next context's table, so the critical path is one load, one <code>bzhi</code> (a shift and a <code>bic</code> on aarch64) and one <code>or</code>. State sizes of 7–10 bits are chosen per list.</li>
     <li><b>Bits-back block starts.</b> Each lane's final state also carries the low raw bits of that lane's last symbol, so the per-block initial states cost little.</li>
     <li><b>Three model kinds, chosen per list by size</b> (1–2 selector bits):
       <ul>
@@ -137,8 +137,8 @@
     <li><b>Skip table.</b> Elias-Fano sequences of block maxima and block bit offsets cost 0.17–0.21 bits per posting. A plain (u32, u32) entry per block would cost 0.5.</li>
   </ul>
   <h3>Queries</h3>
-  <p>An AVX-512 gather decoder decodes eight blocks at once for bulk decoding. AND bulk-decodes the shortest list and filters it through lazy, block-caching cursors on the others, with early exit. OR sets bits in a bitmap over \([\min, \max]\) and extracts them with the shared SIMD extractor.</p>
-  <p>The price is build time, 13–19× PEF's because of model fitting, and decode tables built from the stored models when an index is loaded. They are not part of the serialized size, as with zstd's FSE tables, but they are reported below as auxiliary memory.</p>
+  <p>An AVX-512 gather decoder decodes eight blocks at once for bulk decoding. NEON has no gather, so the timed aarch64 build decodes four blocks at once: eight scalar tANS state chains (two lanes per block) interleave, and NEON does the gap and docID arithmetic. AND bulk-decodes the shortest list and filters it through lazy, block-caching cursors on the others, with early exit. OR sets bits in a bitmap over \([\min, \max]\) and extracts them with the shared SIMD extractor.</p>
+  <p>The price is build time, 7–10× PEF's because of model fitting, and decode tables built from the stored models when an index is loaded. They are not part of the serialized size, as with zstd's FSE tables, but they are reported below as auxiliary memory.</p>
 </section>
 
 <section id="evaluation">

@@ -45,9 +45,9 @@ native multi-list intersection and union.
 ### Algorithms (`src/postings/algorithms/`)
 
 * **Two sorted arrays** (`pairwise`, `simd`): merge, branch-free merge,
-  galloping, binary search, Baeza-Yates, SIMD block merge (SSE 4x4, AVX2 8x8,
-  AVX-512 16x16), and an adaptive kernel (SIMD below a 64x size ratio,
-  galloping above).
+  galloping, binary search, Baeza-Yates, SIMD block merge (SSE 4x4, AVX2 8x8
+  and AVX-512 16x16 on x86-64; NEON 4x4 and 8x8 on aarch64), and an adaptive
+  kernel (SIMD below a 64x size ratio, galloping above).
 * **k sorted arrays** (`multiway`): SvS with any pairwise kernel, Small
   Adaptive (Demaine et al.), Sequential (Barbay & Kenyon).
 * **k cursors** (`cursor`): rarest-first leapfrog AND (PISA, Lucene),
@@ -99,7 +99,13 @@ python3 scripts/postings/build_report.py            # report/postings/report.htm
 by list length, and reports a Pareto frontier and the auxiliary memory each
 codec builds at load time (Entropic's decode tables).
 
-## Results (single thread, Intel Xeon @ 2.1 GHz with AVX-512)
+## Results (single thread, Apple M2 with NEON)
+
+Measured on a MacBook Air with an Apple M2 (4 performance and 4 efficiency
+cores, 24 GB, macOS 26.0.1), on mains power, with the NEON kernels. Two
+independent runs of the same codecs agree to 0.3% at the median and within 3%
+in all but one cell (12%). The study first ran on a 4-core Emerald Rapids Xeon
+VM with AVX-512; its numbers are in the git history.
 
 Bits per posting are measured on the lists that appear in queries; times are
 the best algorithm per codec, in ms per query, with docIDs written out.
@@ -109,30 +115,30 @@ queries.
 
 | codec | clustered bits | clustered AND ms | clustered OR ms | uniform bits | WikiText bits | WikiText AND ms | WikiText OR ms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Uncompressed | 32.00 | 0.061 | 1.86 | 32.00 | 32.00 | 0.022 | 0.561 |
-| VByte | 9.61 | 0.133 | 3.20 | 10.91 | 8.91 | 0.051 | 0.974 |
-| BP128 | 7.69 | 0.080 | 2.89 | 9.39 | 7.11 | 0.033 | 0.966 |
-| BP128 (bitpacking crate) | 7.69 | 0.072 | 2.54 | 9.39 | 7.11 | 0.030 | 0.855 |
-| OptPFor | 5.92 | 0.088 | 3.00 | 8.87 | 5.91 | 0.037 | 0.898 |
-| Elias-Fano | 8.13 | 0.055 | 2.87 | 8.08 | 5.16 | 0.019 | 0.976 |
-| PEF | 4.94 | 0.046 | 2.84 | 8.08 | 4.75 | 0.022 | 0.931 |
-| Interpolative | 4.90 | 0.181 | 5.00 | 8.52 | 4.77 | 0.081 | 1.623 |
-| Hybrid (bitmap + BP128) | 7.58 | 0.067 | 1.91 | 9.31 | 5.85 | 0.025 | 0.387 |
-| Roaring | 9.32 | 0.030 | 0.57 | 13.70 | 8.47 | 0.007 | 0.086 |
-| Trie | 7.18 | 0.147 | 2.50 | 13.24 | 6.50 | 0.062 | 0.485 |
-| Run-Trie | 6.67 | 0.132 | 2.84 | 13.24 | 6.23 | 0.061 | 0.530 |
-| Roaring (roaring crate) | 9.32 | 0.088 | 4.30 | 13.70 | 8.47 | 0.027 | 1.182 |
+| Uncompressed | 32.00 | 0.027 | 1.32 | 32.00 | 32.00 | 0.0089 | 0.496 |
+| VByte | 9.61 | 0.092 | 2.25 | 10.91 | 8.91 | 0.037 | 0.885 |
+| BP128 | 7.69 | 0.065 | 2.09 | 9.39 | 7.11 | 0.027 | 0.848 |
+| BP128 (bitpacking crate) | 7.69 | 0.051 | 1.83 | 9.39 | 7.11 | 0.020 | 0.754 |
+| OptPFor | 5.92 | 0.068 | 2.15 | 8.87 | 5.91 | 0.028 | 0.856 |
+| Elias-Fano | 8.13 | 0.045 | 2.40 | 8.08 | 5.16 | 0.018 | 0.834 |
+| PEF | 4.94 | 0.035 | 2.21 | 8.08 | 4.75 | 0.016 | 0.826 |
+| Interpolative | 4.90 | 0.135 | 3.47 | 8.52 | 4.77 | 0.060 | 1.313 |
+| Hybrid (bitmap + BP128) | 7.58 | 0.052 | 1.33 | 9.31 | 5.85 | 0.019 | 0.305 |
+| Roaring | 9.32 | 0.018 | 0.38 | 13.70 | 8.47 | 0.0043 | 0.069 |
+| Trie | 7.18 | 0.103 | 3.66 | 13.24 | 6.50 | 0.048 | 0.821 |
+| Run-Trie | 6.67 | 0.109 | 3.86 | 13.24 | 6.23 | 0.049 | 0.866 |
+| Roaring (roaring crate) | 9.32 | 0.053 | 2.50 | 13.70 | 8.47 | 0.018 | 0.805 |
 
-* Roaring is the fastest for AND and OR on every collection (4.5-10x faster
-  OR than the best list codec) at 1.6-1.9x PEF's size.
-* PEF is the smallest codec, or within 1% of it, everywhere, and Elias-Fano or
-  PEF is the fastest list codec for AND.
-* Rarest-first leapfrog (`NextGEQ`) is 4-18x faster than decode-then-intersect.
-* SIMD block merge is 4.4x faster than scalar merge on equal-size lists;
-  galloping wins beyond a ~1:24 size ratio.
+* Roaring is the fastest for AND and OR on every collection (4.8-11x faster
+  OR than the best compressed list codec) at 1.6-1.9x PEF's size.
+* PEF is the smallest codec, or within 1% of it, everywhere, and the fastest
+  compressed list codec for AND; uncompressed arrays are 1.3-2.1x faster still.
+* Rarest-first leapfrog (`NextGEQ`) is 3.7-17x faster than decode-then-intersect.
+* The NEON 8x8 block merge is 6.8x faster than a scalar merge on equal-size
+  lists; galloping wins beyond a ~1:35 size ratio.
 * DocID clustering shrinks PEF, interpolative, Roaring and tries by 32-50%.
 
-Full analysis, formulas and diagrams: [`report/report.html`](report/report.html).
+Full analysis, formulas and diagrams: [`report/postings/report.html`](../report/postings/report.html).
 
 ### New designs
 
@@ -141,23 +147,27 @@ Same collections and query generator, rerun together with the existing codecs
 
 | codec | clustered bits | clustered AND ms | clustered OR ms | uniform bits | WikiText bits | WikiText AND ms | WikiText OR ms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| PEF | 4.94 | 0.040 | 2.99 | 8.08 | 4.75 | 0.018 | 0.920 |
-| Interpolative | 4.90 | 0.191 | 5.03 | 8.52 | 4.77 | 0.087 | 1.49 |
-| Roaring | 9.32 | 0.029 | 0.538 | 13.70 | 8.47 | 0.007 | 0.083 |
-| **Pyramid** | 6.20 | 0.023 | 0.308 | 10.47 | 6.30 | 0.010 | 0.068 |
-| **Loom** | 4.90 | 0.021 | 0.509 | 8.01 | 4.74 | 0.010 | 0.104 |
-| **Entropic** | 4.22 | 0.089 | 1.31 | 7.60 | 4.18 | 0.039 | 0.424 |
+| PEF | 4.94 | 0.035 | 2.21 | 8.08 | 4.75 | 0.016 | 0.828 |
+| Interpolative | 4.90 | 0.135 | 3.47 | 8.52 | 4.77 | 0.060 | 1.32 |
+| Roaring | 9.32 | 0.018 | 0.384 | 13.70 | 8.47 | 0.0044 | 0.069 |
+| **Pyramid** | 6.20 | 0.016 | 0.355 | 10.47 | 6.30 | 0.0081 | 0.078 |
+| **Loom** | 4.90 | 0.013 | 0.514 | 8.01 | 4.74 | 0.0067 | 0.107 |
+| **Entropic** | 4.22 | 0.066 | 0.895 | 7.60 | 4.18 | 0.028 | 0.279 |
 
-* On 8 of 10 size/time frontiers (AND and OR on five workloads) every point is
-  a new design; Roaring keeps the fastest AND on uniform and WikiText.
-* Loom: PEF's size with 1.9-2.2x faster AND and 4.9-8.9x faster OR; on the
-  clustered collection it also beats Roaring on both at 53% of its size.
-* Pyramid: 24-33% smaller than Roaring and the fastest OR everywhere
-  (1.2-1.75x Roaring); AND is 19% faster on clustered data but 11% and 38%
-  slower on uniform and WikiText.
+* Loom is on all 10 size/time frontiers (AND and OR on five workloads), and on
+  4 of them (AND and OR on the clustered collection and the dense queries)
+  every point is a new design. Roaring has the fastest AND and OR on uniform
+  and WikiText, and uncompressed arrays on the selective queries.
+* Loom: PEF's size with 2.4-3.0x faster AND and 3.8-7.7x faster OR; on the
+  clustered collection it also beats Roaring on AND at 53% of its size, but
+  takes 1.34x Roaring's time on OR.
+* Pyramid: 24-33% smaller than Roaring; OR is faster on clustered data (1.08x)
+  and selective queries (1.31x) but 13-14% slower on uniform and WikiText; AND
+  is 15% faster on clustered data but 42% and 87% slower on uniform and
+  WikiText.
 * Entropic: the smallest serialized index (6-15% below PEF, 11-14% below
-  interpolative coding, 2.2-2.4x faster AND than the latter), but its decode
-  tables add 1.3-22 MB at load time and it builds 13-19x slower than PEF.
+  interpolative coding, 2.0-2.3x faster AND than the latter), but its decode
+  tables add 1.3-22 MB at load time and it builds 7-10x slower than PEF.
 
-Details: [`report/designs.html`](report/designs.html).
+Details: [`report/postings/designs.html`](../report/postings/designs.html).
 
