@@ -489,12 +489,37 @@ pub fn range_mask128(d: &[u32; BLOCK], lo: u32, span: u32) -> [u64; 2] {
             m
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        // SAFETY: NEON is part of aarch64; 32 loads of 4 lanes stay inside
+        // `d`.
+        unsafe {
+            let vlo = vdupq_n_u32(lo);
+            let vspan = vdupq_n_u32(span);
+            // NEON has no movemask: narrow the lane masks to bytes, weight
+            // byte i by bit i % 8 and add neighbours pairwise three times.
+            let bit = vld1q_u8([1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+            let cmp = |i: usize| vreinterpretq_u16_u32(vcleq_u32(vsubq_u32(vld1q_u32(d.as_ptr().add(i)), vlo), vspan));
+            let mut m = [0u64; 2];
+            for (h, w) in m.iter_mut().enumerate() {
+                let g = [0, 1, 2, 3].map(|k| {
+                    let i = 64 * h + 16 * k;
+                    let b = vuzp1q_u8(vreinterpretq_u8_u16(vuzp1q_u16(cmp(i), cmp(i + 4))), vreinterpretq_u8_u16(vuzp1q_u16(cmp(i + 8), cmp(i + 12))));
+                    vandq_u8(b, bit)
+                });
+                let s = vpaddq_u8(vpaddq_u8(g[0], g[1]), vpaddq_u8(g[2], g[3]));
+                *w = vgetq_lane_u64(vreinterpretq_u64_u8(vpaddq_u8(s, s)), 0);
+            }
+            m
+        }
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
     range_mask128_scalar(d, lo, span)
 }
 
 /// Portable [`range_mask128`] (the fallback, and the tests' reference).
-#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx512f", not(test)), allow(dead_code))]
+#[cfg_attr(all(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64"), not(test)), allow(dead_code))]
 #[inline]
 pub fn range_mask128_scalar(d: &[u32; BLOCK], lo: u32, span: u32) -> [u64; 2] {
     let mut m = [0u64; 2];
@@ -567,5 +592,27 @@ mod tests {
             let span = rng.gen_range(0..=max);
             assert_eq!(range_mask128(&d, lo, span), range_mask128_scalar(&d, lo, span));
         }
+    }
+
+    #[test]
+    fn mask_kernel_matches_scalar_on_edges() {
+        let mut rng = StdRng::seed_from_u64(3);
+        // Every lane on its own: each maps to its bit.
+        for j in 0..BLOCK {
+            let mut d = [7u32; BLOCK];
+            d[j] = 5;
+            assert_eq!(range_mask128(&d, 5, 0), [(j < 64) as u64 * (1 << (j % 64)), (j >= 64) as u64 * (1 << (j % 64))]);
+        }
+        let edges = [0, 1, 2, 63, 64, 127, 128, u32::MAX / 2, u32::MAX / 2 + 1, u32::MAX - 1, u32::MAX];
+        for _ in 0..200 {
+            let d: [u32; BLOCK] = std::array::from_fn(|_| edges[rng.gen_range(0..edges.len())]);
+            for &lo in &edges {
+                for &span in &edges {
+                    assert_eq!(range_mask128(&d, lo, span), range_mask128_scalar(&d, lo, span), "lo {lo} span {span}");
+                }
+            }
+        }
+        assert_eq!(range_mask128(&[0; BLOCK], 0, u32::MAX), [!0, !0]);
+        assert_eq!(range_mask128(&[u32::MAX; BLOCK], 0, u32::MAX - 1), [0, 0]);
     }
 }

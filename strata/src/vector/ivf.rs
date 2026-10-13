@@ -18,9 +18,9 @@
 //! the docID list before any code is touched. `vec.<field>.ivf_dir` holds the
 //! byte offset and size of every cluster; `vec.<field>.ivf_centroids` the
 //! centroids as SQ8 codes with their own ranges. Every query scores all
-//! centroids to pick its probes, so they are scored like documents (VNNI on
-//! 1 KiB codes): float32 centroids cost ~4× more, the scan being memory-bound
-//! once `nlist` × 4 KiB outgrows L2.
+//! centroids to pick its probes, so they are scored like documents (VNNI or
+//! NEON dot products on 1 KiB codes): float32 centroids cost ~4× more, the
+//! scan being memory-bound once `nlist` × 4 KiB outgrows L2.
 
 use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 use rand::seq::SliceRandom;

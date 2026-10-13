@@ -14,9 +14,9 @@
 //! HNSW (`hnsw`, `hnsw_upper`); see [`ivf`] and [`hnsw`] for the layouts.
 //! [`VectorReader`] views all of them in place.
 //!
-//! **Search** scores SQ8 codes with an int8-quantised query (AVX-512 VNNI),
-//! keeps the best `rerank` candidates and re-ranks them with float32. The
-//! [`Strategy`] decides which codes are scored:
+//! **Search** scores SQ8 codes with an int8-quantised query (AVX-512 VNNI or
+//! NEON `usdot`), keeps the best `rerank` candidates and re-ranks them with
+//! float32. The [`Strategy`] decides which codes are scored:
 //!
 //! * `Flat`: every code (a pre-filter scan when there is a filter).
 //! * `Ivf`: the clusters closest to the query; with a filter, each probed
