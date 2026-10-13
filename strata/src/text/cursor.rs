@@ -6,8 +6,8 @@
 //! query reading the positions of a posting skips at most the 127
 //! postings before it in its block, using their frequencies.
 
-use posting_bench::bytes::OwnedBytes;
-use posting_bench::codecs::PostingList;
+use crate::postings::bytes::OwnedBytes;
+use crate::postings::codecs::PostingList;
 
 use super::codec::{get_varint, put_varint};
 use super::postings::{open_loom, read_frontier, BpCursor, Impact, LoomListCursor, BLOCK};

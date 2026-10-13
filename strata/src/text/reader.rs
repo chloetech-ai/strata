@@ -1,9 +1,9 @@
 //! Reading a text field: lookups, posting cursors, boolean retrieval and
 //! cardinality estimates. Ranked retrieval is in [`super::bm25`].
 
-use posting_bench::bytes::{OwnedBytes, Slice};
-use posting_bench::codecs::loom::Loom;
-use posting_bench::codecs::{PostingList, SetOps};
+use crate::postings::bytes::{OwnedBytes, Slice};
+use crate::postings::codecs::loom::Loom;
+use crate::postings::codecs::{PostingList, SetOps};
 
 use super::bm25::FilterStrategy;
 use super::builder::{section, TextMeta};

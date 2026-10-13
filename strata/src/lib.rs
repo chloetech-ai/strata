@@ -11,6 +11,10 @@
 //! * [`storage`]: the single-file pager, commit protocol, WAL, snapshots.
 //! * [`text`], [`forward`], [`vector`]: the three index families, and
 //!   [`graph`]: edges between rows, with traversals.
+//! * [`postings`]: the compressed posting-list formats the text and keyword
+//!   indexes are built on (Loom, Pyramid, BP128 and the formats they were
+//!   compared with), their set-operation algorithms, and the testbed of the
+//!   `strata-posting-bench` binary.
 //! * [`query`]: SQL front end, planner and executor.
 //! * [`data`], [`metrics`]: BEIR loaders and retrieval metrics for the
 //!   evaluation.
@@ -27,6 +31,7 @@ pub mod forward;
 pub mod graph;
 pub mod iostat;
 pub mod metrics;
+pub mod postings;
 pub mod query;
 pub mod schema;
 pub mod segment;

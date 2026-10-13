@@ -12,7 +12,7 @@
 //! scoring a document is an integer dot product of its u8 codes with the i8
 //! query: one `vpdpbusd` per 64 dimensions (NEON: one `usdot` per 16).
 
-use posting_bench::bytes::Slice;
+use crate::postings::bytes::Slice;
 
 use crate::vector::kernels;
 

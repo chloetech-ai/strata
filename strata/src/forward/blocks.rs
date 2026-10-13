@@ -30,7 +30,7 @@
 //! superblock zones, offs, data and presence.
 
 use bitpacking::{BitPacker, BitPacker4x};
-use posting_bench::bytes::{ByteReader, ByteWriter, Slice};
+use crate::postings::bytes::{ByteReader, ByteWriter, Slice};
 
 use crate::error::{corrupt, Result};
 
@@ -534,7 +534,7 @@ pub fn range_mask128_scalar(d: &[u32; BLOCK], lo: u32, span: u32) -> [u64; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use posting_bench::bytes::OwnedBytes;
+    use crate::postings::bytes::OwnedBytes;
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
     fn roundtrip(keys: &[Option<i64>]) -> Blocks {

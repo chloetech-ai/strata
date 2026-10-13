@@ -93,15 +93,15 @@ The first long-session A/B (`engram/results/long/*_v1_leaky`) is kept for the re
 - Several scripts default to data under `/home/user/data/…` and some use `bash` 4 features (`strata/scripts/run_eval.sh` uses `declare -A`); pass paths explicitly and use a recent `bash` on macOS.
 - Benchmarks are single-threaded unless a flag says otherwise. Run them on an otherwise idle machine.
 
-## posting_bench
+## Posting lists
 
 ```sh
-cd posting_bench
-cargo test --release                               # conformance suite for every codec, and the algorithms
-scripts/prepare_wikitext.sh data                   # WikiText-103 via Hugging Face (needs pyarrow)
-scripts/run_experiments.sh data/wikitext103.txt    # first round: every codec and algorithm
-scripts/run_designs.sh data/wikitext103.txt        # Pyramid, Loom and Entropic against the existing codecs
-python3 scripts/build_report.py                    # report/report.html and report/designs.html
+cd strata
+cargo test --release postings                               # conformance suite for every codec, and the algorithms
+scripts/postings/prepare_wikitext.sh data                   # WikiText-103 via Hugging Face (needs pyarrow)
+scripts/postings/run_experiments.sh data/wikitext103.txt    # first round: every codec and algorithm
+scripts/postings/run_designs.sh data/wikitext103.txt        # Pyramid, Loom and Entropic against the existing codecs
+python3 scripts/postings/build_report.py                    # report/postings/report.html and designs.html
 ```
 
 `.cargo/config.toml` builds with `-C target-cpu=native`. Every SIMD kernel has a portable fallback, but only the AVX-512 builds were timed, so timings on other CPUs are not comparable with the committed ones.

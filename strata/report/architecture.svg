@@ -92,7 +92,7 @@
 
   <!-- Codecs side -->
   <rect x="24" y="428" width="464" height="34" rx="7" class="grn"/>
-  <text x="36" y="450" class="s"><tspan class="t" style="font-size:12px">posting_bench codecs</tspan>  Loom (aligned PEF) · Pyramid (256-docID blocks) · BP128 · zero-copy Slice</text>
+  <text x="36" y="450" class="s"><tspan class="t" style="font-size:12px">posting-list codecs</tspan>  Loom (aligned PEF) · Pyramid (256-docID blocks) · BP128 · zero-copy Slice</text>
   <path d="M137 428 V418" class="dash"/>
   <path d="M375 428 V418" class="dash"/>
 

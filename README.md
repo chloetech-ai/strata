@@ -4,7 +4,7 @@
 
 Claude Code forgets. A long session gets compacted into a summary of about 15,000 characters, and a new session starts with almost nothing. Engram records everything a session does (prompts, answers, tool calls and their results, errors, compaction summaries) into one local file per project. It brings the right pieces back on its own when a prompt needs them, and it gives the model tools to search its own history.
 
-Underneath sits **Strata**, a single-file search database in the spirit of SQLite: ACID transactions, SQL, and every table indexed three ways at once (full text, structured columns and vectors), plus graph edges between rows. Strata's posting lists come from **posting_bench**, a study of compressed posting-list formats that produced the Loom and Pyramid codecs it uses.
+Underneath sits **Strata**, a single-file search database in the spirit of SQLite: ACID transactions, SQL, and every table indexed three ways at once (full text, structured columns and vectors), plus graph edges between rows. Strata's posting lists come from its own study of compressed posting-list formats (the `postings` module), which produced the Loom and Pyramid codecs it uses.
 
 📖 **Full documentation:** [`docs/`](docs/index.md) (also publishable as a GitHub Pages site).
 
@@ -43,7 +43,7 @@ flowchart LR
     D -- "SQL: BM25 + vectors + filters" --> S[("Strata<br/>memory.strata + WAL")]
     D -. "after each turn" .-> DL["distiller<br/>(small model via claude -p)<br/>decisions · rules · planned work · facts"]
     DL -.-> S
-    S --- PB["posting lists<br/>Loom · Pyramid · BP128<br/>(posting_bench)"]
+    S --- PB["posting lists<br/>Loom · Pyramid · BP128<br/>(strata::postings)"]
 ```
 
 1. **Store without being asked.** Every hook event becomes records of at most 400 bytes in a Strata table, with secrets redacted. A hook costs about 10 ms.
@@ -111,18 +111,17 @@ target/release/strata db.strata "SELECT category, COUNT(*) FROM docs WHERE MATCH
 | path | what |
 |---|---|
 | [`engram/`](engram/) | the memory system: hooks client, daemon, MCP server, recall and gate, distiller, live inspector (`demo/`), evaluation harnesses and results |
-| [`strata/`](strata/) | the database: storage engine, segments, text / structured / vector / graph indexes, SQL binder, planner and executor, baselines and benchmarks |
-| [`posting_bench/`](posting_bench/) | compressed posting lists and set algorithms, and the Pyramid, Loom and Entropic designs |
+| [`strata/`](strata/) | the database: storage engine, segments, text / structured / vector / graph indexes, SQL binder, planner and executor, baselines and benchmarks; [`src/postings/`](strata/src/postings/) holds the compressed posting lists and set algorithms, the Pyramid, Loom and Entropic designs, and their testbed (`strata-posting-bench`) |
 | [`docs/`](docs/) | this documentation, as Markdown and as a GitHub Pages site |
 
-Each crate also carries its own design document ([Strata](strata/DESIGN.md), [Engram](engram/DESIGN.md)) and full HTML reports with every chart and table ([Strata](strata/report/strata.html), [Strata graphs](strata/report/graph.html), [Engram](engram/report/engram.html), [record structure](engram/report/structure.html), [posting lists](posting_bench/report/report.html), [designs](posting_bench/report/designs.html)).
+Each crate also carries its own design document ([Strata](strata/DESIGN.md), [Engram](engram/DESIGN.md)) and full HTML reports with every chart and table ([Strata](strata/report/strata.html), [Strata graphs](strata/report/graph.html), [Engram](engram/report/engram.html), [record structure](engram/report/structure.html), [posting lists](strata/report/postings/report.html), [designs](strata/report/postings/designs.html)).
 
 ## Documentation
 
 - [Overview](docs/index.md)
 - **Engram:** [how it works](docs/engram/index.md) · [live inspector](docs/engram/inspector.md) · [results](docs/engram/results.md)
 - **Strata:** [design](docs/strata/index.md) · [query language](docs/strata/query-language.md) · [graphs](docs/strata/graphs.md) · [results](docs/strata/results.md)
-- [Posting lists (posting_bench)](docs/posting-lists.md)
+- [Posting lists](docs/posting-lists.md)
 - [Reproducing the results](docs/reproduce.md)
 
 ## Status and limits

@@ -16,7 +16,7 @@
 //! `log2(n) - 9`. Hash collisions are resolved by comparing the stored key.
 //! (hash, docID) pairs are interleaved so that a probe reads one cache line.
 
-use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
+use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};

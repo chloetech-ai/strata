@@ -19,9 +19,9 @@
 
 use std::collections::HashMap;
 
-use posting_bench::bytes::{ByteReader, ByteWriter, Slice};
-use posting_bench::codecs::pyramid::Pyramid;
-use posting_bench::codecs::{PostingList, SetOps};
+use crate::postings::bytes::{ByteReader, ByteWriter, Slice};
+use crate::postings::codecs::pyramid::Pyramid;
+use crate::postings::codecs::{PostingList, SetOps};
 
 use super::blocks::{write_blocks, Blocks, BLOCK};
 use super::lists::{build_list, merge_sorted, write_lists, ListTable};

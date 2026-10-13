@@ -39,7 +39,7 @@ mod io;
 mod ivf;
 mod topk;
 
-use posting_bench::bytes::{ByteReader, Slice};
+use crate::postings::bytes::{ByteReader, Slice};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{corrupt, Result};

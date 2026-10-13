@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use memmap2::Mmap;
-use posting_bench::bytes::OwnedBytes;
+use strata::postings::bytes::OwnedBytes;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 use strata::metrics::{mean, ndcg_at_k, percentile, recall};

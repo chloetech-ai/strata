@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
-use posting_bench::bytes::{ByteReader, Slice};
+use strata::postings::bytes::{ByteReader, Slice};
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use serde_json::{json, Value as Json};

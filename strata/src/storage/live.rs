@@ -5,7 +5,7 @@
 //! changes, so the segment itself stays immutable. [`LiveDocs`] views it in
 //! place and exposes the complement, the live documents, as a [`DocFilter`].
 
-use posting_bench::bytes::{OwnedBytes, Slice};
+use crate::postings::bytes::{OwnedBytes, Slice};
 
 use crate::error::{corrupt, Result};
 use crate::segment::{DocFilter, DocId, DocSet};

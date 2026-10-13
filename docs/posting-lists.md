@@ -6,7 +6,7 @@ nav_order: 4
 # Posting lists: formats and algorithms
 {: .no_toc }
 
-`posting_bench` is a study of compressed posting lists and the algorithms that intersect and unite them. It compares thirteen existing formats on synthetic and real collections, then three new designs built from what the comparison showed: **Pyramid**, **Loom** and **Entropic**. Loom has the size of partitioned Elias-Fano with 1.9–2.2× faster conjunctions and 4.9–8.9× faster unions. Strata's text index stores its long lists as Loom, and its keyword filters as Pyramid.
+Strata's `postings` module is a study of compressed posting lists and the algorithms that intersect and unite them. It compares thirteen existing formats on synthetic and real collections, then three new designs built from what the comparison showed: **Pyramid**, **Loom** and **Entropic**. Loom has the size of partitioned Elias-Fano with 1.9–2.2× faster conjunctions and 4.9–8.9× faster unions. Strata's text index stores its long lists as Loom, and its keyword filters as Pyramid.
 {: .fs-5 .fw-300 }
 
 1. TOC
@@ -56,7 +56,7 @@ Algorithms: for two sorted arrays, merge, branch-free merge, galloping, binary s
 | Interpolative | 4.90 | 0.181 | 5.00 | 4.77 | 0.081 | 1.62 |
 | Roaring | 9.32 | 0.030 | 0.57 | 8.47 | 0.007 | 0.086 |
 
-*Source: `posting_bench/results/`; the full table, with every codec and the uniform collection, is in the [posting_bench README](https://github.com/rkonow/engram/blob/main/posting_bench/README.md).*
+*Source: `strata/results/postings/`; the full table, with every codec and the uniform collection, is in [Strata's posting-list notes](https://github.com/rkonow/engram/blob/main/strata/notes/posting-lists.md).*
 
 - **The skip structure matters more than the gap coder.** Conjunctions spend their time in `NextGEQ`. Elias-Fano's select-based jumps made Elias-Fano or PEF the fastest list codec for AND on every collection, matching or beating uncompressed arrays, though they decode 2.3–2.6× slower than BP128.
 - **PEF is the balanced default:** the smallest or within 1% of it everywhere, at 1.5–3.1× Roaring's AND time.
@@ -138,7 +138,7 @@ Same collections, query generator and harness as the first round, rerun together
 | **Loom** | 4.90 | **0.021** | 0.509 | 8.01 | 4.74 | 0.010 | 0.104 |
 | **Entropic** | **4.22** | 0.089 | 1.31 | **7.60** | **4.18** | 0.039 | 0.424 |
 
-*Source: `posting_bench/results/designs/`.*
+*Source: `strata/results/postings/designs/`.*
 
 On 8 of the 10 size/time frontiers (AND and OR on five workloads), every point is a new design. Roaring keeps the fast end of AND on uniform and WikiText.
 
@@ -187,4 +187,4 @@ Strata's [text index](strata/index.md#full-text) keeps Loom for long lists, addi
 
 - [Posting lists: formats and algorithms](reports/posting-lists.html), the first round with every codec and algorithm.
 - [The three new designs](reports/posting-list-designs.html), with layouts, diagrams and every frontier.
-- [Reproducing the results](reproduce.md#posting_bench) has the commands.
+- [Reproducing the results](reproduce.md#posting-lists) has the commands.

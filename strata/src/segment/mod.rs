@@ -11,7 +11,7 @@
 //! Sections of one page or more start on a 4 KiB boundary, smaller ones on a
 //! 64-byte boundary, relative to the segment start. The storage layer places
 //! segments at page-aligned file offsets, so a section mapped from disk can be
-//! viewed in place as `&[u64]` (see [`posting_bench::bytes`]).
+//! viewed in place as `&[u64]` (see [`crate::postings::bytes`]).
 //!
 //! Section names are `component.field.part`, e.g. `text.body.dict`,
 //! `col.year`, `kw.category.post`, `vec.emb.ivf`, `graph.links`,
@@ -24,7 +24,7 @@ pub use filter::{DocFilter, DocSet};
 
 use std::collections::BTreeMap;
 
-use posting_bench::bytes::OwnedBytes;
+use crate::postings::bytes::OwnedBytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{corrupt, Result};
