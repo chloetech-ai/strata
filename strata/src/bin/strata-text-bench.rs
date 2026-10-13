@@ -503,7 +503,8 @@ fn cold(image: &[u8], path: &Path, w: &Workload, a: &Args) -> Value {
 fn resident_map(ptr: *const u8, len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len.div_ceil(iostat::PAGE)];
     // SAFETY: `ptr..ptr + len` is a live, page-aligned mapping.
-    let r = unsafe { libc::mincore(ptr as *mut libc::c_void, len, v.as_mut_ptr()) };
+    // `*mut c_uchar` on Linux, `*mut c_char` on macOS.
+    let r = unsafe { libc::mincore(ptr as *mut libc::c_void, len, v.as_mut_ptr() as *mut _) };
     assert_eq!(r, 0, "mincore failed");
     v
 }

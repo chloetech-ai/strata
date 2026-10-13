@@ -25,6 +25,8 @@ This repository holds three projects that together address that problem, each bu
 | **Strata** | An embedded, single-file search database with ACID transactions and SQL. Every table is indexed as full text, structured columns and vectors at once, with graph edges between rows and a cost-based planner over all of it. | [Design](strata/index.md) · [SQL](strata/query-language.md) · [Graphs](strata/graphs.md) · [Results](strata/results.md) |
 | **posting_bench** | A study of compressed posting lists and their intersection and union algorithms, which produced three new formats. Strata's text index uses two of them. | [Posting lists](posting-lists.md) |
 
+For the short version, with the week-long Kestrel benchmark and its cost comparison, read [the Engram showcase](engram-showcase.md).
+
 ![The Engram live inspector: a new session answers from memory](assets/img/inspector-new-session.png)
 
 *A fresh Claude Code session, asked what storage was chosen earlier and why, answers from the briefing Engram injected at session start. Right: the records the hooks wrote and the knowledge a small model distilled from the previous session. See [the live inspector](engram/inspector.md).*
