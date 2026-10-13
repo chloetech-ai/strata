@@ -630,16 +630,15 @@ fn main() {
                 .map(|v| ("ef".into(), v, SearchParams { strategy: Strategy::Hnsw, ef: v, rerank: v.min(a.default_rerank), ..defaults }))
                 .collect(),
         };
-        // Touch what the sweep reads before timing it. The segment was just
-        // written, so its pages are cached, but the first touch of each page
-        // through the new mapping still faults; macOS maps one 16 KiB page
-        // per fault, without Linux's fault-around, which made the first
-        // settings of the sweep look slower than the deeper ones.
-        if let Some((_, _, p)) = sweep.last() {
-            run(&r, &qs, 10, p, &|_| None, f64::INFINITY);
-        }
         let mut curve = Vec::new();
         for (name, v, p) in &sweep {
+            // An untimed pass first. The segment was just written, so its
+            // pages are cached, but the first touch of each page through the
+            // new mapping still faults, and each setting re-ranks different
+            // candidates; macOS maps one 16 KiB page per fault, without
+            // Linux's fault-around, which made the shallow settings of the
+            // sweep look slower than the deep ones.
+            run(&r, &qs, 10, p, &|_| None, f64::INFINITY);
             let res = run(&r, &qs, 10, p, &|_| None, f64::INFINITY);
             let mut s = summary(&res, &truth10);
             let nd: Vec<f64> = res.hits.iter().enumerate().filter_map(|(qi, h)| ndcg(&ds, qi, h)).collect();
