@@ -1,0 +1,22 @@
+{
+ "scifact": {
+  "queries": 300,
+  "ndcg10_drop_stopwords": 0.6887138283708758,
+  "ndcg10_keep_stopwords": 0.6871268154414859
+ },
+ "fiqa": {
+  "queries": 648,
+  "ndcg10_drop_stopwords": 0.25205027103354094,
+  "ndcg10_keep_stopwords": 0.25041132307125596
+ },
+ "trec-covid": {
+  "queries": 50,
+  "ndcg10_drop_stopwords": 0.6584617226356745,
+  "ndcg10_keep_stopwords": 0.6031852390758552
+ },
+ "quora": {
+  "queries": 2000,
+  "ndcg10_drop_stopwords": 0.7560205399089509,
+  "ndcg10_keep_stopwords": 0.8107441452125757
+ }
+}

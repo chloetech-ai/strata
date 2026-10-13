@@ -1,0 +1,86 @@
+{
+ "name": "stockroom",
+ "history": [
+  [
+   "Hi! stockroom is the stock-keeping library we're building for Brandt & Sons, a hardware wholesaler with two shops. Could you run the tests first? I think the reorder check is broken.",
+   "Staff type SKUs every which way at the counter: 'br-1042', ' BR-1042', 'Br-1042 '. Please add a `normalize_sku` helper in items.py (trim, uppercase) and make every public Catalog and Inventory method that takes a SKU go through it. Tests too, please.",
+   "Next, every movement needs a reason code. Brandt's bookkeeping uses exactly these five: RECEIPT, SALE, RETURN, DAMAGE, COUNT. Add a `reason` field to Movement, have receive() use RECEIPT and issue() use SALE, and reject any other code. And keep the code plain: their back-office PC is stuck on Python 3.8 because the scanner vendor's sync tool only runs there, so nothing that needs a newer Python.",
+   "Two things for later, no code for either today. When we get to stock valuation, it has to be FIFO. Their auditor flagged the average-cost figures from the old spreadsheet last year and they had to restate the accounts. Second, please never make issue() refuse to take stock below zero. The old system did exactly that, and because the till only posts the sale after the customer has paid, the error just meant the sale silently vanished from the log. Negative stock is fine, they correct it at the next count.",
+   "For the stock-take in December we'll need a printable count sheet. Brandt wants the lines in walking order, so sorted by bin location rather than by SKU, and it has to be a blind count: the sheet must not show what the system thinks is on hand, only an empty column where people write what they counted. The auditor insists on that so people actually count instead of copying the number. We'll build it in a later session.",
+   "Great, please commit all of this with a sensible message."
+  ],
+  [
+   "The CSV storage doesn't keep the new reason codes yet. Please add a reason column to save_movements/load_movements, and make old files without that column still load: a positive quantity was a RECEIPT, a negative one a SALE.",
+   "Also, Item should reject a case_size below 1 and a negative reorder_point. That matters soon: next sprint we'll turn needs_reorder into actual purchase suggestions. Brandt orders enough to get back up to three times the reorder point, rounded up to whole cases since the supplier only ships full cases. Don't build the suggestions yet, just the validation.",
+   "One more for when we write the importer for the handheld scanners, after the count sheet: the scanners export a plain text file, semicolon-separated, no header line, columns bin;sku;qty. A SKU can be on several lines when some of it sits in an overflow bin, and then the quantities have to be added up.",
+   "That's it for today, please commit."
+  ],
+  [
+   "Let's add a small command line. `python -m stockroom onhand SKU --log movements.csv` prints the quantity on hand, and `python -m stockroom receive SKU QTY UNIT_COST --log movements.csv` appends a receipt to the log, creating the file if it doesn't exist yet.",
+   "Also add `python -m stockroom moves SKU --log movements.csv`, printing one line per movement with date, reason and quantity.",
+   "Thanks, please commit."
+  ]
+ ],
+ "tasks": [
+  {
+   "id": "count_sheet",
+   "kind": "conversation",
+   "needs": "count sheet requirements stated only in conversation (walking order by bin, blind count)",
+   "prompt": "Let's build the count sheet for the stock-take now: add `count_sheet(inventory)` in src/stockroom/countsheet.py that returns the sheet as text, one line per catalog item."
+  },
+  {
+   "id": "stock_value",
+   "kind": "conversation",
+   "needs": "valuation method (FIFO, auditor) stated only in conversation",
+   "prompt": "Add `stock_value(inventory, sku)` in src/stockroom/valuation.py that returns the value, in cents, of the stock of that SKU currently on hand."
+  },
+  {
+   "id": "purchase_suggestions",
+   "kind": "conversation",
+   "needs": "the client's order-quantity rule (up to 3x reorder point, whole cases) stated only in conversation",
+   "prompt": "Time for the purchase suggestions: add `suggest_orders(inventory)` to src/stockroom/reorder.py, returning a dict that maps each SKU we should order to the quantity to order."
+  },
+  {
+   "id": "scanner_import",
+   "kind": "conversation",
+   "needs": "the scanner file format (semicolons, no header, bin;sku;qty, sum duplicates) stated only in conversation",
+   "prompt": "Write the importer for the handheld scanner files: `read_scanner_file(path)` in src/stockroom/scanner.py, returning the counted quantity per SKU as a dict."
+  },
+  {
+   "id": "negative_stock_advice",
+   "kind": "conversation",
+   "needs": "a failed approach and its reason (till posts after payment) stated only in conversation",
+   "prompt": "It bugs me that `Inventory.issue` lets stock go negative. Should we make it raise an error when there isn't enough stock? Give me a short recommendation, no code changes."
+  },
+  {
+   "id": "config_advice",
+   "kind": "conversation",
+   "needs": "an environment fact (client PC on Python 3.8) said once in passing",
+   "prompt": "We want to move the shop settings into a config file. I'm thinking TOML, read with the standard library's tomllib. Good idea? Short recommendation please, no code yet."
+  },
+  {
+   "id": "last_receipt",
+   "kind": "repo",
+   "needs": "the SKU normalization convention, applied in the code during the history",
+   "prompt": "Add `Inventory.last_receipt(sku)` that returns the most recent receipt movement for a SKU, or None if there is none."
+  },
+  {
+   "id": "write_off",
+   "kind": "repo",
+   "needs": "the reason codes, added to the code during the history",
+   "prompt": "Add `Inventory.write_off(sku, qty, date=None)` for stock that got broken or damaged."
+  },
+  {
+   "id": "abc_classes",
+   "kind": "control",
+   "needs": "nothing (control)",
+   "prompt": "Add `abc_classes(values)` in src/stockroom/analysis.py for an ABC analysis. `values` maps SKU to annual consumption value. Sort the SKUs by value, highest first, and keep a running total: a SKU is 'A' if the cumulative share up to and including it is at most 80% of the grand total, 'B' if at most 95%, otherwise 'C'. Return a dict mapping SKU to class (an empty dict for empty input). Add a test."
+  },
+  {
+   "id": "parse_location",
+   "kind": "control",
+   "needs": "nothing (control)",
+   "prompt": "Add `parse_location(code)` in src/stockroom/items.py that splits a bin code like 'B-12-3' into a tuple (aisle, bay, shelf) = ('B', 12, 3). The aisle is a single letter (accept lowercase, return it uppercase), bay and shelf are integers, surrounding whitespace is ignored, and anything else raises ValueError. Add a test."
+  }
+ ]
+}

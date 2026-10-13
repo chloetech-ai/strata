@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 800" width="1000" height="800" font-family="IBM Plex Sans, Segoe UI, system-ui, sans-serif">
+  <style>
+    .t { font-size: 13px; fill: #141922; font-weight: 600; }
+    .s { font-size: 11px; fill: #485164; }
+    .m { font-size: 11px; fill: #141922; font-family: IBM Plex Mono, ui-monospace, Menlo, monospace; }
+    .h { font-size: 11px; fill: #737c8f; letter-spacing: 0.08em; }
+    .box { fill: #ffffff; stroke: #c9d1de; stroke-width: 1.2; }
+    .acc { fill: #e4ecfc; stroke: #1d5bd6; stroke-width: 1.2; }
+    .warm { fill: #fdebe1; stroke: #c2410c; stroke-width: 1.2; }
+    .grn { fill: #e3f4ea; stroke: #1b8a4a; stroke-width: 1.2; }
+    .ln { stroke: #737c8f; stroke-width: 1.3; fill: none; }
+    .lna { stroke: #1d5bd6; stroke-width: 1.6; fill: none; }
+    .dash { stroke: #737c8f; stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#737c8f"/></marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#1d5bd6"/></marker>
+  </defs>
+  <rect width="1000" height="800" fill="#f4f6f9"/>
+
+  <text x="24" y="34" font-size="20" font-weight="600" fill="#141922">Strata: an embedded search database in one file</text>
+  <text x="24" y="54" class="s">Full text, structured filters and vectors behind SQL · Rust prototype, current state</text>
+
+  <!-- Front end -->
+  <text x="24" y="86" class="h">QUERY</text>
+  <rect x="24" y="94" width="232" height="58" rx="7" class="box"/>
+  <text x="36" y="114" class="t">SQL text + parameters</text>
+  <text x="36" y="132" class="m">MATCH · bm25 · similarity</text>
+  <text x="36" y="145" class="m">rrf · weighted · GROUP BY</text>
+  <path d="M256 123 H290" class="ln" marker-end="url(#a)"/>
+  <rect x="292" y="94" width="210" height="58" rx="7" class="box"/>
+  <text x="304" y="114" class="t">parser + binder</text>
+  <text x="304" y="132" class="s">sqlparser AST → schema fields</text>
+  <text x="304" y="145" class="s">strict bounds, tie-breaks, opts</text>
+  <path d="M502 123 H536" class="ln" marker-end="url(#a)"/>
+  <rect x="538" y="94" width="210" height="58" rx="7" class="box"/>
+  <text x="550" y="114" class="t">bound query</text>
+  <text x="550" y="132" class="s">predicate tree (AND/OR/NOT)</text>
+  <text x="550" y="145" class="s">score expression · projection</text>
+  <rect x="770" y="94" width="206" height="58" rx="7" class="warm"/>
+  <text x="782" y="114" class="t">Db facade</text>
+  <text x="782" y="132" class="s">query · load · per-segment</text>
+  <text x="782" y="145" class="s">reader cache · merges source</text>
+
+  <!-- Planner -->
+  <path d="M643 152 V182" class="lna" marker-end="url(#b)"/>
+  <text x="24" y="178" class="h">PLANNER (PER SEGMENT)</text>
+  <rect x="24" y="186" width="952" height="76" rx="7" class="acc"/>
+  <text x="36" y="206" class="t">cost-based planner</text>
+  <text x="36" y="224" class="s">statistics: exact list lengths, 64-bucket histograms, segment sizes, the vector index's calibrated cost model</text>
+  <text x="36" y="240" class="s">materialise vs probe each filter (C_mat &lt; m·c_probe) · range: zone-map scan vs bucket postings · conjunctions most selective first</text>
+  <text x="36" y="256" class="s">vectors: pre-filter / in-index / post-filter / flat, re-checked with the selectivity near the query (32-NN sample, 160 when it finds ≤ 1 match)</text>
+
+  <!-- Operators -->
+  <text x="24" y="292" class="h">OPERATORS (ZERO-COPY VIEWS OF SEGMENT SECTIONS)</text>
+  <path d="M120 262 V298" class="ln" marker-end="url(#a)"/>
+  <path d="M360 262 V298" class="ln" marker-end="url(#a)"/>
+  <path d="M600 262 V298" class="ln" marker-end="url(#a)"/>
+  <path d="M860 262 V298" class="ln" marker-end="url(#a)"/>
+  <rect x="24" y="300" width="226" height="116" rx="7" class="box"/>
+  <text x="36" y="320" class="t">full text</text>
+  <text x="36" y="338" class="s">analyzer: fold, 33 stopwords, Snowball</text>
+  <text x="36" y="352" class="s">dictionary blocks of 32</text>
+  <text x="36" y="366" class="s">Loom docIDs + tf blocks (df ≥ 512)</text>
+  <text x="36" y="380" class="s">BM25 k1 1.2, b 0.75 · MaxScore / BMW</text>
+  <text x="36" y="394" class="s">boolean, phrase (positions), prefix</text>
+  <text x="36" y="408" class="s">filter drives or is probed</text>
+  <rect x="262" y="300" width="226" height="116" rx="7" class="box"/>
+  <text x="274" y="320" class="t">structured</text>
+  <text x="274" y="338" class="s">FOR columns, block + superblock</text>
+  <text x="274" y="352" class="s">zone maps; decimals as scaled ints</text>
+  <text x="274" y="366" class="s">keyword dict + codes + Pyramid lists</text>
+  <text x="274" y="380" class="s">range buckets (64, Pyramid)</text>
+  <text x="274" y="394" class="s">facets: codes or count-only AND</text>
+  <text x="274" y="408" class="s">doc store: LZ4 16 KiB blocks</text>
+  <rect x="500" y="300" width="226" height="116" rx="7" class="box"/>
+  <text x="512" y="320" class="t">vectors</text>
+  <text x="512" y="338" class="s">float32 + SQ8 codes (VNNI, 12 ns)</text>
+  <text x="512" y="352" class="s">flat · IVF (clusters = posting lists)</text>
+  <text x="512" y="366" class="s">HNSW (M 16, ef 64)</text>
+  <text x="512" y="380" class="s">pre / in / post-filter strategies</text>
+  <text x="512" y="394" class="s">exact float32 re-rank</text>
+  <text x="512" y="408" class="s">calibrated cost model</text>
+  <rect x="738" y="300" width="238" height="116" rx="7" class="warm"/>
+  <text x="750" y="320" class="t">fusion and output</text>
+  <text x="750" y="338" class="s">per-segment top-k → global merge</text>
+  <text x="750" y="352" class="s">collection-wide BM25 statistics</text>
+  <text x="750" y="366" class="s">RRF Σ 1/(60 + rank)</text>
+  <text x="750" y="380" class="s">weighted: min-max, exact re-score</text>
+  <text x="750" y="394" class="s">of the union of top-100s</text>
+  <text x="750" y="408" class="s">facets, counts, projection, keys</text>
+
+  <!-- Codecs side -->
+  <rect x="24" y="428" width="464" height="34" rx="7" class="grn"/>
+  <text x="36" y="450" class="s"><tspan class="t" style="font-size:12px">posting_bench codecs</tspan>  Loom (aligned PEF) · Pyramid (256-docID blocks) · BP128 · zero-copy Slice</text>
+  <path d="M137 428 V418" class="dash"/>
+  <path d="M375 428 V418" class="dash"/>
+
+  <!-- Snapshot -->
+  <text x="24" y="494" class="h">SNAPSHOT (REFERENCE-COUNTED MANIFEST VERSION)</text>
+  <path d="M500 462 V498" class="ln" marker-end="url(#a)"/>
+  <g>
+    <rect x="24" y="502" width="300" height="88" rx="7" class="box"/>
+    <text x="36" y="522" class="t">segment 1 (on disk, immutable)</text>
+    <rect x="36" y="532" width="66" height="44" rx="3" class="acc"/><text x="69" y="551" class="s" text-anchor="middle">text.body</text><text x="69" y="566" class="s" text-anchor="middle">dict post pos</text>
+    <rect x="106" y="532" width="66" height="44" rx="3" class="acc"/><text x="139" y="551" class="s" text-anchor="middle">col / kw</text><text x="139" y="566" class="s" text-anchor="middle">range</text>
+    <rect x="176" y="532" width="66" height="44" rx="3" class="acc"/><text x="209" y="551" class="s" text-anchor="middle">vec.emb</text><text x="209" y="566" class="s" text-anchor="middle">f32 sq8 hnsw</text>
+    <rect x="246" y="532" width="66" height="44" rx="3" class="acc"/><text x="279" y="551" class="s" text-anchor="middle">store</text><text x="279" y="566" class="s" text-anchor="middle">pk</text>
+  </g>
+  <rect x="336" y="502" width="170" height="88" rx="7" class="box"/>
+  <text x="348" y="522" class="t">segment 2 …</text>
+  <text x="348" y="540" class="s">same sections</text>
+  <text x="348" y="554" class="s">+ delete set (bitset,</text>
+  <text x="348" y="568" class="s">copy-on-write)</text>
+  <rect x="518" y="502" width="220" height="88" rx="7" class="warm"/>
+  <text x="530" y="522" class="t">memtable (in memory)</text>
+  <text x="530" y="540" class="s">committed, not yet flushed</text>
+  <text x="530" y="554" class="s">segments of 1,024 docs, built</text>
+  <text x="530" y="568" class="s">with the same index code</text>
+  <rect x="750" y="502" width="226" height="88" rx="7" class="box"/>
+  <text x="762" y="522" class="t">readers</text>
+  <text x="762" y="540" class="s">opened lazily per field</text>
+  <text x="762" y="554" class="s">cached by segment id</text>
+  <text x="762" y="568" class="s">generated columns rebuilt on merge</text>
+
+  <!-- File -->
+  <text x="24" y="622" class="h">ONE FILE + WAL (SINGLE WRITER, SNAPSHOT READERS)</text>
+  <path d="M260 590 V626" class="ln" marker-end="url(#a)"/>
+  <path d="M628 590 V626" class="dash" marker-end="url(#a)"/>
+  <rect x="24" y="630" width="46" height="46" rx="4" class="acc"/><text x="47" y="651" class="t" text-anchor="middle">A</text><text x="47" y="667" class="s" text-anchor="middle">meta</text>
+  <rect x="74" y="630" width="46" height="46" rx="4" class="box"/><text x="97" y="651" class="t" text-anchor="middle">B</text><text x="97" y="667" class="s" text-anchor="middle">meta</text>
+  <rect x="124" y="630" width="150" height="46" rx="4" class="acc"/><text x="199" y="657" class="s" text-anchor="middle">segment extents</text>
+  <rect x="278" y="630" width="84" height="46" rx="4" class="box"/><text x="320" y="657" class="s" text-anchor="middle">manifest</text>
+  <rect x="366" y="630" width="84" height="46" rx="4" class="box"/><text x="408" y="657" class="s" text-anchor="middle">delete sets</text>
+  <rect x="454" y="630" width="70" height="46" rx="4" class="box"/><text x="489" y="657" class="s" text-anchor="middle">free</text>
+  <rect x="560" y="630" width="160" height="46" rx="4" class="warm"/><text x="640" y="651" class="t" text-anchor="middle">-wal</text><text x="640" y="667" class="s" text-anchor="middle">insert · delete · commit</text>
+  <rect x="740" y="630" width="236" height="46" rx="4" class="box"/><text x="752" y="650" class="s">mmap, read-only · MADV_RANDOM on</text><text x="752" y="666" class="s">graph, f32, norms, dicts, store, pk</text>
+  <text x="24" y="698" class="s">commit = write extents → fsync → write the other meta slot (txn + 1, crc32) → fsync · recovery takes the valid slot with the larger txn, then replays the WAL</text>
+  <text x="24" y="714" class="s">tiered merges and vacuum · freed pages wait for every snapshot that can see them · crash-tested with repeated SIGKILL</text>
+
+  <!-- Evaluation -->
+  <rect x="24" y="732" width="952" height="50" rx="7" class="box"/>
+  <text x="36" y="752" class="t">evaluation harness</text>
+  <text x="36" y="770" class="s">BEIR SciFact · FiQA · TREC-COVID · Quora (1024-d vectors, relevance judgments) → one workload per collection → Strata, SQLite + FTS5, Tantivy · warm, cold, quality, planner regret</text>
+</svg>

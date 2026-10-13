@@ -1,0 +1,7 @@
+train results/retrieval/longmemeval_s_bge-small_round_every5.rows.jsonl: n=193 positive 0.409
+  G = 3.803 cos + 4.311 cov + 0.326 cue + 1.583 agree + 2.778 cos_gap + 0.617 bm_gap;  hi 9.711 (precision 0.9), lo 6.374 (precision 0.7)
+  train: n=193 pos 0.409 | inject (G>=hi): precision 1.000 recall 0.025 rate 0.010 | pointer-or-inject (G>=lo): precision 0.700 recall 0.886 | same-rate precision cos-only 1.000 cov-only 1.000
+  results/retrieval/locomo_bge-small_round.rows.jsonl: n=1996 pos 0.583 | inject (G>=hi): precision 0.750 recall 0.013 rate 0.010 | pointer-or-inject (G>=lo): precision 0.655 recall 0.802 | same-rate precision cos-only 0.700 cov-only 0.700
+gated policy (full at hi, brief at lo):
+  results/retrieval/longmemeval_s_bge-small_round_every5.rows.jsonl: coverage 0.585 (always inject 0.840), precision 0.556 (always 0.409), inject rate 0.513, 486 chars per prompt (always about 3,000)
+  results/retrieval/locomo_bge-small_round.rows.jsonl: coverage 0.404 (always inject 0.758), precision 0.436 (always 0.583), inject rate 0.713, 650 chars per prompt (always about 3,000)

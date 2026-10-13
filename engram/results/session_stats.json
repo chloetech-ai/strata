@@ -1,0 +1,19 @@
+{
+ "transcript_bytes": 43642850,
+ "lines": 5392,
+ "first": "2026-10-11T05:00:50.129Z",
+ "last": "2026-10-12T07:27:45.673Z",
+ "compactions": [
+  {
+   "line": 1952,
+   "chars": 14202,
+   "timestamp": "2026-10-12T00:21:52.509Z"
+  },
+  {
+   "line": 4633,
+   "chars": 17998,
+   "timestamp": "2026-10-12T06:40:04.419Z"
+  }
+ ],
+ "tool_use_lines": 1323
+}

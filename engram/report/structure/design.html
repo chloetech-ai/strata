@@ -1,0 +1,43 @@
+  <p class="thesis">Store everything as small records: a 400-byte window of one event is the value, the window plus its turn's request is the lexical key, and the window alone is the dense key. Keep every attribute a query can filter on. Derived records (episode cards, summaries, and model-written facts) are extra keys over the same history.</p>
+  <h3>The record</h3>
+  <div class="table-wrap schema">
+    <table>
+      <thead><tr><th>field</th><th>role</th><th>index</th><th>used by</th></tr></thead>
+      <tbody>
+        <tr><td><code>text</code></td><td><b>value</b>: one window of an event, at most 400 bytes</td><td>stored</td><td>the injected record, shown whole under a header</td></tr>
+        <tr><td><code>ctx</code></td><td>part of the lexical key: the turn's request (≤ 200 chars) or a summary's section</td><td>stored, never shown</td><td>finding terse records ("test result: ok") by the words of their task</td></tr>
+        <tr><td><code>body</code></td><td><b>lexical key</b>: <code>text ⊕ ctx</code></td><td>BM25, positions (generated)</td><td>recall, <code>memory_search</code>, <code>MATCH</code></td></tr>
+        <tr><td><code>emb</code></td><td><b>dense key</b>: φ(<code>text</code>), 512 dimensions</td><td>SQ8 codes; HNSW on disk, a scan in the memtable</td><td>recall, <code>memory_search</code></td></tr>
+        <tr><td><code>session</code>, <code>seq</code></td><td>attributes: the conversation and the project-wide order of events</td><td>keyword, integer</td><td>the live-window predicate, the recency prior, <code>memory_timeline</code></td></tr>
+        <tr><td><code>turn</code>, <code>ts</code></td><td>attributes: the user turn and the time</td><td>integer</td><td>the per-turn packing cap, dates in the header, time ranges in SQL</td></tr>
+        <tr><td><code>kind</code>, <code>tag</code>, <code>importance</code></td><td>attributes: prompt, answer, tool call or result, error, episode, summary, decision, preference, fact, todo, note; tool name, section, or the state of a distilled item (<code>distilled</code>, <code>planned</code>, <code>done</code>, <code>superseded</code>); salience</td><td>keyword, float</td><td>the briefing, the knowledge query, file notes, priors, the "uncertain" filter</td></tr>
+        <tr><td><code>files</code></td><td>attribute and key: paths the record touches</td><td>text (path parts are terms)</td><td>pre-edit notes, SQL such as "the last errors in <code>exec.rs</code>"</td></tr>
+        <tr><td><code>id</code></td><td>identity: <code>session:seq</code></td><td>primary key</td><td>citations in the injected text, <code>memory_timeline</code>, <code>memory_forget</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>The queries</h3>
+  <div class="flow">
+    <div><h4>Every prompt (automatic)</h4><p>First the knowledge query: the same two searches under <code>kind IN ('preference','decision','fact','note','todo')</code>, keeping at most 4 records not yet shown with cos ≥ 0.40 or coverage ≥ 0.30, whatever the gate says. Then lexical: <code>bm25(body, :q)</code> top 50, and dense: <code>similarity(emb, :v)</code> top 50, both under <code>NOT (session = :s AND seq &gt;= :w)</code>. Fuse, apply priors, gate, then pack at most 12 records, 8 per turn, within 4,000 characters (3 records within 1,200 on weak evidence).</p></div>
+    <div><h4>Session start (automatic)</h4><p>Structured only, newest first in each section: <code>kind = 'todo' AND tag = 'planned'</code>, then <code>'preference'</code>, <code>'decision'</code>, <code>'fact'</code>, never <code>superseded</code> or <code>done</code>; the latest checkpoint's task list; the last session's episode cards. Within 6,000 characters, with a line telling the model to search memory before design decisions. After a compaction it also runs the prompt query on the last two prompts.</p></div>
+    <div><h4>After each turn (background)</h4><p>A small model reads the turn and the latest 40 knowledge records and writes new ones (<code>tag = 'distilled'</code> or <code>'planned'</code>), retagging those it replaces <code>'superseded'</code> and planned work it saw finished <code>'done'</code>. Off the prompt's path.</p></div>
+    <div><h4>Before an edit (automatic)</h4><p>Structured and lexical: <code>MATCH(files, :path) AND kind IN ('error','decision',…) ORDER BY seq DESC LIMIT 3</code>, once per file per context window.</p></div>
+    <div><h4>The model's own tools</h4><p><code>memory_search</code> (hybrid, with kinds), <code>memory_timeline</code> (<code>session = :s AND seq BETWEEN :a AND :b</code>), and <code>memory_sql</code> for any read-only question over the attributes.</p></div>
+  </div>
+<pre>-- "what failed in the planner yesterday?" through memory_sql
+SELECT id, ts, text FROM memory
+WHERE kind = 'error' AND MATCH(files, 'planner') AND ts &gt;= 1791700000
+ORDER BY ts DESC LIMIT 5</pre>
+  <h3>What to keep</h3>
+  <p>Keep all of it. Raw events (prompts, answers, tool calls and results, the commentary between tool calls, compaction summaries) are the source of truth. Episode cards, summary sections and, next, model-written facts are keys derived from them, and can be rebuilt when the layout changes. Large tool outputs keep their head and tail, and file reads are stubs, since the file is on disk.</p>
+  <h3>One trade-off left</h3>
+  <p>On chat histories, 1,500-byte turns with no context gave the most correct answers (75.4%, against 73.0% for 400-byte windows; not significant). On coding sessions the windows win clearly. Engram is for coding sessions, so the windows stay. Cutting prompts and answers at 1,500 bytes and tool output at 400 is an untested middle path.</p>
+  <h3>Done since: knowledge written by a model</h3>
+  <p>The first item of the earlier list is in Engram now (see <a href="#ab">With and without Engram</a>): at <code>Stop</code>, in the background, a small model writes decisions, rules, planned work and facts as their own records, with Engram's hooks off for that call. Strata needed no change for it. The knowledge query is a filtered hybrid search on <code>kind</code>, which Strata already plans as a scan of the few matching rows, and the briefing is a set of structured queries.</p>
+  <h3>Next, in order of evidence</h3>
+  <ol>
+    <li><b>Time-aware queries.</b> Temporal questions are the second-largest gap (68–74% against 94% with the oracle). Phrases such as "yesterday", "last week" or "before the refactor" map to a <code>ts</code> or <code>seq</code> range that Strata already filters on.</li>
+    <li><b>HTTP hooks.</b> Claude Code can POST hook events to a URL for every event except <code>SessionStart</code>, which stays a command hook and starts the daemon. That removes a process start from each tool call (see Execution time). The daemon would need a secret path and a <code>Host</code> check, so that web pages cannot write into memory through localhost.</li>
+    <li><b>A reranker</b> on the top candidates of prompts that pass the gate, which still cannot tell related from relevant well.</li>
+    <li><b>A larger briefing budget, or ranking within it.</b> A long project will hold more knowledge than 6,000 characters. Beyond that, the briefing keeps the newest items and the knowledge query has to find the rest by similarity, which has not been tested here.</li>
+  </ol>

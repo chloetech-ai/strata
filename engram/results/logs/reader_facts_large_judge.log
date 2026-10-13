@@ -1,0 +1,5 @@
+0 answers to get (300 cached)
+300 answers to grade in 30 calls
+facts                        n=100  accuracy 0.780  context 4021 chars  reader tokens 3046
+turn_facts                   n=100  accuracy 0.740  context 3736 chars  reader tokens 2823
+fact_keys                    n=100  accuracy 0.740  context 3620 chars  reader tokens 2750

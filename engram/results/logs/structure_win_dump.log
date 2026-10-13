@@ -1,0 +1,23 @@
+500 units of longmemeval_s, 1 layouts × 6 presentations × 4 budgets
+  25/500 units, 11 s
+  50/500 units, 23 s
+  75/500 units, 33 s
+  100/500 units, 43 s
+  125/500 units, 59 s
+  150/500 units, 74 s
+  175/500 units, 90 s
+  200/500 units, 107 s
+  225/500 units, 123 s
+  250/500 units, 142 s
+  275/500 units, 159 s
+  300/500 units, 177 s
+  325/500 units, 197 s
+  350/500 units, 215 s
+  375/500 units, 230 s
+  400/500 units, 248 s
+  425/500 units, 268 s
+  450/500 units, 283 s
+  475/500 units, 303 s
+  500/500 units, 319 s
+470 questions in 320 s
+win400+req/vec-text    rows   1726 R@10 0.909 MRR 0.664 | snip600 ev 0.904 ans 0.844 span400 ev 0.891 ans 0.878 span600 ev 0.885 ans 0.884 span600+p150 ev 0.902 ans 0.857 span400+p150 ev 0.917 ans 0.857 turn1500 ev 0.881 ans 0.871

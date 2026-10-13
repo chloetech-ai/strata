@@ -1,0 +1,74 @@
+{
+  "dataset": "fiqa",
+  "experiment": "open",
+  "loadavg_at_start": "1.04 1.06 1.22 2/106 21190",
+  "n_docs": 57638,
+  "reps": 5,
+  "results": [
+    {
+      "cold": true,
+      "first_lookup_ms": 0.006684,
+      "first_snapshot_ms": 0.026054,
+      "kind": "segments",
+      "open_ms": 3.342892,
+      "segments": 10
+    },
+    {
+      "cold": false,
+      "first_lookup_ms": 0.003923,
+      "first_snapshot_ms": 0.015460000000000002,
+      "kind": "segments",
+      "open_ms": 0.286729,
+      "segments": 10
+    },
+    {
+      "cold": true,
+      "first_lookup_ms": 0.02211,
+      "first_snapshot_ms": 0.084599,
+      "kind": "segments",
+      "open_ms": 12.634405,
+      "segments": 100
+    },
+    {
+      "cold": false,
+      "first_lookup_ms": 0.009314,
+      "first_snapshot_ms": 0.06658199999999999,
+      "kind": "segments",
+      "open_ms": 1.066225,
+      "segments": 100
+    },
+    {
+      "cold": true,
+      "first_lookup_ms": 0.267331,
+      "first_snapshot_ms": 1.4234060000000002,
+      "kind": "segments",
+      "open_ms": 123.29008599999999,
+      "segments": 994
+    },
+    {
+      "cold": false,
+      "first_lookup_ms": 0.14905,
+      "first_snapshot_ms": 0.604714,
+      "kind": "segments",
+      "open_ms": 8.040111000000001,
+      "segments": 994
+    },
+    {
+      "cold": true,
+      "first_snapshot_ms": 36.024899999999995,
+      "kind": "wal_replay",
+      "open_ms": 5.332795000000001,
+      "wal_bytes": 5698016,
+      "wal_docs": 1000
+    },
+    {
+      "cold": true,
+      "first_snapshot_ms": 369.110461,
+      "kind": "wal_replay",
+      "open_ms": 62.90749399999999,
+      "wal_bytes": 57108144,
+      "wal_docs": 10000
+    }
+  ],
+  "seconds": 14.275405313
+}

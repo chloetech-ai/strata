@@ -1,0 +1,44 @@
+{
+ "reader": "small",
+ "judge": "large",
+ "questions": 50,
+ "configs": {
+  "full": {
+   "n": 50,
+   "accuracy": 0.84,
+   "by_type": {
+    "abstention": {
+     "n": 4,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 7,
+     "accuracy": 0.8571428571428571
+    },
+    "multi-session": {
+     "n": 12,
+     "accuracy": 0.75
+    },
+    "single-session-assistant": {
+     "n": 5,
+     "accuracy": 1.0
+    },
+    "single-session-preference": {
+     "n": 3,
+     "accuracy": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 7,
+     "accuracy": 1.0
+    },
+    "temporal-reasoning": {
+     "n": 12,
+     "accuracy": 0.75
+    }
+   },
+   "context_chars": 498196.34,
+   "reader_tokens": 169459.28,
+   "cost_usd": 8.712018
+  }
+ }
+}

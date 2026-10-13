@@ -1,0 +1,665 @@
+//! Hybrid retrieval with priors, the injection gate, snippets and the
+//! text Engram injects.
+
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::capture::past_reference;
+use crate::record::{Kind, Record};
+use crate::store::{Filter, Hit, Reach, Store};
+use crate::Result;
+
+/// Ranking parameters (see DESIGN.md §5).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RankParams {
+    /// Candidates from each of BM25 and vector search.
+    pub n: usize,
+    /// Weight of normalised BM25 against normalised cosine.
+    pub w_bm25: f64,
+    /// Importance prior: score × (1 + λ_ι ι).
+    pub lambda_imp: f64,
+    /// Recency prior weight λ_t and scale τ (in records).
+    pub lambda_rec: f64,
+    pub tau: f64,
+    /// Use BM25 / vectors at all.
+    pub use_bm25: bool,
+    pub use_vectors: bool,
+    /// Records linked to the best hits (see [`GraphParams`]).
+    #[serde(default)]
+    pub graph: GraphParams,
+}
+
+impl Default for RankParams {
+    fn default() -> Self {
+        RankParams { n: 50, w_bm25: 0.5, lambda_imp: 0.2, lambda_rec: 0.05, tau: 5000.0, use_bm25: true, use_vectors: true, graph: GraphParams::default() }
+    }
+}
+
+/// Graph recall: the best hits, and the entities nearest the query, start a
+/// walk over the records' links that passes through entities and notes; the
+/// records it reaches, best by similarity to the query, are a second ranked
+/// list fused into the hybrid ranking by reciprocal rank,
+/// score = 1/(k + rank_hybrid) + weight/(k + rank_graph).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphParams {
+    pub enabled: bool,
+    /// Top hits whose links start the walk.
+    pub seeds: usize,
+    /// Entities nearest the query that start it too, at this cosine or more.
+    pub entity_seeds: usize,
+    pub min_entity_cos: f64,
+    pub hops: usize,
+    /// Records the walk returns.
+    pub n: usize,
+    pub k: f64,
+    pub weight: f64,
+    pub max_nodes: usize,
+}
+
+impl Default for GraphParams {
+    /// Off unless `ENGRAM_GRAPH=1` (or the config turns it on) until the
+    /// evaluations in eval/graph_eval_plan.md show it helps.
+    fn default() -> Self {
+        GraphParams { enabled: std::env::var("ENGRAM_GRAPH").is_ok_and(|v| v == "1"), seeds: 5, entity_seeds: 3, min_entity_cos: 0.5, hops: 2, n: 20, k: 10.0, weight: 0.5, max_nodes: 5000 }
+    }
+}
+
+/// Kinds a graph walk passes through: entities and the notes about them.
+pub const THROUGH: [Kind; 6] = [Kind::Entity, Kind::Preference, Kind::Decision, Kind::Fact, Kind::Todo, Kind::Note];
+
+/// The records linked to the best hits and to the entities nearest the
+/// query, best first by cosine similarity to `qv`.
+pub fn expand(store: &Store, qv: &[f32], hits: &[Hit], filter: &Filter, p: &GraphParams) -> Result<Vec<(Record, f64)>> {
+    let mut seeds: Vec<String> = hits.iter().take(p.seeds).map(|h| h.record.id.clone()).collect();
+    if p.entity_seeds > 0 {
+        let f = Filter { kinds: vec![Kind::Entity], ..Default::default() };
+        for (r, c) in store.vector_top(qv, p.entity_seeds, &f)? {
+            if c >= p.min_entity_cos {
+                seeds.push(r.id);
+            }
+        }
+    }
+    let reach = Reach { hops: p.hops, through: THROUGH.to_vec(), max_nodes: p.max_nodes };
+    store.reach(&seeds, qv, p.n, filter, &reach)
+}
+
+/// Fuses the graph list into the hybrid ranking (see [`GraphParams`]).
+/// Graph records keep their cosine; their score is the fused one.
+pub fn merge_graph(hits: Vec<Hit>, graph: Vec<(Record, f64)>, p: &GraphParams) -> Vec<Hit> {
+    if graph.is_empty() {
+        return hits;
+    }
+    let mut by: HashMap<String, (Hit, f64)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (i, h) in hits.into_iter().enumerate() {
+        order.push(h.record.id.clone());
+        by.insert(h.record.id.clone(), (h, 1.0 / (p.k + 1.0 + i as f64)));
+    }
+    for (j, (r, c)) in graph.into_iter().enumerate() {
+        let add = p.weight / (p.k + 1.0 + j as f64);
+        match by.get_mut(&r.id) {
+            Some(e) => e.1 += add,
+            None => {
+                order.push(r.id.clone());
+                by.insert(r.id.clone(), (Hit { record: r, bm25: None, cos: Some(c), score: 0.0 }, add));
+            }
+        }
+    }
+    let mut out: Vec<(Hit, f64)> = order.into_iter().filter_map(|id| by.remove(&id)).collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    out.into_iter()
+        .map(|(mut h, s)| {
+            h.score = s;
+            h
+        })
+        .collect()
+}
+
+/// Absolute evidence about the best candidates, for the gate.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Evidence {
+    /// Highest cosine similarity among vector candidates.
+    pub max_cos: f64,
+    /// Highest IDF-weighted query-term coverage among the top 5.
+    pub max_cov: f64,
+    /// The top candidate is in both the BM25 and the vector top 10.
+    pub agree: bool,
+    /// The prompt refers back to earlier work.
+    pub cue: bool,
+    /// How far the best vector candidate stands out: cos₁ − cos₁₀.
+    #[serde(default)]
+    pub cos_gap: f64,
+    /// How far the best BM25 candidate stands out: 1 − bm25₁₀ / bm25₁.
+    #[serde(default)]
+    pub bm_gap: f64,
+}
+
+/// The injection gate, a linear score over the evidence:
+/// G = a·max_cos + b·max_cov + c·cue + d·agree + e·cos_gap + f·bm_gap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Gate {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub e: f64,
+    pub f: f64,
+    /// Full injection at G ≥ hi; a brief one (two records) at lo ≤ G < hi.
+    pub hi: f64,
+    pub lo: f64,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        // Logistic fit on LongMemEval-S with the static embedder and
+        // 400-byte records (scripts/fit_gate.py, results/gate_static_c400.json):
+        // hi holds precision 0.9, lo precision 0.7.
+        Gate { a: 4.868, b: 4.794, c: 0.595, d: 0.981, e: 1.959, f: -1.448, hi: 6.650, lo: 4.508 }
+    }
+}
+
+impl Gate {
+    /// The gate fitted for an embedder spec (cosine scales differ).
+    pub fn for_embedder(spec: &str) -> Gate {
+        // BGE-small vectors (in the daemon, or from a benchmark cache).
+        if spec.starts_with("bert") || spec.contains("bge") {
+            Gate::bert()
+        } else {
+            Gate::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum Decision {
+    /// Strong evidence: the full budget.
+    Inject,
+    /// Weak evidence: the top two records in a small budget.
+    Brief,
+    Skip,
+}
+
+impl Gate {
+    /// Logistic fit on every fifth LongMemEval-S haystack with BGE-small
+    /// vectors (scripts/fit_gate.py); hi holds precision 0.9, lo 0.7.
+    pub fn bert() -> Gate {
+        Gate { a: 3.803, b: 4.311, c: 0.326, d: 1.583, e: 2.778, f: 0.617, hi: 9.711, lo: 6.374 }
+    }
+
+    pub fn score(&self, e: &Evidence) -> f64 {
+        self.a * e.max_cos + self.b * e.max_cov + self.c * e.cue as u8 as f64 + self.d * e.agree as u8 as f64 + self.e * e.cos_gap + self.f * e.bm_gap
+    }
+    pub fn decide(&self, e: &Evidence) -> Decision {
+        let g = self.score(e);
+        if g >= self.hi {
+            Decision::Inject
+        } else if g >= self.lo {
+            Decision::Brief
+        } else {
+            Decision::Skip
+        }
+    }
+}
+
+fn analyzed(text: &str) -> HashSet<String> {
+    strata::text::analyze(text).into_iter().collect()
+}
+
+/// Hybrid search: BM25 and vector candidates, min-max fused, with priors.
+pub fn search(store: &Store, query: &str, filter: &Filter, p: &RankParams) -> Result<(Vec<Hit>, Evidence)> {
+    let terms = strata::text::analyze_query(query);
+    let bm = if p.use_bm25 && !terms.is_empty() { store.bm25_top(query, p.n, filter)? } else { Vec::new() };
+    let vq = if p.use_vectors { Some(store.embedder.embed_query(query)) } else { None };
+    let mut dv = match &vq {
+        Some(v) => store.vector_top(v, p.n, filter)?,
+        None => Vec::new(),
+    };
+    // Earlier copies of the same question and answers that admitted not
+    // knowing match a repeated question best and carry nothing: they would
+    // inflate the gate and repeat the failure.
+    let qterms: HashSet<String> = terms.iter().cloned().collect();
+    let useful = |r: &Record| r.tag != "uncertain" && r.tag != "superseded" && !same_question(r, &qterms);
+    let mut bm = bm;
+    bm.retain(|(r, _)| useful(r));
+    dv.retain(|(r, _)| useful(r));
+    let (hits, ev) = fuse(store, query, &terms, bm, dv, p);
+    if !p.graph.enabled || hits.is_empty() {
+        return Ok((hits, ev));
+    }
+    let qv = vq.unwrap_or_else(|| store.embedder.embed_query(query));
+    let mut graph = expand(store, &qv, &hits, filter, &p.graph)?;
+    graph.retain(|(r, _)| useful(r));
+    Ok((merge_graph(hits, graph, &p.graph), ev))
+}
+
+/// Fuses BM25 and vector candidate lists (exposed for benchmarks that run
+/// the two searches themselves).
+pub fn fuse(store: &Store, query: &str, terms: &[String], bm: Vec<(Record, f64)>, dv: Vec<(Record, f64)>, p: &RankParams) -> (Vec<Hit>, Evidence) {
+    let top_ids = |l: &[(Record, f64)]| l.iter().take(10).map(|(r, _)| r.id.clone()).collect::<HashSet<_>>();
+    let (bm_top, dv_top) = (top_ids(&bm), top_ids(&dv));
+    let max_cos = dv.iter().map(|x| x.1).fold(0.0, f64::max);
+    let nth = |l: &[(Record, f64)], i: usize| l.get(i.min(l.len().saturating_sub(1))).map_or(0.0, |x| x.1);
+    let cos_gap = if dv.is_empty() { 0.0 } else { nth(&dv, 0) - nth(&dv, 9) };
+    let bm_gap = if bm.is_empty() || nth(&bm, 0) <= 0.0 { 0.0 } else { 1.0 - nth(&bm, 9) / nth(&bm, 0) };
+    let range = |l: &[(Record, f64)]| {
+        let lo = l.iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
+        let hi = l.iter().map(|x| x.1).fold(f64::NEG_INFINITY, f64::max);
+        (lo, hi)
+    };
+    let (blo, bhi) = range(&bm);
+    let (vlo, vhi) = range(&dv);
+    let norm = |x: f64, lo: f64, hi: f64| if hi > lo { (x - lo) / (hi - lo) } else { 1.0 };
+    let mut by: HashMap<String, Hit> = HashMap::new();
+    for (r, s) in bm {
+        by.insert(r.id.clone(), Hit { record: r, bm25: Some(s), cos: None, score: 0.0 });
+    }
+    for (r, s) in dv {
+        by.entry(r.id.clone()).and_modify(|h| h.cos = Some(s)).or_insert(Hit { record: r, bm25: None, cos: Some(s), score: 0.0 });
+    }
+    let max_seq = by.values().map(|h| h.record.seq).max().unwrap_or(0).max(store.last_seq());
+    let (wb, wv) = match (bhi.is_finite(), vhi.is_finite()) {
+        (true, true) => (p.w_bm25, 1.0 - p.w_bm25),
+        (true, false) => (1.0, 0.0),
+        _ => (0.0, 1.0),
+    };
+    let mut hits: Vec<Hit> = by
+        .into_values()
+        .map(|mut h| {
+            let b = h.bm25.map_or(0.0, |x| norm(x, blo, bhi));
+            let c = h.cos.map_or(0.0, |x| norm(x, vlo, vhi));
+            let rel = wb * b + wv * c;
+            let age = (max_seq - h.record.seq).max(0) as f64;
+            h.score = rel * (1.0 + p.lambda_imp * h.record.importance) + p.lambda_rec * (-age / p.tau).exp();
+            h
+        })
+        .collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(b.record.seq.cmp(&a.record.seq)));
+    let mut ev = Evidence { max_cos, cue: past_reference(query), cos_gap, bm_gap, ..Default::default() };
+    if let Some(top) = hits.first() {
+        ev.agree = bm_top.contains(&top.record.id) && dv_top.contains(&top.record.id);
+    }
+    if !terms.is_empty() {
+        let idf = store.idf(terms).unwrap_or_else(|_| vec![1.0; terms.len()]);
+        let total: f64 = idf.iter().sum();
+        for h in hits.iter().take(5) {
+            let have = analyzed(&format!("{}\n{}", h.record.text, h.record.ctx));
+            let got: f64 = terms.iter().zip(&idf).filter(|(t, _)| have.contains(*t)).map(|(_, w)| w).sum();
+            ev.max_cov = ev.max_cov.max(if total > 0.0 { got / total } else { 0.0 });
+        }
+    }
+    (hits, ev)
+}
+
+/// The part of `text` (at most `max` bytes) with the most query terms.
+pub fn snippet(text: &str, terms: &HashSet<String>, max: usize) -> String {
+    let (s, e) = snippet_range(text, terms, max);
+    if s == 0 && e == text.len() {
+        return text.to_string();
+    }
+    format!("{}{}{}", if s > 0 { "…" } else { "" }, text[s..e].trim(), if e < text.len() { "…" } else { "" })
+}
+
+/// The byte range [`snippet`] shows.
+pub fn snippet_range(text: &str, terms: &HashSet<String>, max: usize) -> (usize, usize) {
+    if text.len() <= max {
+        return (0, text.len());
+    }
+    let mut hits = Vec::new();
+    let mut pos = 0;
+    for w in text.split(|c: char| !c.is_alphanumeric()) {
+        if !w.is_empty() {
+            if let Some(t) = strata::text::analyzer::term_of(&w.to_lowercase()) {
+                if terms.contains(t.as_ref()) {
+                    hits.push(pos);
+                }
+            }
+        }
+        pos += w.len() + 1;
+    }
+    let mut best = (0usize, 0usize);
+    for &h in &hits {
+        let start = h.saturating_sub(max / 5);
+        let n = hits.iter().filter(|&&x| x >= start && x < start + max).count();
+        if n > best.1 {
+            best = (start, n);
+        }
+    }
+    let floor = |mut i: usize| {
+        i = i.min(text.len());
+        while !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    (floor(best.0), floor(best.0 + max))
+}
+
+/// How retrieved records become injected text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PackParams {
+    pub budget_chars: usize,
+    pub snippet_chars: usize,
+    /// Records taken from one session turn at most.
+    pub per_turn: usize,
+    /// Records at most.
+    pub max_records: usize,
+}
+
+impl Default for PackParams {
+    fn default() -> Self {
+        // Records are at most CHUNK_CHARS (400) bytes, so about ten fit the
+        // budget with their headers. A coding turn spans many records (each
+        // tool call and result), so the per-turn cap is loose: at 3, the
+        // answer was often a fourth record of a turn already shown.
+        PackParams { budget_chars: 4000, snippet_chars: 600, per_turn: 8, max_records: 12 }
+    }
+}
+
+impl PackParams {
+    /// The weak-evidence tier: three records, about 300 tokens.
+    pub fn brief() -> PackParams {
+        PackParams { budget_chars: 1200, snippet_chars: 500, per_turn: 1, max_records: 3 }
+    }
+}
+
+/// Whether a stored prompt is essentially the query asked again: it matches
+/// best and says nothing new, so it only takes up the budget.
+fn same_question(r: &Record, terms: &HashSet<String>) -> bool {
+    // Only stored questions: a statement that repeats the question's words
+    // ("my dog is called Max") is the answer, not a repeat.
+    if r.kind != Kind::Prompt || terms.is_empty() || !r.text.contains('?') {
+        return false;
+    }
+    let other: HashSet<String> = strata::text::analyze_query(&r.text).into_iter().collect();
+    let inter = terms.intersection(&other).count() as f64;
+    let union = terms.union(&other).count() as f64;
+    union > 0.0 && inter / union >= 0.7
+}
+
+/// Selects hits within the budget; returns them oldest first with snippets.
+/// Answers marked uncertain and earlier copies of the same question are skipped.
+pub fn pack(hits: &[Hit], query: &str, skip: &HashSet<String>, p: &PackParams) -> Vec<(Record, String)> {
+    let terms: HashSet<String> = strata::text::analyze_query(query).into_iter().collect();
+    let mut per: HashMap<(String, i64), usize> = HashMap::new();
+    let mut used = 0usize;
+    let mut out: Vec<(Record, String)> = Vec::new();
+    for h in hits {
+        if out.len() >= p.max_records {
+            break;
+        }
+        if skip.contains(&h.record.id) || h.record.tag == "uncertain" || same_question(&h.record, &terms) {
+            continue;
+        }
+        let k = (h.record.session.clone(), h.record.turn);
+        if *per.get(&k).unwrap_or(&0) >= p.per_turn {
+            continue;
+        }
+        let snip = snippet(&h.record.text, &terms, p.snippet_chars);
+        if used + snip.len() + 80 > p.budget_chars && !out.is_empty() {
+            continue;
+        }
+        used += snip.len() + 80;
+        *per.entry(k).or_default() += 1;
+        out.push((h.record.clone(), snip));
+    }
+    out.sort_by_key(|(r, _)| r.seq);
+    out
+}
+
+/// `2026-10-11 07:43 UTC` for a Unix time.
+pub fn fmt_time(ts: i64) -> String {
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", secs / 3600, (secs % 3600) / 60)
+}
+
+/// `3 h ago`, `2 days ago`.
+pub fn fmt_ago(ts: i64, now: i64) -> String {
+    let d = (now - ts).max(0);
+    match d {
+        0..=119 => "just now".into(),
+        120..=7199 => format!("{} min ago", d / 60),
+        7200..=172_799 => format!("{} h ago", d / 3600),
+        _ => format!("{} days ago", d / 86_400),
+    }
+}
+
+fn short(session: &str) -> String {
+    session.chars().take(8).collect()
+}
+
+/// One injected record: a provenance line and its snippet.
+pub fn fmt_record(r: &Record, snip: &str, now: i64) -> String {
+    let mut head = format!("[{}] {} · session {} turn {} · {}", r.id, fmt_time(r.ts), short(&r.session), r.turn, r.kind.as_str());
+    if r.tag != "-" && !r.tag.is_empty() {
+        head += &format!(" ({})", r.tag);
+    }
+    head += &format!(" · {}", fmt_ago(r.ts, now));
+    format!("{head}\n{}", snip.trim())
+}
+
+/// The recall block for a prompt (`weak`: a low-confidence match).
+pub fn fmt_recall_as(items: &[(Record, String)], now: i64, weak: bool) -> String {
+    let mut s = if weak {
+        format!(
+            "Engram found {} possibly related record{} from earlier work in this project (a weak match, outside the current context window). They may be irrelevant or outdated.\n",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "Engram recalled {} record{} from earlier work in this project, outside the current context window (oldest first). They may be outdated; newer records and the current files take precedence.\n",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" }
+        )
+    };
+    for (r, snip) in items {
+        s += "\n";
+        s += &fmt_record(r, snip, now);
+        s += "\n";
+    }
+    s += "\nThe memory_timeline tool shows what surrounded a record id; memory_search finds more.";
+    s
+}
+
+pub fn fmt_recall(items: &[(Record, String)], now: i64) -> String {
+    fmt_recall_as(items, now, false)
+}
+
+/// One line per further candidate (id, kind, opening words), for the model
+/// to follow up with `memory_timeline`.
+pub fn fmt_more(hits: &[Hit], shown: &HashSet<String>, n: usize) -> String {
+    let more: Vec<String> = hits
+        .iter()
+        .filter(|h| !shown.contains(&h.record.id) && h.record.tag != "uncertain")
+        .take(n)
+        .map(|h| {
+            let first: String = h.record.text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(90).collect();
+            format!("- [{}] {}: {}…", h.record.id, h.record.kind.as_str(), first)
+        })
+        .collect();
+    if more.is_empty() {
+        String::new()
+    } else {
+        format!("\nFurther candidates (memory_timeline with an id shows the full record and its surroundings):\n{}", more.join("\n"))
+    }
+}
+
+/// When a prompt gets the knowledge written down earlier (decisions, rules,
+/// requirements, facts) that bears on it, independently of the gate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KnowledgeParams {
+    pub enabled: bool,
+    /// At most this many records per prompt.
+    pub max_records: usize,
+    /// A record qualifies with this cosine similarity to the prompt…
+    pub min_cos: f64,
+    /// …or with this share of the prompt's IDF weight among its terms.
+    pub min_cov: f64,
+    /// Candidates per search.
+    pub n: usize,
+}
+
+impl Default for KnowledgeParams {
+    fn default() -> Self {
+        KnowledgeParams { enabled: true, max_records: 4, min_cos: 0.40, min_cov: 0.30, n: 20 }
+    }
+}
+
+pub const KNOWLEDGE: [Kind; 5] = [Kind::Preference, Kind::Decision, Kind::Fact, Kind::Todo, Kind::Note];
+
+/// Knowledge records that match a prompt well enough on their own text,
+/// best first, leaving out `skip` and records closed as done or superseded.
+pub fn knowledge(store: &Store, query: &str, filter: &Filter, skip: &HashSet<String>, p: &KnowledgeParams) -> Result<Vec<(Record, f64, f64)>> {
+    let mut f = filter.clone();
+    f.kinds = KNOWLEDGE.to_vec();
+    let terms = strata::text::analyze_query(query);
+    let mut by: HashMap<String, (Record, f64)> = HashMap::new();
+    for (r, c) in store.vector_top(&store.embedder.embed_query(query), p.n, &f)? {
+        by.insert(r.id.clone(), (r, c));
+    }
+    if !terms.is_empty() {
+        for (r, _) in store.bm25_top(query, p.n, &f)? {
+            by.entry(r.id.clone()).or_insert((r, 0.0));
+        }
+    }
+    let idf = if terms.is_empty() { Vec::new() } else { store.idf(&terms).unwrap_or_else(|_| vec![1.0; terms.len()]) };
+    let total: f64 = idf.iter().sum();
+    let todo_open = |r: &Record| r.kind != Kind::Todo || r.tag == "planned";
+    let mut out: Vec<(Record, f64, f64)> = by
+        .into_values()
+        .filter(|(r, _)| !skip.contains(&r.id) && r.tag != "superseded" && r.tag != "done" && todo_open(r))
+        .map(|(r, c)| {
+            let have = analyzed(&r.text);
+            let got: f64 = terms.iter().zip(&idf).filter(|(t, _)| have.contains(*t)).map(|(_, w)| w).sum();
+            let cov = if total > 0.0 { got / total } else { 0.0 };
+            (r, c, cov)
+        })
+        .filter(|(_, c, cov)| *c >= p.min_cos || *cov >= p.min_cov)
+        .collect();
+    out.sort_by(|a, b| (b.1 + b.2).total_cmp(&(a.1 + a.2)));
+    out.truncate(p.max_records);
+    Ok(out)
+}
+
+/// The knowledge block of a prompt's context.
+pub fn fmt_knowledge(items: &[(Record, f64, f64)], now: i64) -> String {
+    let mut s = String::from("Engram notes from earlier sessions that may bear on this request (decisions, rules and requirements agreed before; check them before deciding):\n");
+    for (r, _, _) in items {
+        let label = match r.kind {
+            Kind::Todo => "planned",
+            Kind::Preference => "rule",
+            k => k.as_str(),
+        };
+        let t = r.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        s += &format!("- [{label}] {t} ({}, {})\n", r.id, fmt_ago(r.ts, now));
+    }
+    s
+}
+
+/// The briefing given at the start of a session: the knowledge written
+/// down earlier (planned work, rules, decisions, facts), where the last
+/// session left off, and how to search the rest. Returns the text and the
+/// ids it shows, so that per-prompt recall does not repeat them.
+pub fn briefing(store: &Store, current_session: &str, max_chars: usize, now: i64) -> Result<(String, Vec<String>)> {
+    let total = store.len();
+    if total == 0 {
+        return Ok((String::new(), Vec::new()));
+    }
+    let none = Filter::default();
+    let sessions = store.query("SELECT session, COUNT(*) FROM memory GROUP BY session ORDER BY 2 DESC LIMIT 1000")?.rows.len();
+    let prev = Filter { exclude_window: Some((current_session.to_string(), 0)), ..Default::default() };
+    let last = store.latest(&[], 1, &prev)?;
+    let mut s = format!("Engram memory for this project: {total} records from {sessions} session{}", if sessions == 1 { "" } else { "s" });
+    if let Some(r) = last.first() {
+        s += &format!(", last activity {}", fmt_ago(r.ts, now));
+    }
+    s += ". Requirements, decisions and conventions agreed in earlier conversations are often not in the code: \
+          before a design decision, and whenever a task refers to earlier work, search memory (memory_search; memory_timeline \
+          shows a record's surroundings, memory_sql runs structured queries). memory_remember stores a new decision or fact.\n";
+    let clip = |t: &str, n: usize| -> String {
+        let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        if t.chars().count() > n {
+            format!("{}…", t.chars().take(n).collect::<String>())
+        } else {
+            t
+        }
+    };
+    let norm = |t: &str| t.split_whitespace().map(|w| w.to_lowercase()).collect::<Vec<_>>().join(" ");
+    // Once knowledge is distilled, the cue-word preferences (sentences
+    // picked from prompts by their wording) only repeat it in fragments.
+    let distilled = !store.query("SELECT id FROM memory WHERE tag = 'distilled' LIMIT 1")?.rows.is_empty();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut ids = Vec::new();
+    // Most recent first, oldest shown first; one line per record, while the budget lasts.
+    let mut section = |title: &str, recs: Vec<Record>, n: usize, keep: usize, s: &mut String| {
+        let mut lines = Vec::new();
+        for r in recs {
+            if r.tag == "superseded" || r.tag == "done" || (distilled && r.tag == "cue") || !seen.insert(norm(&r.text)) {
+                continue;
+            }
+            lines.push((r.id.clone(), format!("- {} ({}, {})\n", clip(&r.text, n), r.id, fmt_ago(r.ts, now))));
+            if lines.len() == keep {
+                break;
+            }
+        }
+        lines.reverse();
+        let head = format!("\n{title}\n");
+        let mut added = false;
+        for (id, line) in lines {
+            if s.len() + line.len() + if added { 0 } else { head.len() } > max_chars {
+                continue;
+            }
+            if !added {
+                *s += &head;
+                added = true;
+            }
+            *s += &line;
+            ids.push(id);
+        }
+    };
+    let planned: Vec<Record> = store.latest(&[Kind::Todo], 40, &none)?.into_iter().filter(|r| r.tag == "planned").collect();
+    section("Planned work, with the requirements agreed for it:", planned, 400, 10, &mut s);
+    section("Rules and conventions:", store.latest(&[Kind::Preference], 30, &none)?, 260, 12, &mut s);
+    section("Decisions:", store.latest(&[Kind::Decision], 30, &none)?, 260, 10, &mut s);
+    section("Facts about the project:", store.latest(&[Kind::Fact, Kind::Note], 30, &none)?, 260, 10, &mut s);
+    let checkpoint: Vec<Record> = store.latest(&[Kind::Todo], 10, &none)?.into_iter().filter(|r| r.tag != "planned" && r.tag != "done").take(1).collect();
+    section("Open tasks at the last checkpoint:", checkpoint, 500, 1, &mut s);
+    section("Where the most recent earlier session left off:", store.latest(&[Kind::Episode], 3, &prev)?, 300, 3, &mut s);
+    Ok((s, ids))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_formats() {
+        assert_eq!(fmt_time(0), "1970-01-01 00:00 UTC");
+        assert_eq!(fmt_time(1_791_788_086), "2026-10-12 06:54 UTC");
+        assert_eq!(fmt_ago(100, 100 + 3 * 3600), "3 h ago");
+    }
+
+    #[test]
+    fn snippet_finds_terms() {
+        let text = format!("{} the planner probes local selectivity {}", "x ".repeat(500), "y ".repeat(500));
+        let terms: HashSet<String> = strata::text::analyze_query("planner selectivity").into_iter().collect();
+        let s = snippet(&text, &terms, 200);
+        assert!(s.contains("planner probes local selectivity"), "{s}");
+        assert!(s.len() <= 210);
+    }
+}

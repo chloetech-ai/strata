@@ -1,0 +1,10 @@
+{
+ "sessions": 4559,
+ "facts": 66864,
+ "cost_usd": 8.494029470000001,
+ "cost_per_session": 0.0018631343430576884,
+ "facts_per_session": 14.66637420486949,
+ "input_chars": 45144644,
+ "mean_fact_chars": 152.47479959320412,
+ "empty_sessions": 21
+}

@@ -1,0 +1,207 @@
+{
+ "sessions": [
+  "c4fe1ec4-f512-464d-8495-4ca27c663219",
+  "acbb7460-374f-4f32-9d67-593d72f849d0",
+  "3bb11fc6-0522-4b29-bac3-29bd323838c4"
+ ],
+ "store": "/home/user/ab/stockroom/s1/engram/projects/stockroom-57291ad6",
+ "turns": [
+  {
+   "session": 0,
+   "prompt": "Hi! stockroom is the stock-keeping library we're building for Brandt & Sons, a hardware wholesaler with two shops. Could you run the tests first? I think the reorder check is broken.",
+   "result": "You were right: the reorder check was broken. All 10 tests now pass.\n\n**The bug:** `needs_reorder` in `src/stockroom/reorder.py` used `on_hand < reorder_point`, so an item sitting exactly at its reorder point was never flagged. The docstring says \"at or below\", so I changed the comparison to `<=`. That's the only code change. I haven't committed it.\n\n**Running the tests:** `pytest` from the project root can't import `stockroom`, because the package lives under `src/` and the project has no `pyproject.toml` or pytest config to set that up. I ran it with `PYTHONPATH=src python -m pytest -v`. Before the fix, 9 passed and `test_at_reorder_point` failed. After it, all 10 pass.\n\nI didn't change the import setup. If you want plain `pytest` to work, a `pyproject.toml` with a `pythonpath = [\"src\"]` pytest setting would fix it. Want me to add that?",
+   "cost": 0.00603326,
+   "turns": 7,
+   "error": false,
+   "wall_s": 16.827619552612305
+  },
+  {
+   "session": 0,
+   "prompt": "Staff type SKUs every which way at the counter: 'br-1042', ' BR-1042', 'Br-1042 '. Please add a `normalize_sku` helper in items.py (trim, uppercase) and make every public Catalog and Inventory method that takes a SKU go through it. Tests too, please.",
+   "result": "All 16 tests pass. SKUs are now trimmed and uppercased everywhere they enter or are looked up in the library, so `'br-1042'`, `' BR-1042'` and `'Br-1042 '` all refer to the same item.\n\n**What changed**\n- **`items.py`**: added `normalize_sku(sku)`, which returns `sku.strip().upper()`.\n- **`Catalog`**: `add`, `get` and `__contains__` all normalize. `add` also stores the normalized SKU on the item, so a duplicate written in another spelling is caught.\n- **`Inventory`**: `receive`, `issue`, `on_hand` and `movements_for` all normalize, so movements are always stored under the canonical SKU.\n- **`storage.py`**: `load_movements` normalizes the SKU column too. Without this, rows already in a CSV log with stray spaces or lowercase would silently not match anything.\n- **`reorder.py`** needed no change, since it reads SKUs from the catalog, which are already normalized.\n\n**Tests**\n- A unit test for `normalize_sku`.\n- Catalog tests for lookup, storing the normalized form, and duplicate detection across spellings.\n- An Inventory test for mixed spellings in receive, issue, on-hand and movement history.\n- A storage test that loads a CSV row with padded, lowercase SKU.\n\nOne test failed on my first run because I had written literal quote characters into the test CSV. I corrected the test input; the library code was fine.\n\n**Decisions for you to check**\n- `Catalog.add` mutates the `Item` you pass in, setting its `sku` to the normalized value. The alternative is to copy the item, which avoids a side effect on the caller's object.\n- Empty or whitespace-only SKUs are not rejected. `'   '` normalizes to `''` and is accepted. I can add a check if you want one.\n\nNothing is committed yet.",
+   "cost": 0.012930389999999998,
+   "turns": 15,
+   "error": false,
+   "wall_s": 27.04591965675354
+  },
+  {
+   "session": 0,
+   "prompt": "Next, every movement needs a reason code. Brandt's bookkeeping uses exactly these five: RECEIPT, SALE, RETURN, DAMAGE, COUNT. Add a `reason` field to Movement, have receive() use RECEIPT and issue() use SALE, and reject any other code. And keep the code plain: their back-office PC is stuck on Python 3.8 because the scanner vendor's sync tool only runs there, so nothing that needs a newer Python.",
+   "result": "Every movement now carries one of the five reason codes, and the full suite (20 tests) passes on Python 3.8.20 as well as the local 3.13.\n\n**What changed**\n- **`Movement`** has a required `reason` field. `Movement` checks it in `__post_init__`, so any other code raises `ValueError`. The check covers loaded CSV rows too, not only the methods.\n- **`receive()`** records `RECEIPT` and **`issue()`** records `SALE`.\n- **CSV log**: the header gains a `reason` column, and `load_movements` reads it and rejects unknown codes.\n- **Tests**: receive and issue set the right codes, all five codes are accepted, other codes are rejected (including `sale`, `RECEIPT ` and `None`), and a CSV row with an unknown code is rejected on load.\n\n**Python 3.8**\nThe code uses nothing newer than 3.8: no `match`, no `X | None` annotations, no built-in generics. I ran the suite on a real 3.8.20 interpreter, which uv downloaded, and it passed.\n\n**Decisions to check**\n- **Field order changed.** `reason` sits right after `date`, so `Movement` positional calls have a new argument order. The only callers in the repo are updated, but any code outside it that builds `Movement` positionally will break.\n- **Matching is exact.** `\"sale\"` or `\"SALE \"` is rejected rather than cleaned up. I didn't normalize them the way SKUs are, because these codes come from a fixed list and a silent fix could hide a typo. Say if you'd prefer lenient matching.\n- **Old CSV logs will not load.** Any log written before this change has no `reason` column, so `load_movements` will fail with a `KeyError` on it. If real logs exist, we need a migration step that gives old rows a code. I didn't guess one.\n- **No API yet for RETURN, DAMAGE or COUNT.** Those codes are valid, but nothing in the library can record them yet, since `receive()` and `issue()` only use RECEIPT and SALE. Tell me the signature you want, for example `adjust(sku, qty, reason, ...)`, and I'll add it.\n\nNothing is committed yet.",
+   "cost": 0.01964216,
+   "turns": 11,
+   "error": false,
+   "wall_s": 34.06849145889282
+  },
+  {
+   "session": 0,
+   "prompt": "Two things for later, no code for either today. When we get to stock valuation, it has to be FIFO. Their auditor flagged the average-cost figures from the old spreadsheet last year and they had to restate the accounts. Second, please never make issue() refuse to take stock below zero. The old system did exactly that, and because the till only posts the sale after the customer has paid, the error just meant the sale silently vanished from the log. Negative stock is fine, they correct it at the next count.",
+   "result": "Both decisions are recorded, and no code changed today.\n\n- **FIFO valuation (later):** stock valuation will use FIFO, not average cost. Brandt's auditor flagged the old spreadsheet's average-cost figures last year, and the accounts had to be restated. Valuation isn't built yet, so the FIFO work is still ahead.\n- **Negative stock (keep as is):** `issue()` never refuses a sale for going below zero. It only rejects a non-positive quantity, which is the current behavior. A sale the till has already charged for must reach the log. Negative on-hand gets corrected at the next count.\n\nBoth are stored in project memory (records 118 and 119), so later sessions will see them.",
+   "cost": 0.022492039999999998,
+   "turns": 4,
+   "error": false,
+   "wall_s": 10.002271175384521
+  },
+  {
+   "session": 0,
+   "prompt": "For the stock-take in December we'll need a printable count sheet. Brandt wants the lines in walking order, so sorted by bin location rather than by SKU, and it has to be a blind count: the sheet must not show what the system thinks is on hand, only an empty column where people write what they counted. The auditor insists on that so people actually count instead of copying the number. We'll build it in a later session.",
+   "result": "Noted for later, with no code today. I saved the requirements as a to-do in project memory (record 134) so the next session picks them up.\n\n- **Walking order:** lines sort by bin location. Locations look like `B-12-3` (aisle, bay, shelf), so the sort has to compare the numbers, not the text. A plain string sort puts `B-12` before `B-2`, which would send counters back and forth across the shop.\n- **Blind count:** the sheet shows SKU, name and bin, plus an empty column for the counted quantity. It never prints the system's on-hand figure.\n- **Python 3.8:** the same constraint as the rest of the library.",
+   "cost": 0.02454474,
+   "turns": 2,
+   "error": false,
+   "wall_s": 10.031096458435059
+  },
+  {
+   "session": 0,
+   "prompt": "Great, please commit all of this with a sensible message.",
+   "result": "I committed everything as one commit, `a0160b3`, on a new branch `sku-normalize-reason-codes`. I didn't commit to `master`, since it's the default branch. The working tree is clean and all 20 tests passed before the commit.\n\nThe commit covers:\n- **SKU normalization:** `normalize_sku` trims and uppercases SKUs at every public Catalog and Inventory method that takes one, and when loading the CSV log.\n- **Reason codes:** `Movement` has a required `reason` field that accepts only RECEIPT, SALE, RETURN, DAMAGE and COUNT. `receive()` records RECEIPT and `issue()` records SALE. The CSV log has a `reason` column.\n- **Reorder fix:** `needs_reorder` now flags items at their reorder point, not just below it. This was the bug from the first session.\n\nThe commit message notes two things that will affect anyone upgrading:\n- `Movement`'s positional field order changed, so `reason` now comes right after `date`.\n- CSV logs written before the reason column existed will not load. This is still open: we need a migration step if real old logs exist.\n\nThe FIFO valuation, the no-refusal rule for `issue()`, and the blind count sheet are not in this commit. They're recorded as decisions or to-dos for later.\n\nI haven't pushed the branch or opened a pull request. Say the word if you want either.",
+   "cost": 0.02803329,
+   "turns": 3,
+   "error": false,
+   "wall_s": 13.961514711380005
+  },
+  {
+   "session": 1,
+   "prompt": "The CSV storage doesn't keep the new reason codes yet. Please add a reason column to save_movements/load_movements, and make old files without that column still load: a positive quantity was a RECEIPT, a negative one a SALE.",
+   "result": "`load_movements` now accepts old CSV logs that have no `reason` column. Positive quantities load as RECEIPT and negative ones as SALE.\n\nThe `reason` column itself was already in `save_movements` and `load_movements` from the previous commit (`a0160b3`), so the change is only the fallback for files without that column.\n\n- **`src/stockroom/storage.py`**: `load_movements` checks the header once. If there is no `reason` column, it infers the code from the sign of `qty`. Files that do have the column load exactly as before.\n- **Zero quantity**: I made it raise a `ValueError` that names the line, instead of guessing a code. You didn't say what zero should map to, and a guess would silently put a row in the wrong bookkeeping category. Tell me if zero should map to something specific.\n- **`tests/test_storage.py`**: two new tests, one for a legacy file loading as RECEIPT/SALE with the correct on-hand total, and one for the zero-quantity rejection.\n\nTests pass: 22 under the default interpreter with `PYTHONPATH=src python -m pytest`, and 22 under Python 3.8.20 via unittest discovery. The change uses no newer syntax.\n\nI haven't committed anything. Say if you want it committed.",
+   "cost": 0.00836041,
+   "turns": 7,
+   "error": false,
+   "wall_s": 22.596564054489136
+  },
+  {
+   "session": 1,
+   "prompt": "Also, Item should reject a case_size below 1 and a negative reorder_point. That matters soon: next sprint we'll turn needs_reorder into actual purchase suggestions. Brandt orders enough to get back up to three times the reorder point, rounded up to whole cases since the supplier only ships full cases. Don't build the suggestions yet, just the validation.",
+   "result": "`Item` now rejects a `case_size` below 1 and a negative `reorder_point` when it is constructed. Nothing else changed, and the purchase suggestions are not built.\n\n- **`src/stockroom/items.py`**: a `__post_init__` raises `ValueError` for either bad value, and the message names the value that was given. Zero is still a valid `reorder_point`, and `case_size` of 1 is valid.\n- **`tests/test_items.py`**: three new tests cover the two rejections and the accepted boundary values.\n\nTests pass: 25 under the default interpreter with `PYTHONPATH=src python -m pytest`, and the same 25 under Python 3.8.20.\n\nThe check runs only at construction. Setting `item.case_size = 0` after the item exists is not caught. If you want that covered before the purchase-suggestion work, I can add validation on assignment.\n\nI haven't committed anything.",
+   "cost": 0.01194742,
+   "turns": 5,
+   "error": false,
+   "wall_s": 11.478139638900757
+  },
+  {
+   "session": 1,
+   "prompt": "One more for when we write the importer for the handheld scanners, after the count sheet: the scanners export a plain text file, semicolon-separated, no header line, columns bin;sku;qty. A SKU can be on several lines when some of it sits in an overflow bin, and then the quantities have to be added up.",
+   "result": "I've saved this as a to-do in project memory and haven't written any code, since you described it as a later step after the count sheet.\n\nThe requirements as I've recorded them:\n- The scanner file is plain text, semicolon-separated, with no header line and the columns `bin;sku;qty`.\n- A SKU can appear on several lines when stock sits in an overflow bin. The importer must add up the quantities per SKU.\n- SKUs go through `normalize_sku`, like everywhere else, and the code stays Python 3.8 compatible.\n\nTwo things to settle when we build it:\n- **Bad lines**: whether a malformed line, such as a non-numeric qty or a SKU not in the catalog, should stop the import or be reported and skipped.\n- **Bin on the total**: whether the importer keeps the per-bin lines alongside the SKU total, since the count sheet is organized by bin.",
+   "cost": 0.01508488,
+   "turns": 3,
+   "error": false,
+   "wall_s": 10.61630654335022
+  },
+  {
+   "session": 1,
+   "prompt": "That's it for today, please commit.",
+   "result": "I committed the two changes from today as `005d591` on `sku-normalize-reason-codes`. The working tree is clean.\n\n- `Item` rejects a `case_size` below 1 and a negative `reorder_point`.\n- `load_movements` loads CSV logs that have no `reason` column. It infers RECEIPT for positive quantities and SALE for negative ones, and a zero quantity in such a file raises an error naming the line.\n\nThe suite passes: 25 tests under the default interpreter and under Python 3.8.20.\n\nThe branch is not merged or pushed. It holds two commits on top of `master`: `a0160b3` from earlier and `005d591`.\n\nStill to build, none of it started: the December count sheet, the purchase suggestions, and the scanner importer.",
+   "cost": 0.0184417,
+   "turns": 3,
+   "error": false,
+   "wall_s": 12.01183295249939
+  },
+  {
+   "session": 2,
+   "prompt": "Let's add a small command line. `python -m stockroom onhand SKU --log movements.csv` prints the quantity on hand, and `python -m stockroom receive SKU QTY UNIT_COST --log movements.csv` appends a receipt to the log, creating the file if it doesn't exist yet.",
+   "result": "The command line is in place: `onhand` prints the quantity on hand, and `receive` appends a receipt to the log and creates the file if it doesn't exist. All 34 tests pass on Python 3.13 and on Python 3.8.20. I haven't committed anything.\n\n```\n$ python -m stockroom receive \" br-1042 \" 10 1250 --log movements.csv\n$ python -m stockroom receive BR-1042 2 1250 --log movements.csv\n$ python -m stockroom onhand BR-1042 --log movements.csv\n12\n```\n\nWhat changed:\n- **`src/stockroom/cli.py`** (new): the two subcommands. SKUs go through `normalize_sku`, so `\" br-1042 \"` and `BR-1042` are the same item. Errors print `error: ...` to stderr and exit 1; bad arguments exit 2.\n- **`src/stockroom/__main__.py`** (new): lets `python -m stockroom` run the CLI.\n- **`src/stockroom/storage.py`**: new `append_movement()`, which writes one row using the same row format as `save_movements`. The row builder is now shared by both functions.\n- **`tests/test_cli.py`** (new): covers creating the log, appending, normalization, the missing-log error, rejected quantities and costs, and a log with a different header.\n- **`CHANGELOG.md`**: one entry under Unreleased.\n\nChoices I made that you may want to change:\n- **`UNIT_COST` is integer cents**, matching `Movement.unit_cost`. So `1250` means \u00a312.50 or $12.50 depending on your currency. Decimal input would need a conversion step.\n- **`onhand` on a missing log is an error**, not a zero. Otherwise a mistyped path would look like an empty shelf.\n- **`receive` refuses to append to a log with a different header**, such as a legacy file without the `reason` column. Appending the new columns to it would corrupt the file, so the command stops and says so. Rewriting the old file is left to you.\n- **The CLI does not check SKUs against a catalog**, because there's no catalog file argument. Any SKU is accepted, and an unknown one simply has zero on hand.\n\nRunning `python -m stockroom` needs `src` on the path, as with the tests (`PYTHONPATH=src`). Installing the package would remove that requirement; I didn't set that up.",
+   "cost": 0.013389770000000002,
+   "turns": 10,
+   "error": false,
+   "wall_s": 38.02587008476257
+  },
+  {
+   "session": 2,
+   "prompt": "Also add `python -m stockroom moves SKU --log movements.csv`, printing one line per movement with date, reason and quantity.",
+   "result": "I added `python -m stockroom moves SKU --log FILE`. It prints one line per movement for that SKU, in log order, as `date reason qty`:\n\n```\n$ python -m stockroom moves br-1042 --log movements.csv\n2026-10-12 RECEIPT 10\n2026-10-12 RECEIPT 4\n```\n\nAll 37 tests pass on Python 3.13 and on Python 3.8.20.\n\n- **Missing log:** exits 1 with `error: log file not found`, the same as `onhand`. I moved that check into a shared `_load_log` helper so both commands behave the same way.\n- **Unknown SKU:** prints nothing and exits 0. An empty result is not an error here, unlike a missing log.\n- **Quantity sign:** sales would print as negative numbers, but the CLI can only create receipts so far, so the output shows only positive quantities.\n\nThe changes are in `src/stockroom/cli.py` and `tests/test_cli.py`. Nothing is committed.",
+   "cost": 0.019149410000000002,
+   "turns": 8,
+   "error": false,
+   "wall_s": 16.586539030075073
+  },
+  {
+   "session": 2,
+   "prompt": "Thanks, please commit.",
+   "result": "I committed the command line as `181c11e` on the `sku-normalize-reason-codes` branch, on top of `005d591`. The working tree is clean. Tests passed before the commit: 37 on Python 3.13 and 37 on Python 3.8.\n\nThe commit covers `onhand`, `moves` and `receive`, the `append_movement` storage function, the tests, and a changelog entry. It is not pushed and the branch is not merged into `master`.",
+   "cost": 0.022863610000000003,
+   "turns": 3,
+   "error": false,
+   "wall_s": 9.148239850997925
+  }
+ ],
+ "git_log": "181c11e Add command line for onhand, moves and receive\n005d591 Validate Item fields and infer legacy movement reasons\na0160b3 Normalize SKUs and add movement reason codes\n7c409a3 Tally 0.1.0\n",
+ "git_status": "",
+ "tests": 37,
+ "tests_pass": true,
+ "tools": [
+  [
+   "Bash",
+   "Bash",
+   "Bash",
+   "Bash",
+   "Edit",
+   "Bash",
+   "Bash",
+   "mcp__engram__memory_search",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Bash",
+   "Edit",
+   "Bash",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Bash",
+   "Bash",
+   "ToolSearch",
+   "mcp__engram__memory_remember",
+   "mcp__engram__memory_remember",
+   "mcp__engram__memory_remember",
+   "Bash",
+   "Bash"
+  ],
+  [
+   "Bash",
+   "Bash",
+   "Edit",
+   "Edit",
+   "Bash",
+   "Bash",
+   "Bash",
+   "Edit",
+   "Edit",
+   "Bash",
+   "ToolSearch",
+   "mcp__engram__memory_remember",
+   "Bash",
+   "Bash"
+  ],
+  [
+   "Bash",
+   "Bash",
+   "Edit",
+   "Write",
+   "Write",
+   "Write",
+   "Bash",
+   "Bash",
+   "Edit",
+   "Bash",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Edit",
+   "Bash",
+   "Bash",
+   "Bash"
+  ]
+ ]
+}

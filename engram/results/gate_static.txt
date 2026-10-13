@@ -1,0 +1,7 @@
+train results/retrieval/longmemeval_s_static_round.rows.jsonl: n=969 positive 0.423
+  G = 4.936 cos + 3.920 cov + 0.317 cue + 1.099 agree + 1.968 cos_gap + 1.042 bm_gap;  hi 7.658 (precision 0.9), lo 5.329 (precision 0.7)
+  train: n=969 pos 0.423 | inject (G>=hi): precision 0.901 recall 0.420 rate 0.197 | pointer-or-inject (G>=lo): precision 0.701 recall 0.907 | same-rate precision cos-only 0.880 cov-only 0.827
+  results/retrieval/locomo_static_round.rows.jsonl: n=1996 pos 0.526 | inject (G>=hi): precision 0.675 recall 0.435 rate 0.339 | pointer-or-inject (G>=lo): precision 0.572 recall 0.891 | same-rate precision cos-only 0.555 cov-only 0.672
+gated policy (full at hi, brief at lo):
+  results/retrieval/longmemeval_s_static_round.rows.jsonl: coverage 0.666 (always inject 0.872), precision 0.591 (always 0.423), inject rate 0.547, 929 chars per prompt (always about 3,000)
+  results/retrieval/locomo_static_round.rows.jsonl: coverage 0.479 (always inject 0.683), precision 0.450 (always 0.526), inject rate 0.819, 922 chars per prompt (always about 3,000)

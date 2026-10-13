@@ -1,0 +1,135 @@
+{
+ "name": "kestrel",
+ "history": [
+  [
+   "Hi! This is kestrel, the booking library we're building for Kestrel Physio, a physiotherapy practice with three clinics in Auckland: Northgate (NG), Harbour (HB) and Westwick (WK). Could you run the tests first? I think something in the calendar is off.",
+   "Please read through models.py and calendar.py and give me a short overview of how a booking flows through them. Then add `Calendar.for_day(therapist_id, day)` that returns that therapist's appointments on a given date, sorted by start. Appointment times are stored in UTC, but `day` is the local Auckland date (Pacific/Auckland), so convert before comparing. Tests too, please, including one across midnight UTC.",
+   "Patient IDs are 'KP-' plus six digits, like KP-004211, but reception types them every which way: 'kp4211', ' KP-004211 ', 'Kp-4211'. Please add `normalize_patient_id` in a new ids.py (trim, upper case, zero-pad to six digits, add the dash) and make `Calendar.for_patient` go through it. Tests for the messy forms.",
+   "While you're in there, the opening hours, which we'll need when we build slot search: all three clinics are open 07:30 to 18:00 on weekdays. On Saturdays only Northgate opens, 08:00 to 12:00. Sundays everything is closed. No code for that today.",
+   "Great, please commit all of this with a sensible message."
+  ],
+  [
+   "Morning! Today: cancellations. Add `Calendar.cancel(appointment_id, at)` that sets the status to cancelled and records when (`cancelled_at`, a new optional field on Appointment, also saved and loaded by storage). Tests please. For later, not today: the clinic's policy is that cancelling less than 24 hours before the start costs 50% of the session price, and a no-show pays the full price.",
+   "Please run the whole test suite verbosely and fix anything that warns or fails.",
+   "Our privacy officer, Aroha Ngata, went through the plans with me. Two rules from her. Any file that leaves the system, like exports, reports or anything we email, must never contain patient names, only the patient ID. And the SMS reminders must not say what the appointment is for: no treatment, just the date, the time and the clinic's name. Nothing to build for either yet, just keep them in mind.",
+   "Add a `csc` flag to Patient (Community Services Card holders), default False, and make storage save and load it, with old files without the field still loading. CSC holders get 20% off follow-ups, but not off initial assessments; we'll apply that when we do pricing.",
+   "Thanks, please commit."
+  ],
+  [
+   "Let's start on pricing. Add pricing.py with `session_price(kind)` returning the price in cents: an initial assessment is $95 and a follow-up is $70. Tests too.",
+   "A couple of things for the reminders work. The SMS gateway we signed with, Bulkie, takes at most 50 messages per API call and rejects the whole call if there are more. And keep the code boring: the reception PCs are stuck on Python 3.9 because of the practice-management software, so nothing that needs a newer Python, anywhere in this codebase.",
+   "Have a look at data/legacy_appointments.csv, an export from the old booking system, and write `import_legacy(path)` in legacy.py returning Appointment objects. The old system wrote local Auckland times as DD/MM/YYYY HH:MM, type A is an assessment and F a follow-up, and its states map as done->attended, noshow->no_show, cancelled->cancelled, booked->booked. Tests with a small sample file. Then tell me how many rows each clinic has.",
+   "Please commit."
+  ],
+  [
+   "Invoices today. Add `make_invoice(appointment, patient, number, amount_cents)` in invoices.py that builds an Invoice dated the appointment's local date, with a short description. Tests. For when we generate the numbers ourselves: Mere at Tui Accounting wants INV-<clinic code>-<year>-<sequence>, with the sequence five digits, counted separately per clinic and restarting at 00001 every year, e.g. INV-HB-2027-00042.",
+   "Another heads-up from Mere for the monthly export, which we'll build later: she imports it into Xero, so it has to be a CSV with commas and a header row, dates as DD/MM/YYYY, amounts as plain numbers with two decimals and no dollar sign, and the file must be called kestrel-invoices-YYYY-MM.csv.",
+   "Add `Calendar.move(appointment_id, new_start)` that reschedules a booked appointment and refuses to move a cancelled one. Tests please.",
+   "Something the booking form will need: assessments take 45 minutes and follow-ups 30, and every appointment starts on a quarter hour. After an assessment the therapist needs 15 minutes to write notes before the next patient; after a follow-up there's no gap. Also, the therapists' union agreement caps everyone at 8 patient appointments per day. Not today, I'm only writing it down while I remember.",
+   "Please commit."
+  ],
+  [
+   "Update from last night's board meeting: the late-cancellation window is now 48 hours, not 24. The fee is still 50% of the session price, and no-shows still pay in full. Nothing to change yet since we haven't built the fee.",
+   "Please add a reports.py with `therapist_load(calendar, week_start)` that returns, per therapist, the number of booked appointments on each day of that week (local dates). Tests.",
+   "By the way, Harbour once tried double-booking the 07:30 slots to make up for no-shows, and the physiotherapy board got a complaint from a patient who waited 40 minutes and told us off. So whatever anyone suggests later, we don't overbook, ever.",
+   "Run the tests and commit, please."
+  ],
+  [
+   "Let's add a waitlist: waitlist.py with a `WaitlistEntry(patient_id, kind, requested_at, urgent=False)` dataclass and a `Waitlist` class with `add(entry)`, `remove(patient_id)` and `entries()`. Tests. The logic for offering a freed slot comes later, but so you know: entries a therapist flagged urgent go first, and after those everyone in the order they asked.",
+   "Pricing news: prices go up on 1 April 2027, an assessment to $105 and a follow-up to $78. Appointments before 1 April keep the old prices. Don't touch pricing.py yet, the board wants to announce it first.",
+   "Add a small command line: `python -m kestrel day THERAPIST_ID DATE --data kestrel.json` prints that therapist's appointments on that local date, one per line with local time, kind and patient ID.",
+   "Please commit."
+  ],
+  [
+   "Storage should write atomically so a crash can't leave a half-written file: write to a temporary file in the same directory, then rename it over the old one. Tests please.",
+   "Also add `python -m kestrel patients --data kestrel.json` listing patient IDs and names, sorted by ID.",
+   "Please update CHANGELOG.md for everything we added this week and commit."
+  ]
+ ],
+ "tasks": [
+  {
+   "id": "free_slots",
+   "kind": "conversation",
+   "needs": "opening hours (day 1), appointment lengths, quarter-hour starts and the assessment buffer (day 4)",
+   "prompt": "Time for slot search. Add `free_slots(calendar, therapist, day, kind)` in src/kestrel/slots.py: given a Therapist, a local date and an appointment kind, return the local start times (datetime.time, sorted) at which a new appointment of that kind could be booked for that therapist."
+  },
+  {
+   "id": "can_book",
+   "kind": "conversation",
+   "needs": "opening hours, lengths, buffer and the 8-per-day cap (days 1 and 4)",
+   "prompt": "The booking form needs a check before it saves. Add `can_book(calendar, therapist, appointment)` in src/kestrel/booking.py that returns True if the new appointment can be added to the calendar for that therapist, else False."
+  },
+  {
+   "id": "cancellation_fee",
+   "kind": "conversation",
+   "needs": "the cancellation policy (day 2) as revised to 48 hours (day 5)",
+   "prompt": "Let's do the cancellation fee. Add `cancellation_fee(appointment, cancelled_at=None)` in src/kestrel/fees.py returning the fee in cents: for a cancelled appointment `cancelled_at` is when the patient cancelled; for a no-show (status no_show) it is None."
+  },
+  {
+   "id": "appointment_price",
+   "kind": "conversation",
+   "needs": "the CSC discount (day 2) and the 1 April 2027 price rise (day 6)",
+   "prompt": "The board has announced the new prices. Add `appointment_price(appointment, patient)` to src/kestrel/pricing.py that returns what the patient pays for that appointment, in cents."
+  },
+  {
+   "id": "reminder_text",
+   "kind": "conversation",
+   "needs": "the privacy rule for SMS (day 2); local time (day 1)",
+   "prompt": "Add `reminder_text(appointment)` in src/kestrel/reminders.py returning the text of the SMS reminder we send two days before an appointment. Make it friendly and informative."
+  },
+  {
+   "id": "send_reminders",
+   "kind": "conversation",
+   "needs": "Bulkie's 50-per-call limit and the Python 3.9 constraint (day 3)",
+   "prompt": "Add `send_reminders(appointments, patients, client)` in src/kestrel/reminders.py: `patients` maps patient ID to Patient and `client` is a BulkieClient. Send one SMS to the patient of every booked appointment in `appointments`, with whatever text you think fits, and return the number of messages sent."
+  },
+  {
+   "id": "invoice_number",
+   "kind": "conversation",
+   "needs": "the accountant's numbering scheme (day 4)",
+   "prompt": "Add `next_invoice_number(clinic, year, existing)` in src/kestrel/invoices.py: given a clinic code, a year and the invoice numbers issued so far (any clinic, any year), return the number for the next invoice."
+  },
+  {
+   "id": "invoice_export",
+   "kind": "conversation",
+   "needs": "the accountant's export format (day 4) and the privacy rule on names (day 2)",
+   "prompt": "Write the monthly export of invoices for the accountant: `export_invoices(invoices, year, month, out_dir)` in src/kestrel/export.py writes that month's invoices to a file in out_dir and returns its path."
+  },
+  {
+   "id": "waitlist_offer",
+   "kind": "conversation",
+   "needs": "the waitlist order: urgent first, then by request time (day 6)",
+   "prompt": "A slot just freed up. Add `Waitlist.next_for(kind)` that returns the waitlist entry we should offer a freed slot of that kind to, or None if nobody is waiting for that kind."
+  },
+  {
+   "id": "overbooking_advice",
+   "kind": "conversation",
+   "needs": "a failed approach and its reason (the board complaint, day 5)",
+   "prompt": "No-shows at 07:30 keep costing Harbour money. Should we let reception book two patients into the first slot of the day? Short recommendation please, no code changes."
+  },
+  {
+   "id": "python_advice",
+   "kind": "conversation",
+   "needs": "an environment fact said once (reception PCs on Python 3.9, day 3)",
+   "prompt": "For the next importer I'd like to use structural pattern matching (`match` statements), it would make the parsing much cleaner. Any objection? Short answer please, no code changes."
+  },
+  {
+   "id": "upcoming",
+   "kind": "repo",
+   "needs": "the patient ID normalization convention, applied in the code on day 1",
+   "prompt": "Add `Calendar.upcoming(patient_id, now)` returning that patient's booked appointments that start after `now`, soonest first."
+  },
+  {
+   "id": "merge_busy",
+   "kind": "control",
+   "needs": "nothing (control)",
+   "prompt": "Add `merge_busy(intervals)` in src/kestrel/intervals.py: it takes (start, end) pairs, in any order, and returns them merged into sorted, non-overlapping pairs (touching pairs merge too). Add a test."
+  },
+  {
+   "id": "parse_duration",
+   "kind": "control",
+   "needs": "nothing (control)",
+   "prompt": "Add `parse_duration(text)` in src/kestrel/intervals.py that turns strings like '45m', '1h', '1h30' and '1h 30m' into a number of minutes and raises ValueError for anything else. Add a test."
+  }
+ ]
+}

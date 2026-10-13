@@ -1,0 +1,219 @@
+{
+  "collection": "fiqa",
+  "kinds": {
+    "and2": {
+      "differing_counts": [
+        [
+          651,
+          42,
+          60
+        ],
+        [
+          659,
+          99,
+          100
+        ],
+        [
+          667,
+          3052,
+          3065
+        ],
+        [
+          679,
+          15,
+          13
+        ],
+        [
+          691,
+          1539,
+          1226
+        ],
+        [
+          700,
+          308,
+          324
+        ],
+        [
+          706,
+          1151,
+          1154
+        ],
+        [
+          715,
+          3561,
+          3560
+        ],
+        [
+          720,
+          146,
+          33
+        ],
+        [
+          723,
+          42,
+          46
+        ]
+      ],
+      "mean_overlap": 0.9803333333333334,
+      "queries": 300,
+      "same_count": 0.8733333333333333,
+      "same_facets": null,
+      "same_ids": 0.94
+    },
+    "and3": {
+      "differing_counts": [
+        [
+          954,
+          3,
+          6
+        ],
+        [
+          961,
+          462,
+          470
+        ],
+        [
+          971,
+          12,
+          13
+        ],
+        [
+          974,
+          1221,
+          527
+        ],
+        [
+          975,
+          35,
+          31
+        ],
+        [
+          982,
+          27,
+          26
+        ],
+        [
+          984,
+          233,
+          235
+        ],
+        [
+          1002,
+          270,
+          241
+        ],
+        [
+          1003,
+          1417,
+          1421
+        ],
+        [
+          1011,
+          2,
+          3
+        ]
+      ],
+      "mean_overlap": 0.9744126984126984,
+      "queries": 300,
+      "same_count": 0.88,
+      "same_facets": null,
+      "same_ids": 0.9166666666666666
+    },
+    "bm25": {
+      "differing_counts": [],
+      "mean_overlap": 0.9182098765432064,
+      "queries": 648,
+      "same_count": null,
+      "same_facets": null,
+      "same_ids": 0.07407407407407407
+    },
+    "facet": {
+      "differing_counts": [],
+      "mean_overlap": 1.0,
+      "queries": 300,
+      "same_count": null,
+      "same_facets": 0.8766666666666667,
+      "same_ids": 1.0
+    },
+    "filter": {
+      "differing_counts": [],
+      "mean_overlap": 1.0,
+      "queries": 100,
+      "same_count": 1.0,
+      "same_facets": null,
+      "same_ids": 1.0
+    },
+    "filtered_bm25": {
+      "differing_counts": [],
+      "mean_overlap": 0.9396428571428582,
+      "queries": 120,
+      "same_count": null,
+      "same_facets": null,
+      "same_ids": 0.2
+    },
+    "or3": {
+      "differing_counts": [
+        [
+          1252,
+          8526,
+          8523
+        ],
+        [
+          1254,
+          11794,
+          11775
+        ],
+        [
+          1255,
+          7707,
+          7800
+        ],
+        [
+          1261,
+          7339,
+          7337
+        ],
+        [
+          1262,
+          5455,
+          5453
+        ],
+        [
+          1263,
+          11997,
+          11998
+        ],
+        [
+          1264,
+          3640,
+          3748
+        ],
+        [
+          1267,
+          13756,
+          13757
+        ],
+        [
+          1269,
+          17273,
+          17321
+        ],
+        [
+          1270,
+          41832,
+          41822
+        ]
+      ],
+      "mean_overlap": 0.9846666666666668,
+      "queries": 300,
+      "same_count": 0.6533333333333333,
+      "same_facets": null,
+      "same_ids": 0.9266666666666666
+    }
+  },
+  "limit": null,
+  "systems": [
+    "sqlite",
+    "tantivy"
+  ]
+}

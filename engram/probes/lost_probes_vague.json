@@ -1,0 +1,14 @@
+[
+ {"q": "Early on, one of the compression codec unit tests failed. Which test was it?", "a": ["dense_runs_are_nearly_free"]},
+ {"q": "We had a compile error around random sampling in the synthetic data generator. What was it?", "a": ["E0599", "WeightedIndex"]},
+ {"q": "There was a borrow checker complaint in the query generator. What was the error?", "a": ["E0502", "cannot borrow"]},
+ {"q": "Which Python package was missing when we first tried to load the downloaded benchmark files?", "a": ["pyarrow"]},
+ {"q": "What was missing when we first tried to render the report pages to images?", "a": ["playwright"]},
+ {"q": "After adding a new query filter option, a test failed to compile. Which field was missing?", "a": ["max_list_len"]},
+ {"q": "A cherry-pick of the first codec work failed. Which commit was it?", "a": ["ee368ae"]},
+ {"q": "Why did the vector type fail to compile in Strata's value module?", "a": ["serde::Serialize", "Arc<\\[f32\\]>"]},
+ {"q": "Cleaning up after the agents, we could not delete a branch. Which one?", "a": ["worktree-agent-a6168778f20d5c3f4"]},
+ {"q": "What happens if two writers try to start a transaction at the same time in Strata?", "a": ["Error::Busy", "Busy"]},
+ {"q": "How many commits per second could the storage layer sustain?", "a": ["2,800", "3,190"]},
+ {"q": "How quickly did the graph index answer at 0.991 recall on the largest collection?", "a": ["174 µs", "0\\.13 ms"]}
+]

@@ -1,0 +1,21 @@
+0 answers to get (5000 cached)
+4700 answers to grade in 470 calls
+  judge 50/470 in 32 s
+  judge 100/470 in 62 s
+  judge 150/470 in 94 s
+  judge 200/470 in 126 s
+  judge 250/470 in 157 s
+  judge 300/470 in 187 s
+  judge 350/470 in 217 s
+  judge 400/470 in 249 s
+  judge 450/470 in 279 s
+none                         n=500  accuracy 0.066  context 0 chars  reader tokens 1419
+today                        n=500  accuracy 0.706  context 3632 chars  reader tokens 2768
+turn                         n=500  accuracy 0.754  context 3625 chars  reader tokens 2764
+turn_partner                 n=500  accuracy 0.694  context 3617 chars  reader tokens 2747
+turn_partner_grouped         n=500  accuracy 0.682  context 3443 chars  reader tokens 2645
+oracle                       n=500  accuracy 0.918  context 26738 chars  reader tokens 10667
+win400                       n=500  accuracy 0.730  context 3527 chars  reader tokens 2750
+win400_2k                    n=500  accuracy 0.622  context 1734 chars  reader tokens 2103
+today_2k                     n=500  accuracy 0.596  context 1780 chars  reader tokens 2111
+turn_partner_8k              n=500  accuracy 0.744  context 7348 chars  reader tokens 4062

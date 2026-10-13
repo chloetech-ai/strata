@@ -1,0 +1,28 @@
+  25/500 units, 8 s
+  50/500 units, 16 s
+  75/500 units, 25 s
+  100/500 units, 35 s
+  125/500 units, 45 s
+  150/500 units, 53 s
+  175/500 units, 63 s
+  200/500 units, 73 s
+  225/500 units, 83 s
+  250/500 units, 92 s
+  275/500 units, 101 s
+  300/500 units, 110 s
+  325/500 units, 120 s
+  350/500 units, 131 s
+  375/500 units, 140 s
+  400/500 units, 149 s
+  425/500 units, 157 s
+  450/500 units, 164 s
+  475/500 units, 171 s
+  500/500 units, 178 s
+longmemeval_s_static_request_c400: 470 eligible questions in 178 s
+  bm25                 R@5 0.751  R@10 0.851  all@10 0.628  nDCG@10 0.522  sess_all@5 0.840  pack4k 0.768  pack8k 0.862
+  dense                R@5 0.819  R@10 0.898  all@10 0.698  nDCG@10 0.609  sess_all@5 0.904  pack4k 0.891  pack8k 0.934
+  hybrid_0.3           R@5 0.847  R@10 0.917  all@10 0.728  nDCG@10 0.639  sess_all@5 0.909  pack4k 0.894  pack8k 0.934
+  hybrid_0.5           R@5 0.847  R@10 0.906  all@10 0.723  nDCG@10 0.630  sess_all@5 0.885  pack4k 0.887  pack8k 0.923
+  hybrid_0.7           R@5 0.798  R@10 0.891  all@10 0.687  nDCG@10 0.599  sess_all@5 0.864  pack4k 0.843  pack8k 0.911
+  hybrid_0.5_priors    R@5 0.862  R@10 0.909  all@10 0.728  nDCG@10 0.647  sess_all@5 0.885  pack4k 0.894  pack8k 0.921
+  hybrid_0.3_priors    R@5 0.849  R@10 0.919  all@10 0.734  nDCG@10 0.649  sess_all@5 0.913  pack4k 0.900  pack8k 0.936

@@ -1,0 +1,72 @@
+2914 answers to get (86 cached)
+  read 50/2914 in 42 s
+  read 100/2914 in 78 s
+  read 150/2914 in 113 s
+  read 200/2914 in 149 s
+  read 250/2914 in 190 s
+  read 300/2914 in 230 s
+  read 350/2914 in 272 s
+  read 400/2914 in 312 s
+  read 450/2914 in 354 s
+  read 500/2914 in 399 s
+  read 550/2914 in 445 s
+  read 600/2914 in 489 s
+  read 650/2914 in 532 s
+  read 700/2914 in 577 s
+  read 750/2914 in 624 s
+  read 800/2914 in 673 s
+  read 850/2914 in 719 s
+  read 900/2914 in 766 s
+  read 950/2914 in 818 s
+  read 1000/2914 in 869 s
+  read 1050/2914 in 922 s
+  read 1100/2914 in 966 s
+  read 1150/2914 in 1009 s
+  read 1200/2914 in 1055 s
+  read 1250/2914 in 1099 s
+  read 1300/2914 in 1142 s
+  read 1350/2914 in 1186 s
+  read 1400/2914 in 1227 s
+  read 1450/2914 in 1268 s
+  read 1500/2914 in 1314 s
+  read 1550/2914 in 1360 s
+  read 1600/2914 in 1406 s
+  read 1650/2914 in 1450 s
+  read 1700/2914 in 1496 s
+  read 1750/2914 in 1540 s
+  read 1800/2914 in 1585 s
+  read 1850/2914 in 1631 s
+  read 1900/2914 in 1678 s
+  read 1950/2914 in 1722 s
+  read 2000/2914 in 1768 s
+  read 2050/2914 in 1813 s
+  read 2100/2914 in 1860 s
+  read 2150/2914 in 1903 s
+  read 2200/2914 in 1947 s
+  read 2250/2914 in 1993 s
+  read 2300/2914 in 2034 s
+  read 2350/2914 in 2077 s
+  read 2400/2914 in 2121 s
+  read 2450/2914 in 2164 s
+  read 2500/2914 in 2211 s
+  read 2550/2914 in 2263 s
+  read 2600/2914 in 2311 s
+  read 2650/2914 in 2358 s
+  read 2700/2914 in 2403 s
+  read 2750/2914 in 2447 s
+  read 2800/2914 in 2487 s
+  read 2850/2914 in 2531 s
+  read 2900/2914 in 2575 s
+3000 answers to grade in 300 calls
+  judge 50/300 in 47 s
+  judge 100/300 in 88 s
+  judge 150/300 in 128 s
+  judge 200/300 in 171 s
+  judge 250/300 in 204 s
+  judge 300/300 in 245 s
+none                         n=500  accuracy 0.110  context 0 chars  reader tokens 1419
+today                        n=500  accuracy 0.680  context 3632 chars  reader tokens 2768
+turn                         n=500  accuracy 0.670  context 3625 chars  reader tokens 2764
+turn_partner                 n=500  accuracy 0.604  context 3617 chars  reader tokens 2747
+turn_partner_grouped         n=500  accuracy 0.588  context 3443 chars  reader tokens 2645
+oracle                       n=500  accuracy 0.810  context 26738 chars  reader tokens 10667

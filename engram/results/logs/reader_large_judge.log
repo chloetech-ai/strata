@@ -1,0 +1,8 @@
+0 answers to get (4935 cached)
+300 answers to grade in 30 calls
+none                         n=50   accuracy 0.100  context 0 chars  reader tokens 1418
+today                        n=50   accuracy 0.700  context 3645 chars  reader tokens 2754
+turn                         n=50   accuracy 0.780  context 3625 chars  reader tokens 2750
+turn_partner                 n=50   accuracy 0.700  context 3610 chars  reader tokens 2734
+turn_partner_grouped         n=50   accuracy 0.700  context 3440 chars  reader tokens 2635
+oracle                       n=50   accuracy 0.940  context 26566 chars  reader tokens 10530

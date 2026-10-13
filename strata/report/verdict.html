@@ -1,0 +1,44 @@
+  <p>The design holds up. One file, with ACID commits and a SQL front end, serves full text, structured filters, vectors and their combinations. Warm, it is faster than both specialised baselines on most of the workload, and its quality matches theirs. It pays for that in build time and in cold structured filters.</p>
+  <div class="verdict">
+    <div>
+      <h4>One embedded file for three index families</h4>
+      <p><span class="ok">Met:</span> every query of the workload, and the ten compound statements, runs as SQL against one file. Commits are durable at 0.27 ms. Every crash test recovered a committed prefix. Snapshots cost 0.1–0.2 µs, and the file is near SQLite's size.</p>
+      <p><span class="no">Missed:</span> SQL covers single-table <code>SELECT</code> only; writes go through the Rust API. Building the HNSW graph makes loads 1.5–9× slower than SQLite's (0.9–1.5× without it).</p>
+    </div>
+    <div>
+      <h4>Faster than the specialised engines</h4>
+      <p><span class="ok">Met:</span> warm BM25 is 1.8–4.6× faster than Tantivy, and conjunctions 3.6–6.7× faster. Strata wins 23 of 28 warm text and filter comparisons. Vector queries take 0.09–0.20 ms, against SQLite's 12 ms to 1 s scans, and are 50–63× faster cold.</p>
+      <p><span class="no">Missed:</span> Tantivy counts facets 1.1–2.7× faster. Cold structured filters are 1.8–2.9× slower than Tantivy's, because a range touches several sections and key tie-breaks fault one page per key.</p>
+    </div>
+    <div>
+      <h4>Hybrid ranking as one plan</h4>
+      <p><span class="ok">Met:</span> RRF and weighted fusion are single SQL expressions, under the same filter as their inputs. RRF quality equals SQLite's RRF. Weighted fusion adds 0.02–0.03 nDCG@10 over vectors alone on three collections, at 0.4–1.5 ms.</p>
+      <p><span class="no">Missed:</span> the top-100 shortcut recovers 89–95% of the exact fused top-10. The best weight differs by collection (0.1–0.3), and nothing picks it automatically.</p>
+    </div>
+    <div>
+      <h4>A planner that adapts per query</h4>
+      <p><span class="ok">Met:</span> for filtered vector search, the planner is 1.5–5.3× faster than the best fixed strategy on the three larger collections, with recall@10 0.992–0.998. For filtered BM25 and filters alone, geometric-mean regret is 1.07–1.30.</p>
+      <p><span class="no">Missed:</span> it spends 1.3–1.6× an oracle's time. On SciFact, always pre-filtering takes 19% less time. With 5,183 documents, scanning a filter's members is never expensive, and planning, probing and the occasional index plan add 6–49 µs per query.</p>
+    </div>
+  </div>
+  <h3>Where it fits</h3>
+  <ul>
+    <li><b>Embedded retrieval.</b> Applications that want local search over documents with metadata and embeddings, such as retrieval for a model on a laptop, a desktop app's search box, or an edge device. They get SQL and one file to copy, back up or ship.</li>
+    <li><b>Read-mostly corpora with steady writes.</b> Commits are cheap and visible at once, but merges rebuild every index of the segments they combine, and HNSW builds dominate load time. For write-heavy vector workloads, IVF builds 1.7–2.7× faster.</li>
+    <li><b>Not for</b> relational workloads with joins, high write concurrency, or corpora larger than one machine.</li>
+  </ul>
+  <h3>Limitations</h3>
+  <ul>
+    <li><b>One machine.</b> A 4-core cloud VM with an Emerald Rapids Xeon. Small timings vary by about 10–15% between runs. Cold numbers come from evicting the page cache on a virtual disk; a local NVMe drive or a spinning disk would shift them.</li>
+    <li><b>Synthetic structured fields.</b> <code>year</code>, <code>category</code> and <code>rating</code> are random, so they are independent of the text, which the planner assumes. <code>topic</code> is the k-means cluster of the same embeddings, so it correlates with vector queries by construction.</li>
+    <li><b>Baselines.</b> SQLite has no vector index here, so its vector numbers measure a scan, not a competing ANN index. Tantivy has no vectors. A fuller comparison would add sqlite-vec and a dedicated vector store.</li>
+    <li><b>One segment.</b> All three systems are measured after a full merge. Queries over many segments are supported and tested, but not timed here.</li>
+    <li><b>Single-threaded queries</b>, by design for the comparison. Segments could be searched in parallel.</li>
+  </ul>
+  <h3>Next steps</h3>
+  <ul>
+    <li><b>I/O planning.</b> Let the planner choose page-cache hints per query from its access pattern, and keep read-ahead on the docID-to-key half of the key index. That would close the cold filter gap.</li>
+    <li><b>Correlation-aware estimates.</b> Sample multi-predicate conjunctions the way the vector planner samples near the query, instead of assuming independence.</li>
+    <li><b>Fusion without tuning.</b> Fit the weighted-fusion weight per collection from score distributions, or learn it from clicks. Keep function words in queries that are short, where dropping them costs Quora 0.055 nDCG@10.</li>
+    <li><b>Writes in SQL.</b> <code>INSERT</code>, <code>DELETE</code> and <code>UPDATE</code> over the existing transaction API. Then incremental HNSW merges, so that merges stop rebuilding the graph.</li>
+  </ul>

@@ -1,0 +1,262 @@
+{
+ "tasks": {
+  "cancellation_fee": {
+   "needs": "the cancellation fee tiers (48h half, 24h full) stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.00697685,
+    "turns": 6.0,
+    "wall_s": 16.75933756828308,
+    "input_tokens": 226567.6,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 0.4666666666666666,
+    "solved": 0.0,
+    "cost_usd": 0.007346268,
+    "turns": 7.4,
+    "wall_s": 20.104334449768068,
+    "input_tokens": 291523.8,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "fully_booked": {
+   "needs": "the contractual cap of 7 treatments a day, deliberately kept out of book()",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.009109444,
+    "turns": 9.4,
+    "wall_s": 20.42271990776062,
+    "input_tokens": 309019.4,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 0.5,
+    "solved": 0.0,
+    "cost_usd": 0.01185926,
+    "turns": 13.2,
+    "wall_s": 37.40107307434082,
+    "input_tokens": 363568.4,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "day_plan": {
+   "needs": "an environment fact said in passing (receipt printer, 42 characters a line)",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.01044582,
+    "turns": 8.4,
+    "wall_s": 28.452924251556396,
+    "input_tokens": 347603.6,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 0.5,
+    "solved": 0.0,
+    "cost_usd": 0.009870304,
+    "turns": 10.2,
+    "wall_s": 24.426001501083373,
+    "input_tokens": 387581.6,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "series_booking": {
+   "needs": "series rules stated only in conversation (skip a taken week and append one; at most 9 sessions)",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.01191356,
+    "turns": 8.6,
+    "wall_s": 59.41542067527771,
+    "input_tokens": 377811.8,
+    "memory_tool_calls": 0.2
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.010037718,
+    "turns": 8.6,
+    "wall_s": 28.91000895500183,
+    "input_tokens": 318443.8,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "sms_reminder": {
+   "needs": "SMS gateway constraints and the reception number stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.004894502,
+    "turns": 3.0,
+    "wall_s": 12.521163606643677,
+    "input_tokens": 127142.6,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0048480500000000004,
+    "turns": 5.2,
+    "wall_s": 12.46183443069458,
+    "input_tokens": 191259.4,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "ical_advice": {
+   "needs": "a failed approach and why it failed, stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.002906468,
+    "turns": 1.0,
+    "wall_s": 7.547232294082642,
+    "input_tokens": 39223.8,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 0.5,
+    "solved": 0.0,
+    "cost_usd": 0.003479438,
+    "turns": 3.2,
+    "wall_s": 11.806001710891724,
+    "input_tokens": 95526.6,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "reschedule": {
+   "needs": "the BookingError convention and the 10-minute gap, both put into the code during the history",
+   "kind": "repo",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.01157149,
+    "turns": 9.6,
+    "wall_s": 30.05547833442688,
+    "input_tokens": 411642.4,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.010736678,
+    "turns": 14.6,
+    "wall_s": 28.955576515197755,
+    "input_tokens": 362039.6,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "free_slots": {
+   "needs": "the 10-minute gap between appointments, enforced in book() during the history",
+   "kind": "repo",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.013965742,
+    "turns": 10.8,
+    "wall_s": 41.55151424407959,
+    "input_tokens": 459198.2,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.014643312,
+    "turns": 14.6,
+    "wall_s": 44.210380506515506,
+    "input_tokens": 534156.4,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "parse_duration": {
+   "needs": "nothing (control)",
+   "kind": "control",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.008671652,
+    "turns": 7.4,
+    "wall_s": 25.38287310600281,
+    "input_tokens": 311874.0,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0070465319999999994,
+    "turns": 6.8,
+    "wall_s": 21.89300494194031,
+    "input_tokens": 265171.6,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "merge_intervals": {
+   "needs": "nothing (control)",
+   "kind": "control",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0059957299999999995,
+    "turns": 5.8,
+    "wall_s": 13.672823858261108,
+    "input_tokens": 191305.6,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.005146072,
+    "turns": 6.6,
+    "wall_s": 14.620396423339844,
+    "input_tokens": 173681.0,
+    "memory_tool_calls": 0.0
+   }
+  }
+ },
+ "overall": {
+  "engram": {
+   "n": 50,
+   "score": 1.0,
+   "solved": 1.0,
+   "cost_usd": 0.0086451258,
+   "turns": 7.0,
+   "wall_s": 25.578148784637452
+  },
+  "none": {
+   "n": 50,
+   "score": 0.7966666666666667,
+   "solved": 0.6,
+   "cost_usd": 0.0085013632,
+   "turns": 9.04,
+   "wall_s": 24.47886125087738
+  }
+ }
+}

@@ -1,0 +1,135 @@
+<div class="col">
+  <h3 id="r-tradeoff">Space against speed on a reordered index</h3>
+  <p>On the clustered collection the 500 queries average 2.8 terms and touch 576,000 postings each; a conjunction returns 309 documents and a disjunction 563,000. The charts plot each codec's size on the query lists against its fastest algorithm; blue points are Pareto-optimal (nothing else is both smaller and faster).</p>
+  <ul>
+    <li><b>The AND frontier has three members.</b> It runs from interpolative coding (4.90 bits per posting, 0.18 ms) through PEF (4.94 bits, 0.046 ms) to Roaring (9.32 bits, 0.030 ms). PEF is within 1% of interpolative coding's size but 3.9× faster, because its <code>NextGEQ</code> is a select over the high bits instead of a block decode.</li>
+    <li><b>Roaring buys speed with space.</b> It is 1.5× faster than PEF for AND and 5× faster for OR (0.57 against 2.84 ms), at 1.9× the size. Pibiri &amp; Venturini report 4–8× (AND) and 14–18× (OR) for CRoaring over list codecs at about twice the space; the direction holds here, with smaller gaps on these skewed queries.</li>
+    <li><b>Block codecs sit in the middle.</b> BP128 and the bitpacking crate take 0.072–0.080 ms at 7.69 bits, and OptPFor is about as fast at 5.92 bits, 23% smaller. VByte is 1.7× slower than BP128 with no space advantage. Even uncompressed arrays (0.061 ms) lose to PEF: galloping over 32-bit integers touches more memory than PEF's select jumps.</li>
+    <li><b>Unions are bound by their output.</b> Every list codec needs 2.5–5 ms, that is 4.5–9 ns per output docID, whatever its decoding speed. Only representations that OR whole machine words escape this: Roaring (0.57 ms, about 1 ns per result, or 0.38 ms if it only counts), the hybrid index (1.9 ms) and uncompressed arrays merged through a bitmap (1.86 ms).</li>
+    <li><b>Implementation matters as much as format.</b> With identical containers and size, this crate's Roaring answers AND 2.9× faster than the <code>roaring</code> crate and OR 7.5× faster when docIDs are written out. When both only count, the OR gap shrinks to 1.9×, so most of the crate's union cost is its iterator. In the other direction, the bitpacking crate decodes BP128 blocks faster than my auto-vectorised unpacker (0.42 against 0.66 ns per posting).</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND: index size vs query time</p>
+      <p class="chart-sub">Clustered collection · best algorithm per codec · blue: Pareto frontier</p>
+      <div class="chart" id="clustered-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR: index size vs query time</p>
+      <p class="chart-sub">Clustered collection · best algorithm that outputs docIDs</p>
+      <div class="chart" id="clustered-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="clustered-table"></div>
+
+<div class="col">
+  <h3 id="r-algos">Skipping beats decoding for conjunctions</h3>
+  <p>The tables below give every algorithm's time on every codec (clustered collection; blue marks the fastest per row, not counting the count-only variants).</p>
+  <ul>
+    <li><b>Rarest-first leapfrog is the best cursor conjunction for every codec.</b> Driving the shortest list and calling <code>NextGEQ</code> on the others is 4–18× faster than decoding all lists and intersecting the arrays (39× for the <code>roaring</code> crate, whose decoding goes through a slow iterator). The gap is largest for Elias-Fano and PEF (18×), whose decoding is slower but whose jumps are cheap.</li>
+    <li><b>Round-robin order costs 1.2–1.7×.</b> Leapfrog Triejoin's round-robin seeks waste work when one list is much shorter than the rest, as here; it only won for some two-term queries.</li>
+    <li><b>SIMD loses on real query shapes.</b> On uncompressed arrays, SvS with galloping (0.061 ms) beats SvS with every SIMD kernel by 7.8–10× (0.48–0.63 ms), although SIMD wins by 4.4× on equal-size lists. The size ratios of real queries are large, so the adaptive kernel (0.064 ms) is the safe default. Small Adaptive (0.072 ms) and Sequential (0.105 ms) come close but never beat SvS, which is Barbay et al.'s experimental finding.</li>
+    <li><b>Union algorithms:</b> Lucene's bitset window or PISA's min-scan is the fastest cursor union for every codec, 1.2–1.7× faster than a heap of cursors. Native operations beat any cursor union: 5.2× for Roaring and 2.5× for the hybrid index.</li>
+  </ul>
+</div>
+<div class="wide">
+  <p class="chart-title">AND, ms per query, by algorithm (clustered)</p>
+  <div id="algo-and"></div>
+  <p class="chart-title">OR, ms per query, by algorithm (clustered)</p>
+  <div id="algo-or"></div>
+</div>
+
+<div class="col">
+  <h3 id="r-clustering">What docID clustering buys</h3>
+  <p>The uniform collection has exactly the same list lengths as the clustered one, but random docIDs. Comparing the two isolates the effect of docID order, which real systems control by reordering documents (by URL, or by recursive graph bisection).</p>
+  <ul>
+    <li><b>Codecs that model local density gain the most.</b> On the query lists, clustering cuts Run-Trie by 50%, Trie by 46%, interpolative by 42%, PEF by 39%, OptPFor by 33% and Roaring by 32%. BP128 gains 18% and VByte only 12%, because one wide gap still forces a wide block or extra bytes.</li>
+    <li><b>Plain Elias-Fano gains nothing</b> (8.08 → 8.13 bits): its size depends only on \(u\) and \(n\), exactly as the formula says. On uniform data it ties PEF as the smallest codec, which is the case partitioning cannot improve.</li>
+    <li><b>Roaring and the tries pay most for randomness.</b> At 13.2–13.7 bits per posting on uniform data they are 1.6–1.7× the size of PEF, because random docIDs leave few runs and many half-empty 16-bit arrays or trie paths.</li>
+    <li><b>Conjunctions get about 2× faster with clustering</b> for every list codec (PEF 0.083 → 0.046 ms, BP128 0.156 → 0.080 ms), while Roaring changes little. Part of this comes from the workloads: the uniform queries touch 19% more postings and have smaller results, because random lists share fewer documents. The rest comes from skipping, since clustered lists put matching docIDs in fewer blocks and partitions.</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">Index size, clustered vs uniform docIDs</p>
+      <p class="chart-sub">Bits per posting over the query lists</p>
+      <div class="chart" id="space-compare"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND time, clustered vs uniform docIDs</p>
+      <p class="chart-sub">Best algorithm per codec, ms per query</p>
+      <div class="chart" id="time-compare"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="uniform-table"></div>
+
+<div class="col">
+  <h3 id="r-kernels">Kernels: where merging stops paying</h3>
+  <p>The pairwise kernels were timed on uncompressed random lists with a fixed short list of 10,000 docIDs and a long list 1 to 4,096 times larger. The chart plots nanoseconds per element of the short list, so a flat line means the cost tracks the short list (the \(m \log(n/m)\) regime) and a rising line means the long list is scanned (the \(m + n\) regime).</p>
+  <ul>
+    <li><b>Similar sizes favour SIMD.</b> At 1:1 the AVX-512 kernel takes 22 µs against 98 µs for the branchy merge, 4.4× faster; SSE and AVX2 take 25–26 µs, so most of the gain comes from comparing blocks at all, not from vector width. The branch-free merge (66 µs) beats the branchy one only at 1:1 and becomes the slowest kernel by 1:8, because its loop-carried dependency serialises every step.</li>
+    <li><b>Skew favours galloping.</b> Galloping overtakes the SIMD kernel between 1:16 and 1:32 and is 5.8× faster at 1:4,096 (9.6 ms against 55 ms). At 1:4,096 Baeza-Yates is within 13% of galloping and plain binary search is 2.6× slower; both lose badly when the sizes are similar (binary search needs 389 µs at 1:1).</li>
+    <li><b>The switch point is hardware-specific.</b> The adaptive kernel uses CRoaring's 64× threshold. On this CPU that is too late: between 1:32 and 1:64 it pays up to 2.1× more than galloping. A threshold near 1:24 would track the lower envelope of both kernels, consistent with Baeza-Yates and Salinger's ~30:1 crossover for scalar code.</li>
+  </ul>
+</div>
+<figure>
+  <div class="frame">
+    <p class="chart-title">Pairwise intersection cost vs size ratio</p>
+    <p class="chart-sub">|small| = 10,000; the large list has density 0.1 in its universe; uncompressed arrays</p>
+    <div class="chart" id="kernels"></div>
+  </div>
+</figure>
+
+<div class="col">
+  <h3 id="r-terms">Longer queries</h3>
+  <p>Each point uses 300 queries with exactly \(k\) co-occurring terms. As \(k\) grows from 2 to 6, the lists in a query hold more postings in total (400k to 740k–880k), yet every codec answers faster: the mean result shrinks from 744 to 2 documents, and the cost of a rarest-first conjunction follows the shortest list and the number of candidates it proposes, not the total length.</p>
+  <ul>
+    <li><b>Roaring's lead narrows with more terms.</b> It is 1.9× faster than PEF for two-term queries (0.028 against 0.054 ms) but only 1.3× faster at six (0.011 against 0.014 ms). Selective conjunctions let cursor-based codecs take long <code>NextGEQ</code> jumps, while Roaring still visits every shared 2¹⁶ chunk, the effect Pibiri &amp; Venturini describe.</li>
+    <li><b>PEF matches or beats uncompressed arrays</b> from three terms on, at less than a sixth of the space, because a <code>select</code> jump over the high bits costs about as much as galloping over raw integers.</li>
+    <li><b>Tries stay 2.6–3.5× behind PEF</b> at every length. The likely reason is that the traversal pays a rank operation per trie level for every surviving region, which costs more than one cursor jump when a single list is very selective.</li>
+  </ul>
+</div>
+<figure class="narrow">
+  <div class="frame">
+    <p class="chart-title">AND time vs number of query terms</p>
+    <p class="chart-sub">Clustered collection · 300 queries per point · best algorithm per codec</p>
+    <div class="chart" id="terms"></div>
+  </div>
+</figure>
+
+<div class="col">
+  <h3 id="r-wikitext">Real text: WikiText-103</h3>
+  <p>WikiText-103 has 859,532 paragraphs, a 531,033-term vocabulary and 57 million postings. Its lists are far denser than the synthetic ones: function words occur in most paragraphs. The queries use terms with at least 100 postings and average 3.0 terms, with 64 documents per AND and 199,635 per OR.</p>
+  <ul>
+    <li><b>Dense real lists suit Roaring.</b> Its bitmap containers answer AND in 0.007 ms, 2.7× faster than the fastest list codec (Elias-Fano, 0.019 ms), and OR in 0.086 ms, 10× faster than any list codec with a cursor algorithm (0.86–1.6 ms) and 4.5× faster than the hybrid index. On the query lists it costs 8.47 bits per posting, 1.8× PEF.</li>
+    <li><b>The Elias-Fano family leads the list codecs</b>: PEF and interpolative coding are the smallest (4.75 and 4.77 bits per posting on query lists), and Elias-Fano and PEF answer conjunctions 1.4–4.3× faster than the block codecs.</li>
+    <li><b>Small lists dominate whole-index space.</b> Over all 531k lists the ranking changes: interpolative (8.46), Elias-Fano (8.51) and PEF (8.92) stay smallest, but the tries reach 23 bits per posting, because each of the many short lists pays for about 20 trie levels and their rank directories. Roaring pays a container header per list and lands at 15.4.</li>
+    <li><b>The OR algorithm matters as much as the codec.</b> For every cursor codec except the hybrid, the Lucene-style bitset window is the fastest union, 1.6–2.5× faster than the heap.</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND on WikiText-103</p>
+      <p class="chart-sub">859,532 paragraphs · best algorithm per codec</p>
+      <div class="chart" id="wikitext-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR on WikiText-103</p>
+      <p class="chart-sub">Best algorithm that outputs docIDs</p>
+      <div class="chart" id="wikitext-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="wikitext-table"></div>

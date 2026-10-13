@@ -1,0 +1,22 @@
+[package]
+name = "posting_bench"
+version = "0.1.0"
+edition = "2021"
+description = "Compressed posting-list representations, intersection/union algorithms, and a benchmark testbed"
+publish = false
+
+[dependencies]
+bitpacking = "0.9.3"
+clap = { version = "4.6.7", features = ["derive"] }
+rand = "0.8"
+rand_distr = "0.4"
+roaring = "0.11.5"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"
+
+# Tests exercise multi-million-element lists; keep them reasonably fast.
+[profile.test]
+opt-level = 2

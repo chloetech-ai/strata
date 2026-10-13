@@ -1,0 +1,216 @@
+{
+  "build_options": {
+    "forward.store_block": "65536"
+  },
+  "build_secs": {
+    "category": 0.035681665,
+    "id": 0.09578138,
+    "rating": 0.014708951,
+    "seq": 0.012096343,
+    "store": 0.827442735,
+    "tier": 0.031481018,
+    "topic": 0.036723693,
+    "year": 0.010593815
+  },
+  "collection": "trec-covid",
+  "documents": 171332,
+  "peak_rss_mb": 506.30078125,
+  "reps": 5,
+  "sizes": {
+    "fields": {
+      "category": {
+        "code_values_bits_per_doc": 6.002101183666799,
+        "codes_bits_per_doc": 6.768239441552074,
+        "dictionary_bytes": 452,
+        "lists_bits_per_doc": 10.568300142413559,
+        "rare_bits_per_doc": 0.012140172297060678,
+        "values": 64
+      },
+      "id": {
+        "code_values_bits_per_doc": 18.006303551000396,
+        "codes_bits_per_doc": 18.772441808885674,
+        "dictionary_bytes": 2055988,
+        "lists_bits_per_doc": 0.0,
+        "rare_bits_per_doc": 32.0,
+        "values": 171332
+      },
+      "rating": {
+        "block_offsets_bits_per_doc": 0.2502743212009432,
+        "column_bits_per_doc": 9.769290033385474,
+        "histogram_buckets": 64,
+        "histogram_bytes": 1280,
+        "kind": "Decimal(2)",
+        "presence_bits_per_doc": 0.0,
+        "range_lists_bits_per_doc": 11.244414353419092,
+        "values_bits_per_doc": 9.003151775500198,
+        "zone_maps_bits_per_doc": 0.5158639366843322
+      },
+      "seq": {
+        "block_offsets_bits_per_doc": 0.2502743212009432,
+        "column_bits_per_doc": 12.251861882193635,
+        "histogram_buckets": 64,
+        "histogram_bytes": 1280,
+        "kind": "Int",
+        "presence_bits_per_doc": 0.0,
+        "range_lists_bits_per_doc": 2.307006280204515,
+        "values_bits_per_doc": 11.48572362430836,
+        "zone_maps_bits_per_doc": 0.5158639366843322
+      },
+      "tier": {
+        "code_values_bits_per_doc": 2.0007003945555994,
+        "codes_bits_per_doc": 2.766838652440875,
+        "dictionary_bytes": 24,
+        "lists_bits_per_doc": 4.0790978918123875,
+        "rare_bits_per_doc": 0.000933859407466206,
+        "values": 4
+      },
+      "topic": {
+        "code_values_bits_per_doc": 5.001750986388999,
+        "codes_bits_per_doc": 5.767889244274275,
+        "dictionary_bytes": 228,
+        "lists_bits_per_doc": 10.009478672985782,
+        "rare_bits_per_doc": 0.00616347208927696,
+        "values": 32
+      },
+      "year": {
+        "block_offsets_bits_per_doc": 0.2502743212009432,
+        "column_bits_per_doc": 6.768239441552074,
+        "histogram_buckets": 35,
+        "histogram_bytes": 700,
+        "kind": "Int",
+        "presence_bits_per_doc": 0.0,
+        "range_lists_bits_per_doc": 10.287768776410712,
+        "values_bits_per_doc": 6.002101183666799,
+        "zone_maps_bits_per_doc": 0.5158639366843322
+      }
+    },
+    "sections": {
+      "col.rating": {
+        "bits_per_doc": 9.774146102304298,
+        "bytes": 209328
+      },
+      "col.rating.hist": {
+        "bits_per_doc": 0.06126117712978311,
+        "bytes": 1312
+      },
+      "col.seq": {
+        "bits_per_doc": 12.25671795111246,
+        "bytes": 262496
+      },
+      "col.seq.hist": {
+        "bits_per_doc": 0.06126117712978311,
+        "bytes": 1312
+      },
+      "col.year": {
+        "bits_per_doc": 6.773095510470899,
+        "bytes": 145056
+      },
+      "col.year.hist": {
+        "bits_per_doc": 0.03436602619475638,
+        "bytes": 736
+      },
+      "kw.category.codes": {
+        "bits_per_doc": 6.772348422944925,
+        "bytes": 145040
+      },
+      "kw.category.dict": {
+        "bits_per_doc": 0.022412625779188945,
+        "bytes": 480
+      },
+      "kw.category.post": {
+        "bits_per_doc": 10.643008895010857,
+        "bytes": 227936
+      },
+      "kw.id.codes": {
+        "bits_per_doc": 18.776550790278524,
+        "bytes": 402128
+      },
+      "kw.id.dict": {
+        "bits_per_doc": 96.00149417505195,
+        "bytes": 2056016
+      },
+      "kw.id.post": {
+        "bits_per_doc": 32.00261480634091,
+        "bytes": 685384
+      },
+      "kw.tier.codes": {
+        "bits_per_doc": 2.7709476338337264,
+        "bytes": 59344
+      },
+      "kw.tier.dict": {
+        "bits_per_doc": 0.0026148063409053767,
+        "bytes": 56
+      },
+      "kw.tier.post": {
+        "bits_per_doc": 4.088062942124063,
+        "bytes": 87552
+      },
+      "kw.topic.codes": {
+        "bits_per_doc": 5.771998225667126,
+        "bytes": 123616
+      },
+      "kw.topic.dict": {
+        "bits_per_doc": 0.011953400415567436,
+        "bytes": 256
+      },
+      "kw.topic.post": {
+        "bits_per_doc": 10.048327224336376,
+        "bytes": 215200
+      },
+      "range.rating": {
+        "bits_per_doc": 11.295216305185255,
+        "bytes": 241904
+      },
+      "range.seq": {
+        "bits_per_doc": 2.357808231970677,
+        "bytes": 50496
+      },
+      "range.year": {
+        "bits_per_doc": 10.31765227744963,
+        "bytes": 220968
+      },
+      "store.data": {
+        "bits_per_doc": 5439.6571802115195,
+        "bytes": 116498418
+      },
+      "store.index": {
+        "bits_per_doc": 2.2192234959026917,
+        "bytes": 47528
+      }
+    },
+    "segment_bytes": 121724914,
+    "store": {
+      "blocks": 2964,
+      "compressed_bytes": 116498418,
+      "ratio": 1.6942212554337004,
+      "raw_bytes": 197374096
+    }
+  },
+  "store": {
+    "blocks": 2964,
+    "cold": {
+      "cold": {
+        "mean_pages": 676.94,
+        "median_ns": 2910954.0,
+        "min_ns": 1328606.0
+      },
+      "cold_madv_random": {
+        "mean_pages": 117.3,
+        "median_ns": 6567832.0,
+        "min_ns": 3605396.0
+      }
+    },
+    "compressed_bytes": 116498418,
+    "docs_per_query": 10,
+    "queries": 50,
+    "raw_bytes": 197374096,
+    "warm": {
+      "median_ns": 315562.2,
+      "min_ns": 291666.4
+    },
+    "warm_id_title": {
+      "median_ns": 290507.04,
+      "min_ns": 280821.8
+    }
+  }
+}

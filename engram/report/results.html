@@ -1,0 +1,107 @@
+<div class="col">
+  <h3 id="r-retrieval">Retrieval on long-conversation benchmarks</h3>
+  <p>Each benchmark conversation becomes its own store, with one record per turn chunk, each indexed with its exchange partner as context. A question succeeds when its annotated evidence turn comes back.</p>
+  <ul>
+    <li><b>LongMemEval-S:</b> 500 questions, each over its own history of about 115,000 tokens; the 470 with evidence are scored.</li>
+    <li><b>LoCoMo:</b> 10 conversations of about 600 turns and 1,536 answerable questions.</li>
+  </ul>
+  <p>On LongMemEval-S, hybrid search with priors puts the evidence in the top 10 for 90% of questions, against 88% for BM25 and for static vectors alone. The default 4,000-character injection contains it for 87%. LoCoMo's short turns between two people favour exact words: BM25 alone reaches 0.651 at rank 5 and static vectors only 0.382, so the static hybrid (0.607) falls below BM25. BGE vectors reverse that, 0.548 alone and 0.678 in the hybrid, above BM25. On LongMemEval, BGE does not help: on every fifth history (94 questions) its vectors alone score 0.691 against 0.745 for the static model, and the hybrid 0.798 against 0.809. Its strength is paraphrase, which the session probes below show; its cost is a few hundred times the static model's time per record.</p>
+</div>
+<figure class="wide">
+  <div class="frame">
+    <p class="chart-title">Does the evidence come back?</p>
+    <p class="chart-sub">Turn-level recall of the annotated evidence, and whether the default 4,000-character injection contains it · one store per conversation · BGE ran on every fifth LongMemEval history (94 questions), compared with the static model on the same subset</p>
+    <div class="chart" id="retrieval-chart"></div>
+  </div>
+</figure>
+<div class="col">
+  <p>By question type, hybrid search helps most on multi-session questions, which need evidence from several conversations: recall@5 rises from 0.760 with BM25 to 0.835. Preference questions are hardest, at 0.50. A question such as "can you suggest a hotel?" shares no words with the user's earlier statement of taste, and the static vectors do not bridge the gap either.</p>
+</div>
+<div class="wide" id="type-table"></div>
+<div class="col">
+  <p>Indexing a record with its context is not free. On LoCoMo, adding the request to each turn raises recall@5 from 0.549 to 0.607. On LongMemEval it lowers it slightly, from 0.866 to 0.853, and to 0.832 if user turns also get the assistant's reply. Those answers are long, and the questions target the user's own words, so the extra text dilutes them. Engram attaches the request to responses only, which is the "with their request" column.</p>
+</div>
+<div class="wide" id="ctx-table"></div>
+
+<div class="col">
+  <h3 id="r-session">What this repository's session lost, and what came back</h3>
+  <p>The transcript of the session that built this repository is the most realistic test available: 26.5 hours, 43.6 MB, three projects, and two compactions whose summaries keep 14,202 and 17,998 characters. Replaying it through Engram's capture gives the records the hooks would have stored. The questions are asked at line 5,392, just before this task began. At that point the model's context is the second summary plus everything after it.</p>
+  <p>There are three probe sets:</p>
+  <ul>
+    <li><b>Recurring facts (40):</b> questions about decisions and results that later work kept restating.</li>
+    <li><b>Lost details (18):</b> questions about errors, failed commands and measurements that no later text repeats, found by searching the transcript for lines absent from the later context.</li>
+    <li><b>Lost details, vague (12):</b> the same details, asked the way someone would who no longer remembers the identifiers.</li>
+  </ul>
+  <p>The lost-detail questions were written after seeing their answers, so they favour exact terms; the vague set measures how much that matters.</p>
+</div>
+<figure class="wide">
+  <div class="frame">
+    <p class="chart-title">Probe questions about the 26-hour session</p>
+    <p class="chart-sub">Asked at line 5,392 of the transcript, just before this task's prompt: after the second compaction, or in a new session · only probes whose answer Engram stored</p>
+    <div class="chart" id="probes-chart"></div>
+  </div>
+</figure>
+<div class="col">
+  <p>After a compaction, the summary held none of the lost details, and the live window still held 17% of them. Of the 15 the model no longer had, automatic injection brought back 13, and one <code>memory_search</code> 14. Asked vaguely, injection recovered 8 of 10. Recurring facts were mostly still in context (84%), so Engram had little to add there: 2 of the 5 missing ones came back automatically, and all 5 by search.</p>
+  <p>A new session is where memory matters most, because it starts with nothing. There, the gated injection alone answered 83% of the lost-detail probes, 58% of their vague versions and 54% of the recurring facts; search raised these to 94%, 67% and 78%. Most answers that search found but injection missed came through the weak-evidence tier. It injects two records of at most 500 characters, and the answer ranked first to eighth but fell outside those records or their snippets. The injected record ids are what the timeline tool is for.</p>
+  <p>With BGE vectors, raw retrieval improves where the words differ. In a new session, full injection would contain 28 of the 37 recurring-fact answers, against 23 with the static model, and search would find 31, against 29. The BGE gate costs more than it gains, though. Fitted on fewer questions, it rarely reaches full injection, so its gated injection recovered only 4 of the 10 vague lost details, against 8 with the static default. The static embedder with its gate stays the default.</p>
+</div>
+<div class="wide" id="probe-table"></div>
+
+<div class="col">
+  <h3 id="r-gate">The gate</h3>
+  <p>The gate is the weakest part of the design. Fitted on LongMemEval, it compares as follows with injecting the full budget on every prompt:</p>
+  <ul>
+    <li><b>Cost:</b> it injects on 55% of prompts, about 930 characters per prompt against about 3,000.</li>
+    <li><b>Precision:</b> injections that contain evidence rise from 42% to 59%.</li>
+    <li><b>Coverage:</b> questions whose evidence reaches the model fall from 87% to 67%.</li>
+    <li><b>LoCoMo:</b> on this held-out benchmark it saves the same tokens but loses precision, because its foreign questions share too much vocabulary with the stores they are asked against.</li>
+  </ul>
+  <p>With BGE vectors the same fit fares worse: its full-injection threshold is reached by about 1% of questions, so nearly everything goes through the brief tier. In practice, the gate mostly limits cost. The features it has, similarity and term coverage, cannot tell "related" from "relevant" well. A cross-encoder reranker on the top candidates is the obvious next step; in this design its cost would fall only on prompts that pass the cheap gate.</p>
+</div>
+<div class="wide" id="gate-table"></div>
+
+<div class="col">
+  <h3 id="r-scale">Scale and latency</h3>
+  <p>How large does a project's memory get? The 26-hour session produced about 2,200 records, so a million records is roughly 450 sessions of that size, more than a year of daily heavy use. The scale test fills a store with LongMemEval turns and asks about needles in it:</p>
+  <ul>
+    <li><b>Needles:</b> 94 questions whose evidence sessions are kept.</li>
+    <li><b>Filler:</b> generic chat sessions without evidence, repeated to reach 10,000, 100,000 and 1,000,000 records.</li>
+    <li><b>Order:</b> sessions are shuffled, so recency favours neither.</li>
+    <li><b>Hooks:</b> run through the real <code>engram</code> binary and daemon, one prompt every 200 ms.</li>
+  </ul>
+</div>
+<div class="wide" id="scale-table"></div>
+<div class="col">
+  <p>The costs grow slowly. A recall query takes 3–4 ms up to 100,000 records and 11.5 ms at a million (p99 39 ms). A full hook, counting process start, the socket round trip and gated recall, takes 9–10 ms at the median up to 100,000 records and 17 ms at a million (p99 68 ms). Appends with <code>fsync</code> stay under 1.5 ms even at p99. Each record takes about 3.5 KB on disk, mostly its 512-dimension vector, and the static embedder processes 9,500–11,000 records a second. The first hook of a session pays for starting the daemon: 0.3 s, mostly loading the embedding model.</p>
+  <p>Quality is what degrades. The share of needles found in the top 10 falls from 0.78 at 10,000 records to 0.52 at 100,000 and 0.45 at a million. The filler here is chat on every subject, and real project history is more homogeneous, so this is a stress test, not a forecast. For large stores, Strata's filters keep the candidate set small: by session, time, file and kind. <code>memory_sql</code> gives the model those filters directly.</p>
+  <p>The hooks here arrive 200 ms apart. Back to back, each query waits for the previous write's in-memory segment rebuild, and a hook takes 44–53 ms. In a real session, prompts arrive seconds apart.</p>
+</div>
+
+<div class="col">
+  <h3 id="r-live">Live Claude Code runs</h3>
+  <p>The last test is Claude Code itself, headless (<code>claude -p</code>, a small model), in a scratch repository after <code>engram install</code>.</p>
+  <ul>
+    <li><b>Run A</b> states two decisions and writes code. The hooks stored 12 records: the prompt, a preference picked up from "always", tool calls and results, the commentary, the answer and an episode card.</li>
+    <li><b>Runs B and C</b> are new sessions with every file tool disabled, asking for the two decisions, with Engram on and off.</li>
+    <li><b>Run D</b> asks for a detail the briefing does not carry.</li>
+  </ul>
+</div>
+<div class="wide" id="live-table"></div>
+<div class="col">
+  <p>With Engram, the new session answered from the briefing and said it had not checked the code. Without Engram, it said it did not know.</p>
+  <p>In run D, the model looked up the record id named in the injected context and called <code>memory_timeline</code> on it. It then quoted the exact command and output from the earlier session. Its first attempt had failed, because headless mode needs permission for MCP tools; <code>engram install</code> now adds the rule. Engram had also stored that failed attempt's answer, and the next session saw it and corrected it. Memory keeps wrong conclusions as faithfully as right ones, which is why every injected record is labelled as possibly outdated.</p>
+  <p><code>claude -p /compact</code> on run A fired <code>PostCompact</code>, which stored the summary as 9 section records. <code>SessionStart</code> then injected a 4,713-character briefing and recall into the compacted context. The four runs together cost $0.018.</p>
+</div>
+<div class="col">
+  <p>The final test asks a live session about this repository's own history. The 26-hour transcript, cut just before this task began, is back-filled into a fresh scratch project with <code>engram ingest-transcript</code>, giving 1,835 records. Four questions follow, each in a new headless session with file, shell and web tools disabled: two lost details, one design rationale and one result. Each question is asked twice, so the second round finds the first round's turns in memory, and once more with Engram off.</p>
+</div>
+<div class="wide" id="live-qa-table"></div>
+<div class="col">
+  <p>With Engram, all eight answers were right. Two came from automatic injection alone. In the other six, the injection pointed the model at the right records, and it searched or opened a timeline before answering. Without Engram, the model could not answer any of the four.</p>
+  <p>Two earlier versions of this test failed in instructive ways.</p>
+  <ul>
+    <li><b>An instruction suppressed the memory tools.</b> When every question began "Without reading any files or running commands", the model took that to cover memory search too, and answered only two of four.</li>
+    <li><b>Old failures were replayed.</b> Its "I don't know" answers were then stored and recalled by the next session as evidence that the answer was unknown. Engram now tags answers that admit not knowing, never injects them, and skips earlier copies of the same question. It was the second round of the clean run that checked this fix.</li>
+  </ul>
+</div>

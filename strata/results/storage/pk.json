@@ -1,0 +1,30 @@
+{
+  "dataset": "fiqa",
+  "experiment": "pk",
+  "loadavg_at_start": "1.07 1.06 1.21 2/110 21195",
+  "n_docs": 57638,
+  "reps": 5,
+  "results": {
+    "bytes_per_doc": 30.38328880252611,
+    "lookups": [
+      {
+        "binary_search_ns": 126.43878,
+        "binary_search_pages_per_lookup": 9.7734,
+        "keys": "hit",
+        "n_docs": 57638,
+        "radix_lookup_ns": 99.17451,
+        "radix_pages_per_lookup": 4.0195
+      },
+      {
+        "binary_search_ns": 125.27715,
+        "binary_search_pages_per_lookup": 7.7637,
+        "keys": "miss",
+        "n_docs": 57638,
+        "radix_lookup_ns": 51.06824,
+        "radix_pages_per_lookup": 2.0136
+      }
+    ],
+    "pk_section_bytes": 1751232
+  },
+  "seconds": 4.471411288
+}

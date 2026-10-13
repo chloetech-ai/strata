@@ -1,0 +1,9 @@
+  10/10 units, 16 s
+locomo_static_request_c400: 1536 eligible questions in 17 s
+  bm25                 R@5 0.652  R@10 0.757  all@10 0.622  nDCG@10 0.473  sess_all@5 0.789  pack4k 0.770  pack8k 0.825
+  dense                R@5 0.303  R@10 0.391  all@10 0.316  nDCG@10 0.238  sess_all@5 0.534  pack4k 0.410  pack8k 0.510
+  hybrid_0.3           R@5 0.442  R@10 0.552  all@10 0.451  nDCG@10 0.351  sess_all@5 0.643  pack4k 0.573  pack8k 0.688
+  hybrid_0.5           R@5 0.614  R@10 0.708  all@10 0.574  nDCG@10 0.466  sess_all@5 0.747  pack4k 0.727  pack8k 0.810
+  hybrid_0.7           R@5 0.666  R@10 0.757  all@10 0.624  nDCG@10 0.511  sess_all@5 0.782  pack4k 0.775  pack8k 0.833
+  hybrid_0.5_priors    R@5 0.615  R@10 0.710  all@10 0.576  nDCG@10 0.468  sess_all@5 0.749  pack4k 0.727  pack8k 0.810
+  hybrid_0.3_priors    R@5 0.443  R@10 0.550  all@10 0.450  nDCG@10 0.350  sess_all@5 0.643  pack4k 0.571  pack8k 0.688

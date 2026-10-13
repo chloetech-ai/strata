@@ -1,0 +1,15 @@
+10 units of locomo, 12 layouts × 6 presentations × 4 budgets
+  10/10 units, 89 s
+1536 questions in 89 s
+turn                   rows    588 R@10 0.645 MRR 0.423 | snip600 ev 0.717 ans 0.737 span400 ev 0.717 ans 0.737 span600 ev 0.717 ans 0.737 span600+p150 ev 0.715 ans 0.703 span400+p150 ev 0.715 ans 0.705 turn1500 ev 0.717 ans 0.737
+turn+req               rows    588 R@10 0.712 MRR 0.412 | snip600 ev 0.784 ans 0.834 span400 ev 0.784 ans 0.834 span600 ev 0.784 ans 0.834 span600+p150 ev 0.812 ans 0.786 span400+p150 ev 0.812 ans 0.786 turn1500 ev 0.784 ans 0.834
+turn+partner           rows    588 R@10 0.712 MRR 0.412 | snip600 ev 0.784 ans 0.834 span400 ev 0.784 ans 0.834 span600 ev 0.784 ans 0.834 span600+p150 ev 0.812 ans 0.786 span400+p150 ev 0.812 ans 0.786 turn1500 ev 0.784 ans 0.834
+win800+req             rows    588 R@10 0.706 MRR 0.408 | snip600 ev 0.780 ans 0.832 span400 ev 0.780 ans 0.832 span600 ev 0.781 ans 0.832 span600+p150 ev 0.812 ans 0.800 span400+p150 ev 0.812 ans 0.800 turn1500 ev 0.781 ans 0.832
+win400+req             rows    592 R@10 0.708 MRR 0.408 | snip600 ev 0.780 ans 0.834 span400 ev 0.781 ans 0.836 span600 ev 0.781 ans 0.836 span600+p150 ev 0.812 ans 0.806 span400+p150 ev 0.812 ans 0.806 turn1500 ev 0.781 ans 0.836
+win200+req             rows    736 R@10 0.714 MRR 0.424 | snip600 ev 0.786 ans 0.794 span400 ev 0.781 ans 0.840 span600 ev 0.781 ans 0.840 span600+p150 ev 0.815 ans 0.816 span400+p150 ev 0.815 ans 0.816 turn1500 ev 0.781 ans 0.840
+win400                 rows    592 R@10 0.646 MRR 0.424 | snip600 ev 0.717 ans 0.739 span400 ev 0.717 ans 0.737 span600 ev 0.717 ans 0.737 span600+p150 ev 0.715 ans 0.709 span400+p150 ev 0.716 ans 0.709 turn1500 ev 0.717 ans 0.737
+win400+req/vec-text    rows    592 R@10 0.711 MRR 0.453 | snip600 ev 0.786 ans 0.838 span400 ev 0.786 ans 0.838 span600 ev 0.786 ans 0.838 span600+p150 ev 0.781 ans 0.804 span400+p150 ev 0.781 ans 0.804 turn1500 ev 0.786 ans 0.838
+win400+partner         rows    592 R@10 0.708 MRR 0.408 | snip600 ev 0.780 ans 0.834 span400 ev 0.781 ans 0.836 span600 ev 0.781 ans 0.836 span600+p150 ev 0.812 ans 0.806 span400+p150 ev 0.812 ans 0.806 turn1500 ev 0.781 ans 0.836
+turn+win400+req        rows   1180 R@10 0.710 MRR 0.408 | snip600 ev 0.787 ans 0.842 span400 ev 0.787 ans 0.844 span600 ev 0.787 ans 0.844 span600+p150 ev 0.811 ans 0.798 span400+p150 ev 0.811 ans 0.798 turn1500 ev 0.787 ans 0.844
+user-turns             rows      0 R@10 0.000 MRR 0.000 | snip600 ev 0.000 ans 0.000 span400 ev 0.000 ans 0.000 span600 ev 0.000 ans 0.000 span600+p150 ev 0.000 ans 0.000 span400+p150 ev 0.000 ans 0.000 turn1500 ev 0.000 ans 0.000
+session                rows     27 R@10 0.949 MRR 0.738 | snip600 ev 0.664 ans 0.671 span400 ev 0.587 ans 0.577 span600 ev 0.664 ans 0.671 span600+p150 ev 0.664 ans 0.671 span400+p150 ev 0.587 ans 0.577 turn1500 ev 0.682 ans 0.719

@@ -1,0 +1,262 @@
+{
+ "tasks": {
+  "csv_export": {
+   "needs": "a requirement stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.008352126666666668,
+    "turns": 8.0,
+    "wall_s": 23.05644146601359,
+    "input_tokens": 273876.0,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "weighted_split": {
+   "needs": "a client rule (leftover cents)",
+   "kind": "conversation",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.009302636666666668,
+    "turns": 6.666666666666667,
+    "wall_s": 22.085752487182617,
+    "input_tokens": 254013.33333333334,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "exchange_rates": {
+   "needs": "a constraint stated only in conversation (no dependencies)",
+   "kind": "conversation",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0075078333333333325,
+    "turns": 5.666666666666667,
+    "wall_s": 14.621720314025879,
+    "input_tokens": 201712.0,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "rename_api": {
+   "needs": "a process rule (changelog)",
+   "kind": "conversation",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.007228866666666667,
+    "turns": 10.0,
+    "wall_s": 15.779545148213705,
+    "input_tokens": 213274.0,
+    "memory_tool_calls": 0.3333333333333333
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "faster_save": {
+   "needs": "a decision stated only in conversation (JSON for hand-editing)",
+   "kind": "conversation",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.009691163333333334,
+    "turns": 10.0,
+    "wall_s": 39.14011446634928,
+    "input_tokens": 329884.6666666667,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "discount": {
+   "needs": "a rule partly visible in the code (integer cents)",
+   "kind": "repo",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0065101866666666675,
+    "turns": 7.0,
+    "wall_s": 18.94140871365865,
+    "input_tokens": 168978.66666666666,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "summary": {
+   "needs": "a convention visible in the code (CHF format)",
+   "kind": "repo",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.006315863333333334,
+    "turns": 7.0,
+    "wall_s": 14.398345232009888,
+    "input_tokens": 183322.66666666666,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "run_tests": {
+   "needs": "a discovered quirk (PYTHONPATH=src)",
+   "kind": "repo",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0031848900000000006,
+    "turns": 2.0,
+    "wall_s": 6.408306837081909,
+    "input_tokens": 78485.66666666667,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "slugify": {
+   "needs": "nothing (control)",
+   "kind": "control",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.005595183333333333,
+    "turns": 7.0,
+    "wall_s": 14.72238008181254,
+    "input_tokens": 160371.0,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  },
+  "advice": {
+   "needs": "rationale stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 3,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.002830573333333334,
+    "turns": 1.0,
+    "wall_s": 8.343378941218058,
+    "input_tokens": 38390.333333333336,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 0,
+    "score": null,
+    "solved": null,
+    "cost_usd": null,
+    "turns": null,
+    "wall_s": null,
+    "input_tokens": null,
+    "memory_tool_calls": null
+   }
+  }
+ },
+ "overall": {
+  "engram": {
+   "n": 30,
+   "score": 1.0,
+   "solved": 1.0,
+   "cost_usd": 0.006651932333333333,
+   "turns": 6.433333333333334,
+   "wall_s": 17.74973936875661
+  },
+  "none": {
+   "n": 0,
+   "score": null,
+   "solved": null,
+   "cost_usd": null,
+   "turns": null,
+   "wall_s": null
+  }
+ }
+}

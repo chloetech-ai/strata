@@ -1,0 +1,115 @@
+{
+  "collection": "scifact",
+  "queries": [
+    {
+      "first": "52874170 · How do I perform a lumbar puncture and analyze the results t",
+      "label": "phrase, boolean and negation",
+      "ms": 0.08078099999999999,
+      "plan": [
+        "seg 0: filter materialised, 1 docs"
+      ],
+      "rows": 1,
+      "sql": "SELECT id, title FROM docs WHERE MATCH(body, '\"how do i\" AND (learn OR study) -money') LIMIT 10"
+    },
+    {
+      "first": "3",
+      "label": "prefix and conjunction",
+      "ms": 0.028467,
+      "plan": [
+        "seg 0: filter materialised, 3 docs"
+      ],
+      "rows": 1,
+      "sql": "SELECT COUNT(*) FROM docs WHERE MATCH(body, 'progr* AND language')"
+    },
+    {
+      "first": "36178047 · 9.6821",
+      "label": "ranked text, OR / NOT filter",
+      "ms": 0.093492,
+      "plan": [
+        "seg 0: bm25 MaxScore, filter Probe"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE (category IN ('c01', 'c02') OR rating > 4.5) AND NOT topic = 't03' ORDER BY bm25(body, 'best programming language to learn first') DESC LIMIT 10"
+    },
+    {
+      "first": "4979184 · 0.5745",
+      "label": "filtered vector, OR filter",
+      "ms": 0.062065999999999996,
+      "plan": [
+        "seg 0: filter materialised, 799 docs",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE year < 1995 OR category = 'c40' ORDER BY similarity(emb, :q) DESC LIMIT 10"
+    },
+    {
+      "first": "6948886 · 0.9594",
+      "label": "filtered hybrid, weighted",
+      "ms": 0.286356,
+      "plan": [
+        "seg 0: bm25 MaxScore, filter Probe",
+        "seg 0: filter materialised, 923 docs",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize",
+        "weighted: 146 candidates (top-depth union), MinMax"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE rating >= 3 AND year BETWEEN 2005 AND 2020 ORDER BY 0.2 * bm25(body, :t) + 0.8 * similarity(emb, :q) DESC LIMIT 10"
+    },
+    {
+      "first": "33796570 · 0.0315",
+      "label": "hybrid, RRF on a correlated filter",
+      "ms": 0.218324,
+      "plan": [
+        "seg 0: filter materialised, 604 docs",
+        "seg 0: bm25 MaxScore, filter Materialize",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize",
+        "rrf: 2 inputs, depth 100, k 60"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE topic IN ('t05', 't06', 't07') ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10"
+    },
+    {
+      "first": "t02 · 2",
+      "label": "facets over a text match",
+      "ms": 0.049277,
+      "plan": [
+        "seg 0: filter materialised, 4 docs",
+        "seg 0: facet Codes over 4 docs"
+      ],
+      "rows": 2,
+      "sql": "SELECT topic, COUNT(*) FROM docs WHERE MATCH(body, 'india') AND year BETWEEN 2000 AND 2010 GROUP BY topic ORDER BY 2 DESC, 1 LIMIT 5"
+    },
+    {
+      "first": null,
+      "label": "text filter, ordered by a column",
+      "ms": 0.053953,
+      "plan": [
+        "seg 0: filter materialised, 0 docs"
+      ],
+      "rows": 0,
+      "sql": "SELECT id, rating FROM docs WHERE MATCH(body, 'travel AND visa') ORDER BY rating DESC, id LIMIT 5"
+    },
+    {
+      "first": "0",
+      "label": "count over a boolean and a range",
+      "ms": 0.036284,
+      "plan": [
+        "seg 0: filter materialised, 0 docs"
+      ],
+      "rows": 1,
+      "sql": "SELECT COUNT(*) FROM docs WHERE MATCH(body, 'iphone OR android') AND rating BETWEEN 2 AND 3"
+    },
+    {
+      "first": "5123516",
+      "label": "nearest by distance, exact",
+      "ms": 0.212786,
+      "plan": [
+        "seg 0: filter materialised, 2272 docs",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize"
+      ],
+      "rows": 10,
+      "sql": "SELECT id FROM docs WHERE category IN ('c00', 'c01', 'c02', 'c03') ORDER BY distance(emb, :q, strategy => 'prefilter') LIMIT 10"
+    }
+  ],
+  "query_text": "TNFAIP3 is a tumor suppressor in glioblastoma."
+}
