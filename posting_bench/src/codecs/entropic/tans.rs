@@ -183,9 +183,17 @@ fn low_mask(k: u32) -> u32 {
 ///
 /// With BMI2 this is inline assembly rather than `_bzhi_u64`, whose `u32`
 /// count makes the compiler zero-extend the count register first: one
-/// cycle more on the decoder's critical path.
+/// cycle more on the decoder's critical path. On aarch64 it is a shift and
+/// a BIC (LSLV takes its count modulo 64) instead of the portable compare
+/// and select, which requires `n & 0xff < 64`: every count the decoder
+/// passes is.
 #[inline(always)]
 pub fn bzhi(x: u64, n: u64) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        debug_assert!(n & 0xff < 64);
+        x & !(u64::MAX << (n & 63))
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
         let r: u64;
@@ -197,7 +205,7 @@ pub fn bzhi(x: u64, n: u64) -> u64 {
         }
         r
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64")))]
     {
         let n = n & 0xff;
         if n >= 64 {
@@ -280,6 +288,31 @@ impl Decoder {
     fn consume(&mut self, n: u64) {
         self.buf >>= n & 63;
         self.cnt = self.cnt.wrapping_sub(n);
+    }
+
+    /// Position of the next unread bit, relative to `data` (the buffer
+    /// holds the `cnt & 63` bits before `ptr`).
+    ///
+    /// # Safety
+    /// The decoder must read from `data`.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn bit_pos(&self, data: *const u8) -> u64 {
+        8 * self.ptr.offset_from(data) as u64 - (self.cnt & 63)
+    }
+
+    /// Move the bit reader to bit `pos` of `data` (as [`Decoder::new`]).
+    ///
+    /// # Safety
+    /// `data` must be padded and `pos` within its stream.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn seek(&mut self, data: *const u8, pos: u64) {
+        self.ptr = data.add((pos >> 3) as usize);
+        self.cnt = 0;
+        self.buf = 0;
+        self.refill();
+        self.consume(pos & 7);
     }
 
     /// Decode the next gap.
@@ -555,6 +588,150 @@ pub unsafe fn run8<const PAIR: bool>(decs: &mut [Decoder; SIMD_BLOCKS], prev: &[
     }
 }
 
+/// Blocks decoded at once by [`run4`].
+#[cfg(target_arch = "aarch64")]
+pub const NEON_BLOCKS: usize = 4;
+
+/// Most rows [`run4`] decodes.
+#[cfg(target_arch = "aarch64")]
+const RUN4_ROWS: usize = 128;
+
+/// Decode four whole blocks of `out.len()` gaps at once on aarch64, which
+/// has no gather. The blocks' state machines run interleaved in scalar
+/// registers (eight independent chains), each reading its stream through a
+/// bit position, and store every symbol's table entry and bit window; NEON
+/// turns a row of those into four gaps and running docIDs, two rows behind
+/// the scalar code so that the two overlap. On a wide core the scalar
+/// decoders are bound by instruction count rather than latency, and this
+/// split leaves the integer units only the lookups and the state and
+/// position updates. The lanes' final symbols are finished one block at a
+/// time. Row `s` of `out` receives the `s`-th docID of every block (a
+/// transposed layout). All four decoders must use the same table and read
+/// from `data`. With `PAIR`, one window load serves two symbols, as in
+/// [`Decoder::run`].
+///
+/// # Safety
+/// Every block must have exactly `out.len()` symbols, and `data` must be
+/// the padded stream all decoders read.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn run4<const PAIR: bool>(decs: &mut [Decoder; NEON_BLOCKS], prev: &[u32; NEON_BLOCKS], data: *const u8, out: &mut [[u32; NEON_BLOCKS]]) {
+    use core::arch::aarch64::*;
+    assert!(out.len() <= RUN4_ROWS);
+    let table = decs[0].table;
+    let mut idx: [u64; NEON_BLOCKS] = std::array::from_fn(|j| decs[j].idx);
+    let mut idx_next: [u64; NEON_BLOCKS] = std::array::from_fn(|j| decs[j].idx_next);
+    let mut pos: [u64; NEON_BLOCKS] = std::array::from_fn(|j| decs[j].bit_pos(data));
+    // Row `s`: the entries of the blocks' `s`-th symbols, then their windows.
+    let mut ev = std::mem::MaybeUninit::<[[u64; 2 * NEON_BLOCKS]; RUN4_ROWS]>::uninit();
+    let ev = ev.as_mut_ptr() as *mut [u64; 2 * NEON_BLOCKS];
+    // At least 57 bits of block `j`'s stream from its next unread bit.
+    macro_rules! window {
+        ($j:expr) => {
+            load_u64(data.add((pos[$j] >> 3) as usize)) >> (pos[$j] & 7)
+        };
+    }
+    // The state transition of `Decoder::gap_buffered`: returns the entry,
+    // the window and the window past the symbol.
+    macro_rules! step {
+        ($j:expr, $v:expr) => {{
+            let v = $v;
+            let e = *table.add(idx[$j] as usize);
+            idx[$j] = idx_next[$j];
+            idx_next[$j] = (e >> 48) | bzhi(v, e);
+            let t = (e >> 8) & 0xff;
+            pos[$j] += t;
+            (e, v, v >> t)
+        }};
+    }
+    // Row `s` from the blocks' windows; returns the windows past it.
+    macro_rules! row {
+        ($s:expr, $v0:expr, $v1:expr, $v2:expr, $v3:expr) => {{
+            // Stored in pairs, as the NEON loads read them back.
+            let r = ev.add($s) as *mut [u64; 2];
+            let (e0, w0, n0) = step!(0, $v0);
+            let (e1, w1, n1) = step!(1, $v1);
+            r.write([e0, e1]);
+            r.add(2).write([w0, w1]);
+            let (e2, w2, n2) = step!(2, $v2);
+            let (e3, w3, n3) = step!(3, $v3);
+            r.add(1).write([e2, e3]);
+            r.add(3).write([w2, w3]);
+            (n0, n1, n2, n3)
+        }};
+    }
+    macro_rules! pair {
+        ($s:expr) => {
+            let (v0, v1, v2, v3) = row!($s, window!(0), window!(1), window!(2), window!(3));
+            row!($s + 1, v0, v1, v2, v3);
+        };
+    }
+    let ones = vdupq_n_u64(u64::MAX);
+    let one = vdupq_n_u32(1);
+    let mut cur = vld1q_u32(prev.as_ptr());
+    let o = out.as_mut_ptr() as *mut u32;
+    // The gaps of two symbols, `(e >> 16) | (bzhi(v, e >> 8) >> e)` as in
+    // `Decoder::gap_buffered`: USHL shifts by the signed low byte of each
+    // lane, left by the symbol's bit count `e >> 8` and right by its state
+    // bits `-e`. The base has no bits where the raw bits go, so the OR is
+    // an accumulate. The bits above 32 are garbage; the narrowing drops them.
+    macro_rules! gaps {
+        ($e:expr, $v:expr) => {{
+            let (e, v) = ($e, $v);
+            let high = vshlq_u64(ones, vreinterpretq_s64_u64(vshrq_n_u64::<8>(e)));
+            let raw = vshlq_u64(vbicq_u64(v, high), vnegq_s64(vreinterpretq_s64_u64(e)));
+            vsraq_n_u64::<16>(raw, e)
+        }};
+    }
+    // Row `s` of docIDs.
+    macro_rules! finish {
+        ($s:expr) => {{
+            let r = ev.add($s) as *const u64;
+            let g01 = gaps!(vld1q_u64(r), vld1q_u64(r.add(4)));
+            let g23 = gaps!(vld1q_u64(r.add(2)), vld1q_u64(r.add(6)));
+            let g = vaddq_u32(vuzp1q_u32(vreinterpretq_u32_u64(g01), vreinterpretq_u32_u64(g23)), one);
+            // Opaque to LLVM, which would otherwise rewrite `cur + (g + 1)`
+            // as `g - !cur`: two operations on the loop-carried chain.
+            core::arch::asm!("add {c:v}.4s, {c:v}.4s, {g:v}.4s", c = inout(vreg) cur, g = in(vreg) g,
+                options(pure, nomem, nostack));
+            vst1q_u32(o.add(NEON_BLOCKS * $s), cur);
+        }};
+    }
+    let body = out.len().saturating_sub(LANES);
+    let mut s = 0;
+    let mut done = 0;
+    if PAIR && body >= 2 {
+        pair!(0);
+        s = 2;
+        while s + 2 <= body {
+            pair!(s);
+            finish!(s - 2);
+            finish!(s - 1);
+            s += 2;
+        }
+        done = s - 2;
+    }
+    while s < body {
+        row!(s, window!(0), window!(1), window!(2), window!(3));
+        s += 1;
+    }
+    while done < body {
+        finish!(done);
+        done += 1;
+    }
+    let mut p = [0u32; NEON_BLOCKS];
+    vst1q_u32(p.as_mut_ptr(), cur);
+    for (j, d) in decs.iter_mut().enumerate() {
+        d.idx = idx[j];
+        d.idx_next = idx_next[j];
+        d.seek(data, pos[j]);
+        for row in out[body..].iter_mut() {
+            p[j] = p[j].wrapping_add(d.gap_last()).wrapping_add(1);
+            row[j] = p[j];
+        }
+    }
+}
+
 /// Largest symbol (state bits plus raw bits) for which two symbols fit in
 /// one refill of at least 56 bits.
 pub const PAIR_MAX_BITS: u32 = 28;
@@ -603,6 +780,47 @@ mod tests {
                 assert_eq!(out, docs);
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        check_run4(blocks, &starts, &bytes, &table, model);
+    }
+
+    /// The four-block aarch64 decoder against the scalar one, on every run
+    /// of four consecutive blocks of equal length (at most [`RUN4_ROWS`]
+    /// symbols), from docIDs that wrap around.
+    #[cfg(target_arch = "aarch64")]
+    fn check_run4(blocks: &[Vec<u32>], starts: &[usize], bytes: &[u8], table: &[u64], model: &Model) {
+        let new = |j: usize, n: usize| unsafe {
+            Decoder::new(table, bytes.as_ptr(), starts[j], model.start_ctx as u32, n, model.r)
+        };
+        let prev = [7u32, 0, u32::MAX - 3, 1 << 31];
+        for w in 0..blocks.len().saturating_sub(NEON_BLOCKS - 1) {
+            let group = &blocks[w..w + NEON_BLOCKS];
+            let n = group[0].len();
+            if n > RUN4_ROWS || group.iter().any(|b| b.len() != n) {
+                continue;
+            }
+            let mut want = vec![[0u32; NEON_BLOCKS]; n];
+            for j in 0..NEON_BLOCKS {
+                let mut out = vec![0u32; n];
+                unsafe { new(w + j, n).block::<false>(prev[j], &mut out) };
+                for (row, &x) in want.iter_mut().zip(&out) {
+                    row[j] = x;
+                }
+            }
+            let pair_safe = group.iter().flatten().all(|&g| super::super::model::token(g).1 + model.r <= PAIR_MAX_BITS);
+            for pair in [false, true].into_iter().filter(|&p| !p || pair_safe) {
+                let mut decs: [Decoder; NEON_BLOCKS] = std::array::from_fn(|j| new(w + j, n));
+                let mut out = vec![[0u32; NEON_BLOCKS]; n];
+                unsafe {
+                    if pair {
+                        run4::<true>(&mut decs, &prev, bytes.as_ptr(), &mut out)
+                    } else {
+                        run4::<false>(&mut decs, &prev, bytes.as_ptr(), &mut out)
+                    }
+                };
+                assert_eq!(out, want, "run4, {n} symbols, pair {pair}");
+            }
+        }
     }
 
     /// Own models fitted to `blocks`, with every state size.
@@ -644,6 +862,44 @@ mod tests {
             for m in fitted(&blocks) {
                 roundtrip(&blocks, &m);
             }
+        }
+    }
+
+    /// Groups of four equal-length blocks for the four-block decoder: every
+    /// length up to a few symbols, around the body/tail split and the pair
+    /// loop's parity, and full blocks; random and adversarial gaps.
+    #[test]
+    fn grouped_streams_roundtrip() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let lens = [1usize, 2, 3, 4, 5, 6, 7, 63, 64, 125, 126, 127, 128];
+        for (trial, &n) in lens.iter().cycle().take(4 * lens.len()).enumerate() {
+            let blocks: Vec<Vec<u32>> = (0..8)
+                .map(|_| {
+                    (0..n)
+                        .map(|i| match trial % 4 {
+                            0 => rng.gen_range(0..4),
+                            1 => rng.gen::<u32>() >> rng.gen_range(0..32),
+                            2 if i % 5 == 0 => u32::MAX - 1,
+                            2 => 0,
+                            _ => {
+                                let w = rng.gen_range(1..21);
+                                rng.gen_range(0..1u32 << w)
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            for m in fitted(&blocks) {
+                roundtrip(&blocks, &m);
+            }
+        }
+        // Shared models: every token in every context.
+        for (max_tok, r) in [(20u8, R_MIN), (45, 9), (63, R_MAX)] {
+            let m = SharedParams { mean: 20, pi: [3, 5], max_tok, r: r as u8 }.model();
+            let toks: Vec<u32> = (0..NTOK).filter(|&t| t <= max_tok as usize).map(|t| BASE[t]).collect();
+            let blocks: Vec<Vec<u32>> =
+                (0..4).map(|k| toks.iter().cycle().skip(k).take(127).copied().collect()).collect();
+            roundtrip(&blocks, &m);
         }
     }
 

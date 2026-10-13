@@ -53,15 +53,18 @@
 //! * **Bulk decoding** (`decode_into`, `union`, the intersection's driver).
 //!   With AVX-512, eight blocks decode at once: lane `j` of a register runs
 //!   block `j`, table lookups and refills are gathers; the remaining blocks
-//!   decode two at a time (four interleaved chains).
+//!   decode two at a time (four interleaved chains). On aarch64 (no gather),
+//!   four blocks decode at once: their state machines interleave in scalar
+//!   registers and NEON extracts the gaps and docIDs of four blocks at a time.
 //! * **`SetOps::intersect`**: SvS. The shortest list is decoded in bulk;
 //!   each other list, shortest first, filters the candidates through a
 //!   cursor (one lazy block decode serves every candidate in the block),
 //!   stopping early when no candidate is left.
 //! * **`SetOps::union`**: every list sets bits in a bitmap over the result's
 //!   docID range straight from the decoder (the eight-block decoder's
-//!   interleaved output avoids read-modify-write stalls), then the bitmap is
-//!   extracted with [`BitPos::extract`] (AVX-512 VBMI2 when available).
+//!   interleaved output avoids read-modify-write stalls; on aarch64, two
+//!   four-block groups interleave), then the bitmap is extracted with
+//!   [`BitPos::extract`] (AVX-512 VBMI2 when available).
 
 pub mod model;
 pub mod skip;
@@ -78,6 +81,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 use tans::{run8, SIMD_BLOCKS};
+#[cfg(target_arch = "aarch64")]
+use tans::{run4, NEON_BLOCKS};
 use tans::{decode_table, run2, Decoder, Encoder, PADDING, PAIR_MAX_BITS};
 
 /// Postings per block.
@@ -246,6 +251,16 @@ impl Entropic {
                 transpose_group(&tmp, &maxs, dst);
             }
         }
+        // Groups of four full blocks with the aarch64 decoder.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut tmp = [[0u32; NEON_BLOCKS]; BLOCK - 1];
+            for g in 0..self.full_blocks() / NEON_BLOCKS {
+                let maxs = self.neon_group::<PAIR>(&mut it, &mut tmp);
+                let dst = &mut out[g * NEON_BLOCKS * BLOCK..(g + 1) * NEON_BLOCKS * BLOCK];
+                transpose_group(&tmp, &maxs, dst);
+            }
+        }
         while let Some((b, base, max, off)) = it.next() {
             let n = self.block_len(b);
             if n == BLOCK && b + 1 < self.nblocks && self.block_len(b + 1) == BLOCK {
@@ -279,7 +294,7 @@ impl Entropic {
     }
 
     /// Number of blocks with [`BLOCK`] postings (all but possibly the last).
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[cfg(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64"))]
     #[inline]
     fn full_blocks(&self) -> usize {
         self.n / BLOCK
@@ -307,9 +322,35 @@ impl Entropic {
         maxs
     }
 
+    /// Decode the next [`NEON_BLOCKS`] blocks of `it` (all full) into
+    /// `tmp` (row `s`: the `s`-th docID of every block); returns their
+    /// maxima.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn neon_group<const PAIR: bool>(
+        &self,
+        it: &mut Blocks<'_>,
+        tmp: &mut [[u32; NEON_BLOCKS]; BLOCK - 1],
+    ) -> [u32; NEON_BLOCKS] {
+        let mut decs = [Decoder::empty(); NEON_BLOCKS];
+        let mut prev = [0u32; NEON_BLOCKS];
+        let mut maxs = [0u32; NEON_BLOCKS];
+        for j in 0..NEON_BLOCKS {
+            let (b, base, max, off) = it.next().unwrap();
+            debug_assert_eq!(self.block_len(b), BLOCK);
+            decs[j] = self.decoder(off, BLOCK);
+            prev[j] = base.wrapping_sub(1);
+            maxs[j] = max;
+        }
+        // SAFETY: every block has BLOCK - 1 gaps; all decoders read this
+        // list's padded data with its table.
+        unsafe { run4::<PAIR>(&mut decs, &prev, self.data.as_ptr(), tmp) };
+        maxs
+    }
+
     /// Set the bit of every posting in `words` (bit `d - 64 · lo_word`).
     fn set_bits(&self, words: &mut [u64], lo_word: usize) {
-        #[allow(unused_mut)] // only the AVX-512 path advances it here
+        #[allow(unused_mut)] // only the AVX-512 and aarch64 paths advance it here
         let mut it = self.blocks();
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         if self.pair {
@@ -328,10 +369,53 @@ impl Entropic {
                 }
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.pair {
+            self.set_bits_neon::<true>(&mut it, words, lo_word)
+        } else {
+            self.set_bits_neon::<false>(&mut it, words, lo_word)
+        }
         if self.pair {
             self.set_bits_rest::<true>(it, words, lo_word)
         } else {
             self.set_bits_rest::<false>(it, words, lo_word)
+        }
+    }
+
+    /// [`Entropic::set_bits`] for the groups of four full blocks left in
+    /// `it`, with the aarch64 decoder. Two groups at a time, so that eight
+    /// consecutive updates hit different blocks, as with AVX-512.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn set_bits_neon<const PAIR: bool>(&self, it: &mut Blocks<'_>, words: &mut [u64], lo_word: usize) {
+        let mut tmp0 = [[0u32; NEON_BLOCKS]; BLOCK - 1];
+        let mut tmp1 = [[0u32; NEON_BLOCKS]; BLOCK - 1];
+        let groups = self.full_blocks() / NEON_BLOCKS;
+        for _ in 0..groups / 2 {
+            let maxs0 = self.neon_group::<PAIR>(it, &mut tmp0);
+            let maxs1 = self.neon_group::<PAIR>(it, &mut tmp1);
+            for (row0, row1) in tmp0.iter().zip(tmp1.iter()) {
+                for &d in row0 {
+                    set_bit(words, lo_word, d);
+                }
+                for &d in row1 {
+                    set_bit(words, lo_word, d);
+                }
+            }
+            for &d in maxs0.iter().chain(&maxs1) {
+                set_bit(words, lo_word, d);
+            }
+        }
+        if groups % 2 == 1 {
+            let maxs = self.neon_group::<PAIR>(it, &mut tmp0);
+            for row in tmp0.iter() {
+                for &d in row {
+                    set_bit(words, lo_word, d);
+                }
+            }
+            for &d in &maxs {
+                set_bit(words, lo_word, d);
+            }
         }
     }
 
@@ -746,6 +830,35 @@ fn transpose_group(tmp: &[[u32; SIMD_BLOCKS]; BLOCK - 1], maxs: &[u32; SIMD_BLOC
     }
 }
 
+/// Write a group decoded by [`Entropic::neon_group`] (transposed, plus the
+/// blocks' maxima) to `dst`, block after block: LD4 de-interleaves four
+/// rows into four blocks' runs of four docIDs.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn transpose_group(tmp: &[[u32; NEON_BLOCKS]; BLOCK - 1], maxs: &[u32; NEON_BLOCKS], dst: &mut [u32]) {
+    use core::arch::aarch64::*;
+    assert_eq!(dst.len(), NEON_BLOCKS * BLOCK);
+    let full = (BLOCK - 1) & !3;
+    for s in (0..full).step_by(4) {
+        // SAFETY: rows s..s + 4 exist, and each store stays in its block
+        // (s + 4 <= BLOCK - 1).
+        unsafe {
+            let c = vld4q_u32((tmp.as_ptr() as *const u32).add(NEON_BLOCKS * s));
+            let o = dst.as_mut_ptr().add(s);
+            vst1q_u32(o, c.0);
+            vst1q_u32(o.add(BLOCK), c.1);
+            vst1q_u32(o.add(2 * BLOCK), c.2);
+            vst1q_u32(o.add(3 * BLOCK), c.3);
+        }
+    }
+    for (j, blk) in dst.chunks_exact_mut(BLOCK).enumerate() {
+        for (x, row) in blk[full..].iter_mut().zip(&tmp[full..]) {
+            *x = row[j];
+        }
+        blk[BLOCK - 1] = maxs[j];
+    }
+}
+
 thread_local! {
     static CANDIDATES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     static BITMAP: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
@@ -828,13 +941,32 @@ mod tests {
     }
 
     /// Lists exercising every decode path: the eight-block AVX-512 decoder
-    /// (pair-safe lists with at least eight full blocks), the two-block and
-    /// single-block scalar decoders, lists that need a refill per symbol
-    /// (gaps of 2^20 and more), and all three model kinds.
+    /// (pair-safe lists with at least eight full blocks), the four-block
+    /// aarch64 decoder (lists with at least four full blocks, alone or in
+    /// pairs of groups for unions), the two-block and single-block scalar
+    /// decoders, lists that need a refill per symbol (gaps of 2^20 and
+    /// more), and all three model kinds.
     fn path_lists() -> Vec<(Vec<u32>, u32)> {
         let mut rng = StdRng::seed_from_u64(77);
         let mut out = Vec::new();
-        for n in [1usize, 2, 3, 127, 128, 129, 255, 1000, 1024 + 5, 8 * 128, 8 * 128 + 1, 17 * 128 + 3, 60_000] {
+        for n in [
+            1usize,
+            2,
+            3,
+            127,
+            128,
+            129,
+            255,
+            4 * 128 - 1,
+            4 * 128,
+            1000,
+            1024 + 5,
+            8 * 128,
+            8 * 128 + 1,
+            12 * 128 + 2,
+            17 * 128 + 3,
+            60_000,
+        ] {
             // Runs and short jumps (clustered), uniform, and huge gaps.
             let mut d = 0u32;
             let runs: Vec<u32> = (0..n)
@@ -844,6 +976,8 @@ mod tests {
                 })
                 .collect();
             out.push((runs, d + 1));
+            // All gaps zero (symbols without state or raw bits).
+            out.push(((5..5 + n as u32).collect(), n as u32 + 5));
             let u = (n as u32).saturating_mul(50).max(64);
             out.push((conformance::random_sorted(&mut rng, n, u), u));
             if n <= 2000 {
@@ -855,15 +989,41 @@ mod tests {
                     })
                     .collect();
                 out.push((huge, u32::MAX));
+                // Runs broken by rare jumps of up to 2^31 / n.
+                let mut d = 0u32;
+                let jumps: Vec<u32> = (0..n)
+                    .map(|i| {
+                        d += if i % 97 == 96 { rng.gen_range(1..1 << 31) / n as u32 } else { 1 };
+                        d
+                    })
+                    .collect();
+                out.push((jumps, d + 1));
             }
+        }
+        out
+    }
+
+    /// Every block decoded on its own by the scalar decoder.
+    fn scalar_decode(l: &Entropic) -> Vec<u32> {
+        let mut out = vec![0u32; l.n];
+        for (b, base, max, off) in l.blocks() {
+            let n = l.block_len(b);
+            let o = &mut out[b * BLOCK..b * BLOCK + n];
+            if n > 1 {
+                // SAFETY: the block has n - 1 coded gaps.
+                unsafe { l.decoder(off, n).block::<false>(base.wrapping_sub(1), &mut o[..n - 1]) };
+            }
+            o[n - 1] = max;
         }
         out
     }
 
     #[test]
     fn decode_paths_agree() {
+        let mut last: Option<(Vec<u32>, u32)> = None;
         for (docs, universe) in path_lists() {
             let l = Entropic::build(&docs, universe);
+            assert!(scalar_decode(&l) == docs, "scalar, n={}", docs.len());
             let mut out = vec![1, 2, 3];
             l.decode_into(&mut out);
             assert_eq!(&out[..3], &[1, 2, 3]);
@@ -887,6 +1047,18 @@ mod tests {
             let mut i = Vec::new();
             Entropic::intersect(&[&l, &h], &mut i);
             assert!(i == half, "intersect, n={}", docs.len());
+            // Union with the previous list (another length and gap structure).
+            if let Some((prev, prev_universe)) = &last {
+                let u = universe.max(*prev_universe);
+                let (a, b) = (Entropic::build(&docs, u), Entropic::build(prev, u));
+                let mut want: Vec<u32> = docs.iter().chain(prev).copied().collect();
+                want.sort_unstable();
+                want.dedup();
+                let mut got = Vec::new();
+                Entropic::union(&[&a, &b], &mut got);
+                assert!(got == want, "union of two, n={} and {}", docs.len(), prev.len());
+            }
+            last = Some((docs, universe));
         }
     }
 
