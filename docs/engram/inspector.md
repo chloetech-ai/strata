@@ -10,6 +10,8 @@ nav_order: 1
 A local web app for watching Engram work. You chat with Claude Code in a scratch project, and as each turn runs you see what the hooks store, what the distiller writes down and what recall injects. Every panel is a query against the project's Strata file, made through the same daemon the hooks talk to. Nothing is simulated: chat turns are real `claude -p` runs.
 {: .fs-5 .fw-300 }
 
+[Try it in your browser](../demo/inspector.html){: .btn .btn-primary } A static copy replays a recorded session. Its SQL runs in a JavaScript model of Strata over the recorded records and vectors.
+
 1. TOC
 {:toc}
 
