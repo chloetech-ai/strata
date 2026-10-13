@@ -1,0 +1,1202 @@
+<title>Posting List Codec Benchmark</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Literata:opsz,wght@7..72,500;7..72,600&display=swap">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] },
+    svg: { fontCache: "global" },
+    options: { enableMenu: false }
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.min.js" defer></script>
+<style>
+/* Layout: one reading column (~68ch) with figures that break out wider; numbers in mono. */
+:root {
+  --bg: #f4f6f9;
+  --surface: #ffffff;
+  --ink: #141922;
+  --ink-2: #485164;
+  --ink-3: #737c8f;
+  --rule: #dce1ea;
+  --grid: #e8ecf2;
+  --accent: #1d5bd6;
+  --accent-soft: #e4ecfc;
+  --warm: #c2410c;
+  --warm-soft: #fdebe1;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --display: "Literata", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1218; --surface: #171b23; --ink: #e8ebf1; --ink-2: #b3bac8; --ink-3: #8a93a5;
+    --rule: #2a303c; --grid: #222833; --accent: #7aa5ff; --accent-soft: #1b2944; --warm: #f2955b; --warm-soft: #3a2418;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1218; --surface: #171b23; --ink: #e8ebf1; --ink-2: #b3bac8; --ink-3: #8a93a5;
+  --rule: #2a303c; --grid: #222833; --accent: #7aa5ff; --accent-soft: #1b2944; --warm: #f2955b; --warm-soft: #3a2418;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 16px/1.62 var(--body); }
+.page { max-width: 1120px; margin: 0 auto; padding-inline: 20px; padding-block: 40px 80px; }
+.col { max-width: 720px; margin-inline: auto; }
+h1, h2, h3 { font-family: var(--display); font-weight: 600; text-wrap: balance; line-height: 1.2; color: var(--ink); }
+h1 { font-size: clamp(2rem, 4.6vw, 3.05rem); margin: 0.2em 0 0.35em; letter-spacing: -0.01em; }
+h2 { font-size: 1.7rem; margin: 2.6em 0 0.5em; padding-top: 0.9em; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.22rem; margin: 1.8em 0 0.4em; font-weight: 500; }
+p, li { color: var(--ink); }
+p { margin: 0 0 1em; }
+.lede { font-size: 1.13rem; color: var(--ink-2); }
+.eyebrow { font: 500 0.78rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.meta { font: 0.86rem/1.5 var(--mono); color: var(--ink-3); }
+a { color: var(--accent); }
+code, .mono { font-family: var(--mono); font-size: 0.88em; }
+code { background: var(--accent-soft); padding: 0.05em 0.35em; border-radius: 4px; }
+.num { font-variant-numeric: tabular-nums; }
+ul, ol { padding-left: 1.3em; }
+li { margin: 0.25em 0; }
+strong { font-weight: 600; }
+
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 28px 0 8px; }
+.finding { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px; min-width: 0; }
+.finding .k { font: 500 0.74rem/1.2 var(--mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--ink-3); }
+.finding .v { font: 600 1.55rem/1.2 var(--body); margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
+.finding p { font-size: 0.92rem; color: var(--ink-2); margin: 0; }
+
+.toc { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 18px 0 0; padding: 0; list-style: none; font-size: 0.92rem; }
+.toc a { color: var(--ink-2); text-decoration: none; border-bottom: 1px solid var(--rule); }
+.toc a:hover, .toc a:focus-visible { color: var(--accent); border-color: var(--accent); }
+
+figure { margin: 28px auto; max-width: 1000px; }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); gap: 18px; max-width: 1080px; margin: 10px auto; }
+.pair figure { margin: 8px 0; max-width: none; min-width: 0; }
+figure.narrow { max-width: 760px; }
+.frame { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 18px 18px 12px; overflow-x: auto; position: relative; }
+figcaption { font-size: 0.9rem; color: var(--ink-2); margin-top: 10px; max-width: 720px; margin-inline: auto; }
+figcaption b { color: var(--ink); font-weight: 600; }
+.chart-title { font: 600 0.98rem/1.3 var(--body); margin: 0 0 2px; }
+.chart-sub { font-size: 0.85rem; color: var(--ink-3); margin: 0 0 10px; }
+.chart { width: 100%; min-height: 120px; }
+
+.math { overflow-x: auto; overflow-y: hidden; margin: 14px 0 18px; padding: 6px 0; }
+mjx-container[display="true"] { display: block; max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.defs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 0.95rem; margin: 10px 0 18px; }
+.defs dt { font-family: var(--mono); font-size: 0.86rem; color: var(--ink-2); }
+.defs dd { margin: 0; min-width: 0; }
+
+.codecs { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin: 18px 0; }
+.codec { border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; background: var(--surface); min-width: 0; }
+.codec h4 { margin: 0 0 4px; font: 600 0.98rem/1.3 var(--body); }
+.codec p { margin: 0; font-size: 0.88rem; color: var(--ink-2); }
+.tag { display: inline-block; font: 500 0.7rem/1 var(--mono); padding: 3px 6px; border-radius: 4px; border: 1px solid var(--rule); color: var(--ink-3); margin-left: 6px; vertical-align: 2px; }
+
+.table-wrap { overflow-x: auto; margin: 14px 0; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+th, td { padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { font: 600 0.76rem/1.3 var(--mono); letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); background: var(--surface); position: sticky; top: 0; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 0.84rem; }
+tr:last-child td { border-bottom: none; }
+td.best { color: var(--accent); font-weight: 600; }
+td.strong { font-weight: 600; }
+.wide { max-width: 1000px; margin-inline: auto; }
+.algo { color: var(--ink-3); font-size: 0.8rem; }
+details { margin: 14px 0; }
+summary { cursor: pointer; color: var(--accent); font-weight: 500; }
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+
+.callout { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 18px 0; }
+.callout p:last-child { margin: 0; }
+
+/* Diagrams */
+svg text { font-family: var(--body); }
+.dg .box { fill: var(--surface); stroke: var(--rule); stroke-width: 1.2; }
+.dg .box-acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+.dg .box-warm { fill: var(--warm-soft); stroke: var(--warm); stroke-width: 1.2; }
+.dg .t { fill: var(--ink); font-size: 12.5px; }
+.dg .tm { fill: var(--ink); font-family: var(--mono); font-size: 12px; }
+.dg .tl { fill: var(--ink-2); font-size: 12px; }
+.dg .ts { fill: var(--ink-3); font-size: 11px; }
+.dg .tb { fill: var(--ink); font-size: 12.5px; font-weight: 600; }
+.dg .ln { stroke: var(--ink-3); stroke-width: 1.2; fill: none; }
+.dg .ln-acc { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+.dg .ln-warm { stroke: var(--warm); stroke-width: 1.6; fill: none; }
+.dg .dot { fill: var(--ink-2); }
+.dg .dot-acc { fill: var(--accent); }
+.dg .band { fill: var(--accent-soft); }
+.dg .axis { stroke: var(--rule); stroke-width: 1.5; }
+.dg .ah { fill: var(--accent); }
+.dg .ahm { fill: var(--ink-3); }
+
+/* Charts */
+.ch .grid { stroke: var(--grid); stroke-width: 1; }
+.ch .axis { stroke: var(--rule); stroke-width: 1; }
+.ch text { fill: var(--ink-3); font: 11.5px var(--body); }
+.ch text.lab { fill: var(--ink-2); font-size: 12px; }
+.ch text.lab-strong { fill: var(--ink); font-size: 12px; font-weight: 600; }
+.ch text.axis-title { fill: var(--ink-2); font-size: 12px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.84rem; color: var(--ink-2); margin: 4px 0 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { display: inline-block; width: 16px; height: 3px; border-radius: 2px; }
+.legend i.sq { width: 10px; height: 10px; border-radius: 3px; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 8px 10px; font-size: 0.82rem; box-shadow: 0 6px 20px rgba(10, 20, 40, 0.14); min-width: 140px; max-width: 280px; z-index: 5; }
+.tip b { font-variant-numeric: tabular-nums; }
+.tip .row { display: flex; align-items: center; gap: 6px; }
+.tip .row i { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+.tip .h { color: var(--ink-3); font-size: 0.76rem; margin-bottom: 3px; }
+
+.repro pre { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; overflow-x: auto; font: 0.84rem/1.55 var(--mono); }
+footer { margin-top: 60px; color: var(--ink-3); font-size: 0.85rem; }
+@media (max-width: 560px) {
+  body { font-size: 15px; }
+  .page { padding-inline: 16px; }
+  .frame { padding: 12px 10px 8px; }
+  .defs { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .toc a, summary { transition: color 0.15s; }
+}
+</style>
+
+<div class="page">
+<header class="col">
+  <div class="eyebrow">posting_bench · experiment report</div>
+  <h1>Intersecting and merging compressed posting lists</h1>
+  <p class="lede">I implemented 13 posting-list representations and 20 intersection and union algorithms in Rust, built a testbed that checks every query result before it is timed, and ran them on synthetic and real collections. This page explains each technique with its formulas and layout, then reports what was measured.</p>
+  <p class="meta" id="meta-line"></p>
+  <div class="findings" id="findings">
+    <div class="finding"><div class="k">Fastest AND and OR</div><div class="v">Roaring</div><p>0.030 ms AND and 0.57 ms OR on the clustered collection, 1.5× and 5× faster than PEF, at 1.9× its size.</p></div>
+    <div class="finding"><div class="k">Best balance</div><div class="v">PEF · 4.9 bits</div><p>The smallest codec, or within 1% of it, on all three collections, and 1.5× Roaring's AND time on the clustered one.</p></div>
+    <div class="finding"><div class="k">Skip, don't decode</div><div class="v">4–18×</div><p>Rarest-first leapfrog with NextGEQ against decoding every list and intersecting arrays.</p></div>
+    <div class="finding"><div class="k">SIMD crossover</div><div class="v">≈ 1 : 24</div><p>SIMD block merge is 4.4× faster than a scalar merge on equal lists; galloping wins beyond this size ratio.</p></div>
+  </div>
+  <ul class="toc">
+    <li><a href="#problem">The problem</a></li>
+    <li><a href="#testbed">Testbed</a></li>
+    <li><a href="#codecs">Representations</a></li>
+    <li><a href="#algorithms">Algorithms</a></li>
+    <li><a href="#setup">Setup</a></li>
+    <li><a href="#results">Results</a></li>
+    <li><a href="#takeaways">Takeaways</a></li>
+    <li><a href="#reproduce">Reproduce</a></li>
+  </ul>
+</header>
+
+<section class="col" id="problem">
+  <h2>The problem</h2>
+  <p>An inverted index maps every term \(t\) to its <em>posting list</em> \(\mathcal{L}_t\): the strictly increasing docIDs of the documents that contain it, drawn from a universe of \(u\) documents. A query \(q = \{t_1, \dots, t_k\}\) is answered with set operations over the lists:</p>
+  <div class="math">\[ \mathrm{AND}(q) = \bigcap_{i=1}^{k} \mathcal{L}_{t_i}, \qquad \mathrm{OR}(q) = \bigcup_{i=1}^{k} \mathcal{L}_{t_i}, \qquad \mathcal{L}_t \subseteq [0, u),\ n_t = |\mathcal{L}_t| . \]</div>
+  <p>Lists are stored compressed, so the representation decides both the index size and how cheaply a list can be scanned (<code>next</code>) or skipped through (<code>NextGEQ(x)</code>, the first posting \(\ge x\)). For two lists with \(m \le n\) postings, any comparison-based intersection must distinguish all interleavings of the two lists, which gives the lower bound</p>
+  <div class="math">\[ \log_2 \binom{n+m}{m} \;=\; m \log_2 \frac{n}{m} + O(m) \ \text{comparisons}, \]</div>
+  <p>so when the lists differ a lot in size, a good algorithm touches only a small part of the longer list. Union is different: its output alone has up to \(N = \sum_i n_i\) elements, so the work is dominated by sequential decoding and by how cheaply the results can be merged.</p>
+  <p>The two figures of merit used throughout are space and query time:</p>
+  <div class="math">\[ \text{bits/posting} = \frac{\sum_t \lvert \mathrm{enc}(\mathcal{L}_t) \rvert}{\sum_t n_t}, \qquad \text{ms/query} = \min_{r \in \text{reps}} \frac{T_r}{|Q|} . \]</div>
+  <p>\(\lvert \mathrm{enc}(\cdot) \rvert\) counts payload plus every skip pointer, directory and header needed at query time, which is what a serialized index would occupy. \(T_r\) is the wall-clock time of repetition \(r\) over the whole query log \(Q\).</p>
+</section>
+
+<section class="col" id="testbed">
+  <h2>The testbed</h2>
+  <p>The crate is organised around three traits. Every representation implements <code>PostingList</code> (build, size, decode). Representations that can be iterated with skipping implement <code>CursorList</code>, whose cursor exposes <code>docid()</code>, <code>next()</code> and <code>next_geq(x)</code>. Representations with their own multi-list algorithms (Roaring, tries, the hybrid index) also implement <code>SetOps</code>. The harness runs every applicable algorithm on every representation, so each codec is measured both through the generic cursor interface and through its native operations.</p>
+  <figure class="narrow">
+    <div class="frame">
+<pre class="mermaid">
+flowchart LR
+  S["Synthetic generator<br/>ds2i/PISA .docs<br/>text, 1 doc per line"] --> C["Collection<br/>posting lists over [0, u)"]
+  C --> Q["Query log<br/>co-occurring terms"]
+  C --> B["Build 13 codecs"]
+  Q --> R["Reference results<br/>SvS + heap on raw lists"]
+  B --> A["Run every AND / OR<br/>algorithm per codec"]
+  A --> V{"Length + hash<br/>match reference?"}
+  R --> V
+  V -- yes --> T["Time best of 3 passes"]
+  V -- no --> X["Abort with query id"]
+  T --> O["Markdown + JSON"]
+</pre>
+    </div>
+    <figcaption><b>Measurement pipeline.</b> Each algorithm first runs once over the whole query log, and every result is compared with a reference by length and an order-sensitive hash. Only then is it timed. Correctness is also covered by 56 unit and property tests, including a shared conformance suite that every codec passes.</figcaption>
+  </figure>
+</section>
+
+<section class="col" id="codecs">
+  <h2>Representations</h2>
+  <p>The 13 representations fall into four families. All lists in a query share one universe, and every docID is below \(2^{32}-1\), which the cursors use as the end-of-list sentinel.</p>
+</section>
+<div class="wide" id="codec-cards"></div>
+<section class="col">
+
+  <h3>Gap coding in blocks: VByte, BP128, OptPFor, interpolative</h3>
+  <p>Block codecs cut a list into blocks of 128 postings. Within a block they code <em>d-gaps</em>, which are small when docIDs are dense, relative to a base \(b\) (the previous block's last docID plus one):</p>
+  <div class="math">\[ g_0 = d_0 - b, \qquad g_i = d_i - d_{i-1} - 1 \quad (1 \le i < 128). \]</div>
+  <p>A skip table stores each block's last docID and byte offset, 64 bits per block, the same as PISA's <code>block_posting_list</code>. <code>NextGEQ</code> gallops over the skip table, decodes one block and binary-searches inside it.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 262" role="img" aria-label="Block layout: docIDs become gaps, gaps are packed in blocks of 128, and a skip table stores each block's last docID and offset">
+        <defs><marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ahm"/></marker></defs>
+        <text x="0" y="35" class="tl">docIDs</text>
+        <text x="0" y="87" class="tl">gaps g<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+        <text x="0" y="152" class="tl">blocks of 128</text>
+        <text x="0" y="230" class="tl">skip table</text>
+        <g id="blk-docs"></g>
+        <rect x="128" y="128" width="210" height="40" rx="5" class="box-acc"/><text x="140" y="145" class="tb">block 0 · b = 5</text><text x="140" y="161" class="ts">header byte + 128 × 5 bits</text>
+        <rect x="346" y="128" width="170" height="40" rx="5" class="box-acc"/><text x="358" y="145" class="tb">block 1 · b = 4</text><text x="358" y="161" class="ts">128 × 4 bits</text>
+        <rect x="524" y="128" width="130" height="40" rx="5" class="box-acc"/><text x="536" y="145" class="tb">block 2 · b = 7</text><text x="536" y="161" class="ts">128 × 7 bits</text>
+        <rect x="662" y="128" width="96" height="40" rx="5" class="box"/><text x="672" y="145" class="tb">tail</text><text x="672" y="161" class="ts">VByte, n &lt; 128</text>
+        <g class="tm">
+          <rect x="128" y="210" width="120" height="30" rx="4" class="box"/><text x="138" y="230" class="tm">max₀ │ off₀</text>
+          <rect x="346" y="210" width="120" height="30" rx="4" class="box"/><text x="356" y="230" class="tm">max₁ │ off₁</text>
+          <rect x="524" y="210" width="120" height="30" rx="4" class="box"/><text x="534" y="230" class="tm">max₂ │ off₂</text>
+          <rect x="662" y="210" width="96" height="30" rx="4" class="box"/><text x="672" y="230" class="tm">max₃ │ off₃</text>
+        </g>
+        <path d="M188 210 V172" class="ln" marker-end="url(#ar1)"/><path d="M406 210 V172" class="ln" marker-end="url(#ar1)"/><path d="M584 210 V172" class="ln" marker-end="url(#ar1)"/><path d="M710 210 V172" class="ln" marker-end="url(#ar1)"/>
+        <text x="128" y="258" class="ts">NextGEQ(x): gallop over maxᵢ to the first block with maxᵢ ≥ x, decode only that block, binary-search in it.</text>
+      </svg>
+    </div>
+    <figcaption><b>Block layout shared by VByte, BP128, OptPFor, interpolative and the bitpacking-crate baseline.</b> Only the coding of the 128 gaps differs between them. The trailing partial block is VByte-coded, as Lucene and Tantivy do.</figcaption>
+  </figure>
+  <dl class="defs">
+    <dt>VByte</dt><dd>7 data bits per byte with a continuation flag: \(8 \lceil w(g)/7 \rceil\) bits per gap, where \(w(g) = \lfloor \log_2 g \rfloor + 1\) is the bit width. Byte-aligned and branchy.</dd>
+    <dt>BP128</dt><dd>Frame of reference: one width \(b = w(\max_i g_i)\) per block, so a block costs \(8 + 128\,b\) bits. Values are packed in SIMD-BP128's vertical 4-lane layout so that unpacking is the same shift and mask on 4 lanes. The code is written lane-wise with a compile-time \(b\), and LLVM vectorises it.</dd>
+    <dt>OptPFor</dt><dd>Patched frame of reference. Gaps wider than \(b\) bits become exceptions, stored as a position byte plus their high part in VByte, and \(b\) is chosen per block to minimise \[ \mathrm{cost}(b) = 16 + 128\,b + \sum_{g_i \ge 2^b} \Bigl(8 + 8 \Bigl\lceil \tfrac{w(g_i) - b}{7} \Bigr\rceil\Bigr) \ \text{bits}. \]</dd>
+    <dt>Interpolative</dt><dd>Binary interpolative coding (Moffat &amp; Stuiver). The middle element \(d_m\) of a range \([\ell, r]\) holding \(n\) values is coded in the range it can actually occupy, then both halves recurse: \[ d_m \in [\,\ell + m,\ r - (n - 1 - m)\,] \;\Rightarrow\; \lceil \log_2 (r - \ell - n + 2) \rceil \ \text{bits}. \] A run of consecutive docIDs costs zero bits.</dd>
+  </dl>
+
+  <h3>Elias-Fano and partitioned Elias-Fano</h3>
+  <p>Elias-Fano splits each value into \(\ell\) low bits, stored verbatim, and a high part, stored in unary in a bitvector. Element \(i\) with high part \(h_i\) sets bit \(h_i + i\):</p>
+  <div class="math">\[ \ell = \Bigl\lfloor \log_2 \frac{u}{n} \Bigr\rfloor, \qquad \text{bits} = \underbrace{n\,\ell}_{\text{low}} + \underbrace{n + \lfloor u / 2^{\ell} \rfloor + 1}_{\text{high}} \;\le\; n \Bigl( 2 + \Bigl\lceil \log_2 \frac{u}{n} \Bigr\rceil \Bigr). \]</div>
+  <p>Bucket \(h\) of the high bits starts right after the \(h\)-th zero, so <code>NextGEQ(x)</code> jumps to \(\mathrm{select}_0(\lfloor x / 2^{\ell} \rfloor - 1) + 1\) without decoding anything before it. The implementation samples every 256th zero to answer \(\mathrm{select}_0\) in constant time, and scans instead when the target is within a few buckets, as PISA does.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 250" role="img" aria-label="Elias-Fano example with eight values in a universe of 32: two low bits per value and a 16-bit unary high-bits vector">
+        <text x="0" y="28" class="tl">values</text>
+        <text x="0" y="62" class="tl">high │ low</text>
+        <text x="0" y="132" class="tl">high bits</text>
+        <text x="0" y="148" class="ts">(unary buckets)</text>
+        <text x="0" y="214" class="tl">low bits</text>
+        <g id="ef-values"></g>
+        <g id="ef-high"></g>
+        <g id="ef-low"></g>
+        <text x="130" y="246" class="ts">n = 8, u = 32 → ℓ = ⌊log₂ 4⌋ = 2. High 16 bits + low 16 bits = 32 bits = 4 bits/value = 2 + ⌈log₂(u/n)⌉.</text>
+      </svg>
+    </div>
+    <figcaption><b>Elias-Fano on {3, 4, 7, 13, 14, 15, 21, 31}.</b> Bucket \(h\) holds one 1 per value whose high part is \(h\), followed by a 0. To find the first value \(\ge 20\), jump to bucket \(5 = \lfloor 20/4 \rfloor\) with \(\mathrm{select}_0(4) + 1\) and compare low bits there.</figcaption>
+  </figure>
+  <p>Plain Elias-Fano ignores clustering: its size depends only on \(u\) and \(n\). Partitioned Elias-Fano (Ottaviano &amp; Venturini) cuts the list into partitions and codes each one relative to its own base with the cheapest of three encodings: a full run (no payload), a bitvector over the partition's range, or Elias-Fano over that range. The partitions are chosen by dynamic programming over boundaries every 32 postings:</p>
+  <div class="math">\[ C(j) = \min_{\substack{i < j \\ j - i \le 4096}} \Bigl[\, C(i) + 64 + \min\bigl\{ \mathrm{EF}(i, j),\ \underbrace{d_{j-1} - d_{i-1}}_{\text{bitvector}},\ \underbrace{0}_{\text{if a run}} \bigr\} \Bigr], \]</div>
+  <p>where 64 bits pays for the partition's entry in the upper level (last docID and descriptor), the fixed cost PISA uses.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 175" role="img" aria-label="Partitioned Elias-Fano: a list split into a run partition, Elias-Fano partitions and a bitvector partition">
+        <g id="pef-parts"></g>
+        <line x1="40" y1="128" x2="740" y2="128" class="axis"/>
+        <text x="40" y="148" class="ts">0</text><text x="740" y="148" class="ts" text-anchor="end">u</text>
+        <text x="390" y="168" class="ts" text-anchor="middle">docID →   each partition is coded relative to the previous partition's last docID</text>
+      </svg>
+    </div>
+    <figcaption><b>Partitioned Elias-Fano.</b> Dense stretches become runs or bitvectors and sparse stretches keep Elias-Fano, so clustered lists shrink well below the plain Elias-Fano bound.</figcaption>
+  </figure>
+
+  <h3>Roaring bitmaps</h3>
+  <p>Roaring partitions the <em>universe</em> rather than the list. The high 16 bits of a docID select a chunk; the low 16 bits go into that chunk's container, whichever of three is smallest:</p>
+  <div class="math">\[ \text{array: } 16\,c \ \text{bits}, \qquad \text{bitmap: } 2^{16} \ \text{bits}, \qquad \text{run: } 16 + 32\,r \ \text{bits}, \]</div>
+  <p>for \(c\) values in \(r\) runs; arrays switch to bitmaps at \(c = 4096\), where \(16c = 2^{16}\). Because every list uses the same chunk boundaries, AND and OR proceed chunk by chunk with container-pair kernels and need no <code>NextGEQ</code> per element:</p>
+  <ul>
+    <li>array ∩ array: SSE4.2 <code>pcmpistrm</code> all-pairs compare (CRoaring's <code>intersect_vector16</code>), or galloping when one side is more than 64× larger;</li>
+    <li>bitmap ∩ bitmap: word AND with popcount;</li>
+    <li>array ∩ bitmap: bit probes;</li>
+    <li>union: a k-way merge over keys that ORs dense chunks into one bitmap and counts it once at the end.</li>
+  </ul>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 236" role="img" aria-label="Roaring: the high 16 bits of a docID select a key and the low 16 bits are stored in an array, bitmap or run container">
+        <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ahm"/></marker></defs>
+        <rect x="190" y="10" width="190" height="34" rx="5" class="box-acc"/><text x="285" y="32" class="tb" text-anchor="middle">high 16 bits → key</text>
+        <rect x="380" y="10" width="190" height="34" rx="5" class="box"/><text x="475" y="32" class="tb" text-anchor="middle">low 16 bits → container</text>
+        <text x="180" y="32" class="tl" text-anchor="end">docID (32 bits)</text>
+        <g id="roar-keys"></g>
+      </svg>
+    </div>
+    <figcaption><b>Roaring layout.</b> The sorted key array is searched only when an operation leaves the current chunk. Intersection keeps intermediate results as containers, smallest list first, and stops as soon as a result is empty.</figcaption>
+  </figure>
+
+  <h3>Compact binary tries</h3>
+  <p>Arroyuelo &amp; Castillo (CPM 2023) store a set as the binary trie of height \(h = \lceil \log_2 u \rceil\) that spells every docID most significant bit first. Each node contributes two bits, "left child present" and "right child present", and the bits of a level form a bitvector \(B_\ell\) with rank support. Children are found by counting ones:</p>
+  <div class="math">\[ \mathrm{left}(i) = \mathrm{rank}_1(B_\ell, 2i), \qquad \mathrm{right}(i) = \mathrm{rank}_1(B_\ell, 2i + 1). \]</div>
+  <p>Intersection walks all \(k\) tries in lockstep and ANDs the 2-bit codes at each node, so a subtree missing from any input is pruned immediately. This runs in \(O(k\,\delta \log(u/\delta))\) time, where \(\delta\) is the alternation: the size of the smallest certificate that proves the result. DocIDs that are close share their upper paths, so clustered lists need few nodes. The run-compressed variant (Run-Trie) cuts every full subtree and codes its root as <code>00</code>.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 290" role="img" aria-label="Binary trie of the set 2, 3, 9, 12, 13 in a universe of 16, with each node's 2-bit code and the level bitvectors">
+        <g id="trie-tree"></g>
+        <g id="trie-levels"></g>
+      </svg>
+    </div>
+    <figcaption><b>Trie of {2, 3, 9, 12, 13} with \(u = 16\).</b> 18 bits encode 5 values here. With dense or clustered docIDs the cost per value falls fast, because sibling values share every node above them. The highlighted node (prefix <span class="mono">10</span>, node 1 of level 2) has code <span class="mono">10</span>: only a left child, which is node \(\mathrm{rank}_1(B_2, 2) = 1\) of level 3.</figcaption>
+  </figure>
+
+  <h3>Hybrid bitmap + list index</h3>
+  <p>Culpepper &amp; Moffat's hybrid stores a list as a plain bitmap of \(u\) bits when it is dense, \(u / n \le 8\) (at most 8 bits per posting), and as BP128 otherwise. Conjunctions intersect only the sparse lists, rarest first, and then filter every candidate with \(O(1)\) bit probes. Lucene 10.2 uses the same idea per block, storing dense blocks as bitsets.</p>
+</section>
+
+<section class="col" id="algorithms">
+  <h2>Algorithms</h2>
+  <h3>Two sorted arrays</h3>
+  <dl class="defs">
+    <dt>merge</dt><dd>Two pointers, \(m + n\) comparisons. The branch-free variant derives both pointer increments from the comparison result.</dd>
+    <dt>binary search</dt><dd>Search each element of the short list in the rest of the long list: \(m \log_2 n\).</dd>
+    <dt>galloping</dt><dd>Exponential search from the last position, probing 1, 2, 4, … steps ahead, then a binary search: at most \(2 \sum_i \log_2(g_i + 1) \le 2m \log_2(n/m + 1)\) comparisons, which matches the lower bound up to a constant.</dd>
+    <dt>Baeza-Yates</dt><dd>Binary-search the median of the short list in the long list, then recurse on both sides: \(O(m \log(n/m))\) on average.</dd>
+    <dt>SIMD block merge</dt><dd>Compare a block of \(W\) values from each list all-against-all with \(W\) vector compares against rotations of one block, compact the matches, and advance the block with the smaller maximum. Kernels for SSE (\(W = 4\)), AVX2 (\(W = 8\)) and AVX-512 (\(W = 16\), which emulates <code>VP2INTERSECT</code>).</dd>
+    <dt>adaptive</dt><dd>SIMD block merge when \(n/m \le 64\), galloping beyond, which is CRoaring's switch point.</dd>
+  </dl>
+  <figure class="narrow">
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 720 236" role="img" aria-label="SIMD 4 by 4 intersection: a block of a is compared with four rotations of a block of b">
+        <g id="simd-grid"></g>
+      </svg>
+    </div>
+    <figcaption><b>SSE 4×4 step.</b> Four compares cover all 16 pairs. The OR of the lane masks (<span class="mono">1001₂</span>) indexes a shuffle table that packs the matches into the output, and both pointers advance because \(a_3 = b_3\).</figcaption>
+  </figure>
+
+  <h3>k lists</h3>
+  <dl class="defs">
+    <dt>SvS</dt><dd>Set versus set: sort by length and intersect the two shortest lists, then intersect the running result with each next list. Barbay et al. and Culpepper &amp; Moffat found it the fastest in practice.</dd>
+    <dt>Small Adaptive</dt><dd>Demaine, López-Ortiz &amp; Munro: take the next element of the currently shortest list and gallop for it in the others, re-sorting by remaining length.</dd>
+    <dt>Sequential</dt><dd>Barbay &amp; Kenyon's round-robin eliminator, optimal for the alternation measure: \(\Theta\bigl(\delta \sum_i \log (n_i / \delta)\bigr)\) comparisons.</dd>
+    <dt>leapfrog</dt><dd>The cursor form of SvS used by PISA and Lucene: the rarest list proposes a candidate and every other cursor calls <code>NextGEQ</code>. A miss makes the larger docID the new candidate.</dd>
+    <dt>round-robin</dt><dd>Leapfrog Triejoin's unary case: cursors take turns seeking to the current maximum.</dd>
+    <dt>decode + SvS</dt><dd>Decode every list completely, then intersect the arrays (Lemire et al.).</dd>
+  </dl>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 214" role="img" aria-label="Leapfrog intersection of three lists: candidates jump between lists with NextGEQ until all three agree on 40 and 77">
+        <defs><marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker></defs>
+        <g id="leap"></g>
+      </svg>
+    </div>
+    <figcaption><b>Leapfrog on three lists.</b> The arrows are <code>NextGEQ</code> calls: 3 → 5 → 12 → 15 → 40, which all three lists contain, then 41 → 60 → 77. Postings between the jump targets are skipped, and for a block codec whole blocks are never decoded.</figcaption>
+  </figure>
+  <h3>Union</h3>
+  <dl class="defs">
+    <dt>heap</dt><dd>k-way merge with a binary heap of cursors: \(O(N \log k)\).</dd>
+    <dt>min-scan</dt><dd>Scan all cursors for the minimum at every step (PISA's <code>or_query</code>): \(O(N k)\), but branch-friendly for small \(k\).</dd>
+    <dt>bitset window</dt><dd>Lucene's <code>BooleanScorer</code>: drain every cursor into a 4096-docID bitset, then scan the window's 64 words.</dd>
+    <dt>fold, bitmap</dt><dd>On uncompressed arrays: pairwise merges smallest first, or set bits in a bitmap spanning \([\min, \max]\) and scan it.</dd>
+  </dl>
+</section>
+
+<section class="col" id="setup">
+  <h2>Experimental setup</h2>
+</section>
+<div class="wide" id="setup-table"></div>
+<section class="col">
+  <p>The <b>clustered</b> collection mimics an index whose docIDs were reordered by URL or topic, the setting where modern indexes operate. The docID space is split into 1000 topic regions; each term draws 85% of its postings from a few preferred regions, in runs of about 4 consecutive documents, and the rest uniformly. The <b>uniform</b> collection uses the same list lengths with random docIDs, like an index in crawl order. <b>WikiText-103</b> is real text: every paragraph of the training split is a document, in corpus order, so the paragraphs of one article are adjacent.</p>
+  <p>List lengths follow Zipf's law (\(n_r \approx n_1 / r\)). Queries take 2 to 4 terms that co-occur in a randomly sampled document, so conjunctions are rarely empty, as for real queries. Every measurement is the best of 3 timed passes over the whole query log, single-threaded, after a verified warm-up pass.</p>
+</section>
+
+<section id="results">
+  <div class="col"><h2>Results</h2></div>
+  <div class="col">
+  <h3 id="r-tradeoff">Space against speed on a reordered index</h3>
+  <p>On the clustered collection the 500 queries average 2.8 terms and touch 576,000 postings each; a conjunction returns 309 documents and a disjunction 563,000. The charts plot each codec's size on the query lists against its fastest algorithm; blue points are Pareto-optimal (nothing else is both smaller and faster).</p>
+  <ul>
+    <li><b>The AND frontier has three members.</b> It runs from interpolative coding (4.90 bits per posting, 0.18 ms) through PEF (4.94 bits, 0.046 ms) to Roaring (9.32 bits, 0.030 ms). PEF is within 1% of interpolative coding's size but 3.9× faster, because its <code>NextGEQ</code> is a select over the high bits instead of a block decode.</li>
+    <li><b>Roaring buys speed with space.</b> It is 1.5× faster than PEF for AND and 5× faster for OR (0.57 against 2.84 ms), at 1.9× the size. Pibiri &amp; Venturini report 4–8× (AND) and 14–18× (OR) for CRoaring over list codecs at about twice the space; the direction holds here, with smaller gaps on these skewed queries.</li>
+    <li><b>Block codecs sit in the middle.</b> BP128 and the bitpacking crate take 0.072–0.080 ms at 7.69 bits, and OptPFor is about as fast at 5.92 bits, 23% smaller. VByte is 1.7× slower than BP128 with no space advantage. Even uncompressed arrays (0.061 ms) lose to PEF: galloping over 32-bit integers touches more memory than PEF's select jumps.</li>
+    <li><b>Unions are bound by their output.</b> Every list codec needs 2.5–5 ms, that is 4.5–9 ns per output docID, whatever its decoding speed. Only representations that OR whole machine words escape this: Roaring (0.57 ms, about 1 ns per result, or 0.38 ms if it only counts), the hybrid index (1.9 ms) and uncompressed arrays merged through a bitmap (1.86 ms).</li>
+    <li><b>Implementation matters as much as format.</b> With identical containers and size, this crate's Roaring answers AND 2.9× faster than the <code>roaring</code> crate and OR 7.5× faster when docIDs are written out. When both only count, the OR gap shrinks to 1.9×, so most of the crate's union cost is its iterator. In the other direction, the bitpacking crate decodes BP128 blocks faster than my auto-vectorised unpacker (0.42 against 0.66 ns per posting).</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND: index size vs query time</p>
+      <p class="chart-sub">Clustered collection · best algorithm per codec · blue: Pareto frontier</p>
+      <div class="chart" id="clustered-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR: index size vs query time</p>
+      <p class="chart-sub">Clustered collection · best algorithm that outputs docIDs</p>
+      <div class="chart" id="clustered-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="clustered-table"></div>
+
+<div class="col">
+  <h3 id="r-algos">Skipping beats decoding for conjunctions</h3>
+  <p>The tables below give every algorithm's time on every codec (clustered collection; blue marks the fastest per row, not counting the count-only variants).</p>
+  <ul>
+    <li><b>Rarest-first leapfrog is the best cursor conjunction for every codec.</b> Driving the shortest list and calling <code>NextGEQ</code> on the others is 4–18× faster than decoding all lists and intersecting the arrays (39× for the <code>roaring</code> crate, whose decoding goes through a slow iterator). The gap is largest for Elias-Fano and PEF (18×), whose decoding is slower but whose jumps are cheap.</li>
+    <li><b>Round-robin order costs 1.2–1.7×.</b> Leapfrog Triejoin's round-robin seeks waste work when one list is much shorter than the rest, as here; it only won for some two-term queries.</li>
+    <li><b>SIMD loses on real query shapes.</b> On uncompressed arrays, SvS with galloping (0.061 ms) beats SvS with every SIMD kernel by 7.8–10× (0.48–0.63 ms), although SIMD wins by 4.4× on equal-size lists. The size ratios of real queries are large, so the adaptive kernel (0.064 ms) is the safe default. Small Adaptive (0.072 ms) and Sequential (0.105 ms) come close but never beat SvS, which is Barbay et al.'s experimental finding.</li>
+    <li><b>Union algorithms:</b> Lucene's bitset window or PISA's min-scan is the fastest cursor union for every codec, 1.2–1.7× faster than a heap of cursors. Native operations beat any cursor union: 5.2× for Roaring and 2.5× for the hybrid index.</li>
+  </ul>
+</div>
+<div class="wide">
+  <p class="chart-title">AND, ms per query, by algorithm (clustered)</p>
+  <div id="algo-and"></div>
+  <p class="chart-title">OR, ms per query, by algorithm (clustered)</p>
+  <div id="algo-or"></div>
+</div>
+
+<div class="col">
+  <h3 id="r-clustering">What docID clustering buys</h3>
+  <p>The uniform collection has exactly the same list lengths as the clustered one, but random docIDs. Comparing the two isolates the effect of docID order, which real systems control by reordering documents (by URL, or by recursive graph bisection).</p>
+  <ul>
+    <li><b>Codecs that model local density gain the most.</b> On the query lists, clustering cuts Run-Trie by 50%, Trie by 46%, interpolative by 42%, PEF by 39%, OptPFor by 33% and Roaring by 32%. BP128 gains 18% and VByte only 12%, because one wide gap still forces a wide block or extra bytes.</li>
+    <li><b>Plain Elias-Fano gains nothing</b> (8.08 → 8.13 bits): its size depends only on \(u\) and \(n\), exactly as the formula says. On uniform data it ties PEF as the smallest codec, which is the case partitioning cannot improve.</li>
+    <li><b>Roaring and the tries pay most for randomness.</b> At 13.2–13.7 bits per posting on uniform data they are 1.6–1.7× the size of PEF, because random docIDs leave few runs and many half-empty 16-bit arrays or trie paths.</li>
+    <li><b>Conjunctions get about 2× faster with clustering</b> for every list codec (PEF 0.083 → 0.046 ms, BP128 0.156 → 0.080 ms), while Roaring changes little. Part of this comes from the workloads: the uniform queries touch 19% more postings and have smaller results, because random lists share fewer documents. The rest comes from skipping, since clustered lists put matching docIDs in fewer blocks and partitions.</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">Index size, clustered vs uniform docIDs</p>
+      <p class="chart-sub">Bits per posting over the query lists</p>
+      <div class="chart" id="space-compare"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND time, clustered vs uniform docIDs</p>
+      <p class="chart-sub">Best algorithm per codec, ms per query</p>
+      <div class="chart" id="time-compare"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="uniform-table"></div>
+
+<div class="col">
+  <h3 id="r-kernels">Kernels: where merging stops paying</h3>
+  <p>The pairwise kernels were timed on uncompressed random lists with a fixed short list of 10,000 docIDs and a long list 1 to 4,096 times larger. The chart plots nanoseconds per element of the short list, so a flat line means the cost tracks the short list (the \(m \log(n/m)\) regime) and a rising line means the long list is scanned (the \(m + n\) regime).</p>
+  <ul>
+    <li><b>Similar sizes favour SIMD.</b> At 1:1 the AVX-512 kernel takes 22 µs against 98 µs for the branchy merge, 4.4× faster; SSE and AVX2 take 25–26 µs, so most of the gain comes from comparing blocks at all, not from vector width. The branch-free merge (66 µs) beats the branchy one only at 1:1 and becomes the slowest kernel by 1:8, because its loop-carried dependency serialises every step.</li>
+    <li><b>Skew favours galloping.</b> Galloping overtakes the SIMD kernel between 1:16 and 1:32 and is 5.8× faster at 1:4,096 (9.6 ms against 55 ms). At 1:4,096 Baeza-Yates is within 13% of galloping and plain binary search is 2.6× slower; both lose badly when the sizes are similar (binary search needs 389 µs at 1:1).</li>
+    <li><b>The switch point is hardware-specific.</b> The adaptive kernel uses CRoaring's 64× threshold. On this CPU that is too late: between 1:32 and 1:64 it pays up to 2.1× more than galloping. A threshold near 1:24 would track the lower envelope of both kernels, consistent with Baeza-Yates and Salinger's ~30:1 crossover for scalar code.</li>
+  </ul>
+</div>
+<figure>
+  <div class="frame">
+    <p class="chart-title">Pairwise intersection cost vs size ratio</p>
+    <p class="chart-sub">|small| = 10,000; the large list has density 0.1 in its universe; uncompressed arrays</p>
+    <div class="chart" id="kernels"></div>
+  </div>
+</figure>
+
+<div class="col">
+  <h3 id="r-terms">Longer queries</h3>
+  <p>Each point uses 300 queries with exactly \(k\) co-occurring terms. As \(k\) grows from 2 to 6, the lists in a query hold more postings in total (400k to 740k–880k), yet every codec answers faster: the mean result shrinks from 744 to 2 documents, and the cost of a rarest-first conjunction follows the shortest list and the number of candidates it proposes, not the total length.</p>
+  <ul>
+    <li><b>Roaring's lead narrows with more terms.</b> It is 1.9× faster than PEF for two-term queries (0.028 against 0.054 ms) but only 1.3× faster at six (0.011 against 0.014 ms). Selective conjunctions let cursor-based codecs take long <code>NextGEQ</code> jumps, while Roaring still visits every shared 2¹⁶ chunk, the effect Pibiri &amp; Venturini describe.</li>
+    <li><b>PEF matches or beats uncompressed arrays</b> from three terms on, at less than a sixth of the space, because a <code>select</code> jump over the high bits costs about as much as galloping over raw integers.</li>
+    <li><b>Tries stay 2.6–3.5× behind PEF</b> at every length. The likely reason is that the traversal pays a rank operation per trie level for every surviving region, which costs more than one cursor jump when a single list is very selective.</li>
+  </ul>
+</div>
+<figure class="narrow">
+  <div class="frame">
+    <p class="chart-title">AND time vs number of query terms</p>
+    <p class="chart-sub">Clustered collection · 300 queries per point · best algorithm per codec</p>
+    <div class="chart" id="terms"></div>
+  </div>
+</figure>
+
+<div class="col">
+  <h3 id="r-wikitext">Real text: WikiText-103</h3>
+  <p>WikiText-103 has 859,532 paragraphs, a 531,033-term vocabulary and 57 million postings. Its lists are far denser than the synthetic ones: function words occur in most paragraphs. The queries use terms with at least 100 postings and average 3.0 terms, with 64 documents per AND and 199,635 per OR.</p>
+  <ul>
+    <li><b>Dense real lists suit Roaring.</b> Its bitmap containers answer AND in 0.007 ms, 2.7× faster than the fastest list codec (Elias-Fano, 0.019 ms), and OR in 0.086 ms, 10× faster than any list codec with a cursor algorithm (0.86–1.6 ms) and 4.5× faster than the hybrid index. On the query lists it costs 8.47 bits per posting, 1.8× PEF.</li>
+    <li><b>The Elias-Fano family leads the list codecs</b>: PEF and interpolative coding are the smallest (4.75 and 4.77 bits per posting on query lists), and Elias-Fano and PEF answer conjunctions 1.4–4.3× faster than the block codecs.</li>
+    <li><b>Small lists dominate whole-index space.</b> Over all 531k lists the ranking changes: interpolative (8.46), Elias-Fano (8.51) and PEF (8.92) stay smallest, but the tries reach 23 bits per posting, because each of the many short lists pays for about 20 trie levels and their rank directories. Roaring pays a container header per list and lands at 15.4.</li>
+    <li><b>The OR algorithm matters as much as the codec.</b> For every cursor codec except the hybrid, the Lucene-style bitset window is the fastest union, 1.6–2.5× faster than the heap.</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND on WikiText-103</p>
+      <p class="chart-sub">859,532 paragraphs · best algorithm per codec</p>
+      <div class="chart" id="wikitext-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR on WikiText-103</p>
+      <p class="chart-sub">Best algorithm that outputs docIDs</p>
+      <div class="chart" id="wikitext-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="wikitext-table"></div>
+
+</section>
+
+<section class="col" id="takeaways">
+  <h2>Takeaways</h2>
+  <ol>
+  <li><b>Choose the skip structure first, the gap coder second.</b> Conjunctions spend their time in <code>NextGEQ</code>, so how a codec jumps matters more than how fast it decodes. Elias-Fano's select-based jumps made Elias-Fano or PEF the fastest list codec for AND on every collection, matching or beating uncompressed arrays, although they decode 2.3–2.6× slower than BP128.</li>
+  <li><b>PEF is the balanced default.</b> It was the smallest or within 1% of the smallest codec on all three collections (4.75–8.08 bits per posting on query lists) and its AND time was 1.5–3.1× Roaring's. Interpolative coding matches its size but is 4–5× slower.</li>
+  <li><b>Roaring is the speed choice, especially for unions.</b> Container-wise operations with SIMD kernels gave the fastest AND on every collection and 4.5–10× faster OR than the best list codec, because ORing words beats merging docIDs one at a time. The price is 1.6–1.9× PEF's space on query lists, and more on vocabularies with many short lists. Its AND advantage shrinks as queries get more selective (1.9× at two terms, 1.3× at six).</li>
+  <li><b>Use SIMD only where sizes are similar.</b> Block-compare kernels are 4.4× faster than a scalar merge on equal-size lists, but real conjunctions are skewed, and galloping wins beyond about a 1:24 size ratio on this CPU. CRoaring's 64× switch point was measured on older hardware and should be re-tuned per machine.</li>
+  <li><b>Reorder docIDs.</b> Clustering cut the size of PEF, interpolative coding, Roaring and the tries by 32–50% and roughly halved conjunction time for list codecs. Plain Elias-Fano cannot benefit; partitioning is what lets it.</li>
+  <li><b>Compact tries are compact, not fast, in this implementation.</b> On clustered data they are smaller than BP128 and Roaring, but 2.6–3.5× slower than PEF for AND on every query length, and they pay heavily for short lists (23 bits per posting over the whole WikiText vocabulary). The paper measured lists of at least 4,096 postings on URL-sorted web collections; the queries here pair short lists with very long ones, where cursor skipping is hard to beat.</li>
+  <li><b>Implementation quality changes the ranking.</b> Two Roaring implementations with byte-identical containers differ by 2.9× on AND and 7.5× on OR. Published comparisons between formats should be read with that spread in mind.</li>
+</ol>
+<div class="callout">
+  <p><b>Limits of these measurements.</b> One 2.1 GHz Xeon VM (AVX-512, no VP2INTERSECT), single-threaded. The clustered collection was run three times end to end, and individual timings varied by up to about 15% between runs; the conclusions above hold in every run. Queries are generated from co-occurring terms rather than taken from a real query log. All operations are Boolean, with no scoring or top-k pruning, and every result is written out as a <code>Vec&lt;u32&gt;</code> unless marked "count only". Gov2 or ClueWeb in ds2i format, with real TREC queries, can be run with <code>--source ds2i</code>.</p>
+</div>
+
+</section>
+
+<section class="col repro" id="reproduce">
+  <h2>Reproduce</h2>
+  <p>Everything is in <code>posting_bench/</code>. The default build uses <code>-C target-cpu=native</code>; every SIMD path has a portable fallback.</p>
+<pre>cd posting_bench
+cargo test --release                      # 56 tests, every codec and algorithm
+scripts/prepare_wikitext.sh data          # optional: WikiText-103 (needs pyarrow)
+scripts/run_experiments.sh data/wikitext103.txt
+python3 scripts/build_report.py           # rebuilds this page from results/*.json
+
+# your own data: ds2i/PISA .docs collections or one document per line
+target/release/posting-bench run --source ds2i --input gov2.docs --queries q.txt --json out.json
+target/release/posting-bench run --source text --input docs.txt --codecs "pef,roaring,bp128"
+target/release/posting-bench kernels --small 10000 --ratios 1,4,16,64,256,1024</pre>
+</section>
+<footer class="col" id="footer"></footer>
+</div>
+
+<div class="tip" id="tip" hidden></div>
+<script>
+const DATA = {"clustered":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":500,"mean_terms":2.802,"mean_query_postings":576256.5,"mean_and_results":309.1,"mean_or_results":562995.0,"reps":3,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","simd":["sse4.2","avx2","bmi2","avx512f","avx512bw"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0489,"decode_ns_per_posting":0.2193,"query_decode_ns_per_posting":0.2292,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.461055},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":1.518937},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.061023},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.329849},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.110935},{"op":"AND","algorithm":"SvS + SIMD SSE 4x4","ms_per_query":0.631436},{"op":"AND","algorithm":"SvS + SIMD AVX2 8x8","ms_per_query":0.624674},{"op":"AND","algorithm":"SvS + SIMD AVX-512 16x16","ms_per_query":0.47853},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.063832},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.071544},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.104923},{"op":"OR","algorithm":"slices: heap","ms_per_query":7.026672},{"op":"OR","algorithm":"slices: fold (pairwise merge)","ms_per_query":2.378195},{"op":"OR","algorithm":"slices: bitmap","ms_per_query":1.860564},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.06772},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.10892},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.226781},{"op":"OR","algorithm":"heap","ms_per_query":3.492181},{"op":"OR","algorithm":"min-scan","ms_per_query":2.979019},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.026995}]},{"codec":"VByte","bits_per_posting":10.3306,"query_bits_per_posting":9.6105,"build_secs":0.0573,"decode_ns_per_posting":1.9982,"query_decode_ns_per_posting":1.9267,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.132739},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.215773},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.784748},{"op":"OR","algorithm":"heap","ms_per_query":4.525576},{"op":"OR","algorithm":"min-scan","ms_per_query":3.854478},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.203732}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.6945,"build_secs":0.0533,"decode_ns_per_posting":0.8929,"query_decode_ns_per_posting":0.6617,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.079551},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.117473},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.473987},{"op":"OR","algorithm":"heap","ms_per_query":4.250412},{"op":"OR","algorithm":"min-scan","ms_per_query":2.973357},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.889311}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.6945,"build_secs":0.0288,"decode_ns_per_posting":0.6684,"query_decode_ns_per_posting":0.4228,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.072477},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.10115},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.303844},{"op":"OR","algorithm":"heap","ms_per_query":4.094823},{"op":"OR","algorithm":"min-scan","ms_per_query":2.538563},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.638204}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.9248,"build_secs":0.2288,"decode_ns_per_posting":1.349,"query_decode_ns_per_posting":1.028,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.087907},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.127656},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.552241},{"op":"OR","algorithm":"heap","ms_per_query":4.371285},{"op":"OR","algorithm":"min-scan","ms_per_query":2.99833},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.032492}]},{"codec":"Elias-Fano","bits_per_posting":10.8483,"query_bits_per_posting":8.1261,"build_secs":0.0689,"decode_ns_per_posting":1.915,"query_decode_ns_per_posting":1.8363,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.054984},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.079059},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.982949},{"op":"OR","algorithm":"heap","ms_per_query":4.427798},{"op":"OR","algorithm":"min-scan","ms_per_query":3.172452},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.872522}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.941,"build_secs":0.1572,"decode_ns_per_posting":1.7032,"query_decode_ns_per_posting":1.4921,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.046416},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.069287},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.848182},{"op":"OR","algorithm":"heap","ms_per_query":4.686654},{"op":"OR","algorithm":"min-scan","ms_per_query":3.299544},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.841369}]},{"codec":"Interpolative","bits_per_posting":5.9731,"query_bits_per_posting":4.9002,"build_secs":0.1504,"decode_ns_per_posting":4.4622,"query_decode_ns_per_posting":4.2478,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.180554},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.314174},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.802918},{"op":"OR","algorithm":"heap","ms_per_query":6.717703},{"op":"OR","algorithm":"min-scan","ms_per_query":5.002046},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":5.07126}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.584,"build_secs":0.0569,"decode_ns_per_posting":1.0522,"query_decode_ns_per_posting":0.9181,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.066829},{"op":"OR","algorithm":"native","ms_per_query":1.905226},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.077417},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.09007},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.766598},{"op":"OR","algorithm":"heap","ms_per_query":5.577967},{"op":"OR","algorithm":"min-scan","ms_per_query":4.77307},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":5.150597}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.3214,"build_secs":0.1355,"decode_ns_per_posting":2.539,"query_decode_ns_per_posting":1.8408,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.029662},{"op":"OR","algorithm":"native","ms_per_query":0.570161},{"op":"AND","algorithm":"native, count only","ms_per_query":0.029164},{"op":"OR","algorithm":"native, count only","ms_per_query":0.383405},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.042263},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.073419},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.393713},{"op":"OR","algorithm":"heap","ms_per_query":4.60667},{"op":"OR","algorithm":"min-scan","ms_per_query":3.76073},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.959232}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":7.1792,"build_secs":0.6465,"decode_ns_per_posting":8.1516,"query_decode_ns_per_posting":5.2823,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.146582},{"op":"OR","algorithm":"native","ms_per_query":2.496508},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.195709},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.267097},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.402907},{"op":"OR","algorithm":"heap","ms_per_query":7.089313},{"op":"OR","algorithm":"min-scan","ms_per_query":5.400792},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":5.524512}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.6728,"build_secs":0.7541,"decode_ns_per_posting":8.9674,"query_decode_ns_per_posting":6.1717,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.131924},{"op":"OR","algorithm":"native","ms_per_query":2.837802},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.201873},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.278781},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.676762},{"op":"OR","algorithm":"heap","ms_per_query":7.015342},{"op":"OR","algorithm":"min-scan","ms_per_query":6.07259},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":5.85835}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.3214,"build_secs":0.2436,"decode_ns_per_posting":7.9826,"query_decode_ns_per_posting":6.8463,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.08819},{"op":"OR","algorithm":"native","ms_per_query":4.299864},{"op":"AND","algorithm":"native, count only","ms_per_query":0.085756},{"op":"OR","algorithm":"native, count only","ms_per_query":0.745832},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.09179},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.124675},{"op":"AND","algorithm":"decode + SvS","ms_per_query":3.603381},{"op":"OR","algorithm":"heap","ms_per_query":5.961626},{"op":"OR","algorithm":"min-scan","ms_per_query":5.488205},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":4.750905}]}]},"uniform":{"collection":"synthetic-uniform (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":500,"mean_terms":2.698,"mean_query_postings":686097.7,"mean_and_results":119.1,"mean_or_results":675834.1,"reps":3,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","simd":["sse4.2","avx2","bmi2","avx512f","avx512bw"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0494,"decode_ns_per_posting":0.2323,"query_decode_ns_per_posting":0.2347,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.597058},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":1.861811},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.110822},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.350164},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.178168},{"op":"AND","algorithm":"SvS + SIMD SSE 4x4","ms_per_query":0.775646},{"op":"AND","algorithm":"SvS + SIMD AVX2 8x8","ms_per_query":0.758343},{"op":"AND","algorithm":"SvS + SIMD AVX-512 16x16","ms_per_query":0.593672},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.0999},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.123896},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.221649},{"op":"OR","algorithm":"slices: heap","ms_per_query":8.775517},{"op":"OR","algorithm":"slices: fold (pairwise merge)","ms_per_query":2.884503},{"op":"OR","algorithm":"slices: bitmap","ms_per_query":2.05076},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.120065},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.211784},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.298485},{"op":"OR","algorithm":"heap","ms_per_query":4.497712},{"op":"OR","algorithm":"min-scan","ms_per_query":3.871731},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.416462}]},{"codec":"VByte","bits_per_posting":13.9161,"query_bits_per_posting":10.9119,"build_secs":0.0913,"decode_ns_per_posting":3.0186,"query_decode_ns_per_posting":2.6233,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.27132},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.458815},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.999672},{"op":"OR","algorithm":"heap","ms_per_query":5.773681},{"op":"OR","algorithm":"min-scan","ms_per_query":4.485634},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.633161}]},{"codec":"BP128","bits_per_posting":12.3776,"query_bits_per_posting":9.3934,"build_secs":0.0542,"decode_ns_per_posting":0.9095,"query_decode_ns_per_posting":0.635,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.155652},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.254457},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.508747},{"op":"OR","algorithm":"heap","ms_per_query":5.225173},{"op":"OR","algorithm":"min-scan","ms_per_query":3.613685},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.402979}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":12.3776,"query_bits_per_posting":9.3934,"build_secs":0.0302,"decode_ns_per_posting":0.7336,"query_decode_ns_per_posting":0.4077,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.135516},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.213552},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.360003},{"op":"OR","algorithm":"heap","ms_per_query":5.051107},{"op":"OR","algorithm":"min-scan","ms_per_query":3.542085},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.287494}]},{"codec":"OptPFor","bits_per_posting":11.89,"query_bits_per_posting":8.8741,"build_secs":0.1687,"decode_ns_per_posting":1.1234,"query_decode_ns_per_posting":0.7562,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.168985},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.282591},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.611621},{"op":"OR","algorithm":"heap","ms_per_query":5.326265},{"op":"OR","algorithm":"min-scan","ms_per_query":3.605846},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.492286}]},{"codec":"Elias-Fano","bits_per_posting":10.8483,"query_bits_per_posting":8.0837,"build_secs":0.0534,"decode_ns_per_posting":1.7682,"query_decode_ns_per_posting":1.881,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.087251},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.13994},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.251738},{"op":"OR","algorithm":"heap","ms_per_query":5.576764},{"op":"OR","algorithm":"min-scan","ms_per_query":4.008849},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.559402}]},{"codec":"PEF","bits_per_posting":10.9042,"query_bits_per_posting":8.0809,"build_secs":0.1524,"decode_ns_per_posting":1.7611,"query_decode_ns_per_posting":1.6186,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.082812},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.134964},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.068875},{"op":"OR","algorithm":"heap","ms_per_query":6.194488},{"op":"OR","algorithm":"min-scan","ms_per_query":4.33872},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.524632}]},{"codec":"Interpolative","bits_per_posting":11.3291,"query_bits_per_posting":8.5169,"build_secs":0.149,"decode_ns_per_posting":3.5995,"query_decode_ns_per_posting":3.8349,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.424089},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.791178},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.685563},{"op":"OR","algorithm":"heap","ms_per_query":8.06791},{"op":"OR","algorithm":"min-scan","ms_per_query":5.744188},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":5.571083}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":12.329,"query_bits_per_posting":9.3126,"build_secs":0.0582,"decode_ns_per_posting":1.1838,"query_decode_ns_per_posting":0.9292,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.126557},{"op":"OR","algorithm":"native","ms_per_query":2.046803},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.15372},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.20829},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.982891},{"op":"OR","algorithm":"heap","ms_per_query":7.214993},{"op":"OR","algorithm":"min-scan","ms_per_query":6.248614},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":6.26683}]},{"codec":"Roaring","bits_per_posting":20.4195,"query_bits_per_posting":13.7025,"build_secs":0.2037,"decode_ns_per_posting":2.1656,"query_decode_ns_per_posting":0.3665,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.035172},{"op":"OR","algorithm":"native","ms_per_query":0.461473},{"op":"AND","algorithm":"native, count only","ms_per_query":0.03633},{"op":"OR","algorithm":"native, count only","ms_per_query":0.284208},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.069927},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.115343},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.294033},{"op":"OR","algorithm":"heap","ms_per_query":5.561045},{"op":"OR","algorithm":"min-scan","ms_per_query":4.141355},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.312953}]},{"codec":"Trie","bits_per_posting":20.101,"query_bits_per_posting":13.2395,"build_secs":1.1481,"decode_ns_per_posting":17.4228,"query_decode_ns_per_posting":10.6129,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.322675},{"op":"OR","algorithm":"native","ms_per_query":3.49863},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.45461},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.732769},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.101852},{"op":"OR","algorithm":"heap","ms_per_query":9.394304},{"op":"OR","algorithm":"min-scan","ms_per_query":6.921903},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":7.266708}]},{"codec":"Run-Trie","bits_per_posting":20.0993,"query_bits_per_posting":13.2367,"build_secs":1.1924,"decode_ns_per_posting":23.4283,"query_decode_ns_per_posting":13.4029,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.340199},{"op":"OR","algorithm":"native","ms_per_query":3.888942},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.510812},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.753236},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.574651},{"op":"OR","algorithm":"heap","ms_per_query":9.982311},{"op":"OR","algorithm":"min-scan","ms_per_query":8.083559},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":8.142729}]},{"codec":"Roaring (roaring crate)","bits_per_posting":20.4195,"query_bits_per_posting":13.7025,"build_secs":0.2723,"decode_ns_per_posting":7.6833,"query_decode_ns_per_posting":6.2163,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.251439},{"op":"OR","algorithm":"native","ms_per_query":4.815824},{"op":"AND","algorithm":"native, count only","ms_per_query":0.226359},{"op":"OR","algorithm":"native, count only","ms_per_query":0.572546},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.141235},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.20499},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.223041},{"op":"OR","algorithm":"heap","ms_per_query":7.148803},{"op":"OR","algorithm":"min-scan","ms_per_query":6.707741},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":5.845723}]}]},"wikitext":{"collection":"wikitext103.txt","documents":859532,"lists":531033,"postings":57010525,"queries":500,"mean_terms":3.016,"mean_query_postings":221775.9,"mean_and_results":63.6,"mean_or_results":199635.4,"reps":3,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","simd":["sse4.2","avx2","bmi2","avx512f","avx512bw"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.2077,"decode_ns_per_posting":0.4827,"query_decode_ns_per_posting":0.2534,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.172408},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.549227},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.023605},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.059895},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.031902},{"op":"AND","algorithm":"SvS + SIMD SSE 4x4","ms_per_query":0.238836},{"op":"AND","algorithm":"SvS + SIMD AVX2 8x8","ms_per_query":0.223007},{"op":"AND","algorithm":"SvS + SIMD AVX-512 16x16","ms_per_query":0.171185},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.022028},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.024486},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.053243},{"op":"OR","algorithm":"slices: heap","ms_per_query":2.928813},{"op":"OR","algorithm":"slices: fold (pairwise merge)","ms_per_query":0.858779},{"op":"OR","algorithm":"slices: bitmap","ms_per_query":0.561329},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.029088},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.058696},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.083495},{"op":"OR","algorithm":"heap","ms_per_query":1.666541},{"op":"OR","algorithm":"min-scan","ms_per_query":1.16769},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.602449}]},{"codec":"VByte","bits_per_posting":11.4453,"query_bits_per_posting":8.9081,"build_secs":0.4752,"decode_ns_per_posting":3.6523,"query_decode_ns_per_posting":1.5365,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.051485},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.093172},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.267944},{"op":"OR","algorithm":"heap","ms_per_query":2.007614},{"op":"OR","algorithm":"min-scan","ms_per_query":1.451105},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.974198}]},{"codec":"BP128","bits_per_posting":10.8497,"query_bits_per_posting":7.1122,"build_secs":0.512,"decode_ns_per_posting":1.9059,"query_decode_ns_per_posting":0.6957,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.032538},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.056176},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.164397},{"op":"OR","algorithm":"heap","ms_per_query":1.838708},{"op":"OR","algorithm":"min-scan","ms_per_query":1.166665},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.966264}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.8497,"query_bits_per_posting":7.1122,"build_secs":0.4535,"decode_ns_per_posting":1.5942,"query_decode_ns_per_posting":0.4478,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.029531},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.054843},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.113444},{"op":"OR","algorithm":"heap","ms_per_query":1.81148},{"op":"OR","algorithm":"min-scan","ms_per_query":1.198073},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.854784}]},{"codec":"OptPFor","bits_per_posting":9.9483,"query_bits_per_posting":5.9098,"build_secs":0.7264,"decode_ns_per_posting":2.0376,"query_decode_ns_per_posting":0.8742,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.037363},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.06611},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.192734},{"op":"OR","algorithm":"heap","ms_per_query":1.971315},{"op":"OR","algorithm":"min-scan","ms_per_query":1.185784},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.897621}]},{"codec":"Elias-Fano","bits_per_posting":8.5101,"query_bits_per_posting":5.1588,"build_secs":0.492,"decode_ns_per_posting":2.2423,"query_decode_ns_per_posting":1.6611,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.01939},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.031787},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.393932},{"op":"OR","algorithm":"heap","ms_per_query":2.008869},{"op":"OR","algorithm":"min-scan","ms_per_query":1.300036},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.976145}]},{"codec":"PEF","bits_per_posting":8.9159,"query_bits_per_posting":4.7543,"build_secs":0.9106,"decode_ns_per_posting":2.5588,"query_decode_ns_per_posting":1.6138,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.022228},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.033955},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.300301},{"op":"OR","algorithm":"heap","ms_per_query":2.177754},{"op":"OR","algorithm":"min-scan","ms_per_query":1.395582},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.931301}]},{"codec":"Interpolative","bits_per_posting":8.4612,"query_bits_per_posting":4.7728,"build_secs":0.7681,"decode_ns_per_posting":4.6632,"query_decode_ns_per_posting":3.9425,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.080858},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.210014},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.932422},{"op":"OR","algorithm":"heap","ms_per_query":2.717711},{"op":"OR","algorithm":"min-scan","ms_per_query":1.952897},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.623268}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.3578,"query_bits_per_posting":5.849,"build_secs":0.4894,"decode_ns_per_posting":2.1771,"query_decode_ns_per_posting":1.1145,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.02543},{"op":"OR","algorithm":"native","ms_per_query":0.387309},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.026225},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.040457},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.240974},{"op":"OR","algorithm":"heap","ms_per_query":2.444832},{"op":"OR","algorithm":"min-scan","ms_per_query":1.821581},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.902871}]},{"codec":"Roaring","bits_per_posting":15.4446,"query_bits_per_posting":8.4687,"build_secs":0.4311,"decode_ns_per_posting":1.1367,"query_decode_ns_per_posting":0.2772,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.006851},{"op":"OR","algorithm":"native","ms_per_query":0.085954},{"op":"AND","algorithm":"native, count only","ms_per_query":0.007568},{"op":"OR","algorithm":"native, count only","ms_per_query":0.046098},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.015506},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.023644},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.066285},{"op":"OR","algorithm":"heap","ms_per_query":1.905507},{"op":"OR","algorithm":"min-scan","ms_per_query":1.352904},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.77413}]},{"codec":"Trie","bits_per_posting":23.3365,"query_bits_per_posting":6.5001,"build_secs":3.9951,"decode_ns_per_posting":15.3814,"query_decode_ns_per_posting":3.4291,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.062241},{"op":"OR","algorithm":"native","ms_per_query":0.485366},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.084241},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.116558},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.297074},{"op":"OR","algorithm":"heap","ms_per_query":2.412769},{"op":"OR","algorithm":"min-scan","ms_per_query":1.61676},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.407237}]},{"codec":"Run-Trie","bits_per_posting":23.2139,"query_bits_per_posting":6.2273,"build_secs":3.2837,"decode_ns_per_posting":19.0769,"query_decode_ns_per_posting":4.4414,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.060792},{"op":"OR","algorithm":"native","ms_per_query":0.5299},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.07959},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.119543},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.330035},{"op":"OR","algorithm":"heap","ms_per_query":2.515315},{"op":"OR","algorithm":"min-scan","ms_per_query":1.674872},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.506639}]},{"codec":"Roaring (roaring crate)","bits_per_posting":15.4446,"query_bits_per_posting":8.4687,"build_secs":0.801,"decode_ns_per_posting":6.7929,"query_decode_ns_per_posting":6.6815,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.048926},{"op":"OR","algorithm":"native","ms_per_query":1.182037},{"op":"AND","algorithm":"native, count only","ms_per_query":0.045986},{"op":"OR","algorithm":"native, count only","ms_per_query":0.082676},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.026579},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.039705},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.121691},{"op":"OR","algorithm":"heap","ms_per_query":2.353875},{"op":"OR","algorithm":"min-scan","ms_per_query":1.952349},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.463881}]}]},"kernels":{"small":10000,"density":0.1,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","rows":[{"kernel":"merge","ratio":1,"small":10000,"large":10000,"micros_per_op":97.5966,"ns_per_small_element":9.7597},{"kernel":"merge (branchless)","ratio":1,"small":10000,"large":10000,"micros_per_op":66.2865,"ns_per_small_element":6.6287},{"kernel":"galloping","ratio":1,"small":10000,"large":10000,"micros_per_op":101.9473,"ns_per_small_element":10.1947},{"kernel":"binary search","ratio":1,"small":10000,"large":10000,"micros_per_op":389.1174,"ns_per_small_element":38.9117},{"kernel":"Baeza-Yates","ratio":1,"small":10000,"large":10000,"micros_per_op":138.0908,"ns_per_small_element":13.8091},{"kernel":"SIMD SSE 4x4","ratio":1,"small":10000,"large":10000,"micros_per_op":26.4367,"ns_per_small_element":2.6437},{"kernel":"SIMD AVX2 8x8","ratio":1,"small":10000,"large":10000,"micros_per_op":25.431,"ns_per_small_element":2.5431},{"kernel":"SIMD AVX-512 16x16","ratio":1,"small":10000,"large":10000,"micros_per_op":22.2837,"ns_per_small_element":2.2284},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":1,"small":10000,"large":10000,"micros_per_op":21.3841,"ns_per_small_element":2.1384},{"kernel":"merge","ratio":2,"small":10000,"large":20000,"micros_per_op":123.9295,"ns_per_small_element":12.393},{"kernel":"merge (branchless)","ratio":2,"small":10000,"large":20000,"micros_per_op":100.2807,"ns_per_small_element":10.0281},{"kernel":"galloping","ratio":2,"small":10000,"large":20000,"micros_per_op":128.9449,"ns_per_small_element":12.8945},{"kernel":"binary search","ratio":2,"small":10000,"large":20000,"micros_per_op":416.8388,"ns_per_small_element":41.6839},{"kernel":"Baeza-Yates","ratio":2,"small":10000,"large":20000,"micros_per_op":165.1687,"ns_per_small_element":16.5169},{"kernel":"SIMD SSE 4x4","ratio":2,"small":10000,"large":20000,"micros_per_op":39.6901,"ns_per_small_element":3.969},{"kernel":"SIMD AVX2 8x8","ratio":2,"small":10000,"large":20000,"micros_per_op":38.3459,"ns_per_small_element":3.8346},{"kernel":"SIMD AVX-512 16x16","ratio":2,"small":10000,"large":20000,"micros_per_op":31.911,"ns_per_small_element":3.1911},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":2,"small":10000,"large":20000,"micros_per_op":32.3004,"ns_per_small_element":3.23},{"kernel":"merge","ratio":4,"small":10000,"large":40000,"micros_per_op":164.7683,"ns_per_small_element":16.4768},{"kernel":"merge (branchless)","ratio":4,"small":10000,"large":40000,"micros_per_op":170.4036,"ns_per_small_element":17.0404},{"kernel":"galloping","ratio":4,"small":10000,"large":40000,"micros_per_op":138.9159,"ns_per_small_element":13.8916},{"kernel":"binary search","ratio":4,"small":10000,"large":40000,"micros_per_op":446.2485,"ns_per_small_element":44.6249},{"kernel":"Baeza-Yates","ratio":4,"small":10000,"large":40000,"micros_per_op":183.7772,"ns_per_small_element":18.3777},{"kernel":"SIMD SSE 4x4","ratio":4,"small":10000,"large":40000,"micros_per_op":66.7055,"ns_per_small_element":6.6706},{"kernel":"SIMD AVX2 8x8","ratio":4,"small":10000,"large":40000,"micros_per_op":65.3648,"ns_per_small_element":6.5365},{"kernel":"SIMD AVX-512 16x16","ratio":4,"small":10000,"large":40000,"micros_per_op":56.7805,"ns_per_small_element":5.678},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":4,"small":10000,"large":40000,"micros_per_op":56.4072,"ns_per_small_element":5.6407},{"kernel":"merge","ratio":8,"small":10000,"large":80000,"micros_per_op":222.9582,"ns_per_small_element":22.2958},{"kernel":"merge (branchless)","ratio":8,"small":10000,"large":80000,"micros_per_op":293.0233,"ns_per_small_element":29.3023},{"kernel":"galloping","ratio":8,"small":10000,"large":80000,"micros_per_op":183.1223,"ns_per_small_element":18.3122},{"kernel":"binary search","ratio":8,"small":10000,"large":80000,"micros_per_op":505.0224,"ns_per_small_element":50.5022},{"kernel":"Baeza-Yates","ratio":8,"small":10000,"large":80000,"micros_per_op":223.1202,"ns_per_small_element":22.312},{"kernel":"SIMD SSE 4x4","ratio":8,"small":10000,"large":80000,"micros_per_op":123.1459,"ns_per_small_element":12.3146},{"kernel":"SIMD AVX2 8x8","ratio":8,"small":10000,"large":80000,"micros_per_op":122.2691,"ns_per_small_element":12.2269},{"kernel":"SIMD AVX-512 16x16","ratio":8,"small":10000,"large":80000,"micros_per_op":105.1768,"ns_per_small_element":10.5177},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":8,"small":10000,"large":80000,"micros_per_op":101.4843,"ns_per_small_element":10.1484},{"kernel":"merge","ratio":16,"small":10000,"large":160000,"micros_per_op":296.586,"ns_per_small_element":29.6586},{"kernel":"merge (branchless)","ratio":16,"small":10000,"large":160000,"micros_per_op":575.2096,"ns_per_small_element":57.521},{"kernel":"galloping","ratio":16,"small":10000,"large":160000,"micros_per_op":225.4144,"ns_per_small_element":22.5414},{"kernel":"binary search","ratio":16,"small":10000,"large":160000,"micros_per_op":601.814,"ns_per_small_element":60.1814},{"kernel":"Baeza-Yates","ratio":16,"small":10000,"large":160000,"micros_per_op":326.4324,"ns_per_small_element":32.6432},{"kernel":"SIMD SSE 4x4","ratio":16,"small":10000,"large":160000,"micros_per_op":237.3074,"ns_per_small_element":23.7307},{"kernel":"SIMD AVX2 8x8","ratio":16,"small":10000,"large":160000,"micros_per_op":228.8535,"ns_per_small_element":22.8853},{"kernel":"SIMD AVX-512 16x16","ratio":16,"small":10000,"large":160000,"micros_per_op":196.0517,"ns_per_small_element":19.6052},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":16,"small":10000,"large":160000,"micros_per_op":186.5605,"ns_per_small_element":18.6561},{"kernel":"merge","ratio":32,"small":10000,"large":320000,"micros_per_op":474.8907,"ns_per_small_element":47.4891},{"kernel":"merge (branchless)","ratio":32,"small":10000,"large":320000,"micros_per_op":1145.0168,"ns_per_small_element":114.5017},{"kernel":"galloping","ratio":32,"small":10000,"large":320000,"micros_per_op":278.8715,"ns_per_small_element":27.8871},{"kernel":"binary search","ratio":32,"small":10000,"large":320000,"micros_per_op":811.3282,"ns_per_small_element":81.1328},{"kernel":"Baeza-Yates","ratio":32,"small":10000,"large":320000,"micros_per_op":433.5143,"ns_per_small_element":43.3514},{"kernel":"SIMD SSE 4x4","ratio":32,"small":10000,"large":320000,"micros_per_op":438.4805,"ns_per_small_element":43.8481},{"kernel":"SIMD AVX2 8x8","ratio":32,"small":10000,"large":320000,"micros_per_op":442.7621,"ns_per_small_element":44.2762},{"kernel":"SIMD AVX-512 16x16","ratio":32,"small":10000,"large":320000,"micros_per_op":356.709,"ns_per_small_element":35.6709},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":32,"small":10000,"large":320000,"micros_per_op":384.065,"ns_per_small_element":38.4065},{"kernel":"merge","ratio":64,"small":10000,"large":640000,"micros_per_op":769.3285,"ns_per_small_element":76.9329},{"kernel":"merge (branchless)","ratio":64,"small":10000,"large":640000,"micros_per_op":2210.4524,"ns_per_small_element":221.0452},{"kernel":"galloping","ratio":64,"small":10000,"large":640000,"micros_per_op":377.1593,"ns_per_small_element":37.7159},{"kernel":"binary search","ratio":64,"small":10000,"large":640000,"micros_per_op":1070.043,"ns_per_small_element":107.0043},{"kernel":"Baeza-Yates","ratio":64,"small":10000,"large":640000,"micros_per_op":619.1677,"ns_per_small_element":61.9168},{"kernel":"SIMD SSE 4x4","ratio":64,"small":10000,"large":640000,"micros_per_op":786.9093,"ns_per_small_element":78.6909},{"kernel":"SIMD AVX2 8x8","ratio":64,"small":10000,"large":640000,"micros_per_op":835.3207,"ns_per_small_element":83.5321},{"kernel":"SIMD AVX-512 16x16","ratio":64,"small":10000,"large":640000,"micros_per_op":747.6161,"ns_per_small_element":74.7616},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":64,"small":10000,"large":640000,"micros_per_op":782.1754,"ns_per_small_element":78.2175},{"kernel":"merge","ratio":128,"small":10000,"large":1280000,"micros_per_op":1252.0144,"ns_per_small_element":125.2014},{"kernel":"merge (branchless)","ratio":128,"small":10000,"large":1280000,"micros_per_op":4309.8925,"ns_per_small_element":430.9893},{"kernel":"galloping","ratio":128,"small":10000,"large":1280000,"micros_per_op":537.657,"ns_per_small_element":53.7657},{"kernel":"binary search","ratio":128,"small":10000,"large":1280000,"micros_per_op":1790.934,"ns_per_small_element":179.0934},{"kernel":"Baeza-Yates","ratio":128,"small":10000,"large":1280000,"micros_per_op":869.988,"ns_per_small_element":86.9988},{"kernel":"SIMD SSE 4x4","ratio":128,"small":10000,"large":1280000,"micros_per_op":1642.9519,"ns_per_small_element":164.2952},{"kernel":"SIMD AVX2 8x8","ratio":128,"small":10000,"large":1280000,"micros_per_op":1702.6493,"ns_per_small_element":170.2649},{"kernel":"SIMD AVX-512 16x16","ratio":128,"small":10000,"large":1280000,"micros_per_op":1460.7275,"ns_per_small_element":146.0728},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":128,"small":10000,"large":1280000,"micros_per_op":513.5473,"ns_per_small_element":51.3547},{"kernel":"merge","ratio":256,"small":10000,"large":2560000,"micros_per_op":3132.4379,"ns_per_small_element":313.2438},{"kernel":"merge (branchless)","ratio":256,"small":10000,"large":2560000,"micros_per_op":9141.582,"ns_per_small_element":914.1582},{"kernel":"galloping","ratio":256,"small":10000,"large":2560000,"micros_per_op":887.9195,"ns_per_small_element":88.792},{"kernel":"binary search","ratio":256,"small":10000,"large":2560000,"micros_per_op":4469.3546,"ns_per_small_element":446.9355},{"kernel":"Baeza-Yates","ratio":256,"small":10000,"large":2560000,"micros_per_op":1395.3274,"ns_per_small_element":139.5327},{"kernel":"SIMD SSE 4x4","ratio":256,"small":10000,"large":2560000,"micros_per_op":3524.0163,"ns_per_small_element":352.4016},{"kernel":"SIMD AVX2 8x8","ratio":256,"small":10000,"large":2560000,"micros_per_op":3543.6965,"ns_per_small_element":354.3696},{"kernel":"SIMD AVX-512 16x16","ratio":256,"small":10000,"large":2560000,"micros_per_op":2869.3307,"ns_per_small_element":286.9331},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":256,"small":10000,"large":2560000,"micros_per_op":853.3635,"ns_per_small_element":85.3363},{"kernel":"merge","ratio":1024,"small":10000,"large":10240000,"micros_per_op":12078.076,"ns_per_small_element":1207.8076},{"kernel":"merge (branchless)","ratio":1024,"small":10000,"large":10240000,"micros_per_op":34593.9117,"ns_per_small_element":3459.3912},{"kernel":"galloping","ratio":1024,"small":10000,"large":10240000,"micros_per_op":5925.0314,"ns_per_small_element":592.5031},{"kernel":"binary search","ratio":1024,"small":10000,"large":10240000,"micros_per_op":20905.4978,"ns_per_small_element":2090.5498},{"kernel":"Baeza-Yates","ratio":1024,"small":10000,"large":10240000,"micros_per_op":7759.3039,"ns_per_small_element":775.9304},{"kernel":"SIMD SSE 4x4","ratio":1024,"small":10000,"large":10240000,"micros_per_op":15253.3125,"ns_per_small_element":1525.3312},{"kernel":"SIMD AVX2 8x8","ratio":1024,"small":10000,"large":10240000,"micros_per_op":15359.8037,"ns_per_small_element":1535.9804},{"kernel":"SIMD AVX-512 16x16","ratio":1024,"small":10000,"large":10240000,"micros_per_op":13957.2802,"ns_per_small_element":1395.728},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":1024,"small":10000,"large":10240000,"micros_per_op":6022.6864,"ns_per_small_element":602.2686},{"kernel":"merge","ratio":4096,"small":10000,"large":40960000,"micros_per_op":47097.989,"ns_per_small_element":4709.7989},{"kernel":"merge (branchless)","ratio":4096,"small":10000,"large":40960000,"micros_per_op":141126.1775,"ns_per_small_element":14112.6177},{"kernel":"galloping","ratio":4096,"small":10000,"large":40960000,"micros_per_op":9577.082,"ns_per_small_element":957.7082},{"kernel":"binary search","ratio":4096,"small":10000,"large":40960000,"micros_per_op":25111.322,"ns_per_small_element":2511.1322},{"kernel":"Baeza-Yates","ratio":4096,"small":10000,"large":40960000,"micros_per_op":10788.3636,"ns_per_small_element":1078.8364},{"kernel":"SIMD SSE 4x4","ratio":4096,"small":10000,"large":40960000,"micros_per_op":60014.9112,"ns_per_small_element":6001.4911},{"kernel":"SIMD AVX2 8x8","ratio":4096,"small":10000,"large":40960000,"micros_per_op":59663.622,"ns_per_small_element":5966.3622},{"kernel":"SIMD AVX-512 16x16","ratio":4096,"small":10000,"large":40960000,"micros_per_op":55285.6393,"ns_per_small_element":5528.5639},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":4096,"small":10000,"large":40960000,"micros_per_op":8554.2015,"ns_per_small_element":855.4202}]},"terms":{"2":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":2.0,"mean_query_postings":401527.4,"mean_and_results":743.5,"mean_or_results":400783.9,"reps":3,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","simd":["sse4.2","avx2","bmi2","avx512f","avx512bw"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0496,"decode_ns_per_posting":0.2192,"query_decode_ns_per_posting":0.2425,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.430496},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":1.341393},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.092015},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.427065},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.124063},{"op":"AND","algorithm":"SvS + SIMD SSE 4x4","ms_per_query":0.537016},{"op":"AND","algorithm":"SvS + SIMD AVX2 8x8","ms_per_query":0.546167},{"op":"AND","algorithm":"SvS + SIMD AVX-512 16x16","ms_per_query":0.453796},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.09026},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.100099},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.099029},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.095801},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.099262},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.207612}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.3545,"build_secs":0.0507,"decode_ns_per_posting":0.888,"query_decode_ns_per_posting":0.6715,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.122383},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.115892},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.363274}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.3545,"build_secs":0.0294,"decode_ns_per_posting":0.6631,"query_decode_ns_per_posting":0.428,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.108685},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.107692},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.254891}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.7081,"build_secs":0.2239,"decode_ns_per_posting":1.2132,"query_decode_ns_per_posting":0.783,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.128628},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.124036},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.39078}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.6211,"build_secs":0.1689,"decode_ns_per_posting":1.6244,"query_decode_ns_per_posting":1.2969,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.056703},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.054345},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.57324}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.219,"build_secs":0.0482,"decode_ns_per_posting":1.0695,"query_decode_ns_per_posting":0.934,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.072859},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.082091},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.087984},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.570945}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.0725,"build_secs":0.1356,"decode_ns_per_posting":2.5958,"query_decode_ns_per_posting":1.4992,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.028204},{"op":"AND","algorithm":"native, count only","ms_per_query":0.026529},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.044449},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.050097},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.296069}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":6.7401,"build_secs":0.5965,"decode_ns_per_posting":7.6218,"query_decode_ns_per_posting":4.5387,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.186901},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.224293},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.229689},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.918666}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.2299,"build_secs":0.6835,"decode_ns_per_posting":10.0339,"query_decode_ns_per_posting":6.1415,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.166993},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.23731},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.236183},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.135062}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.0725,"build_secs":0.2785,"decode_ns_per_posting":8.3408,"query_decode_ns_per_posting":7.3418,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.053749},{"op":"AND","algorithm":"native, count only","ms_per_query":0.04974},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.095289},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.099059},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.434419}]}]},"3":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":3.0,"mean_query_postings":684896.2,"mean_and_results":110.6,"mean_or_results":669995.0,"reps":3,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","simd":["sse4.2","avx2","bmi2","avx512f","avx512bw"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0582,"decode_ns_per_posting":0.3231,"query_decode_ns_per_posting":0.2625,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.57381},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":1.853519},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.04732},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.235977},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.067029},{"op":"AND","algorithm":"SvS + SIMD SSE 4x4","ms_per_query":0.765026},{"op":"AND","algorithm":"SvS + SIMD AVX2 8x8","ms_per_query":0.752271},{"op":"AND","algorithm":"SvS + SIMD AVX-512 16x16","ms_per_query":0.65199},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.053589},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.056995},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.127683},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.047358},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.123801},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.255714}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.5087,"build_secs":0.0514,"decode_ns_per_posting":0.8554,"query_decode_ns_per_posting":0.6375,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.059386},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.110154},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.485429}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.5087,"build_secs":0.0275,"decode_ns_per_posting":0.6257,"query_decode_ns_per_posting":0.4197,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.059177},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.101818},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.343356}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.8141,"build_secs":0.2236,"decode_ns_per_posting":1.1726,"query_decode_ns_per_posting":0.7609,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.062299},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.141169},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.612116}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.7704,"build_secs":0.1692,"decode_ns_per_posting":1.7283,"query_decode_ns_per_posting":1.3765,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.037039},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.065965},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.928565}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.3875,"build_secs":0.0507,"decode_ns_per_posting":1.0451,"query_decode_ns_per_posting":0.9433,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.06078},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.060923},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.090024},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.924295}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.1749,"build_secs":0.136,"decode_ns_per_posting":2.5698,"query_decode_ns_per_posting":1.7115,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.027762},{"op":"AND","algorithm":"native, count only","ms_per_query":0.027767},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.035008},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.058524},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.434972}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":6.9643,"build_secs":0.6477,"decode_ns_per_posting":7.5903,"query_decode_ns_per_posting":4.6795,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.113685},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.169421},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.275213},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.531641}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.4555,"build_secs":0.6826,"decode_ns_per_posting":9.189,"query_decode_ns_per_posting":5.9868,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.113057},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.17723},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.26698},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.985148}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.1749,"build_secs":0.2561,"decode_ns_per_posting":8.5764,"query_decode_ns_per_posting":7.3353,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.094859},{"op":"AND","algorithm":"native, count only","ms_per_query":0.096909},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.073083},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.100822},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.194813}]}]},"4":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":4.0,"mean_query_postings":875849.0,"mean_and_results":23.6,"mean_or_results":836332.9,"reps":3,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","simd":["sse4.2","avx2","bmi2","avx512f","avx512bw"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0494,"decode_ns_per_posting":0.2933,"query_decode_ns_per_posting":0.2434,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.549086},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":1.672497},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.028499},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.14815},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.054459},{"op":"AND","algorithm":"SvS + SIMD SSE 4x4","ms_per_query":0.690293},{"op":"AND","algorithm":"SvS + SIMD AVX2 8x8","ms_per_query":0.676485},{"op":"AND","algorithm":"SvS + SIMD AVX-512 16x16","ms_per_query":0.495534},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.029369},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.033793},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.110475},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.023683},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.100077},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.273918}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.607,"build_secs":0.052,"decode_ns_per_posting":0.794,"query_decode_ns_per_posting":0.5841,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.039438},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.106047},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.589571}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.607,"build_secs":0.0261,"decode_ns_per_posting":0.6032,"query_decode_ns_per_posting":0.3876,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.034846},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.081027},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.373121}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.8761,"build_secs":0.2072,"decode_ns_per_posting":1.3611,"query_decode_ns_per_posting":0.9833,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.040281},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.110361},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.756337}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.8614,"build_secs":0.1616,"decode_ns_per_posting":1.706,"query_decode_ns_per_posting":1.3733,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.023389},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.068576},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.153293}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.4928,"build_secs":0.0479,"decode_ns_per_posting":1.0109,"query_decode_ns_per_posting":0.8257,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.033337},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.032736},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.085713},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.184657}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.2459,"build_secs":0.1291,"decode_ns_per_posting":2.4443,"query_decode_ns_per_posting":1.6492,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.019391},{"op":"AND","algorithm":"native, count only","ms_per_query":0.01883},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.021009},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.057421},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.517869}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":7.0905,"build_secs":0.6558,"decode_ns_per_posting":7.6925,"query_decode_ns_per_posting":4.6944,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.072888},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.106989},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.261224},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.083285}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.5829,"build_secs":0.656,"decode_ns_per_posting":8.7607,"query_decode_ns_per_posting":6.2756,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.069207},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.100647},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.261631},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.419079}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.2459,"build_secs":0.2363,"decode_ns_per_posting":7.8085,"query_decode_ns_per_posting":7.0303,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.077583},{"op":"AND","algorithm":"native, count only","ms_per_query":0.077003},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.049976},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.095344},{"op":"AND","algorithm":"decode + SvS","ms_per_query":5.093827}]}]},"5":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":5.0,"mean_query_postings":763061.1,"mean_and_results":6.2,"mean_or_results":720237.0,"reps":3,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","simd":["sse4.2","avx2","bmi2","avx512f","avx512bw"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0483,"decode_ns_per_posting":0.2102,"query_decode_ns_per_posting":0.2065,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.388311},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":1.426123},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.021968},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.113055},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.033788},{"op":"AND","algorithm":"SvS + SIMD SSE 4x4","ms_per_query":0.583417},{"op":"AND","algorithm":"SvS + SIMD AVX2 8x8","ms_per_query":0.559979},{"op":"AND","algorithm":"SvS + SIMD AVX-512 16x16","ms_per_query":0.458681},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.019973},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.031571},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.107706},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.019372},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.098717},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.236322}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.736,"build_secs":0.05,"decode_ns_per_posting":0.9328,"query_decode_ns_per_posting":0.7174,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.028762},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.099401},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.52414}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.736,"build_secs":0.0263,"decode_ns_per_posting":0.6046,"query_decode_ns_per_posting":0.4134,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.024818},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.078429},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.343339}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.9508,"build_secs":0.2239,"decode_ns_per_posting":1.2792,"query_decode_ns_per_posting":0.8256,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.029172},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.105683},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.660475}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.9779,"build_secs":0.1631,"decode_ns_per_posting":1.651,"query_decode_ns_per_posting":1.4438,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.018607},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.062833},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.037358}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.6273,"build_secs":0.0525,"decode_ns_per_posting":1.4058,"query_decode_ns_per_posting":0.8844,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.024866},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.02677},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.079542},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.90127}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.3568,"build_secs":0.1291,"decode_ns_per_posting":2.4273,"query_decode_ns_per_posting":1.5879,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.016151},{"op":"AND","algorithm":"native, count only","ms_per_query":0.016984},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.01969},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.056703},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.539049}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":7.2282,"build_secs":0.6193,"decode_ns_per_posting":7.6267,"query_decode_ns_per_posting":4.993,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.055489},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.083257},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.251937},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.039088}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.7224,"build_secs":0.7395,"decode_ns_per_posting":9.3667,"query_decode_ns_per_posting":6.0715,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.058318},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.085664},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.259498},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.499048}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.3568,"build_secs":0.2541,"decode_ns_per_posting":7.7091,"query_decode_ns_per_posting":6.8484,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.077623},{"op":"AND","algorithm":"native, count only","ms_per_query":0.07197},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.046429},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.09768},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.562917}]}]},"6":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":6.0,"mean_query_postings":735851.0,"mean_and_results":2.2,"mean_or_results":686810.9,"reps":3,"cpu":"Intel(R) Xeon(R) Processor @ 2.10GHz","simd":["sse4.2","avx2","bmi2","avx512f","avx512bw"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0496,"decode_ns_per_posting":0.2762,"query_decode_ns_per_posting":0.2284,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.356031},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":1.181088},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.01514},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.070192},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.021874},{"op":"AND","algorithm":"SvS + SIMD SSE 4x4","ms_per_query":0.483095},{"op":"AND","algorithm":"SvS + SIMD AVX2 8x8","ms_per_query":0.481914},{"op":"AND","algorithm":"SvS + SIMD AVX-512 16x16","ms_per_query":0.381941},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.012893},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.025219},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.10165},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.015583},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.09525},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.242252}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.7999,"build_secs":0.0537,"decode_ns_per_posting":0.8981,"query_decode_ns_per_posting":0.7144,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.0269},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.086346},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.495397}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.7999,"build_secs":0.027,"decode_ns_per_posting":0.6214,"query_decode_ns_per_posting":0.4169,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.018732},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.070537},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.33077}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.9814,"build_secs":0.2088,"decode_ns_per_posting":1.3122,"query_decode_ns_per_posting":0.8139,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.022768},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.091192},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.633037}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":5.0332,"build_secs":0.1598,"decode_ns_per_posting":1.7122,"query_decode_ns_per_posting":1.3852,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.01409},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.056017},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.968609}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.6928,"build_secs":0.0483,"decode_ns_per_posting":1.0372,"query_decode_ns_per_posting":0.8712,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.018826},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.020622},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.071305},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.844141}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.4276,"build_secs":0.1269,"decode_ns_per_posting":2.5089,"query_decode_ns_per_posting":1.7677,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.011063},{"op":"AND","algorithm":"native, count only","ms_per_query":0.011013},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.013228},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.05388},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.546529}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":7.2825,"build_secs":0.6982,"decode_ns_per_posting":7.6066,"query_decode_ns_per_posting":5.1033,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.037134},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.060101},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.209841},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.032161}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.7773,"build_secs":0.6825,"decode_ns_per_posting":9.6924,"query_decode_ns_per_posting":7.0212,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.04323},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.068291},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.2306},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.50316}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.4276,"build_secs":0.2556,"decode_ns_per_posting":7.8069,"query_decode_ns_per_posting":7.1443,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.050219},{"op":"AND","algorithm":"native, count only","ms_per_query":0.050112},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.038449},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.100052},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.689641}]}]}},"generated":"2026-10-11","rustc":"1.97.0"};
+</script>
+<script>
+(function () {
+  "use strict";
+  const NS = "http://www.w3.org/2000/svg";
+  const $ = (s) => document.querySelector(s);
+
+  function s(tag, attrs, parent, text) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function h(tag, attrs, parent, text) {
+    const e = document.createElement(tag);
+    for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  const fmt = (v, d) => (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(d === undefined ? 1 : Math.max(0, d - 1)) : v.toFixed(d === undefined ? 2 : d));
+  const ms = (v) => (v < 0.1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v.toFixed(1));
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  // ---------------------------------------------------------------- diagrams
+  function blockDiagram() {
+    const g = $("#blk-docs");
+    const docs = [3, 7, 8, 9, 15, 16, 22, 40];
+    const gaps = [3, 3, 0, 0, 5, 0, 5, 17];
+    docs.forEach((d, i) => {
+      const x = 128 + i * 60;
+      s("rect", { x, y: 16, width: 52, height: 28, rx: 4, class: "box" }, g);
+      s("text", { x: x + 26, y: 35, class: "tm", "text-anchor": "middle" }, g, d);
+      s("rect", { x, y: 68, width: 52, height: 28, rx: 4, class: "box-acc" }, g);
+      s("text", { x: x + 26, y: 87, class: "tm", "text-anchor": "middle" }, g, gaps[i]);
+    });
+    s("text", { x: 128 + 8 * 60 + 6, y: 35, class: "tl" }, g, "… 128 per block");
+    s("text", { x: 128 + 8 * 60 + 6, y: 87, class: "tl" }, g, "max gap 17 → b = 5");
+  }
+
+  function efDiagram() {
+    const vals = [3, 4, 7, 13, 14, 15, 21, 31];
+    const gv = $("#ef-values");
+    vals.forEach((v, i) => {
+      const x = 130 + i * 76;
+      s("rect", { x, y: 10, width: 64, height: 26, rx: 4, class: "box" }, gv);
+      s("text", { x: x + 32, y: 28, class: "tm", "text-anchor": "middle" }, gv, v);
+      const hi = (v >> 2).toString(2).padStart(3, "0");
+      const lo = (v & 3).toString(2).padStart(2, "0");
+      s("text", { x: x + 32, y: 62, class: "tm", "text-anchor": "middle" }, gv, hi + "│" + lo);
+    });
+    const groups = [[1, 0], [1, 1, 0], [0], [1, 1, 1, 0], [0], [1, 0], [0], [1, 0]];
+    const gh = $("#ef-high");
+    let x = 130;
+    groups.forEach((bits, b) => {
+      const x0 = x;
+      bits.forEach((bit) => {
+        s("rect", { x, y: 112, width: 24, height: 26, rx: 3, class: bit ? "box-acc" : "box" }, gh);
+        s("text", { x: x + 12, y: 130, class: "tm", "text-anchor": "middle" }, gh, bit);
+        x += 26;
+      });
+      s("text", { x: (x0 + x - 2) / 2, y: 156, class: "ts", "text-anchor": "middle" }, gh, "h=" + b);
+      x += 8;
+    });
+    const gl = $("#ef-low");
+    vals.forEach((v, i) => {
+      const xx = 130 + i * 58;
+      s("rect", { x: xx, y: 196, width: 50, height: 26, rx: 3, class: "box" }, gl);
+      s("text", { x: xx + 25, y: 214, class: "tm", "text-anchor": "middle" }, gl, (v & 3).toString(2).padStart(2, "0"));
+    });
+  }
+
+  function pefDiagram() {
+    const g = $("#pef-parts");
+    const parts = [
+      { a: 40, b: 120, kind: "run", cls: "box-acc", density: 1 },
+      { a: 120, b: 330, kind: "Elias-Fano", cls: "box", density: 0.12 },
+      { a: 330, b: 455, kind: "bitvector", cls: "box-warm", density: 0.55 },
+      { a: 455, b: 625, kind: "Elias-Fano", cls: "box", density: 0.08 },
+      { a: 625, b: 680, kind: "run", cls: "box-acc", density: 1 },
+      { a: 680, b: 740, kind: "EF", cls: "box", density: 0.15 },
+    ];
+    let seed = 7;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+    parts.forEach((p) => {
+      s("rect", { x: p.a + 1, y: 52, width: p.b - p.a - 2, height: 66, rx: 4, class: p.cls }, g);
+      s("text", { x: (p.a + p.b) / 2, y: 70, class: "tb", "text-anchor": "middle" }, g, p.kind);
+      for (let x = p.a + 5; x < p.b - 3; x += 4) {
+        if (p.density >= 1 || rnd() < p.density) s("circle", { cx: x, cy: 100, r: 1.7, class: "dot" }, g);
+      }
+      s("rect", { x: p.b - 44, y: 20, width: 42, height: 22, rx: 3, class: "box" }, g);
+      s("text", { x: p.b - 23, y: 35, class: "ts", "text-anchor": "middle" }, g, "last");
+      s("line", { x1: p.b - 2, y1: 42, x2: p.b - 2, y2: 52, class: "ln" }, g);
+    });
+    s("text", { x: 40, y: 12, class: "ts" }, g, "upper level: last docID + descriptor per partition (64 bits)");
+  }
+
+  function roaringDiagram() {
+    const g = $("#roar-keys");
+    const items = [
+      { key: 0, title: "array · 3 values", body: "[17, 902, 4410]", size: "6 bytes", cls: "box" },
+      { key: 1, title: "bitmap · 31,207 values", body: "1024 × 64-bit words", size: "8 KiB", cls: "box-acc" },
+      { key: 5, title: "run · 2 runs", body: "(100,2999) (8000,199)", size: "10 bytes", cls: "box-warm" },
+      { key: 9, title: "array · 1 value", body: "[65530]", size: "2 bytes", cls: "box" },
+    ];
+    s("text", { x: 20, y: 86, class: "tl" }, g, "keys");
+    items.forEach((it, i) => {
+      const kx = 70 + i * 62;
+      s("rect", { x: kx, y: 66, width: 54, height: 30, rx: 4, class: "box-acc" }, g);
+      s("text", { x: kx + 27, y: 86, class: "tm", "text-anchor": "middle" }, g, it.key);
+      const cx = 14 + i * 186;
+      s("rect", { x: cx, y: 136, width: 176, height: 86, rx: 6, class: it.cls }, g);
+      s("text", { x: cx + 10, y: 158, class: "tb" }, g, it.title);
+      s("text", { x: cx + 10, y: 182, class: "tm" }, g, it.body);
+      s("text", { x: cx + 10, y: 208, class: "ts" }, g, it.size);
+      s("path", { d: `M${kx + 27} 96 C ${kx + 27} 118, ${cx + 88} 112, ${cx + 88} 134`, class: "ln", "marker-end": "url(#ar2)" }, g);
+    });
+  }
+
+  function trieDiagram() {
+    const g = $("#trie-tree");
+    const H = 4, W = 400, X0 = 14;
+    const ys = [28, 86, 144, 202, 262];
+    const xOf = (p, d) => X0 + ((p + 0.5) * 2 ** (H - d)) / 16 * W;
+    const nodes = [
+      { p: 0, d: 0, code: "11" },
+      { p: 0, d: 1, code: "10" }, { p: 1, d: 1, code: "11" },
+      { p: 0, d: 2, code: "01" }, { p: 2, d: 2, code: "10" }, { p: 3, d: 2, code: "10" },
+      { p: 1, d: 3, code: "11" }, { p: 4, d: 3, code: "01" }, { p: 6, d: 3, code: "11" },
+    ];
+    const leaves = [2, 3, 9, 12, 13];
+    const present = new Set(nodes.map((n) => n.d + ":" + n.p).concat(leaves.map((v) => "4:" + v)));
+    const edges = [];
+    nodes.forEach((n) => {
+      [0, 1].forEach((bit) => {
+        const c = n.p * 2 + bit;
+        if (present.has(n.d + 1 + ":" + c)) edges.push([n, { p: c, d: n.d + 1 }, bit]);
+      });
+    });
+    edges.forEach(([a, b, bit]) => {
+      const x1 = xOf(a.p, a.d), y1 = ys[a.d], x2 = xOf(b.p, b.d), y2 = ys[b.d];
+      s("line", { x1, y1, x2, y2, class: "ln" }, g);
+      s("text", { x: (x1 + x2) / 2 + (bit ? 6 : -12), y: (y1 + y2) / 2, class: "ts" }, g, bit);
+    });
+    nodes.forEach((n) => {
+      const x = xOf(n.p, n.d), y = ys[n.d];
+      s("rect", { x: x - 17, y: y - 12, width: 34, height: 24, rx: 12, class: n.d === 2 && n.p === 2 ? "box-warm" : "box-acc" }, g);
+      s("text", { x, y: y + 4, class: "tm", "text-anchor": "middle" }, g, n.code);
+    });
+    leaves.forEach((v) => {
+      const x = xOf(v, 4), y = ys[4];
+      s("rect", { x: x - 11, y: y - 11, width: 22, height: 22, rx: 3, class: "box" }, g);
+      s("text", { x, y: y + 4, class: "tm", "text-anchor": "middle" }, g, v);
+    });
+    const gl = $("#trie-levels");
+    const levels = [["11"], ["10", "11"], ["01", "10", "10"], ["11", "01", "11"]];
+    s("text", { x: 470, y: 14, class: "ts" }, gl, "level bitvectors (rank-indexed)");
+    levels.forEach((lv, d) => {
+      s("text", { x: 470, y: ys[d] + 4, class: "tl" }, gl, "B" + "₀₁₂₃"[d]);
+      lv.forEach((code, i) => {
+        const x = 500 + i * 62;
+        s("rect", { x, y: ys[d] - 12, width: 54, height: 24, rx: 4, class: d === 2 && i === 1 ? "box-warm" : "box" }, gl);
+        s("text", { x: x + 27, y: ys[d] + 4, class: "tm", "text-anchor": "middle" }, gl, code);
+      });
+    });
+    s("text", { x: 470, y: 250, class: "ts" }, gl, "18 bits for 5 docIDs; leaves are implicit.");
+    s("text", { x: 470, y: 268, class: "ts" }, gl, "left(i) = rank₁(B_ℓ, 2i),  right(i) = rank₁(B_ℓ, 2i+1)");
+  }
+
+  function simdDiagram() {
+    const g = $("#simd-grid");
+    const a = [12, 15, 20, 31];
+    const b = [9, 12, 22, 31];
+    const rows = [0, 1, 2, 3].map((r) => b.map((_, j) => b[(j + r) % 4]));
+    const X = 120, CW = 50;
+    s("text", { x: 10, y: 33, class: "tb" }, g, "a block");
+    a.forEach((v, j) => {
+      s("rect", { x: X + j * (CW + 6), y: 12, width: CW, height: 30, rx: 4, class: "box-acc" }, g);
+      s("text", { x: X + j * (CW + 6) + CW / 2, y: 32, class: "tm", "text-anchor": "middle" }, g, v);
+    });
+    const masks = [];
+    rows.forEach((row, r) => {
+      const y = 62 + r * 40;
+      s("text", { x: 10, y: y + 20, class: "tl" }, g, r === 0 ? "b block" : "b rotated " + r);
+      let m = 0;
+      row.forEach((v, j) => {
+        const hit = v === a[j];
+        if (hit) m |= 1 << j;
+        s("rect", { x: X + j * (CW + 6), y, width: CW, height: 30, rx: 4, class: hit ? "box-warm" : "box" }, g);
+        s("text", { x: X + j * (CW + 6) + CW / 2, y: y + 20, class: "tm", "text-anchor": "middle" }, g, v);
+      });
+      masks.push(m);
+      s("text", { x: X + 4 * (CW + 6) + 10, y: y + 20, class: "tm" }, g, "mask " + m.toString(2).padStart(4, "0") + "₂");
+    });
+    const all = masks.reduce((x, y) => x | y, 0);
+    const out = a.filter((_, j) => all & (1 << j));
+    const ox = 470;
+    s("text", { x: ox, y: 80, class: "tl" }, g, "OR of masks = " + all.toString(2).padStart(4, "0") + "₂");
+    s("text", { x: ox, y: 104, class: "tl" }, g, "pshufb with table[" + all + "]");
+    s("text", { x: ox, y: 140, class: "tb" }, g, "output");
+    out.forEach((v, j) => {
+      s("rect", { x: ox + 56 + j * 56, y: 120, width: 50, height: 30, rx: 4, class: "box-warm" }, g);
+      s("text", { x: ox + 81 + j * 56, y: 140, class: "tm", "text-anchor": "middle" }, g, v);
+    });
+    s("text", { x: ox, y: 182, class: "ts" }, g, "a₃ = 31 ≤ b₃ = 31 → advance a by 4");
+    s("text", { x: ox, y: 200, class: "ts" }, g, "b₃ = 31 ≤ a₃ = 31 → advance b by 4");
+  }
+
+  function leapDiagram() {
+    const g = $("#leap");
+    const lists = { A: [3, 12, 40, 41, 77], B: [5, 15, 40, 60, 77, 90], C: [1, 12, 40, 44, 77, 80] };
+    const ys = { A: 56, B: 112, C: 168 };
+    const vals = [...new Set(Object.values(lists).flat())].sort((p, q) => p - q);
+    const x = (v) => 130 + vals.indexOf(v) * 52;
+    [40, 77].forEach((v) => s("rect", { x: x(v) - 11, y: 30, width: 22, height: 156, rx: 6, class: "band" }, g));
+    s("text", { x: x(40), y: 204, class: "ts", "text-anchor": "middle" }, g, "result");
+    s("text", { x: x(77), y: 204, class: "ts", "text-anchor": "middle" }, g, "result");
+    Object.entries(lists).forEach(([name, vals]) => {
+      const y = ys[name];
+      s("line", { x1: 110, y1: y, x2: 740, y2: y, class: "axis" }, g);
+      s("text", { x: 4, y: y + 4, class: "tl" }, g, name === "A" ? "A (rarest)" : name);
+      vals.forEach((v) => {
+        s("circle", { cx: x(v), cy: y, r: 4.5, class: "dot" }, g);
+        s("text", { x: x(v) + 8, y: y + 17, class: "ts" }, g, v);
+      });
+    });
+    const jumps = [["A", 3, "B", 5], ["B", 5, "A", 12], ["A", 12, "B", 15], ["B", 15, "A", 40], ["A", 40, "B", 40], ["B", 40, "C", 40],
+      ["A", 41, "B", 60], ["B", 60, "A", 77], ["A", 77, "B", 77], ["B", 77, "C", 77]];
+    jumps.forEach(([r1, v1, r2, v2]) => {
+      const x1 = x(v1), y1 = ys[r1], x2 = x(v2), y2 = ys[r2];
+      const dy = y2 > y1 ? 6 : -6;
+      const mx = (x1 + x2) / 2 + (x1 === x2 ? 16 : 0);
+      s("path", { d: `M${x1} ${y1 + dy} Q ${mx + 6} ${(y1 + y2) / 2} ${x2} ${y2 - dy}`, class: "ln-acc", "marker-end": "url(#ar3)" }, g);
+    });
+    s("path", { d: `M${x(40) + 5} ${ys.A - 2} Q ${(x(40) + x(41)) / 2} ${ys.A - 26} ${x(41) - 5} ${ys.A - 4}`, class: "ln" }, g);
+    s("text", { x: (x(40) + x(41)) / 2, y: ys.A - 30, class: "ts", "text-anchor": "middle" }, g, "next()");
+  }
+
+  // ---------------------------------------------------------------- charts
+  const tip = $("#tip");
+  function showTip(evt, html) {
+    tip.replaceChildren(...html);
+    tip.hidden = false;
+    const fr = evt.currentTarget.closest(".frame");
+    const r = fr.getBoundingClientRect();
+    let left = evt.clientX - r.left + fr.scrollLeft + 14;
+    let top = evt.clientY - r.top + 14;
+    if (left + 230 > r.width) left = Math.max(4, left - 250);
+    fr.appendChild(tip);
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  }
+  function hideTip() { tip.hidden = true; }
+  function tipRows(title, rows) {
+    const out = [h("div", { class: "h" }, null, title)];
+    rows.forEach(([color, label, value]) => {
+      const r = h("div", { class: "row" });
+      if (color) { const i = h("i", {}, r); i.style.background = color; }
+      h("b", {}, r, value);
+      h("span", {}, r, " " + label);
+      out.push(r);
+    });
+    return out;
+  }
+
+  function logTicks(min, max) {
+    const t = [];
+    for (let e = Math.floor(Math.log10(min)); e <= Math.ceil(Math.log10(max)); e++) {
+      [1, 2, 5].forEach((m) => { const v = m * 10 ** e; if (v >= min * 0.999 && v <= max * 1.001) t.push(v); });
+    }
+    return t;
+  }
+  function linTicks(min, max, n) {
+    const span = max - min, step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((st) => span / st <= n) || 10 * mag;
+    const t = [];
+    for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) t.push(+v.toFixed(10));
+    return t;
+  }
+  const tickLabel = (v) => (v >= 1000 ? (v / 1000) + "K" : v >= 1 ? String(+v.toFixed(2)) : String(+v.toPrecision(2)));
+
+  function frame(container, height, margin) {
+    container.replaceChildren();
+    const width = Math.max(300, container.clientWidth);
+    const svg = s("svg", { class: "ch", width, height, viewBox: `0 0 ${width} ${height}` }, container);
+    return { svg, width, height, iw: width - margin.l - margin.r, ih: height - margin.t - margin.b, m: margin };
+  }
+
+  function axes(f, xs, ys, xt, yt, xTitle, yTitle) {
+    const g = s("g", {}, f.svg);
+    yt.forEach((v) => {
+      const y = f.m.t + ys(v);
+      s("line", { x1: f.m.l, x2: f.m.l + f.iw, y1: y, y2: y, class: "grid" }, g);
+      s("text", { x: f.m.l - 6, y: y + 4, "text-anchor": "end" }, g, tickLabel(v));
+    });
+    xt.forEach((v) => {
+      const x = f.m.l + xs(v);
+      s("line", { x1: x, x2: x, y1: f.m.t + f.ih, y2: f.m.t + f.ih + 4, class: "axis" }, g);
+      s("text", { x, y: f.m.t + f.ih + 17, "text-anchor": "middle" }, g, tickLabel(v));
+    });
+    s("line", { x1: f.m.l, x2: f.m.l + f.iw, y1: f.m.t + f.ih, y2: f.m.t + f.ih, class: "axis" }, g);
+    s("text", { x: f.m.l + f.iw / 2, y: f.height - 4, "text-anchor": "middle", class: "axis-title" }, g, xTitle);
+    s("text", { x: 12, y: f.m.t + f.ih / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 12 ${f.m.t + f.ih / 2})` }, g, yTitle);
+  }
+
+  // Scatter of space vs time with a highlighted Pareto frontier.
+  function scatter(container, pts, opt) {
+    const f = frame(container, opt.height || 360, { l: 58, r: 20, t: 14, b: 42 });
+    const xmin = Math.min(...pts.map((p) => p.x)) / 1.12, xmax = Math.max(...pts.map((p) => p.x)) * 1.12;
+    const ylo = Math.min(...pts.map((p) => p.y)) / 1.35, yhi = Math.max(...pts.map((p) => p.y)) * 1.35;
+    const xs = (v) => ((Math.log(v) - Math.log(xmin)) / (Math.log(xmax) - Math.log(xmin))) * f.iw;
+    const ys = (v) => f.ih - ((Math.log(v) - Math.log(ylo)) / (Math.log(yhi) - Math.log(ylo))) * f.ih;
+    axes(f, xs, ys, [4, 5, 6, 8, 10, 12, 16, 20, 32].filter((v) => v >= xmin && v <= xmax), logTicks(ylo, yhi), opt.xTitle, opt.yTitle);
+    const sorted = pts.slice().sort((a, b) => a.x - b.x);
+    let best = Infinity;
+    const front = [];
+    sorted.forEach((p) => { if (p.y < best) { best = p.y; front.push(p); p.front = true; } });
+    const g = s("g", {}, f.svg);
+    s("polyline", { points: front.map((p) => `${f.m.l + xs(p.x)},${f.m.t + ys(p.y)}`).join(" "), fill: "none", stroke: css("--accent"), "stroke-width": 1.5, "stroke-dasharray": "0", opacity: 0.45 }, g);
+    const placed = [];
+    const overlaps = (b) => placed.some((q) => b.x < q.x + q.w && b.x + b.w > q.x && b.y < q.y + q.h && b.y + b.h > q.y);
+    pts.forEach((p) => {
+      const cx = f.m.l + xs(p.x), cy = f.m.t + ys(p.y);
+      placed.push({ x: cx - 6, y: cy - 6, w: 12, h: 12 });
+    });
+    pts.forEach((p) => {
+      const cx = f.m.l + xs(p.x), cy = f.m.t + ys(p.y);
+      const c = s("circle", { cx, cy, r: 5.5, fill: p.front ? css("--accent") : css("--ink-3"), stroke: css("--surface"), "stroke-width": 2, tabindex: 0 }, g);
+      const hit = s("circle", { cx, cy, r: 13, fill: "transparent" }, g);
+      const show = (e) => showTip(e, tipRows(p.label, [[null, opt.xTitle, fmt(p.x)], [null, "ms/query" + (p.algo ? " · " + p.algo : ""), ms(p.y)]]));
+      [c, hit].forEach((el) => { el.addEventListener("pointermove", show); el.addEventListener("pointerleave", hideTip); });
+      const w = p.label.length * 6.4 + 4;
+      const cands = [[cx + 9, cy + 4], [cx - 9 - w, cy + 4], [cx - w / 2, cy - 11], [cx - w / 2, cy + 19], [cx + 9, cy - 9], [cx + 9, cy + 15], [cx - 9 - w, cy - 9], [cx - 9 - w, cy + 15]];
+      for (const [lx, ly] of cands) {
+        const box = { x: lx, y: ly - 10, w, h: 13 };
+        if (lx < f.m.l || lx + w > f.width - 2 || ly - 10 < 0 || ly > f.m.t + f.ih) continue;
+        if (!overlaps(box)) {
+          placed.push(box);
+          s("text", { x: lx, y: ly, class: p.front ? "lab-strong" : "lab" }, g, p.label);
+          break;
+        }
+      }
+    });
+  }
+
+  // Horizontal bars, one or more series per category.
+  function hbars(container, cats, series, opt) {
+    const band = series.length > 1 ? 14 * series.length + 10 : 26;
+    const f = frame(container, cats.length * band + 46, { l: opt.labelWidth || 190, r: 64, t: 8, b: 36 });
+    const vmax = Math.max(...series.flatMap((sr) => sr.values.filter((v) => v != null))) * 1.05;
+    const xs = (v) => (v / vmax) * f.iw;
+    const xt = linTicks(0, vmax, 5);
+    const g = s("g", {}, f.svg);
+    xt.forEach((v) => {
+      const x = f.m.l + xs(v);
+      s("line", { x1: x, x2: x, y1: f.m.t, y2: f.m.t + f.ih, class: "grid" }, g);
+      s("text", { x, y: f.m.t + f.ih + 16, "text-anchor": "middle" }, g, tickLabel(v));
+    });
+    s("text", { x: f.m.l + f.iw / 2, y: f.height - 4, "text-anchor": "middle", class: "axis-title" }, g, opt.xTitle);
+    cats.forEach((cat, i) => {
+      const y0 = f.m.t + i * band + 4;
+      s("text", { x: f.m.l - 8, y: y0 + band / 2 - 1, "text-anchor": "end", class: "lab" }, g, cat);
+      series.forEach((sr, j) => {
+        const v = sr.values[i];
+        if (v == null) return;
+        const bh = series.length > 1 ? 12 : 16;
+        const y = y0 + (series.length > 1 ? j * 14 : (band - bh) / 2 - 2);
+        const w = Math.max(2, xs(v));
+        const r = Math.min(4, w / 2);
+        s("path", { d: `M${f.m.l} ${y} H${f.m.l + w - r} Q${f.m.l + w} ${y} ${f.m.l + w} ${y + r} V${y + bh - r} Q${f.m.l + w} ${y + bh} ${f.m.l + w - r} ${y + bh} H${f.m.l} Z`, fill: sr.color }, g);
+        s("text", { x: f.m.l + w + 5, y: y + bh - 3, class: "lab" }, g, opt.valueFmt ? opt.valueFmt(v) : fmt(v));
+        const hit = s("rect", { x: f.m.l, y: y - 1, width: Math.max(w, 30), height: bh + 2, fill: "transparent" }, g);
+        hit.addEventListener("pointermove", (e) => showTip(e, tipRows(cat, series.map((q) => [q.color, q.name, q.values[i] == null ? "—" : (opt.valueFmt ? opt.valueFmt(q.values[i]) : fmt(q.values[i]))]))));
+        hit.addEventListener("pointerleave", hideTip);
+      });
+    });
+  }
+
+  // Multi-series line chart; log axes optional; crosshair tooltip.
+  function lines(container, xsVals, series, opt) {
+    const f = frame(container, opt.height || 340, { l: 58, r: 20, t: 14, b: 42 });
+    const all = series.flatMap((sr) => sr.values.filter((v) => v != null));
+    const ylo = opt.logY ? Math.min(...all) / 1.3 : 0, yhi = Math.max(...all) * (opt.logY ? 1.3 : 1.08);
+    const xlo = Math.min(...xsVals), xhi = Math.max(...xsVals);
+    const xs = opt.logX ? (v) => ((Math.log(v) - Math.log(xlo)) / (Math.log(xhi) - Math.log(xlo))) * f.iw : (v) => ((v - xlo) / (xhi - xlo)) * f.iw;
+    const ys = opt.logY ? (v) => f.ih - ((Math.log(v) - Math.log(ylo)) / (Math.log(yhi) - Math.log(ylo))) * f.ih : (v) => f.ih - (v / yhi) * f.ih;
+    axes(f, xs, ys, opt.xTicks || xsVals, opt.logY ? logTicks(ylo, yhi) : linTicks(0, yhi, 5), opt.xTitle, opt.yTitle);
+    const g = s("g", {}, f.svg);
+    series.forEach((sr) => {
+      const pts = xsVals.map((x, i) => [x, sr.values[i]]).filter((p) => p[1] != null);
+      s("polyline", { points: pts.map(([x, y]) => `${f.m.l + xs(x)},${f.m.t + ys(y)}`).join(" "), fill: "none", stroke: sr.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, g);
+      pts.forEach(([x, y]) => s("circle", { cx: f.m.l + xs(x), cy: f.m.t + ys(y), r: 3.5, fill: sr.color, stroke: css("--surface"), "stroke-width": 1.5 }, g));
+    });
+    const cross = s("line", { y1: f.m.t, y2: f.m.t + f.ih, stroke: css("--ink-3"), "stroke-width": 1, opacity: 0 }, g);
+    const hit = s("rect", { x: f.m.l, y: f.m.t, width: f.iw, height: f.ih, fill: "transparent" }, g);
+    hit.addEventListener("pointermove", (e) => {
+      const r = f.svg.getBoundingClientRect();
+      const px = e.clientX - r.left - f.m.l;
+      let bi = 0;
+      xsVals.forEach((x, i) => { if (Math.abs(xs(x) - px) < Math.abs(xs(xsVals[bi]) - px)) bi = i; });
+      const cx = f.m.l + xs(xsVals[bi]);
+      cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("opacity", 0.5);
+      const rows = series.map((sr) => [sr.color, sr.name, sr.values[bi] == null ? "—" : (opt.valueFmt || fmt)(sr.values[bi])])
+        .sort((a, b) => parseFloat(a[2]) - parseFloat(b[2]));
+      showTip(e, tipRows((opt.xLabel || "") + xsVals[bi], rows));
+    });
+    hit.addEventListener("pointerleave", () => { cross.setAttribute("opacity", 0); hideTip(); });
+  }
+
+  function legend(container, series, square) {
+    const l = h("div", { class: "legend" });
+    series.forEach((sr) => {
+      const sp = h("span", {}, l);
+      const i = h("i", square ? { class: "sq" } : {}, sp);
+      i.style.background = sr.color;
+      sp.appendChild(document.createTextNode(sr.name));
+    });
+    container.parentNode.insertBefore(l, container);
+  }
+
+  // ---------------------------------------------------------------- data helpers
+  const isCount = (m) => m.algorithm.includes("count only");
+  function best(c, op) {
+    return c.measurements.filter((m) => m.op === op && !isCount(m)).sort((a, b) => a.ms_per_query - b.ms_per_query)[0];
+  }
+  function m(c, op, algo) {
+    const x = c.measurements.find((q) => q.op === op && q.algorithm === algo);
+    return x ? x.ms_per_query : null;
+  }
+  const short = (name) => name.replace("Hybrid (bitmap + BP128)", "Hybrid").replace("BP128 (bitpacking crate)", "BP128 (crate)").replace("Roaring (roaring crate)", "Roaring (crate)");
+
+  const shortAlgo = (a) => a.replace(" (NextGEQ)", "").replace(" (4096)", "").replace("adaptive (SIMD / gallop @64x)", "adaptive").replace("slices: ", "");
+  function summaryTable(container, run) {
+    const wrap = h("div", { class: "table-wrap" }, container);
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    ["codec", "bits/posting", "query lists", "decode ns/posting", "best AND ms", "", "best OR ms", ""].forEach((x, i) =>
+      h("th", { class: i && i !== 5 && i !== 7 ? "n" : "" }, hr, x));
+    const tb = h("tbody", {}, t);
+    const bAnd = Math.min(...run.codecs.map((c) => best(c, "AND").ms_per_query));
+    const bOr = Math.min(...run.codecs.map((c) => best(c, "OR").ms_per_query));
+    const bSpace = Math.min(...run.codecs.map((c) => c.query_bits_per_posting));
+    run.codecs.forEach((c) => {
+      const tr = h("tr", {}, tb);
+      const a = best(c, "AND"), o = best(c, "OR");
+      h("td", {}, tr, c.codec);
+      h("td", { class: "n" }, tr, c.bits_per_posting.toFixed(2));
+      h("td", { class: "n" + (c.query_bits_per_posting === bSpace ? " best" : "") }, tr, c.query_bits_per_posting.toFixed(2));
+      h("td", { class: "n" }, tr, c.query_decode_ns_per_posting.toFixed(2));
+      h("td", { class: "n" + (a.ms_per_query === bAnd ? " best" : "") }, tr, ms(a.ms_per_query));
+      h("td", { class: "algo" }, tr, shortAlgo(a.algorithm));
+      h("td", { class: "n" + (o.ms_per_query === bOr ? " best" : "") }, tr, ms(o.ms_per_query));
+      h("td", { class: "algo" }, tr, shortAlgo(o.algorithm));
+    });
+  }
+
+  function algoTable(container, run, op, algos) {
+    const wrap = h("div", { class: "table-wrap" }, container);
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    h("th", {}, hr, "codec");
+    algos.forEach((a) => h("th", { class: "n" }, hr, a));
+    const tb = h("tbody", {}, t);
+    run.codecs.forEach((c) => {
+      const vals = algos.map((a) => m(c, op, a));
+      if (vals.every((v) => v == null)) return;
+      const mn = Math.min(...vals.filter((v, i) => v != null && !algos[i].includes("count only")));
+      const tr = h("tr", {}, tb);
+      h("td", {}, tr, c.codec);
+      vals.forEach((v) => h("td", { class: "n" + (v === mn ? " best" : "") }, tr, v == null ? "—" : ms(v)));
+    });
+  }
+
+  function allTable(container, run) {
+    const d = h("details", {}, container);
+    h("summary", {}, d, "All measurements (" + run.codecs.reduce((n, c) => n + c.measurements.length, 0) + " rows)");
+    const wrap = h("div", { class: "table-wrap" }, d);
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    ["codec", "op", "algorithm", "ms/query"].forEach((x, i) => h("th", { class: i === 3 ? "n" : "" }, hr, x));
+    const tb = h("tbody", {}, t);
+    run.codecs.forEach((c) => c.measurements.forEach((q) => {
+      const tr = h("tr", {}, tb);
+      h("td", {}, tr, c.codec); h("td", {}, tr, q.op); h("td", {}, tr, q.algorithm); h("td", { class: "n" }, tr, ms(q.ms_per_query));
+    }));
+  }
+
+  // ---------------------------------------------------------------- page assembly
+  const renderers = [];
+  function chart(id, fn) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    renderers.push(() => fn(el));
+  }
+
+  function setupTable() {
+    const runs = [["clustered", "Synthetic, clustered"], ["uniform", "Synthetic, uniform"], ["wikitext", "WikiText-103"]].filter(([k]) => DATA[k]);
+    const wrap = h("div", { class: "table-wrap" }, $("#setup-table"));
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    ["collection", "documents", "lists", "postings", "queries", "terms/query", "AND results", "OR results"].forEach((x, i) => h("th", { class: i ? "n" : "" }, hr, x));
+    const tb = h("tbody", {}, t);
+    runs.forEach(([k, name]) => {
+      const r = DATA[k];
+      const tr = h("tr", {}, tb);
+      h("td", {}, tr, name);
+      [r.documents, r.lists, r.postings, r.queries].forEach((v) => h("td", { class: "n" }, tr, v.toLocaleString("en-US")));
+      h("td", { class: "n" }, tr, r.mean_terms.toFixed(2));
+      h("td", { class: "n" }, tr, Math.round(r.mean_and_results).toLocaleString("en-US"));
+      h("td", { class: "n" }, tr, Math.round(r.mean_or_results).toLocaleString("en-US"));
+    });
+    const p = h("p", { class: "meta" }, $("#setup-table"));
+    p.textContent = "CPU: " + DATA.clustered.cpu + " · SIMD: " + DATA.clustered.simd.join(", ") + " · single thread · Rust " + (DATA.rustc || "stable") + " · best of " + DATA.clustered.reps + " passes";
+  }
+
+  function codecCards() {
+    const rows = [
+      ["Uncompressed", "baseline", "sorted u32 array", "galloping", "—"],
+      ["VByte", "block", "varint d-gaps, 128 per block + skip table", "skip table, decode block", "—"],
+      ["BP128", "block", "one bit width per 128 gaps (SIMD-BP128 layout)", "skip table, decode block", "—"],
+      ["BP128 (bitpacking crate)", "baseline", "Tantivy's BitPacker4x in the same blocks", "skip table, decode block", "—"],
+      ["OptPFor", "block", "per-block optimal width + patched exceptions", "skip table, decode block", "—"],
+      ["Interpolative", "block", "binary interpolative coding per block", "skip table, decode block", "—"],
+      ["Elias-Fano", "succinct", "low bits + unary high bits", "select₀ on high bits", "—"],
+      ["PEF", "succinct", "DP partitions: run, bitvector or Elias-Fano", "gallop partitions, then local", "—"],
+      ["Roaring", "bitmap", "2¹⁶ chunks: array, bitmap or run containers", "gallop keys, then container", "SvS over containers, lazy k-way OR"],
+      ["Roaring (roaring crate)", "baseline", "the roaring crate, run-optimised", "iterator advance_to", "MultiOps"],
+      ["Hybrid (bitmap + BP128)", "bitmap", "bitmap if u/n ≤ 8, else BP128", "word scan or block", "leapfrog sparse lists + bit probes"],
+      ["Trie", "succinct", "2 bits per trie node, rank navigation", "descend along target bits", "synchronised traversal"],
+      ["Run-Trie", "succinct", "trie with full subtrees cut", "descend along target bits", "synchronised traversal"],
+    ];
+    const wrap = h("div", { class: "table-wrap" }, $("#codec-cards"));
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    ["codec", "family", "layout", "NextGEQ", "native AND / OR"].forEach((x) => h("th", {}, hr, x));
+    const tb = h("tbody", {}, t);
+    rows.forEach((r) => { const tr = h("tr", {}, tb); r.forEach((c, i) => h("td", i === 0 ? { class: "strong" } : {}, tr, c)); });
+  }
+
+  function runSection(key) {
+    const run = DATA[key];
+    if (!run) return;
+    chart(key + "-and", (el) => scatter(el, run.codecs.map((c) => ({ label: short(c.codec), x: c.query_bits_per_posting, y: best(c, "AND").ms_per_query, algo: best(c, "AND").algorithm })), { xTitle: "bits per posting, query lists (log)", yTitle: "AND ms/query (log)" }));
+    chart(key + "-or", (el) => scatter(el, run.codecs.map((c) => ({ label: short(c.codec), x: c.query_bits_per_posting, y: best(c, "OR").ms_per_query, algo: best(c, "OR").algorithm })), { xTitle: "bits per posting, query lists (log)", yTitle: "OR ms/query (log)" }));
+    const tbl = document.getElementById(key + "-table");
+    if (tbl) { summaryTable(tbl, run); allTable(tbl, run); }
+  }
+
+  function render() { renderers.forEach((r) => r()); }
+
+  function init() {
+    if (!DATA) return;
+    blockDiagram(); efDiagram(); pefDiagram(); roaringDiagram(); trieDiagram(); simdDiagram(); leapDiagram();
+    codecCards();
+    setupTable();
+    ["clustered", "uniform", "wikitext"].forEach(runSection);
+
+    const ANDALGOS = ["leapfrog (NextGEQ)", "round-robin (LFTJ)", "decode + SvS", "native", "native, count only"];
+    const ORALGOS = ["heap", "min-scan", "bitset window (4096)", "native", "native, count only"];
+    const at = $("#algo-and"); if (at) algoTable(at, DATA.clustered, "AND", ANDALGOS);
+    const ot = $("#algo-or"); if (ot) algoTable(ot, DATA.clustered, "OR", ORALGOS);
+
+    if (DATA.uniform) {
+      chart("space-compare", (el) => {
+        const names = DATA.clustered.codecs.map((c) => c.codec).filter((n) => n !== "Uncompressed");
+        const get = (run) => names.map((n) => { const c = run.codecs.find((q) => q.codec === n); return c ? c.query_bits_per_posting : null; });
+        const series = [{ name: "clustered", color: css("--s1"), values: get(DATA.clustered) }, { name: "uniform", color: css("--s2"), values: get(DATA.uniform) }];
+        if (!el.previousElementSibling || !el.previousElementSibling.classList.contains("legend")) legend(el, series, true);
+        hbars(el, names.map(short), series, { xTitle: "bits per posting (query lists)", labelWidth: 120 });
+      });
+      chart("time-compare", (el) => {
+        const names = DATA.clustered.codecs.map((c) => c.codec);
+        const get = (run) => names.map((n) => { const c = run.codecs.find((q) => q.codec === n); return c ? best(c, "AND").ms_per_query : null; });
+        const series = [{ name: "clustered", color: css("--s1"), values: get(DATA.clustered) }, { name: "uniform", color: css("--s2"), values: get(DATA.uniform) }];
+        if (!el.previousElementSibling || !el.previousElementSibling.classList.contains("legend")) legend(el, series, true);
+        hbars(el, names.map(short), series, { xTitle: "best AND ms/query", labelWidth: 120, valueFmt: ms });
+      });
+    }
+
+    if (DATA.kernels) {
+      chart("kernels", (el) => {
+        const rows = DATA.kernels.rows;
+        const ratios = [...new Set(rows.map((r) => r.ratio))];
+        const pick = ["merge", "merge (branchless)", "galloping", "binary search", "Baeza-Yates", "SIMD AVX-512 16x16", "adaptive (SIMD / gallop @64x)"];
+        const cols = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
+        const series = pick.filter((k) => rows.some((r) => r.kernel === k)).map((k, i) => ({
+          name: k.replace(" (SIMD / gallop @64x)", " (SIMD ≤64×, else gallop)"), color: css(cols[i]),
+          values: ratios.map((x) => { const r = rows.find((q) => q.kernel === k && q.ratio === x); return r ? r.ns_per_small_element : null; }),
+        }));
+        if (!el.previousElementSibling || !el.previousElementSibling.classList.contains("legend")) legend(el, series);
+        lines(el, ratios, series, { logX: true, logY: true, xTitle: "size ratio |large| / |small| (log)", yTitle: "ns per element of the small list (log)", xLabel: "ratio 1:", valueFmt: (v) => fmt(v) + " ns" });
+      });
+    }
+
+    if (DATA.terms) {
+      chart("terms", (el) => {
+        const ks = Object.keys(DATA.terms).map(Number).sort((a, b) => a - b);
+        const pick = ["Uncompressed", "BP128", "PEF", "Hybrid (bitmap + BP128)", "Roaring", "Trie"];
+        const cols = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"];
+        const series = pick.map((n, i) => ({
+          name: short(n), color: css(cols[i]),
+          values: ks.map((k) => { const c = DATA.terms[k].codecs.find((q) => q.codec === n); return c ? best(c, "AND").ms_per_query : null; }),
+        }));
+        if (!el.previousElementSibling || !el.previousElementSibling.classList.contains("legend")) legend(el, series);
+        lines(el, ks, series, { logY: true, xTitle: "terms per query", yTitle: "best AND ms/query (log)", xLabel: "k = ", valueFmt: ms });
+      });
+    }
+
+    const f = $("#footer");
+    if (f) f.textContent = "Generated from results/*.json by scripts/build_report.py · " + (DATA.generated || "");
+    const meta = $("#meta-line");
+    if (meta && DATA.clustered) meta.textContent = DATA.clustered.cpu + " · single thread · Rust, -C target-cpu=native";
+
+    render();
+    let t;
+    window.addEventListener("resize", () => { clearTimeout(t); t = setTimeout(render, 120); });
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    if (mq.addEventListener) mq.addEventListener("change", render);
+    new MutationObserver(render).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init); else init();
+})();
+
+</script>

@@ -1,0 +1,201 @@
+<div class="col">
+  <h2>Keys and values</h2>
+  <p>The curves show what each layout puts into the model's context as the budget grows. The default chart is the measure that best predicts a correct answer: whether the answer string itself is in the context. The other tabs show the coding session, and the other metrics.</p>
+</div>
+<figure class="wide">
+  <div class="frame">
+    <p class="chart-title">What reaches the model, by budget</p>
+    <p class="chart-sub" id="budget-sub"></p>
+    <div class="legend" id="budget-legend"></div>
+    <div class="chart" id="budget-chart"></div>
+  </div>
+</figure>
+<div class="col">
+  <h3>Coding sessions want small keys</h3>
+  <p>In a new session, a 4,000-character injection held the answer to 72% of the 67 probe questions with Engram's old 1,500-byte records, and to 85% with 400-byte windows. At 2,000 characters the figures are 66% and 75%. After a compaction, asked only about what the model had lost, they are 72% and 84%. A coding record (a test run, a stack trace, a long answer) holds many unrelated facts. A 1,500-byte key averages them into one vector, spreads BM25's term frequencies over them, and its best 600-byte snippet often misses the one line that matters. A 400-byte window is about one thing.</p>
+  <p>Smaller is not always better: 200-byte windows lead at 1,000 characters (70%) but fall behind at 4,000 (84%), because they cut errors and commands in the middle. 800-byte windows win at 4,000 (88%) and lose at 2,000 (70%).</p>
+  <h3>Chat histories barely notice</h3>
+  <p>On LongMemEval the layouts sit within a few points of each other at 4,000 characters. The answer string reaches the model for 84–85% of questions with Engram's old layout, its new one, and plain turns. The new layout matches the old at 4,000 and is ahead at 1,000 characters: an evidence turn is shown for 72% against 67%. The best ranking comes from the plainest layout, whole turns with no context in either key (R@10 0.923, MRR 0.688).</p>
+  <h3>Context belongs in the lexical key only</h3>
+  <p>Adding the request a turn answers to its key helps when turns are short and elliptical. In LoCoMo, where the median turn is 109 characters, it raises the answer in context from 74% to 83% at 4,000 characters. In LongMemEval, putting the request into the vector as well lowers MRR from 0.664 to 0.603 for 400-byte windows. Every response's vector moves towards its request, and responses then outrank the request, which is where the user said what is asked about. Kept in BM25 only, the context costs nothing there and still finds terse records by the words of their task. That is Engram's choice now.</p>
+  <h3>A session is the wrong unit</h3>
+  <p>One row per session finds the right session easily (R@10 0.985 on LongMemEval, among about 48 sessions). But a session is about 10,000 characters, and its best snippet holds the evidence for only 64% of questions at 4,000 characters, against 91% for turns. Coarse keys are fine for routing, not as values.</p>
+  <h3>Small values cover more evidence</h3>
+  <p>A budget holds about nine 400-byte records or five 600-byte snippets. Questions that aggregate over sessions ("how many …", "in total …") need several pieces of evidence at once. Indexing only the user's turns (short) and showing each with the head of the reply puts every evidence session in the context for 81% of multi-session questions at 4,000 characters, against 61% for the old layout. It loses the questions about what the assistant said, though: the answer in context falls to 74%.</p>
+</div>
+<figure class="wide">
+  <div class="frame">
+    <svg class="dg" id="budget-diagram" viewBox="0 0 770 190" role="img" aria-label="The same 4,000-character budget holds five 600-byte snippets or nine 400-byte windows; the windows include three answer-bearing spans"></svg>
+  </div>
+  <figcaption><b>The same budget, two value sizes.</b> An illustration of why small records help aggregation: more distinct records fit, each with its own header.</figcaption>
+</figure>
+<div class="wide" id="layout-table"></div>
+<div class="col">
+  <h3>The value: show the row, not more</h3>
+  <p>Widening a row within its turn, or adding the head of the other side of the exchange, puts more evidence turns in front of the model but cuts more answer strings in half. For whole turns, 400-byte spans plus the other side's head raise the evidence shown at 4,000 characters from 91% to 92%. The answer string in context falls from 85% to 76%, and so does accuracy (next section). For 400-byte keys, a 600-byte span helps chat answers on paper (answer in context 88% against 84%) but not the coding probes (84% against 85%). Engram shows the row itself.</p>
+</div>
+<div class="wide" id="pres-table"></div>
+
+<div class="col" id="facts">
+  <h2>Keys a model writes</h2>
+  <p>The strongest memory systems in the literature do not index raw turns alone. A model reads each conversation and writes down facts, which become keys, values, or both (LongMemEval's key expansion, Mem0, Zep). To test that on LongMemEval, a small model read every session of every fifth history (4,559 sessions) once. It wrote self-contained facts with dates, each tied to the turn it came from, for example "The user holds a degree in Business Administration, which they feel has helped in their new role." It wrote 66,864 facts, about 15 per session and 152 characters each, for $8.49: $0.0019 per session of about 10,000 characters.</p>
+  <p>Three ways to use them, on the 94 answerable questions of those histories:</p>
+  <ul>
+    <li><b>Facts only:</b> facts are the rows and the values.</li>
+    <li><b>Turns and facts:</b> fact rows next to turn rows in one index.</li>
+    <li><b>Facts in the key:</b> a turn's facts join its lexical key and its vector, and the turn stays the value.</li>
+  </ul>
+  <p>Facts improve ranking (MRR 0.717 → 0.75–0.76, R@10 0.926 → 0.947 with turns), and they change aggregation the most. Every evidence session reaches the context for 70% of multi-session questions at 1,000 characters with facts, against 21% for turns, and 82% against 57% at 4,000. A fact is short and already says what happened, when and to whom.</p>
+  <p>Read by a model, facts alone gave the best answers on these 100 questions: 78% correct, against 75% for plain turns, 70% for Engram's old layout and 68% for its new one (facts against the new layout: 13 wins to 3, p = 0.02). On multi-session questions the figures are 60%, 52%, 40% and 40%. Mixing facts with turns (74%) did not beat facts alone. The sample is small, and the facts come from a model with their own errors, but the direction agrees with the published systems.</p>
+</div>
+<div class="wide" id="facts-table"></div>
+
+<div class="col" id="answers">
+  <h2>Does it change the answers?</h2>
+  <p>Coverage is a proxy. The test that matters is what a model answers from the context it is given. A small, fast model answered all 500 LongMemEval questions from each context, with the question's date, listing the relevant facts before answering. A larger model graded every answer with LongMemEval's own grading prompts, by question type. The small model was also tried as a grader. It agreed on 89% of the 5,350 answers but was stricter (60% against 66% correct), and it ranked two of the layouts the other way round. The figures here use the larger grader.</p>
+</div>
+<figure class="wide">
+  <div class="frame">
+    <p class="chart-title">Correct answers from each context</p>
+    <p class="chart-sub">500 LongMemEval-S questions, 30 of them unanswerable · 4,000 characters unless noted · graded with LongMemEval's prompts</p>
+    <div class="chart" id="accuracy-chart"></div>
+  </div>
+</figure>
+<div class="col">
+  <p>Memory takes the model from 7% (it can only decline) to 71–75%. The evidence sessions alone, in full (an oracle retriever with about 27,000 characters), reach 92%. That leaves 16 to 21 points to retrieval.</p>
+  <ul>
+    <li><b>Layouts:</b> plain turns with no context gave the most correct answers on these chat histories, 75.4% against 70.6% for Engram's old layout (34 against 10 questions, p &lt; 0.001). The new 400-byte layout lands between them at 73.0%, ahead of the old one at 2,000 characters too (62.2% against 59.6%). Neither of those two gaps is significant.</li>
+    <li><b>Value size:</b> 400-byte spans plus the other side's head cost 6 points against whole turns (p &lt; 0.001), as the answer-in-context measure predicted. Doubling the budget to 8,000 characters gains them back.</li>
+    <li><b>Grouping:</b> putting the records under one heading per conversation with its date changed nothing (68.2% against 69.4%).</li>
+  </ul>
+  <p>Coverage predicts the answer closely. When the answer string was in the context, 92–94% of answers were right; when it was not, 0–4%.</p>
+</div>
+<div class="wide" id="cond-table"></div>
+<div class="col">
+  <p>By type, the gaps to the oracle are in multi-session questions (44–55% against 84%) and temporal reasoning (68–74% against 94%). Both need several pieces of evidence and their dates at once. That is what model-written facts address, and what a time-aware query would (see the design).</p>
+</div>
+<div class="wide" id="type-table"></div>
+<div class="col">
+  <h3>Memory or the whole history?</h3>
+  <p>The same model read the whole history of every tenth question: about 170,000 tokens, in order, with dates. It answered 84% of those 50 correctly. With Engram's 4,000-character context (2,750 tokens, 62 times fewer) it answered 72%, and with plain turns 78%. That is $0.17 per question against $0.0007. The oracle answered 94%. Long-context reading wins on accuracy when the history fits and the cost is acceptable. But a project's history outgrows any context window (a million records is about 400 MB of text), and memory still costs about 240 times less per prompt.</p>
+</div>
+<div class="wide" id="long-table"></div>
+
+<div class="col" id="engram">
+  <h2>In Engram now</h2>
+  <p>Engram now cuts records at 400 bytes (head and tail of long outputs kept in 1,500-byte units as before). It embeds a record's text without its context, packs up to twelve records with at most eight per user turn, and gives the brief tier three records. Run through Engram's own pipeline, with the gate refitted for the new records:</p>
+</div>
+<div class="wide" id="product-table"></div>
+<div class="col">
+  <p>Both benchmarks gain coverage in their own pipeline: the injection holds evidence for 89.4% of LongMemEval questions (88.7% before) and 72.7% of LoCoMo questions (68.3%). The brief tier, three small records instead of two snippets, gains the most: 77% against 69% on LongMemEval and 52% against 43% on LoCoMo. The refitted gate brings evidence to 77% of LongMemEval questions instead of 67%, and 65% of its injections hold evidence instead of 59%, for about 1,000 characters per prompt.</p>
+</div>
+<div class="wide" id="gate-table"></div>
+<div class="col">
+  <p>On this repository's 26-hour session, with the gate deciding as it does in Claude Code:</p>
+  <ul>
+    <li><b>New session:</b> the gated injection answered 50 of 67 probes (42 before), the full injection 58 (46), and one search 58 (54).</li>
+    <li><b>After a compaction:</b> of the 30 probes the model no longer had, the full injection answered 29 (22 before) and the gate 25 (23).</li>
+  </ul>
+  <p>The first version of this change kept the old cap of three records per user turn and lost two lost-detail probes. The answer was the fourth window of a turn already shown. A coding turn spans many records, so the cap is now eight.</p>
+</div>
+<div class="wide" id="probes-table"></div>
+
+<div class="col" id="time">
+  <h2>Execution time</h2>
+  <p>A prompt's recall is two index searches, and almost nothing else. Stores of 10,000, 100,000 and a million records were built from LongMemEval turns cut the new way, and timed on four cores with the static embedder.</p>
+</div>
+<div class="wide" id="phase-table"></div>
+<div class="col">
+  <p>BM25 and the vector search each take about half of the search (4.0 and 4.4 ms of 8.8 ms at a million records; 1.8 ms in all at 10,000). Embedding the prompt, fusing, and packing take a fraction of a millisecond. The gate's IDF lookup used to run one <code>COUNT</code> query per query term (1.1 ms at a million records). It now reads each segment's term dictionary (0.05 ms).</p>
+  <h3>The stall after a write</h3>
+  <p>The largest cost was not in the search at all. A write adds records to the memtable, and the next query rebuilds the in-memory segment of its last chunk. That chunk held up to 1,024 records, and the rebuild built a full HNSW graph over them: 22–25 ms. A query right after a tool call stored its result waited for it. That is a <code>PreToolUse</code> before an edit, or the next prompt in a fast exchange.</p>
+</div>
+<div class="wide" id="stall-table"></div>
+<div class="col">
+  <p>Strata now takes separate build options for memtable segments (<code>DbOptions::mem_build</code>), and Engram builds them without a graph: a scan of at most 256 vectors costs less than building one. Chunks hold 256 records. The rebuild fell from 22–25 ms to 1.4–1.5 ms. A query right after a write now costs what any query costs: 4.1 ms instead of 24 at 10,000 records, and 11.5 ms instead of 38 at a million (p99 34 instead of 110). Disk segments keep their HNSW graphs, and a new Strata test checks that flat memtable segments return the exact top ten.</p>
+  <h3>The hook itself</h3>
+  <p>Claude Code runs a command hook as a new process. Starting <code>engram hook</code>, reading the payload and connecting to the socket costs about 3 ms per event, at any store size, on top of the daemon's work. An event Engram ignores takes 3.3–3.5 ms that way, and 0.6 ms from a client that is already running.</p>
+</div>
+<div class="wide" id="hook-table"></div>
+<div class="wide" id="cold-table"></div>
+<div class="col">
+  <p>The daemon also wrote its whole session state to disk before answering each hook. It now writes it after the response, when the state has changed. That took storing a tool call from 1.6 to 0.7 ms inside the daemon, and the whole hook from 4.5 to 3.4 ms. A prompt's hook went from 17.1 to 14.2 ms at a million records.</p>
+  <p>What remains is mostly the process. Claude Code can also send hook events over HTTP to a URL for every event except <code>SessionStart</code>, with the same JSON both ways. A daemon listening on localhost would save the 3 ms of process start for every tool call. It needs a secret path and a <code>Host</code> check first, so that no web page can post into memory. That is the next step for time.</p>
+  <p>Two smaller changes:</p>
+  <ul>
+    <li><b>Daemon start:</b> the embedding table (129 MB) is now memory-mapped instead of read and converted, which took 70–160 ms. The first hook of a session, which starts the daemon, now takes 85–108 ms (second table above) instead of about 300 ms.</li>
+    <li><b>Storage:</b> 400-byte records double the record count of a session, and so the file. This repository's session, up to where the probes are asked, goes from 1,835 records to 3,849. A million records (3.5 GB, mostly vectors) is now about 200 sessions of that size instead of 450.</li>
+  </ul>
+</div>
+
+<div class="col" id="ab">
+  <h2>With and without Engram</h2>
+  <p>Everything above measures what reaches the model. The direct test is Claude Code itself, with and without Engram, on work that depends on earlier sessions. Each test has two parts:</p>
+  <ul>
+    <li><b>History:</b> headless working sessions on a small Python project, recorded by Engram. Along the way the user states rules, decisions with their reasons, failed approaches, and requirements for work planned later. Some of these end up in the code; others are only said.</li>
+    <li><b>Follow-up tasks:</b> each runs in a fresh headless session on a clone of the repository as the history left it, with Engram (its store as the history left it) and without it (no hooks, no memory tools). Both conditions have every normal tool, including files, shell and git history. A script grades each result with one check per fact, so a task is solved only when every remembered requirement holds. The same small, fast model runs everything.</li>
+  </ul>
+  <h3>The first test: almost no difference</h3>
+  <p>On the first project, Tally (an expense-splitting library), Engram solved 26 of 30 runs and the agent without it 25 (permutation test within tasks, \(p = 0.33\)). The difference was one task, the accountant's CSV export, whose requirements the prompt's recall brought back. The rest of what the history said reached the model only where it was also in the repository.</p>
+  <p>Replaying the prompts against the store showed why:</p>
+  <ul>
+    <li>For "should we move storage to SQLite and use pandas?", search ranked the record holding the decision and its reason first. But that record is one long user message about several things, so its similarity to the question is moderate, and the gate scored the prompt 3.4 against a threshold of 4.5.</li>
+    <li>The briefing at session start carried only sentences picked from prompts by cue words ("always", "never"). Decisions given with a reason, and requirements announced for later, were not among them.</li>
+    <li>The model called the memory tools twice in 30 runs.</li>
+  </ul>
+  <h3>What changed</h3>
+  <figure class="wide">
+    <div class="frame"><svg class="dg" id="knowledge-diagram" viewBox="0 0 760 256" role="img" aria-label="After each turn a small model writes decisions, rules, planned work and facts as knowledge records, which reach later sessions through the session-start briefing and a per-prompt knowledge block that bypasses the gate"></svg></div>
+    <figcaption><b>Knowledge records.</b> A small model writes down what a turn agreed. Later sessions get it through the briefing and, per prompt, through a knowledge block that does not wait for the gate.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Distillation:</b> after each turn, off the prompt's path, a small model reads the request, the commands and the reply. It also sees the latest 40 knowledge records, and writes new ones (decision, rule, planned requirement, fact). An item that updates an older one retags it <code>superseded</code>; planned work the turn completed is retagged <code>done</code>. A new item whose analysed terms overlap an existing one by a Jaccard index \(J \ge 0.6\) is dropped.</li>
+    <li><b>Briefing:</b> it now leads with planned work, rules, decisions and facts, in that order, followed by where the last session left off. It opens with an instruction to search memory before design decisions, and it fills up to 6,000 characters.</li>
+    <li><b>Knowledge block:</b> each prompt gets up to four knowledge records not yet shown, whatever the gate decides. A record qualifies on its own text:</li>
+  </ul>
+  \[ \cos\bigl(\phi(q), \phi(r)\bigr) \ge 0.40 \quad\lor\quad \mathrm{cov}(q, r) = \frac{\sum_{t \in q \cap r} \mathrm{idf}(t)}{\sum_{t \in q} \mathrm{idf}(t)} \ge 0.30, \qquad r.\text{kind} \in \{\text{decision}, \text{preference}, \text{fact}, \text{note}, \text{todo}_{\text{planned}}\}. \]
+  <p>Strata needed no change. The knowledge query is the same hybrid search under a <code>kind IN (…)</code> predicate, which the planner already runs as a scan of the few matching rows. The briefing is a handful of structured queries.</p>
+  <p>These were developed on Tally. Its store was distilled after the fact (<code>engram distill</code>), and the Engram condition was rerun against the earlier runs without Engram, on the same repository snapshot. It solved 30 of 30, including the SQLite question it had failed every time, against 25 of 30 (\(p = 0.02\)). But Tally can separate the two conditions on only two tasks, and it was used for development, so it cannot be the verdict.</p>
+  <h3>Held out: two new projects</h3>
+  <p>Two new projects were written by a separate agent, which did not see Engram's code or design, before Engram's changes were tested on them:</p>
+  <ul>
+    <li><b>Stock keeping</b> for a hardware wholesaler: 3 sessions, 13 turns.</li>
+    <li><b>Appointment booking</b> for a physiotherapy practice: 3 sessions, 14 turns.</li>
+  </ul>
+  <p>Each has ten follow-up tasks:</p>
+  <ul>
+    <li><b>Six</b> need something said only in conversation, such as FIFO valuation and why, a planned count sheet in walking order, the client's Python 3.8 machine, a 42-character receipt printer, a cancellation-fee schedule, or an approach tried and abandoned.</li>
+    <li><b>Two</b> need a convention that is in the repository.</li>
+    <li><b>Two</b> are controls that need nothing from earlier sessions.</li>
+  </ul>
+  <p>Engram was frozen first, at the commit the histories ran on. The histories were recorded live, with distillation on. The tasks then ran five times per condition, 200 runs in all, and nothing was changed after.</p>
+</div>
+<div class="wide" id="ab-table"></div>
+<div class="col">
+  <p>With Engram, every one of the 100 held-out runs was solved; without it, 60. All of the difference is on the tasks that need something said only in conversation: 60 of 60 against 20 of 60. Where the fact was in the repository, and on the controls, both conditions solved all 40, so the 6,000-character briefing did no harm.</p>
+  <p>Without Engram, the failed checks are exactly the facts that were only said:</p>
+  <ul>
+    <li>Purchase suggestions did not order up to three times the reorder point (5 of 5 runs), and the count sheet was not in walking order by bin (5 of 5).</li>
+    <li>Every answer recommended <code>tomllib</code>, which needs Python 3.11, without knowing that the client's machine runs 3.8.</li>
+    <li>The day plan overran the 42-character receipt printer (5 of 5), and the cancellation fee was wrong (5 of 5).</li>
+    <li>Online booking did not treat seven treatments a day as fully booked (5 of 5), and no answer knew that a calendar feed had been tried and stopped.</li>
+  </ul>
+  <p>Three of these tasks were solved either way: the history had built the series booking and the SMS text, and the agent chose FIFO valuation on its own.</p>
+</div>
+<div class="wide" id="ab-stats"></div>
+<div class="col">
+  <p>The permutation test shuffles the condition labels within each task, 20,000 times, so a difference between tasks cannot pass for an effect. With no shuffle reaching the observed difference, \(p\) is below \(1/20{,}001\). Fisher's exact test on the pooled solved counts gives \(p \approx 10^{-14}\). The interval resamples tasks, then runs within each task.</p>
+  <p>The briefing did most of the work. It reached every Engram run, at its full 6,000 characters. The model called the memory tools in 9 of 100 runs, mostly for the two advice questions. The gate held back raw records on 4 of the 20 tasks, and all of those were still solved.</p>
+  <p>Engram runs took fewer steps: 6.3 against 7.5, and 7.0 against 9.0. They also read 5–6% fewer input tokens, and cost about the same ($0.007–0.009 a run) at the same wall time.</p>
+  <p>Distillation adds a small model call after every turn of real work. The table below covers the three histories, at about $0.0013 a turn. It never delays a prompt.</p>
+  <p>The knowledge query adds two filtered searches to every prompt. Run after the main search, they raised the prompt hook at a million records (1% of them knowledge) from 14.2 to 22.0 ms at the median, and from 32.0 to 43.0 ms at p99. They depend on nothing the main search computes, and only packing needs both results, so they now run side by side: 14.7 ms at the median and 29.8 ms at p99, the same as before within noise.</p>
+</div>
+<div class="wide" id="ab-distill"></div>
+<div class="col">
+  <p>The limits:</p>
+  <ul>
+    <li>Three small projects, one history each, and one small model for the work and for distillation.</li>
+    <li>The tasks were written alongside the histories, each aimed at facts the history states. Real work rarely depends on earlier sessions this often, so the 40-point gain is a gain on such tasks, not on work in general.</li>
+    <li>The histories are short. A project with more knowledge than 6,000 characters leaves the rest to the knowledge block and to search, which has not been tested here.</li>
+  </ul>
+</div>

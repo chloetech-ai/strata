@@ -1,0 +1,13 @@
+facts for 4559 sessions
+100 units of longmemeval_s, 6 layouts × 6 presentations × 4 budgets
+  25/100 units, 34 s
+  50/100 units, 69 s
+  75/100 units, 102 s
+  100/100 units, 138 s
+94 questions in 138 s
+turn                   rows    674 R@10 0.926 MRR 0.717 | snip600 ev 0.915 ans 0.900 span400 ev 0.904 ans 0.700 span600 ev 0.926 ans 0.800 span600+p150 ev 0.894 ans 0.767 span400+p150 ev 0.904 ans 0.667 turn1500 ev 0.872 ans 0.900
+turn+req               rows    674 R@10 0.883 MRR 0.683 | snip600 ev 0.851 ans 0.867 span400 ev 0.872 ans 0.667 span600 ev 0.862 ans 0.767 span600+p150 ev 0.894 ans 0.733 span400+p150 ev 0.894 ans 0.667 turn1500 ev 0.830 ans 0.833
+win400+req/vec-text    rows   1726 R@10 0.894 MRR 0.667 | snip600 ev 0.872 ans 0.833 span400 ev 0.883 ans 0.867 span600 ev 0.894 ans 0.867 span600+p150 ev 0.915 ans 0.867 span400+p150 ev 0.926 ans 0.867 turn1500 ev 0.883 ans 0.867
+facts                  rows    697 R@10 0.926 MRR 0.760 | snip600 ev 0.957 ans 0.867 span400 ev 0.957 ans 0.867 span600 ev 0.957 ans 0.867 span600+p150 ev 0.957 ans 0.867 span400+p150 ev 0.957 ans 0.867 turn1500 ev 0.957 ans 0.867
+turn+facts             rows   1371 R@10 0.947 MRR 0.753 | snip600 ev 0.947 ans 0.900 span400 ev 0.957 ans 0.900 span600 ev 0.936 ans 0.900 span600+p150 ev 0.915 ans 0.900 span400+p150 ev 0.936 ans 0.900 turn1500 ev 0.915 ans 0.900
+turn/fact-keys         rows    674 R@10 0.947 MRR 0.749 | snip600 ev 0.936 ans 0.900 span400 ev 0.936 ans 0.700 span600 ev 0.926 ans 0.800 span600+p150 ev 0.926 ans 0.767 span400+p150 ev 0.936 ans 0.667 turn1500 ev 0.862 ans 0.900

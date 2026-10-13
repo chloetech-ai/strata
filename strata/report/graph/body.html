@@ -1,0 +1,160 @@
+<section class="col" id="model">
+  <h2>Rows are nodes</h2>
+  <p>Graph databases keep nodes and edges in stores of their own. Strata keeps its one table. A row is a node, and an <code>EDGES</code> field holds the row's outgoing edges: a JSON array of targets, each a primary key of the same table, optionally with a label and a positive weight.</p>
+<pre class="sql">-- id KEYWORD PRIMARY KEY, title TEXT, body TEXT, year INT, emb VECTOR(512), cites EDGES
+INSERT ... ('p1', 'Attention is all you need', ..., 2017, [...],
+            '["p7", ["extends", "p9"], ["refutes", "p11", 0.5]]')</pre>
+  <p>Formally, a snapshot \(S\) holds rows \(V\) with keys \(\kappa: V \to K\), and edges</p>
+  \[ E \subseteq V \times K \times L \times \mathbb{R}_{>0}, \qquad (u, k, \ell, w): \text{row } u \text{ points at key } k \text{ with label } \ell \text{ and weight } w. \]
+  <p>An edge is resolved at query time:</p>
+  \[ \rho_S(k) = \text{the live row } v \in V \text{ with } \kappa(v) = k, \text{ if any}. \]
+  <p>A key has at most one live row in a snapshot, so \(\rho_S\) is a function. When it has none (the target was deleted, or never existed), the edge dangles and traversals skip it, as a foreign key without a constraint would.</p>
+  <p class="thesis">Edges belong to their source row and point at keys, not at storage positions. They are written, logged, updated, deleted, merged and snapshotted with the row, and nothing else in the engine had to change.</p>
+  <p>Targets as keys are what make this work. A merge rewrites every docID, and an update moves a row to a newer segment, but neither changes a key, so no edge is ever rewritten. The price is a lookup per hop, which most of the work below goes into making cheap.</p>
+</section>
+
+<section class="col" id="storage">
+  <h2>Storing edges</h2>
+  <p>Every segment, on disk or built from the memtable, gets one section per indexed <code>EDGES</code> field, read in place through <code>mmap</code>:</p>
+  <figure class="wide">
+    <div class="frame"><svg class="dg" id="storage-diagram" viewBox="0 0 760 330" role="img" aria-label="A segment's graph section holds out-edges as a CSR with target keys, labels, weights and same-segment hints, and a reverse index grouped by target key under a radix directory; hops resolve through the snapshot's primary-key indexes"></svg></div>
+    <figcaption><b>One segment's graph section.</b> Out-edges are a CSR over local docIDs. The reverse index groups edges by target key. A hop along an edge uses the same-segment hint when its row is still live, and otherwise the primary-key indexes of the snapshot's segments.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Out-edges:</b> offsets per docID, then per edge its source, its target key (an <code>i64</code>, or offsets and bytes for string keys), a label code and a weight. Labels and weights are stored only when some edge has one.</li>
+    <li><b>Reverse index:</b> the edges grouped by target key, the groups ordered by the key's 64-bit hash under the radix directory of the primary-key index, and each edge's source stored in group order. "Which rows point at key \(k\)" is one directory read and one key comparison per group, then a sequential read. Integer hashes are a bijection and need no comparison; colliding string keys form separate groups.</li>
+    <li><b>Same-segment hints:</b> per edge, the docID the target had in this segment when it was built. Since \(\rho_S\) has one answer, a hinted row that is still live is that answer, and the hop needs no lookup.</li>
+  </ul>
+  <p>A hop from \(u\) along its edges therefore costs, per edge,</p>
+  \[ c_{\text{out}} = p_{\text{hint}}\,c_{\text{live}} + (1 - p_{\text{hint}})\bigl(p_{\text{memo}}\,c_{\text{memo}} + (1 - p_{\text{memo}}) \textstyle\sum_{i \le j^*} c_{\text{probe},i}\bigr), \]
+  <p>where \(p_{\text{hint}}\) is the share of targets built into the same segment and still live, \(p_{\text{memo}}\) the share already resolved in this query, and \(j^*\) the segment where the key is found. A hop against the edges costs one reverse-index probe per segment for \(u\)'s key, then a liveness check per source. The section costs about</p>
+  \[ b \approx \underbrace{8}_{\text{target}} + \underbrace{4}_{\text{source}} + \underbrace{4 + 4}_{\text{reverse}} + \underbrace{4}_{\text{hint}} + \tfrac{8\,|V| + 16\,|K_E|}{|E|} \text{ bytes per edge}, \]
+  <p>with \(|K_E|\) the distinct targets. That comes to 27 bytes per edge on arXiv:</p>
+  <div class="wide" id="size-table"></div>
+  <p class="note">The graph section of the full table equals that of a table holding only keys and edges, which loads in under a second.</p>
+</section>
+
+<section class="col" id="sql">
+  <h2>The SQL</h2>
+  <p>Two predicates, a column and a score join the existing functions. Each takes seeds: a key, a parameter, a tuple of keys, or any subquery over the same table. A subquery can rank, filter and limit like any other query, so a vector search, a BM25 query or a facet filter can be the way into the graph.</p>
+<pre class="sql">-- papers within two citations of p1, either way, nearest first
+SELECT id, title, hops() FROM papers
+WHERE REACHABLE(cites, 'p1', hops =&gt; 2, dir =&gt; 'both') ORDER BY hops(), id LIMIT 20;
+
+-- one shortest path, only through surveys
+SELECT id, hops() FROM papers
+WHERE PATH(cites, 'p1', 'p9', max_hops =&gt; 6, through =&gt; kind = 'survey') ORDER BY hops();
+
+-- the way in is a vector search: the papers its two best hits cite, by similarity
+SELECT id FROM papers
+WHERE REACHABLE(cites, (SELECT id FROM papers ORDER BY similarity(emb, :q) DESC LIMIT 2))
+ORDER BY similarity(emb, :q) DESC LIMIT 20;
+
+-- personalized PageRank from hybrid hits, fused with both rankings
+SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q),
+    ppr(cites, (SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 2), weighted =&gt; 1)) DESC LIMIT 20;</pre>
+  <div class="table-wrap opts">
+    <table>
+      <thead><tr><th>function</th><th>what it does</th><th>options (defaults)</th></tr></thead>
+      <tbody>
+        <tr><td><code>REACHABLE(f, seeds, ...)</code></td><td>rows \(v\) with \(m \le d(\text{seeds}, v) \le h\)</td><td><code>hops 1</code>, <code>min_hops 1</code>, <code>dir 'out' | 'in' | 'both'</code>, <code>label 'a,b'</code>, <code>through &lt;predicate&gt;</code>, <code>max_nodes 100000</code></td></tr>
+        <tr><td><code>PATH(f, from, to, ...)</code></td><td>the rows of one shortest path</td><td><code>max_hops 6</code>, <code>dir</code>, <code>label</code>, <code>through</code></td></tr>
+        <tr><td><code>hops()</code></td><td>a row's distance, or its position on the path; <code>ORDER BY hops()</code> is nearest first</td><td></td></tr>
+        <tr><td><code>ppr(f, seeds, ...)</code></td><td>personalized PageRank, a score for <code>ORDER BY</code>, <code>rrf</code> and weighted sums</td><td><code>alpha 0.15</code>, <code>eps 1e-4</code>, <code>dir 'both'</code>, <code>label</code>, <code>weighted 0</code> (1: the seeds' subquery scores are the restart weights)</td></tr>
+        <tr><td>a VECTOR field as <code>f</code></td><td>a row's neighbours are its \(k\) most similar rows</td><td><code>k 10</code>, <code>min_sim</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><code>through</code> constrains the rows a traversal passes through, and the rest of <code>WHERE</code> constrains the rows it ends at. <code>REACHABLE(f, seeds, hops =&gt; 0, min_hops =&gt; 0)</code> is the seed set itself, so <code>NOT</code> of it removes the seeds from a result.</p>
+</section>
+
+<section class="col" id="plan">
+  <h2>Planning and traversal</h2>
+  <p>A traversal does not respect segment boundaries, so graph computations run first, over the whole snapshot. Seeds are resolved, a seed subquery running as a query of its own on the same snapshot, and the traversal runs. Its result becomes, per segment, a materialised document set with exact cardinality, plus each row's distance and PageRank score.</p>
+  <figure class="wide">
+    <div class="frame"><svg class="dg" id="flow-diagram" viewBox="0 0 760 236" role="img" aria-label="Seeds from keys or a subquery feed a traversal over the snapshot; its result becomes per-segment document sets with exact cardinality, which the planner uses like any other filter, for example choosing a pre-filtered exact vector scan"></svg></div>
+    <figcaption><b>Graph first, then the usual plan.</b> The planner sees a graph predicate as a filter whose size it knows exactly. A vector search over a neighbourhood of a few hundred rows becomes an exact scan of those rows.</figcaption>
+  </figure>
+  <p>The traversals:</p>
+  <ul>
+    <li><b>Reachability:</b> breadth-first search, frontier by frontier, which stops at <code>max_nodes</code>.</li>
+    <li><b>Shortest paths:</b> bidirectional breadth-first search, always expanding the smaller frontier, forward along the edges or backward against them.</li>
+    <li><b>Personalized PageRank:</b> forward push (Andersen, Chung and Lang, 2006). The vector \(\pi\) solves</li>
+  </ul>
+  \[ \pi = \alpha\, e_S + (1 - \alpha)\, \pi W, \qquad W_{uv} = \frac{w_{uv}}{\sum_{x} w_{ux}}, \]
+  <p>where \(e_S\) is the restart distribution over the seeds. Every row has an estimate \(p\) and a residual \(r\), with \(r = e_S\) at the start, and pushing a row \(u\) does</p>
+  \[ p(u) \mathrel{+}= \alpha\, r(u), \qquad r(v) \mathrel{+}= (1 - \alpha)\, r(u)\, W_{uv} \;\; \forall v, \qquad r(u) \leftarrow 0, \]
+  <p>while some \(r(u) \ge \varepsilon \deg(u)\). Each estimate is then within \(\varepsilon \deg(u)\) of \(\pi(u)\), and the work is bounded by \(1/(\alpha\varepsilon)\) pushes whatever the graph's size. A row is queued only once its residual reaches \(\varepsilon\), the least any threshold can be. Rows that merely received a little mass are never resolved, and resolving them was most of the original cost.</p>
+</section>
+
+<section id="speed">
+  <div class="col">
+    <h2>Speed</h2>
+    <p>Two graphs, each queried from 200 random seeds on a warm cache, one thread, through SQL (parsing and planning included; <code>COUNT(*)</code>, so that no rows are fetched):</p>
+    <ul>
+      <li><b>arXiv:</b> 168,343 papers (ogbn-arxiv, less 1,000 held out) with 1,148,979 citations, in two segments.</li>
+      <li><b>Synthetic:</b> a power-law graph of 1,000,000 rows and 9,998,469 edges, in four segments. Row \(i\) links to 10 earlier rows, each the target of a random earlier edge with probability ½ and a uniform earlier row otherwise.</li>
+    </ul>
+    <p>The baselines answer the same queries, and the bench checks that every count and path length agrees:</p>
+    <ul>
+      <li><b>SQLite:</b> an edge table <code>(src, dst)</code> as a <code>WITHOUT ROWID</code> primary key, an index on <code>(dst, src)</code>, and recursive CTEs.</li>
+      <li><b>CSR:</b> the same traversal code on two in-memory arrays. This is the lower bound: no keys, no segments, no SQL.</li>
+    </ul>
+  </div>
+  <div class="wide" id="speed-tabs"></div>
+  <div class="col">
+    <p>Against SQLite, the one-hop queries cost about the same: roughly 20 µs, mostly parsing and planning on both sides. From two hops on, the gap opens. The tail is where it shows most: two hops both ways on arXiv touch 3,790 rows on average and up to tens of thousands, and their p95 is 2.6 ms in Strata against 24.5 ms in SQLite. The recursive CTE re-expands rows reached at several depths and joins through a B-tree per row, where Strata reads a CSR slice. Shortest paths and PageRank have no practical CTE form.</p>
+    <p>Against the CSR, Strata pays two costs. About 20 µs of SQL per query dominates small traversals. Resolution dominates large ones: PageRank takes 2.8 times the CSR's time on arXiv and 4.6 times on the million-row graph. A target outside its own segment is a hash probe into each segment's primary-key index until found, a cache miss each. Three changes found by profiling cut PageRank on the million-row graph from 21.4 to 5.8 ms:</p>
+    <ul>
+      <li>reverse groups by key, with the sources stored inline;</li>
+      <li>same-segment hints and a per-query memo;</li>
+      <li>queueing only rows that can pass the push threshold.</li>
+    </ul>
+  </div>
+  <div class="wide" id="speed-history"></div>
+</section>
+
+<section id="quality">
+  <div class="col">
+    <h2>Does the graph help search?</h2>
+    <p>Rows here are nodes with text, vectors and edges at once. The question the engine cannot answer alone is whether the edges add anything to a search that already has the text and the vectors, and whether edges made from the vectors themselves (each row linked to its nearest rows) add anything.</p>
+    <p><b>The task:</b> for a new paper, find the papers it cites from its title and abstract. This is citation recommendation, and the same shape as finding the records a new question depends on.</p>
+    <ul>
+      <li>1,000 papers of OGB's test split (809 published in 2019, 191 in 2020, each citing at least five papers) are held out of the table.</li>
+      <li>Each held-out paper's title and abstract is the query. Its references in the table (15.3 on average) are the relevant rows.</li>
+      <li>Vectors come from a static embedder (Model2Vec potion-retrieval-32M, 512 dimensions), the same one Engram uses.</li>
+    </ul>
+    <p>Each method returns 20 papers. Methods that start from vector seeds have one parameter, the number of seeds \(S\), swept from 1 to 50. Papers with even ids choose \(S\) by nDCG@20 (516 queries) and odd ids report it (484 queries), so no reported number was tuned on its own queries. Comparisons are paired over the same queries, with a 95% bootstrap interval and a two-sided sign-flip test:</p>
+    \[ \mathrm{recall@}k = \frac{|R_k \cap T|}{|T|}, \qquad \mathrm{nDCG@}k = \frac{\sum_{i \le k} \mathbb{1}[r_i \in T] / \log_2(i + 1)}{\sum_{i \le \min(k, |T|)} 1 / \log_2(i + 1)}. \]
+  </div>
+  <div class="wide" id="quality-table"></div>
+  <div class="col"><p class="note">Times are from the quality runs, on the build before the speed changes of the previous section; the graph methods are faster now (see the speed tables).</p></div>
+  <div class="col">
+    <p>The graph doubles what vector search finds. The best method is also the simplest: take the two papers nearest the query, follow their citations, and rank what they cite by similarity to the query. It reaches nDCG@20 0.253 against 0.123 for vector search, 0.161 for BM25 and 0.160 for hybrid search, in 0.4 ms. Papers on the same topic cite the same work, and the nearest papers' reference lists are a better candidate set than the nearest papers themselves.</p>
+    <p>PageRank from the same seeds reaches 0.211 at its best (from one seed), below the plain one-hop expansion: on this graph the papers two or three hops away dilute the direct citations. Fusing PageRank with the vector ranking lowers it to 0.188, because the vector ranking's own top results are mostly not references. Fusing BM25, vectors and PageRank from hybrid seeds also reaches 0.211, at the cost of BM25 over long queries (77 ms).</p>
+  </div>
+  <div class="wide">
+    <div class="chart-box"><h4>nDCG@20 by number of vector seeds</h4><p>Report half; horizontal lines are the methods without seeds.</p><div id="sweep-chart"></div></div>
+  </div>
+  <div class="col">
+    <p>Fewer seeds are better. With more seeds, the citations of papers that are less similar to the query crowd out those of the nearest ones. In a first version of the experiment the seeds themselves stayed in the candidate set. Ranked by similarity, they then took the top places, and from 20 seeds on the "graph" method returned exactly the vector search's results. Every graph method above removes the seeds with <code>NOT REACHABLE(cites, seeds, hops =&gt; 0, min_hops =&gt; 0)</code>.</p>
+    <p><b>Vector graph nodes.</b> A VECTOR field can be traversed as a graph, each row's 10 most similar rows being its neighbours. On this task that graph adds nothing:</p>
+    <ul>
+      <li>with the seeds kept, it returns what vector search already found (recall@20 0.112 against 0.111 at 10 seeds, on all queries);</li>
+      <li>with them removed, it is worse (nDCG@20 0.079).</li>
+    </ul>
+    <p>A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows carrying vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in Strata for exploratory queries, cheap at 0.23 ms per hop of 10 neighbours, but it is not what makes the graph worth having.</p>
+  </div>
+  <div class="wide" id="compare-table"></div>
+</section>
+
+<section class="col" id="next">
+  <h2>Limits and next steps</h2>
+  <ul>
+    <li><b>One quality task, one embedder.</b> With a stronger embedder, vector search would score above 0.123, and the relative gain over it would likely shrink. The gains over BM25 (+57%) and hybrid search (+58%) are the more robust numbers.</li>
+    <li><b>Cross-segment hops cost lookups.</b> Two to five times the in-memory CSR on these graphs. A snapshot-wide resolved CSR, rebuilt when the segment set changes, would close the gap for read-mostly tables. Merging into fewer segments narrows it today.</li>
+    <li><b>Patterns.</b> There is no multi-hop pattern matching with a predicate per step (<code>(a:error)-[fixes]-&gt;(b)-[touches]-&gt;(f)</code>). <code>through</code> and labels cover one constraint per traversal; SQL/PGQ's <code>MATCH</code> would be the standard syntax for more.</li>
+    <li><b>Weighted shortest paths.</b> Paths are unweighted; weights are used by PageRank only.</li>
+    <li><b>Engram.</b> Its records have natural edges that the store does not keep yet: a distilled note to the turn it came from, a superseded decision to its replacement, an error to the edit that fixed it. The arXiv result suggests the pattern to try: recall's best hits as seeds, then the notes and records linked to them. Engram's earlier study found that widening a hit to its neighbouring records gained little, so this needs its own measurement before it changes Engram's defaults.</li>
+  </ul>
+</section>

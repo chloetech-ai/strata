@@ -1,0 +1,992 @@
+{
+ "tally-r1": {
+  "all": {
+   "tasks": 10,
+   "runs": {
+    "engram": 30,
+    "none": 30
+   },
+   "solved": {
+    "engram": 26,
+    "none": 25
+   },
+   "solved_rate": {
+    "engram": 0.8666666666666667,
+    "none": 0.8333333333333334
+   },
+   "score": {
+    "engram": 0.9416666666666667,
+    "none": 0.8916666666666667
+   },
+   "fisher_solved": {
+    "two_sided": 0.9999999999999337,
+    "one_sided": 0.49999999999996686
+   },
+   "perm_score": {
+    "diff": 0.04999999999999993,
+    "two_sided": 0.32753362331883407,
+    "one_sided": 0.16534173291335433
+   },
+   "perm_solved": {
+    "diff": 0.033333333333333326,
+    "two_sided": 1.0,
+    "one_sided": 0.49902504874756265
+   },
+   "score_diff_ci95": [
+    -0.06666666666666665,
+    0.22499999999999998
+   ],
+   "cost_usd": {
+    "engram": 0.006161509,
+    "none": 0.006036601666666667
+   },
+   "turns": {
+    "engram": 6.833333333333333,
+    "none": 7.266666666666667
+   },
+   "wall_s": {
+    "engram": 17.311684695879617,
+    "none": 39.454819591840106
+   }
+  },
+  "control": {
+   "tasks": 1,
+   "runs": {
+    "engram": 3,
+    "none": 3
+   },
+   "solved": {
+    "engram": 3,
+    "none": 3
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.0045831100000000005,
+    "none": 0.004879553333333334
+   },
+   "turns": {
+    "engram": 6.0,
+    "none": 6.666666666666667
+   },
+   "wall_s": {
+    "engram": 12.36080797513326,
+    "none": 11.865366379419962
+   }
+  },
+  "conversation": {
+   "tasks": 6,
+   "runs": {
+    "engram": 18,
+    "none": 18
+   },
+   "solved": {
+    "engram": 14,
+    "none": 13
+   },
+   "solved_rate": {
+    "engram": 0.7777777777777778,
+    "none": 0.7222222222222222
+   },
+   "score": {
+    "engram": 0.9027777777777778,
+    "none": 0.8194444444444444
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 0.500000000000001
+   },
+   "perm_score": {
+    "diff": 0.08333333333333337,
+    "two_sided": 0.33033348332583373,
+    "one_sided": 0.16759162041897904
+   },
+   "perm_solved": {
+    "diff": 0.05555555555555558,
+    "two_sided": 1.0,
+    "one_sided": 0.5017749112544373
+   },
+   "score_diff_ci95": [
+    -0.11111111111111116,
+    0.36111111111111116
+   ],
+   "cost_usd": {
+    "engram": 0.00683644,
+    "none": 0.006630477777777778
+   },
+   "turns": {
+    "engram": 7.388888888888889,
+    "none": 7.444444444444445
+   },
+   "wall_s": {
+    "engram": 20.464784185091656,
+    "none": 57.090688387552895
+   }
+  },
+  "repo": {
+   "tasks": 3,
+   "runs": {
+    "engram": 9,
+    "none": 9
+   },
+   "solved": {
+    "engram": 9,
+    "none": 9
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.00533778,
+    "none": 0.0052345322222222225
+   },
+   "turns": {
+    "engram": 6.0,
+    "none": 7.111111111111111
+   },
+   "wall_s": {
+    "engram": 12.655777957704332,
+    "none": 13.379566404554579
+   }
+  }
+ },
+ "tally-dev": {
+  "all": {
+   "tasks": 10,
+   "runs": {
+    "engram": 30,
+    "none": 30
+   },
+   "solved": {
+    "engram": 30,
+    "none": 25
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 0.8333333333333334
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 0.8916666666666667
+   },
+   "fisher_solved": {
+    "two_sided": 0.05218554861730472,
+    "one_sided": 0.02609277430865236
+   },
+   "perm_score": {
+    "diff": 0.10833333333333328,
+    "two_sided": 0.020748962551872405,
+    "one_sided": 0.011149442527873607
+   },
+   "perm_solved": {
+    "diff": 0.16666666666666663,
+    "two_sided": 0.0191990400479976,
+    "one_sided": 0.00974951252437378
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.275
+   ],
+   "cost_usd": {
+    "engram": 0.006651932333333333,
+    "none": 0.006036601666666667
+   },
+   "turns": {
+    "engram": 6.433333333333334,
+    "none": 7.266666666666667
+   },
+   "wall_s": {
+    "engram": 17.74973936875661,
+    "none": 39.454819591840106
+   }
+  },
+  "control": {
+   "tasks": 1,
+   "runs": {
+    "engram": 3,
+    "none": 3
+   },
+   "solved": {
+    "engram": 3,
+    "none": 3
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.005595183333333333,
+    "none": 0.004879553333333334
+   },
+   "turns": {
+    "engram": 7.0,
+    "none": 6.666666666666667
+   },
+   "wall_s": {
+    "engram": 14.72238008181254,
+    "none": 11.865366379419962
+   }
+  },
+  "conversation": {
+   "tasks": 6,
+   "runs": {
+    "engram": 18,
+    "none": 18
+   },
+   "solved": {
+    "engram": 18,
+    "none": 13
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 0.7222222222222222
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 0.8194444444444444
+   },
+   "fisher_solved": {
+    "two_sided": 0.04545454545454536,
+    "one_sided": 0.02272727272727268
+   },
+   "perm_score": {
+    "diff": 0.18055555555555558,
+    "two_sided": 0.018549072546372683,
+    "one_sided": 0.010049497525123744
+   },
+   "perm_solved": {
+    "diff": 0.2777777777777778,
+    "two_sided": 0.019899005049747513,
+    "one_sided": 0.00974951252437378
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.4305555555555556
+   ],
+   "cost_usd": {
+    "engram": 0.007485533333333334,
+    "none": 0.006630477777777778
+   },
+   "turns": {
+    "engram": 6.888888888888889,
+    "none": 7.444444444444445
+   },
+   "wall_s": {
+    "engram": 20.50449213716719,
+    "none": 57.090688387552895
+   }
+  },
+  "repo": {
+   "tasks": 3,
+   "runs": {
+    "engram": 9,
+    "none": 9
+   },
+   "solved": {
+    "engram": 9,
+    "none": 9
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.005336980000000001,
+    "none": 0.0052345322222222225
+   },
+   "turns": {
+    "engram": 5.333333333333333,
+    "none": 7.111111111111111
+   },
+   "wall_s": {
+    "engram": 13.249353594250149,
+    "none": 13.379566404554579
+   }
+  }
+ },
+ "stockroom": {
+  "all": {
+   "tasks": 10,
+   "runs": {
+    "engram": 50,
+    "none": 50
+   },
+   "solved": {
+    "engram": 50,
+    "none": 30
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 0.6
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 0.7533333333333333
+   },
+   "fisher_solved": {
+    "two_sided": 1.7586072571040222e-07,
+    "one_sided": 8.793036285520111e-08
+   },
+   "perm_score": {
+    "diff": 0.2466666666666667,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "perm_solved": {
+    "diff": 0.4,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "score_diff_ci95": [
+    0.07999999999999996,
+    0.43666666666666676
+   ],
+   "cost_usd": {
+    "engram": 0.0072379614,
+    "none": 0.0068629448000000004
+   },
+   "turns": {
+    "engram": 6.26,
+    "none": 7.54
+   },
+   "wall_s": {
+    "engram": 20.260059785842895,
+    "none": 20.25666139125824
+   }
+  },
+  "control": {
+   "tasks": 2,
+   "runs": {
+    "engram": 10,
+    "none": 10
+   },
+   "solved": {
+    "engram": 10,
+    "none": 10
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.007935224000000001,
+    "none": 0.006797405000000001
+   },
+   "turns": {
+    "engram": 7.1,
+    "none": 7.8
+   },
+   "wall_s": {
+    "engram": 25.366891050338744,
+    "none": 19.888196110725403
+   }
+  },
+  "conversation": {
+   "tasks": 6,
+   "runs": {
+    "engram": 30,
+    "none": 30
+   },
+   "solved": {
+    "engram": 30,
+    "none": 10
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 0.3333333333333333
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 0.5888888888888889
+   },
+   "fisher_solved": {
+    "two_sided": 1.4334985450146264e-08,
+    "one_sided": 7.167492725073132e-09
+   },
+   "perm_score": {
+    "diff": 0.4111111111111111,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "perm_solved": {
+    "diff": 0.6666666666666667,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "score_diff_ci95": [
+    0.19999999999999996,
+    0.6277777777777778
+   ],
+   "cost_usd": {
+    "engram": 0.006917216666666667,
+    "none": 0.007025472666666667
+   },
+   "turns": {
+    "engram": 5.466666666666667,
+    "none": 7.166666666666667
+   },
+   "wall_s": {
+    "engram": 19.248220904668173,
+    "none": 21.913125507036845
+   }
+  },
+  "repo": {
+   "tasks": 2,
+   "runs": {
+    "engram": 10,
+    "none": 10
+   },
+   "solved": {
+    "engram": 10,
+    "none": 10
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.007502933000000001,
+    "none": 0.006440901000000001
+   },
+   "turns": {
+    "engram": 7.8,
+    "none": 8.4
+   },
+   "wall_s": {
+    "engram": 18.188745164871214,
+    "none": 15.655734324455262
+   }
+  }
+ },
+ "slotwise": {
+  "all": {
+   "tasks": 10,
+   "runs": {
+    "engram": 50,
+    "none": 50
+   },
+   "solved": {
+    "engram": 50,
+    "none": 30
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 0.6
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 0.7966666666666667
+   },
+   "fisher_solved": {
+    "two_sided": 1.7586072571040222e-07,
+    "one_sided": 8.793036285520111e-08
+   },
+   "perm_score": {
+    "diff": 0.20333333333333325,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "perm_solved": {
+    "diff": 0.4,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "score_diff_ci95": [
+    0.050000000000000044,
+    0.3633333333333334
+   ],
+   "cost_usd": {
+    "engram": 0.0086451258,
+    "none": 0.0085013632
+   },
+   "turns": {
+    "engram": 7.0,
+    "none": 9.04
+   },
+   "wall_s": {
+    "engram": 25.578148784637452,
+    "none": 24.47886125087738
+   }
+  },
+  "control": {
+   "tasks": 2,
+   "runs": {
+    "engram": 10,
+    "none": 10
+   },
+   "solved": {
+    "engram": 10,
+    "none": 10
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.007333691000000001,
+    "none": 0.006096302
+   },
+   "turns": {
+    "engram": 6.6,
+    "none": 6.7
+   },
+   "wall_s": {
+    "engram": 19.527848482131958,
+    "none": 18.256700682640076
+   }
+  },
+  "conversation": {
+   "tasks": 6,
+   "runs": {
+    "engram": 30,
+    "none": 30
+   },
+   "solved": {
+    "engram": 30,
+    "none": 10
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 0.3333333333333333
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 0.6611111111111111
+   },
+   "fisher_solved": {
+    "two_sided": 1.4334985450146264e-08,
+    "one_sided": 7.167492725073132e-09
+   },
+   "perm_score": {
+    "diff": 0.3388888888888889,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "perm_solved": {
+    "diff": 0.6666666666666667,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "score_diff_ci95": [
+    0.1611111111111111,
+    0.5166666666666666
+   ],
+   "cost_usd": {
+    "engram": 0.007707774000000001,
+    "none": 0.007906839666666667
+   },
+   "turns": {
+    "engram": 6.066666666666666,
+    "none": 7.966666666666667
+   },
+   "wall_s": {
+    "engram": 24.18646638393402,
+    "none": 22.518209020296734
+   }
+  },
+  "repo": {
+   "tasks": 2,
+   "runs": {
+    "engram": 10,
+    "none": 10
+   },
+   "solved": {
+    "engram": 10,
+    "none": 10
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.012768616,
+    "none": 0.012689995
+   },
+   "turns": {
+    "engram": 10.2,
+    "none": 14.6
+   },
+   "wall_s": {
+    "engram": 35.80349628925323,
+    "none": 36.58297851085663
+   }
+  }
+ },
+ "pooled": {
+  "all": {
+   "tasks": 20,
+   "runs": {
+    "engram": 100,
+    "none": 100
+   },
+   "solved": {
+    "engram": 100,
+    "none": 60
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 0.6
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 0.775
+   },
+   "fisher_solved": {
+    "two_sided": 1.3409926628090048e-14,
+    "one_sided": 6.704963314045024e-15
+   },
+   "perm_score": {
+    "diff": 0.22499999999999998,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "perm_solved": {
+    "diff": 0.4,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "score_diff_ci95": [
+    0.10499999999999998,
+    0.3466666666666667
+   ],
+   "cost_usd": {
+    "engram": 0.0079415436,
+    "none": 0.007682154
+   },
+   "turns": {
+    "engram": 6.63,
+    "none": 8.29
+   },
+   "wall_s": {
+    "engram": 22.919104285240174,
+    "none": 22.36776132106781
+   }
+  },
+  "control": {
+   "tasks": 4,
+   "runs": {
+    "engram": 20,
+    "none": 20
+   },
+   "solved": {
+    "engram": 20,
+    "none": 20
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.0076344575,
+    "none": 0.0064468535
+   },
+   "turns": {
+    "engram": 6.85,
+    "none": 7.25
+   },
+   "wall_s": {
+    "engram": 22.44736976623535,
+    "none": 19.072448396682738
+   }
+  },
+  "conversation": {
+   "tasks": 12,
+   "runs": {
+    "engram": 60,
+    "none": 60
+   },
+   "solved": {
+    "engram": 60,
+    "none": 20
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 0.3333333333333333
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 0.625
+   },
+   "fisher_solved": {
+    "two_sided": 7.318365632479875e-17,
+    "one_sided": 3.6591828162399376e-17
+   },
+   "perm_score": {
+    "diff": 0.375,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "perm_solved": {
+    "diff": 0.6666666666666667,
+    "two_sided": 4.999750012499375e-05,
+    "one_sided": 4.999750012499375e-05
+   },
+   "score_diff_ci95": [
+    0.23055555555555562,
+    0.525
+   ],
+   "cost_usd": {
+    "engram": 0.007312495333333334,
+    "none": 0.007466156166666667
+   },
+   "turns": {
+    "engram": 5.766666666666667,
+    "none": 7.566666666666666
+   },
+   "wall_s": {
+    "engram": 21.717343644301096,
+    "none": 22.215667263666788
+   }
+  },
+  "repo": {
+   "tasks": 4,
+   "runs": {
+    "engram": 20,
+    "none": 20
+   },
+   "solved": {
+    "engram": 20,
+    "none": 20
+   },
+   "solved_rate": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "score": {
+    "engram": 1.0,
+    "none": 1.0
+   },
+   "fisher_solved": {
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_score": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "perm_solved": {
+    "diff": 0.0,
+    "two_sided": 1.0,
+    "one_sided": 1.0
+   },
+   "score_diff_ci95": [
+    0.0,
+    0.0
+   ],
+   "cost_usd": {
+    "engram": 0.0101357745,
+    "none": 0.009565448
+   },
+   "turns": {
+    "engram": 9.0,
+    "none": 11.5
+   },
+   "wall_s": {
+    "engram": 26.996120727062227,
+    "none": 26.119356417655943
+   }
+  }
+ }
+}

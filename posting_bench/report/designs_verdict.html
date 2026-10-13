@@ -1,0 +1,37 @@
+  <p>Each design met its main target and missed at least one secondary one. Together they hold every point on 8 of the 10 frontiers measured.</p>
+  <div class="verdict">
+    <div>
+      <h4>Pyramid: a smaller Roaring with faster unions</h4>
+      <p><span class="ok">Met:</span> 24–33% smaller than Roaring, the fastest union on every workload (1.2–1.75× Roaring), and faster conjunctions on clustered and selective queries.</p>
+      <p><span class="no">Missed:</span> conjunctions on uniform (11% more time) and WikiText (38% more). There, probes into mid-density sparse blocks cost more than Roaring's gallop through one contiguous array.</p>
+    </div>
+    <div>
+      <h4>Loom: PEF's size with bitmap-like speed</h4>
+      <p><span class="ok">Met:</span> on every collection, PEF's size with 1.9–2.2× faster conjunctions and 4.9–8.9× faster unions. It sits on all ten frontiers and has the fastest conjunction for selective and five- or six-term queries.</p>
+      <p><span class="no">Missed:</span> the stretch goal of beating Roaring everywhere. On uniform and WikiText, Loom takes 9–37% more time than Roaring on AND and 25–54% more on OR. Roaring is 1.7–1.8× Loom's size.</p>
+    </div>
+    <div>
+      <h4>Entropic: the smallest index on disk</h4>
+      <p><span class="ok">Met:</span> the smallest serialized index on every collection, 11–14% below interpolative coding and 6–15% below PEF, while answering queries 2–4× faster than interpolative coding.</p>
+      <p><span class="no">Missed:</span> it is not smaller in memory. Decode tables add 1.3–22 MB, which puts it above PEF on clustered and WikiText. Its conjunctions are about 2× slower than PEF's, and builds 13–19× slower.</p>
+    </div>
+  </div>
+  <h3>Which one to use</h3>
+  <ul>
+    <li><b>Loom</b> as the default. It replaces PEF outright, and takes at most 1.37× Roaring's conjunction time at 53–58% of its size.</li>
+    <li><b>Pyramid</b> where unions dominate or memory is less tight, as in faceting, filters or OR-heavy candidate generation.</li>
+    <li><b>Entropic</b> for cold or storage-bound tiers, where bytes on disk or over the network matter more than query time. It needs decode tables built on demand before it saves memory too.</li>
+  </ul>
+  <h3>Limitations</h3>
+  <ul>
+    <li><b>One machine.</b> This is a shared cloud VM with an Emerald Rapids Xeon. Small timings vary by up to about 15% between runs, so differences under 10% (Loom against Roaring on uniform AND, the dense AND tie) are not significant.</li>
+    <li><b>AVX-512 kernels.</b> Pyramid and Loom have scalar twins for every SIMD kernel, compiled when the target lacks the features, but only the AVX-512 builds were timed.</li>
+    <li><b>Tuned on these data.</b> Thresholds such as 29 values per dense block, the 1.6× Flat bias and Loom's \(\lambda = 5/4\) were chosen while profiling these collections, so the margins may be smaller on others.</li>
+    <li><b>Boolean, static, single-threaded.</b> No scoring, top-k or block-max metadata, no updates, one core. Queries come from the same generator as the first round rather than a real query log, also on WikiText.</li>
+  </ul>
+  <h3>Next steps</h3>
+  <ul>
+    <li><b>Pyramid:</b> a contiguous <code>u16</code> form for chunks made mostly of mid-density sparse blocks, so that a probe is one search instead of a mask, a directory entry and a byte scan. This targets the WikiText conjunction gap.</li>
+    <li><b>Loom:</b> per-partition block-max scores for dynamic pruning. Its 16-posting grid already gives the boundaries.</li>
+    <li><b>Entropic:</b> build decode tables lazily per list or share parametric models, so memory falls below PEF as well as disk.</li>
+  </ul>

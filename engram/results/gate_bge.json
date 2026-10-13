@@ -1,0 +1,68 @@
+{
+ "train": {
+  "n": 193,
+  "positive": 0.40932642487046633,
+  "hi": [
+   1.0,
+   0.02531645569620253,
+   0.010362694300518135
+  ],
+  "lo": [
+   0.7,
+   0.8860759493670886,
+   0.5181347150259067
+  ],
+  "single_feature_precision": {
+   "cos": 1.0,
+   "cov": 1.0
+  }
+ },
+ "weights": {
+  "a_cos": 3.8028982057406444,
+  "b_cov": 4.310973678301212,
+  "c_cue": 0.3256321720283485,
+  "d_agree": 1.5829303527878964,
+  "e_cos_gap": 2.7778880303766296,
+  "f_bm_gap": 0.6174129885688914
+ },
+ "bias": -7.101286535055855,
+ "hi": 9.710972842473398,
+ "lo": 6.373953193687177,
+ "train_positive_rate": 0.40932642487046633,
+ "results/retrieval/locomo_bge-small_round.rows.jsonl": {
+  "n": 1996,
+  "positive": 0.5831663326653307,
+  "hi": [
+   0.75,
+   0.01288659793814433,
+   0.01002004008016032
+  ],
+  "lo": [
+   0.6551966292134831,
+   0.8015463917525774,
+   0.7134268537074149
+  ],
+  "single_feature_precision": {
+   "cos": 0.7,
+   "cov": 0.7
+  }
+ },
+ "policy": {
+  "results/retrieval/longmemeval_s_bge-small_round_every5.rows.jsonl": {
+   "coverage": 0.5851063829787234,
+   "precision": 0.5555555555555556,
+   "inject_rate": 0.5129533678756477,
+   "chars_per_prompt": 486.0777202072539,
+   "always_coverage": 0.8404255319148937,
+   "always_precision": 0.40932642487046633
+  },
+  "results/retrieval/locomo_bge-small_round.rows.jsonl": {
+   "coverage": 0.404296875,
+   "precision": 0.43609550561797755,
+   "inject_rate": 0.7134268537074149,
+   "chars_per_prompt": 650.0325651302605,
+   "always_coverage": 0.7578125,
+   "always_precision": 0.5831663326653307
+  }
+ }
+}

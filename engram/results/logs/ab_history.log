@@ -1,0 +1,16 @@
+session 1 turn 1: 7 steps, $0.006, 18 s
+session 1 turn 2: 5 steps, $0.009, 11 s
+session 1 turn 3: 5 steps, $0.012, 13 s
+session 1 turn 4: 1 steps, $0.013, 6 s
+session 1 turn 5: 6 steps, $0.015, 11 s
+session 1 turn 6: 1 steps, $0.016, 5 s
+session 1 turn 7: 3 steps, $0.019, 11 s
+session 2 turn 1: 8 steps, $0.010, 35 s
+session 2 turn 2: 7 steps, $0.013, 10 s
+session 2 turn 3: 3 steps, $0.016, 8 s
+history done: 10 turns; git log:
+925c5bb Add command-line interface: add, balances, people
+ea4024d Fix equal split rounding, add Ledger.remove, CHF formatting
+d857942 Tally 0.1.0
+status:
+tests: 22 pass=True

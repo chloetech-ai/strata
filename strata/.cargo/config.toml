@@ -1,0 +1,5 @@
+# The testbed measures SIMD kernels; let the compiler use every instruction set
+# of the machine it runs on (AVX2/AVX-512/BMI2 on x86_64, NEON on aarch64).
+# Every SIMD path has a portable fallback, so removing this flag is safe.
+[build]
+rustflags = ["-C", "target-cpu=native"]

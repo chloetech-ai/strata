@@ -1,0 +1,50 @@
+<section class="col" id="pyramid">
+  <h2>Pyramid <span class="tag">speed-first</span></h2>
+  <p class="thesis">Make every membership test O(1) at every density, and make every set operation local to a 256-docID block.</p>
+  <p>Roaring partitions the docID space into \(2^{16}\)-docID chunks and stores each as an array, a bitmap or runs. Its two costs on these workloads are the mid-density chunk and the skewed probe. A mid-density chunk is either a 16-bit-per-value array or an 8 KiB bitmap, with nothing in between. A probe into a large array chunk is a gallop. Pyramid adds one level and stores the two populations the statistics revealed separately: dense topical blocks and isolated noise.</p>
+  <h3>Layout</h3>
+  <p>Each chunk is split into 256 blocks of 256 docIDs and stored as one of three kinds, chosen by exact size:</p>
+  <ul>
+    <li><b>Small</b>: a sorted <code>u16</code> array of at most 48 values, probed with masked AVX-512 compares.</li>
+    <li><b>Tiered</b>: a 256-bit <em>present</em> mask, a 256-bit <em>dense</em> mask (omitted when no block is dense), one 256-bit bitmap per dense block, and the low bytes of the remaining values grouped by block.</li>
+    <li><b>Flat</b>: the present mask plus all 256 block bitmaps, used for chunks that are dense almost everywhere.</li>
+  </ul>
+  <p>A block becomes a bitmap when that is no larger than its sparse form: about 9 bits per value (8 for the low byte, about 1 for the directory), so</p>
+  <div class="math">\[ \text{dense}(B) \iff 256 \le 9\,|B| \iff |B| \ge 29. \]</div>
+  <p>A Tiered chunk then takes</p>
+  <div class="math">\[ S_{\text{tiered}} = 96 + 256 + 256\,[d \gt 0] + 256\,d + 8\,c_s + |\text{dir}| \ \text{bits} \]</div>
+  <p>for \(d\) dense blocks and \(c_s\) sparse values, where 96 bits are the chunk header and counts. Flat is taken whenever \(S_{\text{flat}} \lt 1.6\,S_{\text{tiered}}\). That bias toward bitmaps costs 0.07–0.23 bits per posting and made unions 14–17% faster in the profiling runs.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 266" role="img" aria-label="A Pyramid chunk: blocks are absent, sparse or dense; present and dense masks select them; dense blocks live in a bitmap pool and sparse values as low bytes in a sparse pool">
+        <g id="pyr-diagram"></g>
+      </svg>
+    </div>
+    <figcaption><b>A Tiered chunk</b> (32 of its 256 blocks shown). Blue blocks are dense and stored as 256-bit bitmaps, located by rank in the dense mask. Orange blocks are sparse and store one byte per value. Grey blocks are absent. A probe reads one mask bit, then either one bitmap bit or a handful of bytes.</figcaption>
+  </figure>
+  <h3>Directory for sparse blocks</h3>
+  <p>The offset of sparse block \(b\) in the byte pool comes from one of two directories, chosen per chunk by exact size:</p>
+  <ul>
+    <li><b>Unary ("byte Elias-Fano"):</b> a bit vector \(U\) marks each block's first value, with a <code>u16</code> sample every 8 blocks: \[ \mathrm{off}(b) = \mathrm{select}_1\bigl(U,\ \mathrm{rank}_{P \setminus D}(b)\bigr), \] answered by a single <code>pdep</code> over a 128-bit window. This wins for blocks of 1–3 values, the noise.</li>
+    <li><b><code>u16</code> prefix offsets:</b> one load per lookup. This wins once sparse blocks average about 14 values.</li>
+  </ul>
+  <p>Masks and directories sit in a sequential metadata arena read in key order and prefetched three chunks ahead; bitmaps and bytes sit in a 64-byte-aligned data arena.</p>
+  <h3>Conjunction: driven chunks and block joins</h3>
+  <div class="algo-box"><pre><span class="cm">// the rarest list's chunk keys are galloped in the others</span>
+for each chunk key shared by all lists:
+    D ← the chunk with the fewest values
+    if |D| ≤ 64 or (|D| ≤ 1024 and |D|/blocks(D) ≤ 8):    <span class="cm">// driven chunk</span>
+        for each other list L, rarest first:
+            keep the v ∈ D with probe_L(v)        <span class="cm">// O(1), branch-free</span>
+    else:                                                <span class="cm">// block join</span>
+        for each block b present in every list:   <span class="cm">// AND of present masks</span>
+            if b is dense everywhere:
+                emit the bits of ⋀ bitmaps_b      <span class="cm">// 4-word AND</span>
+            else:
+                test ≤ 32 low bytes at once against the others
+                (vpermb bit lookups, byte compares);
+                emit the survivors with vpcompressd</pre></div>
+  <p>Cost is proportional to the smaller side of each chunk or block, and blocks absent from any list are never touched.</p>
+  <h3>Union</h3>
+  <p>Chunk groups that are dense (96 or more union blocks, or any Flat member) are accumulated in a thread-local 65,536-bit buffer that touches only present blocks. Sparse values are decoded 16 at a time: block ids come from a <code>vpopcntd</code> prefix count over \(U\), then <code>vpermt2d</code>. In sparse groups, runs of blocks owned by a single list are written straight to the output, and shared blocks go through a 256-bit accumulator. Bitmaps are extracted with <code>vpcompressb</code>, or with <code>vpcompressd</code> where VBMI2 is missing. The count-only union skips single-list runs entirely and adds their cardinalities.</p>
+</section>

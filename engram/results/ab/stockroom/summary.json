@@ -1,0 +1,262 @@
+{
+ "tasks": {
+  "count_sheet": {
+   "needs": "count sheet requirements stated only in conversation (walking order by bin, blind count)",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0093255,
+    "turns": 7.6,
+    "wall_s": 27.13159074783325,
+    "input_tokens": 308716.8,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 0.4666666666666666,
+    "solved": 0.0,
+    "cost_usd": 0.00775033,
+    "turns": 8.4,
+    "wall_s": 19.967109537124635,
+    "input_tokens": 313221.0,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "stock_value": {
+   "needs": "valuation method (FIFO, auditor) stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.009261639999999998,
+    "turns": 7.6,
+    "wall_s": 26.858185911178587,
+    "input_tokens": 314307.2,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.008261716,
+    "turns": 9.2,
+    "wall_s": 27.310829162597656,
+    "input_tokens": 269065.6,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "purchase_suggestions": {
+   "needs": "the client's order-quantity rule (up to 3x reorder point, whole cases) stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0071326620000000006,
+    "turns": 5.4,
+    "wall_s": 18.22634859085083,
+    "input_tokens": 204694.8,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 0.6666666666666666,
+    "solved": 0.0,
+    "cost_usd": 0.006576772,
+    "turns": 6.8,
+    "wall_s": 18.579589319229125,
+    "input_tokens": 221914.8,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "scanner_import": {
+   "needs": "the scanner file format (semicolons, no header, bin;sku;qty, sum duplicates) stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.008257544,
+    "turns": 7.2,
+    "wall_s": 23.66015582084656,
+    "input_tokens": 281878.8,
+    "memory_tool_calls": 0.2
+   },
+   "none": {
+    "n": 5,
+    "score": 0.6,
+    "solved": 0.6,
+    "cost_usd": 0.012255286,
+    "turns": 11.6,
+    "wall_s": 41.89172673225403,
+    "input_tokens": 423721.6,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "negative_stock_advice": {
+   "needs": "a failed approach and its reason (till posts after payment) stated only in conversation",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.00399475,
+    "turns": 3.4,
+    "wall_s": 8.906665706634522,
+    "input_tokens": 88301.0,
+    "memory_tool_calls": 1.0
+   },
+   "none": {
+    "n": 5,
+    "score": 0.6,
+    "solved": 0.4,
+    "cost_usd": 0.004332664,
+    "turns": 4.8,
+    "wall_s": 13.921333122253419,
+    "input_tokens": 126990.8,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "config_advice": {
+   "needs": "an environment fact (client PC on Python 3.8) said once in passing",
+   "kind": "conversation",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0035312040000000005,
+    "turns": 1.6,
+    "wall_s": 10.706378650665282,
+    "input_tokens": 62914.6,
+    "memory_tool_calls": 0.4
+   },
+   "none": {
+    "n": 5,
+    "score": 0.2,
+    "solved": 0.0,
+    "cost_usd": 0.002976068,
+    "turns": 2.2,
+    "wall_s": 9.808165168762207,
+    "input_tokens": 79975.0,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "last_receipt": {
+   "needs": "the SKU normalization convention, applied in the code during the history",
+   "kind": "repo",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.007258844,
+    "turns": 6.6,
+    "wall_s": 19.22708168029785,
+    "input_tokens": 250468.8,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0064014200000000005,
+    "turns": 8.2,
+    "wall_s": 16.023887395858765,
+    "input_tokens": 230740.8,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "write_off": {
+   "needs": "the reason codes, added to the code during the history",
+   "kind": "repo",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.007747022000000001,
+    "turns": 9.0,
+    "wall_s": 17.15040864944458,
+    "input_tokens": 257507.4,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.0064803820000000015,
+    "turns": 8.6,
+    "wall_s": 15.287581253051759,
+    "input_tokens": 245918.4,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "abc_classes": {
+   "needs": "nothing (control)",
+   "kind": "control",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.008685822,
+    "turns": 8.2,
+    "wall_s": 27.363214445114135,
+    "input_tokens": 289143.0,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.007401600000000001,
+    "turns": 9.2,
+    "wall_s": 22.80178713798523,
+    "input_tokens": 264386.8,
+    "memory_tool_calls": 0.0
+   }
+  },
+  "parse_location": {
+   "needs": "nothing (control)",
+   "kind": "control",
+   "engram": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.007184626000000001,
+    "turns": 6.0,
+    "wall_s": 23.370567655563356,
+    "input_tokens": 230815.8,
+    "memory_tool_calls": 0.0
+   },
+   "none": {
+    "n": 5,
+    "score": 1.0,
+    "solved": 1.0,
+    "cost_usd": 0.00619321,
+    "turns": 6.4,
+    "wall_s": 16.974605083465576,
+    "input_tokens": 232563.0,
+    "memory_tool_calls": 0.0
+   }
+  }
+ },
+ "overall": {
+  "engram": {
+   "n": 50,
+   "score": 1.0,
+   "solved": 1.0,
+   "cost_usd": 0.0072379614,
+   "turns": 6.26,
+   "wall_s": 20.260059785842895
+  },
+  "none": {
+   "n": 50,
+   "score": 0.7533333333333333,
+   "solved": 0.6,
+   "cost_usd": 0.0068629448000000004,
+   "turns": 7.54,
+   "wall_s": 20.25666139125824
+  }
+ }
+}

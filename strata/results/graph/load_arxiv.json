@@ -1,0 +1,32 @@
+{
+  "edges": 1150908,
+  "edges_only": {
+    "load_s": 0.749271583,
+    "sizes": {
+      "components": {
+        "columns": 254112,
+        "doc store": 669592,
+        "graph": 31122448,
+        "primary key": 4171416
+      },
+      "file_bytes": 36274176,
+      "segments": 2
+    }
+  },
+  "held_out": 1000,
+  "index": "hnsw",
+  "load_s": 23.248243925,
+  "papers": 168343,
+  "sizes": {
+    "components": {
+      "columns": 844584,
+      "doc store": 129354418,
+      "graph": 31122448,
+      "primary key": 4171416,
+      "text": 20095522,
+      "vectors": 453274261
+    },
+    "file_bytes": 638963712,
+    "segments": 2
+  }
+}

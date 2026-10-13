@@ -1,0 +1,235 @@
+<title>Strata</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Literata:opsz,wght@7..72,500;7..72,600&display=swap">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] },
+    svg: { fontCache: "global" },
+    options: { enableMenu: false }
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.min.js" defer></script>
+<style>
+/*__STYLE__*/
+.thesis { font-family: var(--display); font-size: 1.18rem; line-height: 1.45; color: var(--ink); border-left: 3px solid var(--accent); padding: 2px 0 2px 16px; margin: 14px 0 18px; }
+.sqlbox { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; margin: 14px 0; overflow-x: auto; }
+.sqlbox pre { margin: 0; font: 0.84rem/1.6 var(--mono); color: var(--ink); white-space: pre; }
+.sqlbox .kw { color: var(--accent); font-weight: 500; }
+.sqlbox .fn { color: var(--warm); }
+.sqlbox .cm { color: var(--ink-3); }
+.verdict { display: grid; grid-template-columns: 1fr; gap: 12px; margin: 18px 0; }
+.note { font-size: 0.86rem; color: var(--ink-3); margin-top: -4px; }
+.verdict > div { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+.verdict h4 { margin: 0 0 6px; font: 600 1rem/1.3 var(--body); }
+.verdict p { margin: 0; font-size: 0.92rem; color: var(--ink-2); }
+.verdict p + p { margin-top: 6px; }
+:root { --ok: #127a2e; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ok: #5cc677; } }
+:root[data-theme="dark"] { --ok: #5cc677; }
+.ok { color: var(--ok); font-weight: 600; }
+.no { color: var(--s8); font-weight: 600; }
+.compact th, .compact td { padding: 7px 9px; }
+.wrap-head th { white-space: normal; vertical-align: bottom; }
+td.sys { font-weight: 600; }
+.showcase td { vertical-align: top; white-space: normal; }
+.showcase td:first-child { min-width: 280px; }
+.sc-sql, .sc-plan { max-width: 330px; }
+.showcase td:not(:first-child) .sc-plan { max-width: 170px; }
+.ablation th.grp { text-align: center; border-bottom: 1px solid var(--rule); }
+.ablation td .pg { font-size: 0.74rem; color: var(--ink-3); }
+.ablation td.best .pg { color: inherit; }
+.sc-label { font-weight: 600; margin-bottom: 4px; }
+.sc-sql { display: block; font: 0.74rem/1.45 var(--mono); color: var(--ink-2); white-space: normal; word-break: break-word; background: none; padding: 0; border: 0; }
+.sc-ms { font: 500 0.82rem/1.3 var(--mono); font-variant-numeric: tabular-nums; }
+.sc-plan { font-size: 0.76rem; line-height: 1.35; color: var(--ink-3); margin-top: 3px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+.tabs button { font: 500 0.82rem/1 var(--body); color: var(--ink-2); background: var(--surface); border: 1px solid var(--rule); border-radius: 999px; padding: 7px 12px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.dg .gridl { stroke: var(--grid); stroke-width: 1; }
+.dg .lnd { stroke: var(--ink-3); stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+</style>
+
+<div class="page">
+<header class="col">
+  <div class="eyebrow">posting_bench · strata</div>
+  <h1>Strata: full text, structured filters and vectors in one SQL file</h1>
+  <p class="lede">An embedded search database in the spirit of SQLite: one file, ACID transactions, SQL. Every table is indexed three ways at once (posting lists, a columnar forward index and vector ANN indexes), and a cost-based planner combines them in a single query. This page is the design, the prototype built from the earlier posting-list research, and its evaluation against SQLite and Tantivy on four BEIR collections.</p>
+  <p class="meta" id="meta-line"></p>
+  <div class="findings" id="findings"><!--FINDINGS--></div>
+  <ul class="toc">
+    <li><a href="#what">What it does</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#storage">Storage</a></li>
+    <li><a href="#indexes">Indexes</a></li>
+    <li><a href="#planner">Planner</a></li>
+    <li><a href="#evaluation">Evaluation</a></li>
+    <li><a href="#verdict">Verdict</a></li>
+    <li><a href="#reproduce">Reproduce</a></li>
+  </ul>
+</header>
+
+<section class="col" id="what">
+  <h2>What it does</h2>
+  <p class="thesis">One file, one SQL statement, three kinds of index: the planner decides per segment which index drives the query and how the others constrain it.</p>
+  <p>SQLite answers full-text queries with FTS5 and structured ones with B-trees, but it has no vector index, and its FTS5 scores every match without pruning. Search libraries such as Tantivy rank text quickly but have no SQL, no vectors and no transactions. Vector databases do the opposite. Strata keeps SQLite's packaging (an embedded library, one file, a write-ahead log, snapshot isolation) and puts a search engine inside it.</p>
+  <div class="sqlbox"><pre><span class="cm">-- full text, ranked, with structured filters</span>
+<span class="kw">SELECT</span> id, title, <span class="fn">score</span>() <span class="kw">FROM</span> docs
+<span class="kw">WHERE</span> <span class="fn">MATCH</span>(body, 'vaccine AND (mrna OR "messenger rna") -animal')
+  <span class="kw">AND</span> year <span class="kw">BETWEEN</span> 2019 <span class="kw">AND</span> 2021 <span class="kw">AND</span> category <span class="kw">IN</span> ('c01', 'c02')
+<span class="kw">ORDER BY</span> <span class="fn">bm25</span>(body, 'mrna vaccine efficacy') <span class="kw">DESC LIMIT</span> 10;
+
+<span class="cm">-- filtered vector search</span>
+<span class="kw">SELECT</span> id <span class="kw">FROM</span> docs <span class="kw">WHERE</span> rating &gt;= 4 <span class="kw">ORDER BY</span> <span class="fn">similarity</span>(emb, :q) <span class="kw">DESC LIMIT</span> 10;
+
+<span class="cm">-- hybrid ranking: rank fusion, or a weighted sum of normalised scores</span>
+<span class="kw">SELECT</span> id <span class="kw">FROM</span> docs <span class="kw">WHERE</span> year &gt;= 2015
+<span class="kw">ORDER BY</span> 0.2 * <span class="fn">bm25</span>(body, :text) + 0.8 * <span class="fn">similarity</span>(emb, :q) <span class="kw">DESC LIMIT</span> 10;
+
+<span class="cm">-- facets over any result</span>
+<span class="kw">SELECT</span> category, <span class="fn">COUNT</span>(*) <span class="kw">FROM</span> docs <span class="kw">WHERE</span> <span class="fn">MATCH</span>(body, 'vaccine')
+<span class="kw">GROUP BY</span> category <span class="kw">ORDER BY</span> 2 <span class="kw">DESC LIMIT</span> 5;</pre></div>
+  <p>The dialect is plain SQL parsed by <code>sqlparser</code>. Search functions are <code>MATCH</code> (boolean full text with phrases, prefixes and negation, juxtaposition meaning AND as in FTS5), <code>bm25</code>, <code>similarity</code> and <code>distance</code>, and <code>rrf</code>, with named options such as <code>nprobe =&gt; 32</code> or <code>strategy =&gt; 'prefilter'</code>. Text fields can be generated from other fields, like SQLite's <code>GENERATED ALWAYS AS</code>, so the searchable <code>body</code> (title and text) is indexed without being stored twice.</p>
+  <div class="table-wrap compact"><table>
+    <thead><tr><th></th><th>Strata</th><th>SQLite + FTS5</th><th>Tantivy</th></tr></thead>
+    <tbody>
+      <tr><td>Embedded, one file, ACID</td><td class="ok">yes</td><td class="ok">yes</td><td>directory of segment files</td></tr>
+      <tr><td>SQL</td><td class="ok">yes (SELECT)</td><td class="ok">yes</td><td class="no">no</td></tr>
+      <tr><td>BM25 top-k with pruning</td><td class="ok">MaxScore, Block-Max WAND</td><td class="no">scores every match</td><td class="ok">Block-WAND</td></tr>
+      <tr><td>Structured filters</td><td>columns, range and keyword postings</td><td>B-tree indexes</td><td>fast fields, range queries</td></tr>
+      <tr><td>Vector search</td><td class="ok">flat, IVF, HNSW, filtered</td><td class="no">brute force via a function</td><td class="no">none</td></tr>
+      <tr><td>Hybrid ranking in one query</td><td class="ok">yes</td><td>application side</td><td class="no">no</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="col" id="architecture">
+  <h2>Architecture</h2>
+  <p>Strata is layered like SQLite, with a search engine where SQLite keeps its B-tree module. SQL text is parsed and bound to the table's schema, giving a predicate tree (text matches, ranges, <code>IN</code> lists under AND, OR and NOT) and a score expression (BM25, similarity, fusion or a column). The planner decides per segment, from statistics the indexes answer without scanning, how each part is evaluated. Operators run on zero-copy views of the segment's sections, mapped straight from the file.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 420" role="img" aria-label="Layers: SQL front end, planner with statistics, per-segment operators over text, structured and vector indexes, segments made of aligned sections, and a single file with two meta slots, extents and a write-ahead log">
+        <g id="arch-diagram"></g>
+      </svg>
+    </div>
+    <figcaption><b>Layers.</b> Every index structure lives in immutable segments. A segment is a directory of named, aligned sections that operators read in place through one memory mapping of the file, so opening a database reads two pages and a manifest, however large it is.</figcaption>
+  </figure>
+</section>
+
+<section class="col" id="storage">
+  <h2>Storage</h2>
+  <p>SQLite updates B-tree pages in place. Compressed posting lists, bit-packed columns and ANN graphs do not survive in-place updates: the best encodings, such as partitioned Elias-Fano, are chosen per list, and changing one docID means re-encoding the list. SQLite's own FTS5, Lucene and Tantivy all keep their indexes as immutable segments merged in the background. Strata does the same for the whole table and adds SQLite's transactional envelope.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 300" role="img" aria-label="The file: meta slots A and B, then extents holding segments, delete sets and manifests; a separate write-ahead log feeds an in-memory memtable">
+        <g id="file-diagram"></g>
+      </svg>
+    </div>
+    <figcaption><b>One file plus a WAL.</b> Two meta slots name the current manifest. A commit writes new extents, syncs, then flips to the other slot and syncs again. Small transactions go to the write-ahead log and an in-memory memtable first, and are flushed into a segment when the memtable fills.</figcaption>
+  </figure>
+  <h3>Commit and recovery</h3>
+  <p>The commit protocol is shadow paging, as in LMDB: nothing reachable from a valid meta slot is ever overwritten, so there is no rollback journal.</p>
+  <div class="math">\[ \text{commit}_{t+1}:\ \text{write extents} \;\to\; \text{fsync} \;\to\; \text{write slot } (t+1) \bmod 2 \;\to\; \text{fsync}, \qquad \text{recover} = \operatorname*{arg\,max}_{s \in \{A, B\},\ \text{crc}(s)\ \text{ok}} \text{txn}(s). \]</div>
+  <p>A torn slot fails its checksum and recovery falls back to the other one, which still names a complete version. Freed pages wait until no snapshot needs them, plus one extra commit, so the older slot always stays valid. A crash test kills a writer process with SIGKILL at random moments, over and over; after every restart the database equals some committed prefix of the writes.</p>
+  <h3>Writes, snapshots and merges</h3>
+  <ul>
+    <li><b>Write-ahead log.</b> Inserts and deletes append checksummed records to a <code>-wal</code> file, synced at commit. On open, committed transactions are replayed and a torn tail is ignored.</li>
+    <li><b>Memtable.</b> Committed but unflushed documents are searchable at once. A snapshot builds small in-memory segments from them with the same code as on-disk segments, one per 1,024 documents, so a write rebuilds only the last chunk.</li>
+    <li><b>Snapshots.</b> A snapshot is a reference-counted manifest version. Readers never wait for the writer, and a held snapshot keeps its pages from reuse.</li>
+    <li><b>Deletes and updates.</b> Each segment has a primary-key index and a delete set, replaced copy-on-write. An update is a delete plus an insert.</li>
+    <li><b>Merges.</b> A tiered policy merges segments of similar size. It reads the live documents back (stored fields from the doc store, vectors from their sections, generated columns recomputed) and rebuilds every index, which drops deleted documents and re-optimises encodings for the larger lists. <code>vacuum</code> compacts the file.</li>
+  </ul>
+</section>
+
+<section class="col" id="indexes">
+  <h2>Indexes</h2>
+  <p>Every field type maps to the structures that serve it. The posting-list study that preceded this design chose the encodings: Loom for ranked text, Pyramid for filter lists, BP128 for short lists.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 330" role="img" aria-label="One document's fields feed three index families: body into text postings, year, rating, category and topic into columns and filter postings, emb into vector storage and an ANN index, stored fields into the doc store">
+        <g id="index-diagram"></g>
+      </svg>
+    </div>
+    <figcaption><b>One row, three index families.</b> All of them are built once per segment from documents in docID order and read in place.</figcaption>
+  </figure>
+  <h3>Full text</h3>
+  <p>The analyzer splits on non-alphanumeric characters, lowercases, folds accents, drops 33 stopwords and applies the Snowball English stemmer. Ranked queries also drop NLTK's 153 English function words and count each term once. Terms sit in front-coded dictionary blocks of 32. Lists of at least 512 documents keep their docIDs as Loom, with frequencies bit-packed per 128 postings and addressed by posting rank; shorter lists use BP128 blocks. Document lengths are one-byte norms. Ranking is BM25 with collection-wide statistics summed over the snapshot's segments, so a document scores the same in any segment:</p>
+  <div class="math">\[ \mathrm{BM25}(d, q) = \sum_{t \in q} \ln\Bigl(1 + \frac{N - n_t + 0.5}{n_t + 0.5}\Bigr) \cdot \frac{f_{t,d}\,(k_1 + 1)}{f_{t,d} + k_1\bigl(1 - b + b\,\frac{|d|}{\overline{|d|}}\bigr)}, \qquad k_1 = 1.2,\ b = 0.75. \]</div>
+  <p>Top-k uses MaxScore by default: terms are sorted by their upper bound \(U_t\), and once the threshold \(\theta\) of the current top-k exceeds the sum of the smaller bounds, those lists stop driving iteration and are only probed. Block-Max WAND is available, but on these collections' queries MaxScore measured 1.9–2.6× faster. A filter either drives scoring, when it is small enough that scoring its members directly is cheaper, or is probed per candidate. The crossover is a fitted constant times the filter size against the query's list lengths.</p>
+  <h3>Structured fields</h3>
+  <ul>
+    <li><b>Columns.</b> Integers and floats sit in 128-document blocks, frame-of-reference bit-packed, with min/max zone maps per block and per 4,096-document superblock. Two-decimal floats such as <code>rating</code> are detected and stored as scaled integers (0–499).</li>
+    <li><b>Keyword postings.</b> Each value has a Pyramid docID list (a sorted array below 64 documents), so equality and <code>IN</code> are unions. Per-candidate probes instead use the code column and a bitset of accepted codes, at 6–9 ns against 9–24 ns for Pyramid probes.</li>
+    <li><b>Range postings.</b> An equi-depth histogram of 64 buckets stores each bucket as a Pyramid list. A range is the union of the buckets it covers plus the two boundary buckets checked against the column. Counting is exact from the histogram for whole buckets. The histogram is also the planner's selectivity estimator.</li>
+    <li><b>Facets</b> count either by reading the result's codes, or by count-only Pyramid intersections when the result is large and the values few.</li>
+    <li><b>Doc store.</b> Rows are kept in LZ4-compressed 16 KiB blocks.</li>
+  </ul>
+  <h3>Vectors</h3>
+  <p>Each vector field keeps float32 vectors for exact re-ranking and 8-bit codes for scanning. Codes are per-dimension scalar quantised, and the query is quantised too, so the inner loop is an integer dot product on AVX-512 VNNI:</p>
+  <div class="math">\[ c_i = \Bigl\lfloor \frac{x_i - \min_i}{\Delta_i} \Bigr\rceil, \qquad \langle q, \hat{x} \rangle = \sum_i q_i (\min_i + \Delta_i c_i) \;\approx\; \alpha \sum_i \tilde{q}_i\, c_i + \beta, \]</div>
+  <p>with \(\tilde q\) the 8-bit query, \(\alpha, \beta\) per-query constants, and one 1,024-dimension score in 10–15 ns. Three index kinds sit on top. <b>Flat</b> scans codes and re-ranks the best \(r\) in float32. <b>IVF</b> stores each k-means cluster's docIDs contiguously, followed by their codes, so a probe is one sequential read and a filter is an intersection with the cluster's docID list. <b>HNSW</b> keeps fixed-degree adjacency arrays in the segment; filtered HNSW traverses through non-matching nodes but only collects matching ones.</p>
+</section>
+
+<section class="col" id="planner">
+  <h2>Planner</h2>
+  <p>The planner works per segment from statistics the indexes answer in microseconds: exact list lengths for terms and keyword values, histogram counts for ranges, document counts, and the vector index's calibrated cost model. Conjunctions assume independence and disjunctions use inclusion-exclusion:</p>
+  <div class="math">\[ \hat s(P_1 \wedge P_2) = \hat s(P_1)\,\hat s(P_2), \qquad \hat s(P_1 \vee P_2) = 1 - (1 - \hat s(P_1))(1 - \hat s(P_2)), \qquad \hat s(\neg P) = 1 - \hat s(P). \]</div>
+  <h3>Materialise or probe</h3>
+  <p>A predicate is either evaluated into a document set before ranking, or checked per candidate of the ranking operator. If that operator tests \(m\) candidates, it materialises when</p>
+  <div class="math">\[ C_{\text{mat}}(P) < m \cdot c_{\text{probe}}(P), \qquad c_{\text{probe}}(P_1 \wedge \dots \wedge P_k) = \sum_{i=1}^{k} c_i \prod_{j < i} \hat s_j \quad (\hat s_1 \le \hat s_2 \le \dots), \]</div>
+  <p>so a conjunction is probed most selective leaf first, short-circuiting. Inside a materialised conjunction the same test applies child by child: once the running result is small, each remaining child is probed per survivor instead of materialised.</p>
+  <h3>Filtered vector search</h3>
+  <p>Four strategies compete. <i>Pre-filter</i> scans the filter's members exactly. <i>In-index</i> searches IVF or HNSW with the filter applied inside. <i>Post-filter</i> searches unfiltered with \(k' \approx k/s\) and drops non-members. <i>Flat</i> scans everything. Their costs, from the vector index's model, are roughly</p>
+  <div class="math">\[ C_{\text{pre}} \approx C_{\text{mat}} + s\,n\,c_{\text{sq8}}, \qquad C_{\text{HNSW}} \approx \frac{\text{ef}\cdot M\,c_{\text{dist}}}{s_{\text{near}}}, \qquad C_{\text{IVF}} \approx \frac{\text{nprobe}}{\sqrt{s_{\text{near}}}}\cdot\frac{n}{n_{\text{list}}}\,c_{\text{sq8}}, \qquad C_{\text{post}} \approx C_{\text{index}}\Bigl(\frac{k}{\min(s, s_{\text{near}})}\Bigr). \]</div>
+  <p>The index strategies pay for the selectivity <i>near the query</i>, \(s_{\text{near}}\), not the global \(s\). A filter on a topic far from the query has almost no members among the query's neighbours, so HNSW wanders through thousands of nodes. When the global estimate favours an index strategy, the planner measures \(s_{\text{near}}\) with a 32-result unfiltered search and re-plans:</p>
+  <div class="math">\[ \hat s_{\text{near}} = \frac{\bigl|\{\, d \in \mathrm{NN}_{32}(q) : P(d) \,\}\bigr| + \tfrac12}{32 + 1}. \]</div>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 330" role="img" aria-label="Plan of a filtered hybrid query: a weighted fusion node over a BM25 MaxScore operator and an HNSW operator, both constrained by a filter on year and category that is probed per candidate; candidates are re-scored exactly">
+        <g id="plan-diagram"></g>
+      </svg>
+    </div>
+    <figcaption><b>A filtered hybrid query.</b> Each input retrieves its top 100 under the same filter, here probed per candidate because both drivers test few documents. The union is re-scored exactly by both inputs, min-max normalised and summed. RRF fuses ranks instead, using the same retrieval.</figcaption>
+  </figure>
+  <h3>Hybrid ranking</h3>
+  <p>Reciprocal rank fusion and weighted fusion are both one SQL expression:</p>
+  <div class="math">\[ \mathrm{RRF}(d) = \sum_{i} \frac{1}{60 + \mathrm{rank}_i(d)}, \qquad \mathrm{W}(d) = \sum_i w_i\, \frac{s_i(d) - \min_{C} s_i}{\max_{C} s_i - \min_{C} s_i}, \]</div>
+  <p>where \(C\) is the union of each input's top 100. With <code>exact =&gt; 1</code>, \(C\) is every row passing the filter, which gives the reference ranking for measuring how much the top-100 shortcut loses.</p>
+</section>
+
+<section id="evaluation">
+  <div class="col">
+    <h2>Evaluation</h2>
+    <p>Four BEIR collections, with Cohere embed-english-v3 vectors (1,024 dimensions) for documents and queries, and human relevance judgments: SciFact (5,183 documents), FiQA (57,638), TREC-COVID (171,332) and Quora (522,931). Each document also has synthetic structured fields: <code>year</code> uniform over 1990–2024, <code>category</code> Zipf-distributed over 64 values, <code>rating</code> uniform over [0, 5). A content-correlated <code>topic</code> (the k-means cluster of the document's vector) gives filters that correlate with queries. One generated workload per collection is run by all three systems: BM25, boolean, filter, vector, hybrid and facet queries, at filter selectivities from 0.1% to 50%.</p>
+    <p>Each system is fully built (one Strata segment, one Tantivy segment after merging, one SQLite file), then measured single-threaded on a 4-core Xeon with AVX-512, nothing else running. Warm latency is the median of up to three repetitions per query. Cold runs close the database, evict its files from the OS page cache, reopen and run one query; pages read are the file pages the query brought into the page cache.</p>
+  </div>
+  <!--RESULTS-->
+</section>
+
+<section class="col" id="verdict">
+  <h2>Verdict</h2>
+  <!--VERDICT-->
+</section>
+
+<section class="col repro" id="reproduce">
+  <h2>Reproduce</h2>
+<pre>cd strata
+python3 scripts/prepare_beir.py /home/user/data/beir   # BEIR + embeddings (≈ 4.8 GB)
+cargo test --release                                   # every component, end-to-end SQL test
+scripts/run_eval.sh                                    # all experiments, sequentially (≈ 4 h)
+python3 scripts/build_report.py                        # this page</pre>
+</section>
+<footer class="col" id="footer"></footer>
+</div>
+
+<div class="tip" id="tip" hidden></div>
+<script>
+const DATA = /*__DATA__*/null;
+</script>
+<script>
+/*__CHARTS__*/
+</script>
+<script>
+/*__SCRIPT__*/
+</script>

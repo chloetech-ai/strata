@@ -1,0 +1,427 @@
+{
+  "build": {
+    "bytes": 55590204,
+    "components": [
+      [
+        "store",
+        27872099
+      ],
+      [
+        "idx",
+        12640642
+      ],
+      [
+        "fast",
+        5610133
+      ],
+      [
+        "pos",
+        4506315
+      ],
+      [
+        "fieldnorm",
+        3137730
+      ],
+      [
+        "term",
+        1820927
+      ],
+      [
+        "json",
+        2358
+      ],
+      [
+        "lock",
+        0
+      ]
+    ],
+    "phases": [
+      [
+        "index",
+        9.376803961
+      ],
+      [
+        "merge_1_segments",
+        0.000380695
+      ]
+    ],
+    "seconds": 9.377184902
+  },
+  "collection": "quora",
+  "config": {
+    "bm25": "Tantivy BM25, k1 = 1.2, b = 0.75; BooleanQuery of Should TermQuery (Block-WAND)",
+    "doc_store": "LZ4, 16 KiB blocks (defaults)",
+    "facets": "collector counting category ordinals in the fast column",
+    "filters": "Must RangeQuery (fast-field scan) / TermQuery / TermSetQuery; ConstScoreQuery(0) under BM25",
+    "indexing": "1 thread(s), 512 MiB budget, NoMergePolicy, then one explicit merge",
+    "reader": "ReloadPolicy::Manual, single-threaded search",
+    "schema": "id STRING|STORED|FAST, title STORED, text STORED, body TEXT en_stem WithFreqsAndPositions, year i64 INDEXED|FAST, rating f64 INDEXED|FAST, category STRING|FAST, topic STRING|FAST, seq u64 FAST"
+  },
+  "extra": {
+    "segments": 1
+  },
+  "kinds": [
+    {
+      "cold": {
+        "mean_ms": 2.4021146599999996,
+        "n": 100,
+        "p50_ms": 2.288331,
+        "p99_ms": 4.330382
+      },
+      "cold_pages": {
+        "max": 818.0,
+        "mean": 559.4,
+        "p50": 550.0,
+        "p99": 791.0
+      },
+      "kind": "bm25",
+      "mean_results": 9.9965,
+      "ndcg10": 0.7584844568768792,
+      "open_pages": {
+        "max": 168.0,
+        "mean": 168.0,
+        "p50": 168.0,
+        "p99": 168.0
+      },
+      "queries": 2000,
+      "reps": 3,
+      "warm": {
+        "mean_ms": 0.49956383800000076,
+        "n": 2000,
+        "p50_ms": 0.428996,
+        "p99_ms": 1.393518
+      }
+    },
+    {
+      "cold": {
+        "mean_ms": 1.3722687800000002,
+        "n": 100,
+        "p50_ms": 1.36777,
+        "p99_ms": 2.3846190000000003
+      },
+      "cold_pages": {
+        "max": 349.0,
+        "mean": 287.34,
+        "p50": 289.0,
+        "p99": 349.0
+      },
+      "kind": "and2",
+      "mean_results": 6.473333333333334,
+      "open_pages": {
+        "max": 168.0,
+        "mean": 168.0,
+        "p50": 168.0,
+        "p99": 168.0
+      },
+      "queries": 300,
+      "reps": 3,
+      "warm": {
+        "mean_ms": 0.27841124666666667,
+        "n": 300,
+        "p50_ms": 0.316924,
+        "p99_ms": 0.576152
+      }
+    },
+    {
+      "cold": {
+        "mean_ms": 1.1270218699999999,
+        "n": 100,
+        "p50_ms": 1.082421,
+        "p99_ms": 1.6182
+      },
+      "cold_pages": {
+        "max": 389.0,
+        "mean": 328.9,
+        "p50": 328.0,
+        "p99": 386.0
+      },
+      "kind": "and3",
+      "mean_results": 2.56,
+      "open_pages": {
+        "max": 168.0,
+        "mean": 168.0,
+        "p50": 168.0,
+        "p99": 168.0
+      },
+      "queries": 300,
+      "reps": 3,
+      "warm": {
+        "mean_ms": 0.1432138366666667,
+        "n": 300,
+        "p50_ms": 0.099152,
+        "p99_ms": 0.49922099999999997
+      }
+    },
+    {
+      "cold": {
+        "mean_ms": 1.9314572300000006,
+        "n": 100,
+        "p50_ms": 1.747823,
+        "p99_ms": 3.934349
+      },
+      "cold_pages": {
+        "max": 414.0,
+        "mean": 337.94,
+        "p50": 346.0,
+        "p99": 404.0
+      },
+      "kind": "or3",
+      "mean_results": 10.0,
+      "open_pages": {
+        "max": 168.0,
+        "mean": 168.0,
+        "p50": 168.0,
+        "p99": 168.0
+      },
+      "queries": 300,
+      "reps": 3,
+      "warm": {
+        "mean_ms": 0.5596363166666668,
+        "n": 300,
+        "p50_ms": 0.514073,
+        "p99_ms": 1.012001
+      }
+    },
+    {
+      "by_shape": {
+        "category": {
+          "mean_ms": 1.6039487333333333,
+          "n": 15,
+          "p50_ms": 1.1368159999999998,
+          "p99_ms": 3.261694
+        },
+        "rating": {
+          "mean_ms": 3.5053536666666667,
+          "n": 15,
+          "p50_ms": 2.501228,
+          "p99_ms": 7.200721000000001
+        },
+        "rating_category": {
+          "mean_ms": 6.17607555,
+          "n": 20,
+          "p50_ms": 7.064094,
+          "p99_ms": 13.058171
+        },
+        "year": {
+          "mean_ms": 2.0470905,
+          "n": 10,
+          "p50_ms": 2.922331,
+          "p99_ms": 3.2552950000000003
+        },
+        "year_category": {
+          "mean_ms": 4.18719545,
+          "n": 20,
+          "p50_ms": 4.363351,
+          "p99_ms": 10.210208
+        },
+        "year_rating": {
+          "mean_ms": 6.0365876,
+          "n": 20,
+          "p50_ms": 7.285485,
+          "p99_ms": 11.722124
+        }
+      },
+      "by_target": {
+        "0.001": {
+          "mean_ms": 1.6808228666666665,
+          "n": 15,
+          "p50_ms": 1.800906,
+          "p99_ms": 2.317403
+        },
+        "0.01": {
+          "mean_ms": 1.9840552399999998,
+          "n": 25,
+          "p50_ms": 1.726742,
+          "p99_ms": 3.3572290000000002
+        },
+        "0.1": {
+          "mean_ms": 3.9792170333333328,
+          "n": 30,
+          "p50_ms": 4.363351,
+          "p99_ms": 7.61925
+        },
+        "0.5": {
+          "mean_ms": 7.697245933333332,
+          "n": 30,
+          "p50_ms": 8.706368000000001,
+          "p99_ms": 13.058171
+        }
+      },
+      "cold": {
+        "mean_ms": 5.898080879999997,
+        "n": 100,
+        "p50_ms": 4.4387810000000005,
+        "p99_ms": 14.545182
+      },
+      "cold_pages": {
+        "max": 1370.0,
+        "mean": 1200.75,
+        "p50": 1169.0,
+        "p99": 1370.0
+      },
+      "kind": "filter",
+      "mean_results": 10.0,
+      "open_pages": {
+        "max": 168.0,
+        "mean": 168.0,
+        "p50": 168.0,
+        "p99": 168.0
+      },
+      "queries": 100,
+      "reps": 3,
+      "warm": {
+        "mean_ms": 4.251076129999999,
+        "n": 100,
+        "p50_ms": 3.0053609999999997,
+        "p99_ms": 12.78889
+      }
+    },
+    {
+      "by_shape": {
+        "category": {
+          "mean_ms": 0.9762408124999999,
+          "n": 16,
+          "p50_ms": 0.894408,
+          "p99_ms": 1.844273
+        },
+        "rating": {
+          "mean_ms": 2.3061425294117646,
+          "n": 17,
+          "p50_ms": 1.8348419999999999,
+          "p99_ms": 4.780326
+        },
+        "rating_category": {
+          "mean_ms": 2.317386166666667,
+          "n": 24,
+          "p50_ms": 1.1760329999999999,
+          "p99_ms": 5.213294
+        },
+        "year": {
+          "mean_ms": 1.3585154285714285,
+          "n": 14,
+          "p50_ms": 1.2660259999999999,
+          "p99_ms": 3.1010310000000003
+        },
+        "year_category": {
+          "mean_ms": 1.186499142857143,
+          "n": 28,
+          "p50_ms": 1.059698,
+          "p99_ms": 4.093732
+        },
+        "year_rating": {
+          "mean_ms": 1.9036187142857144,
+          "n": 21,
+          "p50_ms": 1.091569,
+          "p99_ms": 6.983946
+        }
+      },
+      "by_target": {
+        "0.001": {
+          "mean_ms": 0.7111677333333333,
+          "n": 30,
+          "p50_ms": 0.780197,
+          "p99_ms": 2.09954
+        },
+        "0.01": {
+          "mean_ms": 1.1915547666666668,
+          "n": 30,
+          "p50_ms": 1.0960130000000001,
+          "p99_ms": 3.553718
+        },
+        "0.1": {
+          "mean_ms": 2.2011485000000004,
+          "n": 30,
+          "p50_ms": 1.734679,
+          "p99_ms": 6.983946
+        },
+        "0.5": {
+          "mean_ms": 2.651419966666666,
+          "n": 30,
+          "p50_ms": 2.884169,
+          "p99_ms": 5.592181
+        }
+      },
+      "cold": {
+        "mean_ms": 4.333558840000001,
+        "n": 100,
+        "p50_ms": 4.273038,
+        "p99_ms": 8.283240000000001
+      },
+      "cold_pages": {
+        "max": 2032.0,
+        "mean": 1239.16,
+        "p50": 1472.0,
+        "p99": 1853.0
+      },
+      "kind": "filtered_bm25",
+      "mean_results": 8.925,
+      "open_pages": {
+        "max": 168.0,
+        "mean": 168.0,
+        "p50": 168.0,
+        "p99": 168.0
+      },
+      "queries": 120,
+      "reps": 3,
+      "warm": {
+        "mean_ms": 1.6888227416666663,
+        "n": 120,
+        "p50_ms": 1.234986,
+        "p99_ms": 5.592181
+      }
+    },
+    {
+      "cold": {
+        "mean_ms": 1.2435453000000003,
+        "n": 100,
+        "p50_ms": 1.238847,
+        "p99_ms": 2.089111
+      },
+      "cold_pages": {
+        "max": 382.0,
+        "mean": 300.83,
+        "p50": 300.0,
+        "p99": 377.0
+      },
+      "kind": "facet",
+      "mean_results": 0.0,
+      "open_pages": {
+        "max": 168.0,
+        "mean": 168.0,
+        "p50": 168.0,
+        "p99": 168.0
+      },
+      "queries": 300,
+      "reps": 3,
+      "warm": {
+        "mean_ms": 0.04239262333333332,
+        "n": 300,
+        "p50_ms": 0.029356,
+        "p99_ms": 0.25227499999999997
+      }
+    }
+  ],
+  "limit": null,
+  "n_docs": 522931,
+  "run": {
+    "options": {
+      "cold_budget_secs": 60.0,
+      "cold_sample": 100,
+      "max_per_kind": null,
+      "max_vector": 300,
+      "reps": 3,
+      "warm_budget_secs": 60.0
+    },
+    "peak_rss_mib": 2518.30078125,
+    "unix_time": 1791782113
+  },
+  "system": "tantivy",
+  "unsupported": [
+    "vector",
+    "filtered_vector",
+    "hybrid",
+    "filtered_hybrid"
+  ],
+  "version": "Tantivy tantivy v0.26.2, index_format v7",
+  "workload": "results/workloads/quora.json"
+}

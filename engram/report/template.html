@@ -1,0 +1,201 @@
+<title>Engram</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Literata:opsz,wght@7..72,500;7..72,600&display=swap">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] },
+    svg: { fontCache: "global" },
+    options: { enableMenu: false }
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.min.js" defer></script>
+<style>
+/*__STYLE__*/
+.thesis { font-family: var(--display); font-size: 1.18rem; line-height: 1.45; color: var(--ink); border-left: 3px solid var(--accent); padding: 2px 0 2px 16px; margin: 14px 0 18px; }
+.note { font-size: 0.86rem; color: var(--ink-3); margin-top: -4px; }
+.verdict { display: grid; grid-template-columns: 1fr; gap: 12px; margin: 18px 0; }
+.verdict > div { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+.verdict h4 { margin: 0 0 6px; font: 600 1rem/1.3 var(--body); }
+.verdict p { margin: 0; font-size: 0.92rem; color: var(--ink-2); }
+.verdict p + p { margin-top: 6px; }
+:root { --ok: #127a2e; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ok: #5cc677; } }
+:root[data-theme="dark"] { --ok: #5cc677; }
+.ok { color: var(--ok); font-weight: 600; }
+.no { color: var(--s8); font-weight: 600; }
+.compact th, .compact td { padding: 7px 9px; }
+.wrap-head th { white-space: normal; vertical-align: bottom; }
+td.sys { font-weight: 600; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+.tabs button { font: 500 0.82rem/1 var(--body); color: var(--ink-2); background: var(--surface); border: 1px solid var(--rule); border-radius: 999px; padding: 7px 12px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.dg .lnd { stroke: var(--ink-3); stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+.live td { vertical-align: top; white-space: normal; }
+.live td:first-child { min-width: 130px; }
+.live td:nth-child(2) { min-width: 260px; }
+.live td:nth-child(3) { min-width: 300px; }
+.live .q { font-size: 0.86rem; color: var(--ink-2); }
+.live .r { font-size: 0.86rem; }
+.flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin: 16px 0; }
+.flow > div { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.flow h4 { margin: 0 0 4px; font: 600 0.95rem/1.3 var(--body); }
+.flow p { margin: 0; font-size: 0.88rem; color: var(--ink-2); }
+.flow code { font-size: 0.8rem; }
+</style>
+
+<div class="page">
+<header class="col">
+  <div class="eyebrow">posting_bench · strata · engram</div>
+  <h1>Engram: long-term context for a coding agent, in one Strata file</h1>
+  <p class="lede">A coding session on a large project outlives its context window many times over. Engram stores everything Claude Code does through its hooks, finds what matters again with Strata's hybrid search, and decides on its own when to put it back into the prompt. The model can also search its history when it decides to. This page is the design, the implementation, and an evaluation on two long-conversation benchmarks, on the 26-hour session that built this repository, and in live Claude Code runs.</p>
+  <p class="meta" id="meta-line"></p>
+  <div class="findings" id="findings"><!--FINDINGS--></div>
+  <ul class="toc">
+    <li><a href="#problem">The problem</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#store">When to store</a></li>
+    <li><a href="#load">When to load</a></li>
+    <li><a href="#evaluation">Evaluation</a></li>
+    <li><a href="#verdict">Verdict</a></li>
+    <li><a href="#reproduce">Reproduce</a></li>
+  </ul>
+</header>
+
+<section class="col" id="problem">
+  <h2>The problem</h2>
+  <p class="thesis">A context window is working memory. Long projects need a long-term memory that fills itself, and that is consulted only when it has something to say.</p>
+  <p id="problem-numbers">When a Claude Code session nears the end of its context window, it <i>compacts</i>: the history is replaced by a summary of about 15,000 characters. That keeps the plan and drops the particulars, such as the exact error, the number a decision rested on, or a preference stated once. A new session starts with only <code>CLAUDE.md</code> and an index of notes.</p>
+  <p>Reading more history is not the fix. On LongMemEval, GPT-4o answers 87% of questions when given only the relevant sessions, but 61% when given the whole 115,000-token history. A memory has to retrieve, and it has to retrieve selectively: in coding-agent experiments, an irrelevant memory lowered the solve rate below having no memory at all (26% with none, 22% with the wrong one).</p>
+  <p>So there are two decisions to make on every event, and the model should not have to make either one deliberately:</p>
+  <ul>
+    <li><b>When to store:</b> always, because storage is cheap and a missed record cannot be recovered. What varies is granularity and salience.</li>
+    <li><b>When to load:</b> only when the evidence is strong, only within a small budget, and never for what is already in the window. The model can still pull more through tools when it knows it needs to.</li>
+  </ul>
+</section>
+
+<section class="col" id="architecture">
+  <h2>Architecture</h2>
+  <p>Strata takes an exclusive lock on its file, and hooks are short-lived processes that may run alongside the MCP server. So one daemon per project owns the store, and every hook and MCP call is a client on a Unix socket. The first client starts the daemon, which exits after 30 idle minutes. A client that cannot reach it in time prints nothing and exits 0, so memory never blocks a prompt or a tool.</p>
+  <figure class="wide">
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 340" role="img" aria-label="Claude Code hook events and MCP tools call thin engram clients, which talk over a Unix socket to a per-project daemon. The daemon captures, embeds and recalls records stored in a Strata file and returns additional context to Claude Code.">
+        <g id="arch-diagram"></g>
+      </svg>
+    </div>
+    <figcaption><b>One daemon per project.</b> Hooks carry events out and context back in. The MCP tools give the model direct access to the same store. Everything lives in one Strata file outside the repository, with secrets redacted before storage.</figcaption>
+  </figure>
+  <p>Each record is one row of a Strata table: the text, an indexed context column, and fields for kind, session, sequence number, time, files and a 512-dimensional vector. The context column holds the request of the turn a tool result belongs to, or the section a summary chunk came from. A generated column indexes the text and its context together, so a tool output can be found by what the user was asking at the time. This follows LongMemEval's finding that expanding a record's index key works only when the expansion is indexed with the record.</p>
+</section>
+
+<section class="col" id="store">
+  <h2>When to store</h2>
+  <p>Always, from the hook payloads. Nothing depends on the model deciding to save:</p>
+  <div class="flow">
+    <div><h4><code>UserPromptSubmit</code></h4><p>The prompt, plus a <code>preference</code> record for each sentence with a lasting rule ("always", "never", "from now on").</p></div>
+    <div><h4><code>PostToolUse</code></h4><p>The call and its result. Failures become <code>error</code> records. Long output is chunked and trimmed to its head and tail; <code>Read</code> results become stubs, since the file is on disk.</p></div>
+    <div><h4><code>Stop</code></h4><p>The final answer, the commentary written between tool calls (read from the transcript tail), and an <i>episode card</i>: prompt, files changed, commands, errors, outcome.</p></div>
+    <div><h4><code>PostCompact</code></h4><p>Claude Code's own summary, split by section. Pending tasks become <code>todo</code> records, and the live window restarts here.</p></div>
+  </div>
+  <p>Each kind carries a salience prior \(\iota\): preference 1.0, decision 0.9, summary and facts 0.8, prompts 0.7, errors and episodes 0.6, answers 0.5, tool calls and results 0.3. Replaying the 26-hour session through this capture gives 1,833 records up to the start of this task, and 2,204 for the whole transcript. The model can add durable knowledge itself with <code>memory_remember</code>, and mark older records as superseded.</p>
+</section>
+
+<section class="col" id="load">
+  <h2>When to load</h2>
+  <p>Records still in the model's context are never injected. For session \(s\), the daemon keeps the window start \(w_s\): the sequence number at session start, or at the last compaction. Every recall excludes</p>
+  <div class="math">\[ \{\, r : r.\mathrm{session} = s \,\wedge\, r.\mathrm{seq} \ge w_s \,\} \;\cup\; \mathrm{injected}_s . \]</div>
+  <figure class="wide">
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 200" role="img" aria-label="A timeline of records: earlier sessions and the part of this session before the last compaction are eligible; the live window after the compaction is excluded; retrieved records from the eligible part are injected with the prompt.">
+        <g id="window-diagram"></g>
+      </svg>
+    </div>
+    <figcaption><b>The live window.</b> What the model can still see is never repeated, and each record is injected at most once per window.</figcaption>
+  </figure>
+  <p>There are three automatic load points and one pull path:</p>
+  <ul>
+    <li><b>Session start, resume and compaction:</b> a briefing of at most 2,500 characters. It covers stated preferences, recorded decisions, open tasks from the last summary, and where the previous session stopped. After a compaction it also recalls what is relevant to the last two prompts.</li>
+    <li><b>Every prompt:</b> gated recall, described below.</li>
+    <li><b>Before <code>Edit</code> or <code>Write</code>:</b> up to two earlier errors, decisions or episodes about that file, once per window.</li>
+    <li><b>Pull:</b> the MCP tools <code>memory_search</code>, <code>memory_timeline</code> and <code>memory_sql</code>.</li>
+  </ul>
+  <h3>Ranking</h3>
+  <p>BM25 over the text and its context, and cosine similarity over the vectors, each return their top 50 through Strata. Scores are min-max normalised over the union, with a missing score counting as 0. Priors break near-ties without overriding relevance:</p>
+  <div class="math">\[ \mathrm{rel}(r) = w\,\widehat{\mathrm{bm25}}(r) + (1-w)\,\widehat{\cos}(r), \qquad S(r) = \mathrm{rel}(r)\bigl(1 + \lambda_\iota\,\iota(r)\bigr) + \lambda_t\, e^{-(\mathrm{seq}_{\max} - \mathrm{seq}(r))/\tau}, \]</div>
+  <p>with \(w = 0.5\), \(\lambda_\iota = 0.2\), \(\lambda_t = 0.05\) and \(\tau = 5{,}000\) records. Packing takes records by \(S\), at most two per turn so that more distinct evidence fits. Each record is cut to the 600 characters around the query's terms. The packed records are shown oldest first, each with its id, time, session, turn and kind, and labelled as possibly outdated. After them come up to five further candidates, one line each (id and opening words), which the model can open with <code>memory_timeline</code>.</p>
+  <p>Two kinds of record are never candidates:</p>
+  <ul>
+    <li><b>Answers that admitted not knowing</b> ("I don't know…"), which are stored with low importance and tagged.</li>
+    <li><b>Earlier copies of the question being asked.</b></li>
+  </ul>
+  <p>Both match a repeated question best and carry nothing, so recalling them would only repeat the failure. The live tests below show why this matters.</p>
+  <h3>The gate</h3>
+  <p>Normalised scores cannot gate, because the best candidate always scores 1. The gate uses absolute evidence about the best candidates:</p>
+  <ul>
+    <li>the highest cosine, and how far it stands above the tenth (\(\Delta_{\cos}\));</li>
+    <li>the highest IDF-weighted share of query terms a top-5 record contains;</li>
+    <li>how far the best BM25 score stands above the tenth (\(\Delta_{\mathrm{bm25}}\));</li>
+    <li>whether BM25 and vectors agree on the top record;</li>
+    <li>whether the prompt refers back ("earlier", "we decided", "did we").</li>
+  </ul>
+  <div class="math">\[ G = a\,\cos_{\max} + b\,\mathrm{cov}_{\max} + c\,\mathbb{1}_{\text{cue}} + d\,\mathbb{1}_{\text{agree}} + e\,\Delta_{\cos} + f\,\Delta_{\mathrm{bm25}}, \]</div>
+  <div class="math">\[ \mathrm{cov}(q, r) = \frac{\sum_{t \in q \cap r} \mathrm{idf}(t)}{\sum_{t \in q} \mathrm{idf}(t)}, \qquad \Delta_{\cos} = \cos_1 - \cos_{10}, \qquad \Delta_{\mathrm{bm25}} = 1 - \frac{\mathrm{bm25}_{10}}{\mathrm{bm25}_1}. \]</div>
+  <p>A logistic fit on LongMemEval gives the weights and the two thresholds: \(\theta_{\text{hi}}\) holds precision 0.9 and \(\theta_{\text{lo}}\) precision 0.7. In the fit, positives are questions whose evidence the packed injection contains; negatives are questions asked against another conversation's store, abstentions and misses.</p>
+  <figure class="wide">
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 120" role="img" aria-label="The gate score axis with two thresholds: below the low one nothing is injected, between them two records, above the high one up to eight records.">
+        <g id="gate-diagram"></g>
+      </svg>
+    </div>
+    <figcaption><b>Three tiers.</b> Weak evidence costs about 300 tokens, not 1,000, and strong evidence gets the full budget. The thresholds come from the fit; the weights are in <code>recall.rs</code>.</figcaption>
+  </figure>
+</section>
+
+<section id="evaluation">
+  <div class="col">
+    <h2>Evaluation</h2>
+    <p>The evaluation has four parts:</p>
+    <ul>
+      <li><b>Retrieval:</b> two public long-conversation memory benchmarks, scored by whether the injected text contains the evidence.</li>
+      <li><b>This repository's session:</b> 26 hours, two compactions, three projects, asked what it had lost.</li>
+      <li><b>Systems:</b> latency and storage up to a million records.</li>
+      <li><b>Live runs:</b> headless Claude Code sessions with Engram installed.</li>
+    </ul>
+    <p>The default embedder is static (Model2Vec potion-retrieval-32M): a token lookup and a mean, 512 dimensions, about 10,000 records a second on four cores. BGE-small, a 33-million-parameter transformer, is the alternative; it took about 50 ms per short text on this CPU.</p>
+  </div>
+  <!--RESULTS-->
+</section>
+
+<section class="col" id="verdict">
+  <h2>Verdict</h2>
+  <!--VERDICT-->
+</section>
+
+<section class="col repro" id="reproduce">
+  <h2>Reproduce</h2>
+<pre>cd engram
+cargo build --release &amp;&amp; cargo test --release
+target/release/engram fetch-model                      # static embedder
+target/release/engram install --project /path/to/project
+python3 scripts/download_memory_benchmarks.py &amp;&amp; python3 scripts/convert_memory_benchmarks.py
+target/release/engram-bench retrieval --data /home/user/data/memory/longmemeval_s.jsonl
+target/release/engram-bench retrieval --data /home/user/data/memory/locomo.jsonl
+target/release/engram-bench probes --transcript SESSION.jsonl --probes probes/lost_probes.json --points 1952:4632,4633:5392
+target/release/engram-bench scale --data /home/user/data/memory/longmemeval_s.jsonl --sizes 10000,100000,1000000
+python3 scripts/fit_gate.py results/retrieval/longmemeval_s_static_round.rows.jsonl results/retrieval/locomo_static_round.rows.jsonl
+python3 scripts/build_report.py                        # this page</pre>
+</section>
+<footer class="col" id="footer"></footer>
+</div>
+
+<div class="tip" id="tip" hidden></div>
+<script>
+const DATA = /*__DATA__*/null;
+</script>
+<script>
+/*__CHARTS__*/
+</script>
+<script>
+/*__SCRIPT__*/
+</script>

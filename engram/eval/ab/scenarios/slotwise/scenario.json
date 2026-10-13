@@ -1,0 +1,87 @@
+{
+ "name": "slotwise",
+ "history": [
+  [
+   "Hi! slotwise is the appointment library we're building for Lindqvist Physio, a practice with four therapists. Could you run the test suite first? I think the overlap check is broken.",
+   "Thanks. The front-desk app will catch our exceptions and show the message to the receptionist, so let's have one hierarchy: a `BookingError` base class in a new errors.py, with `SlotTaken` and `OutsideOpeningHours` subclasses. Use them everywhere instead of ValueError, with messages a receptionist understands.",
+   "Therapists need 10 minutes between two appointments to clean the table and write their notes. Please make book() enforce that gap for the same therapist, both before and after the new appointment, with tests.",
+   "Some background for next sprint, nothing to code today: we'll add cancellation fees. If a client cancels less than 48 hours before the appointment they pay half the treatment price, less than 24 hours before it's the full price, earlier than that it's free. Their old receptionist worked this out by hand and kept getting it wrong, which is why they want it in the library.",
+   "One more for later: the therapists' contract caps them at 7 treatments a day. Don't build that into book(), because reception sometimes goes over it when the therapist agrees. But the online booking page we start in a few weeks has to treat a therapist who has 7 appointments that day as fully booked.",
+   "Great, please commit all of this with a sensible message."
+  ],
+  [
+   "Let's add `Schedule.cancel(appointment_id)`. It should mark the appointment as cancelled rather than delete it, since we'll need the record for the fees, and a cancelled appointment must no longer block its slot.",
+   "Next, `Schedule.week(therapist, monday)`, returning that therapist's appointments for the week as a dict from date to a list sorted by time, without cancelled ones. Reception wants it for their weekly overview. They print their day plans on a tiny receipt printer by the way, 42 characters a line, anything longer wraps into a mess. The printable day plan is a separate job though, later.",
+   "So you can plan ahead: next month we need series bookings, because doctors prescribe a series of sessions. Weekly, same weekday and time. If one of those weeks is already taken, skip it and add a week at the end, so the client still gets all their sessions. And never more than 9 sessions in one series: the insurance only pays for 9 per prescription, and reception keeps trying to book 12.",
+   "And for the SMS reminders that come after that: their SMS gateway only takes plain ASCII. Umlauts and accents arrive as question marks, so 'Brändli' has to go out as 'Braendli'. A reminder can be at most 160 characters, otherwise it's billed as two messages, and every reminder must include the reception's number, 044 512 77 30, so people can call to move their appointment.",
+   "The therapists keep asking for an iCal feed so they can see their appointments on their phones. We actually tried that last year: the phone calendars cached the feed for hours, so cancelled appointments kept showing up, and then the data protection officer stopped it because patient names were ending up on Google's and Apple's servers. So that's off the table. OK, that's all for today, please commit."
+  ],
+  [
+   "New topic: we need a client register. Add `clients.py` with a `Client` dataclass (id, name, phone, email) and a `ClientBook` with `add(client)` and `find_by_phone(phone)`. Phone numbers come in all shapes, and '079 123 45 67', '+41 79 123 45 67' and '0041791234567' must all find the same client.",
+   "Also add `ClientBook.search(text)` for name search: case-insensitive, matching any part of the name.",
+   "Thanks, please commit."
+  ]
+ ],
+ "tasks": [
+  {
+   "id": "cancellation_fee",
+   "kind": "conversation",
+   "needs": "the cancellation fee tiers (48h half, 24h full) stated only in conversation",
+   "prompt": "Let's do the cancellation fees now: add `cancellation_fee(appointment, cancelled_at)` in src/slotwise/fees.py, returning the fee in cents."
+  },
+  {
+   "id": "fully_booked",
+   "kind": "conversation",
+   "needs": "the contractual cap of 7 treatments a day, deliberately kept out of book()",
+   "prompt": "The online booking page needs to know which days to grey out. Add `Schedule.is_fully_booked(therapist, day)`."
+  },
+  {
+   "id": "day_plan",
+   "kind": "conversation",
+   "needs": "an environment fact said in passing (receipt printer, 42 characters a line)",
+   "prompt": "Add `day_plan(schedule, therapist, day)` in src/slotwise/printing.py that returns the printable day plan for reception as text."
+  },
+  {
+   "id": "series_booking",
+   "kind": "conversation",
+   "needs": "series rules stated only in conversation (skip a taken week and append one; at most 9 sessions)",
+   "prompt": "Let's build the series booking: add `book_series(schedule, first, count)` in src/slotwise/series.py, where `first` is the first appointment of the series. It books the series and returns the booked appointments."
+  },
+  {
+   "id": "sms_reminder",
+   "kind": "conversation",
+   "needs": "SMS gateway constraints and the reception number stated only in conversation",
+   "prompt": "Add `reminder_text(appointment)` in src/slotwise/reminders.py that returns the text of the reminder SMS for an appointment."
+  },
+  {
+   "id": "ical_advice",
+   "kind": "conversation",
+   "needs": "a failed approach and why it failed, stated only in conversation",
+   "prompt": "The therapists would love to see their appointments on their phones. Should we add an iCal feed? Short recommendation please, no code changes."
+  },
+  {
+   "id": "reschedule",
+   "kind": "repo",
+   "needs": "the BookingError convention and the 10-minute gap, both put into the code during the history",
+   "prompt": "Add `Schedule.reschedule(appointment_id, new_start)` that moves an existing appointment to a new start time."
+  },
+  {
+   "id": "free_slots",
+   "kind": "repo",
+   "needs": "the 10-minute gap between appointments, enforced in book() during the history",
+   "prompt": "Add `Schedule.free_slots(therapist, day, minutes)` returning the start times (as datetimes) at which an appointment of that length could still be booked for the therapist that day, on a 15-minute grid starting at opening time."
+  },
+  {
+   "id": "parse_duration",
+   "kind": "control",
+   "needs": "nothing (control)",
+   "prompt": "Add `parse_duration(text)` in src/slotwise/durations.py that turns '45', '45m', '45 min', '1h', '1h30', '1h 30m', '2h15' and '1:30' into minutes (45, 45, 45, 60, 90, 90, 135, 90). Ignore case and surrounding spaces; raise ValueError for empty input, zero, or anything else like 'abc' or '-5'. Add a test."
+  },
+  {
+   "id": "merge_intervals",
+   "kind": "control",
+   "needs": "nothing (control)",
+   "prompt": "Add `merge_intervals(intervals)` in src/slotwise/intervals.py: it takes a list of (start, end) pairs (ints or datetimes), merges the ones that overlap or touch, and returns the result as a list of tuples sorted by start, without modifying the input. Add a test."
+  }
+ ]
+}

@@ -1,0 +1,209 @@
+{
+  "collection": "trec-covid",
+  "kinds": {
+    "and2": {
+      "differing_counts": [
+        [
+          50,
+          836,
+          1281
+        ],
+        [
+          51,
+          6038,
+          6033
+        ],
+        [
+          53,
+          7750,
+          7748
+        ],
+        [
+          61,
+          264,
+          236
+        ],
+        [
+          64,
+          6331,
+          6644
+        ],
+        [
+          66,
+          2340,
+          3076
+        ],
+        [
+          67,
+          941,
+          951
+        ],
+        [
+          71,
+          3840,
+          3763
+        ],
+        [
+          74,
+          2015,
+          2432
+        ],
+        [
+          80,
+          9772,
+          10093
+        ]
+      ],
+      "mean_overlap": 0.97,
+      "queries": 50,
+      "same_count": 0.78,
+      "same_facets": null,
+      "same_ids": 0.88
+    },
+    "and3": {
+      "differing_counts": [
+        [
+          112,
+          318,
+          317
+        ],
+        [
+          115,
+          384,
+          398
+        ],
+        [
+          117,
+          1088,
+          1056
+        ],
+        [
+          122,
+          363,
+          377
+        ],
+        [
+          123,
+          1817,
+          1775
+        ],
+        [
+          126,
+          421,
+          420
+        ],
+        [
+          135,
+          993,
+          1216
+        ],
+        [
+          148,
+          2063,
+          2238
+        ]
+      ],
+      "mean_overlap": 0.9816326530612245,
+      "queries": 49,
+      "same_count": 0.8367346938775511,
+      "same_facets": null,
+      "same_ids": 0.9183673469387755
+    },
+    "bm25": {
+      "differing_counts": [],
+      "mean_overlap": 0.8759999999999999,
+      "queries": 50,
+      "same_count": null,
+      "same_facets": null,
+      "same_ids": 0.0
+    },
+    "facet": {
+      "differing_counts": [],
+      "mean_overlap": 1.0,
+      "queries": 50,
+      "same_count": null,
+      "same_facets": 0.74,
+      "same_ids": 1.0
+    },
+    "filter": {
+      "differing_counts": [],
+      "mean_overlap": 1.0,
+      "queries": 100,
+      "same_count": 1.0,
+      "same_facets": null,
+      "same_ids": 1.0
+    },
+    "filtered_bm25": {
+      "differing_counts": [],
+      "mean_overlap": 0.8775000000000005,
+      "queries": 120,
+      "same_count": null,
+      "same_facets": null,
+      "same_ids": 0.025
+    },
+    "or3": {
+      "differing_counts": [
+        [
+          150,
+          32711,
+          32709
+        ],
+        [
+          151,
+          67615,
+          68578
+        ],
+        [
+          152,
+          81857,
+          81848
+        ],
+        [
+          154,
+          70422,
+          70408
+        ],
+        [
+          155,
+          52330,
+          55967
+        ],
+        [
+          158,
+          19473,
+          19476
+        ],
+        [
+          159,
+          14855,
+          14853
+        ],
+        [
+          161,
+          67294,
+          67295
+        ],
+        [
+          162,
+          45809,
+          47085
+        ],
+        [
+          163,
+          70812,
+          70802
+        ]
+      ],
+      "mean_overlap": 0.9918367346938775,
+      "queries": 49,
+      "same_count": 0.3673469387755102,
+      "same_facets": null,
+      "same_ids": 0.9591836734693877
+    }
+  },
+  "limit": null,
+  "systems": [
+    "sqlite",
+    "tantivy"
+  ]
+}

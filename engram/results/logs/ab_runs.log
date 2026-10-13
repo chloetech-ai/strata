@@ -1,0 +1,88 @@
+58 runs
+  1/58 run_tests       none   score 1.00 $0.004 4 steps 7 s
+  2/58 exchange_rates  engram score 1.00 $0.004 4 steps 11 s
+  3/58 exchange_rates  engram score 1.00 $0.005 4 steps 12 s
+  4/58 slugify         none   score 1.00 $0.004 6 steps 10 s
+  5/58 summary         none   score 1.00 $0.005 8 steps 18 s
+  6/58 discount        none   score 1.00 $0.005 7 steps 14 s
+  7/58 discount        engram score 1.00 $0.007 10 steps 18 s
+  8/58 rename_api      engram score 1.00 $0.007 11 steps 17 s
+  9/58 csv_export      engram score 1.00 $0.007 7 steps 21 s
+  10/58 rename_api      none   score 1.00 $0.008 12 steps 18 s
+  11/58 exchange_rates  engram score 1.00 $0.004 4 steps 10 s
+  12/58 faster_save     engram score 1.00 $0.007 6 steps 24 s
+  13/58 advice          none   score 0.50 $0.004 4 steps 12 s
+  14/58 weighted_split  none   score 1.00 $0.006 7 steps 18 s
+  15/58 discount        engram score 1.00 $0.006 8 steps 19 s
+  16/58 slugify         none   score 1.00 $0.005 6 steps 11 s
+  17/58 summary         none   score 1.00 $0.006 7 steps 15 s
+  18/58 rename_api      none   score 1.00 $0.007 13 steps 19 s
+  19/58 discount        none   score 1.00 $0.006 8 steps 17 s
+  20/58 slugify         engram score 1.00 $0.005 6 steps 12 s
+  21/58 rename_api      engram score 1.00 $0.008 10 steps 18 s
+  22/58 summary         engram score 1.00 $0.006 8 steps 14 s
+  23/58 advice          engram score 0.50 $0.003 2 steps 10 s
+  24/58 run_tests       none   score 1.00 $0.005 5 steps 9 s
+  25/58 run_tests       engram score 1.00 $0.003 2 steps 6 s
+  26/58 advice          none   score 1.00 $0.004 3 steps 12 s
+  27/58 faster_save     engram score 1.00 $0.010 10 steps 50 s
+  28/58 rename_api      engram score 1.00 $0.009 13 steps 20 s
+  29/58 slugify         none   score 1.00 $0.006 8 steps 15 s
+  30/58 discount        engram score 1.00 $0.008 9 steps 19 s
+  31/58 slugify         engram score 1.00 $0.005 6 steps 11 s
+  32/58 advice          none   score 0.50 $0.005 4 steps 14 s
+  33/58 exchange_rates  none   score 1.00 $0.005 5 steps 12 s
+  34/58 csv_export      engram score 1.00 $0.010 11 steps 29 s
+  35/58 run_tests       engram score 1.00 $0.003 2 steps 7 s
+  36/58 slugify         engram score 1.00 $0.005 6 steps 13 s
+  37/58 run_tests       none   score 1.00 $0.004 4 steps 8 s
+  38/58 weighted_split  none   score 1.00 $0.007 8 steps 20 s
+  39/58 summary         engram score 1.00 $0.006 5 steps 12 s
+  40/58 exchange_rates  none   score 1.00 $0.004 4 steps 10 s
+  41/58 advice          engram score 0.50 $0.003 1 steps 10 s
+  42/58 faster_save     none   score 1.00 $0.007 9 steps 22 s
+  43/58 csv_export      none   score 0.25 $0.007 6 steps 18 s
+  44/58 weighted_split  engram score 1.00 $0.009 8 steps 22 s
+  45/58 exchange_rates  none   score 1.00 $0.004 4 steps 11 s
+  46/58 discount        none   score 1.00 $0.005 8 steps 15 s
+  47/58 advice          engram score 0.50 $0.004 3 steps 16 s
+  48/58 summary         none   score 1.00 $0.008 13 steps 17 s
+  49/58 weighted_split  engram score 1.00 $0.007 10 steps 18 s
+  50/58 summary         engram score 1.00 $0.006 8 steps 15 s
+  51/58 faster_save     engram score 0.75 $0.011 12 steps 39 s
+  52/58 weighted_split  engram score 1.00 $0.008 10 steps 18 s
+  53/58 run_tests       engram score 1.00 $0.003 2 steps 5 s
+  54/58 csv_export      none   score 0.25 $0.008 10 steps 22 s
+  55/58 rename_api      none   score 1.00 $0.006 12 steps 16 s
+  56/58 weighted_split  none   score 1.00 $0.007 9 steps 20 s
+  57/58 faster_save     none   score 1.00 $0.008 12 steps 24 s
+  58/58 faster_save     none   score 1.00 $0.014 1 steps 734 s
+task            needs                                                       score E  score N     $ E     $ N  steps E  steps N
+csv_export      a requirement stated only in conversation                      1.00     0.25   0.009   0.008      8.3      9.0
+weighted_split  a client rule (leftover cents)                                 1.00     1.00   0.008   0.007      9.3      8.0
+exchange_rates  a constraint stated only in conversation (no dependencie       1.00     1.00   0.004   0.004      4.0      4.3
+rename_api      a process rule (changelog)                                     1.00     1.00   0.008   0.007     11.3     12.3
+faster_save     a decision stated only in conversation (JSON for hand-ed       0.92     1.00   0.009   0.010      9.3      7.3
+discount        a rule partly visible in the code (integer cents)              1.00     1.00   0.007   0.005      9.0      7.7
+summary         a convention visible in the code (CHF format)                  1.00     1.00   0.006   0.006      7.0      9.3
+run_tests       a discovered quirk (PYTHONPATH=src)                            1.00     1.00   0.003   0.004      2.0      4.3
+slugify         nothing (control)                                              1.00     1.00   0.005   0.005      6.0      6.7
+advice          rationale stated only in conversation                          0.50     0.67   0.003   0.004      2.0      3.7
+{
+ "engram": {
+  "n": 30,
+  "score": 0.9416666666666667,
+  "solved": 0.8666666666666667,
+  "cost_usd": 0.006161509,
+  "turns": 6.833333333333333,
+  "wall_s": 17.311684695879617
+ },
+ "none": {
+  "n": 30,
+  "score": 0.8916666666666667,
+  "solved": 0.8333333333333334,
+  "cost_usd": 0.006036601666666667,
+  "turns": 7.266666666666667,
+  "wall_s": 39.454819591840106
+ }
+}

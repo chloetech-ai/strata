@@ -1,0 +1,43 @@
+[package]
+name = "strata"
+version = "0.1.0"
+edition = "2021"
+description = "An embedded, single-file search database: full text, structured and vector indexes behind SQL"
+publish = false
+
+[dependencies]
+posting_bench = { path = "../posting_bench" }
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sqlparser = "0.59"
+crc32fast = "1"
+libc = "0.2"
+lz4_flex = "0.11"
+bitpacking = "0.9.3"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+rust-stemmers = "1.2"
+# Baselines (feature `baselines`): SQLite with FTS5, and Tantivy.
+rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
+tantivy = { version = "0.26", optional = true }
+
+[features]
+# SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
+baselines = ["dep:rusqlite", "dep:tantivy"]
+
+[[bin]]
+name = "strata-baselines"
+path = "src/bin/strata-baselines.rs"
+required-features = ["baselines"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"
+
+[profile.test]
+opt-level = 2

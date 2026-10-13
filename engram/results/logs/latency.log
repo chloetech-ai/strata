@@ -1,0 +1,24 @@
+== 10000 records
+  embedder open 53.4 ms (mapped); reading the table 167.1 ms
+  phases: bm25_top50 0.51, embed_query 0.07, fuse 0.27, idf_count_queries 0.16, idf_dictionary 0.01, pack_format 0.25, search_total 1.78, vector_top50 0.60
+  chunk1024_hnsw: append 0.93, rebuild 22.04, query after write 23.90 (p99 89.90), query after rebuild 2.90
+  chunk1024_flat: append 0.83, rebuild 3.95, query after write 6.39 (p99 16.97), query after rebuild 2.91
+  chunk256_flat: append 0.81, rebuild 1.54, query after write 4.11 (p99 6.91), query after rebuild 2.69
+  chunk64_flat: append 0.79, rebuild 0.68, query after write 4.10 (p99 5.66), query after rebuild 3.43
+  hooks: client_noop 0.63, client_prompt 4.17, client_tool 0.73, process_noop 3.38, process_prompt 7.05, process_tool 3.50
+== 100000 records
+  embedder open 80.1 ms (mapped); reading the table 185.2 ms
+  phases: bm25_top50 1.04, embed_query 0.09, fuse 0.33, idf_count_queries 0.33, idf_dictionary 0.01, pack_format 0.25, search_total 2.98, vector_top50 0.98
+  chunk1024_hnsw: append 0.89, rebuild 23.11, query after write 26.58 (p99 73.60), query after rebuild 3.52
+  chunk1024_flat: append 0.69, rebuild 3.53, query after write 6.58 (p99 14.06), query after rebuild 3.10
+  chunk256_flat: append 0.67, rebuild 1.36, query after write 4.39 (p99 8.62), query after rebuild 3.06
+  chunk64_flat: append 0.79, rebuild 0.66, query after write 4.32 (p99 8.34), query after rebuild 3.68
+  hooks: client_noop 0.65, client_prompt 4.74, client_tool 0.73, process_noop 3.46, process_prompt 7.96, process_tool 3.46
+== 1000000 records
+  embedder open 61.0 ms (mapped); reading the table 73.6 ms
+  phases: bm25_top50 4.02, embed_query 0.09, fuse 0.31, idf_count_queries 1.07, idf_dictionary 0.05, pack_format 0.16, search_total 8.81, vector_top50 4.35
+  chunk1024_hnsw: append 1.00, rebuild 25.43, query after write 37.87 (p99 109.56), query after rebuild 10.91
+  chunk1024_flat: append 0.79, rebuild 3.51, query after write 13.18 (p99 33.13), query after rebuild 9.52
+  chunk256_flat: append 0.83, rebuild 1.38, query after write 11.47 (p99 34.09), query after rebuild 10.40
+  chunk64_flat: append 0.79, rebuild 0.69, query after write 11.50 (p99 32.65), query after rebuild 10.70
+  hooks: client_noop 0.63, client_prompt 11.18, client_tool 0.72, process_noop 3.32, process_prompt 14.16, process_tool 3.36

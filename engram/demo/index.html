@@ -1,0 +1,1108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram Inspector</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%233a5ccc'/%3E%3Ccircle cx='8' cy='8' r='3' fill='white'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f6f6f3; --panel: #ffffff; --panel2: #f0efea; --line: #dddbd3; --text: #1f1e1b; --muted: #6d6a61; --faint: #9a968b;
+  --accent: #3a5ccc; --accent-bg: #e7ecfb; --ok: #2f7d4f; --warn: #a86a12; --bad: #b3372f;
+  --k-prompt: #3a5ccc; --k-answer: #5b6b86; --k-tool_call: #8a7f6a; --k-tool_result: #a99f8b; --k-error: #b3372f; --k-episode: #7a5aa6;
+  --k-summary: #2c8c8c; --k-decision: #c0611b; --k-preference: #b8457a; --k-fact: #2f7d4f; --k-todo: #8b7a12; --k-note: #4a8ab5; --k-entity: #444;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141414; --panel: #1c1c1b; --panel2: #232322; --line: #34332f; --text: #e9e7e1; --muted: #a29e93; --faint: #77736a;
+    --accent: #8aa4ff; --accent-bg: #23293d; --ok: #6cc08e; --warn: #e0a54a; --bad: #ef7d73;
+    --k-prompt: #8aa4ff; --k-answer: #9fb0cc; --k-tool_call: #b9ae96; --k-tool_result: #8c836f; --k-error: #ef7d73; --k-episode: #b79be0;
+    --k-summary: #5cc8c8; --k-decision: #f0954d; --k-preference: #ec86b6; --k-fact: #6cc08e; --k-todo: #d8c24f; --k-note: #7fbbe6; --k-entity: #cfcfcf;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 var(--sans); }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 5px 11px; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .5; cursor: default; }
+input, select, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
+pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
+a { color: var(--accent); cursor: pointer; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+header { display: flex; align-items: center; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+header .meta { color: var(--muted); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; min-width: 0; }
+header .meta b { color: var(--text); font-weight: 600; }
+header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; margin-right: 5px; }
+header .dot.busy { background: var(--warn); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+
+main { display: grid; grid-template-columns: minmax(360px, 40%) 1fr; height: calc(100% - 47px); }
+#chat { display: flex; flex-direction: column; border-right: 1px solid var(--line); min-width: 0; }
+#chatbar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+#chatbar select { flex: 1; min-width: 0; }
+#log { flex: 1; overflow-y: auto; padding: 14px 14px 30px; }
+#compose { border-top: 1px solid var(--line); padding: 10px 12px; background: var(--panel); display: flex; gap: 8px; }
+#compose textarea { flex: 1; resize: none; height: 64px; }
+#compose .col { display: flex; flex-direction: column; gap: 6px; }
+
+.empty { color: var(--muted); padding: 24px 8px; }
+.empty ul { padding-left: 18px; }
+.empty li { margin: 4px 0; }
+.empty li a { font-style: italic; }
+.msg-user { background: var(--accent-bg); border-radius: 10px; padding: 8px 12px; margin: 14px 0 8px auto; max-width: 88%; width: fit-content; white-space: pre-wrap; }
+.turn { margin-bottom: 18px; }
+.bubble { padding: 2px 2px 6px; }
+.bubble p { margin: 6px 0; }
+.bubble pre { background: var(--panel2); padding: 8px 10px; border-radius: 6px; margin: 6px 0; }
+.bubble code { background: var(--panel2); padding: 0 4px; border-radius: 4px; }
+.bubble pre code { background: none; padding: 0; }
+.tool { border: 1px solid var(--line); border-radius: 8px; margin: 6px 0; background: var(--panel); }
+.tool > summary { padding: 5px 10px; cursor: pointer; list-style: none; display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+.tool > summary::-webkit-details-marker { display: none; }
+.tool .tname { font-weight: 600; font-family: var(--mono); font-size: 12px; }
+.tool .targ { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; }
+.tool .body { padding: 6px 10px 8px; border-top: 1px solid var(--line); max-height: 260px; overflow: auto; }
+.tool.err { border-color: var(--bad); }
+.tool.mem { border-color: var(--k-preference); }
+.engram { border-left: 3px solid var(--k-preference); background: var(--panel); border-radius: 0 8px 8px 0; margin: 6px 0; font-size: 13px; }
+.engram > summary { padding: 5px 10px; cursor: pointer; list-style: none; }
+.engram > summary::-webkit-details-marker { display: none; }
+.engram .body { padding: 4px 10px 8px; max-height: 320px; overflow: auto; }
+.engram .lbl { font-weight: 600; color: var(--k-preference); }
+.stored { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.foot { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+.chip { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; padding: 1px 8px; font-size: 11.5px; border: 1px solid var(--line); background: var(--panel); white-space: nowrap; cursor: pointer; }
+.chip i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.kind { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+.tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+.flash { animation: flash 1.6s ease-out; }
+@keyframes flash { from { background: var(--accent-bg); } to { background: transparent; } }
+
+#insp { display: flex; flex-direction: column; min-width: 0; }
+nav { display: flex; gap: 2px; padding: 6px 10px 0; border-bottom: 1px solid var(--line); background: var(--panel); overflow-x: auto; }
+nav button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 7px 12px; color: var(--muted); white-space: nowrap; }
+nav button.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+nav .count { font-size: 11px; color: var(--faint); margin-left: 3px; }
+.pane { flex: 1; overflow: auto; padding: 14px 16px; display: none; min-height: 0; }
+.pane.on { display: block; }
+.pane.full { padding: 0; position: relative; overflow: hidden; }
+.pane.full.on { display: flex; flex-direction: column; }
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.toolbar.pad { padding: 10px 14px; margin: 0; border-bottom: 1px solid var(--line); background: var(--panel); }
+.hint { color: var(--muted); font-size: 12.5px; }
+h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 18px 0 8px; font-weight: 600; }
+h3:first-child { margin-top: 0; }
+
+table.grid { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+table.grid th { text-align: left; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--line); padding: 5px 8px; position: sticky; top: 0; background: var(--bg); white-space: nowrap; }
+table.grid td { border-bottom: 1px solid var(--line); padding: 5px 8px; vertical-align: top; max-width: 520px; }
+table.grid tr.click:hover td { background: var(--panel2); cursor: pointer; }
+td .clip { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; word-break: break-word; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.feed .item { display: grid; grid-template-columns: 54px 1fr; gap: 10px; padding: 7px 4px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.feed .item:hover { background: var(--panel2); }
+.feed .seq { font-family: var(--mono); font-size: 11.5px; color: var(--faint); text-align: right; padding-top: 2px; }
+.feed .head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.feed .txt { white-space: pre-wrap; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; margin-top: 2px; }
+.feed .ev { background: var(--panel); }
+.feed .ev .txt { font-family: var(--mono); font-size: 12px; -webkit-line-clamp: 4; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; cursor: pointer; }
+.card:hover { border-color: var(--muted); }
+.card.off { opacity: .55; }
+.card.off .t { text-decoration: line-through; }
+.card .h { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; flex-wrap: wrap; }
+.card .t { white-space: pre-wrap; word-break: break-word; }
+.card .m { font-size: 11.5px; color: var(--faint); margin-top: 6px; }
+
+.bars .seg { margin: 8px 0 14px; }
+.bars .bar { display: flex; height: 16px; border-radius: 4px; overflow: hidden; background: var(--panel2); }
+.bars .bar span { display: block; height: 100%; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+.legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+.stat span { font-size: 11.5px; color: var(--muted); }
+
+#graphsvg, #vecsvg { flex: 1; width: 100%; min-height: 0; display: block; background: var(--bg); }
+#graphsvg text { font-size: 10.5px; fill: var(--muted); pointer-events: none; }
+#graphsvg .edge { stroke: var(--line); stroke-width: 1.2; }
+#graphsvg .edge.hl { stroke: var(--accent); stroke-width: 2; }
+#graphsvg .node { cursor: pointer; stroke: var(--bg); stroke-width: 1.5; }
+#graphsvg .node.hl { stroke: var(--accent); stroke-width: 3; }
+#graphsvg .node.dim, #graphsvg .edge.dim { opacity: .18; }
+.tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.12); display: none; z-index: 5; white-space: pre-wrap; word-break: break-word; }
+.side { position: absolute; right: 10px; top: 60px; width: 300px; max-height: calc(100% - 80px); overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 12.5px; display: none; }
+
+#sql { width: 100%; height: 120px; font-family: var(--mono); font-size: 13px; resize: vertical; }
+.params .row { display: flex; gap: 6px; margin: 4px 0; align-items: center; }
+.params input.pname { width: 90px; font-family: var(--mono); }
+.params input.pval { flex: 1; }
+.plan { background: var(--panel2); border-radius: 6px; padding: 8px 10px; margin: 8px 0; font-size: 12px; color: var(--muted); }
+.err { color: var(--bad); white-space: pre-wrap; }
+.vec { display: inline-flex; height: 14px; vertical-align: middle; border: 1px solid var(--line); }
+.vec span { width: 2px; height: 100%; }
+.vecbig { display: flex; flex-wrap: wrap; gap: 0; border: 1px solid var(--line); width: fit-content; }
+.vecbig span { width: 9px; height: 9px; }
+
+#drawer { position: fixed; top: 0; right: 0; width: min(560px, 100%); height: 100%; background: var(--panel); border-left: 1px solid var(--line); box-shadow: -8px 0 30px rgba(0,0,0,.12); transform: translateX(105%); transition: transform .18s; z-index: 20; display: flex; flex-direction: column; }
+#drawer.open { transform: none; }
+#drawer .top { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+#drawer .top .id { font-family: var(--mono); font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+#drawer .content { overflow: auto; padding: 12px 14px 30px; flex: 1; }
+.kv { display: grid; grid-template-columns: 110px 1fr; gap: 3px 10px; font-size: 12.5px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; word-break: break-word; }
+.box { background: var(--panel2); border-radius: 6px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto; font-size: 13px; }
+.links { display: flex; flex-wrap: wrap; gap: 4px; }
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; grid-template-rows: 55% 45%; }
+  #chat { border-right: none; border-bottom: 1px solid var(--line); }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Engram Inspector</h1>
+  <div class="meta" id="meta"></div>
+</header>
+<main>
+  <section id="chat">
+    <div id="chatbar">
+      <select id="sessions" title="Claude Code session"></select>
+      <button id="newsess" title="Start a new Claude Code session. Its context starts empty; Engram's memory carries over.">New session</button>
+    </div>
+    <div id="log"></div>
+    <div id="compose">
+      <textarea id="input" placeholder="Message Claude Code (Enter to send, Shift+Enter for a new line)"></textarea>
+      <div class="col">
+        <button class="primary" id="send">Send</button>
+        <button id="stop" disabled>Stop</button>
+      </div>
+    </div>
+  </section>
+  <section id="insp">
+    <nav id="tabs">
+      <button data-tab="live" class="on">Live<span class="count" id="c-live"></span></button>
+      <button data-tab="knowledge">Knowledge<span class="count" id="c-know"></span></button>
+      <button data-tab="table">Table</button>
+      <button data-tab="graph">Graph</button>
+      <button data-tab="vectors">Vectors</button>
+      <button data-tab="query">Query</button>
+      <button data-tab="storage">Storage</button>
+    </nav>
+
+    <div class="pane on" id="p-live">
+      <div class="toolbar">
+        <label><input type="checkbox" id="live-tools"> tool calls and results</label>
+        <label><input type="checkbox" id="live-events" checked> daemon events</label>
+        <span class="hint">Every record the hooks and the distiller write, and every recall decision, as it happens.</span>
+      </div>
+      <div class="feed" id="feed"></div>
+    </div>
+
+    <div class="pane" id="p-knowledge">
+      <div class="toolbar">
+        <button id="know-refresh">Refresh</button>
+        <label><input type="checkbox" id="know-old"> superseded and done</label>
+        <span class="hint">What the distiller and the hooks wrote down as durable knowledge: decisions, rules, facts and planned work.</span>
+      </div>
+      <div id="know"></div>
+    </div>
+
+    <div class="pane" id="p-table">
+      <div class="toolbar">
+        <select id="t-kind"><option value="">all kinds</option></select>
+        <select id="t-session"><option value="">all sessions</option></select>
+        <input id="t-match" placeholder="MATCH(body, …)" style="width:200px">
+        <button id="t-go">Load</button>
+        <button id="t-prev">‹ Newer</button>
+        <button id="t-next">Older ›</button>
+        <span class="hint" id="t-info"></span>
+      </div>
+      <div id="t-sql" class="plan mono"></div>
+      <div id="t-rows"></div>
+    </div>
+
+    <div class="pane full" id="p-graph">
+      <div class="toolbar pad">
+        <select id="g-scope">
+          <option value="linked">records with links, and entities</option>
+          <option value="knowledge">knowledge and entities</option>
+          <option value="all">every record</option>
+        </select>
+        <button id="g-load">Load</button>
+        <button id="g-fit">Fit</button>
+        <input id="g-seed" placeholder="seed id, e.g. e:client" style="width:170px" class="mono">
+        <select id="g-hops"><option>1</option><option selected>2</option><option>3</option></select>
+        <select id="g-dir"><option>both</option><option>out</option><option>in</option></select>
+        <button id="g-reach">REACHABLE</button>
+        <span class="hint" id="g-info"></span>
+      </div>
+      <svg id="graphsvg"></svg>
+      <div class="tip" id="g-tip"></div>
+      <div class="side" id="g-side"></div>
+    </div>
+
+    <div class="pane full" id="p-vectors">
+      <div class="toolbar pad">
+        <button id="v-load">Load vectors</button>
+        <input id="v-q" placeholder="Embed a query and find its neighbours" style="flex:1; min-width:180px">
+        <button id="v-go">Search</button>
+        <span class="hint" id="v-info"></span>
+      </div>
+      <svg id="vecsvg"></svg>
+      <div class="tip" id="v-tip"></div>
+      <div class="side" id="v-side"></div>
+    </div>
+
+    <div class="pane" id="p-query">
+      <div class="toolbar">
+        <select id="q-ex"></select>
+        <label><input type="radio" name="qmode" value="sql" checked> SQL</label>
+        <label><input type="radio" name="qmode" value="search"> Engram hybrid search</label>
+      </div>
+      <textarea id="sql" spellcheck="false"></textarea>
+      <div class="params" id="params"></div>
+      <div class="toolbar" style="margin-top:6px">
+        <button class="primary" id="q-run">Run</button>
+        <button id="q-addp">+ parameter</button>
+        <span class="hint">Read-only: SELECT over the <code>memory</code> table. A text parameter bound as a vector is embedded by the store's embedder.</span>
+      </div>
+      <div id="q-out"></div>
+    </div>
+
+    <div class="pane" id="p-storage"><div id="storage"></div></div>
+  </section>
+</main>
+
+<aside id="drawer">
+  <div class="top"><span class="id" id="d-id"></span><button id="d-close">Close</button></div>
+  <div class="content" id="d-body"></div>
+</aside>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const q1 = s => "'" + String(s).replace(/'/g, "''") + "'";
+const KINDS = ["prompt", "answer", "tool_call", "tool_result", "error", "episode", "summary", "decision", "preference", "fact", "todo", "note", "entity"];
+const KNOWLEDGE = ["decision", "preference", "fact", "todo", "note"];
+const kc = k => `var(--k-${k}, var(--muted))`;
+const kindBadge = k => `<span class="kind" style="color:${kc(k)}">${esc(k)}</span>`;
+const short = s => s && s.length > 10 ? s.slice(0, 8) : s;
+const fmtTs = ts => ts ? new Date(ts * 1000).toLocaleTimeString() : "";
+const fmtBytes = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(2) + " MB";
+const parseLinks = s => { try { return (JSON.parse(s || "[]") || []).map(e => Array.isArray(e) ? {label: e[0], to: e[1]} : {label: "", to: e}); } catch { return []; } };
+
+async function post(url, body) {
+  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  return r.json();
+}
+const rpc = req => post("/api/rpc", req);
+async function sql(text, extra = {}) {
+  const r = await rpc({op: "inspect_query", sql: text, ...extra});
+  if (r.error) throw new Error(r.error);
+  return r;
+}
+const rowsAsObjects = r => r.rows.map(row => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
+
+// ------------------------------------------------------------------ state
+const S = {seq: 0, log: 0, records: new Map(), busy: false, info: null, session: null, turnEl: null, turnStartSeq: 0, turnKey: null, lastStats: null};
+
+function vecStrip(values, big = false) {
+  if (!values) return "";
+  const m = Math.max(1e-6, ...values.map(Math.abs));
+  const cells = values.map(v => {
+    const a = Math.min(1, Math.abs(v) / m);
+    const col = v >= 0 ? `rgba(58,92,204,${a})` : `rgba(192,97,27,${a})`;
+    return `<span style="background:${col}" title="${v.toFixed(4)}"></span>`;
+  }).join("");
+  return `<span class="${big ? "vecbig" : "vec"}">${cells}</span>`;
+}
+
+// ------------------------------------------------------------------ header
+async function loadInfo() {
+  const i = await (await fetch("/api/info")).json();
+  S.info = i;
+  const st = i.stats || {};
+  S.lastStats = st;
+  $("#meta").innerHTML = `
+    <span><span class="dot ${i.busy ? "busy" : ""}" id="busydot"></span><b id="m-records">${st.records ?? "?"}</b> records</span>
+    <span>embedder <b>${esc(st.embedder || "?")}</b></span>
+    <span>chat model <b>${esc(i.model || "CLI default")}</b></span>
+    <span>distill <b>${esc(i.distill_model || "CLI default")}</b></span>
+    <span class="mono" title="${esc(i.store)}">${esc(i.store)}</span>`;
+  const sel = $("#sessions");
+  sel.innerHTML = `<option value="">New session on next message</option>` + i.sessions.slice().reverse().map(s =>
+    `<option value="${esc(s.id)}">${esc(short(s.id))} · ${esc(s.title)}</option>`).join("");
+  S.session = i.current;
+  sel.value = i.current || "";
+}
+
+// ------------------------------------------------------------------ chat
+function md(text) {
+  const parts = String(text).split(/```/);
+  return parts.map((p, i) => {
+    if (i % 2) { const nl = p.indexOf("\n"); return `<pre><code>${esc(nl >= 0 ? p.slice(nl + 1) : p)}</code></pre>`; }
+    return esc(p).split(/\n{2,}/).map(par => "<p>" + par
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+      .replace(/\n/g, "<br>") + "</p>").join("");
+  }).join("");
+}
+
+function toolArg(name, input) {
+  if (!input) return "";
+  return input.command || input.file_path || input.pattern || input.query || input.sql || input.text || JSON.stringify(input).slice(0, 200);
+}
+
+function emptyChat() {
+  $("#log").innerHTML = `<div class="empty">
+    <p><b>Chat with Claude Code in a scratch project.</b> Engram's hooks record each turn into its Strata store; the panels on the right read that store directly.</p>
+    <p>Try a few turns that state rules and decisions, then start a new session and ask about them:</p>
+    <ul>
+      <li><a>We're building a tiny invoicing library. Rule: amounts are integer cents, never floats. The client runs Python 3.8, so no match statements. Create invoice.py with total(items).</a></li>
+      <li><a>Add a discount(total, percent) function. Percent discounts round half up to the cent.</a></li>
+      <li><a>Change of plan: discounts are capped at 50%. Update the code.</a></li>
+      <li><a>(new session) Add a tax(total, rate) helper and follow every rule we agreed on.</a></li>
+    </ul></div>`;
+  $$("#log .empty a").forEach(a => a.onclick = () => { $("#input").value = a.textContent.replace(/^\(new session\) /, ""); if (a.textContent.startsWith("(new")) newSession(); $("#input").focus(); });
+}
+
+function newSession() {
+  S.session = null;
+  $("#sessions").value = "";
+  post("/api/session", {session: null});
+  const d = document.createElement("div");
+  d.className = "foot";
+  d.style.textAlign = "center";
+  d.style.margin = "14px 0";
+  d.textContent = "— new Claude Code session: its context starts empty, Engram's memory carries over —";
+  $("#log").appendChild(d);
+}
+
+async function send() {
+  const msg = $("#input").value.trim();
+  if (!msg || S.busy) return;
+  if ($("#log .empty")) $("#log").innerHTML = "";
+  $("#input").value = "";
+  const u = document.createElement("div");
+  u.className = "msg-user";
+  u.textContent = msg;
+  $("#log").appendChild(u);
+  const turn = document.createElement("div");
+  turn.className = "turn";
+  turn.innerHTML = `<div class="engrams"></div><div class="flow"></div><div class="stored"></div><div class="foot tfoot"></div>`;
+  $("#log").appendChild(turn);
+  S.turnEl = turn;
+  S.turnStartSeq = S.seq;
+  S.turnKey = null;
+  setBusy(true);
+  const bubbles = {}, tools = {}, seenHooks = new Set();
+  const flow = $(".flow", turn);
+  const scroll = () => { const l = $("#log"); if (l.scrollHeight - l.scrollTop - l.clientHeight < 200) l.scrollTop = l.scrollHeight; };
+  const bubble = mid => {
+    if (!bubbles[mid]) { const b = document.createElement("div"); b.className = "bubble"; b.dataset.raw = ""; flow.appendChild(b); bubbles[mid] = b; }
+    return bubbles[mid];
+  };
+  const handle = ev => {
+    if (ev.t === "init") { S.session = ev.session; S.turnSession = ev.session; }
+    else if (ev.t === "hook") {
+      const key = ev.event + ":" + (ev.context || "");
+      if (ev.context && seenHooks.has(key)) return;
+      seenHooks.add(key);
+      if (ev.context) {
+        const label = ev.event === "SessionStart" ? "Engram briefing" : ev.event === "UserPromptSubmit" ? "Engram recalled" : ev.event === "PreToolUse" ? "Engram file notes" : "Engram " + ev.event;
+        const d = document.createElement("details");
+        d.className = "engram";
+        d.innerHTML = `<summary><span class="lbl">${label}</span> <span class="hint">injected ${ev.context.length.toLocaleString()} characters into Claude's context (${esc(ev.event)} hook)</span></summary><div class="body"><pre>${esc(ev.context)}</pre></div>`;
+        (ev.event === "PreToolUse" ? flow : $(".engrams", turn)).appendChild(d);
+      }
+      if (ev.exit_code) flow.insertAdjacentHTML("beforeend", `<div class="err">${esc(ev.name)} hook failed: ${esc(ev.stderr)}</div>`);
+    }
+    else if (ev.t === "delta") { const b = bubble(ev.mid); b.dataset.raw += ev.text; b.innerHTML = md(b.dataset.raw); }
+    else if (ev.t === "text") { const b = bubble(ev.mid + ":" + ev.text.length); if (bubbles[ev.mid]) { bubbles[ev.mid].dataset.raw = ev.text; bubbles[ev.mid].innerHTML = md(ev.text); b.remove(); } else { b.innerHTML = md(ev.text); bubbles[ev.mid] = b; } }
+    else if (ev.t === "tool_start" || ev.t === "tool_use") {
+      let el = tools[ev.id];
+      if (!el) {
+        el = document.createElement("details");
+        el.className = "tool" + (ev.name.startsWith("mcp__engram") ? " mem" : "");
+        el.innerHTML = `<summary><span class="tname"></span><span class="targ"></span><span class="hint st">running…</span></summary><div class="body"><pre class="in"></pre><pre class="out" style="margin-top:6px"></pre></div>`;
+        flow.appendChild(el);
+        tools[ev.id] = el;
+      }
+      $(".tname", el).textContent = ev.name.replace("mcp__engram__", "engram · ");
+      if (ev.input) { $(".targ", el).textContent = toolArg(ev.name, ev.input); $(".in", el).textContent = JSON.stringify(ev.input, null, 1); }
+    }
+    else if (ev.t === "tool_result") {
+      const el = tools[ev.id];
+      if (el) {
+        $(".st", el).textContent = ev.is_error ? "error" : `${ev.chars.toLocaleString()} chars`;
+        if (ev.is_error) el.classList.add("err");
+        $(".out", el).textContent = ev.text + (ev.chars > ev.text.length ? "\n…" : "");
+      }
+    }
+    else if (ev.t === "result") {
+      $(".tfoot", turn).textContent = `${ev.turns} steps · ${(ev.ms / 1000).toFixed(1)} s · $${(ev.cost_usd || 0).toFixed(4)} · ${ev.input_tokens.toLocaleString()} input tokens`;
+    }
+    else if (ev.t === "error") flow.insertAdjacentHTML("beforeend", `<div class="err">${esc(ev.text)}</div>`);
+    else if (ev.t === "done") { if (ev.session) S.session = ev.session; }
+    scroll();
+  };
+  try {
+    const body = {message: msg};
+    body.session = S.session || null;
+    const r = await fetch("/api/chat", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    if (!r.ok) { handle({t: "error", text: (await r.json()).error}); }
+    else {
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, {stream: true});
+        let i;
+        while ((i = buf.indexOf("\n")) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line.trim()) handle(JSON.parse(line)); }
+      }
+    }
+  } catch (e) { handle({t: "error", text: String(e)}); }
+  setBusy(false);
+  loadInfo();
+}
+
+function setBusy(b) {
+  S.busy = b;
+  $("#send").disabled = b;
+  $("#stop").disabled = !b;
+  const d = $("#busydot"); if (d) d.classList.toggle("busy", b);
+}
+
+// ------------------------------------------------------------------ live feed
+function recordItem(r, fresh) {
+  const d = document.createElement("div");
+  d.className = "item" + (fresh ? " flash" : "");
+  const links = parseLinks(r.links);
+  d.innerHTML = `<div class="seq">#${r.seq}</div><div>
+    <div class="head">${kindBadge(r.kind)}${r.tag && r.tag !== "-" ? `<span class="tag">${esc(r.tag)}</span>` : ""}
+      <span class="mono">${esc(r.id)}</span><span>${r.session === "-" ? "" : "session " + esc(short(r.session)) + " · turn " + r.turn}</span>
+      ${links.length ? `<span>→ ${links.map(l => esc(l.label) + " " + esc(l.to)).join(", ")}</span>` : ""}</div>
+    <div class="txt">${esc(r.text)}</div></div>`;
+  d.onclick = () => openRecord(r.id);
+  d.dataset.kind = r.kind;
+  return d;
+}
+
+function eventItem(e) {
+  const d = document.createElement("div");
+  d.className = "item ev flash";
+  d.dataset.kind = "event";
+  let title = e.event, text = "";
+  if (e.event === "recall") {
+    title = `recall · ${e.decision}`;
+    text = `gate ${(+e.gate || 0).toFixed(3)} · ${e.candidates} candidates · ${(e.injected || []).length} injected · ${e.chars} chars · ${(+e.ms).toFixed(1)} ms\n` +
+      `evidence ${JSON.stringify(e.evidence)}` + ((e.injected || []).length ? `\ninjected ${(e.injected || []).join(", ")}` : "");
+  } else if (e.event === "distill") {
+    title = "distill";
+    text = e.error ? `error: ${e.error}` : `turn ${e.turn}: ${e.items} items, ${e.kept} kept · ${(e.ms / 1000).toFixed(1)} s · $${(e.cost_usd || 0).toFixed(4)}` +
+      (e.replaced?.length ? `\nsuperseded ${e.replaced.join(", ")}` : "") + (e.done?.length ? `\ndone ${e.done.join(", ")}` : "");
+  } else {
+    text = Object.entries(e).filter(([k]) => !["ts", "event"].includes(k)).map(([k, v]) => `${k} ${typeof v === "object" ? JSON.stringify(v) : v}`).join(" · ");
+  }
+  d.innerHTML = `<div class="seq">${fmtTs(e.ts)}</div><div><div class="head"><span class="kind" style="color:var(--k-preference)">${esc(title)}</span><span>daemon event</span></div><div class="txt">${esc(text)}</div></div>`;
+  if (e.injected?.length) d.onclick = () => openRecord(e.injected[0]);
+  return d;
+}
+
+function applyLiveFilters() {
+  const tools = $("#live-tools").checked, evs = $("#live-events").checked;
+  $$("#feed .item").forEach(el => {
+    const k = el.dataset.kind;
+    el.style.display = (k === "event" ? evs : (tools || (k !== "tool_call" && k !== "tool_result"))) ? "" : "none";
+  });
+}
+
+function attachToTurn(recs) {
+  // Records written for the turn on screen (and entities they created) show under it.
+  if (!S.turnEl) return;
+  const stored = $(".stored", S.turnEl);
+  for (const r of recs) {
+    if (r.seq <= S.turnStartSeq) continue;
+    const key = r.session + "#" + r.turn;
+    if (r.kind !== "entity") {
+      if (!S.turnKey && S.turnSession && r.session === S.turnSession) S.turnKey = key;
+      if (key !== S.turnKey) continue;
+    }
+    if (!stored.childElementCount) stored.insertAdjacentHTML("beforeend", `<span>Engram stored:</span>`);
+    const c = document.createElement("span");
+    c.className = "chip flash";
+    c.title = r.text.slice(0, 300);
+    c.innerHTML = `<i style="background:${kc(r.kind)}"></i>${esc(r.kind)}${r.tag && r.tag !== "-" ? " · " + esc(r.tag) : ""}`;
+    c.onclick = () => openRecord(r.id);
+    stored.appendChild(c);
+  }
+}
+
+function eventToTurn(e) {
+  if (!S.turnEl || e.session !== S.turnSession) return;
+  if (e.event === "recall") {
+    const d = document.createElement("div");
+    d.className = "foot";
+    const n = (e.injected || []).length;
+    d.innerHTML = `Engram recall: <b>${esc(e.decision)}</b> · gate ${(+e.gate || 0).toFixed(2)} · ${e.candidates} candidates · ${n ? `${n} record${n === 1 ? "" : "s"} injected (${e.chars} chars): ` : "nothing injected"}` +
+      (e.injected || []).map(i => `<a data-open="${esc(i)}">${esc(i)}</a>`).join(", ");
+    $(".engrams", S.turnEl).appendChild(d);
+    wireOpen(d);
+    return;
+  }
+  if (e.event !== "distill") return;
+  const f = $(".tfoot", S.turnEl);
+  f.textContent += (f.textContent ? " · " : "") + (e.error ? `distill failed: ${e.error}` : `distilled ${e.kept} note${e.kept === 1 ? "" : "s"} in ${(e.ms / 1000).toFixed(1)} s ($${(e.cost_usd || 0).toFixed(4)})`) +
+    (e.replaced?.length ? `, superseded ${e.replaced.length}` : "") + (e.done?.length ? `, closed ${e.done.length}` : "");
+}
+
+let knowDirty = false;
+async function poll() {
+  try {
+    const r = await (await fetch(`/api/live?seq=${S.seq}&log=${S.log}`)).json();
+    const recs = r.records && !r.records.error ? rowsAsObjects(r.records) : [];
+    const first = S.seq === 0 && S.log === 0;
+    const feed = $("#feed");
+    for (const x of recs) {
+      S.records.set(x.id, x);
+      S.seq = Math.max(S.seq, x.seq);
+      if (!first || recs.indexOf(x) >= recs.length - 150) feed.prepend(recordItem(x, !first));
+      if (KNOWLEDGE.includes(x.kind)) knowDirty = true;
+    }
+    if (!first) attachToTurn(recs);
+    for (const e of r.events || []) {
+      if (!first || (r.events.indexOf(e) >= r.events.length - 30)) feed.prepend(eventItem(e));
+      if (!first) eventToTurn(e);
+      if (e.event === "distill") knowDirty = true;
+    }
+    S.log = r.log_offset;
+    if (first) $$("#feed .flash").forEach(x => x.classList.remove("flash"));
+    while (feed.childElementCount > 600) feed.lastChild.remove();
+    applyLiveFilters();
+    if (recs.length) {
+      $("#c-live").textContent = S.seq;
+      const m = $("#m-records"); if (m) m.textContent = (+m.textContent || 0) + (first ? 0 : recs.length);
+    }
+    if (knowDirty && $("#p-knowledge").classList.contains("on")) { knowDirty = false; loadKnowledge(); }
+    if (!S.busy && r.busy !== S.busy && r.busy) setBusy(true);
+  } catch (e) { console.warn(e); }
+  setTimeout(poll, S.busy ? 600 : 1500);
+}
+
+// ------------------------------------------------------------------ knowledge
+async function loadKnowledge() {
+  const r = rowsAsObjects(await sql(`SELECT id, session, kind, tag, turn, seq, ts, text, links FROM memory WHERE kind IN (${KNOWLEDGE.map(q1).join(", ")}) ORDER BY seq DESC LIMIT 400`));
+  const old = $("#know-old").checked;
+  const live = r.filter(x => x.tag !== "superseded" && x.tag !== "done");
+  $("#c-know").textContent = live.length || "";
+  const shown = old ? r : live;
+  if (!shown.length) { $("#know").innerHTML = `<p class="hint">Nothing written down yet. The distiller runs after each turn and writes the decisions, rules, facts and planned work the turn stated.</p>`; return; }
+  const groups = {};
+  for (const x of shown) (groups[x.kind] ||= []).push(x);
+  $("#know").innerHTML = KNOWLEDGE.filter(k => groups[k]).map(k => `<h3 style="color:${kc(k)}">${k}s · ${groups[k].length}</h3><div class="cards">` +
+    groups[k].map(x => {
+      const from = parseLinks(x.links).filter(l => l.label === "from").map(l => l.to)[0];
+      const about = parseLinks(x.links).filter(l => l.label === "about" || l.label === "touches").map(l => l.to);
+      return `<div class="card ${x.tag === "superseded" || x.tag === "done" ? "off" : ""}" data-id="${esc(x.id)}">
+        <div class="h"><span class="tag">${esc(x.tag)}</span><span class="mono hint">${esc(x.id)}</span></div>
+        <div class="t">${esc(x.text)}</div>
+        <div class="m">session ${esc(short(x.session))} · turn ${x.turn}${from ? ` · from ${esc(from)}` : ""}${about.length ? ` · about ${about.map(esc).join(", ")}` : ""}</div></div>`;
+    }).join("") + `</div>`).join("");
+  $$("#know .card").forEach(c => c.onclick = () => openRecord(c.dataset.id));
+}
+
+// ------------------------------------------------------------------ table
+const T = {offset: 0, page: 50};
+async function loadTable() {
+  const conds = [];
+  const k = $("#t-kind").value, s = $("#t-session").value, m = $("#t-match").value.trim();
+  if (k) conds.push(`kind = ${q1(k)}`);
+  if (s) conds.push(`session = ${q1(s)}`);
+  if (m) conds.push(`MATCH(body, ${q1(m)})`);
+  const text = `SELECT id, session, kind, tag, turn, seq, ts, importance, files, text, links FROM memory${conds.length ? " WHERE " + conds.join(" AND ") : ""} ORDER BY seq DESC LIMIT ${T.page} OFFSET ${T.offset}`;
+  $("#t-sql").textContent = text;
+  try {
+    const r = await sql(text);
+    $("#t-info").textContent = `rows ${T.offset + 1}–${T.offset + r.rows.length} · ${r.ms.toFixed(2)} ms`;
+    $("#t-rows").innerHTML = resultTable(r, true);
+    $$("#t-rows tr[data-id]").forEach(tr => tr.onclick = () => openRecord(tr.dataset.id));
+  } catch (e) { $("#t-rows").innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+async function loadTableFilters() {
+  const ks = await sql("SELECT kind, COUNT(*) FROM memory GROUP BY kind ORDER BY 2 DESC LIMIT 20");
+  $("#t-kind").innerHTML = `<option value="">all kinds</option>` + ks.rows.map(([k, n]) => `<option value="${esc(k)}">${esc(k)} (${n})</option>`).join("");
+  const ss = await sql("SELECT session, COUNT(*) FROM memory GROUP BY session ORDER BY 2 DESC LIMIT 200");
+  $("#t-session").innerHTML = `<option value="">all sessions</option>` + ss.rows.map(([k, n]) => `<option value="${esc(k)}">${esc(k === "-" ? "- (entities)" : short(k))} (${n})</option>`).join("");
+}
+
+function cell(col, v) {
+  if (v === null || v === undefined) return `<span class="hint">NULL</span>`;
+  if (typeof v === "object" && v.values) return `${vecStrip(v.values.slice(0, 96))} <span class="hint">${v.dim}d</span>`;
+  if (col === "kind") return kindBadge(v);
+  if (col === "links") { const l = parseLinks(v); return l.length ? `<div class="links">${l.map(x => `<span class="chip" data-open="${esc(x.to)}">${esc(x.label)} → ${esc(x.to)}</span>`).join("")}</div>` : ""; }
+  if (col === "ts") return `<span title="${v}">${fmtTs(v)}</span>`;
+  if (col === "session") return `<span class="mono" title="${esc(v)}">${esc(short(v))}</span>`;
+  if (typeof v === "number") return `<span class="num">${Number.isInteger(v) ? v : v.toFixed(4)}</span>`;
+  return `<div class="clip">${esc(v)}</div>`;
+}
+function resultTable(r, clickable) {
+  const idCol = r.columns.indexOf("id");
+  const html = `<table class="grid"><thead><tr>${r.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>` +
+    r.rows.map(row => `<tr ${clickable && idCol >= 0 ? `class="click" data-id="${esc(row[idCol])}"` : ""}>${row.map((v, i) => `<td>${cell(r.columns[i], v)}</td>`).join("")}</tr>`).join("") + `</tbody></table>`;
+  setTimeout(() => $$("[data-open]").forEach(c => c.onclick = e => { e.stopPropagation(); openRecord(c.dataset.open); }));
+  return html;
+}
+
+// ------------------------------------------------------------------ record drawer
+async function openRecord(id) {
+  $("#drawer").classList.add("open");
+  $("#d-id").textContent = id;
+  const body = $("#d-body");
+  body.innerHTML = `<p class="hint">Loading…</p>`;
+  try {
+    const r = await sql(`SELECT id, session, kind, tag, turn, seq, ts, importance, files, text, ctx, links, emb FROM memory WHERE id = ${q1(id)} LIMIT 1`);
+    if (!r.rows.length) { body.innerHTML = `<p class="hint">No record ${esc(id)} (it may have been deleted).</p>`; return; }
+    const x = rowsAsObjects(r)[0];
+    const out = parseLinks(x.links);
+    body.innerHTML = `
+      <dl class="kv">
+        <dt>kind</dt><dd>${kindBadge(x.kind)} ${x.tag !== "-" ? `<span class="tag">${esc(x.tag)}</span>` : ""}</dd>
+        <dt>session</dt><dd class="mono">${esc(x.session)}</dd>
+        <dt>turn · seq</dt><dd>${x.turn} · ${x.seq}</dd>
+        <dt>time</dt><dd>${new Date(x.ts * 1000).toLocaleString()}</dd>
+        <dt>importance</dt><dd>${x.importance}</dd>
+        ${x.files ? `<dt>files</dt><dd class="mono">${esc(x.files)}</dd>` : ""}
+      </dl>
+      <h3>text</h3><div class="box">${esc(x.text)}</div>
+      ${x.ctx ? `<h3>ctx <span class="hint" style="text-transform:none;letter-spacing:0">(searched by BM25, not embedded)</span></h3><div class="box">${esc(x.ctx)}</div>` : ""}
+      <h3>links out · ${out.length}</h3><div class="links">${out.map(l => `<span class="chip" data-open="${esc(l.to)}">${esc(l.label)} → ${esc(l.to)}</span>`).join("") || `<span class="hint">none</span>`}</div>
+      <h3>links in</h3><div class="links" id="d-in"><span class="hint">…</span></div>
+      <h3>vector · ${x.emb ? x.emb.dim : 0} dimensions</h3>${x.emb ? vecStrip(x.emb.values, true) : `<span class="hint">none</span>`}
+      <h3>nearest by cosine similarity</h3><div id="d-nn"><span class="hint">…</span></div>
+      ${x.session !== "-" ? `<h3>timeline</h3><pre class="box" id="d-tl" style="max-height:340px">…</pre>` : ""}`;
+    wireOpen(body);
+    sql(`SELECT id, kind, text, hops() FROM memory WHERE REACHABLE(links, ${q1(id)}, hops => 1, dir => 'in') ORDER BY seq DESC LIMIT 60`).then(rin => {
+      $("#d-in").innerHTML = rin.rows.map(([i, k, t]) => `<span class="chip" data-open="${esc(i)}" title="${esc(t.slice(0, 200))}"><i style="background:${kc(k)}"></i>${esc(i)}</span>`).join("") || `<span class="hint">none</span>`;
+      wireOpen($("#d-in"));
+    }).catch(e => $("#d-in").innerHTML = `<span class="err">${esc(e.message)}</span>`);
+    if (x.emb) sql(`SELECT id, kind, text, score() FROM memory WHERE id != ${q1(id)} AND kind != 'entity' ORDER BY similarity(emb, :v) DESC LIMIT 8`, {params: {v: x.emb.values}}).then(nn => {
+      $("#d-nn").innerHTML = `<table class="grid"><tbody>${nn.rows.map(([i, k, t, s]) => `<tr class="click" data-open="${esc(i)}"><td class="num">${s.toFixed(3)}</td><td>${kindBadge(k)}</td><td><div class="clip">${esc(t)}</div></td></tr>`).join("")}</tbody></table>`;
+      wireOpen($("#d-nn"));
+    }).catch(e => $("#d-nn").innerHTML = `<span class="err">${esc(e.message)}</span>`);
+    if (x.session !== "-") rpc({op: "timeline", id, before: 3, after: 3}).then(t => $("#d-tl").textContent = t.text || t.error);
+  } catch (e) { body.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+function wireOpen(el) { $$("[data-open]", el).forEach(c => c.onclick = e => { e.stopPropagation(); openRecord(c.dataset.open); }); }
+
+// ------------------------------------------------------------------ graph
+const G = {nodes: [], edges: [], byId: new Map(), view: {x: 0, y: 0, k: 1}, sim: null};
+async function loadGraph() {
+  const scope = $("#g-scope").value;
+  const where = scope === "knowledge" ? `WHERE kind IN (${[...KNOWLEDGE, "entity", "episode"].map(q1).join(", ")})` : scope === "linked" ? "" : "";
+  const r = rowsAsObjects(await sql(`SELECT id, kind, tag, session, turn, text, links FROM memory ${where} ORDER BY seq DESC LIMIT 3000`));
+  const all = new Map(r.map(x => [x.id, x]));
+  const edges = [];
+  const keep = new Set();
+  for (const x of r) for (const l of parseLinks(x.links)) {
+    if (!all.has(l.to)) continue;
+    edges.push({s: x.id, t: l.to, label: l.label});
+    keep.add(x.id); keep.add(l.to);
+  }
+  const nodes = (scope === "all" ? r : r.filter(x => keep.has(x.id))).map(x => ({...x}));
+  buildGraph(nodes, edges.filter(e => nodes.some(n => n.id === e.s) && nodes.some(n => n.id === e.t)));
+  $("#g-info").textContent = `${nodes.length} nodes · ${G.edges.length} edges`;
+}
+
+function buildGraph(nodes, edges) {
+  const svg = $("#graphsvg");
+  const W = svg.clientWidth || 800, H = svg.clientHeight || 600;
+  G.byId = new Map(nodes.map((n, i) => { n.x = W / 2 + Math.cos(i) * (50 + i * 3 % 300); n.y = H / 2 + Math.sin(i) * (50 + i * 7 % 300); n.vx = n.vy = 0; return [n.id, n]; }));
+  G.nodes = nodes;
+  G.edges = edges.map(e => ({...e, a: G.byId.get(e.s), b: G.byId.get(e.t)}));
+  const deg = new Map();
+  for (const e of G.edges) { deg.set(e.s, (deg.get(e.s) || 0) + 1); deg.set(e.t, (deg.get(e.t) || 0) + 1); }
+  for (const n of nodes) n.r = n.kind === "entity" ? 6 + Math.min(10, (deg.get(n.id) || 0) * 1.5) : 4.5 + (KNOWLEDGE.includes(n.kind) ? 2 : 0);
+  svg.innerHTML = `<g id="gview"><g id="gedges"></g><g id="gnodes"></g><g id="glabels"></g></g>`;
+  $("#gedges").innerHTML = G.edges.map((e, i) => `<line class="edge" data-i="${i}"></line>`).join("");
+  $("#gnodes").innerHTML = nodes.map((n, i) => n.kind === "entity"
+    ? `<rect class="node" data-i="${i}" width="${n.r * 2}" height="${n.r * 2}" rx="2" style="fill:${kc(n.kind)}"></rect>`
+    : `<circle class="node" data-i="${i}" r="${n.r}" style="fill:${kc(n.kind)}"></circle>`).join("");
+  $("#glabels").innerHTML = nodes.map((n, i) => n.kind === "entity" ? `<text data-i="${i}">${esc(n.id.slice(0, 32))}</text>` : "").join("");
+  const kinds = [...new Set(nodes.map(n => n.kind))];
+  svg.insertAdjacentHTML("beforeend", `<g transform="translate(12,${H - 14})">${kinds.map((k, i) => `<g transform="translate(${i * 92},0)">${k === "entity" ? `<rect x="0" y="-8" width="8" height="8" style="fill:${kc(k)}"/>` : `<circle r="4" cx="4" cy="-4" style="fill:${kc(k)}"/>`}<text x="12" y="0" style="font-size:11px">${k}</text></g>`).join("")}</g>`);
+  const tip = $("#g-tip");
+  $$("#gnodes .node").forEach(el => {
+    const n = nodes[+el.dataset.i];
+    el.onmouseenter = ev => { tip.style.display = "block"; tip.textContent = `${n.id} · ${n.kind}${n.tag !== "-" ? " (" + n.tag + ")" : ""}\n${n.text.slice(0, 300)}`; };
+    el.onmousemove = ev => { const b = $("#p-graph").getBoundingClientRect(); tip.style.left = (ev.clientX - b.left + 14) + "px"; tip.style.top = (ev.clientY - b.top + 10) + "px"; };
+    el.onmouseleave = () => tip.style.display = "none";
+    el.onclick = () => focusNode(n.id);
+    el.ondblclick = () => openRecord(n.id);
+    el.onmousedown = ev => { ev.stopPropagation(); G.drag = n; };
+  });
+  G.alpha = 1;
+  G.view = {x: 0, y: 0, k: 1};
+  G.fitPending = true;
+  if (!G.sim) G.sim = requestAnimationFrame(tick);
+}
+
+function fitGraph() {
+  const svg = $("#graphsvg");
+  const W = svg.clientWidth, H = svg.clientHeight;
+  if (!G.nodes.length || !W || !H) return false;
+  const xs = G.nodes.map(n => n.x), ys = G.nodes.map(n => n.y);
+  const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+  const k = Math.min(1.4, 0.85 * Math.min(W / (x1 - x0 + 1), H / (y1 - y0 + 1)));
+  G.view = {k, x: W / 2 - k * (x0 + x1) / 2, y: H / 2 - k * (y0 + y1) / 2};
+  drawGraph();
+  return true;
+}
+
+function tick() {
+  const N = G.nodes, a = G.alpha;
+  if (a > 0.005 && N.length) {
+    const W = $("#graphsvg").clientWidth || 800, H = $("#graphsvg").clientHeight || 600;
+    // Repulsion on a coarse grid keeps a few thousand nodes interactive.
+    const cell = 110, grid = new Map();
+    for (const n of N) { const k = Math.floor(n.x / cell) + "," + Math.floor(n.y / cell); (grid.get(k) || grid.set(k, []).get(k)).push(n); }
+    for (const n of N) {
+      const cx = Math.floor(n.x / cell), cy = Math.floor(n.y / cell);
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (const m of grid.get((cx + dx) + "," + (cy + dy)) || []) {
+        if (m === n) continue;
+        let x = n.x - m.x, y = n.y - m.y, d2 = x * x + y * y + 0.01;
+        if (d2 > cell * cell) continue;
+        const f = 1600 / d2 * a;
+        n.vx += x * f / Math.sqrt(d2); n.vy += y * f / Math.sqrt(d2);
+      }
+    }
+    for (const e of G.edges) {
+      const x = e.b.x - e.a.x, y = e.b.y - e.a.y, d = Math.sqrt(x * x + y * y) + 0.01;
+      const f = (d - 70) * 0.04 * a;
+      e.a.vx += x / d * f; e.a.vy += y / d * f; e.b.vx -= x / d * f; e.b.vy -= y / d * f;
+    }
+    for (const n of N) {
+      n.vx += (W / 2 - n.x) * 0.002 * a; n.vy += (H / 2 - n.y) * 0.002 * a;
+      if (n === G.drag) { n.vx = n.vy = 0; continue; }
+      n.vx = Math.max(-25, Math.min(25, n.vx || 0)); n.vy = Math.max(-25, Math.min(25, n.vy || 0));
+      n.x += n.vx; n.y += n.vy; n.vx *= 0.6; n.vy *= 0.6;
+    }
+    G.alpha *= 0.985;
+    if (G.fitPending && G.alpha < 0.08 && fitGraph()) G.fitPending = false;
+    drawGraph();
+  }
+  G.sim = requestAnimationFrame(tick);
+}
+
+function drawGraph() {
+  const v = G.view;
+  const g = $("#gview"); if (!g) return;
+  g.setAttribute("transform", `translate(${v.x},${v.y}) scale(${v.k})`);
+  const ls = $$("#gedges line");
+  G.edges.forEach((e, i) => { const l = ls[i]; l.setAttribute("x1", e.a.x); l.setAttribute("y1", e.a.y); l.setAttribute("x2", e.b.x); l.setAttribute("y2", e.b.y); });
+  $$("#gnodes .node").forEach(el => {
+    const n = G.nodes[+el.dataset.i];
+    if (el.tagName === "rect") { el.setAttribute("x", n.x - n.r); el.setAttribute("y", n.y - n.r); } else { el.setAttribute("cx", n.x); el.setAttribute("cy", n.y); }
+  });
+  $$("#glabels text").forEach(el => { const n = G.nodes[+el.dataset.i]; el.setAttribute("x", n.x + n.r + 3); el.setAttribute("y", n.y + 3); });
+}
+
+function wirePanZoom(svg, st, redraw) {
+  let pan = null;
+  svg.onmousedown = ev => { pan = {x: ev.clientX - st.view.x, y: ev.clientY - st.view.y}; };
+  svg.onmousemove = ev => {
+    if (st.drag) { const b = svg.getBoundingClientRect(); st.drag.x = (ev.clientX - b.left - st.view.x) / st.view.k; st.drag.y = (ev.clientY - b.top - st.view.y) / st.view.k; st.alpha = Math.max(st.alpha || 0, 0.3); redraw(); }
+    else if (pan) { st.view.x = ev.clientX - pan.x; st.view.y = ev.clientY - pan.y; redraw(); }
+  };
+  window.addEventListener("mouseup", () => { pan = null; st.drag = null; });
+  svg.onwheel = ev => {
+    ev.preventDefault();
+    const b = svg.getBoundingClientRect(), mx = ev.clientX - b.left, my = ev.clientY - b.top;
+    const k = Math.min(8, Math.max(0.1, st.view.k * Math.exp(-ev.deltaY * 0.0015)));
+    st.view.x = mx - (mx - st.view.x) * k / st.view.k; st.view.y = my - (my - st.view.y) * k / st.view.k; st.view.k = k;
+    redraw();
+  };
+}
+
+function highlight(ids) {
+  const set = new Set(ids);
+  $$("#gnodes .node").forEach(el => { const n = G.nodes[+el.dataset.i]; el.classList.toggle("hl", set.has(n.id)); el.classList.toggle("dim", set.size > 0 && !set.has(n.id)); });
+  $$("#gedges line").forEach((el, i) => { const e = G.edges[i]; const on = set.has(e.s) && set.has(e.t); el.classList.toggle("hl", on); el.classList.toggle("dim", set.size > 0 && !on); });
+}
+
+function focusNode(id) {
+  const n = G.byId.get(id);
+  const nb = G.edges.filter(e => e.s === id || e.t === id);
+  highlight([id, ...nb.map(e => e.s === id ? e.t : e.s)]);
+  const side = $("#g-side");
+  side.style.display = "block";
+  side.innerHTML = `<div class="h">${kindBadge(n.kind)} <span class="mono">${esc(id)}</span></div><div style="margin:6px 0;white-space:pre-wrap">${esc(n.text.slice(0, 600))}</div>
+    <h3>edges · ${nb.length}</h3>${nb.map(e => e.s === id ? `<div>→ <i>${esc(e.label)}</i> <a data-open="${esc(e.t)}">${esc(e.t)}</a></div>` : `<div>← <i>${esc(e.label)}</i> <a data-open="${esc(e.s)}">${esc(e.s)}</a></div>`).join("")}
+    <div style="margin-top:8px"><a id="g-open">Open record ›</a> · <a id="g-seedit">Use as REACHABLE seed</a></div>`;
+  $$("[data-open]", side).forEach(a => a.onclick = () => G.byId.has(a.dataset.open) ? focusNode(a.dataset.open) : openRecord(a.dataset.open));
+  $("#g-open").onclick = () => openRecord(id);
+  $("#g-seedit").onclick = () => { $("#g-seed").value = id; reach(); };
+}
+
+async function reach() {
+  const seed = $("#g-seed").value.trim();
+  if (!seed) return;
+  const text = `SELECT id, kind, hops() FROM memory WHERE REACHABLE(links, ${q1(seed)}, hops => ${$("#g-hops").value}, min_hops => 0, dir => '${$("#g-dir").value}') ORDER BY hops() LIMIT 500`;
+  try {
+    const r = await sql(text);
+    const ids = r.rows.map(x => x[0]);
+    const missing = ids.filter(i => !G.byId.has(i)).length;
+    highlight(ids);
+    $("#g-info").textContent = `${r.rows.length} rows reachable in ${r.ms.toFixed(2)} ms${missing ? ` (${missing} not in this view)` : ""} · ${text}`;
+  } catch (e) { $("#g-info").textContent = e.message; }
+}
+
+// ------------------------------------------------------------------ vectors
+const V = {pts: [], view: {x: 0, y: 0, k: 1}, pcs: null, mean: null};
+function pca(X, k = 2) {
+  const n = X.length, d = X[0].length;
+  const mean = new Float64Array(d);
+  for (const x of X) for (let j = 0; j < d; j++) mean[j] += x[j] / n;
+  const C = X.map(x => x.map((v, j) => v - mean[j]));
+  const pcs = [];
+  for (let c = 0; c < k; c++) {
+    let v = new Float64Array(d).map((_, j) => Math.sin(j * 12.9898 + c * 78.233));
+    for (let it = 0; it < 60; it++) {
+      const w = new Float64Array(d);
+      for (const x of C) { let s = 0; for (let j = 0; j < d; j++) s += x[j] * v[j]; for (let j = 0; j < d; j++) w[j] += s * x[j]; }
+      for (const p of pcs) { let s = 0; for (let j = 0; j < d; j++) s += w[j] * p[j]; for (let j = 0; j < d; j++) w[j] -= s * p[j]; }
+      const norm = Math.hypot(...w) || 1;
+      v = w.map(x => x / norm);
+    }
+    pcs.push(v);
+  }
+  return {mean, pcs};
+}
+const project = (x, P) => P.pcs.map(p => { let s = 0; for (let j = 0; j < x.length; j++) s += (x[j] - P.mean[j]) * p[j]; return s; });
+
+async function loadVectors() {
+  $("#v-info").textContent = "loading…";
+  const r = rowsAsObjects(await sql(`SELECT id, kind, tag, text, emb FROM memory WHERE kind != 'entity' ORDER BY seq DESC LIMIT 1500`));
+  const pts = r.filter(x => x.emb && x.emb.values.some(v => v !== 0));
+  if (pts.length < 3) { $("#v-info").textContent = "need at least 3 records"; return; }
+  V.P = pca(pts.map(p => p.emb.values));
+  V.pts = pts.map(p => { const [a, b] = project(p.emb.values, V.P); return {...p, a, b}; });
+  V.q = null; V.hits = [];
+  $("#v-info").textContent = `${V.pts.length} vectors · ${pts[0].emb.dim} dimensions, projected on their first two principal components`;
+  drawVectors(true);
+}
+
+function drawVectors(fit) {
+  const svg = $("#vecsvg");
+  const W = svg.clientWidth || 800, H = svg.clientHeight || 600;
+  if (!V.pts.length) return;
+  if (fit) {
+    const as = V.pts.map(p => p.a), bs = V.pts.map(p => p.b);
+    const [a0, a1, b0, b1] = [Math.min(...as), Math.max(...as), Math.min(...bs), Math.max(...bs)];
+    V.sx = (W - 80) / (a1 - a0 || 1); V.sy = (H - 80) / (b1 - b0 || 1); V.a0 = a0; V.b0 = b0;
+    V.view = {x: 0, y: 0, k: 1};
+  }
+  const X = p => 40 + (p.a - V.a0) * V.sx, Y = p => 40 + (p.b - V.b0) * V.sy;
+  const hit = new Map((V.hits || []).map((h, i) => [h.id, i]));
+  let s = `<g transform="translate(${V.view.x},${V.view.y}) scale(${V.view.k})">`;
+  if (V.q) for (const p of V.pts) if (hit.has(p.id)) s += `<line x1="${X(V.q)}" y1="${Y(V.q)}" x2="${X(p)}" y2="${Y(p)}" style="stroke:var(--accent);stroke-width:${1 / V.view.k}"/>`;
+  for (const [i, p] of V.pts.entries()) s += `<circle data-i="${i}" cx="${X(p)}" cy="${Y(p)}" r="${(hit.has(p.id) ? 6 : 3.5) / Math.sqrt(V.view.k)}" style="fill:${kc(p.kind)};opacity:${V.q && !hit.has(p.id) ? .35 : .9};cursor:pointer"/>`;
+  if (V.q) s += `<path d="M${X(V.q)},${Y(V.q) - 9} L${X(V.q) + 3},${Y(V.q) - 3} L${X(V.q) + 9},${Y(V.q) - 3} L${X(V.q) + 4},${Y(V.q) + 2} L${X(V.q) + 6},${Y(V.q) + 9} L${X(V.q)},${Y(V.q) + 5} L${X(V.q) - 6},${Y(V.q) + 9} L${X(V.q) - 4},${Y(V.q) + 2} L${X(V.q) - 9},${Y(V.q) - 3} L${X(V.q) - 3},${Y(V.q) - 3} Z" style="fill:var(--accent)"/>`;
+  s += `</g>`;
+  const kinds = [...new Set(V.pts.map(p => p.kind))];
+  s += `<g transform="translate(12,${H - 14})">${kinds.map((k, i) => `<g transform="translate(${i * 92},0)"><circle r="4" cx="4" cy="-4" style="fill:${kc(k)}"/><text x="12" y="0" style="font-size:11px;fill:var(--muted)">${k}</text></g>`).join("")}</g>`;
+  svg.innerHTML = s;
+  const tip = $("#v-tip");
+  $$("circle[data-i]", svg).forEach(el => {
+    const p = V.pts[+el.dataset.i];
+    el.onmouseenter = () => { tip.style.display = "block"; tip.textContent = `${p.id} · ${p.kind}${hit.has(p.id) ? ` · similarity ${V.hits[hit.get(p.id)].score.toFixed(3)}` : ""}\n${p.text.slice(0, 280)}`; };
+    el.onmousemove = ev => { const b = $("#p-vectors").getBoundingClientRect(); tip.style.left = (ev.clientX - b.left + 14) + "px"; tip.style.top = (ev.clientY - b.top + 10) + "px"; };
+    el.onmouseleave = () => tip.style.display = "none";
+    el.onclick = () => vecSide(p);
+  });
+}
+
+function vecSide(p) {
+  const side = $("#v-side");
+  side.style.display = "block";
+  side.innerHTML = `<div>${kindBadge(p.kind)} <span class="mono">${esc(p.id)}</span></div><div style="margin:6px 0;white-space:pre-wrap">${esc(p.text.slice(0, 500))}</div>
+    ${vecStrip(p.emb.values, true)}<div style="margin-top:8px"><a id="v-open">Open record ›</a></div>`;
+  $("#v-open").onclick = () => openRecord(p.id);
+}
+
+async function vecSearch() {
+  const text = $("#v-q").value.trim();
+  if (!text) return;
+  if (!V.pts.length) await loadVectors();
+  const e = await rpc({op: "inspect_embed", text});
+  if (e.error) { $("#v-info").textContent = e.error; return; }
+  const [a, b] = project(e.values, V.P);
+  V.q = {a, b};
+  const r = await sql(`SELECT id, kind, text, score() FROM memory WHERE kind != 'entity' ORDER BY similarity(emb, :q) DESC LIMIT 10`, {embed: {q: text}});
+  V.hits = r.rows.map(([id, kind, t, score]) => ({id, kind, text: t, score}));
+  drawVectors(false);
+  const side = $("#v-side");
+  side.style.display = "block";
+  side.innerHTML = `<div class="hint">query vector (${e.dim}d, ${esc(e.embedder)})</div>${vecStrip(e.values, true)}<h3>top 10 · ${r.ms.toFixed(2)} ms</h3>` +
+    V.hits.map(h => `<div style="margin:5px 0"><span class="num mono">${h.score.toFixed(3)}</span> ${kindBadge(h.kind)} <a data-open="${esc(h.id)}">${esc(h.text.slice(0, 120))}</a></div>`).join("");
+  wireOpen(side);
+}
+
+// ------------------------------------------------------------------ query console
+const EXAMPLES = [
+  ["Newest records", "SELECT id, kind, tag, session, turn, text FROM memory ORDER BY seq DESC LIMIT 20", []],
+  ["Records per kind (facets)", "SELECT kind, COUNT(*) FROM memory GROUP BY kind ORDER BY 2 DESC LIMIT 20", []],
+  ["Active knowledge", "SELECT id, kind, tag, text FROM memory WHERE kind IN ('decision', 'preference', 'fact', 'todo', 'note') AND tag != 'superseded' AND tag != 'done' ORDER BY seq DESC LIMIT 50", []],
+  ["Full text (BM25)", "SELECT id, kind, text, score() FROM memory ORDER BY bm25(body, :t) DESC LIMIT 10", [["t", "str", "integer cents rounding"]]],
+  ["Boolean MATCH with a filter", "SELECT id, kind, text FROM memory WHERE MATCH(body, 'python AND (match OR syntax)') AND kind != 'tool_result' ORDER BY seq DESC LIMIT 20", []],
+  ["Vector similarity", "SELECT id, kind, text, score() FROM memory WHERE kind != 'entity' ORDER BY similarity(emb, :q) DESC LIMIT 10", [["q", "vec", "what version of Python does the client run?"]]],
+  ["Hybrid: weighted BM25 + vector", "SELECT id, kind, text, score() FROM memory WHERE kind != 'entity' ORDER BY 0.3 * bm25(body, :t) + 0.7 * similarity(emb, :q) DESC LIMIT 10", [["t", "str", "discount cap"], ["q", "vec", "how large can a discount be?"]]],
+  ["Hybrid: reciprocal rank fusion", "SELECT id, kind, text, score() FROM memory WHERE kind != 'entity' ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10", [["t", "str", "rounding"], ["q", "vec", "how do we round money?"]]],
+  ["Graph: what an entity connects", "SELECT id, kind, text, hops() FROM memory WHERE REACHABLE(links, 'f:invoice.py', hops => 2, dir => 'both') ORDER BY hops() LIMIT 30", []],
+  ["Graph: vector-seeded traversal", "SELECT id, kind, text, hops() FROM memory WHERE REACHABLE(links, (SELECT id FROM memory WHERE kind != 'entity' ORDER BY similarity(emb, :q) DESC LIMIT 3), hops => 2, dir => 'both') ORDER BY hops() LIMIT 30", [["q", "vec", "client constraints"]]],
+  ["Graph: personalized PageRank", "SELECT id, kind, text, score() FROM memory WHERE kind != 'entity' ORDER BY ppr(links, (SELECT id FROM memory WHERE kind = 'entity' LIMIT 5)) DESC LIMIT 15", []],
+  ["Vectors themselves", "SELECT id, kind, emb FROM memory WHERE kind != 'entity' ORDER BY seq DESC LIMIT 10", []],
+  ["Errors by file", "SELECT id, files, text FROM memory WHERE kind = 'error' ORDER BY seq DESC LIMIT 20", []],
+];
+
+function paramRow(name = "", type = "vec", val = "") {
+  const d = document.createElement("div");
+  d.className = "row";
+  d.innerHTML = `<input class="pname" placeholder="name" value="${esc(name)}">
+    <select class="ptype"><option value="vec">text → vector</option><option value="str">string</option><option value="num">number</option></select>
+    <input class="pval" placeholder="value" value="${esc(val)}"><button title="remove">×</button>`;
+  $(".ptype", d).value = type;
+  $("button", d).onclick = () => d.remove();
+  $("#params").appendChild(d);
+}
+
+function setExample(i) {
+  const [, text, ps] = EXAMPLES[i];
+  $("#sql").value = text;
+  $("#params").innerHTML = "";
+  ps.forEach(p => paramRow(...p));
+}
+
+async function runQuery() {
+  const out = $("#q-out");
+  const mode = $("input[name=qmode]:checked").value;
+  out.innerHTML = `<p class="hint">Running…</p>`;
+  if (mode === "search") {
+    const r = await rpc({op: "search", query: $("#sql").value, limit: 10, include_current: true});
+    out.innerHTML = r.error ? `<div class="err">${esc(r.error)}</div>` : `<div class="plan mono">evidence ${esc(JSON.stringify(r.evidence))}</div><pre class="box" style="max-height:none">${esc(r.text)}</pre>`;
+    return;
+  }
+  const params = {}, embed = {};
+  for (const row of $$("#params .row")) {
+    const n = $(".pname", row).value.trim().replace(/^:/, ""), t = $(".ptype", row).value, v = $(".pval", row).value;
+    if (!n) continue;
+    if (t === "vec") embed[n] = v; else params[n] = t === "num" ? Number(v) : v;
+  }
+  try {
+    const r = await sql($("#sql").value, {params, embed, max_dims: 128, max_rows: 500});
+    out.innerHTML = `<div class="toolbar" style="margin-top:12px"><b>${r.total_rows} row${r.total_rows === 1 ? "" : "s"}</b><span class="hint">${r.ms.toFixed(2)} ms · ${r.filter_docs} docs passed the filter · ${r.scored} scored</span></div>` +
+      (r.plan?.length ? `<details><summary class="hint">plan · ${r.plan.length} lines</summary><div class="plan mono">${r.plan.map(esc).join("<br>")}</div></details>` : "") + resultTable(r, true);
+    $$("#q-out tr[data-id]").forEach(tr => tr.onclick = () => openRecord(tr.dataset.id));
+  } catch (e) { out.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+// ------------------------------------------------------------------ storage
+const SECTION_COLORS = ["#3a5ccc", "#c0611b", "#2f7d4f", "#7a5aa6", "#2c8c8c", "#b8457a", "#8b7a12", "#5b6b86", "#a99f8b", "#4a8ab5"];
+async function loadStorage() {
+  const l = await rpc({op: "inspect_layout"});
+  if (l.error) { $("#storage").innerHTML = `<div class="err">${esc(l.error)}</div>`; return; }
+  const f = l.file;
+  const fields = l.schema.fields;
+  const typeOf = t => typeof t === "string" ? t : Object.keys(t)[0] + (t.Vector ? `(${t.Vector.dim}, ${typeof t.Vector.index === "string" ? t.Vector.index : Object.keys(t.Vector.index)[0]})` : t.Text ? (t.Text.positions ? " (positions)" : "") : "");
+  const families = s => s.split(/[./:]/)[0];
+  const segs = l.segments.map(s => {
+    const fam = {};
+    for (const [k, n] of Object.entries(s.sections)) fam[families(k)] = (fam[families(k)] || 0) + n;
+    return {...s, fam, total: Object.values(s.sections).reduce((a, b) => a + b, 0)};
+  });
+  const allFam = [...new Set(segs.flatMap(s => Object.keys(s.fam)))];
+  const color = k => SECTION_COLORS[allFam.indexOf(k) % SECTION_COLORS.length];
+  $("#storage").innerHTML = `
+    <h3>The file</h3>
+    <div class="stats">
+      <div class="stat"><b>${l.live_docs}</b><span>live rows</span></div>
+      <div class="stat"><b>${fmtBytes(f.file_bytes)}</b><span>file</span></div>
+      <div class="stat"><b>${fmtBytes(f.wal_bytes)}</b><span>write-ahead log</span></div>
+      <div class="stat"><b>${f.memtable_docs}</b><span>rows in the memtable</span></div>
+      <div class="stat"><b>${l.segments.filter(s => !s.in_memory).length}</b><span>on-disk segments</span></div>
+      <div class="stat"><b>${f.live_pages}/${f.page_count}</b><span>live / total pages</span></div>
+    </div>
+    <h3>Table <span class="mono" style="text-transform:none">${esc(l.schema.table)}</span> · primary key ${esc(fields[l.schema.primary_key]?.name)}</h3>
+    <table class="grid"><thead><tr><th>field</th><th>type</th><th>stored</th><th>indexed</th><th>generated from</th></tr></thead><tbody>
+      ${fields.map(x => `<tr><td class="mono">${esc(x.name)}</td><td class="mono">${esc(typeOf(x.ty))}</td><td>${x.stored ? "yes" : ""}</td><td>${x.indexed ? "yes" : ""}</td><td class="mono">${esc((x.generated_from || []).join(", "))}</td></tr>`).join("")}
+    </tbody></table>
+    <h3>Segments · bytes per index family</h3>
+    <div class="bars">${segs.map(s => `<div class="seg"><div class="hint">${s.in_memory ? "memtable segment" : "segment " + s.id} · ${s.n_live}/${s.n_docs} live rows · ${fmtBytes(s.total)}</div>
+      <div class="bar">${Object.entries(s.fam).sort((a, b) => b[1] - a[1]).map(([k, n]) => `<span title="${esc(k)}: ${fmtBytes(n)}" style="width:${100 * n / s.total}%;background:${color(k)}"></span>`).join("")}</div>
+      <details><summary class="hint">${Object.keys(s.sections).length} sections</summary><table class="grid">${Object.entries(s.sections).map(([k, n]) => `<tr><td class="mono">${esc(k)}</td><td class="num">${fmtBytes(n)}</td></tr>`).join("")}</table></details></div>`).join("")}
+      <div class="legend">${allFam.map(k => `<span><i style="background:${color(k)}"></i>${esc(k)}</span>`).join("")}</div></div>
+    <h3>Embedder</h3><p class="mono">${esc(l.embedder)} · ${l.dim} dimensions</p>`;
+}
+
+// ------------------------------------------------------------------ wiring
+const loaders = {knowledge: loadKnowledge, table: () => loadTableFilters().then(loadTable), graph: loadGraph, vectors: loadVectors, storage: loadStorage};
+const loaded = new Set();
+$$("#tabs button").forEach(b => b.onclick = () => {
+  $$("#tabs button").forEach(x => x.classList.toggle("on", x === b));
+  $$(".pane").forEach(p => p.classList.toggle("on", p.id === "p-" + b.dataset.tab));
+  const t = b.dataset.tab;
+  if (loaders[t] && (!loaded.has(t) || t === "knowledge" || t === "storage")) { loaded.add(t); loaders[t]().catch(e => console.error(e)); }
+});
+$("#send").onclick = send;
+$("#stop").onclick = () => post("/api/stop", {});
+$("#input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
+$("#newsess").onclick = newSession;
+$("#sessions").onchange = e => { S.session = e.target.value || null; post("/api/session", {session: S.session}); };
+$("#live-tools").onchange = applyLiveFilters;
+$("#live-events").onchange = applyLiveFilters;
+$("#know-refresh").onclick = loadKnowledge;
+$("#know-old").onchange = loadKnowledge;
+$("#t-go").onclick = () => { T.offset = 0; loadTable(); };
+$("#t-match").onkeydown = e => { if (e.key === "Enter") { T.offset = 0; loadTable(); } };
+$("#t-next").onclick = () => { T.offset += T.page; loadTable(); };
+$("#t-prev").onclick = () => { T.offset = Math.max(0, T.offset - T.page); loadTable(); };
+$("#g-load").onclick = loadGraph;
+$("#g-fit").onclick = fitGraph;
+wirePanZoom($("#graphsvg"), G, () => drawGraph());
+$("#g-reach").onclick = reach;
+$("#g-seed").onkeydown = e => { if (e.key === "Enter") reach(); };
+$("#v-load").onclick = loadVectors;
+$("#v-go").onclick = vecSearch;
+$("#v-q").onkeydown = e => { if (e.key === "Enter") vecSearch(); };
+wirePanZoom($("#vecsvg"), V, () => drawVectors(false));
+$("#q-ex").innerHTML = EXAMPLES.map((e, i) => `<option value="${i}">${esc(e[0])}</option>`).join("");
+$("#q-ex").onchange = e => setExample(+e.target.value);
+$("#q-run").onclick = runQuery;
+$("#q-addp").onclick = () => paramRow();
+$("#sql").onkeydown = e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) runQuery(); };
+$("#d-close").onclick = () => $("#drawer").classList.remove("open");
+document.addEventListener("keydown", e => { if (e.key === "Escape") $("#drawer").classList.remove("open"); });
+setExample(0);
+emptyChat();
+loadInfo().then(poll);
+</script>
+</body>
+</html>

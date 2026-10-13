@@ -1,0 +1,219 @@
+{
+ "model": "small (claude -p, headless)",
+ "project": "scratch git repo with Engram installed (hooks + MCP)",
+ "runs": [
+  {
+   "name": "A: establish decisions and write code",
+   "engram": true,
+   "cost_usd": 0.00484241,
+   "turns": 5,
+   "result": "I created `inventory.py` in the project and both checks behave as you asked: `parse_sku('INV-0042-QX')` passes and `parse_sku('INV-42-QX')` raises `ValueError`.\n\nChoices I made that you may want to change:\n\n- **`parse_sku(s)`** raises `ValueError` on a malformed SKU and returns `(digits, letters)` on success, e.g. `('0042', 'QX')`. I used `fullmatch`, so a trailing newline doesn't slip through.\n- **`price_to_cents(text)`** accepts whole numbers and one or two decimal places (`'7'` \u2192 700, `'12.3'` \u2192 1230, `'12.34'` \u2192 1234). It raises `ValueError` on anything else, including negatives, three decimal places, and thousands separators. It uses `Decimal`, so no floats are involved.\n\nThe file is untracked, so I haven't committed it.",
+   "prompt": "We are building a tiny inventory tool. Two decisions for this project: prices are always stored as integer cents (never floats), and SKUs have the format INV-<4 digits>-<2 uppercase letters> ... Create inventory.py ... Then run a quick python3 check ..."
+  },
+  {
+   "name": "B: new session, file tools disabled, Engram on",
+   "engram": true,
+   "prompt": "Without reading any files: what SKU format did we decide on for this project, and how are prices stored? If you do not know, say so.",
+   "cost_usd": 0.0067036,
+   "turns": 1,
+   "result": "**SKU format:** `INV-<4 digits>-<2 uppercase letters>`, for example `INV-0042-QX`.\n\n**Prices:** stored as integer cents, never floats.\n\nI got both from this project's memory notes, which record them as decisions from an earlier session. I haven't checked them against `inventory.py` or any other file, so the code may differ from what was decided."
+  },
+  {
+   "name": "C: same question, Engram off (control)",
+   "engram": false,
+   "prompt": "Without reading any files: what SKU format did we decide on for this project, and how are prices stored? If you do not know, say so.",
+   "cost_usd": 0.00197528,
+   "turns": 1,
+   "result": "I don't know. This conversation doesn't include any discussion of a SKU format or how prices are stored, and I haven't read any project files, as you asked. Nothing in the context I have describes that decision.\n\nIf you tell me the decision or paste the relevant part of the spec, I can work from that. Otherwise, reading the project's schema, models, or design notes would answer it. Or you could check the commit history or any earlier session where it was discussed."
+  },
+  {
+   "name": "D: new session asks for a detail beyond the briefing",
+   "engram": true,
+   "prompt": "Without reading files: in the earlier session, what exact python3 command did we run to check parse_sku, and what did the failing case print?",
+   "tools": [
+    {
+     "name": "ToolSearch",
+     "input": {
+      "query": "select:mcp__engram__memory_timeline",
+      "max_results": 1
+     }
+    },
+    {
+     "name": "mcp__engram__memory_timeline",
+     "input": {
+      "id": "ca8f40bb:8",
+      "before": 2,
+      "after": 4
+     }
+    }
+   ],
+   "cost_usd": 0.00444121,
+   "turns": 3,
+   "result": "In the earlier session, the check was this `python3 -c` command (record `ca8f40bb:8`):\n\n```\npython3 -c \"\nfrom inventory import parse_sku, price_to_cents\nprint('parse_sku(INV-0042-QX) ->', parse_sku('INV-0042-QX'))\ntry:\n    parse_sku('INV-42-QX')\n    print('parse_sku(INV-42-QX) passed  <-- UNEXPECTED')\nexcept ValueError as e:\n    print('parse_sku(INV-42-QX) failed as expected:', e)\nprint('price_to_cents(12.34) ->', price_to_cents('12.34'))\nprint('price_to_cents(12.3) ->', price_to_cents('12.3'))\nprint('price_to_cents(7) ->', price_to_cents('7'))\n\"\n```\n\nThe failing case printed (record `ca8f40bb:9`):\n\n```\nparse_sku(INV-42-QX) failed as expected: invalid SKU: 'INV-42-QX'\n```\n\nThe full output was:\n\n```\nparse_sku(INV-0042-QX) -> ('0042', 'QX')\nparse_sku(INV-42-QX) failed as expected: invalid SKU: 'INV-42-QX'\nprice_to_cents(12.34) -> 1234\nprice_to_cents(12.3) -> 1230\nprice_to_cents(7) -> 700\n```\n\nMy earlier answer in this conversation said the memory tools returned a permission error and that I couldn't recover the command or output. That was wrong. The memory tools work, and the records were available."
+  }
+ ],
+ "events": [
+  {
+   "chars": 0,
+   "event": "SessionStart",
+   "session": "ca8f40bb-7294-4a3d-854e-26d9df9c0761",
+   "source": "startup",
+   "ts": 1791793779
+  },
+  {
+   "candidates": 0,
+   "chars": 0,
+   "decision": "Skip",
+   "event": "recall",
+   "evidence": {
+    "agree": false,
+    "bm_gap": 0.0,
+    "cos_gap": 0.0,
+    "cue": false,
+    "max_cos": 0.0,
+    "max_cov": 0.0
+   },
+   "gate": 0.0,
+   "injected": [],
+   "ms": 7.058472,
+   "session": "ca8f40bb-7294-4a3d-854e-26d9df9c0761",
+   "ts": 1791793779
+  },
+  {
+   "chars": 830,
+   "event": "SessionStart",
+   "session": "99584c40-bc10-4c22-82f3-37912187dd2a",
+   "source": "startup",
+   "ts": 1791793804
+  },
+  {
+   "candidates": 12,
+   "chars": 213,
+   "decision": "Pointer",
+   "event": "recall",
+   "evidence": {
+    "agree": true,
+    "bm_gap": 0.9303437000159367,
+    "cos_gap": 0.1205098032951355,
+    "cue": true,
+    "max_cos": 0.44404810667037964,
+    "max_cov": 0.19841132068526854
+   },
+   "gate": 5.592175259912679,
+   "injected": [],
+   "ms": 5.355612,
+   "session": "99584c40-bc10-4c22-82f3-37912187dd2a",
+   "ts": 1791793805
+  },
+  {
+   "chars": 1161,
+   "event": "SessionStart",
+   "session": "f329703c-db79-46b2-90dd-f0521911ab43",
+   "source": "startup",
+   "ts": 1791793832
+  },
+  {
+   "candidates": 15,
+   "chars": 191,
+   "decision": "Pointer",
+   "event": "recall",
+   "evidence": {
+    "agree": true,
+    "bm_gap": 0.9026207353087942,
+    "cos_gap": 0.2171686291694641,
+    "cue": true,
+    "max_cos": 0.5151083469390869,
+    "max_cov": 0.43598588156955365
+   },
+   "gate": 7.035558124641253,
+   "injected": [],
+   "ms": 5.040569,
+   "session": "f329703c-db79-46b2-90dd-f0521911ab43",
+   "ts": 1791793833
+  },
+  {
+   "chars": 1161,
+   "event": "SessionStart",
+   "session": "ca8f40bb-7294-4a3d-854e-26d9df9c0761",
+   "source": "resume",
+   "ts": 1791793841
+  },
+  {
+   "candidates": 18,
+   "chars": 3460,
+   "decision": "Inject",
+   "event": "recall",
+   "evidence": {
+    "agree": true,
+    "bm_gap": 0.7613320344206873,
+    "cos_gap": 0.431917667388916,
+    "cue": false,
+    "max_cos": 1.0,
+    "max_cov": 1.0
+   },
+   "gate": 11.598321949287742,
+   "injected": [
+    "ca8f40bb:1",
+    "ca8f40bb:12",
+    "99584c40:14",
+    "99584c40:15",
+    "f329703c:16",
+    "f329703c:18"
+   ],
+   "ms": 8.747368999999999,
+   "session": "ca8f40bb-7294-4a3d-854e-26d9df9c0761",
+   "ts": 1791793852
+  },
+  {
+   "chars": 4713,
+   "event": "SessionStart",
+   "session": "ca8f40bb-7294-4a3d-854e-26d9df9c0761",
+   "source": "compact",
+   "ts": 1791793852
+  },
+  {
+   "event": "PostCompact",
+   "session": "ca8f40bb-7294-4a3d-854e-26d9df9c0761",
+   "summary_records": 9,
+   "ts": 1791793852
+  },
+  {
+   "chars": 2359,
+   "event": "SessionStart",
+   "session": "aaa05c60-f99c-4e0c-b84a-d603709feb8d",
+   "source": "startup",
+   "ts": 1791793986
+  },
+  {
+   "candidates": 27,
+   "chars": 3327,
+   "decision": "Inject",
+   "event": "recall",
+   "evidence": {
+    "agree": true,
+    "bm_gap": 0.8303655120965747,
+    "cos_gap": 0.5317830741405487,
+    "cue": true,
+    "max_cos": 0.9999996423721313,
+    "max_cov": 1.0
+   },
+   "gate": 12.183788188262072,
+   "injected": [
+    "ca8f40bb:1",
+    "ca8f40bb:8",
+    "99584c40:14",
+    "99584c40:15",
+    "f329703c:16",
+    "f329703c:17"
+   ],
+   "ms": 8.275796999999999,
+   "session": "aaa05c60-f99c-4e0c-b84a-d603709feb8d",
+   "ts": 1791793986
+  }
+ ],
+ "compaction": {
+  "command": "claude -p /compact --resume <session A>",
+  "post_compact_summary_records": 9,
+  "session_start_compact_chars": 4713
+ }
+}

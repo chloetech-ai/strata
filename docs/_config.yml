@@ -1,0 +1,30 @@
+title: Engram
+description: Long-term memory for coding agents, built on Strata, an embedded search database with SQL
+remote_theme: just-the-docs/just-the-docs@v0.10.1
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+
+color_scheme: light
+search_enabled: true
+heading_anchors: true
+back_to_top: true
+back_to_top_text: "Back to top"
+
+mermaid:
+  version: "10.9.1"
+
+kramdown:
+  math_engine: mathjax
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+
+aux_links:
+  "GitHub":
+    - "https://github.com/rkonow/engram"
+
+footer_content: "Engram, Strata and posting_bench. Benchmarks were run on a 4-core cloud VM; see each results page for the method."
+
+exclude:
+  - "*.py"

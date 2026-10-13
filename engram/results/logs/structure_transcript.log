@@ -1,0 +1,5 @@
+point 1952:4632 fresh=false: 678 records
+point 1952:4632 fresh=true: 1530 records
+point 4633:5392 fresh=false: 1530 records
+point 4633:5392 fresh=true: 1833 records
+wrote results/structure/transcript.json in 362 s

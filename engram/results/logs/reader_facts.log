@@ -1,0 +1,11 @@
+300 answers to get (0 cached)
+  read 50/300 in 62 s
+  read 100/300 in 106 s
+  read 150/300 in 155 s
+  read 200/300 in 201 s
+  read 250/300 in 251 s
+  read 300/300 in 291 s
+300 answers to grade in 30 calls
+facts                        n=100  accuracy 0.670  context 4021 chars  reader tokens 3046
+turn_facts                   n=100  accuracy 0.710  context 3736 chars  reader tokens 2823
+fact_keys                    n=100  accuracy 0.700  context 3620 chars  reader tokens 2750

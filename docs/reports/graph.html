@@ -1,0 +1,877 @@
+<title>Graphs in Strata</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Literata:opsz,wght@7..72,500;7..72,600&display=swap">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] },
+    svg: { fontCache: "global" },
+    options: { enableMenu: false }
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.min.js" defer></script>
+<style>
+
+/* Layout: one reading column (~68ch) with figures that break out wider; numbers in mono. */
+:root {
+  --bg: #f4f6f9;
+  --surface: #ffffff;
+  --ink: #141922;
+  --ink-2: #485164;
+  --ink-3: #737c8f;
+  --rule: #dce1ea;
+  --grid: #e8ecf2;
+  --accent: #1d5bd6;
+  --accent-soft: #e4ecfc;
+  --warm: #c2410c;
+  --warm-soft: #fdebe1;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --display: "Literata", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1218; --surface: #171b23; --ink: #e8ebf1; --ink-2: #b3bac8; --ink-3: #8a93a5;
+    --rule: #2a303c; --grid: #222833; --accent: #7aa5ff; --accent-soft: #1b2944; --warm: #f2955b; --warm-soft: #3a2418;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1218; --surface: #171b23; --ink: #e8ebf1; --ink-2: #b3bac8; --ink-3: #8a93a5;
+  --rule: #2a303c; --grid: #222833; --accent: #7aa5ff; --accent-soft: #1b2944; --warm: #f2955b; --warm-soft: #3a2418;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 16px/1.62 var(--body); }
+.page { max-width: 1120px; margin: 0 auto; padding-inline: 20px; padding-block: 40px 80px; }
+.col { max-width: 720px; margin-inline: auto; }
+h1, h2, h3 { font-family: var(--display); font-weight: 600; text-wrap: balance; line-height: 1.2; color: var(--ink); }
+h1 { font-size: clamp(2rem, 4.6vw, 3.05rem); margin: 0.2em 0 0.35em; letter-spacing: -0.01em; }
+h2 { font-size: 1.7rem; margin: 2.6em 0 0.5em; padding-top: 0.9em; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.22rem; margin: 1.8em 0 0.4em; font-weight: 500; }
+p, li { color: var(--ink); }
+p { margin: 0 0 1em; }
+.lede { font-size: 1.13rem; color: var(--ink-2); }
+.eyebrow { font: 500 0.78rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.meta { font: 0.86rem/1.5 var(--mono); color: var(--ink-3); }
+a { color: var(--accent); }
+code, .mono { font-family: var(--mono); font-size: 0.88em; }
+code { background: var(--accent-soft); padding: 0.05em 0.35em; border-radius: 4px; }
+.num { font-variant-numeric: tabular-nums; }
+ul, ol { padding-left: 1.3em; }
+li { margin: 0.25em 0; }
+strong { font-weight: 600; }
+
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 28px 0 8px; }
+.finding { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px; min-width: 0; }
+.finding .k { font: 500 0.74rem/1.2 var(--mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--ink-3); }
+.finding .v { font: 600 1.55rem/1.2 var(--body); margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
+.finding p { font-size: 0.92rem; color: var(--ink-2); margin: 0; }
+
+.toc { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 18px 0 0; padding: 0; list-style: none; font-size: 0.92rem; }
+.toc a { color: var(--ink-2); text-decoration: none; border-bottom: 1px solid var(--rule); }
+.toc a:hover, .toc a:focus-visible { color: var(--accent); border-color: var(--accent); }
+
+figure { margin: 28px auto; max-width: 1000px; }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); gap: 18px; max-width: 1080px; margin: 10px auto; }
+.pair figure { margin: 8px 0; max-width: none; min-width: 0; }
+figure.narrow { max-width: 760px; }
+.frame { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 18px 18px 12px; overflow-x: auto; position: relative; }
+figcaption { font-size: 0.9rem; color: var(--ink-2); margin-top: 10px; max-width: 720px; margin-inline: auto; }
+figcaption b { color: var(--ink); font-weight: 600; }
+.chart-title { font: 600 0.98rem/1.3 var(--body); margin: 0 0 2px; }
+.chart-sub { font-size: 0.85rem; color: var(--ink-3); margin: 0 0 10px; }
+.chart { width: 100%; min-height: 120px; }
+
+.math { overflow-x: auto; overflow-y: hidden; margin: 14px 0 18px; padding: 6px 0; }
+mjx-container[display="true"] { display: block; max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.defs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 0.95rem; margin: 10px 0 18px; }
+.defs dt { font-family: var(--mono); font-size: 0.86rem; color: var(--ink-2); }
+.defs dd { margin: 0; min-width: 0; }
+
+.codecs { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin: 18px 0; }
+.codec { border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; background: var(--surface); min-width: 0; }
+.codec h4 { margin: 0 0 4px; font: 600 0.98rem/1.3 var(--body); }
+.codec p { margin: 0; font-size: 0.88rem; color: var(--ink-2); }
+.tag { display: inline-block; font: 500 0.7rem/1 var(--mono); padding: 3px 6px; border-radius: 4px; border: 1px solid var(--rule); color: var(--ink-3); margin-left: 6px; vertical-align: 2px; }
+
+.table-wrap { overflow-x: auto; margin: 14px 0; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+th, td { padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { font: 600 0.76rem/1.3 var(--mono); letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); background: var(--surface); position: sticky; top: 0; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 0.84rem; }
+tr:last-child td { border-bottom: none; }
+td.best { color: var(--accent); font-weight: 600; }
+td.strong { font-weight: 600; }
+.wide { max-width: 1000px; margin-inline: auto; }
+.algo { color: var(--ink-3); font-size: 0.8rem; }
+details { margin: 14px 0; }
+summary { cursor: pointer; color: var(--accent); font-weight: 500; }
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+
+.callout { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 18px 0; }
+.callout p:last-child { margin: 0; }
+
+/* Diagrams */
+svg text { font-family: var(--body); }
+.dg .box { fill: var(--surface); stroke: var(--rule); stroke-width: 1.2; }
+.dg .box-acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+.dg .box-warm { fill: var(--warm-soft); stroke: var(--warm); stroke-width: 1.2; }
+.dg .t { fill: var(--ink); font-size: 12.5px; }
+.dg .tm { fill: var(--ink); font-family: var(--mono); font-size: 12px; }
+.dg .tl { fill: var(--ink-2); font-size: 12px; }
+.dg .ts { fill: var(--ink-3); font-size: 11px; }
+.dg .tb { fill: var(--ink); font-size: 12.5px; font-weight: 600; }
+.dg .ln { stroke: var(--ink-3); stroke-width: 1.2; fill: none; }
+.dg .ln-acc { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+.dg .ln-warm { stroke: var(--warm); stroke-width: 1.6; fill: none; }
+.dg .dot { fill: var(--ink-2); }
+.dg .dot-acc { fill: var(--accent); }
+.dg .band { fill: var(--accent-soft); }
+.dg .axis { stroke: var(--rule); stroke-width: 1.5; }
+.dg .ah { fill: var(--accent); }
+.dg .ahm { fill: var(--ink-3); }
+
+/* Charts */
+.ch .grid { stroke: var(--grid); stroke-width: 1; }
+.ch .axis { stroke: var(--rule); stroke-width: 1; }
+.ch text { fill: var(--ink-3); font: 11.5px var(--body); }
+.ch text.lab { fill: var(--ink-2); font-size: 12px; }
+.ch text.lab-strong { fill: var(--ink); font-size: 12px; font-weight: 600; }
+.ch text.axis-title { fill: var(--ink-2); font-size: 12px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.84rem; color: var(--ink-2); margin: 4px 0 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { display: inline-block; width: 16px; height: 3px; border-radius: 2px; }
+.legend i.sq { width: 10px; height: 10px; border-radius: 3px; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 8px 10px; font-size: 0.82rem; box-shadow: 0 6px 20px rgba(10, 20, 40, 0.14); min-width: 140px; max-width: 280px; z-index: 5; }
+.tip b { font-variant-numeric: tabular-nums; }
+.tip .row { display: flex; align-items: center; gap: 6px; }
+.tip .row i { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+.tip .h { color: var(--ink-3); font-size: 0.76rem; margin-bottom: 3px; }
+
+.repro pre { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; overflow-x: auto; font: 0.84rem/1.55 var(--mono); }
+footer { margin-top: 60px; color: var(--ink-3); font-size: 0.85rem; }
+@media (max-width: 560px) {
+  body { font-size: 15px; }
+  .page { padding-inline: 16px; }
+  .frame { padding: 12px 10px 8px; }
+  .defs { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .toc a, summary { transition: color 0.15s; }
+}
+
+mjx-container { position: relative; }
+pre { max-width: 100%; overflow-x: auto; }
+.col pre.sql { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; font-size: 0.82rem; line-height: 1.5; }
+.thesis { font-family: var(--display); font-size: 1.18rem; line-height: 1.45; color: var(--ink); border-left: 3px solid var(--accent); padding: 2px 0 2px 16px; margin: 14px 0 18px; }
+.note { font-size: 0.86rem; color: var(--ink-3); }
+.compact th, .compact td { padding: 7px 9px; }
+.wrap-head th { white-space: normal; vertical-align: bottom; }
+td.sys { font-weight: 600; }
+td.good { color: var(--accent); font-weight: 600; }
+.chart-box { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 14px 14px 8px; min-width: 0; }
+.chart-box h4 { margin: 0 0 2px; font: 600 0.95rem/1.3 var(--body); }
+.chart-box p { margin: 0 0 6px; font-size: 0.86rem; color: var(--ink-3); }
+.opts td:first-child { white-space: nowrap; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px auto 10px; max-width: 1000px; }
+.tabs button { font: 500 0.82rem/1 var(--body); color: var(--ink-2); background: var(--surface); border: 1px solid var(--rule); border-radius: 999px; padding: 7px 12px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.opts td { vertical-align: top; white-space: normal; }
+</style>
+
+<div class="page">
+<header class="col">
+  <div class="eyebrow">posting_bench · strata · graphs</div>
+  <h1>Graph indexes and graph queries in Strata</h1>
+  <p class="lede">Strata keeps a table's text, structured fields and vectors in one file and queries them with SQL. Rows can now link to other rows. A traversal, a shortest path or personalized PageRank runs in the same statement as BM25, filters and vector search, and can start from any of them. This page covers how edges are stored and resolved, the SQL, the planner's part, speed against SQLite and an in-memory graph, and whether the graph helps search when a vector search is the way into it. It does: on arXiv, the papers cited by a new paper's two nearest neighbours find twice as many of its references as vector search alone. A graph built from the vectors themselves does not help.</p>
+  <p class="meta" id="meta-line"></p>
+  <div class="findings" id="findings"><div class="finding"><div class="k">Finding a paper's references</div><div class="v">nDCG@20 0.123 → 0.253</div><p>Vector search, then the papers cited by the two nearest papers ranked by similarity, on 484 held-out arXiv papers. Hybrid BM25 and vector search reaches 0.160. <i>p</i> &lt; 0.0001.</p></div>
+<div class="finding"><div class="k">Edges built from vectors</div><div class="v">no gain</div><p>A row's ten most similar rows as its edges: a traversal over them returns what vector search already found, or worse.</p></div>
+<div class="finding"><div class="k">Two hops both ways, p95</div><div class="v">24.5 → 2.6 ms</div><p>SQLite recursive CTE against Strata on 168k papers and 1.15M citations, 3,790 rows on average. An in-memory CSR takes 0.66 ms.</p></div>
+<div class="finding"><div class="k">PageRank, 1M rows</div><div class="v">21.4 → 5.8 ms</div><p>Personalized PageRank (ε = 10⁻⁴) on a power-law graph of 10M edges, before and after three changes to the index and the push loop. The CSR takes 1.3 ms.</p></div>
+</div>
+  <ul class="toc">
+    <li><a href="#model">Rows are nodes</a></li>
+    <li><a href="#storage">Storing edges</a></li>
+    <li><a href="#sql">The SQL</a></li>
+    <li><a href="#plan">Planning and traversal</a></li>
+    <li><a href="#speed">Speed</a></li>
+    <li><a href="#quality">Does the graph help search?</a></li>
+    <li><a href="#next">Limits and next steps</a></li>
+    <li><a href="#reproduce">Reproduce</a></li>
+  </ul>
+</header>
+
+<section class="col" id="model">
+  <h2>Rows are nodes</h2>
+  <p>Graph databases keep nodes and edges in stores of their own. Strata keeps its one table. A row is a node, and an <code>EDGES</code> field holds the row's outgoing edges: a JSON array of targets, each a primary key of the same table, optionally with a label and a positive weight.</p>
+<pre class="sql">-- id KEYWORD PRIMARY KEY, title TEXT, body TEXT, year INT, emb VECTOR(512), cites EDGES
+INSERT ... ('p1', 'Attention is all you need', ..., 2017, [...],
+            '["p7", ["extends", "p9"], ["refutes", "p11", 0.5]]')</pre>
+  <p>Formally, a snapshot \(S\) holds rows \(V\) with keys \(\kappa: V \to K\), and edges</p>
+  \[ E \subseteq V \times K \times L \times \mathbb{R}_{>0}, \qquad (u, k, \ell, w): \text{row } u \text{ points at key } k \text{ with label } \ell \text{ and weight } w. \]
+  <p>An edge is resolved at query time:</p>
+  \[ \rho_S(k) = \text{the live row } v \in V \text{ with } \kappa(v) = k, \text{ if any}. \]
+  <p>A key has at most one live row in a snapshot, so \(\rho_S\) is a function. When it has none (the target was deleted, or never existed), the edge dangles and traversals skip it, as a foreign key without a constraint would.</p>
+  <p class="thesis">Edges belong to their source row and point at keys, not at storage positions. They are written, logged, updated, deleted, merged and snapshotted with the row, and nothing else in the engine had to change.</p>
+  <p>Targets as keys are what make this work. A merge rewrites every docID, and an update moves a row to a newer segment, but neither changes a key, so no edge is ever rewritten. The price is a lookup per hop, which most of the work below goes into making cheap.</p>
+</section>
+
+<section class="col" id="storage">
+  <h2>Storing edges</h2>
+  <p>Every segment, on disk or built from the memtable, gets one section per indexed <code>EDGES</code> field, read in place through <code>mmap</code>:</p>
+  <figure class="wide">
+    <div class="frame"><svg class="dg" id="storage-diagram" viewBox="0 0 760 330" role="img" aria-label="A segment's graph section holds out-edges as a CSR with target keys, labels, weights and same-segment hints, and a reverse index grouped by target key under a radix directory; hops resolve through the snapshot's primary-key indexes"></svg></div>
+    <figcaption><b>One segment's graph section.</b> Out-edges are a CSR over local docIDs. The reverse index groups edges by target key. A hop along an edge uses the same-segment hint when its row is still live, and otherwise the primary-key indexes of the snapshot's segments.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Out-edges:</b> offsets per docID, then per edge its source, its target key (an <code>i64</code>, or offsets and bytes for string keys), a label code and a weight. Labels and weights are stored only when some edge has one.</li>
+    <li><b>Reverse index:</b> the edges grouped by target key, the groups ordered by the key's 64-bit hash under the radix directory of the primary-key index, and each edge's source stored in group order. "Which rows point at key \(k\)" is one directory read and one key comparison per group, then a sequential read. Integer hashes are a bijection and need no comparison; colliding string keys form separate groups.</li>
+    <li><b>Same-segment hints:</b> per edge, the docID the target had in this segment when it was built. Since \(\rho_S\) has one answer, a hinted row that is still live is that answer, and the hop needs no lookup.</li>
+  </ul>
+  <p>A hop from \(u\) along its edges therefore costs, per edge,</p>
+  \[ c_{\text{out}} = p_{\text{hint}}\,c_{\text{live}} + (1 - p_{\text{hint}})\bigl(p_{\text{memo}}\,c_{\text{memo}} + (1 - p_{\text{memo}}) \textstyle\sum_{i \le j^*} c_{\text{probe},i}\bigr), \]
+  <p>where \(p_{\text{hint}}\) is the share of targets built into the same segment and still live, \(p_{\text{memo}}\) the share already resolved in this query, and \(j^*\) the segment where the key is found. A hop against the edges costs one reverse-index probe per segment for \(u\)'s key, then a liveness check per source. The section costs about</p>
+  \[ b \approx \underbrace{8}_{\text{target}} + \underbrace{4}_{\text{source}} + \underbrace{4 + 4}_{\text{reverse}} + \underbrace{4}_{\text{hint}} + \tfrac{8\,|V| + 16\,|K_E|}{|E|} \text{ bytes per edge}, \]
+  <p>with \(|K_E|\) the distinct targets. That comes to 27 bytes per edge on arXiv:</p>
+  <div class="wide" id="size-table"></div>
+  <p class="note">The graph section of the full table equals that of a table holding only keys and edges, which loads in under a second.</p>
+</section>
+
+<section class="col" id="sql">
+  <h2>The SQL</h2>
+  <p>Two predicates, a column and a score join the existing functions. Each takes seeds: a key, a parameter, a tuple of keys, or any subquery over the same table. A subquery can rank, filter and limit like any other query, so a vector search, a BM25 query or a facet filter can be the way into the graph.</p>
+<pre class="sql">-- papers within two citations of p1, either way, nearest first
+SELECT id, title, hops() FROM papers
+WHERE REACHABLE(cites, 'p1', hops =&gt; 2, dir =&gt; 'both') ORDER BY hops(), id LIMIT 20;
+
+-- one shortest path, only through surveys
+SELECT id, hops() FROM papers
+WHERE PATH(cites, 'p1', 'p9', max_hops =&gt; 6, through =&gt; kind = 'survey') ORDER BY hops();
+
+-- the way in is a vector search: the papers its two best hits cite, by similarity
+SELECT id FROM papers
+WHERE REACHABLE(cites, (SELECT id FROM papers ORDER BY similarity(emb, :q) DESC LIMIT 2))
+ORDER BY similarity(emb, :q) DESC LIMIT 20;
+
+-- personalized PageRank from hybrid hits, fused with both rankings
+SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q),
+    ppr(cites, (SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 2), weighted =&gt; 1)) DESC LIMIT 20;</pre>
+  <div class="table-wrap opts">
+    <table>
+      <thead><tr><th>function</th><th>what it does</th><th>options (defaults)</th></tr></thead>
+      <tbody>
+        <tr><td><code>REACHABLE(f, seeds, ...)</code></td><td>rows \(v\) with \(m \le d(\text{seeds}, v) \le h\)</td><td><code>hops 1</code>, <code>min_hops 1</code>, <code>dir 'out' | 'in' | 'both'</code>, <code>label 'a,b'</code>, <code>through &lt;predicate&gt;</code>, <code>max_nodes 100000</code></td></tr>
+        <tr><td><code>PATH(f, from, to, ...)</code></td><td>the rows of one shortest path</td><td><code>max_hops 6</code>, <code>dir</code>, <code>label</code>, <code>through</code></td></tr>
+        <tr><td><code>hops()</code></td><td>a row's distance, or its position on the path; <code>ORDER BY hops()</code> is nearest first</td><td></td></tr>
+        <tr><td><code>ppr(f, seeds, ...)</code></td><td>personalized PageRank, a score for <code>ORDER BY</code>, <code>rrf</code> and weighted sums</td><td><code>alpha 0.15</code>, <code>eps 1e-4</code>, <code>dir 'both'</code>, <code>label</code>, <code>weighted 0</code> (1: the seeds' subquery scores are the restart weights)</td></tr>
+        <tr><td>a VECTOR field as <code>f</code></td><td>a row's neighbours are its \(k\) most similar rows</td><td><code>k 10</code>, <code>min_sim</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><code>through</code> constrains the rows a traversal passes through, and the rest of <code>WHERE</code> constrains the rows it ends at. <code>REACHABLE(f, seeds, hops =&gt; 0, min_hops =&gt; 0)</code> is the seed set itself, so <code>NOT</code> of it removes the seeds from a result.</p>
+</section>
+
+<section class="col" id="plan">
+  <h2>Planning and traversal</h2>
+  <p>A traversal does not respect segment boundaries, so graph computations run first, over the whole snapshot. Seeds are resolved, a seed subquery running as a query of its own on the same snapshot, and the traversal runs. Its result becomes, per segment, a materialised document set with exact cardinality, plus each row's distance and PageRank score.</p>
+  <figure class="wide">
+    <div class="frame"><svg class="dg" id="flow-diagram" viewBox="0 0 760 236" role="img" aria-label="Seeds from keys or a subquery feed a traversal over the snapshot; its result becomes per-segment document sets with exact cardinality, which the planner uses like any other filter, for example choosing a pre-filtered exact vector scan"></svg></div>
+    <figcaption><b>Graph first, then the usual plan.</b> The planner sees a graph predicate as a filter whose size it knows exactly. A vector search over a neighbourhood of a few hundred rows becomes an exact scan of those rows.</figcaption>
+  </figure>
+  <p>The traversals:</p>
+  <ul>
+    <li><b>Reachability:</b> breadth-first search, frontier by frontier, which stops at <code>max_nodes</code>.</li>
+    <li><b>Shortest paths:</b> bidirectional breadth-first search, always expanding the smaller frontier, forward along the edges or backward against them.</li>
+    <li><b>Personalized PageRank:</b> forward push (Andersen, Chung and Lang, 2006). The vector \(\pi\) solves</li>
+  </ul>
+  \[ \pi = \alpha\, e_S + (1 - \alpha)\, \pi W, \qquad W_{uv} = \frac{w_{uv}}{\sum_{x} w_{ux}}, \]
+  <p>where \(e_S\) is the restart distribution over the seeds. Every row has an estimate \(p\) and a residual \(r\), with \(r = e_S\) at the start, and pushing a row \(u\) does</p>
+  \[ p(u) \mathrel{+}= \alpha\, r(u), \qquad r(v) \mathrel{+}= (1 - \alpha)\, r(u)\, W_{uv} \;\; \forall v, \qquad r(u) \leftarrow 0, \]
+  <p>while some \(r(u) \ge \varepsilon \deg(u)\). Each estimate is then within \(\varepsilon \deg(u)\) of \(\pi(u)\), and the work is bounded by \(1/(\alpha\varepsilon)\) pushes whatever the graph's size. A row is queued only once its residual reaches \(\varepsilon\), the least any threshold can be. Rows that merely received a little mass are never resolved, and resolving them was most of the original cost.</p>
+</section>
+
+<section id="speed">
+  <div class="col">
+    <h2>Speed</h2>
+    <p>Two graphs, each queried from 200 random seeds on a warm cache, one thread, through SQL (parsing and planning included; <code>COUNT(*)</code>, so that no rows are fetched):</p>
+    <ul>
+      <li><b>arXiv:</b> 168,343 papers (ogbn-arxiv, less 1,000 held out) with 1,148,979 citations, in two segments.</li>
+      <li><b>Synthetic:</b> a power-law graph of 1,000,000 rows and 9,998,469 edges, in four segments. Row \(i\) links to 10 earlier rows, each the target of a random earlier edge with probability ½ and a uniform earlier row otherwise.</li>
+    </ul>
+    <p>The baselines answer the same queries, and the bench checks that every count and path length agrees:</p>
+    <ul>
+      <li><b>SQLite:</b> an edge table <code>(src, dst)</code> as a <code>WITHOUT ROWID</code> primary key, an index on <code>(dst, src)</code>, and recursive CTEs.</li>
+      <li><b>CSR:</b> the same traversal code on two in-memory arrays. This is the lower bound: no keys, no segments, no SQL.</li>
+    </ul>
+  </div>
+  <div class="wide" id="speed-tabs"></div>
+  <div class="col">
+    <p>Against SQLite, the one-hop queries cost about the same: roughly 20 µs, mostly parsing and planning on both sides. From two hops on, the gap opens. The tail is where it shows most: two hops both ways on arXiv touch 3,790 rows on average and up to tens of thousands, and their p95 is 2.6 ms in Strata against 24.5 ms in SQLite. The recursive CTE re-expands rows reached at several depths and joins through a B-tree per row, where Strata reads a CSR slice. Shortest paths and PageRank have no practical CTE form.</p>
+    <p>Against the CSR, Strata pays two costs. About 20 µs of SQL per query dominates small traversals. Resolution dominates large ones: PageRank takes 2.8 times the CSR's time on arXiv and 4.6 times on the million-row graph. A target outside its own segment is a hash probe into each segment's primary-key index until found, a cache miss each. Three changes found by profiling cut PageRank on the million-row graph from 21.4 to 5.8 ms:</p>
+    <ul>
+      <li>reverse groups by key, with the sources stored inline;</li>
+      <li>same-segment hints and a per-query memo;</li>
+      <li>queueing only rows that can pass the push threshold.</li>
+    </ul>
+  </div>
+  <div class="wide" id="speed-history"></div>
+</section>
+
+<section id="quality">
+  <div class="col">
+    <h2>Does the graph help search?</h2>
+    <p>Rows here are nodes with text, vectors and edges at once. The question the engine cannot answer alone is whether the edges add anything to a search that already has the text and the vectors, and whether edges made from the vectors themselves (each row linked to its nearest rows) add anything.</p>
+    <p><b>The task:</b> for a new paper, find the papers it cites from its title and abstract. This is citation recommendation, and the same shape as finding the records a new question depends on.</p>
+    <ul>
+      <li>1,000 papers of OGB's test split (809 published in 2019, 191 in 2020, each citing at least five papers) are held out of the table.</li>
+      <li>Each held-out paper's title and abstract is the query. Its references in the table (15.3 on average) are the relevant rows.</li>
+      <li>Vectors come from a static embedder (Model2Vec potion-retrieval-32M, 512 dimensions), the same one Engram uses.</li>
+    </ul>
+    <p>Each method returns 20 papers. Methods that start from vector seeds have one parameter, the number of seeds \(S\), swept from 1 to 50. Papers with even ids choose \(S\) by nDCG@20 (516 queries) and odd ids report it (484 queries), so no reported number was tuned on its own queries. Comparisons are paired over the same queries, with a 95% bootstrap interval and a two-sided sign-flip test:</p>
+    \[ \mathrm{recall@}k = \frac{|R_k \cap T|}{|T|}, \qquad \mathrm{nDCG@}k = \frac{\sum_{i \le k} \mathbb{1}[r_i \in T] / \log_2(i + 1)}{\sum_{i \le \min(k, |T|)} 1 / \log_2(i + 1)}. \]
+  </div>
+  <div class="wide" id="quality-table"></div>
+  <div class="col"><p class="note">Times are from the quality runs, on the build before the speed changes of the previous section; the graph methods are faster now (see the speed tables).</p></div>
+  <div class="col">
+    <p>The graph doubles what vector search finds. The best method is also the simplest: take the two papers nearest the query, follow their citations, and rank what they cite by similarity to the query. It reaches nDCG@20 0.253 against 0.123 for vector search, 0.161 for BM25 and 0.160 for hybrid search, in 0.4 ms. Papers on the same topic cite the same work, and the nearest papers' reference lists are a better candidate set than the nearest papers themselves.</p>
+    <p>PageRank from the same seeds reaches 0.211 at its best (from one seed), below the plain one-hop expansion: on this graph the papers two or three hops away dilute the direct citations. Fusing PageRank with the vector ranking lowers it to 0.188, because the vector ranking's own top results are mostly not references. Fusing BM25, vectors and PageRank from hybrid seeds also reaches 0.211, at the cost of BM25 over long queries (77 ms).</p>
+  </div>
+  <div class="wide">
+    <div class="chart-box"><h4>nDCG@20 by number of vector seeds</h4><p>Report half; horizontal lines are the methods without seeds.</p><div id="sweep-chart"></div></div>
+  </div>
+  <div class="col">
+    <p>Fewer seeds are better. With more seeds, the citations of papers that are less similar to the query crowd out those of the nearest ones. In a first version of the experiment the seeds themselves stayed in the candidate set. Ranked by similarity, they then took the top places, and from 20 seeds on the "graph" method returned exactly the vector search's results. Every graph method above removes the seeds with <code>NOT REACHABLE(cites, seeds, hops =&gt; 0, min_hops =&gt; 0)</code>.</p>
+    <p><b>Vector graph nodes.</b> A VECTOR field can be traversed as a graph, each row's 10 most similar rows being its neighbours. On this task that graph adds nothing:</p>
+    <ul>
+      <li>with the seeds kept, it returns what vector search already found (recall@20 0.112 against 0.111 at 10 seeds, on all queries);</li>
+      <li>with them removed, it is worse (nDCG@20 0.079).</li>
+    </ul>
+    <p>A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows carrying vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in Strata for exploratory queries, cheap at 0.23 ms per hop of 10 neighbours, but it is not what makes the graph worth having.</p>
+  </div>
+  <div class="wide" id="compare-table"></div>
+</section>
+
+<section class="col" id="next">
+  <h2>Limits and next steps</h2>
+  <ul>
+    <li><b>One quality task, one embedder.</b> With a stronger embedder, vector search would score above 0.123, and the relative gain over it would likely shrink. The gains over BM25 (+57%) and hybrid search (+58%) are the more robust numbers.</li>
+    <li><b>Cross-segment hops cost lookups.</b> Two to five times the in-memory CSR on these graphs. A snapshot-wide resolved CSR, rebuilt when the segment set changes, would close the gap for read-mostly tables. Merging into fewer segments narrows it today.</li>
+    <li><b>Patterns.</b> There is no multi-hop pattern matching with a predicate per step (<code>(a:error)-[fixes]-&gt;(b)-[touches]-&gt;(f)</code>). <code>through</code> and labels cover one constraint per traversal; SQL/PGQ's <code>MATCH</code> would be the standard syntax for more.</li>
+    <li><b>Weighted shortest paths.</b> Paths are unweighted; weights are used by PageRank only.</li>
+    <li><b>Engram.</b> Its records have natural edges that the store does not keep yet: a distilled note to the turn it came from, a superseded decision to its replacement, an error to the edit that fixed it. The arXiv result suggests the pattern to try: recall's best hits as seeds, then the notes and records linked to them. Engram's earlier study found that widening a hit to its neighbouring records gained little, so this needs its own measurement before it changes Engram's defaults.</li>
+  </ul>
+</section>
+
+
+<section class="col repro" id="reproduce">
+  <h2>Reproduce</h2>
+<pre>cd strata &amp;&amp; cargo test --release                         # graph unit tests and tests/graph.rs among them
+# ogbn-arxiv (Open Graph Benchmark) and the papers' titles and abstracts
+curl -O https://snap.stanford.edu/ogb/data/nodeproppred/arxiv.zip          # into /home/user/data/graph/arxiv, unzipped into raw/
+curl -O https://snap.stanford.edu/ogb/data/misc/ogbn_arxiv/titleabs.tsv.gz
+python3 -I scripts/prepare_arxiv.py /home/user/data/graph/arxiv
+engram-bench embed --input /home/user/data/graph/arxiv/arxiv.jsonl --out /home/user/data/graph/arxiv/arxiv.f32
+cargo build --release --features baselines --bin strata-graph-bench
+target/release/strata-graph-bench load                      # holds out 1,000 papers of OGB's test split
+target/release/strata-graph-bench latency --sqlite /home/user/data/graph/arxiv/edges.sqlite
+target/release/strata-graph-bench quality --seeds 1,2,3,5,10,20,50
+python3 scripts/graph_quality_stats.py results/graph/quality_arxiv.rows.jsonl.gz --out results/graph/quality_stats.json
+target/release/strata-graph-bench synthetic --nodes 1000000 --sqlite /home/user/data/graph/synthetic.sqlite
+python3 scripts/build_graph_report.py                       # this page</pre>
+</section>
+<footer class="col" id="footer"></footer>
+</div>
+
+<div class="tip" id="tip" hidden></div>
+<script>
+const DATA = {"generated":"2026-10-12","load":{"edges":1150908,"edges_only":{"load_s":0.749271583,"sizes":{"components":{"columns":254112,"doc store":669592,"graph":31122448,"primary key":4171416},"file_bytes":36274176,"segments":2}},"held_out":1000,"index":"hnsw","load_s":23.248243925,"papers":168343,"sizes":{"components":{"columns":844584,"doc store":129354418,"graph":31122448,"primary key":4171416,"text":20095522,"vectors":453274261},"file_bytes":638963712,"segments":2}},"speed":{"arxiv":{"edges":1148979,"queries":200,"results":{"path_both":{"csr_ms":{"mean":0.17322847000000002,"p50":0.084185,"p95":0.667736},"found":194,"mean_len":5.597938144329897,"strata_ms":{"mean":0.29441536500000004,"p50":0.188835,"p95":0.926664}},"path_out":{"csr_ms":{"mean":0.023038955000000007,"p50":0.001983,"p95":0.126155},"found":6,"mean_len":5.166666666666667,"strata_ms":{"mean":0.075945595,"p50":0.026385,"p95":0.297904}},"ppr_1e-4":{"csr_ms":{"mean":0.495883325,"p50":0.48936,"p95":0.8465480000000001},"pushes":429.265,"strata_ms":{"mean":1.37674871,"p50":1.3574380000000001,"p95":2.555785}},"ppr_1e-5":{"csr_ms":{"mean":3.197850214999999,"p50":3.191043,"p95":5.236138},"pushes":3495.63,"strata_ms":{"mean":8.266997830000003,"p50":8.156194000000001,"p95":16.426949}},"reach_both_1":{"csr_ms":{"mean":0.0014054650000000005,"p50":0.0012029999999999999,"p95":0.002573},"rows":12.81,"sqlite_ms":{"mean":0.021176880000000012,"p50":0.015635,"p95":0.044975},"strata_ms":{"mean":0.022341205000000017,"p50":0.019636,"p95":0.038889}},"reach_both_2":{"csr_ms":{"mean":0.127177075,"p50":0.01255,"p95":0.658568},"rows":3790.09,"sqlite_ms":{"mean":4.324283264999997,"p50":0.16802599999999998,"p95":24.543467},"strata_ms":{"mean":0.5199498849999998,"p50":0.099122,"p95":2.58654}},"reach_both_2_top20":{"strata_ms":{"mean":0.772958585,"p50":0.12005299999999999,"p95":3.734484}},"reach_in_1":{"csr_ms":{"mean":0.001004024999999999,"p50":0.000863,"p95":0.00171},"rows":5.61,"sqlite_ms":{"mean":0.015644555,"p50":0.013018,"p95":0.023846},"strata_ms":{"mean":0.022585235000000013,"p50":0.018016,"p95":0.038888}},"reach_out_1":{"csr_ms":{"mean":0.0009115350000000001,"p50":0.000822,"p95":0.001624},"rows":7.315,"sqlite_ms":{"mean":0.017017105000000005,"p50":0.014421,"p95":0.030154999999999998},"strata_ms":{"mean":0.020736030000000006,"p50":0.01903,"p95":0.028834}},"reach_out_2":{"csr_ms":{"mean":0.004157059999999998,"p50":0.002097,"p95":0.01618},"rows":55.605,"sqlite_ms":{"mean":0.06919086500000002,"p50":0.03196,"p95":0.261609},"strata_ms":{"mean":0.03538669,"p50":0.025638,"p95":0.088209}},"reach_out_3":{"csr_ms":{"mean":0.016018354999999995,"p50":0.004795,"p95":0.071943},"rows":218.74,"sqlite_ms":{"mean":0.4400656799999998,"p50":0.08326900000000001,"p95":2.137214},"strata_ms":{"mean":0.08110235499999999,"p50":0.037717,"p95":0.283803}},"rrf_vector_ppr":{"strata_ms":{"mean":2.2515235899999997,"p50":2.283991,"p95":2.966929}},"semantic_knn_1hop":{"strata_ms":{"mean":0.20536781999999998,"p50":0.200407,"p95":0.260552}},"semantic_knn_2hop":{"strata_ms":{"mean":1.74094313,"p50":1.761072,"p95":2.2185949999999997}},"vector_seeds_expand":{"strata_ms":{"mean":0.31962937000000013,"p50":0.316583,"p95":0.393132}},"vector_top20":{"strata_ms":{"mean":0.40388098000000044,"p50":0.287441,"p95":0.8818860000000001}}},"rows":168343},"synthetic":{"edges":9998469,"load_s":7.558846617,"nodes":1000000,"results":{"path_both":{"csr_ms":{"mean":0.05190836999999998,"p50":0.041006,"p95":0.10966000000000001},"found":200,"mean_len":4.085,"strata_ms":{"mean":0.14641962999999994,"p50":0.134045,"p95":0.2497}},"path_out":{"csr_ms":{"mean":0.2577934399999999,"p50":0.005605,"p95":1.889869},"found":10,"mean_len":6.5,"strata_ms":{"mean":0.584330875,"p50":0.07092899999999999,"p95":3.533614}},"ppr_1e-4":{"csr_ms":{"mean":1.2705847500000003,"p50":1.269666,"p95":1.689311},"pushes":132.79,"strata_ms":{"mean":5.790545589999999,"p50":5.813223,"p95":7.229229999999999}},"ppr_1e-5":{"csr_ms":{"mean":10.38848721,"p50":9.95333,"p95":13.823912},"pushes":1020.39,"strata_ms":{"mean":46.49732588999998,"p50":44.597454,"p95":62.019383}},"reach_both_1":{"csr_ms":{"mean":0.002705670000000001,"p50":0.002556,"p95":0.003999},"rows":18.27,"sqlite_ms":{"mean":0.03265751000000001,"p50":0.028173,"p95":0.055567},"strata_ms":{"mean":0.03988091999999999,"p50":0.036291000000000004,"p95":0.056506}},"reach_both_2":{"csr_ms":{"mean":0.052344274999999996,"p50":0.034196000000000004,"p95":0.149628},"rows":1586.13,"sqlite_ms":{"mean":1.5730364099999994,"p50":0.822717,"p95":5.43544},"strata_ms":{"mean":0.253048895,"p50":0.171741,"p95":0.703931}},"reach_both_2_top20":{"strata_ms":{"mean":0.48689709999999997,"p50":0.31359,"p95":1.4341110000000001}},"reach_in_1":{"csr_ms":{"mean":0.0018204450000000006,"p50":0.001687,"p95":0.003199},"rows":8.27,"sqlite_ms":{"mean":0.026202749999999993,"p50":0.022035000000000003,"p95":0.051972000000000004},"strata_ms":{"mean":0.03042798499999999,"p50":0.027351,"p95":0.045248}},"reach_out_1":{"csr_ms":{"mean":0.0017714949999999999,"p50":0.00164,"p95":0.002239},"rows":10.0,"sqlite_ms":{"mean":0.023526305000000004,"p50":0.021557,"p95":0.030548},"strata_ms":{"mean":0.024077315000000002,"p50":0.022928,"p95":0.03257}},"reach_out_2":{"csr_ms":{"mean":0.007345634999999997,"p50":0.007061,"p95":0.01},"rows":108.215,"sqlite_ms":{"mean":0.11066790499999994,"p50":0.106409,"p95":0.14709599999999998},"strata_ms":{"mean":0.051335105000000006,"p50":0.047816,"p95":0.086641}},"reach_out_3":{"csr_ms":{"mean":0.05400044000000001,"p50":0.049582,"p95":0.07223700000000001},"rows":890.345,"sqlite_ms":{"mean":1.022713635,"p50":1.034432,"p95":1.240863},"strata_ms":{"mean":0.17855936999999994,"p50":0.166017,"p95":0.28871600000000003}}}}},"history":{"arxiv":{"before":{"path_both":{"csr_ms":{"mean":0.17457069,"p50":0.083083,"p95":0.669515},"found":194,"mean_len":5.597938144329897,"strata_ms":{"mean":0.5044300249999997,"p50":0.319994,"p95":1.5143680000000002}},"path_out":{"csr_ms":{"mean":0.022732189999999982,"p50":0.002021,"p95":0.11252200000000001},"found":6,"mean_len":5.166666666666667,"strata_ms":{"mean":0.10101755000000001,"p50":0.029317,"p95":0.375927}},"ppr_1e-4":{"csr_ms":{"mean":0.6188912900000002,"p50":0.627341,"p95":0.9787629999999999},"pushes":429.535,"strata_ms":{"mean":4.009486670000004,"p50":3.883352,"p95":7.547968}},"ppr_1e-5":{"csr_ms":{"mean":3.890696554999999,"p50":4.07212,"p95":6.257043},"pushes":3496.97,"strata_ms":{"mean":26.22630837999999,"p50":25.113411,"p95":53.230743}},"reach_both_1":{"csr_ms":{"mean":0.0017536499999999994,"p50":0.001305,"p95":0.0028320000000000003},"rows":12.81,"sqlite_ms":{"mean":0.01956013,"p50":0.014943999999999999,"p95":0.040216},"strata_ms":{"mean":0.025730185,"p50":0.021012000000000003,"p95":0.055339}},"reach_both_2":{"csr_ms":{"mean":0.1258661650000001,"p50":0.011325,"p95":0.65278},"rows":3790.09,"sqlite_ms":{"mean":4.290360304999997,"p50":0.172935,"p95":24.701896},"strata_ms":{"mean":0.7492918200000004,"p50":0.11745799999999999,"p95":3.799085}},"reach_both_2_top20":{"strata_ms":{"mean":1.1253273400000008,"p50":0.142056,"p95":5.8880349999999995}},"reach_in_1":{"csr_ms":{"mean":0.0010337650000000007,"p50":0.000906,"p95":0.00193},"rows":5.61,"sqlite_ms":{"mean":0.01594777,"p50":0.013175,"p95":0.024641},"strata_ms":{"mean":0.032260555,"p50":0.023331,"p95":0.059283}},"reach_out_1":{"csr_ms":{"mean":0.0011743999999999995,"p50":0.000986,"p95":0.002182},"rows":7.315,"sqlite_ms":{"mean":0.01686853999999999,"p50":0.01413,"p95":0.029028},"strata_ms":{"mean":0.021586920000000013,"p50":0.018825,"p95":0.031599}},"reach_out_2":{"csr_ms":{"mean":0.004619190000000003,"p50":0.002231,"p95":0.016259000000000003},"rows":55.605,"sqlite_ms":{"mean":0.06908230499999995,"p50":0.033026,"p95":0.261263},"strata_ms":{"mean":0.03642436500000003,"p50":0.025797999999999998,"p95":0.100775}},"reach_out_3":{"csr_ms":{"mean":0.017159455,"p50":0.005377000000000001,"p95":0.073855},"rows":218.74,"sqlite_ms":{"mean":0.42146608000000013,"p50":0.085771,"p95":2.047613},"strata_ms":{"mean":0.10211974999999988,"p50":0.042466000000000004,"p95":0.395594}},"rrf_vector_ppr":{"strata_ms":{"mean":5.470625869999999,"p50":5.5173440000000005,"p95":8.081568}},"semantic_knn_1hop":{"strata_ms":{"mean":0.22321361000000003,"p50":0.221487,"p95":0.282145}},"semantic_knn_2hop":{"strata_ms":{"mean":1.6027808299999997,"p50":1.652037,"p95":1.912052}},"vector_seeds_expand":{"strata_ms":{"mean":0.32942143,"p50":0.32579199999999997,"p95":0.40150800000000003}},"vector_top20":{"strata_ms":{"mean":0.2623942999999999,"p50":0.241717,"p95":0.401407}}},"after":{"path_both":{"csr_ms":{"mean":0.17322847000000002,"p50":0.084185,"p95":0.667736},"found":194,"mean_len":5.597938144329897,"strata_ms":{"mean":0.29441536500000004,"p50":0.188835,"p95":0.926664}},"path_out":{"csr_ms":{"mean":0.023038955000000007,"p50":0.001983,"p95":0.126155},"found":6,"mean_len":5.166666666666667,"strata_ms":{"mean":0.075945595,"p50":0.026385,"p95":0.297904}},"ppr_1e-4":{"csr_ms":{"mean":0.495883325,"p50":0.48936,"p95":0.8465480000000001},"pushes":429.265,"strata_ms":{"mean":1.37674871,"p50":1.3574380000000001,"p95":2.555785}},"ppr_1e-5":{"csr_ms":{"mean":3.197850214999999,"p50":3.191043,"p95":5.236138},"pushes":3495.63,"strata_ms":{"mean":8.266997830000003,"p50":8.156194000000001,"p95":16.426949}},"reach_both_1":{"csr_ms":{"mean":0.0014054650000000005,"p50":0.0012029999999999999,"p95":0.002573},"rows":12.81,"sqlite_ms":{"mean":0.021176880000000012,"p50":0.015635,"p95":0.044975},"strata_ms":{"mean":0.022341205000000017,"p50":0.019636,"p95":0.038889}},"reach_both_2":{"csr_ms":{"mean":0.127177075,"p50":0.01255,"p95":0.658568},"rows":3790.09,"sqlite_ms":{"mean":4.324283264999997,"p50":0.16802599999999998,"p95":24.543467},"strata_ms":{"mean":0.5199498849999998,"p50":0.099122,"p95":2.58654}},"reach_both_2_top20":{"strata_ms":{"mean":0.772958585,"p50":0.12005299999999999,"p95":3.734484}},"reach_in_1":{"csr_ms":{"mean":0.001004024999999999,"p50":0.000863,"p95":0.00171},"rows":5.61,"sqlite_ms":{"mean":0.015644555,"p50":0.013018,"p95":0.023846},"strata_ms":{"mean":0.022585235000000013,"p50":0.018016,"p95":0.038888}},"reach_out_1":{"csr_ms":{"mean":0.0009115350000000001,"p50":0.000822,"p95":0.001624},"rows":7.315,"sqlite_ms":{"mean":0.017017105000000005,"p50":0.014421,"p95":0.030154999999999998},"strata_ms":{"mean":0.020736030000000006,"p50":0.01903,"p95":0.028834}},"reach_out_2":{"csr_ms":{"mean":0.004157059999999998,"p50":0.002097,"p95":0.01618},"rows":55.605,"sqlite_ms":{"mean":0.06919086500000002,"p50":0.03196,"p95":0.261609},"strata_ms":{"mean":0.03538669,"p50":0.025638,"p95":0.088209}},"reach_out_3":{"csr_ms":{"mean":0.016018354999999995,"p50":0.004795,"p95":0.071943},"rows":218.74,"sqlite_ms":{"mean":0.4400656799999998,"p50":0.08326900000000001,"p95":2.137214},"strata_ms":{"mean":0.08110235499999999,"p50":0.037717,"p95":0.283803}},"rrf_vector_ppr":{"strata_ms":{"mean":2.2515235899999997,"p50":2.283991,"p95":2.966929}},"semantic_knn_1hop":{"strata_ms":{"mean":0.20536781999999998,"p50":0.200407,"p95":0.260552}},"semantic_knn_2hop":{"strata_ms":{"mean":1.74094313,"p50":1.761072,"p95":2.2185949999999997}},"vector_seeds_expand":{"strata_ms":{"mean":0.31962937000000013,"p50":0.316583,"p95":0.393132}},"vector_top20":{"strata_ms":{"mean":0.40388098000000044,"p50":0.287441,"p95":0.8818860000000001}}}},"synthetic":{"before":{"path_both":{"csr_ms":{"mean":0.05395860499999999,"p50":0.044576000000000005,"p95":0.105059},"found":200,"mean_len":4.085,"strata_ms":{"mean":0.30318414,"p50":0.270438,"p95":0.624675}},"path_out":{"csr_ms":{"mean":0.27327724000000014,"p50":0.006798,"p95":1.70181},"found":10,"mean_len":6.5,"strata_ms":{"mean":2.0244554800000008,"p50":0.095306,"p95":14.510718}},"ppr_1e-4":{"csr_ms":{"mean":1.5533985899999998,"p50":1.558565,"p95":1.8667619999999998},"pushes":132.79,"strata_ms":{"mean":21.823539690000008,"p50":21.391068,"p95":29.465411}},"ppr_1e-5":{"csr_ms":{"mean":12.889080284999993,"p50":12.304825000000001,"p95":17.492192},"pushes":1020.39,"strata_ms":{"mean":144.00538511500002,"p50":139.837908,"p95":181.73820099999998}},"reach_both_1":{"csr_ms":{"mean":0.0023713049999999993,"p50":0.00227,"p95":0.003532},"rows":18.27,"sqlite_ms":{"mean":0.022868890000000003,"p50":0.019856000000000002,"p95":0.037596},"strata_ms":{"mean":0.03276237999999997,"p50":0.029997,"p95":0.050005}},"reach_both_2":{"csr_ms":{"mean":0.056911744999999986,"p50":0.039417,"p95":0.17111},"rows":1586.13,"sqlite_ms":{"mean":1.6213306350000003,"p50":0.856152,"p95":6.012785},"strata_ms":{"mean":0.4010949799999999,"p50":0.277993,"p95":1.196423}},"reach_both_2_top20":{"strata_ms":{"mean":0.7317017749999997,"p50":0.411217,"p95":2.298248}},"reach_in_1":{"csr_ms":{"mean":0.0018477000000000018,"p50":0.001632,"p95":0.003313},"rows":8.27,"sqlite_ms":{"mean":0.03241871000000003,"p50":0.018157,"p95":0.044021},"strata_ms":{"mean":0.02572906499999999,"p50":0.023285,"p95":0.039399}},"reach_out_1":{"csr_ms":{"mean":0.0021022,"p50":0.001872,"p95":0.002835},"rows":10.0,"sqlite_ms":{"mean":0.028031820000000013,"p50":0.020947,"p95":0.046817000000000004},"strata_ms":{"mean":0.041696109999999995,"p50":0.027744,"p95":0.06266999999999999}},"reach_out_2":{"csr_ms":{"mean":0.008443524999999999,"p50":0.0077800000000000005,"p95":0.012876},"rows":108.215,"sqlite_ms":{"mean":0.11238635000000001,"p50":0.10544500000000001,"p95":0.139066},"strata_ms":{"mean":0.088712835,"p50":0.08434599999999999,"p95":0.130138}},"reach_out_3":{"csr_ms":{"mean":0.04771012500000001,"p50":0.048073,"p95":0.06826},"rows":890.345,"sqlite_ms":{"mean":1.1214962699999995,"p50":1.072362,"p95":1.364621},"strata_ms":{"mean":0.485828215,"p50":0.453585,"p95":0.655837}}},"after":{"path_both":{"csr_ms":{"mean":0.05190836999999998,"p50":0.041006,"p95":0.10966000000000001},"found":200,"mean_len":4.085,"strata_ms":{"mean":0.14641962999999994,"p50":0.134045,"p95":0.2497}},"path_out":{"csr_ms":{"mean":0.2577934399999999,"p50":0.005605,"p95":1.889869},"found":10,"mean_len":6.5,"strata_ms":{"mean":0.584330875,"p50":0.07092899999999999,"p95":3.533614}},"ppr_1e-4":{"csr_ms":{"mean":1.2705847500000003,"p50":1.269666,"p95":1.689311},"pushes":132.79,"strata_ms":{"mean":5.790545589999999,"p50":5.813223,"p95":7.229229999999999}},"ppr_1e-5":{"csr_ms":{"mean":10.38848721,"p50":9.95333,"p95":13.823912},"pushes":1020.39,"strata_ms":{"mean":46.49732588999998,"p50":44.597454,"p95":62.019383}},"reach_both_1":{"csr_ms":{"mean":0.002705670000000001,"p50":0.002556,"p95":0.003999},"rows":18.27,"sqlite_ms":{"mean":0.03265751000000001,"p50":0.028173,"p95":0.055567},"strata_ms":{"mean":0.03988091999999999,"p50":0.036291000000000004,"p95":0.056506}},"reach_both_2":{"csr_ms":{"mean":0.052344274999999996,"p50":0.034196000000000004,"p95":0.149628},"rows":1586.13,"sqlite_ms":{"mean":1.5730364099999994,"p50":0.822717,"p95":5.43544},"strata_ms":{"mean":0.253048895,"p50":0.171741,"p95":0.703931}},"reach_both_2_top20":{"strata_ms":{"mean":0.48689709999999997,"p50":0.31359,"p95":1.4341110000000001}},"reach_in_1":{"csr_ms":{"mean":0.0018204450000000006,"p50":0.001687,"p95":0.003199},"rows":8.27,"sqlite_ms":{"mean":0.026202749999999993,"p50":0.022035000000000003,"p95":0.051972000000000004},"strata_ms":{"mean":0.03042798499999999,"p50":0.027351,"p95":0.045248}},"reach_out_1":{"csr_ms":{"mean":0.0017714949999999999,"p50":0.00164,"p95":0.002239},"rows":10.0,"sqlite_ms":{"mean":0.023526305000000004,"p50":0.021557,"p95":0.030548},"strata_ms":{"mean":0.024077315000000002,"p50":0.022928,"p95":0.03257}},"reach_out_2":{"csr_ms":{"mean":0.007345634999999997,"p50":0.007061,"p95":0.01},"rows":108.215,"sqlite_ms":{"mean":0.11066790499999994,"p50":0.106409,"p95":0.14709599999999998},"strata_ms":{"mean":0.051335105000000006,"p50":0.047816,"p95":0.086641}},"reach_out_3":{"csr_ms":{"mean":0.05400044000000001,"p50":0.049582,"p95":0.07223700000000001},"rows":890.345,"sqlite_ms":{"mean":1.022713635,"p50":1.034432,"p95":1.240863},"strata_ms":{"mean":0.17855936999999994,"p50":0.166017,"p95":0.28871600000000003}}}}},"quality":{"queries":{"dev":516,"test":484},"methods":{"bm25":{"S":null,"recall":0.14325811375286915,"ndcg":0.1613667704582455,"ms":30.30243097520661},"vector":{"S":null,"recall":0.10873451997821047,"ndcg":0.12274020427801305,"ms":0.22136797933884297},"hybrid":{"S":null,"recall":0.1447063101103474,"ndcg":0.16027493102757392,"ms":34.263135590909094},"cited by vector seeds, by similarity":{"S":2,"recall":0.22478402632266042,"ndcg":0.25264981487578675,"ms":0.4314783388429752},"linked to vector seeds either way, by similarity":{"S":2,"recall":0.1981968155924063,"ndcg":0.20648472289742723,"ms":0.4867592727272727},"ppr from vector seeds":{"S":1,"recall":0.18527577542035545,"ndcg":0.21059907585372128,"ms":6.65383745661157},"rrf(vector, ppr from vector seeds)":{"S":1,"recall":0.18768250113562823,"ndcg":0.1884518974638426,"ms":6.9021992210743806},"rrf(bm25, vector, ppr from hybrid seeds)":{"S":2,"recall":0.20353297009674556,"ndcg":0.2112136216253649,"ms":77.46877277066115},"semantic kNN graph from vector seeds":{"S":2,"recall":0.06823024425572818,"ndcg":0.0785377818210576,"ms":0.7220054359504132}},"sweep":{"bm25":{"None":{"dev_ndcg":0.16681460378120744,"test_ndcg":0.1613667704582455,"dev_recall":0.14638586703842157,"test_recall":0.14325811375286915}},"vector":{"None":{"dev_ndcg":0.1294271639166484,"test_ndcg":0.12274020427801305,"dev_recall":0.11286969165484363,"test_recall":0.10873451997821047}},"hybrid":{"None":{"dev_ndcg":0.16578814310324178,"test_ndcg":0.16027493102757392,"dev_recall":0.1526876104567248,"test_recall":0.1447063101103474}},"cited by vector seeds, by similarity":{"3":{"dev_ndcg":0.22869269121444752,"test_ndcg":0.25511351903526047,"dev_recall":0.21965861997910158,"test_recall":0.2355964780908877},"5":{"dev_ndcg":0.2069188033015128,"test_ndcg":0.23849929550806848,"dev_recall":0.2061095785306562,"test_recall":0.22729710290208496},"10":{"dev_ndcg":0.1641272615292596,"test_ndcg":0.1857794799583872,"dev_recall":0.16866681093983965,"test_recall":0.18966193614370533},"20":{"dev_ndcg":0.1312456656006471,"test_ndcg":0.13752370480733586,"dev_recall":0.13300194844211352,"test_recall":0.1408140234133624},"50":{"dev_ndcg":0.08552925656514639,"test_ndcg":0.08719960498281562,"dev_recall":0.08670828447819133,"test_recall":0.08875369763711163},"1":{"dev_ndcg":0.20804058049926413,"test_ndcg":0.22903386606363677,"dev_recall":0.17100823534257698,"test_recall":0.18921188169812087},"2":{"dev_ndcg":0.2336146700024552,"test_ndcg":0.25264981487578675,"dev_recall":0.2136671267208545,"test_recall":0.22478402632266042}},"linked to vector seeds either way, by similarity":{"3":{"dev_ndcg":0.19197188134096224,"test_ndcg":0.19692427352784886,"dev_recall":0.19213246615597068,"test_recall":0.19637779694574398},"5":{"dev_ndcg":0.16245693833789468,"test_ndcg":0.16573293563852604,"dev_recall":0.16799987724601478,"test_recall":0.17087721284665816},"10":{"dev_ndcg":0.1162047864426099,"test_ndcg":0.11747770319910661,"dev_recall":0.1215417164642369,"test_recall":0.1230530307104296},"20":{"dev_ndcg":0.08687950261818303,"test_ndcg":0.08307867025508117,"dev_recall":0.089479643955457,"test_recall":0.08851153381157993},"50":{"dev_ndcg":0.05237177083650313,"test_ndcg":0.05136297766609474,"dev_recall":0.05364350749146363,"test_recall":0.05315802938561515},"1":{"dev_ndcg":0.2038555860271136,"test_ndcg":0.20972663571646996,"dev_recall":0.17863562803964078,"test_recall":0.18814734500672983},"2":{"dev_ndcg":0.2090584330869368,"test_ndcg":0.20648472289742723,"dev_recall":0.20146416751720256,"test_recall":0.1981968155924063}},"ppr from vector seeds":{"3":{"dev_ndcg":0.19373996147436473,"test_ndcg":0.18798784808214467,"dev_recall":0.18654146145715012,"test_recall":0.17845036807959735},"5":{"dev_ndcg":0.1808553892166782,"test_ndcg":0.1755727999524594,"dev_recall":0.1694463746972972,"test_recall":0.16927300965715125},"10":{"dev_ndcg":0.1500723214840302,"test_ndcg":0.1479943311227663,"dev_recall":0.1439471170453926,"test_recall":0.14068066008147},"20":{"dev_ndcg":0.12661807639782002,"test_ndcg":0.1262253763577422,"dev_recall":0.11862390141473403,"test_recall":0.1184956394555965},"50":{"dev_ndcg":0.08425229979273516,"test_ndcg":0.08357103064812581,"dev_recall":0.0786534338043384,"test_recall":0.07526684459150242},"1":{"dev_ndcg":0.20759947484684949,"test_ndcg":0.21059907585372128,"dev_recall":0.1898692546028652,"test_recall":0.18527577542035545},"2":{"dev_ndcg":0.206598799124188,"test_ndcg":0.19372134986512352,"dev_recall":0.19487884989812082,"test_recall":0.185526229531048}},"rrf(vector, ppr from vector seeds)":{"3":{"dev_ndcg":0.18729548038547267,"test_ndcg":0.17728794446240617,"dev_recall":0.19079875090016993,"test_recall":0.17796342343059357},"5":{"dev_ndcg":0.17779179336743595,"test_ndcg":0.1714571008567094,"dev_recall":0.17973214597396678,"test_recall":0.1727384884524902},"10":{"dev_ndcg":0.16232960271834573,"test_ndcg":0.15731910837510993,"dev_recall":0.15570395044018762,"test_recall":0.15287008614624206},"20":{"dev_ndcg":0.13779692922097564,"test_ndcg":0.13419628848833423,"dev_recall":0.11487150659270509,"test_recall":0.11005929796677737},"50":{"dev_ndcg":0.150300342502044,"test_ndcg":0.14836025310399836,"dev_recall":0.13370192803733746,"test_recall":0.12889118681463638},"1":{"dev_ndcg":0.19504695533744107,"test_ndcg":0.1884518974638426,"dev_recall":0.19789128002610848,"test_recall":0.18768250113562823},"2":{"dev_ndcg":0.19504221575493,"test_ndcg":0.1787564647040173,"dev_recall":0.20030853835098744,"test_recall":0.1794928123230467}},"rrf(bm25, vector, ppr from hybrid seeds)":{"3":{"dev_ndcg":0.21418649638416828,"test_ndcg":0.20674051839676386,"dev_recall":0.21147096993495387,"test_recall":0.20023517718195616},"5":{"dev_ndcg":0.208921763838947,"test_ndcg":0.2011542848913588,"dev_recall":0.20863662733387456,"test_recall":0.19650155011006884},"10":{"dev_ndcg":0.20021003993060366,"test_ndcg":0.19395802370490942,"dev_recall":0.20367634128572948,"test_recall":0.19216557141629603},"20":{"dev_ndcg":0.17319154506011109,"test_ndcg":0.16753737424162596,"dev_recall":0.15637483255734957,"test_recall":0.14753113968549453},"50":{"dev_ndcg":0.17925103114938784,"test_ndcg":0.17458020318634948,"dev_recall":0.16717899288010837,"test_recall":0.1588611533331685},"1":{"dev_ndcg":0.21363877528807082,"test_ndcg":0.21008731485432558,"dev_recall":0.20717701916683554,"test_recall":0.19770178028070365},"2":{"dev_ndcg":0.21778201984341236,"test_ndcg":0.2112136216253649,"dev_recall":0.21325241124160776,"test_recall":0.20353297009674556}},"semantic kNN graph from vector seeds":{"3":{"dev_ndcg":0.07544213497198472,"test_ndcg":0.07513335177837632,"dev_recall":0.06810798175677184,"test_recall":0.07075961016114245},"5":{"dev_ndcg":0.06161437050373,"test_ndcg":0.06798911156528976,"dev_recall":0.056873299240644104,"test_recall":0.06748588112014048},"10":{"dev_ndcg":0.048428571465560365,"test_ndcg":0.05361378213644495,"dev_recall":0.04920276295783377,"test_recall":0.05782081746833026},"20":{"dev_ndcg":0.04073242571889549,"test_ndcg":0.03853755094452663,"dev_recall":0.04054593128604128,"test_recall":0.04402480559063207},"50":{"dev_ndcg":0.02463243395286293,"test_ndcg":0.026918791015329884,"dev_recall":0.02420861855572836,"test_recall":0.026836707539533187},"1":{"dev_ndcg":0.07300613463045233,"test_ndcg":0.06790214638539806,"dev_recall":0.05340500321319605,"test_recall":0.05369057979655477},"2":{"dev_ndcg":0.07830930489434919,"test_ndcg":0.0785377818210576,"dev_recall":0.06659571857593403,"test_recall":0.06823024425572818}}},"comparisons":{"cited by vector seeds, by similarity vs vector (ndcg)":{"diff":0.1299096105977737,"ci95":[0.11075103025565097,0.14933766775308352],"p":9.999000099990002e-05,"relative":1.0584112301420125},"cited by vector seeds, by similarity vs vector (recall)":{"diff":0.11604950634444998,"ci95":[0.09722916108380555,0.13497821870947896],"p":9.999000099990002e-05,"relative":1.06727381854176},"rrf(bm25, vector, ppr from hybrid seeds) vs vector (ndcg)":{"diff":0.08847341734735183,"ci95":[0.07848827841616979,0.09865026559332157],"p":9.999000099990002e-05,"relative":0.7208185603712608},"rrf(bm25, vector, ppr from hybrid seeds) vs vector (recall)":{"diff":0.09479845011853508,"ci95":[0.08307670466518471,0.10687587392794265],"p":9.999000099990002e-05,"relative":0.8718339873807501},"ppr from vector seeds vs vector (ndcg)":{"diff":0.08785887157570824,"ci95":[0.06723553232280725,0.1086192067281171],"p":9.999000099990002e-05,"relative":0.7158116779462356},"ppr from vector seeds vs vector (recall)":{"diff":0.07654125544214499,"ci95":[0.0578871079394082,0.09543669603299038],"p":9.999000099990002e-05,"relative":0.7039278368772239},"linked to vector seeds either way, by similarity vs vector (ndcg)":{"diff":0.08374451861941416,"ci95":[0.0670713558629245,0.10124738280294962],"p":9.999000099990002e-05,"relative":0.6822908525533199},"linked to vector seeds either way, by similarity vs vector (recall)":{"diff":0.08946229561419582,"ci95":[0.07233784540754469,0.10691715361277783],"p":9.999000099990002e-05,"relative":0.8227589143918909},"rrf(vector, ppr from vector seeds) vs vector (ndcg)":{"diff":0.06571169318582955,"ci95":[0.05577856170094325,0.07592316975380892],"p":9.999000099990002e-05,"relative":0.5353721999434602},"rrf(vector, ppr from vector seeds) vs vector (recall)":{"diff":0.07894798115741777,"ci95":[0.06646294145434294,0.09211586374352879],"p":9.999000099990002e-05,"relative":0.7260617987115621},"bm25 vs vector (ndcg)":{"diff":0.03862656618023244,"ci95":[0.027492948113451356,0.05029773193015645],"p":9.999000099990002e-05,"relative":0.3147018241288016},"bm25 vs vector (recall)":{"diff":0.03452359377465868,"ci95":[0.024394925139064976,0.04501050128607777],"p":9.999000099990002e-05,"relative":0.31750352860873376},"hybrid vs vector (ndcg)":{"diff":0.03753472674956084,"ci95":[0.03009947949985739,0.04505206446354189],"p":9.999000099990002e-05,"relative":0.30580629199983},"hybrid vs vector (recall)":{"diff":0.03597179013213693,"ci95":[0.028340619952086737,0.043673909614895555],"p":9.999000099990002e-05,"relative":0.33082217256622265},"semantic kNN graph from vector seeds vs vector (ndcg)":{"diff":-0.04420242245695546,"ci95":[-0.05448904691326998,-0.03424192779866068],"p":9.999000099990002e-05,"relative":-0.3601299404458757},"semantic kNN graph from vector seeds vs vector (recall)":{"diff":-0.040504275722482275,"ci95":[-0.04930273499570677,-0.0319497305097703],"p":9.999000099990002e-05,"relative":-0.37250613448791614},"cited by vector seeds, by similarity vs bm25 (ndcg)":{"diff":0.09128304441754126,"ci95":[0.07103350915005387,0.11172475011902465],"p":9.999000099990002e-05,"relative":0.5656867529685192},"cited by vector seeds, by similarity vs bm25 (recall)":{"diff":0.0815259125697913,"ci95":[0.06137988570653678,0.10152845252404694],"p":9.999000099990002e-05,"relative":0.569084084901673},"rrf(bm25, vector, ppr from hybrid seeds) vs bm25 (ndcg)":{"diff":0.049846851167119385,"ci95":[0.0401672309652675,0.0593400448138458],"p":9.999000099990002e-05,"relative":0.3089040638637403},"rrf(bm25, vector, ppr from hybrid seeds) vs bm25 (recall)":{"diff":0.0602748563438764,"ci95":[0.04971034385194848,0.0710501079893409],"p":9.999000099990002e-05,"relative":0.4207430543714612},"ppr from vector seeds vs bm25 (ndcg)":{"diff":0.04923230539547579,"ci95":[0.028027812595237903,0.07030123435749215],"p":9.999000099990002e-05,"relative":0.30509568516285646},"ppr from vector seeds vs bm25 (recall)":{"diff":0.0420176616674863,"ci95":[0.02256195489729681,0.061555004013901043],"p":9.999000099990002e-05,"relative":0.2933003972114967},"linked to vector seeds either way, by similarity vs bm25 (ndcg)":{"diff":0.045117952439181715,"ci95":[0.026894202453668085,0.06379099829781062],"p":9.999000099990002e-05,"relative":0.2795987817755591},"linked to vector seeds either way, by similarity vs bm25 (recall)":{"diff":0.054938701839537134,"ci95":[0.03669808436541807,0.0736010405318072],"p":9.999000099990002e-05,"relative":0.38349452188314065},"rrf(vector, ppr from vector seeds) vs bm25 (ndcg)":{"diff":0.02708512700559711,"ci95":[0.01213813287121541,0.04179021168818964],"p":0.00029997000299970003,"relative":0.1678482312602614},"rrf(vector, ppr from vector seeds) vs bm25 (recall)":{"diff":0.04442438738275909,"ci95":[0.029803964214951913,0.05954605996919142],"p":9.999000099990002e-05,"relative":0.31010032324866743},"hybrid vs bm25 (ndcg)":{"diff":-0.0010918394306715978,"ci95":[-0.008792875263809122,0.006632195512601903],"p":0.7834216578342166,"relative":-0.006766197449270493},"hybrid vs bm25 (recall)":{"diff":0.0014481963574782466,"ci95":[-0.006383287865441138,0.009200151197854745],"p":0.7139286071392861,"relative":0.010109000597177292},"vector vs bm25 (ndcg)":{"diff":-0.03862656618023244,"ci95":[-0.05000254785857621,-0.0270701763626429],"p":9.999000099990002e-05,"relative":-0.23937125388666852},"vector vs bm25 (recall)":{"diff":-0.03452359377465868,"ci95":[-0.04484542797795211,-0.024230720977459],"p":9.999000099990002e-05,"relative":-0.24098875009770432},"semantic kNN graph from vector seeds vs bm25 (ndcg)":{"diff":-0.0828289886371879,"ci95":[-0.09582257108155352,-0.06984661382071032],"p":9.999000099990002e-05,"relative":-0.5132964389258837},"semantic kNN graph from vector seeds vs bm25 (recall)":{"diff":-0.07502786949714095,"ci95":[-0.08653948985758046,-0.06342603825389963],"p":9.999000099990002e-05,"relative":-0.5237250968316501},"cited by vector seeds, by similarity vs hybrid (ndcg)":{"diff":0.09237488384821285,"ci95":[0.0720669107021638,0.11304422240830812],"p":9.999000099990002e-05,"relative":0.5763526663587866},"cited by vector seeds, by similarity vs hybrid (recall)":{"diff":0.08007771621231305,"ci95":[0.05970920430201193,0.09999698194480482],"p":9.999000099990002e-05,"relative":0.5533809558909276},"rrf(bm25, vector, ppr from hybrid seeds) vs hybrid (ndcg)":{"diff":0.050938690597790985,"ci95":[0.04441612709126242,0.05775711734731869],"p":9.999000099990002e-05,"relative":0.31782069891533704},"rrf(bm25, vector, ppr from hybrid seeds) vs hybrid (recall)":{"diff":0.058826659986398154,"ci95":[0.049405590029593376,0.06826909325302033],"p":9.999000099990002e-05,"relative":0.4065244973874272},"ppr from vector seeds vs hybrid (ndcg)":{"diff":0.05032414482614738,"ci95":[0.028871009490493187,0.07262828545587285],"p":9.999000099990002e-05,"relative":0.31398637643144295},"ppr from vector seeds vs hybrid (recall)":{"diff":0.04056946531000805,"ci95":[0.02077564123189865,0.060682543167564267],"p":9.999000099990002e-05,"relative":0.28035726485646245},"linked to vector seeds either way, by similarity vs hybrid (ndcg)":{"diff":0.046209791869853314,"ci95":[0.0282987710179632,0.06415630450500205],"p":9.999000099990002e-05,"relative":0.2883157807249552},"linked to vector seeds either way, by similarity vs hybrid (recall)":{"diff":0.05349050548205889,"ci95":[0.03524663560964518,0.07139654265995889],"p":9.999000099990002e-05,"relative":0.36964874193301667},"rrf(vector, ppr from vector seeds) vs hybrid (ndcg)":{"diff":0.02817696643626871,"ci95":[0.015598144775955057,0.040588333537466915],"p":9.999000099990002e-05,"relative":0.17580395296767343},"rrf(vector, ppr from vector seeds) vs hybrid (recall)":{"diff":0.042976191025280844,"ci95":[0.029340781013842146,0.05701229679561638],"p":9.999000099990002e-05,"relative":0.2969890600659285},"bm25 vs hybrid (ndcg)":{"diff":0.0010918394306715978,"ci95":[-0.006420090770377978,0.008886746459571496],"p":0.7821217878212179,"relative":0.006812290753591129},"bm25 vs hybrid (recall)":{"diff":-0.0014481963574782466,"ci95":[-0.00922991834570182,0.006289926696840114],"p":0.7062293770622937,"relative":-0.010007831423342274},"vector vs hybrid (ndcg)":{"diff":-0.03753472674956084,"ci95":[-0.04490472304350246,-0.030274139285256657],"p":9.999000099990002e-05,"relative":-0.23418962971260499},"vector vs hybrid (recall)":{"diff":-0.03597179013213693,"ci95":[-0.04398258064297009,-0.028296602013231035],"p":9.999000099990002e-05,"relative":-0.2485848067351468},"semantic kNN graph from vector seeds vs hybrid (ndcg)":{"diff":-0.0817371492065163,"ci95":[-0.09312456605622947,-0.0703885123727978],"p":9.999000099990002e-05,"relative":-0.5099808727570385},"semantic kNN graph from vector seeds vs hybrid (recall)":{"diff":-0.07647606585461919,"ci95":[-0.08732709030590183,-0.06610868770932822],"p":9.999000099990002e-05,"relative":-0.5284915757737276}}}};
+</script>
+<script>
+(function () {
+  "use strict";
+  const NS = "http://www.w3.org/2000/svg";
+  const $ = (s) => document.querySelector(s);
+
+  function s(tag, attrs, parent, text) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function h(tag, attrs, parent, text) {
+    const e = document.createElement(tag);
+    for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  const fmt = (v, d) => (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(d === undefined ? 1 : Math.max(0, d - 1)) : v.toFixed(d === undefined ? 2 : d));
+  const ms = (v) => (v < 0.1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v.toFixed(1));
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  // ---------------------------------------------------------------- charts
+  const tip = $("#tip");
+  function showTip(evt, html) {
+    tip.replaceChildren(...html);
+    tip.hidden = false;
+    const fr = evt.currentTarget.closest(".frame");
+    const r = fr.getBoundingClientRect();
+    let left = evt.clientX - r.left + fr.scrollLeft + 14;
+    let top = evt.clientY - r.top + 14;
+    if (left + 230 > r.width) left = Math.max(4, left - 250);
+    fr.appendChild(tip);
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  }
+  function hideTip() { tip.hidden = true; }
+  function tipRows(title, rows) {
+    const out = [h("div", { class: "h" }, null, title)];
+    rows.forEach(([color, label, value]) => {
+      const r = h("div", { class: "row" });
+      if (color) { const i = h("i", {}, r); i.style.background = color; }
+      h("b", {}, r, value);
+      h("span", {}, r, " " + label);
+      out.push(r);
+    });
+    return out;
+  }
+
+  function logTicks(min, max) {
+    const t = [];
+    for (let e = Math.floor(Math.log10(min)); e <= Math.ceil(Math.log10(max)); e++) {
+      [1, 2, 5].forEach((m) => { const v = m * 10 ** e; if (v >= min * 0.999 && v <= max * 1.001) t.push(v); });
+    }
+    return t;
+  }
+  function linTicks(min, max, n) {
+    const span = max - min, step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((st) => span / st <= n) || 10 * mag;
+    const t = [];
+    for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) t.push(+v.toFixed(10));
+    return t;
+  }
+  const tickLabel = (v) => (v >= 1000 ? (v / 1000) + "K" : v >= 1 ? String(+v.toFixed(2)) : String(+v.toPrecision(2)));
+
+  function frame(container, height, margin) {
+    container.replaceChildren();
+    const width = Math.max(300, container.clientWidth);
+    const svg = s("svg", { class: "ch", width, height, viewBox: `0 0 ${width} ${height}` }, container);
+    return { svg, width, height, iw: width - margin.l - margin.r, ih: height - margin.t - margin.b, m: margin };
+  }
+
+  function axes(f, xs, ys, xt, yt, xTitle, yTitle) {
+    const g = s("g", {}, f.svg);
+    yt.forEach((v) => {
+      const y = f.m.t + ys(v);
+      s("line", { x1: f.m.l, x2: f.m.l + f.iw, y1: y, y2: y, class: "grid" }, g);
+      s("text", { x: f.m.l - 6, y: y + 4, "text-anchor": "end" }, g, tickLabel(v));
+    });
+    xt.forEach((v) => {
+      const x = f.m.l + xs(v);
+      s("line", { x1: x, x2: x, y1: f.m.t + f.ih, y2: f.m.t + f.ih + 4, class: "axis" }, g);
+      s("text", { x, y: f.m.t + f.ih + 17, "text-anchor": "middle" }, g, tickLabel(v));
+    });
+    s("line", { x1: f.m.l, x2: f.m.l + f.iw, y1: f.m.t + f.ih, y2: f.m.t + f.ih, class: "axis" }, g);
+    s("text", { x: f.m.l + f.iw / 2, y: f.height - 4, "text-anchor": "middle", class: "axis-title" }, g, xTitle);
+    s("text", { x: 12, y: f.m.t + f.ih / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 12 ${f.m.t + f.ih / 2})` }, g, yTitle);
+  }
+
+  // Scatter of space vs time with a highlighted Pareto frontier.
+  function scatter(container, pts, opt) {
+    const f = frame(container, opt.height || 360, { l: 58, r: 20, t: 14, b: 42 });
+    const xmin = Math.min(...pts.map((p) => p.x)) / 1.12, xmax = Math.max(...pts.map((p) => p.x)) * 1.12;
+    const ylo = Math.min(...pts.map((p) => p.y)) / 1.35, yhi = Math.max(...pts.map((p) => p.y)) * 1.35;
+    const xs = (v) => ((Math.log(v) - Math.log(xmin)) / (Math.log(xmax) - Math.log(xmin))) * f.iw;
+    const ys = (v) => f.ih - ((Math.log(v) - Math.log(ylo)) / (Math.log(yhi) - Math.log(ylo))) * f.ih;
+    axes(f, xs, ys, [4, 5, 6, 8, 10, 12, 16, 20, 32].filter((v) => v >= xmin && v <= xmax), logTicks(ylo, yhi), opt.xTitle, opt.yTitle);
+    const sorted = pts.slice().sort((a, b) => a.x - b.x);
+    let best = Infinity;
+    const front = [];
+    sorted.forEach((p) => { if (p.y < best) { best = p.y; front.push(p); p.front = true; } });
+    const g = s("g", {}, f.svg);
+    s("polyline", { points: front.map((p) => `${f.m.l + xs(p.x)},${f.m.t + ys(p.y)}`).join(" "), fill: "none", stroke: css("--accent"), "stroke-width": 1.5, "stroke-dasharray": "0", opacity: 0.45 }, g);
+    const placed = [];
+    const overlaps = (b) => placed.some((q) => b.x < q.x + q.w && b.x + b.w > q.x && b.y < q.y + q.h && b.y + b.h > q.y);
+    pts.forEach((p) => {
+      const cx = f.m.l + xs(p.x), cy = f.m.t + ys(p.y);
+      placed.push({ x: cx - 6, y: cy - 6, w: 12, h: 12 });
+    });
+    pts.slice().sort((a, b) => (b.strong ? 1 : 0) - (a.strong ? 1 : 0)).forEach((p) => {
+      const cx = f.m.l + xs(p.x), cy = f.m.t + ys(p.y);
+      const c = s("circle", { cx, cy, r: p.color ? 6.5 : 5.5, fill: p.color || (p.front ? css("--accent") : css("--ink-3")), stroke: css("--surface"), "stroke-width": 2, tabindex: 0 }, g);
+      const hit = s("circle", { cx, cy, r: 13, fill: "transparent" }, g);
+      const show = (e) => showTip(e, tipRows(p.label, [[null, opt.xTitle, fmt(p.x)], [null, "ms/query" + (p.algo ? " · " + p.algo : ""), ms(p.y)]]));
+      [c, hit].forEach((el) => { el.addEventListener("pointermove", show); el.addEventListener("pointerleave", hideTip); });
+      const w = p.label.length * 6.4 + 4;
+      const cands = [[cx + 9, cy + 4], [cx - 9 - w, cy + 4], [cx - w / 2, cy - 11], [cx - w / 2, cy + 19], [cx + 9, cy - 9], [cx + 9, cy + 15], [cx - 9 - w, cy - 9], [cx - 9 - w, cy + 15]];
+      for (const [lx, ly] of cands) {
+        const box = { x: lx, y: ly - 10, w, h: 13 };
+        if (lx < f.m.l || lx + w > f.width - 2 || ly - 10 < 0 || ly > f.m.t + f.ih) continue;
+        if (!overlaps(box)) {
+          placed.push(box);
+          s("text", { x: lx, y: ly, class: p.front || p.strong ? "lab-strong" : "lab" }, g, p.label);
+          break;
+        }
+      }
+    });
+  }
+
+  // Horizontal bars, one or more series per category.
+  function hbars(container, cats, series, opt) {
+    const band = series.length > 1 ? 14 * series.length + 10 : 26;
+    const f = frame(container, cats.length * band + 46, { l: opt.labelWidth || 190, r: 64, t: 8, b: 36 });
+    const vmax = Math.max(...series.flatMap((sr) => sr.values.filter((v) => v != null))) * 1.05;
+    const xs = (v) => (v / vmax) * f.iw;
+    const xt = linTicks(0, vmax, 5);
+    const g = s("g", {}, f.svg);
+    xt.forEach((v) => {
+      const x = f.m.l + xs(v);
+      s("line", { x1: x, x2: x, y1: f.m.t, y2: f.m.t + f.ih, class: "grid" }, g);
+      s("text", { x, y: f.m.t + f.ih + 16, "text-anchor": "middle" }, g, tickLabel(v));
+    });
+    s("text", { x: f.m.l + f.iw / 2, y: f.height - 4, "text-anchor": "middle", class: "axis-title" }, g, opt.xTitle);
+    cats.forEach((cat, i) => {
+      const y0 = f.m.t + i * band + 4;
+      s("text", { x: f.m.l - 8, y: y0 + band / 2 - 1, "text-anchor": "end", class: "lab" }, g, cat);
+      series.forEach((sr, j) => {
+        const v = sr.values[i];
+        if (v == null) return;
+        const bh = series.length > 1 ? 12 : 16;
+        const y = y0 + (series.length > 1 ? j * 14 : (band - bh) / 2 - 2);
+        const w = Math.max(2, xs(v));
+        const r = Math.min(4, w / 2);
+        s("path", { d: `M${f.m.l} ${y} H${f.m.l + w - r} Q${f.m.l + w} ${y} ${f.m.l + w} ${y + r} V${y + bh - r} Q${f.m.l + w} ${y + bh} ${f.m.l + w - r} ${y + bh} H${f.m.l} Z`, fill: sr.color }, g);
+        s("text", { x: f.m.l + w + 5, y: y + bh - 3, class: "lab" }, g, opt.valueFmt ? opt.valueFmt(v) : fmt(v));
+        const hit = s("rect", { x: f.m.l, y: y - 1, width: Math.max(w, 30), height: bh + 2, fill: "transparent" }, g);
+        hit.addEventListener("pointermove", (e) => showTip(e, tipRows(cat, series.map((q) => [q.color, q.name, q.values[i] == null ? "—" : (opt.valueFmt ? opt.valueFmt(q.values[i]) : fmt(q.values[i]))]))));
+        hit.addEventListener("pointerleave", hideTip);
+      });
+    });
+  }
+
+  // Multi-series line chart; log axes optional; crosshair tooltip.
+  function lines(container, xsVals, series, opt) {
+    const f = frame(container, opt.height || 340, { l: 58, r: 20, t: 14, b: 42 });
+    const all = series.flatMap((sr) => sr.values.filter((v) => v != null));
+    const ylo = opt.logY ? Math.min(...all) / 1.3 : 0, yhi = Math.max(...all) * (opt.logY ? 1.3 : 1.08);
+    const xlo = Math.min(...xsVals), xhi = Math.max(...xsVals);
+    const xs = opt.logX ? (v) => ((Math.log(v) - Math.log(xlo)) / (Math.log(xhi) - Math.log(xlo))) * f.iw : (v) => ((v - xlo) / (xhi - xlo)) * f.iw;
+    const ys = opt.logY ? (v) => f.ih - ((Math.log(v) - Math.log(ylo)) / (Math.log(yhi) - Math.log(ylo))) * f.ih : (v) => f.ih - (v / yhi) * f.ih;
+    axes(f, xs, ys, opt.xTicks || xsVals, opt.logY ? logTicks(ylo, yhi) : linTicks(0, yhi, 5), opt.xTitle, opt.yTitle);
+    const g = s("g", {}, f.svg);
+    series.forEach((sr) => {
+      const pts = xsVals.map((x, i) => [x, sr.values[i]]).filter((p) => p[1] != null);
+      s("polyline", { points: pts.map(([x, y]) => `${f.m.l + xs(x)},${f.m.t + ys(y)}`).join(" "), fill: "none", stroke: sr.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, g);
+      pts.forEach(([x, y]) => s("circle", { cx: f.m.l + xs(x), cy: f.m.t + ys(y), r: 3.5, fill: sr.color, stroke: css("--surface"), "stroke-width": 1.5 }, g));
+    });
+    const cross = s("line", { y1: f.m.t, y2: f.m.t + f.ih, stroke: css("--ink-3"), "stroke-width": 1, opacity: 0 }, g);
+    const hit = s("rect", { x: f.m.l, y: f.m.t, width: f.iw, height: f.ih, fill: "transparent" }, g);
+    hit.addEventListener("pointermove", (e) => {
+      const r = f.svg.getBoundingClientRect();
+      const px = e.clientX - r.left - f.m.l;
+      let bi = 0;
+      xsVals.forEach((x, i) => { if (Math.abs(xs(x) - px) < Math.abs(xs(xsVals[bi]) - px)) bi = i; });
+      const cx = f.m.l + xs(xsVals[bi]);
+      cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("opacity", 0.5);
+      const rows = series.map((sr) => [sr.color, sr.name, sr.values[bi] == null ? "—" : (opt.valueFmt || fmt)(sr.values[bi])])
+        .sort((a, b) => parseFloat(a[2]) - parseFloat(b[2]));
+      showTip(e, tipRows((opt.xLabel || "") + xsVals[bi], rows));
+    });
+    hit.addEventListener("pointerleave", () => { cross.setAttribute("opacity", 0); hideTip(); });
+  }
+
+  function legend(container, series, square) {
+    const l = h("div", { class: "legend" });
+    series.forEach((sr) => {
+      const sp = h("span", {}, l);
+      const i = h("i", square ? { class: "sq" } : {}, sp);
+      i.style.background = sr.color;
+      sp.appendChild(document.createTextNode(sr.name));
+    });
+    container.parentNode.insertBefore(l, container);
+  }
+
+
+  window.PB = { s, h, fmt, ms, css, scatter, hbars, lines, legend, showTip, hideTip, tipRows };
+})();
+
+// Diagrams of the graph report: a segment's graph section and the query
+// flow.
+(function () {
+  "use strict";
+  const { s } = window.PB;
+  const $ = (q) => document.querySelector(q);
+
+  function box(g, x, y, w, h, cls, title, sub) {
+    s("rect", { x, y, width: w, height: h, rx: 6, class: cls }, g);
+    if (title) s("text", { x: x + 10, y: y + (sub ? 19 : h / 2 + 4.5), class: "tb" }, g, title);
+    if (sub) (Array.isArray(sub) ? sub : [sub]).forEach((line, i) => s("text", { x: x + 10, y: y + 35 + i * 14, class: "ts" }, g, line));
+  }
+  function arrow(g, x1, y1, x2, y2, cls) {
+    s("path", { d: `M${x1} ${y1} L${x2} ${y2}`, class: cls || "ln" }, g);
+    const a = Math.atan2(y2 - y1, x2 - x1);
+    const p = (r, t) => `${x2 - r * Math.cos(a - t)} ${y2 - r * Math.sin(a - t)}`;
+    s("path", { d: `M${x2} ${y2} L${p(7, 0.45)} L${p(7, -0.45)} Z`, class: cls === "ln-acc" ? "ah" : "ahm" }, g);
+  }
+  // A row of array cells with a label.
+  function cells(g, x, y, label, values, cls, w) {
+    s("text", { x, y: y - 6, class: "tl" }, g, label);
+    values.forEach((v, i) => {
+      s("rect", { x: x + i * (w || 30), y, width: (w || 30) - 3, height: 22, rx: 3, class: cls || "box" }, g);
+      s("text", { x: x + i * (w || 30) + ((w || 30) - 3) / 2, y: y + 15, class: "tm", "text-anchor": "middle" }, g, v);
+    });
+  }
+
+  function storage() {
+    const g = $("#storage-diagram");
+    if (!g) return;
+    s("rect", { x: 0, y: 0, width: 500, height: 330, rx: 8, class: "box" }, g);
+    s("text", { x: 12, y: 20, class: "tb" }, g, "segment 2 · section graph.cites");
+    // Out CSR.
+    s("text", { x: 12, y: 44, class: "ts" }, g, "out-edges (CSR over local docIDs)");
+    cells(g, 12, 66, "offsets", ["0", "2", "2", "5"], "box", 32);
+    cells(g, 160, 66, "target key", ["p7", "p9", "p2", "p7", "q4"], "box-acc", 46);
+    cells(g, 160, 112, "label · weight", ["—", "ext", "—", "—", "cit"], "box", 46);
+    cells(g, 160, 158, "same-segment hint", ["14", "—", "3", "14", "—"], "box-warm", 46);
+    s("text", { x: 12, y: 104, class: "ts" }, g, "doc 0: edges 0..2");
+    s("text", { x: 12, y: 118, class: "ts" }, g, "doc 2: edges 2..5");
+    // Reverse index.
+    s("text", { x: 12, y: 214, class: "ts" }, g, "reverse index (grouped by target key, ordered by hash)");
+    cells(g, 12, 236, "radix dir", ["·", "·", "·", "·"], "box", 26);
+    cells(g, 130, 236, "groups: key", ["p2", "p7", "p9", "q4"], "box-acc", 46);
+    cells(g, 330, 236, "sources", ["2", "0", "2", "0", "2"], "box", 30);
+    s("text", { x: 12, y: 290, class: "ts" }, g, "who points at p7? one directory read, one key check, then sources 0 and 2 in sequence");
+    s("text", { x: 12, y: 306, class: "ts" }, g, "(hash collisions make separate groups; integer keys need no check)");
+    // Resolution.
+    arrow(g, 395, 77, 540, 60, "ln-acc");
+    box(g, 540, 30, 220, 74, "box-acc", "hint row still live?", ["yes: that row is the target", "(a key has one live row)"]);
+    arrow(g, 650, 104, 650, 132);
+    box(g, 540, 132, 220, 74, "box", "else: memo, then key lookup", ["this query's resolved keys,", "then each segment's pk index"]);
+    arrow(g, 650, 206, 650, 234);
+    box(g, 540, 234, 220, 74, "box-warm", "snapshot", ["disk segments 1, 2, 3 and", "memtable segments; live rows only"]);
+  }
+
+  function flow() {
+    const g = $("#flow-diagram");
+    if (!g) return;
+    box(g, 0, 18, 150, 82, "box-acc", "seeds", ["keys, a tuple, or a", "subquery: vector, BM25,", "filters, LIMIT"]);
+    box(g, 0, 130, 150, 82, "box", "graph options", ["dir, label, through,", "hops, alpha, eps"]);
+    arrow(g, 150, 60, 186, 100, "ln-acc");
+    arrow(g, 150, 170, 186, 130);
+    box(g, 186, 66, 170, 98, "box-warm", "traversal", ["over the whole snapshot:", "BFS, bidirectional path,", "or PageRank push;", "edges resolved by key"]);
+    arrow(g, 356, 115, 392, 115, "ln-acc");
+    box(g, 392, 52, 180, 126, "box-acc", "per segment", ["document set with exact", "cardinality (REACHABLE,", "PATH), plus each row's", "hops and PageRank score", "(hops(), ppr())"]);
+    arrow(g, 572, 115, 608, 115, "ln-acc");
+    box(g, 608, 40, 152, 150, "box", "usual plan", ["filter: probe or", "materialise; vector", "search over a small set", "= exact pre-filtered", "scan; rrf, weighted", "fusion, facets, COUNT"]);
+    s("text", { x: 0, y: 232, class: "ts" }, g, "A seed subquery runs as a query of its own on the same snapshot; through-predicates are compiled per segment and probed during the traversal.");
+  }
+
+  storage();
+  flow();
+})();
+
+</script>
+<script>
+// Tables and charts of the graph report, drawn from DATA
+// (scripts/build_graph_report.py).
+(function () {
+  "use strict";
+  const { h, css, lines, legend } = window.PB;
+  const $ = (q) => document.querySelector(q);
+  const D = DATA;
+  if (!D) return;
+  const num = (v, d) => (v == null || !isFinite(v) ? "—" : v.toFixed(d));
+  const int = (v) => (v == null ? "—" : Math.round(v).toLocaleString("en-US"));
+  const msf = (v) => (v == null ? "—" : v < 0.1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v.toFixed(1));
+  const mb = (b) => (b / 1e6).toFixed(1) + " MB";
+
+  function table(container, head, rows, numeric, opts) {
+    if (!container) return;
+    container.replaceChildren();
+    const wrap = h("div", { class: "table-wrap" + (opts && opts.cls ? " " + opts.cls : "") }, container);
+    const t = h("table", {}, wrap);
+    const tr = h("tr", {}, h("thead", {}, t));
+    head.forEach((c, i) => h("th", numeric.includes(i) ? { class: "num" } : {}, tr, c));
+    const tb = h("tbody", {}, t);
+    rows.forEach((r) => {
+      const row = h("tr", {}, tb);
+      r.forEach((c, i) => {
+        const cell = h("td", numeric.includes(i) ? { class: "num" } : {}, row);
+        if (c && typeof c === "object") {
+          cell.textContent = c.v;
+          if (c.cls) cell.className = (cell.className + " " + c.cls).trim();
+        } else cell.textContent = c;
+      });
+    });
+  }
+
+  function tabs(container, items, onPick) {
+    const bar = h("div", { class: "tabs", role: "group" });
+    container.parentNode.insertBefore(bar, container);
+    const btns = items.map(([key, label]) => {
+      const b = h("button", { type: "button", "aria-pressed": "false" }, bar, label);
+      b.addEventListener("click", () => pick(key));
+      return [key, b];
+    });
+    function pick(key) {
+      btns.forEach(([k, b]) => b.setAttribute("aria-pressed", String(k === key)));
+      onPick(key);
+    }
+    pick(items[0][0]);
+  }
+
+  function sizeTable() {
+    const L = D.load;
+    if (!L) return;
+    const c = L.sizes.components;
+    const order = ["vectors", "doc store", "graph", "text", "primary key", "columns"];
+    const names = { vectors: "vectors (float32, SQ8, HNSW)", "doc store": "doc store (title, abstract, edges as stored JSON)", graph: "graph section", text: "full-text index", "primary key": "primary key", columns: "columns (year, category)" };
+    const rows = order.filter((k) => c[k] != null).map((k) => [{ v: names[k], cls: k === "graph" ? "sys" : "" }, mb(c[k]), num((100 * c[k]) / L.sizes.file_bytes, 1) + "%", k === "graph" ? num(c[k] / L.edges, 1) : ""]);
+    rows.push([{ v: "file", cls: "sys" }, mb(L.sizes.file_bytes), "100%", ""]);
+    table($("#size-table"), ["arXiv table, " + int(L.papers) + " rows, " + int(L.edges) + " edges", "size", "share", "bytes per edge"], rows, [1, 2, 3], { cls: "compact" });
+  }
+
+  const QNAMES = {
+    reach_out_1: "REACHABLE, 1 hop out",
+    reach_out_2: "REACHABLE, 2 hops out",
+    reach_out_3: "REACHABLE, 3 hops out",
+    reach_in_1: "REACHABLE, 1 hop in",
+    reach_both_1: "REACHABLE, 1 hop both ways",
+    reach_both_2: "REACHABLE, 2 hops both ways",
+    reach_both_2_top20: "the same, top 20 by hops() with ids",
+    path_out: "PATH along the edges",
+    path_both: "PATH either way",
+    "ppr_1e-4": "ppr, ε = 10⁻⁴, top 20",
+    "ppr_1e-5": "ppr, ε = 10⁻⁵, top 20",
+    vector_top20: "vector search alone, top 20",
+    vector_seeds_expand: "vector seeds → neighbours, by similarity",
+    rrf_vector_ppr: "rrf(similarity, ppr from vector seeds)",
+    semantic_knn_1hop: "similarity graph, 1 hop of 10",
+    semantic_knn_2hop: "similarity graph, 2 hops of 10",
+  };
+
+  function speedTable(el, R) {
+    const p = (o) => (o ? `${msf(o.p50)} / ${msf(o.p95)}` : "—");
+    const rows = Object.keys(QNAMES).filter((k) => R.results[k]).map((k) => {
+      const r = R.results[k];
+      const vsLite = r.sqlite_ms ? num(r.sqlite_ms.p95 / r.strata_ms.p95, 1) + "×" : "";
+      const vsCsr = r.csr_ms ? num(r.strata_ms.p50 / r.csr_ms.p50, 1) + "×" : "";
+      const extra = r.rows != null ? int(r.rows) + " rows" : r.found != null ? `${r.found} of ${R.queries} found` : r.pushes != null ? int(r.pushes) + " pushes" : "";
+      return [{ v: QNAMES[k], cls: "sys" }, extra, p(r.strata_ms), p(r.sqlite_ms), p(r.csr_ms), vsLite, vsCsr];
+    });
+    table(el, ["query (200 seeds)", "result", "Strata p50 / p95 ms", "SQLite p50 / p95 ms", "in-memory CSR p50 / p95 ms", "SQLite ÷ Strata, p95", "Strata ÷ CSR, p50"], rows, [2, 3, 4, 5, 6], { cls: "wrap-head compact" });
+  }
+
+  function speed() {
+    const el = $("#speed-tabs");
+    if (!el) return;
+    const sets = [["arxiv", "arXiv: 168k rows, 1.15M edges, 2 segments"], ["synthetic", "power law: 1M rows, 10M edges, 4 segments"]].filter(([k]) => D.speed[k]);
+    tabs(el, sets, (k) => speedTable(el, D.speed[k]));
+  }
+
+  function speedHistory() {
+    const el = $("#speed-history");
+    const H = D.history;
+    if (!el || !H) return;
+    const rows = [];
+    for (const [set, label] of [["arxiv", "arXiv"], ["synthetic", "power law, 1M"]]) {
+      const a = H[set] && H[set].before, b = H[set] && H[set].after;
+      if (!a || !b) continue;
+      for (const k of ["reach_out_3", "reach_both_2", "path_both", "ppr_1e-4", "ppr_1e-5"]) {
+        if (!a[k] || !b[k]) continue;
+        rows.push([{ v: label, cls: "sys" }, QNAMES[k], msf(a[k].strata_ms.p50), msf(b[k].strata_ms.p50), num(a[k].strata_ms.p50 / b[k].strata_ms.p50, 1) + "×", b[k].csr_ms ? msf(b[k].csr_ms.p50) : "—"]);
+      }
+    }
+    table(el, ["graph", "query", "first version, p50 ms", "now, p50 ms", "faster by", "CSR, p50 ms"], rows, [2, 3, 4, 5], { cls: "wrap-head compact" });
+  }
+
+  const FAMILY = {
+    vector: "vector search",
+    bm25: "BM25",
+    hybrid: "hybrid: rrf(BM25, vector)",
+    "cited by vector seeds, by similarity": "papers the seeds cite, by similarity",
+    "linked to vector seeds either way, by similarity": "papers linked to the seeds either way, by similarity",
+    "ppr from vector seeds": "PageRank from vector seeds",
+    "rrf(vector, ppr from vector seeds)": "rrf(vector, PageRank from vector seeds)",
+    "rrf(bm25, vector, ppr from hybrid seeds)": "rrf(BM25, vector, PageRank from hybrid seeds)",
+    "semantic kNN graph from vector seeds": "similarity graph (10 nearest) from vector seeds",
+  };
+  const COLORS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"];
+
+  function qualityTable() {
+    const el = $("#quality-table");
+    const Q = D.quality;
+    if (!el || !Q) return;
+    const ms = Object.entries(Q.methods).sort((a, b) => b[1].ndcg - a[1].ndcg);
+    const base = Q.methods.vector;
+    const rows = ms.map(([k, r]) => {
+      const graph = r.S != null;
+      const edges = !graph ? "no" : k.startsWith("semantic") ? "no: similarity edges" : "yes";
+      const cls = k === "cited by vector seeds, by similarity" ? "good" : graph ? "" : "sys";
+      return [{ v: FAMILY[k] || k, cls }, edges, r.S == null ? "" : String(r.S), num(r.recall, 3), num(r.ndcg, 3), (r.ndcg >= base.ndcg ? "+" : "") + num((100 * (r.ndcg - base.ndcg)) / base.ndcg, 0) + "%", msf(r.ms)];
+    });
+    table(el, ["method (report half, " + Q.queries.test + " papers)", "uses citations", "seeds S (chosen on the other half)", "recall@20", "nDCG@20", "nDCG vs vector search", "ms per query"], rows, [2, 3, 4, 5, 6], { cls: "wrap-head compact" });
+  }
+
+  function sweep() {
+    const el = $("#sweep-chart");
+    const Q = D.quality;
+    if (!el || !Q) return;
+    const fams = ["cited by vector seeds, by similarity", "linked to vector seeds either way, by similarity", "ppr from vector seeds", "rrf(bm25, vector, ppr from hybrid seeds)", "rrf(vector, ppr from vector seeds)", "semantic kNN graph from vector seeds"];
+    const xs = [1, 2, 3, 5, 10, 20, 50];
+    const series = fams.filter((f) => Q.sweep[f]).map((f, i) => ({ name: FAMILY[f], color: css(COLORS[i % COLORS.length]), values: xs.map((x) => (Q.sweep[f][String(x)] ? Q.sweep[f][String(x)].test_ndcg : null)) }));
+    for (const [f, c] of [["vector", "--ink-3"], ["hybrid", "--ink-2"]]) {
+      const v = Q.sweep[f] && Q.sweep[f]["None"] ? Q.sweep[f]["None"].test_ndcg : null;
+      if (v != null) series.push({ name: FAMILY[f], color: css(c), values: xs.map(() => v) });
+    }
+    legend(el, series);
+    lines(el, xs, series, { logX: true, xTitle: "vector seeds S", yTitle: "nDCG@20", xLabel: "S = ", valueFmt: (v) => v.toFixed(3), height: 320 });
+  }
+
+  function compareTable() {
+    const el = $("#compare-table");
+    const Q = D.quality;
+    if (!el || !Q) return;
+    const rows = [];
+    for (const base of ["vector", "hybrid", "bm25"]) {
+      const best = Object.entries(Q.methods).filter(([k, r]) => r.S != null).sort((a, b) => b[1].ndcg - a[1].ndcg);
+      for (const [k] of best) {
+        const c = Q.comparisons[`${k} vs ${base} (ndcg)`];
+        const r = Q.comparisons[`${k} vs ${base} (recall)`];
+        if (!c) continue;
+        const p = c.p < 0.001 ? "< 0.001" : num(c.p, 3);
+        rows.push([{ v: FAMILY[k] || k, cls: c.diff > 0 ? "" : "sys" }, FAMILY[base], (c.diff >= 0 ? "+" : "") + num(c.diff, 3), `${num(c.ci95[0], 3)} to ${num(c.ci95[1], 3)}`, (c.relative >= 0 ? "+" : "") + num(100 * c.relative, 0) + "%", r ? (r.diff >= 0 ? "+" : "") + num(r.diff, 3) : "—", p]);
+      }
+    }
+    table(el, ["graph method", "against", "Δ nDCG@20", "95% interval", "relative", "Δ recall@20", "p (sign-flip)"], rows, [2, 3, 4, 5, 6], { cls: "wrap-head compact" });
+  }
+
+  function meta() {
+    const el = $("#meta-line");
+    if (el) el.textContent = `Generated ${D.generated} · ogbn-arxiv and a synthetic power-law graph · 4-core machine, warm cache · results in strata/results/graph`;
+  }
+
+  meta();
+  sizeTable();
+  speed();
+  speedHistory();
+  qualityTable();
+  sweep();
+  compareTable();
+  let last = window.innerWidth;
+  window.addEventListener("resize", () => {
+    if (Math.abs(window.innerWidth - last) < 40) return;
+    last = window.innerWidth;
+    document.querySelectorAll(".legend").forEach((l) => l.remove());
+    sweep();
+  });
+})();
+
+</script>

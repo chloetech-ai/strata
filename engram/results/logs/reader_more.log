@@ -1,0 +1,50 @@
+2000 answers to get (3000 cached)
+  read 50/2000 in 61 s
+  read 100/2000 in 130 s
+  read 150/2000 in 199 s
+  read 200/2000 in 258 s
+  read 250/2000 in 312 s
+  read 300/2000 in 366 s
+  read 350/2000 in 419 s
+  read 400/2000 in 464 s
+  read 450/2000 in 517 s
+  read 500/2000 in 569 s
+  read 550/2000 in 616 s
+  read 600/2000 in 665 s
+  read 650/2000 in 719 s
+  read 700/2000 in 771 s
+  read 750/2000 in 820 s
+  read 800/2000 in 867 s
+  read 850/2000 in 922 s
+  read 900/2000 in 969 s
+  read 950/2000 in 1019 s
+  read 1000/2000 in 1067 s
+  read 1050/2000 in 1114 s
+  read 1100/2000 in 1166 s
+  read 1150/2000 in 1219 s
+  read 1200/2000 in 1269 s
+  read 1250/2000 in 1317 s
+  read 1300/2000 in 1368 s
+  read 1350/2000 in 1412 s
+  read 1400/2000 in 1463 s
+  read 1450/2000 in 1512 s
+  read 1500/2000 in 1556 s
+  read 1550/2000 in 1591 s
+  read 1600/2000 in 1634 s
+  read 1650/2000 in 1685 s
+  read 1700/2000 in 1728 s
+  read 1750/2000 in 1774 s
+  read 1800/2000 in 1822 s
+  read 1850/2000 in 1869 s
+  read 1900/2000 in 1909 s
+  read 1950/2000 in 1952 s
+  read 2000/2000 in 1998 s
+2000 answers to grade in 200 calls
+  judge 50/200 in 49 s
+  judge 100/200 in 93 s
+  judge 150/200 in 138 s
+  judge 200/200 in 183 s
+win400                       n=500  accuracy 0.682  context 3527 chars  reader tokens 2750
+win400_2k                    n=500  accuracy 0.582  context 1734 chars  reader tokens 2103
+today_2k                     n=500  accuracy 0.552  context 1780 chars  reader tokens 2111
+turn_partner_8k              n=500  accuracy 0.684  context 7348 chars  reader tokens 4062

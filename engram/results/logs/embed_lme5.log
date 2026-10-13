@@ -1,0 +1,10 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 3237.99it/s]
+256/63935 in 1 s
+10496/63935 in 295 s
+20736/63935 in 702 s
+30976/63935 in 1265 s
+41216/63935 in 3326 s
+51456/63935 in 5687 s
+61696/63935 in 7119 s
+embedded 63935 texts in 7363 s

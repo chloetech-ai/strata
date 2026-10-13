@@ -1,0 +1,151 @@
+<title>Engram Record Structure</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Literata:opsz,wght@7..72,500;7..72,600&display=swap">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] },
+    svg: { fontCache: "global" },
+    options: { enableMenu: false }
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.min.js" defer></script>
+<style>
+/*__STYLE__*/
+/* MathJax's hidden MathML copy is absolutely positioned: keep it inside its formula. */
+mjx-container { position: relative; }
+pre { max-width: 100%; overflow-x: auto; }
+#design pre { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; font-size: 0.82rem; line-height: 1.5; }
+.thesis { font-family: var(--display); font-size: 1.18rem; line-height: 1.45; color: var(--ink); border-left: 3px solid var(--accent); padding: 2px 0 2px 16px; margin: 14px 0 18px; }
+.note { font-size: 0.86rem; color: var(--ink-3); margin-top: -4px; }
+.compact th, .compact td { padding: 7px 9px; }
+.wrap-head th { white-space: normal; vertical-align: bottom; }
+td.sys { font-weight: 600; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+.tabs button { font: 500 0.82rem/1 var(--body); color: var(--ink-2); background: var(--surface); border: 1px solid var(--rule); border-radius: 999px; padding: 7px 12px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tabs[hidden] { display: none; }
+.schema td { vertical-align: top; white-space: normal; }
+.schema td:first-child { white-space: nowrap; }
+.schema code { font-size: 0.8rem; }
+.flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin: 16px 0; }
+.flow > div { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.flow h4 { margin: 0 0 4px; font: 600 0.95rem/1.3 var(--body); }
+.flow p { margin: 0; font-size: 0.88rem; color: var(--ink-2); }
+</style>
+
+<div class="page">
+<header class="col">
+  <div class="eyebrow">posting_bench · strata · engram</div>
+  <h1>What a memory record should be: keys, values and queries for Engram</h1>
+  <p class="lede">Engram keeps a coding agent's running context in a Strata table and puts parts of it back into the prompt. Each stored record has a lexical key, a dense key, a value that gets injected, and attributes that queries filter on. This page compares ways to cut and key that context, on two long-conversation benchmarks, on the 26-hour session that built this repository, and by the answers a model gives from what is injected. It also covers where a prompt's time goes and what made it shorter. It ends with Claude Code itself, with and without Engram, on work that depends on earlier sessions. A first test found almost no difference; with the knowledge records added in response, Engram solved all 100 held-out runs against 60 without it. The structure that won is now Engram's.</p>
+  <p class="meta" id="meta-line"></p>
+  <div class="findings" id="findings"><!--FINDINGS--></div>
+  <ul class="toc">
+    <li><a href="#record">A record, precisely</a></li>
+    <li><a href="#compared">What was compared</a></li>
+    <li><a href="#keys">Keys and values</a></li>
+    <li><a href="#facts">Keys a model writes</a></li>
+    <li><a href="#answers">Does it change the answers?</a></li>
+    <li><a href="#engram">In Engram now</a></li>
+    <li><a href="#time">Execution time</a></li>
+    <li><a href="#ab">With and without Engram</a></li>
+    <li><a href="#design">The design</a></li>
+    <li><a href="#reproduce">Reproduce</a></li>
+  </ul>
+</header>
+
+<section class="col" id="record">
+  <h2>A record, precisely</h2>
+  <p>Retrieval for an agent's memory has three parts that are easy to conflate:</p>
+  <ul>
+    <li><b>the key:</b> what a query is matched against;</li>
+    <li><b>the value:</b> what is put into the context when the key matches;</li>
+    <li><b>the attributes:</b> what structured queries filter and sort on.</li>
+  </ul>
+  <p>They need not coincide. A small key matches precisely but may not carry enough to answer. A context sentence added to a key helps a terse record be found, but can pull it ahead of the record that really holds the answer. A large value carries everything, but a fixed budget then holds only a few of them.</p>
+  <figure class="wide">
+    <div class="frame"><svg class="dg" id="anatomy-diagram" viewBox="0 0 760 308" role="img" aria-label="A tool call is captured, trimmed and cut into records of at most 400 bytes; each record has a lexical key (text plus the turn's request), a dense key (the embedding of the text), a value (the text) and attributes"></svg></div>
+    <figcaption><b>One record.</b> A captured event is redacted, trimmed to its head and tail, and cut into records of at most 400 bytes. Each record is one Strata row. The request of the turn joins the lexical key only.</figcaption>
+  </figure>
+  <p>For a turn \(t\) cut into windows \(w_{t,1}, w_{t,2}, \dots\), record \(r_{t,k}\) has</p>
+  \[ K_{\text{lex}}(r_{t,k}) = w_{t,k} \oplus \mathrm{req}(t)_{:200}, \qquad K_{\text{vec}}(r_{t,k}) = \phi(w_{t,k}), \qquad V(r_{t,k}) = w_{t,k}, \]
+  <p>where \(\mathrm{req}(t)\) is the user request the turn answers and \(\phi\) the embedder. A prompt \(q\) becomes three queries over the same rows: its analysed terms for BM25 over \(K_{\text{lex}}\), its vector \(\phi(q)\) for approximate nearest neighbours over \(K_{\text{vec}}\), and a predicate \(P\) over the attributes that both searches apply. Engram's default predicate excludes what is still in the context window, \(P = \lnot(\text{session} = s \wedge \text{seq} \ge w_s)\). The two lists are fused, weighted by priors, and packed:</p>
+  \[ S(r) = \bigl(w\,\widehat{\mathrm{bm25}}(q, K_{\text{lex}}(r)) + (1-w)\,\widehat{\cos}(\phi(q), K_{\text{vec}}(r))\bigr)\bigl(1 + \lambda_\iota\,\iota(r)\bigr) + \lambda_t\,e^{-\Delta\mathrm{seq}(r)/\tau}, \]
+  \[ \text{pack: take records in order of } S \text{ while } \sum_{r \in P_B} \bigl(|V(r)| + h\bigr) \le B, \text{ at most } c \text{ per turn}, \]
+  <p>with \(\widehat{\cdot}\) min-max normalised over the candidates, \(w = 0.5\), header cost \(h = 80\) characters and budget \(B\).</p>
+  <figure class="wide">
+    <div class="frame"><svg class="dg" id="query-diagram" viewBox="0 0 760 262" role="img" aria-label="The prompt becomes a lexical query, a dense query and a predicate; the two searches are fused with priors, gated and packed"></svg></div>
+    <figcaption><b>The query path.</b> The predicate runs inside both searches, so excluded rows never take a candidate slot. Strata plans the filtered vector search: a graph walk that skips non-members, or a scan of the members when they are few.</figcaption>
+  </figure>
+</section>
+
+<section class="col" id="compared">
+  <h2>What was compared</h2>
+  <p>A <b>layout</b> decides the keys: how a turn is cut into rows (whole turns up to 1,500 bytes, or windows of 800, 400 or 200 bytes on line, sentence or word boundaries), what context joins the lexical key (nothing, the request a response answers, or both sides of the exchange), and whether the vector embeds that context too. A <b>presentation</b> decides the value: the row itself or its best 600 bytes, the row widened inside its turn, the row plus the head of the other side of the exchange, or the whole turn.</p>
+  <p>Every combination is packed into budgets of 1,000 to 8,000 characters and scored on what reaches the model:</p>
+  \[ \mathrm{AIC}@B = \Pr\bigl[\,a \sqsubseteq \mathrm{norm}(P_B)\,\bigr], \]
+  \[ \mathrm{EIC}@B = \Pr\bigl[\,\exists\, e \in E : |P_B \cap e| \ge \min(80, |e|/2)\,\bigr], \]
+  \[ \mathrm{All}@B = \Pr\bigl[\,\forall\, s \in S_E\ \exists\, e \in E_s : e \text{ shown}\,\bigr]. \]
+  <p>AIC, the answer in context, asks whether the normalised answer string appears in the packed text. It only applies to questions whose answer appears word for word in an evidence turn and has at least four characters. EIC asks whether an evidence turn \(e \in E\) is shown. All asks whether every evidence session is shown, which matters for questions that aggregate over sessions. The data:</p>
+  <ul>
+    <li><b>LongMemEval-S:</b> 500 histories of about 115,000 tokens, one store each; 470 answerable questions, 147 with a verbatim answer.</li>
+    <li><b>LoCoMo:</b> 10 conversations of about 600 short turns between two people; 1,536 questions.</li>
+    <li><b>This repository's session:</b> 26 hours of Claude Code, replayed through Engram's capture into about 1,800 records. 67 probe questions are asked as if in a new session, and 32 after the second compaction (only about what the model no longer had). The answer counts when its regular expression matches the packed text.</li>
+  </ul>
+  <p>Embeddings are static (Model2Vec potion-retrieval-32M, 512 dimensions), and every store is searched exactly so that the layout is the only variable.</p>
+</section>
+
+<section id="keys">
+  <!--RESULTS-->
+</section>
+
+<section class="col" id="design">
+  <h2>The design</h2>
+  <!--DESIGN-->
+</section>
+
+<section class="col repro" id="reproduce">
+  <h2>Reproduce</h2>
+<pre>cd engram &amp;&amp; cargo build --release &amp;&amp; cargo test --release
+export ENGRAM_MODELS=/path/to/models                   # engram fetch-model
+# layouts × presentations × budgets
+target/release/engram-structure --data /home/user/data/memory/longmemeval_s.jsonl --out results/structure \
+    --dump "turn+req/snip600/4000,win400+req/vec-text/snip600/4000"
+target/release/engram-structure --data /home/user/data/memory/locomo.jsonl --out results/structure
+target/release/engram-structure --transcript SESSION.jsonl --probes probes/session_probes.json,probes/lost_probes.json,probes/lost_probes_vague.json \
+    --points 1952:4632,4633:5392 --out results/structure
+# facts written by a model, then the fact layouts
+python3 scripts/extract_facts.py --data longmemeval_s.jsonl --every 5 --out facts_every5.jsonl
+target/release/engram-structure --data longmemeval_s.jsonl --every 5 --facts facts_every5.jsonl --layouts "turn,facts,turn+facts,turn/fact-keys" --tag facts
+# answers from the injected context, graded with LongMemEval's prompts
+python3 scripts/reader_eval.py --data longmemeval_s.jsonl --judge <model> --config today=CONTEXT.jsonl --config oracle=oracle --out results/reader
+# Engram itself, and time
+target/release/engram-bench retrieval --data longmemeval_s.jsonl --ctx request --tag c400
+python3 scripts/fit_gate.py results/retrieval/longmemeval_s_static_request_c400.rows.jsonl --out results/gate_static_c400.json
+target/release/engram-bench probes --transcript SESSION.jsonl --probes probes/lost_probes.json --points 1952:4632,4633:5392
+target/release/engram-bench latency --data longmemeval_s.jsonl --sizes 10000,100000,1000000
+# Claude Code with and without Engram: Tally (dev), then the two held-out projects
+python3 scripts/ab_eval.py history --model MODEL &amp;&amp; python3 scripts/ab_eval.py run --model MODEL --repeats 3
+target/release/engram distill --project /home/user/ab/s1/tally       # Tally's store, distilled after the fact
+python3 scripts/ab_eval.py run --model MODEL --runs runs_v2 --conditions engram --store-src STORE
+python3 scripts/ab_eval.py history --scenario stockroom --model MODEL   # and slotwise
+python3 scripts/ab_eval.py run --scenario stockroom --model MODEL --repeats 5
+python3 scripts/ab_stats.py tally-r1=results/ab/runs.jsonl tally-dev=results/ab/runs_v2.jsonl:engram,results/ab/runs.jsonl:none \
+    stockroom=results/ab/stockroom/runs.jsonl slotwise=results/ab/slotwise/runs.jsonl --pool stockroom,slotwise --out results/ab/stats.json
+python3 scripts/build_structure_report.py              # this page</pre>
+</section>
+<footer class="col" id="footer"></footer>
+</div>
+
+<div class="tip" id="tip" hidden></div>
+<script>
+const DATA = /*__DATA__*/null;
+</script>
+<script>
+/*__CHARTS__*/
+</script>
+<script>
+/*__SCRIPT__*/
+</script>

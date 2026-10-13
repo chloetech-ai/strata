@@ -1,0 +1,38 @@
+{
+ "tally": {
+  "turns": 10,
+  "errors": 0,
+  "items": 25,
+  "kept": 25,
+  "replaced": 4,
+  "done": 1,
+  "cost_usd": 0.01084,
+  "ms_median": 5914,
+  "ms_max": 10725,
+  "mode": "back-filled after the history"
+ },
+ "stockroom": {
+  "turns": 13,
+  "errors": 0,
+  "items": 34,
+  "kept": 34,
+  "replaced": 2,
+  "done": 1,
+  "cost_usd": 0.01751,
+  "ms_median": 7717,
+  "ms_max": 11725,
+  "mode": "live, during the history"
+ },
+ "slotwise": {
+  "turns": 14,
+  "errors": 0,
+  "items": 55,
+  "kept": 55,
+  "replaced": 4,
+  "done": 0,
+  "cost_usd": 0.02167,
+  "ms_median": 8951,
+  "ms_max": 16149,
+  "mode": "live, during the history"
+ }
+}

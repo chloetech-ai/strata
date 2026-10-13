@@ -1,0 +1,20 @@
+[
+ {"q": "Which unit test failed in the interpolative codec?", "a": ["dense_runs_are_nearly_free"]},
+ {"q": "What compile error did we hit when sampling from a WeightedIndex?", "a": ["E0599", "trait bounds were not satisfied"]},
+ {"q": "What borrow checker error came up with the chosen variable?", "a": ["E0502", "cannot borrow `chosen`"]},
+ {"q": "Which Python module was missing when reading the parquet dataset?", "a": ["pyarrow"]},
+ {"q": "Which Python module was missing when taking screenshots of the report?", "a": ["playwright"]},
+ {"q": "Which field was missing in the QueryConfig initializer?", "a": ["max_list_len"]},
+ {"q": "Which commit could not be applied when cherry-picking the Elias-Fano codecs?", "a": ["ee368ae"]},
+ {"q": "Which commit could not be applied when cherry-picking the Pyramid codec?", "a": ["6206ec5"]},
+ {"q": "What serde error did Strata hit for vector values?", "a": ["Arc<\\[f32\\]>: serde::Serialize", "Arc<\\[f32\\]>"]},
+ {"q": "Which worktree branch could not be deleted?", "a": ["worktree-agent-a6168778f20d5c3f4"]},
+ {"q": "Which commit failed to apply while bringing in the Strata full-text index?", "a": ["5930c82"]},
+ {"q": "What compile error did strata-eval have about the Latency struct?", "a": ["no field `p50`"]},
+ {"q": "What were the E0609 errors about fields on usize in the workload code?", "a": ["no field `query` on type `&usize`", "E0610", "E0609"]},
+ {"q": "What does Strata's begin() return while another write is running?", "a": ["Error::Busy"]},
+ {"q": "Which local changes blocked a cherry-pick?", "a": ["would be overwritten by cherry-pick"]},
+ {"q": "How many durable single-document commits per second did the storage layer reach, and how many documents per second batched?", "a": ["2,800", "82k"]},
+ {"q": "How fast did HNSW reach 0.991 recall on Quora in the vector study?", "a": ["174 µs"]},
+ {"q": "What nDCG@10 did weighted hybrid ranking reach on TREC-COVID in the first hybrid run?", "a": ["0\\.847"]}
+]

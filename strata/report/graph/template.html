@@ -1,0 +1,84 @@
+<title>Graphs in Strata</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Literata:opsz,wght@7..72,500;7..72,600&display=swap">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] },
+    svg: { fontCache: "global" },
+    options: { enableMenu: false }
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.min.js" defer></script>
+<style>
+/*__STYLE__*/
+mjx-container { position: relative; }
+pre { max-width: 100%; overflow-x: auto; }
+.col pre.sql { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; font-size: 0.82rem; line-height: 1.5; }
+.thesis { font-family: var(--display); font-size: 1.18rem; line-height: 1.45; color: var(--ink); border-left: 3px solid var(--accent); padding: 2px 0 2px 16px; margin: 14px 0 18px; }
+.note { font-size: 0.86rem; color: var(--ink-3); }
+.compact th, .compact td { padding: 7px 9px; }
+.wrap-head th { white-space: normal; vertical-align: bottom; }
+td.sys { font-weight: 600; }
+td.good { color: var(--accent); font-weight: 600; }
+.chart-box { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 14px 14px 8px; min-width: 0; }
+.chart-box h4 { margin: 0 0 2px; font: 600 0.95rem/1.3 var(--body); }
+.chart-box p { margin: 0 0 6px; font-size: 0.86rem; color: var(--ink-3); }
+.opts td:first-child { white-space: nowrap; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px auto 10px; max-width: 1000px; }
+.tabs button { font: 500 0.82rem/1 var(--body); color: var(--ink-2); background: var(--surface); border: 1px solid var(--rule); border-radius: 999px; padding: 7px 12px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.opts td { vertical-align: top; white-space: normal; }
+</style>
+
+<div class="page">
+<header class="col">
+  <div class="eyebrow">posting_bench · strata · graphs</div>
+  <h1>Graph indexes and graph queries in Strata</h1>
+  <p class="lede">Strata keeps a table's text, structured fields and vectors in one file and queries them with SQL. Rows can now link to other rows. A traversal, a shortest path or personalized PageRank runs in the same statement as BM25, filters and vector search, and can start from any of them. This page covers how edges are stored and resolved, the SQL, the planner's part, speed against SQLite and an in-memory graph, and whether the graph helps search when a vector search is the way into it. It does: on arXiv, the papers cited by a new paper's two nearest neighbours find twice as many of its references as vector search alone. A graph built from the vectors themselves does not help.</p>
+  <p class="meta" id="meta-line"></p>
+  <div class="findings" id="findings"><!--FINDINGS--></div>
+  <ul class="toc">
+    <li><a href="#model">Rows are nodes</a></li>
+    <li><a href="#storage">Storing edges</a></li>
+    <li><a href="#sql">The SQL</a></li>
+    <li><a href="#plan">Planning and traversal</a></li>
+    <li><a href="#speed">Speed</a></li>
+    <li><a href="#quality">Does the graph help search?</a></li>
+    <li><a href="#next">Limits and next steps</a></li>
+    <li><a href="#reproduce">Reproduce</a></li>
+  </ul>
+</header>
+
+<!--BODY-->
+
+<section class="col repro" id="reproduce">
+  <h2>Reproduce</h2>
+<pre>cd strata &amp;&amp; cargo test --release                         # graph unit tests and tests/graph.rs among them
+# ogbn-arxiv (Open Graph Benchmark) and the papers' titles and abstracts
+curl -O https://snap.stanford.edu/ogb/data/nodeproppred/arxiv.zip          # into /home/user/data/graph/arxiv, unzipped into raw/
+curl -O https://snap.stanford.edu/ogb/data/misc/ogbn_arxiv/titleabs.tsv.gz
+python3 -I scripts/prepare_arxiv.py /home/user/data/graph/arxiv
+engram-bench embed --input /home/user/data/graph/arxiv/arxiv.jsonl --out /home/user/data/graph/arxiv/arxiv.f32
+cargo build --release --features baselines --bin strata-graph-bench
+target/release/strata-graph-bench load                      # holds out 1,000 papers of OGB's test split
+target/release/strata-graph-bench latency --sqlite /home/user/data/graph/arxiv/edges.sqlite
+target/release/strata-graph-bench quality --seeds 1,2,3,5,10,20,50
+python3 scripts/graph_quality_stats.py results/graph/quality_arxiv.rows.jsonl.gz --out results/graph/quality_stats.json
+target/release/strata-graph-bench synthetic --nodes 1000000 --sqlite /home/user/data/graph/synthetic.sqlite
+python3 scripts/build_graph_report.py                       # this page</pre>
+</section>
+<footer class="col" id="footer"></footer>
+</div>
+
+<div class="tip" id="tip" hidden></div>
+<script>
+const DATA = /*__DATA__*/null;
+</script>
+<script>
+/*__CHARTS__*/
+</script>
+<script>
+/*__SCRIPT__*/
+</script>

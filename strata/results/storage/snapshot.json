@@ -1,0 +1,100 @@
+{
+  "dataset": "fiqa",
+  "experiment": "snapshot",
+  "loadavg_at_start": "1.08 1.06 1.22 2/109 21193",
+  "n_docs": 57638,
+  "reps": 5,
+  "results": [
+    {
+      "chunk_docs": "1024",
+      "commit_us": 32.596,
+      "memtable_docs": 100,
+      "memtable_segments": 1,
+      "snapshot_after_write_ms": 6.148592,
+      "snapshot_after_write_ms_reps": [
+        6.311699,
+        6.720564,
+        6.028366,
+        5.645873,
+        6.148592
+      ],
+      "snapshot_cached_us": 0.094
+    },
+    {
+      "chunk_docs": "1024",
+      "commit_us": 54.011,
+      "memtable_docs": 1000,
+      "memtable_segments": 1,
+      "snapshot_after_write_ms": 38.585814000000006,
+      "snapshot_after_write_ms_reps": [
+        43.099716,
+        36.425682,
+        37.306583999999994,
+        39.403178,
+        38.585814000000006
+      ],
+      "snapshot_cached_us": 0.14600000000000002
+    },
+    {
+      "chunk_docs": "1024",
+      "commit_us": 77.952,
+      "memtable_docs": 10000,
+      "memtable_segments": 10,
+      "snapshot_after_write_ms": 30.908496,
+      "snapshot_after_write_ms_reps": [
+        31.959913999999998,
+        30.908496,
+        41.462586,
+        30.344979000000002,
+        29.899846
+      ],
+      "snapshot_cached_us": 0.18
+    },
+    {
+      "chunk_docs": "4096",
+      "commit_us": 66.417,
+      "memtable_docs": 10000,
+      "memtable_segments": 3,
+      "snapshot_after_write_ms": 73.30765699999999,
+      "snapshot_after_write_ms_reps": [
+        84.415919,
+        91.793306,
+        73.30765699999999,
+        66.273608,
+        67.88825
+      ],
+      "snapshot_cached_us": 0.21
+    },
+    {
+      "chunk_docs": "all",
+      "commit_us": 60.259,
+      "memtable_docs": 1000,
+      "memtable_segments": 1,
+      "snapshot_after_write_ms": 54.350993,
+      "snapshot_after_write_ms_reps": [
+        57.566925999999995,
+        52.430515,
+        40.210213,
+        54.350993,
+        59.627905
+      ],
+      "snapshot_cached_us": 0.135
+    },
+    {
+      "chunk_docs": "all",
+      "commit_us": 48.231,
+      "memtable_docs": 10000,
+      "memtable_segments": 1,
+      "snapshot_after_write_ms": 410.813986,
+      "snapshot_after_write_ms_reps": [
+        413.821319,
+        419.233059,
+        410.813986,
+        387.571201,
+        406.6746
+      ],
+      "snapshot_cached_us": 0.211
+    }
+  ],
+  "seconds": 10.541190115
+}

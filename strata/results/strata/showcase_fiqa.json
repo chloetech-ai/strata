@@ -1,0 +1,116 @@
+{
+  "collection": "fiqa",
+  "queries": [
+    {
+      "first": "27797 · ",
+      "label": "phrase, boolean and negation",
+      "ms": 1.79494,
+      "plan": [
+        "seg 0: filter materialised, 5 docs"
+      ],
+      "rows": 5,
+      "sql": "SELECT id, title FROM docs WHERE MATCH(body, '\"how do i\" AND (learn OR study) -money') LIMIT 10"
+    },
+    {
+      "first": "48",
+      "label": "prefix and conjunction",
+      "ms": 0.062408000000000005,
+      "plan": [
+        "seg 0: filter materialised, 48 docs"
+      ],
+      "rows": 1,
+      "sql": "SELECT COUNT(*) FROM docs WHERE MATCH(body, 'progr* AND language')"
+    },
+    {
+      "first": "593621 · 16.6392",
+      "label": "ranked text, OR / NOT filter",
+      "ms": 0.264683,
+      "plan": [
+        "seg 0: filter materialised, 14433 docs",
+        "seg 0: bm25 MaxScore, filter Materialize"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE (category IN ('c01', 'c02') OR rating > 4.5) AND NOT topic = 't03' ORDER BY bm25(body, 'best programming language to learn first') DESC LIMIT 10"
+    },
+    {
+      "first": "507445 · 0.5992",
+      "label": "filtered vector, OR filter",
+      "ms": 0.33402,
+      "plan": [
+        "seg 0: selectivity 0.1487 global, 0.1061 near the query",
+        "seg 0: vector PostFilter (PostFilter ran), filter Probe"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE year < 1995 OR category = 'c40' ORDER BY similarity(emb, :q) DESC LIMIT 10"
+    },
+    {
+      "first": "15631 · 1.0000",
+      "label": "filtered hybrid, weighted",
+      "ms": 1.677314,
+      "plan": [
+        "seg 0: filter materialised, 10524 docs",
+        "seg 0: bm25 MaxScore, filter Materialize",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize",
+        "weighted: 163 candidates (top-depth union), MinMax"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE rating >= 3 AND year BETWEEN 2005 AND 2020 ORDER BY 0.2 * bm25(body, :t) + 0.8 * similarity(emb, :q) DESC LIMIT 10"
+    },
+    {
+      "first": "15631 · 0.0328",
+      "label": "hybrid, RRF on a correlated filter",
+      "ms": 1.622603,
+      "plan": [
+        "seg 0: filter materialised, 3577 docs",
+        "seg 0: bm25 MaxScore, filter Materialize",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize",
+        "rrf: 2 inputs, depth 100, k 60"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE topic IN ('t05', 't06', 't07') ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10"
+    },
+    {
+      "first": "t28 · 55",
+      "label": "facets over a text match",
+      "ms": 0.071928,
+      "plan": [
+        "seg 0: filter materialised, 232 docs",
+        "seg 0: facet Codes over 232 docs"
+      ],
+      "rows": 5,
+      "sql": "SELECT topic, COUNT(*) FROM docs WHERE MATCH(body, 'india') AND year BETWEEN 2000 AND 2010 GROUP BY topic ORDER BY 2 DESC, 1 LIMIT 5"
+    },
+    {
+      "first": "89161 · 4.9500",
+      "label": "text filter, ordered by a column",
+      "ms": 0.127362,
+      "plan": [
+        "seg 0: filter materialised, 30 docs"
+      ],
+      "rows": 5,
+      "sql": "SELECT id, rating FROM docs WHERE MATCH(body, 'travel AND visa') ORDER BY rating DESC, id LIMIT 5"
+    },
+    {
+      "first": "65",
+      "label": "count over a boolean and a range",
+      "ms": 0.065051,
+      "plan": [
+        "seg 0: filter materialised, 65 docs"
+      ],
+      "rows": 1,
+      "sql": "SELECT COUNT(*) FROM docs WHERE MATCH(body, 'iphone OR android') AND rating BETWEEN 2 AND 3"
+    },
+    {
+      "first": "523058",
+      "label": "nearest by distance, exact",
+      "ms": 2.98509,
+      "plan": [
+        "seg 0: filter materialised, 25396 docs",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize"
+      ],
+      "rows": 10,
+      "sql": "SELECT id FROM docs WHERE category IN ('c00', 'c01', 'c02', 'c03') ORDER BY distance(emb, :q, strategy => 'prefilter') LIMIT 10"
+    }
+  ],
+  "query_text": "Best way to make most of savings with ISA and Offset mortgage"
+}

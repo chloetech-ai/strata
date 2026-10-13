@@ -1,0 +1,116 @@
+{
+  "collection": "quora",
+  "queries": [
+    {
+      "first": "120 · ",
+      "label": "phrase, boolean and negation",
+      "ms": 5.4030450000000005,
+      "plan": [
+        "seg 0: filter materialised, 1174 docs"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, title FROM docs WHERE MATCH(body, '\"how do i\" AND (learn OR study) -money') LIMIT 10"
+    },
+    {
+      "first": "1149",
+      "label": "prefix and conjunction",
+      "ms": 0.157908,
+      "plan": [
+        "seg 0: filter materialised, 1149 docs"
+      ],
+      "rows": 1,
+      "sql": "SELECT COUNT(*) FROM docs WHERE MATCH(body, 'progr* AND language')"
+    },
+    {
+      "first": "40260 · 23.6148",
+      "label": "ranked text, OR / NOT filter",
+      "ms": 0.821503,
+      "plan": [
+        "seg 0: bm25 MaxScore, filter Probe"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE (category IN ('c01', 'c02') OR rating > 4.5) AND NOT topic = 't03' ORDER BY bm25(body, 'best programming language to learn first') DESC LIMIT 10"
+    },
+    {
+      "first": "239845 · 0.6763",
+      "label": "filtered vector, OR filter",
+      "ms": 0.367342,
+      "plan": [
+        "seg 0: selectivity 0.1479 global, 0.1061 near the query",
+        "seg 0: vector PostFilter (PostFilter ran), filter Probe"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE year < 1995 OR category = 'c40' ORDER BY similarity(emb, :q) DESC LIMIT 10"
+    },
+    {
+      "first": "361951 · 1.0000",
+      "label": "filtered hybrid, weighted",
+      "ms": 1.478381,
+      "plan": [
+        "seg 0: bm25 MaxScore, filter Probe",
+        "seg 0: selectivity 0.1833 global, 0.2273 near the query",
+        "seg 0: vector InIndex (Hnsw ran), filter Probe",
+        "weighted: 185 candidates (top-depth union), MinMax"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE rating >= 3 AND year BETWEEN 2005 AND 2020 ORDER BY 0.2 * bm25(body, :t) + 0.8 * similarity(emb, :q) DESC LIMIT 10"
+    },
+    {
+      "first": "51123 · 0.0306",
+      "label": "hybrid, RRF on a correlated filter",
+      "ms": 5.428363,
+      "plan": [
+        "seg 0: bm25 MaxScore, filter Probe",
+        "seg 0: selectivity 0.1124 global, 0.0342 near the query",
+        "seg 0: filter materialised, 58767 docs",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize",
+        "rrf: 2 inputs, depth 100, k 60"
+      ],
+      "rows": 10,
+      "sql": "SELECT id, score() FROM docs WHERE topic IN ('t05', 't06', 't07') ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10"
+    },
+    {
+      "first": "t17 · 3389",
+      "label": "facets over a text match",
+      "ms": 0.328672,
+      "plan": [
+        "seg 0: filter materialised, 5400 docs",
+        "seg 0: facet Codes over 5400 docs"
+      ],
+      "rows": 5,
+      "sql": "SELECT topic, COUNT(*) FROM docs WHERE MATCH(body, 'india') AND year BETWEEN 2000 AND 2010 GROUP BY topic ORDER BY 2 DESC, 1 LIMIT 5"
+    },
+    {
+      "first": "55724 · 4.8700",
+      "label": "text filter, ordered by a column",
+      "ms": 0.091668,
+      "plan": [
+        "seg 0: filter materialised, 100 docs"
+      ],
+      "rows": 5,
+      "sql": "SELECT id, rating FROM docs WHERE MATCH(body, 'travel AND visa') ORDER BY rating DESC, id LIMIT 5"
+    },
+    {
+      "first": "1176",
+      "label": "count over a boolean and a range",
+      "ms": 0.179313,
+      "plan": [
+        "seg 0: filter materialised, 1176 docs"
+      ],
+      "rows": 1,
+      "sql": "SELECT COUNT(*) FROM docs WHERE MATCH(body, 'iphone OR android') AND rating BETWEEN 2 AND 3"
+    },
+    {
+      "first": "361951",
+      "label": "nearest by distance, exact",
+      "ms": 26.334462,
+      "plan": [
+        "seg 0: filter materialised, 229498 docs",
+        "seg 0: vector PreFilter (PreFilter ran), filter Materialize"
+      ],
+      "rows": 10,
+      "sql": "SELECT id FROM docs WHERE category IN ('c00', 'c01', 'c02', 'c03') ORDER BY distance(emb, :q, strategy => 'prefilter') LIMIT 10"
+    }
+  ],
+  "query_text": "What is the most effective drug?"
+}
