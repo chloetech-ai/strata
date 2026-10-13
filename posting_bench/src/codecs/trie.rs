@@ -39,16 +39,20 @@
 //!   into a 64-bit leaf bitmap with PDEP. In level order, the descendants of a
 //!   node on any deeper level are contiguous. So each level contributes a single
 //!   read of at most 64 bits, deposited under the doubled occupancy mask of the
-//!   level above (bit `s` becomes bits `2s` and `2s + 1`). Leaf words are then
-//!   ANDed or ORed whole and emitted with VPCOMPRESSD (AVX-512) or
-//!   trailing-zero counts.
+//!   level above (bit `s` becomes bits `2s` and `2s + 1`). On aarch64, NEON
+//!   emulates PDEP for masks of more than 8 set bits with byte-lane table
+//!   lookups (smaller masks take the portable loop) and doubles the mask with
+//!   a carry-less square. Leaf words are then ANDed or ORed whole and emitted
+//!   with VPCOMPRESSD (AVX-512), byte-table lookups (NEON) or trailing-zero
+//!   counts.
 //! * Ranks. Each visited node costs at most one rank per input, because the
 //!   right child's index is the left's plus the code's low bit. A traversal
 //!   reaches each level's positions in increasing order, so each (input,
 //!   level) pair remembers the rank just past the last node or range it
 //!   consumed. The adjacent node then needs no rank, and a node less than 64
 //!   bits further on needs one popcount. Anything else goes to the rank
-//!   directory: a sample plus one masked VPOPCNTQ under AVX-512.
+//!   directory: a sample plus one masked VPOPCNTQ under AVX-512 (a masked
+//!   `vcntq_u8` under NEON).
 //! * `decode_into` visits every node, so it needs no rank at all: node indices
 //!   are counters, one per level.
 //! * The cursor keeps the root-to-leaf path. `next_geq` climbs to the level
@@ -223,13 +227,84 @@ fn pdep(src: u64, mask: u64) -> u64 {
         // SAFETY: guarded by the `bmi2` target feature.
         unsafe { core::arch::x86_64::_pdep_u64(src, mask) }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        if mask.count_ones() <= PDEP_LOOP_MAX {
+            pdep_portable(src, mask)
+        } else {
+            pdep_neon(src, mask)
+        }
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64")))]
     {
         pdep_portable(src, mask)
     }
 }
 
-#[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
+/// On aarch64, masks with at most this many set bits take the portable loop
+/// (about 3 cycles per set bit) rather than [`pdep_neon`] (about 35 cycles
+/// of latency whatever the mask). Small masks are the upper levels of a leaf
+/// word and sparse tries; on the M2, Trie decoding and set operations were
+/// fastest with 8 (4 to 16 tried).
+#[cfg(target_arch = "aarch64")]
+const PDEP_LOOP_MAX: u32 = 8;
+
+/// Byte lane `l` of `REP8[g]` is `2g + l / 8`: a `vqtbl1q_u8` of a `u64`
+/// splat by it spreads bytes `2g` and `2g + 1` over 8 lanes each.
+#[cfg(target_arch = "aarch64")]
+static REP8: [[u8; 16]; 4] = {
+    let mut t = [[0u8; 16]; 4];
+    let mut g = 0;
+    while g < 4 {
+        let mut l = 0;
+        while l < 16 {
+            t[g][l] = (2 * g + l / 8) as u8;
+            l += 1;
+        }
+        g += 1;
+    }
+    t
+};
+/// Per byte lane `l`: bit `l % 8`, and the bits below it.
+#[cfg(target_arch = "aarch64")]
+static LANE_BIT8: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+#[cfg(target_arch = "aarch64")]
+static LANE_BELOW8: [u8; 16] = [0, 1, 3, 7, 15, 31, 63, 127, 0, 1, 3, 7, 15, 31, 63, 127];
+
+/// PDEP with one byte lane per bit position `i` (four vectors): lane `i`
+/// looks up bit `popcount(mask mod 2^i)` of `src`, spread to 64 lanes, with
+/// one `vqtbl4q_u8`, and keeps it where `mask` has bit `i`. The rank is the
+/// lane's byte's `vcntq_u8` below `i` plus the prefix popcount of the bytes
+/// before; pairwise adds of the lanes weighted by bit fold them back.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn pdep_neon(src: u64, mask: u64) -> u64 {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON is part of the aarch64 baseline; the loads read whole
+    // statics.
+    unsafe {
+        let (bit, below) = (vld1q_u8(LANE_BIT8.as_ptr()), vld1q_u8(LANE_BELOW8.as_ptr()));
+        let rep = |g: usize| vld1q_u8(REP8[g].as_ptr());
+        let (vm, vs) = (vreinterpretq_u8_u64(vdupq_n_u64(mask)), vreinterpretq_u8_u64(vdupq_n_u64(src)));
+        let cnt = vget_lane_u64::<0>(vreinterpret_u64_u8(vcnt_u8(vcreate_u8(mask))));
+        let vo = vreinterpretq_u8_u64(vdupq_n_u64(cnt.wrapping_mul(0x0101_0101_0101_0101) << 8));
+        let s = uint8x16x4_t(
+            vtstq_u8(vqtbl1q_u8(vs, rep(0)), bit),
+            vtstq_u8(vqtbl1q_u8(vs, rep(1)), bit),
+            vtstq_u8(vqtbl1q_u8(vs, rep(2)), bit),
+            vtstq_u8(vqtbl1q_u8(vs, rep(3)), bit),
+        );
+        let lanes = |g: usize| {
+            let m = vqtbl1q_u8(vm, rep(g));
+            let rank = vaddq_u8(vcntq_u8(vandq_u8(m, below)), vqtbl1q_u8(vo, rep(g)));
+            vandq_u8(vqtbl4q_u8(s, rank), vandq_u8(m, bit))
+        };
+        let p = vpaddq_u8(vpaddq_u8(lanes(0), lanes(1)), vpaddq_u8(lanes(2), lanes(3)));
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(p, p)))
+    }
+}
+
+#[cfg_attr(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64"), allow(dead_code))]
 #[inline]
 fn pdep_portable(mut src: u64, mut mask: u64) -> u64 {
     let mut out = 0;
@@ -245,7 +320,7 @@ fn pdep_portable(mut src: u64, mut mask: u64) -> u64 {
 }
 
 /// Spread the low 32 bits of `x` to the even bit positions.
-#[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
+#[cfg_attr(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64"), allow(dead_code))]
 #[inline]
 fn spread_portable(x: u64) -> u64 {
     let mut x = x & 0xFFFF_FFFF;
@@ -256,12 +331,27 @@ fn spread_portable(x: u64) -> u64 {
     (x | x << 1) & EVEN
 }
 
+/// Spread the low 32 bits of `x` to the even bit positions with a
+/// carry-less square: `vmull_p8` squares each byte, moving bit `b` to `2b`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn spread_neon(x: u64) -> u64 {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON is part of the aarch64 baseline.
+    unsafe {
+        let v = vcreate_p8(x);
+        vgetq_lane_u64::<0>(vreinterpretq_u64_p16(vmull_p8(v, v)))
+    }
+}
+
 /// Each bit `s` of `x` (< 2^32) becomes bits `2s` and `2s + 1`.
 #[inline(always)]
 fn dup(x: u64) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     let s = pdep(x, EVEN);
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    #[cfg(target_arch = "aarch64")]
+    let s = spread_neon(x);
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64")))]
     let s = spread_portable(x);
     s | s << 1
 }
@@ -302,7 +392,8 @@ fn read64(words: &[u64], pos: usize) -> u64 {
 
 /// `rank1(pos)` from the directory, for `pos <= len`. With AVX-512 this is
 /// the block's sample plus one masked VPOPCNTQ over the words of the block
-/// before `pos`, with no loop.
+/// before `pos`, with no loop; with NEON, `vcntq_u8` over the block's 8
+/// words, masked by byte lane.
 #[inline(always)]
 fn rank_dir(rs: &RankSelect, words: &[u64], pos: usize) -> usize {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"))]
@@ -321,12 +412,47 @@ fn rank_dir(rs: &RankSelect, words: &[u64], pos: usize) -> usize {
         let part = words.get(wi).map_or(0, |w| (w & ((1u64 << (pos & 63)) - 1)).count_ones() as usize);
         sample + full + part
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq")))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        let wi = pos >> 6;
+        let blk = wi & !7;
+        if blk + 8 > words.len() {
+            return rs.rank1(pos); // the last block may be short
+        }
+        let sample = rs.rank1(blk << 6);
+        // SAFETY: the words `blk..blk + 8` lie inside `words`; byte lanes
+        // below `8 * (wi - blk)` hold the words `blk..wi`.
+        let full = unsafe {
+            let v = vld1q_u8_x4(words.as_ptr().add(blk) as *const u8);
+            let n = vdupq_n_u8((8 * (wi - blk)) as u8);
+            let c = |x: uint8x16_t, g: usize| vandq_u8(vcntq_u8(x), vcltq_u8(vld1q_u8(IOTA8[16 * g..].as_ptr()), n));
+            vaddlvq_u8(vaddq_u8(vaddq_u8(c(v.0, 0), c(v.1, 1)), vaddq_u8(c(v.2, 2), c(v.3, 3)))) as usize
+        };
+        let part = words.get(wi).map_or(0, |w| (w & ((1u64 << (pos & 63)) - 1)).count_ones() as usize);
+        sample + full + part
+    }
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"),
+        target_arch = "aarch64"
+    )))]
     {
         let _ = words;
         rs.rank1(pos)
     }
 }
+
+/// Byte lanes 0..63.
+#[cfg(target_arch = "aarch64")]
+static IOTA8: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = i as u8;
+        i += 1;
+    }
+    t
+};
 
 /// Append `base + i` for every set bit `i` of `w`.
 #[inline(always)]
@@ -355,7 +481,26 @@ fn emit_word(out: &mut Vec<u32>, base: u32, w: u64) {
         }
         out.set_len(len + w.count_ones() as usize);
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: both paths write at most 64 slots, all reserved, and the
+    // length counts only the set bits.
+    unsafe {
+        use super::roaring::simd::{byte_prefix_counts, bytes_neon_u32};
+        let p = out.as_mut_ptr().add(len);
+        let pre = byte_prefix_counts(w);
+        if pre >> 56 > 4 {
+            bytes_neon_u32(w, pre, base, p);
+        } else {
+            // At most 4 set bits: 4 unconditional writes.
+            let mut w = w;
+            for i in 0..4 {
+                p.add(i).write(base.wrapping_add(w.trailing_zeros()));
+                w &= w.wrapping_sub(1);
+            }
+        }
+        out.set_len(len + (pre >> 56) as usize);
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
     {
         let spare = out.spare_capacity_mut();
         let (mut w, mut i) = (w, 0);
@@ -1326,6 +1471,205 @@ mod tests {
             assert_eq!(pdep_portable(s, m), pdep(s, m));
             let x = rng.gen::<u32>() as u64;
             assert_eq!(spread_portable(x) * 3, dup(x));
+        }
+    }
+
+    /// Words with every popcount, at densities from empty to full.
+    #[cfg(target_arch = "aarch64")]
+    fn words(rng: &mut StdRng) -> Vec<u64> {
+        let mut out = vec![0, !0, 1, 1 << 63, EVEN, !EVEN, 0xFF, 0xFF << 56, 0x8000_0001_8000_0001];
+        for k in 0..=64 {
+            for _ in 0..20 {
+                let mut w = 0u64;
+                while w.count_ones() < k {
+                    w |= 1 << rng.gen_range(0..64);
+                }
+                out.push(w);
+            }
+        }
+        out
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let ws = words(&mut rng);
+        // PDEP: every pair of the edge and random words, plus the masks
+        // `expand` uses (doubled occupancies).
+        for &s in &ws {
+            for &m in &ws {
+                assert_eq!(pdep_neon(s, m), pdep_portable(s, m), "pdep({s:#x}, {m:#x})");
+            }
+            let occ = rng.gen::<u32>() as u64 >> rng.gen_range(0..32);
+            assert_eq!(pdep_neon(s, dup(occ)), pdep_portable(s, spread_portable(occ) * 3));
+        }
+        for &x in &ws {
+            assert_eq!(spread_neon(x), spread_portable(x), "spread({x:#x})");
+        }
+        // emit_word: every word at a few bases, appended after a prefix.
+        for &w in &ws {
+            for base in [0u32, 64, 12_345 << 6, u32::MAX - 63] {
+                let mut out = vec![7u32; 3];
+                emit_word(&mut out, base, w);
+                let want: Vec<u32> = [7, 7, 7].into_iter().chain((0..64).filter(|b| w >> b & 1 == 1).map(|b| base + b)).collect();
+                assert_eq!(out, want, "emit_word({base}, {w:#x})");
+            }
+        }
+        // rank_dir: every position of bit vectors of many lengths (short
+        // last blocks included) and densities.
+        for len in [1usize, 63, 64, 65, 511, 512, 513, 1000, 4096, 4097, 5000] {
+            for p in [0.0, 0.01, 0.5, 0.99, 1.0] {
+                let mut bv = BitVec::new();
+                for _ in 0..len {
+                    bv.push_bits(rng.gen_bool(p) as u64, 1);
+                }
+                let rs = RankSelect::new(bv, false, false);
+                for pos in 0..=len {
+                    assert_eq!(rank_dir(&rs, rs.bits().words(), pos), rs.rank1(pos), "rank_dir(len {len}, p {p}, {pos})");
+                }
+            }
+        }
+    }
+
+    /// Throwaway kernel timings: `cargo test --release -- --ignored --nocapture trie::tests::kernel_timing`
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing only"]
+    fn kernel_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        fn ns_per<R>(items: usize, mut f: impl FnMut() -> R) -> f64 {
+            let reps = (2_000_000 / items.max(1)).clamp(20, 20_000);
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let s = Instant::now();
+                for _ in 0..reps {
+                    black_box(f());
+                }
+                best = best.min(s.elapsed().as_secs_f64() * 1e9 / (reps * items) as f64);
+            }
+            best
+        }
+        let mut rng = StdRng::seed_from_u64(3);
+        let n = 4096;
+        // `expand`'s PDEP: masks doubling occupancies of `k` random nodes
+        // out of 32, chained through the source as in a leaf word.
+        println!("pdep (doubled occupancy masks), ns per call:");
+        for k in [1, 2, 4, 8, 16, 32] {
+            let occ: Vec<u64> = (0..n)
+                .map(|_| {
+                    let mut o = 0u64;
+                    while o.count_ones() < k {
+                        o |= 1 << rng.gen_range(0..32);
+                    }
+                    o
+                })
+                .collect();
+            let src: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
+            let masks: Vec<u64> = occ.iter().map(|&o| spread_portable(o) * 3).collect();
+            let chain = |f: fn(u64, u64) -> u64| {
+                ns_per(n, || masks.iter().zip(&src).fold(0u64, |acc, (&m, &s)| f(s ^ (acc & 1), m)))
+            };
+            let tput = |f: fn(u64, u64) -> u64| {
+                ns_per(n, || masks.iter().zip(&src).fold(0u64, |acc, (&m, &s)| acc ^ f(s, m)))
+            };
+            println!(
+                "  k={k:>2}: latency portable {:.2} neon {:.2} pdep {:.2}; throughput portable {:.2} neon {:.2} pdep {:.2}",
+                chain(pdep_portable),
+                chain(pdep_neon),
+                chain(pdep),
+                tput(pdep_portable),
+                tput(pdep_neon),
+                tput(pdep)
+            );
+        }
+        let xs: Vec<u64> = (0..n).map(|_| rng.gen::<u32>() as u64).collect();
+        println!(
+            "spread, ns per call: latency portable {:.2} neon {:.2}; throughput portable {:.2} neon {:.2}",
+            ns_per(n, || xs.iter().fold(0u64, |acc, &x| spread_portable(x ^ (acc & 1)))),
+            ns_per(n, || xs.iter().fold(0u64, |acc, &x| spread_neon(x ^ (acc & 1)))),
+            ns_per(n, || xs.iter().fold(0u64, |acc, &x| acc ^ spread_portable(x))),
+            ns_per(n, || xs.iter().fold(0u64, |acc, &x| acc ^ spread_neon(x))),
+        );
+        // rank_dir at random positions of a 2^20-bit level.
+        let mut bv = BitVec::new();
+        for _ in 0..1 << 20 {
+            bv.push_bits(rng.gen_bool(0.5) as u64, 1);
+        }
+        let rs = RankSelect::new(bv, false, false);
+        let pos: Vec<usize> = (0..n).map(|_| rng.gen_range(0..1 << 20)).collect();
+        println!(
+            "rank, ns per call: rank1 {:.2} rank_dir {:.2}",
+            ns_per(n, || pos.iter().map(|&p| rs.rank1(p)).sum::<usize>()),
+            ns_per(n, || pos.iter().map(|&p| rank_dir(&rs, rs.bits().words(), p)).sum::<usize>()),
+        );
+        // emit_word on random non-zero words of k bits on average.
+        println!("emit_word, ns per word:");
+        let mut out: Vec<u32> = Vec::with_capacity(64 * n + 64);
+        for p in [0.01, 0.05, 0.1, 0.3, 0.5, 0.9] {
+            let ws: Vec<u64> = (0..n)
+                .map(|_| loop {
+                    let w = (0..64).fold(0u64, |w, b| w | ((rng.gen_bool(p) as u64) << b));
+                    if w != 0 {
+                        break w;
+                    }
+                })
+                .collect();
+            let naive = ns_per(n, || {
+                out.clear();
+                for (i, &w) in ws.iter().enumerate() {
+                    let (mut w, base) = (w, (i as u32) << 6);
+                    out.reserve(64);
+                    while w != 0 {
+                        out.push(base + w.trailing_zeros());
+                        w &= w - 1;
+                    }
+                }
+                out.len()
+            });
+            let neon = ns_per(n, || {
+                out.clear();
+                for (i, &w) in ws.iter().enumerate() {
+                    emit_word(&mut out, (i as u32) << 6, w);
+                }
+                out.len()
+            });
+            println!("  bits/word {:>5.1}: naive {naive:.2} neon {neon:.2}", 64.0 * p);
+        }
+        // Whole codecs (all kernels together): decode, AND and OR of three
+        // lists of 30K, 300K and 2M postings out of 8M.
+        fn codec<C: PostingList + SetOps>(lists: &[Vec<u32>], u: u32) -> String {
+            let cs: Vec<C> = lists.iter().map(|l| C::build(l, u)).collect();
+            let refs: Vec<&C> = cs.iter().collect();
+            let n: usize = lists.iter().map(|l| l.len()).sum();
+            let mut out = Vec::new();
+            let dec = ns_per(n, || {
+                out.clear();
+                for c in &cs {
+                    c.decode_into(&mut out);
+                }
+                out.len()
+            });
+            let and = ns_per(n, || {
+                out.clear();
+                C::intersect(&refs, &mut out);
+                out.len()
+            });
+            let or = ns_per(n, || {
+                out.clear();
+                C::union(&refs, &mut out);
+                out.len()
+            });
+            format!("{}: decode {dec:.2} and {and:.3} or {or:.2}", C::NAME)
+        }
+        let u = 8_000_000;
+        for (name, clustered) in [("uniform", false), ("clustered", true)] {
+            let lists: Vec<Vec<u32>> = [30_000, 300_000, 2_000_000]
+                .iter()
+                .map(|&n| if clustered { conformance::clustered(&mut rng, n, u) } else { conformance::random_sorted(&mut rng, n, u) })
+                .collect();
+            println!("{name} ns/posting: {} | {}", codec::<Trie>(&lists, u), codec::<RunTrie>(&lists, u));
         }
     }
 }

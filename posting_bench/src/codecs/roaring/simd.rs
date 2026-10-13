@@ -18,8 +18,13 @@
 //!   lane), then by 4..7, so two compares cover all 64 pairs. Folding the
 //!   32-bit compare mask gives the match mask, and `vpcompressw`
 //!   (AVX512-VBMI2) packs the matches without a lookup table.
+//! * [`intersect_neon`]: the same 8 x 8 block merge with NEON. A's block is
+//!   compared (`vceqq_u16`) with B's block and its seven rotations
+//!   (`vextq_u16`, built once per B block); the ORed compares, weighted by
+//!   lane bit and summed (`vaddvq_u16`), give the match mask, which indexes
+//!   the `pshufb` table for a `vqtbl1q_u8`.
 //!
-//! Both block kernels advance the block whose maximum is smaller (both on a
+//! The block kernels advance the block whose maximum is smaller (both on a
 //! tie) and finish the tails (`len % 8` elements) with the scalar merge. They
 //! store whole 16-byte vectors at the output cursor, so they reserve
 //! [`OUT_SLACK`] spare slots past `min(a.len(), b.len())`.
@@ -29,13 +34,16 @@
 //! input element against about 0.26 for the AVX-512 kernel, whose zmm
 //! shuffles, mask compares and compress (about 5 port-5 uops per 8 x 8 step)
 //! all compete for one port; both are 12-15x faster than the scalar merge.
-//! The `kernel_timing` test (ignored) reproduces the numbers.
+//! On aarch64 it dispatches to the NEON kernel: about 0.25 ns per element on
+//! an Apple M2, 8x faster than the scalar merge. The `kernel_timing` test
+//! (ignored) reproduces the numbers.
 //!
 //! Union: [`union_sse`] ports CRoaring's `union_vector16` (a min/max merge
 //! network on 8-lane vectors plus a duplicate-removing `pshufb`, reusing the
-//! same 256-entry table); [`union_scalar`] is the branch-free fallback. Large
-//! unions go through bitmaps (see `container.rs`), so array unions stay at
-//! most 4096 elements.
+//! same 256-entry table); [`union_neon`] is the same network with NEON
+//! (`vminq_u16` / `vmaxq_u16`, `vextq_u16` rotations, `vqtbl1q_u8`);
+//! [`union_scalar`] is the branch-free fallback. Large unions go through
+//! bitmaps (see `container.rs`), so array unions stay at most 4096 elements.
 //!
 //! Bit extraction ([`BitPos::extract`]: bitmap to sorted values, as `u16`
 //! inside a container or `u32` docIDs). The textbook loop
@@ -47,7 +55,11 @@
 //! more set bits than that. With AVX512-VBMI2, `vpcompressb` packs the bit
 //! positions 0..63 selected by a word into bytes, which are widened and offset
 //! (`extract_avx512_u16` / `extract_avx512_u32`), in the spirit of CRoaring's
-//! `bitset_extract_setbits_avx512`.
+//! `bitset_extract_setbits_avx512`. With NEON (`extract_neon_u16` /
+//! `extract_neon_u32`), a word's bytes index a 256-entry table of bit
+//! positions, widened and stored at the bytes' prefix popcounts (one
+//! `vcnt_u8` and a multiply); sparse blocks of 8 words keep the flatten
+//! writes.
 
 use std::ops::Range;
 
@@ -75,7 +87,12 @@ impl BitPos for u16 {
     unsafe fn extract(words: Range<usize>, word: impl Fn(usize) -> u64, base: u32, dst: *mut u16) -> *mut u16 {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2"))]
         return extract_avx512_u16(words, word, base, dst);
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2")))]
+        #[cfg(target_arch = "aarch64")]
+        return extract_neon_u16(words, word, base, dst);
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2"),
+            target_arch = "aarch64"
+        )))]
         return extract_scalar::<u16, 4>(words, word, base, dst, |x| x as u16);
     }
 }
@@ -85,7 +102,12 @@ impl BitPos for u32 {
     unsafe fn extract(words: Range<usize>, word: impl Fn(usize) -> u64, base: u32, dst: *mut u32) -> *mut u32 {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2"))]
         return extract_avx512_u32(words, word, base, dst);
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2")))]
+        #[cfg(target_arch = "aarch64")]
+        return extract_neon_u32(words, word, base, dst);
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2"),
+            target_arch = "aarch64"
+        )))]
         return extract_scalar::<u32, 4>(words, word, base, dst, |x| x);
     }
 }
@@ -232,6 +254,163 @@ pub unsafe fn extract_avx512_u32(
     dst
 }
 
+/// `BIT_POS8[j][m]`: the positions `8j + b` of the set bits `b` of the byte
+/// value `m`, packed to the front.
+#[cfg(target_arch = "aarch64")]
+pub(crate) static BIT_POS8: [[[u8; 8]; 256]; 8] = {
+    let mut t = [[[0u8; 8]; 256]; 8];
+    let mut j = 0;
+    while j < 8 {
+        let mut m = 0;
+        while m < 256 {
+            let (mut b, mut k) = (0, 0);
+            while b < 8 {
+                if m & (1 << b) != 0 {
+                    t[j][m][k] = (8 * j + b) as u8;
+                    k += 1;
+                }
+                b += 1;
+            }
+            m += 1;
+        }
+        j += 1;
+    }
+    t
+};
+
+/// Prefix popcounts of the bytes of `w`: byte `j` of the result is the number
+/// of set bits of `w` in bytes `0..=j` (so the top byte is the popcount).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn byte_prefix_counts(w: u64) -> u64 {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is part of the aarch64 baseline.
+    let cnt = unsafe { vget_lane_u64::<0>(vreinterpret_u64_u8(vcnt_u8(vcreate_u8(w)))) };
+    cnt.wrapping_mul(0x0101_0101_0101_0101)
+}
+
+/// Shared driver of the NEON extraction kernels. Words go 8 at a time to
+/// one of three branch-free paths, chosen by the block's largest popcount:
+/// up to 4, the scalar flatten loop's 4 unconditional writes per word; up to
+/// 8, two rounds of them; above, `bytes(w, prefix, base, dst)`, which writes
+/// every byte's positions at the byte's prefix popcount. A misprediction of
+/// the choice is thus shared by 8 words. The remaining words go one by one.
+///
+/// # Safety
+/// As for [`BitPos::extract`]; `bytes` must write at most 64 slots.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn extract_neon<T>(
+    words: Range<usize>,
+    word: impl Fn(usize) -> u64,
+    base: u32,
+    mut dst: *mut T,
+    conv: impl Fn(u32) -> T,
+    bytes: impl Fn(u64, u64, u32, *mut T),
+) -> *mut T {
+    let flat = |mut w: u64, b: u32, mut p: *mut T, n: usize| {
+        for _ in 0..n {
+            p.write(conv(b.wrapping_add(w.trailing_zeros())));
+            p = p.add(1);
+            w &= w.wrapping_sub(1);
+        }
+    };
+    let mut i = words.start;
+    while i + 8 <= words.end {
+        let w: [u64; 8] = std::array::from_fn(|t| word(i + t));
+        let pre = w.map(byte_prefix_counts);
+        let max = pre.iter().fold(0, |m, &p| m.max(p >> 56));
+        for t in 0..8 {
+            let b = base.wrapping_add(((i + t) as u32) << 6);
+            if max > 8 {
+                bytes(w[t], pre[t], b, dst);
+            } else if max > 4 {
+                flat(w[t], b, dst, 8);
+            } else {
+                flat(w[t], b, dst, 4);
+            }
+            dst = dst.add((pre[t] >> 56) as usize);
+        }
+        i += 8;
+    }
+    for i in i..words.end {
+        let w = word(i);
+        let b = base.wrapping_add((i as u32) << 6);
+        let pre = byte_prefix_counts(w);
+        if pre >> 56 > 4 {
+            bytes(w, pre, b, dst);
+        } else {
+            flat(w, b, dst, 4);
+        }
+        dst = dst.add((pre >> 56) as usize);
+    }
+    dst
+}
+
+/// The dense case of [`extract_neon_u16`]: each byte of `w` is a
+/// [`BIT_POS8`] lookup widened and offset to 8 `u16` lanes, stored at the
+/// byte's prefix popcount (`pre` is [`byte_prefix_counts`]`(w)`). Writes
+/// at most 64 slots.
+///
+/// # Safety
+/// `dst` must have room for 64 values.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bytes_neon_u16(w: u64, pre: u64, b: u32, dst: *mut u16) {
+    use std::arch::aarch64::*;
+    // Byte offsets of the stores: counts below 64, doubled, stay within
+    // their bytes.
+    let off = pre << 9;
+    let vb = vdupq_n_u16(b as u16);
+    for (j, t) in BIT_POS8.iter().enumerate() {
+        let pos = vld1_u8(t[(w >> (8 * j)) as u8 as usize].as_ptr());
+        let p = (dst as *mut u8).add((off >> (8 * j)) as u8 as usize) as *mut u16;
+        vst1q_u16(p, vaddw_u8(vb, pos));
+    }
+}
+
+/// [`bytes_neon_u16`] to `u32`: each byte's 8 positions are widened to two
+/// vectors of 4 `u32`. Writes at most 64 slots.
+///
+/// # Safety
+/// `dst` must have room for 64 values.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bytes_neon_u32(w: u64, pre: u64, b: u32, dst: *mut u32) {
+    use std::arch::aarch64::*;
+    // Counts below 64, times 4, stay within their bytes.
+    let off = pre << 10;
+    let vb = vdupq_n_u32(b);
+    for (j, t) in BIT_POS8.iter().enumerate() {
+        let pos = vmovl_u8(vld1_u8(t[(w >> (8 * j)) as u8 as usize].as_ptr()));
+        let p = (dst as *mut u8).add((off >> (8 * j)) as u8 as usize) as *mut u32;
+        vst1q_u32(p, vaddw_u16(vb, vget_low_u16(pos)));
+        vst1q_u32(p.add(4), vaddw_high_u16(vb, pos));
+    }
+}
+
+/// NEON bit extraction to `u16` (see [`extract_neon`] and
+/// [`bytes_neon_u16`]).
+///
+/// # Safety
+/// As for [`BitPos::extract`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn extract_neon_u16(words: Range<usize>, word: impl Fn(usize) -> u64, base: u32, dst: *mut u16) -> *mut u16 {
+    extract_neon(words, word, base, dst, |x| x as u16, |w, pre, b, dst| bytes_neon_u16(w, pre, b, dst))
+}
+
+/// NEON bit extraction to `u32` (see [`extract_neon`] and
+/// [`bytes_neon_u32`]).
+///
+/// # Safety
+/// As for [`BitPos::extract`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn extract_neon_u32(words: Range<usize>, word: impl Fn(usize) -> u64, base: u32, dst: *mut u32) -> *mut u32 {
+    extract_neon(words, word, base, dst, |x| x, |w, pre, b, dst| bytes_neon_u32(w, pre, b, dst))
+}
+
 /// First index `i >= from` with `s[i] >= target` (or `s.len()`), found by
 /// galloping: probe `from + 1, from + 2, from + 4, ...`, then binary-search.
 #[inline]
@@ -278,7 +457,9 @@ pub fn intersect(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
 pub fn intersect_vector(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
     intersect_sse42(a, b, out);
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+    #[cfg(target_arch = "aarch64")]
+    intersect_neon(a, b, out);
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "sse4.2"), target_arch = "aarch64")))]
     intersect_scalar(a, b, out);
 }
 
@@ -362,7 +543,9 @@ pub fn union_scalar(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
 pub fn union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
     union_sse(a, b, out);
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+    #[cfg(target_arch = "aarch64")]
+    union_neon(a, b, out);
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "sse4.2"), target_arch = "aarch64")))]
     union_scalar(a, b, out);
 }
 
@@ -474,8 +657,9 @@ pub fn union_sse(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
 }
 
 /// `pshufb` controls that pack the u16 lanes selected by an 8-bit mask to
-/// the front (CRoaring's `shuffle_mask16`). Unused bytes select zero.
-#[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+/// the front (CRoaring's `shuffle_mask16`). Unused bytes select zero (also
+/// as `vqtbl1q_u8` indices, being out of range).
+#[cfg(any(all(target_arch = "x86_64", target_feature = "sse4.2"), target_arch = "aarch64"))]
 static SHUFFLE16: [[u8; 16]; 256] = {
     let mut t = [[0x80u8; 16]; 256];
     let mut m = 0;
@@ -642,6 +826,172 @@ pub fn intersect_avx512(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
     }
 }
 
+/// `1 << i` in u16 lane `i`: ANDed with a compare result and summed across
+/// (`vaddvq_u16`), it gives the 8-bit lane mask.
+#[cfg(target_arch = "aarch64")]
+static LANE_BITS: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// `out = a ∩ b`: 8 x 8 all-pairs blocks with NEON compares against the
+/// eight rotations of B's block and a `vqtbl1q_u8` pack.
+#[cfg(target_arch = "aarch64")]
+pub fn intersect_neon(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
+    use std::arch::aarch64::*;
+
+    out.clear();
+    out.reserve(a.len().min(b.len()) + OUT_SLACK);
+    let (sta, stb) = (a.len() & !7, b.len() & !7);
+    let (pa, pb, dst) = (a.as_ptr(), b.as_ptr(), out.as_mut_ptr());
+    let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+    // SAFETY: as in `intersect_sse42`.
+    unsafe {
+        if sta > 0 && stb > 0 {
+            let bits = vld1q_u16(LANE_BITS.as_ptr());
+            // B's rotations are built once per B block.
+            let rotate = |v: uint16x8_t| {
+                [
+                    v,
+                    vextq_u16::<1>(v, v),
+                    vextq_u16::<2>(v, v),
+                    vextq_u16::<3>(v, v),
+                    vextq_u16::<4>(v, v),
+                    vextq_u16::<5>(v, v),
+                    vextq_u16::<6>(v, v),
+                    vextq_u16::<7>(v, v),
+                ]
+            };
+            let mut va = vld1q_u16(pa);
+            let mut vb = rotate(vld1q_u16(pb));
+            loop {
+                // Lane p is all-ones when A[p] equals B[(p + r) % 8] for some r.
+                let eq = |r: usize| vceqq_u16(va, vb[r]);
+                let m = vorrq_u16(
+                    vorrq_u16(vorrq_u16(eq(0), eq(1)), vorrq_u16(eq(2), eq(3))),
+                    vorrq_u16(vorrq_u16(eq(4), eq(5)), vorrq_u16(eq(6), eq(7))),
+                );
+                let r = vaddvq_u16(vandq_u16(m, bits)) as usize;
+                let shuf = vld1q_u8(SHUFFLE16.as_ptr().add(r) as *const u8);
+                vst1q_u8(dst.add(k) as *mut u8, vqtbl1q_u8(vreinterpretq_u8_u16(va), shuf));
+                k += r.count_ones() as usize;
+                let (amax, bmax) = (*pa.add(i + 7), *pb.add(j + 7));
+                if amax <= bmax {
+                    i += 8;
+                    if i == sta {
+                        break;
+                    }
+                    va = vld1q_u16(pa.add(i));
+                }
+                if bmax <= amax {
+                    j += 8;
+                    if j == stb {
+                        break;
+                    }
+                    vb = rotate(vld1q_u16(pb.add(j)));
+                }
+            }
+        }
+        let k = merge_tail(a, b, i, j, dst, k);
+        out.set_len(k);
+    }
+}
+
+/// [`merge8`] with NEON: `vextq_u16` rotates by one lane.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn merge8_neon(
+    a: std::arch::aarch64::uint16x8_t,
+    b: std::arch::aarch64::uint16x8_t,
+) -> (std::arch::aarch64::uint16x8_t, std::arch::aarch64::uint16x8_t) {
+    use std::arch::aarch64::*;
+    let t = vminq_u16(a, b);
+    let mut max = vmaxq_u16(a, b);
+    let t = vextq_u16::<1>(t, t);
+    let mut min = vminq_u16(t, max);
+    max = vmaxq_u16(t, max);
+    for _ in 0..6 {
+        let t = vextq_u16::<1>(min, min);
+        min = vminq_u16(t, max);
+        max = vmaxq_u16(t, max);
+    }
+    (vextq_u16::<1>(min, min), max)
+}
+
+/// [`store_unique`] with NEON; `bits` holds [`LANE_BITS`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_unique_neon(
+    old: std::arch::aarch64::uint16x8_t,
+    new: std::arch::aarch64::uint16x8_t,
+    bits: std::arch::aarch64::uint16x8_t,
+    dst: *mut u16,
+) -> usize {
+    use std::arch::aarch64::*;
+    let prev = vextq_u16::<7>(old, new);
+    let keep = vaddvq_u16(vbicq_u16(bits, vceqq_u16(prev, new))) as usize;
+    let shuf = vld1q_u8(SHUFFLE16.as_ptr().add(keep) as *const u8);
+    vst1q_u8(dst as *mut u8, vqtbl1q_u8(vreinterpretq_u8_u16(new), shuf));
+    keep.count_ones() as usize
+}
+
+/// `out = a ∪ b`: [`union_sse`] with NEON.
+#[cfg(target_arch = "aarch64")]
+pub fn union_neon(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
+    use std::arch::aarch64::*;
+    if a.len() < 8 || b.len() < 8 {
+        return union_scalar(a, b, out);
+    }
+    out.clear();
+    out.reserve(a.len() + b.len() + OUT_SLACK);
+    let (la, lb) = (a.len() / 8, b.len() / 8);
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    // SAFETY: as in `union_sse`.
+    unsafe {
+        let bits = vld1q_u16(LANE_BITS.as_ptr());
+        let start = out.as_mut_ptr();
+        let mut dst = start;
+        let (mut ia, mut ib) = (1, 1);
+        let (mut vmin, mut vmax) = merge8_neon(vld1q_u16(pa), vld1q_u16(pb));
+        // All-ones never equals the first lane (see `union_sse`).
+        dst = dst.add(store_unique_neon(vdupq_n_u16(u16::MAX), vmin, bits, dst));
+        let mut last = vmin;
+        if ia < la && ib < lb {
+            let (mut ca, mut cb) = (a[8], b[8]);
+            loop {
+                let v;
+                let done;
+                if ca <= cb {
+                    v = vld1q_u16(pa.add(8 * ia));
+                    ia += 1;
+                    done = ia == la;
+                    if !done {
+                        ca = *a.get_unchecked(8 * ia);
+                    }
+                } else {
+                    v = vld1q_u16(pb.add(8 * ib));
+                    ib += 1;
+                    done = ib == lb;
+                    if !done {
+                        cb = *b.get_unchecked(8 * ib);
+                    }
+                }
+                (vmin, vmax) = merge8_neon(v, vmax);
+                dst = dst.add(store_unique_neon(last, vmin, bits, dst));
+                last = vmin;
+                if done {
+                    break;
+                }
+            }
+        }
+        let mut carry = [0u16; 8];
+        let nc = store_unique_neon(last, vmax, bits, carry.as_mut_ptr());
+        let (tail, rest) = if ia == la { (&a[8 * la..], &b[8 * ib..]) } else { (&b[8 * lb..], &a[8 * ia..]) };
+        let mut small = [0u16; 16];
+        let ns = union_tail(&carry[..nc], tail, small.as_mut_ptr());
+        let k = dst.offset_from(start) as usize;
+        let k = k + union_tail(&small[..ns], rest, dst);
+        out.set_len(k);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +1084,12 @@ mod tests {
         check_kernel("avx512", intersect_avx512);
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar() {
+        check_kernel("neon", intersect_neon);
+    }
+
     #[test]
     fn union_matches_reference() {
         let mut out = Vec::new();
@@ -751,6 +1107,13 @@ mod tests {
                 assert_eq!(out, want, "sse |a|={} |b|={}", a.len(), b.len());
                 union_sse(&b, &a, &mut out);
                 assert_eq!(out, want, "sse swapped |a|={} |b|={}", a.len(), b.len());
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                union_neon(&a, &b, &mut out);
+                assert_eq!(out, want, "neon |a|={} |b|={}", a.len(), b.len());
+                union_neon(&b, &a, &mut out);
+                assert_eq!(out, want, "neon swapped |a|={} |b|={}", a.len(), b.len());
             }
         }
     }
@@ -821,6 +1184,11 @@ mod tests {
             );
             check_extract::<u32>("avx512 u32", |r, w, b, d| unsafe { extract_avx512_u32(r, |i| w[i], b, d) }, |x| x);
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            check_extract::<u16>("neon u16", |r, w, b, d| unsafe { extract_neon_u16(r, |i| w[i], b, d) }, |x| x as u16);
+            check_extract::<u32>("neon u32", |r, w, b, d| unsafe { extract_neon_u32(r, |i| w[i], b, d) }, |x| x);
+        }
     }
 
     /// Throwaway kernel timings: `cargo test --release -- --ignored --nocapture kernel_timing`
@@ -865,6 +1233,10 @@ mod tests {
             {
                 row += &format!(" avx512 {:.2}", ns_per(n, || intersect_avx512(&a, &b, &mut out)));
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                row += &format!(" neon {:.2}", ns_per(n, || intersect_neon(&a, &b, &mut out)));
+            }
             println!("{row}");
         }
         println!("union, ns per input element:");
@@ -877,6 +1249,10 @@ mod tests {
             #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
             {
                 row += &format!(" sse {:.2}", ns_per(n, || union_sse(&a, &b, &mut out)));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                row += &format!(" neon {:.2}", ns_per(n, || union_neon(&a, &b, &mut out)));
             }
             println!("{row}");
         }
@@ -911,6 +1287,11 @@ mod tests {
             {
                 time!("avx512_16", |w: &[u64]| extract_avx512_u16(0..1024, |i| w[i], 0, p16));
                 time!("avx512_32", |w: &[u64]| extract_avx512_u32(0..1024, |i| w[i], 0, p32));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                time!("neon16", |w: &[u64]| extract_neon_u16(0..1024, |i| w[i], 0, p16));
+                time!("neon32", |w: &[u64]| extract_neon_u32(0..1024, |i| w[i], 0, p32));
             }
             println!("{row}");
         }

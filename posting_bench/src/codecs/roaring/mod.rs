@@ -37,7 +37,7 @@
 //!
 //! Turning bitmaps into values (decoding, bitmap ∩ bitmap into an array)
 //! uses a branch-light extraction kernel, `vpcompressb`-based with
-//! AVX512-VBMI2 (see [`simd::BitPos`]).
+//! AVX512-VBMI2 and table-based with NEON (see [`simd::BitPos`]).
 //!
 //! [`Roaring::and_native`] and [`Roaring::or_native`] return Roaring results
 //! without materialising `u32`s, as CRoaring benchmarks do. The [`SetOps`]
