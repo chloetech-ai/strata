@@ -1,0 +1,158 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 3327407..9e26dfe 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1,9 +1 @@
+-{
+-  "tests/test_customers.py": true,
+-  "tests/test_invoice.py": true,
+-  "tests/test_orders.py": true,
+-  "tests/test_production.py": true,
+-  "tests/test_products.py": true,
+-  "tests/test_reports.py": true,
+-  "tests/test_standing.py": true
+-}
+\ No newline at end of file
++{}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 76932c2..60d870f 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,9 +1,18 @@
+ [
+   "tests/test_customers.py::CustomersTest::test_duplicate_route_seq_is_rejected",
++  "tests/test_customers.py::CustomersTest::test_email_column_is_optional",
++  "tests/test_customers.py::CustomersTest::test_email_is_read_and_blank_when_missing",
+   "tests/test_customers.py::CustomersTest::test_load_customers",
+   "tests/test_customers.py::CustomersTest::test_str_is_name",
++  "tests/test_invoice.py::FormatPenceTest::test_negative_amount_gets_leading_minus",
++  "tests/test_invoice.py::FormatPenceTest::test_pounds_and_pence",
++  "tests/test_invoice.py::FormatPenceTest::test_under_one_pound_keeps_leading_zero",
++  "tests/test_invoice.py::FormatPenceTest::test_whole_pounds",
++  "tests/test_invoice.py::InvoiceForTest::test_ignores_other_customers_lines",
+   "tests/test_invoice.py::InvoiceForTest::test_no_orders_gives_empty_invoice",
+   "tests/test_invoice.py::InvoiceForTest::test_one_line_per_product_at_catalog_price",
++  "tests/test_invoice.py::InvoiceNumberTest::test_sequence_must_fit_four_digits",
++  "tests/test_invoice.py::InvoiceNumberTest::test_year_then_four_digit_sequence",
+   "tests/test_invoice.py::InvoiceTest::test_empty_invoice",
+   "tests/test_invoice.py::InvoiceTest::test_total",
+   "tests/test_orders.py::CutoffTest::test_a_minute_after_the_cutoff_is_too_late",
+@@ -15,27 +24,58 @@
+   "tests/test_orders.py::CutoffTest::test_on_the_delivery_day_is_too_late",
+   "tests/test_orders.py::CutoffTest::test_well_before_the_cutoff",
+   "tests/test_orders.py::OrderBookTest::test_customers_for_is_sorted_and_unique",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_three_customers_on_one_day",
++  "tests/test_orders.py::OrderBookTest::test_days_are_sorted_and_distinct",
++  "tests/test_orders.py::OrderBookTest::test_days_empty_book",
+   "tests/test_orders.py::OrderBookTest::test_for_day",
++  "tests/test_orders.py::OrderBookTest::test_len_counts_lines",
++  "tests/test_orders.py::OrderBookTest::test_lines_for_customer_and_day",
+   "tests/test_orders.py::OrderBookTest::test_quantity_must_be_positive",
++  "tests/test_orders.py::OrderBookTest::test_remove_missing_line_returns_false",
++  "tests/test_orders.py::OrderBookTest::test_remove_takes_out_that_line",
+   "tests/test_orders.py::OrderBookTest::test_save_and_load",
+   "tests/test_orders.py::OrderBookTest::test_total_for_adds_up_customers",
+   "tests/test_orders.py::OrderBookTest::test_total_for_nothing_ordered_is_zero",
+   "tests/test_orders.py::OrderBookTest::test_unknown_product_rejected",
+   "tests/test_orders.py::OrderBookTest::test_unknown_product_rejected_in_constructor",
++  "tests/test_pricing.py::NewPricesTest::test_empty_catalog_gives_empty_dict",
++  "tests/test_pricing.py::NewPricesTest::test_raises_by_four_percent_rounded_half_up_to_the_penny",
++  "tests/test_pricing.py::NewPricesTest::test_rounds_to_nearest_penny_not_down",
++  "tests/test_pricing.py::NewPricesTest::test_zero_price_stays_zero",
++  "tests/test_production.py::ProductionTest::test_crates_exact_and_partial",
++  "tests/test_production.py::ProductionTest::test_dough_weight_is_dough_per_piece_times_units",
++  "tests/test_production.py::ProductionTest::test_dough_weight_rejects_negative_units",
+   "tests/test_production.py::ProductionTest::test_exact_batches",
+   "tests/test_production.py::ProductionTest::test_partial_batch_rounds_up",
+   "tests/test_production.py::ProductionTest::test_plan_adds_up_customers",
++  "tests/test_production.py::ProductionTest::test_plan_leaves_out_products_not_ordered_for_that_day",
++  "tests/test_production.py::ProductionTest::test_total_batches_adds_batches_across_products",
++  "tests/test_production.py::ProductionTest::test_total_batches_matches_plan",
++  "tests/test_production.py::ProductionTest::test_total_batches_of_empty_plan_is_zero",
+   "tests/test_products.py::CatalogTest::test_add_and_get",
+   "tests/test_products.py::CatalogTest::test_allergen_text_empty_when_no_allergens",
+   "tests/test_products.py::CatalogTest::test_allergen_text_is_sorted_and_capitalised",
+   "tests/test_products.py::CatalogTest::test_duplicate_code_rejected",
++  "tests/test_products.py::CatalogTest::test_get_unknown_code_raises_key_error_naming_it",
+   "tests/test_products.py::CatalogTest::test_has_allergen_is_case_insensitive",
+   "tests/test_products.py::CatalogTest::test_load_catalog",
+   "tests/test_products.py::CatalogTest::test_negative_batch_size_rejected",
+   "tests/test_products.py::CatalogTest::test_negative_price_rejected",
++  "tests/test_products.py::CatalogTest::test_price_text_formats_pence_as_pounds",
+   "tests/test_products.py::CatalogTest::test_zero_batch_size_rejected",
+   "tests/test_products.py::CatalogTest::test_zero_price_allowed",
+   "tests/test_reports.py::DaySummaryTest::test_no_orders_gives_empty_summary",
+   "tests/test_reports.py::DaySummaryTest::test_other_days_are_left_out",
+-  "tests/test_reports.py::DaySummaryTest::test_value_per_customer_in_pence"
++  "tests/test_reports.py::DaySummaryTest::test_two_customers_same_day_totals_stay_separate",
++  "tests/test_reports.py::DaySummaryTest::test_value_per_customer_in_pence",
++  "tests/test_reports.py::TopProductsTest::test_default_n_is_five",
++  "tests/test_reports.py::TopProductsTest::test_most_units_first_across_customers",
++  "tests/test_reports.py::TopProductsTest::test_no_orders_gives_empty_list",
++  "tests/test_reports.py::TopProductsTest::test_range_is_inclusive_and_excludes_outside_days",
++  "tests/test_reports.py::TopProductsTest::test_ties_are_ordered_by_product_code",
++  "tests/test_standing.py::ExpandTest::test_empty_range_when_end_is_before_start",
++  "tests/test_standing.py::ExpandTest::test_end_day_is_included",
++  "tests/test_standing.py::ExpandTest::test_no_lines_when_range_has_no_matching_day",
++  "tests/test_standing.py::ExpandTest::test_repeats_weekly_on_the_matching_weekday",
++  "tests/test_standing.py::ExpandTest::test_several_standing_lines_on_the_same_day"
+ ]
+\ No newline at end of file
+diff --git a/src/bakehouse/pricing.py b/src/bakehouse/pricing.py
+new file mode 100644
+index 0000000..03a2738
+--- /dev/null
++++ b/src/bakehouse/pricing.py
+@@ -0,0 +1,16 @@
++"""January price rise. All amounts are integer pence."""
++
++# Greta's January rise: every wholesale price goes up 4%.
++RISE_PERCENT = 4
++
++
++def new_prices(catalog):
++    """{product code: new wholesale price in pence} for every product in `catalog`.
++
++    Each new price is the old price times 1.04, rounded half up to the nearest penny.
++    Integer arithmetic keeps the halfway cases exact (no float rounding surprises).
++    """
++    return {
++        product.code: (product.price * (100 + RISE_PERCENT) + 50) // 100
++        for product in catalog
++    }
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+new file mode 100644
+index 0000000..6ca6aaa
+--- /dev/null
++++ b/tests/test_pricing.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from bakehouse.pricing import new_prices
++from bakehouse.products import Catalog, Product
++
++
++class NewPricesTest(unittest.TestCase):
++    def test_raises_by_four_percent_rounded_half_up_to_the_penny(self):
++        catalog = Catalog([
++            Product("BAG", "Baguette", 95),   # 98.8 -> 99
++            Product("BRO", "Brownie", 40),    # 41.6 -> 42
++            Product("CRO", "Croissant", 110), # 114.4 -> 114
++            Product("PCH", "Pain au chocolat", 125),  # 130.0 -> 130
++        ])
++        self.assertEqual(new_prices(catalog), {"BAG": 99, "BRO": 42, "CRO": 114, "PCH": 130})
++
++    def test_rounds_to_nearest_penny_not_down(self):
++        self.assertEqual(new_prices(Catalog([Product("X", "x", 37)])), {"X": 38})  # 38.48 -> 38
++        self.assertEqual(new_prices(Catalog([Product("Y", "y", 13)])), {"Y": 14})  # 13.52 -> 14
++
++    def test_zero_price_stays_zero(self):
++        self.assertEqual(new_prices(Catalog([Product("FRE", "Free sample", 0)])), {"FRE": 0})
++
++    def test_empty_catalog_gives_empty_dict(self):
++        self.assertEqual(new_prices(Catalog()), {})
++
++
++if __name__ == "__main__":
++    unittest.main()

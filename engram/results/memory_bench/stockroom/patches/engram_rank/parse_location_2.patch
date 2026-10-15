@@ -1,0 +1,96 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 784f784..616f6ff 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -28,6 +28,12 @@
+   "tests/test_items.py::ItemValidationTest::test_negative_reorder_point_rejected",
+   "tests/test_items.py::ItemValidationTest::test_valid_values_accepted",
+   "tests/test_items.py::NormalizeSkuTest::test_trims_and_uppercases",
++  "tests/test_items.py::ParseLocationTest::test_lowercase_aisle_returned_uppercase",
++  "tests/test_items.py::ParseLocationTest::test_malformed_codes_rejected",
++  "tests/test_items.py::ParseLocationTest::test_non_string_rejected",
++  "tests/test_items.py::ParseLocationTest::test_numbers_compare_as_integers",
++  "tests/test_items.py::ParseLocationTest::test_splits_bin_code",
++  "tests/test_items.py::ParseLocationTest::test_surrounding_whitespace_ignored",
+   "tests/test_reorder.py::ReorderTest::test_at_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
+diff --git a/src/stockroom/items.py b/src/stockroom/items.py
+index 951a68e..9354c17 100644
+--- a/src/stockroom/items.py
++++ b/src/stockroom/items.py
+@@ -1,13 +1,31 @@
+ """The item catalog."""
+ 
++import re
+ from dataclasses import dataclass, replace
+ 
++_BIN_CODE = re.compile(r"([A-Za-z])-([0-9]+)-([0-9]+)")
++
+ 
+ def normalize_sku(sku):
+     """Canonical form of a SKU: surrounding whitespace removed, uppercased."""
+     return sku.strip().upper()
+ 
+ 
++def parse_location(code):
++    """Split a bin code like 'B-12-3' into (aisle, bay, shelf).
++
++    The aisle is a single letter, returned uppercase; bay and shelf are integers.
++    Surrounding whitespace is ignored. Anything else raises ValueError.
++    """
++    if not isinstance(code, str):
++        raise ValueError(f"bin code must be a string, got {code!r}")
++    match = _BIN_CODE.fullmatch(code.strip())
++    if match is None:
++        raise ValueError(f"invalid bin code {code!r}, expected form like 'B-12-3'")
++    aisle, bay, shelf = match.groups()
++    return aisle.upper(), int(bay), int(shelf)
++
++
+ @dataclass
+ class Item:
+     sku: str
+diff --git a/tests/test_items.py b/tests/test_items.py
+index 32fe805..ae93880 100644
+--- a/tests/test_items.py
++++ b/tests/test_items.py
+@@ -1,6 +1,6 @@
+ import unittest
+ 
+-from stockroom.items import Catalog, Item, normalize_sku
++from stockroom.items import Catalog, Item, normalize_sku, parse_location
+ 
+ 
+ class NormalizeSkuTest(unittest.TestCase):
+@@ -62,5 +62,30 @@ class CatalogTest(unittest.TestCase):
+         self.assertEqual([item.sku for item in catalog], ["BR-1", "BR-2"])
+ 
+ 
++class ParseLocationTest(unittest.TestCase):
++    def test_splits_bin_code(self):
++        self.assertEqual(parse_location("B-12-3"), ("B", 12, 3))
++
++    def test_lowercase_aisle_returned_uppercase(self):
++        self.assertEqual(parse_location("b-12-3"), ("B", 12, 3))
++
++    def test_surrounding_whitespace_ignored(self):
++        self.assertEqual(parse_location("  B-12-3\n"), ("B", 12, 3))
++
++    def test_numbers_compare_as_integers(self):
++        self.assertEqual(parse_location("B-12-10"), ("B", 12, 10))
++
++    def test_malformed_codes_rejected(self):
++        for code in ["", "B-12", "B-12-3-4", "BB-12-3", "1-12-3", "B-x-3",
++                     "B--3", "B-12-", "B-12.5-3", "B-+12-3", "B-12-3 4", "B 12 3"]:
++            with self.subTest(code=code):
++                with self.assertRaises(ValueError):
++                    parse_location(code)
++
++    def test_non_string_rejected(self):
++        with self.assertRaises(ValueError):
++            parse_location(None)
++
++
+ if __name__ == "__main__":
+     unittest.main()

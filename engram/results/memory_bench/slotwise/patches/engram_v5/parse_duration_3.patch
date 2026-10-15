@@ -1,0 +1,91 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..201fe25 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,7 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_clients.py": true,
++  "tests/test_hours.py": true,
++  "tests/test_model.py": true,
++  "tests/test_schedule.py": true,
++  "tests/test_storage.py": true
++}
+\ No newline at end of file
+diff --git a/src/slotwise/durations.py b/src/slotwise/durations.py
+new file mode 100644
+index 0000000..ef4a98f
+--- /dev/null
++++ b/src/slotwise/durations.py
+@@ -0,0 +1,32 @@
++"""Reading durations typed by reception, such as '45', '1h30' or '1:30'."""
++
++import re
++
++_MINUTES = re.compile(r"([0-9]+)\s*(?:m|min)?")
++_HOURS = re.compile(r"([0-9]+)\s*h(?:\s*([0-9]+)\s*(?:m|min)?)?")
++_CLOCK = re.compile(r"([0-9]+):([0-9]+)")
++
++
++def parse_duration(text):
++    """Length in minutes of a duration such as '45', '45 min', '1h', '1h30' or '1:30'.
++
++    Raises ValueError if the text is not a duration or the duration is zero.
++    """
++    cleaned = text.strip().lower()
++    if match := _MINUTES.fullmatch(cleaned):
++        minutes = int(match[1])
++    elif match := _HOURS.fullmatch(cleaned):
++        minutes = _hours_and_minutes(text, match[1], match[2] or "0")
++    elif match := _CLOCK.fullmatch(cleaned):
++        minutes = _hours_and_minutes(text, match[1], match[2])
++    else:
++        raise ValueError(f"Cannot read {text!r} as a duration; try 45, 1h or 1h30")
++    if minutes == 0:
++        raise ValueError(f"Duration must be more than zero: {text!r}")
++    return minutes
++
++
++def _hours_and_minutes(text, hours, minutes):
++    if int(minutes) >= 60:
++        raise ValueError(f"Minutes must be less than 60 in {text!r}")
++    return int(hours) * 60 + int(minutes)
+diff --git a/tests/test_durations.py b/tests/test_durations.py
+new file mode 100644
+index 0000000..87e1b59
+--- /dev/null
++++ b/tests/test_durations.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from slotwise.durations import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_accepted_forms(self):
++        cases = {
++            "45": 45,
++            "45m": 45,
++            "45 min": 45,
++            "1h": 60,
++            "1h30": 90,
++            "1h 30m": 90,
++            "2h15": 135,
++            "1:30": 90,
++            "  45M  ": 45,
++            "1H30": 90,
++        }
++        for text, minutes in cases.items():
++            with self.subTest(text=text):
++                self.assertEqual(parse_duration(text), minutes)
++
++    def test_rejects_empty_zero_and_nonsense(self):
++        for text in ["", "   ", "0", "0m", "0:00", "abc", "-5", "1h60", "1:75", "1.5h", "45 seconds"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

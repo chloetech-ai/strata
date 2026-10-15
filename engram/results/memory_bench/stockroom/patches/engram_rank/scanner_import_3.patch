@@ -1,0 +1,104 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 784f784..7992ff3 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -31,6 +31,14 @@
+   "tests/test_reorder.py::ReorderTest::test_at_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
++  "tests/test_scanner.py::ScannerTest::test_empty_file_gives_no_counts",
++  "tests/test_scanner.py::ScannerTest::test_empty_sku_is_an_error",
++  "tests/test_scanner.py::ScannerTest::test_non_numeric_quantity_is_an_error",
++  "tests/test_scanner.py::ScannerTest::test_normalizes_sku_case_and_spacing",
++  "tests/test_scanner.py::ScannerTest::test_skips_blank_lines_and_handles_crlf",
++  "tests/test_scanner.py::ScannerTest::test_sums_a_sku_across_bins",
++  "tests/test_scanner.py::ScannerTest::test_wrong_number_of_fields_is_an_error",
++  "tests/test_scanner.py::ScannerTest::test_zero_and_negative_quantities_are_kept_as_counted",
+   "tests/test_storage.py::StorageTest::test_legacy_file_without_reason_column_infers_reason_from_qty",
+   "tests/test_storage.py::StorageTest::test_loaded_skus_are_normalized",
+   "tests/test_storage.py::StorageTest::test_roundtrip",
+diff --git a/src/stockroom/scanner.py b/src/stockroom/scanner.py
+new file mode 100644
+index 0000000..d619635
+--- /dev/null
++++ b/src/stockroom/scanner.py
+@@ -0,0 +1,28 @@
++"""Reading the handheld scanners' counts: plain text, semicolon-separated, columns bin;sku;qty."""
++
++from typing import Dict
++
++from .items import normalize_sku
++
++
++def read_scanner_file(path) -> Dict[str, int]:
++    """Counted quantity per SKU. A SKU may appear on several lines (overflow bins), so they are summed."""
++    counts = {}  # type: Dict[str, int]
++    with open(path, encoding="utf-8") as f:
++        for lineno, line in enumerate(f, 1):
++            line = line.rstrip("\r\n")
++            if not line.strip():
++                continue
++            fields = line.split(";")
++            if len(fields) != 3:
++                raise ValueError(f"{path}:{lineno}: expected bin;sku;qty, got {line!r}")
++            _bin, sku, qty = fields
++            try:
++                qty = int(qty)
++            except ValueError:
++                raise ValueError(f"{path}:{lineno}: quantity is not a whole number: {qty!r}") from None
++            sku = normalize_sku(sku)
++            if not sku:
++                raise ValueError(f"{path}:{lineno}: empty SKU")
++            counts[sku] = counts.get(sku, 0) + qty
++    return counts
+diff --git a/tests/test_scanner.py b/tests/test_scanner.py
+new file mode 100644
+index 0000000..6eda65e
+--- /dev/null
++++ b/tests/test_scanner.py
+@@ -0,0 +1,45 @@
++import os
++import tempfile
++import unittest
++
++from stockroom.scanner import read_scanner_file
++
++
++class ScannerTest(unittest.TestCase):
++    def read(self, text):
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "scan.txt")
++            with open(path, "w", encoding="utf-8") as f:
++                f.write(text)
++            return read_scanner_file(path)
++
++    def test_sums_a_sku_across_bins(self):
++        counts = self.read("B-12-3;BR-1042;7\nF-01-1;BR-1042;5\nB-12-4;BR-2000;3\n")
++        self.assertEqual(counts, {"BR-1042": 12, "BR-2000": 3})
++
++    def test_normalizes_sku_case_and_spacing(self):
++        counts = self.read("B-12-3; br-1042 ;4\nB-12-3;BR-1042 ;1\n")
++        self.assertEqual(counts, {"BR-1042": 5})
++
++    def test_skips_blank_lines_and_handles_crlf(self):
++        counts = self.read("B-12-3;BR-1042;2\r\n\r\n\nB-12-3;BR-1042;3\r\n")
++        self.assertEqual(counts, {"BR-1042": 5})
++
++    def test_zero_and_negative_quantities_are_kept_as_counted(self):
++        counts = self.read("B-12-3;BR-1042;0\nB-12-3;BR-2000;-1\n")
++        self.assertEqual(counts, {"BR-1042": 0, "BR-2000": -1})
++
++    def test_empty_file_gives_no_counts(self):
++        self.assertEqual(self.read(""), {})
++
++    def test_wrong_number_of_fields_is_an_error(self):
++        with self.assertRaisesRegex(ValueError, ":2:"):
++            self.read("B-12-3;BR-1042;7\nBR-1042;7\n")
++
++    def test_non_numeric_quantity_is_an_error(self):
++        with self.assertRaisesRegex(ValueError, ":1:.*whole number"):
++            self.read("B-12-3;BR-1042;seven\n")
++
++    def test_empty_sku_is_an_error(self):
++        with self.assertRaisesRegex(ValueError, ":1:.*empty SKU"):
++            self.read("B-12-3;  ;7\n")

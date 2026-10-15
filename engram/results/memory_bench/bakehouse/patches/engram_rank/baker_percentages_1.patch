@@ -1,0 +1,59 @@
+diff --git a/src/bakehouse/recipes.py b/src/bakehouse/recipes.py
+new file mode 100644
+index 0000000..86db229
+--- /dev/null
++++ b/src/bakehouse/recipes.py
+@@ -0,0 +1,13 @@
++"""Recipe maths: ingredient weights expressed as baker's percentages."""
++
++
++def baker_percentages(recipe):
++    """{ingredient: percentage of total flour weight}, rounded to one decimal place.
++
++    `recipe` maps ingredient names to grams. Any ingredient whose name contains
++    'flour' (any case) counts as flour.
++    """
++    flour_g = sum(grams for name, grams in recipe.items() if "flour" in name.lower())
++    if flour_g <= 0:
++        raise ValueError("recipe needs flour to calculate baker's percentages")
++    return {name: round(grams / flour_g * 100, 1) for name, grams in recipe.items()}
+diff --git a/tests/test_recipes.py b/tests/test_recipes.py
+new file mode 100644
+index 0000000..f577774
+--- /dev/null
++++ b/tests/test_recipes.py
+@@ -0,0 +1,34 @@
++import unittest
++
++from bakehouse.recipes import baker_percentages
++
++
++class BakerPercentagesTest(unittest.TestCase):
++    def test_percentages_of_flour_weight(self):
++        recipe = {"Strong White Flour": 1000, "Water": 700, "Salt": 20, "Yeast": 5}
++        self.assertEqual(
++            baker_percentages(recipe),
++            {"Strong White Flour": 100.0, "Water": 70.0, "Salt": 2.0, "Yeast": 0.5},
++        )
++
++    def test_rounds_to_one_decimal(self):
++        recipe = {"Flour": 300, "Water": 200, "Salt": 7}
++        self.assertEqual(baker_percentages(recipe)["Salt"], 2.3)
++
++    def test_every_flour_counts_towards_total(self):
++        recipe = {"Wholemeal flour": 500, "White FLOUR": 500, "Water": 700}
++        result = baker_percentages(recipe)
++        self.assertEqual(result["Water"], 70.0)
++        self.assertEqual(result["Wholemeal flour"], 50.0)
++
++    def test_no_flour_raises(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"Water": 700, "Salt": 20})
++
++    def test_empty_recipe_raises(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({})
++
++
++if __name__ == "__main__":
++    unittest.main()

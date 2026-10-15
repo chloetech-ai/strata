@@ -1,0 +1,110 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..61b5682
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1,8 @@
++{
++  "tests/test_clients.py::NormalizePhoneTest": true,
++  "tests/test_clients.py::ClientBookTest": true,
++  "tests/test_hours.py::HoursTest": true,
++  "tests/test_model.py::AppointmentTest": true,
++  "tests/test_schedule.py::ScheduleTest": true,
++  "tests/test_storage.py::StorageTest": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..ef0323a
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1,35 @@
++[
++  "tests/test_clients.py::ClientBookTest::test_empty_phone_returns_none",
++  "tests/test_clients.py::ClientBookTest::test_finds_client_by_any_phone_notation",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_any_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_returns_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_phone_returns_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_notations_of_one_number_match",
++  "tests/test_clients.py::NormalizePhoneTest::test_empty_input_gives_no_digits",
++  "tests/test_hours.py::HoursTest::test_closed_on_sunday",
++  "tests/test_hours.py::HoursTest::test_friday_closes_early",
++  "tests/test_hours.py::HoursTest::test_weekday",
++  "tests/test_model.py::AppointmentTest::test_end_and_price",
++  "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
++  "tests/test_schedule.py::ScheduleTest::test_book",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_record",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_id",
++  "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_buffer",
++  "tests/test_schedule.py::ScheduleTest::test_cancelled_slot_can_be_rebooked",
++  "tests/test_schedule.py::ScheduleTest::test_gap_after_is_enough",
++  "tests/test_schedule.py::ScheduleTest::test_gap_after_must_be_ten_minutes",
++  "tests/test_schedule.py::ScheduleTest::test_gap_before_is_enough",
++  "tests/test_schedule.py::ScheduleTest::test_gap_before_must_be_ten_minutes",
++  "tests/test_schedule.py::ScheduleTest::test_other_therapist_is_free",
++  "tests/test_schedule.py::ScheduleTest::test_outside_opening_hours",
++  "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_slot_taken_message_is_for_receptionist",
++  "tests/test_schedule.py::ScheduleTest::test_unknown_treatment",
++  "tests/test_schedule.py::ScheduleTest::test_week_groups_by_day_in_order",
++  "tests/test_schedule.py::ScheduleTest::test_week_leaves_out_cancelled",
++  "tests/test_schedule.py::ScheduleTest::test_week_needs_a_monday",
++  "tests/test_storage.py::StorageTest::test_cancelled_flag_survives_roundtrip",
++  "tests/test_storage.py::StorageTest::test_roundtrip"
++]
+\ No newline at end of file
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..9c6d978
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,15 @@
++"""Printable documents for the front desk."""
++
++
++def day_plan(schedule, therapist, day):
++    """Plain-text plan of `therapist`'s appointments on `day`, for reception to print.
++
++    Cancelled appointments are left out, as they no longer take up a slot.
++    """
++    appointments = [a for a in schedule.appointments_for(therapist, day) if not a.cancelled]
++    lines = [f"Day plan: {therapist.title()}, {day:%A %d %B %Y}", ""]
++    if not appointments:
++        lines.append("No appointments.")
++    for a in appointments:
++        lines.append(f"{a.start:%H:%M}-{a.end:%H:%M}  {a.client}  ({a.treatment})")
++    return "\n".join(lines) + "\n"

@@ -1,0 +1,64 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index a80e205..124c0ba 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -52,6 +52,22 @@ def invoice_for(orderbook, customer, day):
+     return Invoice(customer, day, lines)
+ 
+ 
++DELIVERY_CHARGE = 450  # pence (£4.50)
++DELIVERY_CHARGE_BELOW = 4000  # pence (£40.00): orders under this pay the charge
++DELIVERY_CHARGE_EXEMPT = ("AIDAN",)  # St Aidan's Primary: contract price already includes delivery
++
++
++def delivery_charge(customer_code, subtotal):
++    """Delivery charge in pence on one customer's order for one delivery day.
++
++    `subtotal` is the value of that order in pence, before VAT. Orders under £40.00 pay £4.50;
++    St Aidan's Primary never pays it, and a day with no order (subtotal 0) has no charge.
++    """
++    if customer_code in DELIVERY_CHARGE_EXEMPT or not 0 < subtotal < DELIVERY_CHARGE_BELOW:
++        return 0
++    return DELIVERY_CHARGE
++
++
+ def invoice_number(year, seq):
+     """Invoice number such as 'LK-2026-0001': the year, then a running number that restarts each year."""
+     if not 1 <= seq <= 9999:
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 7731b15..8476a71 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, sale_or_return_credit
++from bakehouse.invoice import Invoice, InvoiceLine, delivery_charge, format_pence, invoice_for, invoice_number, sale_or_return_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -26,6 +26,23 @@ class FormatPenceTest(unittest.TestCase):
+         self.assertEqual(format_pence(-5), "-£0.05")
+ 
+ 
++class DeliveryChargeTest(unittest.TestCase):
++    def test_under_forty_pounds_pays_four_fifty(self):
++        self.assertEqual(delivery_charge("CAFE", 3999), 450)
++
++    def test_forty_pounds_exactly_pays_nothing(self):
++        self.assertEqual(delivery_charge("CAFE", 4000), 0)
++
++    def test_over_forty_pounds_pays_nothing(self):
++        self.assertEqual(delivery_charge("CAFE", 4001), 0)
++
++    def test_st_aidans_never_pays(self):
++        self.assertEqual(delivery_charge("AIDAN", 1000), 0)
++
++    def test_no_order_has_no_charge(self):
++        self.assertEqual(delivery_charge("CAFE", 0), 0)
++
++
+ class InvoiceNumberTest(unittest.TestCase):
+     def test_year_then_four_digit_sequence(self):
+         self.assertEqual(invoice_number(2026, 1), "LK-2026-0001")

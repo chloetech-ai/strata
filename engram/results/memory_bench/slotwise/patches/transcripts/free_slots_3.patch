@@ -1,0 +1,156 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3996565..9a93b71 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,7 @@
+ - Appointments for the same therapist need a 10-minute gap before and after each other.
+ - Fixed: a booking that started before an existing appointment and ran into it was accepted.
+ - Added `Schedule.cancel(appointment_id)`. Cancelled appointments stay in the schedule with `status == "cancelled"` but no longer block their slot or the buffer around it. Saved files gain a `status` field; older files load as booked.
++- Added `Schedule.free_slots(therapist, day, minutes)`: start times (datetimes) on `day` where an appointment of `minutes` could still be booked for the therapist, every 15 minutes from opening time. Uses the same buffer rule as `book`; empty on closed days.
+ - Added `Schedule.week(therapist, monday)`: a therapist's booked appointments for the seven days from `monday`, keyed by date, each day sorted by start time. Cancelled appointments are left out.
+ - Added `Schedule.book_series(therapist, client, start, sessions, treatment="standard")`: weekly appointments at the same weekday and time. A week already taken is skipped and a later week is added, so the client still gets every session. Series are capped at 9 sessions (`SeriesTooLong`, a new `BookingError`).
+ - Added `slotwise.clients`: `Client` (id, name, phone, email) and `ClientBook`, a register with `add(client)` and `find_by_phone(phone)`. Phone numbers are matched after normalizing, so "079 123 45 67", "+41 79 123 45 67" and "0041791234567" all find the same client. National numbers with a leading 0 are read as Swiss. `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case and surrounding spaces.
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index c7956d1..034a21f 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -3,12 +3,15 @@
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SeriesTooLong, SlotTaken
+-from .hours import is_open_between
++from .hours import is_open_between, opening_hours
+ from .model import BOOKED, CANCELLED, TREATMENTS, Appointment
+ 
+ # Time a therapist needs after each appointment to clean up and write notes.
+ BUFFER = datetime.timedelta(minutes=10)
+ 
++# Granularity of the start times free_slots offers.
++FREE_SLOT_STEP = datetime.timedelta(minutes=15)
++
+ # Most sessions one prescription covers; insurance pays for no more.
+ MAX_SERIES_SESSIONS = 9
+ 
+@@ -25,18 +28,47 @@ class Schedule:
+         when = f"{appointment.start:%d %b %Y, %H:%M}–{appointment.end:%H:%M}"
+         if not is_open_between(appointment.start, appointment.end):
+             raise OutsideOpeningHours(f"The practice is closed {when}. Please choose a time within opening hours.")
+-        for other in self.appointments:
+-            if other.therapist != appointment.therapist or other.status == CANCELLED:
+-                continue
+-            if other.start < appointment.end + BUFFER and appointment.start < other.end + BUFFER:
+-                raise SlotTaken(
+-                    f"{appointment.therapist} already has an appointment {other.start:%H:%M}–{other.end:%H:%M}, "
+-                    f"which is too close to {when}. Appointments need {BUFFER.seconds // 60} minutes between them. "
+-                    "Please choose another time."
+-                )
++        other = self._blocking(appointment.therapist, appointment.start, appointment.end)
++        if other is not None:
++            raise SlotTaken(
++                f"{appointment.therapist} already has an appointment {other.start:%H:%M}–{other.end:%H:%M}, "
++                f"which is too close to {when}. Appointments need {BUFFER.seconds // 60} minutes between them. "
++                "Please choose another time."
++            )
+         self.appointments.append(appointment)
+         return appointment
+ 
++    def _blocking(self, therapist, start, end):
++        """The first booked appointment of `therapist` that leaves no BUFFER gap to [start, end), or None."""
++        for other in self.appointments:
++            if other.therapist != therapist or other.status == CANCELLED:
++                continue
++            if other.start < end + BUFFER and start < other.end + BUFFER:
++                return other
++        return None
++
++    def free_slots(self, therapist, day, minutes):
++        """Start times on `day` where a `minutes`-long appointment for `therapist` could be booked.
++
++        Candidates run every 15 minutes from opening time, and each must fit inside opening hours
++        and leave BUFFER either side of existing appointments. Empty if the practice is closed.
++        """
++        if minutes < 1:
++            raise ValueError("An appointment needs at least one minute.")
++        hours = opening_hours(day)
++        if hours is None:
++            return []
++        opens, closes = hours
++        length = datetime.timedelta(minutes=minutes)
++        slots = []
++        start = opens
++        while start + length <= closes:
++            end = start + length
++            if is_open_between(start, end) and self._blocking(therapist, start, end) is None:
++                slots.append(start)
++            start += FREE_SLOT_STEP
++        return slots
++
+     def book_series(self, therapist, client, start, sessions, treatment="standard"):
+         """Books `sessions` weekly appointments from `start`, same weekday and time.
+ 
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index fe27fdc..4c000b3 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -176,6 +176,61 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().book_series("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0), 0)
+ 
++    def test_free_slots_empty_day_is_whole_grid(self):
++        slots = Schedule().free_slots("lena", datetime.date(2026, 9, 8), 60)
++        self.assertEqual(slots[0], datetime.datetime(2026, 9, 8, 7, 30))
++        self.assertEqual(slots[-1], datetime.datetime(2026, 9, 8, 18, 0))  # 60 min ends at 19:00
++        self.assertEqual(len(slots), 43)  # 07:30 to 18:00 every 15 min
++
++    def test_free_slots_closed_day_is_empty(self):
++        self.assertEqual(Schedule().free_slots("lena", datetime.date(2026, 9, 13), 30), [])  # Sunday
++
++    def test_free_slots_respects_shorter_saturday(self):
++        slots = Schedule().free_slots("lena", datetime.date(2026, 9, 12), 60)  # Saturday 08:00-12:00
++        self.assertEqual(slots[0], datetime.datetime(2026, 9, 12, 8, 0))
++        self.assertEqual(slots[-1], datetime.datetime(2026, 9, 12, 11, 0))
++
++    def test_free_slots_leaves_out_buffer_around_booking(self):
++        s = Schedule()
++        s.book(at(9))  # standard, 09:00-09:45, buffer to 09:55
++        starts = s.free_slots("lena", datetime.date(2026, 9, 8), 45)
++        self.assertIn(datetime.datetime(2026, 9, 8, 8, 0), starts)  # ends 08:45, buffer ends 08:55
++        self.assertNotIn(datetime.datetime(2026, 9, 8, 8, 15), starts)  # ends 09:00, buffer runs into 09:00
++        self.assertNotIn(datetime.datetime(2026, 9, 8, 9, 30), starts)
++        self.assertNotIn(datetime.datetime(2026, 9, 8, 9, 45), starts)  # starts inside buffer
++        self.assertIn(datetime.datetime(2026, 9, 8, 10, 0), starts)  # 09:45 end plus 10 min buffer, exactly
++
++    def test_free_slots_agree_with_book(self):
++        s = Schedule()
++        s.book(at(9))
++        s.book(at(13, 30, client="Jo Li", treatment="initial"))
++        day = datetime.date(2026, 9, 8)
++        for minutes, treatment in ((30, "short"), (45, "standard"), (60, "initial")):
++            offered = s.free_slots("lena", day, minutes)
++            for hour in range(7, 19):
++                for minute in (0, 15, 30, 45):
++                    start = datetime.datetime(2026, 9, 8, hour, minute)
++                    probe = Schedule()
++                    probe.appointments = list(s.appointments)
++                    try:
++                        probe.book(Appointment("lena", "Probe", start, treatment))
++                        bookable = True
++                    except BookingError:
++                        bookable = False
++                    self.assertEqual(start in offered, bookable, f"{minutes} min at {start:%H:%M}")
++
++    def test_free_slots_ignores_cancelled_and_other_therapists(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        s.book(at(10, therapist="marco", client="Jo Li"))
++        self.assertIn(datetime.datetime(2026, 9, 8, 9, 0), s.free_slots("lena", datetime.date(2026, 9, 8), 45))
++        self.assertIn(datetime.datetime(2026, 9, 8, 10, 0), s.free_slots("lena", datetime.date(2026, 9, 8), 45))
++
++    def test_free_slots_rejects_nonpositive_length(self):
++        with self.assertRaises(ValueError):
++            Schedule().free_slots("lena", datetime.date(2026, 9, 8), 0)
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

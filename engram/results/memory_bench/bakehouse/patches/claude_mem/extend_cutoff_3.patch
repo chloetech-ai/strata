@@ -1,0 +1,28 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d197174..8781298 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,7 +5,7 @@
+ - Planned: the bake sheet lists products hottest oven first (Tomasz, deck oven).
+ - Standing orders: weekly customer lines expand into dated order lines.
+ - Deliveries on Sundays; closed on Mondays instead.
+-- Order cutoff moved to 13:00 the day before delivery.
++- Order cutoff moved to 13:30 the day before delivery.
+ - Orders reject unknown product codes; new order lookups: `lines_for`, `customers_for`, `days`, `remove`, `len()`.
+ - Reports: `day_summary` (per-customer value) and `top_products` (units over a date range).
+ - `python -m bakehouse plan` replaces `scripts/print_plan.py`.
+diff --git a/src/bakehouse/config.py b/src/bakehouse/config.py
+index 8636bbf..2f11de3 100644
+--- a/src/bakehouse/config.py
++++ b/src/bakehouse/config.py
+@@ -5,8 +5,8 @@ import datetime
+ BAKERY_NAME = "Larkspur Bakery"
+ 
+ # Orders for a delivery day must be in by this time on the day before.
+-# 13:00 because the mill now wants our flour order by 13:30.
+-ORDER_CUTOFF = datetime.time(13, 0)
++# 13:30 (was 13:00). The mill wants our flour order by 13:30, so this leaves no gap.
++ORDER_CUTOFF = datetime.time(13, 30)
+ 
+ # Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).
+ # Monday since November: we have the stall at the Sunday farmers' market.

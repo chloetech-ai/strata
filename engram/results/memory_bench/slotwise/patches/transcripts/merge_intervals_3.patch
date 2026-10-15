@@ -1,0 +1,151 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..8f87aef 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,9 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_clients.py::NormalizePhoneTest": true,
++  "tests/test_clients.py::ClientBookTest": true,
++  "tests/test_model.py::AppointmentTest": true,
++  "tests/test_reminders.py::ToAsciiTest": true,
++  "tests/test_reminders.py::ReminderTest": true,
++  "tests/test_schedule.py::ScheduleTest": true,
++  "tests/test_storage.py::StorageTest": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 8d71167..37fa4d2 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,14 +1,40 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_add_refuses_unreadable_phone",
++  "tests/test_clients.py::ClientBookTest::test_finds_client_by_any_spelling",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_order",
++  "tests/test_clients.py::ClientBookTest::test_search_without_match_is_empty",
++  "tests/test_clients.py::ClientBookTest::test_second_client_with_same_phone_is_refused",
++  "tests/test_clients.py::ClientBookTest::test_unknown_number_returns_none",
++  "tests/test_clients.py::ClientBookTest::test_unreadable_number_returns_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_swiss_spellings_match",
++  "tests/test_clients.py::NormalizePhoneTest::test_foreign_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_unreadable_numbers_raise",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
++  "tests/test_intervals.py::MergeIntervalsTest::test_contained_interval_does_not_shrink",
++  "tests/test_intervals.py::MergeIntervalsTest::test_datetimes",
++  "tests/test_intervals.py::MergeIntervalsTest::test_disjoint_sorted_by_start",
++  "tests/test_intervals.py::MergeIntervalsTest::test_empty",
++  "tests/test_intervals.py::MergeIntervalsTest::test_input_not_modified",
++  "tests/test_intervals.py::MergeIntervalsTest::test_overlapping_and_touching_merge",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTest::test_reminder_contents",
++  "tests/test_reminders.py::ReminderTest::test_too_long_is_refused_not_split",
++  "tests/test_reminders.py::ToAsciiTest::test_accents_are_dropped",
++  "tests/test_reminders.py::ToAsciiTest::test_plain_ascii_is_unchanged",
++  "tests/test_reminders.py::ToAsciiTest::test_umlauts_are_spelled_out",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_back_to_back_is_allowed",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_booking_that_contains_existing_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_buffer_does_not_block_other_therapist",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_record",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_id_is_key_error",
++  "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_buffer",
++  "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_slot",
+   "tests/test_schedule.py::ScheduleTest::test_end_inside_buffer_before_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_exactly_buffer_after_is_allowed",
+   "tests/test_schedule.py::ScheduleTest::test_exactly_buffer_before_is_allowed",
+@@ -16,7 +42,19 @@
+   "tests/test_schedule.py::ScheduleTest::test_outside_opening_hours",
+   "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_series_is_weekly_same_time",
++  "tests/test_schedule.py::ScheduleTest::test_series_needs_at_least_one_session",
++  "tests/test_schedule.py::ScheduleTest::test_series_of_nine_is_allowed",
++  "tests/test_schedule.py::ScheduleTest::test_series_over_nine_is_refused_and_books_nothing",
++  "tests/test_schedule.py::ScheduleTest::test_series_passes_treatment_through",
++  "tests/test_schedule.py::ScheduleTest::test_series_skips_taken_week_and_adds_one_at_end",
+   "tests/test_schedule.py::ScheduleTest::test_start_inside_buffer_after_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_unknown_treatment_is_booking_error",
++  "tests/test_schedule.py::ScheduleTest::test_week_excludes_next_monday",
++  "tests/test_schedule.py::ScheduleTest::test_week_groups_by_day_in_order",
++  "tests/test_schedule.py::ScheduleTest::test_week_leaves_out_cancelled_and_other_therapists",
++  "tests/test_schedule.py::ScheduleTest::test_week_rejects_non_monday",
++  "tests/test_storage.py::StorageTest::test_cancelled_status_roundtrip",
++  "tests/test_storage.py::StorageTest::test_file_without_status_loads_as_booked",
+   "tests/test_storage.py::StorageTest::test_roundtrip"
+ ]
+\ No newline at end of file
+diff --git a/src/slotwise/intervals.py b/src/slotwise/intervals.py
+new file mode 100644
+index 0000000..167847c
+--- /dev/null
++++ b/src/slotwise/intervals.py
+@@ -0,0 +1,16 @@
++"""Helpers for working with (start, end) intervals."""
++
++
++def merge_intervals(intervals):
++    """Merge overlapping or touching (start, end) pairs.
++
++    Works for ints or datetimes. Returns a new list of tuples sorted by start;
++    the input list is not modified.
++    """
++    merged = []
++    for start, end in sorted(intervals):
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..a071d5f
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,40 @@
++import datetime
++import unittest
++
++from slotwise.intervals import merge_intervals
++
++DT = datetime.datetime
++
++
++class MergeIntervalsTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(merge_intervals([]), [])
++
++    def test_disjoint_sorted_by_start(self):
++        self.assertEqual(merge_intervals([(5, 6), (1, 2)]), [(1, 2), (5, 6)])
++
++    def test_overlapping_and_touching_merge(self):
++        self.assertEqual(merge_intervals([(1, 3), (2, 5), (5, 7)]), [(1, 7)])
++
++    def test_contained_interval_does_not_shrink(self):
++        self.assertEqual(merge_intervals([(1, 10), (2, 3)]), [(1, 10)])
++
++    def test_datetimes(self):
++        intervals = [
++            (DT(2026, 9, 7, 9, 0), DT(2026, 9, 7, 9, 30)),
++            (DT(2026, 9, 7, 9, 30), DT(2026, 9, 7, 10, 0)),
++            (DT(2026, 9, 7, 11, 0), DT(2026, 9, 7, 11, 30)),
++        ]
++        self.assertEqual(
++            merge_intervals(intervals),
++            [(DT(2026, 9, 7, 9, 0), DT(2026, 9, 7, 10, 0)), (DT(2026, 9, 7, 11, 0), DT(2026, 9, 7, 11, 30))],
++        )
++
++    def test_input_not_modified(self):
++        intervals = [(5, 6), (1, 3), (2, 4)]
++        merge_intervals(intervals)
++        self.assertEqual(intervals, [(5, 6), (1, 3), (2, 4)])
++
++
++if __name__ == "__main__":
++    unittest.main()

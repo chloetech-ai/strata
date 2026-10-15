@@ -1,0 +1,120 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d197174..7c5e27e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,7 @@
+ - Invoices: `invoice_number(year, seq)` gives numbers like `LK-2026-0001`; `invoice_for` only includes the named customer's lines.
+ - Dough weights: `dough_weight_g` rejects negative units; product dough weights are whole grams.
+ - Production: `crates_needed(units, per_crate)` rounds up to whole crates.
++- Labels: `crate_labels(orderbook, customers, day)` gives one packing label per customer and product, in run order.
+ - Python 3.7 compatibility fixes.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..e2b6181
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,22 @@
++"""Crate labels for packing a delivery day."""
++
++
++def crate_labels(orderbook, customers, day):
++    """One label per customer and product ordered for delivery on `day`, in run order:
++    by the customer's route_seq, then product code. Duplicate lines for the same customer
++    and product are combined into one label.
++
++    `customers` is the dict from load_customers. Raises ValueError if an order names a
++    customer that is not in it.
++    """
++    totals = {}
++    for line in orderbook.for_day(day):
++        if line.customer not in customers:
++            raise ValueError(f"unknown customer code {line.customer}")
++        key = (line.customer, line.product)
++        totals[key] = totals.get(key, 0) + line.qty
++    run_order = sorted(totals, key=lambda key: (customers[key[0]].route_seq, key[1]))
++    return [
++        f"{customers[code].name}: {totals[(code, product)]} x {orderbook.catalog.get(product).name}"
++        for code, product in run_order
++    ]
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..d6a2e1f
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,74 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("CRO", "Croissant", 110, 24),
++            Product("SOU", "White sourdough", 320, 10),
++        ])
++        self.customers = {
++            "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++            "HARBOUR": Customer("HARBOUR", "Harbour Deli", "3 Quay Street", "LK2 7QS", 2),
++        }
++
++    def test_one_label_per_customer_and_product_in_run_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "HARBOUR", "SOU", 3),
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY, "LUMEN", "CRO", 24),
++            OrderLine(DAY, "HARBOUR", "CRO", 12),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Café Lumen: 24 x Croissant",
++            "Café Lumen: 6 x White sourdough",
++            "Harbour Deli: 12 x Croissant",
++            "Harbour Deli: 3 x White sourdough",
++        ])
++
++    def test_run_order_follows_route_seq_not_customer_code(self):
++        self.customers["HARBOUR"] = Customer("HARBOUR", "Harbour Deli", "3 Quay Street", "LK2 7QS", 0)
++        self.customers["LUMEN"] = Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 5)
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "CRO", 24),
++            OrderLine(DAY, "HARBOUR", "CRO", 12),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Harbour Deli: 12 x Croissant",
++            "Café Lumen: 24 x Croissant",
++        ])
++
++    def test_duplicate_lines_for_same_customer_and_product_are_combined(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "CRO", 12),
++            OrderLine(DAY, "LUMEN", "CRO", 12),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Café Lumen: 24 x Croissant"])
++
++    def test_only_the_named_day_is_labelled(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "CRO", 24),
++            OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "SOU", 10),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Café Lumen: 24 x Croissant"])
++
++    def test_no_orders_gives_no_labels(self):
++        book = OrderBook(self.catalog)
++        self.assertEqual(crate_labels(book, self.customers, DAY), [])
++
++    def test_unknown_customer_is_an_error(self):
++        book = OrderBook(self.catalog, [OrderLine(DAY, "NOPE", "CRO", 24)])
++        with self.assertRaises(ValueError):
++            crate_labels(book, self.customers, DAY)
++
++
++if __name__ == "__main__":
++    unittest.main()

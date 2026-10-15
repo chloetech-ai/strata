@@ -1,0 +1,27 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cca8021..9b1ae6e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- `config.ORDER_CUTOFF` moved from 13:00 to 13:30, giving customers an extra half hour to order for the next day.
+ - `OrderBook.add` raises `ValueError` for a product code not in the catalog, instead of dropping the line. `load_orders` raises the same way.
+ - `OrderBook.total_for(day, product_code)` and `OrderBook.customers_for(day)`.
+ - `Product.allergen_text()`, the allergens sorted and joined with `', '`.
+diff --git a/src/bakehouse/config.py b/src/bakehouse/config.py
+index 8636bbf..b581fdc 100644
+--- a/src/bakehouse/config.py
++++ b/src/bakehouse/config.py
+@@ -5,8 +5,8 @@ import datetime
+ BAKERY_NAME = "Larkspur Bakery"
+ 
+ # Orders for a delivery day must be in by this time on the day before.
+-# 13:00 because the mill now wants our flour order by 13:30.
+-ORDER_CUTOFF = datetime.time(13, 0)
++# Was 13:00; moved to 13:30 to give customers an extra half hour.
++ORDER_CUTOFF = datetime.time(13, 30)
+ 
+ # Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).
+ # Monday since November: we have the stall at the Sunday farmers' market.

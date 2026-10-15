@@ -1,0 +1,76 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a15384c..4853a53 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- `Inventory.write_off(sku, qty, date=None)` takes broken or damaged stock out, recorded with the DAMAGE reason code.
+ - Command line: `onhand`, `receive` and `moves` subcommands over the CSV movement log.
+ 
+ ## 0.1.0
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index f7ed019..4c55003 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -47,6 +47,12 @@ class Inventory:
+             raise ValueError("quantity must be positive")
+         return self._record(Movement(sku, -qty, date or datetime.date.today(), "SALE", None, note))
+ 
++    def write_off(self, sku, qty, date=None, note=""):
++        """Stock lost to breakage or damage, taken out at no sale price."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self._record(Movement(sku, -qty, date or datetime.date.today(), "DAMAGE", None, note))
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index b6ea772..d3885be 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -47,6 +47,42 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual(inv.receive("BR-1042", 10, 12, DAY).reason, "RECEIPT")
+         self.assertEqual(inv.issue("BR-1042", 3, DAY).reason, "SALE")
+ 
++    def test_write_off_takes_stock_out_as_damage(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        movement = inv.write_off("BR-1042", 3, DAY)
++        self.assertEqual(movement.qty, -3)
++        self.assertEqual(movement.reason, "DAMAGE")
++        self.assertIsNone(movement.unit_cost)
++        self.assertEqual(movement.date, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_defaults_to_today(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        self.assertEqual(inv.write_off("BR-1042", 1).date, datetime.date.today())
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        for bad in [0, -2]:
++            with self.subTest(qty=bad):
++                with self.assertRaises(ValueError):
++                    inv.write_off("BR-1042", bad)
++        self.assertEqual(inv.movements, [])
++
++    def test_write_off_normalizes_sku(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.write_off(" br-1042", 4, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 6)
++        self.assertEqual(inv.movements_for("br-1042")[-1].sku, "BR-1042")
++
++    def test_write_off_can_take_stock_negative(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 2, 12, DAY)
++        inv.write_off("BR-1042", 5, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -3)
++
+     def test_movement_rejects_unknown_reason(self):
+         for bad in ["sale", " SALE", "SHRINK", "", None]:
+             with self.subTest(reason=bad):

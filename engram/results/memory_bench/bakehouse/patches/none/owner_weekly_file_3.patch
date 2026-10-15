@@ -1,0 +1,206 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index afad7d2..f1a96ef 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,11 +1,20 @@
+ [
++  "tests/test_customers.py::CustomersTest::test_blank_email_is_empty",
+   "tests/test_customers.py::CustomersTest::test_distinct_route_seqs_load",
+   "tests/test_customers.py::CustomersTest::test_duplicate_route_seq_is_rejected",
++  "tests/test_customers.py::CustomersTest::test_email_defaults_to_empty",
++  "tests/test_customers.py::CustomersTest::test_email_is_read_when_present",
++  "tests/test_customers.py::CustomersTest::test_file_without_email_column_gives_empty_email",
+   "tests/test_customers.py::CustomersTest::test_load_customers",
+   "tests/test_customers.py::CustomersTest::test_str_is_name",
+   "tests/test_invoice.py::InvoiceTest::test_empty_invoice",
++  "tests/test_invoice.py::InvoiceTest::test_format_pence_negative_gets_leading_minus",
++  "tests/test_invoice.py::InvoiceTest::test_format_pence_pounds_and_pence",
+   "tests/test_invoice.py::InvoiceTest::test_invoice_for_customer_with_no_orders_is_empty",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_for_ignores_other_customers_lines",
+   "tests/test_invoice.py::InvoiceTest::test_invoice_for_one_line_per_product_at_catalog_price",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_number_is_year_and_four_digit_sequence",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_number_sequence_must_fit_four_digits",
+   "tests/test_invoice.py::InvoiceTest::test_total",
+   "tests/test_orders.py::CutoffTest::test_a_minute_after_the_cutoff_is_too_late",
+   "tests/test_orders.py::CutoffTest::test_a_minute_before_the_cutoff_is_on_time",
+@@ -16,28 +25,59 @@
+   "tests/test_orders.py::CutoffTest::test_well_before_the_cutoff",
+   "tests/test_orders.py::OrderBookTest::test_customers_for_is_sorted_and_unique",
+   "tests/test_orders.py::OrderBookTest::test_customers_for_nothing_ordered_is_empty",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_three_customers_on_one_day",
++  "tests/test_orders.py::OrderBookTest::test_days_is_sorted_and_distinct",
++  "tests/test_orders.py::OrderBookTest::test_days_of_empty_book_is_empty",
+   "tests/test_orders.py::OrderBookTest::test_for_day",
++  "tests/test_orders.py::OrderBookTest::test_len_counts_lines",
++  "tests/test_orders.py::OrderBookTest::test_lines_for_customer_on_day",
++  "tests/test_orders.py::OrderBookTest::test_lines_for_nothing_ordered_is_empty",
+   "tests/test_orders.py::OrderBookTest::test_quantity_must_be_positive",
++  "tests/test_orders.py::OrderBookTest::test_remove_missing_line_returns_false",
++  "tests/test_orders.py::OrderBookTest::test_remove_takes_out_that_line",
+   "tests/test_orders.py::OrderBookTest::test_save_and_load",
+   "tests/test_orders.py::OrderBookTest::test_total_for_adds_up_customers",
+   "tests/test_orders.py::OrderBookTest::test_total_for_nothing_ordered_is_zero",
+   "tests/test_orders.py::OrderBookTest::test_unknown_product_in_file_is_rejected",
+   "tests/test_orders.py::OrderBookTest::test_unknown_product_is_rejected",
++  "tests/test_production.py::ProductionTest::test_crates_reject_crate_size_below_one",
++  "tests/test_production.py::ProductionTest::test_crates_round_up_to_whole_crates",
++  "tests/test_production.py::ProductionTest::test_dough_weight_is_grams_per_piece_times_units",
++  "tests/test_production.py::ProductionTest::test_dough_weight_rejects_negative_units",
+   "tests/test_production.py::ProductionTest::test_exact_batches",
+   "tests/test_production.py::ProductionTest::test_partial_batch_rounds_up",
+   "tests/test_production.py::ProductionTest::test_plan_adds_up_customers",
++  "tests/test_production.py::ProductionTest::test_plan_leaves_out_products_not_ordered_for_that_day",
++  "tests/test_production.py::ProductionTest::test_total_batches_of_empty_plan_is_zero",
++  "tests/test_production.py::ProductionTest::test_total_batches_sums_batches_over_products",
+   "tests/test_products.py::CatalogTest::test_add_and_get",
+   "tests/test_products.py::CatalogTest::test_allergen_text_empty_when_no_allergens",
+   "tests/test_products.py::CatalogTest::test_allergen_text_is_sorted_and_joined",
+   "tests/test_products.py::CatalogTest::test_duplicate_code_rejected",
++  "tests/test_products.py::CatalogTest::test_get_unknown_code_raises_key_error_naming_it",
+   "tests/test_products.py::CatalogTest::test_has_allergen_from_catalog",
+   "tests/test_products.py::CatalogTest::test_has_allergen_is_case_insensitive",
+   "tests/test_products.py::CatalogTest::test_load_catalog",
+   "tests/test_products.py::CatalogTest::test_negative_batch_size_rejected",
+   "tests/test_products.py::CatalogTest::test_negative_price_rejected",
++  "tests/test_products.py::CatalogTest::test_price_text_formats_pence_as_pounds",
+   "tests/test_products.py::CatalogTest::test_zero_batch_size_rejected",
+   "tests/test_products.py::CatalogTest::test_zero_price_accepted",
+   "tests/test_reports.py::DaySummaryTest::test_no_orders_gives_empty_summary",
+   "tests/test_reports.py::DaySummaryTest::test_other_days_are_ignored",
+-  "tests/test_reports.py::DaySummaryTest::test_value_per_customer_in_pence"
++  "tests/test_reports.py::DaySummaryTest::test_two_customers_same_day_with_interleaved_lines",
++  "tests/test_reports.py::DaySummaryTest::test_value_per_customer_in_pence",
++  "tests/test_reports.py::TopProductsTest::test_default_n_is_five",
++  "tests/test_reports.py::TopProductsTest::test_most_units_first_across_the_range",
++  "tests/test_reports.py::TopProductsTest::test_no_orders_gives_empty_list",
++  "tests/test_reports.py::TopProductsTest::test_range_is_inclusive_and_excludes_outside_days",
++  "tests/test_reports.py::TopProductsTest::test_ties_are_broken_by_product_code",
++  "tests/test_standing.py::ExpandTest::test_end_before_start_gives_nothing",
++  "tests/test_standing.py::ExpandTest::test_no_orders_when_range_has_no_matching_weekday",
++  "tests/test_standing.py::ExpandTest::test_no_standing_lines_gives_nothing",
++  "tests/test_standing.py::ExpandTest::test_repeats_on_matching_weekday_inclusive_of_both_ends",
++  "tests/test_standing.py::ExpandTest::test_several_lines_on_one_day_keep_given_order",
++  "tests/test_standing.py::ExpandTest::test_single_day_range_on_matching_weekday",
++  "tests/test_standing.py::StandingLineTest::test_quantity_must_be_positive",
++  "tests/test_standing.py::StandingLineTest::test_weekday_must_be_a_day_of_the_week"
+ ]
+\ No newline at end of file
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f3e54c7..a2a26ed 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@
+ - Added Potter's Farm Shop (POTTER) to customers.csv, route 6. Joins next month.
+ - Added `invoice.invoice_number(year, seq)`: invoice numbers such as 'LK-2026-0001'. Sequence must be 1 to 9999.
+ - Added `production.crates_needed(units, per_crate)`: whole crates needed, rounding a partial crate up.
++- Added `reports.week_totals_file(orderbook, week_start, path)`: writes a CSV of each customer's total in pounds for the seven days from `week_start`, for opening in a spreadsheet.
+ - Planned: the bake sheet lists products hottest oven first, to avoid reheating the deck oven after its overnight cool-down.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index a48ad3f..1b113d0 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,8 @@
+ """Reports on the order book."""
+ 
++import csv
++import datetime
++
+ 
+ def day_summary(orderbook, day):
+     """{customer code: order value in pence} for everything delivered on `day`."""
+@@ -18,3 +21,20 @@ def top_products(orderbook, start, end, n=5):
+         if start <= line.day <= end:
+             units[line.product] = units.get(line.product, 0) + line.qty
+     return sorted(units, key=lambda code: (-units[code], code))[:n]
++
++
++def week_totals_file(orderbook, week_start, path):
++    """Write a CSV with one row per customer who ordered in the seven days from `week_start`:
++    the customer code and their total in pounds, e.g. 'LUMEN,12.34'. Sorted by customer code."""
++    week_end = week_start + datetime.timedelta(days=6)
++    totals = {}
++    for line in orderbook:
++        if week_start <= line.day <= week_end:
++            price = orderbook.catalog.get(line.product).price
++            totals[line.customer] = totals.get(line.customer, 0) + line.qty * price
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(["customer", "total_gbp"])
++        for customer in sorted(totals):
++            pounds, pence = divmod(totals[customer], 100)
++            writer.writerow([customer, f"{pounds}.{pence:02d}"])
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index 641b1eb..4b1299c 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -1,9 +1,12 @@
++import csv
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ 
+@@ -87,5 +90,54 @@ class TopProductsTest(unittest.TestCase):
+         self.assertEqual(top_products(OrderBook(self.catalog), DAY, DAY), [])
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12),
++            Product("SOU", "White sourdough", 320, batch_size=10),
++            Product("CRO", "Croissant", 5, batch_size=24),
++        ])
++        self.tmp = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self.tmp.name, "week.csv")
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def read_rows(self):
++        with open(self.path, newline="", encoding="utf-8") as f:
++            return list(csv.reader(f))
++
++    def test_one_row_per_customer_in_pounds_for_seven_days(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY + datetime.timedelta(days=6), "LUMEN", "SOU", 2),
++            OrderLine(DAY + datetime.timedelta(days=3), "GREENWAY", "BAG", 20),
++        ])
++        week_totals_file(book, DAY, self.path)
++        self.assertEqual(self.read_rows(), [
++            ["customer", "total_gbp"],
++            ["GREENWAY", "19.00"],
++            ["LUMEN", "11.15"],
++        ])
++
++    def test_days_outside_the_week_are_ignored(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY - datetime.timedelta(days=1), "LUMEN", "BAG", 100),
++            OrderLine(DAY, "LUMEN", "BAG", 1),
++            OrderLine(DAY + datetime.timedelta(days=7), "LUMEN", "BAG", 100),
++        ])
++        week_totals_file(book, DAY, self.path)
++        self.assertEqual(self.read_rows(), [["customer", "total_gbp"], ["LUMEN", "0.95"]])
++
++    def test_pence_are_zero_padded(self):
++        book = OrderBook(self.catalog, [OrderLine(DAY, "LUMEN", "CRO", 1)])
++        week_totals_file(book, DAY, self.path)
++        self.assertEqual(self.read_rows(), [["customer", "total_gbp"], ["LUMEN", "0.05"]])
++
++    def test_empty_week_writes_only_the_header(self):
++        week_totals_file(OrderBook(self.catalog), DAY, self.path)
++        self.assertEqual(self.read_rows(), [["customer", "total_gbp"]])
++
++
+ if __name__ == "__main__":
+     unittest.main()

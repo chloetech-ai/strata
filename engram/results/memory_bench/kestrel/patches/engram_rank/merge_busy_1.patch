@@ -1,0 +1,69 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..c7a864d
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,17 @@
++"""Working with busy periods as (start, end) pairs."""
++
++
++def merge_busy(intervals):
++    """Merge (start, end) pairs into sorted, non-overlapping pairs.
++
++    The pairs may come in any order. Pairs that touch, such as (1, 2) and
++    (2, 3), are merged as well.
++    """
++    merged = []
++    for start, end in sorted(intervals):
++        if merged and start <= merged[-1][1]:
++            if end > merged[-1][1]:
++                merged[-1] = (merged[-1][0], end)
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..f67e690
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,40 @@
++import unittest
++
++from kestrel.intervals import merge_busy
++
++
++class MergeBusyTest(unittest.TestCase):
++    def test_empty_input_gives_empty_output(self):
++        self.assertEqual(merge_busy([]), [])
++
++    def test_single_pair_is_unchanged(self):
++        self.assertEqual(merge_busy([(1, 2)]), [(1, 2)])
++
++    def test_disjoint_pairs_are_sorted(self):
++        self.assertEqual(merge_busy([(5, 6), (1, 2)]), [(1, 2), (5, 6)])
++
++    def test_overlapping_pairs_merge(self):
++        self.assertEqual(merge_busy([(1, 4), (3, 6)]), [(1, 6)])
++
++    def test_touching_pairs_merge(self):
++        self.assertEqual(merge_busy([(1, 2), (2, 3)]), [(1, 3)])
++
++    def test_contained_pair_does_not_shrink_result(self):
++        self.assertEqual(merge_busy([(1, 10), (3, 4)]), [(1, 10)])
++
++    def test_any_order_gives_same_result(self):
++        pairs = [(8, 9), (1, 3), (2, 5), (7, 7), (5, 6)]
++        self.assertEqual(merge_busy(pairs), [(1, 6), (7, 7), (8, 9)])
++        self.assertEqual(merge_busy(list(reversed(pairs))), [(1, 6), (7, 7), (8, 9)])
++
++    def test_chain_of_overlaps_merges_into_one(self):
++        self.assertEqual(merge_busy([(1, 2), (3, 4), (2, 3)]), [(1, 4)])
++
++    def test_input_is_not_modified(self):
++        pairs = [(3, 4), (1, 2)]
++        merge_busy(pairs)
++        self.assertEqual(pairs, [(3, 4), (1, 2)])
++
++
++if __name__ == "__main__":
++    unittest.main()

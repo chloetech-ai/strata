@@ -1,0 +1,101 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f3e54c7..7ef1c95 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@
+ - Added Potter's Farm Shop (POTTER) to customers.csv, route 6. Joins next month.
+ - Added `invoice.invoice_number(year, seq)`: invoice numbers such as 'LK-2026-0001'. Sequence must be 1 to 9999.
+ - Added `production.crates_needed(units, per_crate)`: whole crates needed, rounding a partial crate up.
++- Added `labels.crate_labels(orderbook, customers, day)`: one label of text per customer and product for that day, in route order.
+ - Planned: the bake sheet lists products hottest oven first, to avoid reheating the deck oven after its overnight cool-down.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..a1c0987
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,19 @@
++"""Crate labels for packing a delivery day."""
++
++
++def crate_labels(orderbook, customers, day):
++    """One label of text per customer and product ordered for delivery on `day`.
++
++    Labels follow the van's run (route_seq), then product code. A customer's lines for the
++    same product are added together into one label.
++    """
++    labels = []
++    for code in sorted(orderbook.customers_for(day), key=lambda c: customers[c].route_seq):
++        customer = customers[code]
++        totals = {}
++        for line in orderbook.lines_for(code, day):
++            totals[line.product] = totals.get(line.product, 0) + line.qty
++        for product_code, qty in sorted(totals.items()):
++            product = orderbook.catalog.get(product_code)
++            labels.append(f"{customer.name}\n{product.name} x {qty}\n{day.isoformat()}")
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..9be8db8
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,58 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12),
++            Product("SOU", "White sourdough", 320, batch_size=10),
++        ])
++        self.customers = {
++            "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "88 High Street", "LK1 4HS", 4),
++            "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++        }
++
++    def test_one_label_per_customer_and_product_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "GREENWAY", "SOU", 5),
++            OrderLine(DAY, "GREENWAY", "BAG", 20),
++            OrderLine(DAY, "LUMEN", "BAG", 6),
++        ])
++        labels = crate_labels(book, self.customers, DAY)
++        self.assertEqual(labels, [
++            "Café Lumen\nBaguette x 6\n2026-10-20",
++            "Greenway Grocers\nBaguette x 20\n2026-10-20",
++            "Greenway Grocers\nWhite sourdough x 5\n2026-10-20",
++        ])
++
++    def test_lines_for_the_same_product_are_added_together(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 6),
++            OrderLine(DAY, "LUMEN", "BAG", 4),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Café Lumen\nBaguette x 10\n2026-10-20",
++        ])
++
++    def test_only_orders_for_the_given_day(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 6),
++            OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "SOU", 2),
++        ])
++        self.assertEqual(len(crate_labels(book, self.customers, DAY)), 1)
++
++    def test_no_orders_gives_no_labels(self):
++        book = OrderBook(self.catalog)
++        self.assertEqual(crate_labels(book, self.customers, DAY), [])
++
++
++if __name__ == "__main__":
++    unittest.main()

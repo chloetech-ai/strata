@@ -1,0 +1,93 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index cdcf6fb..293d5a1 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -7,6 +7,9 @@
+   "tests/test_clients.py::ClientBookTest::test_unknown_phone_raises_key_error",
+   "tests/test_clients.py::NormalizePhoneTest::test_all_forms_of_one_number_match",
+   "tests/test_clients.py::NormalizePhoneTest::test_bare_international_number_is_kept",
++  "tests/test_durations.py::DurationTest::test_formats",
++  "tests/test_durations.py::DurationTest::test_ignores_case_and_surrounding_spaces",
++  "tests/test_durations.py::DurationTest::test_rejects_invalid",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/src/slotwise/durations.py b/src/slotwise/durations.py
+new file mode 100644
+index 0000000..d278dfc
+--- /dev/null
++++ b/src/slotwise/durations.py
+@@ -0,0 +1,33 @@
++"""Parsing of treatment durations typed by reception."""
++
++import re
++
++# 1h, 1h30, 1h 30m, 2h15 | 45, 45m, 45 min | 1:30
++_DURATION = re.compile(
++    r"(?:(?P<hours>[0-9]+)\s*h\s*(?:(?P<h_minutes>[0-9]+)\s*m?)?"
++    r"|(?P<minutes>[0-9]+)\s*(?:m|min)?"
++    r"|(?P<c_hours>[0-9]+):(?P<c_minutes>[0-9]{1,2}))",
++    re.ASCII,
++)
++
++
++def parse_duration(text):
++    """Minutes for a duration such as '45', '1h', '1h30' or '1:30'.
++
++    Raises ValueError for empty input, zero, minutes of 60 or more, or anything else.
++    """
++    match = _DURATION.fullmatch(text.strip().lower())
++    if match is None:
++        raise ValueError(f"not a duration: {text!r}")
++    if match["minutes"] is not None:
++        minutes = int(match["minutes"])
++    else:
++        hours = int(match["hours"] or match["c_hours"])
++        rest = match["h_minutes"] or match["c_minutes"]
++        rest = int(rest) if rest is not None else 0
++        if rest > 59:
++            raise ValueError(f"minutes must be below 60: {text!r}")
++        minutes = hours * 60 + rest
++    if minutes == 0:
++        raise ValueError(f"duration must be more than zero: {text!r}")
++    return minutes
+diff --git a/tests/test_durations.py b/tests/test_durations.py
+new file mode 100644
+index 0000000..64f0d73
+--- /dev/null
++++ b/tests/test_durations.py
+@@ -0,0 +1,34 @@
++import unittest
++
++from slotwise.durations import parse_duration
++
++
++class DurationTest(unittest.TestCase):
++    def test_formats(self):
++        cases = {
++            "45": 45,
++            "45m": 45,
++            "45 min": 45,
++            "1h": 60,
++            "1h30": 90,
++            "1h 30m": 90,
++            "2h15": 135,
++            "1:30": 90,
++        }
++        for text, minutes in cases.items():
++            with self.subTest(text=text):
++                self.assertEqual(parse_duration(text), minutes)
++
++    def test_ignores_case_and_surrounding_spaces(self):
++        self.assertEqual(parse_duration("  1H 30M "), 90)
++        self.assertEqual(parse_duration("45 MIN"), 45)
++
++    def test_rejects_invalid(self):
++        for text in ["", "   ", "abc", "-5", "0", "0:00", "1:75", "1h90", "1.5h", "45 sec"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,65 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index c576cf0..1b5cf3f 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -47,6 +47,14 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Credit in pence for `returned` unsold units out of `delivered` on one delivery, at the
++    catalog price. Raises ValueError if the returned count is negative or more than was delivered."""
++    if not 0 <= returned <= delivered:
++        raise ValueError(f"returned must be between 0 and delivered ({delivered}), got {returned}")
++    return returned * catalog.get(product_code).price
++
++
+ def format_pence(pence):
+     """Format integer pence as pounds, e.g. 1234 -> '£12.34'. Negative amounts get a leading minus."""
+     sign = "-" if pence < 0 else ""
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 62bd57a..6e6b643 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -64,6 +64,32 @@ class InvoiceNumberTest(unittest.TestCase):
+             invoice_number(2026, 10000)
+ 
+ 
++class ReturnsCreditTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([Product("SOU", "White sourdough", 320, 10)])
++
++    def test_credit_is_returned_units_at_catalog_price(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SOU", 12, 3), 3 * 320)
++
++    def test_nothing_returned_gives_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SOU", 12, 0), 0)
++
++    def test_everything_returned(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SOU", 12, 12), 12 * 320)
++
++    def test_returned_more_than_delivered_is_rejected(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SOU", 12, 13)
++
++    def test_negative_return_is_rejected(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SOU", 12, -1)
++
++    def test_unknown_product_is_rejected(self):
++        with self.assertRaises(KeyError):
++            returns_credit(self.catalog, "GREENWAY", "BAG", 12, 1)
++
++
+ class FormatPenceTest(unittest.TestCase):
+     def test_pounds_and_pence(self):
+         self.assertEqual(format_pence(1234), "£12.34")

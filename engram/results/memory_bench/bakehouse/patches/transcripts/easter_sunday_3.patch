@@ -1,0 +1,69 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 05a3f86..09b9ee0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - Products: `price_text` and `allergen_text` helpers.
+ - Production: `total_batches`, `crates_needed` (whole crates, rounded up), and `dough_weight_g` rejects negative units.
+ - `python -m bakehouse plan` replaces `scripts/print_plan.py`, with aligned columns for product names, units and batches.
++- Seasons: `easter_sunday(year)` gives the Western Easter Sunday date for planning hot cross bun season.
+ - Invoices: `invoice_for` builds one line per product at catalog prices; `day_summary` gives order value per customer; `format_pence` shows pence as pounds; `invoice_number` gives numbers like `LK-2026-0001`.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/seasons.py b/src/bakehouse/seasons.py
+new file mode 100644
+index 0000000..1f96e90
+--- /dev/null
++++ b/src/bakehouse/seasons.py
+@@ -0,0 +1,19 @@
++"""Seasons: dates that set the bake calendar, such as hot cross bun season."""
++
++import datetime
++
++
++def easter_sunday(year):
++    """Date of Easter Sunday in the Western church, Gregorian calendar
++    (the Meeus/Jones/Butcher algorithm)."""
++    a = year % 19
++    b, c = divmod(year, 100)
++    d, e = divmod(b, 4)
++    f = (b + 8) // 25
++    g = (b - f + 1) // 3
++    h = (19 * a + b - d - g + 15) % 30
++    i, k = divmod(c, 4)
++    l = (32 + 2 * e + 2 * i - h - k) % 7
++    m = (a + 11 * h + 22 * l) // 451
++    month, day = divmod(h + l - 7 * m + 114, 31)
++    return datetime.date(year, month, day + 1)
+diff --git a/tests/test_seasons.py b/tests/test_seasons.py
+new file mode 100644
+index 0000000..c372d2e
+--- /dev/null
++++ b/tests/test_seasons.py
+@@ -0,0 +1,26 @@
++import datetime
++import unittest
++
++from bakehouse.seasons import easter_sunday
++
++
++class EasterSundayTest(unittest.TestCase):
++    def test_known_dates(self):
++        self.assertEqual(easter_sunday(1900), datetime.date(1900, 4, 15))
++        self.assertEqual(easter_sunday(1961), datetime.date(1961, 4, 2))
++        self.assertEqual(easter_sunday(1981), datetime.date(1981, 4, 19))
++        self.assertEqual(easter_sunday(2000), datetime.date(2000, 4, 23))
++        self.assertEqual(easter_sunday(2024), datetime.date(2024, 3, 31))
++        self.assertEqual(easter_sunday(2026), datetime.date(2026, 4, 5))
++
++    def test_always_a_sunday_between_march_22_and_april_25(self):
++        for year in range(1900, 2200):
++            easter = easter_sunday(year)
++            with self.subTest(year=year):
++                self.assertEqual(easter.weekday(), 6)
++                self.assertGreaterEqual(easter, datetime.date(year, 3, 22))
++                self.assertLessEqual(easter, datetime.date(year, 4, 25))
++
++
++if __name__ == "__main__":
++    unittest.main()

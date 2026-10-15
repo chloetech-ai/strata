@@ -1,0 +1,103 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3996565..7095add 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@
+ - Added `Schedule.week(therapist, monday)`: a therapist's booked appointments for the seven days from `monday`, keyed by date, each day sorted by start time. Cancelled appointments are left out.
+ - Added `Schedule.book_series(therapist, client, start, sessions, treatment="standard")`: weekly appointments at the same weekday and time. A week already taken is skipped and a later week is added, so the client still gets every session. Series are capped at 9 sessions (`SeriesTooLong`, a new `BookingError`).
+ - Added `slotwise.clients`: `Client` (id, name, phone, email) and `ClientBook`, a register with `add(client)` and `find_by_phone(phone)`. Phone numbers are matched after normalizing, so "079 123 45 67", "+41 79 123 45 67" and "0041791234567" all find the same client. National numbers with a leading 0 are read as Swiss. `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case and surrounding spaces.
++- Added `slotwise.printing.day_plan(schedule, therapist, day)`: the day's booked appointments as text for the receipt printer. Cancelled appointments are left out, and no line is longer than 42 characters (`LINE_WIDTH`); long names and treatments wrap onto indented lines.
+ - Added `slotwise.reminders`: `reminder(appointment)` builds the SMS text. It is plain ASCII (umlauts spelled out, so "Brändli" becomes "Braendli"), includes the reception number 044 512 77 30, and raises `ValueError` rather than exceed 160 characters.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..db1e49a
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,25 @@
++"""Printable day plan for reception. The receipt printer fits 42 characters a line."""
++
++import textwrap
++
++from .model import CANCELLED
++
++LINE_WIDTH = 42
++
++
++def _wrap(text, indent=""):
++    return textwrap.wrap(text, width=LINE_WIDTH, subsequent_indent=indent)
++
++
++def day_plan(schedule, therapist, day):
++    """Text of `therapist`'s booked appointments on `day`, by start time. Cancelled ones are left out.
++
++    No line is longer than 42 characters: long client names and treatments wrap onto indented lines.
++    """
++    appointments = [a for a in schedule.appointments_for(therapist, day) if a.status != CANCELLED]
++    lines = _wrap(f"Day plan {therapist}, {day:%a %d.%m.%Y}")
++    if not appointments:
++        lines += _wrap("No appointments.")
++    for a in appointments:
++        lines += _wrap(f"{a.start:%H:%M}-{a.end:%H:%M} {a.client}, {a.treatment}", indent="      ")
++    return "\n".join(lines)
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..33265a9
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,54 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.printing import LINE_WIDTH, day_plan
++from slotwise.schedule import Schedule
++
++MONDAY = datetime.date(2026, 9, 7)
++
++
++class DayPlanTest(unittest.TestCase):
++    def setUp(self):
++        self.schedule = Schedule()
++
++    def test_lists_appointments_by_start_time(self):
++        self.schedule.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 10, 0), "short"))
++        self.schedule.book(Appointment("lena", "Ana Brun", datetime.datetime(2026, 9, 7, 8, 0)))
++        self.assertEqual(
++            day_plan(self.schedule, "lena", MONDAY),
++            "Day plan lena, Mon 07.09.2026\n"
++            "08:00-08:45 Ana Brun, standard\n"
++            "10:00-10:30 Kim Weber, short",
++        )
++
++    def test_cancelled_appointments_are_left_out(self):
++        booked = self.schedule.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 8, 0)))
++        self.schedule.book(Appointment("lena", "Ana Brun", datetime.datetime(2026, 9, 7, 10, 0)))
++        self.schedule.cancel(booked.id)
++        self.assertNotIn("Kim Weber", day_plan(self.schedule, "lena", MONDAY))
++
++    def test_other_therapists_and_days_are_left_out(self):
++        self.schedule.book(Appointment("max", "Kim Weber", datetime.datetime(2026, 9, 7, 8, 0)))
++        self.schedule.book(Appointment("lena", "Ana Brun", datetime.datetime(2026, 9, 8, 8, 0)))
++        self.assertEqual(day_plan(self.schedule, "lena", MONDAY), "Day plan lena, Mon 07.09.2026\nNo appointments.")
++
++    def test_no_line_exceeds_the_printer_width(self):
++        self.schedule.book(
++            Appointment(
++                "lena",
++                "Maria-Theresia Oberholzer-Tschudi-Müller von Steinberg-Schwarzenbach",
++                datetime.datetime(2026, 9, 7, 8, 0),
++                "initial",
++            )
++        )
++        text = day_plan(self.schedule, "lena", MONDAY)
++        for line in text.splitlines():
++            self.assertLessEqual(len(line), LINE_WIDTH, line)
++        self.assertIn("Tschudi-Müller", text)
++        self.assertIn("Schwarzenbach", text)
++        self.assertIn("initial", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

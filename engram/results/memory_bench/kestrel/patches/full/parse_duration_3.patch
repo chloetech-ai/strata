@@ -1,0 +1,69 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..e0078bd
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,26 @@
++"""Durations such as '45m', '1h' and '1h 30m'."""
++
++import re
++
++_MINUTES = re.compile(r"([0-9]+)m")
++_HOURS = re.compile(r"([0-9]+)h\s*(?:([0-9]{1,2})m?)?")
++
++
++def parse_duration(text):
++    """Minutes in a duration written as '45m', '1h', '1h30' or '1h 30m'.
++
++    A bare number has no unit and is rejected, as is a zero total and minutes
++    of 60 or more after an hour. Raises ValueError for anything else.
++    """
++    cleaned = text.strip().lower()
++    minutes = _MINUTES.fullmatch(cleaned)
++    if minutes is not None:
++        total = int(minutes.group(1))
++    else:
++        hours = _HOURS.fullmatch(cleaned)
++        if hours is None or (hours.group(2) is not None and int(hours.group(2)) >= 60):
++            raise ValueError(f"not a duration: {text!r}")
++        total = int(hours.group(1)) * 60 + int(hours.group(2) or 0)
++    if total == 0:
++        raise ValueError(f"not a duration: {text!r}")
++    return total
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..dabd264
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,31 @@
++import unittest
++
++from kestrel.intervals import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_accepted_forms(self):
++        cases = {
++            "45m": 45,
++            "1h": 60,
++            "1h30": 90,
++            "1h30m": 90,
++            "1h 30m": 90,
++            "1h 30": 90,
++            "90m": 90,
++            "2h": 120,
++            " 45M ": 45,
++        }
++        for text, minutes in cases.items():
++            with self.subTest(text=text):
++                self.assertEqual(parse_duration(text), minutes)
++
++    def test_rejects_everything_else(self):
++        for text in ["", "   ", "45", "m45", "1 h", "45 m", "1.5h", "1h90", "1h60m", "0m", "0h", "-15m", "1h-30", "1h30m5", "abc", "1hm"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,148 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index f707cf8..cd9af2e 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -30,5 +30,15 @@
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
+   "tests/test_storage.py::StorageTest::test_old_file_without_reason_column_infers_reason_from_sign",
+-  "tests/test_storage.py::StorageTest::test_roundtrip"
++  "tests/test_storage.py::StorageTest::test_roundtrip",
++  "tests/test_valuation.py::StockValueTest::test_empty_is_zero",
++  "tests/test_valuation.py::StockValueTest::test_issue_spanning_layers_exactly",
++  "tests/test_valuation.py::StockValueTest::test_issues_consume_oldest_cost_first",
++  "tests/test_valuation.py::StockValueTest::test_later_receipt_after_issue",
++  "tests/test_valuation.py::StockValueTest::test_negative_stock_has_no_value",
++  "tests/test_valuation.py::StockValueTest::test_other_skus_ignored",
++  "tests/test_valuation.py::StockValueTest::test_positive_adjustment_needs_cost",
++  "tests/test_valuation.py::StockValueTest::test_receipt_fills_shortfall_before_costing",
++  "tests/test_valuation.py::StockValueTest::test_single_receipt",
++  "tests/test_valuation.py::StockValueTest::test_sku_is_normalized"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..6b5a6ae
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,38 @@
++"""Value of stock on hand, costed FIFO."""
++
++from collections import deque
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand, costed FIFO.
++
++    Each receipt opens a cost layer at its unit cost. Goods going out consume
++    the oldest layers first, so what remains is costed at the most recent
++    receipts. Movements are read in log order.
++
++    Issues may take stock below zero. The shortfall has no cost layer: later
++    receipts fill it before they add costed stock, so the value always
++    matches the goods actually on hand.
++    """
++    layers = deque()  # [qty, unit_cost] pairs, oldest first
++    deficit = 0  # units issued beyond what was on hand
++    for m in inventory.movements_for(sku):
++        if m.qty > 0:
++            qty = m.qty
++            covered = min(qty, deficit)
++            deficit -= covered
++            qty -= covered
++            if qty:
++                if m.unit_cost is None:
++                    raise ValueError(f"movement of {m.qty} into {m.sku} has no unit cost")
++                layers.append([qty, m.unit_cost])
++            continue
++        remaining = -m.qty
++        while remaining and layers:
++            take = min(remaining, layers[0][0])
++            layers[0][0] -= take
++            remaining -= take
++            if layers[0][0] == 0:
++                layers.popleft()
++        deficit += remaining
++    return sum(qty * cost for qty, cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..95c4491
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,76 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_issues_consume_oldest_cost_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 20, DAY)
++        inv.issue("BR-1042", 15, DAY)  # 10 @ 12 and 5 @ 20 leave; 5 @ 20 remain
++        self.assertEqual(stock_value(inv, "BR-1042"), 100)
++
++    def test_issue_spanning_layers_exactly(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 20, DAY)
++        inv.issue("BR-1042", 10, DAY)  # all of the first layer
++        self.assertEqual(stock_value(inv, "BR-1042"), 200)
++
++    def test_later_receipt_after_issue(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 4, 5, DAY)
++        inv.issue("BR-1042", 2, DAY)
++        inv.receive("BR-1042", 2, 9, DAY)
++        # remaining: 2 @ 5 and 2 @ 9
++        self.assertEqual(stock_value(inv, "BR-1042"), 28)
++
++    def test_positive_adjustment_needs_cost(self):
++        inv = Inventory()
++        inv.movements.append(Movement("BR-1042", 3, DAY, "COUNT"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++    def test_negative_stock_has_no_value(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 2, 12, DAY)
++        inv.issue("BR-1042", 5, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -3)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_receipt_fills_shortfall_before_costing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 2, 12, DAY)
++        inv.issue("BR-1042", 5, DAY)  # 3 short
++        inv.receive("BR-1042", 4, 20, DAY)  # 3 fill the shortfall, 1 left
++        self.assertEqual(inv.on_hand("BR-1042"), 1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 20)
++
++    def test_other_skus_ignored(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-2210", 5, 30, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive("br-1042", 10, 12, DAY)
++        self.assertEqual(stock_value(inv, " BR-1042 "), 120)
++        self.assertEqual(stock_value(inv, "Br-1042"), 120)
++
++
++if __name__ == "__main__":
++    unittest.main()

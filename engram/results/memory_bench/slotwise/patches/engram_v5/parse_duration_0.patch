@@ -1,0 +1,111 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..61b5682 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,8 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_clients.py::NormalizePhoneTest": true,
++  "tests/test_clients.py::ClientBookTest": true,
++  "tests/test_hours.py::HoursTest": true,
++  "tests/test_model.py::AppointmentTest": true,
++  "tests/test_schedule.py::ScheduleTest": true,
++  "tests/test_storage.py::StorageTest": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 4d21a09..13d2676 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -7,6 +7,12 @@
+   "tests/test_clients.py::ClientBookTest::test_unknown_phone_returns_none",
+   "tests/test_clients.py::NormalizePhoneTest::test_all_forms_of_the_same_number_match",
+   "tests/test_clients.py::NormalizePhoneTest::test_rejects_garbage",
++  "tests/test_durations.py::ParseDurationTest::test_clock_style",
++  "tests/test_durations.py::ParseDurationTest::test_hours",
++  "tests/test_durations.py::ParseDurationTest::test_hours_and_minutes",
++  "tests/test_durations.py::ParseDurationTest::test_ignores_case_and_surrounding_spaces",
++  "tests/test_durations.py::ParseDurationTest::test_minutes",
++  "tests/test_durations.py::ParseDurationTest::test_rejects_empty_zero_and_invalid_input",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/src/slotwise/durations.py b/src/slotwise/durations.py
+new file mode 100644
+index 0000000..604215c
+--- /dev/null
++++ b/src/slotwise/durations.py
+@@ -0,0 +1,31 @@
++"""Appointment durations typed by the front desk, e.g. '45', '1h30' or '1:30'."""
++
++import re
++
++_MINUTES = re.compile(r"(\d+)\s*(?:m|min)?")
++_HOURS = re.compile(r"(\d+)\s*h")
++_HOURS_AND_MINUTES = re.compile(r"(\d+)\s*h\s*(\d+)\s*(?:m|min)?")
++_CLOCK = re.compile(r"(\d+):(\d{2})")
++
++
++def parse_duration(text):
++    """Return the duration in minutes, e.g. '1h30' -> 90.
++
++    Accepts minutes ('45', '45m', '45 min'), hours ('1h'), hours and minutes
++    ('1h30', '1h 30m') and clock style ('1:30'). Case and surrounding spaces
++    are ignored.
++    """
++    value = text.strip().casefold()
++    minutes = None
++    if match := _MINUTES.fullmatch(value):
++        minutes = int(match.group(1))
++    elif match := _HOURS.fullmatch(value):
++        minutes = int(match.group(1)) * 60
++    elif match := _HOURS_AND_MINUTES.fullmatch(value):
++        minutes = int(match.group(1)) * 60 + int(match.group(2))
++    elif match := _CLOCK.fullmatch(value):
++        if int(match.group(2)) < 60:
++            minutes = int(match.group(1)) * 60 + int(match.group(2))
++    if not minutes:
++        raise ValueError(f"Not a valid duration: {text!r}. Please enter a time like 45, 1h or 1h30.")
++    return minutes
+diff --git a/tests/test_durations.py b/tests/test_durations.py
+new file mode 100644
+index 0000000..f5097bc
+--- /dev/null
++++ b/tests/test_durations.py
+@@ -0,0 +1,35 @@
++import unittest
++
++from slotwise.durations import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes(self):
++        self.assertEqual(parse_duration("45"), 45)
++        self.assertEqual(parse_duration("45m"), 45)
++        self.assertEqual(parse_duration("45 min"), 45)
++
++    def test_hours(self):
++        self.assertEqual(parse_duration("1h"), 60)
++
++    def test_hours_and_minutes(self):
++        self.assertEqual(parse_duration("1h30"), 90)
++        self.assertEqual(parse_duration("1h 30m"), 90)
++        self.assertEqual(parse_duration("2h15"), 135)
++
++    def test_clock_style(self):
++        self.assertEqual(parse_duration("1:30"), 90)
++
++    def test_ignores_case_and_surrounding_spaces(self):
++        self.assertEqual(parse_duration("  1H 30M  "), 90)
++        self.assertEqual(parse_duration(" 45 MIN "), 45)
++
++    def test_rejects_empty_zero_and_invalid_input(self):
++        for text in ["", "   ", "0", "0h", "0:00", "abc", "-5", "1:60", "1h-30", "1.5h"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

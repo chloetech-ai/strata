@@ -1,0 +1,81 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index f707cf8..1f8cc76 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -12,10 +12,14 @@
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue",
++  "tests/test_inventory.py::InventoryTest::test_write_off_normalizes_sku",
++  "tests/test_inventory.py::InventoryTest::test_write_off_quantity_must_be_positive",
++  "tests/test_inventory.py::InventoryTest::test_write_off_reduces_on_hand",
+   "tests/test_inventory.py::ReasonCodeTest::test_five_codes",
+   "tests/test_inventory.py::ReasonCodeTest::test_issue_uses_sale",
+   "tests/test_inventory.py::ReasonCodeTest::test_receive_uses_receipt",
+   "tests/test_inventory.py::ReasonCodeTest::test_unknown_code_rejected",
++  "tests/test_inventory.py::ReasonCodeTest::test_write_off_uses_damage",
+   "tests/test_items.py::CatalogTest::test_add_and_get",
+   "tests/test_items.py::CatalogTest::test_duplicate_detected_across_spellings",
+   "tests/test_items.py::CatalogTest::test_duplicate_sku_rejected",
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index d1dff89..702d3ab 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -48,6 +48,12 @@ class Inventory:
+             raise ValueError("quantity must be positive")
+         return self._record(Movement(sku, -qty, date or datetime.date.today(), "SALE", None, note))
+ 
++    def write_off(self, sku, qty, date=None):
++        """Goods out as broken or damaged."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self._record(Movement(sku, -qty, date or datetime.date.today(), "DAMAGE"))
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 28152fa..967674d 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -15,6 +15,10 @@ class ReasonCodeTest(unittest.TestCase):
+         inv = Inventory()
+         self.assertEqual(inv.issue("BR-1042", 3, DAY).reason, "SALE")
+ 
++    def test_write_off_uses_damage(self):
++        inv = Inventory()
++        self.assertEqual(inv.write_off("BR-1042", 3, DAY).reason, "DAMAGE")
++
+     def test_five_codes(self):
+         self.assertEqual(REASON_CODES, ("RECEIPT", "SALE", "RETURN", "DAMAGE", "COUNT"))
+         for code in REASON_CODES:
+@@ -42,6 +46,29 @@ class InventoryTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             inv.issue("BR-1042", -5)
+ 
++    def test_write_off_reduces_on_hand(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        m = inv.write_off("BR-1042", 4, DAY)
++        self.assertEqual(m.qty, -4)
++        self.assertEqual(m.date, DAY)
++        self.assertIsNone(m.unit_cost)
++        self.assertEqual(inv.on_hand("BR-1042"), 6)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", 0)
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", -2)
++
++    def test_write_off_normalizes_sku(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.write_off(" br-1042 ", 2, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 8)
++        self.assertEqual(inv.movements_for("BR-1042")[-1].sku, "BR-1042")
++
+     def test_messy_sku_is_same_item(self):
+         inv = Inventory()
+         inv.receive("br-1042", 100, 12, DAY)

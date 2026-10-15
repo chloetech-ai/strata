@@ -1,0 +1,115 @@
+diff --git a/src/slotwise/series.py b/src/slotwise/series.py
+new file mode 100644
+index 0000000..b955d4c
+--- /dev/null
++++ b/src/slotwise/series.py
+@@ -0,0 +1,33 @@
++"""Booking a prescribed series of weekly sessions."""
++
++import datetime
++
++from .errors import BookingError, SlotTaken
++from .model import Appointment
++
++# Insurance pays for at most 9 sessions per prescription.
++MAX_SESSIONS = 9
++WEEK = datetime.timedelta(weeks=1)
++
++
++def book_series(schedule, first, count):
++    """Books `count` sessions, one a week at the time of `first`, and returns them in order.
++
++    A week whose slot is already taken is skipped and the series continues in a later week,
++    so the client still gets `count` sessions. If `first` itself cannot be booked, SlotTaken is raised.
++    """
++    if not 1 <= count <= MAX_SESSIONS:
++        raise BookingError(
++            f"A series can have 1 to {MAX_SESSIONS} sessions, because insurance pays for "
++            f"{MAX_SESSIONS} per prescription. Please choose a number in that range."
++        )
++    booked = [schedule.book(first)]
++    week = 1
++    while len(booked) < count:
++        session = Appointment(first.therapist, first.client, first.start + week * WEEK, first.treatment)
++        week += 1
++        try:
++            booked.append(schedule.book(session))
++        except SlotTaken:
++            continue
++    return booked
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..181695d
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,70 @@
++import datetime
++import unittest
++
++from slotwise.errors import BookingError, SlotTaken
++from slotwise.model import Appointment
++from slotwise.schedule import Schedule
++from slotwise.series import MAX_SESSIONS, book_series
++
++
++def at(day, hour, minute=0, therapist="lena", client="Kim Weber"):
++    return Appointment(therapist, client, datetime.datetime(2026, 9, day, hour, minute), "standard")
++
++
++class BookSeriesTest(unittest.TestCase):
++    def test_books_weekly_sessions_at_the_same_time_in_order(self):
++        s = Schedule()
++        booked = book_series(s, at(8, 9), 3)
++        self.assertEqual([a.start.day for a in booked], [8, 15, 22])
++        self.assertEqual({a.start.time() for a in booked}, {datetime.time(9, 0)})
++        self.assertEqual({a.client for a in booked}, {"Kim Weber"})
++        self.assertEqual(len(s.appointments), 3)
++
++    def test_skips_a_taken_week_and_adds_a_session_at_the_end(self):
++        s = Schedule()
++        s.book(at(15, 9, client="Jo Li"))
++        booked = book_series(s, at(8, 9), 3)
++        self.assertEqual([a.start.day for a in booked], [8, 22, 29])
++        self.assertEqual(len(s.appointments), 4)
++
++    def test_several_taken_weeks_are_all_skipped(self):
++        s = Schedule()
++        s.book(at(15, 9, client="Jo Li"))
++        s.book(at(22, 9, client="Jo Li"))
++        booked = book_series(s, at(8, 9), 2)
++        self.assertEqual([a.start.day for a in booked], [8, 29])
++
++    def test_taken_first_session_raises_and_books_nothing(self):
++        s = Schedule()
++        s.book(at(8, 9, client="Jo Li"))
++        with self.assertRaises(SlotTaken):
++            book_series(s, at(8, 9), 3)
++        self.assertEqual(len(s.appointments), 1)
++
++    def test_a_series_of_nine_is_allowed(self):
++        s = Schedule()
++        booked = book_series(s, at(8, 9), MAX_SESSIONS)
++        self.assertEqual(len(booked), 9)
++
++    def test_more_than_nine_sessions_is_refused_and_books_nothing(self):
++        s = Schedule()
++        with self.assertRaises(BookingError):
++            book_series(s, at(8, 9), 12)
++        self.assertEqual(s.appointments, [])
++
++    def test_zero_sessions_is_refused(self):
++        s = Schedule()
++        with self.assertRaises(BookingError):
++            book_series(s, at(8, 9), 0)
++        self.assertEqual(s.appointments, [])
++
++    def test_cancelled_week_does_not_block_the_series(self):
++        s = Schedule()
++        blocker = s.book(at(15, 9, client="Jo Li"))
++        s.cancel(blocker.id)
++        booked = book_series(s, at(8, 9), 2)
++        self.assertEqual([a.start.day for a in booked], [8, 15])
++
++
++if __name__ == "__main__":
++    unittest.main()

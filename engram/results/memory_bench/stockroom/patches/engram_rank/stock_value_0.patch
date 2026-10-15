@@ -1,0 +1,129 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 784f784..c2f6e97 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -34,5 +34,13 @@
+   "tests/test_storage.py::StorageTest::test_legacy_file_without_reason_column_infers_reason_from_qty",
+   "tests/test_storage.py::StorageTest::test_loaded_skus_are_normalized",
+   "tests/test_storage.py::StorageTest::test_roundtrip",
+-  "tests/test_storage.py::StorageTest::test_row_with_invalid_reason_fails_to_load"
++  "tests/test_storage.py::StorageTest::test_row_with_invalid_reason_fails_to_load",
++  "tests/test_valuation.py::StockValueTest::test_empty_stock_is_worth_nothing",
++  "tests/test_valuation.py::StockValueTest::test_fifo_is_by_date_not_entry_order",
++  "tests/test_valuation.py::StockValueTest::test_issues_consume_oldest_cost_first",
++  "tests/test_valuation.py::StockValueTest::test_negative_stock_has_no_value_and_is_set_against_later_receipts",
++  "tests/test_valuation.py::StockValueTest::test_other_skus_are_ignored",
++  "tests/test_valuation.py::StockValueTest::test_receipt_without_cost_is_rejected",
++  "tests/test_valuation.py::StockValueTest::test_single_receipt",
++  "tests/test_valuation.py::StockValueTest::test_sku_variants_value_the_same_stock"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..77e8f54
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,33 @@
++"""Stock valuation at FIFO cost."""
++
++from collections import deque
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` on hand, costed first in, first out.
++
++    Each receipt opens a cost layer and each issue consumes the oldest layers
++    first. Issues that outrun the receipts leave negative stock; that shortfall
++    is set against the next receipts, and it has no value of its own.
++    """
++    layers = deque()  # [qty, unit_cost] pairs, oldest first
++    shortfall = 0  # units issued but not yet covered by a receipt
++    movements = sorted(inventory.movements_for(sku), key=lambda m: m.date)
++    for m in movements:
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"receipt of {m.sku} has no unit cost")
++            covered = min(m.qty, shortfall)
++            shortfall -= covered
++            if m.qty > covered:
++                layers.append([m.qty - covered, m.unit_cost])
++        else:
++            owed = -m.qty
++            while owed and layers:
++                take = min(owed, layers[0][0])
++                layers[0][0] -= take
++                owed -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            shortfall += owed
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..5830316
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,64 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_stock_is_worth_nothing(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 1250, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 12500)
++
++    def test_issues_consume_oldest_cost_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, DAY)
++        inv.receive("BR-1042", 10, 200, DAY + datetime.timedelta(days=1))
++        inv.issue("BR-1042", 15, DAY + datetime.timedelta(days=2))
++        # 10 at 100 are gone, 5 at 200 remain
++        self.assertEqual(stock_value(inv, "BR-1042"), 1000)
++
++    def test_fifo_is_by_date_not_entry_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 200, DAY + datetime.timedelta(days=1))
++        inv.receive("BR-1042", 10, 100, DAY)
++        inv.issue("BR-1042", 10, DAY + datetime.timedelta(days=2))
++        # the cheaper receipt is the older one, so the 200 layer remains
++        self.assertEqual(stock_value(inv, "BR-1042"), 2000)
++
++    def test_negative_stock_has_no_value_and_is_set_against_later_receipts(self):
++        inv = Inventory()
++        inv.issue("BR-1042", 4, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++        inv.receive("BR-1042", 10, 100, DAY + datetime.timedelta(days=1))
++        # the first 4 units received cover the earlier sale
++        self.assertEqual(inv.on_hand("BR-1042"), 6)
++        self.assertEqual(stock_value(inv, "BR-1042"), 600)
++
++    def test_sku_variants_value_the_same_stock(self):
++        inv = Inventory()
++        inv.receive("br-1042", 10, 100, DAY)
++        self.assertEqual(stock_value(inv, " BR-1042 "), 1000)
++
++    def test_other_skus_are_ignored(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, DAY)
++        inv.receive("BR-9999", 10, 700, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 1000)
++
++    def test_receipt_without_cost_is_rejected(self):
++        from stockroom.inventory import Movement
++        inv = Inventory()
++        inv._record(Movement("BR-1042", 5, DAY, None, "", "COUNT"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

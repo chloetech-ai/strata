@@ -1,0 +1,93 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 784f784..6a98df7 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -10,6 +10,11 @@
+   "tests/test_cli.py::CliTest::test_receive_appends_to_legacy_log_without_reason_column",
+   "tests/test_cli.py::CliTest::test_receive_creates_log_with_header",
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity_without_writing",
++  "tests/test_countsheet.py::CountSheetTest::test_blind_count_shows_no_quantity_on_hand",
++  "tests/test_countsheet.py::CountSheetTest::test_empty_catalog_gives_empty_sheet",
++  "tests/test_countsheet.py::CountSheetTest::test_inventory_without_catalog_is_rejected",
++  "tests/test_countsheet.py::CountSheetTest::test_lines_follow_walking_order_with_numeric_bay_and_shelf",
++  "tests/test_countsheet.py::CountSheetTest::test_one_line_per_item",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_other_reason_codes_accepted",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..ad9e26d
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,26 @@
++"""Printable count sheet for the stock-take: a blind count in walking order."""
++
++
++def _walk_key(location):
++    """Sort key for a bin code "aisle-bay-shelf": bay and shelf compare as numbers."""
++    parts = []
++    for part in location.split("-"):
++        if part.isdigit():
++            parts.append((0, int(part), ""))
++        else:
++            parts.append((1, 0, part.upper()))
++    return parts
++
++
++def count_sheet(inventory):
++    """One line per catalog item in walking order, with no quantity on hand shown.
++
++    Each line ends in a blank column for the counted figure.
++    """
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog")
++    items = sorted(inventory.catalog, key=lambda item: (_walk_key(item.location), item.sku))
++    return "".join(
++        f"{item.location:<10}{item.sku:<14}{item.name:<30}{item.unit:<6}{'_' * 10}\n"
++        for item in items
++    )
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..4fdf020
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,39 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def test_lines_follow_walking_order_with_numeric_bay_and_shelf(self):
++        catalog = Catalog([
++            Item("BR-1", "Bolt", "B-12-10"),
++            Item("BR-2", "Nut", "B-12-2"),
++            Item("BR-3", "Washer", "A-01-1"),
++        ])
++        lines = count_sheet(Inventory(catalog)).splitlines()
++        self.assertEqual([line.split()[1] for line in lines], ["BR-3", "BR-2", "BR-1"])
++
++    def test_one_line_per_item(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1"), Item("BR-2", "Nut", "A-01-2")])
++        self.assertEqual(len(count_sheet(Inventory(catalog)).splitlines()), 2)
++
++    def test_blind_count_shows_no_quantity_on_hand(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1")])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 37, 10)
++        line = count_sheet(inv).splitlines()[0]
++        self.assertNotIn("37", line)
++        self.assertTrue(line.endswith("_" * 10))
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++    def test_inventory_without_catalog_is_rejected(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,28 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f02e422..b5ca3db 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -29,6 +29,7 @@
+ - Tests: `customers_for` with three customers on one day, and `invoice_for` ignoring other customers' lines.
+ - Potter's Farm Shop (POTTER) added to customers.csv, on route 6.
+ - The closed day moved from Sunday to Monday (`CLOSED_WEEKDAYS = (0,)`); orders that miss Saturday's cutoff go out on Sunday.
++- `config.ORDER_CUTOFF` moved from 13:00 to 13:30, giving customers an extra half hour to order for the next day.
+ - Planned: the bake sheet lists products hottest oven first, so the deck oven isn't reheated after the overnight cool-down.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/config.py b/src/bakehouse/config.py
+index 8636bbf..7b6b07c 100644
+--- a/src/bakehouse/config.py
++++ b/src/bakehouse/config.py
+@@ -5,8 +5,9 @@ import datetime
+ BAKERY_NAME = "Larkspur Bakery"
+ 
+ # Orders for a delivery day must be in by this time on the day before.
+-# 13:00 because the mill now wants our flour order by 13:30.
+-ORDER_CUTOFF = datetime.time(13, 0)
++# 13:30 (was 13:00) to give customers an extra half hour. The mill wants our
++# flour order by 13:30, so check that still works before relying on this.
++ORDER_CUTOFF = datetime.time(13, 30)
+ 
+ # Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).
+ # Monday since November: we have the stall at the Sunday farmers' market.

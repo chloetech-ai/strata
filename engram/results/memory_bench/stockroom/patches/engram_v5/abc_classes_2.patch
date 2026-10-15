@@ -1,0 +1,80 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index f707cf8..512c6e3 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,9 @@
+ [
++  "tests/test_analysis.py::AbcClassesTest::test_boundaries_are_inclusive",
++  "tests/test_analysis.py::AbcClassesTest::test_classes_by_cumulative_share",
++  "tests/test_analysis.py::AbcClassesTest::test_empty_input",
++  "tests/test_analysis.py::AbcClassesTest::test_single_sku_reaches_100_percent_so_is_c",
++  "tests/test_analysis.py::AbcClassesTest::test_ties_are_ordered_by_sku",
+   "tests/test_cli.py::CliTest::test_moves_for_unknown_sku_prints_nothing",
+   "tests/test_cli.py::CliTest::test_moves_lists_one_line_per_movement_for_the_sku",
+   "tests/test_cli.py::CliTest::test_moves_missing_log_is_an_error",
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..bc6b645
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,24 @@
++"""Stock analysis helpers."""
++
++
++def abc_classes(values):
++    """Classify SKUs by annual consumption value (ABC analysis).
++
++    SKUs are sorted by value, highest first. A SKU is 'A' if the cumulative
++    share of the grand total up to and including it is at most 80%, 'B' if
++    at most 95%, and 'C' otherwise. Returns a dict mapping SKU to class.
++    """
++    total = sum(values.values())
++    ranked = sorted(values.items(), key=lambda kv: (-kv[1], kv[0]))
++    classes = {}
++    running = 0
++    for sku, value in ranked:
++        running += value
++        # Compare cross-multiplied to avoid float error at the 80% and 95% edges.
++        if 100 * running <= 80 * total:
++            classes[sku] = "A"
++        elif 100 * running <= 95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..d64a494
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,30 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: X 50 (50%), Y 30 (80%), Z 15 (95%), W 5 (100%)
++        values = {"W": 5, "X": 50, "Y": 30, "Z": 15}
++        self.assertEqual(abc_classes(values), {"X": "A", "Y": "A", "Z": "B", "W": "C"})
++
++    def test_boundaries_are_inclusive(self):
++        # X reaches exactly 80% and Y exactly 95%: both stay in the higher class.
++        self.assertEqual(abc_classes({"X": 80, "Y": 15, "Z": 5}),
++                         {"X": "A", "Y": "B", "Z": "C"})
++
++    def test_single_sku_reaches_100_percent_so_is_c(self):
++        self.assertEqual(abc_classes({"BR-1042": 900}), {"BR-1042": "C"})
++
++    def test_ties_are_ordered_by_sku(self):
++        # Equal values: A (33%), B (67%), C (100%) in SKU order.
++        values = {"B": 10, "A": 10, "C": 10}
++        self.assertEqual(abc_classes(values), {"A": "A", "B": "A", "C": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

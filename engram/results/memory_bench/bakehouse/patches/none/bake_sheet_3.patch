@@ -1,0 +1,65 @@
+diff --git a/src/bakehouse/production.py b/src/bakehouse/production.py
+index 02ccb26..6ba480a 100644
+--- a/src/bakehouse/production.py
++++ b/src/bakehouse/production.py
+@@ -32,6 +32,24 @@ def plan(orderbook, day):
+     }
+ 
+ 
++def bake_sheet(orderbook, day):
++    """Text bake sheet for `day`: one line per product with its name, units, batches and the
++    dough to weigh out. Dough is weighed for whole batches, since that is what goes in the oven."""
++    catalog = orderbook.catalog
++    rows = []
++    for code, (units, batches) in plan(orderbook, day).items():
++        product = catalog.get(code)
++        dough = dough_weight_g(product, batches * product.batch_size)
++        rows.append((product.name, units, batches, dough))
++    if not rows:
++        return ""
++    width = max(len(name) for name, *_ in rows)
++    return "\n".join(
++        f"{name:<{width}}  {units:>5} units  {batches:>4} batches  {dough:>8} g dough"
++        for name, units, batches, dough in rows
++    )
++
++
+ def total_batches(plan_result):
+     """Trays for the oven: one tray holds one batch, so this is the batches summed over all products."""
+     return sum(batches for _units, batches in plan_result.values())
+diff --git a/tests/test_production.py b/tests/test_production.py
+index 4a9f54e..02e83b5 100644
+--- a/tests/test_production.py
++++ b/tests/test_production.py
+@@ -2,7 +2,7 @@ import datetime
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+-from bakehouse.production import batches_needed, crates_needed, dough_weight_g, plan, total_batches
++from bakehouse.production import batches_needed, bake_sheet, crates_needed, dough_weight_g, plan, total_batches
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -51,6 +51,22 @@ class ProductionTest(unittest.TestCase):
+         ])
+         self.assertEqual(plan(book, DAY), {"BAG": (5, 1)})
+ 
++    def test_bake_sheet_weighs_dough_for_whole_batches(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12, dough_g=250), Product("SOU", "White sourdough", 320, batch_size=10, dough_g=800)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 20),
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY, "LUMEN", "SOU", 10),
++        ])
++        self.assertEqual(bake_sheet(book, DAY), "\n".join([
++            "Baguette            25 units     3 batches      9000 g dough",
++            "White sourdough     10 units     1 batches      8000 g dough",
++        ]))
++
++    def test_bake_sheet_of_day_with_no_orders_is_empty(self):
++        book = OrderBook(Catalog([Product("BAG", "Baguette", 95, batch_size=12)]))
++        self.assertEqual(bake_sheet(book, DAY), "")
++
+     def test_total_batches_sums_batches_over_products(self):
+         self.assertEqual(total_batches({"BAG": (25, 3), "SOU": (10, 1)}), 4)
+ 

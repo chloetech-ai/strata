@@ -1,0 +1,117 @@
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index d8441e9..4201e89 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,8 @@
+ """Reports for the office. All amounts are integer pence, before VAT."""
+ 
++import csv
++import datetime
++
+ 
+ def day_summary(orderbook, day):
+     """{customer code: order value in pence} for everything ordered for delivery on `day`."""
+@@ -18,3 +21,28 @@ def top_products(orderbook, start, end, n=5):
+         if start <= line.day <= end:
+             units[line.product] = units.get(line.product, 0) + line.qty
+     return sorted(units, key=lambda code: (-units[code], code))[:n]
++
++
++def week_totals_file(orderbook, week_start, path):
++    """Write each customer's order value for the seven days from `week_start` to `path`, sorted by customer code.
++
++    The file is for Greta's German-locale Excel: semicolon between fields, a comma before the pence,
++    and a UTF-8 byte order mark so Excel reads the £ sign correctly."""
++    week_end = week_start + datetime.timedelta(days=6)
++    totals = {}
++    for line in orderbook:
++        if week_start <= line.day <= week_end:
++            price = orderbook.catalog.get(line.product).price
++            totals[line.customer] = totals.get(line.customer, 0) + line.qty * price
++    with open(path, "w", newline="", encoding="utf-8-sig") as f:
++        writer = csv.writer(f, delimiter=";")
++        writer.writerow(["Customer", "Total (£)"])
++        for customer in sorted(totals):
++            writer.writerow([customer, _pence_with_comma(totals[customer])])
++
++
++def _pence_with_comma(pence):
++    """Pounds with a comma decimal and no currency sign: 1234 -> '12,34'. Done in integers, never floats."""
++    sign = "-" if pence < 0 else ""
++    pounds, rest = divmod(abs(pence), 100)
++    return f"{sign}{pounds},{rest:02d}"
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index 4c6cd50..02d800b 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -1,9 +1,11 @@
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ OTHER_DAY = datetime.date(2026, 10, 21)
+@@ -72,5 +74,57 @@ class TopProductsTest(unittest.TestCase):
+         self.assertEqual(top_products(book, OTHER_DAY, OTHER_DAY + datetime.timedelta(days=3)), [])
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12),
++            Product("SOU", "White sourdough", 320, batch_size=10),
++        ])
++        self.tmpdir = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self.tmpdir.name, "week.csv")
++
++    def tearDown(self):
++        self.tmpdir.cleanup()
++
++    def read(self):
++        with open(self.path, encoding="utf-8-sig", newline="") as f:
++            return f.read().splitlines()
++
++    def test_one_row_per_customer_with_comma_decimal_and_semicolons(self):
++        week_start = datetime.date(2026, 10, 19)  # a Monday
++        book = OrderBook(self.catalog, [
++            OrderLine(week_start, "LUMEN", "BAG", 5),
++            OrderLine(week_start + datetime.timedelta(days=3), "LUMEN", "SOU", 10),
++            OrderLine(week_start + datetime.timedelta(days=6), "GREENWAY", "BAG", 20),
++        ])
++        week_totals_file(book, week_start, self.path)
++        self.assertEqual(self.read(), [
++            "Customer;Total (£)",
++            "GREENWAY;19,00",
++            "LUMEN;36,75",
++        ])
++
++    def test_only_the_seven_days_from_week_start_count(self):
++        week_start = datetime.date(2026, 10, 19)
++        book = OrderBook(self.catalog, [
++            OrderLine(week_start - datetime.timedelta(days=1), "LUMEN", "BAG", 100),
++            OrderLine(week_start, "LUMEN", "BAG", 1),
++            OrderLine(week_start + datetime.timedelta(days=6), "LUMEN", "BAG", 1),
++            OrderLine(week_start + datetime.timedelta(days=7), "LUMEN", "BAG", 100),
++        ])
++        week_totals_file(book, week_start, self.path)
++        self.assertEqual(self.read(), ["Customer;Total (£)", "LUMEN;1,90"])
++
++    def test_pence_below_ten_keep_their_leading_zero(self):
++        catalog = Catalog([Product("CHE", "Cheap roll", 5, batch_size=12)])
++        book = OrderBook(catalog, [OrderLine(DAY, "LUMEN", "CHE", 1)])
++        week_totals_file(book, DAY, self.path)
++        self.assertEqual(self.read()[1], "LUMEN;0,05")
++
++    def test_no_orders_in_the_week_writes_only_the_header(self):
++        week_totals_file(OrderBook(self.catalog), DAY, self.path)
++        self.assertEqual(self.read(), ["Customer;Total (£)"])
++
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,170 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..0890e8c
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1,15 @@
++{
++  "tests/test_customers.py::CustomersTest": true,
++  "tests/test_invoice.py::FormatPenceTest": true,
++  "tests/test_invoice.py::InvoiceNumberTest": true,
++  "tests/test_invoice.py::SaleOrReturnTest": true,
++  "tests/test_invoice.py::InvoiceTest": true,
++  "tests/test_invoice.py::InvoiceForTest": true,
++  "tests/test_orders.py::OrderBookTest": true,
++  "tests/test_orders.py::CutoffTest": true,
++  "tests/test_production.py::ProductionTest": true,
++  "tests/test_products.py::CatalogTest": true,
++  "tests/test_reports.py::DaySummaryTest": true,
++  "tests/test_reports.py::TopProductsTest": true,
++  "tests/test_standing.py::ExpandTest": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..59a44c4
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1,99 @@
++[
++  "tests/test_customers.py::CustomersTest::test_duplicate_route_seq_is_rejected",
++  "tests/test_customers.py::CustomersTest::test_email_default_is_empty",
++  "tests/test_customers.py::CustomersTest::test_email_is_read_from_optional_column",
++  "tests/test_customers.py::CustomersTest::test_load_customers",
++  "tests/test_customers.py::CustomersTest::test_missing_email_column_gives_empty_email",
++  "tests/test_customers.py::CustomersTest::test_str_is_name",
++  "tests/test_customers.py::CustomersTest::test_zero_route_seq_is_rejected",
++  "tests/test_invoice.py::FormatPenceTest::test_negative_gets_leading_minus",
++  "tests/test_invoice.py::FormatPenceTest::test_negative_pence_only",
++  "tests/test_invoice.py::FormatPenceTest::test_pence_only_keeps_two_digits",
++  "tests/test_invoice.py::FormatPenceTest::test_pounds_and_pence",
++  "tests/test_invoice.py::FormatPenceTest::test_whole_pounds",
++  "tests/test_invoice.py::FormatPenceTest::test_zero",
++  "tests/test_invoice.py::InvoiceForTest::test_no_orders_gives_empty_invoice",
++  "tests/test_invoice.py::InvoiceForTest::test_one_line_per_product_at_catalog_prices",
++  "tests/test_invoice.py::InvoiceForTest::test_only_this_customers_orders_and_this_day",
++  "tests/test_invoice.py::InvoiceForTest::test_other_customers_lines_are_ignored",
++  "tests/test_invoice.py::InvoiceForTest::test_repeated_product_lines_are_combined",
++  "tests/test_invoice.py::InvoiceNumberTest::test_sequence_is_zero_padded_to_four_digits",
++  "tests/test_invoice.py::InvoiceNumberTest::test_sequence_must_be_positive",
++  "tests/test_invoice.py::InvoiceNumberTest::test_sequence_must_fit_four_digits",
++  "tests/test_invoice.py::InvoiceNumberTest::test_year_then_four_digit_sequence",
++  "tests/test_invoice.py::InvoiceTest::test_empty_invoice",
++  "tests/test_invoice.py::InvoiceTest::test_total",
++  "tests/test_invoice.py::SaleOrReturnTest::test_cap_rounds_down",
++  "tests/test_invoice.py::SaleOrReturnTest::test_capped_at_ten_percent_of_delivered",
++  "tests/test_invoice.py::SaleOrReturnTest::test_half_price_per_returned_loaf",
++  "tests/test_invoice.py::SaleOrReturnTest::test_no_credit_when_nothing_returned",
++  "tests/test_invoice.py::SaleOrReturnTest::test_only_greenway",
++  "tests/test_invoice.py::SaleOrReturnTest::test_only_sandwich_loaves",
++  "tests/test_orders.py::CutoffTest::test_a_minute_after_the_cutoff_is_too_late",
++  "tests/test_orders.py::CutoffTest::test_a_minute_before_the_cutoff_is_on_time",
++  "tests/test_orders.py::CutoffTest::test_closed_days",
++  "tests/test_orders.py::CutoffTest::test_exactly_at_the_cutoff_is_on_time",
++  "tests/test_orders.py::CutoffTest::test_on_the_delivery_day_is_too_late",
++  "tests/test_orders.py::CutoffTest::test_saturday_order_after_cutoff_misses_sunday",
++  "tests/test_orders.py::CutoffTest::test_well_before_the_cutoff",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_is_sorted_and_unique",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_nothing_ordered_is_empty",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_three_customers_on_one_day",
++  "tests/test_orders.py::OrderBookTest::test_days_empty_book_is_empty",
++  "tests/test_orders.py::OrderBookTest::test_days_is_sorted_and_unique",
++  "tests/test_orders.py::OrderBookTest::test_for_day",
++  "tests/test_orders.py::OrderBookTest::test_len_counts_all_lines",
++  "tests/test_orders.py::OrderBookTest::test_lines_for_customer_with_nothing_that_day_is_empty",
++  "tests/test_orders.py::OrderBookTest::test_lines_for_gives_only_that_customers_lines_for_the_day",
++  "tests/test_orders.py::OrderBookTest::test_quantity_must_be_positive",
++  "tests/test_orders.py::OrderBookTest::test_remove_missing_line_returns_false_and_changes_nothing",
++  "tests/test_orders.py::OrderBookTest::test_remove_takes_out_duplicate_lines_for_the_same_product",
++  "tests/test_orders.py::OrderBookTest::test_remove_takes_out_that_line_and_returns_true",
++  "tests/test_orders.py::OrderBookTest::test_save_and_load",
++  "tests/test_orders.py::OrderBookTest::test_total_for_adds_up_customers",
++  "tests/test_orders.py::OrderBookTest::test_total_for_nothing_ordered_is_zero",
++  "tests/test_orders.py::OrderBookTest::test_unknown_product_raises",
++  "tests/test_production.py::ProductionTest::test_crates_exact",
++  "tests/test_production.py::ProductionTest::test_crates_rejects_crate_size_below_one",
++  "tests/test_production.py::ProductionTest::test_crates_rejects_negative_units",
++  "tests/test_production.py::ProductionTest::test_dough_weight_is_dough_per_piece_times_units",
++  "tests/test_production.py::ProductionTest::test_dough_weight_rejects_negative_units",
++  "tests/test_production.py::ProductionTest::test_dough_weight_zero_units",
++  "tests/test_production.py::ProductionTest::test_exact_batches",
++  "tests/test_production.py::ProductionTest::test_no_units_needs_no_crates",
++  "tests/test_production.py::ProductionTest::test_partial_batch_rounds_up",
++  "tests/test_production.py::ProductionTest::test_partial_crate_rounds_up",
++  "tests/test_production.py::ProductionTest::test_plan_adds_up_customers",
++  "tests/test_production.py::ProductionTest::test_plan_leaves_out_products_not_ordered_for_the_day",
++  "tests/test_production.py::ProductionTest::test_total_batches_adds_up_all_products",
++  "tests/test_production.py::ProductionTest::test_total_batches_empty_plan_is_zero",
++  "tests/test_products.py::CatalogTest::test_add_and_get",
++  "tests/test_products.py::CatalogTest::test_allergen_text_empty_when_no_allergens",
++  "tests/test_products.py::CatalogTest::test_allergen_text_is_sorted_and_joined",
++  "tests/test_products.py::CatalogTest::test_duplicate_code_rejected",
++  "tests/test_products.py::CatalogTest::test_get_unknown_code_raises_key_error_naming_it",
++  "tests/test_products.py::CatalogTest::test_has_allergen_from_catalog",
++  "tests/test_products.py::CatalogTest::test_has_allergen_ignores_case",
++  "tests/test_products.py::CatalogTest::test_load_catalog",
++  "tests/test_products.py::CatalogTest::test_negative_batch_size_rejected",
++  "tests/test_products.py::CatalogTest::test_negative_price_rejected",
++  "tests/test_products.py::CatalogTest::test_price_text_formats_pence_as_pounds",
++  "tests/test_products.py::CatalogTest::test_zero_batch_size_rejected",
++  "tests/test_products.py::CatalogTest::test_zero_price_allowed",
++  "tests/test_reports.py::DaySummaryTest::test_day_without_orders_is_empty",
++  "tests/test_reports.py::DaySummaryTest::test_other_days_are_left_out",
++  "tests/test_reports.py::DaySummaryTest::test_two_customers_on_one_day_are_sorted_by_code",
++  "tests/test_reports.py::DaySummaryTest::test_value_per_customer_in_pence",
++  "tests/test_reports.py::TopProductsTest::test_most_units_first",
++  "tests/test_reports.py::TopProductsTest::test_n_defaults_to_five",
++  "tests/test_reports.py::TopProductsTest::test_no_orders_in_range_is_empty",
++  "tests/test_reports.py::TopProductsTest::test_range_is_inclusive_at_both_ends",
++  "tests/test_reports.py::TopProductsTest::test_ties_are_broken_by_product_code",
++  "tests/test_standing.py::ExpandTest::test_end_date_is_inclusive",
++  "tests/test_standing.py::ExpandTest::test_no_standing_lines_gives_nothing",
++  "tests/test_standing.py::ExpandTest::test_one_line_for_each_matching_weekday_in_range",
++  "tests/test_standing.py::ExpandTest::test_range_with_no_matching_weekday_gives_nothing",
++  "tests/test_standing.py::ExpandTest::test_several_standing_lines_on_the_same_day",
++  "tests/test_standing.py::ExpandTest::test_start_after_end_gives_nothing",
++  "tests/test_standing.py::ExpandTest::test_sunday_weekday_is_six"
++]
+\ No newline at end of file
+diff --git a/data/orders.csv b/data/orders.csv
+index dd8d8fc..3705a69 100644
+--- a/data/orders.csv
++++ b/data/orders.csv
+@@ -8,3 +8,5 @@ date,customer,product,qty
+ 2026-10-21,HARBOUR,PCH,24
+ 2026-10-21,OLDMILL,CIN,20
+ 2026-10-21,OLDMILL,FLO,40
++2026-11-20,AIDAN,SWL,6
++2026-11-20,AIDAN,WRL,60

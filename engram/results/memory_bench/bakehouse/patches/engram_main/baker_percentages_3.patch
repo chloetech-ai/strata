@@ -1,0 +1,54 @@
+diff --git a/src/bakehouse/recipes.py b/src/bakehouse/recipes.py
+new file mode 100644
+index 0000000..6cdced5
+--- /dev/null
++++ b/src/bakehouse/recipes.py
+@@ -0,0 +1,13 @@
++"""Recipe maths: ingredient weights expressed as baker's percentages."""
++
++
++def baker_percentages(recipe):
++    """{ingredient: percent of total flour weight}, rounded to one decimal.
++
++    `recipe` maps ingredient names to grams. Any ingredient whose name contains
++    'flour' (any case) counts towards the flour total.
++    """
++    flour_g = sum(grams for name, grams in recipe.items() if "flour" in name.lower())
++    if flour_g <= 0:
++        raise ValueError("recipe needs flour weighing more than 0 g to calculate baker's percentages")
++    return {name: round(grams / flour_g * 100, 1) for name, grams in recipe.items()}
+diff --git a/tests/test_recipes.py b/tests/test_recipes.py
+new file mode 100644
+index 0000000..dab7bd0
+--- /dev/null
++++ b/tests/test_recipes.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from bakehouse.recipes import baker_percentages
++
++
++class BakerPercentagesTest(unittest.TestCase):
++    def test_percentages_are_of_total_flour(self):
++        recipe = {"Strong White Flour": 1000, "Wholemeal Flour": 200, "Water": 750, "Salt": 20}
++        self.assertEqual(
++            baker_percentages(recipe),
++            {"Strong White Flour": 83.3, "Wholemeal Flour": 16.7, "Water": 62.5, "Salt": 1.7},
++        )
++
++    def test_flour_is_matched_case_insensitively(self):
++        recipe = {"FLOUR": 500, "flour (rye)": 500, "Water": 350}
++        self.assertEqual(baker_percentages(recipe)["Water"], 35.0)
++        self.assertEqual(baker_percentages(recipe)["FLOUR"], 50.0)
++
++    def test_no_flour_raises(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"Water": 300, "Salt": 10})
++
++    def test_zero_flour_raises(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"Flour": 0, "Water": 300})
++
++
++if __name__ == "__main__":
++    unittest.main()

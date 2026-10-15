@@ -1,0 +1,49 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index aef508a..239ea48 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -62,3 +62,11 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The most recently recorded RECEIPT for `sku`, or None if there is none."""
++        sku = normalize_sku(sku)
++        for m in reversed(self.movements):
++            if m.sku == sku and m.reason == "RECEIPT":
++                return m
++        return None
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 5aa3ccb..4dff84e 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -60,6 +60,28 @@ class InventoryTest(unittest.TestCase):
+         inv.issue("BR-1042", 4, DAY)
+         self.assertEqual([m.qty for m in inv.movements_for("BR-1042")], [10, -4])
+ 
++    def test_last_receipt_is_most_recent_receipt_for_sku(self):
++        inv = Inventory()
++        first = inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-2210", 5, 30, DAY)
++        inv.issue("BR-1042", 4, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), first)
++        second = inv.receive(" br-1042", 6, 13, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), second)
++
++    def test_last_receipt_ignores_non_receipt_movements(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.adjust("BR-1042", 2, "RETURN", DAY)
++        inv.issue("BR-1042", 1, DAY)
++        self.assertEqual(inv.last_receipt("BR-1042").qty, 10)
++
++    def test_last_receipt_is_none_without_receipts(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.adjust("BR-1042", 2, "COUNT", DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
+     def test_sku_spellings_all_hit_the_same_stock(self):
+         inv = Inventory()
+         inv.receive("br-1042", 10, 12, DAY)

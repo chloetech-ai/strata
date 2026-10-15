@@ -1,0 +1,113 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..d04211c
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,39 @@
++"""Stock valuation, FIFO: issues consume the oldest receipts first."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand, costed FIFO.
++
++    Movements are read in log order. Each receipt adds a layer at its unit cost;
++    each issue consumes the oldest layers. An issue that finds no stock to take
++    from is owed against the next receipts, so negative stock is never valued.
++    """
++    sku = normalize_sku(sku)
++    layers = deque()  # [qty, unit_cost] per receipt still on hand, oldest first
++    owed = 0  # units issued beyond the stock received so far
++    for m in inventory.movements:
++        if m.sku != sku:
++            continue
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"inbound movement for {sku} has no unit cost")
++            qty = m.qty
++            paid = min(owed, qty)  # earlier shortfalls are met by this stock first
++            owed -= paid
++            qty -= paid
++            if qty:
++                layers.append([qty, m.unit_cost])
++        else:
++            need = -m.qty
++            while need and layers:
++                take = min(need, layers[0][0])
++                layers[0][0] -= take
++                need -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            owed += need
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..8b513c9
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,62 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_fifo_uses_oldest_receipt_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 15, DAY)
++        inv.issue("BR-1042", 12, DAY)
++        # 10 @ 12 gone, then 2 @ 15 taken: 8 @ 15 left
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_partial_layer_consumed(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.issue("BR-1042", 4, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 72)
++
++    def test_negative_stock_is_worth_nothing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 12, DAY)
++        inv.issue("BR-1042", 8, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_later_receipt_covers_earlier_shortfall(self):
++        inv = Inventory()
++        inv.issue("BR-1042", 5, DAY)
++        inv.receive("BR-1042", 10, 12, DAY)
++        # on hand is 5; the sale took 5 of the new stock
++        self.assertEqual(stock_value(inv, "BR-1042"), 60)
++
++    def test_other_skus_and_sku_forms_are_handled(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-2000", 3, 7, DAY)
++        self.assertEqual(stock_value(inv, " br-1042 "), 120)
++        self.assertEqual(stock_value(inv, "BR-2000"), 21)
++
++    def test_return_without_cost_is_rejected(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.movements.append(Movement("BR-1042", 2, DAY, "RETURN", None))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

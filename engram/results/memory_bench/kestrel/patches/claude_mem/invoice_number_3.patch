@@ -1,0 +1,75 @@
+diff --git a/src/kestrel/invoices.py b/src/kestrel/invoices.py
+index 6013a52..beebf7b 100644
+--- a/src/kestrel/invoices.py
++++ b/src/kestrel/invoices.py
+@@ -23,6 +23,22 @@ class Invoice:
+     description: str = ""
+ 
+ 
++def next_invoice_number(clinic, year, existing):
++    """Return the next invoice number for a clinic in a year, e.g. 'INV-NG-2027-00004'.
++
++    Numbers run in sequence per clinic and per year, so only the entries in
++    `existing` for that clinic and year count. The next number is one past the
++    highest sequence issued so far, or 00001 if there are none.
++    """
++    prefix = f"INV-{clinic}-{year}-"
++    sequences = [
++        int(number[len(prefix):])
++        for number in existing
++        if number.startswith(prefix) and number[len(prefix):].isdecimal()
++    ]
++    return f"{prefix}{max(sequences, default=0) + 1:05d}"
++
++
+ def make_invoice(appointment, patient, number, amount_cents):
+     """Build an Invoice for an appointment.
+ 
+diff --git a/tests/test_invoices.py b/tests/test_invoices.py
+index 485b6d3..57b94e9 100644
+--- a/tests/test_invoices.py
++++ b/tests/test_invoices.py
+@@ -2,7 +2,7 @@ import datetime
+ import unittest
+ 
+ from helpers import appt, utc
+-from kestrel.invoices import make_invoice
++from kestrel.invoices import make_invoice, next_invoice_number
+ from kestrel.models import Patient
+ 
+ 
+@@ -52,5 +52,34 @@ class MakeInvoiceTest(unittest.TestCase):
+         self.assertEqual(make_invoice(a, PATIENT, "n", 0).amount_cents, 0)
+ 
+ 
++class NextInvoiceNumberTest(unittest.TestCase):
++    def test_first_invoice_of_the_year_is_00001(self):
++        self.assertEqual(next_invoice_number("NG", 2027, []), "INV-NG-2027-00001")
++
++    def test_one_past_the_highest_sequence(self):
++        existing = ["INV-NG-2027-00001", "INV-NG-2027-00003", "INV-NG-2027-00002"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00004")
++
++    def test_ignores_other_clinics(self):
++        existing = ["INV-HB-2027-00009", "INV-NG-2027-00002"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00003")
++
++    def test_ignores_other_years(self):
++        existing = ["INV-NG-2026-00040", "INV-NG-2028-00050"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00001")
++
++    def test_clinic_codes_match_whole_segment(self):
++        existing = ["INV-NGX-2027-00007"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00001")
++
++    def test_ignores_malformed_numbers_for_the_same_prefix(self):
++        existing = ["INV-NG-2027-", "INV-NG-2027-ABCDE", "INV-NG-2027-00002"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00003")
++
++    def test_sequence_grows_past_five_digits(self):
++        existing = ["INV-NG-2027-99999"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-100000")
++
++
+ if __name__ == "__main__":
+     unittest.main()

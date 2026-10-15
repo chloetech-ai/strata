@@ -1,0 +1,112 @@
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..d9f8727
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,31 @@
++"""Crate labels for packing a delivery day."""
++
++import unicodedata
++
++LABEL_WIDTH = 48  # characters per line on the label printer
++
++
++def _ascii(text):
++    """`text` as plain ASCII, accents removed and anything else dropped, e.g. 'Brötchen' -> 'Brotchen'."""
++    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++
++
++def crate_labels(orderbook, customers, day):
++    """One label per customer and product ordered for delivery on `day`, as text.
++
++    `customers` is the dict from load_customers. Line one of a label is the customer's name, line two the
++    quantity and product name, and any allergens follow in capitals. Each line is plain ASCII and cut to LABEL_WIDTH.
++    """
++    labels = []
++    for code in orderbook.customers_for(day):
++        customer = customers[code]
++        units = {}
++        for line in orderbook.lines_for(code, day):
++            units[line.product] = units.get(line.product, 0) + line.qty
++        for product_code in sorted(units):
++            product = orderbook.catalog.get(product_code)
++            lines = [customer.name, f"{units[product_code]} x {product.name}"]
++            if product.allergens:
++                lines.append(", ".join(sorted(allergen.upper() for allergen in product.allergens)))
++            labels.append("\n".join(_ascii(line)[:LABEL_WIDTH] for line in lines))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..489f163
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,69 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import LABEL_WIDTH, crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12, allergens=("wheat",)),
++            Product("BRO", "Brötchen", 40, batch_size=30, allergens=("wheat", "milk")),
++            Product("FLO", "Florentine", 90, batch_size=40, allergens=("milk", "nuts")),
++        ])
++        self.customers = {
++            "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "1 High St", "AB1 2CD", 1),
++            "LUMEN": Customer("LUMEN", "Café Lumen", "2 Mill Rd", "AB3 4EF", 2),
++        }
++
++    def test_one_label_per_customer_and_product_in_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "FLO", 2),
++            OrderLine(DAY, "GREENWAY", "BAG", 20),
++            OrderLine(DAY, "GREENWAY", "BRO", 30),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Greenway Grocers\n20 x Baguette\nWHEAT",
++            "Greenway Grocers\n30 x Brotchen\nMILK, WHEAT",
++            "Cafe Lumen\n2 x Florentine\nMILK, NUTS",
++        ])
++
++    def test_repeated_lines_for_one_product_make_one_label(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 5),
++            OrderLine(DAY, "GREENWAY", "BAG", 7),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Greenway Grocers\n12 x Baguette\nWHEAT"])
++
++    def test_product_without_allergens_has_two_lines(self):
++        catalog = Catalog([Product("PLN", "Plain loaf", 200)])
++        book = OrderBook(catalog, [OrderLine(DAY, "GREENWAY", "PLN", 1)])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Greenway Grocers\n1 x Plain loaf"])
++
++    def test_other_days_are_left_out(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 1),
++            OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "BAG", 1),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Greenway Grocers\n1 x Baguette\nWHEAT"])
++
++    def test_no_orders_gives_no_labels(self):
++        self.assertEqual(crate_labels(OrderBook(self.catalog), self.customers, DAY), [])
++
++    def test_lines_are_cut_to_label_width(self):
++        long_name = "A" * 60
++        customers = {"LONG": Customer("LONG", long_name, "x", "y", 1)}
++        book = OrderBook(self.catalog, [OrderLine(DAY, "LONG", "BAG", 1)])
++        label = crate_labels(book, customers, DAY)[0]
++        self.assertEqual(label.split("\n")[0], "A" * LABEL_WIDTH)
++        for line in label.split("\n"):
++            self.assertLessEqual(len(line), LABEL_WIDTH)
++
++
++if __name__ == "__main__":
++    unittest.main()

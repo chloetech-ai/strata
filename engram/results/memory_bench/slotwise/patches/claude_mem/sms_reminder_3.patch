@@ -1,0 +1,101 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..201fe25 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,7 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_clients.py": true,
++  "tests/test_hours.py": true,
++  "tests/test_model.py": true,
++  "tests/test_schedule.py": true,
++  "tests/test_storage.py": true
++}
+\ No newline at end of file
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..1a93a2a
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,29 @@
++"""The text of the reminder SMS sent to clients before an appointment."""
++
++import unicodedata
++
++RECEPTION_NUMBER = "044 512 77 30"
++SMS_LIMIT = 160
++
++# German letters have standard ASCII spellings. This runs before NFKD, which would reduce ä to a.
++_GERMAN = str.maketrans({
++    "ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss",
++})
++
++
++def to_ascii(text):
++    """`text` in plain ASCII: German letters spelled out, accents dropped, anything else replaced by '?'."""
++    decomposed = unicodedata.normalize("NFKD", text.translate(_GERMAN))
++    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
++    return stripped.encode("ascii", "replace").decode("ascii")
++
++
++def reminder_text(appointment):
++    """The reminder SMS for `appointment`: ASCII, at most SMS_LIMIT characters, always with the reception number.
++
++    The greeting with the client's name is left out if a long name would push the message past the limit.
++    """
++    when = appointment.start.strftime("%d.%m. um %H:%M")
++    body = f"Erinnerung: Termin am {when} bei Lindqvist Physio. Absage bitte an {RECEPTION_NUMBER}."
++    greeted = f"Hallo {to_ascii(appointment.client)}, {body}"
++    return greeted if len(greeted) <= SMS_LIMIT else body
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..73b766d
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,45 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import RECEPTION_NUMBER, SMS_LIMIT, reminder_text, to_ascii
++
++
++def appointment(client, start=datetime.datetime(2026, 10, 19, 14, 30)):
++    return Appointment("Anna Lindqvist", client, start)
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_german_letters_are_spelled_out(self):
++        self.assertEqual(to_ascii("Müller-Lüdi Jörg Äpfel Groß"), "Mueller-Luedi Joerg Aepfel Gross")
++
++    def test_accents_are_dropped(self):
++        self.assertEqual(to_ascii("René Hélène Zoë"), "Rene Helene Zoe")
++
++    def test_characters_without_a_latin_equivalent_become_question_marks(self):
++        self.assertEqual(to_ascii("Li 李"), "Li ?")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_contains_time_and_reception_number(self):
++        text = reminder_text(appointment("Kim Weber"))
++        self.assertIn("19.10. um 14:30", text)
++        self.assertIn(RECEPTION_NUMBER, text)
++        self.assertIn("Hallo Kim Weber", text)
++
++    def test_name_is_transliterated(self):
++        self.assertIn("Hallo Joerg Mueller", reminder_text(appointment("Jörg Müller")))
++
++    def test_long_name_drops_the_greeting_and_stays_within_limit(self):
++        text = reminder_text(appointment("Maria " + "Schneider-" * 20 + "Zweig"))
++        self.assertLessEqual(len(text), SMS_LIMIT)
++        self.assertTrue(text.startswith("Erinnerung: Termin am 19.10."))
++        self.assertIn(RECEPTION_NUMBER, text)
++
++    def test_result_is_ascii(self):
++        text = reminder_text(appointment("Zoë Bäumler"))
++        text.encode("ascii")
++
++
++if __name__ == "__main__":
++    unittest.main()

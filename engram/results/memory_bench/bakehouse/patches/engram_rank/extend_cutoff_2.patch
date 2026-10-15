@@ -1,0 +1,28 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cca8021..829875f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -28,6 +28,7 @@
+ - `OrderBook.days()`: sorted distinct delivery days that have at least one order line.
+ - `CLOSED_WEEKDAYS` is now Monday (`0`) instead of Sunday, as the stall at the Sunday farmers' market takes Sundays. Saturday orders that miss the cutoff go out on Sunday.
+ - `crates_needed(units, per_crate)` in `production.py`: whole crates for a number of pieces, rounding a partial crate up. Raises `ValueError` for negative units or a crate size below 1.
++- `ORDER_CUTOFF` is now 13:30, up from 13:00, giving customers another half hour to order for the next day.
+ - `invoice_number(year, seq)` in `invoice.py`: invoice numbers such as `LK-2026-0001`, with a four-digit sequence. Raises `ValueError` for a sequence outside 1 to 9999.
+ - `customers.csv`: added Potter's Farm Shop (`POTTER`), route 6.
+ - Tests that `customers_for` returns three customers on one day in sorted order, and that `invoice_for` ignores other customers' lines.
+diff --git a/src/bakehouse/config.py b/src/bakehouse/config.py
+index 8636bbf..8c86da5 100644
+--- a/src/bakehouse/config.py
++++ b/src/bakehouse/config.py
+@@ -5,8 +5,9 @@ import datetime
+ BAKERY_NAME = "Larkspur Bakery"
+ 
+ # Orders for a delivery day must be in by this time on the day before.
+-# 13:00 because the mill now wants our flour order by 13:30.
+-ORDER_CUTOFF = datetime.time(13, 0)
++# 13:30, half an hour later than before, so customers have more time to order.
++# The mill still wants our flour order by 13:30; that order needs checking.
++ORDER_CUTOFF = datetime.time(13, 30)
+ 
+ # Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).
+ # Monday since November: we have the stall at the Sunday farmers' market.

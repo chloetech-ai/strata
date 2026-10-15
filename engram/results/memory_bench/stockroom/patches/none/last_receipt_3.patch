@@ -1,0 +1,44 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 6c1193e..b248b31 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -60,3 +60,9 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The latest RECEIPT for `sku` by date, or None. Ties go to the later-logged one."""
++        receipts = [m for m in self.movements_for(sku) if m.reason == "RECEIPT"]
++        # max() keeps the first maximal item, so scan newest-logged first to break ties in its favour.
++        return max(reversed(receipts), key=lambda m: m.date, default=None)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 12a58fb..7d60818 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -55,6 +55,25 @@ class InventoryTest(unittest.TestCase):
+         inv.issue("BR-1042", 4, DAY)
+         self.assertEqual([m.qty for m in inv.movements_for("BR-1042")], [10, -4])
+ 
++    def test_last_receipt_is_none_without_receipts(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.issue("BR-1042", 1, DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
++    def test_last_receipt_is_the_latest_by_date(self):
++        inv = Inventory()
++        newer = inv.receive("BR-1042", 10, 12, DAY + datetime.timedelta(days=5))
++        inv.receive("BR-1042", 4, 11, DAY)
++        inv.issue("BR-1042", 2, DAY + datetime.timedelta(days=9))
++        self.assertIs(inv.last_receipt("br-1042 "), newer)
++
++    def test_last_receipt_ties_go_to_the_later_logged_one(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        later = inv.receive("BR-1042", 4, 11, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), later)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

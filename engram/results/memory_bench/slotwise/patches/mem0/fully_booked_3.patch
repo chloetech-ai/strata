@@ -1,0 +1,77 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 28b672a..ed11dd6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ - `Client` and `ClientBook` (`add`, `find_by_phone`) form the client register. `ClientBook.search(text)` finds clients whose name contains the text, ignoring case. Phone numbers are compared as international digits, so '079 123 45 67', '+41 79 123 45 67' and '0041791234567' find the same client.
+ - `Schedule.cancel(appointment_id)` marks an appointment as cancelled (kept for fees) and frees its slot. Saved files without the field load as not cancelled.
++- `Schedule.is_fully_booked(therapist, day)` is true when the therapist has 7 non-cancelled appointments that day (`DAILY_LIMIT`), so the online booking page can grey the day out.
+ - Booking errors are now `BookingError` subclasses (`SlotTaken`, `OutsideOpeningHours`) with receptionist-facing messages, replacing `ValueError`.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 47b4f7f..a9f7818 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,9 @@ from .model import TREATMENTS
+ # Time a therapist needs after each appointment to clean up and write notes.
+ CHANGEOVER = datetime.timedelta(minutes=10)
+ 
++# Most treatments a therapist may give in one day under the daily contract.
++DAILY_LIMIT = 7
++
+ 
+ class Schedule:
+     def __init__(self):
+@@ -49,6 +52,11 @@ class Schedule:
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True if `therapist` already has DAILY_LIMIT non-cancelled appointments on `day`."""
++        active = [a for a in self.appointments_for(therapist, day) if not a.cancelled]
++        return len(active) >= DAILY_LIMIT
++
+     def week(self, therapist, monday):
+         """`therapist`'s non-cancelled appointments for the seven days from `monday`, by date."""
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index f6ba16b..40779b5 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -103,6 +103,34 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(KeyError):
+             s.cancel(999999)
+ 
++    def test_fully_booked_at_seven_appointments(self):
++        s = Schedule()
++        for hour in range(8, 15):  # 08:00 to 15:00, seven back-to-back-ish treatments
++            s.book(at(hour, client=f"Client {hour}"))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_not_fully_booked_below_seven(self):
++        s = Schedule()
++        for hour in range(8, 14):
++            s.book(at(hour, client=f"Client {hour}"))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_cancelled_appointment_does_not_count(self):
++        s = Schedule()
++        for hour in range(8, 14):
++            s.book(at(hour, client=f"Client {hour}"))
++        last = s.book(at(14, client="Jo Li"))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++        s.cancel(last.id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_fully_booked_is_per_therapist_and_day(self):
++        s = Schedule()
++        for hour in range(8, 15):
++            s.book(at(hour, client=f"Client {hour}"))
++        self.assertFalse(s.is_fully_booked("marco", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 9)))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

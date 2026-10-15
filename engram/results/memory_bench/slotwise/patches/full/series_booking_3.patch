@@ -1,0 +1,185 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 0b192c0..742ffd2 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -27,6 +27,13 @@
+   "tests/test_schedule.py::ScheduleTest::test_week_groups_by_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_week_leaves_out_cancelled",
+   "tests/test_schedule.py::ScheduleTest::test_week_requires_monday",
++  "tests/test_series.py::SeriesTest::test_all_or_nothing_when_search_limit_is_hit",
++  "tests/test_series.py::SeriesTest::test_books_weekly_same_weekday_and_time",
++  "tests/test_series.py::SeriesTest::test_more_than_nine_is_refused_and_nothing_booked",
++  "tests/test_series.py::SeriesTest::test_series_of_nine_is_allowed",
++  "tests/test_series.py::SeriesTest::test_skips_closed_week",
++  "tests/test_series.py::SeriesTest::test_skips_taken_week_and_adds_one_at_end",
++  "tests/test_series.py::SeriesTest::test_zero_sessions_refused",
+   "tests/test_storage.py::StorageTest::test_cancelled_roundtrip",
+   "tests/test_storage.py::StorageTest::test_loads_files_without_cancelled_field",
+   "tests/test_storage.py::StorageTest::test_roundtrip"
+diff --git a/src/slotwise/__init__.py b/src/slotwise/__init__.py
+index 88b5f92..265c86f 100644
+--- a/src/slotwise/__init__.py
++++ b/src/slotwise/__init__.py
+@@ -1,7 +1,17 @@
+ """slotwise: appointment scheduling for a small physiotherapy practice."""
+ 
+-from .errors import BookingError, OutsideOpeningHours, SlotTaken
++from .errors import BookingError, OutsideOpeningHours, SeriesTooLong, SlotTaken
+ from .model import TREATMENTS, Appointment
+ from .schedule import Schedule
++from .series import book_series
+ 
+-__all__ = ["TREATMENTS", "Appointment", "BookingError", "OutsideOpeningHours", "Schedule", "SlotTaken"]
++__all__ = [
++    "TREATMENTS",
++    "Appointment",
++    "BookingError",
++    "OutsideOpeningHours",
++    "Schedule",
++    "SeriesTooLong",
++    "SlotTaken",
++    "book_series",
++]
+diff --git a/src/slotwise/errors.py b/src/slotwise/errors.py
+index e6700a4..339d42a 100644
+--- a/src/slotwise/errors.py
++++ b/src/slotwise/errors.py
+@@ -11,3 +11,7 @@ class SlotTaken(BookingError):
+ 
+ class OutsideOpeningHours(BookingError):
+     """The practice is closed for the whole requested appointment."""
++
++
++class SeriesTooLong(BookingError):
++    """A series asks for more sessions than the insurance pays for."""
+diff --git a/src/slotwise/series.py b/src/slotwise/series.py
+new file mode 100644
+index 0000000..f0ad65f
+--- /dev/null
++++ b/src/slotwise/series.py
+@@ -0,0 +1,55 @@
++"""Booking a weekly series of sessions, as prescribed by a doctor."""
++
++import datetime
++
++from .errors import BookingError, SeriesTooLong
++from .model import Appointment
++
++# Insurance pays for at most this many sessions per prescription.
++MAX_SESSIONS = 9
++
++# How many weeks ahead to look for free weeks before giving up.
++MAX_WEEKS_SEARCHED = 26
++
++
++def book_series(schedule, first, count):
++    """Books `count` weekly appointments starting with `first`, at the same weekday and time.
++
++    A week that is already taken or closed is skipped, and the series continues in the
++    next week, so the client still gets `count` sessions. If that can't be done within
++    MAX_WEEKS_SEARCHED weeks, nothing is booked and BookingError is raised.
++
++    Returns the booked appointments in date order.
++    """
++    if count < 1:
++        raise ValueError("a series needs at least one session")
++    if count > MAX_SESSIONS:
++        raise SeriesTooLong(
++            f"A series can have at most {MAX_SESSIONS} sessions, but {count} were asked for. "
++            f"Please book the rest separately."
++        )
++    booked = []
++    try:
++        week = 0
++        while len(booked) < count:
++            if week >= MAX_WEEKS_SEARCHED:
++                raise BookingError(
++                    f"Only {len(booked)} of the {count} sessions could be booked within "
++                    f"{MAX_WEEKS_SEARCHED} weeks, so none were booked. Please check the diary."
++                )
++            if week == 0:
++                candidate = first
++            else:
++                candidate = Appointment(
++                    first.therapist, first.client, first.start + datetime.timedelta(weeks=week), first.treatment
++                )
++            try:
++                booked.append(schedule.book(candidate))
++            except BookingError:
++                pass  # taken or closed: try the same time next week
++            week += 1
++    except Exception:
++        for appointment in booked:
++            schedule.appointments.remove(appointment)
++        raise
++    return booked
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..923a187
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,64 @@
++import datetime
++import unittest
++from unittest import mock
++
++from slotwise import series
++from slotwise.errors import BookingError, SeriesTooLong
++from slotwise.model import Appointment
++from slotwise.schedule import Schedule
++from slotwise.series import book_series
++
++MONDAY_9 = datetime.datetime(2026, 9, 7, 9, 0)
++
++
++def first(start=MONDAY_9):
++    return Appointment("lena", "Kim Weber", start, "standard")
++
++
++class SeriesTest(unittest.TestCase):
++    def test_books_weekly_same_weekday_and_time(self):
++        s = Schedule()
++        booked = book_series(s, first(), 3)
++        self.assertEqual([a.start for a in booked], [MONDAY_9 + datetime.timedelta(weeks=i) for i in range(3)])
++        self.assertEqual(len(s.appointments), 3)
++
++    def test_skips_taken_week_and_adds_one_at_end(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", MONDAY_9 + datetime.timedelta(weeks=1)))
++        booked = book_series(s, first(), 3)
++        self.assertEqual([a.start for a in booked],
++                         [MONDAY_9, MONDAY_9 + datetime.timedelta(weeks=2), MONDAY_9 + datetime.timedelta(weeks=3)])
++        self.assertEqual(len(booked), 3)
++
++    def test_skips_closed_week(self):
++        s = Schedule()
++        saturday = datetime.datetime(2026, 9, 12, 9, 0)  # Saturday is open 08:00-12:00, so 09:00 works
++        booked = book_series(s, first(saturday), 2)
++        self.assertEqual([a.start for a in booked], [saturday, saturday + datetime.timedelta(weeks=1)])
++
++    def test_series_of_nine_is_allowed(self):
++        s = Schedule()
++        self.assertEqual(len(book_series(s, first(), 9)), 9)
++
++    def test_more_than_nine_is_refused_and_nothing_booked(self):
++        s = Schedule()
++        with self.assertRaises(SeriesTooLong):
++            book_series(s, first(), 12)
++        self.assertEqual(s.appointments, [])
++
++    def test_zero_sessions_refused(self):
++        with self.assertRaises(ValueError):
++            book_series(Schedule(), first(), 0)
++
++    def test_all_or_nothing_when_search_limit_is_hit(self):
++        s = Schedule()
++        blockers = [s.book(Appointment("lena", "Jo Li", MONDAY_9 + datetime.timedelta(weeks=w)))
++                    for w in (0, 1, 2)]
++        with mock.patch.object(series, "MAX_WEEKS_SEARCHED", 3):
++            with self.assertRaises(BookingError):
++                book_series(s, first(), 2)
++        self.assertEqual(s.appointments, blockers)
++
++
++if __name__ == "__main__":
++    unittest.main()

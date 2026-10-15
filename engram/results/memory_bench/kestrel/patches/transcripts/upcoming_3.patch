@@ -1,0 +1,60 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9e5da12..d38778b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- `Calendar.upcoming(patient_id, now)` returns a patient's booked appointments starting after `now`, soonest first. `now` must be timezone-aware.
+ - `Calendar.cancel(appointment_id, at)` marks an appointment cancelled and records `cancelled_at`.
+ - `session_price(kind)` returns the session price in cents: $95 for an assessment, $70 for a follow-up.
+ - `BulkieClient.send_batch` splits messages into calls of at most 50 (`MAX_BATCH`), since Bulkie rejects a whole call that is over the limit. It now returns one response per call.
+diff --git a/src/kestrel/calendar.py b/src/kestrel/calendar.py
+index cd6f931..b0dda71 100644
+--- a/src/kestrel/calendar.py
++++ b/src/kestrel/calendar.py
+@@ -60,5 +60,11 @@ class Calendar:
+     def booked(self):
+         return [a for a in self.all() if a.status == BOOKED]
+ 
++    def upcoming(self, patient_id, now):
++        """A patient's booked appointments starting after `now`, soonest first."""
++        if now.tzinfo is None:
++            raise ValueError("now must be timezone-aware")
++        return [a for a in self.for_patient(patient_id) if a.status == BOOKED and a.start > now]
++
+     def __len__(self):
+         return len(self._appointments)
+diff --git a/tests/test_calendar.py b/tests/test_calendar.py
+index 2edc833..76367d6 100644
+--- a/tests/test_calendar.py
++++ b/tests/test_calendar.py
+@@ -37,6 +37,27 @@ class CalendarTest(unittest.TestCase):
+         cal = Calendar([appt("a1", utc(2027, 3, 1, 20)), appt("a2", utc(2027, 3, 1, 21), status="cancelled")])
+         self.assertEqual([a.id for a in cal.booked()], ["a1"])
+ 
++    def test_upcoming_booked_after_now_soonest_first(self):
++        now = utc(2027, 3, 1, 20)
++        cal = Calendar([
++            appt("a3", utc(2027, 3, 3, 20), patient="KP-000001"),
++            appt("a1", utc(2027, 3, 2, 20), patient="KP-000001"),
++            appt("past", utc(2027, 2, 28, 20), patient="KP-000001"),
++            appt("exact", now, patient="KP-000001"),
++            appt("cancelled", utc(2027, 3, 2, 21), patient="KP-000001", status="cancelled"),
++            appt("other", utc(2027, 3, 2, 22), patient="KP-000002"),
++        ])
++        self.assertEqual([a.id for a in cal.upcoming("kp1", now)], ["a1", "a3"])
++
++    def test_upcoming_empty(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), patient="KP-000001")])
++        self.assertEqual(cal.upcoming("KP-000002", utc(2027, 2, 1, 0)), [])
++
++    def test_upcoming_requires_aware_now(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), patient="KP-000001")])
++        with self.assertRaises(ValueError):
++            cal.upcoming("KP-000001", datetime.datetime(2027, 2, 1, 0))
++
+     def test_for_day_sorted_by_start(self):
+         # Mid-October Auckland is NZDT (UTC+13). "a9" sorts first by id but starts later.
+         cal = Calendar([

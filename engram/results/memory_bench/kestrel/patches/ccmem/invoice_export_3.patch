@@ -1,0 +1,158 @@
+diff --git a/src/kestrel/export.py b/src/kestrel/export.py
+new file mode 100644
+index 0000000..9d672e9
+--- /dev/null
++++ b/src/kestrel/export.py
+@@ -0,0 +1,46 @@
++"""Monthly export of invoices for the accountants (Tui Accounting, imported into Xero by Mere).
++
++Format rules from Mere: CSV with a header row, dates as DD/MM/YYYY, amounts as plain
++dollars with two decimal places, and the file name kestrel-invoices-YYYY-MM.csv.
++The file leaves the system, so it carries the patient id only, never the patient's name.
++"""
++
++import csv
++import io
++import decimal
++import os
++
++from .storage import _write_atomic
++
++COLUMNS = ["Invoice Number", "Clinic", "Patient ID", "Date", "Description", "Amount"]
++
++
++def export_invoices(invoices, year, month, out_dir):
++    """Write the invoices issued in `year`-`month` to out_dir and return the path of the file.
++
++    Invoices are matched on their issue date (the clinic's local date). The file is always
++    written, with just the header row if no invoices were issued that month.
++    """
++    selected = [i for i in invoices if i.issued.year == year and i.issued.month == month]
++
++    buffer = io.StringIO()
++    writer = csv.writer(buffer, lineterminator="\n")
++    writer.writerow(COLUMNS)
++    for invoice in selected:
++        writer.writerow([
++            invoice.number,
++            invoice.clinic,
++            invoice.patient_id,
++            invoice.issued.strftime("%d/%m/%Y"),
++            invoice.description,
++            _dollars(invoice.amount_cents),
++        ])
++
++    path = os.path.join(out_dir, f"kestrel-invoices-{year:04d}-{month:02d}.csv")
++    _write_atomic(path, buffer.getvalue())
++    return path
++
++
++def _dollars(cents):
++    """Cents as a plain dollar amount with two decimal places, e.g. 9500 -> "95.00"."""
++    return f"{decimal.Decimal(cents) / 100:.2f}"
+diff --git a/tests/test_export.py b/tests/test_export.py
+new file mode 100644
+index 0000000..4befa8d
+--- /dev/null
++++ b/tests/test_export.py
+@@ -0,0 +1,100 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from kestrel.export import export_invoices
++from kestrel.invoices import Invoice
++
++
++def invoice(number, issued, amount_cents=9500, patient_id="KP-004211", patient_name="", description="Physiotherapy assessment"):
++    return Invoice(
++        number=number,
++        clinic="HB",
++        patient_id=patient_id,
++        patient_name=patient_name,
++        issued=issued,
++        amount_cents=amount_cents,
++        description=description,
++    )
++
++
++class ExportInvoicesTest(unittest.TestCase):
++    def setUp(self):
++        self._dir = tempfile.TemporaryDirectory()
++        self.out_dir = self._dir.name
++
++    def tearDown(self):
++        self._dir.cleanup()
++
++    def read(self, path):
++        with open(path, encoding="utf-8", newline="") as f:
++            return f.read()
++
++    def test_file_name_and_return_path(self):
++        path = export_invoices([], 2026, 10, self.out_dir)
++        self.assertEqual(path, os.path.join(self.out_dir, "kestrel-invoices-2026-10.csv"))
++        self.assertTrue(os.path.isfile(path))
++
++    def test_header_row_and_one_row_per_invoice(self):
++        invoices = [invoice("INV-HB-2026-00001", datetime.date(2026, 10, 15))]
++        text = self.read(export_invoices(invoices, 2026, 10, self.out_dir))
++        rows = list(csv.reader(text.splitlines()))
++        self.assertEqual(rows[0], ["Invoice Number", "Clinic", "Patient ID", "Date", "Description", "Amount"])
++        self.assertEqual(rows[1], ["INV-HB-2026-00001", "HB", "KP-004211", "15/10/2026", "Physiotherapy assessment", "95.00"])
++        self.assertEqual(len(rows), 2)
++
++    def test_only_invoices_issued_in_that_month(self):
++        invoices = [
++            invoice("INV-1", datetime.date(2026, 9, 30)),
++            invoice("INV-2", datetime.date(2026, 10, 1)),
++            invoice("INV-3", datetime.date(2026, 10, 31)),
++            invoice("INV-4", datetime.date(2026, 11, 1)),
++            invoice("INV-5", datetime.date(2025, 10, 15)),
++        ]
++        text = self.read(export_invoices(invoices, 2026, 10, self.out_dir))
++        numbers = [row[0] for row in list(csv.reader(text.splitlines()))[1:]]
++        self.assertEqual(numbers, ["INV-2", "INV-3"])
++
++    def test_empty_month_writes_header_only(self):
++        path = export_invoices([invoice("INV-1", datetime.date(2026, 9, 1))], 2026, 10, self.out_dir)
++        self.assertEqual(self.read(path), "Invoice Number,Clinic,Patient ID,Date,Description,Amount\n")
++
++    def test_amounts_have_two_decimal_places(self):
++        invoices = [
++            invoice("A", datetime.date(2026, 10, 1), amount_cents=9500),
++            invoice("B", datetime.date(2026, 10, 2), amount_cents=7000),
++            invoice("C", datetime.date(2026, 10, 3), amount_cents=5),
++            invoice("D", datetime.date(2026, 10, 4), amount_cents=12345),
++        ]
++        rows = list(csv.reader(self.read(export_invoices(invoices, 2026, 10, self.out_dir)).splitlines()))[1:]
++        self.assertEqual([r[5] for r in rows], ["95.00", "70.00", "0.05", "123.45"])
++
++    def test_dates_are_day_month_year(self):
++        invoices = [invoice("A", datetime.date(2026, 3, 7))]
++        text = self.read(export_invoices(invoices, 2026, 3, self.out_dir))
++        self.assertIn("07/03/2026", text)
++
++    def test_patient_name_is_never_written(self):
++        # Even if an invoice carries a name, the export only writes the patient id.
++        invoices = [invoice("A", datetime.date(2026, 10, 1), patient_name="Aroha Test")]
++        text = self.read(export_invoices(invoices, 2026, 10, self.out_dir))
++        self.assertNotIn("Aroha", text)
++        self.assertNotIn("Test", text)
++
++    def test_fields_with_commas_are_quoted(self):
++        invoices = [invoice("A", datetime.date(2026, 10, 1), description="Follow-up, extended")]
++        rows = list(csv.reader(self.read(export_invoices(invoices, 2026, 10, self.out_dir)).splitlines()))
++        self.assertEqual(rows[1][4], "Follow-up, extended")
++
++    def test_overwrites_existing_file(self):
++        path = os.path.join(self.out_dir, "kestrel-invoices-2026-10.csv")
++        with open(path, "w", encoding="utf-8") as f:
++            f.write("old contents\n")
++        export_invoices([], 2026, 10, self.out_dir)
++        self.assertNotIn("old contents", self.read(path))
++
++
++if __name__ == "__main__":
++    unittest.main()

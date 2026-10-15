@@ -1,0 +1,64 @@
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..613a370
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,14 @@
++"""Checks run before an appointment is saved."""
++
++from .models import BOOKED
++
++
++def can_book(calendar, therapist, appointment):
++    """True if the appointment can be added: the therapist has no booked appointment at the same start time.
++
++    Appointments have no duration yet, so only an exact start-time clash is detected.
++    """
++    for existing in calendar.for_therapist(therapist.id):
++        if existing.status == BOOKED and existing.start == appointment.start:
++            return False
++    return True
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..330e62a
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,38 @@
++import datetime
++import unittest
++
++from helpers import appt, utc
++from kestrel.booking import can_book
++from kestrel.calendar import Calendar
++from kestrel.models import CANCELLED, Therapist
++
++T1 = Therapist("T1", "Ana", "HB")
++T2 = Therapist("T2", "Ben", "HB")
++
++
++class CanBookTest(unittest.TestCase):
++    def test_free_slot(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), therapist="T1")])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 21), therapist="T1")))
++
++    def test_same_start_clashes(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), therapist="T1")])
++        self.assertFalse(can_book(cal, T1, appt("new", utc(2027, 3, 1, 20), therapist="T1")))
++
++    def test_other_therapist_does_not_clash(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), therapist="T2")])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 20), therapist="T1")))
++
++    def test_cancelled_does_not_clash(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), therapist="T1", status=CANCELLED)])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 20), therapist="T1")))
++
++    def test_same_instant_in_different_zone_clashes(self):
++        nz = datetime.timezone(datetime.timedelta(hours=13))
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 7), therapist="T1")])
++        new = appt("new", datetime.datetime(2027, 3, 1, 20, tzinfo=nz), therapist="T1")
++        self.assertFalse(can_book(cal, T1, new))
++
++
++if __name__ == "__main__":
++    unittest.main()

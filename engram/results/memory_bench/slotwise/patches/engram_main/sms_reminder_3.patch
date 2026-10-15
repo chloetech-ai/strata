@@ -1,0 +1,111 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..5f52eef
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,51 @@
++"""Text of the SMS reminder sent before an appointment."""
++
++import unicodedata
++
++from .model import Appointment
++
++# The SMS gateway accepts only plain ASCII, and one message holds at most 160 characters.
++MAX_LENGTH = 160
++
++# The practice's reception number. Every reminder asks clients to call it to move their appointment.
++RECEPTION_PHONE = "044 512 77 30"
++
++# Letters that Unicode does not split into a base letter and an accent.
++_TRANSLITERATIONS = {
++    "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
++    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
++}
++
++
++def to_ascii(text):
++    """Return `text` as plain ASCII: umlauts are transliterated, other accents are dropped.
++
++    'Brändli' becomes 'Braendli'. Raises ValueError if a character has no ASCII equivalent.
++    """
++    spelled = "".join(_TRANSLITERATIONS.get(ch, ch) for ch in text)
++    decomposed = unicodedata.normalize("NFKD", spelled)
++    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
++    if not stripped.isascii():
++        bad = "".join(sorted(set(ch for ch in stripped if not ch.isascii())))
++        raise ValueError(f"name {text!r} has characters with no ASCII equivalent: {bad!r}")
++    return stripped
++
++
++def reminder_text(appointment):
++    """Return the reminder SMS for `appointment`.
++
++    Raises ValueError if the name cannot be written in ASCII or the text would exceed
++    160 characters, so that reception can fix the name or the appointment is flagged.
++    """
++    name = to_ascii(appointment.client)
++    when = f"{appointment.start:%d.%m.%Y} um {appointment.start:%H:%M} Uhr"
++    text = (
++        f"Guten Tag {name}. Erinnerung: Ihr Termin ist am {when}. "
++        f"Wenn Sie verhindert sind, rufen Sie bitte {RECEPTION_PHONE} an."
++    )
++    if len(text) > MAX_LENGTH:
++        raise ValueError(
++            f"reminder for {appointment.client!r} is {len(text)} characters, "
++            f"more than {MAX_LENGTH}"
++        )
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..5073cd4
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,48 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import MAX_LENGTH, reminder_text, to_ascii
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_umlauts_are_transliterated(self):
++        self.assertEqual(to_ascii("Brändli"), "Braendli")
++        self.assertEqual(to_ascii("Öztürk Strauß"), "Oeztuerk Strauss")
++        self.assertEqual(to_ascii("Ädi Üeli"), "Aedi Ueeli")
++
++    def test_other_accents_are_stripped(self):
++        self.assertEqual(to_ascii("José Müller-Çelik"), "Jose Mueller-Celik")
++
++    def test_letter_without_ascii_equivalent_raises(self):
++        with self.assertRaises(ValueError):
++            to_ascii("李 Wei")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_text_contains_time_and_reception_number(self):
++        a = Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0))
++        text = reminder_text(a)
++        self.assertIn("Kim Weber", text)
++        self.assertIn("07.09.2026 um 09:00 Uhr", text)
++        self.assertIn("044 512 77 30", text)
++        self.assertTrue(text.isascii())
++        self.assertLessEqual(len(text), MAX_LENGTH)
++
++    def test_name_is_transliterated(self):
++        a = Appointment("lena", "Brändli", datetime.datetime(2026, 9, 7, 9, 0))
++        self.assertIn("Braendli", reminder_text(a))
++
++    def test_long_name_raises_instead_of_exceeding_limit(self):
++        a = Appointment("lena", "X" * 150, datetime.datetime(2026, 9, 7, 9, 0))
++        with self.assertRaises(ValueError):
++            reminder_text(a)
++
++    def test_non_ascii_name_raises(self):
++        a = Appointment("lena", "李 Wei", datetime.datetime(2026, 9, 7, 9, 0))
++        with self.assertRaises(ValueError):
++            reminder_text(a)
++
++
++if __name__ == "__main__":
++    unittest.main()

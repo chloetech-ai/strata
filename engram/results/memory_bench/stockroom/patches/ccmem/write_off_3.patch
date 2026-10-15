@@ -1,0 +1,62 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..41ee57b 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,7 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_cli.py": true,
++  "tests/test_inventory.py": true,
++  "tests/test_items.py": true,
++  "tests/test_reorder.py": true,
++  "tests/test_storage.py": true
++}
+\ No newline at end of file
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index aef508a..03f7da0 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -47,6 +47,12 @@ class Inventory:
+             raise ValueError("quantity must be positive")
+         return self._record(Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "SALE", None, note))
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock broken or damaged beyond use; `qty` is the positive number of units lost."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self._record(Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "DAMAGE"))
++
+     def adjust(self, sku, qty, reason, date=None, note=""):
+         """Signed correction for a RETURN, DAMAGE or COUNT; `qty` is positive for goods in, negative for out."""
+         if reason not in ("RETURN", "DAMAGE", "COUNT"):
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 5aa3ccb..390cc89 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -21,6 +21,25 @@ class ReasonCodeTest(unittest.TestCase):
+         self.assertEqual([m.reason for m in inv.movements], ["RETURN", "DAMAGE", "COUNT"])
+         self.assertEqual(inv.on_hand("BR-1042"), -2)
+ 
++    def test_write_off_records_damage_as_goods_out(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        movement = inv.write_off("BR-1042", 3, DAY)
++        self.assertEqual(movement.reason, "DAMAGE")
++        self.assertEqual(movement.qty, -3)
++        self.assertEqual(movement.date, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_does_not_refuse_when_short(self):
++        inv = Inventory()
++        inv.write_off("BR-1042", 2, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -2)
++
++    def test_write_off_rejects_non_positive_quantity(self):
++        for bad in [0, -5]:
++            with self.assertRaises(ValueError):
++                Inventory().write_off("BR-1042", bad, DAY)
++
+     def test_adjust_rejects_receipt_and_sale(self):
+         inv = Inventory()
+         with self.assertRaises(ValueError):

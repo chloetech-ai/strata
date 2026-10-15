@@ -1,0 +1,111 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 291fa70..c12dc05 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -28,6 +28,14 @@
+   "tests/test_reorder.py::ReorderTest::test_at_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
++  "tests/test_scanner.py::ScannerTest::test_counts_per_sku",
++  "tests/test_scanner.py::ScannerTest::test_empty_file_gives_empty_dict",
++  "tests/test_scanner.py::ScannerTest::test_normalizes_sku",
++  "tests/test_scanner.py::ScannerTest::test_rejects_negative_quantity",
++  "tests/test_scanner.py::ScannerTest::test_rejects_non_integer_quantity",
++  "tests/test_scanner.py::ScannerTest::test_rejects_wrong_field_count",
++  "tests/test_scanner.py::ScannerTest::test_skips_blank_lines_and_tolerates_crlf_and_bom",
++  "tests/test_scanner.py::ScannerTest::test_sums_overflow_bins",
+   "tests/test_storage.py::StorageTest::test_legacy_file_without_reason_column",
+   "tests/test_storage.py::StorageTest::test_roundtrip"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/scanner.py b/src/stockroom/scanner.py
+new file mode 100644
+index 0000000..11bc1ae
+--- /dev/null
++++ b/src/stockroom/scanner.py
+@@ -0,0 +1,30 @@
++"""Reading the handheld scanners' plain-text stock export."""
++
++from .items import normalize_sku
++
++
++def read_scanner_file(path):
++    """Counted quantity per SKU from a scanner export.
++
++    Each line is ``bin;sku;qty`` with no header. A SKU may appear on several
++    lines (overflow bins), so its quantities are summed.
++    """
++    counts = {}
++    with open(path, encoding="utf-8-sig") as f:
++        for number, line in enumerate(f, start=1):
++            line = line.rstrip("\r\n")
++            if not line.strip():
++                continue
++            fields = line.split(";")
++            if len(fields) != 3:
++                raise ValueError(f"{path} line {number}: expected bin;sku;qty, got {line!r}")
++            _, sku, qty = fields
++            try:
++                quantity = int(qty)
++            except ValueError:
++                raise ValueError(f"{path} line {number}: quantity {qty!r} is not a whole number")
++            if quantity < 0:
++                raise ValueError(f"{path} line {number}: counted quantity {quantity} is negative")
++            sku = normalize_sku(sku)
++            counts[sku] = counts.get(sku, 0) + quantity
++    return counts
+diff --git a/tests/test_scanner.py b/tests/test_scanner.py
+new file mode 100644
+index 0000000..a17ce43
+--- /dev/null
++++ b/tests/test_scanner.py
+@@ -0,0 +1,49 @@
++import os
++import tempfile
++import unittest
++
++from stockroom.scanner import read_scanner_file
++
++
++class ScannerTest(unittest.TestCase):
++    def _read(self, text):
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "scan.txt")
++            with open(path, "w", encoding="utf-8") as f:
++                f.write(text)
++            return read_scanner_file(path)
++
++    def test_counts_per_sku(self):
++        counts = self._read("A1;BR-1042;12\nA2;BR-2001;5\n")
++        self.assertEqual(counts, {"BR-1042": 12, "BR-2001": 5})
++
++    def test_sums_overflow_bins(self):
++        counts = self._read("A1;BR-1042;12\nB9;BR-1042;4\n")
++        self.assertEqual(counts, {"BR-1042": 16})
++
++    def test_normalizes_sku(self):
++        counts = self._read(" a1 ; br-1042 ;3\nA1;BR-1042;2\n")
++        self.assertEqual(counts, {"BR-1042": 5})
++
++    def test_skips_blank_lines_and_tolerates_crlf_and_bom(self):
++        counts = self._read("﻿A1;BR-1042;3\r\n\r\nA1;BR-2001;1\r\n")
++        self.assertEqual(counts, {"BR-1042": 3, "BR-2001": 1})
++
++    def test_rejects_wrong_field_count(self):
++        with self.assertRaisesRegex(ValueError, "line 2"):
++            self._read("A1;BR-1042;3\nBR-2001;1\n")
++
++    def test_rejects_non_integer_quantity(self):
++        with self.assertRaisesRegex(ValueError, "line 1"):
++            self._read("A1;BR-1042;three\n")
++
++    def test_rejects_negative_quantity(self):
++        with self.assertRaisesRegex(ValueError, "negative"):
++            self._read("A1;BR-1042;-2\n")
++
++    def test_empty_file_gives_empty_dict(self):
++        self.assertEqual(self._read(""), {})
++
++
++if __name__ == "__main__":
++    unittest.main()

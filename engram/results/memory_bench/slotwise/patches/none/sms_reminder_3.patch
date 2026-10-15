@@ -1,0 +1,41 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..c68c299
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,11 @@
++"""Reminder messages sent to clients before their appointment."""
++
++from .model import Appointment
++
++
++def reminder_text(appointment: Appointment) -> str:
++    """Return the text of the reminder SMS for `appointment`."""
++    return (
++        f"Hi {appointment.client}, this is a reminder of your appointment with "
++        f"{appointment.therapist.title()} on {appointment.start:%A %d %B} at {appointment.start:%H:%M}."
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..d704468
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,18 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import reminder_text
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_names_therapist_day_and_time(self):
++        a = Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0))
++        self.assertEqual(
++            reminder_text(a),
++            "Hi Kim Weber, this is a reminder of your appointment with Lena on Monday 07 September at 09:00.",
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()

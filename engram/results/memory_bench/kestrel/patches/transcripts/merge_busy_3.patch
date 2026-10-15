@@ -1,0 +1,65 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..c17eb7f
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,16 @@
++"""Working with time intervals as (start, end) pairs."""
++
++
++def merge_busy(intervals):
++    """Merge (start, end) pairs into sorted, non-overlapping pairs.
++
++    Input may be in any order. Pairs that touch (one ends where the next
++    starts) are merged too.
++    """
++    merged = []
++    for start, end in sorted(intervals):
++        if merged and start <= merged[-1][1]:
++            merged[-1][1] = max(merged[-1][1], end)
++        else:
++            merged.append([start, end])
++    return [(start, end) for start, end in merged]
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..a92191c
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,37 @@
++import unittest
++
++from kestrel.intervals import merge_busy
++
++
++class MergeBusyTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(merge_busy([]), [])
++
++    def test_single_pair(self):
++        self.assertEqual(merge_busy([(9, 10)]), [(9, 10)])
++
++    def test_disjoint_pairs_are_sorted(self):
++        self.assertEqual(merge_busy([(13, 14), (9, 10)]), [(9, 10), (13, 14)])
++
++    def test_overlapping_pairs_merge(self):
++        self.assertEqual(merge_busy([(9, 11), (10, 12)]), [(9, 12)])
++
++    def test_touching_pairs_merge(self):
++        self.assertEqual(merge_busy([(9, 10), (10, 11)]), [(9, 11)])
++
++    def test_contained_pair_is_absorbed(self):
++        self.assertEqual(merge_busy([(9, 17), (10, 11)]), [(9, 17)])
++
++    def test_any_order(self):
++        self.assertEqual(
++            merge_busy([(12, 13), (10, 11), (9, 10), (11, 12)]), [(9, 13)]
++        )
++
++    def test_does_not_modify_input(self):
++        pairs = [(10, 11), (9, 10)]
++        merge_busy(pairs)
++        self.assertEqual(pairs, [(10, 11), (9, 10)])
++
++
++if __name__ == "__main__":
++    unittest.main()

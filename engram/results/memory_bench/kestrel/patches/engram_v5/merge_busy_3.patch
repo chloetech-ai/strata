@@ -1,0 +1,69 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..5a09abc
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,17 @@
++"""Time intervals, such as a therapist's busy periods."""
++
++
++def merge_busy(intervals):
++    """Merge (start, end) pairs given in any order into sorted, non-overlapping pairs.
++
++    Pairs that touch (one ends where the next starts) are merged too.
++    """
++    merged = []
++    for start, end in sorted(intervals):
++        if end < start:
++            raise ValueError(f"interval ends before it starts: {(start, end)!r}")
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..3da4b01
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,40 @@
++import unittest
++
++from kestrel.intervals import merge_busy
++
++
++class MergeBusyTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(merge_busy([]), [])
++
++    def test_single_pair(self):
++        self.assertEqual(merge_busy([(9, 10)]), [(9, 10)])
++
++    def test_disjoint_pairs_sorted(self):
++        self.assertEqual(merge_busy([(13, 14), (9, 10)]), [(9, 10), (13, 14)])
++
++    def test_overlapping_pairs_merge(self):
++        self.assertEqual(merge_busy([(9, 11), (10, 12)]), [(9, 12)])
++
++    def test_touching_pairs_merge(self):
++        self.assertEqual(merge_busy([(9, 10), (10, 11)]), [(9, 11)])
++
++    def test_any_order(self):
++        self.assertEqual(
++            merge_busy([(15, 16), (10, 12), (9, 10), (11, 13)]),
++            [(9, 13), (15, 16)],
++        )
++
++    def test_contained_pair_does_not_shorten(self):
++        self.assertEqual(merge_busy([(9, 12), (10, 11)]), [(9, 12)])
++
++    def test_zero_length_pair(self):
++        self.assertEqual(merge_busy([(9, 9), (9, 10)]), [(9, 10)])
++
++    def test_reversed_pair_raises(self):
++        with self.assertRaises(ValueError):
++            merge_busy([(10, 9)])
++
++
++if __name__ == "__main__":
++    unittest.main()

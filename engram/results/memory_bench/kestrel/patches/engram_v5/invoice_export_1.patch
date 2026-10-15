@@ -1,0 +1,123 @@
+diff --git a/src/kestrel/export.py b/src/kestrel/export.py
+new file mode 100644
+index 0000000..2198b10
+--- /dev/null
++++ b/src/kestrel/export.py
+@@ -0,0 +1,31 @@
++"""Exports for the accountant."""
++
++import csv
++import pathlib
++
++HEADER = ["Invoice number", "Clinic", "Patient ID", "Date", "Description", "Amount"]
++
++
++def export_invoices(invoices, year, month, out_dir):
++    """Write one month's invoices to a CSV file in out_dir and return its path.
++
++    Only invoices issued in the given year and month are included. Dates are
++    DD/MM/YYYY and amounts are dollars with two decimals and no dollar sign.
++    Patients appear by ID only, never by name.
++    """
++    path = pathlib.Path(out_dir) / f"kestrel-invoices-{year:04d}-{month:02d}.csv"
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(HEADER)
++        for invoice in invoices:
++            if invoice.issued.year != year or invoice.issued.month != month:
++                continue
++            writer.writerow([
++                invoice.number,
++                invoice.clinic,
++                invoice.patient_id,
++                invoice.issued.strftime("%d/%m/%Y"),
++                invoice.description,
++                f"{invoice.amount_cents / 100:.2f}",
++            ])
++    return path
+diff --git a/tests/test_export.py b/tests/test_export.py
+new file mode 100644
+index 0000000..e4ea517
+--- /dev/null
++++ b/tests/test_export.py
+@@ -0,0 +1,80 @@
++import csv
++import datetime
++import pathlib
++import tempfile
++import unittest
++
++from kestrel.export import export_invoices
++from kestrel.invoices import Invoice
++
++
++def invoice(number, issued, amount_cents=9500, patient_id="KP-004211", patient_name="Aroha Test"):
++    return Invoice(
++        number=number,
++        clinic="HB",
++        patient_id=patient_id,
++        patient_name=patient_name,
++        issued=issued,
++        amount_cents=amount_cents,
++        description="Initial assessment",
++    )
++
++
++class ExportInvoicesTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.out_dir = pathlib.Path(self.tmp.name)
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def read_rows(self, path):
++        with open(path, newline="", encoding="utf-8") as f:
++            return list(csv.reader(f))
++
++    def test_writes_named_file_with_header_and_returns_its_path(self):
++        path = export_invoices([invoice("INV-HB-2027-00001", datetime.date(2027, 3, 1))], 2027, 3, self.out_dir)
++        self.assertEqual(path, self.out_dir / "kestrel-invoices-2027-03.csv")
++        self.assertTrue(path.exists())
++        self.assertEqual(self.read_rows(path)[0], [
++            "Invoice number", "Clinic", "Patient ID", "Date", "Description", "Amount",
++        ])
++
++    def test_formats_date_and_amount(self):
++        inv = invoice("INV-HB-2027-00001", datetime.date(2027, 3, 1), amount_cents=7005)
++        path = export_invoices([inv], 2027, 3, self.out_dir)
++        self.assertEqual(self.read_rows(path)[1], [
++            "INV-HB-2027-00001", "HB", "KP-004211", "01/03/2027", "Initial assessment", "70.05",
++        ])
++
++    def test_whole_dollar_amount_has_two_decimals(self):
++        inv = invoice("INV-HB-2027-00001", datetime.date(2027, 3, 1), amount_cents=9500)
++        path = export_invoices([inv], 2027, 3, self.out_dir)
++        self.assertEqual(self.read_rows(path)[1][5], "95.00")
++
++    def test_includes_only_invoices_from_the_given_month(self):
++        invoices = [
++            invoice("INV-HB-2027-00001", datetime.date(2027, 2, 28)),
++            invoice("INV-HB-2027-00002", datetime.date(2027, 3, 1)),
++            invoice("INV-HB-2027-00003", datetime.date(2027, 3, 31)),
++            invoice("INV-HB-2027-00004", datetime.date(2027, 4, 1)),
++            invoice("INV-HB-2026-00005", datetime.date(2026, 3, 15)),
++        ]
++        path = export_invoices(invoices, 2027, 3, self.out_dir)
++        numbers = [row[0] for row in self.read_rows(path)[1:]]
++        self.assertEqual(numbers, ["INV-HB-2027-00002", "INV-HB-2027-00003"])
++
++    def test_writes_header_only_when_no_invoices_match(self):
++        path = export_invoices([invoice("INV-HB-2027-00001", datetime.date(2027, 2, 1))], 2027, 3, self.out_dir)
++        self.assertEqual(len(self.read_rows(path)), 1)
++
++    def test_contains_patient_id_but_never_patient_name(self):
++        inv = invoice("INV-HB-2027-00001", datetime.date(2027, 3, 1), patient_name="Aroha Test")
++        path = export_invoices([inv], 2027, 3, self.out_dir)
++        text = path.read_text(encoding="utf-8")
++        self.assertIn("KP-004211", text)
++        self.assertNotIn("Aroha", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

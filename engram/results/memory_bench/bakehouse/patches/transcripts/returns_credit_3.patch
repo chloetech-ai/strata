@@ -1,0 +1,75 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 05a3f86..0653c74 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@
+ - Customers: optional `email` column; duplicate `route_seq` values are rejected; Potter's Farm Shop added on route 6.
+ - Products: `price_text` and `allergen_text` helpers.
+ - Production: `total_batches`, `crates_needed` (whole crates, rounded up), and `dough_weight_g` rejects negative units.
++- Invoices: `returns_credit` gives the credit in pence for unsold units sent back from a delivery, at catalog price.
+ - `python -m bakehouse plan` replaces `scripts/print_plan.py`, with aligned columns for product names, units and batches.
+ - Invoices: `invoice_for` builds one line per product at catalog prices; `day_summary` gives order value per customer; `format_pence` shows pence as pounds; `invoice_number` gives numbers like `LK-2026-0001`.
+ 
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index 07b9dd8..0ce99c9 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -41,6 +41,16 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Credit in pence for the unsold units `customer_code` sent back from one delivery
++    of `product_code`: each returned unit at catalog price."""
++    if not 0 <= returned <= delivered:
++        raise ValueError(
++            f"{customer_code} returned {returned} of {product_code} but was delivered {delivered}"
++        )
++    return returned * catalog.get(product_code).price
++
++
+ def invoice_for(orderbook, customer, day):
+     """Invoice for what `customer` ordered for delivery on `day`: one line per product,
+     at catalog prices, sorted by product code."""
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 2f2ecc8..fbc847c 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -71,6 +71,28 @@ class InvoiceNumberTest(unittest.TestCase):
+             invoice_number(2026, 10000)
+ 
+ 
++class ReturnsCreditTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([Product("SOU", "White sourdough", 320)])
++
++    def test_returned_units_at_catalog_price(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SOU", 20, 3), 3 * 320)
++
++    def test_nothing_returned_is_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SOU", 20, 0), 0)
++
++    def test_everything_returned(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SOU", 20, 20), 20 * 320)
++
++    def test_more_back_than_delivered_is_rejected(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SOU", 20, 21)
++
++    def test_negative_return_is_rejected(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SOU", 20, -1)
++
++
+ class InvoiceTest(unittest.TestCase):
+     def test_total(self):
+         invoice = Invoice("LUMEN", datetime.date(2026, 10, 20), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)])

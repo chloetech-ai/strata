@@ -1,0 +1,106 @@
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index 69b6bf0..7773996 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,8 @@
+ """Summaries of the order book for the office."""
+ 
++import csv
++import datetime
++
+ 
+ def day_summary(orderbook, day):
+     """{customer code: order value in pence, before VAT} for everything ordered for delivery on `day`."""
+@@ -18,3 +21,27 @@ def top_products(orderbook, start, end, n=5):
+         if start <= line.day <= end:
+             units[line.product] = units.get(line.product, 0) + line.qty
+     return sorted(units, key=lambda code: (-units[code], code))[:n]
++
++
++def week_totals_file(orderbook, week_start, path):
++    """Write a semicolon-separated file with one row per customer: their order value for the seven
++    days starting at `week_start`, before VAT. Amounts use a comma as the decimal separator (e.g. 12,50)
++    for Greta's German-locale Excel. Customers with no orders that week are left out."""
++    end = week_start + datetime.timedelta(days=6)
++    totals = {}
++    for line in orderbook:
++        if week_start <= line.day <= end:
++            price = orderbook.catalog.get(line.product).price
++            totals[line.customer] = totals.get(line.customer, 0) + line.qty * price
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f, delimiter=";")
++        writer.writerow(["Customer", "Total (GBP)"])
++        for code in sorted(totals):
++            writer.writerow([code, _pounds_with_comma(totals[code])])
++
++
++def _pounds_with_comma(pence):
++    """Integer pence as pounds with a comma and two decimals: 1250 -> '12,50'."""
++    sign = "-" if pence < 0 else ""
++    pounds, rest = divmod(abs(pence), 100)
++    return f"{sign}{pounds},{rest:02d}"
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index 96e367e..1b3720c 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -1,9 +1,12 @@
++import csv
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ 
+@@ -76,5 +79,46 @@ class TopProductsTest(unittest.TestCase):
+         self.assertEqual(top_products(book, DAY + datetime.timedelta(days=1), DAY + datetime.timedelta(days=5)), [])
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def write(self, book, week_start):
++        with tempfile.TemporaryDirectory() as folder:
++            path = os.path.join(folder, "week.csv")
++            week_totals_file(book, week_start, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                return f.read()
++
++    def test_one_row_per_customer_with_pounds_and_comma_decimals(self):
++        book = OrderBook(catalog(), [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY, "AIDAN", "SOU", 4),
++            OrderLine(DAY, "AIDAN", "CRO", 48),
++        ])
++        self.assertEqual(
++            self.write(book, DAY),
++            "Customer;Total (GBP)\r\nAIDAN;" + format_text(4 * 320 + 48 * 110) + "\r\nLUMEN;" + format_text(6 * 320) + "\r\n",
++        )
++
++    def test_seven_days_from_week_start_inclusive(self):
++        book = OrderBook(catalog(), [
++            OrderLine(DAY - datetime.timedelta(days=1), "LUMEN", "SOU", 6),
++            OrderLine(DAY, "LUMEN", "SOU", 1),
++            OrderLine(DAY + datetime.timedelta(days=6), "LUMEN", "SOU", 2),
++            OrderLine(DAY + datetime.timedelta(days=7), "LUMEN", "SOU", 100),
++        ])
++        self.assertEqual(self.write(book, DAY), "Customer;Total (GBP)\r\nLUMEN;9,60\r\n")
++
++    def test_fields_are_separated_by_semicolons(self):
++        book = OrderBook(catalog(), [OrderLine(DAY, "LUMEN", "CRO", 24)])
++        rows = list(csv.reader(self.write(book, DAY).splitlines(), delimiter=";"))
++        self.assertEqual(rows, [["Customer", "Total (GBP)"], ["LUMEN", "26,40"]])
++
++    def test_no_orders_gives_only_the_header(self):
++        self.assertEqual(self.write(OrderBook(catalog()), DAY), "Customer;Total (GBP)\r\n")
++
++
++def format_text(pence):
++    return f"{pence // 100},{pence % 100:02d}"
++
++
+ if __name__ == "__main__":
+     unittest.main()

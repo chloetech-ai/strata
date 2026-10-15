@@ -1,0 +1,57 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 784f784..dfc0d69 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -17,6 +17,8 @@
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue_set_reason",
+   "tests/test_inventory.py::InventoryTest::test_sku_variants_hit_the_same_stock",
+   "tests/test_inventory.py::InventoryTest::test_unknown_reason_rejected",
++  "tests/test_inventory.py::InventoryTest::test_write_off_quantity_must_be_positive",
++  "tests/test_inventory.py::InventoryTest::test_write_off_records_damage",
+   "tests/test_items.py::CatalogTest::test_add_and_get",
+   "tests/test_items.py::CatalogTest::test_duplicate_sku_rejected",
+   "tests/test_items.py::CatalogTest::test_iterates_by_sku",
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index d8a15e8..f809328 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -49,6 +49,13 @@ class Inventory:
+         return self._record(
+             Movement(normalize_sku(sku), -qty, date or datetime.date.today(), None, note, "SALE"))
+ 
++    def write_off(self, sku, qty, date=None):
++        """Goods out because they were broken or damaged."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self._record(
++            Movement(normalize_sku(sku), -qty, date or datetime.date.today(), None, "", "DAMAGE"))
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 5eaa9d8..b928c03 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -36,6 +36,21 @@ class InventoryTest(unittest.TestCase):
+         inv.issue("BR-1042", 4, DAY)
+         self.assertEqual([m.reason for m in inv.movements], ["RECEIPT", "SALE"])
+ 
++    def test_write_off_records_damage(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        m = inv.write_off(" br-1042 ", 3, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++        self.assertEqual((m.sku, m.qty, m.reason, m.date), ("BR-1042", -3, "DAMAGE", DAY))
++        self.assertEqual(inv.movements[-1], m)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", 0)
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", -2)
++
+     def test_unknown_reason_rejected(self):
+         from stockroom.inventory import Movement
+         for code in ("", "receipt", "TRANSFER"):

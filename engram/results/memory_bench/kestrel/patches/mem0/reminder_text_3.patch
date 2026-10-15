@@ -1,0 +1,71 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6b019d6..0272933 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - Waitlist: urgent entries are ordered ahead of the rest.
+ - Legacy import: appointments can be imported from the legacy booking export.
+ - SMS: Bulkie batches are split into calls of at most 50 messages.
++- Reminders: `reminder_text` gives the text of the two-day-before SMS (clinic, local date and time only).
+ - Storage: `save` writes atomically (temp file, fsync, then rename), so a crash cannot leave a half-written file.
+ - CLI: `python -m kestrel day THERAPIST_ID DATE --data FILE` and `python -m kestrel patients --data FILE` (patient IDs and names, sorted by ID).
+ 
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..c63bb13
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,19 @@
++"""Text of the appointment reminder SMS."""
++
++from .calendar import CLINIC_TZ
++from .models import CLINICS
++
++
++def reminder_text(appointment):
++    """The SMS sent two days before an appointment.
++
++    Only the clinic, date and time are included: the treatment is private.
++    """
++    local = appointment.start.astimezone(CLINIC_TZ)
++    clinic = CLINICS[appointment.clinic].name
++    when = f"{local:%A} {local.day} {local:%B} at {local:%H:%M}"
++    return (
++        f"Hi there, this is a reminder of your appointment at {clinic} "
++        f"on {when}. We look forward to seeing you! "
++        f"If you need to change it, please call the clinic."
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..e93fe25
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from helpers import appt, utc
++
++from kestrel.reminders import reminder_text
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_gives_clinic_day_and_local_time(self):
++        # 03:30 UTC on 20 Oct 2026 is 16:30 in Auckland (NZDT, UTC+13).
++        text = reminder_text(appt("a1", utc(2026, 10, 20, 3, 30), clinic="HB"))
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("Tuesday 20 October at 16:30", text)
++
++    def test_uses_clinic_local_date_not_utc_date(self):
++        # 11:00 UTC on 19 Oct is already 00:00 on 20 Oct in Auckland.
++        text = reminder_text(appt("a1", utc(2026, 10, 19, 11, 0), clinic="NG"))
++        self.assertIn("Tuesday 20 October at 00:00", text)
++        self.assertIn("Kestrel Physio Northgate", text)
++
++    def test_leaves_out_treatment_and_patient_details(self):
++        text = reminder_text(appt("a1", utc(2026, 10, 20, 3, 30), treatment="lower back pain", patient="KP-004211"))
++        self.assertNotIn("lower back pain", text)
++        self.assertNotIn("KP-004211", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

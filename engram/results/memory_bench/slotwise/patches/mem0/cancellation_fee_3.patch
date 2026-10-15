@@ -1,0 +1,79 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 28b672a..be022e8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ - `Client` and `ClientBook` (`add`, `find_by_phone`) form the client register. `ClientBook.search(text)` finds clients whose name contains the text, ignoring case. Phone numbers are compared as international digits, so '079 123 45 67', '+41 79 123 45 67' and '0041791234567' find the same client.
+ - `Schedule.cancel(appointment_id)` marks an appointment as cancelled (kept for fees) and frees its slot. Saved files without the field load as not cancelled.
++- `cancellation_fee(appointment, cancelled_at)` in `slotwise.fees` returns the fee in cents: free with 48 hours' notice or more, half the price under 48 hours, full price under 24 hours or after the start.
+ - Booking errors are now `BookingError` subclasses (`SlotTaken`, `OutsideOpeningHours`) with receptionist-facing messages, replacing `ValueError`.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..47c0d04
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,17 @@
++"""Cancellation fees."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours before the start (or after it) costs the full price,
++    less than 48 hours costs half the price, and earlier is free.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..9fffb87
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,38 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++START = datetime.datetime(2026, 9, 8, 10, 0)
++
++
++def before(hours):
++    return START - datetime.timedelta(hours=hours)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def setUp(self):
++        self.appointment = Appointment("lena", "Kim Weber", START, "standard")
++
++    def test_more_than_48_hours_is_free(self):
++        self.assertEqual(cancellation_fee(self.appointment, before(72)), 0)
++
++    def test_exactly_48_hours_is_free(self):
++        self.assertEqual(cancellation_fee(self.appointment, before(48)), 0)
++
++    def test_under_48_hours_is_half_price(self):
++        self.assertEqual(cancellation_fee(self.appointment, before(47)), 4900)
++
++    def test_exactly_24_hours_is_half_price(self):
++        self.assertEqual(cancellation_fee(self.appointment, before(24)), 4900)
++
++    def test_under_24_hours_is_full_price(self):
++        self.assertEqual(cancellation_fee(self.appointment, before(23)), 9800)
++
++    def test_after_start_is_full_price(self):
++        self.assertEqual(cancellation_fee(self.appointment, START + datetime.timedelta(minutes=5)), 9800)
++
++    def test_half_price_uses_treatment_price(self):
++        initial = Appointment("lena", "Kim Weber", START, "initial")
++        self.assertEqual(cancellation_fee(initial, before(30)), 7250)

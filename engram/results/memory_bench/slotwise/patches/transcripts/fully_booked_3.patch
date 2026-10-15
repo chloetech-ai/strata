@@ -1,0 +1,205 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 8d71167..203442a 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,22 +1,59 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_add_refuses_unreadable_phone",
++  "tests/test_clients.py::ClientBookTest::test_finds_client_by_any_spelling",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_order",
++  "tests/test_clients.py::ClientBookTest::test_search_without_match_is_empty",
++  "tests/test_clients.py::ClientBookTest::test_second_client_with_same_phone_is_refused",
++  "tests/test_clients.py::ClientBookTest::test_unknown_number_returns_none",
++  "tests/test_clients.py::ClientBookTest::test_unreadable_number_returns_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_swiss_spellings_match",
++  "tests/test_clients.py::NormalizePhoneTest::test_foreign_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_unreadable_numbers_raise",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTest::test_reminder_contents",
++  "tests/test_reminders.py::ReminderTest::test_too_long_is_refused_not_split",
++  "tests/test_reminders.py::ToAsciiTest::test_accents_are_dropped",
++  "tests/test_reminders.py::ToAsciiTest::test_plain_ascii_is_unchanged",
++  "tests/test_reminders.py::ToAsciiTest::test_umlauts_are_spelled_out",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_back_to_back_is_allowed",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_booking_that_contains_existing_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_buffer_does_not_block_other_therapist",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_record",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_id_is_key_error",
++  "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_buffer",
++  "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_slot",
++  "tests/test_schedule.py::ScheduleTest::test_cancelling_one_appointment_reopens_the_day",
++  "tests/test_schedule.py::ScheduleTest::test_closed_day_is_not_fully_booked",
++  "tests/test_schedule.py::ScheduleTest::test_day_with_no_gap_for_shortest_treatment_is_fully_booked",
++  "tests/test_schedule.py::ScheduleTest::test_empty_day_is_not_fully_booked",
+   "tests/test_schedule.py::ScheduleTest::test_end_inside_buffer_before_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_exactly_buffer_after_is_allowed",
+   "tests/test_schedule.py::ScheduleTest::test_exactly_buffer_before_is_allowed",
++  "tests/test_schedule.py::ScheduleTest::test_other_therapist_does_not_fill_the_day",
+   "tests/test_schedule.py::ScheduleTest::test_other_therapist_is_free",
+   "tests/test_schedule.py::ScheduleTest::test_outside_opening_hours",
+   "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_series_is_weekly_same_time",
++  "tests/test_schedule.py::ScheduleTest::test_series_needs_at_least_one_session",
++  "tests/test_schedule.py::ScheduleTest::test_series_of_nine_is_allowed",
++  "tests/test_schedule.py::ScheduleTest::test_series_over_nine_is_refused_and_books_nothing",
++  "tests/test_schedule.py::ScheduleTest::test_series_passes_treatment_through",
++  "tests/test_schedule.py::ScheduleTest::test_series_skips_taken_week_and_adds_one_at_end",
+   "tests/test_schedule.py::ScheduleTest::test_start_inside_buffer_after_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_unknown_treatment_is_booking_error",
++  "tests/test_schedule.py::ScheduleTest::test_week_excludes_next_monday",
++  "tests/test_schedule.py::ScheduleTest::test_week_groups_by_day_in_order",
++  "tests/test_schedule.py::ScheduleTest::test_week_leaves_out_cancelled_and_other_therapists",
++  "tests/test_schedule.py::ScheduleTest::test_week_rejects_non_monday",
++  "tests/test_storage.py::StorageTest::test_cancelled_status_roundtrip",
++  "tests/test_storage.py::StorageTest::test_file_without_status_loads_as_booked",
+   "tests/test_storage.py::StorageTest::test_roundtrip"
+ ]
+\ No newline at end of file
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3996565..eb15d6f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@
+ - Added `Schedule.week(therapist, monday)`: a therapist's booked appointments for the seven days from `monday`, keyed by date, each day sorted by start time. Cancelled appointments are left out.
+ - Added `Schedule.book_series(therapist, client, start, sessions, treatment="standard")`: weekly appointments at the same weekday and time. A week already taken is skipped and a later week is added, so the client still gets every session. Series are capped at 9 sessions (`SeriesTooLong`, a new `BookingError`).
+ - Added `slotwise.clients`: `Client` (id, name, phone, email) and `ClientBook`, a register with `add(client)` and `find_by_phone(phone)`. Phone numbers are matched after normalizing, so "079 123 45 67", "+41 79 123 45 67" and "0041791234567" all find the same client. National numbers with a leading 0 are read as Swiss. `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case and surrounding spaces.
++- Added `Schedule.is_fully_booked(therapist, day)`: true if the therapist has no room left on `day` for even the shortest treatment, counting buffers. A closed day is not fully booked (it is closed), so the booking page should grey out closed days separately.
+ - Added `slotwise.reminders`: `reminder(appointment)` builds the SMS text. It is plain ASCII (umlauts spelled out, so "Brändli" becomes "Braendli"), includes the reception number 044 512 77 30, and raises `ValueError` rather than exceed 160 characters.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index c7956d1..89b5144 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -3,7 +3,7 @@
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SeriesTooLong, SlotTaken
+-from .hours import is_open_between
++from .hours import is_open_between, opening_hours
+ from .model import BOOKED, CANCELLED, TREATMENTS, Appointment
+ 
+ # Time a therapist needs after each appointment to clean up and write notes.
+@@ -25,18 +25,25 @@ class Schedule:
+         when = f"{appointment.start:%d %b %Y, %H:%M}–{appointment.end:%H:%M}"
+         if not is_open_between(appointment.start, appointment.end):
+             raise OutsideOpeningHours(f"The practice is closed {when}. Please choose a time within opening hours.")
+-        for other in self.appointments:
+-            if other.therapist != appointment.therapist or other.status == CANCELLED:
+-                continue
+-            if other.start < appointment.end + BUFFER and appointment.start < other.end + BUFFER:
+-                raise SlotTaken(
+-                    f"{appointment.therapist} already has an appointment {other.start:%H:%M}–{other.end:%H:%M}, "
+-                    f"which is too close to {when}. Appointments need {BUFFER.seconds // 60} minutes between them. "
+-                    "Please choose another time."
+-                )
++        other = self._conflict(appointment.therapist, appointment.start, appointment.end)
++        if other is not None:
++            raise SlotTaken(
++                f"{appointment.therapist} already has an appointment {other.start:%H:%M}–{other.end:%H:%M}, "
++                f"which is too close to {when}. Appointments need {BUFFER.seconds // 60} minutes between them. "
++                "Please choose another time."
++            )
+         self.appointments.append(appointment)
+         return appointment
+ 
++    def _conflict(self, therapist, start, end):
++        """The non-cancelled appointment of `therapist` that a booking from `start` to `end` would clash with, or None."""
++        for other in self.appointments:
++            if other.therapist != therapist or other.status == CANCELLED:
++                continue
++            if other.start < end + BUFFER and start < other.end + BUFFER:
++                return other
++        return None
++
+     def book_series(self, therapist, client, start, sessions, treatment="standard"):
+         """Books `sessions` weekly appointments from `start`, same weekday and time.
+ 
+@@ -78,6 +85,25 @@ class Schedule:
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True if `therapist` has no room left on `day` for even the shortest treatment.
++
++        A day the practice is closed is not fully booked; it is closed.
++        """
++        hours = opening_hours(day)
++        if hours is None:
++            return False
++        closes = hours[1]
++        duration = datetime.timedelta(minutes=min(minutes for minutes, _ in TREATMENTS.values()))
++        # A free start is either opening time or the moment a booking's buffer ends, so only those need checking.
++        mine = [a for a in self.appointments_for(therapist, day) if a.status != CANCELLED]
++        candidates = [hours[0]] + [a.end + BUFFER for a in mine]
++        return not any(
++            start + duration <= closes and is_open_between(start, start + duration)
++            and self._conflict(therapist, start, start + duration) is None
++            for start in candidates
++        )
++
+     def week(self, therapist, monday):
+         """`therapist`'s booked appointments for the seven days from `monday`: date -> list by start time.
+ 
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index fe27fdc..eec95c9 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -6,10 +6,22 @@ from slotwise.model import Appointment
+ from slotwise.schedule import Schedule
+ 
+ 
++FRIDAY = datetime.date(2026, 9, 11)
++
++
+ def at(hour, minute=0, therapist="lena", treatment="standard", client="Kim Weber"):
+     return Appointment(therapist, client, datetime.datetime(2026, 9, 8, hour, minute), treatment)
+ 
+ 
++def fill_friday(s, therapist):
++    """Books 45-minute appointments back to back on Friday until the next one would run past closing (17:00)."""
++    start = datetime.datetime(2026, 9, 11, 7, 30)
++    while start + datetime.timedelta(minutes=45) <= datetime.datetime(2026, 9, 11, 17, 0):
++        s.book(Appointment(therapist, "Jo Li", start, "standard"))
++        start += datetime.timedelta(minutes=55)
++    return s
++
++
+ class ScheduleTest(unittest.TestCase):
+     def test_book(self):
+         s = Schedule()
+@@ -176,6 +188,26 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().book_series("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0), 0)
+ 
++    def test_empty_day_is_not_fully_booked(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_closed_day_is_not_fully_booked(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 13)))  # Sunday
++
++    def test_day_with_no_gap_for_shortest_treatment_is_fully_booked(self):
++        s = fill_friday(Schedule(), "lena")
++        self.assertTrue(s.is_fully_booked("lena", FRIDAY))
++
++    def test_cancelling_one_appointment_reopens_the_day(self):
++        s = fill_friday(Schedule(), "lena")
++        gap = next(a for a in s.appointments if a.start.hour == 8 and a.start.minute == 25)
++        s.cancel(gap.id)
++        self.assertFalse(s.is_fully_booked("lena", FRIDAY))
++
++    def test_other_therapist_does_not_fill_the_day(self):
++        s = fill_friday(Schedule(), "marco")
++        self.assertFalse(s.is_fully_booked("lena", FRIDAY))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

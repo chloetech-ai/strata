@@ -1,0 +1,54 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index f7ed019..454bb76 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -54,3 +54,12 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """Most recent RECEIPT for `sku` by date; ties go to the later entry, or None."""
++        sku = normalize_sku(sku)
++        receipts = [m for m in self.movements if m.sku == sku and m.reason == "RECEIPT"]
++        if not receipts:
++            return None
++        # Reversed so that max() keeps the last-appended of any tied dates.
++        return max(reversed(receipts), key=lambda m: m.date)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index b6ea772..bfa5f46 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -53,6 +53,32 @@ class InventoryTest(unittest.TestCase):
+                 with self.assertRaises(ValueError):
+                     Movement("BR-1042", 1, DAY, bad)
+ 
++    def test_last_receipt_is_none_without_receipts(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.receive("BR-2210", 5, 30, DAY)
++        inv.issue("BR-1042", 3, DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
++    def test_last_receipt_picks_latest_date_not_latest_entry(self):
++        inv = Inventory()
++        newer = inv.receive("BR-1042", 10, 12, datetime.date(2026, 9, 10))
++        inv.receive("BR-1042", 4, 11, datetime.date(2026, 9, 2))  # backdated entry
++        self.assertIs(inv.last_receipt("BR-1042"), newer)
++
++    def test_last_receipt_ties_go_to_later_entry(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        later = inv.receive("BR-1042", 4, 11, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), later)
++
++    def test_last_receipt_ignores_issues_and_other_skus(self):
++        inv = Inventory()
++        receipt = inv.receive("BR-1042", 10, 12, DAY)
++        inv.issue("BR-1042", 3, datetime.date(2026, 9, 20))
++        inv.receive("BR-2210", 5, 30, datetime.date(2026, 9, 25))
++        self.assertIs(inv.last_receipt(" br-1042"), receipt)
++
+     def test_movement_accepts_all_reason_codes(self):
+         for code in ["RECEIPT", "SALE", "RETURN", "DAMAGE", "COUNT"]:
+             with self.subTest(reason=code):

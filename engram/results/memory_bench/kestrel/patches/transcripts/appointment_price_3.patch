@@ -1,0 +1,127 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9e5da12..0db8b46 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ - `Calendar.cancel(appointment_id, at)` marks an appointment cancelled and records `cancelled_at`.
+ - `session_price(kind)` returns the session price in cents: $95 for an assessment, $70 for a follow-up.
++- `appointment_price(appointment, patient)` returns what the patient pays, in cents. From 1 April 2027 (clinic-local date of the appointment) an assessment is $105 and a follow-up $78; earlier appointments keep the old prices. Community Services Card holders get 20% off follow-ups.
+ - `BulkieClient.send_batch` splits messages into calls of at most 50 (`MAX_BATCH`), since Bulkie rejects a whole call that is over the limit. It now returns one response per call.
+ - Code must run on Python 3.9 (reception PCs): no `X | None` annotations or other 3.10+ syntax.
+ - `import_legacy(path)` reads appointments from the legacy booking export. Its DD/MM/YYYY local times are parsed as Auckland time; a bad row raises `ValueError` naming the line.
+diff --git a/src/kestrel/pricing.py b/src/kestrel/pricing.py
+index 6231211..23fd4a6 100644
+--- a/src/kestrel/pricing.py
++++ b/src/kestrel/pricing.py
+@@ -1,5 +1,8 @@
+ """Session prices, in cents."""
+ 
++import datetime
++
++from .calendar import CLINIC_TZ
+ from .models import ASSESSMENT, FOLLOWUP
+ 
+ PRICES_CENTS = {
+@@ -7,6 +10,15 @@ PRICES_CENTS = {
+     FOLLOWUP: 7000,
+ }
+ 
++# Appointments on or after this clinic-local date pay NEW_PRICES_CENTS.
++NEW_PRICES_FROM = datetime.date(2027, 4, 1)
++NEW_PRICES_CENTS = {
++    ASSESSMENT: 10500,
++    FOLLOWUP: 7800,
++}
++
++CSC_FOLLOWUP_PERCENT_OFF = 20  # Community Services Card holders; follow-ups only
++
+ 
+ def session_price(kind):
+     """Price in cents for a session of the given kind ('assessment' or 'followup')."""
+@@ -14,3 +26,18 @@ def session_price(kind):
+         return PRICES_CENTS[kind]
+     except KeyError:
+         raise ValueError(f"unknown session kind: {kind!r}") from None
++
++
++def appointment_price(appointment, patient):
++    """What the patient pays for the appointment, in cents.
++
++    The rate depends on the appointment's clinic-local date, not on when it was booked.
++    """
++    if appointment.patient_id != patient.id:
++        raise ValueError(f"appointment {appointment.id} is not for patient {patient.id}")
++    day = appointment.start.astimezone(CLINIC_TZ).date()
++    prices = NEW_PRICES_CENTS if day >= NEW_PRICES_FROM else PRICES_CENTS
++    price = prices[appointment.kind]
++    if patient.csc and appointment.kind == FOLLOWUP:
++        price = price * (100 - CSC_FOLLOWUP_PERCENT_OFF) // 100
++    return price
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+index 6fdd2de..0ab2758 100644
+--- a/tests/test_pricing.py
++++ b/tests/test_pricing.py
+@@ -1,7 +1,24 @@
++import datetime
+ import unittest
++from zoneinfo import ZoneInfo
+ 
+-from kestrel.models import ASSESSMENT, FOLLOWUP, KINDS
+-from kestrel.pricing import session_price
++from kestrel.models import ASSESSMENT, FOLLOWUP, KINDS, Appointment, Patient
++from kestrel.pricing import appointment_price, session_price
++
++AUCKLAND = ZoneInfo("Pacific/Auckland")
++
++
++def local(y, m, d, hh=10, mm=0):
++    return datetime.datetime(y, m, d, hh, mm, tzinfo=AUCKLAND)
++
++
++def appt(kind, start, patient_id="KP-000001"):
++    return Appointment(id="a1", patient_id=patient_id, therapist_id="T1", clinic="NG",
++                       start=start, kind=kind)
++
++
++def patient(csc=False, patient_id="KP-000001"):
++    return Patient(patient_id, "Ana Silva", "+64211234567", csc=csc)
+ 
+ 
+ class SessionPriceTest(unittest.TestCase):
+@@ -23,5 +40,35 @@ class SessionPriceTest(unittest.TestCase):
+                     session_price(kind)
+ 
+ 
++class AppointmentPriceTest(unittest.TestCase):
++    def test_before_change_uses_old_prices(self):
++        self.assertEqual(appointment_price(appt(ASSESSMENT, local(2027, 3, 1)), patient()), 9500)
++        self.assertEqual(appointment_price(appt(FOLLOWUP, local(2027, 3, 1)), patient()), 7000)
++
++    def test_late_evening_31_march_keeps_old_price(self):
++        start = local(2027, 3, 31, 23, 30)
++        self.assertEqual(appointment_price(appt(ASSESSMENT, start), patient()), 9500)
++
++    def test_first_moment_of_1_april_gets_new_price(self):
++        start = local(2027, 4, 1, 0, 0)
++        self.assertEqual(appointment_price(appt(ASSESSMENT, start), patient()), 10500)
++        self.assertEqual(appointment_price(appt(FOLLOWUP, start), patient()), 7800)
++
++    def test_local_date_decides_not_utc(self):
++        # 1 April 08:00 in Auckland is 31 March 19:00 UTC: the new price applies.
++        start = local(2027, 4, 1, 8, 0)
++        self.assertEqual(start.astimezone(datetime.timezone.utc).date(), datetime.date(2027, 3, 31))
++        self.assertEqual(appointment_price(appt(FOLLOWUP, start), patient()), 7800)
++
++    def test_csc_discount_on_followups_only(self):
++        self.assertEqual(appointment_price(appt(FOLLOWUP, local(2027, 3, 1)), patient(csc=True)), 5600)
++        self.assertEqual(appointment_price(appt(FOLLOWUP, local(2027, 4, 2)), patient(csc=True)), 6240)
++        self.assertEqual(appointment_price(appt(ASSESSMENT, local(2027, 4, 2)), patient(csc=True)), 10500)
++
++    def test_appointment_must_belong_to_patient(self):
++        with self.assertRaises(ValueError):
++            appointment_price(appt(ASSESSMENT, local(2027, 4, 2)), patient(patient_id="KP-000002"))
++
++
+ if __name__ == "__main__":
+     unittest.main()

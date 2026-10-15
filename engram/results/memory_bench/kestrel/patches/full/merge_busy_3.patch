@@ -1,0 +1,72 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..15043aa
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,20 @@
++"""Time intervals."""
++
++
++def merge_busy(intervals):
++    """Merge (start, end) pairs, given in any order, into sorted, non-overlapping pairs.
++
++    Pairs that touch (one ends where the next starts) are merged too.
++    Raises ValueError for a pair whose start is after its end.
++    """
++    pairs = [(start, end) for start, end in intervals]
++    for start, end in pairs:
++        if start > end:
++            raise ValueError(f"interval starts after it ends: {(start, end)!r}")
++    merged = []
++    for start, end in sorted(pairs):
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..ccd27c1
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,40 @@
++import datetime
++import unittest
++
++from kestrel.intervals import merge_busy
++
++
++class MergeBusyTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(merge_busy([]), [])
++
++    def test_sorts_unordered_input(self):
++        self.assertEqual(merge_busy([(5, 6), (1, 2), (3, 4)]), [(1, 2), (3, 4), (5, 6)])
++
++    def test_overlapping_pairs_merge(self):
++        self.assertEqual(merge_busy([(1, 4), (3, 6), (2, 3)]), [(1, 6)])
++
++    def test_contained_pair_is_absorbed(self):
++        self.assertEqual(merge_busy([(1, 10), (3, 4)]), [(1, 10)])
++
++    def test_touching_pairs_merge(self):
++        self.assertEqual(merge_busy([(1, 3), (3, 5)]), [(1, 5)])
++
++    def test_disjoint_pairs_stay_apart(self):
++        self.assertEqual(merge_busy([(1, 2), (4, 5)]), [(1, 2), (4, 5)])
++
++    def test_works_with_datetimes(self):
++        t =datetime.datetime(2026, 10, 13, 9)
++        h = datetime.timedelta(hours=1)
++        self.assertEqual(
++            merge_busy([(t + h, t + 2 * h), (t, t + h)]),
++            [(t, t + 2 * h)],
++        )
++
++    def test_rejects_reversed_pair(self):
++        with self.assertRaises(ValueError):
++            merge_busy([(5, 1)])
++
++
++if __name__ == "__main__":
++    unittest.main()

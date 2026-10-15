@@ -1,0 +1,102 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 4d21a09..99a3b71 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -12,6 +12,10 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_accents_become_ascii",
++  "tests/test_reminders.py::ReminderTextTest::test_contains_details_and_reception_number",
++  "tests/test_reminders.py::ReminderTextTest::test_too_long_is_refused",
++  "tests/test_reminders.py::ReminderTextTest::test_umlauts_become_ascii",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_record_and_frees_slot",
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..3adbb44
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,39 @@
++"""Text of the SMS reminder sent before an appointment."""
++
++import unicodedata
++
++from .model import Appointment
++
++RECEPTION_NUMBER = "044 512 77 30"
++MAX_LENGTH = 160
++
++# Umlauts and sharp s are written with an added e, as the gateway cannot send them.
++_UMLAUTS = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
++
++
++def _to_ascii(text):
++    """Turn umlauts and accents into plain ASCII letters, e.g. 'Brändli' -> 'Braendli'."""
++    for char, replacement in _UMLAUTS.items():
++        text = text.replace(char, replacement)
++    decomposed = unicodedata.normalize("NFKD", text)
++    return "".join(char for char in decomposed if not unicodedata.combining(char))
++
++
++def reminder_text(appointment):
++    """Return the reminder SMS for an appointment as plain ASCII.
++
++    Raises ValueError if the text would be longer than 160 characters, so that
++    a reminder is never sent cut short or billed as two messages.
++    """
++    text = (
++        f"Reminder: Hi {appointment.client}, your appointment with {appointment.therapist} "
++        f"is on {appointment.start:%d.%m.%Y} at {appointment.start:%H:%M}. "
++        f"To move it, call {RECEPTION_NUMBER}."
++    )
++    text = _to_ascii(text)
++    if len(text) > MAX_LENGTH:
++        raise ValueError(
++            f"The reminder is {len(text)} characters long, but the limit is {MAX_LENGTH}. "
++            "Please use a shorter client or therapist name."
++        )
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..7f0681a
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,36 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import RECEPTION_NUMBER, reminder_text
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_contains_details_and_reception_number(self):
++        a = Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0))
++        text = reminder_text(a)
++        self.assertEqual(
++            text,
++            "Reminder: Hi Kim Weber, your appointment with lena is on 07.09.2026 at 09:00. "
++            "To move it, call 044 512 77 30.",
++        )
++        self.assertIn(RECEPTION_NUMBER, text)
++
++    def test_umlauts_become_ascii(self):
++        a = Appointment("lena", "Brändli Öztürk", datetime.datetime(2026, 9, 7, 9, 0))
++        text = reminder_text(a)
++        self.assertIn("Hi Braendli Oeztuerk,", text)
++        self.assertTrue(text.isascii())
++
++    def test_accents_become_ascii(self):
++        a = Appointment("lena", "René Müller", datetime.datetime(2026, 9, 7, 9, 0))
++        self.assertIn("Hi Rene Mueller,", reminder_text(a))
++
++    def test_too_long_is_refused(self):
++        a = Appointment("lena", "x" * 150, datetime.datetime(2026, 9, 7, 9, 0))
++        with self.assertRaises(ValueError):
++            reminder_text(a)
++
++
++if __name__ == "__main__":
++    unittest.main()

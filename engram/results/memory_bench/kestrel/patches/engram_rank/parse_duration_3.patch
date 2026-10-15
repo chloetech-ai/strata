@@ -1,0 +1,80 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..1b07ce7
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,21 @@
++"""Reading the durations that reception types in by hand."""
++
++import re
++
++_DURATION = re.compile(
++    r"(?:(?P<hours>[0-9]+)h\s*(?:(?P<h_minutes>[0-9]+)m?)?|(?P<minutes>[0-9]+)m)",
++    re.IGNORECASE,
++)
++
++
++def parse_duration(text):
++    """Turn a typed duration such as '45m', '1h', '1h30' or '1h 30m' into minutes."""
++    match = _DURATION.fullmatch(text.strip()) if isinstance(text, str) else None
++    if match is None:
++        raise ValueError(f"not a duration: {text!r}")
++    if match.group("minutes") is not None:
++        return int(match.group("minutes"))
++    minutes = int(match.group("h_minutes") or 0)
++    if minutes > 59:
++        raise ValueError(f"minutes after hours must be under 60: {text!r}")
++    return int(match.group("hours")) * 60 + minutes
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..99770cd
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,47 @@
++import unittest
++
++from kestrel.intervals import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes_only(self):
++        self.assertEqual(parse_duration("45m"), 45)
++
++    def test_hours_only(self):
++        self.assertEqual(parse_duration("1h"), 60)
++
++    def test_hours_then_bare_minutes(self):
++        self.assertEqual(parse_duration("1h30"), 90)
++
++    def test_hours_with_space_then_minutes(self):
++        self.assertEqual(parse_duration("1h 30m"), 90)
++
++    def test_hours_then_minutes_with_unit(self):
++        self.assertEqual(parse_duration("1h30m"), 90)
++
++    def test_surrounding_whitespace_and_case(self):
++        self.assertEqual(parse_duration(" 2H 15M "), 135)
++
++    def test_rejects_bare_number(self):
++        with self.assertRaises(ValueError):
++            parse_duration("30")
++
++    def test_rejects_minutes_of_sixty_or_more_after_hours(self):
++        with self.assertRaises(ValueError):
++            parse_duration("1h90")
++
++    def test_rejects_empty(self):
++        with self.assertRaises(ValueError):
++            parse_duration("   ")
++
++    def test_rejects_words(self):
++        with self.assertRaises(ValueError):
++            parse_duration("forty-five minutes")
++
++    def test_rejects_negative(self):
++        with self.assertRaises(ValueError):
++            parse_duration("-45m")
++
++    def test_rejects_non_string(self):
++        with self.assertRaises(ValueError):
++            parse_duration(45)

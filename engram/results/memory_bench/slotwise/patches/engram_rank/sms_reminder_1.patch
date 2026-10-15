@@ -1,0 +1,107 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index cdcf6fb..fd4a24f 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -12,6 +12,12 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_contains_reception_number_and_no_client_name",
++  "tests/test_reminders.py::ReminderTextTest::test_text",
++  "tests/test_reminders.py::ReminderTextTest::test_too_long_raises",
++  "tests/test_reminders.py::ToAsciiTest::test_german_letters",
++  "tests/test_reminders.py::ToAsciiTest::test_other_accents_are_stripped",
++  "tests/test_reminders.py::ToAsciiTest::test_unconvertible_text_raises",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_the_record",
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..e82c6d1
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,34 @@
++"""SMS reminders for appointments."""
++
++import unicodedata
++
++from .model import Appointment
++
++RECEPTION_PHONE = "044 512 77 30"
++MAX_LENGTH = 160
++
++# German letters that Unicode decomposition cannot handle as plain ASCII.
++_GERMAN = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
++
++
++def to_ascii(text):
++    """Transliterate to plain ASCII, because the SMS gateway cannot carry anything else."""
++    for char, replacement in _GERMAN.items():
++        text = text.replace(char, replacement)
++    # Accents such as é or ë decompose into a base letter plus a combining mark.
++    text = unicodedata.normalize("NFKD", text)
++    text = "".join(c for c in text if not unicodedata.combining(c))
++    text.encode("ascii")  # raises UnicodeEncodeError rather than sending a '?'
++    return text
++
++
++def reminder_text(appointment):
++    """Return the ASCII SMS text reminding the client of the appointment."""
++    start = appointment.start
++    text = to_ascii(
++        f"Erinnerung: Ihr Termin bei {appointment.therapist} am "
++        f"{start:%d.%m.%Y} um {start:%H:%M}. Verschieben bitte unter {RECEPTION_PHONE}."
++    )
++    if len(text) > MAX_LENGTH:
++        raise ValueError(f"reminder is {len(text)} characters, the limit is {MAX_LENGTH}")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..027690a
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,44 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import RECEPTION_PHONE, reminder_text, to_ascii
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_german_letters(self):
++        self.assertEqual(to_ascii("Brändli"), "Braendli")
++        self.assertEqual(to_ascii("Gößmann Müller Äbi Öl"), "Goessmann Mueller Aebi Oel")
++
++    def test_other_accents_are_stripped(self):
++        self.assertEqual(to_ascii("café Zoë"), "cafe Zoe")
++
++    def test_unconvertible_text_raises(self):
++        with self.assertRaises(UnicodeEncodeError):
++            to_ascii("Ærø")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_text(self):
++        a = Appointment("Brändli", "Kim Weber", datetime.datetime(2026, 10, 20, 14, 30))
++        self.assertEqual(
++            reminder_text(a),
++            "Erinnerung: Ihr Termin bei Braendli am 20.10.2026 um 14:30. "
++            "Verschieben bitte unter 044 512 77 30.",
++        )
++
++    def test_contains_reception_number_and_no_client_name(self):
++        a = Appointment("lena", "Kim Weber", datetime.datetime(2026, 10, 20, 9, 0))
++        text = reminder_text(a)
++        self.assertIn(RECEPTION_PHONE, text)
++        self.assertNotIn("Kim Weber", text)
++        self.assertLessEqual(len(text), 160)
++
++    def test_too_long_raises(self):
++        a = Appointment("x" * 150, "Kim", datetime.datetime(2026, 10, 20, 9, 0))
++        with self.assertRaises(ValueError):
++            reminder_text(a)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,97 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 0b192c0..a61f0cd 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -11,6 +11,10 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_printing.py::DayPlanTest::test_empty_day",
++  "tests/test_printing.py::DayPlanTest::test_leaves_out_cancelled_and_other_therapists",
++  "tests/test_printing.py::DayPlanTest::test_lists_appointments_in_order",
++  "tests/test_printing.py::DayPlanTest::test_no_line_exceeds_printer_width",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_buffer_after_existing_appointment",
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..cf19c26
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,23 @@
++"""Printable day plans for the receptionist's 42-character receipt printer."""
++
++WIDTH = 42
++
++
++def _fit(line):
++    """Cuts `line` to the printer width so it can't wrap."""
++    if len(line) <= WIDTH:
++        return line
++    return line[: WIDTH - 3] + "..."
++
++
++def day_plan(schedule, therapist, day):
++    """The day's active appointments for `therapist` as text, one block per appointment."""
++    header = f"{therapist.capitalize()} - {day:%A %d %B %Y}"
++    lines = [_fit(header), "-" * WIDTH]
++    appointments = [a for a in schedule.appointments_for(therapist, day) if not a.cancelled]
++    if not appointments:
++        lines.append("No appointments.")
++    for a in appointments:
++        lines.append(_fit(f"{a.start:%H:%M}-{a.end:%H:%M} {a.client}"))
++        lines.append(_fit(f"  {a.treatment}, {a.minutes} min"))
++    return "\n".join(lines)
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..19a3ae6
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,47 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.printing import WIDTH, day_plan
++from slotwise.schedule import Schedule
++
++MONDAY = datetime.date(2026, 9, 7)
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_appointments_in_order(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 14, 0), "initial"))
++        s.book(Appointment("lena", "Jo Li", datetime.datetime(2026, 9, 7, 8, 0), "short"))
++        text = day_plan(s, "lena", MONDAY)
++        self.assertEqual(
++            text.splitlines(),
++            [
++                "Lena - Monday 07 September 2026",
++                "-" * WIDTH,
++                "08:00-08:30 Jo Li",
++                "  short, 30 min",
++                "14:00-15:00 Kim Weber",
++                "  initial, 60 min",
++            ],
++        )
++
++    def test_empty_day(self):
++        self.assertIn("No appointments.", day_plan(Schedule(), "lena", MONDAY))
++
++    def test_leaves_out_cancelled_and_other_therapists(self):
++        s = Schedule()
++        a = s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0)))
++        s.cancel(a.id)
++        s.book(Appointment("marco", "Jo Li", datetime.datetime(2026, 9, 7, 10, 0)))
++        self.assertIn("No appointments.", day_plan(s, "lena", MONDAY))
++
++    def test_no_line_exceeds_printer_width(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Maximiliana-Constantina von Hohenberg-Wolfsberg", datetime.datetime(2026, 9, 7, 9, 0)))
++        for line in day_plan(s, "lena", MONDAY).splitlines():
++            self.assertLessEqual(len(line), WIDTH, line)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,54 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b74cb21..40efd0e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,7 @@
+ ## Unreleased
+ 
+ - Command line: `python -m stockroom onhand SKU --log FILE` and `receive SKU QTY UNIT_COST --log FILE`, and `moves SKU --log FILE`.
++- `Inventory.write_off(sku, qty, date=None)` logs broken or damaged stock with reason DAMAGE.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index f09c4c5..e2ee812 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -46,6 +46,12 @@ class Inventory:
+             raise ValueError("quantity must be positive")
+         return self._record(Movement(normalize_sku(sku), -qty, date or datetime.date.today(), None, note, "SALE"))
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock lost to breakage or damage, logged with reason DAMAGE."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self._record(Movement(normalize_sku(sku), -qty, date or datetime.date.today(), None, "", "DAMAGE"))
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 7145561..3fe3605 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -52,6 +52,20 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual([m.sku for m in inv.movements], ["BR-1042"] * 3)
+         self.assertEqual([m.qty for m in inv.movements_for("bR-1042 ")], [100, -30, -5])
+ 
++    def test_write_off_is_damage_out(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        m = inv.write_off(" br-1042", 3, DAY)
++        self.assertEqual((m.sku, m.qty, m.reason, m.date), ("BR-1042", -3, "DAMAGE", DAY))
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        for bad in (0, -2):
++            with self.assertRaises(ValueError):
++                inv.write_off("BR-1042", bad, DAY)
++        self.assertEqual(inv.movements, [])
++
+     def test_movements_for(self):
+         inv = Inventory()
+         inv.receive("BR-1042", 10, 12, DAY)

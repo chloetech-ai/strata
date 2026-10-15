@@ -1,0 +1,100 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 924e656..3bb7623 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,7 +2,7 @@
+ 
+ ## Unreleased
+ 
+-- Planned: bake sheet lists products hottest oven first (by `bake_temp`), so the deck oven isn't reheated.
++- Production: `bake_sheet(orderbook, day)` gives the day's bake sheet as text, hottest oven first (by `bake_temp`), so the deck oven isn't reheated.
+ - Deliveries now run on Sundays; we are closed on Mondays (Sunday farmers' market).
+ - Order cutoff moved to 13:00 the day before delivery (was 14:00), for the mill's flour order.
+ - `python -m bakehouse plan` replaces `scripts/print_plan.py`.
+diff --git a/src/bakehouse/production.py b/src/bakehouse/production.py
+index dde3b3a..3d82251 100644
+--- a/src/bakehouse/production.py
++++ b/src/bakehouse/production.py
+@@ -33,3 +33,24 @@ def plan(orderbook, day):
+         code: (units, batches_needed(units, catalog.get(code).batch_size))
+         for code, units in sorted(totals.items())
+     }
++
++
++def bake_sheet(orderbook, day):
++    """Text bake sheet for `day`: one line per product, hottest oven first, so the deck oven isn't reheated."""
++    rows = plan(orderbook, day)
++    if not rows:
++        return f"Nothing to bake for {day.isoformat()}."
++    catalog = orderbook.catalog
++    order = sorted(rows, key=lambda code: (-catalog.get(code).bake_temp, code))
++    width = max(len(catalog.get(code).name) for code in order)
++    lines = [
++        f"Bake sheet for {day:%A %d %B %Y}",
++        f"{'Product':<{width}}  {'Units':>5}  {'Batches':>7}  {'Dough (g)':>9}",
++    ]
++    for code in order:
++        product = catalog.get(code)
++        units, batches = rows[code]
++        lines.append(
++            f"{product.name:<{width}}  {units:>5}  {batches:>7}  {dough_weight_g(product, units):>9}"
++        )
++    return "\n".join(lines)
+diff --git a/tests/test_production.py b/tests/test_production.py
+index 54074dc..eb1b0e5 100644
+--- a/tests/test_production.py
++++ b/tests/test_production.py
+@@ -2,7 +2,7 @@ import datetime
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+-from bakehouse.production import batches_needed, crates_needed, dough_weight_g, plan, total_batches
++from bakehouse.production import bake_sheet, batches_needed, crates_needed, dough_weight_g, plan, total_batches
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -63,6 +63,44 @@ class ProductionTest(unittest.TestCase):
+         self.assertEqual(plan(book, DAY), {"BAG": (12, 1)})
+         self.assertEqual(plan(book, DAY + datetime.timedelta(days=2)), {})
+ 
++    def test_bake_sheet_lists_hottest_oven_first(self):
++        catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12, dough_g=250, bake_temp=230),
++            Product("SOU", "White sourdough", 320, batch_size=10, dough_g=800, bake_temp=250),
++            Product("BUN", "Bun", 60, batch_size=24, dough_g=90, bake_temp=200),
++        ])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 20),
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY, "LUMEN", "SOU", 10),
++            OrderLine(DAY, "LUMEN", "BUN", 24),
++        ])
++        self.assertEqual(bake_sheet(book, DAY).splitlines(), [
++            "Bake sheet for Tuesday 20 October 2026",
++            "Product          Units  Batches  Dough (g)",
++            "White sourdough     10        1       8000",
++            "Baguette            25        3       6250",
++            "Bun                 24        1       2160",
++        ])
++
++    def test_bake_sheet_breaks_oven_ties_by_code(self):
++        catalog = Catalog([
++            Product("ZZZ", "Zebra loaf", 300, batch_size=1, dough_g=500, bake_temp=230),
++            Product("AAA", "Apple tart", 200, batch_size=1, dough_g=100, bake_temp=230),
++        ])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "ZZZ", 1),
++            OrderLine(DAY, "LUMEN", "AAA", 1),
++        ])
++        lines = bake_sheet(book, DAY).splitlines()
++        self.assertTrue(lines[2].startswith("Apple tart"))
++        self.assertTrue(lines[3].startswith("Zebra loaf"))
++
++    def test_bake_sheet_for_empty_day(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12)])
++        book = OrderBook(catalog, [])
++        self.assertEqual(bake_sheet(book, DAY), "Nothing to bake for 2026-10-20.")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

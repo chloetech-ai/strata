@@ -1,0 +1,57 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..0f110ab
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,16 @@
++"""Working with (start, end) time intervals."""
++
++
++def merge_busy(intervals):
++    """Merge (start, end) pairs into sorted, non-overlapping pairs.
++
++    Pairs may come in any order. Pairs that touch (one ends exactly where
++    the next starts) are merged as well.
++    """
++    merged = []
++    for start, end in sorted(intervals):
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..efec2b0
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from kestrel.intervals import merge_busy
++
++
++class MergeBusyTest(unittest.TestCase):
++    def test_no_intervals(self):
++        self.assertEqual(merge_busy([]), [])
++
++    def test_single_interval(self):
++        self.assertEqual(merge_busy([(9, 10)]), [(9, 10)])
++
++    def test_disjoint_intervals_are_kept_in_order(self):
++        self.assertEqual(merge_busy([(13, 14), (9, 10)]), [(9, 10), (13, 14)])
++
++    def test_overlapping_intervals_are_merged(self):
++        self.assertEqual(merge_busy([(9, 11), (10, 12)]), [(9, 12)])
++
++    def test_touching_intervals_are_merged(self):
++        self.assertEqual(merge_busy([(9, 10), (10, 11)]), [(9, 11)])
++
++    def test_nested_interval_does_not_shorten_outer(self):
++        self.assertEqual(merge_busy([(9, 12), (10, 11)]), [(9, 12)])
++
++    def test_unsorted_input_chain_is_merged(self):
++        self.assertEqual(
++            merge_busy([(11, 13), (9, 10), (10, 11), (15, 16)]),
++            [(9, 13), (15, 16)],
++        )

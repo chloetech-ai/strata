@@ -1,0 +1,298 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..9e26dfe
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..b8fe357
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1,124 @@
++[
++  "tests/test_calendar.py::CalendarTest::test_all_in_start_order",
++  "tests/test_calendar.py::CalendarTest::test_booked",
++  "tests/test_calendar.py::CalendarTest::test_cancel_leaves_cancelled_at_unset_until_cancelled",
++  "tests/test_calendar.py::CalendarTest::test_cancel_rejects_appointment_not_booked",
++  "tests/test_calendar.py::CalendarTest::test_cancel_rejects_naive_time",
++  "tests/test_calendar.py::CalendarTest::test_cancel_sets_status_and_time",
++  "tests/test_calendar.py::CalendarTest::test_cancel_twice_keeps_first_time",
++  "tests/test_calendar.py::CalendarTest::test_cancel_unknown_id",
++  "tests/test_calendar.py::CalendarTest::test_duplicate_id",
++  "tests/test_calendar.py::CalendarTest::test_for_day_across_utc_midnight",
++  "tests/test_calendar.py::CalendarTest::test_for_day_sorted_by_start_and_filtered_by_therapist",
++  "tests/test_calendar.py::CalendarTest::test_for_day_uses_auckland_date",
++  "tests/test_calendar.py::CalendarTest::test_for_patient_accepts_messy_ids",
++  "tests/test_calendar.py::CalendarTest::test_for_patient_rejects_malformed_id",
++  "tests/test_calendar.py::CalendarTest::test_for_therapist",
++  "tests/test_calendar.py::CalendarTest::test_move_keeps_booking_in_start_order",
++  "tests/test_calendar.py::CalendarTest::test_move_refuses_attended_or_no_show_appointment",
++  "tests/test_calendar.py::CalendarTest::test_move_refuses_cancelled_appointment",
++  "tests/test_calendar.py::CalendarTest::test_move_rejects_naive_start",
++  "tests/test_calendar.py::CalendarTest::test_move_sets_new_start",
++  "tests/test_calendar.py::CalendarTest::test_move_stores_start_in_utc",
++  "tests/test_calendar.py::CalendarTest::test_move_unknown_id",
++  "tests/test_fees.py::LateCancellationTest::test_cancel_after_start_costs_half_the_price",
++  "tests/test_fees.py::LateCancellationTest::test_cancel_exactly_48_hours_ahead_is_free",
++  "tests/test_fees.py::LateCancellationTest::test_cancel_inside_48_hours_costs_half_the_assessment_price",
++  "tests/test_fees.py::LateCancellationTest::test_cancel_inside_48_hours_costs_half_the_followup_price",
++  "tests/test_fees.py::LateCancellationTest::test_cancel_more_than_48_hours_ahead_is_free",
++  "tests/test_fees.py::LateCancellationTest::test_rejects_cancelled_without_cancelled_at",
++  "tests/test_fees.py::LateCancellationTest::test_rejects_naive_cancelled_at",
++  "tests/test_fees.py::LateCancellationTest::test_window_is_absolute_time_across_timezones",
++  "tests/test_fees.py::NoFeeStatusTest::test_rejects_attended_appointment",
++  "tests/test_fees.py::NoFeeStatusTest::test_rejects_booked_appointment",
++  "tests/test_fees.py::NoShowTest::test_no_show_assessment_pays_full_price",
++  "tests/test_fees.py::NoShowTest::test_no_show_followup_pays_full_price",
++  "tests/test_fees.py::NoShowTest::test_rejects_no_show_with_cancelled_at",
++  "tests/test_ids.py::NormalizePatientIdTest::test_all_six_digits_kept",
++  "tests/test_ids.py::NormalizePatientIdTest::test_canonical_form_is_unchanged",
++  "tests/test_ids.py::NormalizePatientIdTest::test_missing_dash_and_lower_case",
++  "tests/test_ids.py::NormalizePatientIdTest::test_rejects_bare_digits",
++  "tests/test_ids.py::NormalizePatientIdTest::test_rejects_empty",
++  "tests/test_ids.py::NormalizePatientIdTest::test_rejects_too_many_digits",
++  "tests/test_ids.py::NormalizePatientIdTest::test_rejects_wrong_prefix",
++  "tests/test_ids.py::NormalizePatientIdTest::test_short_digits_are_zero_padded",
++  "tests/test_ids.py::NormalizePatientIdTest::test_surrounding_whitespace",
++  "tests/test_invoices.py::MakeInvoiceTest::test_assessment_description",
++  "tests/test_invoices.py::MakeInvoiceTest::test_copies_appointment_and_patient_details",
++  "tests/test_invoices.py::MakeInvoiceTest::test_dated_in_auckland_local_time_not_utc",
++  "tests/test_invoices.py::MakeInvoiceTest::test_description_does_not_name_the_treatment",
++  "tests/test_invoices.py::MakeInvoiceTest::test_leaves_patient_name_out",
++  "tests/test_invoices.py::MakeInvoiceTest::test_rejects_bool_amount",
++  "tests/test_invoices.py::MakeInvoiceTest::test_rejects_float_amount",
++  "tests/test_legacy.py::ImportLegacyTest::test_cancelled_rows_have_no_cancelled_at",
++  "tests/test_legacy.py::ImportLegacyTest::test_local_time_is_converted_to_utc_in_summer_offset",
++  "tests/test_legacy.py::ImportLegacyTest::test_local_time_is_converted_to_utc_in_winter_offset",
++  "tests/test_legacy.py::ImportLegacyTest::test_maps_fields",
++  "tests/test_legacy.py::ImportLegacyTest::test_maps_kind",
++  "tests/test_legacy.py::ImportLegacyTest::test_maps_state",
++  "tests/test_legacy.py::ImportLegacyTest::test_reads_every_row",
++  "tests/test_legacy.py::ImportLegacyTest::test_rejects_bad_patient_id",
++  "tests/test_legacy.py::ImportLegacyTest::test_rejects_unknown_state",
++  "tests/test_legacy.py::ImportLegacyTest::test_rejects_unknown_type",
++  "tests/test_legacy.py::ImportLegacyTest::test_start_is_aware",
++  "tests/test_main.py::DayCommandTest::test_cancelled_appointments_are_not_listed",
++  "tests/test_main.py::DayCommandTest::test_day_is_the_local_date_not_utc",
++  "tests/test_main.py::DayCommandTest::test_no_appointments_prints_nothing",
++  "tests/test_main.py::DayCommandTest::test_only_that_therapists_appointments",
++  "tests/test_main.py::DayCommandTest::test_prints_time_kind_and_patient_in_local_time_order",
++  "tests/test_main.py::DayCommandTest::test_rejects_bad_date",
++  "tests/test_main.py::PatientsCommandTest::test_lists_id_and_name_sorted_by_id",
++  "tests/test_main.py::PatientsCommandTest::test_no_patients_prints_nothing",
++  "tests/test_main.py::PatientsCommandTest::test_older_file_without_csc_still_lists",
++  "tests/test_models.py::AppointmentTest::test_rejects_unknown_kind",
++  "tests/test_models.py::AppointmentTest::test_rejects_unknown_status",
++  "tests/test_models.py::AppointmentTest::test_requires_aware_start",
++  "tests/test_pricing.py::PriceForTest::test_csc_assessment_is_not_discounted",
++  "tests/test_pricing.py::PriceForTest::test_csc_followup_is_20_percent_off",
++  "tests/test_pricing.py::PriceForTest::test_rejects_unknown_kind",
++  "tests/test_pricing.py::PriceForTest::test_standard_patient_pays_list_price",
++  "tests/test_pricing.py::SessionPriceTest::test_followup_is_70_dollars",
++  "tests/test_pricing.py::SessionPriceTest::test_initial_assessment_is_95_dollars",
++  "tests/test_pricing.py::SessionPriceTest::test_rejects_unknown_kind",
++  "tests/test_reports.py::TherapistLoadTest::test_counts_booked_appointments_per_day",
++  "tests/test_reports.py::TherapistLoadTest::test_empty_calendar",
++  "tests/test_reports.py::TherapistLoadTest::test_every_day_of_the_week_is_present_with_zero_fill",
++  "tests/test_reports.py::TherapistLoadTest::test_ignores_appointments_outside_the_week",
++  "tests/test_reports.py::TherapistLoadTest::test_ignores_cancelled_attended_and_no_show",
++  "tests/test_reports.py::TherapistLoadTest::test_only_therapists_with_bookings_in_the_week_appear",
++  "tests/test_reports.py::TherapistLoadTest::test_separates_therapists",
++  "tests/test_reports.py::TherapistLoadTest::test_uses_auckland_local_date",
++  "tests/test_sms.py::SendBatchTest::test_51_splits_into_50_and_1",
++  "tests/test_sms.py::SendBatchTest::test_each_call_carries_key_and_path",
++  "tests/test_sms.py::SendBatchTest::test_empty_batch_sends_nothing",
++  "tests/test_sms.py::SendBatchTest::test_exactly_50_is_one_call",
++  "tests/test_sms.py::SendBatchTest::test_limit_is_50",
++  "tests/test_sms.py::SendBatchTest::test_no_call_exceeds_50_and_order_is_kept",
++  "tests/test_sms.py::SendBatchTest::test_requires_transport",
++  "tests/test_sms.py::SendBatchTest::test_small_batch_is_one_call",
++  "tests/test_storage.py::StorageTest::test_crash_during_rename_keeps_old_file",
++  "tests/test_storage.py::StorageTest::test_failed_save_keeps_old_file",
++  "tests/test_storage.py::StorageTest::test_old_patient_file_without_csc_loads",
++  "tests/test_storage.py::StorageTest::test_patient_csc_round_trip",
++  "tests/test_storage.py::StorageTest::test_round_trip",
++  "tests/test_storage.py::StorageTest::test_round_trip_cancelled",
++  "tests/test_storage.py::StorageTest::test_save_keeps_existing_file_permissions",
++  "tests/test_storage.py::StorageTest::test_save_leaves_no_temporary_files",
++  "tests/test_storage.py::StorageTest::test_temporary_file_is_in_target_directory",
++  "tests/test_waitlist.py::WaitlistEntryTest::test_rejects_naive_requested_at",
++  "tests/test_waitlist.py::WaitlistEntryTest::test_rejects_unknown_kind",
++  "tests/test_waitlist.py::WaitlistEntryTest::test_urgent_defaults_to_false",
++  "tests/test_waitlist.py::WaitlistTest::test_add_does_not_change_caller_entry",
++  "tests/test_waitlist.py::WaitlistTest::test_add_normalizes_patient_id",
++  "tests/test_waitlist.py::WaitlistTest::test_add_rejects_duplicate_patient",
++  "tests/test_waitlist.py::WaitlistTest::test_add_rejects_malformed_patient_id",
++  "tests/test_waitlist.py::WaitlistTest::test_add_then_entries",
++  "tests/test_waitlist.py::WaitlistTest::test_empty",
++  "tests/test_waitlist.py::WaitlistTest::test_entries_in_request_order",
++  "tests/test_waitlist.py::WaitlistTest::test_remove",
++  "tests/test_waitlist.py::WaitlistTest::test_remove_accepts_messy_id",
++  "tests/test_waitlist.py::WaitlistTest::test_remove_missing_patient_raises",
++  "tests/test_waitlist.py::WaitlistTest::test_removed_patient_can_join_again",
++  "tests/test_waitlist.py::WaitlistTest::test_urgent_entries_go_first",
++  "tests/test_waitlist.py::WaitlistTest::test_urgent_order_is_by_request_time_too"
++]
+\ No newline at end of file
+diff --git a/src/kestrel/fees.py b/src/kestrel/fees.py
+new file mode 100644
+index 0000000..eec662f
+--- /dev/null
++++ b/src/kestrel/fees.py
+@@ -0,0 +1,33 @@
++"""Cancellation and no-show fees."""
++
++import datetime
++
++from kestrel.models import CANCELLED, NO_SHOW
++from kestrel.pricing import session_price
++
++LATE_CANCEL_WINDOW = datetime.timedelta(hours=48)
++LATE_CANCEL_PERCENT = 50  # of the session price
++NO_SHOW_PERCENT = 100  # of the session price
++
++
++def cancellation_fee(appointment, cancelled_at=None):
++    """Fee in cents for a cancelled or no-show appointment.
++
++    A cancellation less than 48 hours before the start costs 50% of the session
++    price, otherwise nothing. A no-show costs the full session price. cancelled_at
++    is when the patient cancelled; it must be None for a no-show.
++    """
++    price = session_price(appointment.kind)
++    if appointment.status == NO_SHOW:
++        if cancelled_at is not None:
++            raise ValueError(f"no-show appointment {appointment.id} has no cancellation time")
++        return price * NO_SHOW_PERCENT // 100
++    if appointment.status == CANCELLED:
++        if cancelled_at is None:
++            raise ValueError(f"cancelled appointment {appointment.id} needs cancelled_at")
++        if cancelled_at.tzinfo is None:
++            raise ValueError("cancelled_at must be timezone-aware")
++        if appointment.start - cancelled_at < LATE_CANCEL_WINDOW:
++            return price * LATE_CANCEL_PERCENT // 100
++        return 0
++    raise ValueError(f"no fee for {appointment.status} appointment {appointment.id}")
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..d8e3f5e
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,82 @@
++import datetime
++import unittest
++
++from helpers import appt, utc
++from kestrel.fees import cancellation_fee
++from kestrel.models import ASSESSMENT, ATTENDED, BOOKED, CANCELLED, FOLLOWUP, NO_SHOW
++
++NZ = datetime.timezone(datetime.timedelta(hours=13))  # Pacific/Auckland in NZDT
++
++
++class LateCancellationTest(unittest.TestCase):
++    def start(self):
++        return utc(2026, 11, 2, 9, 0)
++
++    def cancelled(self, kind):
++        return appt("A1", self.start(), kind=kind, status=CANCELLED)
++
++    def test_cancel_more_than_48_hours_ahead_is_free(self):
++        at = self.start() - datetime.timedelta(hours=49)
++        self.assertEqual(cancellation_fee(self.cancelled(FOLLOWUP), at), 0)
++
++    def test_cancel_exactly_48_hours_ahead_is_free(self):
++        at = self.start() - datetime.timedelta(hours=48)
++        self.assertEqual(cancellation_fee(self.cancelled(FOLLOWUP), at), 0)
++
++    def test_cancel_inside_48_hours_costs_half_the_assessment_price(self):
++        at = self.start() - datetime.timedelta(hours=47, minutes=59)
++        self.assertEqual(cancellation_fee(self.cancelled(ASSESSMENT), at), 4750)
++
++    def test_cancel_inside_48_hours_costs_half_the_followup_price(self):
++        at = self.start() - datetime.timedelta(hours=24)
++        self.assertEqual(cancellation_fee(self.cancelled(FOLLOWUP), at), 3500)
++
++    def test_cancel_after_start_costs_half_the_price(self):
++        at = self.start() + datetime.timedelta(hours=1)
++        self.assertEqual(cancellation_fee(self.cancelled(FOLLOWUP), at), 3500)
++
++    def test_window_is_absolute_time_across_timezones(self):
++        start = datetime.datetime(2026, 11, 2, 9, 0, tzinfo=NZ)
++        at = start.astimezone(datetime.timezone.utc) - datetime.timedelta(hours=47)
++        appointment = appt("A1", start, kind=FOLLOWUP, status=CANCELLED)
++        self.assertEqual(cancellation_fee(appointment, at), 3500)
++
++    def test_rejects_naive_cancelled_at(self):
++        at = datetime.datetime(2026, 11, 1, 9, 0)
++        with self.assertRaises(ValueError):
++            cancellation_fee(self.cancelled(FOLLOWUP), at)
++
++    def test_rejects_cancelled_without_cancelled_at(self):
++        with self.assertRaises(ValueError):
++            cancellation_fee(self.cancelled(FOLLOWUP), None)
++
++
++class NoShowTest(unittest.TestCase):
++    def test_no_show_assessment_pays_full_price(self):
++        appointment = appt("A1", utc(2026, 11, 2, 9, 0), kind=ASSESSMENT, status=NO_SHOW)
++        self.assertEqual(cancellation_fee(appointment), 9500)
++
++    def test_no_show_followup_pays_full_price(self):
++        appointment = appt("A1", utc(2026, 11, 2, 9, 0), kind=FOLLOWUP, status=NO_SHOW)
++        self.assertEqual(cancellation_fee(appointment), 7000)
++
++    def test_rejects_no_show_with_cancelled_at(self):
++        appointment = appt("A1", utc(2026, 11, 2, 9, 0), kind=FOLLOWUP, status=NO_SHOW)
++        with self.assertRaises(ValueError):
++            cancellation_fee(appointment, utc(2026, 11, 1, 9, 0))
++
++
++class NoFeeStatusTest(unittest.TestCase):
++    def test_rejects_booked_appointment(self):
++        appointment = appt("A1", utc(2026, 11, 2, 9, 0), status=BOOKED)
++        with self.assertRaises(ValueError):
++            cancellation_fee(appointment)
++
++    def test_rejects_attended_appointment(self):
++        appointment = appt("A1", utc(2026, 11, 2, 9, 0), status=ATTENDED)
++        with self.assertRaises(ValueError):
++            cancellation_fee(appointment)
++
++
++if __name__ == "__main__":
++    unittest.main()

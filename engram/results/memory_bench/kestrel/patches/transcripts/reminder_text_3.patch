@@ -1,0 +1,101 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9e5da12..82f0514 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@
+ - `Waitlist` holds patients waiting for an appointment, with `add`, `remove` and `entries`.
+ - `python -m kestrel day THERAPIST_ID DATE --data kestrel.json` prints a therapist's booked appointments on a local date.
+ - `python -m kestrel patients --data kestrel.json` prints patient IDs and names, sorted by ID.
++- `reminder_text(appointment)` returns the SMS reminder sent two days before an appointment. It gives the day, time and clinic name only, never the treatment.
+ - Storage writes atomically: data goes to a temporary file in the same directory, which then replaces the old file. A crash or failed write leaves the previous file intact. Saved files are now owner-only (mode 0600).
+ 
+ ## 0.1.0
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..9b68711
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,26 @@
++"""Text of the SMS reminder sent two days before an appointment."""
++
++from .calendar import CLINIC_TZ
++from .models import CLINICS
++
++
++def reminder_text(appointment):
++    """Return the reminder for an appointment.
++
++    It gives the date, time and clinic name only. The treatment is never
++    included, per the privacy officer's rule for SMS reminders.
++    """
++    local = appointment.start.astimezone(CLINIC_TZ)
++    day = f"{local.strftime('%A')} {local.day} {local.strftime('%B')}"
++    hour = local.hour % 12 or 12
++    suffix = "am" if local.hour < 12 else "pm"
++    if local.minute:
++        clock = f"{hour}:{local.minute:02d}{suffix}"
++    else:
++        clock = f"{hour}{suffix}"
++    clinic = CLINICS[appointment.clinic].name
++    return (
++        f"Hi from {clinic}! This is a friendly reminder of your appointment "
++        f"on {day} at {clock}. We look forward to seeing you. "
++        f"If you need to change it, please get in touch with the clinic."
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..3886f7e
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,51 @@
++import datetime
++import unittest
++from zoneinfo import ZoneInfo
++
++from kestrel.models import ASSESSMENT, Appointment
++from kestrel.reminders import reminder_text
++
++AUCKLAND = ZoneInfo("Pacific/Auckland")
++
++
++def appt(start, clinic="HB", treatment="lower back pain"):
++    return Appointment(
++        id="A1", patient_id="KP-000001", therapist_id="T04", clinic=clinic,
++        start=start, kind=ASSESSMENT, treatment=treatment,
++    )
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_gives_day_time_and_clinic(self):
++        start = datetime.datetime(2027, 3, 2, 14, 30, tzinfo=AUCKLAND)
++        text = reminder_text(appt(start))
++        self.assertIn("Tuesday 2 March", text)
++        self.assertIn("2:30pm", text)
++        self.assertIn("Kestrel Physio Harbour", text)
++
++    def test_whole_hour_has_no_minutes(self):
++        start = datetime.datetime(2027, 3, 2, 9, 0, tzinfo=AUCKLAND)
++        self.assertIn("at 9am", reminder_text(appt(start)))
++
++    def test_midday_and_midnight_hours(self):
++        noon = datetime.datetime(2027, 3, 2, 12, 5, tzinfo=AUCKLAND)
++        midnight = datetime.datetime(2027, 3, 2, 0, 15, tzinfo=AUCKLAND)
++        self.assertIn("at 12:05pm", reminder_text(appt(noon)))
++        self.assertIn("at 12:15am", reminder_text(appt(midnight)))
++
++    def test_uses_clinic_local_time(self):
++        # 02:30 UTC on 2 March 2027 is 15:30 in Auckland (NZDT, UTC+13).
++        start = datetime.datetime(2027, 3, 2, 2, 30, tzinfo=datetime.timezone.utc)
++        text = reminder_text(appt(start))
++        self.assertIn("Tuesday 2 March", text)
++        self.assertIn("at 3:30pm", text)
++
++    def test_never_includes_treatment(self):
++        start = datetime.datetime(2027, 3, 2, 14, 30, tzinfo=AUCKLAND)
++        text = reminder_text(appt(start, treatment="lower back pain"))
++        self.assertNotIn("back", text.lower())
++        self.assertNotIn("pain", text.lower())
++
++
++if __name__ == "__main__":
++    unittest.main()

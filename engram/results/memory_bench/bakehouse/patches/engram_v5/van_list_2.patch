@@ -1,0 +1,111 @@
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..b8134f8
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,25 @@
++"""The van's run: which customers to visit on a delivery day, and in what order."""
++
++import csv
++
++
++def drops_for(orderbook, customers, day):
++    """Customers with orders on `day`, in the order the van visits them.
++
++    Greenway Grocers opens at 7:00 and needs bread before then, so it always
++    goes first; everyone else follows in route_seq order.
++    """
++    codes = orderbook.customers_for(day)
++    return sorted(
++        (customers[code] for code in codes),
++        key=lambda c: (c.code != "GREENWAY", c.route_seq),
++    )
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes the van's drops for `day` to `path` as CSV, one row per drop in run order."""
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(["code", "name", "address", "postcode"])
++        for customer in drops_for(orderbook, customers, day):
++            writer.writerow([customer.code, customer.name, customer.address, customer.postcode])
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..1eda896
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,74 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.delivery import drops_file, drops_for
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++def catalog():
++    return Catalog([Product("SOU", "White sourdough", 320, 10)])
++
++
++def customers():
++    return {
++        "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++        "AIDAN": Customer("AIDAN", "St Aidan's Primary School", "School Road", "LK4 9SA", 5),
++        "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "88 High Street", "LK1 4HS", 4),
++        "POTTER": Customer("POTTER", "Potter's Farm Shop", "Lower Farm, Ashby Road", "LK5 3PF", 6),
++    }
++
++
++class DropsForTest(unittest.TestCase):
++    def test_only_customers_with_orders_that_day(self):
++        book = OrderBook(catalog(), [OrderLine(DAY, "LUMEN", "SOU", 6)])
++        self.assertEqual([c.code for c in drops_for(book, customers(), DAY)], ["LUMEN"])
++
++    def test_route_seq_order(self):
++        book = OrderBook(catalog(), [
++            OrderLine(DAY, "AIDAN", "SOU", 4),
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++        ])
++        self.assertEqual([c.code for c in drops_for(book, customers(), DAY)], ["LUMEN", "AIDAN"])
++
++    def test_greenway_is_first_even_though_its_route_seq_is_later(self):
++        book = OrderBook(catalog(), [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY, "GREENWAY", "SOU", 10),
++            OrderLine(DAY, "POTTER", "SOU", 2),
++        ])
++        self.assertEqual([c.code for c in drops_for(book, customers(), DAY)], ["GREENWAY", "LUMEN", "POTTER"])
++
++    def test_other_days_are_left_out(self):
++        book = OrderBook(catalog(), [OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "SOU", 6)])
++        self.assertEqual(drops_for(book, customers(), DAY), [])
++
++
++class DropsFileTest(unittest.TestCase):
++    def test_writes_header_and_one_row_per_drop_in_run_order(self):
++        book = OrderBook(catalog(), [
++            OrderLine(DAY, "AIDAN", "SOU", 4),
++            OrderLine(DAY, "GREENWAY", "SOU", 10),
++            OrderLine(DAY, "POTTER", "SOU", 2),
++        ])
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "drops.csv")
++            drops_file(book, customers(), DAY, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                rows = list(csv.reader(f))
++        self.assertEqual(rows, [
++            ["code", "name", "address", "postcode"],
++            ["GREENWAY", "Greenway Grocers", "88 High Street", "LK1 4HS"],
++            ["AIDAN", "St Aidan's Primary School", "School Road", "LK4 9SA"],
++            ["POTTER", "Potter's Farm Shop", "Lower Farm, Ashby Road", "LK5 3PF"],
++        ])
++
++
++if __name__ == "__main__":
++    unittest.main()

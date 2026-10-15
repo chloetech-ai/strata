@@ -1,0 +1,105 @@
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..a2534f5
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,32 @@
++"""Appointment reminder texts."""
++
++from .calendar import CLINIC_TZ
++from .models import ASSESSMENT, CLINICS, FOLLOWUP
++
++_KIND_NAMES = {
++    ASSESSMENT: "physiotherapy assessment",
++    FOLLOWUP: "physiotherapy follow-up",
++}
++
++
++def reminder_text(appointment):
++    """The SMS sent two days before an appointment.
++
++    Names the clinic and gives the kind of appointment and its local (Auckland)
++    day and time. The patient's name and the treatment are left out of the text.
++    """
++    local = appointment.start.astimezone(CLINIC_TZ)
++    clinic = CLINICS[appointment.clinic].name
++    when = f"{local:%A} {local.day} {local:%B} at {_clock(local)}"
++    return (
++        f"Kind reminder from {clinic}: you have a {_KIND_NAMES[appointment.kind]} "
++        f"on {when}. We look forward to seeing you! "
++        "If you need to change or cancel, please call the clinic to reschedule."
++    )
++
++
++def _clock(local):
++    """Twelve-hour time such as '9:30am'."""
++    hour = local.hour % 12 or 12
++    suffix = "am" if local.hour < 12 else "pm"
++    return f"{hour}:{local.minute:02d}{suffix}"
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..a0560a7
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,61 @@
++import datetime
++import unittest
++
++from kestrel.calendar import CLINIC_TZ
++from kestrel.models import ASSESSMENT, FOLLOWUP, Appointment
++from kestrel.reminders import reminder_text
++
++
++def appointment(start, kind=ASSESSMENT, clinic="NG", treatment=""):
++    return Appointment(
++        id="A-1",
++        patient_id="KP-004211",
++        therapist_id="T-1",
++        clinic=clinic,
++        start=start,
++        kind=kind,
++        treatment=treatment,
++    )
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_names_clinic_kind_day_and_time(self):
++        start = datetime.datetime(2026, 10, 17, 9, 30, tzinfo=CLINIC_TZ)
++        text = reminder_text(appointment(start))
++        self.assertIn("Kestrel Physio Northgate", text)
++        self.assertIn("physiotherapy assessment", text)
++        self.assertIn("Saturday 17 October at 9:30am", text)
++
++    def test_follow_up_is_named_as_one(self):
++        start = datetime.datetime(2026, 10, 17, 14, 0, tzinfo=CLINIC_TZ)
++        text = reminder_text(appointment(start, kind=FOLLOWUP, clinic="HB"))
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("physiotherapy follow-up", text)
++        self.assertIn("2:00pm", text)
++
++    def test_time_is_local_auckland_time(self):
++        # 21:30 UTC on 16 October is 10:30am on 17 October in Auckland (NZDT).
++        start = datetime.datetime(2026, 10, 16, 21, 30, tzinfo=datetime.timezone.utc)
++        text = reminder_text(appointment(start))
++        self.assertIn("Saturday 17 October at 10:30am", text)
++
++    def test_midnight_and_noon_are_twelve_hour_times(self):
++        midnight = datetime.datetime(2026, 10, 17, 0, 5, tzinfo=CLINIC_TZ)
++        noon = datetime.datetime(2026, 10, 17, 12, 0, tzinfo=CLINIC_TZ)
++        self.assertIn("at 12:05am", reminder_text(appointment(midnight)))
++        self.assertIn("at 12:00pm", reminder_text(appointment(noon)))
++
++    def test_leaves_out_patient_and_treatment(self):
++        start = datetime.datetime(2026, 10, 17, 9, 30, tzinfo=CLINIC_TZ)
++        text = reminder_text(appointment(start, treatment="lower back pain"))
++        self.assertNotIn("KP-004211", text)
++        self.assertNotIn("lower back pain", text)
++
++    def test_is_plain_ascii_for_sms(self):
++        start = datetime.datetime(2026, 10, 17, 9, 30, tzinfo=CLINIC_TZ)
++        text = reminder_text(appointment(start))
++        self.assertTrue(text.isascii())
++
++
++if __name__ == "__main__":
++    unittest.main()

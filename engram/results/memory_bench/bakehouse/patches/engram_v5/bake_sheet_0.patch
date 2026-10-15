@@ -1,0 +1,83 @@
+diff --git a/src/bakehouse/production.py b/src/bakehouse/production.py
+index 5d99a89..dad030c 100644
+--- a/src/bakehouse/production.py
++++ b/src/bakehouse/production.py
+@@ -37,3 +37,24 @@ def plan(orderbook, day):
+         code: (units, batches_needed(units, catalog.get(code).batch_size))
+         for code, units in sorted(totals.items())
+     }
++
++
++def bake_sheet(orderbook, day):
++    """Text bake sheet for `day`, one line per product, hottest oven first.
++
++    The deck oven only cools down overnight, so the hottest bakes go first.
++    """
++    catalog = orderbook.catalog
++    bakes = plan(orderbook, day)
++    products = sorted(
++        (catalog.get(code) for code in bakes),
++        key=lambda p: (-p.bake_temp, p.code),
++    )
++    lines = []
++    for product in products:
++        units, batches = bakes[product.code]
++        lines.append(
++            f"{product.name}: {units} units, {batches} batches, "
++            f"{dough_weight_g(product, units)} g dough"
++        )
++    return "\n".join(lines)
+diff --git a/tests/test_production.py b/tests/test_production.py
+index 51a8fab..c9aa705 100644
+--- a/tests/test_production.py
++++ b/tests/test_production.py
+@@ -2,7 +2,7 @@ import datetime
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+-from bakehouse.production import batches_needed, crates_needed, dough_weight_g, plan, total_batches
++from bakehouse.production import bake_sheet, batches_needed, crates_needed, dough_weight_g, plan, total_batches
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -66,6 +66,40 @@ class ProductionTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             dough_weight_g(baguette, -1)
+ 
++    def test_bake_sheet_has_one_line_per_product_with_units_batches_and_grams(self):
++        catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12, dough_g=300, bake_temp=240),
++            Product("SOU", "White sourdough", 320, batch_size=10, dough_g=900, bake_temp=230),
++        ])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 20),
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY, "LUMEN", "SOU", 10),
++        ])
++        self.assertEqual(
++            bake_sheet(book, DAY),
++            "Baguette: 25 units, 3 batches, 7500 g dough\n"
++            "White sourdough: 10 units, 1 batches, 9000 g dough",
++        )
++
++    def test_bake_sheet_puts_hottest_oven_first(self):
++        catalog = Catalog([
++            Product("SOU", "White sourdough", 320, batch_size=10, dough_g=900, bake_temp=230),
++            Product("BAG", "Baguette", 95, batch_size=12, dough_g=300, bake_temp=240),
++            Product("LOA", "Sandwich loaf", 210, batch_size=8, dough_g=800, bake_temp=200),
++        ])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 10),
++            OrderLine(DAY, "LUMEN", "BAG", 12),
++            OrderLine(DAY, "LUMEN", "LOA", 8),
++        ])
++        names = [line.split(":")[0] for line in bake_sheet(book, DAY).splitlines()]
++        self.assertEqual(names, ["Baguette", "White sourdough", "Sandwich loaf"])
++
++    def test_bake_sheet_for_day_with_no_orders_is_empty(self):
++        book = OrderBook(Catalog([Product("BAG", "Baguette", 95, batch_size=12, dough_g=300, bake_temp=240)]), [])
++        self.assertEqual(bake_sheet(book, DAY), "")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

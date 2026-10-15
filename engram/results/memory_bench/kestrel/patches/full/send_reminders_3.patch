@@ -1,0 +1,118 @@
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..79ffe39
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,23 @@
++"""Appointment reminders by SMS."""
++
++from .calendar import AUCKLAND
++from .models import BOOKED, CLINICS
++
++
++def reminder_text(appointment):
++    """The reminder for an appointment. It gives only the clinic, date and time, never the treatment."""
++    start = appointment.start.astimezone(AUCKLAND)
++    clinic = CLINICS[appointment.clinic].name
++    return f"{clinic}: reminder of your appointment on {start:%d/%m/%Y} at {start:%H:%M}."
++
++
++def send_reminders(appointments, patients, client):
++    """Send one SMS to the patient of each booked appointment. Returns the number of messages sent.
++
++    patients maps patient ID to Patient. Every booked patient must be in it; if one is
++    missing, KeyError is raised before anything is sent.
++    """
++    booked = [a for a in appointments if a.status == BOOKED]
++    messages = [(patients[a.patient_id].phone, reminder_text(a)) for a in booked]
++    client.send_batch(messages)
++    return len(messages)
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..db18939
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,83 @@
++import unittest
++
++from helpers import appt, utc
++from kestrel.models import Patient
++from kestrel.reminders import reminder_text, send_reminders
++from kestrel.sms import BulkieClient
++
++
++class RecordingTransport:
++    def __init__(self):
++        self.posts = []
++
++    def post(self, path, body):
++        self.posts.append(body)
++        return {"ok": True}
++
++    def sent(self):
++        return [m for body in self.posts for m in body["messages"]]
++
++
++PATIENTS = {
++    "KP-000001": Patient("KP-000001", "Ana Silva", "+64211111111"),
++    "KP-000002": Patient("KP-000002", "Ben Hora", "+64222222222"),
++}
++
++
++class SendRemindersTest(unittest.TestCase):
++    def setUp(self):
++        self.transport = RecordingTransport()
++        self.client = BulkieClient("key", self.transport)
++
++    def test_one_message_per_booked_appointment(self):
++        appointments = [
++            appt("a1", utc(2026, 10, 14, 20), patient="KP-000001", clinic="HB"),
++            appt("a2", utc(2026, 10, 15, 20), patient="KP-000002", clinic="NG"),
++        ]
++        self.assertEqual(send_reminders(appointments, PATIENTS, self.client), 2)
++        self.assertEqual([m["to"] for m in self.transport.sent()], ["+64211111111", "+64222222222"])
++
++    def test_skips_appointments_that_are_not_booked(self):
++        appointments = [
++            appt("a1", utc(2026, 10, 14, 20), patient="KP-000001"),
++            appt("a2", utc(2026, 10, 14, 21), patient="KP-000002", status="cancelled"),
++            appt("a3", utc(2026, 10, 14, 22), patient="KP-000002", status="no_show"),
++        ]
++        self.assertEqual(send_reminders(appointments, PATIENTS, self.client), 1)
++        self.assertEqual(len(self.transport.sent()), 1)
++
++    def test_no_booked_appointments_sends_nothing(self):
++        self.assertEqual(send_reminders([], PATIENTS, self.client), 0)
++        self.assertEqual(self.transport.posts, [])
++
++    def test_missing_patient_sends_nothing(self):
++        appointments = [
++            appt("a1", utc(2026, 10, 14, 20), patient="KP-000001"),
++            appt("a2", utc(2026, 10, 14, 21), patient="KP-000009"),
++        ]
++        with self.assertRaises(KeyError):
++            send_reminders(appointments, PATIENTS, self.client)
++        self.assertEqual(self.transport.posts, [])
++
++    def test_large_run_is_split_by_the_client(self):
++        patients = {f"KP-{i:06d}": Patient(f"KP-{i:06d}", "Test", f"+6421{i:07d}") for i in range(1, 121)}
++        appointments = [appt(f"a{i}", utc(2026, 10, 14, 20), patient=pid) for i, pid in enumerate(patients, 1)]
++        self.assertEqual(send_reminders(appointments, patients, self.client), 120)
++        self.assertEqual([len(b["messages"]) for b in self.transport.posts], [50, 50, 20])
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_gives_clinic_date_and_time_local(self):
++        # 14 Oct 2026 20:00 UTC is 15 Oct 09:00 in Auckland (NZDT).
++        text = reminder_text(appt("a1", utc(2026, 10, 14, 20), clinic="HB", treatment="lower back pain"))
++        self.assertEqual(text, "Kestrel Physio Harbour: reminder of your appointment on 15/10/2026 at 09:00.")
++
++    def test_never_mentions_the_treatment(self):
++        text = reminder_text(appt("a1", utc(2026, 10, 14, 20), clinic="NG", treatment="lower back pain", kind="assessment"))
++        self.assertNotIn("lower back pain", text)
++        self.assertNotIn("assessment", text.lower())
++        self.assertIn("Kestrel Physio Northgate", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

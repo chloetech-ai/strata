@@ -1,0 +1,104 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index f707cf8..54220da 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -29,6 +29,12 @@
+   "tests/test_reorder.py::ReorderTest::test_at_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
++  "tests/test_scanner.py::ReadScannerFileTest::test_empty_file_gives_empty_dict",
++  "tests/test_scanner.py::ReadScannerFileTest::test_handles_crlf_and_blank_lines",
++  "tests/test_scanner.py::ReadScannerFileTest::test_non_integer_quantity_rejected",
++  "tests/test_scanner.py::ReadScannerFileTest::test_normalizes_sku",
++  "tests/test_scanner.py::ReadScannerFileTest::test_sums_quantities_for_sku_across_bins",
++  "tests/test_scanner.py::ReadScannerFileTest::test_wrong_field_count_rejected_with_line_number",
+   "tests/test_storage.py::StorageTest::test_old_file_without_reason_column_infers_reason_from_sign",
+   "tests/test_storage.py::StorageTest::test_roundtrip"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/scanner.py b/src/stockroom/scanner.py
+new file mode 100644
+index 0000000..dee145d
+--- /dev/null
++++ b/src/stockroom/scanner.py
+@@ -0,0 +1,28 @@
++"""Import the handheld scanners' plain-text count export."""
++
++from .items import normalize_sku
++
++
++def read_scanner_file(path):
++    """Counted quantity per SKU from a scanner export.
++
++    Each line is ``bin;sku;qty`` with no header. A SKU may appear on several
++    lines (part of it in an overflow bin), so its quantities are summed.
++    Returns a dict mapping normalized SKU to total quantity.
++    """
++    counts = {}
++    with open(path, encoding="utf-8") as f:
++        for number, line in enumerate(f, start=1):
++            if not line.strip():
++                continue
++            fields = line.rstrip("\r\n").split(";")
++            if len(fields) != 3:
++                raise ValueError(f"{path}:{number}: expected 3 fields, got {len(fields)}")
++            _bin, sku, qty = fields
++            try:
++                quantity = int(qty)
++            except ValueError:
++                raise ValueError(f"{path}:{number}: quantity is not a whole number: {qty!r}") from None
++            sku = normalize_sku(sku)
++            counts[sku] = counts.get(sku, 0) + quantity
++    return counts
+diff --git a/tests/test_scanner.py b/tests/test_scanner.py
+new file mode 100644
+index 0000000..1a02801
+--- /dev/null
++++ b/tests/test_scanner.py
+@@ -0,0 +1,46 @@
++import os
++import tempfile
++import unittest
++
++from stockroom.scanner import read_scanner_file
++
++
++class ReadScannerFileTest(unittest.TestCase):
++    def setUp(self):
++        self._dir = tempfile.TemporaryDirectory()
++        self.addCleanup(self._dir.cleanup)
++
++    def write(self, text):
++        path = os.path.join(self._dir.name, "scan.txt")
++        with open(path, "w", encoding="utf-8", newline="") as f:
++            f.write(text)
++        return path
++
++    def test_sums_quantities_for_sku_across_bins(self):
++        path = self.write("B-12-3;BR-1042;10\nOVF-1;BR-1042;5\nB-12-3;XX-7;2\n")
++        self.assertEqual(read_scanner_file(path), {"BR-1042": 15, "XX-7": 2})
++
++    def test_normalizes_sku(self):
++        path = self.write("B-12-3;br-1042;4\nOVF-1; BR-1042 ;1\nB-12-3;Br-1042 ;2\n")
++        self.assertEqual(read_scanner_file(path), {"BR-1042": 7})
++
++    def test_handles_crlf_and_blank_lines(self):
++        path = self.write("B-12-3;BR-1042;3\r\n\r\nB-12-3;XX-7;1\r\n")
++        self.assertEqual(read_scanner_file(path), {"BR-1042": 3, "XX-7": 1})
++
++    def test_empty_file_gives_empty_dict(self):
++        self.assertEqual(read_scanner_file(self.write("")), {})
++
++    def test_wrong_field_count_rejected_with_line_number(self):
++        path = self.write("B-12-3;BR-1042;3\nB-12-3;BR-1042\n")
++        with self.assertRaisesRegex(ValueError, ":2:"):
++            read_scanner_file(path)
++
++    def test_non_integer_quantity_rejected(self):
++        path = self.write("B-12-3;BR-1042;1.5\n")
++        with self.assertRaisesRegex(ValueError, ":1:"):
++            read_scanner_file(path)
++
++
++if __name__ == "__main__":
++    unittest.main()

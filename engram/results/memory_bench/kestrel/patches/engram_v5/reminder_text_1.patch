@@ -1,0 +1,63 @@
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..8f25bc6
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,22 @@
++"""Text of the SMS reminders sent to patients."""
++
++from .calendar import CLINIC_TZ
++from .models import CLINICS
++
++
++def reminder_text(appointment):
++    """The SMS sent two days before an appointment.
++
++    Privacy rule: states only the date, the time and the clinic name. It never
++    mentions the treatment or any other purpose of the appointment.
++    """
++    local = appointment.start.astimezone(CLINIC_TZ)
++    day = f"{local:%A} {local.day} {local:%B}"
++    hour = local.hour % 12 or 12
++    meridiem = "am" if local.hour < 12 else "pm"
++    time = f"{hour}:{local.minute:02d}{meridiem}"
++    clinic = CLINICS[appointment.clinic].name
++    return (
++        f"Hi, this is a friendly reminder of your appointment at {clinic} "
++        f"on {day} at {time}. We look forward to seeing you!"
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..5144380
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from helpers import appt, utc
++from kestrel.reminders import reminder_text
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_states_clinic_date_and_time(self):
++        # 09:00 on Sat 17 Oct 2026 in Auckland (NZDT, UTC+13) is 20:00 UTC on 16 Oct.
++        text = reminder_text(appt("A1", utc(2026, 10, 16, 20, 0), clinic="HB"))
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("Saturday 17 October", text)
++        self.assertIn("9:00am", text)
++
++    def test_afternoon_time_uses_pm(self):
++        text = reminder_text(appt("A1", utc(2026, 10, 19, 3, 30), clinic="NG"))  # 16:30 NZDT
++        self.assertIn("4:30pm", text)
++        self.assertIn("Kestrel Physio Northgate", text)
++
++    def test_never_mentions_treatment_or_kind(self):
++        text = reminder_text(appt("A1", utc(2026, 10, 16, 20, 0), kind="assessment",
++                                  treatment="lower back pain"))
++        self.assertNotIn("lower back", text.lower())
++        self.assertNotIn("assessment", text.lower())
++        self.assertNotIn("follow", text.lower())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,152 @@
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..55dd81d
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,58 @@
++"""Checks for the booking form."""
++
++import datetime
++
++from .calendar import LOCAL_TZ
++from .models import ASSESSMENT, CANCELLED
++
++ASSESSMENT_MINUTES = 45
++FOLLOWUP_MINUTES = 30
++# Gap after an assessment so the therapist can write notes before the next patient.
++ASSESSMENT_GAP_MINUTES = 15
++# Union agreement: at most this many patient appointments per therapist per local day.
++DAILY_LIMIT = 8
++
++
++def _length(kind):
++    return ASSESSMENT_MINUTES if kind == ASSESSMENT else FOLLOWUP_MINUTES
++
++
++def _gap(kind):
++    return ASSESSMENT_GAP_MINUTES if kind == ASSESSMENT else 0
++
++
++def _blocked_until(appointment):
++    """When an appointment stops blocking the therapist, including any gap after it."""
++    minutes = _length(appointment.kind) + _gap(appointment.kind)
++    return appointment.start + datetime.timedelta(minutes=minutes)
++
++
++def can_book(calendar, therapist, appointment):
++    """True if the appointment can be added to the calendar for this therapist.
++
++    Refuses a start that is not on a quarter hour, an overlap with another
++    live appointment for the therapist (including the gap after an
++    assessment), and a ninth live appointment on the same Auckland date.
++    Does not change the calendar.
++    """
++    if appointment.therapist_id != therapist.id:
++        raise ValueError(f"appointment is for {appointment.therapist_id}, not {therapist.id}")
++
++    local_start = appointment.start.astimezone(LOCAL_TZ)
++    if local_start.minute % 15 or local_start.second or local_start.microsecond:
++        return False
++
++    live = [a for a in calendar.for_therapist(therapist.id) if a.status != CANCELLED]
++
++    new_end = _blocked_until(appointment)
++    for other in live:
++        # The new appointment must start after the other one's blocked time ends,
++        # and end before the other one starts.
++        if appointment.start < _blocked_until(other) and other.start < new_end:
++            return False
++
++    same_day = [a for a in live if a.start.astimezone(LOCAL_TZ).date() == local_start.date()]
++    if len(same_day) >= DAILY_LIMIT:
++        return False
++
++    return True
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..717d4fe
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,82 @@
++import datetime
++from zoneinfo import ZoneInfo
++import unittest
++
++from helpers import appt, utc
++from kestrel.booking import can_book
++from kestrel.calendar import Calendar
++from kestrel.models import Therapist
++
++T1 = Therapist("T1", "Ana", "HB")
++NZ = ZoneInfo("Pacific/Auckland")
++
++
++def nz(y, m, d, hh=0, mm=0):
++    return datetime.datetime(y, m, d, hh, mm, tzinfo=NZ)
++
++
++class CanBookTest(unittest.TestCase):
++    def test_free_slot(self):
++        cal = Calendar()
++        self.assertTrue(can_book(cal, T1, appt("n", nz(2027, 3, 1, 9), kind="assessment", therapist="T1")))
++
++    def test_overlap_with_existing_appointment(self):
++        cal = Calendar([appt("a1", nz(2027, 3, 1, 9), kind="followup", therapist="T1")])
++        self.assertFalse(can_book(cal, T1, appt("n", nz(2027, 3, 1, 9, 15), therapist="T1")))
++
++    def test_back_to_back_followups_allowed(self):
++        cal = Calendar([appt("a1", nz(2027, 3, 1, 9), kind="followup", therapist="T1")])
++        self.assertTrue(can_book(cal, T1, appt("n", nz(2027, 3, 1, 9, 30), kind="followup", therapist="T1")))
++
++    def test_gap_after_assessment_is_blocked(self):
++        cal = Calendar([appt("a1", nz(2027, 3, 1, 9), kind="assessment", therapist="T1")])
++        # Assessment runs 09:00-09:45, then a 15-minute gap until 10:00.
++        self.assertFalse(can_book(cal, T1, appt("n", nz(2027, 3, 1, 9, 45), kind="followup", therapist="T1")))
++        self.assertTrue(can_book(cal, T1, appt("n", nz(2027, 3, 1, 10), kind="followup", therapist="T1")))
++
++    def test_new_assessment_gap_blocks_next_appointment(self):
++        cal = Calendar([appt("a1", nz(2027, 3, 1, 10), kind="followup", therapist="T1")])
++        # 09:00 assessment blocks until 10:00 (45 min + 15 min gap), so a 10:00 follow-up is fine.
++        self.assertTrue(can_book(cal, T1, appt("n", nz(2027, 3, 1, 9), kind="assessment", therapist="T1")))
++        self.assertFalse(can_book(cal, T1, appt("n", nz(2027, 3, 1, 9, 30), kind="assessment", therapist="T1")))
++
++    def test_cancelled_appointment_does_not_block(self):
++        cal = Calendar([appt("a1", nz(2027, 3, 1, 9), kind="followup", therapist="T1", status="cancelled")])
++        self.assertTrue(can_book(cal, T1, appt("n", nz(2027, 3, 1, 9), therapist="T1")))
++
++    def test_other_therapist_does_not_block(self):
++        cal = Calendar([appt("a1", nz(2027, 3, 1, 9), therapist="T2")])
++        self.assertTrue(can_book(cal, T1, appt("n", nz(2027, 3, 1, 9), therapist="T1")))
++
++    def test_start_must_be_quarter_hour(self):
++        self.assertFalse(can_book(Calendar(), T1, appt("n", nz(2027, 3, 1, 9, 10), therapist="T1")))
++        self.assertTrue(can_book(Calendar(), T1, appt("n", nz(2027, 3, 1, 9, 45), therapist="T1")))
++
++    def test_daily_limit_of_eight(self):
++        existing = [appt("a%d" % i, nz(2027, 3, 1, 8) + datetime.timedelta(minutes=30 * i), therapist="T1") for i in range(8)]
++        cal = Calendar(existing)
++        self.assertFalse(can_book(cal, T1, appt("n", nz(2027, 3, 1, 15), therapist="T1")))
++
++    def test_daily_limit_counts_by_auckland_date(self):
++        # 2027-03-01 23:30 UTC is 2027-03-02 in Auckland (NZDT, +13).
++        existing = [appt("a%d" % i, utc(2027, 3, 1, 9) + datetime.timedelta(minutes=30 * i), therapist="T1") for i in range(7)]
++        cal = Calendar(existing)
++        self.assertTrue(can_book(cal, T1, appt("n", nz(2027, 3, 2, 9), therapist="T1")))
++
++    def test_cancelled_appointments_do_not_count_toward_limit(self):
++        existing = [appt("a%d" % i, nz(2027, 3, 1, 8) + datetime.timedelta(minutes=30 * i), therapist="T1") for i in range(7)]
++        existing.append(appt("c", nz(2027, 3, 1, 15), therapist="T1", status="cancelled"))
++        self.assertTrue(can_book(Calendar(existing), T1, appt("n", nz(2027, 3, 1, 15), therapist="T1")))
++
++    def test_wrong_therapist_raises(self):
++        with self.assertRaises(ValueError):
++            can_book(Calendar(), T1, appt("n", nz(2027, 3, 1, 9), therapist="T2"))
++
++    def test_does_not_modify_calendar(self):
++        cal = Calendar()
++        can_book(cal, T1, appt("n", nz(2027, 3, 1, 9), therapist="T1"))
++        self.assertEqual(len(cal), 0)
++
++
++if __name__ == "__main__":
++    unittest.main()

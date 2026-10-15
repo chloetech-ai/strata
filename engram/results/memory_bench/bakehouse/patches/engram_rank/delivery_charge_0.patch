@@ -1,0 +1,80 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cca8021..06be661 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- `delivery_charge(customer_code, subtotal)` in `invoice.py`: £4.50 (450 pence) on a customer's order under £40.00 for a delivery day, before VAT. Nothing at £40.00 or over, for an order with no value, or for St Aidan's Primary.
+ - `OrderBook.add` raises `ValueError` for a product code not in the catalog, instead of dropping the line. `load_orders` raises the same way.
+ - `OrderBook.total_for(day, product_code)` and `OrderBook.customers_for(day)`.
+ - `Product.allergen_text()`, the allergens sorted and joined with `', '`.
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index a80e205..360bcb8 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -52,6 +52,23 @@ def invoice_for(orderbook, customer, day):
+     return Invoice(customer, day, lines)
+ 
+ 
++DELIVERY_CHARGE = 450  # pence: £4.50
++DELIVERY_CHARGE_BELOW = 4000  # pence: orders under £40.00 pay the charge
++DELIVERY_CHARGE_EXEMPT = {"AIDAN"}  # St Aidan's Primary: the contract price already includes delivery
++
++
++def delivery_charge(customer_code, subtotal):
++    """Delivery charge in pence for one customer's order for one delivery day, before VAT.
++
++    `subtotal` is the value in pence of that order before VAT. Orders under £40.00 pay £4.50;
++    an order of £40.00 or more pays nothing, and so does an order with no value. St Aidan's
++    Primary never pays it.
++    """
++    if customer_code in DELIVERY_CHARGE_EXEMPT or not 0 < subtotal < DELIVERY_CHARGE_BELOW:
++        return 0
++    return DELIVERY_CHARGE
++
++
+ def invoice_number(year, seq):
+     """Invoice number such as 'LK-2026-0001': the year, then a running number that restarts each year."""
+     if not 1 <= seq <= 9999:
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 7731b15..2accae8 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, sale_or_return_credit
++from bakehouse.invoice import Invoice, InvoiceLine, delivery_charge, format_pence, invoice_for, invoice_number, sale_or_return_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -64,6 +64,26 @@ class SaleOrReturnTest(unittest.TestCase):
+         self.assertEqual(sale_or_return_credit("GREENWAY", "BAG", 95, delivered=50, returned=3), 0)
+ 
+ 
++class DeliveryChargeTest(unittest.TestCase):
++    def test_charged_under_forty_pounds(self):
++        self.assertEqual(delivery_charge("LUMEN", 3999), 450)
++
++    def test_charged_on_small_order(self):
++        self.assertEqual(delivery_charge("GREENWAY", 1), 450)
++
++    def test_not_charged_at_forty_pounds(self):
++        self.assertEqual(delivery_charge("LUMEN", 4000), 0)
++
++    def test_not_charged_over_forty_pounds(self):
++        self.assertEqual(delivery_charge("GREENWAY", 12345), 0)
++
++    def test_no_order_no_charge(self):
++        self.assertEqual(delivery_charge("LUMEN", 0), 0)
++
++    def test_st_aidans_never_pays(self):
++        self.assertEqual(delivery_charge("AIDAN", 100), 0)
++
++
+ class InvoiceTest(unittest.TestCase):
+     def test_total(self):
+         invoice = Invoice("LUMEN", datetime.date(2026, 10, 20), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)])

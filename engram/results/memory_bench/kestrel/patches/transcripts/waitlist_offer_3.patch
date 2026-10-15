@@ -1,0 +1,55 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9e5da12..57cf73b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - `Calendar.move(appointment_id, new_start)` reschedules a booked appointment. The new start must be timezone-aware.
+ - `therapist_load(calendar, week_start)` counts booked appointments per therapist for each clinic-local day of a week.
+ - `Waitlist` holds patients waiting for an appointment, with `add`, `remove` and `entries`.
++- `Waitlist.next_for(kind)` returns the entry to offer a freed slot of that kind to (urgent first, then request order), or `None` if nobody is waiting for that kind.
+ - `python -m kestrel day THERAPIST_ID DATE --data kestrel.json` prints a therapist's booked appointments on a local date.
+ - `python -m kestrel patients --data kestrel.json` prints patient IDs and names, sorted by ID.
+ - Storage writes atomically: data goes to a temporary file in the same directory, which then replaces the old file. A crash or failed write leaves the previous file intact. Saved files are now owner-only (mode 0600).
+diff --git a/src/kestrel/waitlist.py b/src/kestrel/waitlist.py
+index aaedc0c..96dbaf0 100644
+--- a/src/kestrel/waitlist.py
++++ b/src/kestrel/waitlist.py
+@@ -35,3 +35,10 @@ class Waitlist:
+     def entries(self):
+         """Urgent entries first, then everyone else; each group in the order they asked."""
+         return sorted(self._entries.values(), key=lambda e: (not e.urgent, e.requested_at))
++
++    def next_for(self, kind):
++        """The entry to offer a freed slot of this kind to, or None if nobody is waiting for it."""
++        for entry in self.entries():
++            if entry.kind == kind:
++                return entry
++        return None
+diff --git a/tests/test_waitlist.py b/tests/test_waitlist.py
+index d4dfb3c..45070b9 100644
+--- a/tests/test_waitlist.py
++++ b/tests/test_waitlist.py
+@@ -61,6 +61,23 @@ class WaitlistTest(unittest.TestCase):
+         wl.add(entry("KP-000001", utc(2027, 3, 2, 9)))
+         self.assertEqual(len(wl.entries()), 1)
+ 
++    def test_next_for_picks_urgent_then_request_order_within_kind(self):
++        wl = Waitlist()
++        wl.add(entry("KP-000001", utc(2027, 3, 1, 9), kind="assessment"))
++        wl.add(entry("KP-000002", utc(2027, 3, 1, 8), kind="followup"))
++        wl.add(entry("KP-000003", utc(2027, 3, 1, 10), kind="followup", urgent=True))
++        wl.add(entry("KP-000004", utc(2027, 3, 1, 7), kind="followup"))
++        self.assertEqual(wl.next_for("followup").patient_id, "KP-000003")
++        wl.remove("KP-000003")
++        self.assertEqual(wl.next_for("followup").patient_id, "KP-000004")
++        self.assertEqual(wl.next_for("assessment").patient_id, "KP-000001")
++
++    def test_next_for_none_when_nobody_waiting_for_kind(self):
++        wl = Waitlist()
++        wl.add(entry("KP-000001", utc(2027, 3, 1, 9), kind="followup"))
++        self.assertIsNone(wl.next_for("assessment"))
++        self.assertIsNone(Waitlist().next_for("followup"))
++
+     def test_empty(self):
+         self.assertEqual(Waitlist().entries(), [])
+ 

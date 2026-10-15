@@ -1,0 +1,53 @@
+diff --git a/src/bakehouse/recipes.py b/src/bakehouse/recipes.py
+new file mode 100644
+index 0000000..bcbf7ce
+--- /dev/null
++++ b/src/bakehouse/recipes.py
+@@ -0,0 +1,13 @@
++"""Recipes: ingredient weights expressed relative to the flour."""
++
++
++def baker_percentages(recipe):
++    """{ingredient: percentage of total flour weight}, rounded to one decimal.
++
++    `recipe` maps ingredient names to grams. Any ingredient whose name contains
++    'flour' (any case) counts as flour.
++    """
++    flour_g = sum(grams for name, grams in recipe.items() if "flour" in name.lower())
++    if flour_g <= 0:
++        raise ValueError("recipe has no flour to base the percentages on")
++    return {name: round(100 * grams / flour_g, 1) for name, grams in recipe.items()}
+diff --git a/tests/test_recipes.py b/tests/test_recipes.py
+new file mode 100644
+index 0000000..a64cc02
+--- /dev/null
++++ b/tests/test_recipes.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from bakehouse.recipes import baker_percentages
++
++
++class BakerPercentagesTest(unittest.TestCase):
++    def test_percentages_are_of_total_flour(self):
++        recipe = {"Strong White Flour": 500, "Wholemeal Flour": 100, "Water": 375, "Salt": 10}
++        self.assertEqual(
++            baker_percentages(recipe),
++            {"Strong White Flour": 83.3, "Wholemeal Flour": 16.7, "Water": 62.5, "Salt": 1.7},
++        )
++
++    def test_flour_is_matched_case_insensitively(self):
++        recipe = {"FLOUR": 200, "water": 100}
++        self.assertEqual(baker_percentages(recipe), {"FLOUR": 100.0, "water": 50.0})
++
++    def test_no_flour_raises(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"Water": 300, "Salt": 10})
++
++    def test_zero_flour_raises(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"Flour": 0, "Water": 300})
++
++
++if __name__ == "__main__":
++    unittest.main()

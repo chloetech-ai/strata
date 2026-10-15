@@ -1,0 +1,96 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f6b1d49..385cedb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,7 @@
+ - Booking errors are now `BookingError` subclasses (`SlotTaken`, `OutsideOpeningHours`) with receptionist-facing messages, instead of `ValueError`.
+ - Each therapist needs a 10-minute gap before and after every appointment (`schedule.BUFFER`).
+ - Fixed overlap check missing appointments that start before an existing one and run into it.
++- `Schedule.is_fully_booked(therapist, day)` is true once a therapist has `schedule.MAX_TREATMENTS_PER_DAY` (7) active appointments that day. For the online booking page only; `book()` does not enforce it.
+ - Client register (`clients.Client`, `clients.ClientBook`). Phone lookup ignores formatting and matches `079…`, `+41…` and `0041…` notations of the same number.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 2cb49ff..7b2d56e 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,10 @@ from .model import TREATMENTS
+ # Time a therapist needs between two appointments to clean up and write notes.
+ BUFFER = datetime.timedelta(minutes=10)
+ 
++# Therapists' contracts allow at most this many treatments a day. Only the
++# online booking page enforces it; reception may exceed it case by case.
++MAX_TREATMENTS_PER_DAY = 7
++
+ 
+ class Schedule:
+     def __init__(self):
+@@ -58,6 +62,15 @@ class Schedule:
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True if `therapist` already has MAX_TREATMENTS_PER_DAY active appointments on `day`.
++
++        For the online booking page, which greys out such days. Cancelled
++        appointments do not count.
++        """
++        active = [a for a in self.appointments_for(therapist, day) if not a.cancelled]
++        return len(active) >= MAX_TREATMENTS_PER_DAY
++
+     def week(self, therapist, monday):
+         """`therapist`'s active appointments for the week starting on `monday`.
+ 
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 0b39970..84db34f 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -3,7 +3,7 @@ import unittest
+ 
+ from slotwise.errors import BookingError, OutsideOpeningHours, SlotTaken
+ from slotwise.model import Appointment
+-from slotwise.schedule import Schedule
++from slotwise.schedule import MAX_TREATMENTS_PER_DAY, Schedule
+ 
+ 
+ def at(hour, minute=0, therapist="lena", treatment="standard", client="Kim Weber"):
+@@ -125,6 +125,39 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().week("lena", datetime.date(2026, 9, 8))
+ 
++    def book_day(self, s, count, therapist="lena"):
++        # 45-minute treatments with the 10-minute buffer: one starts every 55 minutes from 08:00
++        for i in range(count):
++            start = datetime.datetime(2026, 9, 8, 8, 0) + datetime.timedelta(minutes=55 * i)
++            s.book(Appointment(therapist, f"Client {i}", start))
++
++    def test_not_fully_booked_below_limit(self):
++        s = Schedule()
++        self.book_day(s, MAX_TREATMENTS_PER_DAY - 1)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_fully_booked_at_limit(self):
++        s = Schedule()
++        self.book_day(s, MAX_TREATMENTS_PER_DAY)
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_fully_booked_is_per_therapist_and_day(self):
++        s = Schedule()
++        self.book_day(s, MAX_TREATMENTS_PER_DAY)
++        self.assertFalse(s.is_fully_booked("marco", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 9)))
++
++    def test_cancelled_does_not_count_towards_fully_booked(self):
++        s = Schedule()
++        self.book_day(s, MAX_TREATMENTS_PER_DAY)
++        s.cancel(s.appointments[0].id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_book_does_not_enforce_daily_limit(self):
++        s = Schedule()
++        self.book_day(s, MAX_TREATMENTS_PER_DAY + 1)
++        self.assertEqual(len(s.appointments_for("lena", datetime.date(2026, 9, 8))), MAX_TREATMENTS_PER_DAY + 1)
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

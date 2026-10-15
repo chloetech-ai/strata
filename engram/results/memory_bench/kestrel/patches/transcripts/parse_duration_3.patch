@@ -1,0 +1,64 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..ce6174d
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,19 @@
++"""Reading durations typed in by reception."""
++
++import re
++
++_DURATION = re.compile(r"(?:(\d+)m|(\d+)h(?:\s*(\d+)m?)?)")
++
++
++def parse_duration(text):
++    """Turn a duration such as '45m', '1h', '1h30' or '1h 30m' into minutes."""
++    match = _DURATION.fullmatch(text.strip())
++    if match is None:
++        raise ValueError(f"not a duration: {text!r}")
++    minutes, hours, rest = match.groups()
++    if minutes is not None:
++        return int(minutes)
++    extra = int(rest) if rest is not None else 0
++    if extra >= 60:
++        raise ValueError(f"minutes must be under 60 after hours: {text!r}")
++    return int(hours) * 60 + extra
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..688971a
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,33 @@
++import unittest
++
++from kestrel.intervals import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes_only(self):
++        self.assertEqual(parse_duration("45m"), 45)
++
++    def test_hours_only(self):
++        self.assertEqual(parse_duration("1h"), 60)
++
++    def test_hours_and_minutes_without_unit(self):
++        self.assertEqual(parse_duration("1h30"), 90)
++
++    def test_hours_and_minutes_with_space(self):
++        self.assertEqual(parse_duration("1h 30m"), 90)
++
++    def test_hours_and_minutes_with_unit(self):
++        self.assertEqual(parse_duration("1h30m"), 90)
++
++    def test_surrounding_whitespace(self):
++        self.assertEqual(parse_duration(" 45m "), 45)
++
++    def test_rejects_other_input(self):
++        for text in ["", "45", "m", "h", "1h60", "1h 90m", "-45m", "1.5h", "45 m", "1d", "abc"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

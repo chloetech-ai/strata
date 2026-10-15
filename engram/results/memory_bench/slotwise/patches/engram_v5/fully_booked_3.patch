@@ -1,0 +1,69 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 157729f..c4d8ebf 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,9 @@ from .model import TREATMENTS
+ # minutes a therapist needs between appointments to clean up and write notes
+ GAP = datetime.timedelta(minutes=10)
+ 
++# therapists' contracts allow at most this many treatments a day
++DAILY_CAP = 7
++
+ 
+ class Schedule:
+     def __init__(self):
+@@ -49,6 +52,14 @@ class Schedule:
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True if `therapist` has reached the daily cap of non-cancelled appointments on `day`.
++
++        Only used by the online booking page to grey out days. `book()` does not enforce the cap.
++        """
++        active = [a for a in self.appointments_for(therapist, day) if not a.cancelled]
++        return len(active) >= DAILY_CAP
++
+     def week(self, therapist, monday):
+         """`therapist`'s active appointments for the seven days from `monday`, keyed by date."""
+         if monday.weekday() != 0:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 338558b..e4cc001 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -107,6 +107,35 @@ class ScheduleTest(unittest.TestCase):
+         s.book(at(10, therapist="marco"))
+         self.assertEqual([a.start.hour for a in s.appointments_for("lena", datetime.date(2026, 9, 8))], [8, 14])
+ 
++    def test_fully_booked_at_seven_appointments(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        for hour in range(8, 15):  # seven appointments, one per hour
++            s.book(at(hour))
++        self.assertTrue(s.is_fully_booked("lena", day))
++        self.assertFalse(s.is_fully_booked("marco", day))
++
++    def test_six_appointments_is_not_fully_booked(self):
++        s = Schedule()
++        for hour in range(8, 14):
++            s.book(at(hour))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_cancelled_appointments_do_not_count_towards_full(self):
++        s = Schedule()
++        first = s.book(at(8))
++        for hour in range(9, 15):
++            s.book(at(hour))
++        s.cancel(first.id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_book_still_accepts_appointments_past_the_cap(self):
++        s = Schedule()
++        for hour in range(8, 16):  # eight appointments
++            s.book(at(hour))
++        self.assertEqual(len(s.appointments_for("lena", datetime.date(2026, 9, 8))), 8)
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

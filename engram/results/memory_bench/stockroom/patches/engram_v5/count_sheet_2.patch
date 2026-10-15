@@ -1,0 +1,98 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index f707cf8..0e171a2 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -8,6 +8,12 @@
+   "tests/test_cli.py::CliTest::test_receive_creates_log_and_onhand_reads_it",
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity_and_leaves_log_alone",
+   "tests/test_cli.py::CliTest::test_receive_writes_receipt_reason",
++  "tests/test_countsheet.py::CountSheetTest::test_counted_column_is_blank",
++  "tests/test_countsheet.py::CountSheetTest::test_does_not_print_on_hand",
++  "tests/test_countsheet.py::CountSheetTest::test_empty_catalog_gives_empty_sheet",
++  "tests/test_countsheet.py::CountSheetTest::test_one_line_per_item",
++  "tests/test_countsheet.py::CountSheetTest::test_requires_catalog",
++  "tests/test_countsheet.py::CountSheetTest::test_walking_order_by_location_then_sku",
+   "tests/test_inventory.py::InventoryTest::test_messy_sku_is_same_item",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..d9d0a7d
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,16 @@
++"""Printable blind count sheet for the stock-take."""
++
++
++def count_sheet(inventory):
++    """One line per catalog item, in walking order (bin location, then SKU).
++
++    The sheet deliberately leaves out the on-hand quantity so the count is
++    blind; each line ends with an empty column for the counted quantity.
++    """
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog")
++    items = sorted(inventory.catalog, key=lambda item: (item.location, item.sku))
++    lines = []
++    for item in items:
++        lines.append(f"{item.location:<10}  {item.sku:<12}  {item.name:<30}  {item.unit:<6}  ________")
++    return "\n".join(lines)
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..1c1101d
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,53 @@
++import datetime
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++DAY = datetime.date(2026, 9, 1)
++
++
++def make_inventory():
++    catalog = Catalog([
++        Item("BR-1042", "Hex bolt M8", "C-03-1", reorder_point=5),
++        Item("BR-2001", "Washer M8", "B-12-3"),
++        Item("BR-1007", "Lock nut M8", "B-12-3"),
++    ])
++    inv = Inventory(catalog)
++    inv.receive("BR-1042", 40, 12, DAY)
++    return inv
++
++
++class CountSheetTest(unittest.TestCase):
++    def test_one_line_per_item(self):
++        lines = count_sheet(make_inventory()).split("\n")
++        self.assertEqual(len(lines), 3)
++
++    def test_walking_order_by_location_then_sku(self):
++        lines = count_sheet(make_inventory()).split("\n")
++        self.assertTrue(lines[0].startswith("B-12-3"))
++        self.assertIn("BR-1007", lines[0])
++        self.assertIn("BR-2001", lines[1])
++        self.assertTrue(lines[2].startswith("C-03-1"))
++
++    def test_does_not_print_on_hand(self):
++        inv = make_inventory()
++        text = count_sheet(inv)
++        self.assertNotIn("40", text)
++        self.assertNotIn("on hand", text.lower())
++
++    def test_counted_column_is_blank(self):
++        for line in count_sheet(make_inventory()).split("\n"):
++            self.assertTrue(line.endswith("________"))
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++    def test_requires_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,144 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index f707cf8..0abe15b 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -30,5 +30,14 @@
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
+   "tests/test_storage.py::StorageTest::test_old_file_without_reason_column_infers_reason_from_sign",
+-  "tests/test_storage.py::StorageTest::test_roundtrip"
++  "tests/test_storage.py::StorageTest::test_roundtrip",
++  "tests/test_valuation.py::StockValueTest::test_empty_is_zero",
++  "tests/test_valuation.py::StockValueTest::test_issue_spans_layers",
++  "tests/test_valuation.py::StockValueTest::test_issue_takes_oldest_layer_first",
++  "tests/test_valuation.py::StockValueTest::test_negative_stock_is_absorbed_by_next_receipt",
++  "tests/test_valuation.py::StockValueTest::test_negative_stock_values_nothing",
++  "tests/test_valuation.py::StockValueTest::test_other_skus_ignored",
++  "tests/test_valuation.py::StockValueTest::test_receipt_without_cost_is_rejected",
++  "tests/test_valuation.py::StockValueTest::test_single_receipt",
++  "tests/test_valuation.py::StockValueTest::test_sku_is_normalized"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..7db817b
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,41 @@
++"""What stock is worth, costed FIFO."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand, costed FIFO.
++
++    Each receipt opens a cost layer. Issues consume the oldest layers first,
++    so what is left on hand is valued at the most recent costs. Issues that
++    exceed the stock received so far (negative stock) are carried forward and
++    absorb the next receipts, so they are costed against the stock that
++    actually arrived after them.
++    """
++    sku = normalize_sku(sku)
++    layers = deque()  # [qty, unit_cost in cents], oldest first
++    shortfall = 0  # units issued before there was stock to issue them from
++
++    for m in inventory.movements_for(sku):
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"cannot cost {sku} movement of {m.qty} without a unit cost")
++            qty = m.qty
++            absorbed = min(shortfall, qty)
++            shortfall -= absorbed
++            qty -= absorbed
++            if qty:
++                layers.append([qty, m.unit_cost])
++        else:
++            remaining = -m.qty
++            while remaining and layers:
++                take = min(remaining, layers[0][0])
++                layers[0][0] -= take
++                remaining -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            shortfall += remaining
++
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..6b03f9a
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,70 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_issue_takes_oldest_layer_first(self):
++        # FIFO: the 3 sold leave the 10 @ 12 layer, so 7 @ 12 + 10 @ 20 remain (284).
++        # Average cost would value the 17 units at 16 each (272).
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 20, DAY)
++        inv.issue("BR-1042", 3, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 7 * 12 + 10 * 20)
++
++    def test_issue_spans_layers(self):
++        # 10 @ 12 and 5 @ 20 are sold, leaving 5 @ 20.
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 20, DAY)
++        inv.issue("BR-1042", 15, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 20)
++
++    def test_negative_stock_is_absorbed_by_next_receipt(self):
++        # Sold 8 when only 5 were in: the 3 short are the first 3 of the 200 receipt.
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, DAY)
++        inv.issue("BR-1042", 8, DAY)
++        inv.receive("BR-1042", 5, 200, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 2 * 200)
++
++    def test_negative_stock_values_nothing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, DAY)
++        inv.issue("BR-1042", 8, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive("br-1042", 4, 25, DAY)
++        self.assertEqual(stock_value(inv, " BR-1042 "), 100)
++        self.assertEqual(stock_value(inv, "Br-1042"), 100)
++
++    def test_other_skus_ignored(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 4, 25, DAY)
++        inv.receive("BR-2210", 9, 30, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 100)
++
++    def test_receipt_without_cost_is_rejected(self):
++        inv = Inventory()
++        inv._record(Movement("BR-1042", 5, DAY, "RECEIPT"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

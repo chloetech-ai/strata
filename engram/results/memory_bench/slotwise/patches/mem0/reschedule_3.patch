@@ -1,0 +1,131 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 28b672a..5ebb67e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ - `Client` and `ClientBook` (`add`, `find_by_phone`) form the client register. `ClientBook.search(text)` finds clients whose name contains the text, ignoring case. Phone numbers are compared as international digits, so '079 123 45 67', '+41 79 123 45 67' and '0041791234567' find the same client.
+ - `Schedule.cancel(appointment_id)` marks an appointment as cancelled (kept for fees) and frees its slot. Saved files without the field load as not cancelled.
++- `Schedule.reschedule(appointment_id, new_start)` moves an appointment to a new start time. The new time gets the same checks as booking, and if it fails the appointment stays where it was. Cancelled appointments cannot be moved.
+ - Booking errors are now `BookingError` subclasses (`SlotTaken`, `OutsideOpeningHours`) with receptionist-facing messages, replacing `ValueError`.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 47b4f7f..c1666c7 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -1,5 +1,6 @@
+ """Booking appointments."""
+ 
++import dataclasses
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SlotTaken
+@@ -20,17 +21,35 @@ class Schedule:
+         The therapist must also have a CHANGEOVER gap before and after the appointment.
+         Raises BookingError (or a subclass) if it cannot be booked.
+         """
++        self._check(appointment)
++        self.appointments.append(appointment)
++        return appointment
++
++    def reschedule(self, appointment_id, new_start):
++        """Moves the appointment to `new_start`, keeping its therapist, client and treatment.
++
++        The new time must pass the same checks as booking, ignoring the appointment's
++        old time. If it fails, the appointment stays where it was.
++        Raises BookingError (or a subclass) if it cannot be moved.
++        """
++        appointment = self.get(appointment_id)
++        if appointment.cancelled:
++            raise BookingError("This appointment has been cancelled, so it cannot be moved.")
++        self._check(dataclasses.replace(appointment, start=new_start), ignore=appointment)
++        appointment.start = new_start
++        return appointment
++
++    def _check(self, appointment, ignore=None):
++        """Raises BookingError if `appointment` cannot be placed. `ignore` is skipped in the overlap check."""
+         if appointment.treatment not in TREATMENTS:
+             raise BookingError(f"We don't offer the treatment '{appointment.treatment}'.")
+         if not is_open_between(appointment.start, appointment.end):
+             raise OutsideOpeningHours()
+         for other in self.appointments:
+-            if other.cancelled or other.therapist != appointment.therapist:
++            if other is ignore or other.cancelled or other.therapist != appointment.therapist:
+                 continue
+             if appointment.start < other.end + CHANGEOVER and other.start < appointment.end + CHANGEOVER:
+                 raise SlotTaken(appointment.therapist)
+-        self.appointments.append(appointment)
+-        return appointment
+ 
+     def get(self, appointment_id):
+         for appointment in self.appointments:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index f6ba16b..239df9e 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -98,6 +98,64 @@ class ScheduleTest(unittest.TestCase):
+         self.assertEqual([a.start.hour for a in week[datetime.date(2026, 9, 12)]], [9])
+         self.assertEqual(week[datetime.date(2026, 9, 9)], [])
+ 
++    def test_reschedule_moves_appointment(self):
++        s = Schedule()
++        a = s.book(at(9))
++        moved = s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertIs(moved, a)
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual((a.therapist, a.client, a.treatment), ("lena", "Kim Weber", "standard"))
++        self.assertEqual(len(s.appointments), 1)
++
++    def test_reschedule_frees_old_slot(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        s.book(at(9, client="Jo Li"))
++        self.assertEqual(len(s.appointments), 2)
++
++    def test_reschedule_to_same_time_is_allowed(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 9, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_onto_taken_slot_keeps_old_time(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(11, client="Jo Li"))
++        with self.assertRaises(SlotTaken):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_respects_changeover(self):
++        s = Schedule()
++        a = s.book(at(9))  # 09:00-09:45
++        s.book(at(11, client="Jo Li"))  # 11:00-11:45
++        with self.assertRaises(SlotTaken):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 10, 55))  # ends 5 min before 11:00
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 10, 0))  # 10:00-10:45, 15 min gap: fine
++
++    def test_reschedule_outside_opening_hours_keeps_old_time(self):
++        s = Schedule()
++        a = s.book(at(9))
++        with self.assertRaises(OutsideOpeningHours):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 18, 30))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_cancelled_is_refused(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        with self.assertRaises(BookingError):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_unknown_id(self):
++        s = Schedule()
++        with self.assertRaises(KeyError):
++            s.reschedule(999999, datetime.datetime(2026, 9, 8, 11, 0))
++
+     def test_cancel_unknown_id(self):
+         s = Schedule()
+         with self.assertRaises(KeyError):

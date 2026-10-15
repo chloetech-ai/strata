@@ -1,0 +1,146 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index cdcf6fb..60874e8 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -25,6 +25,14 @@
+   "tests/test_schedule.py::ScheduleTest::test_other_therapist_is_free",
+   "tests/test_schedule.py::ScheduleTest::test_outside_opening_hours",
+   "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_cancelled_appointment_is_rejected",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_ignores_cancelled_appointments",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_into_taken_slot_is_rejected_and_leaves_it_in_place",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_may_overlap_its_own_old_slot",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_moves_the_appointment",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_outside_opening_hours_is_rejected",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_respects_the_gap",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_unknown_id_is_a_key_error",
+   "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_ten_minute_gap_after_existing_is_required",
+   "tests/test_schedule.py::ScheduleTest::test_ten_minute_gap_before_existing_is_required",
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index f000d3a..240db1f 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -18,16 +18,36 @@ class Schedule:
+         """Adds `appointment` if the practice is open and the therapist is free, with GAP either side."""
+         if appointment.treatment not in TREATMENTS:
+             raise BookingError(f"We don't offer a '{appointment.treatment}' treatment.")
+-        if not is_open_between(appointment.start, appointment.end):
+-            raise OutsideOpeningHours(appointment.start, appointment.end)
++        self._check_slot(appointment.therapist, appointment.start, appointment.end)
++        self.appointments.append(appointment)
++        return appointment
++
++    def reschedule(self, appointment_id, new_start):
++        """Moves an existing appointment to `new_start`, keeping its treatment and therapist.
++
++        The same checks as `book` apply, and the appointment does not block its own old slot.
++        """
++        appointment = self.get(appointment_id)
++        if appointment.status == CANCELLED:
++            raise BookingError(
++                f"{appointment.client}'s appointment on {appointment.start:%d %b %Y} was cancelled "
++                "and cannot be moved. Please book a new appointment instead."
++            )
++        new_end = new_start + (appointment.end - appointment.start)
++        self._check_slot(appointment.therapist, new_start, new_end, ignore=appointment)
++        appointment.start = new_start
++        return appointment
++
++    def _check_slot(self, therapist, start, end, ignore=None):
++        """Raises if the practice is closed from `start` to `end`, or `therapist` is not free with GAP either side."""
++        if not is_open_between(start, end):
++            raise OutsideOpeningHours(start, end)
+         for other in self.appointments:
+-            if other.therapist != appointment.therapist or other.status == CANCELLED:
++            if other is ignore or other.therapist != therapist or other.status == CANCELLED:
+                 continue
+             # Overlap test with each appointment widened by GAP on both sides.
+-            if appointment.start - GAP < other.end and other.start < appointment.end + GAP:
+-                raise SlotTaken(appointment.therapist, appointment.start, appointment.end)
+-        self.appointments.append(appointment)
+-        return appointment
++            if start - GAP < other.end and other.start < end + GAP:
++                raise SlotTaken(therapist, start, end)
+ 
+     def get(self, appointment_id):
+         for appointment in self.appointments:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 1ee8d87..007dc00 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from slotwise.errors import OutsideOpeningHours, SlotTaken
++from slotwise.errors import BookingError, OutsideOpeningHours, SlotTaken
+ from slotwise.model import Appointment
+ from slotwise.schedule import Schedule
+ 
+@@ -105,6 +105,65 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(KeyError):
+             s.cancel(999999)
+ 
++    def test_reschedule_moves_the_appointment(self):
++        s = Schedule()
++        a = s.book(at(9))
++        moved = s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertIs(moved, a)
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.end, datetime.datetime(2026, 9, 8, 11, 45))
++        self.assertEqual(a.treatment, "standard")
++        self.assertEqual(len(s.appointments), 1)
++
++    def test_reschedule_may_overlap_its_own_old_slot(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 9, 5))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 5))
++
++    def test_reschedule_into_taken_slot_is_rejected_and_leaves_it_in_place(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(11, client="Jo Li"))
++        with self.assertRaises(SlotTaken):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_respects_the_gap(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(11, client="Jo Li"))
++        # new 10:10–10:55 leaves only 5 minutes before the existing 11:00
++        with self.assertRaises(SlotTaken):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 10, 10))
++
++    def test_reschedule_ignores_cancelled_appointments(self):
++        s = Schedule()
++        a = s.book(at(9))
++        b = s.book(at(11, client="Jo Li"))
++        s.cancel(b.id)
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 11, 0))
++
++    def test_reschedule_outside_opening_hours_is_rejected(self):
++        s = Schedule()
++        a = s.book(at(9))
++        with self.assertRaises(OutsideOpeningHours):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 18, 30))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_cancelled_appointment_is_rejected(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        with self.assertRaises(BookingError):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_unknown_id_is_a_key_error(self):
++        with self.assertRaises(KeyError):
++            Schedule().reschedule(999999, datetime.datetime(2026, 9, 8, 11, 0))
++
+     def test_week_groups_by_day_in_time_order(self):
+         s = Schedule()
+         s.book(at(14))

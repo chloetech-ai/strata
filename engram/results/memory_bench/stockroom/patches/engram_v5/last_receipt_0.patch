@@ -1,0 +1,38 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index d1dff89..2d04cfc 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -55,3 +55,10 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The most recent RECEIPT movement for `sku`, or None if there is none."""
++        for m in reversed(self.movements_for(sku)):
++            if m.reason == "RECEIPT":
++                return m
++        return None
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 28152fa..f41b865 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -59,6 +59,18 @@ class InventoryTest(unittest.TestCase):
+         inv.issue("BR-1042", 4, DAY)
+         self.assertEqual([m.qty for m in inv.movements_for("BR-1042")], [10, -4])
+ 
++    def test_last_receipt(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        first = inv.receive("BR-1042", 10, 12, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), first)
++        inv.issue("BR-1042", 4, DAY)
++        self.assertIs(inv.last_receipt(" br-1042"), first)
++        second = inv.receive("br-1042 ", 5, 13, DAY)
++        inv.issue("BR-1042", 2, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), second)
++        self.assertIsNone(inv.last_receipt("BR-2210"))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,64 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..7091d53
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,24 @@
++"""Inventory analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B, or C by their share of total annual consumption.
++
++    `values` maps SKU to annual consumption value. SKUs are walked from highest
++    to lowest value with a running total; a SKU is 'A' while the cumulative
++    share through it is at most 80% of the grand total, 'B' while it is at most
++    95%, and 'C' otherwise.
++    """
++    total = sum(values.values())
++    ranked = sorted(values, key=lambda sku: values[sku], reverse=True)
++    classes = {}
++    running = 0
++    for sku in ranked:
++        running += values[sku]
++        if running <= 0.8 * total:
++            classes[sku] = "A"
++        elif running <= 0.95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..3153e00
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_boundaries_are_inclusive(self):
++        # Running shares: 50%, 80%, 95%, 100% of a total of 100.
++        values = {"BR-1": 5, "BR-2": 15, "BR-3": 30, "BR-4": 50}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-4": "A", "BR-3": "A", "BR-2": "B", "BR-1": "C"},
++        )
++
++    def test_crossing_sku_goes_to_next_class(self):
++        # Running shares: 60%, 90%, 100%. The second SKU crosses 80%, so it is B.
++        values = {"BR-1": 60, "BR-2": 30, "BR-3": 10}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "B", "BR-3": "C"},
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()

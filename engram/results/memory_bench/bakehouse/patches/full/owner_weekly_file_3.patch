@@ -1,0 +1,101 @@
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index ecd6081..38f7aaa 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,7 @@
+ """Reports on a delivery day, for the people who read them."""
+ 
++import csv
++import datetime
+ from collections import Counter
+ 
+ 
+@@ -16,10 +18,37 @@ def top_products(orderbook, start, end, n=5):
+     return [code for code, _ in ranked[:n]]
+ 
+ 
+-def day_summary(orderbook, day):
+-    """{customer code: order value in pence} for everything delivered on `day`, before VAT."""
++def _value_by_customer(orderbook, start, end):
++    """{customer code: order value in pence} for deliveries from `start` to `end` inclusive, before VAT."""
+     totals = {}
+-    for line in orderbook.for_day(day):
+-        price = orderbook.catalog.get(line.product).price
+-        totals[line.customer] = totals.get(line.customer, 0) + line.qty * price
++    for line in orderbook:
++        if start <= line.day <= end:
++            price = orderbook.catalog.get(line.product).price
++            totals[line.customer] = totals.get(line.customer, 0) + line.qty * price
+     return totals
++
++
++def day_summary(orderbook, day):
++    """{customer code: order value in pence} for everything delivered on `day`, before VAT."""
++    return _value_by_customer(orderbook, day, day)
++
++
++def _decimal_comma(pence):
++    """Pounds with a comma before the pence, as German Excel expects: 1234 gives '12,34'."""
++    pounds, rest = divmod(pence, 100)
++    return f"{pounds},{rest:02d}"
++
++
++def week_totals_file(orderbook, week_start, path):
++    """Writes one row per customer with their order total in pounds for the seven days from `week_start`.
++
++    Semicolon-separated with a comma decimal separator, for German-set Excel. The file starts with a
++    byte-order mark so accented names open correctly.
++    """
++    week_end = week_start + datetime.timedelta(days=6)
++    totals = _value_by_customer(orderbook, week_start, week_end)
++    with open(path, "w", newline="", encoding="utf-8-sig") as f:
++        writer = csv.writer(f, delimiter=";")
++        writer.writerow(["Customer", "Total"])
++        for code in sorted(totals):
++            writer.writerow([code, _decimal_comma(totals[code])])
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index ab3747f..021cb40 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -1,13 +1,40 @@
++import csv
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def test_semicolons_decimal_comma_and_bom(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320), Product("CRO", "Croissant", 110)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY + datetime.timedelta(days=6), "LUMEN", "CRO", 24),
++            OrderLine(DAY + datetime.timedelta(days=7), "LUMEN", "CRO", 100),
++            OrderLine(DAY, "AIDAN", "CRO", 5),
++        ])
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "week.csv")
++            week_totals_file(book, DAY, path)
++            with open(path, "rb") as f:
++                raw = f.read()
++            with open(path, encoding="utf-8-sig", newline="") as f:
++                rows = list(csv.reader(f, delimiter=";"))
++        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
++        self.assertEqual(rows, [
++            ["Customer", "Total"],
++            ["AIDAN", "5,50"],
++            ["LUMEN", "45,60"],
++        ])
++
++
+ class TopProductsTest(unittest.TestCase):
+     def test_most_units_first_within_the_range(self):
+         catalog = Catalog([Product(c, c, 100) for c in ("SOU", "CRO", "BAG", "RYE")])

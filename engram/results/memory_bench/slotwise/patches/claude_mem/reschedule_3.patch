@@ -1,0 +1,146 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index d770a02..0bf33f7 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -24,6 +24,14 @@
+   "tests/test_schedule.py::ScheduleTest::test_other_therapist_is_free",
+   "tests/test_schedule.py::ScheduleTest::test_outside_opening_hours",
+   "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_cancelled_raises",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_frees_old_slot",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_into_taken_slot_leaves_it_unchanged",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_may_overlap_its_own_old_slot",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_moves_and_keeps_id",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_needs_break_from_others",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_outside_opening_hours_leaves_it_unchanged",
++  "tests/test_schedule.py::ScheduleTest::test_reschedule_unknown_appointment_raises",
+   "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_week_has_every_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_week_leaves_out_cancelled",
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 33d507c..fde4ef0 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -16,24 +16,37 @@ class Schedule:
+ 
+     def book(self, appointment):
+         """Adds `appointment` if the practice is open and the therapist is free, with a break either side."""
++        self._check(appointment, appointment.start)
++        self.appointments.append(appointment)
++        return appointment
++
++    def reschedule(self, appointment_id, new_start):
++        """Moves an appointment to `new_start`, keeping its id. If the new time is refused, nothing changes."""
++        appointment = self.get(appointment_id)
++        if appointment.cancelled:
++            raise BookingError("This appointment is cancelled, so it can't be moved. Book a new one instead.")
++        self._check(appointment, new_start, ignore=appointment)
++        appointment.start = new_start
++        return appointment
++
++    def _check(self, appointment, start, ignore=None):
++        """Raises a BookingError if `appointment` can't start at `start`. `ignore` is left out of the clash check."""
+         if appointment.treatment not in TREATMENTS:
+             raise BookingError(f"We don't offer a treatment called '{appointment.treatment}'.")
+-        if not is_open_between(appointment.start, appointment.end):
++        end = start + datetime.timedelta(minutes=appointment.minutes)
++        if not is_open_between(start, end):
+             raise OutsideOpeningHours(
+-                f"The practice is closed at {appointment.start:%H:%M} on "
+-                f"{appointment.start:%A} {appointment.start.day} {appointment.start:%B}."
++                f"The practice is closed at {start:%H:%M} on {start:%A} {start.day} {start:%B}."
+             )
+         for other in self.appointments:
+-            if other.therapist != appointment.therapist or other.cancelled:
++            if other is ignore or other.therapist != appointment.therapist or other.cancelled:
+                 continue
+             # Overlapping, once each appointment is extended by the break on its end.
+-            if appointment.start < other.end + BREAK and other.start < appointment.end + BREAK:
++            if start < other.end + BREAK and other.start < end + BREAK:
+                 raise SlotTaken(
+                     f"{appointment.therapist.capitalize()} has an appointment at {other.start:%H:%M} "
+                     "and needs a 10-minute break between appointments. Please choose another time."
+                 )
+-        self.appointments.append(appointment)
+-        return appointment
+ 
+     def get(self, appointment_id):
+         for appointment in self.appointments:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index f8120fe..155c407 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from slotwise.errors import OutsideOpeningHours, SlotTaken
++from slotwise.errors import BookingError, OutsideOpeningHours, SlotTaken
+ from slotwise.model import Appointment
+ from slotwise.schedule import Schedule
+ 
+@@ -91,6 +91,64 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(KeyError):
+             s.cancel(-1)
+ 
++    def test_reschedule_moves_and_keeps_id(self):
++        s = Schedule()
++        a = s.book(at(9))
++        moved = s.reschedule(a.id, datetime.datetime(2026, 9, 9, 14, 0))
++        self.assertIs(moved, a)
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 9, 14, 0))
++        self.assertEqual(a.client, "Kim Weber")
++        self.assertIs(s.get(a.id), a)
++
++    def test_reschedule_frees_old_slot(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.reschedule(a.id, datetime.datetime(2026, 9, 9, 14, 0))
++        s.book(at(9, client="Jo Li"))
++        self.assertEqual(len(s.appointments), 2)
++
++    def test_reschedule_may_overlap_its_own_old_slot(self):
++        s = Schedule()
++        a = s.book(at(9))  # 09:00-09:45
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 9, 5))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 5))
++
++    def test_reschedule_into_taken_slot_leaves_it_unchanged(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(14, client="Jo Li"))
++        with self.assertRaises(SlotTaken):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 14, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_needs_break_from_others(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(14, client="Jo Li"))  # ends 14:45
++        with self.assertRaises(SlotTaken):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 14, 50))
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 14, 55))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 14, 55))
++
++    def test_reschedule_outside_opening_hours_leaves_it_unchanged(self):
++        s = Schedule()
++        a = s.book(at(9))
++        with self.assertRaises(OutsideOpeningHours):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 18, 30))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_cancelled_raises(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        with self.assertRaises(BookingError):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 14, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_unknown_appointment_raises(self):
++        with self.assertRaises(KeyError):
++            Schedule().reschedule(-1, datetime.datetime(2026, 9, 8, 9, 0))
++
+     def test_week_has_every_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

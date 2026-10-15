@@ -1,0 +1,84 @@
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..e0ea861
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,17 @@
++"""The van's run: which drops to make on a delivery day, in driving order."""
++
++# Greenway Grocers opens at 7:00 and needs bread on its shelves before then, so it is always first.
++FIRST_DROP = "GREENWAY"
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes the van's drops for `day` to `path`, one per line, in driving order.
++
++    Only customers with orders for `day` are listed. Greenway Grocers always comes first;
++    the rest follow their route_seq.
++    """
++    codes = sorted(orderbook.customers_for(day), key=lambda code: (code != FIRST_DROP, customers[code].route_seq))
++    with open(path, "w", encoding="utf-8") as f:
++        for n, code in enumerate(codes, 1):
++            customer = customers[code]
++            f.write(f"{n}. {customer.name}, {customer.address}, {customer.postcode}\n")
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..9baa2c4
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,55 @@
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import load_customers
++from bakehouse.delivery import drops_file
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DATA = os.path.join(os.path.dirname(__file__), "..", "data")
++DAY = datetime.date(2026, 10, 20)
++
++
++class DropsFileTest(unittest.TestCase):
++    def read_drops(self, book, customers, day):
++        f = tempfile.NamedTemporaryFile("r", suffix=".txt", delete=False, encoding="utf-8")
++        f.close()
++        self.addCleanup(os.unlink, f.name)
++        drops_file(book, customers, day, f.name)
++        with open(f.name, encoding="utf-8") as f:
++            return f.read().splitlines()
++
++    def test_only_customers_with_orders_on_the_day_in_driving_order(self):
++        customers = load_customers(os.path.join(DATA, "customers.csv"))
++        catalog = Catalog([Product("SOU", "White sourdough", 320, batch_size=10)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "OLDMILL", "SOU", 2),
++            OrderLine(DAY, "LUMEN", "SOU", 4),
++            OrderLine(DAY + datetime.timedelta(days=1), "HARBOUR", "SOU", 6),
++        ])
++        self.assertEqual(self.read_drops(book, customers, DAY), [
++            "1. Café Lumen, 14 Mill Lane, LK1 2AB",
++            "2. The Old Mill Tearoom, Old Mill Yard, LK3 1MY",
++        ])
++
++    def test_greenway_is_first_whatever_its_route_seq(self):
++        customers = load_customers(os.path.join(DATA, "customers.csv"))
++        catalog = Catalog([Product("SOU", "White sourdough", 320, batch_size=10)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 4),
++            OrderLine(DAY, "GREENWAY", "SOU", 20),
++        ])
++        drops = self.read_drops(book, customers, DAY)
++        self.assertTrue(drops[0].startswith("1. Greenway Grocers,"))
++        self.assertTrue(drops[1].startswith("2. Café Lumen,"))
++
++    def test_day_with_no_orders_gives_empty_file(self):
++        customers = load_customers(os.path.join(DATA, "customers.csv"))
++        book = OrderBook(Catalog([Product("SOU", "White sourdough", 320, batch_size=10)]))
++        self.assertEqual(self.read_drops(book, customers, DAY), [])
++
++
++if __name__ == "__main__":
++    unittest.main()

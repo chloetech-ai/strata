@@ -1,0 +1,32 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..b6bcd0b
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,26 @@
++"""Text of the reminder SMS sent before an appointment."""
++
++import unicodedata
++
++# The gateway only passes plain ASCII and a single SMS holds 160 characters.
++SMS_LIMIT = 160
++RECEPTION_NUMBER = "044 512 77 30"
++
++
++def _ascii(text):
++    """Drop accents and other non-ASCII characters, e.g. 'Müller' -> 'Muller'."""
++    decomposed = unicodedata.normalize("NFKD", text)
++    return decomposed.encode("ascii", "ignore").decode("ascii")
++
++
++def reminder_text(appointment):
++    """Return the reminder SMS for an appointment. Raises ValueError if it would not fit in one SMS."""
++    when = appointment.start.strftime("%d.%m.%Y at %H:%M")
++    text = (
++        f"Reminder: {_ascii(appointment.client)}, your appointment with "
++        f"{_ascii(appointment.therapist)} is on {when}. "
++        f"Questions? Call reception {RECEPTION_NUMBER}."
++    )
++    if len(text) > SMS_LIMIT:
++        raise ValueError(f"reminder is {len(text)} characters, limit is {SMS_LIMIT}")
++    return text

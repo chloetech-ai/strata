@@ -1,0 +1,62 @@
+diff --git a/src/kestrel/invoices.py b/src/kestrel/invoices.py
+index e6671f4..f7b39e2 100644
+--- a/src/kestrel/invoices.py
++++ b/src/kestrel/invoices.py
+@@ -5,6 +5,7 @@ Invoices can leave the system, so they carry the patient id only, never the name
+ 
+ from dataclasses import dataclass
+ import datetime
++import re
+ 
+ from .calendar import AUCKLAND
+ from .models import ASSESSMENT, CLINICS, FOLLOWUP
+@@ -48,12 +49,12 @@ def invoice_number(clinic, year, sequence):
+     return f"INV-{clinic}-{year}-{sequence:05d}"
+ 
+ 
+-def next_invoice_number(existing, clinic, year):
+-    """The next number for a clinic in a year, given the numbers already issued.
++def next_invoice_number(clinic, year, existing):
++    """The next number for a clinic in a year, given every invoice number issued so far.
+ 
+     Sequences count separately per clinic and restart each year, so numbers from
+-    other clinics or years are ignored.
++    other clinics or years are ignored, as are entries that aren't invoice numbers.
+     """
+-    prefix = f"INV-{clinic}-{year}-"
+-    used = [int(n[len(prefix):]) for n in existing if n.startswith(prefix)]
++    pattern = re.compile(r"INV-" + re.escape(clinic) + "-" + str(year) + r"-([0-9]{5})")
++    used = [int(m.group(1)) for m in (pattern.fullmatch(n) for n in existing) if m]
+     return invoice_number(clinic, year, max(used, default=0) + 1)
+diff --git a/tests/test_invoices.py b/tests/test_invoices.py
+index f0834b2..b7faf1b 100644
+--- a/tests/test_invoices.py
++++ b/tests/test_invoices.py
+@@ -48,19 +48,23 @@ class InvoiceNumberTest(unittest.TestCase):
+                     invoice_number("NG", 2027, seq)
+ 
+     def test_next_starts_at_one(self):
+-        self.assertEqual(next_invoice_number([], "WK", 2027), "INV-WK-2027-00001")
++        self.assertEqual(next_invoice_number("WK", 2027, []), "INV-WK-2027-00001")
+ 
+     def test_next_follows_highest_issued(self):
+         existing = ["INV-HB-2027-00041", "INV-HB-2027-00042", "INV-HB-2027-00007"]
+-        self.assertEqual(next_invoice_number(existing, "HB", 2027), "INV-HB-2027-00043")
++        self.assertEqual(next_invoice_number("HB", 2027, existing), "INV-HB-2027-00043")
+ 
+     def test_sequences_are_per_clinic(self):
+         existing = ["INV-HB-2027-00042", "INV-NG-2027-00003"]
+-        self.assertEqual(next_invoice_number(existing, "NG", 2027), "INV-NG-2027-00004")
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00004")
+ 
+     def test_restarts_each_year(self):
+         existing = ["INV-HB-2026-00900"]
+-        self.assertEqual(next_invoice_number(existing, "HB", 2027), "INV-HB-2027-00001")
++        self.assertEqual(next_invoice_number("HB", 2027, existing), "INV-HB-2027-00001")
++
++    def test_ignores_entries_that_are_not_invoice_numbers(self):
++        existing = ["INV-HB-2027-abc", "INV-HB-2027-00005x", "INV-HB-2027-123456", "HB-2027-00009", "INV-HB-2027-00003"]
++        self.assertEqual(next_invoice_number("HB", 2027, existing), "INV-HB-2027-00004")
+ 
+ 
+ if __name__ == "__main__":

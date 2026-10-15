@@ -1,0 +1,85 @@
+diff --git a/src/bakehouse/config.py b/src/bakehouse/config.py
+index 8636bbf..9af1929 100644
+--- a/src/bakehouse/config.py
++++ b/src/bakehouse/config.py
+@@ -11,3 +11,11 @@ ORDER_CUTOFF = datetime.time(13, 0)
+ # Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).
+ # Monday since November: we have the stall at the Sunday farmers' market.
+ CLOSED_WEEKDAYS = (0,)
++
++# Delivery charge, in pence, on a customer's order for one delivery day (before VAT),
++# when that order is under DELIVERY_THRESHOLD. Set from November 2026.
++DELIVERY_CHARGE = 450
++DELIVERY_THRESHOLD = 4000
++
++# Customers whose contract price already includes delivery.
++DELIVERY_CHARGE_EXEMPT = ("AIDAN",)  # St Aidan's Primary School
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index c576cf0..2231aea 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -4,6 +4,8 @@ import datetime
+ from dataclasses import dataclass, field
+ from typing import List
+ 
++from . import config
++
+ 
+ @dataclass
+ class InvoiceLine:
+@@ -39,6 +41,17 @@ def invoice_for(orderbook, customer, day):
+     return invoice
+ 
+ 
++def delivery_charge(customer_code, subtotal):
++    """Delivery charge in pence for `customer_code`'s order for one delivery day, where `subtotal`
++    is that order's value in pence before VAT. Orders under the threshold pay the charge; a
++    customer with nothing ordered pays nothing, and exempt customers never pay it."""
++    if customer_code in config.DELIVERY_CHARGE_EXEMPT or subtotal <= 0:
++        return 0
++    if subtotal < config.DELIVERY_THRESHOLD:
++        return config.DELIVERY_CHARGE
++    return 0
++
++
+ def invoice_number(year, seq):
+     """Invoice number such as 'LK-2026-0001': the year, then the running number for that year
+     (starting again at 1 each year), zero-padded to four digits."""
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 62bd57a..5471a91 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, delivery_charge, format_pence, invoice_for, invoice_number
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -51,6 +51,24 @@ class InvoiceTest(unittest.TestCase):
+         self.assertEqual(Invoice("LUMEN", datetime.date(2026, 10, 20)).total(), 0)
+ 
+ 
++class DeliveryChargeTest(unittest.TestCase):
++    def test_order_under_threshold_pays_charge(self):
++        self.assertEqual(delivery_charge("LUMEN", 3999), 450)
++        self.assertEqual(delivery_charge("LUMEN", 1), 450)
++
++    def test_order_at_threshold_pays_nothing(self):
++        self.assertEqual(delivery_charge("LUMEN", 4000), 0)
++
++    def test_order_over_threshold_pays_nothing(self):
++        self.assertEqual(delivery_charge("LUMEN", 12345), 0)
++
++    def test_exempt_customer_pays_nothing(self):
++        self.assertEqual(delivery_charge("AIDAN", 1000), 0)
++
++    def test_no_order_pays_nothing(self):
++        self.assertEqual(delivery_charge("LUMEN", 0), 0)
++
++
+ class InvoiceNumberTest(unittest.TestCase):
+     def test_year_then_four_digit_sequence(self):
+         self.assertEqual(invoice_number(2026, 1), "LK-2026-0001")

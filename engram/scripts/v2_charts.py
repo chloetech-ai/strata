@@ -97,8 +97,14 @@ def evidence_chart():
 
 
 LANE_NAMES = {"none": "no memory", "ccmem": "Claude Code\nauto memory", "transcripts": "past\ntranscripts", "claude-mem": "claude-mem", "mem0": "mem0",
-              "engram@main": "Engram\nmain", "engram+nodeep": "Engram new,\nno query engine", "engram": "Engram new\n(async)", "engram+deep": "Engram new\n(sync)", "full": "whole history\nin context"}
-LANE_COLORS = {"none": GREY, "ccmem": AMBER, "transcripts": AMBER, "claude-mem": PURPLE, "mem0": PURPLE, "engram@main": BLUE, "engram+nodeep": TEAL, "engram": DARK, "engram+deep": DARK, "full": GREEN}
+              "engram@main": "Engram\nmain", "engram+v5": "Engram new\n(default)", "engram+rank": "Engram new,\nranker only", "full": "whole history\nin context",
+              "engram+nodeep": "first build,\nno query engine", "engram": "first build\n(async)", "engram+deep": "first build\n(sync)"}
+LANE_COLORS = {"none": GREY, "ccmem": AMBER, "transcripts": AMBER, "claude-mem": PURPLE, "mem0": PURPLE, "engram@main": BLUE, "engram+v5": DARK, "engram+rank": TEAL,
+               "engram+nodeep": TEAL, "engram": DARK, "engram+deep": DARK, "full": GREEN}
+# Every task ran four times in these lanes; the first build's lanes (the
+# query engine as first proposed) ran three times, before two bakehouse tasks
+# existed, and are reported in pooled.md only.
+CHART_LANES = ["none", "ccmem", "transcripts", "claude-mem", "mem0", "engram@main", "engram+v5", "engram+rank", "full"]
 
 
 def lanes_chart(scenarios):
@@ -109,7 +115,7 @@ def lanes_chart(scenarios):
             data[sc] = [json.loads(l) for l in open(os.path.join(RES, "memory_bench", sc, "runs.jsonl"))]
     if not data:
         return
-    lanes = [l for l in LANE_NAMES if any(r["lane"] == l for rs in data.values() for r in rs)]
+    lanes = [l for l in CHART_LANES if any(r["lane"] == l for rs in data.values() for r in rs)]
     fig, axes = plt.subplots(1, len(data), figsize=(3.3 * len(data) + 2.2, 0.42 * len(lanes) + 1.4), sharey=True, squeeze=False)
     ys = list(range(len(lanes)))[::-1]
     for ax, (sc, runs) in zip(axes[0], data.items()):
@@ -127,7 +133,7 @@ def lanes_chart(scenarios):
         ax.set_title(sc, fontsize=12, fontweight="bold")
     axes[0][0].set_yticks(ys, [LANE_NAMES[l].replace("\n", " ") for l in lanes], fontsize=10)
     fig.suptitle("Claude Code with each memory system: follow-up runs solved", x=0.01, ha="left", fontweight="bold")
-    fig.text(0.01, -0.03, "Each task run 3 times per lane in a new headless session, after the lane recorded the project's history. Agent and memory systems: Haiku. Cloud VM, 2026-10-15.", fontsize=9, color="#555")
+    fig.text(0.01, -0.03, "Each task run 4 times per lane in a new headless session, after the lane recorded the project's history. Agent and memory systems: Haiku. Cloud VM, 2026-10-15.", fontsize=9, color="#555")
     fig.tight_layout()
     save(fig, "chart-engram-v2-lanes.png")
 
@@ -175,8 +181,54 @@ def pooled(scenarios):
     print("wrote", base + ".md")
 
 
+def efficiency(scenarios):
+    """What each lane's memory costs a run: the context it adds, the agent's
+    input, the memory system's own model calls, money and time. From the runs
+    that logged where memory reached the agent (the fourth repeat, and every
+    run of the lanes added with it)."""
+    rows = []
+    for sc in scenarios:
+        p = os.path.join(RES, "memory_bench", sc, "runs.jsonl")
+        if os.path.exists(p):
+            rows += [json.loads(l) for l in open(p) if '"memory_chars"' in l]
+    if not rows:
+        return
+
+    def q(xs, f):
+        xs = sorted(xs)
+        return xs[min(len(xs) - 1, int(f * len(xs)))]
+
+    out, md = {}, ["# Memory bench: what memory costs a run", "",
+                   "Runs that logged where memory reached the agent: the fourth repeat of every task, and all four in the lanes added with it. "
+                   "Memory context = characters that hooks injected, memory tools returned, or the agent read from the memory's files, per run (mean). "
+                   "Agent input = tokens the agent read per run, cached or not (median). Memory model tokens = the memory system's own model calls per run "
+                   "(input + output, mean). For `full` the history is the forked session's own context, so it shows in agent input, not memory context. "
+                   "Wall time includes load from the lanes running beside it.", "",
+                   "| lane | runs | solved | memory context, chars | agent input, tokens (p50) | memory model tokens | $ per run, agent + memory | wall s p50 / p95 |",
+                   "|---|---|---|---|---|---|---|---|"]
+    for lane in [l for l in LANE_NAMES if any(r["lane"] == l for r in rows)]:
+        rs = [r for r in rows if r["lane"] == lane]
+        mem_chars = sum(sum((r.get("memory_chars") or {}).values()) for r in rs) / len(rs)
+        mt = [(r.get("memory_tokens") or {}) for r in rs]
+        mem_tok = sum(t.get("input", 0) + t.get("cache_read", 0) + t.get("cache_write", 0) + t.get("output", 0) for t in mt) / len(rs)
+        agent_in = q([(r.get("input_tokens") or 0) for r in rs], 0.5)
+        cost = sum(r.get("cost_usd") or 0 for r in rs) / len(rs)
+        mem_cost = sum(r.get("memory_cost_usd") or 0 for r in rs) / len(rs)
+        wall = [r.get("wall_s") or 0 for r in rs]
+        solved = sum(r["solved"] for r in rs)
+        out[lane] = {"runs": len(rs), "solved": solved, "memory_chars": mem_chars, "agent_input_tokens_p50": agent_in, "memory_model_tokens": mem_tok,
+                     "cost_usd": cost, "memory_cost_usd": mem_cost, "wall_s_p50": q(wall, 0.5), "wall_s_p95": q(wall, 0.95)}
+        md.append(f"| {lane} | {len(rs)} | {solved}/{len(rs)} ({solved / len(rs):.0%}) | {mem_chars:,.0f} | {agent_in:,} | {mem_tok:,.0f} | "
+                  f"{cost:.4f} + {mem_cost:.4f} | {q(wall, 0.5):.0f} / {q(wall, 0.95):.0f} |")
+    base = os.path.join(RES, "memory_bench", "efficiency")
+    json.dump(out, open(base + ".json", "w"), indent=1)
+    open(base + ".md", "w").write("\n".join(md) + "\n")
+    print("wrote", base + ".md")
+
+
 if __name__ == "__main__":
     answers_chart()
     evidence_chart()
     lanes_chart(["bakehouse", "stockroom", "slotwise", "kestrel"])
     pooled(["bakehouse", "stockroom", "slotwise", "kestrel"])
+    efficiency(["bakehouse", "stockroom", "slotwise", "kestrel"])

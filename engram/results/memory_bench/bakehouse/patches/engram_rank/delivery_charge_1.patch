@@ -1,0 +1,67 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index a80e205..93f3ec8 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -29,6 +29,22 @@ def sale_or_return_credit(customer, product, price, delivered, returned):
+     return credited * price // 2
+ 
+ 
++DELIVERY_CHARGE = 450  # £4.50
++DELIVERY_CHARGE_BELOW = 4000  # charged on orders under £40.00
++EXEMPT_FROM_DELIVERY_CHARGE = {"AIDAN"}  # St Aidan's Primary: contract price includes delivery
++
++
++def delivery_charge(customer_code, subtotal):
++    """Delivery charge in pence for one customer's order for one delivery day, before VAT.
++
++    `subtotal` is the value in pence of that customer's order for the day. Orders under
++    £40.00 pay £4.50; an order of nothing pays no charge, and St Aidan's Primary is exempt.
++    """
++    if customer_code in EXEMPT_FROM_DELIVERY_CHARGE or not 0 < subtotal < DELIVERY_CHARGE_BELOW:
++        return 0
++    return DELIVERY_CHARGE
++
++
+ @dataclass
+ class Invoice:
+     customer: str  # customer code
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 7731b15..8eba69d 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, sale_or_return_credit
++from bakehouse.invoice import Invoice, InvoiceLine, delivery_charge, format_pence, invoice_for, invoice_number, sale_or_return_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -64,6 +64,26 @@ class SaleOrReturnTest(unittest.TestCase):
+         self.assertEqual(sale_or_return_credit("GREENWAY", "BAG", 95, delivered=50, returned=3), 0)
+ 
+ 
++class DeliveryChargeTest(unittest.TestCase):
++    def test_charged_under_forty_pounds(self):
++        self.assertEqual(delivery_charge("LUMEN", 3999), 450)
++
++    def test_one_penny_order_is_charged(self):
++        self.assertEqual(delivery_charge("LUMEN", 1), 450)
++
++    def test_not_charged_at_exactly_forty_pounds(self):
++        self.assertEqual(delivery_charge("LUMEN", 4000), 0)
++
++    def test_not_charged_over_forty_pounds(self):
++        self.assertEqual(delivery_charge("GREENWAY", 12345), 0)
++
++    def test_no_charge_for_an_empty_order(self):
++        self.assertEqual(delivery_charge("LUMEN", 0), 0)
++
++    def test_st_aidans_is_exempt(self):
++        self.assertEqual(delivery_charge("AIDAN", 2400), 0)
++
++
+ class InvoiceTest(unittest.TestCase):
+     def test_total(self):
+         invoice = Invoice("LUMEN", datetime.date(2026, 10, 20), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)])

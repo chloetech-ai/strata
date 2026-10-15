@@ -1,0 +1,85 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f3e54c7..6474bb2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@
+ - Added Potter's Farm Shop (POTTER) to customers.csv, route 6. Joins next month.
+ - Added `invoice.invoice_number(year, seq)`: invoice numbers such as 'LK-2026-0001'. Sequence must be 1 to 9999.
+ - Added `production.crates_needed(units, per_crate)`: whole crates needed, rounding a partial crate up.
++- Added `invoice.returns_credit(catalog, customer_code, product_code, delivered, returned)`: the credit in pence for unsold pieces returned from one delivery, at the catalog price. Raises ValueError if more are returned than delivered.
+ - Planned: the bake sheet lists products hottest oven first, to avoid reheating the deck oven after its overnight cool-down.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index 69817df..c354f73 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -40,6 +40,19 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Credit in pence for `returned` unsold pieces of one product from one delivery, at the catalog price.
++
++    `customer_code` is accepted so each delivery's credit is labelled with its customer; prices are the same for all customers.
++    Raises ValueError if a count is negative or `returned` is more than `delivered`.
++    """
++    if delivered < 0 or returned < 0:
++        raise ValueError("delivered and returned must not be negative")
++    if returned > delivered:
++        raise ValueError(f"cannot return {returned} of {delivered} delivered {product_code} for {customer_code}")
++    return returned * catalog.get(product_code).price
++
++
+ def invoice_for(orderbook, customer, day):
+     """Invoice for what `customer` ordered for delivery on `day`: one line per product, at catalog prices."""
+     totals = {}
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 58b5526..98a8757 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -48,6 +48,35 @@ class InvoiceTest(unittest.TestCase):
+     def test_empty_invoice(self):
+         self.assertEqual(Invoice("LUMEN", datetime.date(2026, 10, 20)).total(), 0)
+ 
++    def test_returns_credit_is_returned_pieces_at_catalog_price(self):
++        catalog = Catalog([Product("BAG", "Bagel", 95)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "BAG", 25, 4), 4 * 95)
++
++    def test_returns_credit_nothing_returned_is_zero(self):
++        catalog = Catalog([Product("BAG", "Bagel", 95)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "BAG", 25, 0), 0)
++
++    def test_returns_credit_all_returned(self):
++        catalog = Catalog([Product("BAG", "Bagel", 95)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "BAG", 25, 25), 25 * 95)
++
++    def test_returns_credit_more_than_delivered_is_an_error(self):
++        catalog = Catalog([Product("BAG", "Bagel", 95)])
++        with self.assertRaises(ValueError):
++            returns_credit(catalog, "GREENWAY", "BAG", 25, 26)
++
++    def test_returns_credit_negative_counts_are_errors(self):
++        catalog = Catalog([Product("BAG", "Bagel", 95)])
++        with self.assertRaises(ValueError):
++            returns_credit(catalog, "GREENWAY", "BAG", 25, -1)
++        with self.assertRaises(ValueError):
++            returns_credit(catalog, "GREENWAY", "BAG", -25, 0)
++
++    def test_returns_credit_unknown_product_is_an_error(self):
++        catalog = Catalog([Product("BAG", "Bagel", 95)])
++        with self.assertRaises(KeyError):
++            returns_credit(catalog, "GREENWAY", "SOU", 5, 1)
++
+     def test_format_pence_pounds_and_pence(self):
+         self.assertEqual(format_pence(1234), "£12.34")
+         self.assertEqual(format_pence(5), "£0.05")

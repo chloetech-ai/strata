@@ -1,0 +1,105 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 784f784..3f84038 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -10,6 +10,12 @@
+   "tests/test_cli.py::CliTest::test_receive_appends_to_legacy_log_without_reason_column",
+   "tests/test_cli.py::CliTest::test_receive_creates_log_with_header",
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity_without_writing",
++  "tests/test_countsheet.py::CountSheetTest::test_counted_column_is_empty",
++  "tests/test_countsheet.py::CountSheetTest::test_does_not_show_on_hand_quantity",
++  "tests/test_countsheet.py::CountSheetTest::test_empty_catalog_gives_empty_sheet",
++  "tests/test_countsheet.py::CountSheetTest::test_inventory_without_catalog_rejected",
++  "tests/test_countsheet.py::CountSheetTest::test_lines_in_walking_order_with_numeric_bay_and_shelf",
++  "tests/test_countsheet.py::CountSheetTest::test_one_line_per_catalog_item",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_other_reason_codes_accepted",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..fd5a85d
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,27 @@
++"""Printable blind-count sheet for stock-takes."""
++
++COUNT_WIDTH = 10  # width of the empty column staff write the counted figure in
++
++
++def _location_key(location):
++    """Walking order for a bin code like "B-12-3": parts that are numbers compare as numbers."""
++    return tuple((0, int(part), "") if part.isdigit() else (1, 0, part)
++                 for part in location.split("-"))
++
++
++def count_sheet(inventory):
++    """One line per catalog item in walking order by bin location.
++
++    It is a blind count, so the system's quantity on hand is left out and the
++    last column is empty for staff to write what they counted.
++    """
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog")
++    items = sorted(inventory.catalog, key=lambda item: (_location_key(item.location), item.sku))
++    lines = []
++    for item in items:
++        line = "{}  {}  {}  {}  {}".format(
++            item.location.ljust(8), item.sku.ljust(12), item.name.ljust(30),
++            item.unit.ljust(5), " " * COUNT_WIDTH)
++        lines.append(line.rstrip())
++    return "".join(line + "\n" for line in lines)
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..05b118d
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,49 @@
++import datetime
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Item("BR-1042", "Hex bolt M8x40", "B-12-10", unit="pcs"),
++            Item("BR-2000", "Wood screw 4x30", "B-12-2", unit="pcs"),
++            Item("BR-3000", "Paint roller", "A-01-1", unit="ea"),
++        ])
++        self.inventory = Inventory(self.catalog)
++        self.inventory.receive("BR-1042", 50, 125, datetime.date(2026, 10, 1))
++
++    def test_one_line_per_catalog_item(self):
++        lines = count_sheet(self.inventory).splitlines()
++        self.assertEqual(len(lines), len(self.catalog))
++
++    def test_lines_in_walking_order_with_numeric_bay_and_shelf(self):
++        lines = count_sheet(self.inventory).splitlines()
++        self.assertEqual([line.split()[0] for line in lines],
++                         ["A-01-1", "B-12-2", "B-12-10"])
++
++    def test_does_not_show_on_hand_quantity(self):
++        sheet = count_sheet(self.inventory)
++        self.assertNotIn("50", sheet)
++        self.assertEqual(self.inventory.on_hand("BR-1042"), 50)
++
++    def test_counted_column_is_empty(self):
++        line = count_sheet(self.inventory).splitlines()[2]
++        self.assertTrue(line.startswith("B-12-10"))
++        self.assertIn("BR-1042", line)
++        self.assertEqual(line, line.rstrip())
++        self.assertTrue(line.endswith("pcs"))
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++    def test_inventory_without_catalog_rejected(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

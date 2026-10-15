@@ -1,0 +1,54 @@
+diff --git a/src/bakehouse/recipes.py b/src/bakehouse/recipes.py
+new file mode 100644
+index 0000000..c6e87af
+--- /dev/null
++++ b/src/bakehouse/recipes.py
+@@ -0,0 +1,13 @@
++"""Recipe arithmetic: ingredient weights relative to the flour in a dough."""
++
++
++def baker_percentages(recipe):
++    """{ingredient: percent of total flour weight}, rounded to one decimal.
++
++    `recipe` maps ingredient names to grams. Any ingredient whose name contains
++    'flour' (any case) counts as flour.
++    """
++    flour_g = sum(grams for name, grams in recipe.items() if "flour" in name.lower())
++    if flour_g <= 0:
++        raise ValueError("recipe has no flour to base percentages on")
++    return {name: round(grams / flour_g * 100, 1) for name, grams in recipe.items()}
+diff --git a/tests/test_recipes.py b/tests/test_recipes.py
+new file mode 100644
+index 0000000..cb2afd8
+--- /dev/null
++++ b/tests/test_recipes.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from bakehouse.recipes import baker_percentages
++
++
++class BakerPercentagesTest(unittest.TestCase):
++    def test_percentages_are_of_total_flour(self):
++        recipe = {"Strong White Flour": 500, "Wholemeal Flour": 100, "Water": 350, "Salt": 10}
++        self.assertEqual(
++            baker_percentages(recipe),
++            {"Strong White Flour": 83.3, "Wholemeal Flour": 16.7, "Water": 58.3, "Salt": 1.7},
++        )
++
++    def test_flour_match_ignores_case(self):
++        self.assertEqual(
++            baker_percentages({"FLOUR": 200, "water": 100}),
++            {"FLOUR": 100.0, "water": 50.0},
++        )
++
++    def test_rounds_to_one_decimal(self):
++        self.assertEqual(baker_percentages({"flour": 3, "water": 1}), {"flour": 100.0, "water": 33.3})
++
++    def test_no_flour_raises(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"water": 350, "salt": 10})
++
++    def test_zero_flour_raises(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"flour": 0, "water": 350})
