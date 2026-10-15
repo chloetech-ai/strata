@@ -23,7 +23,7 @@
 //! (bucket key bounds and counts of an equi-depth histogram over the
 //! present values, also the planner's selectivity estimator).
 
-use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
+use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 
 use super::blocks::{write_blocks, Blocks, KeyRange};
 use crate::error::{corrupt, Error, Result};

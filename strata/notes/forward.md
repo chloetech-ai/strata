@@ -5,7 +5,7 @@ packed blocks and zone maps, `numeric.rs` INT/FLOAT columns and histograms,
 `range.rs` range postings and strategy choice, `keyword.rs` dictionary,
 codes, value lists and facets, `lists.rs` lazily parsed Pyramid list
 tables, `store.rs` doc store), the zero-copy Pyramid in
-`posting_bench/src/codecs/pyramid/`, tests in `strata/tests/forward_*.rs`,
+`strata/src/postings/codecs/pyramid/`, tests in `strata/tests/forward_*.rs`,
 experiment binary `strata/src/bin/strata-forward-bench.rs`, results in
 `strata/results/forward/`.
 
@@ -109,7 +109,7 @@ impl DocStore {
 }
 ```
 
-`posting_bench::codecs::pyramid::Pyramid` gains:
+`strata::postings::codecs::pyramid::Pyramid` gains:
 
 ```rust
 pub fn write_to(&self, w: &mut ByteWriter);
@@ -300,7 +300,7 @@ way, dominated by the device.
 
 ### Zero-copy Pyramid
 
-* Arrays are `posting_bench::bytes::Slice`s. `Chunk` descriptors became a
+* Arrays are `strata::postings::bytes::Slice`s. `Chunk` descriptors became a
   `#[repr(C)]` POD (flags in a u32 instead of three bools; still 28 bytes)
   so they are viewed in place. Built lists keep their meta and data arenas
   in the original 64-byte-aligned buffer (a `Slice::Shared` view of their
@@ -646,7 +646,7 @@ Peak RSS MB: trec-covid 521, quora 366
 
 ## Changes outside `strata/src/forward`
 
-* `posting_bench/src/codecs/pyramid/` (in scope): zero-copy arrays,
+* `strata/src/postings/codecs/pyramid/` (in scope): zero-copy arrays,
   serialisation, `or_into_bits`, `and_count_bits`, tests.
 * `strata/Cargo.toml`: added `bitpacking = "0.9.3"` (already a dependency of
   posting_bench, so no new crate in the build); `strata/Cargo.lock`

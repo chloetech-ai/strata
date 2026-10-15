@@ -1,0 +1,1210 @@
+<title>Posting List Codec Benchmark</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Literata:opsz,wght@7..72,500;7..72,600&display=swap">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] },
+    svg: { fontCache: "global" },
+    options: { enableMenu: false }
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.min.js" defer></script>
+<style>
+/* Layout: one reading column (~68ch) with figures that break out wider; numbers in mono. */
+:root {
+  --bg: #f4f6f9;
+  --surface: #ffffff;
+  --ink: #141922;
+  --ink-2: #485164;
+  --ink-3: #737c8f;
+  --rule: #dce1ea;
+  --grid: #e8ecf2;
+  --accent: #1d5bd6;
+  --accent-soft: #e4ecfc;
+  --warm: #c2410c;
+  --warm-soft: #fdebe1;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --display: "Literata", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1218; --surface: #171b23; --ink: #e8ebf1; --ink-2: #b3bac8; --ink-3: #8a93a5;
+    --rule: #2a303c; --grid: #222833; --accent: #7aa5ff; --accent-soft: #1b2944; --warm: #f2955b; --warm-soft: #3a2418;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1218; --surface: #171b23; --ink: #e8ebf1; --ink-2: #b3bac8; --ink-3: #8a93a5;
+  --rule: #2a303c; --grid: #222833; --accent: #7aa5ff; --accent-soft: #1b2944; --warm: #f2955b; --warm-soft: #3a2418;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 16px/1.62 var(--body); }
+.page { max-width: 1120px; margin: 0 auto; padding-inline: 20px; padding-block: 40px 80px; }
+.col { max-width: 720px; margin-inline: auto; }
+h1, h2, h3 { font-family: var(--display); font-weight: 600; text-wrap: balance; line-height: 1.2; color: var(--ink); }
+h1 { font-size: clamp(2rem, 4.6vw, 3.05rem); margin: 0.2em 0 0.35em; letter-spacing: -0.01em; }
+h2 { font-size: 1.7rem; margin: 2.6em 0 0.5em; padding-top: 0.9em; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.22rem; margin: 1.8em 0 0.4em; font-weight: 500; }
+p, li { color: var(--ink); }
+p { margin: 0 0 1em; }
+.lede { font-size: 1.13rem; color: var(--ink-2); }
+.eyebrow { font: 500 0.78rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.meta { font: 0.86rem/1.5 var(--mono); color: var(--ink-3); }
+a { color: var(--accent); }
+code, .mono { font-family: var(--mono); font-size: 0.88em; }
+code { background: var(--accent-soft); padding: 0.05em 0.35em; border-radius: 4px; }
+.num { font-variant-numeric: tabular-nums; }
+ul, ol { padding-left: 1.3em; }
+li { margin: 0.25em 0; }
+strong { font-weight: 600; }
+
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 28px 0 8px; }
+.finding { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px; min-width: 0; }
+.finding .k { font: 500 0.74rem/1.2 var(--mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--ink-3); }
+.finding .v { font: 600 1.55rem/1.2 var(--body); margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
+.finding p { font-size: 0.92rem; color: var(--ink-2); margin: 0; }
+
+.toc { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 18px 0 0; padding: 0; list-style: none; font-size: 0.92rem; }
+.toc a { color: var(--ink-2); text-decoration: none; border-bottom: 1px solid var(--rule); }
+.toc a:hover, .toc a:focus-visible { color: var(--accent); border-color: var(--accent); }
+
+figure { margin: 28px auto; max-width: 1000px; }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); gap: 18px; max-width: 1080px; margin: 10px auto; }
+.pair figure { margin: 8px 0; max-width: none; min-width: 0; }
+figure.narrow { max-width: 760px; }
+.frame { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 18px 18px 12px; overflow-x: auto; position: relative; }
+figcaption { font-size: 0.9rem; color: var(--ink-2); margin-top: 10px; max-width: 720px; margin-inline: auto; }
+figcaption b { color: var(--ink); font-weight: 600; }
+.chart-title { font: 600 0.98rem/1.3 var(--body); margin: 0 0 2px; }
+.chart-sub { font-size: 0.85rem; color: var(--ink-3); margin: 0 0 10px; }
+.chart { width: 100%; min-height: 120px; }
+
+.math { overflow-x: auto; overflow-y: hidden; margin: 14px 0 18px; padding: 6px 0; }
+mjx-container[display="true"] { display: block; max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.defs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 0.95rem; margin: 10px 0 18px; }
+.defs dt { font-family: var(--mono); font-size: 0.86rem; color: var(--ink-2); }
+.defs dd { margin: 0; min-width: 0; }
+
+.codecs { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin: 18px 0; }
+.codec { border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; background: var(--surface); min-width: 0; }
+.codec h4 { margin: 0 0 4px; font: 600 0.98rem/1.3 var(--body); }
+.codec p { margin: 0; font-size: 0.88rem; color: var(--ink-2); }
+.tag { display: inline-block; font: 500 0.7rem/1 var(--mono); padding: 3px 6px; border-radius: 4px; border: 1px solid var(--rule); color: var(--ink-3); margin-left: 6px; vertical-align: 2px; }
+
+.table-wrap { overflow-x: auto; margin: 14px 0; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+th, td { padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { font: 600 0.76rem/1.3 var(--mono); letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); background: var(--surface); position: sticky; top: 0; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 0.84rem; }
+tr:last-child td { border-bottom: none; }
+td.best { color: var(--accent); font-weight: 600; }
+td.strong { font-weight: 600; }
+.wide { max-width: 1000px; margin-inline: auto; }
+.algo { color: var(--ink-3); font-size: 0.8rem; }
+details { margin: 14px 0; }
+summary { cursor: pointer; color: var(--accent); font-weight: 500; }
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+
+.callout { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 18px 0; }
+.callout p:last-child { margin: 0; }
+
+/* Diagrams */
+svg text { font-family: var(--body); }
+.dg .box { fill: var(--surface); stroke: var(--rule); stroke-width: 1.2; }
+.dg .box-acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+.dg .box-warm { fill: var(--warm-soft); stroke: var(--warm); stroke-width: 1.2; }
+.dg .t { fill: var(--ink); font-size: 12.5px; }
+.dg .tm { fill: var(--ink); font-family: var(--mono); font-size: 12px; }
+.dg .tl { fill: var(--ink-2); font-size: 12px; }
+.dg .ts { fill: var(--ink-3); font-size: 11px; }
+.dg .tb { fill: var(--ink); font-size: 12.5px; font-weight: 600; }
+.dg .ln { stroke: var(--ink-3); stroke-width: 1.2; fill: none; }
+.dg .ln-acc { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+.dg .ln-warm { stroke: var(--warm); stroke-width: 1.6; fill: none; }
+.dg .dot { fill: var(--ink-2); }
+.dg .dot-acc { fill: var(--accent); }
+.dg .band { fill: var(--accent-soft); }
+.dg .axis { stroke: var(--rule); stroke-width: 1.5; }
+.dg .ah { fill: var(--accent); }
+.dg .ahm { fill: var(--ink-3); }
+
+/* Charts */
+.ch .grid { stroke: var(--grid); stroke-width: 1; }
+.ch .axis { stroke: var(--rule); stroke-width: 1; }
+.ch text { fill: var(--ink-3); font: 11.5px var(--body); }
+.ch text.lab { fill: var(--ink-2); font-size: 12px; }
+.ch text.lab-strong { fill: var(--ink); font-size: 12px; font-weight: 600; }
+.ch text.axis-title { fill: var(--ink-2); font-size: 12px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.84rem; color: var(--ink-2); margin: 4px 0 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { display: inline-block; width: 16px; height: 3px; border-radius: 2px; }
+.legend i.sq { width: 10px; height: 10px; border-radius: 3px; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 8px 10px; font-size: 0.82rem; box-shadow: 0 6px 20px rgba(10, 20, 40, 0.14); min-width: 140px; max-width: 280px; z-index: 5; }
+.tip b { font-variant-numeric: tabular-nums; }
+.tip .row { display: flex; align-items: center; gap: 6px; }
+.tip .row i { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+.tip .h { color: var(--ink-3); font-size: 0.76rem; margin-bottom: 3px; }
+
+.repro pre { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; overflow-x: auto; font: 0.84rem/1.55 var(--mono); }
+footer { margin-top: 60px; color: var(--ink-3); font-size: 0.85rem; }
+@media (max-width: 560px) {
+  body { font-size: 15px; }
+  .page { padding-inline: 16px; }
+  .frame { padding: 12px 10px 8px; }
+  .defs { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .toc a, summary { transition: color 0.15s; }
+}
+</style>
+
+<div class="page">
+<header class="col">
+  <div class="eyebrow">strata · posting lists · experiment report</div>
+  <h1>Intersecting and merging compressed posting lists</h1>
+  <p class="lede">I implemented 13 posting-list representations and 20 intersection and union algorithms in Rust, built a testbed that checks every query result before it is timed, and ran them on synthetic and real collections. This page explains each technique with its formulas and layout, then reports what was measured.</p>
+  <p class="meta" id="meta-line"></p>
+  <div class="findings" id="findings">
+    <div class="finding"><div class="k">Fastest AND and OR</div><div class="v">Roaring</div><p>0.018 ms AND and 0.38 ms OR on the clustered collection, 2.0× and 5.8× faster than PEF, at 1.9× its size.</p></div>
+    <div class="finding"><div class="k">Best balance</div><div class="v">PEF · 4.9 bits</div><p>The smallest codec, or within 1% of it, on all three collections, and 2.0× Roaring's AND time on the clustered one.</p></div>
+    <div class="finding"><div class="k">Skip, don't decode</div><div class="v">3.7–17×</div><p>Rarest-first leapfrog with NextGEQ against decoding every list and intersecting arrays.</p></div>
+    <div class="finding"><div class="k">SIMD crossover</div><div class="v">≈ 1 : 35</div><p>The NEON 8×8 block merge is 6.8× faster than a scalar merge on equal lists; galloping wins beyond this size ratio.</p></div>
+  </div>
+  <ul class="toc">
+    <li><a href="#problem">The problem</a></li>
+    <li><a href="#testbed">Testbed</a></li>
+    <li><a href="#codecs">Representations</a></li>
+    <li><a href="#algorithms">Algorithms</a></li>
+    <li><a href="#setup">Setup</a></li>
+    <li><a href="#results">Results</a></li>
+    <li><a href="#takeaways">Takeaways</a></li>
+    <li><a href="#reproduce">Reproduce</a></li>
+  </ul>
+</header>
+
+<section class="col" id="problem">
+  <h2>The problem</h2>
+  <p>An inverted index maps every term \(t\) to its <em>posting list</em> \(\mathcal{L}_t\): the strictly increasing docIDs of the documents that contain it, drawn from a universe of \(u\) documents. A query \(q = \{t_1, \dots, t_k\}\) is answered with set operations over the lists:</p>
+  <div class="math">\[ \mathrm{AND}(q) = \bigcap_{i=1}^{k} \mathcal{L}_{t_i}, \qquad \mathrm{OR}(q) = \bigcup_{i=1}^{k} \mathcal{L}_{t_i}, \qquad \mathcal{L}_t \subseteq [0, u),\ n_t = |\mathcal{L}_t| . \]</div>
+  <p>Lists are stored compressed, so the representation decides both the index size and how cheaply a list can be scanned (<code>next</code>) or skipped through (<code>NextGEQ(x)</code>, the first posting \(\ge x\)). For two lists with \(m \le n\) postings, any comparison-based intersection must distinguish all interleavings of the two lists, which gives the lower bound</p>
+  <div class="math">\[ \log_2 \binom{n+m}{m} \;=\; m \log_2 \frac{n}{m} + O(m) \ \text{comparisons}, \]</div>
+  <p>so when the lists differ a lot in size, a good algorithm touches only a small part of the longer list. Union is different: its output alone has up to \(N = \sum_i n_i\) elements, so the work is dominated by sequential decoding and by how cheaply the results can be merged.</p>
+  <p>The two figures of merit used throughout are space and query time:</p>
+  <div class="math">\[ \text{bits/posting} = \frac{\sum_t \lvert \mathrm{enc}(\mathcal{L}_t) \rvert}{\sum_t n_t}, \qquad \text{ms/query} = \min_{r \in \text{reps}} \frac{T_r}{|Q|} . \]</div>
+  <p>\(\lvert \mathrm{enc}(\cdot) \rvert\) counts payload plus every skip pointer, directory and header needed at query time, which is what a serialized index would occupy. \(T_r\) is the wall-clock time of repetition \(r\) over the whole query log \(Q\).</p>
+</section>
+
+<section class="col" id="testbed">
+  <h2>The testbed</h2>
+  <p>The crate is organised around three traits. Every representation implements <code>PostingList</code> (build, size, decode). Representations that can be iterated with skipping implement <code>CursorList</code>, whose cursor exposes <code>docid()</code>, <code>next()</code> and <code>next_geq(x)</code>. Representations with their own multi-list algorithms (Roaring, tries, the hybrid index) also implement <code>SetOps</code>. The harness runs every applicable algorithm on every representation, so each codec is measured both through the generic cursor interface and through its native operations.</p>
+  <figure class="narrow">
+    <div class="frame">
+<pre class="mermaid">
+flowchart LR
+  S["Synthetic generator<br/>ds2i/PISA .docs<br/>text, 1 doc per line"] --> C["Collection<br/>posting lists over [0, u)"]
+  C --> Q["Query log<br/>co-occurring terms"]
+  C --> B["Build 13 codecs"]
+  Q --> R["Reference results<br/>SvS + heap on raw lists"]
+  B --> A["Run every AND / OR<br/>algorithm per codec"]
+  A --> V{"Length + hash<br/>match reference?"}
+  R --> V
+  V -- yes --> T["Time best of 3 passes"]
+  V -- no --> X["Abort with query id"]
+  T --> O["Markdown + JSON"]
+</pre>
+    </div>
+    <figcaption><b>Measurement pipeline.</b> Each algorithm first runs once over the whole query log, and every result is compared with a reference by length and an order-sensitive hash. Only then is it timed. Correctness is also covered by 56 unit and property tests, including a shared conformance suite that every codec passes.</figcaption>
+  </figure>
+</section>
+
+<section class="col" id="codecs">
+  <h2>Representations</h2>
+  <p>The 13 representations fall into four families. All lists in a query share one universe, and every docID is below \(2^{32}-1\), which the cursors use as the end-of-list sentinel.</p>
+</section>
+<div class="wide" id="codec-cards"></div>
+<section class="col">
+
+  <h3>Gap coding in blocks: VByte, BP128, OptPFor, interpolative</h3>
+  <p>Block codecs cut a list into blocks of 128 postings. Within a block they code <em>d-gaps</em>, which are small when docIDs are dense, relative to a base \(b\) (the previous block's last docID plus one):</p>
+  <div class="math">\[ g_0 = d_0 - b, \qquad g_i = d_i - d_{i-1} - 1 \quad (1 \le i < 128). \]</div>
+  <p>A skip table stores each block's last docID and byte offset, 64 bits per block, the same as PISA's <code>block_posting_list</code>. <code>NextGEQ</code> gallops over the skip table, decodes one block and binary-searches inside it.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 262" role="img" aria-label="Block layout: docIDs become gaps, gaps are packed in blocks of 128, and a skip table stores each block's last docID and offset">
+        <defs><marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ahm"/></marker></defs>
+        <text x="0" y="35" class="tl">docIDs</text>
+        <text x="0" y="87" class="tl">gaps g<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+        <text x="0" y="152" class="tl">blocks of 128</text>
+        <text x="0" y="230" class="tl">skip table</text>
+        <g id="blk-docs"></g>
+        <rect x="128" y="128" width="210" height="40" rx="5" class="box-acc"/><text x="140" y="145" class="tb">block 0 · b = 5</text><text x="140" y="161" class="ts">header byte + 128 × 5 bits</text>
+        <rect x="346" y="128" width="170" height="40" rx="5" class="box-acc"/><text x="358" y="145" class="tb">block 1 · b = 4</text><text x="358" y="161" class="ts">128 × 4 bits</text>
+        <rect x="524" y="128" width="130" height="40" rx="5" class="box-acc"/><text x="536" y="145" class="tb">block 2 · b = 7</text><text x="536" y="161" class="ts">128 × 7 bits</text>
+        <rect x="662" y="128" width="96" height="40" rx="5" class="box"/><text x="672" y="145" class="tb">tail</text><text x="672" y="161" class="ts">VByte, n &lt; 128</text>
+        <g class="tm">
+          <rect x="128" y="210" width="120" height="30" rx="4" class="box"/><text x="138" y="230" class="tm">max₀ │ off₀</text>
+          <rect x="346" y="210" width="120" height="30" rx="4" class="box"/><text x="356" y="230" class="tm">max₁ │ off₁</text>
+          <rect x="524" y="210" width="120" height="30" rx="4" class="box"/><text x="534" y="230" class="tm">max₂ │ off₂</text>
+          <rect x="662" y="210" width="96" height="30" rx="4" class="box"/><text x="672" y="230" class="tm">max₃ │ off₃</text>
+        </g>
+        <path d="M188 210 V172" class="ln" marker-end="url(#ar1)"/><path d="M406 210 V172" class="ln" marker-end="url(#ar1)"/><path d="M584 210 V172" class="ln" marker-end="url(#ar1)"/><path d="M710 210 V172" class="ln" marker-end="url(#ar1)"/>
+        <text x="128" y="258" class="ts">NextGEQ(x): gallop over maxᵢ to the first block with maxᵢ ≥ x, decode only that block, binary-search in it.</text>
+      </svg>
+    </div>
+    <figcaption><b>Block layout shared by VByte, BP128, OptPFor, interpolative and the bitpacking-crate baseline.</b> Only the coding of the 128 gaps differs between them. The trailing partial block is VByte-coded, as Lucene and Tantivy do.</figcaption>
+  </figure>
+  <dl class="defs">
+    <dt>VByte</dt><dd>7 data bits per byte with a continuation flag: \(8 \lceil w(g)/7 \rceil\) bits per gap, where \(w(g) = \lfloor \log_2 g \rfloor + 1\) is the bit width. Byte-aligned and branchy.</dd>
+    <dt>BP128</dt><dd>Frame of reference: one width \(b = w(\max_i g_i)\) per block, so a block costs \(8 + 128\,b\) bits. Values are packed in SIMD-BP128's vertical 4-lane layout so that unpacking is the same shift and mask on 4 lanes. The code is written lane-wise with a compile-time \(b\), and LLVM vectorises it.</dd>
+    <dt>OptPFor</dt><dd>Patched frame of reference. Gaps wider than \(b\) bits become exceptions, stored as a position byte plus their high part in VByte, and \(b\) is chosen per block to minimise \[ \mathrm{cost}(b) = 16 + 128\,b + \sum_{g_i \ge 2^b} \Bigl(8 + 8 \Bigl\lceil \tfrac{w(g_i) - b}{7} \Bigr\rceil\Bigr) \ \text{bits}. \]</dd>
+    <dt>Interpolative</dt><dd>Binary interpolative coding (Moffat &amp; Stuiver). The middle element \(d_m\) of a range \([\ell, r]\) holding \(n\) values is coded in the range it can actually occupy, then both halves recurse: \[ d_m \in [\,\ell + m,\ r - (n - 1 - m)\,] \;\Rightarrow\; \lceil \log_2 (r - \ell - n + 2) \rceil \ \text{bits}. \] A run of consecutive docIDs costs zero bits.</dd>
+  </dl>
+
+  <h3>Elias-Fano and partitioned Elias-Fano</h3>
+  <p>Elias-Fano splits each value into \(\ell\) low bits, stored verbatim, and a high part, stored in unary in a bitvector. Element \(i\) with high part \(h_i\) sets bit \(h_i + i\):</p>
+  <div class="math">\[ \ell = \Bigl\lfloor \log_2 \frac{u}{n} \Bigr\rfloor, \qquad \text{bits} = \underbrace{n\,\ell}_{\text{low}} + \underbrace{n + \lfloor u / 2^{\ell} \rfloor + 1}_{\text{high}} \;\le\; n \Bigl( 2 + \Bigl\lceil \log_2 \frac{u}{n} \Bigr\rceil \Bigr). \]</div>
+  <p>Bucket \(h\) of the high bits starts right after the \(h\)-th zero, so <code>NextGEQ(x)</code> jumps to \(\mathrm{select}_0(\lfloor x / 2^{\ell} \rfloor - 1) + 1\) without decoding anything before it. The implementation samples every 256th zero to answer \(\mathrm{select}_0\) in constant time, and scans instead when the target is within a few buckets, as PISA does.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 250" role="img" aria-label="Elias-Fano example with eight values in a universe of 32: two low bits per value and a 16-bit unary high-bits vector">
+        <text x="0" y="28" class="tl">values</text>
+        <text x="0" y="62" class="tl">high │ low</text>
+        <text x="0" y="132" class="tl">high bits</text>
+        <text x="0" y="148" class="ts">(unary buckets)</text>
+        <text x="0" y="214" class="tl">low bits</text>
+        <g id="ef-values"></g>
+        <g id="ef-high"></g>
+        <g id="ef-low"></g>
+        <text x="130" y="246" class="ts">n = 8, u = 32 → ℓ = ⌊log₂ 4⌋ = 2. High 16 bits + low 16 bits = 32 bits = 4 bits/value = 2 + ⌈log₂(u/n)⌉.</text>
+      </svg>
+    </div>
+    <figcaption><b>Elias-Fano on {3, 4, 7, 13, 14, 15, 21, 31}.</b> Bucket \(h\) holds one 1 per value whose high part is \(h\), followed by a 0. To find the first value \(\ge 20\), jump to bucket \(5 = \lfloor 20/4 \rfloor\) with \(\mathrm{select}_0(4) + 1\) and compare low bits there.</figcaption>
+  </figure>
+  <p>Plain Elias-Fano ignores clustering: its size depends only on \(u\) and \(n\). Partitioned Elias-Fano (Ottaviano &amp; Venturini) cuts the list into partitions and codes each one relative to its own base with the cheapest of three encodings: a full run (no payload), a bitvector over the partition's range, or Elias-Fano over that range. The partitions are chosen by dynamic programming over boundaries every 32 postings:</p>
+  <div class="math">\[ C(j) = \min_{\substack{i < j \\ j - i \le 4096}} \Bigl[\, C(i) + 64 + \min\bigl\{ \mathrm{EF}(i, j),\ \underbrace{d_{j-1} - d_{i-1}}_{\text{bitvector}},\ \underbrace{0}_{\text{if a run}} \bigr\} \Bigr], \]</div>
+  <p>where 64 bits pays for the partition's entry in the upper level (last docID and descriptor), the fixed cost PISA uses.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 175" role="img" aria-label="Partitioned Elias-Fano: a list split into a run partition, Elias-Fano partitions and a bitvector partition">
+        <g id="pef-parts"></g>
+        <line x1="40" y1="128" x2="740" y2="128" class="axis"/>
+        <text x="40" y="148" class="ts">0</text><text x="740" y="148" class="ts" text-anchor="end">u</text>
+        <text x="390" y="168" class="ts" text-anchor="middle">docID →   each partition is coded relative to the previous partition's last docID</text>
+      </svg>
+    </div>
+    <figcaption><b>Partitioned Elias-Fano.</b> Dense stretches become runs or bitvectors and sparse stretches keep Elias-Fano, so clustered lists shrink well below the plain Elias-Fano bound.</figcaption>
+  </figure>
+
+  <h3>Roaring bitmaps</h3>
+  <p>Roaring partitions the <em>universe</em> rather than the list. The high 16 bits of a docID select a chunk; the low 16 bits go into that chunk's container, whichever of three is smallest:</p>
+  <div class="math">\[ \text{array: } 16\,c \ \text{bits}, \qquad \text{bitmap: } 2^{16} \ \text{bits}, \qquad \text{run: } 16 + 32\,r \ \text{bits}, \]</div>
+  <p>for \(c\) values in \(r\) runs; arrays switch to bitmaps at \(c = 4096\), where \(16c = 2^{16}\). Because every list uses the same chunk boundaries, AND and OR proceed chunk by chunk with container-pair kernels and need no <code>NextGEQ</code> per element:</p>
+  <ul>
+    <li>array ∩ array: SSE4.2 <code>pcmpistrm</code> all-pairs compare (CRoaring's <code>intersect_vector16</code>; on NEON, an 8×8 compare against <code>ext</code> rotations with <code>tbl</code> compaction), or galloping when one side is more than 64× larger;</li>
+    <li>bitmap ∩ bitmap: word AND with popcount;</li>
+    <li>array ∩ bitmap: bit probes;</li>
+    <li>union: a k-way merge over keys that ORs dense chunks into one bitmap and counts it once at the end.</li>
+  </ul>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 236" role="img" aria-label="Roaring: the high 16 bits of a docID select a key and the low 16 bits are stored in an array, bitmap or run container">
+        <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ahm"/></marker></defs>
+        <rect x="190" y="10" width="190" height="34" rx="5" class="box-acc"/><text x="285" y="32" class="tb" text-anchor="middle">high 16 bits → key</text>
+        <rect x="380" y="10" width="190" height="34" rx="5" class="box"/><text x="475" y="32" class="tb" text-anchor="middle">low 16 bits → container</text>
+        <text x="180" y="32" class="tl" text-anchor="end">docID (32 bits)</text>
+        <g id="roar-keys"></g>
+      </svg>
+    </div>
+    <figcaption><b>Roaring layout.</b> The sorted key array is searched only when an operation leaves the current chunk. Intersection keeps intermediate results as containers, smallest list first, and stops as soon as a result is empty.</figcaption>
+  </figure>
+
+  <h3>Compact binary tries</h3>
+  <p>Arroyuelo &amp; Castillo (CPM 2023) store a set as the binary trie of height \(h = \lceil \log_2 u \rceil\) that spells every docID most significant bit first. Each node contributes two bits, "left child present" and "right child present", and the bits of a level form a bitvector \(B_\ell\) with rank support. Children are found by counting ones:</p>
+  <div class="math">\[ \mathrm{left}(i) = \mathrm{rank}_1(B_\ell, 2i), \qquad \mathrm{right}(i) = \mathrm{rank}_1(B_\ell, 2i + 1). \]</div>
+  <p>Intersection walks all \(k\) tries in lockstep and ANDs the 2-bit codes at each node, so a subtree missing from any input is pruned immediately. This runs in \(O(k\,\delta \log(u/\delta))\) time, where \(\delta\) is the alternation: the size of the smallest certificate that proves the result. DocIDs that are close share their upper paths, so clustered lists need few nodes. The run-compressed variant (Run-Trie) cuts every full subtree and codes its root as <code>00</code>.</p>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 290" role="img" aria-label="Binary trie of the set 2, 3, 9, 12, 13 in a universe of 16, with each node's 2-bit code and the level bitvectors">
+        <g id="trie-tree"></g>
+        <g id="trie-levels"></g>
+      </svg>
+    </div>
+    <figcaption><b>Trie of {2, 3, 9, 12, 13} with \(u = 16\).</b> 18 bits encode 5 values here. With dense or clustered docIDs the cost per value falls fast, because sibling values share every node above them. The highlighted node (prefix <span class="mono">10</span>, node 1 of level 2) has code <span class="mono">10</span>: only a left child, which is node \(\mathrm{rank}_1(B_2, 2) = 1\) of level 3.</figcaption>
+  </figure>
+
+  <h3>Hybrid bitmap + list index</h3>
+  <p>Culpepper &amp; Moffat's hybrid stores a list as a plain bitmap of \(u\) bits when it is dense, \(u / n \le 8\) (at most 8 bits per posting), and as BP128 otherwise. Conjunctions intersect only the sparse lists, rarest first, and then filter every candidate with \(O(1)\) bit probes. Lucene 10.2 uses the same idea per block, storing dense blocks as bitsets.</p>
+</section>
+
+<section class="col" id="algorithms">
+  <h2>Algorithms</h2>
+  <h3>Two sorted arrays</h3>
+  <dl class="defs">
+    <dt>merge</dt><dd>Two pointers, \(m + n\) comparisons. The branch-free variant derives both pointer increments from the comparison result.</dd>
+    <dt>binary search</dt><dd>Search each element of the short list in the rest of the long list: \(m \log_2 n\).</dd>
+    <dt>galloping</dt><dd>Exponential search from the last position, probing 1, 2, 4, … steps ahead, then a binary search: at most \(2 \sum_i \log_2(g_i + 1) \le 2m \log_2(n/m + 1)\) comparisons, which matches the lower bound up to a constant.</dd>
+    <dt>Baeza-Yates</dt><dd>Binary-search the median of the short list in the long list, then recurse on both sides: \(O(m \log(n/m))\) on average.</dd>
+    <dt>SIMD block merge</dt><dd>Compare a block of \(W\) values from each list all-against-all with \(W\) vector compares against rotations of one block, compact the matches, and advance the block with the smaller maximum. Kernels for SSE (\(W = 4\)), AVX2 (\(W = 8\)) and AVX-512 (\(W = 16\), which emulates <code>VP2INTERSECT</code>), and for NEON (\(W = 4\), and \(W = 8\) with two 128-bit registers a side; <code>ext</code> rotations and <code>tbl</code> compaction). The timed kernels are the NEON ones.</dd>
+    <dt>adaptive</dt><dd>SIMD block merge when \(n/m \le 64\), galloping beyond, which is CRoaring's switch point.</dd>
+  </dl>
+  <figure class="narrow">
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 720 236" role="img" aria-label="SIMD 4 by 4 intersection: a block of a is compared with four rotations of a block of b">
+        <g id="simd-grid"></g>
+      </svg>
+    </div>
+    <figcaption><b>SSE 4×4 step.</b> Four compares cover all 16 pairs. The OR of the lane masks (<span class="mono">1001₂</span>) indexes a shuffle table that packs the matches into the output, and both pointers advance because \(a_3 = b_3\). NEON does the same with <code>ext</code> rotations and a <code>tbl</code> lookup.</figcaption>
+  </figure>
+
+  <h3>k lists</h3>
+  <dl class="defs">
+    <dt>SvS</dt><dd>Set versus set: sort by length and intersect the two shortest lists, then intersect the running result with each next list. Barbay et al. and Culpepper &amp; Moffat found it the fastest in practice.</dd>
+    <dt>Small Adaptive</dt><dd>Demaine, López-Ortiz &amp; Munro: take the next element of the currently shortest list and gallop for it in the others, re-sorting by remaining length.</dd>
+    <dt>Sequential</dt><dd>Barbay &amp; Kenyon's round-robin eliminator, optimal for the alternation measure: \(\Theta\bigl(\delta \sum_i \log (n_i / \delta)\bigr)\) comparisons.</dd>
+    <dt>leapfrog</dt><dd>The cursor form of SvS used by PISA and Lucene: the rarest list proposes a candidate and every other cursor calls <code>NextGEQ</code>. A miss makes the larger docID the new candidate.</dd>
+    <dt>round-robin</dt><dd>Leapfrog Triejoin's unary case: cursors take turns seeking to the current maximum.</dd>
+    <dt>decode + SvS</dt><dd>Decode every list completely, then intersect the arrays (Lemire et al.).</dd>
+  </dl>
+  <figure>
+    <div class="frame">
+      <svg class="dg" viewBox="0 0 760 214" role="img" aria-label="Leapfrog intersection of three lists: candidates jump between lists with NextGEQ until all three agree on 40 and 77">
+        <defs><marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker></defs>
+        <g id="leap"></g>
+      </svg>
+    </div>
+    <figcaption><b>Leapfrog on three lists.</b> The arrows are <code>NextGEQ</code> calls: 3 → 5 → 12 → 15 → 40, which all three lists contain, then 41 → 60 → 77. Postings between the jump targets are skipped, and for a block codec whole blocks are never decoded.</figcaption>
+  </figure>
+  <h3>Union</h3>
+  <dl class="defs">
+    <dt>heap</dt><dd>k-way merge with a binary heap of cursors: \(O(N \log k)\).</dd>
+    <dt>min-scan</dt><dd>Scan all cursors for the minimum at every step (PISA's <code>or_query</code>): \(O(N k)\), but branch-friendly for small \(k\).</dd>
+    <dt>bitset window</dt><dd>Lucene's <code>BooleanScorer</code>: drain every cursor into a 4096-docID bitset, then scan the window's 64 words.</dd>
+    <dt>fold, bitmap</dt><dd>On uncompressed arrays: pairwise merges smallest first, or set bits in a bitmap spanning \([\min, \max]\) and scan it.</dd>
+  </dl>
+</section>
+
+<section class="col" id="setup">
+  <h2>Experimental setup</h2>
+</section>
+<div class="wide" id="setup-table"></div>
+<section class="col">
+  <p>The <b>clustered</b> collection mimics an index whose docIDs were reordered by URL or topic, the setting where modern indexes operate. The docID space is split into 1000 topic regions; each term draws 85% of its postings from a few preferred regions, in runs of about 4 consecutive documents, and the rest uniformly. The <b>uniform</b> collection uses the same list lengths with random docIDs, like an index in crawl order. <b>WikiText-103</b> is real text: every paragraph of the training split is a document, in corpus order, so the paragraphs of one article are adjacent.</p>
+  <p>List lengths follow Zipf's law (\(n_r \approx n_1 / r\)). Queries take 2 to 4 terms that co-occur in a randomly sampled document, so conjunctions are rarely empty, as for real queries. Every measurement is the best of 3 timed passes over the whole query log, single-threaded, after a verified warm-up pass.</p>
+</section>
+
+<section id="results">
+  <div class="col"><h2>Results</h2></div>
+  <div class="col">
+  <h3 id="r-tradeoff">Space against speed on a reordered index</h3>
+  <p>On the clustered collection the 500 queries average 2.8 terms and touch 576,000 postings each; a conjunction returns 309 documents and a disjunction 563,000. The charts plot each codec's size on the query lists against its fastest algorithm; blue points are Pareto-optimal (nothing else is both smaller and faster).</p>
+  <ul>
+    <li><b>The AND frontier has three members.</b> It runs from interpolative coding (4.90 bits per posting, 0.14 ms) through PEF (4.94 bits, 0.035 ms) to Roaring (9.32 bits, 0.018 ms). PEF is within 1% of interpolative coding's size but 3.8× faster, because its <code>NextGEQ</code> is a select over the high bits instead of a block decode.</li>
+    <li><b>Roaring buys speed with space.</b> It is 2.0× faster than PEF for AND and 5.8× faster for OR (0.38 against 2.21 ms), at 1.9× the size. Pibiri &amp; Venturini report 4–8× (AND) and 14–18× (OR) for CRoaring over list codecs at about twice the space; the direction holds here, with smaller gaps on these skewed queries.</li>
+    <li><b>Block codecs sit in the middle.</b> BP128 and the bitpacking crate take 0.051–0.065 ms at 7.69 bits, and OptPFor is about as fast at 5.92 bits, 23% smaller. VByte is 1.4× slower than BP128 with no space advantage. Uncompressed arrays (0.027 ms) beat every compressed list codec, PEF by 1.3×, at 6.5× its size.</li>
+    <li><b>Unions are bound by their output.</b> Every list codec needs 1.8–3.5 ms, that is 3.2–6.2 ns per output docID, whatever its decoding speed. Only representations that OR whole machine words, or need no decoding, escape this: Roaring (0.38 ms, about 0.7 ns per result, or 0.23 ms if it only counts), the hybrid index (1.3 ms) and uncompressed arrays (1.32 ms with a pairwise merge, 1.73 ms through a bitmap).</li>
+    <li><b>Implementation matters as much as format.</b> With identical containers and size, this crate's Roaring answers AND 3.0× faster than the <code>roaring</code> crate and OR 6.5× faster when docIDs are written out. When both only count, the OR gap shrinks to 2.7×, so most of the crate's union cost is its iterator. In the other direction, the bitpacking crate decodes BP128 blocks faster than my auto-vectorised unpacker (0.30 against 0.76 ns per posting).</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND: index size vs query time</p>
+      <p class="chart-sub">Clustered collection · best algorithm per codec · blue: Pareto frontier</p>
+      <div class="chart" id="clustered-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR: index size vs query time</p>
+      <p class="chart-sub">Clustered collection · best algorithm that outputs docIDs</p>
+      <div class="chart" id="clustered-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="clustered-table"></div>
+
+<div class="col">
+  <h3 id="r-algos">Skipping beats decoding for conjunctions</h3>
+  <p>The tables below give every algorithm's time on every codec (clustered collection; blue marks the fastest per row, not counting the count-only variants).</p>
+  <ul>
+    <li><b>Rarest-first leapfrog is the best cursor conjunction for every codec.</b> Driving the shortest list and calling <code>NextGEQ</code> on the others is 3.7–17× faster than decoding all lists and intersecting the arrays (43× for the <code>roaring</code> crate, whose decoding goes through a slow iterator). The gap is largest for the tries, PEF and Elias-Fano (15–17×), whose decoding is slowest relative to a jump.</li>
+    <li><b>Round-robin order costs 1.2–1.7×.</b> Leapfrog Triejoin's round-robin seeks waste work when one list is much shorter than the rest, as here; it only won on two-term queries, and there by under 1%.</li>
+    <li><b>SIMD loses on real query shapes.</b> On uncompressed arrays, SvS with galloping (0.029 ms) beats SvS with either NEON kernel by 7.7–9.5× (0.23–0.28 ms), although the 8×8 kernel wins by 6.8× on equal-size lists. The size ratios of real queries are large, so the adaptive kernel (0.027 ms, the fastest here) is the safe default. Small Adaptive (0.042 ms) and Sequential (0.052 ms) never beat SvS, which is Barbay et al.'s experimental finding.</li>
+    <li><b>Union algorithms:</b> Lucene's bitset window or PISA's min-scan is the fastest cursor union for every codec, 1.2–1.6× faster than a heap of cursors. Native operations beat any cursor union for this crate's structures: 6.2× for Roaring and 2.4× for the hybrid index. The <code>roaring</code> crate's native union is 18% slower than a bitset window over its cursor.</li>
+  </ul>
+</div>
+<div class="wide">
+  <p class="chart-title">AND, ms per query, by algorithm (clustered)</p>
+  <div id="algo-and"></div>
+  <p class="chart-title">OR, ms per query, by algorithm (clustered)</p>
+  <div id="algo-or"></div>
+</div>
+
+<div class="col">
+  <h3 id="r-clustering">What docID clustering buys</h3>
+  <p>The uniform collection has exactly the same list lengths as the clustered one, but random docIDs. Comparing the two isolates the effect of docID order, which real systems control by reordering documents (by URL, or by recursive graph bisection).</p>
+  <ul>
+    <li><b>Codecs that model local density gain the most.</b> On the query lists, clustering cuts Run-Trie by 50%, Trie by 46%, interpolative by 42%, PEF by 39%, OptPFor by 33% and Roaring by 32%. BP128 gains 18% and VByte only 12%, because one wide gap still forces a wide block or extra bytes.</li>
+    <li><b>Plain Elias-Fano gains nothing</b> (8.08 → 8.13 bits): its size depends only on \(u\) and \(n\), exactly as the formula says. On uniform data it ties PEF as the smallest codec, which is the case partitioning cannot improve.</li>
+    <li><b>Roaring and the tries pay most for randomness.</b> At 13.2–13.7 bits per posting on uniform data they are 1.6–1.7× the size of PEF, because random docIDs leave few runs and many half-empty 16-bit arrays or trie paths.</li>
+    <li><b>Conjunctions get about 2× faster with clustering</b> for every list codec (PEF 0.076 → 0.035 ms, BP128 0.145 → 0.065 ms), while Roaring changes little. Part of this comes from the workloads: the uniform queries touch 19% more postings and have smaller results, because random lists share fewer documents. The rest comes from skipping, since clustered lists put matching docIDs in fewer blocks and partitions.</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">Index size, clustered vs uniform docIDs</p>
+      <p class="chart-sub">Bits per posting over the query lists</p>
+      <div class="chart" id="space-compare"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND time, clustered vs uniform docIDs</p>
+      <p class="chart-sub">Best algorithm per codec, ms per query</p>
+      <div class="chart" id="time-compare"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="uniform-table"></div>
+
+<div class="col">
+  <h3 id="r-kernels">Kernels: where merging stops paying</h3>
+  <p>The pairwise kernels were timed on uncompressed random lists with a fixed short list of 10,000 docIDs and a long list 1 to 4,096 times larger. The chart plots nanoseconds per element of the short list, so a flat line means the cost tracks the short list (the \(m \log(n/m)\) regime) and a rising line means the long list is scanned (the \(m + n\) regime).</p>
+  <ul>
+    <li><b>Similar sizes favour SIMD.</b> At 1:1 the NEON 8×8 kernel takes 9.6 µs against 65 µs for the branchy merge, 6.8× faster. The NEON 4×4 kernel takes 24 µs, so even with 128-bit registers the 8-value block (two registers a side) is worth 2.5×. The branch-free merge (41 µs) beats the branchy one only at 1:1 and 1:2 and becomes the slowest kernel by 1:32, because its loop-carried dependency serialises every step.</li>
+    <li><b>Skew favours galloping.</b> Galloping overtakes the 8×8 kernel between 1:32 and 1:64 and is 4.5× faster at 1:4,096 (4.5 ms against 19.9 ms). At 1:4,096 Baeza-Yates takes 1.3× galloping's time and plain binary search 3.6×; both lose badly when the sizes are similar (binary search needs 297 µs at 1:1).</li>
+    <li><b>The switch point is hardware-specific.</b> The adaptive kernel uses CRoaring's 64× threshold. On the M2 that is too late: at 1:64 it pays 1.7× more than galloping (on the AVX-512 Xeon VM where this study first ran, galloping already won between 1:16 and 1:32). A threshold near 1:35 would track the lower envelope of both kernels, consistent with Baeza-Yates and Salinger's ~30:1 crossover for scalar code.</li>
+  </ul>
+</div>
+<figure>
+  <div class="frame">
+    <p class="chart-title">Pairwise intersection cost vs size ratio</p>
+    <p class="chart-sub">|small| = 10,000; the large list has density 0.1 in its universe; uncompressed arrays</p>
+    <div class="chart" id="kernels"></div>
+  </div>
+</figure>
+
+<div class="col">
+  <h3 id="r-terms">Longer queries</h3>
+  <p>Each point uses 300 queries with exactly \(k\) co-occurring terms. As \(k\) grows from 2 to 6, the lists in a query hold more postings in total (400k to 740k–880k), yet every codec answers faster: the mean result shrinks from 744 to 2 documents, and the cost of a rarest-first conjunction follows the shortest list and the number of candidates it proposes, not the total length.</p>
+  <ul>
+    <li><b>Roaring's lead narrows with more terms.</b> It is 2.5× faster than PEF for two-term queries (0.019 against 0.046 ms) but only 1.6× faster at six (0.0069 against 0.011 ms). Selective conjunctions let cursor-based codecs take long <code>NextGEQ</code> jumps, while Roaring still visits every shared 2¹⁶ chunk, the effect Pibiri &amp; Venturini describe.</li>
+    <li><b>Uncompressed arrays beat PEF at every length,</b> by 1.3× at two terms and 2.2× at six, though they take more than six times the space.</li>
+    <li><b>Tries stay 2.8–3.3× behind PEF</b> at every length. The likely reason is that the traversal pays a rank operation per trie level for every surviving region, which costs more than one cursor jump when a single list is very selective.</li>
+  </ul>
+</div>
+<figure class="narrow">
+  <div class="frame">
+    <p class="chart-title">AND time vs number of query terms</p>
+    <p class="chart-sub">Clustered collection · 300 queries per point · best algorithm per codec</p>
+    <div class="chart" id="terms"></div>
+  </div>
+</figure>
+
+<div class="col">
+  <h3 id="r-wikitext">Real text: WikiText-103</h3>
+  <p>WikiText-103 has 859,532 paragraphs, a 531,033-term vocabulary and 57 million postings. Its lists are far denser than the synthetic ones: function words occur in most paragraphs. The queries use terms with at least 100 postings and average 3.0 terms, with 64 documents per AND and 199,635 per OR.</p>
+  <ul>
+    <li><b>Dense real lists suit Roaring.</b> Its bitmap containers answer AND in 0.0043 ms, 3.8× faster than the fastest compressed list codec (PEF, 0.016 ms) and 2.1× faster than uncompressed arrays, and OR in 0.069 ms, 11× faster than any list codec with a cursor algorithm (0.75–1.3 ms) and 4.4× faster than the hybrid index. On the query lists it costs 8.47 bits per posting, 1.8× PEF.</li>
+    <li><b>The Elias-Fano family leads the list codecs</b>: PEF and interpolative coding are the smallest (4.75 and 4.77 bits per posting on query lists), and Elias-Fano and PEF answer conjunctions 1.1–3.7× faster than the block codecs.</li>
+    <li><b>Small lists dominate whole-index space.</b> Over all 531k lists the ranking changes: interpolative (8.46), Elias-Fano (8.51) and PEF (8.92) stay smallest, but the tries reach 23 bits per posting, because each of the many short lists pays for about 20 trie levels and their rank directories. Roaring pays a container header per list and lands at 15.4.</li>
+    <li><b>The OR algorithm matters as much as the codec.</b> For every cursor codec, the Lucene-style bitset window is the fastest union, 1.4–2.0× faster than the heap.</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND on WikiText-103</p>
+      <p class="chart-sub">859,532 paragraphs · best algorithm per codec</p>
+      <div class="chart" id="wikitext-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR on WikiText-103</p>
+      <p class="chart-sub">Best algorithm that outputs docIDs</p>
+      <div class="chart" id="wikitext-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="wikitext-table"></div>
+
+</section>
+
+<section class="col" id="takeaways">
+  <h2>Takeaways</h2>
+  <ol>
+  <li><b>Choose the skip structure first, the gap coder second.</b> Conjunctions spend their time in <code>NextGEQ</code>, so how a codec jumps matters more than how fast it decodes. Elias-Fano's select-based jumps made PEF the fastest compressed list codec for AND on every collection, although it decodes 1.3–1.5× slower than BP128. Uncompressed arrays, galloping through plain memory, are still 1.3–2.1× faster than PEF on the M2 (on the Xeon VM that first ran this study, PEF matched or beat them).</li>
+  <li><b>PEF is the balanced default.</b> It was the smallest or within 1% of the smallest codec on all three collections (4.75–8.08 bits per posting on query lists) and its AND time was 2.0–3.8× Roaring's. Interpolative coding matches its size but is 3.7–4.3× slower.</li>
+  <li><b>Roaring is the speed choice, especially for unions.</b> Container-wise operations with SIMD kernels gave the fastest AND on every collection and 4.8–11× faster OR than the best compressed list codec, because ORing words beats merging docIDs one at a time. The price is 1.6–1.9× PEF's space on query lists, and more on vocabularies with many short lists. Its AND advantage shrinks as queries get more selective (2.5× at two terms, 1.6× at six).</li>
+  <li><b>Use SIMD only where sizes are similar.</b> A NEON 8×8 block-compare kernel is 6.8× faster than a scalar merge on equal-size lists, but real conjunctions are skewed, and galloping wins beyond about a 1:35 size ratio on the M2. CRoaring's 64× switch point was measured on older hardware and should be re-tuned per machine.</li>
+  <li><b>Reorder docIDs.</b> Clustering cut the size of PEF, interpolative coding, Roaring and the tries by 32–50% and roughly halved conjunction time for list codecs. Plain Elias-Fano cannot benefit; partitioning is what lets it.</li>
+  <li><b>Compact tries are compact, not fast, in this implementation.</b> On clustered data they are smaller than BP128 and Roaring, but 2.8–3.3× slower than PEF for AND on every query length, and they pay heavily for short lists (23 bits per posting over the whole WikiText vocabulary). The paper measured lists of at least 4,096 postings on URL-sorted web collections; the queries here pair short lists with very long ones, where cursor skipping is hard to beat.</li>
+  <li><b>Implementation quality changes the ranking.</b> Two Roaring implementations with byte-identical containers differ by 3.0× on AND and 6.5× on OR. Published comparisons between formats should be read with that spread in mind.</li>
+</ol>
+<div class="callout">
+  <p><b>Limits of these measurements.</b> One MacBook Air with an Apple M2 (4 performance and 4 efficiency cores, 24 GB, macOS 26.0.1), on mains power, single-threaded, timed with the NEON kernels. Two independent runs of the same codecs agree to 0.3% at the median and within 3% in all but one cell (12%). The study first ran on a 4-core Emerald Rapids Xeon VM with AVX-512; the conclusions that changed on the M2 are noted above. Queries are generated from co-occurring terms rather than taken from a real query log. All operations are Boolean, with no scoring or top-k pruning, and every result is written out as a <code>Vec&lt;u32&gt;</code> unless marked "count only". Gov2 or ClueWeb in ds2i format, with real TREC queries, can be run with <code>--source ds2i</code>.</p>
+</div>
+
+</section>
+
+<section class="col repro" id="reproduce">
+  <h2>Reproduce</h2>
+  <p>Everything is in Strata's <code>postings</code> module (<code>strata/src/postings/</code>) and the <code>strata-posting-bench</code> binary. The default build uses <code>-C target-cpu=native</code>; every SIMD path has a portable fallback.</p>
+<pre>cd strata
+cargo test --release postings                      # every codec and algorithm
+scripts/postings/prepare_wikitext.sh data          # optional: WikiText-103 (needs pyarrow)
+scripts/postings/run_experiments.sh data/wikitext103.txt
+python3 scripts/postings/build_report.py           # rebuilds this page from results/postings/*.json
+
+# your own data: ds2i/PISA .docs collections or one document per line
+target/release/strata-posting-bench run --source ds2i --input gov2.docs --queries q.txt --json out.json
+target/release/strata-posting-bench run --source text --input docs.txt --codecs "pef,roaring,bp128"
+target/release/strata-posting-bench kernels --small 10000 --ratios 1,4,16,64,256,1024</pre>
+</section>
+<footer class="col" id="footer"></footer>
+</div>
+
+<div class="tip" id="tip" hidden></div>
+<script>
+const DATA = {"clustered":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":500,"mean_terms":2.802,"mean_query_postings":576256.5,"mean_and_results":309.1,"mean_or_results":562995.0,"reps":3,"cpu":"aarch64","simd":["neon"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.008,"decode_ns_per_posting":0.0771,"query_decode_ns_per_posting":0.0826,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.400538},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.573482},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.029212},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.176356},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.048284},{"op":"AND","algorithm":"SvS + SIMD NEON 4x4","ms_per_query":0.277384},{"op":"AND","algorithm":"SvS + SIMD NEON 8x8","ms_per_query":0.225523},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.026695},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.041509},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.052088},{"op":"OR","algorithm":"slices: heap","ms_per_query":3.665345},{"op":"OR","algorithm":"slices: fold (pairwise merge)","ms_per_query":1.320399},{"op":"OR","algorithm":"slices: bitmap","ms_per_query":1.725175},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.031127},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.048456},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.061739},{"op":"OR","algorithm":"heap","ms_per_query":2.14573},{"op":"OR","algorithm":"min-scan","ms_per_query":1.739538},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.784253}]},{"codec":"VByte","bits_per_posting":10.3306,"query_bits_per_posting":9.6105,"build_secs":0.0337,"decode_ns_per_posting":1.5223,"query_decode_ns_per_posting":1.3526,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.092144},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.145536},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.649001},{"op":"OR","algorithm":"heap","ms_per_query":2.912158},{"op":"OR","algorithm":"min-scan","ms_per_query":2.246262},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.571381}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.6945,"build_secs":0.0309,"decode_ns_per_posting":0.8841,"query_decode_ns_per_posting":0.7647,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.065395},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.096429},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.460473},{"op":"OR","algorithm":"heap","ms_per_query":2.808088},{"op":"OR","algorithm":"min-scan","ms_per_query":2.089509},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.437654}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.6945,"build_secs":0.0148,"decode_ns_per_posting":0.4378,"query_decode_ns_per_posting":0.2986,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.051311},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.069919},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.19039},{"op":"OR","algorithm":"heap","ms_per_query":2.481674},{"op":"OR","algorithm":"min-scan","ms_per_query":1.828145},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.180337}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.9248,"build_secs":0.1395,"decode_ns_per_posting":1.1062,"query_decode_ns_per_posting":0.8871,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.067538},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.098391},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.518535},{"op":"OR","algorithm":"heap","ms_per_query":2.82174},{"op":"OR","algorithm":"min-scan","ms_per_query":2.154133},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.489133}]},{"codec":"Elias-Fano","bits_per_posting":10.8483,"query_bits_per_posting":8.1261,"build_secs":0.0533,"decode_ns_per_posting":1.1141,"query_decode_ns_per_posting":1.1042,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.044581},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.060434},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.674107},{"op":"OR","algorithm":"heap","ms_per_query":3.04256},{"op":"OR","algorithm":"min-scan","ms_per_query":2.696902},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.399037}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.941,"build_secs":0.1847,"decode_ns_per_posting":1.1174,"query_decode_ns_per_posting":1.0065,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.035303},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.049267},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.581677},{"op":"OR","algorithm":"heap","ms_per_query":3.179931},{"op":"OR","algorithm":"min-scan","ms_per_query":2.207888},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.419479}]},{"codec":"Loom","bits_per_posting":6.857,"query_bits_per_posting":4.9036,"build_secs":0.4904,"decode_ns_per_posting":0.3553,"query_decode_ns_per_posting":0.2366,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.013361},{"op":"OR","algorithm":"native","ms_per_query":0.513133},{"op":"AND","algorithm":"native, count only","ms_per_query":0.013308},{"op":"OR","algorithm":"native, count only","ms_per_query":0.280476},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.032869},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.045972},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.141228},{"op":"OR","algorithm":"heap","ms_per_query":2.860708},{"op":"OR","algorithm":"min-scan","ms_per_query":2.290917},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.245149}]},{"codec":"Interpolative","bits_per_posting":5.9731,"query_bits_per_posting":4.9002,"build_secs":0.0929,"decode_ns_per_posting":3.193,"query_decode_ns_per_posting":3.1257,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.135205},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.231874},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.836474},{"op":"OR","algorithm":"heap","ms_per_query":4.162791},{"op":"OR","algorithm":"min-scan","ms_per_query":3.465013},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.808616}]},{"codec":"Entropic","bits_per_posting":4.9678,"query_bits_per_posting":4.2222,"build_secs":1.8518,"decode_ns_per_posting":0.9536,"query_decode_ns_per_posting":0.7831,"aux_memory_bytes":14308352,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.06423},{"op":"OR","algorithm":"native","ms_per_query":0.896614},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.066543},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.115105},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.458425},{"op":"OR","algorithm":"heap","ms_per_query":4.209007},{"op":"OR","algorithm":"min-scan","ms_per_query":3.827253},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.982988}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.584,"build_secs":0.0331,"decode_ns_per_posting":0.9388,"query_decode_ns_per_posting":0.8554,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.052151},{"op":"OR","algorithm":"native","ms_per_query":1.325638},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.055063},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.074281},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.593641},{"op":"OR","algorithm":"heap","ms_per_query":4.019693},{"op":"OR","algorithm":"min-scan","ms_per_query":3.373787},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.210417}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.3214,"build_secs":0.0775,"decode_ns_per_posting":1.3404,"query_decode_ns_per_posting":0.9517,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.017837},{"op":"OR","algorithm":"native","ms_per_query":0.382461},{"op":"AND","algorithm":"native, count only","ms_per_query":0.019138},{"op":"OR","algorithm":"native, count only","ms_per_query":0.228203},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.024177},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.034027},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.296792},{"op":"OR","algorithm":"heap","ms_per_query":3.022994},{"op":"OR","algorithm":"min-scan","ms_per_query":2.353664},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.438601}]},{"codec":"Pyramid","bits_per_posting":10.3529,"query_bits_per_posting":6.2002,"build_secs":0.3355,"decode_ns_per_posting":0.709,"query_decode_ns_per_posting":0.4483,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.01567},{"op":"OR","algorithm":"native","ms_per_query":0.355532},{"op":"AND","algorithm":"native, count only","ms_per_query":0.015151},{"op":"OR","algorithm":"native, count only","ms_per_query":0.104823},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.039468},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.05583},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.210549},{"op":"OR","algorithm":"heap","ms_per_query":4.508045},{"op":"OR","algorithm":"min-scan","ms_per_query":3.803389},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":4.257301}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":7.1792,"build_secs":0.3902,"decode_ns_per_posting":10.7266,"query_decode_ns_per_posting":7.9435,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.10313},{"op":"OR","algorithm":"native","ms_per_query":3.659819},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.17804},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.237854},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.929825},{"op":"OR","algorithm":"heap","ms_per_query":7.184869},{"op":"OR","algorithm":"min-scan","ms_per_query":6.208084},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":5.863905}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.6728,"build_secs":0.4287,"decode_ns_per_posting":11.5976,"query_decode_ns_per_posting":8.6748,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.10865},{"op":"OR","algorithm":"native","ms_per_query":3.863191},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.186},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.247568},{"op":"AND","algorithm":"decode + SvS","ms_per_query":3.145894},{"op":"OR","algorithm":"heap","ms_per_query":7.476329},{"op":"OR","algorithm":"min-scan","ms_per_query":6.508495},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":6.052299}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.3214,"build_secs":0.1561,"decode_ns_per_posting":5.6385,"query_decode_ns_per_posting":5.3271,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.052993},{"op":"OR","algorithm":"native","ms_per_query":2.949043},{"op":"AND","algorithm":"native, count only","ms_per_query":0.050234},{"op":"OR","algorithm":"native, count only","ms_per_query":0.605003},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.057604},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.071164},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.457737},{"op":"OR","algorithm":"heap","ms_per_query":4.080955},{"op":"OR","algorithm":"min-scan","ms_per_query":4.047182},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.497717}]}]},"uniform":{"collection":"synthetic-uniform (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":500,"mean_terms":2.698,"mean_query_postings":686097.7,"mean_and_results":119.1,"mean_or_results":675834.1,"reps":3,"cpu":"aarch64","simd":["neon"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0068,"decode_ns_per_posting":0.0777,"query_decode_ns_per_posting":0.0826,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.496984},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.752735},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.049615},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.14964},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.07222},{"op":"AND","algorithm":"SvS + SIMD NEON 4x4","ms_per_query":0.427152},{"op":"AND","algorithm":"SvS + SIMD NEON 8x8","ms_per_query":0.288088},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.035184},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.060253},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.09465},{"op":"OR","algorithm":"slices: heap","ms_per_query":4.475436},{"op":"OR","algorithm":"slices: fold (pairwise merge)","ms_per_query":1.600963},{"op":"OR","algorithm":"slices: bitmap","ms_per_query":2.040314},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.054335},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.08778},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.077235},{"op":"OR","algorithm":"heap","ms_per_query":2.876039},{"op":"OR","algorithm":"min-scan","ms_per_query":2.134864},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.090098}]},{"codec":"VByte","bits_per_posting":13.9161,"query_bits_per_posting":10.9119,"build_secs":0.0512,"decode_ns_per_posting":2.2208,"query_decode_ns_per_posting":1.7803,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.195075},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.342185},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.751343},{"op":"OR","algorithm":"heap","ms_per_query":3.811899},{"op":"OR","algorithm":"min-scan","ms_per_query":2.786615},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.07009}]},{"codec":"BP128","bits_per_posting":12.3776,"query_bits_per_posting":9.3934,"build_secs":0.0328,"decode_ns_per_posting":0.9376,"query_decode_ns_per_posting":0.7619,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.144876},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.247848},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.546657},{"op":"OR","algorithm":"heap","ms_per_query":3.649955},{"op":"OR","algorithm":"min-scan","ms_per_query":2.610449},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.916108}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":12.3776,"query_bits_per_posting":9.3934,"build_secs":0.0164,"decode_ns_per_posting":0.4844,"query_decode_ns_per_posting":0.2892,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.105665},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.162169},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.226958},{"op":"OR","algorithm":"heap","ms_per_query":3.322132},{"op":"OR","algorithm":"min-scan","ms_per_query":2.298537},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.601489}]},{"codec":"OptPFor","bits_per_posting":11.89,"query_bits_per_posting":8.8741,"build_secs":0.1039,"decode_ns_per_posting":0.9731,"query_decode_ns_per_posting":0.8008,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.143984},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.249276},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.571396},{"op":"OR","algorithm":"heap","ms_per_query":3.674286},{"op":"OR","algorithm":"min-scan","ms_per_query":2.67128},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.937634}]},{"codec":"Elias-Fano","bits_per_posting":10.8483,"query_bits_per_posting":8.0837,"build_secs":0.0537,"decode_ns_per_posting":1.1311,"query_decode_ns_per_posting":1.1099,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.083595},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.126512},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.808489},{"op":"OR","algorithm":"heap","ms_per_query":3.969942},{"op":"OR","algorithm":"min-scan","ms_per_query":3.354138},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.863538}]},{"codec":"PEF","bits_per_posting":10.9042,"query_bits_per_posting":8.0809,"build_secs":0.1813,"decode_ns_per_posting":1.1448,"query_decode_ns_per_posting":1.1196,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.075574},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.113038},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.752857},{"op":"OR","algorithm":"heap","ms_per_query":4.248662},{"op":"OR","algorithm":"min-scan","ms_per_query":2.861921},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.949064}]},{"codec":"Loom","bits_per_posting":10.8371,"query_bits_per_posting":8.0087,"build_secs":0.49,"decode_ns_per_posting":0.358,"query_decode_ns_per_posting":0.332,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.025392},{"op":"OR","algorithm":"native","ms_per_query":0.755145},{"op":"AND","algorithm":"native, count only","ms_per_query":0.025629},{"op":"OR","algorithm":"native, count only","ms_per_query":0.457322},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.073905},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.106394},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.220804},{"op":"OR","algorithm":"heap","ms_per_query":3.873741},{"op":"OR","algorithm":"min-scan","ms_per_query":3.022967},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.722379}]},{"codec":"Interpolative","bits_per_posting":11.3291,"query_bits_per_posting":8.5169,"build_secs":0.0998,"decode_ns_per_posting":2.8549,"query_decode_ns_per_posting":2.876,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.321888},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.64262},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.066724},{"op":"OR","algorithm":"heap","ms_per_query":5.236071},{"op":"OR","algorithm":"min-scan","ms_per_query":4.114444},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":4.421387}]},{"codec":"Entropic","bits_per_posting":10.394,"query_bits_per_posting":7.6024,"build_secs":1.2662,"decode_ns_per_posting":0.9627,"query_decode_ns_per_posting":0.7634,"aux_memory_bytes":1319936,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.14128},{"op":"OR","algorithm":"native","ms_per_query":1.063101},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.152133},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.301526},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.546308},{"op":"OR","algorithm":"heap","ms_per_query":5.422016},{"op":"OR","algorithm":"min-scan","ms_per_query":4.603857},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":4.743709}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":12.329,"query_bits_per_posting":9.3126,"build_secs":0.0351,"decode_ns_per_posting":0.9854,"query_decode_ns_per_posting":0.8399,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.105306},{"op":"OR","algorithm":"native","ms_per_query":1.46863},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.108865},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.168524},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.700316},{"op":"OR","algorithm":"heap","ms_per_query":5.296089},{"op":"OR","algorithm":"min-scan","ms_per_query":4.249233},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":3.923711}]},{"codec":"Roaring","bits_per_posting":20.4195,"query_bits_per_posting":13.7025,"build_secs":0.1121,"decode_ns_per_posting":0.8607,"query_decode_ns_per_posting":0.2791,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.021492},{"op":"OR","algorithm":"native","ms_per_query":0.443292},{"op":"AND","algorithm":"native, count only","ms_per_query":0.022691},{"op":"OR","algorithm":"native, count only","ms_per_query":0.2275},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.044541},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.064115},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.252841},{"op":"OR","algorithm":"heap","ms_per_query":3.86184},{"op":"OR","algorithm":"min-scan","ms_per_query":2.830974},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.922849}]},{"codec":"Pyramid","bits_per_posting":18.2884,"query_bits_per_posting":10.4675,"build_secs":0.6377,"decode_ns_per_posting":1.1581,"query_decode_ns_per_posting":0.6324,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.030452},{"op":"OR","algorithm":"native","ms_per_query":0.495609},{"op":"AND","algorithm":"native, count only","ms_per_query":0.030536},{"op":"OR","algorithm":"native, count only","ms_per_query":0.156632},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.091925},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.138043},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.314414},{"op":"OR","algorithm":"heap","ms_per_query":5.867586},{"op":"OR","algorithm":"min-scan","ms_per_query":4.816454},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":5.219702}]},{"codec":"Trie","bits_per_posting":20.101,"query_bits_per_posting":13.2395,"build_secs":0.7217,"decode_ns_per_posting":22.6921,"query_decode_ns_per_posting":16.9686,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.255872},{"op":"OR","algorithm":"native","ms_per_query":5.480595},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.442934},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.627395},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.523423},{"op":"OR","algorithm":"heap","ms_per_query":10.710661},{"op":"OR","algorithm":"min-scan","ms_per_query":9.214699},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":8.702923}]},{"codec":"Run-Trie","bits_per_posting":20.0993,"query_bits_per_posting":13.2367,"build_secs":0.7421,"decode_ns_per_posting":24.6286,"query_decode_ns_per_posting":18.3755,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.264614},{"op":"OR","algorithm":"native","ms_per_query":5.741542},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.467176},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.658099},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.793091},{"op":"OR","algorithm":"heap","ms_per_query":11.052498},{"op":"OR","algorithm":"min-scan","ms_per_query":9.617451},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":8.940038}]},{"codec":"Roaring (roaring crate)","bits_per_posting":20.4195,"query_bits_per_posting":13.7025,"build_secs":0.1722,"decode_ns_per_posting":4.9697,"query_decode_ns_per_posting":4.3306,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.125921},{"op":"OR","algorithm":"native","ms_per_query":3.158008},{"op":"AND","algorithm":"native, count only","ms_per_query":0.127085},{"op":"OR","algorithm":"native, count only","ms_per_query":0.376248},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.086334},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.112771},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.82778},{"op":"OR","algorithm":"heap","ms_per_query":4.996066},{"op":"OR","algorithm":"min-scan","ms_per_query":4.658706},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":2.853842}]}]},"wikitext":{"collection":"wikitext103.txt","documents":859532,"lists":531033,"postings":57010525,"queries":500,"mean_terms":3.016,"mean_query_postings":221775.9,"mean_and_results":63.6,"mean_or_results":199635.4,"reps":3,"cpu":"aarch64","simd":["neon"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0378,"decode_ns_per_posting":0.1663,"query_decode_ns_per_posting":0.0826,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.157665},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.212567},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.013984},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.037854},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.01729},{"op":"AND","algorithm":"SvS + SIMD NEON 4x4","ms_per_query":0.122548},{"op":"AND","algorithm":"SvS + SIMD NEON 8x8","ms_per_query":0.094334},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.008941},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.013962},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.027963},{"op":"OR","algorithm":"slices: heap","ms_per_query":1.619528},{"op":"OR","algorithm":"slices: fold (pairwise merge)","ms_per_query":0.495955},{"op":"OR","algorithm":"slices: bitmap","ms_per_query":0.658872},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.019498},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.033285},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.023373},{"op":"OR","algorithm":"heap","ms_per_query":1.051171},{"op":"OR","algorithm":"min-scan","ms_per_query":0.717719},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.60122}]},{"codec":"VByte","bits_per_posting":11.4453,"query_bits_per_posting":8.9081,"build_secs":0.1944,"decode_ns_per_posting":2.3144,"query_decode_ns_per_posting":1.2406,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.037447},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.067878},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.234729},{"op":"OR","algorithm":"heap","ms_per_query":1.345826},{"op":"OR","algorithm":"min-scan","ms_per_query":0.90049},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.884996}]},{"codec":"BP128","bits_per_posting":10.8497,"query_bits_per_posting":7.1122,"build_secs":0.1611,"decode_ns_per_posting":1.1436,"query_decode_ns_per_posting":0.7759,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.026556},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.05003},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.17902},{"op":"OR","algorithm":"heap","ms_per_query":1.316167},{"op":"OR","algorithm":"min-scan","ms_per_query":0.857553},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.847549}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.8497,"query_bits_per_posting":7.1122,"build_secs":0.1119,"decode_ns_per_posting":0.7042,"query_decode_ns_per_posting":0.3055,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.019512},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.032929},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.074695},{"op":"OR","algorithm":"heap","ms_per_query":1.19744},{"op":"OR","algorithm":"min-scan","ms_per_query":0.756644},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.754028}]},{"codec":"OptPFor","bits_per_posting":9.9483,"query_bits_per_posting":5.9098,"build_secs":0.3554,"decode_ns_per_posting":1.2311,"query_decode_ns_per_posting":0.8359,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.027679},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.052213},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.188468},{"op":"OR","algorithm":"heap","ms_per_query":1.314329},{"op":"OR","algorithm":"min-scan","ms_per_query":0.877784},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.856068}]},{"codec":"Elias-Fano","bits_per_posting":8.5101,"query_bits_per_posting":5.1588,"build_secs":0.2076,"decode_ns_per_posting":1.2427,"query_decode_ns_per_posting":1.1138,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.01763},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.027198},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.262373},{"op":"OR","algorithm":"heap","ms_per_query":1.418646},{"op":"OR","algorithm":"min-scan","ms_per_query":1.058763},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.834312}]},{"codec":"PEF","bits_per_posting":8.9159,"query_bits_per_posting":4.7543,"build_secs":0.6581,"decode_ns_per_posting":1.2994,"query_decode_ns_per_posting":1.0394,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.016257},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.023921},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.210446},{"op":"OR","algorithm":"heap","ms_per_query":1.45312},{"op":"OR","algorithm":"min-scan","ms_per_query":0.903046},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.825979}]},{"codec":"Loom","bits_per_posting":8.9587,"query_bits_per_posting":4.7364,"build_secs":1.444,"decode_ns_per_posting":0.4808,"query_decode_ns_per_posting":0.2654,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.006637},{"op":"OR","algorithm":"native","ms_per_query":0.107285},{"op":"AND","algorithm":"native, count only","ms_per_query":0.006682},{"op":"OR","algorithm":"native, count only","ms_per_query":0.06437},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.015637},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.022149},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.043096},{"op":"OR","algorithm":"heap","ms_per_query":1.262582},{"op":"OR","algorithm":"min-scan","ms_per_query":0.900701},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.766873}]},{"codec":"Interpolative","bits_per_posting":8.4612,"query_bits_per_posting":4.7728,"build_secs":0.3411,"decode_ns_per_posting":3.0284,"query_decode_ns_per_posting":2.9851,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.059588},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.13192},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.652854},{"op":"OR","algorithm":"heap","ms_per_query":1.78614},{"op":"OR","algorithm":"min-scan","ms_per_query":1.328774},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.313039}]},{"codec":"Entropic","bits_per_posting":7.2526,"query_bits_per_posting":4.1755,"build_secs":5.7272,"decode_ns_per_posting":1.3236,"query_decode_ns_per_posting":0.7994,"aux_memory_bytes":22428672,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.027902},{"op":"OR","algorithm":"native","ms_per_query":0.278869},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.02905},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.063255},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.174977},{"op":"OR","algorithm":"heap","ms_per_query":1.834229},{"op":"OR","algorithm":"min-scan","ms_per_query":1.506631},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.434033}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.3578,"query_bits_per_posting":5.849,"build_secs":0.17,"decode_ns_per_posting":1.19,"query_decode_ns_per_posting":0.8744,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.019179},{"op":"OR","algorithm":"native","ms_per_query":0.305205},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.020479},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.029246},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.202764},{"op":"OR","algorithm":"heap","ms_per_query":1.743666},{"op":"OR","algorithm":"min-scan","ms_per_query":1.295276},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.157085}]},{"codec":"Roaring","bits_per_posting":15.4446,"query_bits_per_posting":8.4687,"build_secs":0.1664,"decode_ns_per_posting":0.453,"query_decode_ns_per_posting":0.287,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.004308},{"op":"OR","algorithm":"native","ms_per_query":0.069377},{"op":"AND","algorithm":"native, count only","ms_per_query":0.004461},{"op":"OR","algorithm":"native, count only","ms_per_query":0.037963},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.009055},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.013151},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.048176},{"op":"OR","algorithm":"heap","ms_per_query":1.261359},{"op":"OR","algorithm":"min-scan","ms_per_query":0.880975},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.813323}]},{"codec":"Pyramid","bits_per_posting":12.0457,"query_bits_per_posting":6.3006,"build_secs":0.9892,"decode_ns_per_posting":0.9178,"query_decode_ns_per_posting":0.4461,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.008113},{"op":"OR","algorithm":"native","ms_per_query":0.080303},{"op":"AND","algorithm":"native, count only","ms_per_query":0.008288},{"op":"OR","algorithm":"native, count only","ms_per_query":0.028529},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.019744},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.028371},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.060278},{"op":"OR","algorithm":"heap","ms_per_query":1.860573},{"op":"OR","algorithm":"min-scan","ms_per_query":1.398872},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.531311}]},{"codec":"Trie","bits_per_posting":23.3365,"query_bits_per_posting":6.5001,"build_secs":1.835,"decode_ns_per_posting":17.8341,"query_decode_ns_per_posting":7.8461,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.048239},{"op":"OR","algorithm":"native","ms_per_query":0.821074},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.076786},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.113045},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.691742},{"op":"OR","algorithm":"heap","ms_per_query":2.266265},{"op":"OR","algorithm":"min-scan","ms_per_query":1.748524},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.553101}]},{"codec":"Run-Trie","bits_per_posting":23.2139,"query_bits_per_posting":6.2273,"build_secs":1.8743,"decode_ns_per_posting":19.2008,"query_decode_ns_per_posting":8.3842,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.049237},{"op":"OR","algorithm":"native","ms_per_query":0.866168},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.080687},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.118222},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.742569},{"op":"OR","algorithm":"heap","ms_per_query":2.31178},{"op":"OR","algorithm":"min-scan","ms_per_query":1.850769},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":1.595792}]},{"codec":"Roaring (roaring crate)","bits_per_posting":15.4446,"query_bits_per_posting":8.4687,"build_secs":0.3567,"decode_ns_per_posting":4.4961,"query_decode_ns_per_posting":4.5258,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.028082},{"op":"OR","algorithm":"native","ms_per_query":0.83772},{"op":"AND","algorithm":"native, count only","ms_per_query":0.027788},{"op":"OR","algorithm":"native, count only","ms_per_query":0.066998},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.018357},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.023021},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.861996},{"op":"OR","algorithm":"heap","ms_per_query":1.640907},{"op":"OR","algorithm":"min-scan","ms_per_query":1.478562},{"op":"OR","algorithm":"bitset window (4096)","ms_per_query":0.804618}]}]},"kernels":{"small":10000,"density":0.1,"cpu":"aarch64","rows":[{"kernel":"merge","ratio":1,"small":10000,"large":10000,"micros_per_op":64.8959,"ns_per_small_element":6.4896},{"kernel":"merge (branchless)","ratio":1,"small":10000,"large":10000,"micros_per_op":40.5938,"ns_per_small_element":4.0594},{"kernel":"galloping","ratio":1,"small":10000,"large":10000,"micros_per_op":61.1676,"ns_per_small_element":6.1168},{"kernel":"binary search","ratio":1,"small":10000,"large":10000,"micros_per_op":296.9844,"ns_per_small_element":29.6984},{"kernel":"Baeza-Yates","ratio":1,"small":10000,"large":10000,"micros_per_op":88.2807,"ns_per_small_element":8.8281},{"kernel":"SIMD NEON 4x4","ratio":1,"small":10000,"large":10000,"micros_per_op":23.7917,"ns_per_small_element":2.3792},{"kernel":"SIMD NEON 8x8","ratio":1,"small":10000,"large":10000,"micros_per_op":9.5781,"ns_per_small_element":0.9578},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":1,"small":10000,"large":10000,"micros_per_op":9.347,"ns_per_small_element":0.9347},{"kernel":"merge","ratio":2,"small":10000,"large":20000,"micros_per_op":69.547,"ns_per_small_element":6.9547},{"kernel":"merge (branchless)","ratio":2,"small":10000,"large":20000,"micros_per_op":58.9011,"ns_per_small_element":5.8901},{"kernel":"galloping","ratio":2,"small":10000,"large":20000,"micros_per_op":72.4989,"ns_per_small_element":7.2499},{"kernel":"binary search","ratio":2,"small":10000,"large":20000,"micros_per_op":302.1041,"ns_per_small_element":30.2104},{"kernel":"Baeza-Yates","ratio":2,"small":10000,"large":20000,"micros_per_op":106.2812,"ns_per_small_element":10.6281},{"kernel":"SIMD NEON 4x4","ratio":2,"small":10000,"large":20000,"micros_per_op":33.9505,"ns_per_small_element":3.3951},{"kernel":"SIMD NEON 8x8","ratio":2,"small":10000,"large":20000,"micros_per_op":13.625,"ns_per_small_element":1.3625},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":2,"small":10000,"large":20000,"micros_per_op":13.625,"ns_per_small_element":1.3625},{"kernel":"merge","ratio":4,"small":10000,"large":40000,"micros_per_op":87.4688,"ns_per_small_element":8.7469},{"kernel":"merge (branchless)","ratio":4,"small":10000,"large":40000,"micros_per_op":99.5834,"ns_per_small_element":9.9583},{"kernel":"galloping","ratio":4,"small":10000,"large":40000,"micros_per_op":90.0592,"ns_per_small_element":9.0059},{"kernel":"binary search","ratio":4,"small":10000,"large":40000,"micros_per_op":321.7669,"ns_per_small_element":32.1767},{"kernel":"Baeza-Yates","ratio":4,"small":10000,"large":40000,"micros_per_op":124.2796,"ns_per_small_element":12.428},{"kernel":"SIMD NEON 4x4","ratio":4,"small":10000,"large":40000,"micros_per_op":56.832,"ns_per_small_element":5.6832},{"kernel":"SIMD NEON 8x8","ratio":4,"small":10000,"large":40000,"micros_per_op":22.7344,"ns_per_small_element":2.2734},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":4,"small":10000,"large":40000,"micros_per_op":23.377,"ns_per_small_element":2.3377},{"kernel":"merge","ratio":8,"small":10000,"large":80000,"micros_per_op":121.9427,"ns_per_small_element":12.1943},{"kernel":"merge (branchless)","ratio":8,"small":10000,"large":80000,"micros_per_op":179.776,"ns_per_small_element":17.9776},{"kernel":"galloping","ratio":8,"small":10000,"large":80000,"micros_per_op":113.4294,"ns_per_small_element":11.3429},{"kernel":"binary search","ratio":8,"small":10000,"large":80000,"micros_per_op":341.638,"ns_per_small_element":34.1638},{"kernel":"Baeza-Yates","ratio":8,"small":10000,"large":80000,"micros_per_op":145.582,"ns_per_small_element":14.5582},{"kernel":"SIMD NEON 4x4","ratio":8,"small":10000,"large":80000,"micros_per_op":102.3386,"ns_per_small_element":10.2339},{"kernel":"SIMD NEON 8x8","ratio":8,"small":10000,"large":80000,"micros_per_op":41.1061,"ns_per_small_element":4.1106},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":8,"small":10000,"large":80000,"micros_per_op":41.9242,"ns_per_small_element":4.1924},{"kernel":"merge","ratio":16,"small":10000,"large":160000,"micros_per_op":192.3851,"ns_per_small_element":19.2385},{"kernel":"merge (branchless)","ratio":16,"small":10000,"large":160000,"micros_per_op":342.1211,"ns_per_small_element":34.2121},{"kernel":"galloping","ratio":16,"small":10000,"large":160000,"micros_per_op":138.5697,"ns_per_small_element":13.857},{"kernel":"binary search","ratio":16,"small":10000,"large":160000,"micros_per_op":368.1355,"ns_per_small_element":36.8135},{"kernel":"Baeza-Yates","ratio":16,"small":10000,"large":160000,"micros_per_op":170.4388,"ns_per_small_element":17.0439},{"kernel":"SIMD NEON 4x4","ratio":16,"small":10000,"large":160000,"micros_per_op":193.7526,"ns_per_small_element":19.3753},{"kernel":"SIMD NEON 8x8","ratio":16,"small":10000,"large":160000,"micros_per_op":78.4297,"ns_per_small_element":7.843},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":16,"small":10000,"large":160000,"micros_per_op":80.6771,"ns_per_small_element":8.0677},{"kernel":"merge","ratio":32,"small":10000,"large":320000,"micros_per_op":332.9062,"ns_per_small_element":33.2906},{"kernel":"merge (branchless)","ratio":32,"small":10000,"large":320000,"micros_per_op":664.0938,"ns_per_small_element":66.4094},{"kernel":"galloping","ratio":32,"small":10000,"large":320000,"micros_per_op":165.0807,"ns_per_small_element":16.5081},{"kernel":"binary search","ratio":32,"small":10000,"large":320000,"micros_per_op":418.4115,"ns_per_small_element":41.8411},{"kernel":"Baeza-Yates","ratio":32,"small":10000,"large":320000,"micros_per_op":202.1842,"ns_per_small_element":20.2184},{"kernel":"SIMD NEON 4x4","ratio":32,"small":10000,"large":320000,"micros_per_op":381.2441,"ns_per_small_element":38.1244},{"kernel":"SIMD NEON 8x8","ratio":32,"small":10000,"large":320000,"micros_per_op":155.7812,"ns_per_small_element":15.5781},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":32,"small":10000,"large":320000,"micros_per_op":160.0964,"ns_per_small_element":16.0096},{"kernel":"merge","ratio":64,"small":10000,"large":640000,"micros_per_op":610.948,"ns_per_small_element":61.0948},{"kernel":"merge (branchless)","ratio":64,"small":10000,"large":640000,"micros_per_op":1301.5835,"ns_per_small_element":130.1584},{"kernel":"galloping","ratio":64,"small":10000,"large":640000,"micros_per_op":190.8177,"ns_per_small_element":19.0818},{"kernel":"binary search","ratio":64,"small":10000,"large":640000,"micros_per_op":529.6354,"ns_per_small_element":52.9635},{"kernel":"Baeza-Yates","ratio":64,"small":10000,"large":640000,"micros_per_op":239.3665,"ns_per_small_element":23.9367},{"kernel":"SIMD NEON 4x4","ratio":64,"small":10000,"large":640000,"micros_per_op":743.8853,"ns_per_small_element":74.3885},{"kernel":"SIMD NEON 8x8","ratio":64,"small":10000,"large":640000,"micros_per_op":308.1977,"ns_per_small_element":30.8198},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":64,"small":10000,"large":640000,"micros_per_op":317.8852,"ns_per_small_element":31.7885},{"kernel":"merge","ratio":128,"small":10000,"large":1280000,"micros_per_op":1164.3438,"ns_per_small_element":116.4344},{"kernel":"merge (branchless)","ratio":128,"small":10000,"large":1280000,"micros_per_op":2568.8542,"ns_per_small_element":256.8854},{"kernel":"galloping","ratio":128,"small":10000,"large":1280000,"micros_per_op":225.3027,"ns_per_small_element":22.5303},{"kernel":"binary search","ratio":128,"small":10000,"large":1280000,"micros_per_op":740.8919,"ns_per_small_element":74.0892},{"kernel":"Baeza-Yates","ratio":128,"small":10000,"large":1280000,"micros_per_op":298.0915,"ns_per_small_element":29.8091},{"kernel":"SIMD NEON 4x4","ratio":128,"small":10000,"large":1280000,"micros_per_op":1456.2395,"ns_per_small_element":145.624},{"kernel":"SIMD NEON 8x8","ratio":128,"small":10000,"large":1280000,"micros_per_op":613.302,"ns_per_small_element":61.3302},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":128,"small":10000,"large":1280000,"micros_per_op":224.8724,"ns_per_small_element":22.4872},{"kernel":"merge","ratio":256,"small":10000,"large":2560000,"micros_per_op":2265.3177,"ns_per_small_element":226.5318},{"kernel":"merge (branchless)","ratio":256,"small":10000,"large":2560000,"micros_per_op":5059.25,"ns_per_small_element":505.925},{"kernel":"galloping","ratio":256,"small":10000,"large":2560000,"micros_per_op":289.4261,"ns_per_small_element":28.9426},{"kernel":"binary search","ratio":256,"small":10000,"large":2560000,"micros_per_op":1272.3307,"ns_per_small_element":127.2331},{"kernel":"Baeza-Yates","ratio":256,"small":10000,"large":2560000,"micros_per_op":488.9779,"ns_per_small_element":48.8978},{"kernel":"SIMD NEON 4x4","ratio":256,"small":10000,"large":2560000,"micros_per_op":2847.4949,"ns_per_small_element":284.7495},{"kernel":"SIMD NEON 8x8","ratio":256,"small":10000,"large":2560000,"micros_per_op":1208.5312,"ns_per_small_element":120.8531},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":256,"small":10000,"large":2560000,"micros_per_op":286.0983,"ns_per_small_element":28.6098},{"kernel":"merge","ratio":1024,"small":10000,"large":10240000,"micros_per_op":8906.552,"ns_per_small_element":890.6552},{"kernel":"merge (branchless)","ratio":1024,"small":10000,"large":10240000,"micros_per_op":16544.448,"ns_per_small_element":1654.4448},{"kernel":"galloping","ratio":1024,"small":10000,"large":10240000,"micros_per_op":1774.0573,"ns_per_small_element":177.4057},{"kernel":"binary search","ratio":1024,"small":10000,"large":10240000,"micros_per_op":8755.3853,"ns_per_small_element":875.5385},{"kernel":"Baeza-Yates","ratio":1024,"small":10000,"large":10240000,"micros_per_op":2741.2447,"ns_per_small_element":274.1245},{"kernel":"SIMD NEON 4x4","ratio":1024,"small":10000,"large":10240000,"micros_per_op":9392.0209,"ns_per_small_element":939.2021},{"kernel":"SIMD NEON 8x8","ratio":1024,"small":10000,"large":10240000,"micros_per_op":4906.3385,"ns_per_small_element":490.6338},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":1024,"small":10000,"large":10240000,"micros_per_op":1788.4817,"ns_per_small_element":178.8482},{"kernel":"merge","ratio":4096,"small":10000,"large":40960000,"micros_per_op":35346.6562,"ns_per_small_element":3534.6656},{"kernel":"merge (branchless)","ratio":4096,"small":10000,"large":40960000,"micros_per_op":45869.948,"ns_per_small_element":4586.9948},{"kernel":"galloping","ratio":4096,"small":10000,"large":40960000,"micros_per_op":4474.0105,"ns_per_small_element":447.401},{"kernel":"binary search","ratio":4096,"small":10000,"large":40960000,"micros_per_op":16066.7915,"ns_per_small_element":1606.6791},{"kernel":"Baeza-Yates","ratio":4096,"small":10000,"large":40960000,"micros_per_op":5834.4688,"ns_per_small_element":583.4469},{"kernel":"SIMD NEON 4x4","ratio":4096,"small":10000,"large":40960000,"micros_per_op":17250.8125,"ns_per_small_element":1725.0812},{"kernel":"SIMD NEON 8x8","ratio":4096,"small":10000,"large":40960000,"micros_per_op":19912.25,"ns_per_small_element":1991.225},{"kernel":"adaptive (SIMD / gallop @64x)","ratio":4096,"small":10000,"large":40960000,"micros_per_op":4388.5625,"ns_per_small_element":438.8562}]},"terms":{"2":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":2.0,"mean_query_postings":401527.4,"mean_and_results":743.5,"mean_or_results":400783.9,"reps":3,"cpu":"aarch64","simd":["neon"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0067,"decode_ns_per_posting":0.0794,"query_decode_ns_per_posting":0.0819,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.356579},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.562929},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.039107},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.219094},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.059217},{"op":"AND","algorithm":"SvS + SIMD NEON 4x4","ms_per_query":0.257023},{"op":"AND","algorithm":"SvS + SIMD NEON 8x8","ms_per_query":0.194128},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.036698},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.053023},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.047945},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.043793},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.04579},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.058347}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.3545,"build_secs":0.0314,"decode_ns_per_posting":0.8856,"query_decode_ns_per_posting":0.7631,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.097352},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.097117},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.337511}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.3545,"build_secs":0.0142,"decode_ns_per_posting":0.4384,"query_decode_ns_per_posting":0.2948,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.074647},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.074837},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.149505}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.7081,"build_secs":0.1398,"decode_ns_per_posting":1.1317,"query_decode_ns_per_posting":0.8749,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.101056},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.10076},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.379982}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.6211,"build_secs":0.1804,"decode_ns_per_posting":1.1127,"query_decode_ns_per_posting":0.9903,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.046416},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.047847},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.420722}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.219,"build_secs":0.0336,"decode_ns_per_posting":0.9444,"query_decode_ns_per_posting":0.8448,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.058265},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.066462},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.067726},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.430124}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.0725,"build_secs":0.0818,"decode_ns_per_posting":1.3499,"query_decode_ns_per_posting":0.8633,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.018705},{"op":"AND","algorithm":"native, count only","ms_per_query":0.018858},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.029584},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.03119},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.201606}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":6.7401,"build_secs":0.3899,"decode_ns_per_posting":10.5894,"query_decode_ns_per_posting":7.4243,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.145114},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.226433},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.232023},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.88592}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.2299,"build_secs":0.4272,"decode_ns_per_posting":11.5352,"query_decode_ns_per_posting":8.0822,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.153614},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.240882},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.241129},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.011571}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.0725,"build_secs":0.156,"decode_ns_per_posting":5.6439,"query_decode_ns_per_posting":5.1707,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.033524},{"op":"AND","algorithm":"native, count only","ms_per_query":0.029901},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.065703},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.067019},{"op":"AND","algorithm":"decode + SvS","ms_per_query":1.717628}]}]},"3":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":3.0,"mean_query_postings":684896.2,"mean_and_results":110.6,"mean_or_results":669995.0,"reps":3,"cpu":"aarch64","simd":["neon"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0072,"decode_ns_per_posting":0.0765,"query_decode_ns_per_posting":0.0805,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.498129},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.679187},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.023237},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.13156},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.035184},{"op":"AND","algorithm":"SvS + SIMD NEON 4x4","ms_per_query":0.344867},{"op":"AND","algorithm":"SvS + SIMD NEON 8x8","ms_per_query":0.277533},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.02121},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.032826},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.051899},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.023428},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.047719},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.063584}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.5087,"build_secs":0.0315,"decode_ns_per_posting":0.886,"query_decode_ns_per_posting":0.7636,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.049223},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.102229},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.536855}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.5087,"build_secs":0.014,"decode_ns_per_posting":0.4364,"query_decode_ns_per_posting":0.2967,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.039129},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.070375},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.216146}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.8141,"build_secs":0.1391,"decode_ns_per_posting":1.1215,"query_decode_ns_per_posting":0.8552,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.050968},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.107795},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.603159}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.7704,"build_secs":0.1814,"decode_ns_per_posting":1.1205,"query_decode_ns_per_posting":1.0009,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.029217},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.047634},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.680024}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.3875,"build_secs":0.0332,"decode_ns_per_posting":0.9375,"query_decode_ns_per_posting":0.8597,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.046821},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.046499},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.068027},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.694173}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.1749,"build_secs":0.0778,"decode_ns_per_posting":1.3448,"query_decode_ns_per_posting":0.9032,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.017235},{"op":"AND","algorithm":"native, count only","ms_per_query":0.017245},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.020114},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.030191},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.323562}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":6.9643,"build_secs":0.3908,"decode_ns_per_posting":10.5408,"query_decode_ns_per_posting":7.6724,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.084113},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.149949},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.237278},{"op":"AND","algorithm":"decode + SvS","ms_per_query":3.342802}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.4555,"build_secs":0.429,"decode_ns_per_posting":11.4943,"query_decode_ns_per_posting":8.3546,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.08765},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.156844},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.254992},{"op":"AND","algorithm":"decode + SvS","ms_per_query":3.608057}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.1749,"build_secs":0.1561,"decode_ns_per_posting":5.5752,"query_decode_ns_per_posting":5.1658,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.05782},{"op":"AND","algorithm":"native, count only","ms_per_query":0.056923},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.04928},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.065291},{"op":"AND","algorithm":"decode + SvS","ms_per_query":2.898996}]}]},"4":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":4.0,"mean_query_postings":875849.0,"mean_and_results":23.6,"mean_or_results":836332.9,"reps":3,"cpu":"aarch64","simd":["neon"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0072,"decode_ns_per_posting":0.0781,"query_decode_ns_per_posting":0.0809,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.449111},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.665398},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.014382},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.080858},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.020997},{"op":"AND","algorithm":"SvS + SIMD NEON 4x4","ms_per_query":0.315027},{"op":"AND","algorithm":"SvS + SIMD NEON 8x8","ms_per_query":0.262298},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.012687},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.024415},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.052311},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.013977},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.049627},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.069589}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.607,"build_secs":0.0313,"decode_ns_per_posting":0.8835,"query_decode_ns_per_posting":0.7661,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.029934},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.090917},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.673227}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.607,"build_secs":0.0139,"decode_ns_per_posting":0.438,"query_decode_ns_per_posting":0.298,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.02357},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.058758},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.263268}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.8761,"build_secs":0.1404,"decode_ns_per_posting":1.1357,"query_decode_ns_per_posting":0.885,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.03052},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.093173},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.758382}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.8614,"build_secs":0.1804,"decode_ns_per_posting":1.1121,"query_decode_ns_per_posting":1.0052,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.018972},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.045365},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.85754}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.4928,"build_secs":0.0333,"decode_ns_per_posting":0.9113,"query_decode_ns_per_posting":0.8532,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.028881},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.028946},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.067013},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.887989}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.2459,"build_secs":0.078,"decode_ns_per_posting":1.3261,"query_decode_ns_per_posting":0.9062,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.012339},{"op":"AND","algorithm":"native, count only","ms_per_query":0.012463},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.012881},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.029926},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.418929}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":7.0905,"build_secs":0.3908,"decode_ns_per_posting":10.649,"query_decode_ns_per_posting":7.8145,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.05398},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.098024},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.209596},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.489885}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.5829,"build_secs":0.4283,"decode_ns_per_posting":11.4434,"query_decode_ns_per_posting":8.5268,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.056521},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.10828},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.224485},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.82474}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.2459,"build_secs":0.156,"decode_ns_per_posting":5.6367,"query_decode_ns_per_posting":5.2585,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.052414},{"op":"AND","algorithm":"native, count only","ms_per_query":0.052222},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.035747},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.06268},{"op":"AND","algorithm":"decode + SvS","ms_per_query":3.716279}]}]},"5":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":5.0,"mean_query_postings":763061.1,"mean_and_results":6.2,"mean_or_results":720237.0,"reps":3,"cpu":"aarch64","simd":["neon"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0068,"decode_ns_per_posting":0.0774,"query_decode_ns_per_posting":0.0818,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.349813},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.464508},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.010807},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.065856},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.01594},{"op":"AND","algorithm":"SvS + SIMD NEON 4x4","ms_per_query":0.253272},{"op":"AND","algorithm":"SvS + SIMD NEON 8x8","ms_per_query":0.208758},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.008096},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.021269},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.049879},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.010492},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.048127},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.060378}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.736,"build_secs":0.0314,"decode_ns_per_posting":0.8839,"query_decode_ns_per_posting":0.7657,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.022358},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.083359},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.585083}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.736,"build_secs":0.014,"decode_ns_per_posting":0.4398,"query_decode_ns_per_posting":0.3006,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.017925},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.05276},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.227732}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.9508,"build_secs":0.1402,"decode_ns_per_posting":1.1354,"query_decode_ns_per_posting":0.8888,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.022816},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.085482},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.662507}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":4.9779,"build_secs":0.1806,"decode_ns_per_posting":1.1208,"query_decode_ns_per_posting":1.0068,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.014764},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.042759},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.749205}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.6273,"build_secs":0.0336,"decode_ns_per_posting":0.9405,"query_decode_ns_per_posting":0.8537,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.022122},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.022247},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.06606},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.755221}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.3568,"build_secs":0.0776,"decode_ns_per_posting":1.3471,"query_decode_ns_per_posting":0.9584,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.009539},{"op":"AND","algorithm":"native, count only","ms_per_query":0.009521},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.010108},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.02957},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.410026}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":7.2282,"build_secs":0.3897,"decode_ns_per_posting":10.6255,"query_decode_ns_per_posting":7.9773,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.041827},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.078654},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.196248},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.213617}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.7224,"build_secs":0.4307,"decode_ns_per_posting":11.4911,"query_decode_ns_per_posting":8.6569,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.043091},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.082023},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.205755},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.545788}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.3568,"build_secs":0.155,"decode_ns_per_posting":5.6392,"query_decode_ns_per_posting":5.2248,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.044197},{"op":"AND","algorithm":"native, count only","ms_per_query":0.043928},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.031151},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.063309},{"op":"AND","algorithm":"decode + SvS","ms_per_query":3.242079}]}]},"6":{"collection":"synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)","documents":8000000,"lists":20000,"postings":20951573,"queries":300,"mean_terms":6.0,"mean_query_postings":735851.0,"mean_and_results":2.2,"mean_or_results":686810.9,"reps":3,"cpu":"aarch64","simd":["neon"],"codecs":[{"codec":"Uncompressed","bits_per_posting":32.0,"query_bits_per_posting":32.0,"build_secs":0.0076,"decode_ns_per_posting":0.0776,"query_decode_ns_per_posting":0.0866,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"SvS + merge","ms_per_query":0.310776},{"op":"AND","algorithm":"SvS + merge (branchless)","ms_per_query":0.385032},{"op":"AND","algorithm":"SvS + galloping","ms_per_query":0.007915},{"op":"AND","algorithm":"SvS + binary search","ms_per_query":0.047944},{"op":"AND","algorithm":"SvS + Baeza-Yates","ms_per_query":0.011563},{"op":"AND","algorithm":"SvS + SIMD NEON 4x4","ms_per_query":0.228078},{"op":"AND","algorithm":"SvS + SIMD NEON 8x8","ms_per_query":0.195735},{"op":"AND","algorithm":"SvS + adaptive (SIMD / gallop @64x)","ms_per_query":0.005043},{"op":"AND","algorithm":"Small Adaptive","ms_per_query":0.016887},{"op":"AND","algorithm":"Sequential (Barbay-Kenyon)","ms_per_query":0.045151},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.007465},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.044256},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.057513}]},{"codec":"BP128","bits_per_posting":10.0734,"query_bits_per_posting":7.7999,"build_secs":0.0315,"decode_ns_per_posting":0.8872,"query_decode_ns_per_posting":0.7694,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.016375},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.071612},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.5618}]},{"codec":"BP128 (bitpacking crate)","bits_per_posting":10.0734,"query_bits_per_posting":7.7999,"build_secs":0.0139,"decode_ns_per_posting":0.4367,"query_decode_ns_per_posting":0.3016,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.013105},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.044932},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.217288}]},{"codec":"OptPFor","bits_per_posting":7.1273,"query_bits_per_posting":5.9814,"build_secs":0.1399,"decode_ns_per_posting":1.1395,"query_decode_ns_per_posting":0.8951,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.017631},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.07381},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.639828}]},{"codec":"PEF","bits_per_posting":7.0358,"query_bits_per_posting":5.0332,"build_secs":0.183,"decode_ns_per_posting":1.1118,"query_decode_ns_per_posting":1.0143,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.011217},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.036783},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.721289}]},{"codec":"Hybrid (bitmap + BP128)","bits_per_posting":10.0058,"query_bits_per_posting":7.6928,"build_secs":0.0334,"decode_ns_per_posting":0.938,"query_decode_ns_per_posting":0.8521,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.016286},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.016364},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.060109},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.711577}]},{"codec":"Roaring","bits_per_posting":11.7241,"query_bits_per_posting":9.4276,"build_secs":0.078,"decode_ns_per_posting":1.3258,"query_decode_ns_per_posting":0.9622,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.006899},{"op":"AND","algorithm":"native, count only","ms_per_query":0.006858},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.007656},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.025957},{"op":"AND","algorithm":"decode + SvS","ms_per_query":0.406725}]},{"codec":"Trie","bits_per_posting":9.6125,"query_bits_per_posting":7.2825,"build_secs":0.3921,"decode_ns_per_posting":10.6724,"query_decode_ns_per_posting":8.0577,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.032284},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.059526},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.169927},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.177411}]},{"codec":"Run-Trie","bits_per_posting":9.1282,"query_bits_per_posting":6.7773,"build_secs":0.4282,"decode_ns_per_posting":11.5407,"query_decode_ns_per_posting":8.8075,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.033289},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.06183},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.176356},{"op":"AND","algorithm":"decode + SvS","ms_per_query":4.493405}]},{"codec":"Roaring (roaring crate)","bits_per_posting":11.7241,"query_bits_per_posting":9.4276,"build_secs":0.156,"decode_ns_per_posting":5.6322,"query_decode_ns_per_posting":5.2747,"aux_memory_bytes":0,"measurements":[{"op":"AND","algorithm":"native","ms_per_query":0.034036},{"op":"AND","algorithm":"native, count only","ms_per_query":0.033012},{"op":"AND","algorithm":"leapfrog (NextGEQ)","ms_per_query":0.02585},{"op":"AND","algorithm":"round-robin (LFTJ)","ms_per_query":0.0573},{"op":"AND","algorithm":"decode + SvS","ms_per_query":3.151678}]}]}},"generated":"2026-10-13","rustc":"1.92.0"};
+</script>
+<script>
+(function () {
+  "use strict";
+  const NS = "http://www.w3.org/2000/svg";
+  const $ = (s) => document.querySelector(s);
+
+  function s(tag, attrs, parent, text) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function h(tag, attrs, parent, text) {
+    const e = document.createElement(tag);
+    for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  const fmt = (v, d) => (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(d === undefined ? 1 : Math.max(0, d - 1)) : v.toFixed(d === undefined ? 2 : d));
+  const ms = (v) => (v < 0.1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v.toFixed(1));
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  // ---------------------------------------------------------------- diagrams
+  function blockDiagram() {
+    const g = $("#blk-docs");
+    const docs = [3, 7, 8, 9, 15, 16, 22, 40];
+    const gaps = [3, 3, 0, 0, 5, 0, 5, 17];
+    docs.forEach((d, i) => {
+      const x = 128 + i * 60;
+      s("rect", { x, y: 16, width: 52, height: 28, rx: 4, class: "box" }, g);
+      s("text", { x: x + 26, y: 35, class: "tm", "text-anchor": "middle" }, g, d);
+      s("rect", { x, y: 68, width: 52, height: 28, rx: 4, class: "box-acc" }, g);
+      s("text", { x: x + 26, y: 87, class: "tm", "text-anchor": "middle" }, g, gaps[i]);
+    });
+    s("text", { x: 128 + 8 * 60 + 6, y: 35, class: "tl" }, g, "… 128 per block");
+    s("text", { x: 128 + 8 * 60 + 6, y: 87, class: "tl" }, g, "max gap 17 → b = 5");
+  }
+
+  function efDiagram() {
+    const vals = [3, 4, 7, 13, 14, 15, 21, 31];
+    const gv = $("#ef-values");
+    vals.forEach((v, i) => {
+      const x = 130 + i * 76;
+      s("rect", { x, y: 10, width: 64, height: 26, rx: 4, class: "box" }, gv);
+      s("text", { x: x + 32, y: 28, class: "tm", "text-anchor": "middle" }, gv, v);
+      const hi = (v >> 2).toString(2).padStart(3, "0");
+      const lo = (v & 3).toString(2).padStart(2, "0");
+      s("text", { x: x + 32, y: 62, class: "tm", "text-anchor": "middle" }, gv, hi + "│" + lo);
+    });
+    const groups = [[1, 0], [1, 1, 0], [0], [1, 1, 1, 0], [0], [1, 0], [0], [1, 0]];
+    const gh = $("#ef-high");
+    let x = 130;
+    groups.forEach((bits, b) => {
+      const x0 = x;
+      bits.forEach((bit) => {
+        s("rect", { x, y: 112, width: 24, height: 26, rx: 3, class: bit ? "box-acc" : "box" }, gh);
+        s("text", { x: x + 12, y: 130, class: "tm", "text-anchor": "middle" }, gh, bit);
+        x += 26;
+      });
+      s("text", { x: (x0 + x - 2) / 2, y: 156, class: "ts", "text-anchor": "middle" }, gh, "h=" + b);
+      x += 8;
+    });
+    const gl = $("#ef-low");
+    vals.forEach((v, i) => {
+      const xx = 130 + i * 58;
+      s("rect", { x: xx, y: 196, width: 50, height: 26, rx: 3, class: "box" }, gl);
+      s("text", { x: xx + 25, y: 214, class: "tm", "text-anchor": "middle" }, gl, (v & 3).toString(2).padStart(2, "0"));
+    });
+  }
+
+  function pefDiagram() {
+    const g = $("#pef-parts");
+    const parts = [
+      { a: 40, b: 120, kind: "run", cls: "box-acc", density: 1 },
+      { a: 120, b: 330, kind: "Elias-Fano", cls: "box", density: 0.12 },
+      { a: 330, b: 455, kind: "bitvector", cls: "box-warm", density: 0.55 },
+      { a: 455, b: 625, kind: "Elias-Fano", cls: "box", density: 0.08 },
+      { a: 625, b: 680, kind: "run", cls: "box-acc", density: 1 },
+      { a: 680, b: 740, kind: "EF", cls: "box", density: 0.15 },
+    ];
+    let seed = 7;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+    parts.forEach((p) => {
+      s("rect", { x: p.a + 1, y: 52, width: p.b - p.a - 2, height: 66, rx: 4, class: p.cls }, g);
+      s("text", { x: (p.a + p.b) / 2, y: 70, class: "tb", "text-anchor": "middle" }, g, p.kind);
+      for (let x = p.a + 5; x < p.b - 3; x += 4) {
+        if (p.density >= 1 || rnd() < p.density) s("circle", { cx: x, cy: 100, r: 1.7, class: "dot" }, g);
+      }
+      s("rect", { x: p.b - 44, y: 20, width: 42, height: 22, rx: 3, class: "box" }, g);
+      s("text", { x: p.b - 23, y: 35, class: "ts", "text-anchor": "middle" }, g, "last");
+      s("line", { x1: p.b - 2, y1: 42, x2: p.b - 2, y2: 52, class: "ln" }, g);
+    });
+    s("text", { x: 40, y: 12, class: "ts" }, g, "upper level: last docID + descriptor per partition (64 bits)");
+  }
+
+  function roaringDiagram() {
+    const g = $("#roar-keys");
+    const items = [
+      { key: 0, title: "array · 3 values", body: "[17, 902, 4410]", size: "6 bytes", cls: "box" },
+      { key: 1, title: "bitmap · 31,207 values", body: "1024 × 64-bit words", size: "8 KiB", cls: "box-acc" },
+      { key: 5, title: "run · 2 runs", body: "(100,2999) (8000,199)", size: "10 bytes", cls: "box-warm" },
+      { key: 9, title: "array · 1 value", body: "[65530]", size: "2 bytes", cls: "box" },
+    ];
+    s("text", { x: 20, y: 86, class: "tl" }, g, "keys");
+    items.forEach((it, i) => {
+      const kx = 70 + i * 62;
+      s("rect", { x: kx, y: 66, width: 54, height: 30, rx: 4, class: "box-acc" }, g);
+      s("text", { x: kx + 27, y: 86, class: "tm", "text-anchor": "middle" }, g, it.key);
+      const cx = 14 + i * 186;
+      s("rect", { x: cx, y: 136, width: 176, height: 86, rx: 6, class: it.cls }, g);
+      s("text", { x: cx + 10, y: 158, class: "tb" }, g, it.title);
+      s("text", { x: cx + 10, y: 182, class: "tm" }, g, it.body);
+      s("text", { x: cx + 10, y: 208, class: "ts" }, g, it.size);
+      s("path", { d: `M${kx + 27} 96 C ${kx + 27} 118, ${cx + 88} 112, ${cx + 88} 134`, class: "ln", "marker-end": "url(#ar2)" }, g);
+    });
+  }
+
+  function trieDiagram() {
+    const g = $("#trie-tree");
+    const H = 4, W = 400, X0 = 14;
+    const ys = [28, 86, 144, 202, 262];
+    const xOf = (p, d) => X0 + ((p + 0.5) * 2 ** (H - d)) / 16 * W;
+    const nodes = [
+      { p: 0, d: 0, code: "11" },
+      { p: 0, d: 1, code: "10" }, { p: 1, d: 1, code: "11" },
+      { p: 0, d: 2, code: "01" }, { p: 2, d: 2, code: "10" }, { p: 3, d: 2, code: "10" },
+      { p: 1, d: 3, code: "11" }, { p: 4, d: 3, code: "01" }, { p: 6, d: 3, code: "11" },
+    ];
+    const leaves = [2, 3, 9, 12, 13];
+    const present = new Set(nodes.map((n) => n.d + ":" + n.p).concat(leaves.map((v) => "4:" + v)));
+    const edges = [];
+    nodes.forEach((n) => {
+      [0, 1].forEach((bit) => {
+        const c = n.p * 2 + bit;
+        if (present.has(n.d + 1 + ":" + c)) edges.push([n, { p: c, d: n.d + 1 }, bit]);
+      });
+    });
+    edges.forEach(([a, b, bit]) => {
+      const x1 = xOf(a.p, a.d), y1 = ys[a.d], x2 = xOf(b.p, b.d), y2 = ys[b.d];
+      s("line", { x1, y1, x2, y2, class: "ln" }, g);
+      s("text", { x: (x1 + x2) / 2 + (bit ? 6 : -12), y: (y1 + y2) / 2, class: "ts" }, g, bit);
+    });
+    nodes.forEach((n) => {
+      const x = xOf(n.p, n.d), y = ys[n.d];
+      s("rect", { x: x - 17, y: y - 12, width: 34, height: 24, rx: 12, class: n.d === 2 && n.p === 2 ? "box-warm" : "box-acc" }, g);
+      s("text", { x, y: y + 4, class: "tm", "text-anchor": "middle" }, g, n.code);
+    });
+    leaves.forEach((v) => {
+      const x = xOf(v, 4), y = ys[4];
+      s("rect", { x: x - 11, y: y - 11, width: 22, height: 22, rx: 3, class: "box" }, g);
+      s("text", { x, y: y + 4, class: "tm", "text-anchor": "middle" }, g, v);
+    });
+    const gl = $("#trie-levels");
+    const levels = [["11"], ["10", "11"], ["01", "10", "10"], ["11", "01", "11"]];
+    s("text", { x: 470, y: 14, class: "ts" }, gl, "level bitvectors (rank-indexed)");
+    levels.forEach((lv, d) => {
+      s("text", { x: 470, y: ys[d] + 4, class: "tl" }, gl, "B" + "₀₁₂₃"[d]);
+      lv.forEach((code, i) => {
+        const x = 500 + i * 62;
+        s("rect", { x, y: ys[d] - 12, width: 54, height: 24, rx: 4, class: d === 2 && i === 1 ? "box-warm" : "box" }, gl);
+        s("text", { x: x + 27, y: ys[d] + 4, class: "tm", "text-anchor": "middle" }, gl, code);
+      });
+    });
+    s("text", { x: 470, y: 250, class: "ts" }, gl, "18 bits for 5 docIDs; leaves are implicit.");
+    s("text", { x: 470, y: 268, class: "ts" }, gl, "left(i) = rank₁(B_ℓ, 2i),  right(i) = rank₁(B_ℓ, 2i+1)");
+  }
+
+  function simdDiagram() {
+    const g = $("#simd-grid");
+    const a = [12, 15, 20, 31];
+    const b = [9, 12, 22, 31];
+    const rows = [0, 1, 2, 3].map((r) => b.map((_, j) => b[(j + r) % 4]));
+    const X = 120, CW = 50;
+    s("text", { x: 10, y: 33, class: "tb" }, g, "a block");
+    a.forEach((v, j) => {
+      s("rect", { x: X + j * (CW + 6), y: 12, width: CW, height: 30, rx: 4, class: "box-acc" }, g);
+      s("text", { x: X + j * (CW + 6) + CW / 2, y: 32, class: "tm", "text-anchor": "middle" }, g, v);
+    });
+    const masks = [];
+    rows.forEach((row, r) => {
+      const y = 62 + r * 40;
+      s("text", { x: 10, y: y + 20, class: "tl" }, g, r === 0 ? "b block" : "b rotated " + r);
+      let m = 0;
+      row.forEach((v, j) => {
+        const hit = v === a[j];
+        if (hit) m |= 1 << j;
+        s("rect", { x: X + j * (CW + 6), y, width: CW, height: 30, rx: 4, class: hit ? "box-warm" : "box" }, g);
+        s("text", { x: X + j * (CW + 6) + CW / 2, y: y + 20, class: "tm", "text-anchor": "middle" }, g, v);
+      });
+      masks.push(m);
+      s("text", { x: X + 4 * (CW + 6) + 10, y: y + 20, class: "tm" }, g, "mask " + m.toString(2).padStart(4, "0") + "₂");
+    });
+    const all = masks.reduce((x, y) => x | y, 0);
+    const out = a.filter((_, j) => all & (1 << j));
+    const ox = 470;
+    s("text", { x: ox, y: 80, class: "tl" }, g, "OR of masks = " + all.toString(2).padStart(4, "0") + "₂");
+    s("text", { x: ox, y: 104, class: "tl" }, g, "pshufb with table[" + all + "]");
+    s("text", { x: ox, y: 140, class: "tb" }, g, "output");
+    out.forEach((v, j) => {
+      s("rect", { x: ox + 56 + j * 56, y: 120, width: 50, height: 30, rx: 4, class: "box-warm" }, g);
+      s("text", { x: ox + 81 + j * 56, y: 140, class: "tm", "text-anchor": "middle" }, g, v);
+    });
+    s("text", { x: ox, y: 182, class: "ts" }, g, "a₃ = 31 ≤ b₃ = 31 → advance a by 4");
+    s("text", { x: ox, y: 200, class: "ts" }, g, "b₃ = 31 ≤ a₃ = 31 → advance b by 4");
+  }
+
+  function leapDiagram() {
+    const g = $("#leap");
+    const lists = { A: [3, 12, 40, 41, 77], B: [5, 15, 40, 60, 77, 90], C: [1, 12, 40, 44, 77, 80] };
+    const ys = { A: 56, B: 112, C: 168 };
+    const vals = [...new Set(Object.values(lists).flat())].sort((p, q) => p - q);
+    const x = (v) => 130 + vals.indexOf(v) * 52;
+    [40, 77].forEach((v) => s("rect", { x: x(v) - 11, y: 30, width: 22, height: 156, rx: 6, class: "band" }, g));
+    s("text", { x: x(40), y: 204, class: "ts", "text-anchor": "middle" }, g, "result");
+    s("text", { x: x(77), y: 204, class: "ts", "text-anchor": "middle" }, g, "result");
+    Object.entries(lists).forEach(([name, vals]) => {
+      const y = ys[name];
+      s("line", { x1: 110, y1: y, x2: 740, y2: y, class: "axis" }, g);
+      s("text", { x: 4, y: y + 4, class: "tl" }, g, name === "A" ? "A (rarest)" : name);
+      vals.forEach((v) => {
+        s("circle", { cx: x(v), cy: y, r: 4.5, class: "dot" }, g);
+        s("text", { x: x(v) + 8, y: y + 17, class: "ts" }, g, v);
+      });
+    });
+    const jumps = [["A", 3, "B", 5], ["B", 5, "A", 12], ["A", 12, "B", 15], ["B", 15, "A", 40], ["A", 40, "B", 40], ["B", 40, "C", 40],
+      ["A", 41, "B", 60], ["B", 60, "A", 77], ["A", 77, "B", 77], ["B", 77, "C", 77]];
+    jumps.forEach(([r1, v1, r2, v2]) => {
+      const x1 = x(v1), y1 = ys[r1], x2 = x(v2), y2 = ys[r2];
+      const dy = y2 > y1 ? 6 : -6;
+      const mx = (x1 + x2) / 2 + (x1 === x2 ? 16 : 0);
+      s("path", { d: `M${x1} ${y1 + dy} Q ${mx + 6} ${(y1 + y2) / 2} ${x2} ${y2 - dy}`, class: "ln-acc", "marker-end": "url(#ar3)" }, g);
+    });
+    s("path", { d: `M${x(40) + 5} ${ys.A - 2} Q ${(x(40) + x(41)) / 2} ${ys.A - 26} ${x(41) - 5} ${ys.A - 4}`, class: "ln" }, g);
+    s("text", { x: (x(40) + x(41)) / 2, y: ys.A - 30, class: "ts", "text-anchor": "middle" }, g, "next()");
+  }
+
+  // ---------------------------------------------------------------- charts
+  const tip = $("#tip");
+  function showTip(evt, html) {
+    tip.replaceChildren(...html);
+    tip.hidden = false;
+    const fr = evt.currentTarget.closest(".frame");
+    const r = fr.getBoundingClientRect();
+    let left = evt.clientX - r.left + fr.scrollLeft + 14;
+    let top = evt.clientY - r.top + 14;
+    if (left + 230 > r.width) left = Math.max(4, left - 250);
+    fr.appendChild(tip);
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  }
+  function hideTip() { tip.hidden = true; }
+  function tipRows(title, rows) {
+    const out = [h("div", { class: "h" }, null, title)];
+    rows.forEach(([color, label, value]) => {
+      const r = h("div", { class: "row" });
+      if (color) { const i = h("i", {}, r); i.style.background = color; }
+      h("b", {}, r, value);
+      h("span", {}, r, " " + label);
+      out.push(r);
+    });
+    return out;
+  }
+
+  function logTicks(min, max) {
+    const t = [];
+    for (let e = Math.floor(Math.log10(min)); e <= Math.ceil(Math.log10(max)); e++) {
+      [1, 2, 5].forEach((m) => { const v = m * 10 ** e; if (v >= min * 0.999 && v <= max * 1.001) t.push(v); });
+    }
+    return t;
+  }
+  function linTicks(min, max, n) {
+    const span = max - min, step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((st) => span / st <= n) || 10 * mag;
+    const t = [];
+    for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) t.push(+v.toFixed(10));
+    return t;
+  }
+  const tickLabel = (v) => (v >= 1000 ? (v / 1000) + "K" : v >= 1 ? String(+v.toFixed(2)) : String(+v.toPrecision(2)));
+
+  function frame(container, height, margin) {
+    container.replaceChildren();
+    const width = Math.max(300, container.clientWidth);
+    const svg = s("svg", { class: "ch", width, height, viewBox: `0 0 ${width} ${height}` }, container);
+    return { svg, width, height, iw: width - margin.l - margin.r, ih: height - margin.t - margin.b, m: margin };
+  }
+
+  function axes(f, xs, ys, xt, yt, xTitle, yTitle) {
+    const g = s("g", {}, f.svg);
+    yt.forEach((v) => {
+      const y = f.m.t + ys(v);
+      s("line", { x1: f.m.l, x2: f.m.l + f.iw, y1: y, y2: y, class: "grid" }, g);
+      s("text", { x: f.m.l - 6, y: y + 4, "text-anchor": "end" }, g, tickLabel(v));
+    });
+    xt.forEach((v) => {
+      const x = f.m.l + xs(v);
+      s("line", { x1: x, x2: x, y1: f.m.t + f.ih, y2: f.m.t + f.ih + 4, class: "axis" }, g);
+      s("text", { x, y: f.m.t + f.ih + 17, "text-anchor": "middle" }, g, tickLabel(v));
+    });
+    s("line", { x1: f.m.l, x2: f.m.l + f.iw, y1: f.m.t + f.ih, y2: f.m.t + f.ih, class: "axis" }, g);
+    s("text", { x: f.m.l + f.iw / 2, y: f.height - 4, "text-anchor": "middle", class: "axis-title" }, g, xTitle);
+    s("text", { x: 12, y: f.m.t + f.ih / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 12 ${f.m.t + f.ih / 2})` }, g, yTitle);
+  }
+
+  // Scatter of space vs time with a highlighted Pareto frontier.
+  function scatter(container, pts, opt) {
+    const f = frame(container, opt.height || 360, { l: 58, r: 20, t: 14, b: 42 });
+    const xmin = Math.min(...pts.map((p) => p.x)) / 1.12, xmax = Math.max(...pts.map((p) => p.x)) * 1.12;
+    const ylo = Math.min(...pts.map((p) => p.y)) / 1.35, yhi = Math.max(...pts.map((p) => p.y)) * 1.35;
+    const xs = (v) => ((Math.log(v) - Math.log(xmin)) / (Math.log(xmax) - Math.log(xmin))) * f.iw;
+    const ys = (v) => f.ih - ((Math.log(v) - Math.log(ylo)) / (Math.log(yhi) - Math.log(ylo))) * f.ih;
+    axes(f, xs, ys, [4, 5, 6, 8, 10, 12, 16, 20, 32].filter((v) => v >= xmin && v <= xmax), logTicks(ylo, yhi), opt.xTitle, opt.yTitle);
+    const sorted = pts.slice().sort((a, b) => a.x - b.x);
+    let best = Infinity;
+    const front = [];
+    sorted.forEach((p) => { if (p.y < best) { best = p.y; front.push(p); p.front = true; } });
+    const g = s("g", {}, f.svg);
+    s("polyline", { points: front.map((p) => `${f.m.l + xs(p.x)},${f.m.t + ys(p.y)}`).join(" "), fill: "none", stroke: css("--accent"), "stroke-width": 1.5, "stroke-dasharray": "0", opacity: 0.45 }, g);
+    const placed = [];
+    const overlaps = (b) => placed.some((q) => b.x < q.x + q.w && b.x + b.w > q.x && b.y < q.y + q.h && b.y + b.h > q.y);
+    pts.forEach((p) => {
+      const cx = f.m.l + xs(p.x), cy = f.m.t + ys(p.y);
+      placed.push({ x: cx - 6, y: cy - 6, w: 12, h: 12 });
+    });
+    pts.forEach((p) => {
+      const cx = f.m.l + xs(p.x), cy = f.m.t + ys(p.y);
+      const c = s("circle", { cx, cy, r: 5.5, fill: p.front ? css("--accent") : css("--ink-3"), stroke: css("--surface"), "stroke-width": 2, tabindex: 0 }, g);
+      const hit = s("circle", { cx, cy, r: 13, fill: "transparent" }, g);
+      const show = (e) => showTip(e, tipRows(p.label, [[null, opt.xTitle, fmt(p.x)], [null, "ms/query" + (p.algo ? " · " + p.algo : ""), ms(p.y)]]));
+      [c, hit].forEach((el) => { el.addEventListener("pointermove", show); el.addEventListener("pointerleave", hideTip); });
+      const w = p.label.length * 6.4 + 4;
+      const cands = [[cx + 9, cy + 4], [cx - 9 - w, cy + 4], [cx - w / 2, cy - 11], [cx - w / 2, cy + 19], [cx + 9, cy - 9], [cx + 9, cy + 15], [cx - 9 - w, cy - 9], [cx - 9 - w, cy + 15]];
+      for (const [lx, ly] of cands) {
+        const box = { x: lx, y: ly - 10, w, h: 13 };
+        if (lx < f.m.l || lx + w > f.width - 2 || ly - 10 < 0 || ly > f.m.t + f.ih) continue;
+        if (!overlaps(box)) {
+          placed.push(box);
+          s("text", { x: lx, y: ly, class: p.front ? "lab-strong" : "lab" }, g, p.label);
+          break;
+        }
+      }
+    });
+  }
+
+  // Horizontal bars, one or more series per category.
+  function hbars(container, cats, series, opt) {
+    const band = series.length > 1 ? 14 * series.length + 10 : 26;
+    const f = frame(container, cats.length * band + 46, { l: opt.labelWidth || 190, r: 64, t: 8, b: 36 });
+    const vmax = Math.max(...series.flatMap((sr) => sr.values.filter((v) => v != null))) * 1.05;
+    const xs = (v) => (v / vmax) * f.iw;
+    const xt = linTicks(0, vmax, 5);
+    const g = s("g", {}, f.svg);
+    xt.forEach((v) => {
+      const x = f.m.l + xs(v);
+      s("line", { x1: x, x2: x, y1: f.m.t, y2: f.m.t + f.ih, class: "grid" }, g);
+      s("text", { x, y: f.m.t + f.ih + 16, "text-anchor": "middle" }, g, tickLabel(v));
+    });
+    s("text", { x: f.m.l + f.iw / 2, y: f.height - 4, "text-anchor": "middle", class: "axis-title" }, g, opt.xTitle);
+    cats.forEach((cat, i) => {
+      const y0 = f.m.t + i * band + 4;
+      s("text", { x: f.m.l - 8, y: y0 + band / 2 - 1, "text-anchor": "end", class: "lab" }, g, cat);
+      series.forEach((sr, j) => {
+        const v = sr.values[i];
+        if (v == null) return;
+        const bh = series.length > 1 ? 12 : 16;
+        const y = y0 + (series.length > 1 ? j * 14 : (band - bh) / 2 - 2);
+        const w = Math.max(2, xs(v));
+        const r = Math.min(4, w / 2);
+        s("path", { d: `M${f.m.l} ${y} H${f.m.l + w - r} Q${f.m.l + w} ${y} ${f.m.l + w} ${y + r} V${y + bh - r} Q${f.m.l + w} ${y + bh} ${f.m.l + w - r} ${y + bh} H${f.m.l} Z`, fill: sr.color }, g);
+        s("text", { x: f.m.l + w + 5, y: y + bh - 3, class: "lab" }, g, opt.valueFmt ? opt.valueFmt(v) : fmt(v));
+        const hit = s("rect", { x: f.m.l, y: y - 1, width: Math.max(w, 30), height: bh + 2, fill: "transparent" }, g);
+        hit.addEventListener("pointermove", (e) => showTip(e, tipRows(cat, series.map((q) => [q.color, q.name, q.values[i] == null ? "—" : (opt.valueFmt ? opt.valueFmt(q.values[i]) : fmt(q.values[i]))]))));
+        hit.addEventListener("pointerleave", hideTip);
+      });
+    });
+  }
+
+  // Multi-series line chart; log axes optional; crosshair tooltip.
+  function lines(container, xsVals, series, opt) {
+    const f = frame(container, opt.height || 340, { l: 58, r: 20, t: 14, b: 42 });
+    const all = series.flatMap((sr) => sr.values.filter((v) => v != null));
+    const ylo = opt.logY ? Math.min(...all) / 1.3 : 0, yhi = Math.max(...all) * (opt.logY ? 1.3 : 1.08);
+    const xlo = Math.min(...xsVals), xhi = Math.max(...xsVals);
+    const xs = opt.logX ? (v) => ((Math.log(v) - Math.log(xlo)) / (Math.log(xhi) - Math.log(xlo))) * f.iw : (v) => ((v - xlo) / (xhi - xlo)) * f.iw;
+    const ys = opt.logY ? (v) => f.ih - ((Math.log(v) - Math.log(ylo)) / (Math.log(yhi) - Math.log(ylo))) * f.ih : (v) => f.ih - (v / yhi) * f.ih;
+    axes(f, xs, ys, opt.xTicks || xsVals, opt.logY ? logTicks(ylo, yhi) : linTicks(0, yhi, 5), opt.xTitle, opt.yTitle);
+    const g = s("g", {}, f.svg);
+    series.forEach((sr) => {
+      const pts = xsVals.map((x, i) => [x, sr.values[i]]).filter((p) => p[1] != null);
+      s("polyline", { points: pts.map(([x, y]) => `${f.m.l + xs(x)},${f.m.t + ys(y)}`).join(" "), fill: "none", stroke: sr.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, g);
+      pts.forEach(([x, y]) => s("circle", { cx: f.m.l + xs(x), cy: f.m.t + ys(y), r: 3.5, fill: sr.color, stroke: css("--surface"), "stroke-width": 1.5 }, g));
+    });
+    const cross = s("line", { y1: f.m.t, y2: f.m.t + f.ih, stroke: css("--ink-3"), "stroke-width": 1, opacity: 0 }, g);
+    const hit = s("rect", { x: f.m.l, y: f.m.t, width: f.iw, height: f.ih, fill: "transparent" }, g);
+    hit.addEventListener("pointermove", (e) => {
+      const r = f.svg.getBoundingClientRect();
+      const px = e.clientX - r.left - f.m.l;
+      let bi = 0;
+      xsVals.forEach((x, i) => { if (Math.abs(xs(x) - px) < Math.abs(xs(xsVals[bi]) - px)) bi = i; });
+      const cx = f.m.l + xs(xsVals[bi]);
+      cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("opacity", 0.5);
+      const rows = series.map((sr) => [sr.color, sr.name, sr.values[bi] == null ? "—" : (opt.valueFmt || fmt)(sr.values[bi])])
+        .sort((a, b) => parseFloat(a[2]) - parseFloat(b[2]));
+      showTip(e, tipRows((opt.xLabel || "") + xsVals[bi], rows));
+    });
+    hit.addEventListener("pointerleave", () => { cross.setAttribute("opacity", 0); hideTip(); });
+  }
+
+  function legend(container, series, square) {
+    const l = h("div", { class: "legend" });
+    series.forEach((sr) => {
+      const sp = h("span", {}, l);
+      const i = h("i", square ? { class: "sq" } : {}, sp);
+      i.style.background = sr.color;
+      sp.appendChild(document.createTextNode(sr.name));
+    });
+    container.parentNode.insertBefore(l, container);
+  }
+
+  // ---------------------------------------------------------------- data helpers
+  const isCount = (m) => m.algorithm.includes("count only");
+  function best(c, op) {
+    return c.measurements.filter((m) => m.op === op && !isCount(m)).sort((a, b) => a.ms_per_query - b.ms_per_query)[0];
+  }
+  function m(c, op, algo) {
+    const x = c.measurements.find((q) => q.op === op && q.algorithm === algo);
+    return x ? x.ms_per_query : null;
+  }
+  const short = (name) => name.replace("Hybrid (bitmap + BP128)", "Hybrid").replace("BP128 (bitpacking crate)", "BP128 (crate)").replace("Roaring (roaring crate)", "Roaring (crate)");
+
+  const shortAlgo = (a) => a.replace(" (NextGEQ)", "").replace(" (4096)", "").replace("adaptive (SIMD / gallop @64x)", "adaptive").replace("slices: ", "");
+  function summaryTable(container, run) {
+    const wrap = h("div", { class: "table-wrap" }, container);
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    ["codec", "bits/posting", "query lists", "decode ns/posting", "best AND ms", "", "best OR ms", ""].forEach((x, i) =>
+      h("th", { class: i && i !== 5 && i !== 7 ? "n" : "" }, hr, x));
+    const tb = h("tbody", {}, t);
+    const bAnd = Math.min(...run.codecs.map((c) => best(c, "AND").ms_per_query));
+    const bOr = Math.min(...run.codecs.map((c) => best(c, "OR").ms_per_query));
+    const bSpace = Math.min(...run.codecs.map((c) => c.query_bits_per_posting));
+    run.codecs.forEach((c) => {
+      const tr = h("tr", {}, tb);
+      const a = best(c, "AND"), o = best(c, "OR");
+      h("td", {}, tr, c.codec);
+      h("td", { class: "n" }, tr, c.bits_per_posting.toFixed(2));
+      h("td", { class: "n" + (c.query_bits_per_posting === bSpace ? " best" : "") }, tr, c.query_bits_per_posting.toFixed(2));
+      h("td", { class: "n" }, tr, c.query_decode_ns_per_posting.toFixed(2));
+      h("td", { class: "n" + (a.ms_per_query === bAnd ? " best" : "") }, tr, ms(a.ms_per_query));
+      h("td", { class: "algo" }, tr, shortAlgo(a.algorithm));
+      h("td", { class: "n" + (o.ms_per_query === bOr ? " best" : "") }, tr, ms(o.ms_per_query));
+      h("td", { class: "algo" }, tr, shortAlgo(o.algorithm));
+    });
+  }
+
+  function algoTable(container, run, op, algos) {
+    const wrap = h("div", { class: "table-wrap" }, container);
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    h("th", {}, hr, "codec");
+    algos.forEach((a) => h("th", { class: "n" }, hr, a));
+    const tb = h("tbody", {}, t);
+    run.codecs.forEach((c) => {
+      const vals = algos.map((a) => m(c, op, a));
+      if (vals.every((v) => v == null)) return;
+      const mn = Math.min(...vals.filter((v, i) => v != null && !algos[i].includes("count only")));
+      const tr = h("tr", {}, tb);
+      h("td", {}, tr, c.codec);
+      vals.forEach((v) => h("td", { class: "n" + (v === mn ? " best" : "") }, tr, v == null ? "—" : ms(v)));
+    });
+  }
+
+  function allTable(container, run) {
+    const d = h("details", {}, container);
+    h("summary", {}, d, "All measurements (" + run.codecs.reduce((n, c) => n + c.measurements.length, 0) + " rows)");
+    const wrap = h("div", { class: "table-wrap" }, d);
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    ["codec", "op", "algorithm", "ms/query"].forEach((x, i) => h("th", { class: i === 3 ? "n" : "" }, hr, x));
+    const tb = h("tbody", {}, t);
+    run.codecs.forEach((c) => c.measurements.forEach((q) => {
+      const tr = h("tr", {}, tb);
+      h("td", {}, tr, c.codec); h("td", {}, tr, q.op); h("td", {}, tr, q.algorithm); h("td", { class: "n" }, tr, ms(q.ms_per_query));
+    }));
+  }
+
+  // ---------------------------------------------------------------- page assembly
+  const renderers = [];
+  function chart(id, fn) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    renderers.push(() => fn(el));
+  }
+
+  function setupTable() {
+    const runs = [["clustered", "Synthetic, clustered"], ["uniform", "Synthetic, uniform"], ["wikitext", "WikiText-103"]].filter(([k]) => DATA[k]);
+    const wrap = h("div", { class: "table-wrap" }, $("#setup-table"));
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    ["collection", "documents", "lists", "postings", "queries", "terms/query", "AND results", "OR results"].forEach((x, i) => h("th", { class: i ? "n" : "" }, hr, x));
+    const tb = h("tbody", {}, t);
+    runs.forEach(([k, name]) => {
+      const r = DATA[k];
+      const tr = h("tr", {}, tb);
+      h("td", {}, tr, name);
+      [r.documents, r.lists, r.postings, r.queries].forEach((v) => h("td", { class: "n" }, tr, v.toLocaleString("en-US")));
+      h("td", { class: "n" }, tr, r.mean_terms.toFixed(2));
+      h("td", { class: "n" }, tr, Math.round(r.mean_and_results).toLocaleString("en-US"));
+      h("td", { class: "n" }, tr, Math.round(r.mean_or_results).toLocaleString("en-US"));
+    });
+    const p = h("p", { class: "meta" }, $("#setup-table"));
+    p.textContent = "CPU: " + DATA.clustered.cpu + " · SIMD: " + DATA.clustered.simd.join(", ") + " · single thread · Rust " + (DATA.rustc || "stable") + " · best of " + DATA.clustered.reps + " passes";
+  }
+
+  function codecCards() {
+    const rows = [
+      ["Uncompressed", "baseline", "sorted u32 array", "galloping", "—"],
+      ["VByte", "block", "varint d-gaps, 128 per block + skip table", "skip table, decode block", "—"],
+      ["BP128", "block", "one bit width per 128 gaps (SIMD-BP128 layout)", "skip table, decode block", "—"],
+      ["BP128 (bitpacking crate)", "baseline", "Tantivy's BitPacker4x in the same blocks", "skip table, decode block", "—"],
+      ["OptPFor", "block", "per-block optimal width + patched exceptions", "skip table, decode block", "—"],
+      ["Interpolative", "block", "binary interpolative coding per block", "skip table, decode block", "—"],
+      ["Elias-Fano", "succinct", "low bits + unary high bits", "select₀ on high bits", "—"],
+      ["PEF", "succinct", "DP partitions: run, bitvector or Elias-Fano", "gallop partitions, then local", "—"],
+      ["Roaring", "bitmap", "2¹⁶ chunks: array, bitmap or run containers", "gallop keys, then container", "SvS over containers, lazy k-way OR"],
+      ["Roaring (roaring crate)", "baseline", "the roaring crate, run-optimised", "iterator advance_to", "MultiOps"],
+      ["Hybrid (bitmap + BP128)", "bitmap", "bitmap if u/n ≤ 8, else BP128", "word scan or block", "leapfrog sparse lists + bit probes"],
+      ["Trie", "succinct", "2 bits per trie node, rank navigation", "descend along target bits", "synchronised traversal"],
+      ["Run-Trie", "succinct", "trie with full subtrees cut", "descend along target bits", "synchronised traversal"],
+    ];
+    const wrap = h("div", { class: "table-wrap" }, $("#codec-cards"));
+    const t = h("table", {}, wrap);
+    const hr = h("tr", {}, h("thead", {}, t));
+    ["codec", "family", "layout", "NextGEQ", "native AND / OR"].forEach((x) => h("th", {}, hr, x));
+    const tb = h("tbody", {}, t);
+    rows.forEach((r) => { const tr = h("tr", {}, tb); r.forEach((c, i) => h("td", i === 0 ? { class: "strong" } : {}, tr, c)); });
+  }
+
+  function runSection(key) {
+    const run = DATA[key];
+    if (!run) return;
+    chart(key + "-and", (el) => scatter(el, run.codecs.map((c) => ({ label: short(c.codec), x: c.query_bits_per_posting, y: best(c, "AND").ms_per_query, algo: best(c, "AND").algorithm })), { xTitle: "bits per posting, query lists (log)", yTitle: "AND ms/query (log)" }));
+    chart(key + "-or", (el) => scatter(el, run.codecs.map((c) => ({ label: short(c.codec), x: c.query_bits_per_posting, y: best(c, "OR").ms_per_query, algo: best(c, "OR").algorithm })), { xTitle: "bits per posting, query lists (log)", yTitle: "OR ms/query (log)" }));
+    const tbl = document.getElementById(key + "-table");
+    if (tbl) { summaryTable(tbl, run); allTable(tbl, run); }
+  }
+
+  function render() { renderers.forEach((r) => r()); }
+
+  function init() {
+    if (!DATA) return;
+    // This page covers the 13 existing representations; the bench now also
+    // runs Pyramid, Loom and Entropic by default, which have their own page.
+    const DESIGNS = ["Pyramid", "Loom", "Entropic"];
+    ["clustered", "uniform", "wikitext"].forEach((k) => {
+      if (DATA[k]) DATA[k].codecs = DATA[k].codecs.filter((c) => !DESIGNS.includes(c.codec));
+    });
+    blockDiagram(); efDiagram(); pefDiagram(); roaringDiagram(); trieDiagram(); simdDiagram(); leapDiagram();
+    codecCards();
+    setupTable();
+    ["clustered", "uniform", "wikitext"].forEach(runSection);
+
+    const ANDALGOS = ["leapfrog (NextGEQ)", "round-robin (LFTJ)", "decode + SvS", "native", "native, count only"];
+    const ORALGOS = ["heap", "min-scan", "bitset window (4096)", "native", "native, count only"];
+    const at = $("#algo-and"); if (at) algoTable(at, DATA.clustered, "AND", ANDALGOS);
+    const ot = $("#algo-or"); if (ot) algoTable(ot, DATA.clustered, "OR", ORALGOS);
+
+    if (DATA.uniform) {
+      chart("space-compare", (el) => {
+        const names = DATA.clustered.codecs.map((c) => c.codec).filter((n) => n !== "Uncompressed");
+        const get = (run) => names.map((n) => { const c = run.codecs.find((q) => q.codec === n); return c ? c.query_bits_per_posting : null; });
+        const series = [{ name: "clustered", color: css("--s1"), values: get(DATA.clustered) }, { name: "uniform", color: css("--s2"), values: get(DATA.uniform) }];
+        if (!el.previousElementSibling || !el.previousElementSibling.classList.contains("legend")) legend(el, series, true);
+        hbars(el, names.map(short), series, { xTitle: "bits per posting (query lists)", labelWidth: 120 });
+      });
+      chart("time-compare", (el) => {
+        const names = DATA.clustered.codecs.map((c) => c.codec);
+        const get = (run) => names.map((n) => { const c = run.codecs.find((q) => q.codec === n); return c ? best(c, "AND").ms_per_query : null; });
+        const series = [{ name: "clustered", color: css("--s1"), values: get(DATA.clustered) }, { name: "uniform", color: css("--s2"), values: get(DATA.uniform) }];
+        if (!el.previousElementSibling || !el.previousElementSibling.classList.contains("legend")) legend(el, series, true);
+        hbars(el, names.map(short), series, { xTitle: "best AND ms/query", labelWidth: 120, valueFmt: ms });
+      });
+    }
+
+    if (DATA.kernels) {
+      chart("kernels", (el) => {
+        const rows = DATA.kernels.rows;
+        const ratios = [...new Set(rows.map((r) => r.ratio))];
+        // The widest block-merge kernel of the machine that produced the data
+        // (AVX-512 on x86-64, NEON 8x8 on aarch64); only one of them is present.
+        const pick = ["merge", "merge (branchless)", "galloping", "binary search", "Baeza-Yates", "SIMD AVX-512 16x16", "SIMD NEON 8x8", "adaptive (SIMD / gallop @64x)"];
+        const cols = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
+        const series = pick.filter((k) => rows.some((r) => r.kernel === k)).map((k, i) => ({
+          name: k.replace(" (SIMD / gallop @64x)", " (SIMD ≤64×, else gallop)"), color: css(cols[i]),
+          values: ratios.map((x) => { const r = rows.find((q) => q.kernel === k && q.ratio === x); return r ? r.ns_per_small_element : null; }),
+        }));
+        if (!el.previousElementSibling || !el.previousElementSibling.classList.contains("legend")) legend(el, series);
+        lines(el, ratios, series, { logX: true, logY: true, xTitle: "size ratio |large| / |small| (log)", yTitle: "ns per element of the small list (log)", xLabel: "ratio 1:", valueFmt: (v) => fmt(v) + " ns" });
+      });
+    }
+
+    if (DATA.terms) {
+      chart("terms", (el) => {
+        const ks = Object.keys(DATA.terms).map(Number).sort((a, b) => a - b);
+        const pick = ["Uncompressed", "BP128", "PEF", "Hybrid (bitmap + BP128)", "Roaring", "Trie"];
+        const cols = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"];
+        const series = pick.map((n, i) => ({
+          name: short(n), color: css(cols[i]),
+          values: ks.map((k) => { const c = DATA.terms[k].codecs.find((q) => q.codec === n); return c ? best(c, "AND").ms_per_query : null; }),
+        }));
+        if (!el.previousElementSibling || !el.previousElementSibling.classList.contains("legend")) legend(el, series);
+        lines(el, ks, series, { logY: true, xTitle: "terms per query", yTitle: "best AND ms/query (log)", xLabel: "k = ", valueFmt: ms });
+      });
+    }
+
+    const f = $("#footer");
+    if (f) f.textContent = "Generated from results/*.json by scripts/build_report.py · " + (DATA.generated || "");
+    const meta = $("#meta-line");
+    if (meta && DATA.clustered) meta.textContent = DATA.clustered.cpu + " · single thread · Rust, -C target-cpu=native";
+
+    render();
+    let t;
+    window.addEventListener("resize", () => { clearTimeout(t); t = setTimeout(render, 120); });
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    if (mq.addEventListener) mq.addEventListener("change", render);
+    new MutationObserver(render).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init); else init();
+})();
+
+</script>

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use posting_bench::bytes::OwnedBytes;
+use crate::postings::bytes::OwnedBytes;
 
 use crate::error::{corrupt, Result};
 use crate::schema::Schema;

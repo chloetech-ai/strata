@@ -1,7 +1,7 @@
 {
   "dataset": "fiqa",
   "experiment": "space",
-  "loadavg_at_start": "1.10 1.07 1.22 1/109 21193",
+  "loadavg_at_start": "",
   "n_docs": 57638,
   "reps": 5,
   "results": {
@@ -206,5 +206,5 @@
       }
     ]
   },
-  "seconds": 7.055192258
+  "seconds": 4.327948334
 }

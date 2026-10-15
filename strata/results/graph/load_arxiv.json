@@ -1,7 +1,7 @@
 {
   "edges": 1150908,
   "edges_only": {
-    "load_s": 0.749271583,
+    "load_s": 0.295029875,
     "sizes": {
       "components": {
         "columns": 254112,
@@ -15,7 +15,7 @@
   },
   "held_out": 1000,
   "index": "hnsw",
-  "load_s": 23.248243925,
+  "load_s": 16.077776541,
   "papers": 168343,
   "sizes": {
     "components": {

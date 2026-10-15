@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use posting_bench::bytes::OwnedBytes;
+use crate::postings::bytes::OwnedBytes;
 
 use crate::error::Result;
 use crate::schema::Schema;

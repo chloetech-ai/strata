@@ -1,0 +1,140 @@
+<div class="col">
+  <h3 id="r-head">Head to head</h3>
+    <p>Each design was built to beat a specific reference: Pyramid against Roaring, Loom against PEF (and, as a stretch, Roaring), and Entropic against interpolative coding and PEF. The table gives each design's size and best AND and OR times relative to its reference. Green means smaller or faster.</p>
+  <ul>
+    <li><b>Pyramid vs Roaring:</b> 24–33% smaller on all three collections. Unions are 1.08× faster on clustered data but take 14% more time on uniform and 13% more on WikiText. Conjunctions take 15% less time on clustered data, 42% more on uniform and 87% more on WikiText.</li>
+    <li><b>Loom vs PEF:</b> the same size (0.4–0.9% smaller), 2.4–3.0× faster conjunctions and 3.8–7.7× faster unions. On clustered data Loom also beats Roaring on conjunctions at half its size, though not on unions (1.34× Roaring's time).</li>
+    <li><b>Entropic vs interpolative coding:</b> 11–14% smaller, 2.0–2.3× faster conjunctions and 3.9–4.7× faster unions. Against PEF it is 6–15% smaller with 2.5–3.0× faster unions, but conjunctions are 1.7–1.9× slower.</li>
+  </ul>
+</div>
+<div class="wide" id="ratio-table"></div>
+
+<div class="col">
+  <h3 id="r-clustered">Clustered collection</h3>
+    <p>On the reordered-like collection the old codecs drop off both frontiers entirely. For AND the frontier is Entropic (4.22 bits, 0.066 ms) followed by Loom (4.90 bits, 0.013 ms). For OR it adds Pyramid (6.20 bits, 0.355 ms) at the fast end.</p>
+  <ul>
+    <li><b>Loom</b> answers conjunctions faster than Roaring (0.013 against 0.018 ms) at 53% of its size. That is the result the first round said was out of reach for a list codec. Its unions take 1.34× Roaring's time (0.514 against 0.384 ms).</li>
+    <li><b>Pyramid</b> has the fastest union of any structure (0.355 ms, 1.08× Roaring), and 0.105 ms when only the count is needed (2.2× Roaring's count-only union).</li>
+    <li><b>Entropic</b> is 14% smaller than interpolative coding (4.90 bits), the smallest existing codec, and still answers conjunctions 2.0× and unions 3.9× faster.</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND: size vs time, clustered</p>
+      <p class="chart-sub">Best algorithm per codec · line: Pareto frontier</p>
+      <div class="chart" id="clustered-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR: size vs time, clustered</p>
+      <p class="chart-sub">Best algorithm that writes docIDs out</p>
+      <div class="chart" id="clustered-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="clustered-table"></div>
+
+<div class="col">
+  <h3 id="r-uniform">Uniform docIDs</h3>
+    <p>With random docIDs there is no clustering to exploit, so the gains shrink, and Pyramid's union advantage turns around. Entropic (7.60 bits) is 6% below PEF and Elias-Fano, the previous best. Loom answers conjunctions in 0.026 ms against PEF's 0.077, and unions in 0.76 against 2.86 ms. Pyramid is 24% smaller than Roaring, but its unions take 14% more time (0.497 against 0.435 ms). Roaring is ahead on conjunctions (0.021 against 0.026 ms for Loom and 0.030 for Pyramid) and on unions, and holds the fast end of both frontiers, at 1.7× Loom's size.</p>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND: size vs time, uniform</p>
+      <p class="chart-sub">Random docID order: no clustering to exploit</p>
+      <div class="chart" id="uniform-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR: size vs time, uniform</p>
+      <p class="chart-sub">Best algorithm that writes docIDs out</p>
+      <div class="chart" id="uniform-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="uniform-table"></div>
+
+<div class="col">
+  <h3 id="r-wikitext">WikiText-103</h3>
+    <p>On real text the lists are denser and queries more skewed (the shortest list has a median of 288 postings). Loom sits at PEF's size (4.74 bits) with 2.4× faster conjunctions and 7.7× faster unions (0.107 against 0.828 ms). Roaring has both the fastest conjunction (0.0044 ms, against 0.0067 for Loom and 0.0081 for Pyramid) and the fastest union (0.069 ms); Pyramid unites in 1.13× Roaring's time (0.078 ms) with 26% less space.</p>
+  <p>Pyramid's conjunction gap is the per-candidate cost of probing mid-density sparse blocks (about 12 postings per block here). Each probe reads a mask, a directory entry and a few bytes, while Roaring gallops through one contiguous <code>u16</code> array. Entropic is again the smallest (4.18 bits, 12% below PEF).</p>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND: size vs time, WikiText-103</p>
+      <p class="chart-sub">859,532 paragraphs · 500 queries</p>
+      <div class="chart" id="wikitext-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR: size vs time, WikiText-103</p>
+      <p class="chart-sub">Best algorithm that writes docIDs out</p>
+      <div class="chart" id="wikitext-or"></div>
+    </div>
+  </figure>
+</div>
+<div class="wide" id="wikitext-table"></div>
+
+<div class="col">
+  <h3 id="r-extremes">Workload extremes</h3>
+    <p>Two extra workloads on the clustered collection stress opposite ends:</p>
+  <ul>
+    <li><b>Selective queries</b> use only terms with at most 20,000 postings: 81 results per AND, 13,274 per OR. They take microseconds, and uncompressed arrays are fastest on both operations (0.0043 ms per AND, 0.038 ms per OR). Loom (0.0046 ms) and Pyramid (0.0049 ms) follow on AND, well ahead of Roaring (0.0068 ms), and Pyramid has the fastest union of the compressed structures (0.045 ms against 0.059 for Roaring). The AND frontier is Entropic, Loom and uncompressed arrays; on OR, where every codec takes 0.04–0.12 ms, it also picks up interpolative coding, PEF, OptPFor, the bitpacking crate's BP128 and Pyramid.</li>
+    <li><b>Dense queries</b> use only terms with at least 200,000 postings: 42,798 results per AND, 1.63 million per OR. Loom has the fastest conjunction (0.478 ms), 1.3× faster than Roaring (0.621 ms) and 1.6× faster than Pyramid (0.772 ms). On OR, Pyramid and Roaring tie (0.879 and 0.883 ms), Pyramid at 58% of Roaring's size on these lists, and Loom (1.21 ms) is 5.7× faster than PEF. Bitmaps win here, and both new structures store dense regions as word-aligned bitmaps.</li>
+  </ul>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND: selective queries</p>
+      <p class="chart-sub">Clustered collection · every term has ≤ 20,000 postings</p>
+      <div class="chart" id="selective-and"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">AND: dense queries</p>
+      <p class="chart-sub">Clustered collection · every term has ≥ 200,000 postings</p>
+      <div class="chart" id="dense-and"></div>
+    </div>
+  </figure>
+</div>
+<div class="pair">
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR: selective queries</p>
+      <p class="chart-sub">Every term has ≤ 20,000 postings</p>
+      <div class="chart" id="selective-or"></div>
+    </div>
+  </figure>
+  <figure>
+    <div class="frame">
+      <p class="chart-title">OR: dense queries</p>
+      <p class="chart-sub">Every term has ≥ 200,000 postings</p>
+      <div class="chart" id="dense-or"></div>
+    </div>
+  </figure>
+</div>
+
+<div class="col">
+  <h3 id="r-terms">Longer queries</h3>
+    <p>Conjunctions mostly get cheaper as terms are added, because results shrink from 744 documents at two terms to 2 at six. Pyramid is the fastest at two terms (0.0172 ms, 1.11× Roaring), with Loom 2% behind. Loom takes over from three terms on (0.0041 ms at six, 1.8× Roaring and 2.7× PEF), where each extra list empties its candidate batches sooner, and it is faster than Roaring at every length. Entropic runs at 0.97–1.05× BP128's time at every length.</p>
+</div>
+<figure class="narrow">
+  <div class="frame">
+    <p class="chart-title">AND time vs number of query terms</p>
+    <p class="chart-sub">Clustered collection · 300 queries per point · best algorithm per codec</p>
+    <div class="chart" id="terms"></div>
+  </div>
+</figure>
+<div class="col">
+    <div class="callout">
+    <p><b>Memory and build time.</b> Entropic's sizes are serialized sizes. When an index is loaded, it rebuilds decode tables from the stored models: 14.3 MB on clustered, 1.3 MB on uniform and 22.4 MB on WikiText. Held fully in memory, Entropic therefore takes about 27 MB on clustered against PEF's 18 MB, and 74 against 64 MB on WikiText. It only wins in memory if tables are built on demand for the lists a workload touches, which this implementation does not yet do. Building an index takes 1.3–5.7 s for Entropic, mostly model fitting, 0.3–1.4 s for Loom and Pyramid, and 0.1–0.6 s for PEF and Roaring.</p>
+  </div>
+</div>

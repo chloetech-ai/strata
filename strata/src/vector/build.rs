@@ -15,7 +15,7 @@
 //!
 //! A field that is not `indexed` gets the forward vectors only (flat).
 
-use posting_bench::bytes::ByteWriter;
+use crate::postings::bytes::ByteWriter;
 
 use crate::error::{Error, Result};
 use crate::schema::{Field, FieldType, VectorIndexKind};

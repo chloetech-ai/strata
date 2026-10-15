@@ -82,7 +82,7 @@ impl PostingCursor<'_> {                                         // END = u32::M
 // Building: TextFieldBuilder::new(field, positions, format, loom_min_df), add_text, write, write_as.
 // Build options: text.postings = loom | bp128 (default loom), text.loom_min_df (default 512).
 
-// posting_bench::codecs::loom (changed)
+// strata::postings::codecs::loom (changed)
 impl Loom {
     pub fn write_to(&self, w: &mut ByteWriter);
     pub fn to_bytes(&self) -> Vec<u8>;
@@ -358,7 +358,7 @@ All differences are within the run-to-run noise of the shared machine.
 
 ## Changes outside `strata/src/text`
 
-* `posting_bench/src/codecs/loom/{mod,tests}.rs`: `Slice` storage,
+* `strata/src/postings/codecs/loom/{mod,tests}.rs`: `Slice` storage,
   serialisation, ranks and `LoomCursor::rank`, generic cursor (in scope).
 * `strata/src/segment/filter.rs`: `DocFilter::members` (provided method,
   default `None`) and its `DocSet` implementation, so that selective

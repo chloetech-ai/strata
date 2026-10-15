@@ -22,10 +22,10 @@
 //! block: bd: u8 | bf: u8 | docID gaps (bd bits) | tf - 1 (bf bits)
 //! ```
 //!
-//! Full blocks use posting_bench's SIMD-BP128 vertical layout (16 * width
-//! bytes); the last, partial block is packed horizontally. A cursor decodes
-//! a block's docIDs when it enters it and its frequencies on the first
-//! `freq()` in it.
+//! Full blocks use the SIMD-BP128 vertical layout of
+//! [`crate::postings::codecs::bp128`] (16 * width bytes); the last, partial
+//! block is packed horizontally. A cursor decodes a block's docIDs when it
+//! enters it and its frequencies on the first `freq()` in it.
 //!
 //! **Loom lists** (`text.postings = loom`, lists of at least
 //! [`LOOM_MIN_DF`] postings):
@@ -38,11 +38,11 @@
 //! DocIDs are a zero-copy [`Loom`] view; a frequency is read in O(1) from
 //! the cursor's rank (`LoomCursor::rank`), without decoding its block.
 
-use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes};
-use posting_bench::codecs::block::{block_gaps, prefix_sum};
-use posting_bench::codecs::bp128;
-use posting_bench::codecs::loom::{Loom, LoomCursor};
-use posting_bench::codecs::{Cursor, PostingList};
+use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes};
+use crate::postings::codecs::block::{block_gaps, prefix_sum};
+use crate::postings::codecs::bp128;
+use crate::postings::codecs::loom::{Loom, LoomCursor};
+use crate::postings::codecs::{Cursor, PostingList};
 use serde::{Deserialize, Serialize};
 
 use super::codec::{bit_width, get_packed, get_varint, pack_bits, packed_len, put_varint, unpack_bits};

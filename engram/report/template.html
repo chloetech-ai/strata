@@ -47,7 +47,7 @@ td.sys { font-weight: 600; }
 
 <div class="page">
 <header class="col">
-  <div class="eyebrow">posting_bench · strata · engram</div>
+  <div class="eyebrow">strata · engram</div>
   <h1>Engram: long-term context for a coding agent, in one Strata file</h1>
   <p class="lede">A coding session on a large project outlives its context window many times over. Engram stores everything Claude Code does through its hooks, finds what matters again with Strata's hybrid search, and decides on its own when to put it back into the prompt. The model can also search its history when it decides to. This page is the design, the implementation, and an evaluation on two long-conversation benchmarks, on the 26-hour session that built this repository, and in live Claude Code runs.</p>
   <p class="meta" id="meta-line"></p>
@@ -162,7 +162,7 @@ td.sys { font-weight: 600; }
       <li><b>Systems:</b> latency and storage up to a million records.</li>
       <li><b>Live runs:</b> headless Claude Code sessions with Engram installed.</li>
     </ul>
-    <p>The default embedder is static (Model2Vec potion-retrieval-32M): a token lookup and a mean, 512 dimensions, about 10,000 records a second on four cores. BGE-small, a 33-million-parameter transformer, is the alternative; it took about 50 ms per short text on this CPU.</p>
+    <p>The default embedder is static (Model2Vec potion-retrieval-32M): a token lookup and a mean, 512 dimensions, about 50,000 records a second on an Apple M2 laptop. BGE-small, a 33-million-parameter transformer, is the alternative; it took about 50 ms per short text on the 4-core cloud VM where it was measured.</p>
   </div>
   <!--RESULTS-->
 </section>

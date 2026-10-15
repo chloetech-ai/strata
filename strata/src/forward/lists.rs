@@ -10,9 +10,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
-use posting_bench::codecs::pyramid::Pyramid;
-use posting_bench::codecs::PostingList;
+use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
+use crate::postings::codecs::pyramid::Pyramid;
+use crate::postings::codecs::PostingList;
 
 use crate::error::{corrupt, Result};
 

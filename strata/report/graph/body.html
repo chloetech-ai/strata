@@ -103,8 +103,8 @@ SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q),
   </div>
   <div class="wide" id="speed-tabs"></div>
   <div class="col">
-    <p>Against SQLite, the one-hop queries cost about the same: roughly 20 µs, mostly parsing and planning on both sides. From two hops on, the gap opens. The tail is where it shows most: two hops both ways on arXiv touch 3,790 rows on average and up to tens of thousands, and their p95 is 2.6 ms in Strata against 24.5 ms in SQLite. The recursive CTE re-expands rows reached at several depths and joins through a B-tree per row, where Strata reads a CSR slice. Shortest paths and PageRank have no practical CTE form.</p>
-    <p>Against the CSR, Strata pays two costs. About 20 µs of SQL per query dominates small traversals. Resolution dominates large ones: PageRank takes 2.8 times the CSR's time on arXiv and 4.6 times on the million-row graph. A target outside its own segment is a hash probe into each segment's primary-key index until found, a cache miss each. Three changes found by profiling cut PageRank on the million-row graph from 21.4 to 5.8 ms:</p>
+    <p>Against SQLite, the one-hop queries cost about the same: roughly 10–15 µs, mostly parsing and planning on both sides. From two hops on, the gap opens. The tail is where it shows most: two hops both ways on arXiv touch 3,790 rows on average and up to tens of thousands, and their p95 is 1.6 ms in Strata against 14.8 ms in SQLite. The recursive CTE re-expands rows reached at several depths and joins through a B-tree per row, where Strata reads a CSR slice. Shortest paths and PageRank have no practical CTE form.</p>
+    <p>Against the CSR, Strata pays two costs. About 10 µs of SQL per query dominates small traversals. Resolution dominates large ones: PageRank takes 2.4 times the CSR's time on arXiv and 5.3 times on the million-row graph. A target outside its own segment is a hash probe into each segment's primary-key index until found, a cache miss each. Three changes found by profiling on the cloud VM that first ran these benchmarks cut PageRank on the million-row graph from 21.4 to 5.8 ms there (3.5 ms on the M2):</p>
     <ul>
       <li>reverse groups by key, with the sources stored inline;</li>
       <li>same-segment hints and a per-query memo;</li>
@@ -128,10 +128,10 @@ SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q),
     \[ \mathrm{recall@}k = \frac{|R_k \cap T|}{|T|}, \qquad \mathrm{nDCG@}k = \frac{\sum_{i \le k} \mathbb{1}[r_i \in T] / \log_2(i + 1)}{\sum_{i \le \min(k, |T|)} 1 / \log_2(i + 1)}. \]
   </div>
   <div class="wide" id="quality-table"></div>
-  <div class="col"><p class="note">Times are from the quality runs, on the build before the speed changes of the previous section; the graph methods are faster now (see the speed tables).</p></div>
+  <div class="col"><p class="note">Times are from the quality runs on the M2, after one untimed pass per method.</p></div>
   <div class="col">
-    <p>The graph doubles what vector search finds. The best method is also the simplest: take the two papers nearest the query, follow their citations, and rank what they cite by similarity to the query. It reaches nDCG@20 0.253 against 0.123 for vector search, 0.161 for BM25 and 0.160 for hybrid search, in 0.4 ms. Papers on the same topic cite the same work, and the nearest papers' reference lists are a better candidate set than the nearest papers themselves.</p>
-    <p>PageRank from the same seeds reaches 0.211 at its best (from one seed), below the plain one-hop expansion: on this graph the papers two or three hops away dilute the direct citations. Fusing PageRank with the vector ranking lowers it to 0.188, because the vector ranking's own top results are mostly not references. Fusing BM25, vectors and PageRank from hybrid seeds also reaches 0.211, at the cost of BM25 over long queries (77 ms).</p>
+    <p>The graph doubles what vector search finds. The best method is also the simplest: take the two papers nearest the query, follow their citations, and rank what they cite by similarity to the query. It reaches nDCG@20 0.253 against 0.123 for vector search, 0.161 for BM25 and 0.160 for hybrid search, in 0.2 ms. Papers on the same topic cite the same work, and the nearest papers' reference lists are a better candidate set than the nearest papers themselves.</p>
+    <p>PageRank from the same seeds reaches 0.211 at its best (from one seed), below the plain one-hop expansion: on this graph the papers two or three hops away dilute the direct citations. Fusing PageRank with the vector ranking lowers it to 0.179, because the vector ranking's own top results are mostly not references. Fusing BM25, vectors and PageRank from hybrid seeds also reaches 0.211, at the cost of BM25 over long queries (48 ms).</p>
   </div>
   <div class="wide">
     <div class="chart-box"><h4>nDCG@20 by number of vector seeds</h4><p>Report half; horizontal lines are the methods without seeds.</p><div id="sweep-chart"></div></div>
@@ -143,7 +143,7 @@ SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q),
       <li>with the seeds kept, it returns what vector search already found (recall@20 0.112 against 0.111 at 10 seeds, on all queries);</li>
       <li>with them removed, it is worse (nDCG@20 0.079).</li>
     </ul>
-    <p>A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows carrying vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in Strata for exploratory queries, cheap at 0.23 ms per hop of 10 neighbours, but it is not what makes the graph worth having.</p>
+    <p>A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows carrying vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in Strata for exploratory queries, cheap at 0.12 ms per hop of 10 neighbours, but it is not what makes the graph worth having.</p>
   </div>
   <div class="wide" id="compare-table"></div>
 </section>

@@ -1,5 +1,6 @@
 """Assemble report/strata.html from the template, the narrative fragments,
-the shared style and chart helpers of posting_bench's reports, and results/.
+the shared style and chart helpers of the posting-list reports
+(report/postings/), and results/.
 Usage: python3 scripts/build_report.py"""
 import datetime
 import json
@@ -8,7 +9,7 @@ import pathlib
 root = pathlib.Path(__file__).resolve().parent.parent
 results = root / "results"
 report = root / "report"
-shared = root.parent / "posting_bench" / "report"
+shared = root / "report" / "postings"
 COLLECTIONS = ["scifact", "fiqa", "trec-covid", "quora"]
 
 

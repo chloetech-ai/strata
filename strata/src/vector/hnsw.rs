@@ -35,7 +35,7 @@ use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
+use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 
 use crate::error::{corrupt, Result};
 use crate::segment::DocId;

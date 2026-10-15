@@ -4,7 +4,7 @@
     {
       "first": "52874170 · How do I perform a lumbar puncture and analyze the results t",
       "label": "phrase, boolean and negation",
-      "ms": 0.08078099999999999,
+      "ms": 0.036625000000000005,
       "plan": [
         "seg 0: filter materialised, 1 docs"
       ],
@@ -14,7 +14,7 @@
     {
       "first": "3",
       "label": "prefix and conjunction",
-      "ms": 0.028467,
+      "ms": 0.011459,
       "plan": [
         "seg 0: filter materialised, 3 docs"
       ],
@@ -24,7 +24,7 @@
     {
       "first": "36178047 · 9.6821",
       "label": "ranked text, OR / NOT filter",
-      "ms": 0.093492,
+      "ms": 0.0455,
       "plan": [
         "seg 0: bm25 MaxScore, filter Probe"
       ],
@@ -34,7 +34,7 @@
     {
       "first": "4979184 · 0.5745",
       "label": "filtered vector, OR filter",
-      "ms": 0.062065999999999996,
+      "ms": 0.042041,
       "plan": [
         "seg 0: filter materialised, 799 docs",
         "seg 0: vector PreFilter (PreFilter ran), filter Materialize"
@@ -45,7 +45,7 @@
     {
       "first": "6948886 · 0.9594",
       "label": "filtered hybrid, weighted",
-      "ms": 0.286356,
+      "ms": 0.12237500000000001,
       "plan": [
         "seg 0: bm25 MaxScore, filter Probe",
         "seg 0: filter materialised, 923 docs",
@@ -58,7 +58,7 @@
     {
       "first": "33796570 · 0.0315",
       "label": "hybrid, RRF on a correlated filter",
-      "ms": 0.218324,
+      "ms": 0.07166700000000001,
       "plan": [
         "seg 0: filter materialised, 604 docs",
         "seg 0: bm25 MaxScore, filter Materialize",
@@ -71,7 +71,7 @@
     {
       "first": "t02 · 2",
       "label": "facets over a text match",
-      "ms": 0.049277,
+      "ms": 0.018542,
       "plan": [
         "seg 0: filter materialised, 4 docs",
         "seg 0: facet Codes over 4 docs"
@@ -82,7 +82,7 @@
     {
       "first": null,
       "label": "text filter, ordered by a column",
-      "ms": 0.053953,
+      "ms": 0.012041,
       "plan": [
         "seg 0: filter materialised, 0 docs"
       ],
@@ -92,7 +92,7 @@
     {
       "first": "0",
       "label": "count over a boolean and a range",
-      "ms": 0.036284,
+      "ms": 0.014,
       "plan": [
         "seg 0: filter materialised, 0 docs"
       ],
@@ -102,7 +102,7 @@
     {
       "first": "5123516",
       "label": "nearest by distance, exact",
-      "ms": 0.212786,
+      "ms": 0.069875,
       "plan": [
         "seg 0: filter materialised, 2272 docs",
         "seg 0: vector PreFilter (PreFilter ran), filter Materialize"

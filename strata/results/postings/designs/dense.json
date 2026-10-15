@@ -1,0 +1,153 @@
+{
+  "collection": "synthetic-clustered (u=8000000, terms=20000, max_len=2000000, zipf=1)",
+  "documents": 8000000,
+  "lists": 20000,
+  "postings": 20951573,
+  "queries": 300,
+  "mean_terms": 2.6433,
+  "mean_query_postings": 1787965.2,
+  "mean_and_results": 42798.5,
+  "mean_or_results": 1628737.7,
+  "reps": 3,
+  "cpu": "aarch64",
+  "simd": ["neon"],
+  "codecs": [
+    {"codec": "Uncompressed", "bits_per_posting": 32.0000, "query_bits_per_posting": 32.0000, "build_secs": 0.0085, "decode_ns_per_posting": 0.0787, "query_decode_ns_per_posting": 0.0712, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "SvS + merge", "ms_per_query": 2.414223},
+      {"op": "AND", "algorithm": "SvS + merge (branchless)", "ms_per_query": 3.319963},
+      {"op": "AND", "algorithm": "SvS + galloping", "ms_per_query": 1.737733},
+      {"op": "AND", "algorithm": "SvS + binary search", "ms_per_query": 14.156212},
+      {"op": "AND", "algorithm": "SvS + Baeza-Yates", "ms_per_query": 2.511573},
+      {"op": "AND", "algorithm": "SvS + SIMD NEON 4x4", "ms_per_query": 1.915837},
+      {"op": "AND", "algorithm": "SvS + SIMD NEON 8x8", "ms_per_query": 0.873996},
+      {"op": "AND", "algorithm": "SvS + adaptive (SIMD / gallop @64x)", "ms_per_query": 0.736922},
+      {"op": "AND", "algorithm": "Small Adaptive", "ms_per_query": 3.022658},
+      {"op": "AND", "algorithm": "Sequential (Barbay-Kenyon)", "ms_per_query": 2.832744},
+      {"op": "OR", "algorithm": "slices: heap", "ms_per_query": 13.061409},
+      {"op": "OR", "algorithm": "slices: fold (pairwise merge)", "ms_per_query": 4.859125},
+      {"op": "OR", "algorithm": "slices: bitmap", "ms_per_query": 4.789334},
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 2.115288},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 2.565502},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 0.851091},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 10.792794},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 7.383771},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 4.852900}
+    ]},
+    {"codec": "BP128", "bits_per_posting": 10.0734, "query_bits_per_posting": 6.3798, "build_secs": 0.0316, "decode_ns_per_posting": 0.8849, "query_decode_ns_per_posting": 0.7486, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 4.434669},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 4.986473},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 2.082746},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 12.982642},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 8.450945},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 6.967338}
+    ]},
+    {"codec": "BP128 (bitpacking crate)", "bits_per_posting": 10.0734, "query_bits_per_posting": 6.3798, "build_secs": 0.0141, "decode_ns_per_posting": 0.4399, "query_decode_ns_per_posting": 0.2835, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 3.897757},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 4.246395},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 1.249068},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 12.027795},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 7.595931},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 6.162281}
+    ]},
+    {"codec": "OptPFor", "bits_per_posting": 7.1273, "query_bits_per_posting": 5.0861, "build_secs": 0.1432, "decode_ns_per_posting": 1.1095, "query_decode_ns_per_posting": 0.8478, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 4.517267},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 5.131897},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 2.267398},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 12.988109},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 8.730142},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 7.094403}
+    ]},
+    {"codec": "Elias-Fano", "bits_per_posting": 10.8483, "query_bits_per_posting": 5.4438, "build_secs": 0.0529, "decode_ns_per_posting": 1.1155, "query_decode_ns_per_posting": 1.0960, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 3.691001},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 4.362048},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 2.753310},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 14.211034},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 10.120020},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 6.822953}
+    ]},
+    {"codec": "PEF", "bits_per_posting": 7.0358, "query_bits_per_posting": 3.7145, "build_secs": 0.1795, "decode_ns_per_posting": 1.1174, "query_decode_ns_per_posting": 0.9642, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 2.400766},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 2.874391},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 2.465730},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 14.408964},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 9.046274},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 6.879716}
+    ]},
+    {"codec": "Loom", "bits_per_posting": 6.8570, "query_bits_per_posting": 3.6862, "build_secs": 0.4910, "decode_ns_per_posting": 0.3561, "query_decode_ns_per_posting": 0.2069, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "native", "ms_per_query": 0.478260},
+      {"op": "OR", "algorithm": "native", "ms_per_query": 1.206758},
+      {"op": "AND", "algorithm": "native, count only", "ms_per_query": 0.479702},
+      {"op": "OR", "algorithm": "native, count only", "ms_per_query": 0.765810},
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 2.220863},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 2.684901},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 1.102452},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 12.968166},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 8.605552},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 6.325944}
+    ]},
+    {"codec": "Interpolative", "bits_per_posting": 5.9731, "query_bits_per_posting": 3.9322, "build_secs": 0.0935, "decode_ns_per_posting": 3.2198, "query_decode_ns_per_posting": 3.1162, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 7.475068},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 9.192949},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 6.350774},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 17.283882},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 12.698605},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 11.190544}
+    ]},
+    {"codec": "Entropic", "bits_per_posting": 4.9678, "query_bits_per_posting": 3.4016, "build_secs": 1.8483, "decode_ns_per_posting": 0.9548, "query_decode_ns_per_posting": 0.7435, "aux_memory_bytes": 14308352, "measurements": [
+      {"op": "AND", "algorithm": "native", "ms_per_query": 3.564980},
+      {"op": "OR", "algorithm": "native", "ms_per_query": 2.302911},
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 3.995402},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 5.233766},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 2.075380},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 17.499058},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 16.023591},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 11.731999}
+    ]},
+    {"codec": "Hybrid (bitmap + BP128)", "bits_per_posting": 10.0058, "query_bits_per_posting": 6.1381, "build_secs": 0.0333, "decode_ns_per_posting": 0.9369, "query_decode_ns_per_posting": 0.9384, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "native", "ms_per_query": 2.636972},
+      {"op": "OR", "algorithm": "native", "ms_per_query": 5.009360},
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 3.211393},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 3.437997},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 2.468815},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 15.836568},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 11.544448},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 9.283634}
+    ]},
+    {"codec": "Roaring", "bits_per_posting": 11.7241, "query_bits_per_posting": 8.0255, "build_secs": 0.0782, "decode_ns_per_posting": 1.3461, "query_decode_ns_per_posting": 0.5678, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "native", "ms_per_query": 0.621385},
+      {"op": "OR", "algorithm": "native", "ms_per_query": 0.883236},
+      {"op": "AND", "algorithm": "native, count only", "ms_per_query": 0.617890},
+      {"op": "OR", "algorithm": "native, count only", "ms_per_query": 0.433922},
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 1.697521},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 1.901029},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 1.646033},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 13.240387},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 8.892254},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 6.964219}
+    ]},
+    {"codec": "Pyramid", "bits_per_posting": 10.3529, "query_bits_per_posting": 4.6176, "build_secs": 0.3480, "decode_ns_per_posting": 0.7069, "query_decode_ns_per_posting": 0.2804, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "native", "ms_per_query": 0.771693},
+      {"op": "OR", "algorithm": "native", "ms_per_query": 0.879016},
+      {"op": "AND", "algorithm": "native, count only", "ms_per_query": 0.722574},
+      {"op": "OR", "algorithm": "native, count only", "ms_per_query": 0.356793},
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 2.751406},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 3.254257},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 1.243860},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 17.364611},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 12.838576},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 12.548846}
+    ]},
+    {"codec": "Roaring (roaring crate)", "bits_per_posting": 11.7241, "query_bits_per_posting": 8.0255, "build_secs": 0.1561, "decode_ns_per_posting": 5.6475, "query_decode_ns_per_posting": 5.0244, "aux_memory_bytes": 0, "measurements": [
+      {"op": "AND", "algorithm": "native", "ms_per_query": 1.095127},
+      {"op": "OR", "algorithm": "native", "ms_per_query": 9.740190},
+      {"op": "AND", "algorithm": "native, count only", "ms_per_query": 0.924568},
+      {"op": "OR", "algorithm": "native, count only", "ms_per_query": 3.065158},
+      {"op": "AND", "algorithm": "leapfrog (NextGEQ)", "ms_per_query": 3.772827},
+      {"op": "AND", "algorithm": "round-robin (LFTJ)", "ms_per_query": 4.099532},
+      {"op": "AND", "algorithm": "decode + SvS", "ms_per_query": 8.366392},
+      {"op": "OR", "algorithm": "heap", "ms_per_query": 16.597151},
+      {"op": "OR", "algorithm": "min-scan", "ms_per_query": 14.284102},
+      {"op": "OR", "algorithm": "bitset window (4096)", "ms_per_query": 7.163612}
+    ]}
+  ]
+}

@@ -393,7 +393,7 @@
         if (!p || !c) return;
         rows.push([i === 0 ? int(r.records) : "", label, msf((before[`process_${k}`] || {}).p50), { v: msf(p.p50), cls: "sys" }, msf(p.p90), msf(c.p50), msf(p.p50 - c.p50)]);
       }));
-      table(hk, ["records", "hook", "process per event, state written first", "process per event, now", "p90", "running client, now", "saved by a running client"], rows, [2, 3, 4, 5, 6], { cls: "wrap-head" });
+      table(hk, ["records", "hook", "process per event, state written first (cloud VM)", "process per event, now", "p90", "running client, now", "saved by a running client"], rows, [2, 3, 4, 5, 6], { cls: "wrap-head" });
     }
     const cs = $("#cold-table");
     if (cs) {
@@ -468,7 +468,7 @@
 
   function meta() {
     const el = $("#meta-line");
-    if (el) el.textContent = `Generated ${D.generated} · static embedder (Model2Vec potion-retrieval-32M) · results in engram/results/structure, reader, latency`;
+    if (el) el.textContent = `Generated ${D.generated} · static embedder (Model2Vec potion-retrieval-32M) · timings on an Apple M2 MacBook Air (4 performance + 4 efficiency cores, 24 GB, macOS 26.0.1); the A/B and reader runs (model calls) and the figures marked as such are the earlier ones, from a 4-core cloud VM · results in engram/results/structure, reader, latency`;
   }
 
   meta();

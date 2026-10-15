@@ -1,7 +1,8 @@
 //! Cold-cache I/O measurement that works for any engine's files.
 //!
 //! [`evict`] drops a file's pages from the OS page cache
-//! (`posix_fadvise(DONTNEED)`), so the next read goes to the device.
+//! (`posix_fadvise(DONTNEED)` on Linux, `msync(MS_INVALIDATE)` elsewhere), so
+//! the next read goes to the device.
 //! [`resident_pages`] counts how many of a file's pages are in the page cache
 //! (`mincore` over a fresh read-only mapping). Evicting, running a query and
 //! counting gives the pages the query read from disk, for Strata, SQLite and
@@ -17,8 +18,6 @@ use std::path::Path;
 pub const PAGE: usize = 4096;
 
 /// Drops the file's clean pages from the page cache.
-/// Only Linux has `posix_fadvise`; elsewhere this is a no-op and pages stay
-/// resident.
 #[cfg(target_os = "linux")]
 pub fn evict(path: &Path) -> io::Result<()> {
     let f = File::open(path)?;
@@ -29,9 +28,30 @@ pub fn evict(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Drops the file's clean pages from the page cache. There is no
+/// `posix_fadvise` here; invalidating a fresh shared mapping of the whole file
+/// frees its cached pages instead (macOS also unmaps them from mappings other
+/// processes or this one hold), as `vmtouch -e` does.
 #[cfg(not(target_os = "linux"))]
 pub fn evict(path: &Path) -> io::Result<()> {
-    File::open(path).map(|_| ())
+    let f = File::open(path)?;
+    let len = f.metadata()?.len() as usize;
+    if len == 0 {
+        return Ok(());
+    }
+    unsafe {
+        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0);
+        if p == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let r = libc::msync(p, len, libc::MS_INVALIDATE);
+        let e = io::Error::last_os_error();
+        libc::munmap(p, len);
+        if r != 0 {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// Evicts every regular file under `dir` (for multi-file engines).

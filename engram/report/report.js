@@ -233,7 +233,7 @@
   // ------------------------------------------------------------ sections
   function meta() {
     const m = $("#meta-line");
-    if (m) m.textContent = "Intel Xeon (Emerald Rapids), 4 cores · Rust · Strata storage and search · static embedder potion-retrieval-32M (512-d), BGE-small for comparison · Claude Code 2.1 hooks and MCP";
+    if (m) m.textContent = "Scale and latency on an Apple M2 MacBook Air (4 performance + 4 efficiency cores, 24 GB, macOS 26.0.1); retrieval, probes, BGE timing and the live Claude Code runs (model calls) are the earlier ones, from a 4-core Intel Xeon (Emerald Rapids) cloud VM · Rust · Strata storage and search · static embedder potion-retrieval-32M (512-d), BGE-small for comparison · Claude Code 2.1 hooks and MCP";
     const f = $("#footer");
     if (f) f.textContent = `Generated from engram/results/ by scripts/build_report.py · ${D.generated}`;
   }

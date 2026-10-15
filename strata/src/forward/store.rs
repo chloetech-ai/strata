@@ -13,7 +13,7 @@
 //! block its first docID, its byte offset in `store.data` and its
 //! uncompressed size) and `store.data` (the compressed blocks).
 
-use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
+use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};

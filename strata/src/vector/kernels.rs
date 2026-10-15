@@ -1,23 +1,39 @@
 //! Distance kernels.
 //!
-//! * [`dot_f32`]: exact float32 dot product (AVX-512 FMA, four accumulators).
+//! * [`dot_f32`]: exact float32 dot product (AVX-512 FMA, four accumulators;
+//!   NEON FMA, eight).
 //! * [`dot_u8_i8`], [`dot_u8_i8_x4`]: SQ8 codes against an int8-quantised
 //!   query, summed in int32 with AVX-512 VNNI (`vpdpbusd`: 64 byte products
-//!   per instruction). The `x4` form scores four rows per query load, which
-//!   is what scans use.
+//!   per instruction), or on aarch64 with `usdot` (i8mm: 16 per instruction;
+//!   with dotprod only, `sdot` on the codes biased to signed and a
+//!   correction, see `dot4`). The `x4` form scores four rows per query
+//!   load, which is what scans use.
 //! * [`dot_u8_f32`]: SQ8 codes against a float32 query (asymmetric: widen the
 //!   codes, then FMA). Kept for the kernel comparison in the bench; scans use
-//!   the VNNI kernel (see `notes/vector.md`).
+//!   the int8 kernel (VNNI or NEON; see `notes/vector.md`).
 //! * [`dot_f32_4x4`]: a 4×4 block of float32 dot products sharing loads, for
 //!   k-means and brute-force ground truth.
 //!
 //! The SIMD paths are chosen at compile time (`-C target-cpu=native`); every
 //! kernel has a portable scalar version, used on other targets and as the
 //! reference in tests. Lengths need not be multiples of the vector width:
-//! tails use masked loads.
+//! tails use masked loads (AVX-512) or a scalar loop (NEON).
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
+/// The int8 SQ8 kernel compiled in ([`dot_u8_i8`]), for reports.
+pub const SQ8_KERNEL: &str = if cfg!(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw")) {
+    "vnni"
+} else if cfg!(all(target_arch = "aarch64", target_feature = "i8mm")) {
+    "neon-usdot"
+} else if cfg!(all(target_arch = "aarch64", target_feature = "dotprod")) {
+    "neon-sdot"
+} else {
+    "scalar"
+};
 
 /// Exact dot product of two float32 vectors of equal length.
 #[inline]
@@ -28,7 +44,12 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         dot_f32_avx512(a.as_ptr(), b.as_ptr(), a.len())
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: both slices hold `a.len()` elements; the tail is scalar.
+    unsafe {
+        dot_f32_neon(a.as_ptr(), b.as_ptr(), a.len())
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
     dot_f32_scalar(a, b)
 }
 
@@ -55,7 +76,12 @@ pub fn dot_u8_i8(a: &[u8], b: &[i8]) -> i32 {
     unsafe {
         dot_u8_i8_vnni(a.as_ptr(), b.as_ptr(), a.len())
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw")))]
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    // SAFETY: both slices hold `a.len()` bytes; the tail is scalar.
+    unsafe {
+        dot_u8_i8_neon(a.as_ptr(), b.as_ptr(), a.len())
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"), all(target_arch = "aarch64", target_feature = "dotprod"))))]
     dot_u8_i8_scalar(a, b)
 }
 
@@ -77,7 +103,12 @@ pub fn dot_u8_i8_x4(rows: [&[u8]; 4], q: &[i8]) -> [i32; 4] {
     unsafe {
         dot_u8_i8_x4_vnni([rows[0].as_ptr(), rows[1].as_ptr(), rows[2].as_ptr(), rows[3].as_ptr()], q.as_ptr(), q.len())
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw")))]
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    // SAFETY: every row holds `q.len()` bytes; the tail is scalar.
+    unsafe {
+        dot_u8_i8_x4_neon(rows.map(|r| r.as_ptr()), q.as_ptr(), q.len())
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"), all(target_arch = "aarch64", target_feature = "dotprod"))))]
     rows.map(|r| dot_u8_i8_scalar(r, q))
 }
 
@@ -90,7 +121,12 @@ pub fn dot_u8_f32(a: &[u8], w: &[f32]) -> f32 {
     unsafe {
         dot_u8_f32_avx512(a.as_ptr(), w.as_ptr(), a.len())
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `a` holds `w.len()` bytes; the tail is scalar.
+    unsafe {
+        dot_u8_f32_neon(a.as_ptr(), w.as_ptr(), a.len())
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
     dot_u8_f32_scalar(a, w)
 }
 
@@ -122,13 +158,18 @@ pub fn dot_f32_4x4(a: [&[f32]; 4], b: [&[f32]; 4]) -> [[f32; 4]; 4] {
     unsafe {
         dot_f32_4x4_avx512(a.map(|v| v.as_ptr()), b.map(|v| v.as_ptr()), n)
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: all eight vectors hold `n` elements; the tail is scalar.
+    unsafe {
+        dot_f32_4x4_neon(a.map(|v| v.as_ptr()), b.map(|v| v.as_ptr()), n)
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
     a.map(|x| b.map(|y| dot_f32_scalar(x, y)))
 }
 
 /// Hints the CPU to fetch `bytes` starting at `p` into cache (one hint per
-/// 64-byte line). Used ahead of random accesses (graph neighbours, sparse
-/// filter members).
+/// 64-byte line; 128-byte on Apple silicon). Used ahead of random accesses
+/// (graph neighbours, sparse filter members).
 #[inline]
 pub fn prefetch(p: *const u8, bytes: usize) {
     #[cfg(target_arch = "x86_64")]
@@ -140,7 +181,18 @@ pub fn prefetch(p: *const u8, bytes: usize) {
             off += 64;
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        let line = if cfg!(target_vendor = "apple") { 128 } else { 64 };
+        let mut off = 0;
+        while off < bytes {
+            // SAFETY: prefetch never faults, whatever the address
+            // (`_prefetch` is not stable yet).
+            unsafe { std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p.wrapping_add(off), options(nostack, readonly, preserves_flags)) };
+            off += line;
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = (p, bytes);
 }
 
@@ -252,6 +304,188 @@ unsafe fn dot_f32_4x4_avx512(a: [*const f32; 4], b: [*const f32; 4], n: usize) -
     s.map(|row| row.map(|v| _mm512_reduce_add_ps(v)))
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_f32_neon(a: *const f32, b: *const f32, n: usize) -> f32 {
+    // Eight chains: the loop is load-bound only once FMA latency is hidden.
+    let mut s = [vdupq_n_f32(0.0); 8];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (j, acc) in s.iter_mut().enumerate() {
+            *acc = vfmaq_f32(*acc, vld1q_f32(a.add(i + 4 * j)), vld1q_f32(b.add(i + 4 * j)));
+        }
+        i += 32;
+    }
+    while i + 4 <= n {
+        s[0] = vfmaq_f32(s[0], vld1q_f32(a.add(i)), vld1q_f32(b.add(i)));
+        i += 4;
+    }
+    let mut t = 0f32;
+    while i < n {
+        t += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    let h = |k: usize| vaddq_f32(vaddq_f32(s[k], s[k + 1]), vaddq_f32(s[k + 2], s[k + 3]));
+    vaddvq_f32(vaddq_f32(h(0), h(4))) + t
+}
+
+/// `acc` plus, per 32-bit lane, the dot product of four unsigned codes with
+/// four signed weights: `usdot` with i8mm. With dotprod only, `sdot` of the
+/// codes biased to signed (`c - 128`), which falls short by `128 Σq`: the
+/// kernels sum `q` with [`qsum4`] and add that back, exactly (the identity
+/// holds modulo 2^32, as int32 sums wrap). The intrinsics are not stable
+/// yet, hence `asm!`.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn dot4(mut acc: int32x4_t, c: uint8x16_t, q: int8x16_t) -> int32x4_t {
+    #[cfg(target_feature = "i8mm")]
+    std::arch::asm!("usdot {0:v}.4s, {1:v}.16b, {2:v}.16b", inout(vreg) acc, in(vreg) c, in(vreg) q, options(pure, nomem, nostack, preserves_flags));
+    #[cfg(not(target_feature = "i8mm"))]
+    {
+        let c = vreinterpretq_s8_u8(veorq_u8(c, vdupq_n_u8(0x80)));
+        std::arch::asm!("sdot {0:v}.4s, {1:v}.16b, {2:v}.16b", inout(vreg) acc, in(vreg) c, in(vreg) q, options(pure, nomem, nostack, preserves_flags));
+    }
+    acc
+}
+
+/// `acc + Σq` per 32-bit lane when [`dot4`] needs the correction; `acc`
+/// (optimised away) with i8mm.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn qsum4(acc: int32x4_t, q: int8x16_t) -> int32x4_t {
+    #[cfg(target_feature = "i8mm")]
+    {
+        let _ = q;
+        acc
+    }
+    #[cfg(not(target_feature = "i8mm"))]
+    {
+        let mut acc = acc;
+        std::arch::asm!("sdot {0:v}.4s, {1:v}.16b, {2:v}.16b", inout(vreg) acc, in(vreg) vdupq_n_s8(1), in(vreg) q, options(pure, nomem, nostack, preserves_flags));
+        acc
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline]
+unsafe fn dot_u8_i8_neon(a: *const u8, b: *const i8, n: usize) -> i32 {
+    // Four chains, and four for the correction (one would be latency-bound).
+    let mut s = [vdupq_n_s32(0); 4];
+    let mut qs = [vdupq_n_s32(0); 4];
+    let mut i = 0;
+    while i + 64 <= n {
+        for (j, (acc, qa)) in s.iter_mut().zip(&mut qs).enumerate() {
+            let qv = vld1q_s8(b.add(i + 16 * j));
+            *qa = qsum4(*qa, qv);
+            *acc = dot4(*acc, vld1q_u8(a.add(i + 16 * j)), qv);
+        }
+        i += 64;
+    }
+    while i + 16 <= n {
+        let qv = vld1q_s8(b.add(i));
+        qs[0] = qsum4(qs[0], qv);
+        s[0] = dot4(s[0], vld1q_u8(a.add(i)), qv);
+        i += 16;
+    }
+    let sum = |v: [int32x4_t; 4]| vaddvq_s32(vaddq_s32(vaddq_s32(v[0], v[1]), vaddq_s32(v[2], v[3])));
+    let mut t = sum(s).wrapping_add(sum(qs).wrapping_mul(128));
+    while i < n {
+        t = t.wrapping_add(*a.add(i) as i32 * *b.add(i) as i32);
+        i += 1;
+    }
+    t
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline]
+unsafe fn dot_u8_i8_x4_neon(rows: [*const u8; 4], q: *const i8, n: usize) -> [i32; 4] {
+    // Two chains per row (and for the correction): 32 bytes per step.
+    let mut s = [[vdupq_n_s32(0); 4]; 2];
+    let mut qs = [vdupq_n_s32(0); 2];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (h, (acc, qa)) in s.iter_mut().zip(&mut qs).enumerate() {
+            let qv = vld1q_s8(q.add(i + 16 * h));
+            *qa = qsum4(*qa, qv);
+            for (a, r) in acc.iter_mut().zip(rows) {
+                *a = dot4(*a, vld1q_u8(r.add(i + 16 * h)), qv);
+            }
+        }
+        i += 32;
+    }
+    if i + 16 <= n {
+        let qv = vld1q_s8(q.add(i));
+        qs[0] = qsum4(qs[0], qv);
+        for (a, r) in s[0].iter_mut().zip(rows) {
+            *a = dot4(*a, vld1q_u8(r.add(i)), qv);
+        }
+        i += 16;
+    }
+    let fix = vaddvq_s32(vaddq_s32(qs[0], qs[1])).wrapping_mul(128);
+    let mut t = [0; 4];
+    for (k, v) in t.iter_mut().enumerate() {
+        *v = vaddvq_s32(vaddq_s32(s[0][k], s[1][k])).wrapping_add(fix);
+    }
+    while i < n {
+        let w = *q.add(i) as i32;
+        for (v, r) in t.iter_mut().zip(rows) {
+            *v = v.wrapping_add(*r.add(i) as i32 * w);
+        }
+        i += 1;
+    }
+    t
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_u8_f32_neon(a: *const u8, w: *const f32, n: usize) -> f32 {
+    let mut s = [vdupq_n_f32(0.0); 4];
+    let mut i = 0;
+    while i + 16 <= n {
+        // Widen 16 codes to four vectors of float32.
+        let c = vld1q_u8(a.add(i));
+        let (lo, hi) = (vmovl_u8(vget_low_u8(c)), vmovl_high_u8(c));
+        let f = [vmovl_u16(vget_low_u16(lo)), vmovl_high_u16(lo), vmovl_u16(vget_low_u16(hi)), vmovl_high_u16(hi)];
+        for (j, acc) in s.iter_mut().enumerate() {
+            *acc = vfmaq_f32(*acc, vcvtq_f32_u32(f[j]), vld1q_f32(w.add(i + 4 * j)));
+        }
+        i += 16;
+    }
+    let mut t = 0f32;
+    while i < n {
+        t += *a.add(i) as f32 * *w.add(i);
+        i += 1;
+    }
+    vaddvq_f32(vaddq_f32(vaddq_f32(s[0], s[1]), vaddq_f32(s[2], s[3]))) + t
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_f32_4x4_neon(a: [*const f32; 4], b: [*const f32; 4], n: usize) -> [[f32; 4]; 4] {
+    let mut s = [[vdupq_n_f32(0.0); 4]; 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        let bv = b.map(|p| vld1q_f32(p.add(i)));
+        for (row, p) in s.iter_mut().zip(a) {
+            let av = vld1q_f32(p.add(i));
+            for (acc, bj) in row.iter_mut().zip(bv) {
+                *acc = vfmaq_f32(*acc, av, bj);
+            }
+        }
+        i += 4;
+    }
+    let mut t = s.map(|row| row.map(|v| vaddvq_f32(v)));
+    while i < n {
+        for (row, p) in t.iter_mut().zip(a) {
+            for (x, q) in row.iter_mut().zip(b) {
+                *x += *p.add(i) * *q.add(i);
+            }
+        }
+        i += 1;
+    }
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +526,60 @@ mod tests {
             for i in 0..4 {
                 for j in 0..4 {
                     assert!(close(m[i][j], dot_f32_scalar(&vs[i], &vs[4 + j]), n as f32), "4x4 n={n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kernels_match_scalar_on_edge_cases() {
+        let lens = [0, 1, 3, 4, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 1023, 1024, 1025];
+        for n in lens {
+            // Codes: zeros, all 255, alternating extremes, a ramp.
+            let codes: [Vec<u8>; 4] = [vec![0; n], vec![255; n], (0..n).map(|i| if i % 2 == 0 { 255 } else { 0 }).collect(), (0..n).map(|i| i as u8).collect()];
+            // Weights: zeros, both extremes (including -128, which `prepare`
+            // never makes), alternating extremes, a signed ramp.
+            let qs: [Vec<i8>; 5] = [
+                vec![0; n],
+                vec![-128; n],
+                vec![127; n],
+                (0..n).map(|i| if i % 3 == 0 { -128 } else { 127 }).collect(),
+                (0..n).map(|i| (i as i32 % 256 - 128) as i8).collect(),
+            ];
+            for q in &qs {
+                for c in &codes {
+                    assert_eq!(dot_u8_i8(c, q), dot_u8_i8_scalar(c, q), "dot_u8_i8 n={n}");
+                }
+                let x4 = dot_u8_i8_x4([&codes[0], &codes[1], &codes[2], &codes[3]], q);
+                assert_eq!(x4, codes.each_ref().map(|c| dot_u8_i8_scalar(c, q)), "x4 n={n}");
+                // A non-zero element at every position lands in its own lane.
+                for p in 0..n.min(70) {
+                    let mut one = vec![0u8; n];
+                    one[p] = 255;
+                    assert_eq!(dot_u8_i8(&one, q), 255 * q[p] as i32, "dot_u8_i8 n={n} p={p}");
+                    let x4 = dot_u8_i8_x4([&one, &codes[0], &one, &codes[1]], q);
+                    assert_eq!(x4, [&one, &codes[0], &one, &codes[1]].map(|c| dot_u8_i8_scalar(c, q)), "x4 n={n} p={p}");
+                }
+            }
+
+            // Float32: zeros are exact; mixed magnitudes and signs agree up
+            // to summation order.
+            let z = vec![0f32; n];
+            let f: Vec<f32> = (0..n).map(|i| [1e3, -1e-3, 7.5, -2e2, 0.0][i % 5]).collect();
+            let g: Vec<f32> = (0..n).map(|i| [-3.0, 1e2, 0.25, 1e-2][i % 4]).collect();
+            assert_eq!(dot_f32(&z, &f), 0.0);
+            let mag: f32 = f.iter().zip(&g).map(|(x, y)| (x * y).abs()).sum();
+            assert!(close(dot_f32(&f, &g), dot_f32_scalar(&f, &g), mag), "dot_f32 n={n}");
+            for c in &codes {
+                let wmag: f32 = c.iter().zip(&g).map(|(&x, y)| (x as f32 * y).abs()).sum();
+                assert!(close(dot_u8_f32(c, &g), dot_u8_f32_scalar(c, &g), wmag), "dot_u8_f32 n={n}");
+                assert_eq!(dot_u8_f32(c, &z), 0.0);
+            }
+            let m = dot_f32_4x4([&f, &g, &z, &f], [&g, &z, &f, &f]);
+            for (i, a) in [&f, &g, &z, &f].into_iter().enumerate() {
+                for (j, b) in [&g, &z, &f, &f].into_iter().enumerate() {
+                    let mag: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x * y).abs()).sum();
+                    assert!(close(m[i][j], dot_f32_scalar(a, b), mag), "4x4 n={n} ({i}, {j})");
                 }
             }
         }

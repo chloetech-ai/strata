@@ -4,7 +4,7 @@
 
 Claude Code forgets. A long session gets compacted into a summary of about 15,000 characters, and a new session starts with almost nothing. Engram records everything a session does (prompts, answers, tool calls and their results, errors, compaction summaries) into one local file per project. It brings the right pieces back on its own when a prompt needs them, and it gives the model tools to search its own history.
 
-Underneath sits **Strata**, a single-file search database in the spirit of SQLite: ACID transactions, SQL, and every table indexed three ways at once (full text, structured columns and vectors), plus graph edges between rows. Strata's posting lists come from **posting_bench**, a study of compressed posting-list formats that produced the Loom and Pyramid codecs it uses.
+Underneath sits **Strata**, a single-file search database in the spirit of SQLite: ACID transactions, SQL, and every table indexed three ways at once (full text, structured columns and vectors), plus graph edges between rows. Strata's posting lists come from its own study of compressed posting-list formats (the `postings` module), which produced the Loom and Pyramid codecs it uses.
 
 📖 **Full documentation:** [`docs/`](docs/index.md) (also publishable as a GitHub Pages site).
 
@@ -20,12 +20,12 @@ Underneath sits **Strata**, a single-file search database in the spirit of SQLit
 | After a compaction, details the summary dropped | **13 of 15** came back automatically, 14 with one search | [Engram results](docs/engram/results.md#this-repositorys-own-26-hour-session) |
 | Live sessions asked about a 26-hour project history | **8 of 8** answered with Engram, **0 of 4** without | [Engram results](docs/engram/results.md#live-claude-code-runs) |
 | LongMemEval-S retrieval (115k-token histories) | **R@10 0.90**; the 4,000-character injection holds the evidence for 87% of questions | [Engram results](docs/engram/results.md#retrieval-on-long-conversation-benchmarks) |
-| Cost of a prompt hook | **9–17 ms** median from 10k to 1M records; 11.5 ms recall at a million records | [Engram results](docs/engram/results.md#scale-and-latency) |
-| Strata vs Tantivy, warm BM25 top-10 | **1.8–4.6× faster**; conjunctions 3.6–6.7× faster; 23 of 28 text and filter comparisons won | [Strata results](docs/strata/results.md#query-latency) |
-| Strata vector top-10 (HNSW, 1,024-d) | **0.09–0.20 ms**, recall@10 0.99 on Quora; SQLite's scan takes 12 ms to 1 s | [Strata results](docs/strata/results.md#vector-indexes) |
-| Filtered vector search planner | **1.5–5.3× faster** than the best fixed strategy, recall@10 0.992–0.998 | [Strata results](docs/strata/results.md#filtered-vector-search-and-the-planner) |
+| Cost of a prompt hook | **14–26 ms** median from 10k to 1M records, mostly starting the hook process; 5.7 ms recall at a million records | [Engram results](docs/engram/results.md#scale-and-latency) |
+| Strata vs Tantivy, warm BM25 top-10 | **1.7–3.2× faster**; conjunctions 2.7–4.1× faster; 24 of 28 text and filter comparisons won | [Strata results](docs/strata/results.md#query-latency) |
+| Strata vector top-10 (HNSW, 1,024-d) | **0.05–0.10 ms**, recall@10 0.99 on Quora; SQLite's scan takes 7.7 ms to 0.7 s | [Strata results](docs/strata/results.md#vector-indexes) |
+| Filtered vector search planner | **1.8–6.1× faster** than the best fixed strategy, recall@10 0.991–0.998 | [Strata results](docs/strata/results.md#filtered-vector-search-and-the-planner) |
 | Graph expansion for citation search (arXiv) | nDCG@20 **0.123 → 0.253** over vector search alone (p < 0.0001) | [Strata graphs](docs/strata/graphs.md#does-the-graph-help-search) |
-| Loom posting lists vs partitioned Elias-Fano | same size, **1.9–2.2× faster AND**, 4.9–8.9× faster OR | [Posting lists](docs/posting-lists.md) |
+| Loom posting lists vs partitioned Elias-Fano | same size, **2.4–3.0× faster AND**, 3.8–7.7× faster OR | [Posting lists](docs/posting-lists.md) |
 
 All numbers come from the experiments in this repository; [Reproducing the results](docs/reproduce.md) says how each was produced, and which ones were re-run for this release.
 
@@ -37,16 +37,16 @@ flowchart LR
         HK["hooks<br/>SessionStart · UserPromptSubmit<br/>PreToolUse · PostToolUse · Stop · Compact"]
         MCP["MCP tools<br/>memory_search · memory_timeline<br/>memory_sql · memory_remember"]
     end
-    HK -- "engram hook &lt;event&gt;<br/>~10 ms, never blocks" --> D
+    HK -- "engram hook &lt;event&gt;<br/>~15 ms, never blocks" --> D
     MCP -- "engram mcp (stdio)" --> D
     D["engram serve<br/>one daemon per project<br/>capture → embed → store<br/>recall → gate → pack"]
     D -- "SQL: BM25 + vectors + filters" --> S[("Strata<br/>memory.strata + WAL")]
     D -. "after each turn" .-> DL["distiller<br/>(small model via claude -p)<br/>decisions · rules · planned work · facts"]
     DL -.-> S
-    S --- PB["posting lists<br/>Loom · Pyramid · BP128<br/>(posting_bench)"]
+    S --- PB["posting lists<br/>Loom · Pyramid · BP128<br/>(strata::postings)"]
 ```
 
-1. **Store without being asked.** Every hook event becomes records of at most 400 bytes in a Strata table, with secrets redacted. A hook costs about 10 ms.
+1. **Store without being asked.** Every hook event becomes records of at most 400 bytes in a Strata table, with secrets redacted. A hook costs about 15 ms on a Mac, most of it process start.
 2. **Load without being asked, only when it helps.** A briefing at session start, a knowledge block and gated recall on every prompt, notes before editing a file. Nothing the model can still see is repeated.
 3. **Let the model ask precisely.** Hybrid search, a timeline around any record, and read-only SQL over its own memory.
 
@@ -118,20 +118,19 @@ target/release/strata db.strata "SELECT category, COUNT(*) FROM docs WHERE MATCH
 | path | what |
 |---|---|
 | [`engram/`](engram/) | the memory system: hooks client, daemon, MCP server, recall and gate, distiller, live inspector (`demo/`), evaluation harnesses and results |
-| [`strata/`](strata/) | the database: storage engine, segments, text / structured / vector / graph indexes, SQL binder, planner and executor, baselines and benchmarks |
-| [`posting_bench/`](posting_bench/) | compressed posting lists and set algorithms, and the Pyramid, Loom and Entropic designs |
+| [`strata/`](strata/) | the database: storage engine, segments, text / structured / vector / graph indexes, SQL binder, planner and executor, baselines and benchmarks; [`src/postings/`](strata/src/postings/) holds the compressed posting lists and set algorithms, the Pyramid, Loom and Entropic designs, and their testbed (`strata-posting-bench`) |
 | [`docs/`](docs/) | this documentation, as Markdown and as a GitHub Pages site |
 
-Each crate also carries its own design document ([Strata](strata/DESIGN.md), [Engram](engram/DESIGN.md)) and full HTML reports with every chart and table ([Strata](strata/report/strata.html), [Strata graphs](strata/report/graph.html), [Engram](engram/report/engram.html), [record structure](engram/report/structure.html), [posting lists](posting_bench/report/report.html), [designs](posting_bench/report/designs.html)).
+Each crate also carries its own design document ([Strata](strata/DESIGN.md), [Engram](engram/DESIGN.md)) and full HTML reports with every chart and table ([Strata](strata/report/strata.html), [Strata graphs](strata/report/graph.html), [Engram](engram/report/engram.html), [record structure](engram/report/structure.html), [posting lists](strata/report/postings/report.html), [designs](strata/report/postings/designs.html)).
 
 ## Documentation
 
 - [Overview](docs/index.md)
 - **Engram:** [how it works](docs/engram/index.md) · [live inspector](docs/engram/inspector.md) · [results](docs/engram/results.md)
 - **Strata:** [design](docs/strata/index.md) · [query language](docs/strata/query-language.md) · [graphs](docs/strata/graphs.md) · [results](docs/strata/results.md)
-- [Posting lists (posting_bench)](docs/posting-lists.md)
+- [Posting lists](docs/posting-lists.md)
 - [Reproducing the results](docs/reproduce.md)
 
 ## Status and limits
 
-This is a research prototype, measured carefully but on one machine (a 4-core cloud VM). Strata's SQL covers single-table `SELECT`; writes go through the Rust API. Engram's coding evidence comes from one long session, a handful of live runs and three small A/B projects; the public benchmarks it uses (LongMemEval, LoCoMo) are chat histories, not coding sessions. Each results page lists its own limitations.
+This is a research prototype, measured carefully but on one machine (an Apple M2 MacBook Air; the model-based runs on an earlier 4-core cloud VM). Strata's SQL covers single-table `SELECT`; writes go through the Rust API. Engram's coding evidence comes from one long session, a handful of live runs and three small A/B projects; the public benchmarks it uses (LongMemEval, LoCoMo) are chat histories, not coding sessions. Each results page lists its own limitations.

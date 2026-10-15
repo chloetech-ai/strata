@@ -6,7 +6,7 @@ nav_order: 4
 # Posting lists: formats and algorithms
 {: .no_toc }
 
-`posting_bench` is a study of compressed posting lists and the algorithms that intersect and unite them. It compares thirteen existing formats on synthetic and real collections, then three new designs built from what the comparison showed: **Pyramid**, **Loom** and **Entropic**. Loom has the size of partitioned Elias-Fano with 1.9–2.2× faster conjunctions and 4.9–8.9× faster unions. Strata's text index stores its long lists as Loom, and its keyword filters as Pyramid.
+Strata's `postings` module is a study of compressed posting lists and the algorithms that intersect and unite them. It compares thirteen existing formats on synthetic and real collections, then three new designs built from what the comparison showed: **Pyramid**, **Loom** and **Entropic**. Loom has the size of partitioned Elias-Fano with 2.4–3.0× faster conjunctions and 3.8–7.7× faster unions. Strata's text index stores its long lists as Loom, and its keyword filters as Pyramid.
 {: .fs-5 .fw-300 }
 
 1. TOC
@@ -48,22 +48,22 @@ Algorithms: for two sorted arrays, merge, branch-free merge, galloping, binary s
 
 | codec | clustered bits | clustered AND ms | clustered OR ms | WikiText bits | WikiText AND ms | WikiText OR ms |
 |---|---:|---:|---:|---:|---:|---:|
-| Uncompressed | 32.00 | 0.061 | 1.86 | 32.00 | 0.022 | 0.561 |
-| BP128 | 7.69 | 0.080 | 2.89 | 7.11 | 0.033 | 0.966 |
-| OptPFor | 5.92 | 0.088 | 3.00 | 5.91 | 0.037 | 0.898 |
-| Elias-Fano | 8.13 | 0.055 | 2.87 | 5.16 | 0.019 | 0.976 |
-| PEF | 4.94 | 0.046 | 2.84 | 4.75 | 0.022 | 0.931 |
-| Interpolative | 4.90 | 0.181 | 5.00 | 4.77 | 0.081 | 1.62 |
-| Roaring | 9.32 | 0.030 | 0.57 | 8.47 | 0.007 | 0.086 |
+| Uncompressed | 32.00 | 0.027 | 1.32 | 32.00 | 0.0089 | 0.496 |
+| BP128 | 7.69 | 0.065 | 2.09 | 7.11 | 0.027 | 0.848 |
+| OptPFor | 5.92 | 0.068 | 2.15 | 5.91 | 0.028 | 0.856 |
+| Elias-Fano | 8.13 | 0.045 | 2.40 | 5.16 | 0.018 | 0.834 |
+| PEF | 4.94 | 0.035 | 2.21 | 4.75 | 0.016 | 0.826 |
+| Interpolative | 4.90 | 0.135 | 3.47 | 4.77 | 0.060 | 1.31 |
+| Roaring | 9.32 | 0.018 | 0.382 | 8.47 | 0.0043 | 0.069 |
 
-*Source: `posting_bench/results/`; the full table, with every codec and the uniform collection, is in the [posting_bench README](https://github.com/rkonow/engram/blob/main/posting_bench/README.md).*
+*Source: `strata/results/postings/`; the full table, with every codec and the uniform collection, is in [Strata's posting-list notes](https://github.com/rkonow/engram/blob/main/strata/notes/posting-lists.md).*
 
-- **The skip structure matters more than the gap coder.** Conjunctions spend their time in `NextGEQ`. Elias-Fano's select-based jumps made Elias-Fano or PEF the fastest list codec for AND on every collection, matching or beating uncompressed arrays, though they decode 2.3–2.6× slower than BP128.
-- **PEF is the balanced default:** the smallest or within 1% of it everywhere, at 1.5–3.1× Roaring's AND time.
-- **Roaring is the speed choice,** especially for unions: the fastest AND on every collection and 4.5–10× faster OR than the best list codec, because ORing words beats merging docIDs one at a time. It costs 1.6–1.9× PEF's space.
-- **SIMD only where sizes are similar.** Block-compare kernels are 4.4× faster than a scalar merge on equal-size lists, but galloping wins beyond about a 1:24 size ratio, and real conjunctions are skewed.
+- **The skip structure matters more than the gap coder.** Conjunctions spend their time in `NextGEQ`. Elias-Fano's select-based jumps made PEF the fastest compressed list codec for AND on every collection, though it decodes 1.3–1.5× slower than BP128. Uncompressed arrays, galloping through plain memory, are still 1.3–2.1× faster than PEF on the M2 (on the Xeon VM that first ran this study, PEF matched them).
+- **PEF is the balanced default:** the smallest or within 1% of it everywhere, at 2.0–3.8× Roaring's AND time.
+- **Roaring is the speed choice,** especially for unions: the fastest AND on every collection and 4.8–11× faster OR than the best compressed list codec, because ORing words beats merging docIDs one at a time. It costs 1.6–1.9× PEF's space.
+- **SIMD only where sizes are similar.** A NEON 8×8 block-compare kernel is 6.8× faster than a scalar merge on equal-size lists, but galloping wins beyond about a 1:35 size ratio, and real conjunctions are skewed.
 - **Reorder docIDs.** Clustering cut PEF, interpolative coding, Roaring and the tries by 32–50% and roughly halved conjunction time for list codecs.
-- **Implementation quality changes the ranking.** Two Roaring implementations with byte-identical containers differ by 2.9× on AND and 7.5× on OR.
+- **Implementation quality changes the ranking.** Two Roaring implementations with byte-identical containers differ by 3.0× on AND and 6.5× on OR.
 
 That left a gap: nothing was both as small as PEF and as fast as Roaring. Each new design aims at one corner of it.
 
@@ -131,36 +131,36 @@ Same collections, query generator and harness as the first round, rerun together
 
 | codec | clustered bits | clustered AND ms | clustered OR ms | uniform bits | WikiText bits | WikiText AND ms | WikiText OR ms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| PEF | 4.94 | 0.040 | 2.99 | 8.08 | 4.75 | 0.018 | 0.920 |
-| Interpolative | 4.90 | 0.191 | 5.03 | 8.52 | 4.77 | 0.087 | 1.49 |
-| Roaring | 9.32 | 0.029 | 0.538 | 13.70 | 8.47 | **0.007** | 0.083 |
-| **Pyramid** | 6.20 | 0.023 | **0.308** | 10.47 | 6.30 | 0.010 | **0.068** |
-| **Loom** | 4.90 | **0.021** | 0.509 | 8.01 | 4.74 | 0.010 | 0.104 |
-| **Entropic** | **4.22** | 0.089 | 1.31 | **7.60** | **4.18** | 0.039 | 0.424 |
+| PEF | 4.94 | 0.035 | 2.21 | 8.08 | 4.75 | 0.016 | 0.828 |
+| Interpolative | 4.90 | 0.135 | 3.47 | 8.52 | 4.77 | 0.060 | 1.32 |
+| Roaring | 9.32 | 0.018 | 0.384 | 13.70 | 8.47 | **0.0044** | **0.069** |
+| **Pyramid** | 6.20 | 0.016 | **0.355** | 10.47 | 6.30 | 0.0081 | 0.078 |
+| **Loom** | 4.90 | **0.013** | 0.514 | 8.01 | 4.74 | 0.0067 | 0.107 |
+| **Entropic** | **4.22** | 0.066 | 0.895 | **7.60** | **4.18** | 0.028 | 0.279 |
 
-*Source: `posting_bench/results/designs/`.*
+*Source: `strata/results/postings/designs/`.*
 
-On 8 of the 10 size/time frontiers (AND and OR on five workloads), every point is a new design. Roaring keeps the fast end of AND on uniform and WikiText.
+Loom is on all ten size/time frontiers (AND and OR on five workloads), and on four of them, AND and OR on the clustered and dense collections, every point is a new design. Roaring holds the fast end of both AND and OR on uniform and WikiText, and on the selective queries, which take microseconds, uncompressed arrays are fastest.
 
 ![AND on the clustered collection: bits per posting against time; the Pareto frontier is Entropic then Loom, with Pyramid close](assets/img/chart-postings-and-clustered.png)
 
-On the clustered collection the old codecs drop off both frontiers. Loom answers conjunctions faster than Roaring (0.021 against 0.029 ms) and unions slightly faster (0.509 against 0.538 ms) at 53% of its size, the result the first round said was out of reach for a list codec.
+On the clustered collection the old codecs drop off both frontiers. Loom answers conjunctions faster than Roaring (0.013 against 0.018 ms) at 53% of its size, the result the first round said was out of reach for a list codec; its unions take 1.34× Roaring's time (0.514 against 0.384 ms), and Pyramid's are the fastest (0.355 ms).
 
-![AND on WikiText-103: Entropic, Loom and Roaring on the frontier; Loom and Pyramid at 0.010 ms](assets/img/chart-postings-and-wikitext.png)
+![AND on WikiText-103: Entropic, Loom and Roaring on the frontier; Loom at 0.0067 ms, Roaring at 0.0044 ms](assets/img/chart-postings-and-wikitext.png)
 
-![OR on WikiText-103: Entropic, Loom and Pyramid on the frontier; Pyramid fastest at 0.068 ms](assets/img/chart-postings-or-wikitext.png)
+![OR on WikiText-103: Entropic, Loom, Pyramid and Roaring on the frontier; Roaring fastest at 0.069 ms](assets/img/chart-postings-or-wikitext.png)
 
-On WikiText-103 the lists are denser and queries more skewed (the shortest list has a median of 288 postings). Loom sits at PEF's size with 1.9× faster conjunctions and 8.9× faster unions; Pyramid has the fastest union at 26% less space than Roaring, and Roaring keeps the fastest conjunction.
+On WikiText-103 the lists are denser and queries more skewed (the shortest list has a median of 288 postings). Loom sits at PEF's size with 2.4× faster conjunctions and 7.7× faster unions; Roaring has both the fastest conjunction and the fastest union, and Pyramid unites in 1.13× Roaring's time with 26% less space.
 
 ### Verdict
 
 | design | met | missed |
 |---|---|---|
-| **Pyramid** vs Roaring | 24–33% smaller; the fastest union on every workload (1.2–1.75× Roaring); faster conjunctions on clustered and selective queries | conjunctions on uniform (11% more time) and WikiText (38% more), where probes into mid-density sparse blocks cost more than Roaring's gallop through one array |
-| **Loom** vs PEF | PEF's size with 1.9–2.2× faster conjunctions and 4.9–8.9× faster unions; on all ten frontiers; fastest conjunction for selective and five- or six-term queries | the stretch goal of beating Roaring everywhere: on uniform and WikiText it takes 9–37% more time on AND and 25–54% more on OR, while Roaring is 1.7–1.8× its size |
-| **Entropic** vs interpolative and PEF | the smallest serialized index on every collection, 11–14% below interpolative coding and 6–15% below PEF, 2–4× faster than interpolative coding | not smaller in memory: decode tables add 1.3–22 MB at load time; conjunctions about 2× slower than PEF's; builds 13–19× slower |
+| **Pyramid** vs Roaring | 24–33% smaller; faster unions on the clustered collection (1.08×) and on selective queries (1.31×), level on dense ones; faster conjunctions on clustered and selective queries | unions on uniform and WikiText (13–14% more time); conjunctions on uniform (42% more), WikiText (87% more) and dense queries (24% more), where probes into mid-density sparse blocks cost more than Roaring's gallop through one array |
+| **Loom** vs PEF | PEF's size with 2.4–3.0× faster conjunctions and 3.8–7.7× faster unions; on all ten frontiers; fastest conjunction for three- to six-term queries | the stretch goal of beating Roaring everywhere: on uniform and WikiText it takes 21–54% more time on AND, and on all three collections 34–74% more on OR, while Roaring is 1.7–1.9× its size |
+| **Entropic** vs interpolative and PEF | the smallest serialized index on every collection, 11–14% below interpolative coding and 6–15% below PEF, 2.0–4.7× faster than interpolative coding | not smaller in memory: decode tables add 1.3–22 MB at load time; conjunctions 1.7–1.9× slower than PEF's; builds 7–10× slower |
 
-**Which one to use.** Loom as the default: it replaces PEF outright and takes at most 1.37× Roaring's conjunction time at 53–58% of its size. Pyramid where unions dominate or memory is less tight, as in facets, filters or OR-heavy candidate generation. Entropic for cold or storage-bound tiers, once its decode tables are built on demand.
+**Which one to use.** Loom as the default: it replaces PEF outright and takes at most 1.54× Roaring's conjunction time at 53–58% of its size. Pyramid where unions over clustered docIDs dominate or memory is less tight, as in facets, filters or OR-heavy candidate generation; on uniform and WikiText lists Roaring now unites faster. Entropic for cold or storage-bound tiers, once its decode tables are built on demand.
 
 ## In Strata
 
@@ -178,13 +178,13 @@ Strata's [text index](strata/index.md#full-text) keeps Loom for long lists, addi
 
 ## Limitations
 
-- **One machine.** A shared cloud VM with an Emerald Rapids Xeon (AVX-512, no VP2INTERSECT). Small timings vary by up to about 15% between runs, so differences under 10% are not significant.
-- **AVX-512 kernels.** Pyramid and Loom have a scalar twin for every SIMD kernel, compiled when the target lacks the features, but only the AVX-512 builds were timed.
-- **Tuned on these data.** Thresholds such as 29 values per dense block, Pyramid's bias toward Flat chunks and Loom's λ = 5/4 were chosen while profiling these collections.
+- **One machine.** A MacBook Air with an Apple M2 (4 performance and 4 efficiency cores, 24 GB, macOS 26.0.1), on mains power. Two independent runs of the same codecs agree to 0.3% at the median and within 3% in all but one cell (12%), so differences under 5% are not significant. The study first ran on a 4-core cloud VM with an Emerald Rapids Xeon; [Reproducing the results](reproduce.md#what-changed-on-the-laptop) compares the two.
+- **NEON kernels.** Every SIMD kernel has an AVX-512 version for x86-64, a NEON version for aarch64 and a portable twin; these numbers time the NEON builds. NEON has 128-bit registers and no compress or gather instructions, so some kernels take a different route than their AVX-512 versions (Entropic's decoder runs four blocks' state machines in scalar registers), and a few stay scalar where NEON was not faster.
+- **Tuned on these data, on the Xeon.** Thresholds such as 29 values per dense block, Pyramid's bias toward Flat chunks and Loom's λ = 5/4 were chosen while profiling these collections on the VM and were kept for the M2. The 64× switch from SIMD merging to galloping is one that no longer fits: with NEON, galloping wins from about 1:35.
 - **Boolean, static, single-threaded.** No scoring or top-k inside the study, no updates, one core. Queries come from a generator of co-occurring terms rather than a real query log.
 
 ## Reports
 
 - [Posting lists: formats and algorithms](reports/posting-lists.html), the first round with every codec and algorithm.
 - [The three new designs](reports/posting-list-designs.html), with layouts, diagrams and every frontier.
-- [Reproducing the results](reproduce.md#posting_bench) has the commands.
+- [Reproducing the results](reproduce.md#posting-lists) has the commands.

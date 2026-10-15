@@ -15,7 +15,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 
 use memmap2::Mmap;
-use posting_bench::bytes::OwnedBytes;
+use crate::postings::bytes::OwnedBytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{corrupt, Result};

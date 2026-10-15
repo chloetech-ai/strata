@@ -1,6 +1,6 @@
 """Assemble report/graph.html (graph indexes and graph queries in Strata)
-from report/graph/, the shared style and chart helpers of posting_bench's
-reports, and results/graph/.
+from report/graph/, the shared style and chart helpers of the posting-list
+reports (report/postings/), and results/graph/.
 Usage: python3 scripts/build_graph_report.py"""
 import datetime
 import json
@@ -9,7 +9,7 @@ import pathlib
 root = pathlib.Path(__file__).resolve().parent.parent
 results = root / "results" / "graph"
 src = root / "report" / "graph"
-shared = root.parent / "posting_bench" / "report"
+shared = root / "report" / "postings"
 
 
 def load(name):

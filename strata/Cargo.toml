@@ -6,7 +6,6 @@ description = "An embedded, single-file search database: full text, structured a
 publish = false
 
 [dependencies]
-posting_bench = { path = "../posting_bench" }
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -16,6 +15,9 @@ libc = "0.2"
 lz4_flex = "0.11"
 bitpacking = "0.9.3"
 rand = "0.8"
+rand_distr = "0.4"
+# Reference implementation in the posting-list comparison (`postings::codecs::external`).
+roaring = "0.11.5"
 clap = { version = "4", features = ["derive"] }
 rust-stemmers = "1.2"
 # Baselines (feature `baselines`): SQLite with FTS5, and Tantivy.

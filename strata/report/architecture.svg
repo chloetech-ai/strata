@@ -75,7 +75,7 @@
   <text x="274" y="408" class="s">doc store: LZ4 16 KiB blocks</text>
   <rect x="500" y="300" width="226" height="116" rx="7" class="box"/>
   <text x="512" y="320" class="t">vectors</text>
-  <text x="512" y="338" class="s">float32 + SQ8 codes (VNNI, 12 ns)</text>
+  <text x="512" y="338" class="s">float32 + SQ8 codes (NEON, 14 ns)</text>
   <text x="512" y="352" class="s">flat · IVF (clusters = posting lists)</text>
   <text x="512" y="366" class="s">HNSW (M 16, ef 64)</text>
   <text x="512" y="380" class="s">pre / in / post-filter strategies</text>
@@ -92,7 +92,7 @@
 
   <!-- Codecs side -->
   <rect x="24" y="428" width="464" height="34" rx="7" class="grn"/>
-  <text x="36" y="450" class="s"><tspan class="t" style="font-size:12px">posting_bench codecs</tspan>  Loom (aligned PEF) · Pyramid (256-docID blocks) · BP128 · zero-copy Slice</text>
+  <text x="36" y="450" class="s"><tspan class="t" style="font-size:12px">posting-list codecs</tspan>  Loom (aligned PEF) · Pyramid (256-docID blocks) · BP128 · zero-copy Slice</text>
   <path d="M137 428 V418" class="dash"/>
   <path d="M375 428 V418" class="dash"/>
 

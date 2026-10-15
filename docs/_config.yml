@@ -24,7 +24,7 @@ aux_links:
   "GitHub":
     - "https://github.com/rkonow/engram"
 
-footer_content: "Engram, Strata and posting_bench. Benchmarks were run on a 4-core cloud VM; see each results page for the method."
+footer_content: "Engram and Strata. Benchmarks were run on an Apple M2 MacBook Air; see Reproducing the results for the machine and the method."
 
 exclude:
   - "*.py"
