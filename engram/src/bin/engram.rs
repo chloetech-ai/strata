@@ -5,7 +5,7 @@
 //!   engram uninstall [--user]                    remove them again (stores are kept)
 //!   engram hook [--user] <Event>                 (called by Claude Code hooks)
 //!   engram mcp                                   (MCP stdio server, started by Claude Code)
-//!   engram search "query" | sql "SELECT ..." | stats | briefing | stop
+//!   engram search "query" | sql "SELECT ..." | stats | briefing | stop [--all]
 //!   engram remember <kind> "text"
 //!   engram ingest-transcript <file.jsonl>        back-fill from a Claude Code transcript
 //!   engram fetch-model [static|bert]             download the embedding model
@@ -88,8 +88,11 @@ enum Cmd {
     /// Write down the decisions, rules, requirements and facts of every
     /// stored turn (for a store recorded before distillation existed).
     Distill,
-    /// Stop the daemon.
-    Stop,
+    /// Stop the daemon (with --all, every running daemon, e.g. after an upgrade).
+    Stop {
+        #[arg(long)]
+        all: bool,
+    },
     /// Check that Engram is wired into Claude Code and the project's daemon answers.
     Doctor,
     /// Serve the inspector over every Engram store on this machine.
@@ -203,8 +206,20 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Cmd::Stop => {
+        Cmd::Stop { all: false } => {
             send(&project, json!({"op": "shutdown"}), 10);
+        }
+        Cmd::Stop { all: true } => {
+            let mut n = 0;
+            for s in ui::list_stores(&paths::engram_home()) {
+                let sock = paths::StorePaths::new(&s.dir).socket;
+                if std::os::unix::net::UnixStream::connect(&sock).is_ok()
+                    && daemon::request(&s.dir, s.project.as_deref().unwrap_or(""), &json!({"op": "shutdown"}), Duration::from_secs(10)).is_ok()
+                {
+                    n += 1;
+                }
+            }
+            println!("stopped {n} daemon{}; each starts again when a hook or tool needs it", if n == 1 { "" } else { "s" });
         }
         Cmd::IngestTranscript { path } => {
             let events = transcript::read(&path).unwrap_or_else(|e| {

@@ -73,33 +73,32 @@ See the [query language reference](docs/strata/query-language.md).
 
 ## Quick start
 
-Requirements: Rust (stable), Python 3, and the [Claude Code](https://claude.com/claude-code) CLI for the hooks and the inspector.
+Requirements: macOS or Linux (WSL 2 on Windows), Rust (stable), a C compiler, and the [Claude Code](https://claude.com/claude-code) CLI, logged in (`claude auth status`).
 
 ```sh
-git clone https://github.com/rkonow/engram && cd engram/engram
-cargo build --release
-target/release/engram fetch-model                       # static embedder, 129 MB
-target/release/engram install --project /path/to/your/project
+git clone https://github.com/rkonow/engram && cd engram
+./install.sh                          # every Claude Code session on this machine
+./install.sh --project ~/code/app     # ... or one project
 ```
 
-`install` adds the hooks to `.claude/settings.local.json`, the MCP server to `.mcp.json`, and a permission rule for the memory tools. The store lives in `~/.local/share/engram/projects/<project>/`, outside the repository.
+`install.sh` builds Engram, installs it to `~/.local/bin/engram`, downloads the embedding model (129 MB), wires the hooks and the MCP server into Claude Code (`engram install --user`, or `--project`), and runs `engram doctor` to check the result. Each project directory gets its own store under `~/.local/share/engram/projects/`, outside the repository. Run it again after `git pull` to upgrade; `engram uninstall --user` removes it and keeps the stores. [Install on your machine](docs/engram/setup.md) covers the details, remote machines, dev containers and troubleshooting.
 
-To record every Claude Code session instead, each project into its own Strata file, install the binary somewhere stable and use `--user` ([details](engram/README.md#every-session)):
+Then browse what it stored, per project and per session:
 
 ```sh
-cargo install --path . --bin engram --root ~/.local
-engram install --user --distill-model haiku           # engram uninstall --user undoes it
+engram ui           # the inspector over every local store, at http://127.0.0.1:8765/?token=...
+engram doctor       # what is wired where, and whether the daemon and the distiller work
 ```
 
 Try it by hand:
 
 ```sh
-target/release/engram search "why did we pick JSON over SQLite"
-target/release/engram sql "SELECT ts, text FROM memory WHERE kind = 'error' ORDER BY ts DESC LIMIT 5"
-target/release/engram remember decision "Prices are integer cents"
+engram search "why did we pick JSON over SQLite"
+engram sql "SELECT ts, text FROM memory WHERE kind = 'error' ORDER BY ts DESC LIMIT 5"
+engram remember decision "Prices are integer cents"
 ```
 
-Or watch it work in the live inspector:
+Or watch it work in the scripted demo, which chats with Claude Code in a scratch project (from `engram/`):
 
 ```sh
 demo/run.sh --model <model> --distill-model <small model>     # http://127.0.0.1:8765
@@ -120,13 +119,14 @@ target/release/strata db.strata "SELECT category, COUNT(*) FROM docs WHERE MATCH
 | [`engram/`](engram/) | the memory system: hooks client, daemon, MCP server, recall and gate, distiller, live inspector (`demo/`), evaluation harnesses and results |
 | [`strata/`](strata/) | the database: storage engine, segments, text / structured / vector / graph indexes, SQL binder, planner and executor, baselines and benchmarks; [`src/postings/`](strata/src/postings/) holds the compressed posting lists and set algorithms, the Pyramid, Loom and Entropic designs, and their testbed (`strata-posting-bench`) |
 | [`docs/`](docs/) | this documentation, as Markdown and as a GitHub Pages site |
+| [`install.sh`](install.sh) | builds Engram, installs it to `~/.local/bin` and wires it into Claude Code |
 
 Each crate also carries its own design document ([Strata](strata/DESIGN.md), [Engram](engram/DESIGN.md)) and full HTML reports with every chart and table ([Strata](strata/report/strata.html), [Strata graphs](strata/report/graph.html), [Engram](engram/report/engram.html), [record structure](engram/report/structure.html), [posting lists](strata/report/postings/report.html), [designs](strata/report/postings/designs.html)).
 
 ## Documentation
 
 - [Overview](docs/index.md)
-- **Engram:** [how it works](docs/engram/index.md) · [live inspector](docs/engram/inspector.md) · [results](docs/engram/results.md)
+- **Engram:** [install on your machine](docs/engram/setup.md) · [how it works](docs/engram/index.md) · [live inspector](docs/engram/inspector.md) · [results](docs/engram/results.md)
 - **Strata:** [design](docs/strata/index.md) · [query language](docs/strata/query-language.md) · [graphs](docs/strata/graphs.md) · [results](docs/strata/results.md)
 - [Posting lists](docs/posting-lists.md)
 - [Reproducing the results](docs/reproduce.md)

@@ -330,6 +330,7 @@ const parseLinks = s => { try { return (JSON.parse(s || "[]") || []).map(e => Ar
 
 // `engram ui` serves several stores; every call names the one on screen.
 const URLP = new URLSearchParams(location.search);
+if (["light", "dark"].includes(URLP.get("theme"))) document.documentElement.dataset.theme = URLP.get("theme");
 const api = p => S.store ? p + (p.includes("?") ? "&" : "?") + "store=" + encodeURIComponent(S.store) : p;
 async function post(url, body) {
   const r = await fetch(api(url), {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
@@ -422,6 +423,8 @@ async function browseInfo(i) {
   await loadSessions(i.sessions || []);
   const want = URLP.get("session");
   selectSession(want && S.sessions.some(s => s.id === want) ? want : null);
+  const tab = $(`#tabs button[data-tab="${URLP.get("tab")}"]`);
+  if (tab) tab.click();
 }
 
 async function loadSessions(fromState) {
@@ -472,8 +475,8 @@ async function loadConversation(sid) {
   recs.reverse();
   log.innerHTML = recs.length === CONV_MAX ? `<p class="hint">Showing the last ${CONV_MAX} records of this session; the Table tab has the rest.</p>` : "";
   S.conv = {session: sid, turn: null, el: null, kind: null, tag: null, node: null, maxSeq: 0, tools: []};
-  const ev = events.filter(e => e.event === "recall" || e.event === "distill").sort((a, b) => a.ts - b.ts);
-  if (recs.length) {
+  const ev = events.filter(e => ["SessionStart", "recall", "distill"].includes(e.event)).sort((a, b) => a.ts - b.ts);
+  if (recs.length === CONV_MAX) {
     const t0 = recs[0].ts;
     while (ev.length && ev[0].ts < t0) ev.shift(); // events older than the records shown
   }
@@ -491,7 +494,7 @@ function convTurn(r) {
   const c = S.conv;
   if (c.el && c.turn === r.turn && !(r.kind === "prompt" && c.kind !== "prompt")) return;
   const log = $("#log");
-  log.insertAdjacentHTML("beforeend", `<div class="thead">turn ${esc(r.turn)} · ${esc(fmtDate(r.ts))}</div>`);
+  log.insertAdjacentHTML("beforeend", `<div class="thead">${r.turn === "start" ? "session start" : "turn " + esc(r.turn)} · ${esc(fmtDate(r.ts))}</div>`);
   const t = document.createElement("div");
   t.className = "turn";
   t.innerHTML = `<div class="user"></div><div class="engrams"></div><div class="flow"></div><div class="stored"></div><div class="foot tfoot"></div>`;
@@ -581,8 +584,13 @@ function convRecord(r) {
 function convEvent(e) {
   const c = S.conv;
   if (!c) return;
-  if (!c.el) convTurn({turn: "?", ts: e.ts, kind: "event"});
-  if (e.event === "recall") {
+  if (!c.el) convTurn({turn: "start", ts: e.ts, kind: "event"});
+  if (e.event === "SessionStart") {
+    const d = document.createElement("div");
+    d.className = "foot";
+    d.innerHTML = `Engram briefing: <b>${(+e.chars || 0).toLocaleString()}</b> characters injected at session start${e.source ? ` (${esc(e.source)})` : ""}`;
+    $(".engrams", c.el).appendChild(d);
+  } else if (e.event === "recall") {
     const d = document.createElement("div");
     d.className = "foot";
     const n = (e.injected || []).length, kn = (e.knowledge || []).length;

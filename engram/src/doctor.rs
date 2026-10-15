@@ -68,8 +68,19 @@ fn check_hooks(r: &mut Report, what: &str, path: &Path) -> bool {
 
 fn command_output(cmd: &str, args: &[&str]) -> Option<(bool, String)> {
     let out = std::process::Command::new(cmd).args(args).output().ok()?;
-    let text = String::from_utf8_lossy(if out.status.success() { &out.stdout } else { &out.stderr }).trim().to_string();
-    Some((out.status.success(), text))
+    let text = if out.stdout.is_empty() { &out.stderr } else { &out.stdout };
+    Some((out.status.success(), String::from_utf8_lossy(text).trim().to_string()))
+}
+
+/// The last distillation the store's daemon logged, if any.
+fn last_distill(store: &Path) -> Option<Json> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(store.join("events.log")).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(256 * 1024))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    buf.split(|&b| b == b'\n').rev().filter_map(|l| serde_json::from_slice::<Json>(l).ok()).find(|e| e["event"] == "distill")
 }
 
 pub fn run(project: &Path) -> i32 {
@@ -108,10 +119,24 @@ pub fn run(project: &Path) -> i32 {
     if mcp_json.pointer("/mcpServers/engram").is_some() {
         r.ok("MCP server", format!("{}/.mcp.json", project.display()));
     } else {
-        match command_output("claude", &["mcp", "get", "engram"]) {
-            Some((true, _)) => r.ok("MCP server", "registered with Claude Code (`claude mcp get engram`)"),
-            _ if user || proj => r.fail("MCP server", "not registered; run `engram install --user` again, or `claude mcp add-json engram '{\"type\":\"stdio\",\"command\":\"<engram path>\",\"args\":[\"mcp\"]}' --scope user`"),
-            _ => r.warn("MCP server", "not registered (Engram is not installed)"),
+        // User-scope servers live in ~/.claude.json (`claude mcp get` would
+        // start the server, and with it a store for this directory).
+        let cfg_file = std::env::var("CLAUDE_CONFIG_DIR")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .map(|d| Path::new(&d).join(".claude.json"))
+            .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap_or_default()).join(".claude.json"));
+        match read_json(&cfg_file).pointer("/mcpServers/engram") {
+            Some(s) => {
+                let cmd = s.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                if Path::new(cmd).is_file() {
+                    r.ok("MCP server", format!("user scope in {} ({cmd} mcp)", cfg_file.display()))
+                } else {
+                    r.fail("MCP server", format!("user scope in {} calls {cmd}, which does not exist; run `engram install --user` again", cfg_file.display()))
+                }
+            }
+            None if user || proj => r.fail("MCP server", "not registered; run `engram install --user` again, or `claude mcp add-json engram '{\"type\":\"stdio\",\"command\":\"<engram path>\",\"args\":[\"mcp\"]}' --scope user`"),
+            None => r.warn("MCP server", "not registered (Engram is not installed)"),
         }
     }
 
@@ -141,17 +166,53 @@ pub fn run(project: &Path) -> i32 {
             Some((m, from)) => r.ok("distillation", format!("model {m} (from the {from})")),
             None => r.warn("distillation", "uses the Claude Code CLI's default model; a small one is enough (`engram install --user --distill-model haiku`)"),
         }
+        // The distiller runs `claude -p`, which needs the CLI's own login
+        // (an interactive session can work while the CLI's has expired).
+        if let Some((_, out)) = command_output("claude", &["auth", "status"]) {
+            if let Ok(st) = serde_json::from_str::<Json>(&out) {
+                match st.get("loggedIn").and_then(|v| v.as_bool()) {
+                    Some(false) => r.fail("Claude Code login", "the `claude` CLI is logged out, so every distillation fails; run `claude auth login`"),
+                    Some(true) => r.ok("Claude Code login", "logged in"),
+                    None => {}
+                }
+            }
+        }
+        if let Some(e) = last_distill(&store) {
+            let when = e["ts"].as_i64().map(|t| format!("{} min ago", (crate::now() - t) / 60)).unwrap_or_default();
+            match e.get("error").and_then(|v| v.as_str()) {
+                Some(err) => r.warn("last distillation", format!("failed {when}: {err}")),
+                None => r.ok("last distillation", format!("{when}, {} notes kept", e["kept"])),
+            }
+        }
     }
 
-    // The daemon: start it if needed and ask for the store's counts.
+    // The daemon: the project's, when it has a store; otherwise one on a
+    // scratch store, so that checking does not create a store here.
     let t0 = Instant::now();
-    match daemon::request(&store, &project.to_string_lossy(), &json!({"op": "stats"}), Duration::from_secs(30)) {
-        Ok(s) if s.get("error").is_none() => r.ok(
-            "store",
-            format!("{} ({} records, {} sessions; daemon answered in {} ms)", store.display(), s["records"], s["sessions"], t0.elapsed().as_millis()),
-        ),
-        Ok(s) => r.fail("store", format!("{}: {}", store.display(), s["error"])),
-        Err(e) => r.fail("store", format!("{}: {e}; see {}", store.display(), store.join("daemon.log").display())),
+    if store.join("memory.strata").exists() {
+        match daemon::request(&store, &project.to_string_lossy(), &json!({"op": "stats"}), Duration::from_secs(30)) {
+            Ok(s) if s.get("error").is_none() => r.ok(
+                "store",
+                format!("{} ({} records, {} sessions; daemon answered in {} ms)", store.display(), s["records"], s["sessions"], t0.elapsed().as_millis()),
+            ),
+            Ok(s) => r.fail("store", format!("{}: {}", store.display(), s["error"])),
+            Err(e) => r.fail("store", format!("{}: {e}; see {}", store.display(), store.join("daemon.log").display())),
+        }
+    } else {
+        let scratch = std::env::temp_dir().join(format!("engram-doctor-{}", std::process::id()));
+        let res = daemon::request(&scratch, &project.to_string_lossy(), &json!({"op": "stats"}), Duration::from_secs(30));
+        let log = std::fs::read_to_string(scratch.join("daemon.log")).unwrap_or_default();
+        let _ = daemon::request(&scratch, "", &json!({"op": "shutdown"}), Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = std::fs::remove_dir_all(&scratch);
+        match res {
+            Ok(s) if s.get("error").is_none() => r.ok(
+                "daemon",
+                format!("a scratch store opened and answered in {} ms; this project's store will be {} once a session runs here", t0.elapsed().as_millis(), store.display()),
+            ),
+            Ok(s) => r.fail("daemon", s["error"].to_string()),
+            Err(e) => r.fail("daemon", format!("{e}: {}", log.trim())),
+        }
     }
 
     if r.failed == 0 {

@@ -11,7 +11,7 @@ permalink: /
 Long-term memory for coding agents, built on Strata, an embedded search database with SQL.
 {: .fs-6 .fw-300 }
 
-[How Engram works](engram/index.md){: .btn .btn-primary .mr-2 } [Strata's query language](strata/query-language.md){: .btn .mr-2 } [Source on GitHub](https://github.com/rkonow/engram){: .btn }
+[How Engram works](engram/index.md){: .btn .btn-primary .mr-2 } [Install it](engram/setup.md){: .btn .mr-2 } [Strata's query language](strata/query-language.md){: .btn .mr-2 } [Source on GitHub](https://github.com/rkonow/engram){: .btn }
 
 ---
 
@@ -21,7 +21,7 @@ This repository holds two projects that together address that problem, Engram bu
 
 | layer | what it is | read more |
 |---|---|---|
-| **Engram** | Automatic long-term context for Claude Code. Hooks store every event of a session; a per-project daemon decides when to bring history back, and MCP tools let the model search it. | [How it works](engram/index.md) · [Inspector](engram/inspector.md) · [Results](engram/results.md) |
+| **Engram** | Automatic long-term context for Claude Code. Hooks store every event of a session; a per-project daemon decides when to bring history back, and MCP tools let the model search it. | [How it works](engram/index.md) · [Install](engram/setup.md) · [Inspector](engram/inspector.md) · [Results](engram/results.md) |
 | **Strata** | An embedded, single-file search database with ACID transactions and SQL. Every table is indexed as full text, structured columns and vectors at once, with graph edges between rows and a cost-based planner over all of it. | [Design](strata/index.md) · [SQL](strata/query-language.md) · [Graphs](strata/graphs.md) · [Results](strata/results.md) |
 | **Strata's posting lists** | A study of compressed posting lists and their intersection and union algorithms, which produced three new formats. Strata's text and keyword indexes use two of them. | [Posting lists](posting-lists.md) |
 

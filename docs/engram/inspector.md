@@ -7,15 +7,36 @@ nav_order: 1
 # The live inspector
 {: .no_toc }
 
-A local web app for watching Engram work. You chat with Claude Code in a scratch project, and as each turn runs you see what the hooks store, what the distiller writes down and what recall injects. Every panel is a query against the project's Strata file, made through the same daemon the hooks talk to. Nothing is simulated: chat turns are real `claude -p` runs.
+A local web app for watching Engram work: what the hooks store, what the distiller writes down and what recall injects, for your own sessions or for a chat in a scratch project. Every panel is a query against the project's Strata file, made through the same daemon the hooks talk to. Nothing is simulated: chat turns are real `claude -p` runs.
 {: .fs-5 .fw-300 }
 
 [Try it in your browser](../demo/inspector.html){: .btn .btn-primary } A static copy replays a recorded session. Its SQL runs in a JavaScript model of Strata over the recorded records and vectors.
 
+The inspector runs in two ways: `engram ui` points it at the stores of your own sessions, and `demo/run.sh` runs it with a chat column against a scratch project.
+
 1. TOC
 {:toc}
 
-## Running it
+## On your own stores: `engram ui`
+
+```bash
+engram ui                  # http://127.0.0.1:8765/?token=..., opened in your browser
+```
+
+![engram ui: a session rebuilt from its records, with the briefing, recall decisions and distilled notes; the store's knowledge on the right](../assets/img/inspector-ui-conversation.png)
+
+Once Engram is [installed](setup.md), `engram ui` serves this page from the binary over every store under `~/.local/share/engram/projects` (or `--home DIR`). Pick a store (one per project directory) and a session. The left column then replays the session from its records, in place of the demo's chat:
+
+- the prompts, the answers and the narration between tool calls;
+- each tool call, with its stored result loaded when you open it, and errors in red;
+- the briefing injected at session start and, for every prompt, the recall decision, its gate score and the records it injected (each one a link);
+- the notes the distiller kept after each turn, with what they superseded or closed, and the turn's episode card.
+
+A session that is still running grows as it goes, and the panels on the right work as described below, against the chosen store. Nothing is written: reads go through each project's daemon with the same read-only operations the demo allows, so the inspector can stay open while sessions write. The server listens on 127.0.0.1 and wants the random token in the URL it prints (kept in a cookie after the first load); on a remote machine, forward the port with `ssh -L 8765:127.0.0.1:8765`. The address keeps the view (`?store=…&session=…&tab=knowledge`).
+
+![engram ui with the live feed: every record and daemon event of the store as it happens](../assets/img/inspector-ui-live.png)
+
+## The demo: chat in a scratch project
 
 ```sh
 cd engram
