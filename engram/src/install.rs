@@ -21,11 +21,13 @@ use crate::{err, Result};
 
 const EVENTS: [(&str, Option<&str>, u64); 9] = [
     ("SessionStart", None, 15),
-    ("UserPromptSubmit", None, 10),
+    // Long enough for query understanding in `sync` mode.
+    ("UserPromptSubmit", None, 90),
     ("PreToolUse", Some("Edit|MultiEdit|Write"), 5),
     ("PostToolUse", None, 10),
     ("PostToolUseFailure", None, 10),
-    ("Stop", None, 10),
+    // Long enough to wait for a query-understanding search still running.
+    ("Stop", None, 40),
     ("PreCompact", None, 15),
     ("PostCompact", None, 15),
     ("SessionEnd", None, 10),

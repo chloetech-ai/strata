@@ -159,11 +159,16 @@ pub struct Draft {
     /// Names of the entities the record is about; the store links the
     /// record to them and creates the ones it has not seen.
     pub entities: Vec<String>,
+    /// For a note: situations and requests in which it matters, in the words
+    /// a later request would use (stored in the context as a `When:` line,
+    /// which joins the lexical key and the vector).
+    #[serde(default)]
+    pub when: Vec<String>,
 }
 
 impl Draft {
     pub fn new(kind: Kind, text: impl Into<String>) -> Draft {
-        Draft { kind, tag: "-".into(), files: Vec::new(), text: text.into(), ctx: String::new(), importance: None, links: Vec::new(), entities: Vec::new() }
+        Draft { kind, tag: "-".into(), files: Vec::new(), text: text.into(), ctx: String::new(), importance: None, links: Vec::new(), entities: Vec::new(), when: Vec::new() }
     }
     pub fn link(mut self, label: &str, to: impl Into<String>) -> Draft {
         self.links.push(Link::new(label, to));
@@ -190,6 +195,10 @@ impl Draft {
         self.importance = Some(x);
         self
     }
+    pub fn when(mut self, w: Vec<String>) -> Draft {
+        self.when = w;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -210,6 +219,14 @@ pub struct Record {
 
 impl Record {
     pub fn from_draft(d: Draft, session: &str, turn: i64, seq: i64, ts: i64) -> Record {
+        let mut ctx = d.ctx;
+        let when: Vec<String> = d.when.iter().map(|w| w.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|w| !w.is_empty()).collect();
+        if !when.is_empty() {
+            if !ctx.is_empty() {
+                ctx.push('\n');
+            }
+            ctx += &format!("When: {}", when.join("; "));
+        }
         Record {
             id: record_id(session, seq),
             session: session.to_string(),
@@ -221,8 +238,22 @@ impl Record {
             importance: d.importance.unwrap_or_else(|| d.kind.prior()).clamp(0.0, 1.0),
             files: d.files.join(" "),
             text: d.text,
-            ctx: d.ctx,
+            ctx,
             links: d.links,
+        }
+    }
+
+    /// The note's `When:` line (situations in which it matters), if any.
+    pub fn when(&self) -> Option<&str> {
+        self.ctx.lines().find_map(|l| l.strip_prefix("When: "))
+    }
+
+    /// The text and, for a note, when it matters: what a request is matched
+    /// against.
+    pub fn key_text(&self) -> String {
+        match self.when() {
+            Some(w) if self.kind.is_knowledge() => format!("{}\n{w}", self.text),
+            _ => self.text.clone(),
         }
     }
 
@@ -256,12 +287,14 @@ impl Record {
         self.links.iter().filter(move |l| l.label == label).map(|l| l.to.as_str())
     }
 
-    /// What the embedding is computed from: the text alone. The context
-    /// joins the lexical key only; in a vector it pulls a response towards
-    /// its request, which then crowds out the request itself
-    /// (results/structure: MRR 0.60 → 0.66 on LongMemEval-S).
+    /// What the embedding is computed from: the text, and for a note the
+    /// situations it matters in. The rest of the context joins the lexical
+    /// key only; in a vector it pulls a response towards its request, which
+    /// then crowds out the request itself (results/structure: MRR 0.60 →
+    /// 0.66 on LongMemEval-S). A note's `When:` line is different: it is
+    /// written to resemble the later requests the note answers.
     pub fn embed_text(&self) -> String {
-        self.text.clone()
+        self.key_text()
     }
 }
 

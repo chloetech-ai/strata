@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 
+use crate::anchor::{self, Checker};
 use crate::capture::{self, EpisodeAcc};
 use crate::paths::StorePaths;
 use crate::recall::{self, Decision, Gate, PackParams, RankParams};
@@ -41,6 +42,10 @@ pub struct Config {
     pub sync: bool,
     /// Knowledge written down by a small model after each turn.
     pub distill: crate::distill::DistillConfig,
+    /// Related notes merged now and then, so the knowledge stays small.
+    pub consolidate: crate::consolidate::ConsolidateConfig,
+    /// Query understanding: model-planned searches and a model ranker.
+    pub deep: crate::deep::DeepConfig,
 }
 
 impl Default for Config {
@@ -56,6 +61,8 @@ impl Default for Config {
             file_notes: true,
             sync: true,
             distill: Default::default(),
+            consolidate: Default::default(),
+            deep: Default::default(),
         }
     }
 }
@@ -69,6 +76,7 @@ impl Config {
         if raw.get("gate").is_none() {
             cfg.gate = Gate::for_embedder(&cfg.embedder);
         }
+        cfg.deep = cfg.deep.resolved();
         cfg
     }
 }
@@ -92,6 +100,17 @@ pub struct Session {
     pub transcript_offset: u64,
 }
 
+/// A query-understanding search started after a prompt (`async` mode).
+#[derive(Clone, Debug, Default)]
+struct DeepJob {
+    turn: i64,
+    done: bool,
+    text: String,
+    ids: Vec<String>,
+    confidence: String,
+    delivered: bool,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     sessions: HashMap<String, Session>,
@@ -111,6 +130,10 @@ pub struct Daemon {
     pending: std::sync::atomic::AtomicUsize,
     /// Distillations run one at a time, so each sees what the last wrote.
     distilling: Mutex<()>,
+    /// Turns distilled since the notes were last consolidated.
+    distilled_since: std::sync::atomic::AtomicUsize,
+    /// Query-understanding searches by session.
+    deep_jobs: Mutex<HashMap<String, DeepJob>>,
     last_activity: AtomicI64,
 }
 
@@ -126,7 +149,7 @@ impl Daemon {
         let store = Arc::new(Store::open(&paths.db, embedder, StoreOptions { sync: cfg.sync, ..Default::default() })?);
         let state: State = std::fs::read_to_string(&paths.state).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         Ok(Daemon { paths, project: project.to_string(), store, cfg, state: Mutex::new(state), dirty: Default::default(), pending: Default::default(),
-            distilling: Mutex::new(()), last_activity: AtomicI64::new(now()) })
+            distilling: Mutex::new(()), distilled_since: Default::default(), deep_jobs: Mutex::new(HashMap::new()), last_activity: AtomicI64::new(now()) })
     }
 
     fn save_state(&self, st: &State) {
@@ -178,9 +201,12 @@ impl Daemon {
             "inspect_layout" => crate::inspect::layout(&self.store).map(|r| (r, None)),
             "inspect_embed" => crate::inspect::embed(&self.store, req).map(|r| (r, None)),
             "distill_backfill" => self.distill_backfill().map(|(t, n)| (json!({"turns": t, "items": n}), None)),
+            "consolidate" => self.op_consolidate().map(|r| (r, None)),
+            "ask" => self.op_ask(req).map(|r| (r, None)),
             "briefing" => {
                 let sid = req.get("session").and_then(|v| v.as_str()).unwrap_or("");
-                recall::briefing(&self.store, sid, self.cfg.briefing_chars, now()).map(|(t, _)| (json!({"text": t}), None))
+                let mut ck = self.checker();
+                recall::briefing_checked(&self.store, sid, self.cfg.briefing_chars, now(), Some(&mut ck)).map(|(t, _)| (json!({"text": t}), None))
             }
             "shutdown" => {
                 let me = self.clone();
@@ -253,11 +279,12 @@ impl Daemon {
                     }
                     s.last_prompts.clone()
                 });
-                let (mut text, shown) = recall::briefing(&self.store, &sid, self.cfg.briefing_chars, now())?;
+                let mut ck = self.checker();
+                let (mut text, shown) = recall::briefing_checked(&self.store, &sid, self.cfg.briefing_chars, now(), Some(&mut ck))?;
                 self.with_session(&sid, |s| s.injected.extend(shown));
                 if source == "compact" && !last_prompts.is_empty() {
                     let q: Vec<String> = last_prompts.iter().rev().take(2).cloned().collect();
-                    if let Some(r) = self.recall_for(&sid, &q.join("\n"), true)? {
+                    if let Some((r, _)) = self.recall_for(&sid, &q.join("\n"), true)? {
                         text += "\n\nRecords relevant to the work in progress, which the compaction summary may have left out:\n";
                         text += &r;
                     }
@@ -267,20 +294,37 @@ impl Daemon {
             }
             "UserPromptSubmit" => {
                 let prompt = p.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let turn = self.with_session(&sid, |s| {
+                let (turn, recent) = self.with_session(&sid, |s| {
                     s.turn += 1;
                     s.episode = EpisodeAcc { prompt: prompt.clone(), ..Default::default() };
                     s.episode_stored = false;
+                    let recent: Vec<String> = s.last_prompts.iter().rev().take(2).rev().cloned().collect();
                     s.last_prompts.push_back(prompt.chars().take(1000).collect());
                     while s.last_prompts.len() > 4 {
                         s.last_prompts.pop_front();
                     }
-                    s.turn
+                    (s.turn, recent)
                 });
                 // Recall first: the prompt is in the live window anyway, and
                 // storing it afterwards keeps the write (and the memtable
                 // rebuild it causes) off the prompt's critical path.
-                let text = self.recall_for(&sid, &prompt, false)?.unwrap_or_default();
+                let mut text = self.recall_for(&sid, &prompt, false)?.map(|x| x.0).unwrap_or_default();
+                let deep = self.cfg.deep.wants(&prompt, self.store.len());
+                let deep_async = deep && self.cfg.deep.mode == "async";
+                if deep && self.cfg.deep.mode == "sync" {
+                    let (t, _) = self.deep_for(&sid, &prompt, &recent);
+                    if !t.is_empty() {
+                        text = if text.is_empty() { t } else { format!("{text}\n\n{t}") };
+                    }
+                }
+                {
+                    let mut jobs = self.deep_jobs.lock().unwrap();
+                    if deep_async {
+                        jobs.insert(sid.clone(), DeepJob { turn, ..Default::default() });
+                    } else {
+                        jobs.remove(&sid);
+                    }
+                }
                 let me = self.clone();
                 Ok((
                     ctx_out("UserPromptSubmit", text),
@@ -289,6 +333,16 @@ impl Daemon {
                             me.log(&json!({"ts": now(), "error": e.to_string(), "event": "UserPromptSubmit"}));
                         }
                         me.store.warm();
+                        if deep_async {
+                            let (t, res) = me.deep_for(&sid, &prompt, &recent);
+                            let mut jobs = me.deep_jobs.lock().unwrap();
+                            if let Some(j) = jobs.get_mut(&sid).filter(|j| j.turn == turn) {
+                                j.done = true;
+                                j.text = t;
+                                j.confidence = res.as_ref().map(|r| r.confidence.clone()).unwrap_or_default();
+                                j.ids = res.map(|r| r.ids()).unwrap_or_default();
+                            }
+                        }
                     })),
                 ))
             }
@@ -318,8 +372,12 @@ impl Daemon {
                     (s.turn, format!("Turn {} request: {}", s.turn, s.episode.prompt.chars().take(200).collect::<String>()))
                 });
                 let me = self.clone();
+                let out = match self.take_deep(&sid, turn, false) {
+                    Some(t) => ctx_out(event, t),
+                    None => json!({"output": null}),
+                };
                 Ok((
-                    json!({"output": null}),
+                    out,
                     Some(Box::new(move || {
                         let drafts: Vec<Draft> = capture::tool_drafts(&tool, &input, &resp, &project).into_iter().map(|d| d.ctx(ctx.clone())).collect();
                         if let Err(e) = me.store.append(&sid, turn, now(), drafts) {
@@ -331,6 +389,20 @@ impl Daemon {
             }
             "Stop" => {
                 let answer = p.get("last_assistant_message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let active = p.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false);
+                let cur = self.with_session(&sid, |s| s.turn);
+                // A search still running for this turn: wait for it, and if it
+                // found records the turn did not see, ask the model once to
+                // reconsider with them.
+                if !active && self.cfg.deep.mode == "async" && self.cfg.deep.stop_recheck {
+                    if let Some(t) = self.take_deep(&sid, cur, true) {
+                        self.log(&json!({"ts": now(), "event": "deep_recheck", "session": sid, "turn": cur, "chars": t.len()}));
+                        let reason = format!(
+                            "{t}\n\nBefore you finish: if these records change your answer or your changes, make the corrections now and then give your complete answer again. If they change nothing, repeat your previous answer unchanged."
+                        );
+                        return Ok((json!({"output": {"decision": "block", "reason": reason}}), None));
+                    }
+                }
                 let (turn, ep, first) = self.with_session(&sid, |s| {
                     let first = !s.episode_stored;
                     s.episode_stored = true;
@@ -354,7 +426,8 @@ impl Daemon {
                             me.log(&json!({"ts": now(), "error": e.to_string(), "event": "Stop"}));
                         }
                         me.store.warm();
-                        me.distill_turn(&sid, turn, now(), &ep.prompt, &answer, &ep.commands);
+                        let files: Vec<String> = ep.files.iter().cloned().collect();
+                        me.distill_turn(&sid, turn, now(), &ep.prompt, &answer, &ep.commands, &files);
                     })),
                 ))
             }
@@ -400,20 +473,27 @@ impl Daemon {
     /// [`crate::distill`]): new items that are not near-copies of what is
     /// already noted, replacements (the old item is marked superseded), and
     /// planned work it completed (marked done).
-    pub fn distill_turn(&self, sid: &str, turn: i64, ts: i64, prompt: &str, answer: &str, commands: &[String]) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn distill_turn(&self, sid: &str, turn: i64, ts: i64, prompt: &str, answer: &str, commands: &[String], files: &[String]) {
         if !self.cfg.distill.active() || (prompt.trim().is_empty() && answer.trim().is_empty()) {
             return;
         }
         self.pending.fetch_add(1, Ordering::AcqRel);
         let _one = self.distilling.lock().unwrap_or_else(|e| e.into_inner());
-        let known: Vec<Record> = self
-            .store
-            .latest(&recall::KNOWLEDGE, 80, &Filter::default())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.tag != "superseded" && r.tag != "done" && (r.kind != Kind::Todo || r.tag == "planned"))
-            .take(40)
-            .collect();
+        // The notes most related to this exchange, wherever they are in the
+        // history, and the newest few: the model can update an old note
+        // instead of adding a near-copy next to it.
+        let about: String = format!("{}\n{}", prompt.chars().take(1500).collect::<String>(), answer.chars().take(1500).collect::<String>());
+        let mut known: Vec<Record> = recall::related(&self.store, &about, 30).unwrap_or_default();
+        for r in crate::consolidate::live_notes(&self.store, 40).unwrap_or_default() {
+            if known.len() >= 40 {
+                break;
+            }
+            if !known.iter().any(|k| k.id == r.id) {
+                known.push(r);
+            }
+        }
+        known.sort_by_key(|r| -r.seq);
         let listed: Vec<(String, Kind, String)> = known.iter().rev().map(|r| (r.id.clone(), r.kind, r.text.clone())).collect();
         let t0 = Instant::now();
         match crate::distill::distill(&self.cfg.distill, prompt, answer, commands, &listed) {
@@ -442,7 +522,10 @@ impl Daemon {
                     });
                     if !dup {
                         seen.push(t);
-                        let mut x = x.ctx(ctx.clone());
+                        // Anchored to the code the note is about, as it is now.
+                        let a = anchor::make(Path::new(&self.project), &x.text, &x.files, files);
+                        let ctx = if a.is_empty() { ctx.clone() } else { format!("{ctx}\n{}", a.to_line()) };
+                        let mut x = x.ctx(ctx);
                         if let Some(src) = &source {
                             x = x.link("from", src.clone());
                         }
@@ -467,7 +550,151 @@ impl Daemon {
             }
             Err(e) => self.log(&json!({"ts": now(), "event": "distill", "session": sid, "turn": turn, "error": e.to_string()})),
         }
+        let since = self.distilled_since.fetch_add(1, Ordering::AcqRel) + 1;
+        let cc = &self.cfg.consolidate;
+        if cc.active() && since >= cc.every_turns {
+            let live = crate::consolidate::live_notes(&self.store, 2000).map(|v| v.len()).unwrap_or(0);
+            if live >= cc.min_live {
+                self.distilled_since.store(0, Ordering::Release);
+                self.consolidate_now();
+            }
+        }
         self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Merges related notes (the caller holds the distillation lock).
+    fn consolidate_now(&self) -> Json {
+        let t0 = Instant::now();
+        match crate::consolidate::run(&self.store, &self.cfg.consolidate, &self.cfg.distill, now()) {
+            Ok(r) => {
+                let j = json!({"ts": now(), "event": "consolidate", "live_before": r.live_before, "groups": r.groups, "replaced": r.replaced,
+                    "written": r.written, "cost_usd": r.cost_usd, "errors": r.errors, "ms": t0.elapsed().as_millis() as u64});
+                self.log(&j);
+                j
+            }
+            Err(e) => {
+                let j = json!({"ts": now(), "event": "consolidate", "error": e.to_string()});
+                self.log(&j);
+                j
+            }
+        }
+    }
+
+    fn op_consolidate(&self) -> Result<Json> {
+        let _one = self.distilling.lock().unwrap_or_else(|e| e.into_inner());
+        self.distilled_since.store(0, Ordering::Release);
+        let j = self.consolidate_now();
+        let text = format!("{j}");
+        Ok(json!({"text": text, "report": j}))
+    }
+
+    /// Checks notes' anchors against this project's working tree.
+    fn checker(&self) -> Checker {
+        Checker::new(Path::new(&self.project))
+    }
+
+    /// Runs query understanding for a prompt of a session: the context
+    /// block (records not shown to the session yet) and the result.
+    fn deep_for(&self, sid: &str, prompt: &str, recent: &[String]) -> (String, Option<crate::deep::DeepResult>) {
+        let (w, shown) = {
+            let st = self.state.lock().unwrap();
+            let s = st.sessions.get(sid).cloned().unwrap_or_default();
+            (s.window_start, s.injected)
+        };
+        let filter = Filter { exclude_window: Some((sid.to_string(), w)), ..Default::default() };
+        let project = Path::new(&self.project);
+        let res = crate::deep::run(&self.store, &self.cfg.deep, &self.cfg.distill, prompt, recent, &filter, Some(project));
+        let text = crate::deep::format(&res, &shown, now(), Some(project));
+        let mut log = crate::deep::log_json(&res);
+        log["ts"] = json!(now());
+        log["event"] = json!("deep");
+        log["session"] = json!(sid);
+        log["mode"] = json!(self.cfg.deep.mode);
+        log["chars"] = json!(text.len());
+        self.log(&log);
+        if !text.is_empty() {
+            let ids = res.ids();
+            let mut st = self.state.lock().unwrap();
+            if let Some(s) = st.sessions.get_mut(sid) {
+                if self.cfg.deep.mode == "sync" {
+                    s.injected.extend(ids);
+                }
+            }
+            self.dirty.store(true, Ordering::Release);
+        }
+        (text, Some(res))
+    }
+
+    /// The finished search of `turn` not delivered yet, once. With `wait`,
+    /// waits for a running one (up to `stop_wait_secs`) and returns it only
+    /// when its confidence is high or medium.
+    fn take_deep(&self, sid: &str, turn: i64, wait: bool) -> Option<String> {
+        let until = Instant::now() + Duration::from_secs(if wait { self.cfg.deep.stop_wait_secs } else { 0 });
+        loop {
+            {
+                let mut jobs = self.deep_jobs.lock().unwrap();
+                let j = jobs.get_mut(sid).filter(|j| j.turn == turn && !j.delivered)?;
+                if j.done {
+                    j.delivered = true;
+                    if j.text.is_empty() || (wait && !matches!(j.confidence.as_str(), "high" | "medium")) {
+                        return None;
+                    }
+                    let (text, ids) = (j.text.clone(), j.ids.clone());
+                    drop(jobs);
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(s) = st.sessions.get_mut(sid) {
+                        s.injected.extend(ids);
+                    }
+                    self.dirty.store(true, Ordering::Release);
+                    return Some(text);
+                }
+            }
+            if Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// memory_ask: query understanding for a question, everything it picks.
+    fn op_ask(&self, req: &Json) -> Result<Json> {
+        let q = req.get("question").or_else(|| req.get("query")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if q.is_empty() {
+            return Err(err("question is empty"));
+        }
+        let mut cfg = self.cfg.deep.clone();
+        if let Some(m) = req.get("model").and_then(|v| v.as_str()).filter(|m| !m.is_empty()) {
+            cfg.planner_model = m.to_string();
+            cfg.ranker_model = m.to_string();
+        }
+        let (active, w) = self.active_session();
+        let mut filter = Filter::default();
+        if !req.get("include_current").and_then(|v| v.as_bool()).unwrap_or(false) && !active.is_empty() {
+            filter.exclude_window = Some((active.clone(), w));
+        }
+        let project = Path::new(&self.project);
+        let mut res = crate::deep::run(&self.store, &cfg, &self.cfg.distill, &q, &[], &filter, Some(project));
+        // A question asked on purpose gets an answer even when the planner
+        // thought memory could not matter.
+        if !res.plan.need {
+            res.plan.need = true;
+            let (cands, _) = crate::deep::gather(&self.store, &cfg, &q, &res.plan, &filter);
+            let (picks, answer, conf, model, cost, e) = crate::deep::rank(&cfg, &self.cfg.distill, &q, &cands, &HashMap::new(), false, now());
+            let by: HashMap<&str, &Record> = cands.iter().map(|c| (c.record.id.as_str(), &c.record)).collect();
+            res.picks = picks.into_iter().filter_map(|(id, why)| by.get(id.as_str()).map(|r| ((*r).clone(), why))).collect();
+            (res.answer, res.confidence, res.ranker_model, res.error) = (answer, conf, model, e);
+            res.cost_usd += cost;
+            res.candidates = cands;
+        }
+        let mut text = crate::deep::format(&res, &HashSet::new(), now(), Some(project));
+        if text.is_empty() {
+            text = format!("Engram found nothing relevant in memory ({} searches over {} candidates).", res.plan.queries.len() + 2, res.candidates.len());
+        }
+        let mut log = crate::deep::log_json(&res);
+        log["ts"] = json!(now());
+        log["event"] = json!("ask");
+        self.log(&log);
+        Ok(json!({"text": text, "ids": res.ids(), "answer": res.answer, "confidence": res.confidence, "cost_usd": res.cost_usd, "ms": res.ms}))
     }
 
     /// Distills every past turn of the store that has a prompt (for stores
@@ -475,14 +702,14 @@ impl Daemon {
     fn distill_backfill(&self) -> Result<(usize, usize)> {
         let rs = self.store.query(&format!("SELECT {} FROM memory WHERE kind IN ('prompt', 'answer', 'episode') ORDER BY seq ASC LIMIT 1000000", crate::record::COLUMNS))?;
         let recs: Vec<Record> = rs.rows.iter().filter_map(|r| crate::store::row_record(r)).collect();
-        // (session, turn) -> (prompt, answer, commands)
-        let mut turns: Vec<((String, i64), (String, String, Vec<String>, i64))> = Vec::new();
+        // (session, turn) -> (prompt, answer, commands, ts, files)
+        let mut turns: Vec<((String, i64), (String, String, Vec<String>, i64, Vec<String>))> = Vec::new();
         for r in recs {
             let key = (r.session.clone(), r.turn);
             if turns.last().map_or(true, |(k, _)| *k != key) {
                 turns.push((key.clone(), Default::default()));
             }
-            let (_, (p, a, c, ts)) = turns.last_mut().unwrap();
+            let (_, (p, a, c, ts, files)) = turns.last_mut().unwrap();
             *ts = (*ts).max(r.ts);
             match r.kind {
                 Kind::Prompt => {
@@ -497,15 +724,16 @@ impl Daemon {
                     if let Some(line) = r.text.lines().find(|l| l.starts_with("Ran: ")) {
                         c.extend(line[5..].split(" ; ").map(String::from));
                     }
+                    files.extend(r.files.split_whitespace().map(String::from));
                 }
                 _ => {}
             }
         }
         let before = self.store.len();
         let n = turns.len();
-        for ((sid, turn), (p, a, c, ts)) in turns {
+        for ((sid, turn), (p, a, c, ts, files)) in turns {
             if !p.trim().is_empty() {
-                self.distill_turn(&sid, turn, ts, p.trim(), a.trim(), &c);
+                self.distill_turn(&sid, turn, ts, p.trim(), a.trim(), &c, &files);
             }
         }
         Ok((n, (self.store.len() - before) as usize))
@@ -532,7 +760,8 @@ impl Daemon {
     }
 
     /// Gated recall for a prompt in a session; `force` skips the gate.
-    fn recall_for(&self, sid: &str, prompt: &str, force: bool) -> Result<Option<String>> {
+    /// Returns the context and the ids it shows.
+    fn recall_for(&self, sid: &str, prompt: &str, force: bool) -> Result<Option<(String, Vec<String>)>> {
         let (w, mut skip) = {
             let st = self.state.lock().unwrap();
             let s = st.sessions.get(sid).cloned().unwrap_or_default();
@@ -558,8 +787,9 @@ impl Daemon {
         let g = self.cfg.gate.score(&ev);
         let decision = if force && !hits.is_empty() { Decision::Inject } else { self.cfg.gate.decide(&ev) };
         let mut parts = Vec::new();
+        let mut ck = self.checker();
         if !known.is_empty() {
-            parts.push(recall::fmt_knowledge(&known, now()));
+            parts.push(recall::fmt_knowledge_checked(&known, now(), Some(&mut ck)));
         }
         match decision {
             _ if hits.is_empty() => {}
@@ -570,7 +800,7 @@ impl Daemon {
                 if !items.is_empty() {
                     let packed: Vec<String> = items.iter().map(|(r, _)| r.id.clone()).collect();
                     let shown: HashSet<String> = packed.iter().cloned().chain(skip.iter().cloned()).collect();
-                    let mut t = recall::fmt_recall_as(&items, now(), weak);
+                    let mut t = recall::fmt_recall_checked(&items, now(), weak, Some(&mut ck));
                     t += &recall::fmt_more(&hits, &shown, if weak { 5 } else { 3 });
                     parts.push(t);
                     ids.extend(packed);
@@ -578,7 +808,7 @@ impl Daemon {
             }
             Decision::Skip => {}
         }
-        let text = if parts.is_empty() { None } else { Some(parts.join("\n")) };
+        let text = if parts.is_empty() { None } else { Some((parts.join("\n"), ids.clone())) };
         if !ids.is_empty() {
             let mut st = self.state.lock().unwrap();
             if let Some(s) = st.sessions.get_mut(sid) {
@@ -589,7 +819,7 @@ impl Daemon {
         let known: Vec<Json> = known.iter().map(|(r, c, v)| json!({"id": r.id, "cos": c, "cov": v})).collect();
         self.log(&json!({
             "ts": now(), "event": "recall", "session": sid, "decision": format!("{decision:?}"), "gate": g,
-            "evidence": ev, "candidates": hits.len(), "injected": ids, "knowledge": known, "chars": text.as_ref().map_or(0, |t| t.len()),
+            "evidence": ev, "candidates": hits.len(), "injected": ids, "knowledge": known, "chars": text.as_ref().map_or(0, |t| t.0.len()),
             "ms": t0.elapsed().as_secs_f64() * 1e3,
         }));
         Ok(text)
@@ -622,9 +852,11 @@ impl Daemon {
             return Ok(String::new());
         }
         let mut s = format!("Engram notes on {rel} from earlier work (newest first):\n");
+        let mut ck = self.checker();
         for r in recs.iter().take(2) {
             let snip: String = r.text.chars().take(500).collect();
-            s += &format!("\n{}\n", recall::fmt_record(r, &snip, now()));
+            let label = if r.kind.is_knowledge() { ck.check_ctx(&r.ctx).label() } else { String::new() };
+            s += &format!("\n{}\n", recall::fmt_record_labeled(r, &snip, now(), &label));
         }
         Ok(s)
     }
@@ -725,7 +957,12 @@ impl Daemon {
                 self.store.insert(&[r])?;
             }
         }
-        let recs = self.store.append(&sid, turn, now(), vec![Draft::new(kind, text).files(files).tag("remembered")])?;
+        let a = anchor::make(Path::new(&self.project), &text, &files, &[]);
+        let mut d = Draft::new(kind, text).files(files).tag("remembered");
+        if !a.is_empty() {
+            d = d.ctx(a.to_line());
+        }
+        let recs = self.store.append(&sid, turn, now(), vec![d])?;
         Ok(json!({"id": recs[0].id, "text": format!("Stored {} as {}.", kind.as_str(), recs[0].id)}))
     }
 

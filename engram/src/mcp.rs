@@ -11,12 +11,22 @@ use crate::{daemon, paths};
 
 const INSTRUCTIONS: &str = "Engram is this project's long-term memory: every earlier prompt, answer, tool call, error and compaction summary, across sessions. \
 Relevant records are injected automatically when a prompt clearly matches them; these tools are for everything else. \
-memory_search is the way to answer questions about earlier work (what was decided, why, which error, which numbers) when that history is not in the current context. \
+memory_ask is the way to answer a question about earlier work (what was decided, why, where something happens and why, which error, which numbers): it plans several searches, runs them and picks the records that answer it. \
+memory_search is one quick hybrid search. \
 memory_timeline shows what happened around a record id. memory_sql answers structured questions (counts, by file, by kind, by time). \
 memory_remember stores a decision, preference, fact or open task worth keeping beyond this session, ideally one sentence that will make sense later.";
 
 fn tools() -> Json {
     json!([
+        {
+            "name": "memory_ask",
+            "description": "Answer a question about this project's earlier work from memory. A model rewrites the question into several searches (keyword, semantic, notes, entity graph, file, SQL), all of them run, and a second model call picks the records that bear on it and says why, with a short answer that cites record ids. Use it for questions with several parts or that need reasoning (\"where does X happen and why is Y responsible for it?\", \"what constrains how we build Z?\") and before design decisions. Takes several seconds.",
+            "inputSchema": {"type": "object", "properties": {
+                "question": {"type": "string", "description": "The question or task, in natural language."},
+                "model": {"type": "string", "description": "Model for planning and ranking (default: the configured one, usually haiku); a stronger model for hard questions, e.g. sonnet."},
+                "include_current": {"type": "boolean", "default": false}
+            }, "required": ["question"]}
+        },
         {
             "name": "memory_search",
             "description": "Search this project's history (earlier prompts, answers, tool calls and results, errors, compaction summaries, remembered decisions) with hybrid BM25 + vector search. Returns record ids with time, session, turn, kind and a snippet. Records already in the current context window are excluded unless include_current is true.",
@@ -60,6 +70,7 @@ fn tools() -> Json {
 
 fn call(dir: &std::path::Path, project: &str, name: &str, args: &Json) -> (String, bool) {
     let op = match name {
+        "memory_ask" => "ask",
         "memory_search" => "search",
         "memory_timeline" => "timeline",
         "memory_sql" => "sql",
@@ -72,7 +83,8 @@ fn call(dir: &std::path::Path, project: &str, name: &str, args: &Json) -> (Strin
         req = json!({});
     }
     req["op"] = json!(op);
-    match daemon::request(dir, project, &req, Duration::from_secs(20)) {
+    let wait = Duration::from_secs(if op == "ask" { 300 } else { 20 });
+    match daemon::request(dir, project, &req, wait) {
         Ok(r) => match r.get("error") {
             Some(e) => (e.as_str().unwrap_or("error").to_string(), true),
             None => (r.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(), false),

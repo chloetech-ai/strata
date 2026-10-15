@@ -14,14 +14,25 @@ use serde_json::{json, Value as Json};
 use crate::{daemon, install, paths};
 
 /// How long each event may wait for the daemon (the first one may start it).
-fn budget(event: &str) -> Duration {
+/// With query understanding on, a prompt may wait for it (`sync`), and the
+/// end of a turn for a search still running (`async`).
+fn budget(event: &str, deep: &crate::deep::DeepConfig) -> Duration {
     Duration::from_millis(match event {
         "SessionStart" => 8000,
+        "UserPromptSubmit" if deep.mode == "sync" => 1000 + 2 * 1000 * deep.timeout_secs.min(40),
         "UserPromptSubmit" => 3000,
+        "Stop" if deep.mode == "async" && deep.stop_recheck => 3000 + 1000 * deep.stop_wait_secs,
         "PostCompact" => 5000,
         "PreToolUse" => 1500,
         _ => 2000,
     })
+}
+
+/// The store's query-understanding settings (config file and environment).
+fn deep_config(dir: &std::path::Path) -> crate::deep::DeepConfig {
+    let raw: Json = std::fs::read_to_string(dir.join("config.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Json::Null);
+    let cfg: crate::deep::DeepConfig = raw.get("deep").cloned().and_then(|d| serde_json::from_value(d).ok()).unwrap_or_default();
+    cfg.resolved()
 }
 
 pub fn run(event: &str, user: bool) -> i32 {
@@ -40,7 +51,8 @@ pub fn run(event: &str, user: bool) -> i32 {
     }
     let dir = paths::store_dir(&project);
     let req = json!({"op": "hook", "event": event, "payload": payload});
-    match daemon::request(&dir, &project.to_string_lossy(), &req, budget(&event)) {
+    let wait = if matches!(event.as_str(), "UserPromptSubmit" | "Stop") { budget(&event, &deep_config(&dir)) } else { budget(&event, &crate::deep::DeepConfig::default()) };
+    match daemon::request(&dir, &project.to_string_lossy(), &req, wait) {
         Ok(resp) => {
             if let Some(out) = resp.get("output").filter(|o| !o.is_null()) {
                 println!("{out}");

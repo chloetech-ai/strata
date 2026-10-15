@@ -1,0 +1,12 @@
+code,name,price,batch_size,dough_g,bake_temp,allergens
+BAG,Baguette,95,12,350,250,wheat
+SOU,White sourdough,320,10,800,240,wheat
+RYE,Seeded rye sourdough,360,8,900,230,rye|wheat|sesame
+BRO,Brötchen,40,30,85,230,wheat
+SWL,Sandwich loaf,180,16,850,220,wheat|soya
+WRL,White roll,35,30,90,220,wheat
+CRO,Croissant,110,24,95,200,wheat|milk|eggs
+PCH,Pain au chocolat,125,24,100,200,wheat|milk|eggs|soya
+CIN,Cinnamon bun,140,20,110,190,wheat|milk|eggs
+BKW,Bakewell slice,150,24,120,180,wheat|milk|eggs|nuts
+FLO,Florentine,90,40,30,170,milk|nuts

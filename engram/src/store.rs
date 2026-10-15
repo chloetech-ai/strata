@@ -54,7 +54,7 @@ impl Filter {
 
     /// The filter's conditions. Entity records are never results unless
     /// asked for by kind.
-    fn conds(&self) -> Vec<String> {
+    pub fn conds(&self) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some((s, w)) = &self.exclude_window {
             parts.push(format!("NOT (session = '{}' AND seq >= {w})", quote(s)));

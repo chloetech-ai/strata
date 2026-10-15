@@ -12,16 +12,15 @@
 //! it). It runs in the daemon after the hook has answered, so it never
 //! delays a prompt.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
+use crate::llm::{self, clip, Cli};
 use crate::record::{Draft, Kind};
 use crate::redact::redact;
-use crate::{err, Result};
+use crate::Result;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -55,6 +54,11 @@ impl DistillConfig {
     pub fn model(&self) -> String {
         std::env::var("ENGRAM_DISTILL_MODEL").ok().filter(|m| !m.is_empty()).unwrap_or_else(|| self.model.clone())
     }
+
+    /// The CLI call for `model` with this configuration's command and isolation.
+    pub fn cli<'a>(&'a self, model: &'a str, timeout_secs: u64) -> Cli<'a> {
+        Cli { command: &self.command, model, timeout: Duration::from_secs(timeout_secs), isolated: self.isolated }
+    }
 }
 
 const SYSTEM: &str = "You keep the long-term notes of a software project. You read one exchange between a developer and a coding assistant and write down what a future session will need. Output JSON lines only.";
@@ -85,6 +89,10 @@ Write down what someone working on this project in a later session would need to
 
 Each item is one self-contained sentence that names its subject and keeps the exact details and the reason. One item per distinct point; a planned piece of work with all its requirements is one item. With each item list the entities it is about, so that notes about the same thing can be found together: the components, features, files, data formats, external systems and people it concerns (short names, e.g. "count sheet", "CSV export", "items.py", "Petra Keller").
 
+Also list, for each item, 2 to 4 situations in which a later session must recall it, phrased the way a later request would be phrased, including indirect ones: what kind of task, choice or question it constrains, in words that need not appear in the item itself. For example, "the client's office PCs run Python 3.8" matters "when choosing a library or standard-library module (tomllib needs 3.11)", "when parsing a config file", "when using newer syntax such as match statements".
+
+The already-noted items above are the notes most related to this exchange (not all notes). When this exchange changes, reverses or extends one of them, write the new version with "replaces": the new sentence must stand on its own (repeat what still holds) and may say what changed (e.g. "30 days, changed from 14").
+
 Leave out:
 - anything already noted above, unless this exchange changes it;
 - status that will soon be stale (test counts, what is committed or pushed, which branch is checked out);
@@ -92,8 +100,8 @@ Leave out:
 - details of the code that reading it shows (signatures, what a function does).
 
 Output one JSON object per line and nothing else:
-{"kind": "decision" | "rule" | "requirement" | "fact", "text": "<sentence>", "entities": ["<entity>", ...]}
-{"kind": "decision" | "rule" | "requirement" | "fact", "text": "<new sentence>", "entities": ["<entity>", ...], "replaces": "<id of the noted item it updates>"}
+{"kind": "decision" | "rule" | "requirement" | "fact", "text": "<sentence>", "entities": ["<entity>", ...], "when": ["<situation>", ...]}
+{"kind": "decision" | "rule" | "requirement" | "fact", "text": "<new sentence>", "entities": ["<entity>", ...], "when": ["<situation>", ...], "replaces": "<id of the noted item it updates>"}
 {"kind": "done", "id": "<id of a noted requirement that this exchange completed>"}
 If there is nothing worth keeping, output nothing."#;
 
@@ -105,17 +113,6 @@ pub struct Distilled {
     pub replaced: Vec<String>,
     pub done: Vec<String>,
     pub cost_usd: f64,
-}
-
-fn clip(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        return s.to_string();
-    }
-    let mut i = n;
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    format!("{}…", &s[..i])
 }
 
 /// The label a noted record carries in the prompt.
@@ -138,6 +135,11 @@ pub fn prompt_for(request: &str, answer: &str, commands: &[String], known: &[(St
         .replace("{commands}", &clip(&redact(&commands), 1500))
         .replace("{answer}", &clip(&redact(answer), 4000))
         .replace("{known}", &known)
+}
+
+/// Up to `n` non-empty strings (each at most `max` bytes) of an array field.
+pub fn strings(v: &Json, key: &str, n: usize, max: usize) -> Vec<String> {
+    v.get(key).and_then(|e| e.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(|x| clip(x.trim(), max)).filter(|x| !x.is_empty()).take(n).collect()).unwrap_or_default()
 }
 
 /// Parses the model's JSON lines; anything else is ignored.
@@ -167,8 +169,9 @@ pub fn parse(text: &str) -> Distilled {
             _ => continue,
         };
         let replaces = id_of(&v, "replaces");
-        let entities: Vec<String> = v.get("entities").and_then(|e| e.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(|x| clip(x.trim(), 60)).filter(|x| !x.is_empty()).take(6).collect()).unwrap_or_default();
-        let mut d = Draft::new(k, clip(&redact(text), 600)).tag(tag).files(crate::capture::paths_in(text)).entities(entities);
+        let entities = strings(&v, "entities", 6, 60);
+        let when = strings(&v, "when", 4, 160);
+        let mut d = Draft::new(k, clip(&redact(text), 600)).tag(tag).files(crate::capture::paths_in(text)).entities(entities).when(when);
         if let Some(r) = &replaces {
             d = d.link("supersedes", r.clone());
         }
@@ -181,45 +184,10 @@ pub fn parse(text: &str) -> Distilled {
 /// Runs the model on one exchange.
 pub fn distill(cfg: &DistillConfig, request: &str, answer: &str, commands: &[String], known: &[(String, Kind, String)]) -> Result<Distilled> {
     let prompt = prompt_for(request, answer, commands, known);
-    let scratch = std::env::temp_dir().join("engram-distill");
-    std::fs::create_dir_all(&scratch)?;
-    let mut cmd = Command::new(&cfg.command);
-    cmd.args(["-p", "--system-prompt", SYSTEM, "--tools", "", "--no-session-persistence", "--output-format", "json"]);
-    if cfg.isolated {
-        cmd.args(["--setting-sources", "project", "--strict-mcp-config"]);
-    }
     let model = cfg.model();
-    if !model.is_empty() {
-        cmd.args(["--model", &model]);
-    }
-    let mut child = cmd
-        .current_dir(&scratch)
-        .env("ENGRAM_DISABLE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| err(format!("{}: {e}", cfg.command)))?;
-    child.stdin.take().unwrap().write_all(prompt.as_bytes())?;
-    let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs);
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(err("distillation timed out"));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let out = child.wait_with_output()?;
-    let v: Json = serde_json::from_slice(&out.stdout).map_err(|e| err(format!("distillation output: {e}")))?;
-    if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
-        return Err(err(format!("distillation failed: {}", v.get("result").and_then(|r| r.as_str()).unwrap_or(""))));
-    }
-    let mut d = parse(v.get("result").and_then(|r| r.as_str()).unwrap_or(""));
-    d.cost_usd = v.get("total_cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
+    let r = llm::complete(&cfg.cli(&model, cfg.timeout_secs), SYSTEM, &prompt)?;
+    let mut d = parse(&r.text);
+    d.cost_usd = r.cost_usd;
     Ok(d)
 }
 
@@ -229,13 +197,14 @@ mod tests {
 
     #[test]
     fn parses_items_and_ignores_the_rest() {
-        let text = "Here you go:\n{\"kind\": \"decision\", \"text\": \"Storage stays JSON because admins edit the files by hand.\", \"entities\": [\"storage\", \"JSON files\"]}\n\
+        let text = "Here you go:\n{\"kind\": \"decision\", \"text\": \"Storage stays JSON because admins edit the files by hand.\", \"entities\": [\"storage\", \"JSON files\"], \"when\": [\"making saving faster\"]}\n\
                     {\"kind\": \"requirement\", \"text\": \"The CSV export uses semicolons and DD.MM.YYYY dates.\", \"replaces\": \"abc:3\"},\n\
                     {\"kind\": \"done\", \"id\": \"[abc:12]\"}\n{\"kind\": \"mood\", \"text\": \"The user seems happy today.\"}\nnot json";
         let d = parse(text);
         assert_eq!(d.drafts.len(), 2);
         assert_eq!(d.drafts[0].kind, Kind::Decision);
         assert_eq!(d.drafts[0].entities, vec!["storage".to_string(), "JSON files".to_string()]);
+        assert_eq!(d.drafts[0].when, vec!["making saving faster".to_string()]);
         assert_eq!(d.drafts[1].links, vec![crate::record::Link::new("supersedes", "abc:3")]);
         assert_eq!(d.drafts[1].kind, Kind::Todo);
         assert_eq!(d.drafts[1].tag, "planned");
