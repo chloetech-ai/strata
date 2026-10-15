@@ -31,3 +31,18 @@ Tests on the branch (cargo test --release, after the timed runs)
 Note: main's scale run began a few minutes after both release builds finished, so its 5- and
 15-minute averages (7.58, 5.74) still carried the build load. The 1-minute average was 2.22,
 and nothing else was running. Each side ran once, so no run-to-run spread was measured.
+
+Follow-up: latency bench at 1M records only (--sizes 1000000), two more runs per side,
+alternating main, branch, main, branch, same commands and quiet-machine check, under caffeinate -i.
+Output: {main,branch}/latency_1m_r2 and latency_1m_r3 (r1 is {main,branch}/latency).
+Load averages (1, 5, 15 min) at the start and end of each run:
+  main latency_1m_r2 | 2026-10-15T08:35:55Z | waited 30s | quiet | 2.69 6.04 4.94
+  main latency_1m_r2 | end 2026-10-15T08:41:17Z | exit 0 | 1.48 3.15 3.92
+  branch latency_1m_r2 | 2026-10-15T08:41:17Z | waited 0s | quiet | 1.48 3.15 3.92
+  branch latency_1m_r2 | end 2026-10-15T08:46:37Z | exit 0 | 1.94 2.19 3.20
+  main latency_1m_r3 | 2026-10-15T08:46:37Z | waited 0s | quiet | 1.94 2.19 3.20
+  main latency_1m_r3 | end 2026-10-15T08:51:57Z | exit 0 | 1.21 1.79 2.72
+  branch latency_1m_r3 | 2026-10-15T08:51:57Z | waited 0s | quiet | 1.21 1.79 2.72
+  branch latency_1m_r3 | end 2026-10-15T08:57:18Z | exit 0 | 1.74 1.86 2.48
+main r2 began about 3 minutes after the test suites finished (08:32:58Z); its 5-minute average
+(6.04) still carried that load, and its 1-minute average was 2.69.
