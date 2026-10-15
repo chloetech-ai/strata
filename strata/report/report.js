@@ -177,7 +177,7 @@
   // ------------------------------------------------------------ sections
   function meta() {
     const m = $("#meta-line");
-    if (m) m.textContent = "Intel Xeon (Emerald Rapids), 4 cores, AVX-512 · single-threaded queries · Rust, -C target-cpu=native · SQLite 3.x bundled with FTS5 · Tantivy 0.26";
+    if (m) m.textContent = "Apple M2 (4 performance + 4 efficiency cores), 24 GB, macOS 26.0.1, NEON (usdot) · single-threaded queries · Rust 1.92, -C target-cpu=native · SQLite 3.x bundled with FTS5 · Tantivy 0.26";
     const f = $("#footer");
     if (f) f.textContent = `Generated from strata/results/ by scripts/build_report.py · ${D.generated}`;
   }

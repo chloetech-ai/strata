@@ -1,7 +1,7 @@
 <div class="col">
   <h3 id="r-build">Build time and size</h3>
-  <p>Strata builds every index of the table in one pass: text, structured, doc store, keys, float32 and 8-bit vectors, and an HNSW graph. That takes 0.9 s for SciFact and 242.5 s for Quora, against 0.6–27.2 s for SQLite and 0.7–18.2 s for Tantivy. Neither baseline builds a vector index: SQLite keeps the vectors as blobs and scans them, and Tantivy has none.</p>
-  <p>The graph is most of the difference. It takes 13.5 s of FiQA's 17.4 s, 43 s of TREC-COVID's 63.6 s and 201 s of Quora's 242.5 s, on four threads. The rest of the load takes 3.9–42 s, 0.9–1.5× SQLite's time. With IVF instead of HNSW, TREC-COVID builds in 36.6 s and Quora in 91.2 s.</p>
+  <p>Strata builds every index of the table in one pass: text, structured, doc store, keys, float32 and 8-bit vectors, and an HNSW graph. That takes 0.5 s for SciFact and 153.1 s for Quora, against 0.3–30.7 s for SQLite and 0.4–9.3 s for Tantivy. Neither baseline builds a vector index: SQLite keeps the vectors as blobs and scans them, and Tantivy has none.</p>
+  <p>The graph is most of the difference. It takes 12.9 s of FiQA's 14.2 s, 37 s of TREC-COVID's 40.6 s and 146 s of Quora's 153.1 s, on four threads. The rest of the load takes 1.3–7.5 s, 0.2–0.5× SQLite's time. With IVF instead of HNSW, TREC-COVID builds in 19.2 s and Quora in 60.1 s.</p>
 </div>
 <div class="wide" id="build-table"></div>
 <div class="col">
@@ -12,13 +12,13 @@
 
 <div class="col">
   <h3 id="r-latency">Query latency</h3>
-  <p>Warm, Strata is faster than Tantivy in 23 of the 28 text and filter comparisons:</p>
+  <p>Warm, Strata is faster than Tantivy in 24 of the 28 text and filter comparisons:</p>
   <ul>
-    <li><b>BM25 top-10:</b> 1.8–4.6× faster than Tantivy, and 45–213× faster than FTS5, which scores every match.</li>
-    <li><b>Two-term conjunctions:</b> 3.6–6.7× faster than Tantivy.</li>
-    <li><b>Filtered BM25:</b> 3.5–4.6× faster than Tantivy.</li>
-    <li><b>Vector top-10:</b> 0.09–0.20 ms with HNSW. SQLite's scan takes 12 ms on SciFact and over a second on Quora.</li>
-    <li><b>Hybrid queries:</b> 0.36–1.3 ms. They run BM25 and the vector index, then fuse their top 100s.</li>
+    <li><b>BM25 top-10:</b> 1.7–3.2× faster than Tantivy, and 43–200× faster than FTS5, which scores every match.</li>
+    <li><b>Two-term conjunctions:</b> 2.7–4.1× faster than Tantivy.</li>
+    <li><b>Filtered BM25:</b> 3.1–4.0× faster than Tantivy.</li>
+    <li><b>Vector top-10:</b> 0.05–0.10 ms with HNSW. SQLite's scan takes 7.7 ms on SciFact and 0.7 s on Quora.</li>
+    <li><b>Hybrid queries:</b> 0.17–0.77 ms. They run BM25 and the vector index, then fuse their top 100s.</li>
   </ul>
 </div>
 <figure class="wide">
@@ -29,13 +29,14 @@
   </div>
 </figure>
 <div class="col">
-  <p>The exceptions are facet counts, where Tantivy is 1.1–2.7× faster, and SciFact's three-term conjunctions. These queries take 12–124 µs in Tantivy. At that size, the fixed cost of a SQL statement shows: a query that matches nothing takes Strata 7–10 µs to parse, bind, plan and run. That is about half of the facet gap on SciFact. The rest is that Strata materialises the match before reading category codes, while Tantivy's collector reads its column inside the intersection.</p>
+  <p>The exceptions are facet counts on SciFact, FiQA and Quora, where Tantivy is 1.1–2.1× faster (on TREC-COVID Strata is 1.5× faster), and SciFact's three-term conjunctions. These queries take 9–27 µs in Tantivy. At that size, the fixed cost of a SQL statement shows: even a query that matches nothing is parsed, bound, planned and run. Strata also materialises the match before reading category codes, while Tantivy's collector reads its column inside the intersection.</p>
   <p>Cold, every system waits on page faults and the gaps narrow:</p>
   <ul>
-    <li><b>Text queries:</b> Strata is within 0.7–1.5× of Tantivy. It is faster on TREC-COVID (BM25 in 3.8 ms against 5.0 ms) and 11–27% slower on BM25 for the other three collections.</li>
-    <li><b>Structured filters:</b> Strata is 1.8–2.9× slower than Tantivy's columns. A range touches histogram buckets, boundary blocks, zone maps and the key index, each on different pages.</li>
-    <li><b>Vectors against SQLite:</b> a cold vector query is 50–63× faster on the two large collections. HNSW touches about 1,000 pages, where the scan reads all 239,000 or 592,000. On SciFact, a cold scan of SQLite's 20 MiB of vectors is as fast as a cold graph walk (27 against 29 ms).</li>
+    <li><b>Text queries:</b> Strata is within 0.5–1.5× of Tantivy. On BM25 it is faster on SciFact (1.6 against 2.1 ms) and TREC-COVID (6.6 against 7.2 ms), and 12–38% slower on Quora and FiQA.</li>
+    <li><b>Structured filters:</b> Strata is 1.4–3.4× slower than Tantivy's columns. A range touches histogram buckets, boundary blocks, zone maps and the key index, each on different pages.</li>
+    <li><b>Vectors against SQLite:</b> a cold vector query is 28–63× faster on the two large collections. HNSW touches about 3,700–4,400 pages, where the scan reads all 239,000 or 592,000. On SciFact, a cold scan of SQLite's 20 MiB of vectors is faster than a cold graph walk (30 against 39 ms).</li>
   </ul>
+  <p>Page counts are in 4 KiB units, but macOS pages are 16 KiB: a random fault reads four times the data of a 4 KiB page, so random-access queries such as HNSW read more, and are slower cold, than on the Xeon VM these runs replace.</p>
 </div>
 <div class="wide" id="speedup-table"></div>
 
@@ -43,23 +44,23 @@
   <h3 id="r-cold">Cold reads and page-cache hints</h3>
   <p>Cold latency depends on what the kernel reads around each page fault, and the right policy differs by section. The table compares three policies on the two large collections:</p>
   <ul>
-    <li><b>Read-ahead everywhere</b> (the kernel's default). A cold HNSW query reads 20,262 pages on TREC-COVID and takes 83 ms: each random hop through the graph pulls in up to 128 KiB around it.</li>
-    <li><b>No read-ahead</b> (<code>MADV_RANDOM</code> on the whole file). Vector queries drop to about 1,000 pages and 40–44 ms. BM25, facets and filters, which read postings and columns in order, then fault page by page and are 1.9–3.6× slower than with read-ahead.</li>
-    <li><b>Default hints.</b> Random access is advised only for sections read at random: the doc store, the key index, term dictionaries, float32 vectors, and the graph with its codes. Postings, norms, columns and IVF lists keep read-ahead. Vector and hybrid queries stay at the random-access cost, and BM25 is 0.7–1.1× its read-ahead time.</li>
+    <li><b>Read-ahead everywhere</b> (the kernel's default). A cold HNSW query reads 7,364 pages on TREC-COVID and takes 117 ms: twice the pages it reads when the graph is advised random access.</li>
+    <li><b>No read-ahead</b> (<code>MADV_RANDOM</code> on the whole file). Vector queries drop to 3,676 pages on TREC-COVID and 4,416 on Quora, and take 102–115 ms. BM25, facets and filters, which read postings and columns in order, then fault page by page and are up to 1.5× slower than with read-ahead.</li>
+    <li><b>Default hints.</b> Random access is advised only for sections read at random: the doc store, the key index, term dictionaries, float32 vectors, and the graph with its codes. Postings, norms, columns and IVF lists keep read-ahead. Vector and hybrid queries stay at the random-access cost, and BM25 is 0.8–1.0× its read-ahead time.</li>
   </ul>
-  <p>Structured filters are the exception: under the default hints they are 1.3–2.1× slower than with read-ahead everywhere. These queries sort by rating and break ties by key. With 500 rating values, a permissive filter leaves hundreds of documents tied at the top. Their keys are scattered over the key index, so each one costs a separate fault. Keeping read-ahead on the docID-to-key half of that index would remove the cost. Per-section hints are a first step; the planner knows each query's access pattern and could choose them per query.</p>
+  <p>Structured filters are the exception: under the default hints they are 1.2–1.5× slower than with read-ahead everywhere. These queries sort by rating and break ties by key. With 500 rating values, a permissive filter leaves hundreds of documents tied at the top. Their keys are scattered over the key index, so each one costs a separate fault. Keeping read-ahead on the docID-to-key half of that index would remove the cost. Per-section hints are a first step; the planner knows each query's access pattern and could choose them per query.</p>
 </div>
 <div class="wide" id="ablation-table"></div>
-<div class="col"><p class="note">Median milliseconds per query after evicting the database from the page cache, and the median number of 4 KiB pages read. Highlighted: the fastest policy for each kind.</p></div>
+<div class="col"><p class="note">Median milliseconds per query after evicting the database from the page cache, and the median number of 4 KiB pages read (macOS faults in 16 KiB pages, four of these units). Highlighted: the fastest policy for each kind.</p></div>
 
 <div class="col">
   <h3 id="r-quality">Ranking quality</h3>
-  <p>Strata's BM25 is within 0.017 nDCG@10 of both baselines on every collection, and no system is consistently ahead: Strata leads on SciFact, Tantivy on TREC-COVID, FTS5 on FiQA and Quora. The analysers differ. Strata stems with Snowball and drops stopwords, FTS5 uses the Porter stemmer, and Tantivy uses Snowball and keeps stopwords.</p>
-  <p>HNSW is within 0.005 of the exact scan on three collections. SQLite ran only 300 of Quora's 2,000 vector and hybrid queries, so the Quora row compares different query sets. On the shared 300, HNSW scores 0.867 against 0.880 exact, with recall@10 0.991; four queries that lost a relevant duplicate account for the whole difference. Strata's RRF is within 0.006 of SQLite's RRF over the same two rankings, also on those 300 Quora queries (0.845 against 0.850).</p>
+  <p>Strata's BM25 is within 0.018 nDCG@10 of both baselines on every collection, and no system is consistently ahead: Strata leads on SciFact, Tantivy on TREC-COVID, FTS5 on FiQA and Quora. The analysers differ. Strata stems with Snowball and drops stopwords, FTS5 uses the Porter stemmer, and Tantivy uses Snowball and keeps stopwords.</p>
+  <p>HNSW is within 0.006 of the exact scan on three collections. SQLite ran only 300 of Quora's 2,000 vector and hybrid queries, so the Quora row compares different query sets. On the shared 300, HNSW scores 0.867 against 0.880 exact, with recall@10 0.989; four queries that lost a relevant duplicate account for the whole difference. Strata's RRF is within 0.005 of SQLite's RRF over the same two rankings, also on those 300 Quora queries (0.846 against 0.850).</p>
   <p>All three systems drop NLTK's 153 English function words from BM25 queries, so the rankings are comparable; <code>bm25(body, :text, stopwords =&gt; 0)</code> keeps them. On the same queries, dropping them gains 0.055 nDCG@10 on TREC-COVID, whose queries are full questions, and 0.002 on SciFact and FiQA. It costs Quora 0.055 (0.756 against 0.811): its questions are short, and "how", "why" or "can" carry much of their meaning.</p>
 </div>
 <div class="wide" id="quality-table"></div>
-<div class="col"><p class="note">Quora: SQLite's exact vector and RRF columns cover 300 queries, Strata's 2,000. On the same 300, Strata scores 0.867 (HNSW) and 0.845 (RRF).</p></div>
+<div class="col"><p class="note">Quora: SQLite's exact vector and RRF columns cover 300 queries, Strata's 2,000. On the same 300, Strata scores 0.867 (HNSW) and 0.846 (RRF).</p></div>
 <figure class="narrow">
   <div class="frame">
     <p class="chart-title">Weighted hybrid ranking: nDCG@10 by BM25 weight</p>
@@ -68,17 +69,17 @@
   </div>
 </figure>
 <div class="col">
-    <p>Weighted fusion beats both of its inputs on three of the four collections. The best BM25 weight is small, 0.1–0.3: the scales differ, and on these collections the embeddings are the stronger ranking. On TREC-COVID it reaches nDCG@10 0.851, against 0.817 for vectors alone, 0.835 for RRF and 0.658 for BM25. On Quora it reaches 0.920 against 0.899 and 0.859. On FiQA, where BM25 is weak (0.268), fusion only matches the vector ranking (0.437), and RRF falls below it (0.382), because RRF gives both rankings equal weight.</p>
-  <p>The top-100 shortcut is cheap and close to exact. Against weighted ranking computed over every document, it recovers 89–95% of the exact top-10, and its nDCG@10 is within 0.01–0.03. It costs 0.4–1.5 ms per query, where the exact computation costs 1.8 ms on SciFact, 44 ms on FiQA and 211 ms on TREC-COVID.</p>
+    <p>Weighted fusion beats both of its inputs on three of the four collections. The best BM25 weight is small, 0.1–0.3: the scales differ, and on these collections the embeddings are the stronger ranking. On TREC-COVID it reaches nDCG@10 0.851, against 0.815 for vectors alone, 0.835 for RRF and 0.658 for BM25. On Quora it reaches 0.920 against 0.899 and 0.860. On FiQA, where BM25 is weak (0.268), fusion only matches the vector ranking (0.437), and RRF falls below it (0.381), because RRF gives both rankings equal weight.</p>
+  <p>The top-100 shortcut is cheap and close to exact. Against weighted ranking computed over every document, it recovers 89–95% of the exact top-10, and its nDCG@10 is within 0.01–0.03. It costs 0.2–0.8 ms per query, where the exact computation costs 0.9 ms on SciFact, 12 ms on FiQA and 62 ms on TREC-COVID.</p>
 </div>
 
 <div class="col">
   <h3 id="r-text">Posting formats and top-k</h3>
   <p>The text index stores long lists (at least 512 documents) as Loom, the aligned partitioned Elias-Fano design from the posting-list study, and short lists as BP128 blocks. The table compares that against BP128 for every list, on the same index:</p>
   <ul>
-    <li><b>Boolean queries</b> are where Loom pays off. AND is 7.6–12× faster (8.9 against 68 µs on FiQA, 24 against 287 µs on TREC-COVID), and OR 1.5–2.3× faster. Loom's cursors skip with sampled pointers instead of decoding whole blocks.</li>
+    <li><b>Conjunctions</b> are where Loom pays off. AND is 7.6–11× faster (7.5 against 57 µs on FiQA, 21 against 230 µs on TREC-COVID): Loom's cursors skip with sampled pointers instead of decoding whole blocks. OR gains nothing: the two formats are within 2% of each other on TREC-COVID and Quora, and Loom is 1.2× slower on FiQA.</li>
     <li><b>Size</b> is 2–4% smaller than BP128, at 11.7–12.7 bits per posting including frequencies.</li>
-    <li><b>Ranked top-10</b> is close: MaxScore is within 0.9–1.3× across formats. MaxScore beats Block-Max WAND by 1.9–2.6× on these queries.</li>
+    <li><b>Ranked top-10</b> is close: MaxScore is within 0.95–1.0× across formats. MaxScore beats Block-Max WAND by 1.9–2.6× on these queries.</li>
   </ul>
 </div>
 <div class="wide" id="text-table"></div>
@@ -86,9 +87,9 @@
 
 <div class="col">
   <h3 id="r-vectors">Vector indexes</h3>
-    <p>On Quora (522,931 vectors, 1,024 dimensions), HNSW reaches recall@10 0.962 at 0.054 ms and 0.991 at 0.13 ms (ef 64, the default). IVF needs 0.58 ms for 0.936 (nprobe 32) and 1.8 ms for 0.977. The exact scan of 8-bit codes with float32 re-ranking reaches 1.000 in 38 ms.</p>
-  <p>The quantised dot product costs 12 ns per vector with VNNI (7.6 ns when four rows are scored at once), against 48 ns in float32. Scoring on the codes alone already ranks the exact top-10 correctly in all 100 sampled queries; float32 re-ranking only settles ties. HNSW took 201 s to build with four threads, IVF 54 s.</p>
-  <p>Cold, access patterns decide. With the kernel's default read-around, one HNSW query reads 32,290 pages (124 ms). Advising the graph and its codes <code>MADV_RANDOM</code> cuts that to 1,193 pages (54 ms), and prefetching each hop's neighbours cuts it to 15 ms. IVF reads its clusters sequentially, so it is fastest with read-ahead: 15 ms, or 8 ms with prefetching.</p>
+    <p>On Quora (522,931 vectors, 1,024 dimensions), HNSW reaches recall@10 0.960 at 0.036 ms and 0.990 at 0.086 ms (ef 64, the default). IVF needs 0.22 ms for 0.936 (nprobe 32) and 0.67 ms for 0.977. The exact scan of 8-bit codes with float32 re-ranking reaches 1.000 in 9.7 ms.</p>
+  <p>The quantised dot product costs 14 ns per vector with NEON <code>usdot</code> (9.8 ns when four rows are scored at once), against 70 ns in float32; on x86-64 the same kernel uses AVX-512 VNNI. Scoring on the codes alone already finds 99.8% of the exact top-10 over 100 sampled queries; float32 re-ranking settles the rest. HNSW took 146 s to build with four threads, IVF 53 s.</p>
+  <p>Cold, access patterns decide. With the kernel's default read-ahead, one HNSW query reads 9,672 pages (136 ms). Advising the graph and its codes <code>MADV_RANDOM</code> cuts that to 4,836 pages (113 ms), and prefetching each hop's neighbours cuts it to 28 ms. IVF reads its clusters sequentially, so it is fastest with read-ahead: 26 ms, or 10 ms with prefetching.</p>
 </div>
 <figure class="narrow">
   <div class="frame">
@@ -116,22 +117,22 @@
   </div>
 </figure>
 <div class="col">
-    <p>Across 300 filtered vector queries per collection, the planner is 2.1× faster than the best fixed strategy on TREC-COVID (251 ms against 523 ms for always pre-filtering) and 5.3× faster on Quora (451 ms against 2,375 ms). Recall@10 stays at 0.992–0.998. Always using the HNSW index would take 6–16 s. Against an oracle that knows the fastest plan per query with recall ≥ 0.9, the planner spends 1.3–1.6× more time in total.</p>
-  <p>Two refinements made that gap small. The first measures selectivity near the query. Planning on global selectivity alone, 100 TREC-COVID queries took 328 ms against an oracle's 48 ms. A 32-neighbour sample brought that to 61 ms. On Quora, though, it still sent far-topic 10% filters into 60–100 ms graph walks where a 5 ms scan sufficed: 1,076 ms in total. A second, 160-neighbour sample, taken when the first finds at most one match, brought Quora to 451 ms. The second refinement costs post-filtering with the smaller of the global and local selectivity, since its candidate pool is sized from the global one.</p>
-  <p>For BM25 with filters, and for structured filters alone, geometric-mean regret is 1.07–1.30. Range filters choose between a zone-map scan and histogram bucket postings, and filtered BM25 chooses between driving scoring from the filter and probing it. On IVF, the planner leans on the index and gets recall 0.93; an oracle limited to recall ≥ 0.9 must spend more, which is why the IVF rows show the planner faster than that oracle.</p>
+    <p>Across 300 filtered vector queries per collection, the planner is 2.7× faster than the best fixed strategy on TREC-COVID (121 ms against 325 ms for always pre-filtering) and 6.1× faster on Quora (179 ms against 1,089 ms). Recall@10 stays at 0.991–0.998. Always using the HNSW index would take 2.9–6.1 s. Against an oracle that knows the fastest plan per query with recall ≥ 0.9, the planner's total time is 1.0–1.6× the oracle's.</p>
+  <p>Two refinements made that gap small; the timings in this paragraph come from the development runs on the earlier Xeon VM. The first measures selectivity near the query. Planning on global selectivity alone, 100 TREC-COVID queries took 328 ms against an oracle's 48 ms. A 32-neighbour sample brought that to 61 ms. On Quora, though, it still sent far-topic 10% filters into 60–100 ms graph walks where a 5 ms scan sufficed: 1,076 ms in total. A second, 160-neighbour sample, taken when the first finds at most one match, brought Quora to 451 ms. The second refinement costs post-filtering with the smaller of the global and local selectivity, since its candidate pool is sized from the global one.</p>
+  <p>For BM25 with filters, and for structured filters alone, geometric-mean regret is 1.06–1.18. Range filters choose between a zone-map scan and histogram bucket postings, and filtered BM25 chooses between driving scoring from the filter and probing it. On IVF, the planner leans on the index and gets recall 0.93; an oracle limited to recall ≥ 0.9 must spend more, which is why the IVF rows show the planner faster than that oracle.</p>
 </div>
 <div class="wide" id="planner-table"></div>
 
 <div class="col">
   <h3 id="r-showcase">Compound queries</h3>
   <p>The workload measures one query shape at a time. These ten statements combine them: phrases with negation, prefixes, OR and NOT filters, both fusion methods, facets over a match, column ordering, and exact distance with a forced strategy. Each runs on every collection with the first test query's text and vector bound to <code>:t</code> and <code>:q</code>. Each cell shows the median time, the row count and the plan, read from the executor's plan lines.</p>
-  <p>The same statement gets different plans as the data changes. The OR filter in the fourth query matches about 15% of documents everywhere. On SciFact the planner scans those 800 documents. On the larger collections it measures 11% near the query and post-filters the HNSW result. The RRF query's topic filter matches 11% of Quora globally but only 3.4% near this query, so the planner switches to an exact scan of the 58,767 members, at 5.4 ms.</p>
+  <p>The same statement gets different plans as the data changes. The OR filter in the fourth query matches about 15% of documents everywhere. On SciFact the planner scans those 800 documents. On the larger collections it measures 11% near the query and post-filters the HNSW result. The RRF query's topic filter matches 11% of Quora globally but only 3.4% near this query, so the planner switches to an exact scan of the 58,767 members, at 3.1 ms.</p>
 </div>
 <div class="wide" id="showcase-table"></div>
 
 <div class="col">
   <h3 id="r-storage">Transactions and storage</h3>
-    <p>A durable single-document commit is one WAL append and one <code>fsync</code>: 0.27 ms at the median, 3,190 commits per second. Batching amortises the sync. With 1,000 documents per transaction, the WAL takes 87,000 documents per second. Without <code>fsync</code> it takes 155,000–269,000; a process crash still loses nothing then, but a power failure may lose recent commits.</p>
+    <p>A durable single-document commit is one WAL append and one <code>fsync</code>: 4.1 ms at the median, 227 commits per second. On macOS the sync is <code>F_FULLFSYNC</code>, which makes the SSD flush its write cache; the earlier VM's <code>fdatasync</code> on a virtual disk did not have to, and took 0.27 ms. Batching amortises the sync. With 1,000 documents per transaction, the WAL takes 98,000 documents per second. Without <code>fsync</code> it takes 155,000–438,000; a process crash still loses nothing then, but a power failure may lose recent commits.</p>
 </div>
 <figure class="narrow">
   <div class="frame">
@@ -142,9 +143,9 @@
 </figure>
 <div class="col">
     <ul>
-    <li><b>Read your writes.</b> Committed documents are searchable at once. The first query after a write rebuilds the memtable's last 1,024-document chunk with every index of the evaluation table, which takes 31–39 ms. An unchunked memtable of 10,000 documents takes 411 ms. Later queries reuse the chunk, and taking a snapshot costs 0.1–0.2 µs.</li>
-    <li><b>Opening a database</b> reads the meta slots, the manifest and each segment's directory. Cold, that takes 3.3 ms for 10 segments, 13 ms for 100 and 123 ms for 994 (8 ms warm). Replaying 10,000 WAL documents takes 63 ms at open, plus 369 ms to index them at the first query.</li>
-    <li><b>Merges.</b> A tiered merge of eight 5,000-document segments, 10% of them deleted, rebuilds every index in 2.2 s, about 16,000 documents per second. After a delete-heavy workload the file is 1.22× its compacted size until <code>vacuum</code>.</li>
+    <li><b>Read your writes.</b> Committed documents are searchable at once. The first query after a write rebuilds the memtable's last 1,024-document chunk with every index of the evaluation table, which takes 17–20 ms. An unchunked memtable of 10,000 documents takes 169 ms. Later queries reuse the chunk, and taking a snapshot costs at most 0.13 µs.</li>
+    <li><b>Opening a database</b> reads the meta slots, the manifest and each segment's directory. Cold, that takes 6.8 ms for 10 segments, 40 ms for 100 and 279 ms for 994 (6 ms warm). Replaying 10,000 WAL documents takes 34 ms at open, plus 207 ms to index them at the first query.</li>
+    <li><b>Merges.</b> A tiered merge of eight 5,000-document segments, 10% of them deleted, rebuilds every index in 0.75 s, about 48,000 documents per second. After a delete-heavy workload the file is 1.22× its compacted size until <code>vacuum</code>.</li>
     <li><b>Recovery.</b> The crash test kills a writer process with SIGKILL at a random moment during inserts, deletes, commits and flushes, then reopens. Every restart recovered a committed prefix: 20 runs by default, and 60 and 80 in longer runs. A damaged meta slot falls back to the other one.</li>
   </ul>
 </div>

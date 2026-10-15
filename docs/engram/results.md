@@ -17,10 +17,10 @@ Engram works as a long-term memory for Claude Code. Every hook event is stored w
 
 | requirement | met | missed |
 |---|---|---|
-| **Store without being asked** | Prompts, tool calls and results, errors, answers, commentary and compaction summaries are captured from hooks. A hook costs 9–17 ms, appends under 1.5 ms. The 26-hour session becomes 2,204 records, back-filled in 6 s. | The model's reasoning is redacted in transcripts, so the "why" survives only where it was written out. |
+| **Store without being asked** | Prompts, tool calls and results, errors, answers, commentary and compaction summaries are captured from hooks. A hook costs 14–26 ms, most of it starting the hook process; a durable append takes about 4.5 ms. The 26-hour session becomes 2,204 records, back-filled in 6 s (on the cloud VM). | The model's reasoning is redacted in transcripts, so the "why" survives only where it was written out. |
 | **Load without being asked, only when it helps** | 13 of 15 lost details came back automatically after a compaction; 8 of 8 questions about the 26-hour history answered in live sessions, against 0 of 4 without Engram. | The gate's precision is modest: 59% against 42% for always injecting on LongMemEval, no gain on LoCoMo. |
 | **Let the model ask precisely** | In a live session the model followed an injected record id with `memory_timeline` and quoted the exact command and output of a previous session. | Whether the model searches depends on the model and the prompt. |
-| **Scale far beyond a context window** | At a million records (about 200 sessions of this repository's size) a recall query takes 11.5 ms at the median and the file holds 3.5 KB per record. | Finding one conversation's needle among generic filler gets harder: recall@10 0.78 at 10k records, 0.45 at 1M. |
+| **Scale far beyond a context window** | At a million records (about 200 sessions of this repository's size) a recall query takes 5.7 ms at the median and the file holds 3.1 KB per record. | Finding one conversation's needle among generic filler gets harder: recall@10 0.80 at 10k records, 0.44 at 1M. |
 
 ## Claude Code with and without Engram
 
@@ -125,13 +125,13 @@ A store is filled with LongMemEval turns: 94 needle questions whose evidence ses
 
 | records | recall query p50 / p99 | full hook p50 / p99 | append p99 | bytes per record | needles in top 10 |
 |---|---|---|---|---|---|
-| 10,000 | 3.1 / 7.5 ms | 9.4 / 15.4 ms | 0.9 ms | 3.5 KB | 0.78 |
-| 100,000 | 4.0 / 11.7 ms | 9.6 / 15.5 ms | 1.5 ms | 3.5 KB | 0.52 |
-| 1,000,000 | 11.5 / 39 ms | 17.2 / 67.7 ms | 0.7 ms | 3.5 KB | 0.45 |
+| 10,000 | 1.3 / 3.3 ms | 14.4 / 17.2 ms | 6.2 ms | 3.1 KB | 0.80 |
+| 100,000 | 1.7 / 5.0 ms | 15.6 / 19.8 ms | 5.6 ms | 3.1 KB | 0.65 |
+| 1,000,000 | 5.7 / 16 ms | 26.1 / 42.7 ms | 8.0 ms | 3.1 KB | 0.44 |
 
-*Source: `engram/results/scale/scale_static.json`. A million records is about 3.5 GB, mostly 512-dimension vectors. The static embedder processes 9,500–11,000 records a second.*
+*Source: `engram/results/scale/scale_static.json`, on the M2 MacBook Air. A million records is about 3.1 GB, mostly 512-dimension vectors. The static embedder processes 48,000–52,000 records a second. Records are cut at 400 characters, so the needles' evidence spans 8,762 records. A full hook is mostly process start (about 10 ms on macOS, against 3 ms on Linux), and an append is a durable commit, which on macOS flushes the drive's write cache (about 4.5 ms).*
 
-Later work removed the biggest remaining cost, which was not the search at all. A write used to make the next query rebuild an HNSW graph over the last memtable chunk (22–25 ms); memtable segments now scan their vectors instead. A query right after a write fell from 38 to **11.5 ms** at a million records (p99 110 → 34 ms), and the prompt hook, with the knowledge query running beside the main search, takes **14.7 ms** at the median and 29.8 ms at p99.
+Later work removed the biggest remaining cost, which was not the search at all. A write used to make the next query rebuild an HNSW graph over the last memtable chunk (12 ms); memtable segments now scan their vectors instead. A query right after a write fell from 18 to **6.4 ms** at a million records (p99 45 → 16 ms), and the prompt hook, with the knowledge query running beside the main search, takes **24.9 ms** at the median and 38.6 ms at p99.
 
 Quality is what degrades with size: the filler here is chat on every subject, while real project history is more homogeneous, so this is a stress test rather than a forecast. Strata's filters (session, time, file, kind) are what keep large stores precise, and `memory_sql` gives the model those filters directly.
 
@@ -148,7 +148,7 @@ Quality is what degrades with size: the filler here is chat on every subject, wh
 - A reranker behind the gate, scoring only the candidates of prompts that pass it.
 - Two-speed embeddings: capture with the static model, re-embed with BGE when the machine is idle.
 - Time-aware queries: turn "yesterday" or "before the refactor" into the time and sequence filters Strata already evaluates.
-- Hooks over HTTP to a localhost daemon, saving the 3 ms of process start per event.
+- Hooks over HTTP to a localhost daemon, saving the process start per event: about 10 ms on macOS, 3 ms on Linux.
 - Shared project memory: one store per repository, synced between teammates' agents.
 
 The long-form reports have every chart and table: [Engram](../reports/engram.html) and [record structure](../reports/structure.html).

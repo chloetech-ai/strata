@@ -41,7 +41,7 @@
     s("text", { x: 18, y: 300, class: "tm" }, g, "MCP: memory_search,");
     s("text", { x: 18, y: 316, class: "tm" }, g, "timeline, sql, remember");
     // clients
-    box(g, 240, 70, 150, 58, "box", "engram hook <event>", ["one process per hook", "~10 ms, never blocks"]);
+    box(g, 240, 70, 150, 58, "box", "engram hook <event>", ["one process per hook", "~15 ms, never blocks"]);
     box(g, 240, 276, 150, 50, "box", "engram mcp", ["stdio JSON-RPC"]);
     arrow(g, 200, 99, 240, 99);
     arrow(g, 200, 305, 240, 305);

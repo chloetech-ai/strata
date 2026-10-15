@@ -4,7 +4,7 @@
     {
       "first": null,
       "label": "phrase, boolean and negation",
-      "ms": 0.469242,
+      "ms": 0.35716699999999996,
       "plan": [
         "seg 0: filter materialised, 0 docs"
       ],
@@ -14,7 +14,7 @@
     {
       "first": "204",
       "label": "prefix and conjunction",
-      "ms": 0.13224,
+      "ms": 0.09112500000000001,
       "plan": [
         "seg 0: filter materialised, 204 docs"
       ],
@@ -24,7 +24,7 @@
     {
       "first": "v4bjjpku · 17.9950",
       "label": "ranked text, OR / NOT filter",
-      "ms": 0.472522,
+      "ms": 0.28650000000000003,
       "plan": [
         "seg 0: filter materialised, 43164 docs",
         "seg 0: bm25 MaxScore, filter Materialize"
@@ -35,7 +35,7 @@
     {
       "first": "e54b5cbs · 0.6456",
       "label": "filtered vector, OR filter",
-      "ms": 0.400374,
+      "ms": 0.1005,
       "plan": [
         "seg 0: selectivity 0.1492 global, 0.1061 near the query",
         "seg 0: vector PostFilter (PostFilter ran), filter Probe"
@@ -46,7 +46,7 @@
     {
       "first": "nol2n8fo · 0.9722",
       "label": "filtered hybrid, weighted",
-      "ms": 3.1004840000000002,
+      "ms": 1.460834,
       "plan": [
         "seg 0: filter materialised, 31260 docs",
         "seg 0: bm25 MaxScore, filter Materialize",
@@ -60,7 +60,7 @@
     {
       "first": "fnmztcol · 0.0271",
       "label": "hybrid, RRF on a correlated filter",
-      "ms": 3.34413,
+      "ms": 1.964917,
       "plan": [
         "seg 0: filter materialised, 21113 docs",
         "seg 0: bm25 MaxScore, filter Materialize",
@@ -73,7 +73,7 @@
     {
       "first": "t27 · 116",
       "label": "facets over a text match",
-      "ms": 0.07783899999999999,
+      "ms": 0.043292,
       "plan": [
         "seg 0: filter materialised, 465 docs",
         "seg 0: facet Codes over 465 docs"
@@ -84,7 +84,7 @@
     {
       "first": "u3yvpcnr · 4.6100",
       "label": "text filter, ordered by a column",
-      "ms": 0.0562,
+      "ms": 0.041291,
       "plan": [
         "seg 0: filter materialised, 4 docs"
       ],
@@ -94,7 +94,7 @@
     {
       "first": "4",
       "label": "count over a boolean and a range",
-      "ms": 0.02595,
+      "ms": 0.016958,
       "plan": [
         "seg 0: filter materialised, 4 docs"
       ],
@@ -104,7 +104,7 @@
     {
       "first": "5enmq7do",
       "label": "nearest by distance, exact",
-      "ms": 5.100033000000001,
+      "ms": 3.2676250000000002,
       "plan": [
         "seg 0: filter materialised, 74660 docs",
         "seg 0: vector PreFilter (PreFilter ran), filter Materialize"

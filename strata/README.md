@@ -26,12 +26,13 @@ diagrams and results, is built into `report/strata.html` by
 | `src/segment/` | immutable segments of named, aligned sections, read zero-copy through `mmap` |
 | `src/text/` | analyser, Loom and BP128 postings, positions, BM25 with MaxScore and Block-Max WAND |
 | `src/forward/` | FOR-packed columns with zone maps, keyword dictionaries and Pyramid lists, range histograms, facets, LZ4 doc store |
-| `src/vector/` | float32 and SQ8 (VNNI) vectors, flat, IVF and HNSW, filtered search |
+| `src/vector/` | float32 and SQ8 (VNNI on x86-64, NEON dot products on aarch64) vectors, flat, IVF and HNSW, filtered search |
 | `src/graph/` | EDGES fields: out-edge CSR and reverse index per segment; breadth-first search, shortest paths, personalized PageRank |
 | `src/query/` | SQL binder (sqlparser), logical plan, cost-based planner, executor, RRF and weighted fusion, graph predicates and scores |
+| `src/postings/` | compressed posting-list formats (Loom, Pyramid, Entropic, BP128 and the formats they were compared with), intersection and union algorithms, and their testbed; see [`notes/posting-lists.md`](notes/posting-lists.md) |
 | `src/db.rs` | `Db`: open, load, query |
 | `src/baselines/` | SQLite + FTS5 and Tantivy baselines (feature `baselines`) |
-| `src/bin/` | `strata` shell, `strata-eval`, component benchmarks, `strata-baselines`, `strata-graph-bench` |
+| `src/bin/` | `strata` shell, `strata-eval`, component benchmarks, `strata-baselines`, `strata-graph-bench`, `strata-posting-bench` |
 
 ## Using it
 
@@ -84,5 +85,16 @@ python3 scripts/graph_quality_stats.py results/graph/quality_arxiv.rows.jsonl.gz
 target/release/strata-graph-bench synthetic --nodes 1000000 --sqlite /home/user/data/graph/synthetic.sqlite
 ```
 
+Posting lists (WikiText-103 and synthetic collections; see
+[`notes/posting-lists.md`](notes/posting-lists.md)):
+
+```sh
+scripts/postings/prepare_wikitext.sh data
+scripts/postings/run_experiments.sh data/wikitext103.txt
+scripts/postings/run_designs.sh data/wikitext103.txt
+python3 scripts/postings/build_report.py              # report/postings/report.html and designs.html
+```
+
 Results are in `results/` as JSON, one file per system, study and
-collection; logs of the runs that produced them are in `results/logs/`.
+collection (the posting-list study's under `results/postings/`); logs of the
+runs that produced them are in `results/logs/`.

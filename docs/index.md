@@ -17,13 +17,13 @@ Long-term memory for coding agents, built on Strata, an embedded search database
 
 A coding agent's context window is its whole working memory. When a long session fills it, Claude Code *compacts*: it replaces the history with a summary of about 15,000 characters. The plan survives; the particulars do not. Exact error messages, the reason an approach was dropped, and a rule the user stated once three hours earlier all go. A new session starts with almost nothing.
 
-This repository holds three projects that together address that problem, each built on the one below it.
+This repository holds two projects that together address that problem, Engram built on Strata, and Strata's own study of the posting lists underneath it.
 
 | layer | what it is | read more |
 |---|---|---|
 | **Engram** | Automatic long-term context for Claude Code. Hooks store every event of a session; a per-project daemon decides when to bring history back, and MCP tools let the model search it. | [How it works](engram/index.md) · [Inspector](engram/inspector.md) · [Results](engram/results.md) |
 | **Strata** | An embedded, single-file search database with ACID transactions and SQL. Every table is indexed as full text, structured columns and vectors at once, with graph edges between rows and a cost-based planner over all of it. | [Design](strata/index.md) · [SQL](strata/query-language.md) · [Graphs](strata/graphs.md) · [Results](strata/results.md) |
-| **posting_bench** | A study of compressed posting lists and their intersection and union algorithms, which produced three new formats. Strata's text index uses two of them. | [Posting lists](posting-lists.md) |
+| **Strata's posting lists** | A study of compressed posting lists and their intersection and union algorithms, which produced three new formats. Strata's text and keyword indexes use two of them. | [Posting lists](posting-lists.md) |
 
 For the short version, with the week-long Kestrel benchmark and its cost comparison, read [the Engram showcase](engram-showcase.md).
 
@@ -65,8 +65,8 @@ flowchart TB
 | After a compaction, do the lost details come back? | **13 of 15** automatically, 14 with one search. None were in the summary. |
 | Can a new session answer questions about a 26-hour history? | **8 of 8** with Engram, **0 of 4** without. |
 | How good is retrieval on a public benchmark? | LongMemEval-S: evidence in the top 10 for **90%** of questions; inside the default 4,000-character injection for 87%. |
-| What does it cost per prompt? | **9–17 ms** for a full hook at 10k–1M records; a million records take 3.5 GB. |
-| Is Strata fast? | Warm BM25 **1.8–4.6×** faster than Tantivy; vector top-10 in **0.09–0.20 ms**; the filtered-vector planner **1.5–5.3×** faster than the best fixed strategy. |
+| What does it cost per prompt? | **14–26 ms** for a full hook at 10k–1M records, most of it starting the hook process; a million records take 3.1 GB. |
+| Is Strata fast? | Warm BM25 **1.7–3.2×** faster than Tantivy; vector top-10 in **0.05–0.10 ms**; the filtered-vector planner **1.8–6.1×** faster than the best fixed strategy. |
 | Do graph edges help search? | Following the citations of the two nearest papers doubles nDCG@20 on arXiv (0.123 → 0.253). |
 
 </div>
@@ -85,4 +85,4 @@ Each project also has a long-form report with interactive charts, formulas and e
 
 ## Where the numbers come from
 
-Every figure on these pages comes from the experiments committed in this repository (`*/results/`), run on a 4-core cloud VM with an Emerald Rapids Xeon. Some of them were run again for this release; [Reproducing the results](reproduce.md) lists which, and how to run the rest.
+Every figure on these pages comes from the experiments committed in this repository (`*/results/`). The timings were measured on a MacBook Air with an Apple M2 (8 cores, 24 GB), replacing earlier runs on a 4-core cloud VM; the runs that call a model are the original ones. [Reproducing the results](reproduce.md) compares the two machines and has the commands.

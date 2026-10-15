@@ -45,7 +45,7 @@ pub mod traverse;
 
 use std::collections::BTreeMap;
 
-use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
+use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 use serde_json::Value as Json;
 
 use crate::error::{corrupt, Error, Result};

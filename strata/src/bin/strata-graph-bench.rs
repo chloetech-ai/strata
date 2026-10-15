@@ -610,8 +610,20 @@ fn quality(dbp: &Path, data: &Path, vectors: &Path, dim: usize, k: usize, seeds:
             }
         })
         .collect();
+    let params_of = |q: i64| {
+        let p = &papers[q as usize];
+        Params::new()
+            .set("q", Value::Vector(vecs[q as usize * dim..(q as usize + 1) * dim].to_vec().into()))
+            .set("t", Value::Str(format!("{}\n{}", p.title, p.abstract_)))
+    };
     for (name, sql) in &methods {
         let sql = sql.replace(":k", &k.to_string());
+        // One untimed pass first, so that the times are warm: the first touch
+        // of each page through the mapping faults, and on macOS (16 KiB pages,
+        // no fault-around) that cost dominated the first method.
+        for &q in &held {
+            db.query(&sql, &params_of(q)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
         let (mut rec, mut nd, mut ms) = (Vec::new(), Vec::new(), Vec::new());
         for &q in &held {
             let p = &papers[q as usize];
@@ -619,9 +631,7 @@ fn quality(dbp: &Path, data: &Path, vectors: &Path, dim: usize, k: usize, seeds:
             if truth.is_empty() {
                 continue;
             }
-            let params = Params::new()
-                .set("q", Value::Vector(vecs[q as usize * dim..(q as usize + 1) * dim].to_vec().into()))
-                .set("t", Value::Str(format!("{}\n{}", p.title, p.abstract_)));
+            let params = params_of(q);
             let t = Instant::now();
             let rs = db.query(&sql, &params).unwrap_or_else(|e| panic!("{name}: {e}"));
             ms.push(t.elapsed().as_secs_f64() * 1e3);

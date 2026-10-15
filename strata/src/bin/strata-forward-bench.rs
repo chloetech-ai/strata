@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
-use posting_bench::bytes::OwnedBytes;
+use strata::postings::bytes::OwnedBytes;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde_json::{json, Value as Json};
 use strata::forward::{self, count_range, eval_range, DocStore, FacetStrategy, KeywordColumn, NumericColumn, RangeIndex, RangeStrategy};

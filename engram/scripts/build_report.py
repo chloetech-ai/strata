@@ -1,5 +1,5 @@
 """Assemble report/engram.html from the template, the shared style and chart
-helpers of posting_bench's reports, and results/.
+helpers of Strata's posting-list reports, and results/.
 Usage: python3 scripts/build_report.py"""
 import datetime
 import json
@@ -8,7 +8,7 @@ import pathlib
 root = pathlib.Path(__file__).resolve().parent.parent
 results = root / "results"
 report = root / "report"
-shared = root.parent / "posting_bench" / "report"
+shared = root.parent / "strata" / "report" / "postings"
 
 
 def load(path):

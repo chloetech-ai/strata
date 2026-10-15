@@ -10,9 +10,9 @@
 //! `bias` is the same for every document, so ranking needs only `Σ w_j·c_j`.
 //! The weights `w` are quantised once per query to int8 (`w ≈ alpha · v`), so
 //! scoring a document is an integer dot product of its u8 codes with the i8
-//! query: one `vpdpbusd` per 64 dimensions.
+//! query: one `vpdpbusd` per 64 dimensions (NEON: one `usdot` per 16).
 
-use posting_bench::bytes::Slice;
+use crate::postings::bytes::Slice;
 
 use crate::vector::kernels;
 

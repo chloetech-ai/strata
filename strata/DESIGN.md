@@ -154,7 +154,7 @@ reader (sections to a zero-copy view). Global docIDs are
   for terms in at least 512 documents (the posting-list study that preceded
   this design), with frequencies bit-packed in 128-posting blocks addressed by
   posting rank; rarer terms use BP128 blocks. Against an all-BP128 layout,
-  Loom is 2–4% smaller with 7.6–12× faster conjunctions. MaxScore is the
+  Loom is 2–4% smaller with 7.6–11× faster conjunctions. MaxScore is the
   default top-k algorithm: on the BEIR queries it beats Block-Max WAND by
   1.9–2.6×. A filter either drives the scoring (its members
   are scored directly) or is probed per candidate, by a fitted crossover.
@@ -175,8 +175,8 @@ reader (sections to a zero-copy view). Global docIDs are
   equality and `IN` filters become set operations. Pyramid is the encoding
   (plain sorted arrays below 64 documents): the fastest unions and count-only
   intersections for facet counts. Per-candidate probes use the code column
-  and a bitset of accepted codes (6–9 ns), which beats probing the Pyramid
-  lists (9–24 ns).
+  and a bitset of accepted codes (4–5 ns), which beats probing the Pyramid
+  lists (5–33 ns).
 * **Range postings.** Numeric fields get an equi-depth histogram (64
   buckets) whose buckets are docID lists. A range is the union of the buckets
   it covers, plus the boundary buckets filtered through the column. The
@@ -189,7 +189,8 @@ reader (sections to a zero-copy view). Global docIDs are
 * **Forward vectors.** Every vector field stores float32 vectors (for exact
   re-ranking) and 8-bit scalar-quantised codes (SQ8, per-dimension min/max)
   for scanning: 4× less I/O, and with the query quantised too, integer dot
-  products with AVX-512 VNNI at 10–15 ns per 1,024-dimension vector.
+  products with AVX-512 VNNI on x86-64 or NEON `usdot` on aarch64, at
+  10–14 ns per 1,024-dimension vector on the M2.
 * **Flat.** Exact scan of SQ8 codes plus float32 re-ranking. The right answer
   for small segments and very selective filters.
 * **IVF.** k-means centroids; each cluster's members are stored contiguously
@@ -250,8 +251,8 @@ needs no graph code: its in-memory segments are built by the same builder.
 Keys instead of docIDs are what let edges survive updates, deletes and
 merges untouched, and they are also the cost: a cross-segment hop is a hash
 probe per segment where an in-memory CSR reads an array. On a million-row
-power-law graph in four segments, personalized PageRank takes 5.8 ms where
-the CSR takes 1.3 ms; on arXiv in two segments, 1.4 ms against 0.5 ms. A
+power-law graph in four segments, personalized PageRank takes 3.5 ms where
+the CSR takes 0.66 ms; on arXiv in two segments, 0.72 ms against 0.30 ms. A
 merge into fewer segments narrows the gap; a snapshot-wide resolved CSR,
 rebuilt when segments change, would close it at the price of memory and
 rebuild time.

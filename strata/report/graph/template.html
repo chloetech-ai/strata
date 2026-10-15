@@ -34,7 +34,7 @@ td.good { color: var(--accent); font-weight: 600; }
 
 <div class="page">
 <header class="col">
-  <div class="eyebrow">posting_bench · strata · graphs</div>
+  <div class="eyebrow">strata · graphs</div>
   <h1>Graph indexes and graph queries in Strata</h1>
   <p class="lede">Strata keeps a table's text, structured fields and vectors in one file and queries them with SQL. Rows can now link to other rows. A traversal, a shortest path or personalized PageRank runs in the same statement as BM25, filters and vector search, and can start from any of them. This page covers how edges are stored and resolved, the SQL, the planner's part, speed against SQLite and an in-memory graph, and whether the graph helps search when a vector search is the way into it. It does: on arXiv, the papers cited by a new paper's two nearest neighbours find twice as many of its references as vector search alone. A graph built from the vectors themselves does not help.</p>
   <p class="meta" id="meta-line"></p>

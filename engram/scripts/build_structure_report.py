@@ -1,5 +1,5 @@
 """Assemble report/structure.html (what a memory record should be) from
-report/structure/, the shared style and chart helpers of posting_bench's
+report/structure/, the shared style and chart helpers of Strata's posting-list
 reports, and results/.
 Usage: python3 scripts/build_structure_report.py"""
 import datetime
@@ -11,7 +11,7 @@ from collections import defaultdict
 root = pathlib.Path(__file__).resolve().parent.parent
 results = root / "results"
 src = root / "report" / "structure"
-shared = root.parent / "posting_bench" / "report"
+shared = root.parent / "strata" / "report" / "postings"
 
 
 def load(path):

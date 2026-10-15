@@ -4,8 +4,8 @@
 //!
 //! 1. exact float32 top-100 per query (cached next to the data), and nDCG@10
 //!    of exact dense retrieval;
-//! 2. kernel speed (float32, SQ8 with VNNI, SQ8 asymmetric) and the ranking
-//!    quality of the two SQ8 scorings;
+//! 2. kernel speed (float32, SQ8 with VNNI or NEON dot products, SQ8
+//!    asymmetric) and the ranking quality of the two SQ8 scorings;
 //! 3. per index kind (flat, IVF, HNSW): build time, section sizes, recall@10
 //!    against latency (re-rank, `nprobe` and `ef` sweeps), and cold-cache
 //!    latency with pages read (segment file mapped, evicted before each query);
@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use memmap2::Mmap;
-use posting_bench::bytes::OwnedBytes;
+use strata::postings::bytes::OwnedBytes;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 use strata::metrics::{mean, ndcg_at_k, percentile, recall};
@@ -297,6 +297,7 @@ fn kernels_study(ds: &Dataset, r: &VectorReader, gt: &[Vec<Hit>], nq: usize) -> 
     let scalar_ns = time_ns(200_000, |i| {
         std::hint::black_box(kernels::dot_u8_i8_scalar(cs[i % 64], &qc.q8));
     });
+    let isa = kernels::SQ8_KERNEL;
     // Ranking quality of SQ8 alone (no re-ranking): top-10 by each scoring.
     let n = ds.n as u32;
     let nq = nq.min(ds.queries.len());
@@ -312,12 +313,13 @@ fn kernels_study(ds: &Dataset, r: &VectorReader, gt: &[Vec<Hit>], nq: usize) -> 
         ra.push(recall(&b.iter().take(10).map(|x| x.1).collect::<Vec<_>>(), &truth));
     }
     println!(
-        "kernels ({dim}d): f32 {f32_ns:.1} ns, sq8 vnni {vnni_ns:.1} ns (x4 {x4_ns:.1} ns/row), sq8 asym {asym_ns:.1} ns, sq8 scalar {scalar_ns:.1} ns; SQ8-only recall@10 vnni {:.4} asym {:.4}",
+        "kernels ({dim}d): f32 {f32_ns:.1} ns, sq8 {isa} {vnni_ns:.1} ns (x4 {x4_ns:.1} ns/row), sq8 asym {asym_ns:.1} ns, sq8 scalar {scalar_ns:.1} ns; SQ8-only recall@10 {isa} {:.4} asym {:.4}",
         mean(&rv),
         mean(&ra)
     );
+    // The `vnni` keys hold whichever int8 kernel ran (`sq8_kernel`).
     json!({
-        "dim": dim,
+        "dim": dim, "sq8_kernel": isa,
         "ns_dot_f32": f32_ns, "ns_dot_u8_i8_vnni": vnni_ns, "ns_dot_u8_i8_vnni_x4_per_row": x4_ns,
         "ns_dot_u8_f32_asym": asym_ns, "ns_dot_u8_i8_scalar": scalar_ns,
         "sq8_only_recall10_vnni": mean(&rv), "sq8_only_recall10_asym": mean(&ra), "sq8_queries": nq,
@@ -630,6 +632,13 @@ fn main() {
         };
         let mut curve = Vec::new();
         for (name, v, p) in &sweep {
+            // An untimed pass first. The segment was just written, so its
+            // pages are cached, but the first touch of each page through the
+            // new mapping still faults, and each setting re-ranks different
+            // candidates; macOS maps one 16 KiB page per fault, without
+            // Linux's fault-around, which made the shallow settings of the
+            // sweep look slower than the deep ones.
+            run(&r, &qs, 10, p, &|_| None, f64::INFINITY);
             let res = run(&r, &qs, 10, p, &|_| None, f64::INFINITY);
             let mut s = summary(&res, &truth10);
             let nd: Vec<f64> = res.hits.iter().enumerate().filter_map(|(qi, h)| ndcg(&ds, qi, h)).collect();

@@ -53,7 +53,7 @@ td.sys { font-weight: 600; }
 
 <div class="page">
 <header class="col">
-  <div class="eyebrow">posting_bench · strata</div>
+  <div class="eyebrow">strata</div>
   <h1>Strata: full text, structured filters and vectors in one SQL file</h1>
   <p class="lede">An embedded search database in the spirit of SQLite: one file, ACID transactions, SQL. Every table is indexed three ways at once (posting lists, a columnar forward index and vector ANN indexes), and a cost-based planner combines them in a single query. This page is the design, the prototype built from the earlier posting-list research, and its evaluation against SQLite and Tantivy on four BEIR collections.</p>
   <p class="meta" id="meta-line"></p>
@@ -160,15 +160,15 @@ td.sys { font-weight: 600; }
   <h3>Structured fields</h3>
   <ul>
     <li><b>Columns.</b> Integers and floats sit in 128-document blocks, frame-of-reference bit-packed, with min/max zone maps per block and per 4,096-document superblock. Two-decimal floats such as <code>rating</code> are detected and stored as scaled integers (0–499).</li>
-    <li><b>Keyword postings.</b> Each value has a Pyramid docID list (a sorted array below 64 documents), so equality and <code>IN</code> are unions. Per-candidate probes instead use the code column and a bitset of accepted codes, at 6–9 ns against 9–24 ns for Pyramid probes.</li>
+    <li><b>Keyword postings.</b> Each value has a Pyramid docID list (a sorted array below 64 documents), so equality and <code>IN</code> are unions. Per-candidate probes instead use the code column and a bitset of accepted codes, at 4–5 ns against 5–33 ns for Pyramid probes.</li>
     <li><b>Range postings.</b> An equi-depth histogram of 64 buckets stores each bucket as a Pyramid list. A range is the union of the buckets it covers plus the two boundary buckets checked against the column. Counting is exact from the histogram for whole buckets. The histogram is also the planner's selectivity estimator.</li>
     <li><b>Facets</b> count either by reading the result's codes, or by count-only Pyramid intersections when the result is large and the values few.</li>
     <li><b>Doc store.</b> Rows are kept in LZ4-compressed 16 KiB blocks.</li>
   </ul>
   <h3>Vectors</h3>
-  <p>Each vector field keeps float32 vectors for exact re-ranking and 8-bit codes for scanning. Codes are per-dimension scalar quantised, and the query is quantised too, so the inner loop is an integer dot product on AVX-512 VNNI:</p>
+  <p>Each vector field keeps float32 vectors for exact re-ranking and 8-bit codes for scanning. Codes are per-dimension scalar quantised, and the query is quantised too, so the inner loop is an integer dot product: NEON <code>usdot</code> on aarch64 (16 byte products per instruction), AVX-512 VNNI on x86-64:</p>
   <div class="math">\[ c_i = \Bigl\lfloor \frac{x_i - \min_i}{\Delta_i} \Bigr\rceil, \qquad \langle q, \hat{x} \rangle = \sum_i q_i (\min_i + \Delta_i c_i) \;\approx\; \alpha \sum_i \tilde{q}_i\, c_i + \beta, \]</div>
-  <p>with \(\tilde q\) the 8-bit query, \(\alpha, \beta\) per-query constants, and one 1,024-dimension score in 10–15 ns. Three index kinds sit on top. <b>Flat</b> scans codes and re-ranks the best \(r\) in float32. <b>IVF</b> stores each k-means cluster's docIDs contiguously, followed by their codes, so a probe is one sequential read and a filter is an intersection with the cluster's docID list. <b>HNSW</b> keeps fixed-degree adjacency arrays in the segment; filtered HNSW traverses through non-matching nodes but only collects matching ones.</p>
+  <p>with \(\tilde q\) the 8-bit query, \(\alpha, \beta\) per-query constants, and one 1,024-dimension score in 10–14 ns on the M2. Three index kinds sit on top. <b>Flat</b> scans codes and re-ranks the best \(r\) in float32. <b>IVF</b> stores each k-means cluster's docIDs contiguously, followed by their codes, so a probe is one sequential read and a filter is an intersection with the cluster's docID list. <b>HNSW</b> keeps fixed-degree adjacency arrays in the segment; filtered HNSW traverses through non-matching nodes but only collects matching ones.</p>
 </section>
 
 <section class="col" id="planner">
@@ -202,7 +202,7 @@ td.sys { font-weight: 600; }
   <div class="col">
     <h2>Evaluation</h2>
     <p>Four BEIR collections, with Cohere embed-english-v3 vectors (1,024 dimensions) for documents and queries, and human relevance judgments: SciFact (5,183 documents), FiQA (57,638), TREC-COVID (171,332) and Quora (522,931). Each document also has synthetic structured fields: <code>year</code> uniform over 1990–2024, <code>category</code> Zipf-distributed over 64 values, <code>rating</code> uniform over [0, 5). A content-correlated <code>topic</code> (the k-means cluster of the document's vector) gives filters that correlate with queries. One generated workload per collection is run by all three systems: BM25, boolean, filter, vector, hybrid and facet queries, at filter selectivities from 0.1% to 50%.</p>
-    <p>Each system is fully built (one Strata segment, one Tantivy segment after merging, one SQLite file), then measured single-threaded on a 4-core Xeon with AVX-512, nothing else running. Warm latency is the median of up to three repetitions per query. Cold runs close the database, evict its files from the OS page cache, reopen and run one query; pages read are the file pages the query brought into the page cache.</p>
+    <p>Each system is fully built (one Strata segment, one Tantivy segment after merging, one SQLite file), then measured single-threaded on an Apple M2 MacBook Air (NEON kernels, on mains power), nothing else running. Warm latency is the median of up to three repetitions per query. Cold runs close the database, evict its files from the OS page cache, reopen and run one query; pages read are the file pages the query brought into the page cache.</p>
   </div>
   <!--RESULTS-->
 </section>

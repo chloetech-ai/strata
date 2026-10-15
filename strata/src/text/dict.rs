@@ -23,7 +23,7 @@
 
 use std::cmp::Ordering;
 
-use posting_bench::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
+use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 
 use super::codec::{get_varint, put_varint};
 use crate::error::{corrupt, Result};

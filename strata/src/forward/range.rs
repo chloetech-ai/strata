@@ -8,9 +8,9 @@
 //! duplicates: an OR into a bitset for dense results (Flat chunks and dense
 //! blocks OR word by word), Pyramid's k-way union for sparse ones.
 
-use posting_bench::bytes::{ByteReader, ByteWriter};
-use posting_bench::codecs::pyramid::Pyramid;
-use posting_bench::codecs::{PostingList, SetOps};
+use crate::postings::bytes::{ByteReader, ByteWriter};
+use crate::postings::codecs::pyramid::Pyramid;
+use crate::postings::codecs::{PostingList, SetOps};
 
 use super::blocks::KeyRange;
 use super::lists::{build_list, merge_sorted, write_lists, ListTable};

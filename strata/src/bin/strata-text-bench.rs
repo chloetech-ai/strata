@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use memmap2::{Advice, Mmap};
-use posting_bench::bytes::OwnedBytes;
+use strata::postings::bytes::OwnedBytes;
 use rand::{rngs::StdRng, seq::index, Rng, SeedableRng};
 use serde::Deserialize;
 use serde_json::{json, Value};

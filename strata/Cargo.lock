@@ -764,17 +764,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
-name = "posting_bench"
-version = "0.1.0"
-dependencies = [
- "bitpacking",
- "clap",
- "rand",
- "rand_distr",
- "roaring",
-]
-
-[[package]]
 name = "powerfmt"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1133,8 +1122,9 @@ dependencies = [
  "libc",
  "lz4_flex 0.11.6",
  "memmap2",
- "posting_bench",
  "rand",
+ "rand_distr",
+ "roaring",
  "rusqlite",
  "rust-stemmers",
  "serde",
