@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds Engram from this checkout, installs the binary, downloads the
 # embedding model and wires Engram into Claude Code. Run it again after
-# `git pull` to upgrade.
+# `git pull` to upgrade. Non-interactive; exits non-zero when a step fails or
+# when `engram doctor` reports a failed check. Agents: see AGENTS.md.
 #
 #   ./install.sh                         every Claude Code session on this machine
 #   ./install.sh --project ~/code/app    one project only
@@ -24,7 +25,7 @@ while [ $# -gt 0 ]; do
     --distill-model) DISTILL="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --no-wire) WIRE=0; shift ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown option $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -88,7 +89,8 @@ else
 fi
 
 say "checking"
-"$BIN" doctor || true
+STATUS=0
+"$BIN" doctor || STATUS=$?
 
 cat <<EOF
 
@@ -99,3 +101,5 @@ Next:
   - $BIN doctor        check the setup again
   - $BIN uninstall --user   (or: uninstall in the project) to remove it; stores are kept
 EOF
+[ "$STATUS" = 0 ] || say "engram doctor reported a problem above; fix it and run $BIN doctor again"
+exit "$STATUS"

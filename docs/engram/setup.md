@@ -50,6 +50,14 @@ git clone https://github.com/rkonow/engram && cd engram && ./install.sh
 
 Sessions that were already open pick Engram up when they restart.
 
+## Or let your agent do it
+
+Tell Claude Code (or another coding agent) in any session:
+
+> Clone https://github.com/rkonow/engram and set Engram up for my Claude Code by following its AGENTS.md.
+
+[`AGENTS.md`](https://github.com/rkonow/engram/blob/main/AGENTS.md) tells the agent to check the prerequisites without installing anything unasked, to ask you whether to install for every session or one project, to run `install.sh` and `engram doctor`, and to report what failed. Two things stay with you: `claude auth login` if the CLI is logged out (it is interactive), and starting a new session afterwards, because the session that ran the install started before the hooks existed.
+
 ## Or step by step
 
 ```bash
