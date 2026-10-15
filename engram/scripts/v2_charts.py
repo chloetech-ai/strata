@@ -97,14 +97,15 @@ def evidence_chart():
 
 
 LANE_NAMES = {"none": "no memory", "ccmem": "Claude Code\nauto memory", "transcripts": "past\ntranscripts", "claude-mem": "claude-mem", "mem0": "mem0",
-              "engram@main": "Engram\nmain", "engram+v5": "Engram new\n(default)", "engram+rank": "Engram new,\nranker only", "full": "whole history\nin context",
+              "engram@main": "Engram\nmain", "engram+v7": "Engram new\n(default)", "engram+v5": "Engram new,\nearlier ranker prompt", "engram+rank": "Engram new, ranker only,\nearlier prompt",
+              "full": "whole history\nin context",
               "engram+nodeep": "first build,\nno query engine", "engram": "first build\n(async)", "engram+deep": "first build\n(sync)"}
-LANE_COLORS = {"none": GREY, "ccmem": AMBER, "transcripts": AMBER, "claude-mem": PURPLE, "mem0": PURPLE, "engram@main": BLUE, "engram+v5": DARK, "engram+rank": TEAL,
+LANE_COLORS = {"none": GREY, "ccmem": AMBER, "transcripts": AMBER, "claude-mem": PURPLE, "mem0": PURPLE, "engram@main": BLUE, "engram+v7": DARK, "engram+v5": DARK, "engram+rank": TEAL,
                "engram+nodeep": TEAL, "engram": DARK, "engram+deep": DARK, "full": GREEN}
 # Every task ran four times in these lanes; the first build's lanes (the
 # query engine as first proposed) ran three times, before two bakehouse tasks
 # existed, and are reported in pooled.md only.
-CHART_LANES = ["none", "ccmem", "transcripts", "claude-mem", "mem0", "engram@main", "engram+v5", "engram+rank", "full"]
+CHART_LANES = ["none", "ccmem", "transcripts", "claude-mem", "mem0", "engram@main", "engram+v7", "engram+v5", "engram+rank", "full"]
 
 
 def lanes_chart(scenarios):

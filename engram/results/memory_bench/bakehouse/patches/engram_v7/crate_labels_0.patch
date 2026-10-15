@@ -1,0 +1,126 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 22397be..037ec4a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@
+ - Added `format_pence` and `Product.price_text` for pounds display of pence amounts.
+ - Added `invoice_for` to build a customer's invoice for a day at catalog prices, and `invoice_number` for numbers like `LK-2026-0001`.
+ - Added the sale-or-return credit calculation for Greenway Grocers' sandwich loaves.
++- Added `crate_labels` (one label per customer and product for a day, lines wrapped to 48 ASCII characters, allergens in capitals).
+ - Added `day_summary` and `top_products` reports.
+ - Added `total_batches` (trays for the oven) and `crates_needed` (whole crates, rounding up).
+ - Customers: optional `email` column, `Customer.__str__` returns the name, and `load_customers` rejects duplicate `route_seq` values.
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..28ffeda
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,34 @@
++"""Crate labels for the packing room. The label printer prints plain ASCII only, fits
++48 characters per line and cuts off anything longer rather than wrapping it."""
++
++import textwrap
++import unicodedata
++
++from .invoice import invoice_for
++
++LINE_WIDTH = 48
++
++
++def ascii_text(text):
++    """`text` with accents folded to plain ASCII, e.g. 'Café' -> 'Cafe'. Other characters are dropped."""
++    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++
++
++def crate_labels(orderbook, customers, day):
++    """One label per customer and product ordered for delivery on `day`, as a list of strings.
++
++    Labels follow the van run (route_seq), then product code. Each label is the customer's
++    name, then the quantity and product name, then the allergens in capitals. Every line is
++    wrapped to LINE_WIDTH characters, so nothing is cut off."""
++    labels = []
++    for code in sorted(orderbook.customers_for(day), key=lambda c: customers[c].route_seq):
++        for line in invoice_for(orderbook, code, day).lines:
++            product = orderbook.catalog.get(line.product)
++            parts = [customers[code].name, f"{line.qty} x {product.name}"]
++            if product.allergens:
++                parts.append(f"ALLERGENS: {product.allergen_text()}")
++            lines = []
++            for part in parts:
++                lines.extend(textwrap.wrap(ascii_text(part), LINE_WIDTH))
++            labels.append("\n".join(lines))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..5696190
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,68 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import ascii_text, crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("CRO", "Croissant", 110),
++            Product("RYE", "Seeded rye sourdough", 360, allergens=("wheat", "sesame", "rye")),
++            Product("SOU", "White sourdough", 320),
++        ])
++        self.customers = {
++            "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 2),
++            "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "1 High St", "LK3 4CD", 1),
++        }
++
++    def test_one_label_per_customer_and_product_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY, "LUMEN", "CRO", 10),
++            OrderLine(DAY, "GREENWAY", "CRO", 20),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Greenway Grocers\n20 x Croissant",
++            "Cafe Lumen\n10 x Croissant",
++            "Cafe Lumen\n6 x White sourdough",
++        ])
++
++    def test_quantities_for_the_same_product_are_summed(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "CRO", 10),
++            OrderLine(DAY, "LUMEN", "CRO", 14),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Cafe Lumen\n24 x Croissant"])
++
++    def test_allergens_follow_in_capitals(self):
++        book = OrderBook(self.catalog, [OrderLine(DAY, "LUMEN", "RYE", 4)])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Cafe Lumen\n4 x Seeded rye sourdough\nALLERGENS: RYE, SESAME, WHEAT",
++        ])
++
++    def test_long_lines_wrap_and_stay_within_48_characters(self):
++        long_name = "The Very Long Name Of A Café And Delicatessen Company Limited"
++        customers = {"LUMEN": Customer("LUMEN", long_name, "14 Mill Lane", "LK1 2AB", 1)}
++        book = OrderBook(self.catalog, [OrderLine(DAY, "LUMEN", "RYE", 4)])
++        label = crate_labels(book, customers, DAY)[0]
++        lines = label.split("\n")
++        self.assertTrue(all(len(line) <= 48 for line in lines), lines)
++        self.assertEqual(" ".join(lines[:-2]), long_name.replace("é", "e"))
++        self.assertEqual(lines[-1], "ALLERGENS: RYE, SESAME, WHEAT")
++
++    def test_other_days_and_empty_days_give_no_labels(self):
++        book = OrderBook(self.catalog, [OrderLine(datetime.date(2026, 10, 21), "LUMEN", "CRO", 5)])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [])
++
++    def test_ascii_text_folds_accents(self):
++        self.assertEqual(ascii_text("Crème brûlée"), "Creme brulee")
++
++
++if __name__ == "__main__":
++    unittest.main()

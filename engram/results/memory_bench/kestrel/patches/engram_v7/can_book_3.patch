@@ -1,0 +1,98 @@
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..c49edf5
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,35 @@
++"""Checks run by the booking form before it saves an appointment."""
++
++import datetime
++
++from .models import ASSESSMENT, ATTENDED, BOOKED, FOLLOWUP
++
++DURATIONS = {
++    ASSESSMENT: datetime.timedelta(minutes=45),
++    FOLLOWUP: datetime.timedelta(minutes=30),
++}
++
++# Statuses that hold the slot. Cancelled and no-show appointments free it.
++HOLDS_SLOT = (BOOKED, ATTENDED)
++
++
++def _end(appointment):
++    return appointment.start + DURATIONS[appointment.kind]
++
++
++def can_book(calendar, therapist, appointment):
++    """True if the appointment can be added to the calendar for this therapist.
++
++    It must belong to the therapist and must not overlap any other
++    appointment of theirs that still holds its slot.
++    """
++    if appointment.therapist_id != therapist.id:
++        return False
++    start = appointment.start
++    end = _end(appointment)
++    for other in calendar.for_therapist(therapist.id):
++        if other.status not in HOLDS_SLOT:
++            continue
++        if start < _end(other) and other.start < end:
++            return False
++    return True
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..2ca815a
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,51 @@
++import unittest
++
++from helpers import appt, utc
++from kestrel.booking import can_book
++from kestrel.calendar import Calendar
++from kestrel.models import ASSESSMENT, CANCELLED, NO_SHOW, Therapist
++
++THERAPIST = Therapist("T1", "Alex", "HB")
++
++
++class CanBookTest(unittest.TestCase):
++    def test_empty_calendar(self):
++        self.assertTrue(can_book(Calendar(), THERAPIST, appt("new", utc(2027, 3, 1, 9))))
++
++    def test_back_to_back_is_allowed(self):
++        # A 30-minute follow-up at 09:00 ends at 09:30, so 09:30 is free.
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9))])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 9, 30))))
++
++    def test_overlapping_start_is_refused(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9))])
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 9, 15))))
++
++    def test_new_appointment_overlapping_existing_is_refused(self):
++        # An assessment at 09:00 runs to 09:45, which overlaps a follow-up at 09:30.
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9, 30))])
++        new = appt("new", utc(2027, 3, 1, 9), kind=ASSESSMENT)
++        self.assertFalse(can_book(cal, THERAPIST, new))
++
++    def test_same_slot_is_refused(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9))])
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 9))))
++
++    def test_other_therapists_appointments_do_not_block(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9), therapist="T2")])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 9))))
++
++    def test_cancelled_and_no_show_free_the_slot(self):
++        cal = Calendar([
++            appt("c", utc(2027, 3, 1, 9), status=CANCELLED),
++            appt("n", utc(2027, 3, 1, 10), status=NO_SHOW),
++        ])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 9))))
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 10))))
++
++    def test_appointment_for_another_therapist_is_refused(self):
++        self.assertFalse(can_book(Calendar(), THERAPIST, appt("new", utc(2027, 3, 1, 9), therapist="T2")))
++
++
++if __name__ == "__main__":
++    unittest.main()

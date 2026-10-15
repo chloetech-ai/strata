@@ -1,0 +1,87 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..0e01c03
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,32 @@
++"""Text of the SMS reminders sent to clients before their appointment."""
++
++import unicodedata
++
++RECEPTION_NUMBER = "044 512 77 30"
++MAX_LENGTH = 160
++
++# German spellings first: a generic accent strip would turn "ä" into "a", not "ae".
++_GERMAN = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
++
++
++def to_ascii(text):
++    """Plain ASCII for the SMS gateway, which turns other characters into question marks."""
++    for letter, replacement in _GERMAN.items():
++        text = text.replace(letter, replacement)
++    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
++    if not text.isascii():
++        bad = "".join(sorted({c for c in text if not c.isascii()}))
++        raise ValueError(f"cannot send {bad!r} in an SMS")
++    return text
++
++
++def reminder_text(appointment):
++    """The reminder for `appointment`, at most MAX_LENGTH characters, always with the reception number."""
++    when = appointment.start.strftime("%d.%m.%Y um %H:%M")
++    text = to_ascii(
++        f"Hallo {appointment.client}, Erinnerung an Ihren Termin am {when} "
++        f"bei {appointment.therapist}. Zum Verschieben: {RECEPTION_NUMBER}"
++    )
++    if len(text) > MAX_LENGTH:
++        raise ValueError(f"reminder is {len(text)} characters, the limit is {MAX_LENGTH}")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..7ea1960
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,43 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import MAX_LENGTH, RECEPTION_NUMBER, reminder_text, to_ascii
++
++
++def appointment(client="Zoë Brändli", therapist="Anna Keller"):
++    return Appointment(therapist, client, datetime.datetime(2026, 10, 20, 9, 30))
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_umlauts_are_spelled_out(self):
++        self.assertEqual(to_ascii("Brändli Böhler Müller Strauß"), "Braendli Boehler Mueller Strauss")
++
++    def test_other_accents_are_stripped(self):
++        self.assertEqual(to_ascii("Zoë Éric"), "Zoe Eric")
++
++    def test_characters_that_cannot_be_sent_are_refused(self):
++        with self.assertRaises(ValueError):
++            to_ascii("王")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_text_is_plain_ascii_with_transliterated_name(self):
++        text = reminder_text(appointment())
++        self.assertTrue(text.isascii())
++        self.assertIn("Zoe Braendli", text)
++        self.assertIn("20.10.2026 um 09:30", text)
++
++    def test_every_reminder_has_the_reception_number(self):
++        self.assertIn(RECEPTION_NUMBER, reminder_text(appointment()))
++
++    def test_reminder_is_at_most_160_characters(self):
++        self.assertLessEqual(len(reminder_text(appointment(client="A" * 40, therapist="B" * 20))), MAX_LENGTH)
++
++    def test_too_long_reminder_is_refused(self):
++        with self.assertRaises(ValueError):
++            reminder_text(appointment(client="A" * 200))
++
++
++if __name__ == "__main__":
++    unittest.main()

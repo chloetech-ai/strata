@@ -1,6 +1,6 @@
 # Memory bench: bakehouse
 
-Model haiku; 792 runs. Solved = score 1.0. Costs in USD per run; memory $ = the memory system's own model calls during the run; history $ = agent + memory system while recording the history.
+Model haiku; 864 runs. Solved = score 1.0. Costs in USD per run; memory $ = the memory system's own model calls during the run; history $ = agent + memory system while recording the history.
 
 | lane | runs | solved | score | control solved | inference solved | recall solved | revised solved | stale solved | where_why solved | $/run | memory $/run | steps | wall s | memory tool calls | history $ (agent + memory) | p vs none (Fisher / perm) | p vs engram@main (Fisher / perm) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -16,28 +16,29 @@ Model haiku; 792 runs. Solved = score 1.0. Costs in USD per run; memory $ = the 
 | full | 72 | 62/72 | 0.95 | 8/8 | 10/16 | 4/4 | 15/16 | 17/20 | 8/8 | 0.042 | 0.000 | 3.9 | 18 | 0.0 | 0.19 + 0.00 | 0.000 / 0.000 | 1.000 / 0.578 |
 | engram+rank | 72 | 70/72 | 0.98 | 8/8 | 14/16 | 4/4 | 16/16 | 20/20 | 8/8 | 0.006 | 0.001 | 7.0 | 24 | 0.1 | 0.19 + 0.09 | 0.000 / 0.000 | 0.055 / 0.021 |
 | engram+v5 | 72 | 69/72 | 0.98 | 8/8 | 13/16 | 4/4 | 16/16 | 20/20 | 8/8 | 0.007 | 0.002 | 7.9 | 27 | 0.2 | 0.19 + 0.11 | 0.000 / 0.000 | 0.129 / 0.004 |
+| engram+v7 | 72 | 67/72 | 0.95 | 8/8 | 12/16 | 4/4 | 15/16 | 20/20 | 8/8 | 0.007 | 0.002 | 7.7 | 27 | 0.2 | 0.21 + 0.11 | 0.000 / 0.000 | 0.400 / 0.466 |
 
 Per task (mean score):
 
-| task | kind | none | ccmem | transcripts | claude-mem | mem0 | engram@main | engram | engram+deep | engram+nodeep | full | engram+rank | engram+v5 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| delivery_charge | revised | 0.00 | 1.00 | 0.83 | 0.25 | 0.67 | 1.00 | 1.00 | 1.00 | 0.56 | 0.83 | 1.00 | 1.00 |
-| price_rise | revised | 0.00 | 0.08 | 1.00 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| bake_sheet | revised | 0.92 | 1.00 | 0.92 | 0.67 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| crate_labels | revised | 0.55 | 0.75 | 0.90 | 0.50 | 0.85 | 0.95 | 1.00 | 0.87 | 1.00 | 1.00 | 1.00 | 1.00 |
-| extend_cutoff | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.62 | 1.00 | 1.00 |
-| next_delivery_day | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| relief_baker_note | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| cutoff_quick | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | – | – | – | 1.00 | 1.00 | 1.00 |
-| closed_day_quick | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | – | – | – | 1.00 | 1.00 | 1.00 |
-| owner_weekly_file | inference | 0.33 | 1.00 | 0.33 | 0.33 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| vat_export | inference | 0.50 | 1.00 | 0.58 | 0.58 | 0.33 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| van_list | inference | 0.00 | 0.38 | 0.12 | 0.00 | 0.12 | 0.56 | 0.17 | 0.50 | 0.67 | 0.75 | 0.62 | 0.88 |
-| school_order | inference | 0.33 | 0.33 | 0.33 | 0.33 | 0.33 | 0.33 | 1.00 | 1.00 | 0.33 | 0.83 | 1.00 | 0.83 |
-| returns_credit | recall | 0.00 | 1.00 | 0.25 | 0.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| pence_why | where_why | 0.50 | 0.50 | 0.75 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| unknown_code_why | where_why | 0.50 | 1.00 | 0.88 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| easter_sunday | control | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| baker_percentages | control | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| task | kind | none | ccmem | transcripts | claude-mem | mem0 | engram@main | engram | engram+deep | engram+nodeep | full | engram+rank | engram+v5 | engram+v7 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| delivery_charge | revised | 0.00 | 1.00 | 0.83 | 0.25 | 0.67 | 1.00 | 1.00 | 1.00 | 0.56 | 0.83 | 1.00 | 1.00 | 1.00 |
+| price_rise | revised | 0.00 | 0.08 | 1.00 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| bake_sheet | revised | 0.92 | 1.00 | 0.92 | 0.67 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| crate_labels | revised | 0.55 | 0.75 | 0.90 | 0.50 | 0.85 | 0.95 | 1.00 | 0.87 | 1.00 | 1.00 | 1.00 | 1.00 | 0.95 |
+| extend_cutoff | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.62 | 1.00 | 1.00 | 1.00 |
+| next_delivery_day | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| relief_baker_note | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| cutoff_quick | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | – | – | – | 1.00 | 1.00 | 1.00 | 1.00 |
+| closed_day_quick | stale | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | – | – | – | 1.00 | 1.00 | 1.00 | 1.00 |
+| owner_weekly_file | inference | 0.33 | 1.00 | 0.33 | 0.33 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| vat_export | inference | 0.50 | 1.00 | 0.58 | 0.58 | 0.33 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| van_list | inference | 0.00 | 0.38 | 0.12 | 0.00 | 0.12 | 0.56 | 0.17 | 0.50 | 0.67 | 0.75 | 0.62 | 0.88 | 0.12 |
+| school_order | inference | 0.33 | 0.33 | 0.33 | 0.33 | 0.33 | 0.33 | 1.00 | 1.00 | 0.33 | 0.83 | 1.00 | 0.83 | 1.00 |
+| returns_credit | recall | 0.00 | 1.00 | 0.25 | 0.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| pence_why | where_why | 0.50 | 0.50 | 0.75 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| unknown_code_why | where_why | 0.50 | 1.00 | 0.88 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| easter_sunday | control | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| baker_percentages | control | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
 
 p: two-sided. Fisher = Fisher's exact test on solved runs pooled over tasks; perm = permutation test of the mean score difference with lane labels shuffled within each task (scripts/ab_stats.py).

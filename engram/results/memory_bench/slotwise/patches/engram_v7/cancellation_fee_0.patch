@@ -1,0 +1,89 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index ca928f0..dd3c7df 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,19 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_add_rejects_text_without_digits",
++  "tests/test_clients.py::ClientBookTest::test_email_is_optional",
++  "tests/test_clients.py::ClientBookTest::test_finds_client_by_any_notation",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_umlauts_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_order",
++  "tests/test_clients.py::ClientBookTest::test_search_without_match_returns_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_phone_returns_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_notations_give_the_same_number",
++  "tests/test_fees.py::CancellationFeeTest::test_cancelling_after_the_start_is_full_price",
++  "tests/test_fees.py::CancellationFeeTest::test_exactly_24_hours_notice_is_half_price",
++  "tests/test_fees.py::CancellationFeeTest::test_exactly_48_hours_notice_is_free",
++  "tests/test_fees.py::CancellationFeeTest::test_less_than_24_hours_notice_is_full_price",
++  "tests/test_fees.py::CancellationFeeTest::test_less_than_48_hours_notice_is_half_price",
++  "tests/test_fees.py::CancellationFeeTest::test_more_than_48_hours_notice_is_free",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..bfe2830
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,17 @@
++"""Cancellation fees."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours before the start costs the full price, less than 48 hours
++    costs half, and 48 hours or more before the start is free.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..73faf90
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,36 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def setUp(self):
++        self.start = datetime.datetime(2026, 9, 7, 9, 0)
++        self.appointment = Appointment("lena", "Kim Weber", self.start, "standard")
++
++    def cancel_after(self, notice):
++        return cancellation_fee(self.appointment, self.start - notice)
++
++    def test_more_than_48_hours_notice_is_free(self):
++        self.assertEqual(self.cancel_after(datetime.timedelta(hours=49)), 0)
++
++    def test_exactly_48_hours_notice_is_free(self):
++        self.assertEqual(self.cancel_after(datetime.timedelta(hours=48)), 0)
++
++    def test_less_than_48_hours_notice_is_half_price(self):
++        self.assertEqual(self.cancel_after(datetime.timedelta(hours=47, minutes=59)), 4900)
++
++    def test_exactly_24_hours_notice_is_half_price(self):
++        self.assertEqual(self.cancel_after(datetime.timedelta(hours=24)), 4900)
++
++    def test_less_than_24_hours_notice_is_full_price(self):
++        self.assertEqual(self.cancel_after(datetime.timedelta(hours=23, minutes=59)), 9800)
++
++    def test_cancelling_after_the_start_is_full_price(self):
++        self.assertEqual(self.cancel_after(datetime.timedelta(hours=-1)), 9800)
++
++
++if __name__ == "__main__":
++    unittest.main()

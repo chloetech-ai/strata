@@ -1,0 +1,122 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index a535ae8..bd8ad1e 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -31,6 +31,16 @@
+   "tests/test_reorder.py::ReorderTest::test_at_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
++  "tests/test_scanner.py::ReadScannerFileTest::test_blank_lines_and_crlf_are_ignored",
++  "tests/test_scanner.py::ReadScannerFileTest::test_empty_file_gives_empty_dict",
++  "tests/test_scanner.py::ReadScannerFileTest::test_empty_sku_is_rejected",
++  "tests/test_scanner.py::ReadScannerFileTest::test_negative_quantity_is_rejected_with_line_number",
++  "tests/test_scanner.py::ReadScannerFileTest::test_non_integer_quantity_is_rejected",
++  "tests/test_scanner.py::ReadScannerFileTest::test_normalizes_sku_spelling",
++  "tests/test_scanner.py::ReadScannerFileTest::test_reads_bin_sku_qty",
++  "tests/test_scanner.py::ReadScannerFileTest::test_sums_a_sku_across_bins",
++  "tests/test_scanner.py::ReadScannerFileTest::test_wrong_column_count_is_rejected",
++  "tests/test_scanner.py::ReadScannerFileTest::test_zero_quantity_is_a_counted_empty_bin",
+   "tests/test_storage.py::StorageTest::test_load_legacy_file_without_reason_column",
+   "tests/test_storage.py::StorageTest::test_load_legacy_zero_quantity_is_rejected",
+   "tests/test_storage.py::StorageTest::test_load_rejects_unknown_reason",
+diff --git a/src/stockroom/scanner.py b/src/stockroom/scanner.py
+new file mode 100644
+index 0000000..d7ec80c
+--- /dev/null
++++ b/src/stockroom/scanner.py
+@@ -0,0 +1,33 @@
++"""Reading the handheld scanner export.
++
++The export is plain text with no header line, one count per line, with the
++columns bin;sku;qty separated by semicolons.
++"""
++
++from typing import Dict
++
++from .items import normalize_sku
++
++
++def read_scanner_file(path) -> Dict[str, int]:
++    """Counted quantity per SKU. A SKU on several lines (overflow bins) is summed."""
++    counts = {}  # type: Dict[str, int]
++    with open(path, newline="", encoding="utf-8") as f:
++        for number, line in enumerate(f, start=1):
++            if not line.strip():
++                continue
++            fields = line.rstrip("\r\n").split(";")
++            if len(fields) != 3:
++                raise ValueError(f"line {number}: expected bin;sku;qty, got {line.strip()!r}")
++            _bin, sku, qty_text = fields
++            try:
++                qty = int(qty_text)
++            except ValueError:
++                raise ValueError(f"line {number}: quantity is not a whole number: {qty_text.strip()!r}")
++            if qty < 0:
++                raise ValueError(f"line {number}: quantity must not be negative, got {qty}")
++            sku = normalize_sku(sku)
++            if not sku:
++                raise ValueError(f"line {number}: SKU is empty")
++            counts[sku] = counts.get(sku, 0) + qty
++    return counts
+diff --git a/tests/test_scanner.py b/tests/test_scanner.py
+new file mode 100644
+index 0000000..77f7f23
+--- /dev/null
++++ b/tests/test_scanner.py
+@@ -0,0 +1,56 @@
++import os
++import tempfile
++import unittest
++
++from stockroom.scanner import read_scanner_file
++
++
++class ReadScannerFileTest(unittest.TestCase):
++    def read(self, text):
++        fd, path = tempfile.mkstemp(suffix=".txt")
++        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
++            f.write(text)
++        self.addCleanup(os.remove, path)
++        return read_scanner_file(path)
++
++    def test_reads_bin_sku_qty(self):
++        counts = self.read("B-12-3;BR-1042;7\nC-03-2;HX-0009;12\n")
++        self.assertEqual(counts, {"BR-1042": 7, "HX-0009": 12})
++
++    def test_sums_a_sku_across_bins(self):
++        counts = self.read("B-12-3;BR-1042;7\nOVR-1;BR-1042;5\n")
++        self.assertEqual(counts, {"BR-1042": 12})
++
++    def test_normalizes_sku_spelling(self):
++        counts = self.read("B-12-3; br-1042 ;2\nOVR-1;Br-1042 ;3\n")
++        self.assertEqual(counts, {"BR-1042": 5})
++
++    def test_zero_quantity_is_a_counted_empty_bin(self):
++        self.assertEqual(self.read("B-12-3;BR-1042;0\n"), {"BR-1042": 0})
++
++    def test_blank_lines_and_crlf_are_ignored(self):
++        counts = self.read("B-12-3;BR-1042;7\r\n\r\n   \r\nC-03-2;HX-0009;1\r\n")
++        self.assertEqual(counts, {"BR-1042": 7, "HX-0009": 1})
++
++    def test_empty_file_gives_empty_dict(self):
++        self.assertEqual(self.read(""), {})
++
++    def test_negative_quantity_is_rejected_with_line_number(self):
++        with self.assertRaisesRegex(ValueError, "line 2"):
++            self.read("B-12-3;BR-1042;7\nB-12-3;BR-1042;-1\n")
++
++    def test_non_integer_quantity_is_rejected(self):
++        with self.assertRaisesRegex(ValueError, "line 1"):
++            self.read("B-12-3;BR-1042;seven\n")
++
++    def test_wrong_column_count_is_rejected(self):
++        with self.assertRaisesRegex(ValueError, "line 1"):
++            self.read("B-12-3,BR-1042,7\n")
++
++    def test_empty_sku_is_rejected(self):
++        with self.assertRaisesRegex(ValueError, "line 1"):
++            self.read("B-12-3;  ;7\n")
++
++
++if __name__ == "__main__":
++    unittest.main()

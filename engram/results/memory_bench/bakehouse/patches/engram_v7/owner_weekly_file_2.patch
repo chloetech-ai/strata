@@ -1,0 +1,93 @@
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index 376c0ff..d0db1bc 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,8 @@
+ """Reports on the order book. All amounts are integer pence, before VAT."""
+ 
++import csv
++import datetime
++
+ 
+ def day_summary(orderbook, day):
+     """{customer code: value of that customer's orders for delivery on `day`, in pence}."""
+@@ -19,3 +22,21 @@ def top_products(orderbook, start, end, n=5):
+             units[line.product] = units.get(line.product, 0) + line.qty
+     ranked = sorted(units, key=lambda code: (-units[code], code))
+     return ranked[:n]
++
++
++def week_totals_file(orderbook, week_start, path):
++    """Write one row per customer with orders in the seven days from `week_start`: their total
++    before VAT in pounds. Semicolon-separated with a comma decimal separator, for Greta's
++    German-locale Excel. Customers are sorted by code."""
++    week_end = week_start + datetime.timedelta(days=7)
++    totals = {}
++    for line in orderbook.lines:
++        if week_start <= line.day < week_end:
++            price = orderbook.catalog.get(line.product).price
++            totals[line.customer] = totals.get(line.customer, 0) + line.qty * price
++    with open(path, "w", newline="", encoding="utf-8-sig") as f:
++        writer = csv.writer(f, delimiter=";")
++        writer.writerow(["customer", "total_gbp"])
++        for customer in sorted(totals):
++            pence = totals[customer]
++            writer.writerow([customer, "{},{:02d}".format(pence // 100, pence % 100)])
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index 25eac38..da87258 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -3,7 +3,10 @@ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++import os
++import tempfile
++
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ 
+@@ -56,5 +59,41 @@ class DaySummaryTest(unittest.TestCase):
+         self.assertEqual(day_summary(book, datetime.date(2026, 10, 22)), {})
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def read_file(self, book, week_start):
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "week.csv")
++            week_totals_file(book, week_start, path)
++            with open(path, newline="", encoding="utf-8-sig") as f:
++                return f.read()
++
++    def test_totals_in_pounds_semicolon_and_comma_decimal(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95), Product("SOU", "White sourdough", 320)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY + datetime.timedelta(days=6), "LUMEN", "SOU", 10),
++            OrderLine(DAY, "AIDAN", "BAG", 1),
++        ])
++        self.assertEqual(self.read_file(book, DAY), "customer;total_gbp\r\nAIDAN;0,95\r\nLUMEN;36,75\r\n")
++
++    def test_only_days_in_the_seven_day_window(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY - datetime.timedelta(days=1), "LUMEN", "BAG", 100),
++            OrderLine(DAY + datetime.timedelta(days=7), "LUMEN", "BAG", 100),
++            OrderLine(DAY + datetime.timedelta(days=2), "GREENWAY", "BAG", 3),
++        ])
++        self.assertEqual(self.read_file(book, DAY), "customer;total_gbp\r\nGREENWAY;2,85\r\n")
++
++    def test_pence_below_ten_keep_two_digits(self):
++        catalog = Catalog([Product("CHE", "Cheap bun", 5)])
++        book = OrderBook(catalog, [OrderLine(DAY, "LUMEN", "CHE", 3)])
++        self.assertEqual(self.read_file(book, DAY), "customer;total_gbp\r\nLUMEN;0,15\r\n")
++
++    def test_no_orders_gives_header_only(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95)])
++        self.assertEqual(self.read_file(OrderBook(catalog), DAY), "customer;total_gbp\r\n")
++
++
+ if __name__ == "__main__":
+     unittest.main()

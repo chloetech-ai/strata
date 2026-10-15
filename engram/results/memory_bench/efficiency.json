@@ -65,6 +65,17 @@
   "wall_s_p50": 27.9,
   "wall_s_p95": 46.9
  },
+ "engram+v7": {
+  "runs": 208,
+  "solved": 196,
+  "memory_chars": 12504.125,
+  "agent_input_tokens_p50": 158526,
+  "memory_model_tokens": 10627.923076923076,
+  "cost_usd": 0.006812544038461539,
+  "memory_cost_usd": 0.0019440096153846152,
+  "wall_s_p50": 25.4,
+  "wall_s_p95": 49.1
+ },
  "engram+v5": {
   "runs": 208,
   "solved": 201,

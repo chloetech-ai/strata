@@ -1,0 +1,111 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 16ea9b2..728594b 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1,3 +1,8 @@
+ {
+-  "tests/test_reorder.py::ReorderTest::test_at_reorder_point": true
++  "tests/test_reorder.py::ReorderTest::test_at_reorder_point": true,
++  "tests/test_cli.py": true,
++  "tests/test_inventory.py": true,
++  "tests/test_items.py": true,
++  "tests/test_reorder.py": true,
++  "tests/test_storage.py": true
+ }
+\ No newline at end of file
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..f22d43d
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,27 @@
++"""Printable blind count sheet for the stock-take."""
++
++
++def _bin_key(location):
++    """Sort key for an "aisle-bay-shelf" code, comparing numeric parts as numbers."""
++    key = []
++    for part in location.split("-"):
++        if part.isdigit():
++            key.append((0, int(part), ""))
++        else:
++            key.append((1, 0, part))
++    return tuple(key)
++
++
++def count_sheet(inventory):
++    """The count sheet as text, one line per catalog item in walking order.
++
++    It is a blind count: no quantity on hand is shown, only a blank field
++    where the counter writes what they counted.
++    """
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog")
++    items = sorted(inventory.catalog, key=lambda item: (_bin_key(item.location), item.sku))
++    return "".join(
++        f"{item.location:<10} {item.sku:<12} {item.name:<30} {item.unit:<5} {'_' * 12}\n"
++        for item in items
++    )
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..1ca9a36
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,57 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def test_one_line_per_item(self):
++        inv = Inventory(Catalog([
++            Item("BR-1", "Bolt", "A-01-1"),
++            Item("BR-2", "Nut", "A-01-2"),
++        ]))
++        self.assertEqual(len(count_sheet(inv).splitlines()), 2)
++
++    def test_walking_order_compares_bin_numbers(self):
++        inv = Inventory(Catalog([
++            Item("BR-1", "Bolt", "B-12-3"),
++            Item("BR-2", "Nut", "B-2-1"),
++        ]))
++        lines = count_sheet(inv).splitlines()
++        self.assertIn("BR-2", lines[0])
++        self.assertIn("BR-1", lines[1])
++
++    def test_walking_order_ignores_sku_order(self):
++        inv = Inventory(Catalog([
++            Item("BR-9", "Washer", "A-01-1"),
++            Item("BR-1", "Bolt", "A-02-1"),
++        ]))
++        lines = count_sheet(inv).splitlines()
++        self.assertIn("BR-9", lines[0])
++        self.assertIn("BR-1", lines[1])
++
++    def test_same_bin_sorted_by_sku(self):
++        inv = Inventory(Catalog([
++            Item("BR-2", "Nut", "A-01-1"),
++            Item("BR-1", "Bolt", "A-01-1"),
++        ]))
++        lines = count_sheet(inv).splitlines()
++        self.assertIn("BR-1", lines[0])
++        self.assertIn("BR-2", lines[1])
++
++    def test_does_not_show_quantity_on_hand(self):
++        inv = Inventory(Catalog([Item("BR-1", "Bolt", "A-01-1")]))
++        inv.receive("BR-1", 4321, 10)
++        self.assertNotIn("4321", count_sheet(inv))
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++    def test_requires_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,64 @@
+diff --git a/src/bakehouse/seasons.py b/src/bakehouse/seasons.py
+new file mode 100644
+index 0000000..3e7d933
+--- /dev/null
++++ b/src/bakehouse/seasons.py
+@@ -0,0 +1,21 @@
++"""Seasons: dates that set the bakery calendar, such as the hot cross bun season."""
++
++import datetime
++
++
++def easter_sunday(year):
++    """Date of Easter Sunday in the Western church (Gregorian calendar), for 1900 to 2199.
++    Anonymous Gregorian algorithm (Meeus/Jones/Butcher)."""
++    if not 1900 <= year <= 2199:
++        raise ValueError(f"easter_sunday is only defined here for 1900 to 2199, not {year}")
++    a = year % 19
++    b, c = divmod(year, 100)
++    d, e = divmod(b, 4)
++    f = (b + 8) // 25
++    g = (b - f + 1) // 3
++    h = (19 * a + b - d - g + 15) % 30
++    i, k = divmod(c, 4)
++    l = (32 + 2 * e + 2 * i - h - k) % 7
++    m = (a + 11 * h + 22 * l) // 451
++    month, day = divmod(h + l - 7 * m + 114, 31)
++    return datetime.date(year, month, day + 1)
+diff --git a/tests/test_seasons.py b/tests/test_seasons.py
+new file mode 100644
+index 0000000..60b9d41
+--- /dev/null
++++ b/tests/test_seasons.py
+@@ -0,0 +1,31 @@
++import datetime
++import unittest
++
++from bakehouse.seasons import easter_sunday
++
++
++class EasterSundayTest(unittest.TestCase):
++    def test_known_dates(self):
++        self.assertEqual(easter_sunday(1900), datetime.date(1900, 4, 15))
++        self.assertEqual(easter_sunday(1927), datetime.date(1927, 4, 17))
++        self.assertEqual(easter_sunday(1961), datetime.date(1961, 4, 2))
++        self.assertEqual(easter_sunday(2000), datetime.date(2000, 4, 23))
++        self.assertEqual(easter_sunday(2024), datetime.date(2024, 3, 31))
++        self.assertEqual(easter_sunday(2026), datetime.date(2026, 4, 5))
++
++    def test_is_always_a_sunday_in_range(self):
++        for year in range(1900, 2200):
++            with self.subTest(year=year):
++                self.assertEqual(easter_sunday(year).weekday(), 6)
++
++    def test_march_22_to_april_25_in_range(self):
++        for year in range(1900, 2200):
++            with self.subTest(year=year):
++                easter = easter_sunday(year)
++                self.assertTrue(datetime.date(year, 3, 22) <= easter <= datetime.date(year, 4, 25))
++
++    def test_year_outside_range_is_refused(self):
++        with self.assertRaises(ValueError):
++            easter_sunday(1899)
++        with self.assertRaises(ValueError):
++            easter_sunday(2200)

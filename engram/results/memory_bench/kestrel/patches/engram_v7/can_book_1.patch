@@ -1,0 +1,107 @@
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..96c9249
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,32 @@
++"""Booking checks for the booking form."""
++
++import datetime
++
++from .models import ASSESSMENT, BOOKED, FOLLOWUP
++
++# Appointment lengths, used to tell whether two appointments overlap.
++DURATIONS = {
++    ASSESSMENT: datetime.timedelta(minutes=45),
++    FOLLOWUP: datetime.timedelta(minutes=30),
++}
++
++
++def _end(appointment):
++    return appointment.start + DURATIONS[appointment.kind]
++
++
++def can_book(calendar, therapist, appointment):
++    """True if the appointment can be added without overbooking the therapist.
++
++    The appointment must be for this therapist, and it must not overlap any
++    booked appointment the therapist already has.
++    """
++    if appointment.therapist_id != therapist.id:
++        return False
++    start, end = appointment.start, _end(appointment)
++    for other in calendar.for_therapist(therapist.id):
++        if other.status != BOOKED:
++            continue
++        if start < _end(other) and other.start < end:
++            return False
++    return True
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..cd287a3
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,63 @@
++import datetime
++import unittest
++
++from helpers import appt, utc
++from kestrel.booking import can_book
++from kestrel.calendar import AUCKLAND, Calendar
++from kestrel.models import CANCELLED, NO_SHOW, Therapist
++
++T1 = Therapist("T1", "Ana", "HB")
++T2 = Therapist("T2", "Ben", "HB")
++
++
++class CanBookTest(unittest.TestCase):
++    def test_empty_calendar_allows_booking(self):
++        self.assertTrue(can_book(Calendar(), T1, appt("new", utc(2027, 3, 1, 9), therapist="T1")))
++
++    def test_exact_clash_refused(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9), therapist="T1")])
++        self.assertFalse(can_book(cal, T1, appt("new", utc(2027, 3, 1, 9), therapist="T1")))
++
++    def test_new_follow_up_overlapping_end_of_existing_assessment_refused(self):
++        # Assessment 09:00-09:45, so a follow-up at 09:30 overlaps it.
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9), kind="assessment", therapist="T1")])
++        self.assertFalse(can_book(cal, T1, appt("new", utc(2027, 3, 1, 9, 30), therapist="T1")))
++
++    def test_new_assessment_overlapping_start_of_existing_follow_up_refused(self):
++        # Follow-up 09:30-10:00, so an assessment at 09:15 runs into it.
++        cal = Calendar([appt("f1", utc(2027, 3, 1, 9, 30), kind="followup", therapist="T1")])
++        self.assertFalse(can_book(cal, T1, appt("new", utc(2027, 3, 1, 9, 15), kind="assessment", therapist="T1")))
++
++    def test_back_to_back_allowed(self):
++        # Follow-up 09:00-09:30, so a new one at 09:30 does not overlap.
++        cal = Calendar([appt("f1", utc(2027, 3, 1, 9), kind="followup", therapist="T1")])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 9, 30), therapist="T1")))
++        # And an existing assessment ending at 09:45 allows a booking at 09:45.
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9), kind="assessment", therapist="T1")])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 9, 45), therapist="T1")))
++
++    def test_other_therapists_bookings_ignored(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 9), therapist="T2")])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 9), therapist="T1")))
++
++    def test_cancelled_and_no_show_do_not_block(self):
++        cal = Calendar([
++            appt("c1", utc(2027, 3, 1, 9), therapist="T1", status=CANCELLED),
++            appt("n1", utc(2027, 3, 1, 9), therapist="T1", status=NO_SHOW),
++        ])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 9), therapist="T1")))
++
++    def test_appointment_for_another_therapist_refused(self):
++        self.assertFalse(can_book(Calendar(), T1, appt("new", utc(2027, 3, 1, 9), therapist="T2")))
++
++    def test_clash_across_timezones_refused(self):
++        # 21:00 UTC on 28 Feb is 10:00 on 1 March in Auckland (NZDT).
++        # That follow-up runs 10:00-10:30 Auckland, so a new 10:15 Auckland booking overlaps it
++        # even though the two start values are written in different timezones.
++        cal = Calendar([appt("a1", utc(2027, 2, 28, 21), therapist="T1")])
++        auckland_1015 = datetime.datetime(2027, 3, 1, 10, 15, tzinfo=AUCKLAND)
++        self.assertFalse(can_book(cal, T1, appt("new", auckland_1015, therapist="T1")))
++
++
++if __name__ == "__main__":
++    unittest.main()

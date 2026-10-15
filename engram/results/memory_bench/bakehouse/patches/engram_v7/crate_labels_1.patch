@@ -1,0 +1,93 @@
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..9626d7d
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,25 @@
++"""Crate labels for packing: one label per customer and product for a delivery day."""
++
++# The label printer truncates any line longer than this and does not wrap it.
++LABEL_WIDTH = 48
++
++
++def crate_labels(orderbook, customers, day):
++    """Text of each crate label for delivery on `day`, one per customer and product.
++
++    Labels are ordered by customer code, then product code. Each label is three lines:
++    the customer's name, the quantity and product name, and the allergens (if any).
++    Every line is cut to LABEL_WIDTH characters because the printer does not wrap.
++    """
++    labels = []
++    for customer in orderbook.customers_for(day):
++        quantities = {}
++        for line in orderbook.lines_for(customer, day):
++            quantities[line.product] = quantities.get(line.product, 0) + line.qty
++        for code in sorted(quantities):
++            product = orderbook.catalog.get(code)
++            lines = [customers[customer].name, f"{quantities[code]} x {product.name}"]
++            if product.allergens:
++                lines.append(f"Allergens: {product.allergen_text()}")
++            labels.append("\n".join(line[:LABEL_WIDTH] for line in lines))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..3cfbe21
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,56 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import LABEL_WIDTH, crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++def customer(code, name):
++    return Customer(code, name, "1 High St", "AB1 2CD", 1)
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def test_one_label_per_customer_and_product_sorted_by_code(self):
++        catalog = Catalog([
++            Product("BAG", "Baguette", 95),
++            Product("SOU", "White sourdough", 320, allergens=("gluten", "egg")),
++        ])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 10),
++            OrderLine(DAY, "AIDAN", "BAG", 6),
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++        ])
++        customers = {"AIDAN": customer("AIDAN", "St Aidan's"), "LUMEN": customer("LUMEN", "Lumen Cafe")}
++        self.assertEqual(crate_labels(book, customers, DAY), [
++            "St Aidan's\n6 x Baguette",
++            "Lumen Cafe\n5 x Baguette",
++            "Lumen Cafe\n10 x White sourdough\nAllergens: EGG, GLUTEN",
++        ])
++
++    def test_quantities_for_the_same_product_are_summed(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95)])
++        book = OrderBook(catalog, [OrderLine(DAY, "LUMEN", "BAG", 4), OrderLine(DAY, "LUMEN", "BAG", 3)])
++        self.assertEqual(crate_labels(book, {"LUMEN": customer("LUMEN", "Lumen Cafe")}, DAY), ["Lumen Cafe\n7 x Baguette"])
++
++    def test_other_days_are_ignored(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95)])
++        book = OrderBook(catalog, [OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "BAG", 4)])
++        self.assertEqual(crate_labels(book, {"LUMEN": customer("LUMEN", "Lumen Cafe")}, DAY), [])
++
++    def test_long_lines_are_cut_to_the_label_width(self):
++        catalog = Catalog([Product("BAG", "A" * 60, 95)])
++        book = OrderBook(catalog, [OrderLine(DAY, "LUMEN", "BAG", 1)])
++        name = "B" * 60
++        (label,) = crate_labels(book, {"LUMEN": customer("LUMEN", name)}, DAY)
++        first, second = label.split("\n")
++        self.assertEqual(first, "B" * LABEL_WIDTH)
++        self.assertEqual(second, "1 x " + "A" * (LABEL_WIDTH - 4))
++        self.assertTrue(all(len(line) <= LABEL_WIDTH for line in label.split("\n")))
++
++
++if __name__ == "__main__":
++    unittest.main()

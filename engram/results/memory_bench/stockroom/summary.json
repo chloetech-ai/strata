@@ -1896,6 +1896,175 @@
      }
     }
    }
+  },
+  "engram+v7": {
+   "runs": 40,
+   "solved": 40,
+   "solved_rate": 1.0,
+   "score": 1.0,
+   "cost_usd": 0.0059427745,
+   "memory_cost_usd": 0.0019021025,
+   "steps": 6.75,
+   "wall_s": 25.09,
+   "memory_tool_calls": 0.2,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.05439173,
+    "memory_cost_usd": 0.0312651,
+    "wall_s": 324.1,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "conversation": {
+     "runs": 24,
+     "solved": 24,
+     "score": 1.0
+    },
+    "repo": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 10,
+      "runs": [
+       40,
+       40
+      ],
+      "solved": [
+       40,
+       18
+      ],
+      "fisher_solved_p": 8.371010919163172e-09,
+      "score_diff": 0.3916666666666667,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.55,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "conversation": {
+      "tasks": 6,
+      "runs": [
+       24,
+       24
+      ],
+      "solved": [
+       24,
+       2
+      ],
+      "fisher_solved_p": 2.0156536479039194e-11,
+      "score_diff": 0.6527777777777777,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.9166666666666666,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "repo": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 10,
+      "runs": [
+       40,
+       40
+      ],
+      "solved": [
+       40,
+       40
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "conversation": {
+      "tasks": 6,
+      "runs": [
+       24,
+       24
+      ],
+      "solved": [
+       24,
+       24
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "repo": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
   }
  },
  "tasks": {
@@ -1913,7 +2082,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "stock_value": {
    "kind": "conversation",
@@ -1929,7 +2099,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "purchase_suggestions": {
    "kind": "conversation",
@@ -1945,7 +2116,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "scanner_import": {
    "kind": "conversation",
@@ -1961,7 +2133,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "negative_stock_advice": {
    "kind": "conversation",
@@ -1977,7 +2150,8 @@
    "engram+nodeep": 0.8333333333333334,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "config_advice": {
    "kind": "conversation",
@@ -1993,7 +2167,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "last_receipt": {
    "kind": "repo",
@@ -2009,7 +2184,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "write_off": {
    "kind": "repo",
@@ -2025,7 +2201,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "abc_classes": {
    "kind": "control",
@@ -2041,7 +2218,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   },
   "parse_location": {
    "kind": "control",
@@ -2057,7 +2235,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+rank": 1.0,
-   "engram+v5": 1.0
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
   }
  }
 }

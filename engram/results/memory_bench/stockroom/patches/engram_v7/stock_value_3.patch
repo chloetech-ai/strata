@@ -1,0 +1,115 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..a82237d
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,32 @@
++"""What the stock on hand is worth."""
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` on hand, costed first in, first out.
++
++    Each positive movement adds a layer at its unit cost. Each negative
++    movement takes goods from the oldest layers first. Movements are
++    ordered by date; movements on the same day keep their logged order.
++    """
++    sku = normalize_sku(sku)
++    moves = sorted(
++        (m for m in inventory.movements if m.sku == sku),
++        key=lambda m: m.date,
++    )
++    layers = []  # [qty, unit_cost] pairs, oldest first
++    for m in moves:
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"{sku} movement of {m.qty} on {m.date} has no unit cost")
++            layers.append([m.qty, m.unit_cost])
++        else:
++            remaining = -m.qty
++            while remaining and layers:
++                taken = min(remaining, layers[0][0])
++                layers[0][0] -= taken
++                remaining -= taken
++                if layers[0][0] == 0:
++                    layers.pop(0)
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..1b5a5c9
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,71 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++NEXT = datetime.date(2026, 9, 2)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_stock_is_worth_nothing(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 1250, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 12500)
++
++    def test_issues_take_the_oldest_cost_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, DAY)
++        inv.receive("BR-1042", 10, 300, NEXT)
++        inv.issue("BR-1042", 15, NEXT)
++        # 5 left at 300 from the second receipt; the first receipt is used up
++        self.assertEqual(stock_value(inv, "BR-1042"), 1500)
++
++    def test_issue_spanning_a_layer_boundary(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 4, 100, DAY)
++        inv.receive("BR-1042", 4, 200, DAY)
++        inv.issue("BR-1042", 2, DAY)
++        # 2 left at 100 and 4 at 200
++        self.assertEqual(stock_value(inv, "BR-1042"), 200 + 800)
++
++    def test_movements_are_ordered_by_date_not_logged_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 300, NEXT)
++        inv.issue("BR-1042", 5, NEXT)
++        inv.receive("BR-1042", 5, 100, DAY)
++        # the day-one receipt at 100 is the oldest, so the sale takes it
++        # and the 300 layer from NEXT stays
++        self.assertEqual(stock_value(inv, "BR-1042"), 1500)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 2, 50, DAY)
++        self.assertEqual(stock_value(inv, " br-1042 "), 100)
++
++    def test_other_skus_are_not_counted(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 2, 50, DAY)
++        inv.receive("BR-9999", 7, 1000, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 100)
++
++    def test_negative_stock_values_only_the_layers_that_remain(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 3, 100, DAY)
++        inv.issue("BR-1042", 5, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -2)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_positive_movement_without_cost_is_rejected(self):
++        inv = Inventory()
++        inv.movements.append(Movement(sku="BR-1042", qty=4, date=DAY, reason="COUNT"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

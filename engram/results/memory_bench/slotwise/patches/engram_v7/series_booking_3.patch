@@ -1,0 +1,178 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index ca928f0..05e07ec 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,13 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_add_rejects_text_without_digits",
++  "tests/test_clients.py::ClientBookTest::test_email_is_optional",
++  "tests/test_clients.py::ClientBookTest::test_finds_client_by_any_notation",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_umlauts_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_order",
++  "tests/test_clients.py::ClientBookTest::test_search_without_match_returns_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_phone_returns_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_notations_give_the_same_number",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+@@ -24,6 +33,15 @@
+   "tests/test_schedule.py::ScheduleTest::test_week_groups_by_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_week_leaves_out_cancelled",
+   "tests/test_schedule.py::ScheduleTest::test_week_needs_a_monday",
++  "tests/test_series.py::BookSeriesTest::test_books_weekly_on_same_weekday_and_time",
++  "tests/test_series.py::BookSeriesTest::test_break_violation_skips_week",
++  "tests/test_series.py::BookSeriesTest::test_cancelled_slot_is_not_skipped",
++  "tests/test_series.py::BookSeriesTest::test_first_is_the_given_appointment",
++  "tests/test_series.py::BookSeriesTest::test_incomplete_series_books_nothing",
++  "tests/test_series.py::BookSeriesTest::test_more_than_nine_sessions_is_refused",
++  "tests/test_series.py::BookSeriesTest::test_nine_sessions_are_allowed",
++  "tests/test_series.py::BookSeriesTest::test_other_errors_are_not_skipped",
++  "tests/test_series.py::BookSeriesTest::test_taken_week_is_skipped_and_session_added_at_end",
+   "tests/test_storage.py::StorageTest::test_cancelled_flag_survives_roundtrip",
+   "tests/test_storage.py::StorageTest::test_roundtrip"
+ ]
+\ No newline at end of file
+diff --git a/src/slotwise/series.py b/src/slotwise/series.py
+new file mode 100644
+index 0000000..390709b
+--- /dev/null
++++ b/src/slotwise/series.py
+@@ -0,0 +1,53 @@
++"""Booking a series of weekly appointments, e.g. the sessions on one prescription."""
++
++import datetime
++
++from .errors import BookingError, SlotTaken
++from .model import Appointment
++
++# The insurance pays for at most this many sessions per prescription.
++MAX_SESSIONS = 9
++# Skipped weeks push the last session later; the search gives up after this many weeks.
++SEARCH_WEEKS = 12
++
++
++def book_series(schedule, first, count):
++    """Books `count` weekly appointments, starting with `first`, on the same weekday and time.
++
++    A week whose slot is taken (SlotTaken) is skipped, and the series continues in the
++    next week. Either all `count` sessions are booked or none are: if the series cannot
++    be completed within SEARCH_WEEKS weeks, nothing is booked and BookingError is raised.
++
++    Returns the booked appointments by start time.
++    """
++    if count > MAX_SESSIONS:
++        raise BookingError(
++            f"A series can have at most {MAX_SESSIONS} sessions, because the insurance "
++            f"pays for {MAX_SESSIONS} per prescription. Please choose {MAX_SESSIONS} or fewer."
++        )
++    booked = []
++    try:
++        for week in range(SEARCH_WEEKS):
++            if len(booked) == count:
++                break
++            if week == 0:
++                appointment = first
++            else:
++                start = first.start + datetime.timedelta(weeks=week)
++                appointment = Appointment(first.therapist, first.client, start, first.treatment)
++            try:
++                schedule.book(appointment)
++            except SlotTaken:
++                continue
++            booked.append(appointment)
++        if len(booked) < count:
++            raise BookingError(
++                f"Only {len(booked)} of the {count} sessions fit within {SEARCH_WEEKS} weeks "
++                f"from {first.start.strftime('%A %d.%m.%Y')} at {first.start.strftime('%H:%M')}, "
++                "so the series was not booked. Please choose another start time."
++            )
++    except BookingError:
++        for appointment in booked:
++            schedule.appointments.remove(appointment)
++        raise
++    return booked
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..75e4ed6
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,78 @@
++import datetime
++import unittest
++
++from slotwise.errors import BookingError, OutsideOpeningHours
++from slotwise.model import Appointment
++from slotwise.schedule import Schedule
++from slotwise.series import MAX_SESSIONS, SEARCH_WEEKS, book_series
++
++# Tuesday 8 September 2026, 09:00 (practice is open)
++FIRST = datetime.datetime(2026, 9, 8, 9, 0)
++
++
++def appointment(start=FIRST, therapist="lena", client="Kim Weber"):
++    return Appointment(therapist, client, start, "standard")
++
++
++class BookSeriesTest(unittest.TestCase):
++    def test_books_weekly_on_same_weekday_and_time(self):
++        s = Schedule()
++        booked = book_series(s, appointment(), 3)
++        self.assertEqual([a.start for a in booked], [FIRST, FIRST.replace(day=15), FIRST.replace(day=22)])
++        self.assertEqual(len(s.appointments), 3)
++
++    def test_first_is_the_given_appointment(self):
++        s = Schedule()
++        first = appointment()
++        self.assertIs(book_series(s, first, 2)[0], first)
++
++    def test_taken_week_is_skipped_and_session_added_at_end(self):
++        s = Schedule()
++        s.book(appointment(start=FIRST.replace(day=15)))
++        booked = book_series(s, appointment(), 3)
++        self.assertEqual([a.start.day for a in booked], [8, 22, 29])
++
++    def test_cancelled_slot_is_not_skipped(self):
++        s = Schedule()
++        taken = s.book(appointment(start=FIRST.replace(day=15)))
++        s.cancel(taken.id)
++        booked = book_series(s, appointment(), 2)
++        self.assertEqual([a.start.day for a in booked], [8, 15])
++
++    def test_other_errors_are_not_skipped(self):
++        s = Schedule()
++        # Sunday 13 September 2026: the practice is closed, which is not a taken slot, so nothing is skipped
++        with self.assertRaises(OutsideOpeningHours):
++            book_series(s, appointment(start=datetime.datetime(2026, 9, 13, 9, 0)), 2)
++        self.assertEqual(s.appointments, [])
++
++    def test_more_than_nine_sessions_is_refused(self):
++        s = Schedule()
++        with self.assertRaisesRegex(BookingError, "at most 9 sessions"):
++            book_series(s, appointment(), MAX_SESSIONS + 1)
++        self.assertEqual(s.appointments, [])
++
++    def test_nine_sessions_are_allowed(self):
++        s = Schedule()
++        self.assertEqual(len(book_series(s, appointment(), MAX_SESSIONS)), MAX_SESSIONS)
++
++    def test_incomplete_series_books_nothing(self):
++        s = Schedule()
++        # Every week in the search window is taken except the first, so 2 sessions cannot be booked
++        for week in range(1, SEARCH_WEEKS):
++            s.book(appointment(start=FIRST + datetime.timedelta(weeks=week), client="Jo Li"))
++        before = list(s.appointments)
++        with self.assertRaisesRegex(BookingError, "Only 1 of the 2 sessions"):
++            book_series(s, appointment(), 2)
++        self.assertEqual(s.appointments, before)
++
++    def test_break_violation_skips_week(self):
++        s = Schedule()
++        # 09:50 is only 5 minutes after the 09:00 session ends, so that week breaks the 10-minute rule
++        s.book(appointment(start=FIRST.replace(day=15, hour=9, minute=50), client="Jo Li"))
++        booked = book_series(s, appointment(), 2)
++        self.assertEqual([a.start.day for a in booked], [8, 22])
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,89 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index ae23e67..0033f1d 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -1,5 +1,6 @@
+ """Invoices. All amounts are integer pence."""
+ 
++import csv
+ import datetime
+ from dataclasses import dataclass, field
+ from typing import List
+@@ -48,6 +49,24 @@ def format_pence(pence):
+     return f"{sign}£{pounds}.{remainder:02d}"
+ 
+ 
++def export_invoices(invoices, path):
++    """Writes one row per invoice (date, customer code, total) to `path` as a Ledgerly
++    import file: plain comma-separated with a header row, DD/MM/YYYY dates, and totals
++    in pounds with a decimal point and two decimals, e.g. 1234 -> 12.34, never pence."""
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(["Date", "Customer", "Total"])
++        for invoice in invoices:
++            total = invoice.total()
++            sign = "-" if total < 0 else ""
++            pounds, remainder = divmod(abs(total), 100)
++            writer.writerow([
++                invoice.day.strftime("%d/%m/%Y"),
++                invoice.customer,
++                f"{sign}{pounds}.{remainder:02d}",
++            ])
++
++
+ def invoice_number(year, seq):
+     """Invoice number for the `seq`th invoice of `year`, e.g. 2026, 1 -> 'LK-2026-0001'.
+     The running number restarts at 1 each year and has four digits."""
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index c504cbf..96ca947 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,11 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, sale_or_return_credit
++import csv
++import os
++import tempfile
++
++from bakehouse.invoice import Invoice, InvoiceLine, export_invoices, format_pence, invoice_for, invoice_number, sale_or_return_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -46,6 +50,35 @@ class InvoiceTest(unittest.TestCase):
+         self.assertEqual(invoice_for(book, "GREENWAY", datetime.date(2026, 10, 20)).lines, [])
+ 
+ 
++class ExportInvoicesTest(unittest.TestCase):
++    def test_one_row_per_invoice_in_ledgerly_format(self):
++        invoices = [
++            Invoice("LUMEN", datetime.date(2026, 10, 1), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)]),
++            Invoice("GREENWAY", datetime.date(2026, 10, 4), [InvoiceLine("BAG", 5, 95)]),
++            Invoice("AIDAN", datetime.date(2026, 12, 20)),
++        ]
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "invoices.csv")
++            export_invoices(invoices, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                rows = list(csv.reader(f))
++        self.assertEqual(rows, [
++            ["Date", "Customer", "Total"],
++            ["01/10/2026", "LUMEN", "45.60"],
++            ["04/10/2026", "GREENWAY", "4.75"],
++            ["20/12/2026", "AIDAN", "0.00"],
++        ])
++
++    def test_no_pence_or_currency_symbol_in_raw_text(self):
++        invoices = [Invoice("LUMEN", datetime.date(2026, 10, 1), [InvoiceLine("CRO", 1, 5)])]
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "invoices.csv")
++            export_invoices(invoices, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                text = f.read()
++        self.assertEqual(text, "Date,Customer,Total\r\n01/10/2026,LUMEN,0.05\r\n")
++
++
+ class FormatPenceTest(unittest.TestCase):
+     def test_pounds_and_pence(self):
+         self.assertEqual(format_pence(1234), "£12.34")

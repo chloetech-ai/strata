@@ -1,0 +1,134 @@
+diff --git a/src/kestrel/export.py b/src/kestrel/export.py
+new file mode 100644
+index 0000000..fab4b85
+--- /dev/null
++++ b/src/kestrel/export.py
+@@ -0,0 +1,36 @@
++"""Exports for the accountant."""
++
++import csv
++import os
++
++HEADER = ["Invoice Number", "Clinic", "Patient ID", "Date", "Description", "Amount"]
++
++
++def export_invoices(invoices, year, month, out_dir):
++    """Write the invoices issued in year-month to out_dir as CSV, and return the file's path.
++
++    The file is named kestrel-invoices-YYYY-MM.csv for import into Xero. Patients
++    appear only by patient ID: patient names must never leave the system.
++    """
++    path = os.path.join(out_dir, f"kestrel-invoices-{year:04d}-{month:02d}.csv")
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(HEADER)
++        for invoice in invoices:
++            if invoice.issued.year == year and invoice.issued.month == month:
++                writer.writerow([
++                    invoice.number,
++                    invoice.clinic,
++                    invoice.patient_id,
++                    invoice.issued.strftime("%d/%m/%Y"),
++                    invoice.description,
++                    _amount(invoice.amount_cents),
++                ])
++    return path
++
++
++def _amount(cents):
++    """Plain dollars with two decimals, e.g. 9500 -> '95.00', no dollar sign."""
++    sign = "-" if cents < 0 else ""
++    dollars, remainder = divmod(abs(cents), 100)
++    return f"{sign}{dollars}.{remainder:02d}"
+diff --git a/tests/test_export.py b/tests/test_export.py
+new file mode 100644
+index 0000000..0a0cc44
+--- /dev/null
++++ b/tests/test_export.py
+@@ -0,0 +1,86 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from kestrel.export import export_invoices
++from kestrel.invoices import Invoice
++
++
++def invoice(number="INV-HB-2026-00001", issued=datetime.date(2026, 10, 15), amount_cents=9500,
++            description="Initial assessment", patient_id="KP-004211", patient_name="", clinic="HB"):
++    return Invoice(number=number, clinic=clinic, patient_id=patient_id, patient_name=patient_name,
++                   issued=issued, amount_cents=amount_cents, description=description)
++
++
++class ExportInvoicesTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++
++    def read_rows(self, path):
++        with open(path, newline="", encoding="utf-8") as f:
++            return list(csv.reader(f))
++
++    def test_file_is_named_for_the_month_and_path_is_returned(self):
++        path = export_invoices([], 2026, 10, self.tmp.name)
++        self.assertEqual(path, os.path.join(self.tmp.name, "kestrel-invoices-2026-10.csv"))
++        self.assertTrue(os.path.exists(path))
++
++    def test_writes_header_then_one_row_per_invoice(self):
++        path = export_invoices([invoice(), invoice(number="INV-HB-2026-00002", description="Follow-up session", amount_cents=7000)],
++                               2026, 10, self.tmp.name)
++        self.assertEqual(self.read_rows(path), [
++            ["Invoice Number", "Clinic", "Patient ID", "Date", "Description", "Amount"],
++            ["INV-HB-2026-00001", "HB", "KP-004211", "15/10/2026", "Initial assessment", "95.00"],
++            ["INV-HB-2026-00002", "HB", "KP-004211", "15/10/2026", "Follow-up session", "70.00"],
++        ])
++
++    def test_only_invoices_issued_in_the_month_are_exported(self):
++        invoices = [
++            invoice(number="INV-HB-2026-00001", issued=datetime.date(2026, 9, 30)),
++            invoice(number="INV-HB-2026-00002", issued=datetime.date(2026, 10, 1)),
++            invoice(number="INV-HB-2026-00003", issued=datetime.date(2026, 10, 31)),
++            invoice(number="INV-HB-2026-00004", issued=datetime.date(2026, 11, 1)),
++            invoice(number="INV-HB-2025-00005", issued=datetime.date(2025, 10, 15)),
++        ]
++        path = export_invoices(invoices, 2026, 10, self.tmp.name)
++        numbers = [row[0] for row in self.read_rows(path)[1:]]
++        self.assertEqual(numbers, ["INV-HB-2026-00002", "INV-HB-2026-00003"])
++
++    def test_patient_names_are_never_written(self):
++        inv = invoice(patient_name="Aroha Test")
++        path = export_invoices([inv], 2026, 10, self.tmp.name)
++        with open(path, encoding="utf-8") as f:
++            self.assertNotIn("Aroha", f.read())
++
++    def test_dates_are_day_month_year(self):
++        path = export_invoices([invoice(issued=datetime.date(2026, 3, 4))], 2026, 3, self.tmp.name)
++        self.assertEqual(self.read_rows(path)[1][3], "04/03/2026")
++
++    def test_amounts_are_plain_two_decimal_numbers(self):
++        invoices = [invoice(number="A", amount_cents=10500), invoice(number="B", amount_cents=7805),
++                    invoice(number="C", amount_cents=5), invoice(number="D", amount_cents=0)]
++        path = export_invoices(invoices, 2026, 10, self.tmp.name)
++        self.assertEqual([row[5] for row in self.read_rows(path)[1:]], ["105.00", "78.05", "0.05", "0.00"])
++
++    def test_negative_amounts_keep_a_single_minus_sign(self):
++        path = export_invoices([invoice(amount_cents=-4750)], 2026, 10, self.tmp.name)
++        self.assertEqual(self.read_rows(path)[1][5], "-47.50")
++
++    def test_no_dollar_sign_or_thousands_separator(self):
++        path = export_invoices([invoice(amount_cents=123456)], 2026, 10, self.tmp.name)
++        with open(path, encoding="utf-8") as f:
++            text = f.read()
++        self.assertNotIn("$", text)
++        self.assertNotIn("1,234", text)
++        self.assertEqual(self.read_rows(path)[1][5], "1234.56")
++
++    def test_no_invoices_gives_header_only(self):
++        path = export_invoices([invoice(issued=datetime.date(2026, 9, 1))], 2026, 10, self.tmp.name)
++        self.assertEqual(self.read_rows(path), [["Invoice Number", "Clinic", "Patient ID", "Date", "Description", "Amount"]])
++
++
++if __name__ == "__main__":
++    unittest.main()

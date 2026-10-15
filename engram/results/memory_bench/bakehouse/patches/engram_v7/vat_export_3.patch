@@ -1,0 +1,76 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index ae23e67..6f14e85 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -1,5 +1,6 @@
+ """Invoices. All amounts are integer pence."""
+ 
++import csv
+ import datetime
+ from dataclasses import dataclass, field
+ from typing import List
+@@ -56,6 +57,24 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++def export_invoices(invoices, path):
++    """Write `invoices` to `path` as a Ledgerly import for the VAT return: a CSV with a
++    header row, one row per invoice with its date (DD/MM/YYYY), customer code and total
++    in pounds with two decimals and a decimal point, e.g. 12.50, never pence."""
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f, lineterminator="\n")
++        writer.writerow(["date", "customer", "total"])
++        for invoice in invoices:
++            writer.writerow([invoice.day.strftime("%d/%m/%Y"), invoice.customer, _pounds(invoice.total())])
++
++
++def _pounds(pence):
++    """Pounds for an integer pence amount with a decimal point and two decimals, e.g. 1250 -> '12.50'."""
++    sign = "-" if pence < 0 else ""
++    pounds, remainder = divmod(abs(pence), 100)
++    return f"{sign}{pounds}.{remainder:02d}"
++
++
+ def sale_or_return_credit(customer, product, delivered, returned, unit_price):
+     """Pence credited for `returned` loaves of `product` sent back by `customer`
+     the morning after `delivered` loaves were delivered that day.
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index c504cbf..cf16dc6 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,9 @@
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, sale_or_return_credit
++from bakehouse.invoice import Invoice, InvoiceLine, export_invoices, format_pence, invoice_for, invoice_number, sale_or_return_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -46,6 +48,24 @@ class InvoiceTest(unittest.TestCase):
+         self.assertEqual(invoice_for(book, "GREENWAY", datetime.date(2026, 10, 20)).lines, [])
+ 
+ 
++class ExportInvoicesTest(unittest.TestCase):
++    def test_writes_header_then_one_row_per_invoice(self):
++        invoices = [
++            Invoice("LUMEN", datetime.date(2026, 10, 2), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)]),
++            Invoice("GREENWAY", datetime.date(2026, 7, 1), [InvoiceLine("BAG", 5, 95)]),
++            Invoice("AIDAN", datetime.date(2026, 9, 30)),
++        ]
++        with tempfile.TemporaryDirectory() as folder:
++            path = os.path.join(folder, "invoices.csv")
++            export_invoices(invoices, path)
++            with open(path, encoding="utf-8") as f:
++                text = f.read()
++        self.assertEqual(text, "date,customer,total\n"
++                               "02/10/2026,LUMEN,45.60\n"
++                               "01/07/2026,GREENWAY,4.75\n"
++                               "30/09/2026,AIDAN,0.00\n")
++
++
+ class FormatPenceTest(unittest.TestCase):
+     def test_pounds_and_pence(self):
+         self.assertEqual(format_pence(1234), "£12.34")

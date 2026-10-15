@@ -1896,6 +1896,175 @@
      }
     }
    }
+  },
+  "engram+v7": {
+   "runs": 56,
+   "solved": 49,
+   "solved_rate": 0.875,
+   "score": 0.9339285714285713,
+   "cost_usd": 0.0070341875,
+   "memory_cost_usd": 0.0019421232142857144,
+   "steps": 6.875,
+   "wall_s": 29.755357142857143,
+   "memory_tool_calls": 0.10714285714285714,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.14997731,
+    "memory_cost_usd": 0.08376139999999999,
+    "wall_s": 704.0,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "conversation": {
+     "runs": 44,
+     "solved": 37,
+     "score": 0.9159090909090909
+    },
+    "repo": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 14,
+      "runs": [
+       56,
+       56
+      ],
+      "solved": [
+       49,
+       27
+      ],
+      "fisher_solved_p": 1.3864239193732514e-05,
+      "score_diff": 0.29940476190476184,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.39285714285714285,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "conversation": {
+      "tasks": 11,
+      "runs": [
+       44,
+       44
+      ],
+      "solved": [
+       37,
+       15
+      ],
+      "fisher_solved_p": 3.132118117028771e-06,
+      "score_diff": 0.3810606060606061,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "repo": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 14,
+      "runs": [
+       56,
+       56
+      ],
+      "solved": [
+       49,
+       52
+      ],
+      "fisher_solved_p": 0.5273323184625002,
+      "score_diff": -0.03392857142857153,
+      "perm_score_p": 0.008899110088991101,
+      "solved_diff": -0.0535714285714286,
+      "perm_solved_p": 0.1404859514048595
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "conversation": {
+      "tasks": 11,
+      "runs": [
+       44,
+       44
+      ],
+      "solved": [
+       37,
+       40
+      ],
+      "fisher_solved_p": 0.5209532624153237,
+      "score_diff": -0.04318181818181821,
+      "perm_score_p": 0.0105989401059894,
+      "solved_diff": -0.06818181818181812,
+      "perm_solved_p": 0.14078592140785923
+     },
+     "repo": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
   }
  },
  "tasks": {
@@ -1913,7 +2082,8 @@
    "engram+nodeep": 0.8888888888888888,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 0.9166666666666666
+   "engram+rank": 0.9166666666666666,
+   "engram+v7": 0.875
   },
   "can_book": {
    "kind": "conversation",
@@ -1929,7 +2099,8 @@
    "engram+nodeep": 0.20000000000000004,
    "full": 0.2,
    "engram+v5": 0.8,
-   "engram+rank": 0.8
+   "engram+rank": 0.8,
+   "engram+v7": 0.2
   },
   "cancellation_fee": {
    "kind": "conversation",
@@ -1945,7 +2116,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "appointment_price": {
    "kind": "conversation",
@@ -1961,7 +2133,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "reminder_text": {
    "kind": "conversation",
@@ -1977,7 +2150,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "send_reminders": {
    "kind": "conversation",
@@ -1993,7 +2167,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "invoice_number": {
    "kind": "conversation",
@@ -2009,7 +2184,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "invoice_export": {
    "kind": "conversation",
@@ -2025,7 +2201,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "waitlist_offer": {
    "kind": "conversation",
@@ -2041,7 +2218,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "overbooking_advice": {
    "kind": "conversation",
@@ -2057,7 +2235,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "python_advice": {
    "kind": "conversation",
@@ -2073,7 +2252,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "upcoming": {
    "kind": "repo",
@@ -2089,7 +2269,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "merge_busy": {
    "kind": "control",
@@ -2105,7 +2286,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   },
   "parse_duration": {
    "kind": "control",
@@ -2121,7 +2303,8 @@
    "engram+nodeep": 1.0,
    "full": 1.0,
    "engram+v5": 1.0,
-   "engram+rank": 1.0
+   "engram+rank": 1.0,
+   "engram+v7": 1.0
   }
  }
 }

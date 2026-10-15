@@ -1,0 +1,40 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 22397be..d67f952 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,7 @@
+ - Added Potter's Farm Shop to `customers.csv` (route 6).
+ - The bake plan prints in aligned columns, and `python -m bakehouse plan` replaces `scripts/print_plan.py`.
+ - Changed: the order cutoff moved to 13:00, and the bakery now delivers on Sundays and closes on Mondays.
++- Changed: the order cutoff moved to 13:30, giving customers an extra half hour.
+ - Fixed: `load_customers` no longer uses the walrus operator, so it runs on Python 3.7.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/config.py b/src/bakehouse/config.py
+index 8636bbf..65ee4fe 100644
+--- a/src/bakehouse/config.py
++++ b/src/bakehouse/config.py
+@@ -5,8 +5,8 @@ import datetime
+ BAKERY_NAME = "Larkspur Bakery"
+ 
+ # Orders for a delivery day must be in by this time on the day before.
+-# 13:00 because the mill now wants our flour order by 13:30.
+-ORDER_CUTOFF = datetime.time(13, 0)
++# 13:30 at Greta's request, giving customers an extra half hour.
++ORDER_CUTOFF = datetime.time(13, 30)
+ 
+ # Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).
+ # Monday since November: we have the stall at the Sunday farmers' market.
+diff --git a/tests/test_orders.py b/tests/test_orders.py
+index 9abf7f7..2c716ab 100644
+--- a/tests/test_orders.py
++++ b/tests/test_orders.py
+@@ -135,7 +135,7 @@ class CutoffTest(unittest.TestCase):
+         self.assertFalse(is_on_time(placed, DAY))
+ 
+     def test_monday_delivery_cutoff_is_sunday_afternoon(self):
+-        # Sunday is a closed day, but the cutoff is still 14:00 on the day before.
++        # Sunday is a closed day, but the cutoff is still ORDER_CUTOFF on the day before.
+         monday = DAY + datetime.timedelta(days=(0 - DAY.weekday()) % 7)
+         sunday_cutoff = datetime.datetime.combine(monday - datetime.timedelta(days=1), config.ORDER_CUTOFF)
+         self.assertTrue(is_on_time(sunday_cutoff, monday))

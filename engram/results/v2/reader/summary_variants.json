@@ -2,7 +2,7 @@
  "reader": "haiku",
  "judge": "haiku",
  "questions": 500,
- "note": "Every context read in the cloud container on 2026-10-15, from verdicts_small.jsonl. deep_<tag>: the query engine's picks from results/v2/deep/longmemeval_s_deep_<tag>; win400_deep_<tag>: Engram main's recall (win400) followed by those picks. haiku = first run (model calls inherited the session's memory); v2clean, v6old = first ranker prompt, clean; v6pref = the default prompt; v3 = longer prompt, dropped; rankonly = no planner; local5 = local ranker.",
+ "note": "Every context read in the cloud container on 2026-10-15, from verdicts_small.jsonl. deep_<tag>: the query engine's picks from results/v2/deep/longmemeval_s_deep_<tag> (tags in results/v2/deep/VARIANTS.md); win400_deep_<tag>: Engram main's recall (win400) followed by those picks.",
  "configs": {
   "none": {
    "n": 500,
@@ -631,6 +631,76 @@
     "temporal-reasoning": {
      "n": 127,
      "accuracy": 0.8110236220472441
+    }
+   }
+  },
+  "deep_v7rank": {
+   "n": 500,
+   "accuracy": 0.794,
+   "context_chars": 912.86,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9027777777777778
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.6363636363636364
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9285714285714286
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.921875
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7165354330708661
+    }
+   }
+  },
+  "win400_deep_v7rank": {
+   "n": 500,
+   "accuracy": 0.806,
+   "context_chars": 4506.462,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9027777777777778
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.628099173553719
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9107142857142857
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.9
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.9375
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7401574803149606
     }
    }
   }

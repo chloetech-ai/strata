@@ -1,0 +1,68 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index a535ae8..1696f9e 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -31,6 +31,8 @@
+   "tests/test_reorder.py::ReorderTest::test_at_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
++  "tests/test_reorder.py::ReorderTest::test_suggest_orders_rounds_up_to_whole_cases",
++  "tests/test_reorder.py::ReorderTest::test_suggest_orders_tops_up_to_three_times_reorder_point",
+   "tests/test_storage.py::StorageTest::test_load_legacy_file_without_reason_column",
+   "tests/test_storage.py::StorageTest::test_load_legacy_zero_quantity_is_rejected",
+   "tests/test_storage.py::StorageTest::test_load_rejects_unknown_reason",
+diff --git a/src/stockroom/reorder.py b/src/stockroom/reorder.py
+index 2f0080f..9e557a5 100644
+--- a/src/stockroom/reorder.py
++++ b/src/stockroom/reorder.py
+@@ -8,3 +8,19 @@ def needs_reorder(inventory):
+         if inventory.on_hand(item.sku) < item.reorder_point:
+             out.append(item.sku)
+     return out
++
++
++def suggest_orders(inventory):
++    """Quantity to order for each SKU that needs reorder.
++
++    Orders up to three times the reorder point, rounded up to whole cases.
++    Returns {sku: quantity}.
++    """
++    orders = {}
++    for sku in needs_reorder(inventory):
++        item = inventory.catalog.get(sku)
++        shortfall = 3 * item.reorder_point - inventory.on_hand(sku)
++        if shortfall > 0:
++            cases = -(-shortfall // item.case_size)  # ceiling division
++            orders[sku] = cases * item.case_size
++    return orders
+diff --git a/tests/test_reorder.py b/tests/test_reorder.py
+index 62219cf..4063e2c 100644
+--- a/tests/test_reorder.py
++++ b/tests/test_reorder.py
+@@ -2,7 +2,7 @@ import unittest
+ 
+ from stockroom.inventory import Inventory
+ from stockroom.items import Catalog, Item
+-from stockroom.reorder import needs_reorder
++from stockroom.reorder import needs_reorder, suggest_orders
+ 
+ 
+ def make_inventory():
+@@ -28,6 +28,17 @@ class ReorderTest(unittest.TestCase):
+     def test_enough_stock(self):
+         self.assertNotIn("BR-3", needs_reorder(make_inventory()))
+ 
++    def test_suggest_orders_tops_up_to_three_times_reorder_point(self):
++        orders = suggest_orders(make_inventory())
++        self.assertEqual(orders["BR-1"], 25)  # 30 wanted, 5 on hand
++        self.assertNotIn("BR-3", orders)
++
++    def test_suggest_orders_rounds_up_to_whole_cases(self):
++        catalog = Catalog([Item("BR-4", "Screw", "A-02-1", reorder_point=10, case_size=12)])
++        inv = Inventory(catalog)
++        inv.receive("BR-4", 5, 10)
++        self.assertEqual(suggest_orders(inv), {"BR-4": 36})  # 25 short, rounded up to 3 cases
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

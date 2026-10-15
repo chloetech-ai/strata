@@ -1,6 +1,6 @@
 # Memory bench: kestrel
 
-Model haiku; 630 runs. Solved = score 1.0. Costs in USD per run; memory $ = the memory system's own model calls during the run; history $ = agent + memory system while recording the history.
+Model haiku; 686 runs. Solved = score 1.0. Costs in USD per run; memory $ = the memory system's own model calls during the run; history $ = agent + memory system while recording the history.
 
 | lane | runs | solved | score | control solved | conversation solved | repo solved | $/run | memory $/run | steps | wall s | memory tool calls | history $ (agent + memory) | p vs none (Fisher / perm) | p vs engram@main (Fisher / perm) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -16,24 +16,25 @@ Model haiku; 630 runs. Solved = score 1.0. Costs in USD per run; memory $ = the 
 | full | 56 | 52/56 | 0.94 | 8/8 | 40/44 | 4/4 | 0.055 | 0.000 | 5.4 | 25 | 0.0 | 0.24 + 0.00 | 0.000 / 0.000 | 1.000 / 0.147 |
 | engram+v5 | 56 | 52/56 | 0.99 | 8/8 | 40/44 | 4/4 | 0.008 | 0.002 | 7.2 | 33 | 0.1 | 0.15 + 0.09 | 0.000 / 0.000 | 1.000 / 0.436 |
 | engram+rank | 56 | 51/56 | 0.98 | 8/8 | 39/44 | 4/4 | 0.008 | 0.001 | 7.1 | 32 | 0.2 | 0.17 + 0.07 | 0.000 / 0.000 | 1.000 / 0.421 |
+| engram+v7 | 56 | 49/56 | 0.93 | 8/8 | 37/44 | 4/4 | 0.007 | 0.002 | 6.9 | 30 | 0.1 | 0.15 + 0.08 | 0.000 / 0.000 | 0.527 / 0.009 |
 
 Per task (mean score):
 
-| task | kind | none | ccmem | transcripts | claude-mem | mem0 | engram@main | engram | engram+deep | engram+nodeep | full | engram+v5 | engram+rank |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| free_slots | conversation | 0.25 | 0.67 | 1.00 | 0.29 | 0.96 | 1.00 | 1.00 | 1.00 | 0.89 | 1.00 | 1.00 | 0.92 |
-| can_book | conversation | 0.05 | 0.65 | 0.65 | 0.05 | 0.20 | 0.55 | 0.73 | 0.20 | 0.20 | 0.20 | 0.80 | 0.80 |
-| cancellation_fee | conversation | 0.25 | 1.00 | 1.00 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| appointment_price | conversation | 0.00 | 0.12 | 1.00 | 0.19 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| reminder_text | conversation | 0.92 | 0.92 | 1.00 | 0.92 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| send_reminders | conversation | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| invoice_number | conversation | 1.00 | 1.00 | 1.00 | 1.00 | 0.75 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| invoice_export | conversation | 0.54 | 1.00 | 0.79 | 0.54 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| waitlist_offer | conversation | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| overbooking_advice | conversation | 0.38 | 1.00 | 0.75 | 0.38 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| python_advice | conversation | 0.50 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| upcoming | repo | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| merge_busy | control | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
-| parse_duration | control | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| task | kind | none | ccmem | transcripts | claude-mem | mem0 | engram@main | engram | engram+deep | engram+nodeep | full | engram+v5 | engram+rank | engram+v7 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| free_slots | conversation | 0.25 | 0.67 | 1.00 | 0.29 | 0.96 | 1.00 | 1.00 | 1.00 | 0.89 | 1.00 | 1.00 | 0.92 | 0.88 |
+| can_book | conversation | 0.05 | 0.65 | 0.65 | 0.05 | 0.20 | 0.55 | 0.73 | 0.20 | 0.20 | 0.20 | 0.80 | 0.80 | 0.20 |
+| cancellation_fee | conversation | 0.25 | 1.00 | 1.00 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| appointment_price | conversation | 0.00 | 0.12 | 1.00 | 0.19 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| reminder_text | conversation | 0.92 | 0.92 | 1.00 | 0.92 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| send_reminders | conversation | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| invoice_number | conversation | 1.00 | 1.00 | 1.00 | 1.00 | 0.75 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| invoice_export | conversation | 0.54 | 1.00 | 0.79 | 0.54 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| waitlist_offer | conversation | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| overbooking_advice | conversation | 0.38 | 1.00 | 0.75 | 0.38 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| python_advice | conversation | 0.50 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| upcoming | repo | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| merge_busy | control | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| parse_duration | control | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
 
 p: two-sided. Fisher = Fisher's exact test on solved runs pooled over tasks; perm = permutation test of the mean score difference with lane labels shuffled within each task (scripts/ab_stats.py).

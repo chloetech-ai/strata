@@ -1,0 +1,200 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..cf1a1cc
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1,12 @@
++{
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_cap_rounds_down_to_whole_loaves": true,
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_half_price_for_returns_within_the_cap": true,
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_no_credit_below_one_loaf_of_cap": true,
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_odd_price_rounds_down_to_whole_pence": true,
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_only_greenway_gets_credit": true,
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_only_sandwich_loaves_get_credit": true,
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_returns_above_ten_percent_are_not_credited": true,
++  "tests/test_standing.py::ExpandTest::test_no_lines_for_a_closed_day": true,
++  "tests/test_standing.py::ExpandTest::test_one_line_per_matching_weekday_in_range": true,
++  "tests/test_standing.py::ExpandTest::test_start_and_end_are_inclusive": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..ad4370e
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1,84 @@
++[
++  "tests/test_customers.py::CustomersTest::test_distinct_route_seq_accepted",
++  "tests/test_customers.py::CustomersTest::test_duplicate_route_seq_rejected",
++  "tests/test_customers.py::CustomersTest::test_email_defaults_to_empty_when_cell_blank",
++  "tests/test_customers.py::CustomersTest::test_email_defaults_to_empty_when_column_missing",
++  "tests/test_customers.py::CustomersTest::test_email_read_from_optional_column",
++  "tests/test_customers.py::CustomersTest::test_load_customers",
++  "tests/test_customers.py::CustomersTest::test_load_customers_reads_greenway_email",
++  "tests/test_customers.py::CustomersTest::test_str_is_name",
++  "tests/test_invoice.py::FormatPenceTest::test_negative_gets_leading_minus",
++  "tests/test_invoice.py::FormatPenceTest::test_pence_only_keeps_two_digits",
++  "tests/test_invoice.py::FormatPenceTest::test_pounds_and_pence",
++  "tests/test_invoice.py::FormatPenceTest::test_whole_pounds",
++  "tests/test_invoice.py::FormatPenceTest::test_zero",
++  "tests/test_invoice.py::InvoiceNumberTest::test_number_outside_one_to_9999_is_rejected",
++  "tests/test_invoice.py::InvoiceNumberTest::test_running_number_is_zero_padded_to_four_digits",
++  "tests/test_invoice.py::InvoiceNumberTest::test_year_then_four_digit_running_number",
++  "tests/test_invoice.py::InvoiceTest::test_empty_invoice",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_for_customer_with_no_orders_is_empty",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_for_ignores_other_customers_lines",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_for_one_line_per_product_at_catalog_price",
++  "tests/test_invoice.py::InvoiceTest::test_total",
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_cap_rounds_down_to_whole_loaves",
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_half_price_for_returns_within_the_cap",
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_negative_counts_rejected",
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_no_credit_below_one_loaf_of_cap",
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_odd_price_rounds_down_to_whole_pence",
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_only_greenway_gets_credit",
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_only_sandwich_loaves_get_credit",
++  "tests/test_invoice.py::SaleOrReturnCreditTest::test_returns_above_ten_percent_are_not_credited",
++  "tests/test_orders.py::CutoffTest::test_closed_days",
++  "tests/test_orders.py::CutoffTest::test_exactly_at_the_cutoff_is_on_time",
++  "tests/test_orders.py::CutoffTest::test_monday_delivery_cutoff_is_sunday_afternoon",
++  "tests/test_orders.py::CutoffTest::test_on_the_delivery_day_is_too_late",
++  "tests/test_orders.py::CutoffTest::test_one_minute_after_the_cutoff_is_too_late",
++  "tests/test_orders.py::CutoffTest::test_one_minute_before_the_cutoff_is_on_time",
++  "tests/test_orders.py::CutoffTest::test_well_before_the_cutoff",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_is_sorted_and_unique",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_three_customers_on_one_day",
++  "tests/test_orders.py::OrderBookTest::test_days_are_sorted_and_distinct",
++  "tests/test_orders.py::OrderBookTest::test_days_of_empty_book_is_empty",
++  "tests/test_orders.py::OrderBookTest::test_for_day",
++  "tests/test_orders.py::OrderBookTest::test_len_counts_lines",
++  "tests/test_orders.py::OrderBookTest::test_lines_for_returns_only_that_customers_lines_for_the_day",
++  "tests/test_orders.py::OrderBookTest::test_quantity_must_be_positive",
++  "tests/test_orders.py::OrderBookTest::test_remove_deletes_that_line_and_returns_true",
++  "tests/test_orders.py::OrderBookTest::test_remove_returns_false_when_no_such_line",
++  "tests/test_orders.py::OrderBookTest::test_save_and_load",
++  "tests/test_orders.py::OrderBookTest::test_total_for_sums_across_customers",
++  "tests/test_orders.py::OrderBookTest::test_unknown_product_is_rejected",
++  "tests/test_production.py::ProductionTest::test_crates_needed_rejects_bad_inputs",
++  "tests/test_production.py::ProductionTest::test_crates_needed_rounds_a_partial_crate_up",
++  "tests/test_production.py::ProductionTest::test_dough_weight_for_no_units_is_zero",
++  "tests/test_production.py::ProductionTest::test_dough_weight_is_grams_per_piece_times_units",
++  "tests/test_production.py::ProductionTest::test_dough_weight_rejects_negative_units",
++  "tests/test_production.py::ProductionTest::test_exact_batches",
++  "tests/test_production.py::ProductionTest::test_partial_batch_rounds_up",
++  "tests/test_production.py::ProductionTest::test_plan_adds_up_customers",
++  "tests/test_production.py::ProductionTest::test_plan_leaves_out_products_not_ordered_for_the_day",
++  "tests/test_production.py::ProductionTest::test_total_batches_for_empty_plan_is_zero",
++  "tests/test_production.py::ProductionTest::test_total_batches_sums_every_product",
++  "tests/test_products.py::CatalogTest::test_add_and_get",
++  "tests/test_products.py::CatalogTest::test_allergen_text_sorted_capitals_joined",
++  "tests/test_products.py::CatalogTest::test_duplicate_code_rejected",
++  "tests/test_products.py::CatalogTest::test_get_unknown_code_raises_key_error_naming_it",
++  "tests/test_products.py::CatalogTest::test_has_allergen_ignores_case",
++  "tests/test_products.py::CatalogTest::test_load_catalog",
++  "tests/test_products.py::CatalogTest::test_minimum_valid_values_accepted",
++  "tests/test_products.py::CatalogTest::test_negative_batch_size_rejected_naming_code",
++  "tests/test_products.py::CatalogTest::test_negative_price_rejected_naming_code",
++  "tests/test_products.py::CatalogTest::test_price_text_formats_pence_as_pounds",
++  "tests/test_products.py::CatalogTest::test_zero_batch_size_rejected_naming_code",
++  "tests/test_reports.py::DaySummaryTest::test_no_orders_for_day",
++  "tests/test_reports.py::DaySummaryTest::test_top_products_breaks_ties_by_code",
++  "tests/test_reports.py::DaySummaryTest::test_top_products_ranks_by_units_within_range",
++  "tests/test_reports.py::DaySummaryTest::test_two_customers_same_day_sorted_by_code",
++  "tests/test_reports.py::DaySummaryTest::test_value_per_customer",
++  "tests/test_standing.py::ExpandTest::test_no_lines_for_a_closed_day",
++  "tests/test_standing.py::ExpandTest::test_no_lines_when_range_has_no_matching_weekday",
++  "tests/test_standing.py::ExpandTest::test_no_standing_lines_gives_no_order_lines",
++  "tests/test_standing.py::ExpandTest::test_one_line_per_matching_weekday_in_range",
++  "tests/test_standing.py::ExpandTest::test_several_standing_lines_on_the_same_day_keep_their_order",
++  "tests/test_standing.py::ExpandTest::test_start_and_end_are_inclusive"
++]
+\ No newline at end of file
+diff --git a/src/bakehouse/config.py b/src/bakehouse/config.py
+index 8636bbf..8d50970 100644
+--- a/src/bakehouse/config.py
++++ b/src/bakehouse/config.py
+@@ -11,3 +11,11 @@ ORDER_CUTOFF = datetime.time(13, 0)
+ # Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).
+ # Monday since November: we have the stall at the Sunday farmers' market.
+ CLOSED_WEEKDAYS = (0,)
++
++# Sale-or-return for unsold loaves sent back the next morning: only this customer
++# and product earn a credit, at this percentage of wholesale price per loaf, for at
++# most this percentage of the loaves delivered that day.
++SALE_OR_RETURN_CUSTOMER = "GREENWAY"
++SALE_OR_RETURN_PRODUCT = "SWL"  # sandwich loaf
++SALE_OR_RETURN_RATE_PERCENT = 50
++SALE_OR_RETURN_CAP_PERCENT = 10
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index ae23e67..1b754a6 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -70,3 +70,10 @@ def sale_or_return_credit(customer, product, delivered, returned, unit_price):
+         return 0
+     creditable = min(returned, delivered * config.SALE_OR_RETURN_CAP_PERCENT // 100)
+     return creditable * unit_price * config.SALE_OR_RETURN_RATE_PERCENT // 100
++
++
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Pence credited for one delivery's returns, at the catalog's wholesale price.
++    See sale_or_return_credit for the rules."""
++    unit_price = catalog.get(product_code).price
++    return sale_or_return_credit(customer_code, product_code, delivered, returned, unit_price)
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index c504cbf..84c4e37 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, sale_or_return_credit
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit, sale_or_return_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -112,6 +112,13 @@ class SaleOrReturnCreditTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             self.credit(delivered=-1)
+ 
++    def test_returns_credit_uses_catalog_price(self):
++        catalog = Catalog([Product("SWL", "Sandwich loaf", 180), Product("BAG", "Baguette", 95)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "SWL", 40, 3), 3 * 90)
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "SWL", 40, 10), 4 * 90)
++        self.assertEqual(returns_credit(catalog, "LUMEN", "SWL", 40, 4), 0)
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "BAG", 40, 4), 0)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
