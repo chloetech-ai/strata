@@ -31,3 +31,5 @@ Load averages (1, 5, 15 min) at the start and end of each run:
 Final runs (2026-10-15, after every model-calling run): the changed side is now the final build of
 claude/project-thread-v6u255 (query engine prompt and planner SQL fix included); the branch runs above,
 from 8c5c20c, are superseded and not used. main's runs above stand.
+  (container restarted 2026-10-15 ~20:53Z while the final runs waited for quiet; none had started. Re-queued.)
+  branch scale | 2026-10-15T21:04:39Z | waited 560s | quiet | 0.95 2.59 1.74
