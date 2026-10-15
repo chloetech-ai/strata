@@ -1,0 +1,79 @@
+diff --git a/src/bakehouse/pricing.py b/src/bakehouse/pricing.py
+new file mode 100644
+index 0000000..b04f958
+--- /dev/null
++++ b/src/bakehouse/pricing.py
+@@ -0,0 +1,21 @@
++"""Wholesale price changes for the price list."""
++
++# Greta Vogel's January rise, as a percentage. Prices rise by this much, then
++# round up to the next 5p, so a café's price board never shows odd pennies.
++JANUARY_RISE_PERCENT = 5
++
++
++def new_prices(catalog):
++    """{product code: new wholesale price in pence} after the January rise.
++
++    Each new price is the old price times 1.05, rounded up to the next 5p.
++    Rounding is done in whole pence so no float error can push a price over
++    a 5p step, and a price never goes down.
++    """
++    prices = {}
++    for product in catalog:
++        # ceil(price * 1.05 / 0.05) * 5 pence, in integer arithmetic.
++        raised = product.price * (100 + JANUARY_RISE_PERCENT)
++        step = 100 * 5
++        prices[product.code] = -(-raised // step) * 5
++    return prices
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+new file mode 100644
+index 0000000..ac59bcc
+--- /dev/null
++++ b/tests/test_pricing.py
+@@ -0,0 +1,46 @@
++import os
++import unittest
++
++from bakehouse.pricing import new_prices
++from bakehouse.products import Catalog, Product, load_catalog
++
++DATA = os.path.join(os.path.dirname(__file__), "..", "data")
++
++
++class NewPricesTest(unittest.TestCase):
++    def test_rise_rounds_up_to_next_5p(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95)])
++        # 95p * 1.05 = 99.75p, rounded up to 100p
++        self.assertEqual(new_prices(catalog), {"BAG": 100})
++
++    def test_exact_5p_step_is_not_bumped(self):
++        catalog = Catalog([Product("X", "Test", 100)])
++        # 100p * 1.05 = 105p exactly, which is already on a 5p step
++        self.assertEqual(new_prices(catalog), {"X": 105})
++
++    def test_small_price_rounds_up(self):
++        catalog = Catalog([Product("BRO", "Brötchen", 40)])
++        # 40p * 1.05 = 42p, rounded up to 45p
++        self.assertEqual(new_prices(catalog), {"BRO": 45})
++
++    def test_never_goes_down(self):
++        catalog = Catalog([Product("X", "Test", 1)])
++        self.assertEqual(new_prices(catalog), {"X": 5})
++
++    def test_zero_stays_zero(self):
++        catalog = Catalog([Product("X", "Test", 0)])
++        self.assertEqual(new_prices(catalog), {"X": 0})
++
++    def test_january_price_list(self):
++        catalog = load_catalog(os.path.join(DATA, "products.csv"))
++        prices = new_prices(catalog)
++        self.assertEqual(prices["SOU"], 340)
++        self.assertEqual(prices["SWL"], 190)
++        self.assertEqual(set(prices), {p.code for p in catalog})
++        for product in catalog:
++            self.assertGreaterEqual(prices[product.code], product.price)
++            self.assertEqual(prices[product.code] % 5, 0)
++
++
++if __name__ == "__main__":
++    unittest.main()

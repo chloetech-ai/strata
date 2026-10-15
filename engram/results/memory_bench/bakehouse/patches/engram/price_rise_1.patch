@@ -1,0 +1,74 @@
+diff --git a/src/bakehouse/pricing.py b/src/bakehouse/pricing.py
+new file mode 100644
+index 0000000..897d98f
+--- /dev/null
++++ b/src/bakehouse/pricing.py
+@@ -0,0 +1,19 @@
++"""Wholesale price changes."""
++
++# Greta's January rise: 5%, with each new price rounded up (never down) to the next 5p.
++RISE_NUMERATOR = 105  # 100% + 5%, over
++RISE_DENOMINATOR = 100
++ROUND_TO = 5  # pence
++
++
++def new_price(pence):
++    """The price after the January rise, in whole pence, rounded up to the next 5p."""
++    # Integer arithmetic only: ceil(pence * 1.05 / 5) * 5, written without floats.
++    scaled = pence * RISE_NUMERATOR
++    step = RISE_DENOMINATOR * ROUND_TO
++    return -(-scaled // step) * ROUND_TO
++
++
++def new_prices(catalog):
++    """{product code: new wholesale price in pence} for every product in `catalog`."""
++    return {product.code: new_price(product.price) for product in catalog}
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+new file mode 100644
+index 0000000..b023a53
+--- /dev/null
++++ b/tests/test_pricing.py
+@@ -0,0 +1,43 @@
++import unittest
++
++from bakehouse.pricing import new_price, new_prices
++from bakehouse.products import Catalog, Product
++
++
++class NewPriceTest(unittest.TestCase):
++    def test_rise_is_five_percent_then_rounded_up_to_next_5p(self):
++        # 320 * 1.05 = 336 -> 340
++        self.assertEqual(new_price(320), 340)
++
++    def test_exact_multiple_of_5p_is_not_bumped(self):
++        # 400 * 1.05 = 420 exactly
++        self.assertEqual(new_price(400), 420)
++
++    def test_rounds_up_never_down(self):
++        # 95 * 1.05 = 99.75 -> 100
++        self.assertEqual(new_price(95), 100)
++        # 360 * 1.05 = 378 -> 380
++        self.assertEqual(new_price(360), 380)
++
++    def test_zero_stays_zero(self):
++        self.assertEqual(new_price(0), 0)
++
++    def test_result_is_whole_pence(self):
++        for pence in range(0, 1000):
++            self.assertIsInstance(new_price(pence), int)
++
++
++class NewPricesTest(unittest.TestCase):
++    def test_maps_each_product_code_to_new_price(self):
++        catalog = Catalog([
++            Product("SOU", "White sourdough", 320),
++            Product("BAG", "Baguette", 95),
++        ])
++        self.assertEqual(new_prices(catalog), {"SOU": 340, "BAG": 100})
++
++    def test_empty_catalog_gives_empty_dict(self):
++        self.assertEqual(new_prices(Catalog()), {})
++
++
++if __name__ == "__main__":
++    unittest.main()

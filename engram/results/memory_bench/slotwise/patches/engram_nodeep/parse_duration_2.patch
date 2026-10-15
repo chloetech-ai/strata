@@ -1,0 +1,91 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9d5392b..23ffd62 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ - `Schedule.cancel(appointment_id)` marks an appointment cancelled instead of deleting it; cancelled appointments no longer block their slot.
+ - Client register: `Client` dataclass and `ClientBook` with `add()` and `find_by_phone()`. Phone numbers are matched in any format (`079 …`, `+41 79 …`, `0041 79 …`).
++- `parse_duration(text)` in `slotwise.durations` turns `45`, `45m`, `1h`, `1h30` or `1:30` into minutes.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/slotwise/durations.py b/src/slotwise/durations.py
+new file mode 100644
+index 0000000..2ecc136
+--- /dev/null
++++ b/src/slotwise/durations.py
+@@ -0,0 +1,35 @@
++"""Durations typed by receptionists, such as '45', '1h30' or '1:30'."""
++
++import re
++
++# '45', '45m', '45 min'
++_MINUTES = re.compile(r"(\d+)\s*(?:min|m)?")
++# '1h', '1h30', '1h 30m', '2h15'
++_HOURS = re.compile(r"(\d+)\s*h\s*(?:(\d+)\s*(?:min|m)?)?")
++# '1:30'
++_CLOCK = re.compile(r"(\d+):(\d+)")
++
++
++def parse_duration(text):
++    """Minutes for a duration typed as '45', '45m', '1h', '1h30' or '1:30'.
++
++    Case and surrounding spaces are ignored. Raises ValueError for empty
++    input, zero, or anything else.
++    """
++    cleaned = text.strip().lower()
++    if match := _MINUTES.fullmatch(cleaned):
++        minutes = int(match[1])
++    elif match := _HOURS.fullmatch(cleaned) or _CLOCK.fullmatch(cleaned):
++        minutes = _hours_and_minutes(match[1], match[2])
++    else:
++        raise ValueError(f"not a duration: {text!r}; use for example 45, 1h or 1h30")
++    if minutes == 0:
++        raise ValueError(f"duration must be more than zero: {text!r}")
++    return minutes
++
++
++def _hours_and_minutes(hours, minutes):
++    minutes = int(minutes or 0)
++    if minutes >= 60:
++        raise ValueError(f"minutes must be below 60, got {minutes}")
++    return int(hours) * 60 + minutes
+diff --git a/tests/test_durations.py b/tests/test_durations.py
+new file mode 100644
+index 0000000..d2474e9
+--- /dev/null
++++ b/tests/test_durations.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from slotwise.durations import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_accepted_formats(self):
++        cases = {
++            "45": 45,
++            "45m": 45,
++            "45 min": 45,
++            "1h": 60,
++            "1h30": 90,
++            "1h 30m": 90,
++            "2h15": 135,
++            "1:30": 90,
++        }
++        for text, minutes in cases.items():
++            self.assertEqual(parse_duration(text), minutes, text)
++
++    def test_ignores_case_and_surrounding_spaces(self):
++        self.assertEqual(parse_duration("  1H 30M  "), 90)
++        self.assertEqual(parse_duration(" 45 MIN "), 45)
++
++    def test_rejects_empty_zero_and_other_input(self):
++        for text in ["", "   ", "0", "0h", "0:00", "abc", "-5", "1.5h", "1h90", "1:75", "45 seconds"]:
++            with self.assertRaises(ValueError, msg=repr(text)):
++                parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

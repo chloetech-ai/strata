@@ -1,0 +1,65 @@
+diff --git a/src/bakehouse/orders.py b/src/bakehouse/orders.py
+index c1de2b3..2e95dd5 100644
+--- a/src/bakehouse/orders.py
++++ b/src/bakehouse/orders.py
+@@ -68,6 +68,16 @@ def is_delivery_day(day):
+     return day.weekday() not in config.CLOSED_WEEKDAYS
+ 
+ 
++def next_delivery_day(day):
++    """The first date after `day` on which we deliver."""
++    if len(set(config.CLOSED_WEEKDAYS)) >= 7:
++        raise ValueError("no weekday is a delivery day")
++    candidate = day + datetime.timedelta(days=1)
++    while not is_delivery_day(candidate):
++        candidate += datetime.timedelta(days=1)
++    return candidate
++
++
+ def is_on_time(placed_at, delivery_day):
+     """Whether an order placed at `placed_at` (a datetime) is in time for
+     `delivery_day`: orders must be in by config.ORDER_CUTOFF on the day before."""
+diff --git a/tests/test_orders.py b/tests/test_orders.py
+index 4b403dd..6f0c454 100644
+--- a/tests/test_orders.py
++++ b/tests/test_orders.py
+@@ -2,9 +2,12 @@ import datetime
+ import os
+ import tempfile
+ import unittest
++from unittest import mock
+ 
+ from bakehouse import config
+-from bakehouse.orders import OrderBook, OrderLine, is_delivery_day, is_on_time, load_orders, sale_or_return_credit, save_orders
++from bakehouse.orders import (
++    OrderBook, OrderLine, is_delivery_day, is_on_time, load_orders, next_delivery_day, sale_or_return_credit, save_orders,
++)
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -130,6 +133,25 @@ class SaleOrReturnTest(unittest.TestCase):
+         self.assertEqual(sale_or_return_credit("GREENWAY", "BAG", 95, delivered=32, returned=5), 0)
+ 
+ 
++class NextDeliveryDayTest(unittest.TestCase):
++    def test_skips_closed_days(self):
++        sunday = datetime.date(2026, 10, 18)
++        monday = datetime.date(2026, 10, 19)
++        with mock.patch.object(config, "CLOSED_WEEKDAYS", (0,)):
++            self.assertEqual(next_delivery_day(sunday), datetime.date(2026, 10, 20))
++            self.assertEqual(next_delivery_day(monday - datetime.timedelta(days=1)), datetime.date(2026, 10, 20))
++
++    def test_next_day_when_it_is_open(self):
++        tuesday = datetime.date(2026, 10, 20)
++        with mock.patch.object(config, "CLOSED_WEEKDAYS", (0,)):
++            self.assertEqual(next_delivery_day(tuesday), datetime.date(2026, 10, 21))
++
++    def test_all_days_closed_rejected(self):
++        with mock.patch.object(config, "CLOSED_WEEKDAYS", tuple(range(7))):
++            with self.assertRaises(ValueError):
++                next_delivery_day(DAY)
++
++
+ class CutoffTest(unittest.TestCase):
+     def cutoff_on(self, delivery_day):
+         return datetime.datetime.combine(delivery_day - datetime.timedelta(days=1), config.ORDER_CUTOFF)

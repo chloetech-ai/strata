@@ -1,0 +1,150 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 69c1bcf..7db481c 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,14 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_finds_client_in_any_phone_format",
++  "tests/test_clients.py::ClientBookTest::test_invalid_phone_is_rejected_on_add",
++  "tests/test_clients.py::ClientBookTest::test_same_number_cannot_be_added_twice",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_added_order",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_gives_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_number_gives_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_common_shapes_give_the_same_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_letters",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_numbers_without_prefix",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+@@ -10,6 +20,12 @@
+   "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_id_is_a_key_error",
+   "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_the_gap",
+   "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_frees_its_slot",
++  "tests/test_schedule.py::ScheduleTest::test_free_slots_ignore_cancelled_appointments",
++  "tests/test_schedule.py::ScheduleTest::test_free_slots_ignore_other_therapists",
++  "tests/test_schedule.py::ScheduleTest::test_free_slots_on_a_closed_day_are_empty",
++  "tests/test_schedule.py::ScheduleTest::test_free_slots_on_empty_day_run_from_opening_in_15_minute_steps",
++  "tests/test_schedule.py::ScheduleTest::test_free_slots_respect_a_shorter_day",
++  "tests/test_schedule.py::ScheduleTest::test_free_slots_skip_a_booking_and_its_gap",
+   "tests/test_schedule.py::ScheduleTest::test_gap_message_mentions_the_rule",
+   "tests/test_schedule.py::ScheduleTest::test_gap_only_applies_to_same_therapist",
+   "tests/test_schedule.py::ScheduleTest::test_no_gap_after_existing_is_taken",
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 618a27a..09d231c 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,9 @@ from .model import TREATMENTS
+ # Time a therapist needs between two appointments to clean up and write notes.
+ GAP = datetime.timedelta(minutes=10)
+ 
++# Spacing of the start times offered by free_slots.
++SLOT_STEP = datetime.timedelta(minutes=15)
++
+ 
+ class Schedule:
+     def __init__(self):
+@@ -21,19 +24,41 @@ class Schedule:
+             raise BookingError(f"We don't offer '{appointment.treatment}'. Choose one of: {known}.")
+         if not is_open_between(appointment.start, appointment.end):
+             raise OutsideOpeningHours(_closed_message(appointment))
++        other = self._clash(appointment.therapist, appointment.start, appointment.end)
++        if other is not None:
++            raise SlotTaken(
++                f"{appointment.therapist.title()} is booked from "
++                f"{other.start:%H:%M} to {other.end:%H:%M}, and needs "
++                f"{int(GAP.total_seconds() // 60)} minutes between appointments, so that time is taken."
++            )
++        self.appointments.append(appointment)
++        return appointment
++
++    def free_slots(self, therapist, day, minutes):
++        """Start times on `day` (every 15 minutes from opening) where a `minutes`-long appointment could be booked."""
++        hours = opening_hours(day)
++        if hours is None:
++            return []
++        opens, closes = hours
++        length = datetime.timedelta(minutes=minutes)
++        slots = []
++        start = opens
++        while start + length <= closes:
++            if self._clash(therapist, start, start + length) is None:
++                slots.append(start)
++            start += SLOT_STEP
++        return slots
++
++    def _clash(self, therapist, start, end):
++        """The therapist's live appointment that stops one running from `start` to `end`, or None."""
+         for other in self.appointments:
+-            if other.cancelled or other.therapist != appointment.therapist:
++            if other.cancelled or other.therapist != therapist:
+                 continue
+             # Each existing appointment is widened by GAP on both sides, so a new one
+             # must start at least GAP after it ends, or end at least GAP before it starts.
+-            if other.start < appointment.end + GAP and appointment.start < other.end + GAP:
+-                raise SlotTaken(
+-                    f"{appointment.therapist.title()} is booked from "
+-                    f"{other.start:%H:%M} to {other.end:%H:%M}, and needs "
+-                    f"{int(GAP.total_seconds() // 60)} minutes between appointments, so that time is taken."
+-                )
+-        self.appointments.append(appointment)
+-        return appointment
++            if other.start < end + GAP and start < other.end + GAP:
++                return other
++        return None
+ 
+     def get(self, appointment_id):
+         for appointment in self.appointments:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index c74c8d3..6b205f4 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -144,6 +144,48 @@ class ScheduleTest(unittest.TestCase):
+         s.book(at(10, therapist="marco"))
+         self.assertEqual([a.start.hour for a in s.appointments_for("lena", datetime.date(2026, 9, 8))], [8, 14])
+ 
++    def test_free_slots_on_empty_day_run_from_opening_in_15_minute_steps(self):
++        s = Schedule()
++        slots = s.free_slots("lena", datetime.date(2026, 9, 8), 45)  # Tuesday, 07:30-19:00
++        self.assertEqual(slots[0], datetime.datetime(2026, 9, 8, 7, 30))
++        self.assertEqual(slots[-1], datetime.datetime(2026, 9, 8, 18, 15))  # last 45-minute slot that ends by 19:00
++        self.assertEqual(len(slots), 44)
++        self.assertTrue(all(isinstance(t, datetime.datetime) for t in slots))
++
++    def test_free_slots_respect_a_shorter_day(self):
++        s = Schedule()
++        slots = s.free_slots("lena", datetime.date(2026, 9, 12), 60)  # Saturday, 08:00-12:00
++        self.assertEqual(slots[0], datetime.datetime(2026, 9, 12, 8, 0))
++        self.assertEqual(slots[-1], datetime.datetime(2026, 9, 12, 11, 0))
++        self.assertEqual(len(slots), 13)
++
++    def test_free_slots_on_a_closed_day_are_empty(self):
++        s = Schedule()
++        self.assertEqual(s.free_slots("lena", datetime.date(2026, 9, 13), 45), [])  # Sunday
++
++    def test_free_slots_skip_a_booking_and_its_gap(self):
++        s = Schedule()
++        s.book(at(9))  # 09:00-09:45, so starts from 08:15 to 09:45 would clash for a 45-minute visit
++        day = datetime.date(2026, 9, 8)
++        empty = Schedule().free_slots("lena", day, 45)
++        blocked = [datetime.datetime(2026, 9, 8, h, m) for h, m in [(8, 15), (8, 30), (8, 45), (9, 0), (9, 15), (9, 30), (9, 45)]]
++        self.assertEqual(s.free_slots("lena", day, 45), [t for t in empty if t not in blocked])
++        self.assertIn(datetime.datetime(2026, 9, 8, 8, 0), s.free_slots("lena", day, 45))  # ends 08:45, 10 minutes before 09:00
++        self.assertIn(datetime.datetime(2026, 9, 8, 10, 0), s.free_slots("lena", day, 45))  # starts 10 minutes after 09:45
++
++    def test_free_slots_ignore_cancelled_appointments(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        day = datetime.date(2026, 9, 8)
++        self.assertEqual(s.free_slots("lena", day, 45), Schedule().free_slots("lena", day, 45))
++
++    def test_free_slots_ignore_other_therapists(self):
++        s = Schedule()
++        s.book(at(9, therapist="marco"))
++        day = datetime.date(2026, 9, 8)
++        self.assertEqual(s.free_slots("lena", day, 45), Schedule().free_slots("lena", day, 45))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

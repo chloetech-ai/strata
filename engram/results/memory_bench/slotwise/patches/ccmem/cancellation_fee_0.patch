@@ -1,0 +1,73 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f6b1d49..b9fabb6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,7 @@
+ - Booking errors are now `BookingError` subclasses (`SlotTaken`, `OutsideOpeningHours`) with receptionist-facing messages, instead of `ValueError`.
+ - Each therapist needs a 10-minute gap before and after every appointment (`schedule.BUFFER`).
+ - Fixed overlap check missing appointments that start before an existing one and run into it.
++- `fees.cancellation_fee(appointment, cancelled_at)` returns the fee in cents: full price under 24 hours' notice, half under 48 hours, free otherwise.
+ - Client register (`clients.Client`, `clients.ClientBook`). Phone lookup ignores formatting and matches `079…`, `+41…` and `0041…` notations of the same number.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..046dd04
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,17 @@
++"""Cancellation fees."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours' notice costs the full price, less than 48 hours costs
++    half, and anything earlier is free.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..2b02fcb
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,32 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def setUp(self):
++        self.appointment = Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0), "initial")
++
++    def cancel_with_notice(self, hours):
++        return cancellation_fee(self.appointment, self.appointment.start - datetime.timedelta(hours=hours))
++
++    def test_free_with_two_or_more_days_notice(self):
++        self.assertEqual(self.cancel_with_notice(48), 0)
++        self.assertEqual(self.cancel_with_notice(72), 0)
++
++    def test_half_price_under_48_hours(self):
++        self.assertEqual(self.cancel_with_notice(47), 7250)
++        self.assertEqual(self.cancel_with_notice(24), 7250)
++
++    def test_full_price_under_24_hours(self):
++        self.assertEqual(self.cancel_with_notice(23), 14500)
++        self.assertEqual(self.cancel_with_notice(0), 14500)
++
++    def test_full_price_after_start(self):
++        self.assertEqual(cancellation_fee(self.appointment, self.appointment.start + datetime.timedelta(hours=1)), 14500)
++
++
++if __name__ == "__main__":
++    unittest.main()

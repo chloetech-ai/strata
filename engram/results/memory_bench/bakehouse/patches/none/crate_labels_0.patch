@@ -1,0 +1,102 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..3327407 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,9 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_customers.py": true,
++  "tests/test_invoice.py": true,
++  "tests/test_orders.py": true,
++  "tests/test_production.py": true,
++  "tests/test_products.py": true,
++  "tests/test_reports.py": true,
++  "tests/test_standing.py": true
++}
+\ No newline at end of file
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f3e54c7..16ef5b8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@
+ - Added Potter's Farm Shop (POTTER) to customers.csv, route 6. Joins next month.
+ - Added `invoice.invoice_number(year, seq)`: invoice numbers such as 'LK-2026-0001'. Sequence must be 1 to 9999.
+ - Added `production.crates_needed(units, per_crate)`: whole crates needed, rounding a partial crate up.
++- Added `labels.crate_labels(orderbook, customers, day)`: one label's text per customer and product for that day, with name, address and quantity.
+ - Planned: the bake sheet lists products hottest oven first, to avoid reheating the deck oven after its overnight cool-down.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..4bc5056
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,24 @@
++"""Crate labels for packing a delivery day."""
++
++
++def crate_labels(orderbook, customers, day):
++    """One label's text per customer and product ordered for delivery on `day`.
++
++    Customers come in sorted code order, then products in sorted code order.
++    Quantities for the same customer and product are added together.
++    `customers` is the dict that load_customers returns.
++    """
++    labels = []
++    for code in orderbook.customers_for(day):
++        customer = customers[code]
++        totals = {}
++        for line in orderbook.lines_for(code, day):
++            totals[line.product] = totals.get(line.product, 0) + line.qty
++        for product_code in sorted(totals):
++            product = orderbook.catalog.get(product_code)
++            labels.append(
++                f"{customer.name}\n"
++                f"{customer.address}, {customer.postcode}\n"
++                f"{product.name} x {totals[product_code]}"
++            )
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..099ab91
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,37 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def test_one_label_per_customer_and_product_for_the_day(self):
++        day = datetime.date(2026, 10, 20)
++        catalog = Catalog([Product("CRO", "Croissant", 110), Product("SOU", "White sourdough", 320)])
++        customers = {
++            "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++            "HARBOUR": Customer("HARBOUR", "Harbour Deli", "3 Quay Street", "LK2 7QS", 2),
++        }
++        book = OrderBook(catalog, [
++            OrderLine(day, "LUMEN", "SOU", 6),
++            OrderLine(day, "LUMEN", "CRO", 10),
++            OrderLine(day, "LUMEN", "CRO", 14),
++            OrderLine(day, "HARBOUR", "CRO", 12),
++            OrderLine(day.replace(day=21), "HARBOUR", "SOU", 99),
++        ])
++        self.assertEqual(crate_labels(book, customers, day), [
++            "Harbour Deli\n3 Quay Street, LK2 7QS\nCroissant x 12",
++            "Café Lumen\n14 Mill Lane, LK1 2AB\nCroissant x 24",
++            "Café Lumen\n14 Mill Lane, LK1 2AB\nWhite sourdough x 6",
++        ])
++
++    def test_no_orders_gives_no_labels(self):
++        catalog = Catalog([Product("CRO", "Croissant", 110)])
++        self.assertEqual(crate_labels(OrderBook(catalog), {}, datetime.date(2026, 10, 20)), [])
++
++
++if __name__ == "__main__":
++    unittest.main()

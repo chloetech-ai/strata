@@ -1,0 +1,126 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3996565..47a4485 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@
+ - Added `Schedule.cancel(appointment_id)`. Cancelled appointments stay in the schedule with `status == "cancelled"` but no longer block their slot or the buffer around it. Saved files gain a `status` field; older files load as booked.
+ - Added `Schedule.week(therapist, monday)`: a therapist's booked appointments for the seven days from `monday`, keyed by date, each day sorted by start time. Cancelled appointments are left out.
+ - Added `Schedule.book_series(therapist, client, start, sessions, treatment="standard")`: weekly appointments at the same weekday and time. A week already taken is skipped and a later week is added, so the client still gets every session. Series are capped at 9 sessions (`SeriesTooLong`, a new `BookingError`).
++- Added `Schedule.reschedule(appointment_id, new_start)`: moves a booked appointment to `new_start`, keeping its therapist, client, treatment and id. The new time is checked like `book`, and if it is refused the appointment stays where it was. Cancelled appointments raise `BookingError`.
+ - Added `slotwise.clients`: `Client` (id, name, phone, email) and `ClientBook`, a register with `add(client)` and `find_by_phone(phone)`. Phone numbers are matched after normalizing, so "079 123 45 67", "+41 79 123 45 67" and "0041791234567" all find the same client. National numbers with a leading 0 are read as Swiss. `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case and surrounding spaces.
+ - Added `slotwise.reminders`: `reminder(appointment)` builds the SMS text. It is plain ASCII (umlauts spelled out, so "Brändli" becomes "Braendli"), includes the reception number 044 512 77 30, and raises `ValueError` rather than exceed 160 characters.
+ 
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index c7956d1..350a47d 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -1,5 +1,6 @@
+ """Booking appointments."""
+ 
++import dataclasses
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SeriesTooLong, SlotTaken
+@@ -19,6 +20,25 @@ class Schedule:
+ 
+     def book(self, appointment):
+         """Adds `appointment` if the practice is open and the therapist is free, with BUFFER either side."""
++        self._check(appointment)
++        self.appointments.append(appointment)
++        return appointment
++
++    def reschedule(self, appointment_id, new_start):
++        """Moves a booked appointment to `new_start`, keeping its length. Checks the new time like `book`.
++
++        If the new time is refused, the appointment stays where it was.
++        """
++        appointment = self.get(appointment_id)
++        if appointment.status == CANCELLED:
++            raise BookingError(f"Appointment {appointment_id} is cancelled. Book a new appointment instead.")
++        moved = dataclasses.replace(appointment, start=new_start)
++        self._check(moved, replacing=appointment)
++        appointment.start = new_start
++        return appointment
++
++    def _check(self, appointment, replacing=None):
++        """Raises a BookingError if `appointment` cannot go in. `replacing` is ignored as an existing booking."""
+         if appointment.treatment not in TREATMENTS:
+             choices = ", ".join(sorted(TREATMENTS))
+             raise BookingError(f"Unknown treatment {appointment.treatment!r}. Choose one of: {choices}.")
+@@ -26,7 +46,7 @@ class Schedule:
+         if not is_open_between(appointment.start, appointment.end):
+             raise OutsideOpeningHours(f"The practice is closed {when}. Please choose a time within opening hours.")
+         for other in self.appointments:
+-            if other.therapist != appointment.therapist or other.status == CANCELLED:
++            if other is replacing or other.therapist != appointment.therapist or other.status == CANCELLED:
+                 continue
+             if other.start < appointment.end + BUFFER and appointment.start < other.end + BUFFER:
+                 raise SlotTaken(
+@@ -34,8 +54,6 @@ class Schedule:
+                     f"which is too close to {when}. Appointments need {BUFFER.seconds // 60} minutes between them. "
+                     "Please choose another time."
+                 )
+-        self.appointments.append(appointment)
+-        return appointment
+ 
+     def book_series(self, therapist, client, start, sessions, treatment="standard"):
+         """Books `sessions` weekly appointments from `start`, same weekday and time.
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index fe27fdc..53953e7 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -176,6 +176,54 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().book_series("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0), 0)
+ 
++    def test_reschedule_moves_appointment_and_keeps_identity(self):
++        s = Schedule()
++        a = s.book(at(9))
++        moved = s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertIs(moved, a)
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual((a.therapist, a.client, a.treatment, a.status), ("lena", "Kim Weber", "standard", "booked"))
++        self.assertEqual(len(s.appointments), 1)
++
++    def test_reschedule_to_same_time_is_allowed(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 9, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_into_buffer_of_other_is_taken_and_stays_put(self):
++        s = Schedule()
++        s.book(at(9))
++        a = s.book(at(11, client="Jo Li"))
++        with self.assertRaises(SlotTaken):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 9, 50))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 11, 0))
++
++    def test_reschedule_outside_opening_hours_stays_put(self):
++        s = Schedule()
++        a = s.book(at(9))
++        with self.assertRaises(OutsideOpeningHours):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 18, 30))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_ignores_own_old_slot_for_buffer(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 9, 5))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 5))
++
++    def test_reschedule_cancelled_is_booking_error(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        with self.assertRaises(BookingError):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_unknown_id_is_key_error(self):
++        with self.assertRaises(KeyError):
++            Schedule().reschedule(-1, datetime.datetime(2026, 9, 8, 11, 0))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

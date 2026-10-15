@@ -1,0 +1,72 @@
+diff --git a/src/bakehouse/pricing.py b/src/bakehouse/pricing.py
+new file mode 100644
+index 0000000..1e42eb2
+--- /dev/null
++++ b/src/bakehouse/pricing.py
+@@ -0,0 +1,19 @@
++"""Wholesale price changes."""
++
++# Each new price is 5% up, rounded up to the next 5p (never down).
++RISE_PERCENT = 5
++ROUND_TO_PENCE = 5
++
++
++def new_price(price):
++    """The price after the January rise, in pence."""
++    # price * (100 + RISE_PERCENT) / 100, rounded up to a multiple of ROUND_TO_PENCE,
++    # done in integers: ceil(x / 500) * 5 for x = price * 105.
++    scale = 100 * ROUND_TO_PENCE
++    raised = price * (100 + RISE_PERCENT)
++    return -(-raised // scale) * ROUND_TO_PENCE
++
++
++def new_prices(catalog):
++    """{product code: new wholesale price in pence} for every product in `catalog`."""
++    return {product.code: new_price(product.price) for product in catalog}
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+new file mode 100644
+index 0000000..3580a85
+--- /dev/null
++++ b/tests/test_pricing.py
+@@ -0,0 +1,41 @@
++import os
++import unittest
++
++from bakehouse.pricing import new_price, new_prices
++from bakehouse.products import Catalog, Product, load_catalog
++
++DATA = os.path.join(os.path.dirname(__file__), "..", "data")
++
++
++class NewPriceTest(unittest.TestCase):
++    def test_five_percent_rounded_up_to_next_5p(self):
++        self.assertEqual(new_price(320), 340)  # 336 rounds up to 340
++        self.assertEqual(new_price(95), 100)  # 99.75 rounds up to 100
++        self.assertEqual(new_price(40), 45)  # 42 rounds up to 45
++
++    def test_exact_multiple_of_5p_is_not_rounded_further(self):
++        self.assertEqual(new_price(100), 105)  # exactly 105
++        self.assertEqual(new_price(180), 190)  # 189 rounds up to 190
++
++    def test_never_rounds_down(self):
++        for price in range(0, 1000):
++            self.assertGreaterEqual(new_price(price) * 100, price * 105)
++            self.assertLess(new_price(price) * 100, price * 105 + 500)
++
++    def test_zero_stays_zero(self):
++        self.assertEqual(new_price(0), 0)
++
++
++class NewPricesTest(unittest.TestCase):
++    def test_every_product_in_the_catalog(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320), Product("BAG", "Baguette", 95)])
++        self.assertEqual(new_prices(catalog), {"SOU": 340, "BAG": 100})
++
++    def test_real_catalog_covers_every_product(self):
++        catalog = load_catalog(os.path.join(DATA, "products.csv"))
++        prices = new_prices(catalog)
++        self.assertEqual(set(prices), {p.code for p in catalog})
++
++
++if __name__ == "__main__":
++    unittest.main()

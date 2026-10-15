@@ -1,0 +1,98 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 83c7660..3c9caf2 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -9,6 +9,11 @@
+   "tests/test_clients.py::NormalizePhoneTest::test_all_notations_of_a_swiss_number_are_the_same",
+   "tests/test_clients.py::NormalizePhoneTest::test_number_without_digits_is_refused",
+   "tests/test_clients.py::NormalizePhoneTest::test_number_without_plus_or_zero_is_taken_as_already_international",
++  "tests/test_durations.py::ParseDurationTest::test_colon",
++  "tests/test_durations.py::ParseDurationTest::test_hours",
++  "tests/test_durations.py::ParseDurationTest::test_ignores_case_and_surrounding_spaces",
++  "tests/test_durations.py::ParseDurationTest::test_minutes",
++  "tests/test_durations.py::ParseDurationTest::test_rejects_empty_zero_and_garbage",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5680409..360bca1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@
+ - `Schedule.book_series(therapist, client, start, treatment, sessions)` books weekly sessions at the same weekday and time. A week whose slot is taken is skipped and a later week is used instead. Series of more than 9 sessions are refused, and a series is either fully booked or not booked at all.
+ - `Schedule.week(therapist, monday)` returns a therapist's non-cancelled appointments for the seven days from `monday`, as a dict from date to a list sorted by start time. Days with no appointments map to an empty list.
+ - `Schedule.cancel(appointment_id)` marks an appointment as cancelled (`status` field) instead of deleting it. Cancelled appointments no longer block their slot or changeover gap, and the status is saved to JSON.
++- `slotwise.durations.parse_duration(text)` turns '45', '45 min', '1h', '1h30', '1h 30m' or '1:30' into minutes. It raises `ValueError` for empty input, zero, or anything else.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/slotwise/durations.py b/src/slotwise/durations.py
+new file mode 100644
+index 0000000..f96deb7
+--- /dev/null
++++ b/src/slotwise/durations.py
+@@ -0,0 +1,27 @@
++"""Durations typed by the front desk, such as '45', '1h30' or '1:30'."""
++
++import re
++
++_COLON = re.compile(r"([0-9]+):([0-9]{1,2})")  # 1:30
++_HOURS = re.compile(r"([0-9]+)\s*h(?:\s*([0-9]+)\s*(?:m|min)?)?")  # 1h, 1h30, 1h 30m
++_MINUTES = re.compile(r"([0-9]+)\s*(?:m|min)?")  # 45, 45m, 45 min
++
++
++def parse_duration(text):
++    """Return the length of text in minutes, e.g. '1h30' -> 90.
++
++    Raises ValueError for empty input, zero, or anything not written in one of the forms above.
++    """
++    value = text.strip().lower()
++    if match := _COLON.fullmatch(value) or _HOURS.fullmatch(value):
++        minutes = int(match[2] or 0)
++        if minutes >= 60:
++            raise ValueError(f"minutes must be below 60: {text!r}")
++        total = int(match[1]) * 60 + minutes
++    elif match := _MINUTES.fullmatch(value):
++        total = int(match[1])
++    else:
++        raise ValueError(f"not a duration: {text!r}")
++    if total == 0:
++        raise ValueError(f"duration must be more than zero: {text!r}")
++    return total
+diff --git a/tests/test_durations.py b/tests/test_durations.py
+new file mode 100644
+index 0000000..ad36a7c
+--- /dev/null
++++ b/tests/test_durations.py
+@@ -0,0 +1,31 @@
++import unittest
++
++from slotwise.durations import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes(self):
++        self.assertEqual(parse_duration("45"), 45)
++        self.assertEqual(parse_duration("45m"), 45)
++        self.assertEqual(parse_duration("45 min"), 45)
++
++    def test_hours(self):
++        self.assertEqual(parse_duration("1h"), 60)
++        self.assertEqual(parse_duration("1h30"), 90)
++        self.assertEqual(parse_duration("1h 30m"), 90)
++        self.assertEqual(parse_duration("2h15"), 135)
++
++    def test_colon(self):
++        self.assertEqual(parse_duration("1:30"), 90)
++
++    def test_ignores_case_and_surrounding_spaces(self):
++        self.assertEqual(parse_duration("  1H 30 MIN "), 90)
++
++    def test_rejects_empty_zero_and_garbage(self):
++        for text in ["", "   ", "0", "0h", "0:00", "abc", "-5", "1.5h", "1h90", "1:60", "1h30x"]:
++            with self.subTest(text=text), self.assertRaises(ValueError):
++                parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

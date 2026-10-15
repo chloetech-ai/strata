@@ -1,0 +1,95 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 0b192c0..2c73b83 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -11,6 +11,9 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_ascii_transliteration",
++  "tests/test_reminders.py::ReminderTextTest::test_long_name_is_shortened_to_fit",
++  "tests/test_reminders.py::ReminderTextTest::test_reminder_contents",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_buffer_after_existing_appointment",
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..3ebaf7a
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,32 @@
++"""Text of the reminder SMS sent before an appointment."""
++
++import unicodedata
++
++PRACTICE = "Lindqvist Physio"
++RECEPTION_PHONE = "044 512 77 30"
++# Longer messages are billed as two SMS.
++MAX_LENGTH = 160
++
++# German letters that NFKD decomposition can't turn into plain ASCII.
++_GERMAN = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
++
++
++def ascii_text(text):
++    """Plain ASCII version of `text`: Brändli becomes Braendli, Zoë becomes Zoe."""
++    for char, replacement in _GERMAN.items():
++        text = text.replace(char, replacement)
++    decomposed = unicodedata.normalize("NFKD", text)
++    return decomposed.encode("ascii", "ignore").decode("ascii")
++
++
++def reminder_text(appointment):
++    """The reminder for `appointment`, at most MAX_LENGTH characters of plain ASCII."""
++    when = appointment.start.strftime("%a %d.%m. %H:%M")
++    therapist = ascii_text(appointment.therapist).capitalize()
++    client = ascii_text(appointment.client)
++    template = f"{PRACTICE}: reminder for {{client}}, {when} with {therapist}. To move it, call {RECEPTION_PHONE}."
++    room = MAX_LENGTH - len(template.format(client=""))
++    if len(client) > room:
++        # Shorten the name, not the phone number or the time.
++        client = client[: room - 2] + ".."
++    return template.format(client=client)
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..97da8aa
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,37 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import MAX_LENGTH, RECEPTION_PHONE, ascii_text, reminder_text
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_ascii_transliteration(self):
++        self.assertEqual(ascii_text("Zoë Brändli"), "Zoe Braendli")
++        self.assertEqual(ascii_text("Gößmann Ülker"), "Goessmann Uelker")
++        self.assertEqual(ascii_text("José"), "Jose")
++
++    def test_reminder_contents(self):
++        a = Appointment("lena", "Zoë Brändli", datetime.datetime(2026, 9, 8, 9, 0))
++        text = reminder_text(a)
++        self.assertEqual(
++            text,
++            "Lindqvist Physio: reminder for Zoe Braendli, Tue 08.09. 09:00 with Lena. "
++            "To move it, call 044 512 77 30.",
++        )
++        self.assertIn(RECEPTION_PHONE, text)
++        self.assertLessEqual(len(text), MAX_LENGTH)
++        self.assertTrue(text.isascii())
++
++    def test_long_name_is_shortened_to_fit(self):
++        a = Appointment("lena", "Maximilian Alexander Wolfgang Friedrich von Oberstein-Hohenlohe " * 3,
++                        datetime.datetime(2026, 9, 8, 9, 0))
++        text = reminder_text(a)
++        self.assertLessEqual(len(text), MAX_LENGTH)
++        self.assertIn("call 044 512 77 30.", text)
++        self.assertIn("Tue 08.09. 09:00 with Lena", text)
++        self.assertTrue(text.isascii())
++
++
++if __name__ == "__main__":
++    unittest.main()

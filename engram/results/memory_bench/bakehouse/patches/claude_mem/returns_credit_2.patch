@@ -1,0 +1,85 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d197174..e8b41f1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@
+ - Products: `price_text()` formats wholesale prices in pounds; `total_batches()` sums a bake plan.
+ - Customers: optional `email` column; Old Mill Tearoom name typo fixed; new customer Potter's Farm Shop (route 6).
+ - Invoices: `invoice_number(year, seq)` gives numbers like `LK-2026-0001`; `invoice_for` only includes the named customer's lines.
++- Invoices: `returns_credit(catalog, customer_code, product_code, delivered, returned)` gives the credit in pence for unsold units sent back.
+ - Dough weights: `dough_weight_g` rejects negative units; product dough weights are whole grams.
+ - Production: `crates_needed(units, per_crate)` rounds up to whole crates.
+ - Python 3.7 compatibility fixes.
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index c576cf0..e7d6b7b 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -47,6 +47,20 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Credit in pence for `returned` unsold units of `product_code` from one delivery of
++    `delivered` units to `customer_code`, credited at the catalog price.
++
++    The customer code does not change the price today; it is taken so the credit can be
++    tied to the customer's delivery. Raises ValueError for negative counts or for more
++    units returned than were delivered."""
++    if delivered < 0 or returned < 0:
++        raise ValueError(f"unit counts must not be negative, got delivered={delivered}, returned={returned}")
++    if returned > delivered:
++        raise ValueError(f"cannot return {returned} of {product_code}: only {delivered} were delivered")
++    return returned * catalog.get(product_code).price
++
++
+ def format_pence(pence):
+     """Format integer pence as pounds, e.g. 1234 -> '£12.34'. Negative amounts get a leading minus."""
+     sign = "-" if pence < 0 else ""
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 62bd57a..20513ad 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -64,6 +64,34 @@ class InvoiceNumberTest(unittest.TestCase):
+             invoice_number(2026, 10000)
+ 
+ 
++class ReturnsCreditTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([Product("SOU", "White sourdough", 320, 10), Product("CRO", "Croissant", 110, 24)])
++
++    def test_returned_units_credited_at_catalog_price(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SOU", 10, 3), 3 * 320)
++
++    def test_nothing_returned_is_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "CRO", 24, 0), 0)
++
++    def test_everything_returned(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "CRO", 24, 24), 24 * 110)
++
++    def test_returning_more_than_delivered_is_an_error(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SOU", 10, 11)
++
++    def test_negative_counts_are_errors(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SOU", -1, 0)
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SOU", 10, -1)
++
++    def test_unknown_product_is_an_error(self):
++        with self.assertRaises(KeyError):
++            returns_credit(self.catalog, "GREENWAY", "BAG", 10, 1)
++
++
+ class FormatPenceTest(unittest.TestCase):
+     def test_pounds_and_pence(self):
+         self.assertEqual(format_pence(1234), "£12.34")

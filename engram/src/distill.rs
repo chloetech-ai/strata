@@ -97,6 +97,7 @@ Leave out:
 - anything already noted above, unless this exchange changes it;
 - status that will soon be stale (test counts, what is committed or pushed, which branch is checked out);
 - the assistant's own working conventions (commit message trailers, tool usage) and its suggestions the user did not take up;
+- questions the assistant asked and assumptions it made that the user has not answered or confirmed: they are not requirements, and never write one up as something that must be settled before the work can start;
 - details of the code that reading it shows (signatures, what a function does).
 
 Output one JSON object per line and nothing else:

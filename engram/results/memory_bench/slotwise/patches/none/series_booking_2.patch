@@ -1,0 +1,166 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 01273c4..e3f2e5d 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,13 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_duplicate_phone_is_rejected",
++  "tests/test_clients.py::ClientBookTest::test_email_is_optional",
++  "tests/test_clients.py::ClientBookTest::test_find_by_any_phone_format",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_no_match_or_blank_returns_empty",
++  "tests/test_clients.py::ClientBookTest::test_unknown_phone_returns_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_swiss_forms_match",
++  "tests/test_clients.py::NormalizePhoneTest::test_empty_is_rejected",
++  "tests/test_clients.py::NormalizePhoneTest::test_too_short_is_rejected",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+@@ -7,6 +16,8 @@
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_booking_errors_share_base_class",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_record_and_frees_slot",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_id",
+   "tests/test_schedule.py::ScheduleTest::test_gap_after_is_required",
+   "tests/test_schedule.py::ScheduleTest::test_gap_after_of_ten_minutes_is_enough",
+   "tests/test_schedule.py::ScheduleTest::test_gap_applies_per_therapist_only",
+@@ -17,5 +28,16 @@
+   "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_unknown_treatment",
++  "tests/test_schedule.py::ScheduleTest::test_week_groups_by_day_in_order_without_cancelled",
++  "tests/test_schedule.py::ScheduleTest::test_week_requires_monday",
++  "tests/test_series.py::BookSeriesTest::test_appointments_get_distinct_ids",
++  "tests/test_series.py::BookSeriesTest::test_books_weekly_appointments",
++  "tests/test_series.py::BookSeriesTest::test_clash_books_nothing",
++  "tests/test_series.py::BookSeriesTest::test_copies_therapist_client_and_treatment",
++  "tests/test_series.py::BookSeriesTest::test_count_must_be_positive",
++  "tests/test_series.py::BookSeriesTest::test_first_is_the_given_appointment",
++  "tests/test_series.py::BookSeriesTest::test_other_therapist_does_not_clash",
++  "tests/test_series.py::BookSeriesTest::test_refused_first_appointment_books_nothing",
++  "tests/test_storage.py::StorageTest::test_cancelled_status_roundtrip",
+   "tests/test_storage.py::StorageTest::test_roundtrip"
+ ]
+\ No newline at end of file
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f13634a..a09aa27 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@
+ - `Schedule.week(therapist, monday)` returns a therapist's non-cancelled appointments for the week as a dict keyed by each date (all seven days, empty lists included), sorted by start time.
+ - New client register in `clients.py`: `Client` dataclass and `ClientBook` with `add(client)` and `find_by_phone(phone)`. Phone numbers are normalized, so `079 123 45 67`, `+41 79 123 45 67` and `0041791234567` all find the same client. Adding a phone number that is already registered raises `ValueError`.
+ - `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case, in the order they were added; a blank query returns `[]`.
++- `book_series(schedule, first, count)` in `series.py` books `count` weekly appointments starting with `first`, with the same therapist, client and treatment, and returns them. If any one is refused, none are booked and the error is raised.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/slotwise/series.py b/src/slotwise/series.py
+new file mode 100644
+index 0000000..e751586
+--- /dev/null
++++ b/src/slotwise/series.py
+@@ -0,0 +1,31 @@
++"""Booking a series of weekly appointments."""
++
++import datetime
++
++from .errors import BookingError
++from .model import Appointment
++
++WEEK = datetime.timedelta(weeks=1)
++
++
++def book_series(schedule, first, count):
++    """Books `count` weekly appointments, starting with `first`, all with the same therapist, client and treatment.
++
++    Either every appointment is booked or none is: if one of them is refused, the ones already added are removed and the error is raised.
++    Returns the booked appointments in date order.
++    """
++    if count < 1:
++        raise ValueError(f"A series needs at least one appointment, not {count}")
++    later = [
++        Appointment(first.therapist, first.client, first.start + i * WEEK, first.treatment)
++        for i in range(1, count)
++    ]
++    booked = []
++    try:
++        for appointment in [first, *later]:
++            booked.append(schedule.book(appointment))
++    except BookingError:
++        for appointment in booked:
++            schedule.appointments.remove(appointment)
++        raise
++    return booked
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..a9e6cb6
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,66 @@
++import datetime
++import unittest
++
++from slotwise.errors import OutsideOpeningHours, SlotTaken
++from slotwise.model import Appointment
++from slotwise.schedule import Schedule
++from slotwise.series import book_series
++
++
++def at(day, hour, minute=0, therapist="lena", treatment="standard", client="Kim Weber"):
++    return Appointment(therapist, client, datetime.datetime(2026, 9, day, hour, minute), treatment)
++
++
++class BookSeriesTest(unittest.TestCase):
++    def test_books_weekly_appointments(self):
++        s = Schedule()
++        booked = book_series(s, at(7, 9), 3)  # Mondays 7, 14, 21 September
++        self.assertEqual([a.start.day for a in booked], [7, 14, 21])
++        self.assertEqual(s.appointments, booked)
++
++    def test_first_is_the_given_appointment(self):
++        s = Schedule()
++        first = at(7, 9)
++        booked = book_series(s, first, 2)
++        self.assertIs(booked[0], first)
++        self.assertIs(s.get(first.id), first)
++
++    def test_copies_therapist_client_and_treatment(self):
++        s = Schedule()
++        booked = book_series(s, at(7, 9, therapist="omar", treatment="initial", client="Jo Li"), 2)
++        for a in booked:
++            self.assertEqual((a.therapist, a.client, a.treatment), ("omar", "Jo Li", "initial"))
++
++    def test_appointments_get_distinct_ids(self):
++        s = Schedule()
++        booked = book_series(s, at(7, 9), 3)
++        self.assertEqual(len({a.id for a in booked}), 3)
++
++    def test_count_must_be_positive(self):
++        s = Schedule()
++        with self.assertRaises(ValueError):
++            book_series(s, at(7, 9), 0)
++        self.assertEqual(s.appointments, [])
++
++    def test_clash_books_nothing(self):
++        s = Schedule()
++        s.book(at(14, 9, client="Jo Li"))  # blocks the second week
++        with self.assertRaises(SlotTaken):
++            book_series(s, at(7, 9), 3)
++        self.assertEqual([a.client for a in s.appointments], ["Jo Li"])
++
++    def test_refused_first_appointment_books_nothing(self):
++        s = Schedule()
++        # Saturday 12 September closes at 12:00, so a 45-minute appointment at 11:30 is refused
++        with self.assertRaises(OutsideOpeningHours):
++            book_series(s, at(12, 11, 30), 2)
++        self.assertEqual(s.appointments, [])
++
++    def test_other_therapist_does_not_clash(self):
++        s = Schedule()
++        s.book(at(14, 9, therapist="omar"))
++        self.assertEqual(len(book_series(s, at(7, 9), 3)), 3)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,96 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7ddc543..042c8de 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@
+ - Added `invoice_number(year, seq)`, giving numbers such as `LK-2026-0001`.
+ - Added `invoice_for`, which builds one customer's invoice for one delivery day.
+ - Added `crates_needed(units, per_crate)` for whole crates.
++- Added `drops_file(orderbook, customers, day, path)`, which writes the day's drops in route order as a Stopwise import file.
+ - Added Potter's Farm Shop (`POTTER`, route 6) to `customers.csv`.
+ - Reject unknown product codes; add order totals and allergen text.
+ - Reject a `customers.csv` where two customers share a `route_seq`.
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..337a25d
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,14 @@
++"""The van's run for a delivery day."""
++
++import csv
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes the van's drops for `day` to `path` as a Stopwise import file: one row per customer with an order
++    that day, in route_seq order. `customers` is the dict from load_customers."""
++    drops = sorted((customers[code] for code in orderbook.customers_for(day)), key=lambda c: c.route_seq)
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(["Name", "Address", "Postcode", "Notes"])
++        for c in drops:
++            writer.writerow([c.name, c.address, c.postcode, ""])
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..422663a
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,58 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.delivery import drops_file
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class DropsFileTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12)])
++        self.customers = {
++            "LUMEN": Customer("LUMEN", "Café Lumen", "1 High St", "AB1 2CD", 3),
++            "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "9 Mill Rd", "AB3 4EF", 1),
++            "MILL": Customer("MILL", "The Old Mill Tearoom", "2 Weir Ln", "AB5 6GH", 2),
++            "POTTER": Customer("POTTER", "Potter's Farm Shop", "Farm Lane", "AB7 8IJ", 4),
++        }
++
++    def write(self, book):
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "drops.csv")
++            drops_file(book, self.customers, DAY, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                return list(csv.reader(f))
++
++    def test_header_and_one_row_per_drop_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY, "GREENWAY", "BAG", 20),
++            OrderLine(DAY, "MILL", "BAG", 2),
++        ])
++        self.assertEqual(self.write(book), [
++            ["Name", "Address", "Postcode", "Notes"],
++            ["Greenway Grocers", "9 Mill Rd", "AB3 4EF", ""],
++            ["The Old Mill Tearoom", "2 Weir Ln", "AB5 6GH", ""],
++            ["Café Lumen", "1 High St", "AB1 2CD", ""],
++        ])
++
++    def test_customers_without_orders_that_day_are_left_out(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "POTTER", "BAG", 1),
++            OrderLine(DAY + datetime.timedelta(days=1), "GREENWAY", "BAG", 1),
++        ])
++        rows = self.write(book)
++        self.assertEqual(rows[1:], [["Potter's Farm Shop", "Farm Lane", "AB7 8IJ", ""]])
++
++    def test_no_orders_gives_header_only(self):
++        self.assertEqual(self.write(OrderBook(self.catalog)), [["Name", "Address", "Postcode", "Notes"]])
++
++
++if __name__ == "__main__":
++    unittest.main()

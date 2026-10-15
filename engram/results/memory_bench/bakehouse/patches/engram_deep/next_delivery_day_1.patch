@@ -1,0 +1,67 @@
+diff --git a/src/bakehouse/orders.py b/src/bakehouse/orders.py
+index 71021b0..75fa343 100644
+--- a/src/bakehouse/orders.py
++++ b/src/bakehouse/orders.py
+@@ -68,6 +68,14 @@ def is_delivery_day(day):
+     return day.weekday() not in config.CLOSED_WEEKDAYS
+ 
+ 
++def next_delivery_day(day):
++    """The first delivery day after `day` (`day` itself is not counted)."""
++    candidate = day + datetime.timedelta(days=1)
++    while not is_delivery_day(candidate):
++        candidate += datetime.timedelta(days=1)
++    return candidate
++
++
+ def is_on_time(placed_at, delivery_day):
+     """Whether an order placed at `placed_at` (a datetime) is in time for
+     `delivery_day`: orders must be in by config.ORDER_CUTOFF on the day before."""
+diff --git a/tests/test_orders.py b/tests/test_orders.py
+index e59d813..b24a3c0 100644
+--- a/tests/test_orders.py
++++ b/tests/test_orders.py
+@@ -4,7 +4,15 @@ import tempfile
+ import unittest
+ 
+ from bakehouse import config
+-from bakehouse.orders import OrderBook, OrderLine, is_delivery_day, is_on_time, load_orders, save_orders
++from bakehouse.orders import (
++    OrderBook,
++    OrderLine,
++    is_delivery_day,
++    is_on_time,
++    load_orders,
++    next_delivery_day,
++    save_orders,
++)
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -158,5 +166,26 @@ class CutoffTest(unittest.TestCase):
+             self.assertEqual(is_delivery_day(day), day.weekday() not in config.CLOSED_WEEKDAYS)
+ 
+ 
++class NextDeliveryDayTest(unittest.TestCase):
++    def test_the_day_after_a_delivery_day(self):
++        tuesday = datetime.date(2026, 10, 20)
++        self.assertEqual(next_delivery_day(tuesday), datetime.date(2026, 10, 21))
++
++    def test_skips_the_closed_monday(self):
++        sunday = datetime.date(2026, 10, 18)
++        self.assertEqual(next_delivery_day(sunday), datetime.date(2026, 10, 20))
++
++    def test_from_a_closed_day_gives_the_next_open_day(self):
++        monday = datetime.date(2026, 10, 19)
++        self.assertEqual(next_delivery_day(monday), datetime.date(2026, 10, 20))
++
++    def test_result_is_always_a_delivery_day_after_the_given_day(self):
++        for offset in range(14):
++            day = DAY + datetime.timedelta(days=offset)
++            result = next_delivery_day(day)
++            self.assertGreater(result, day)
++            self.assertTrue(is_delivery_day(result))
++
++
+ if __name__ == "__main__":
+     unittest.main()

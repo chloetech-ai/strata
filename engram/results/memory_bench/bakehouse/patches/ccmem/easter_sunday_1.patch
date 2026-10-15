@@ -1,0 +1,77 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 924e656..aaac65a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - Orders: `remove`, `len`, `days`, `lines_for`, `total_for`, `customers_for`; unknown product codes are rejected when added; standing weekly orders.
+ - Reports: `day_summary` and `top_products`.
+ - Production: `total_batches`; `plan` leaves out products not ordered for the day; `crates_needed` rounds up to whole crates.
++- Seasons: `easter_sunday(year)` gives Easter Sunday for 1900 to 2199, for planning the hot cross bun season.
+ - Invoices: `invoice_number` gives `LK-YYYY-NNNN`; `invoice_for` ignores other customers' lines. Invoices still carry no VAT; Ledgerly handles it.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/seasons.py b/src/bakehouse/seasons.py
+new file mode 100644
+index 0000000..fb5a059
+--- /dev/null
++++ b/src/bakehouse/seasons.py
+@@ -0,0 +1,23 @@
++"""Seasonal dates, such as the hot cross bun season that runs up to Easter."""
++
++import datetime
++
++
++def easter_sunday(year):
++    """Date of Easter Sunday in the Western church (Gregorian calendar), for 1900 to 2199.
++
++    Uses the anonymous Gregorian algorithm (Meeus/Jones/Butcher).
++    """
++    if not 1900 <= year <= 2199:
++        raise ValueError(f"year must be between 1900 and 2199, not {year}")
++    a = year % 19
++    b, c = divmod(year, 100)
++    d, e = divmod(b, 4)
++    f = (b + 8) // 25
++    g = (b - f + 1) // 3
++    h = (19 * a + b - d - g + 15) % 30
++    i, k = divmod(c, 4)
++    l = (32 + 2 * e + 2 * i - h - k) % 7
++    m = (a + 11 * h + 22 * l) // 451
++    month, day = divmod(h + l - 7 * m + 114, 31)
++    return datetime.date(year, month, day + 1)
+diff --git a/tests/test_seasons.py b/tests/test_seasons.py
+new file mode 100644
+index 0000000..58f553a
+--- /dev/null
++++ b/tests/test_seasons.py
+@@ -0,0 +1,30 @@
++import datetime
++import unittest
++
++from bakehouse.seasons import easter_sunday
++
++
++class EasterSundayTest(unittest.TestCase):
++    def test_known_dates(self):
++        self.assertEqual(easter_sunday(1900), datetime.date(1900, 4, 15))
++        self.assertEqual(easter_sunday(1961), datetime.date(1961, 4, 2))
++        self.assertEqual(easter_sunday(2000), datetime.date(2000, 4, 23))
++        self.assertEqual(easter_sunday(2024), datetime.date(2024, 3, 31))
++        self.assertEqual(easter_sunday(2026), datetime.date(2026, 4, 5))
++
++    def test_always_a_sunday_between_22_march_and_25_april(self):
++        for year in range(1900, 2200):
++            easter = easter_sunday(year)
++            self.assertEqual(easter.weekday(), 6, year)
++            self.assertGreaterEqual(easter, datetime.date(year, 3, 22), year)
++            self.assertLessEqual(easter, datetime.date(year, 4, 25), year)
++
++    def test_rejects_years_outside_range(self):
++        with self.assertRaises(ValueError):
++            easter_sunday(1899)
++        with self.assertRaises(ValueError):
++            easter_sunday(2200)
++
++
++if __name__ == "__main__":
++    unittest.main()

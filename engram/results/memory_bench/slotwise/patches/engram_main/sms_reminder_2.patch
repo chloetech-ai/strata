@@ -1,0 +1,97 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..e03ab2d
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,40 @@
++"""Text of the SMS reminder sent before an appointment."""
++
++import unicodedata
++
++# The reception number is part of every reminder so clients can call to move their appointment.
++RECEPTION_PHONE = "044 512 77 30"
++
++# The SMS gateway accepts only plain ASCII, and a longer message is billed as two.
++MAX_LENGTH = 160
++
++# German letters that NFKD decomposition cannot handle, written the way they are spelled.
++_UMLAUTS = str.maketrans({
++    "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
++    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
++})
++
++
++def to_ascii(text):
++    """Transliterate German letters and strip accents, e.g. 'Brändli' -> 'Braendli'.
++
++    Raises ValueError if any character still has no ASCII equivalent, so reception can fix the name.
++    """
++    text = unicodedata.normalize("NFKD", text.translate(_UMLAUTS))
++    text = "".join(c for c in text if not unicodedata.combining(c))
++    if not text.isascii():
++        raise ValueError(f"no ASCII equivalent for {text!r}")
++    return text
++
++
++def reminder_text(appointment):
++    """Return the reminder SMS for an appointment. Raises ValueError if it would exceed 160 characters."""
++    when = appointment.start
++    text = (
++        f"Hallo {to_ascii(appointment.client)}, Erinnerung an Ihren Termin am "
++        f"{when:%d.%m.%Y} um {when:%H:%M} bei {to_ascii(appointment.therapist)}. "
++        f"Zum Verschieben bitte {RECEPTION_PHONE} anrufen."
++    )
++    if len(text) > MAX_LENGTH:
++        raise ValueError(f"reminder is {len(text)} characters, the limit is {MAX_LENGTH}")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..249ca22
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,45 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import MAX_LENGTH, reminder_text, to_ascii
++
++
++def appointment(client="Lena Meier", therapist="Anna Keller"):
++    return Appointment(therapist=therapist, client=client, start=datetime.datetime(2026, 10, 20, 9, 0))
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_transliterates_umlauts_and_sharp_s(self):
++        self.assertEqual(to_ascii("Brändli"), "Braendli")
++        self.assertEqual(to_ascii("Größe Öl Über"), "Groesse Oel Ueber")
++
++    def test_strips_other_accents(self):
++        self.assertEqual(to_ascii("José Ñandú Çelik"), "Jose Nandu Celik")
++
++    def test_rejects_characters_without_ascii_equivalent(self):
++        with self.assertRaises(ValueError):
++            to_ascii("Łukasz")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_contains_date_time_therapist_and_reception_number(self):
++        text = reminder_text(appointment())
++        self.assertEqual(
++            text,
++            "Hallo Lena Meier, Erinnerung an Ihren Termin am 20.10.2026 um 09:00 bei Anna Keller. "
++            "Zum Verschieben bitte 044 512 77 30 anrufen.",
++        )
++
++    def test_output_is_ascii_with_transliterated_names(self):
++        text = reminder_text(appointment(client="Brändli Jürg"))
++        self.assertTrue(text.isascii())
++        self.assertIn("Hallo Braendli Juerg,", text)
++
++    def test_rejects_text_over_the_sms_limit(self):
++        with self.assertRaises(ValueError):
++            reminder_text(appointment(client="A" * MAX_LENGTH))
++
++
++if __name__ == "__main__":
++    unittest.main()

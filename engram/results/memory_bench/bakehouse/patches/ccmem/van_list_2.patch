@@ -1,0 +1,114 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 924e656..05ddcb7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@
+ - Products: unknown product codes raise a `KeyError` naming the code; `price_text` shows prices as pounds; `dough_g` per piece gives dough weight; negative dough units are rejected.
+ - Orders: `remove`, `len`, `days`, `lines_for`, `total_for`, `customers_for`; unknown product codes are rejected when added; standing weekly orders.
+ - Reports: `day_summary` and `top_products`.
++- Delivery: `drops_file` writes the van's drops for a day in run order (customers with orders only).
+ - Production: `total_batches`; `plan` leaves out products not ordered for the day; `crates_needed` rounds up to whole crates.
+ - Invoices: `invoice_number` gives `LK-YYYY-NNNN`; `invoice_for` ignores other customers' lines. Invoices still carry no VAT; Ledgerly handles it.
+ 
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..b3061d4
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,17 @@
++"""The van's run for a delivery day."""
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes the van's drops for `day` to `path`, one line per customer in run order.
++
++    Only customers with orders for `day` are listed. `customers` is the dict from load_customers.
++    """
++    stops = []
++    for code in orderbook.customers_for(day):
++        if code not in customers:
++            raise ValueError(f"no customer record for {code}")
++        stops.append(customers[code])
++    stops.sort(key=lambda customer: customer.route_seq)
++    with open(path, "w", encoding="utf-8") as f:
++        for number, customer in enumerate(stops, start=1):
++            f.write(f"{number}. {customer.name}, {customer.address}, {customer.postcode}\n")
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..1ae3421
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,73 @@
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.delivery import drops_file
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class DropsFileTest(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self.dir.name, "drops.txt")
++        self.customers = {
++            "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "88 High Street", "LK1 4HS", 4),
++            "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++            "OLDMILL": Customer("OLDMILL", "The Old Mill Tearoom", "Old Mill Yard", "LK3 1MY", 3),
++        }
++        self.catalog = Catalog([Product("BAG", "Baguette", 95)])
++
++    def tearDown(self):
++        self.dir.cleanup()
++
++    def read(self):
++        with open(self.path, encoding="utf-8") as f:
++            return f.read()
++
++    def test_lists_drops_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 2),
++            OrderLine(DAY, "LUMEN", "BAG", 1),
++            OrderLine(DAY, "OLDMILL", "BAG", 3),
++        ])
++        drops_file(book, self.customers, DAY, self.path)
++        self.assertEqual(self.read(), (
++            "1. Café Lumen, 14 Mill Lane, LK1 2AB\n"
++            "2. The Old Mill Tearoom, Old Mill Yard, LK3 1MY\n"
++            "3. Greenway Grocers, 88 High Street, LK1 4HS\n"
++        ))
++
++    def test_customers_without_orders_that_day_are_left_out(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 2),
++            OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "BAG", 1),
++        ])
++        drops_file(book, self.customers, DAY, self.path)
++        self.assertEqual(self.read(), "1. Greenway Grocers, 88 High Street, LK1 4HS\n")
++
++    def test_customer_with_several_lines_is_one_drop(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 1),
++            OrderLine(DAY, "LUMEN", "BAG", 4),
++        ])
++        drops_file(book, self.customers, DAY, self.path)
++        self.assertEqual(self.read(), "1. Café Lumen, 14 Mill Lane, LK1 2AB\n")
++
++    def test_no_orders_writes_empty_file(self):
++        book = OrderBook(self.catalog)
++        drops_file(book, self.customers, DAY, self.path)
++        self.assertEqual(self.read(), "")
++
++    def test_order_for_unknown_customer_is_an_error(self):
++        book = OrderBook(self.catalog, [OrderLine(DAY, "NOBODY", "BAG", 1)])
++        with self.assertRaisesRegex(ValueError, "NOBODY"):
++            drops_file(book, self.customers, DAY, self.path)
++
++
++if __name__ == "__main__":
++    unittest.main()

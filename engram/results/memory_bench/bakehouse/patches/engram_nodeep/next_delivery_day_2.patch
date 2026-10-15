@@ -1,0 +1,187 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..9e26dfe
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..a22e109
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1,83 @@
++[
++  "tests/test_customers.py::CustomersTest::test_duplicate_route_seq_is_rejected",
++  "tests/test_customers.py::CustomersTest::test_email_column_is_optional",
++  "tests/test_customers.py::CustomersTest::test_email_defaults_to_empty",
++  "tests/test_customers.py::CustomersTest::test_email_is_read_from_customers_csv",
++  "tests/test_customers.py::CustomersTest::test_load_customers",
++  "tests/test_customers.py::CustomersTest::test_str_is_the_name",
++  "tests/test_invoice.py::FormatPenceTest::test_negative_amount_has_leading_minus",
++  "tests/test_invoice.py::FormatPenceTest::test_pounds_and_pence",
++  "tests/test_invoice.py::FormatPenceTest::test_under_a_pound_keeps_two_decimals",
++  "tests/test_invoice.py::FormatPenceTest::test_whole_pounds",
++  "tests/test_invoice.py::FormatPenceTest::test_zero",
++  "tests/test_invoice.py::InvoiceNumberTest::test_larger_numbers_keep_four_digits",
++  "tests/test_invoice.py::InvoiceNumberTest::test_number_must_fit_four_digits",
++  "tests/test_invoice.py::InvoiceNumberTest::test_year_then_four_digit_number",
++  "tests/test_invoice.py::InvoiceTest::test_empty_invoice",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_for_customer_with_no_orders",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_for_ignores_other_customers_lines",
++  "tests/test_invoice.py::InvoiceTest::test_invoice_for_one_line_per_product",
++  "tests/test_invoice.py::InvoiceTest::test_total",
++  "tests/test_orders.py::CutoffTest::test_a_minute_after_the_cutoff_is_too_late",
++  "tests/test_orders.py::CutoffTest::test_a_minute_before_the_cutoff_is_on_time",
++  "tests/test_orders.py::CutoffTest::test_closed_days",
++  "tests/test_orders.py::CutoffTest::test_exactly_at_the_cutoff_is_on_time",
++  "tests/test_orders.py::CutoffTest::test_on_the_delivery_day_is_too_late",
++  "tests/test_orders.py::CutoffTest::test_well_before_the_cutoff",
++  "tests/test_orders.py::NextDeliveryDayTest::test_is_strictly_after_the_given_day",
++  "tests/test_orders.py::NextDeliveryDayTest::test_next_day_when_it_is_a_delivery_day",
++  "tests/test_orders.py::NextDeliveryDayTest::test_skips_closed_days",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_is_sorted_and_unique",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_with_no_orders_is_empty",
++  "tests/test_orders.py::OrderBookTest::test_customers_for_with_three_customers_on_one_day",
++  "tests/test_orders.py::OrderBookTest::test_days_is_empty_for_an_empty_book",
++  "tests/test_orders.py::OrderBookTest::test_days_is_sorted_and_distinct",
++  "tests/test_orders.py::OrderBookTest::test_for_day",
++  "tests/test_orders.py::OrderBookTest::test_len_counts_lines_across_all_days",
++  "tests/test_orders.py::OrderBookTest::test_lines_for_returns_only_that_customers_lines_for_the_day",
++  "tests/test_orders.py::OrderBookTest::test_quantity_must_be_positive",
++  "tests/test_orders.py::OrderBookTest::test_remove_returns_false_when_there_is_no_such_line",
++  "tests/test_orders.py::OrderBookTest::test_remove_takes_out_that_line_and_returns_true",
++  "tests/test_orders.py::OrderBookTest::test_save_and_load",
++  "tests/test_orders.py::OrderBookTest::test_total_for_adds_up_customers",
++  "tests/test_orders.py::OrderBookTest::test_total_for_with_no_orders_is_zero",
++  "tests/test_orders.py::OrderBookTest::test_unknown_product_is_rejected",
++  "tests/test_production.py::ProductionTest::test_crates_round_up_to_whole_crates",
++  "tests/test_production.py::ProductionTest::test_dough_weight_is_grams_per_piece_times_units",
++  "tests/test_production.py::ProductionTest::test_dough_weight_rejects_negative_units",
++  "tests/test_production.py::ProductionTest::test_exact_batches",
++  "tests/test_production.py::ProductionTest::test_partial_batch_rounds_up",
++  "tests/test_production.py::ProductionTest::test_plan_adds_up_customers",
++  "tests/test_production.py::ProductionTest::test_plan_leaves_out_products_not_ordered_for_that_day",
++  "tests/test_production.py::ProductionTest::test_total_batches_adds_up_all_products",
++  "tests/test_production.py::ProductionTest::test_total_batches_is_zero_for_empty_plan",
++  "tests/test_products.py::CatalogTest::test_add_and_get",
++  "tests/test_products.py::CatalogTest::test_allergen_text_is_empty_without_allergens",
++  "tests/test_products.py::CatalogTest::test_allergen_text_is_sorted_and_joined",
++  "tests/test_products.py::CatalogTest::test_duplicate_code_rejected",
++  "tests/test_products.py::CatalogTest::test_get_unknown_code_raises_key_error_naming_it",
++  "tests/test_products.py::CatalogTest::test_has_allergen_ignores_case",
++  "tests/test_products.py::CatalogTest::test_has_allergen_matches_mixed_case_data",
++  "tests/test_products.py::CatalogTest::test_load_catalog",
++  "tests/test_products.py::CatalogTest::test_negative_batch_size_rejected",
++  "tests/test_products.py::CatalogTest::test_negative_price_rejected",
++  "tests/test_products.py::CatalogTest::test_price_text_formats_pence_as_pounds",
++  "tests/test_products.py::CatalogTest::test_price_text_pads_pence",
++  "tests/test_products.py::CatalogTest::test_zero_batch_size_rejected",
++  "tests/test_products.py::CatalogTest::test_zero_price_allowed",
++  "tests/test_reports.py::DaySummaryTest::test_empty_day",
++  "tests/test_reports.py::DaySummaryTest::test_ignores_other_days",
++  "tests/test_reports.py::DaySummaryTest::test_two_customers_same_day_are_sorted_by_code",
++  "tests/test_reports.py::DaySummaryTest::test_value_per_customer_in_pence",
++  "tests/test_reports.py::TopProductsTest::test_n_limits_the_result",
++  "tests/test_reports.py::TopProductsTest::test_no_orders_in_range_is_empty",
++  "tests/test_reports.py::TopProductsTest::test_ranked_by_units_most_first",
++  "tests/test_reports.py::TopProductsTest::test_start_and_end_are_inclusive_and_other_days_ignored",
++  "tests/test_reports.py::TopProductsTest::test_ties_are_broken_by_product_code",
++  "tests/test_standing.py::StandingTest::test_no_lines_when_range_has_no_matching_weekday",
++  "tests/test_standing.py::StandingTest::test_range_is_inclusive_at_both_ends",
++  "tests/test_standing.py::StandingTest::test_several_lines_on_the_same_day_all_appear",
++  "tests/test_standing.py::StandingTest::test_start_after_end_gives_nothing",
++  "tests/test_standing.py::StandingTest::test_weekday_must_be_in_range",
++  "tests/test_standing.py::StandingTest::test_weekly_line_repeats_on_its_weekday"
++]
+\ No newline at end of file
+diff --git a/src/bakehouse/orders.py b/src/bakehouse/orders.py
+index 4f8190a..1bcd386 100644
+--- a/src/bakehouse/orders.py
++++ b/src/bakehouse/orders.py
+@@ -68,6 +68,14 @@ def is_delivery_day(day):
+     return day.weekday() not in config.CLOSED_WEEKDAYS
+ 
+ 
++def next_delivery_day(day):
++    """The first delivery day strictly after `day`."""
++    following = day + datetime.timedelta(days=1)
++    while not is_delivery_day(following):
++        following += datetime.timedelta(days=1)
++    return following
++
++
+ def is_on_time(placed_at, delivery_day):
+     """Whether an order placed at `placed_at` (a datetime) is in time for
+     `delivery_day`: orders must be in by config.ORDER_CUTOFF on the day before."""
+diff --git a/tests/test_orders.py b/tests/test_orders.py
+index ad856dc..6db9383 100644
+--- a/tests/test_orders.py
++++ b/tests/test_orders.py
+@@ -4,7 +4,7 @@ import tempfile
+ import unittest
+ 
+ from bakehouse import config
+-from bakehouse.orders import OrderBook, OrderLine, is_delivery_day, is_on_time, load_orders, save_orders
++from bakehouse.orders import OrderBook, OrderLine, is_delivery_day, is_on_time, load_orders, next_delivery_day, save_orders
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -154,5 +154,24 @@ class CutoffTest(unittest.TestCase):
+             self.assertEqual(is_delivery_day(day), day.weekday() not in config.CLOSED_WEEKDAYS)
+ 
+ 
++class NextDeliveryDayTest(unittest.TestCase):
++    def test_next_day_when_it_is_a_delivery_day(self):
++        self.assertEqual(next_delivery_day(DAY), DAY + datetime.timedelta(days=1))
++
++    def test_skips_closed_days(self):
++        # 2026-10-18 is a Sunday, 2026-10-19 a Monday (closed), so the next delivery day is Tuesday.
++        sunday = datetime.date(2026, 10, 18)
++        self.assertEqual(next_delivery_day(sunday), datetime.date(2026, 10, 20))
++
++    def test_is_strictly_after_the_given_day(self):
++        for offset in range(14):
++            day = DAY + datetime.timedelta(days=offset)
++            following = next_delivery_day(day)
++            self.assertGreater(following, day)
++            self.assertTrue(is_delivery_day(following))
++            between = [day + datetime.timedelta(days=i) for i in range(1, (following - day).days)]
++            self.assertFalse(any(is_delivery_day(d) for d in between))
++
++
+ if __name__ == "__main__":
+     unittest.main()

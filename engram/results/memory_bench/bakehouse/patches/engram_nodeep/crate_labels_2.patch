@@ -1,0 +1,107 @@
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..769301f
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,35 @@
++"""Crate labels for packing. The label printer prints plain ASCII, 48 characters a line."""
++
++import unicodedata
++
++LINE_WIDTH = 48
++
++
++def _line(text):
++    """`text` folded to ASCII (accents dropped) and cut to fit one printed line."""
++    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++    return ascii_text[:LINE_WIDTH]
++
++
++def crate_labels(orderbook, customers, day):
++    """One label per customer and product ordered for delivery on `day`.
++
++    Each label is three lines: the customer's name, the quantity and product
++    name, then the allergens in capitals (omitted if the product has none).
++    `customers` is the dict from load_customers. Customers are in code order.
++    """
++    labels = []
++    for code in orderbook.customers_for(day):
++        qty_by_product = {}
++        for line in orderbook.lines_for(code, day):
++            qty_by_product[line.product] = qty_by_product.get(line.product, 0) + line.qty
++        for product_code in sorted(qty_by_product):
++            product = orderbook.catalog.get(product_code)
++            lines = [
++                _line(customers[code].name),
++                _line(f"{qty_by_product[product_code]} x {product.name}"),
++            ]
++            if product.allergens:
++                lines.append(_line(product.allergen_text().upper()))
++            labels.append("\n".join(lines))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..d92d205
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,60 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import LINE_WIDTH, crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12),
++            Product("SOU", "White sourdough", 320, batch_size=10, allergens=("wheat", "milk")),
++        ])
++        self.customers = {
++            "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "1 High St", "AB1 2CD", 1),
++            "LUMEN": Customer("LUMEN", "Café Lumen", "9 Mill Rd", "AB3 4EF", 2),
++        }
++
++    def test_one_label_per_customer_and_product_in_code_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 2),
++            OrderLine(DAY, "GREENWAY", "BAG", 12),
++            OrderLine(DAY, "GREENWAY", "SOU", 1),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Greenway Grocers\n12 x Baguette",
++            "Greenway Grocers\n1 x White sourdough\nMILK, WHEAT",
++            "Cafe Lumen\n2 x White sourdough\nMILK, WHEAT",
++        ])
++
++    def test_same_product_twice_gives_one_label_with_total(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 3),
++            OrderLine(DAY, "LUMEN", "BAG", 4),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Cafe Lumen\n7 x Baguette"])
++
++    def test_ignores_other_days(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "BAG", 9),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [])
++
++    def test_text_is_ascii_and_fits_the_printer(self):
++        long_name = "Ü" * 60
++        customers = {"LUMEN": Customer("LUMEN", long_name, "", "", 1)}
++        book = OrderBook(self.catalog, [OrderLine(DAY, "LUMEN", "SOU", 1)])
++        labels = crate_labels(book, customers, DAY)
++        for line in labels[0].split("\n"):
++            self.assertLessEqual(len(line), LINE_WIDTH)
++            self.assertTrue(line.isascii())
++        self.assertEqual(labels[0].split("\n")[0], "U" * LINE_WIDTH)
++
++
++if __name__ == "__main__":
++    unittest.main()

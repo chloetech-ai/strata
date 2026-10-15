@@ -1,0 +1,65 @@
+diff --git a/src/bakehouse/pricing.py b/src/bakehouse/pricing.py
+new file mode 100644
+index 0000000..aee0a9b
+--- /dev/null
++++ b/src/bakehouse/pricing.py
+@@ -0,0 +1,19 @@
++"""Wholesale price changes."""
++
++# Greta's January rise: 5%, with each new price rounded up to the next 5p.
++RISE_PERCENT = 5
++ROUND_TO_PENCE = 5
++
++
++def new_prices(catalog):
++    """Maps each product code to its new wholesale price in pence.
++
++    Done in whole pence: the rise is price * (100 + RISE_PERCENT) / 100, then rounded up
++    to the next ROUND_TO_PENCE. Rounding is always up, so a price never goes down.
++    """
++    prices = {}
++    for product in catalog:
++        raised_times_100 = product.price * (100 + RISE_PERCENT)  # pence * 100
++        step = ROUND_TO_PENCE * 100
++        prices[product.code] = -(-raised_times_100 // step) * ROUND_TO_PENCE
++    return prices
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+new file mode 100644
+index 0000000..fe01741
+--- /dev/null
++++ b/tests/test_pricing.py
+@@ -0,0 +1,34 @@
++import unittest
++
++from bakehouse.pricing import new_prices
++from bakehouse.products import Catalog, Product
++
++
++class NewPricesTest(unittest.TestCase):
++    def test_rise_is_rounded_up_to_next_5p(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320)])
++        # 320 * 1.05 = 336, rounded up to 340
++        self.assertEqual(new_prices(catalog), {"SOU": 340})
++
++    def test_exact_multiple_of_5p_is_not_bumped(self):
++        catalog = Catalog([Product("X", "Test", 100)])
++        # 100 * 1.05 = 105 exactly
++        self.assertEqual(new_prices(catalog), {"X": 105})
++
++    def test_small_prices_round_up(self):
++        catalog = Catalog([Product("BRO", "Brötchen", 40), Product("WRL", "White roll", 35)])
++        # 40 -> 42 -> 45; 35 -> 36.75 -> 40
++        self.assertEqual(new_prices(catalog), {"BRO": 45, "WRL": 40})
++
++    def test_never_rounds_down(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95)])
++        # 95 * 1.05 = 99.75 -> 100
++        self.assertEqual(new_prices(catalog), {"BAG": 100})
++
++    def test_covers_every_product(self):
++        catalog = Catalog([Product("A", "a", 1), Product("B", "b", 2)])
++        self.assertEqual(set(new_prices(catalog)), {"A", "B"})
++
++
++if __name__ == "__main__":
++    unittest.main()

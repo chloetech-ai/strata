@@ -1,0 +1,77 @@
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index ecd6081..aa5dbb5 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,7 @@
+ """Reports on a delivery day, for the people who read them."""
+ 
++import csv
++import datetime
+ from collections import Counter
+ 
+ 
+@@ -23,3 +25,21 @@ def day_summary(orderbook, day):
+         price = orderbook.catalog.get(line.product).price
+         totals[line.customer] = totals.get(line.customer, 0) + line.qty * price
+     return totals
++
++
++def week_totals_file(orderbook, week_start, path):
++    """Writes each customer's order total for the seven days from `week_start`, for Greta's Excel.
++
++    Semicolon-separated, comma as the decimal separator, UTF-8 with a byte-order mark.
++    """
++    totals = {}
++    for offset in range(7):
++        day = week_start + datetime.timedelta(days=offset)
++        for customer, pence in day_summary(orderbook, day).items():
++            totals[customer] = totals.get(customer, 0) + pence
++    with open(path, "w", newline="", encoding="utf-8-sig") as f:
++        writer = csv.writer(f, delimiter=";", lineterminator="\r\n")
++        writer.writerow(["Customer", "Total (GBP)"])
++        for customer in sorted(totals):
++            pounds, pence = divmod(totals[customer], 100)
++            writer.writerow([customer, f"{pounds},{pence:02d}"])
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index ab3747f..1f1791b 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -1,13 +1,37 @@
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def test_semicolons_comma_decimals_and_bom(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320), Product("CRO", "Croissant", 110), Product("FREE", "Taster", 5)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY + datetime.timedelta(days=6), "LUMEN", "SOU", 1),
++            OrderLine(DAY + datetime.timedelta(days=7), "LUMEN", "SOU", 9),
++            OrderLine(DAY + datetime.timedelta(days=3), "AIDAN", "CRO", 48),
++            OrderLine(DAY, "GREENWAY", "FREE", 1),
++        ])
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "week.csv")
++            week_totals_file(book, DAY, path)
++            with open(path, "rb") as f:
++                raw = f.read()
++        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
++        self.assertEqual(
++            raw[3:].decode("utf-8"),
++            "Customer;Total (GBP)\r\nAIDAN;52,80\r\nGREENWAY;0,05\r\nLUMEN;22,40\r\n",
++        )
++
++
+ class TopProductsTest(unittest.TestCase):
+     def test_most_units_first_within_the_range(self):
+         catalog = Catalog([Product(c, c, 100) for c in ("SOU", "CRO", "BAG", "RYE")])

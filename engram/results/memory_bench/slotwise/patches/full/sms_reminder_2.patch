@@ -1,0 +1,128 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 0b192c0..5ff44b4 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -11,6 +11,12 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_is_ascii_and_fits",
++  "tests/test_reminders.py::ReminderTextTest::test_long_name_is_shortened_and_still_fits",
++  "tests/test_reminders.py::ReminderTextTest::test_name_too_long_to_fit_raises",
++  "tests/test_reminders.py::ReminderTextTest::test_text",
++  "tests/test_reminders.py::ToAsciiTest::test_umlauts_and_accents",
++  "tests/test_reminders.py::ToAsciiTest::test_unconvertible_characters_are_dropped",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_buffer_after_existing_appointment",
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..749d2f7
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,51 @@
++"""Text of the reminder SMS sent before an appointment."""
++
++import unicodedata
++
++# The gateway takes plain ASCII only, and a longer message is billed as two.
++MAX_LENGTH = 160
++RECEPTION_NUMBER = "044 512 77 30"
++
++# Letters that don't decompose to ASCII under NFKD, or that the German spelling writes as two letters.
++_DIGRAPHS = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
++
++
++def to_ascii(text):
++    """Plain ASCII version of `text`: 'Brändli' -> 'Braendli', 'Zoë' -> 'Zoe'.
++
++    Characters with no ASCII equivalent are dropped.
++    """
++    parts = []
++    for ch in text:
++        if ch in _DIGRAPHS:
++            parts.append(_DIGRAPHS[ch])
++        else:
++            decomposed = unicodedata.normalize("NFKD", ch)
++            parts.append("".join(c for c in decomposed if c.isascii()))
++    return "".join(parts)
++
++
++def _render(name, appointment):
++    therapist = to_ascii(appointment.therapist).capitalize()
++    return (
++        f"Hi {name}, reminder of your appointment with {therapist} on "
++        f"{appointment.start:%A %d %B} at {appointment.start:%H:%M}. "
++        f"To move it, call {RECEPTION_NUMBER}."
++    )
++
++
++def reminder_text(appointment):
++    """The reminder SMS for `appointment`, at most MAX_LENGTH ASCII characters.
++
++    If the client's name makes the text too long, the name is shortened.
++    Raises ValueError if the text can't fit even without the name.
++    """
++    name = to_ascii(appointment.client).strip()
++    text = _render(name, appointment)
++    over = len(text) - MAX_LENGTH
++    if over > 0:
++        keep = len(name) - over
++        if keep < 1:
++            raise ValueError("reminder does not fit in 160 characters")
++        text = _render(name[:keep].rstrip(), appointment)
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..967191b
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,48 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import MAX_LENGTH, reminder_text, to_ascii
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_umlauts_and_accents(self):
++        self.assertEqual(to_ascii("Brändli"), "Braendli")
++        self.assertEqual(to_ascii("Zoë Müller"), "Zoe Mueller")
++        self.assertEqual(to_ascii("Ölberg"), "Oelberg")
++        self.assertEqual(to_ascii("Straße"), "Strasse")
++        self.assertEqual(to_ascii("José"), "Jose")
++
++    def test_unconvertible_characters_are_dropped(self):
++        self.assertEqual(to_ascii("Li 李"), "Li ")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def appointment(self, client="Zoë Brändli", therapist="lena"):
++        return Appointment(therapist, client, datetime.datetime(2026, 9, 8, 9, 0), "standard")
++
++    def test_text(self):
++        self.assertEqual(
++            reminder_text(self.appointment()),
++            "Hi Zoe Braendli, reminder of your appointment with Lena on Tuesday 08 September at 09:00. "
++            "To move it, call 044 512 77 30.",
++        )
++
++    def test_is_ascii_and_fits(self):
++        text = reminder_text(self.appointment())
++        self.assertTrue(text.isascii())
++        self.assertLessEqual(len(text), MAX_LENGTH)
++
++    def test_long_name_is_shortened_and_still_fits(self):
++        text = reminder_text(self.appointment(client="Maria-Theresia " * 10))
++        self.assertLessEqual(len(text), MAX_LENGTH)
++        self.assertIn("044 512 77 30", text)
++        self.assertIn("at 09:00.", text)
++
++    def test_name_too_long_to_fit_raises(self):
++        with self.assertRaises(ValueError):
++            reminder_text(self.appointment(therapist="x" * 200))
++
++
++if __name__ == "__main__":
++    unittest.main()

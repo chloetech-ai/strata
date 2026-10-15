@@ -1,0 +1,47 @@
+diff --git a/src/bakehouse/orders.py b/src/bakehouse/orders.py
+index ca97a42..ce41cdc 100644
+--- a/src/bakehouse/orders.py
++++ b/src/bakehouse/orders.py
+@@ -69,6 +69,14 @@ def is_delivery_day(day):
+     return day.weekday() not in config.CLOSED_WEEKDAYS
+ 
+ 
++def next_delivery_day(day):
++    """The first date after `day` on which we bake and deliver."""
++    candidate = day + datetime.timedelta(days=1)
++    while not is_delivery_day(candidate):
++        candidate += datetime.timedelta(days=1)
++    return candidate
++
++
+ def is_on_time(placed_at, delivery_day):
+     """Whether an order placed at `placed_at` (a datetime) is in time for
+     `delivery_day`: orders must be in by config.ORDER_CUTOFF on the day before."""
+diff --git a/tests/test_orders.py b/tests/test_orders.py
+index b691394..c46da3d 100644
+--- a/tests/test_orders.py
++++ b/tests/test_orders.py
+@@ -4,7 +4,7 @@ import tempfile
+ import unittest
+ 
+ from bakehouse import config
+-from bakehouse.orders import OrderBook, OrderLine, is_delivery_day, is_on_time, load_orders, save_orders
++from bakehouse.orders import OrderBook, OrderLine, is_delivery_day, is_on_time, load_orders, next_delivery_day, save_orders
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -150,6 +150,14 @@ class CutoffTest(unittest.TestCase):
+             day = DAY + datetime.timedelta(days=offset)
+             self.assertEqual(is_delivery_day(day), day.weekday() not in config.CLOSED_WEEKDAYS)
+ 
++    def test_next_delivery_day_is_the_following_day_when_it_is_open(self):
++        day = datetime.date(2026, 10, 13)  # a Tuesday, with Wednesday open
++        self.assertEqual(next_delivery_day(day), datetime.date(2026, 10, 14))
++
++    def test_next_delivery_day_skips_closed_days(self):
++        sunday = datetime.date(2026, 10, 18)  # Monday is closed
++        self.assertEqual(next_delivery_day(sunday), datetime.date(2026, 10, 20))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

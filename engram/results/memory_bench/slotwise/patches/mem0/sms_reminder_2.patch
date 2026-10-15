@@ -1,0 +1,162 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..13c734d
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1,37 @@
++[
++  "tests/test_clients.py::ClientBookTest::test_empty_phone_never_matches",
++  "tests/test_clients.py::ClientBookTest::test_finds_client_whatever_the_phone_shape",
++  "tests/test_clients.py::ClientBookTest::test_ids_are_unique",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_any_part_of_the_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_or_blank_text_gives_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_number_gives_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_shapes_give_the_same_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_text_without_digits_gives_empty",
++  "tests/test_hours.py::HoursTest::test_closed_on_sunday",
++  "tests/test_hours.py::HoursTest::test_friday_closes_early",
++  "tests/test_hours.py::HoursTest::test_weekday",
++  "tests/test_model.py::AppointmentTest::test_end_and_price",
++  "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_is_plain_ascii_and_fits_one_sms",
++  "tests/test_reminders.py::ReminderTextTest::test_names_time_and_reception_number",
++  "tests/test_reminders.py::ReminderTextTest::test_too_long_raises_rather_than_dropping_the_phone_number",
++  "tests/test_reminders.py::ToAsciiTest::test_spells_out_umlauts_and_sharp_s",
++  "tests/test_reminders.py::ToAsciiTest::test_strips_other_accents",
++  "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
++  "tests/test_schedule.py::ScheduleTest::test_book",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_record_and_frees_slot",
++  "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_id",
++  "tests/test_schedule.py::ScheduleTest::test_changeover_gap_after_is_free",
++  "tests/test_schedule.py::ScheduleTest::test_changeover_gap_before_is_free",
++  "tests/test_schedule.py::ScheduleTest::test_changeover_gap_does_not_block_other_therapists",
++  "tests/test_schedule.py::ScheduleTest::test_no_changeover_gap_after_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_no_changeover_gap_before_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_other_therapist_is_free",
++  "tests/test_schedule.py::ScheduleTest::test_outside_opening_hours",
++  "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_unknown_treatment",
++  "tests/test_schedule.py::ScheduleTest::test_week_groups_by_day_without_cancelled",
++  "tests/test_storage.py::StorageTest::test_cancelled_survives_roundtrip",
++  "tests/test_storage.py::StorageTest::test_roundtrip"
++]
+\ No newline at end of file
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..f60e351
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,35 @@
++"""Reminder SMS sent to clients before their appointment."""
++
++import unicodedata
++
++# Clients call this number to move their appointment, so every reminder includes it.
++RECEPTION_PHONE = "044 512 77 30"
++
++# One SMS segment. Longer messages are billed as two.
++MAX_LENGTH = 160
++
++# The SMS gateway accepts only plain ASCII, so these are spelled out before the rest is stripped.
++_SPELLED_OUT = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
++
++
++def to_ascii(text):
++    """Plain ASCII version of `text`, e.g. 'Brändli' -> 'Braendli'."""
++    for char, replacement in _SPELLED_OUT.items():
++        text = text.replace(char, replacement)
++    decomposed = unicodedata.normalize("NFKD", text)
++    return decomposed.encode("ascii", "ignore").decode("ascii")
++
++
++def reminder_text(appointment):
++    """The text of the reminder SMS for `appointment`.
++
++    Raises ValueError if the text would not fit in one SMS.
++    """
++    when = appointment.start.strftime("%d.%m.%Y at %H:%M")
++    text = to_ascii(
++        f"Reminder: your appointment with {appointment.therapist} is on {when}. "
++        f"To move it, call {RECEPTION_PHONE}."
++    )
++    if len(text) > MAX_LENGTH:
++        raise ValueError(f"Reminder is {len(text)} characters, over the {MAX_LENGTH} limit.")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..2de654e
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,39 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import MAX_LENGTH, RECEPTION_PHONE, reminder_text, to_ascii
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_names_time_and_reception_number(self):
++        appointment = Appointment("Brändli", "Zoë Müller", datetime.datetime(2026, 10, 20, 14, 30))
++        self.assertEqual(
++            reminder_text(appointment),
++            "Reminder: your appointment with Braendli is on 20.10.2026 at 14:30. "
++            "To move it, call 044 512 77 30.",
++        )
++
++    def test_is_plain_ascii_and_fits_one_sms(self):
++        appointment = Appointment("Brändli", "Zoë Müller", datetime.datetime(2026, 10, 20, 14, 30))
++        text = reminder_text(appointment)
++        self.assertTrue(text.isascii())
++        self.assertLessEqual(len(text), MAX_LENGTH)
++        self.assertIn(RECEPTION_PHONE, text)
++
++    def test_too_long_raises_rather_than_dropping_the_phone_number(self):
++        appointment = Appointment("x" * 150, "Kim", datetime.datetime(2026, 10, 20, 14, 30))
++        with self.assertRaises(ValueError):
++            reminder_text(appointment)
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_spells_out_umlauts_and_sharp_s(self):
++        self.assertEqual(to_ascii("Straße Äpfel Öl Über"), "Strasse Aepfel Oel Ueber")
++
++    def test_strips_other_accents(self):
++        self.assertEqual(to_ascii("Éloïse"), "Eloise")
++
++
++if __name__ == "__main__":
++    unittest.main()

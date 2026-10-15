@@ -1,0 +1,76 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f13634a..ac96818 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@
+ - `Schedule.week(therapist, monday)` returns a therapist's non-cancelled appointments for the week as a dict keyed by each date (all seven days, empty lists included), sorted by start time.
+ - New client register in `clients.py`: `Client` dataclass and `ClientBook` with `add(client)` and `find_by_phone(phone)`. Phone numbers are normalized, so `079 123 45 67`, `+41 79 123 45 67` and `0041791234567` all find the same client. Adding a phone number that is already registered raises `ValueError`.
+ - `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case, in the order they were added; a blank query returns `[]`.
++- New `cancellation_fee(appointment, cancelled_at)` in `fees.py` returns the fee in cents: free if cancelled at least 24 hours before the start, 50% of the price if later than that, and the full price if cancelled at or after the start. Notice period and percentages are constants in `fees.py`.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..2f93ac9
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,20 @@
++"""Cancellation fees."""
++
++import datetime
++
++# Cancelling at least this long before the start is free.
++FREE_NOTICE = datetime.timedelta(hours=24)
++# Share of the price (in percent) charged for a late cancellation, and for a no-show.
++LATE_PERCENT = 50
++NO_SHOW_PERCENT = 100
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """Fee in cents for cancelling `appointment` at `cancelled_at`."""
++    if cancelled_at >= appointment.start:
++        percent = NO_SHOW_PERCENT
++    elif appointment.start - cancelled_at >= FREE_NOTICE:
++        return 0
++    else:
++        percent = LATE_PERCENT
++    return appointment.price * percent // 100
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..a967c0c
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,32 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++
++def appointment(treatment="standard"):
++    return Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 10, 0), treatment)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def test_a_day_ahead_is_free(self):
++        a = appointment()
++        self.assertEqual(cancellation_fee(a, a.start - datetime.timedelta(hours=24)), 0)
++
++    def test_less_than_a_day_ahead_is_half_price(self):
++        a = appointment()
++        self.assertEqual(cancellation_fee(a, a.start - datetime.timedelta(hours=23, minutes=59)), 4900)
++
++    def test_half_price_depends_on_treatment(self):
++        a = appointment("initial")
++        self.assertEqual(cancellation_fee(a, a.start - datetime.timedelta(hours=2)), 7250)
++
++    def test_after_start_is_full_price(self):
++        a = appointment("short")
++        self.assertEqual(cancellation_fee(a, a.start), 6800)
++        self.assertEqual(cancellation_fee(a, a.start + datetime.timedelta(minutes=5)), 6800)
++
++
++if __name__ == "__main__":
++    unittest.main()

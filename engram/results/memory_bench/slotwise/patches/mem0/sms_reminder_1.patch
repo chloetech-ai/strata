@@ -1,0 +1,80 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..8bfe4c3
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,31 @@
++"""The text of the reminder SMS sent before an appointment."""
++
++import unicodedata
++
++# The gateway accepts plain ASCII only, and clients must be able to call this number to move.
++RECEPTION_PHONE = "044 512 77 30"
++
++# Umlauts are spelled out the German way, since the practice's clients write their names that way.
++_SPELLED = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
++
++
++def to_ascii(text):
++    """Turn accented letters into plain ASCII, e.g. 'Bräendli' -> 'Braeendli', 'Müller' -> 'Mueller'."""
++    decomposed = unicodedata.normalize("NFKD", text.translate(_SPELLED))
++    return decomposed.encode("ascii", "ignore").decode("ascii")
++
++
++def _short(name, limit=30):
++    """The name, cut to at most `limit` characters with '...' when it is longer."""
++    return name if len(name) <= limit else name[: limit - 3] + "..."
++
++
++def reminder_text(appointment):
++    """The reminder SMS for an appointment, in plain ASCII and at most 160 characters."""
++    when = appointment.start.strftime("%a %d.%m. at %H:%M")
++    client = _short(to_ascii(appointment.client))
++    therapist = _short(to_ascii(appointment.therapist))
++    return (
++        f"Reminder: {client}, you have an appointment with {therapist} on {when}. "
++        f"To change it call {RECEPTION_PHONE}."
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..5122740
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,37 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import RECEPTION_PHONE, reminder_text, to_ascii
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_names_text_time_and_reception_number(self):
++        a = Appointment("lena", "Kim Weber", datetime.datetime(2026, 10, 19, 14, 0))
++        text = reminder_text(a)
++        self.assertIn("Kim Weber", text)
++        self.assertIn("lena", text)
++        self.assertIn("19.10. at 14:00", text)
++        self.assertIn(RECEPTION_PHONE, text)
++
++    def test_plain_ascii_and_at_most_160_characters(self):
++        a = Appointment("Jörg Müller", "Bräendli Größe", datetime.datetime(2026, 10, 19, 14, 0))
++        text = reminder_text(a)
++        self.assertTrue(text.isascii())
++        self.assertLessEqual(len(text), 160)
++        self.assertIn("Braeendli Groesse", text)
++        self.assertIn("Joerg Mueller", text)
++
++    def test_long_names_still_fit_in_160_characters(self):
++        a = Appointment("Dr. " + "Ä" * 60, "Ü" * 80, datetime.datetime(2026, 10, 19, 14, 0))
++        self.assertLessEqual(len(reminder_text(a)), 160)
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_accents_are_removed_or_spelled_out(self):
++        self.assertEqual(to_ascii("Émile Örtli"), "Emile Oertli")
++        self.assertEqual(to_ascii("Zoë"), "Zoe")
++
++
++if __name__ == "__main__":
++    unittest.main()

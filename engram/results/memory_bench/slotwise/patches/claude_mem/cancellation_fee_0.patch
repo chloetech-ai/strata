@@ -1,0 +1,90 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index d770a02..0778991 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -6,6 +6,11 @@
+   "tests/test_clients.py::ClientBookTest::test_unknown_phone_returns_none",
+   "tests/test_clients.py::NormalizePhoneTest::test_non_numbers_are_refused",
+   "tests/test_clients.py::NormalizePhoneTest::test_same_number_in_every_format",
++  "tests/test_fees.py::CancellationFeeTest::test_free_with_48_or_more_hours",
++  "tests/test_fees.py::CancellationFeeTest::test_full_price_after_the_start",
++  "tests/test_fees.py::CancellationFeeTest::test_full_price_under_24_hours",
++  "tests/test_fees.py::CancellationFeeTest::test_half_price_from_24_to_48_hours",
++  "tests/test_fees.py::CancellationFeeTest::test_half_price_rounds_up_to_the_cent",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..1895c81
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,20 @@
++"""Cancellation fees."""
++
++import datetime
++
++from .model import Appointment
++
++
++def cancellation_fee(appointment: Appointment, cancelled_at: datetime.datetime) -> int:
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Free with 48 or more hours' notice, half price from 24 to 48 hours,
++    full price under 24 hours (including after the start).
++    """
++    notice = appointment.start - cancelled_at
++    if notice >= datetime.timedelta(hours=48):
++        return 0
++    if notice >= datetime.timedelta(hours=24):
++        # Round half up to the cent.
++        return (appointment.price + 1) // 2
++    return appointment.price
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..223a91e
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,42 @@
++import datetime
++import unittest
++from unittest import mock
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import TREATMENTS, Appointment
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def setUp(self):
++        self.start = datetime.datetime(2026, 9, 7, 9, 0)
++        self.standard = Appointment("lena", "Kim Weber", self.start, "standard")
++
++    def cancel_hours_before(self, hours, appointment=None):
++        appointment = appointment or self.standard
++        return cancellation_fee(appointment, appointment.start - datetime.timedelta(hours=hours))
++
++    def test_free_with_48_or_more_hours(self):
++        self.assertEqual(self.cancel_hours_before(72), 0)
++        self.assertEqual(self.cancel_hours_before(48), 0)
++
++    def test_half_price_from_24_to_48_hours(self):
++        self.assertEqual(self.cancel_hours_before(47), 4900)
++        self.assertEqual(self.cancel_hours_before(24), 4900)
++
++    def test_full_price_under_24_hours(self):
++        self.assertEqual(self.cancel_hours_before(23), 9800)
++        self.assertEqual(self.cancel_hours_before(0), 9800)
++
++    def test_full_price_after_the_start(self):
++        late = self.start + datetime.timedelta(minutes=10)
++        self.assertEqual(cancellation_fee(self.standard, late), 9800)
++
++    def test_half_price_rounds_up_to_the_cent(self):
++        # Current prices are all even; this covers a future odd price.
++        odd = Appointment("lena", "Kim Weber", self.start, "initial")
++        with mock.patch.dict(TREATMENTS, {"initial": (60, 14501)}):
++            self.assertEqual(self.cancel_hours_before(30, odd), 7251)
++
++
++if __name__ == "__main__":
++    unittest.main()

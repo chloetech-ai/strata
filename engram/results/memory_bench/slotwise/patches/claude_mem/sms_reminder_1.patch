@@ -1,0 +1,124 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index d770a02..2f315de 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -11,6 +11,12 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_contains_date_time_and_reception_number",
++  "tests/test_reminders.py::ReminderTextTest::test_fits_in_one_sms",
++  "tests/test_reminders.py::ReminderTextTest::test_is_plain_ascii",
++  "tests/test_reminders.py::ReminderTextTest::test_long_client_name_is_shortened_and_keeps_essentials",
++  "tests/test_reminders.py::ReminderTextTest::test_long_therapist_name_is_dropped_before_client_name",
++  "tests/test_reminders.py::ReminderTextTest::test_unmappable_characters_become_question_marks",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_break_after_is_enough_at_ten_minutes",
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..78abe23
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,46 @@
++"""The text of the SMS reminders sent to clients before their appointments."""
++
++import unicodedata
++
++RECEPTION_NUMBER = "044 512 77 30"
++# A single SMS carries 160 characters of plain ASCII.
++SMS_LIMIT = 160
++
++# Must run before NFKD: NFKD would turn 'ä' into 'a' and lose the 'e' German writes after it.
++_GERMAN = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
++
++
++def _ascii(text):
++    """Reduces `text` to ASCII. Characters with no Latin equivalent become '?'."""
++    text = unicodedata.normalize("NFKD", text.translate(_GERMAN))
++    text = "".join(c for c in text if not unicodedata.combining(c))
++    return text.encode("ascii", "replace").decode("ascii")
++
++
++def _compose(client, therapist, when):
++    intro = f"Erinnerung: Termin bei {therapist} am {when}." if therapist else f"Erinnerung: Termin am {when}."
++    return f"Hallo {client}, {intro} Bei Fragen: {RECEPTION_NUMBER}. Lindqvist Physio"
++
++
++def reminder_text(appointment):
++    """Returns the reminder SMS for `appointment`, at most SMS_LIMIT characters.
++
++    If the text is too long, the therapist's name is dropped first. If it is still too long,
++    the client's name is shortened. The date, time and reception number are always kept.
++    """
++    start = appointment.start
++    when = f"{start.day:02d}.{start.month:02d}. {start.hour:02d}:{start.minute:02d}"
++    client = _ascii(appointment.client)
++    therapist = _ascii(appointment.therapist)
++
++    text = _compose(client, therapist, when)
++    if len(text) > SMS_LIMIT:
++        text = _compose(client, "", when)
++    if len(text) > SMS_LIMIT:
++        excess = len(text) - SMS_LIMIT
++        keep = len(client) - excess - len("...")
++        if keep < 1:
++            raise ValueError(f"reminder for {appointment.client!r} does not fit in {SMS_LIMIT} characters")
++        client = client[:keep].rstrip() + "..."
++        text = _compose(client, "", when)
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..d076ae9
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,49 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import RECEPTION_NUMBER, SMS_LIMIT, reminder_text
++
++
++def appointment(client="Kim Weber", therapist="Anna Lindqvist", start=datetime.datetime(2026, 10, 19, 9, 0)):
++    return Appointment(therapist=therapist, client=client, start=start)
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_contains_date_time_and_reception_number(self):
++        text = reminder_text(appointment())
++        self.assertIn("19.10. 09:00", text)
++        self.assertIn(RECEPTION_NUMBER, text)
++        self.assertIn("Kim Weber", text)
++
++    def test_is_plain_ascii(self):
++        text = reminder_text(appointment(client="Jürgen Groß", therapist="Zoë Éclair"))
++        self.assertTrue(text.isascii())
++        self.assertIn("Juergen Gross", text)
++        self.assertIn("Zoe Eclair", text)
++
++    def test_unmappable_characters_become_question_marks(self):
++        text = reminder_text(appointment(client="王 Wei"))
++        self.assertIn("? Wei", text)
++
++    def test_fits_in_one_sms(self):
++        text = reminder_text(appointment(client="A" * 300, therapist="B" * 300))
++        self.assertLessEqual(len(text), SMS_LIMIT)
++
++    def test_long_therapist_name_is_dropped_before_client_name(self):
++        text = reminder_text(appointment(client="Kim Weber", therapist="T" * 200))
++        self.assertNotIn("TTT", text)
++        self.assertIn("Kim Weber", text)
++        self.assertIn(RECEPTION_NUMBER, text)
++
++    def test_long_client_name_is_shortened_and_keeps_essentials(self):
++        text = reminder_text(appointment(client="Maximilian " * 20))
++        self.assertLessEqual(len(text), SMS_LIMIT)
++        self.assertTrue(text.endswith("Lindqvist Physio"))
++        self.assertIn("...", text)
++        self.assertIn("19.10. 09:00", text)
++        self.assertIn(RECEPTION_NUMBER, text)
++
++
++if __name__ == "__main__":
++    unittest.main()

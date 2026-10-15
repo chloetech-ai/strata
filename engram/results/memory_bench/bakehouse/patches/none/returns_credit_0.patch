@@ -1,0 +1,72 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f3e54c7..2c730aa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@
+ - Added `OrderBook.total_for(day, product_code)`: units ordered for that day across all customers.
+ - Added `OrderBook.customers_for(day)`: sorted codes of the customers ordering for that day.
+ - Added `Product.allergen_text()`: the allergens sorted and joined with ', '.
++- Added `invoice.returns_credit(catalog, customer_code, product_code, delivered, returned)`: the credit in pence for unsold units returned from one delivery, at catalog price. Raises ValueError if `returned` is outside 0..`delivered`.
+ - Added `Product.price_text()`: the price formatted with `format_pence`, e.g. '£3.20'.
+ - Added `Customer.email` (default empty), read from an optional `email` column in customers.csv. Greenway Grocers' email is Marek's, the buyer.
+ - Added `OrderBook.days()`: the sorted distinct delivery days that have orders.
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index 69817df..5a273f2 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -51,3 +51,14 @@ def invoice_for(orderbook, customer, day):
+         for code, qty in sorted(totals.items())
+     ]
+     return Invoice(customer, day, lines)
++
++
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Credit in pence for `returned` unsold units of `product_code` from one delivery to `customer_code`.
++
++    Units are credited at the catalog price, the same as on the invoice. Raises ValueError
++    if `returned` is negative or more than `delivered`.
++    """
++    if not 0 <= returned <= delivered:
++        raise ValueError(f"returned must be between 0 and delivered ({delivered}) for {product_code}")
++    return returned * catalog.get(product_code).price
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 58b5526..de92d87 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -71,6 +71,27 @@ class InvoiceTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             invoice_number(2026, 10000)
+ 
++    def test_returns_credit_at_catalog_price(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320), Product("BAG", "Baguette", 95)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "SOU", 32, 3), 3 * 320)
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "BAG", 25, 25), 25 * 95)
++
++    def test_returns_credit_zero_returned_is_zero(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "SOU", 32, 0), 0)
++
++    def test_returns_credit_rejects_bad_counts(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320)])
++        with self.assertRaises(ValueError):
++            returns_credit(catalog, "GREENWAY", "SOU", 32, 33)
++        with self.assertRaises(ValueError):
++            returns_credit(catalog, "GREENWAY", "SOU", 32, -1)
++
++    def test_returns_credit_unknown_product_raises(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320)])
++        with self.assertRaises(KeyError):
++            returns_credit(catalog, "GREENWAY", "XYZ", 5, 1)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

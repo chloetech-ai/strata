@@ -1,0 +1,113 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 83c7660..78507dc 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -14,6 +14,11 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_printing.py::DayPlanTest::test_empty_day_says_so",
++  "tests/test_printing.py::DayPlanTest::test_every_line_fits_the_receipt_printer",
++  "tests/test_printing.py::DayPlanTest::test_leaves_out_cancelled_appointments",
++  "tests/test_printing.py::DayPlanTest::test_leaves_out_other_therapists_and_days",
++  "tests/test_printing.py::DayPlanTest::test_lists_the_day_in_start_order",
+   "tests/test_reminders.py::AsciiTest::test_other_accents_lose_their_marks",
+   "tests/test_reminders.py::AsciiTest::test_umlauts_become_german_spellings",
+   "tests/test_reminders.py::AsciiTest::test_unknown_characters_become_question_marks",
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..96dec38
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,23 @@
++"""Printed day plans for reception's receipt printer."""
++
++import textwrap
++
++# The receipt printer fits this many characters on a line; longer lines wrap into an unreadable mess.
++LINE_WIDTH = 42
++
++
++def _wrapped(text, indent=""):
++    """`text` split into lines no wider than the printer, continuation lines indented by `indent`."""
++    return textwrap.wrap(text, LINE_WIDTH, subsequent_indent=indent) or [""]
++
++
++def day_plan(schedule, therapist, day):
++    """`therapist`'s appointments on `day` as printable text, cancelled ones left out. Every line fits the printer."""
++    lines = [*_wrapped(therapist.title()), *_wrapped(f"{day:%A %d %B %Y}"), "-" * LINE_WIDTH]
++    booked = [a for a in schedule.appointments_for(therapist, day) if a.status != "cancelled"]
++    if not booked:
++        lines.append("No appointments.")
++    for appointment in booked:
++        entry = f"{appointment.start:%H:%M} {appointment.treatment.title()}: {appointment.client}"
++        lines.extend(_wrapped(entry, indent="      "))
++    return "\n".join(lines)
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..3eff577
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,62 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.printing import LINE_WIDTH, day_plan
++from slotwise.schedule import Schedule
++
++MONDAY = datetime.date(2026, 9, 7)
++
++
++def at(hour, minute=0):
++    return datetime.datetime(2026, 9, 7, hour, minute)
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_the_day_in_start_order(self):
++        schedule = Schedule()
++        schedule.book(Appointment("lena", "Anna Keller", at(14), "short"))
++        schedule.book(Appointment("lena", "Ben Meier", at(9), "initial"))
++        plan = day_plan(schedule, "lena", MONDAY)
++        self.assertEqual(
++            plan.splitlines(),
++            [
++                "Lena",
++                "Monday 07 September 2026",
++                "-" * LINE_WIDTH,
++                "09:00 Initial: Ben Meier",
++                "14:00 Short: Anna Keller",
++            ],
++        )
++
++    def test_leaves_out_other_therapists_and_days(self):
++        schedule = Schedule()
++        schedule.book(Appointment("lena", "Anna Keller", at(9)))
++        schedule.book(Appointment("marc", "Ben Meier", at(10)))
++        schedule.book(Appointment("lena", "Cora Wyss", at(9) + datetime.timedelta(days=1)))
++        self.assertIn("Anna Keller", day_plan(schedule, "lena", MONDAY))
++        self.assertNotIn("Ben Meier", day_plan(schedule, "lena", MONDAY))
++        self.assertNotIn("Cora Wyss", day_plan(schedule, "lena", MONDAY))
++
++    def test_leaves_out_cancelled_appointments(self):
++        schedule = Schedule()
++        appointment = schedule.book(Appointment("lena", "Anna Keller", at(9)))
++        schedule.cancel(appointment.id)
++        plan = day_plan(schedule, "lena", MONDAY)
++        self.assertNotIn("Anna Keller", plan)
++        self.assertTrue(plan.endswith("No appointments."))
++
++    def test_empty_day_says_so(self):
++        plan = day_plan(Schedule(), "lena", MONDAY)
++        self.assertTrue(plan.endswith("No appointments."))
++
++    def test_every_line_fits_the_receipt_printer(self):
++        schedule = Schedule()
++        schedule.book(Appointment("lena", "Maximilian Alexander Freiherr von Hohenzollern-Sigmaringen", at(9)))
++        schedule.book(Appointment("lena", "Zoë Brändli", at(11)))
++        for line in day_plan(schedule, "lena", MONDAY).splitlines():
++            self.assertLessEqual(len(line), LINE_WIDTH, line)
++
++
++if __name__ == "__main__":
++    unittest.main()

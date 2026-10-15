@@ -1,0 +1,85 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3996565..2e09aa3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@
+ - Added `Schedule.week(therapist, monday)`: a therapist's booked appointments for the seven days from `monday`, keyed by date, each day sorted by start time. Cancelled appointments are left out.
+ - Added `Schedule.book_series(therapist, client, start, sessions, treatment="standard")`: weekly appointments at the same weekday and time. A week already taken is skipped and a later week is added, so the client still gets every session. Series are capped at 9 sessions (`SeriesTooLong`, a new `BookingError`).
+ - Added `slotwise.clients`: `Client` (id, name, phone, email) and `ClientBook`, a register with `add(client)` and `find_by_phone(phone)`. Phone numbers are matched after normalizing, so "079 123 45 67", "+41 79 123 45 67" and "0041791234567" all find the same client. National numbers with a leading 0 are read as Swiss. `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case and surrounding spaces.
++- Added `Schedule.is_fully_booked(therapist, day)`: true once a therapist has `MAX_DAILY_TREATMENTS` (7) non-cancelled appointments that day. For the online booking page to grey out days; `book()` does not enforce the cap.
+ - Added `slotwise.reminders`: `reminder(appointment)` builds the SMS text. It is plain ASCII (umlauts spelled out, so "Brändli" becomes "Braendli"), includes the reception number 044 512 77 30, and raises `ValueError` rather than exceed 160 characters.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index c7956d1..4dacb1a 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -12,6 +12,10 @@ BUFFER = datetime.timedelta(minutes=10)
+ # Most sessions one prescription covers; insurance pays for no more.
+ MAX_SERIES_SESSIONS = 9
+ 
++# Therapists' contract cap on treatments per day. Only the online booking page enforces it;
++# book() lets reception go over when the therapist agrees.
++MAX_DAILY_TREATMENTS = 7
++
+ 
+ class Schedule:
+     def __init__(self):
+@@ -78,6 +82,11 @@ class Schedule:
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True if `therapist` already has MAX_DAILY_TREATMENTS non-cancelled appointments on `day`."""
++        booked = [a for a in self.appointments_for(therapist, day) if a.status != CANCELLED]
++        return len(booked) >= MAX_DAILY_TREATMENTS
++
+     def week(self, therapist, monday):
+         """`therapist`'s booked appointments for the seven days from `monday`: date -> list by start time.
+ 
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index fe27fdc..2ffb9b2 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -183,6 +183,41 @@ class ScheduleTest(unittest.TestCase):
+         s.book(at(10, therapist="marco"))
+         self.assertEqual([a.start.hour for a in s.appointments_for("lena", datetime.date(2026, 9, 8))], [8, 14])
+ 
++    def test_fully_booked_at_seven_treatments(self):
++        s = Schedule()
++        for hour in range(8, 15):
++            s.book(at(hour))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_six_treatments_is_not_fully_booked(self):
++        s = Schedule()
++        for hour in range(8, 14):
++            s.book(at(hour))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_cancelled_treatments_do_not_count_towards_full(self):
++        s = Schedule()
++        cancelled = [s.book(at(hour)) for hour in range(8, 10)]
++        for a in cancelled:
++            s.cancel(a.id)
++        for hour in range(10, 15):
++            s.book(at(hour))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_full_day_of_other_therapist_or_other_day_is_not_full(self):
++        s = Schedule()
++        for hour in range(8, 15):
++            s.book(at(hour, therapist="marco"))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("marco", datetime.date(2026, 9, 9)))
++
++    def test_book_still_allows_an_eighth_treatment(self):
++        s = Schedule()
++        for hour in range(8, 15):
++            s.book(at(hour))
++        s.book(at(15))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

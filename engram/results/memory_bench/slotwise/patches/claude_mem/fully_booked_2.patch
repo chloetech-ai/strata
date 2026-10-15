@@ -1,0 +1,94 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index d770a02..5dd3d8c 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -21,9 +21,14 @@
+   "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_appointment_raises",
+   "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_break",
+   "tests/test_schedule.py::ScheduleTest::test_cancelled_slot_can_be_rebooked",
++  "tests/test_schedule.py::ScheduleTest::test_cancelling_frees_the_day",
++  "tests/test_schedule.py::ScheduleTest::test_closed_day_is_not_fully_booked",
++  "tests/test_schedule.py::ScheduleTest::test_empty_day_is_not_fully_booked",
++  "tests/test_schedule.py::ScheduleTest::test_no_room_for_a_short_appointment_is_fully_booked",
+   "tests/test_schedule.py::ScheduleTest::test_other_therapist_is_free",
+   "tests/test_schedule.py::ScheduleTest::test_outside_opening_hours",
+   "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
++  "tests/test_schedule.py::ScheduleTest::test_room_for_a_short_appointment_is_not_fully_booked",
+   "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_week_has_every_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_week_leaves_out_cancelled",
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 33d507c..e18dd2a 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -3,7 +3,7 @@
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SlotTaken
+-from .hours import is_open_between
++from .hours import is_open_between, opening_hours
+ from .model import TREATMENTS
+ 
+ # Time a therapist needs after each appointment to clean up and write notes.
+@@ -58,3 +58,20 @@ class Schedule:
+             raise ValueError(f"{monday} is not a Monday")
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+         return {day: [a for a in self.appointments_for(therapist, day) if not a.cancelled] for day in days}
++
++    def is_fully_booked(self, therapist, day):
++        """True if no treatment fits in `therapist`'s free time on `day`, breaks included. A closed day is not fully booked."""
++        hours = opening_hours(day)
++        if hours is None:
++            return False
++        opens, closes = hours
++        shortest = datetime.timedelta(minutes=min(minutes for minutes, _ in TREATMENTS.values()))
++        free_from = opens
++        for a in self.appointments_for(therapist, day):
++            if a.cancelled:
++                continue
++            # A new appointment has to finish a break before `a` starts.
++            if a.start - BREAK - free_from >= shortest:
++                return False
++            free_from = max(free_from, a.end + BREAK)
++        return closes - free_from < shortest
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index f8120fe..4bafcf7 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -116,6 +116,36 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().week("lena", datetime.date(2026, 9, 8))
+ 
++    def test_empty_day_is_not_fully_booked(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_closed_day_is_not_fully_booked(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 13)))  # Sunday
++
++    def test_room_for_a_short_appointment_is_not_fully_booked(self):
++        # Saturday 08:00-12:00. Last free stretch is 11:25-12:00, 35 minutes.
++        s = Schedule()
++        saturday = datetime.date(2026, 9, 12)
++        for hour, minute, treatment in [(8, 0, "standard"), (8, 55, "standard"), (9, 50, "standard"), (10, 45, "short")]:
++            s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 12, hour, minute), treatment))
++        self.assertFalse(s.is_fully_booked("lena", saturday))
++
++    def test_no_room_for_a_short_appointment_is_fully_booked(self):
++        # Same day, but the last stretch is 11:40-12:00, 20 minutes.
++        s = Schedule()
++        saturday = datetime.date(2026, 9, 12)
++        for hour, minute in [(8, 0), (8, 55), (9, 50), (10, 45)]:
++            s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 12, hour, minute)))
++        self.assertTrue(s.is_fully_booked("lena", saturday))
++
++    def test_cancelling_frees_the_day(self):
++        s = Schedule()
++        saturday = datetime.date(2026, 9, 12)
++        booked = [s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 12, h, m))) for h, m in [(8, 0), (8, 55), (9, 50), (10, 45)]]
++        self.assertTrue(s.is_fully_booked("lena", saturday))
++        s.cancel(booked[1].id)
++        self.assertFalse(s.is_fully_booked("lena", saturday))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

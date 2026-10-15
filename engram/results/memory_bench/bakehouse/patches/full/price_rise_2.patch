@@ -1,0 +1,56 @@
+diff --git a/src/bakehouse/pricing.py b/src/bakehouse/pricing.py
+new file mode 100644
+index 0000000..1a147fa
+--- /dev/null
++++ b/src/bakehouse/pricing.py
+@@ -0,0 +1,16 @@
++"""Wholesale price changes."""
++
++PRICE_RISE_PERCENT = 5
++ROUND_TO_PENCE = 5
++
++
++def new_price(price):
++    """`price` raised by PRICE_RISE_PERCENT, rounded up to the next ROUND_TO_PENCE, in whole pence."""
++    raised = price * (100 + PRICE_RISE_PERCENT)  # the raised price, times 100
++    step = 100 * ROUND_TO_PENCE
++    return -(-raised // step) * ROUND_TO_PENCE
++
++
++def new_prices(catalog):
++    """{product code: new wholesale price in pence} for every product in the catalog."""
++    return {product.code: new_price(product.price) for product in catalog}
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+new file mode 100644
+index 0000000..a7055d0
+--- /dev/null
++++ b/tests/test_pricing.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from bakehouse.pricing import new_price, new_prices
++from bakehouse.products import Catalog, Product
++
++
++class NewPriceTest(unittest.TestCase):
++    def test_five_percent_rounded_up_to_the_next_5p(self):
++        self.assertEqual(new_price(320), 340)  # 336 rounds up to 340
++        self.assertEqual(new_price(95), 100)  # 99.75 rounds up to 100
++        self.assertEqual(new_price(110), 120)  # 115.50 rounds up to 120
++
++    def test_never_rounds_down(self):
++        self.assertEqual(new_price(40), 45)  # 42 rounds up to 45, not down to 40
++
++    def test_exact_multiple_of_5p_is_kept(self):
++        self.assertEqual(new_price(100), 105)  # 105 is already a multiple of 5p
++        self.assertEqual(new_price(0), 0)
++
++
++class NewPricesTest(unittest.TestCase):
++    def test_maps_each_code_to_its_new_price(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320), Product("BAG", "Baguette", 95)])
++        self.assertEqual(new_prices(catalog), {"SOU": 340, "BAG": 100})
++
++
++if __name__ == "__main__":
++    unittest.main()

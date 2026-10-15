@@ -1,0 +1,99 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 91280f6..e628179 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,7 @@
+ - Customers: route_seq must be unique, and POTTER (Potter's Farm Shop) is added as route 6.
+ - Unknown product codes are rejected; `crates_needed(units, per_crate)` rounds up to whole crates.
+ - Removed the walrus operator so the code runs on Python 3.7.
++- Delivery: `drops_file(orderbook, customers, day, path)` writes the van's drops for a day in route order, for customers with orders that day.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..7da9296
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,18 @@
++"""The van's run: the drops for a delivery day."""
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes the van's drops for `day` to `path`, one numbered line per customer in
++    route order. Only customers with orders for `day` are listed.
++
++    `customers` is the dict from load_customers. Raises ValueError if an order is
++    for a customer code that is not in `customers`.
++    """
++    codes = orderbook.customers_for(day)
++    missing = [code for code in codes if code not in customers]
++    if missing:
++        raise ValueError(f"no customer for order code {', '.join(missing)}")
++    drops = sorted((customers[code] for code in codes), key=lambda c: c.route_seq)
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        for n, c in enumerate(drops, start=1):
++            f.write(f"{n}. {c.name}, {c.address}, {c.postcode}\n")
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..686ea55
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,57 @@
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import load_customers
++from bakehouse.delivery import drops_file
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DATA = os.path.join(os.path.dirname(__file__), "..", "data")
++DAY = datetime.date(2026, 11, 3)
++
++
++class DropsFileTest(unittest.TestCase):
++    def setUp(self):
++        self.customers = load_customers(os.path.join(DATA, "customers.csv"))
++        self.catalog = Catalog([Product("BAP", "Bap", 50)])
++
++    def read(self, book):
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "drops.txt")
++            drops_file(book, self.customers, DAY, path)
++            with open(path, encoding="utf-8") as f:
++                return f.read()
++
++    def test_lists_only_customers_with_orders_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "POTTER", "BAP", 2),
++            OrderLine(DAY, "LUMEN", "BAP", 1),
++            OrderLine(DAY, "GREENWAY", "BAP", 3),
++        ])
++        self.assertEqual(self.read(book), (
++            "1. Café Lumen, 14 Mill Lane, LK1 2AB\n"
++            "2. Greenway Grocers, 88 High Street, LK1 4HS\n"
++            "3. Potter's Farm Shop, Lower Farm, Ashby Road, LK5 3PF\n"
++        ))
++
++    def test_other_days_are_ignored(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAP", 1),
++            OrderLine(DAY + datetime.timedelta(days=1), "HARBOUR", "BAP", 1),
++        ])
++        self.assertEqual(self.read(book), "1. Café Lumen, 14 Mill Lane, LK1 2AB\n")
++
++    def test_no_orders_writes_an_empty_file(self):
++        self.assertEqual(self.read(OrderBook(self.catalog)), "")
++
++    def test_unknown_customer_is_rejected(self):
++        book = OrderBook(self.catalog, [OrderLine(DAY, "NOBODY", "BAP", 1)])
++        with tempfile.TemporaryDirectory() as tmp:
++            with self.assertRaisesRegex(ValueError, "NOBODY"):
++                drops_file(book, self.customers, DAY, os.path.join(tmp, "drops.txt"))
++
++
++if __name__ == "__main__":
++    unittest.main()

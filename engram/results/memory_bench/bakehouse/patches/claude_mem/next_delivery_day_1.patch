@@ -1,0 +1,63 @@
+diff --git a/src/bakehouse/orders.py b/src/bakehouse/orders.py
+index 568f2fe..d453f8d 100644
+--- a/src/bakehouse/orders.py
++++ b/src/bakehouse/orders.py
+@@ -68,6 +68,16 @@ def is_delivery_day(day):
+     return day.weekday() not in config.CLOSED_WEEKDAYS
+ 
+ 
++def next_delivery_day(day):
++    """The first delivery day strictly after `day`."""
++    candidate = day + datetime.timedelta(days=1)
++    for _ in range(7):
++        if is_delivery_day(candidate):
++            return candidate
++        candidate += datetime.timedelta(days=1)
++    raise ValueError("no delivery days: every weekday is in config.CLOSED_WEEKDAYS")
++
++
+ def is_on_time(placed_at, delivery_day):
+     """Whether an order placed at `placed_at` (a datetime) is in time for
+     `delivery_day`: orders must be in by config.ORDER_CUTOFF on the day before."""
+diff --git a/tests/test_orders.py b/tests/test_orders.py
+index 988361d..5437e44 100644
+--- a/tests/test_orders.py
++++ b/tests/test_orders.py
+@@ -4,7 +4,15 @@ import tempfile
+ import unittest
+ 
+ from bakehouse import config
+-from bakehouse.orders import OrderBook, OrderLine, is_delivery_day, is_on_time, load_orders, save_orders
++from bakehouse.orders import (
++    OrderBook,
++    OrderLine,
++    is_delivery_day,
++    is_on_time,
++    load_orders,
++    next_delivery_day,
++    save_orders,
++)
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -173,6 +181,20 @@ class CutoffTest(unittest.TestCase):
+             day = DAY + datetime.timedelta(days=offset)
+             self.assertEqual(is_delivery_day(day), day.weekday() not in config.CLOSED_WEEKDAYS)
+ 
++    def test_next_delivery_day(self):
++        for offset in range(14):
++            day = DAY + datetime.timedelta(days=offset)
++            nxt = next_delivery_day(day)
++            self.assertGreater(nxt, day)
++            self.assertTrue(is_delivery_day(nxt))
++            # Nothing skipped: every day strictly between `day` and `nxt` is a closed day.
++            between = [day + datetime.timedelta(days=i) for i in range(1, (nxt - day).days)]
++            self.assertFalse(any(is_delivery_day(d) for d in between))
++        # Saturday 2026-10-17 -> Sunday 2026-10-18 (Monday is closed, but Sunday is open).
++        self.assertEqual(next_delivery_day(datetime.date(2026, 10, 17)), datetime.date(2026, 10, 18))
++        # Sunday 2026-10-18 -> Tuesday 2026-10-20 (Monday 2026-10-19 is closed).
++        self.assertEqual(next_delivery_day(datetime.date(2026, 10, 18)), datetime.date(2026, 10, 20))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

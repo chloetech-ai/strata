@@ -1,0 +1,103 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 91280f6..eed3f60 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@
+ - Pence formatting (`format_pence`) and dough weight (`dough_weight_g`, rejects negative units).
+ - Customers: route_seq must be unique, and POTTER (Potter's Farm Shop) is added as route 6.
+ - Unknown product codes are rejected; `crates_needed(units, per_crate)` rounds up to whole crates.
++- Crate labels: `crate_labels(orderbook, customers, day)` gives one label per customer and product for a delivery day, in route order, with allergens in capitals.
+ - Removed the walrus operator so the code runs on Python 3.7.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..764d85c
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,25 @@
++"""Crate labels: one label per customer and product for a delivery day, printed for the packing room."""
++
++
++def crate_labels(orderbook, customers, day):
++    """The text of each crate label for delivery on `day`, one per customer and product.
++
++    Labels run in van route order (by route_seq), then by product code. Each label is
++    three lines: the customer's name, the quantity and product name, and the allergens
++    in capitals (allergens must be emphasised, and the printer cannot do bold). The
++    allergen line is left out for a product with no allergens.
++    """
++    labels = []
++    codes = sorted(orderbook.customers_for(day), key=lambda code: customers[code].route_seq)
++    for code in codes:
++        customer = customers[code]
++        qty_by_product = {}
++        for line in orderbook.lines_for(code, day):
++            qty_by_product[line.product] = qty_by_product.get(line.product, 0) + line.qty
++        for product_code in sorted(qty_by_product):
++            product = orderbook.catalog.get(product_code)
++            text = [customer.name, f"{qty_by_product[product_code]} x {product.name}"]
++            if product.allergens:
++                text.append(product.allergen_text().upper())
++            labels.append("\n".join(text))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..a20c48b
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,54 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12),
++            Product("SOU", "White sourdough", 320, batch_size=10, allergens=("wheat", "sesame")),
++        ])
++        self.customers = {
++            "LUMEN": Customer("LUMEN", "Lumen Cafe", "1 High St", "AB1 2CD", 2),
++            "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "9 Mill Rd", "AB3 4EF", 1),
++        }
++
++    def test_one_label_per_customer_and_product_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 4),
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY, "GREENWAY", "BAG", 20),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Greenway Grocers\n20 x Baguette",
++            "Lumen Cafe\n5 x Baguette",
++            "Lumen Cafe\n4 x White sourdough\nSESAME, WHEAT",
++        ])
++
++    def test_quantities_for_the_same_product_are_added_together(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 2),
++            OrderLine(DAY, "LUMEN", "BAG", 3),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Lumen Cafe\n5 x Baguette"])
++
++    def test_product_without_allergens_has_no_allergen_line(self):
++        book = OrderBook(self.catalog, [OrderLine(DAY, "GREENWAY", "BAG", 1)])
++        self.assertEqual(crate_labels(book, self.customers, DAY), ["Greenway Grocers\n1 x Baguette"])
++
++    def test_orders_for_other_days_are_left_out(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "BAG", 5),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [])
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,77 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 924e656..bf655fc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,7 +11,7 @@
+ - Orders: `remove`, `len`, `days`, `lines_for`, `total_for`, `customers_for`; unknown product codes are rejected when added; standing weekly orders.
+ - Reports: `day_summary` and `top_products`.
+ - Production: `total_batches`; `plan` leaves out products not ordered for the day; `crates_needed` rounds up to whole crates.
+-- Invoices: `invoice_number` gives `LK-YYYY-NNNN`; `invoice_for` ignores other customers' lines. Invoices still carry no VAT; Ledgerly handles it.
++- Invoices: `invoice_number` gives `LK-YYYY-NNNN`; `invoice_for` ignores other customers' lines; `delivery_charge` gives £4.50 under £40.00 pre-VAT, St Aidan's exempt (not yet on invoices). Invoices still carry no VAT; Ledgerly handles it.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index effee1c..8b06e1f 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -40,6 +40,22 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++DELIVERY_CHARGE = 450  # pence: £4.50
++DELIVERY_CHARGE_UNDER = 4000  # pence: orders under £40.00 pay the charge
++DELIVERY_EXEMPT = {"AIDAN"}  # St Aidan's contract price already includes delivery
++
++
++def delivery_charge(customer_code, subtotal):
++    """Delivery charge in pence for `customer_code`'s order for one delivery day.
++
++    `subtotal` is the order value in pence before VAT. Orders under £40.00 pay £4.50;
++    St Aidan's is exempt, and an order with no value pays nothing.
++    """
++    if customer_code in DELIVERY_EXEMPT or subtotal <= 0:
++        return 0
++    return DELIVERY_CHARGE if subtotal < DELIVERY_CHARGE_UNDER else 0
++
++
+ def invoice_for(orderbook, customer, day):
+     """Invoice for what `customer` ordered for delivery on `day`: one line per product, at catalog prices."""
+     totals = {}
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 3785145..f6973c6 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, delivery_charge, format_pence, invoice_for, invoice_number
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -71,6 +71,23 @@ class InvoiceNumberTest(unittest.TestCase):
+             invoice_number(2026, 10000)
+ 
+ 
++class DeliveryChargeTest(unittest.TestCase):
++    def test_under_forty_pounds_pays_four_fifty(self):
++        self.assertEqual(delivery_charge("LUMEN", 1000), 450)
++        self.assertEqual(delivery_charge("GREENWAY", 3999), 450)
++
++    def test_forty_pounds_or_more_pays_nothing(self):
++        self.assertEqual(delivery_charge("LUMEN", 4000), 0)
++        self.assertEqual(delivery_charge("POTTER", 12345), 0)
++
++    def test_st_aidans_is_exempt(self):
++        self.assertEqual(delivery_charge("AIDAN", 1000), 0)
++        self.assertEqual(delivery_charge("AIDAN", 4000), 0)
++
++    def test_no_order_pays_nothing(self):
++        self.assertEqual(delivery_charge("LUMEN", 0), 0)
++
++
+ class InvoiceTest(unittest.TestCase):
+     def test_total(self):
+         invoice = Invoice("LUMEN", datetime.date(2026, 10, 20), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)])

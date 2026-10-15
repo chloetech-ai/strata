@@ -1,0 +1,105 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 05a3f86..933108b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@
+ - Production: `total_batches`, `crates_needed` (whole crates, rounded up), and `dough_weight_g` rejects negative units.
+ - `python -m bakehouse plan` replaces `scripts/print_plan.py`, with aligned columns for product names, units and batches.
+ - Invoices: `invoice_for` builds one line per product at catalog prices; `day_summary` gives order value per customer; `format_pence` shows pence as pounds; `invoice_number` gives numbers like `LK-2026-0001`.
++- Reports: `week_totals_file` writes each customer's total in pounds for seven days from a start date to a CSV that opens in Excel.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index d624d5f..4b29bc0 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,8 @@
+ """Summaries of the order book for a delivery day."""
+ 
++import csv
++import datetime
++
+ 
+ def day_summary(orderbook, day):
+     """{customer code: order value in pence} for everything ordered for delivery on `day`.
+@@ -23,3 +26,24 @@ def top_products(orderbook, start, end, n=5):
+         if start <= line.day <= end:
+             units[line.product] = units.get(line.product, 0) + line.qty
+     return sorted(units, key=lambda code: (-units[code], code))[:n]
++
++
++def week_totals_file(orderbook, week_start, path):
++    """Write a CSV with one row per customer who ordered for delivery in the seven days
++    from `week_start` (inclusive): the customer code and their total in pounds before VAT,
++    such as 19.00. Customers are sorted by code.
++
++    The file has a byte-order mark so Excel opens it as UTF-8.
++    """
++    week_end = week_start + datetime.timedelta(days=6)
++    totals = {}
++    for line in orderbook:
++        if week_start <= line.day <= week_end:
++            price = orderbook.catalog.get(line.product).price
++            totals[line.customer] = totals.get(line.customer, 0) + line.qty * price
++    with open(path, "w", newline="", encoding="utf-8-sig") as f:
++        writer = csv.writer(f)
++        writer.writerow(["customer", "total_gbp"])
++        for customer in sorted(totals):
++            pence = totals[customer]
++            writer.writerow([customer, f"{pence // 100}.{pence % 100:02d}"])
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index 07a08e7..d6b8640 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -1,9 +1,12 @@
++import csv
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ 
+@@ -48,5 +51,36 @@ class DaySummaryTest(unittest.TestCase):
+         self.assertEqual(day_summary(OrderBook(catalog), DAY), {})
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def read_rows(self, path):
++        with open(path, newline="", encoding="utf-8-sig") as f:
++            return list(csv.reader(f))
++
++    def test_totals_in_pounds_for_seven_days_from_week_start(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12), Product("SOU", "White sourdough", 320, batch_size=10)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 20),                       # first day: counted
++            OrderLine(datetime.date(2026, 10, 26), "LUMEN", "SOU", 10),  # last day: counted
++            OrderLine(datetime.date(2026, 10, 26), "LUMEN", "BAG", 5),
++            OrderLine(datetime.date(2026, 10, 27), "LUMEN", "SOU", 3),   # day after: not counted
++            OrderLine(datetime.date(2026, 10, 19), "AIDAN", "BAG", 9),   # day before: not counted
++        ])
++        with tempfile.TemporaryDirectory() as folder:
++            path = os.path.join(folder, "week.csv")
++            week_totals_file(book, DAY, path)
++            self.assertEqual(self.read_rows(path), [
++                ["customer", "total_gbp"],
++                ["GREENWAY", "19.00"],
++                ["LUMEN", "36.75"],
++            ])
++
++    def test_no_orders_writes_only_the_header(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95)])
++        with tempfile.TemporaryDirectory() as folder:
++            path = os.path.join(folder, "week.csv")
++            week_totals_file(OrderBook(catalog), DAY, path)
++            self.assertEqual(self.read_rows(path), [["customer", "total_gbp"]])
++
++
+ if __name__ == "__main__":
+     unittest.main()

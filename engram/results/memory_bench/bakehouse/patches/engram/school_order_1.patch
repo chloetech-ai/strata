@@ -1,0 +1,10 @@
+diff --git a/data/orders.csv b/data/orders.csv
+index dd8d8fc..3b4502d 100644
+--- a/data/orders.csv
++++ b/data/orders.csv
+@@ -8,3 +8,5 @@ date,customer,product,qty
+ 2026-10-21,HARBOUR,PCH,24
+ 2026-10-21,OLDMILL,CIN,20
+ 2026-10-21,OLDMILL,FLO,40
++2026-11-20,AIDAN,WRL,60
++2026-11-20,AIDAN,SWL,6

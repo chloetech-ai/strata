@@ -1,0 +1,111 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 69c1bcf..5256a14 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,14 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_finds_client_in_any_phone_format",
++  "tests/test_clients.py::ClientBookTest::test_invalid_phone_is_rejected_on_add",
++  "tests/test_clients.py::ClientBookTest::test_same_number_cannot_be_added_twice",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_added_order",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_gives_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_number_gives_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_common_shapes_give_the_same_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_letters",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_numbers_without_prefix",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+@@ -6,10 +16,14 @@
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
++  "tests/test_schedule.py::ScheduleTest::test_book_still_allows_going_over_the_cap",
+   "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_the_record_and_marks_it",
+   "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_id_is_a_key_error",
+   "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_the_gap",
+   "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_frees_its_slot",
++  "tests/test_schedule.py::ScheduleTest::test_cancelled_appointments_do_not_count_towards_full",
++  "tests/test_schedule.py::ScheduleTest::test_fully_booked_at_seven_appointments",
++  "tests/test_schedule.py::ScheduleTest::test_fully_booked_is_per_therapist_and_day",
+   "tests/test_schedule.py::ScheduleTest::test_gap_message_mentions_the_rule",
+   "tests/test_schedule.py::ScheduleTest::test_gap_only_applies_to_same_therapist",
+   "tests/test_schedule.py::ScheduleTest::test_no_gap_after_existing_is_taken",
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 618a27a..8ab1d03 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,11 @@ from .model import TREATMENTS
+ # Time a therapist needs between two appointments to clean up and write notes.
+ GAP = datetime.timedelta(minutes=10)
+ 
++# Therapists' contracts cap them at this many treatments a day. Reception can still
++# book over the cap when the therapist agrees, so `book` does not enforce it; only
++# `is_fully_booked` uses it, to grey out days on the online booking page.
++MAX_PER_DAY = 7
++
+ 
+ class Schedule:
+     def __init__(self):
+@@ -52,6 +57,11 @@ class Schedule:
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True if `therapist` already has `MAX_PER_DAY` non-cancelled appointments on `day`."""
++        live = [a for a in self.appointments_for(therapist, day) if not a.cancelled]
++        return len(live) >= MAX_PER_DAY
++
+     def week(self, therapist, monday):
+         """`therapist`'s non-cancelled appointments for the seven days from `monday`, keyed by date."""
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index c74c8d3..2b8b4ae 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -3,7 +3,7 @@ import unittest
+ 
+ from slotwise.errors import BookingError, OutsideOpeningHours, SlotTaken
+ from slotwise.model import Appointment
+-from slotwise.schedule import Schedule
++from slotwise.schedule import MAX_PER_DAY, Schedule
+ 
+ 
+ def at(hour, minute=0, therapist="lena", treatment="standard", client="Kim Weber"):
+@@ -137,6 +137,35 @@ class ScheduleTest(unittest.TestCase):
+         week = s.week("lena", datetime.date(2026, 9, 7))
+         self.assertEqual([a.start.hour for a in week[datetime.date(2026, 9, 8)]], [11])
+ 
++    def test_fully_booked_at_seven_appointments(self):
++        s = Schedule()
++        for i in range(MAX_PER_DAY - 1):
++            start = datetime.datetime(2026, 9, 8, 7, 30) + datetime.timedelta(minutes=55 * i)
++            s.book(Appointment("lena", "Jo Li", start))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++        s.book(Appointment("lena", "Jo Li", datetime.datetime(2026, 9, 8, 15, 0)))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_cancelled_appointments_do_not_count_towards_full(self):
++        s = Schedule()
++        booked = [s.book(at(8 + i)) for i in range(MAX_PER_DAY)]
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++        s.cancel(booked[0].id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_fully_booked_is_per_therapist_and_day(self):
++        s = Schedule()
++        for i in range(MAX_PER_DAY):
++            s.book(at(8 + i))
++        self.assertFalse(s.is_fully_booked("marco", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 9)))
++
++    def test_book_still_allows_going_over_the_cap(self):
++        s = Schedule()
++        for i in range(MAX_PER_DAY + 1):
++            s.book(at(8 + i))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

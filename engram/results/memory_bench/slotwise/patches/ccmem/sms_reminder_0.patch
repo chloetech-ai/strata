@@ -1,0 +1,70 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..d84af74
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,26 @@
++"""Text of the reminder SMS sent to clients before an appointment."""
++
++import unicodedata
++
++# The SMS gateway only takes plain ASCII and bills per 160-character message.
++SMS_LIMIT = 160
++RECEPTION_NUMBER = "044 512 77 30"
++
++
++def _ascii(text):
++    """Fold accented letters to their ASCII base ('Müller' -> 'Muller'), dropping the rest."""
++    text = text.replace("ß", "ss")
++    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++
++
++def reminder_text(appointment):
++    """Return the reminder SMS for `appointment`, at most SMS_LIMIT characters of ASCII.
++
++    A very long therapist name is shortened so the reception number always fits.
++    """
++    when = appointment.start.strftime("%d.%m.%Y %H:%M")
++    prefix = f"Reminder: appointment {when} with "
++    suffix = f". Reception: {RECEPTION_NUMBER}"
++    room = SMS_LIMIT - len(prefix) - len(suffix)
++    therapist = _ascii(appointment.therapist)[:room].rstrip()
++    return f"{prefix}{therapist}{suffix}"
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..6ac2f01
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,32 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import SMS_LIMIT, reminder_text
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_states_time_therapist_and_reception(self):
++        a = Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0))
++        self.assertEqual(
++            reminder_text(a),
++            "Reminder: appointment 07.09.2026 09:00 with lena. Reception: 044 512 77 30",
++        )
++
++    def test_is_ascii_and_within_sms_limit(self):
++        a = Appointment("Jürgen Müller-Großhänsel", "Kim Weber", datetime.datetime(2026, 12, 31, 16, 45))
++        text = reminder_text(a)
++        text.encode("ascii")
++        self.assertLessEqual(len(text), SMS_LIMIT)
++        self.assertIn("with Jurgen Muller-Grosshansel. Reception", text)
++        self.assertTrue(text.endswith("Reception: 044 512 77 30"))
++
++    def test_long_therapist_name_is_shortened_not_the_reception_number(self):
++        a = Appointment("x" * 300, "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0))
++        text = reminder_text(a)
++        self.assertLessEqual(len(text), SMS_LIMIT)
++        self.assertTrue(text.endswith("Reception: 044 512 77 30"))
++
++
++if __name__ == "__main__":
++    unittest.main()

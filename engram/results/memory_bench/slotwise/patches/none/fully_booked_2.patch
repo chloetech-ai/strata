@@ -1,0 +1,139 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 4ac3dc1..703a29d 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -3,7 +3,7 @@
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SlotTaken
+-from .hours import is_open_between
++from .hours import is_open_between, opening_hours
+ from .model import BOOKED, CANCELLED, TREATMENTS
+ 
+ # Time a therapist needs after each appointment to clean up and write notes.
+@@ -16,29 +16,34 @@ class Schedule:
+ 
+     def book(self, appointment):
+         """Adds `appointment` if the practice is open and the therapist is free, with a turnaround gap either side."""
+-        if appointment.treatment not in TREATMENTS:
++        self._check(appointment.therapist, appointment.treatment, appointment.start)
++        self.appointments.append(appointment)
++        return appointment
++
++    def _check(self, therapist, treatment, start):
++        """Raises a BookingError if a `treatment` starting at `start` could not be booked for `therapist`."""
++        if treatment not in TREATMENTS:
+             raise BookingError(
+-                f"'{appointment.treatment}' is not a treatment we offer. "
++                f"'{treatment}' is not a treatment we offer. "
+                 f"Choose one of: {', '.join(TREATMENTS)}."
+             )
+-        if not is_open_between(appointment.start, appointment.end):
++        end = start + datetime.timedelta(minutes=TREATMENTS[treatment][0])
++        if not is_open_between(start, end):
+             raise OutsideOpeningHours(
+-                f"The practice is closed from {appointment.start:%H:%M} to {appointment.end:%H:%M} "
+-                f"on {appointment.start:%A %d %B}. Please choose a time within opening hours."
++                f"The practice is closed from {start:%H:%M} to {end:%H:%M} "
++                f"on {start:%A %d %B}. Please choose a time within opening hours."
+             )
+         for other in self.appointments:
+-            if other.therapist != appointment.therapist or other.status == CANCELLED:
++            if other.therapist != therapist or other.status == CANCELLED:
+                 continue
+             # Each appointment blocks the therapist until TURNAROUND after it ends.
+-            if other.start < appointment.end + TURNAROUND and appointment.start < other.end + TURNAROUND:
++            if other.start < end + TURNAROUND and start < other.end + TURNAROUND:
+                 raise SlotTaken(
+-                    f"{appointment.therapist.title()} has an appointment at "
++                    f"{therapist.title()} has an appointment at "
+                     f"{other.start:%H:%M}–{other.end:%H:%M} on {other.start:%A %d %B}, and needs "
+                     f"{TURNAROUND.seconds // 60} minutes between appointments. "
+                     f"Please choose another time or therapist."
+                 )
+-        self.appointments.append(appointment)
+-        return appointment
+ 
+     def get(self, appointment_id):
+         for appointment in self.appointments:
+@@ -66,3 +71,23 @@ class Schedule:
+             day: [a for a in self.appointments_for(therapist, day) if a.status != CANCELLED]
+             for day in days
+         }
++
++    def is_fully_booked(self, therapist, day):
++        """True if no treatment at all could be booked for `therapist` on `day`. A closed day counts as fully booked."""
++        hours = opening_hours(day)
++        if hours is None:
++            return True
++        shortest = min(TREATMENTS, key=lambda t: TREATMENTS[t][0])
++        # The earliest free start in any gap is either opening time or just after a turnaround.
++        candidates = [hours[0]] + [
++            a.end + TURNAROUND
++            for a in self.appointments_for(therapist, day)
++            if a.status != CANCELLED
++        ]
++        for start in sorted(candidates):
++            try:
++                self._check(therapist, shortest, start)
++            except BookingError:
++                continue
++            return False
++        return True
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index ecfbf1a..096563d 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -9,6 +9,14 @@ from slotwise.schedule import Schedule
+ def at(hour, minute=0, therapist="lena", treatment="standard", client="Kim Weber"):
+     return Appointment(therapist, client, datetime.datetime(2026, 9, 8, hour, minute), treatment)
+ 
++SATURDAY = datetime.date(2026, 9, 12)
++# Standard appointments every 55 minutes fill 08:00-12:00 with only 10-minute gaps.
++PACKED_SATURDAY = [(8, 0), (8, 55), (9, 50), (10, 45)]
++
++
++def saturday(hour, minute=0):
++    return Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 12, hour, minute))
++
+ 
+ class ScheduleTest(unittest.TestCase):
+     def test_book(self):
+@@ -110,6 +118,37 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().week("lena", datetime.date(2026, 9, 8))
+ 
++    def test_is_fully_booked_empty_day(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_is_fully_booked_closed_day(self):
++        self.assertTrue(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 6)))  # Sunday
++
++    def test_is_fully_booked_when_no_gap_fits_shortest_treatment(self):
++        s = Schedule()
++        for hour, minute in PACKED_SATURDAY:
++            s.book(saturday(hour, minute))
++        self.assertTrue(s.is_fully_booked("lena", SATURDAY))
++
++    def test_is_not_fully_booked_when_a_gap_fits_a_treatment(self):
++        s = Schedule()
++        s.book(saturday(8, 0))
++        s.book(saturday(8, 55))  # 09:40 onward is free
++        self.assertFalse(s.is_fully_booked("lena", SATURDAY))
++
++    def test_cancelled_appointment_frees_its_slot(self):
++        s = Schedule()
++        packed = [s.book(saturday(hour, minute)) for hour, minute in PACKED_SATURDAY]
++        self.assertTrue(s.is_fully_booked("lena", SATURDAY))
++        s.cancel(packed[-1].id)
++        self.assertFalse(s.is_fully_booked("lena", SATURDAY))
++
++    def test_is_fully_booked_is_per_therapist(self):
++        s = Schedule()
++        for hour, minute in PACKED_SATURDAY:
++            s.book(saturday(hour, minute))
++        self.assertFalse(s.is_fully_booked("marco", SATURDAY))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

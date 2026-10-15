@@ -1,0 +1,58 @@
+diff --git a/src/bakehouse/recipes.py b/src/bakehouse/recipes.py
+new file mode 100644
+index 0000000..c008df4
+--- /dev/null
++++ b/src/bakehouse/recipes.py
+@@ -0,0 +1,14 @@
++"""Recipe helpers."""
++
++
++def baker_percentages(recipe):
++    """Each ingredient's weight as a percentage of the total flour weight, to one decimal place.
++
++    `recipe` maps ingredient names to grams. Any ingredient whose name contains
++    'flour' (case-insensitive) counts as flour. Raises ValueError if there is no
++    flour, or if the flour weighs nothing.
++    """
++    flour_g = sum(grams for name, grams in recipe.items() if "flour" in name.lower())
++    if flour_g <= 0:
++        raise ValueError("recipe has no flour weight to base percentages on")
++    return {name: round(grams / flour_g * 100, 1) for name, grams in recipe.items()}
+diff --git a/tests/test_recipes.py b/tests/test_recipes.py
+new file mode 100644
+index 0000000..5576862
+--- /dev/null
++++ b/tests/test_recipes.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from bakehouse.recipes import baker_percentages
++
++
++class BakerPercentagesTest(unittest.TestCase):
++    def test_percentages_are_of_total_flour_weight(self):
++        recipe = {"Strong white flour": 500, "Rye flour": 100, "Water": 375, "Salt": 10}
++        result = baker_percentages(recipe)
++        self.assertEqual(result["Strong white flour"], 83.3)
++        self.assertEqual(result["Rye flour"], 16.7)
++        self.assertEqual(result["Water"], 62.5)
++        self.assertEqual(result["Salt"], 1.7)
++
++    def test_flour_match_is_case_insensitive(self):
++        result = baker_percentages({"FLOUR": 200, "flour blend": 200, "Water": 150})
++        self.assertEqual(result["Water"], 37.5)
++
++    def test_flour_itself_is_100_percent_when_only_flour(self):
++        self.assertEqual(baker_percentages({"Bread Flour": 1000}), {"Bread Flour": 100.0})
++
++    def test_raises_when_no_flour(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"Water": 300, "Salt": 10})
++
++    def test_raises_when_flour_weighs_nothing(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"Flour": 0, "Water": 300})
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,147 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..201fe25
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1,7 @@
++{
++  "tests/test_clients.py": true,
++  "tests/test_hours.py": true,
++  "tests/test_model.py": true,
++  "tests/test_schedule.py": true,
++  "tests/test_storage.py": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..0637a08
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1 @@
++[]
+\ No newline at end of file
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f6b1d49..384f1b3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,7 @@
+ - Booking errors are now `BookingError` subclasses (`SlotTaken`, `OutsideOpeningHours`) with receptionist-facing messages, instead of `ValueError`.
+ - Each therapist needs a 10-minute gap before and after every appointment (`schedule.BUFFER`).
+ - Fixed overlap check missing appointments that start before an existing one and run into it.
++- `reminders.reminder_text(appointment)` builds the reminder SMS: ASCII only, within 160 characters, always with the reception number.
+ - Client register (`clients.Client`, `clients.ClientBook`). Phone lookup ignores formatting and matches `079…`, `+41…` and `0041…` notations of the same number.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..9b6cafd
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,37 @@
++"""Text of the SMS reminders sent before appointments."""
++
++import unicodedata
++
++from .model import Appointment
++
++# The SMS gateway only takes ASCII and one message is 160 characters.
++SMS_LIMIT = 160
++
++# Clients can call this number if they need to change their appointment.
++RECEPTION_NUMBER = "044 512 77 30"
++
++# Letters that NFKD does not split into base letter plus accent.
++_TRANSLITERATIONS = str.maketrans({"ß": "ss", "ø": "o", "Ø": "O", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE"})
++
++
++def _ascii(text):
++    """Reduce text to ASCII, keeping the base letter of accented characters (ä -> a)."""
++    decomposed = unicodedata.normalize("NFKD", text.translate(_TRANSLITERATIONS))
++    return decomposed.encode("ascii", "ignore").decode("ascii")
++
++
++def _compose(client, therapist, when):
++    return f"Hi {client}, reminder of your appointment with {therapist} on {when}. Questions? Call {RECEPTION_NUMBER}"
++
++
++def reminder_text(appointment: Appointment) -> str:
++    """Return the reminder SMS for an appointment, within the gateway's limits."""
++    when = appointment.start.strftime("%d.%m.%Y at %H:%M")
++    therapist = _ascii(appointment.therapist)
++    client = _ascii(appointment.client)
++    text = _compose(client, therapist, when)
++    if len(text) > SMS_LIMIT:
++        # The reception number must stay in every reminder, so shorten the client's name instead.
++        excess = len(text) - SMS_LIMIT
++        text = _compose(client[: max(len(client) - excess, 0)].rstrip(), therapist, when)
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..3f79f97
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,32 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import RECEPTION_NUMBER, SMS_LIMIT, reminder_text
++
++
++def appointment(client="Anna Weber-Keller", therapist="Dr. Bernet"):
++    return Appointment(therapist, client, datetime.datetime(2026, 10, 20, 14, 30))
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_contains_time_therapist_and_reception_number(self):
++        text = reminder_text(appointment())
++        self.assertIn("20.10.2026 at 14:30", text)
++        self.assertIn("Dr. Bernet", text)
++        self.assertIn(RECEPTION_NUMBER, text)
++
++    def test_is_ascii_and_within_limit(self):
++        text = reminder_text(appointment(client="Jörg Müller-Østergaard"))
++        self.assertTrue(text.isascii())
++        self.assertLessEqual(len(text), SMS_LIMIT)
++        self.assertIn("Jorg Muller-Ostergaard", text)
++
++    def test_long_name_is_shortened_but_number_kept(self):
++        text = reminder_text(appointment(client="A" * 200))
++        self.assertLessEqual(len(text), SMS_LIMIT)
++        self.assertIn(RECEPTION_NUMBER, text)
++
++
++if __name__ == "__main__":
++    unittest.main()

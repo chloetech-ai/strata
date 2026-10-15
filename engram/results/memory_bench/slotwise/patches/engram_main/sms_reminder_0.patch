@@ -1,0 +1,137 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 69c1bcf..bebb8d4 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,9 +1,26 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_finds_client_in_any_phone_format",
++  "tests/test_clients.py::ClientBookTest::test_invalid_phone_is_rejected_on_add",
++  "tests/test_clients.py::ClientBookTest::test_same_number_cannot_be_added_twice",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_added_order",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_gives_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_number_gives_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_common_shapes_give_the_same_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_letters",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_numbers_without_prefix",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_contains_time_date_and_reception_number",
++  "tests/test_reminders.py::ReminderTextTest::test_fits_in_one_sms",
++  "tests/test_reminders.py::ReminderTextTest::test_is_plain_ascii",
++  "tests/test_reminders.py::ReminderTextTest::test_refuses_names_that_push_it_over_160",
++  "tests/test_reminders.py::ToSmsAsciiTest::test_rejects_characters_without_ascii_equivalent",
++  "tests/test_reminders.py::ToSmsAsciiTest::test_strips_other_accents",
++  "tests/test_reminders.py::ToSmsAsciiTest::test_transliterates_umlauts_and_sharp_s",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_the_record_and_marks_it",
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..2f4d43c
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,49 @@
++"""Text of the SMS reminder sent before an appointment."""
++
++import unicodedata
++
++from .model import Appointment
++
++# The SMS gateway accepts only plain ASCII and a single SMS holds 160 characters.
++MAX_SMS_LENGTH = 160
++
++RECEPTION_PHONE = "044 512 77 30"
++
++# Umlauts and sharp s are transliterated the German way; other accents are stripped.
++_TRANSLITERATIONS = {
++    "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
++    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
++}
++
++
++def to_sms_ascii(text):
++    """Return the text in plain ASCII, e.g. 'Brändli' -> 'Braendli'.
++
++    Raises ValueError for characters with no ASCII equivalent, so that reception
++    can correct the name instead of sending a question mark to the client.
++    """
++    for char, replacement in _TRANSLITERATIONS.items():
++        text = text.replace(char, replacement)
++    decomposed = unicodedata.normalize("NFKD", text)
++    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
++    if not stripped.isascii():
++        bad = sorted({c for c in stripped if not c.isascii()})
++        raise ValueError(f"no ASCII equivalent for {''.join(bad)!r} in {text!r}")
++    return stripped
++
++
++def reminder_text(appointment):
++    """Return the reminder SMS for this appointment.
++
++    Raises ValueError if the text is longer than one SMS, so the caller can flag
++    the appointment instead of sending a message that is billed as two.
++    """
++    when = appointment.start
++    text = (
++        f"Guten Tag {appointment.client}. Erinnerung an Ihren Termin am "
++        f"{when:%d.%m.%Y} um {when:%H:%M}. Verschieben bitte unter {RECEPTION_PHONE}."
++    )
++    text = to_sms_ascii(text)
++    if len(text) > MAX_SMS_LENGTH:
++        raise ValueError(f"reminder is {len(text)} characters, the limit is {MAX_SMS_LENGTH}")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..f8aab29
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,45 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import reminder_text, to_sms_ascii
++
++
++def appointment(client):
++    return Appointment("Lena", client, datetime.datetime(2026, 10, 20, 9, 0))
++
++
++class ToSmsAsciiTest(unittest.TestCase):
++    def test_transliterates_umlauts_and_sharp_s(self):
++        self.assertEqual(to_sms_ascii("Brändli Müller Öztürk Straße"), "Braendli Mueller Oeztuerk Strasse")
++
++    def test_strips_other_accents(self):
++        self.assertEqual(to_sms_ascii("café Zoë"), "cafe Zoe")
++
++    def test_rejects_characters_without_ascii_equivalent(self):
++        with self.assertRaises(ValueError):
++            to_sms_ascii("Søren")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_contains_time_date_and_reception_number(self):
++        text = reminder_text(appointment("Anna Meier"))
++        self.assertIn("20.10.2026", text)
++        self.assertIn("09:00", text)
++        self.assertIn("044 512 77 30", text)
++
++    def test_is_plain_ascii(self):
++        text = reminder_text(appointment("Brändli"))
++        self.assertTrue(text.isascii())
++        self.assertIn("Braendli", text)
++
++    def test_fits_in_one_sms(self):
++        self.assertLessEqual(len(reminder_text(appointment("Anna Meier"))), 160)
++
++    def test_refuses_names_that_push_it_over_160(self):
++        with self.assertRaises(ValueError):
++            reminder_text(appointment("A" * 150))
++
++
++if __name__ == "__main__":
++    unittest.main()

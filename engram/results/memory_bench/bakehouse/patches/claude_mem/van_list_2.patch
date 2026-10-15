@@ -1,0 +1,86 @@
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..865b33c
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,14 @@
++"""Delivery run sheets for the van."""
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes the van's drops for `day` to `path`, one per line in route order.
++
++    Only customers with an order for `day` are listed. `customers` is the dict from load_customers.
++    Raises KeyError if an order names a customer code that isn't in `customers`.
++    """
++    codes = sorted(orderbook.customers_for(day), key=lambda code: customers[code].route_seq)
++    with open(path, "w", encoding="utf-8") as f:
++        for code in codes:
++            c = customers[code]
++            f.write(f"{c.route_seq:>2}  {c.name}, {c.address}, {c.postcode}\n")
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..69f0ba0
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,60 @@
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.delivery import drops_file
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class DropsFileTest(unittest.TestCase):
++    def setUp(self):
++        self.customers = {
++            "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++            "GREENWAY": Customer("GREENWAY", "Greenway Stores", "2 High Street", "LK3 4CD", 4),
++            "HARBOUR": Customer("HARBOUR", "Harbour Deli", "9 Quay Road", "LK5 6EF", 2),
++        }
++        self.catalog = Catalog([Product("SOU", "White sourdough", 320, 10)])
++        self.dir = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self.dir.name, "drops.txt")
++
++    def tearDown(self):
++        self.dir.cleanup()
++
++    def read(self):
++        with open(self.path, encoding="utf-8") as f:
++            return f.read()
++
++    def test_lists_only_customers_with_orders_that_day_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "GREENWAY", "SOU", 2),
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY + datetime.timedelta(days=1), "HARBOUR", "SOU", 3),
++        ])
++        drops_file(book, self.customers, DAY, self.path)
++        self.assertEqual(
++            self.read(),
++            " 1  Café Lumen, 14 Mill Lane, LK1 2AB\n"
++            " 4  Greenway Stores, 2 High Street, LK3 4CD\n",
++        )
++
++    def test_customer_with_several_lines_is_listed_once(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY, "LUMEN", "SOU", 2),
++        ])
++        drops_file(book, self.customers, DAY, self.path)
++        self.assertEqual(self.read(), " 1  Café Lumen, 14 Mill Lane, LK1 2AB\n")
++
++    def test_day_with_no_orders_writes_empty_file(self):
++        book = OrderBook(self.catalog)
++        drops_file(book, self.customers, DAY, self.path)
++        self.assertEqual(self.read(), "")
++
++
++if __name__ == "__main__":
++    unittest.main()

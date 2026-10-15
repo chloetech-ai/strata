@@ -1,0 +1,78 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 5d1e741..11cb41c 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,10 @@ from .model import TREATMENTS, Appointment
+ # Time a therapist needs between two appointments to clean up and write notes.
+ CHANGEOVER = datetime.timedelta(minutes=10)
+ 
++# Therapists' contracts cap treatments per day. Only the online booking page enforces this, not book(),
++# because reception can still book past it when a therapist agrees.
++MAX_TREATMENTS_PER_DAY = 7
++
+ # Insurance pays for at most this many sessions per prescription.
+ SERIES_MAX_SESSIONS = 9
+ # How many weeks after the first session a series may reach for free weeks before giving up.
+@@ -90,6 +94,14 @@ class Schedule:
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True when `therapist` already has `MAX_TREATMENTS_PER_DAY` live appointments on `day`.
++
++        Counts every non-cancelled appointment, including ones reception booked over the limit.
++        """
++        live = [a for a in self.appointments_for(therapist, day) if a.status != "cancelled"]
++        return len(live) >= MAX_TREATMENTS_PER_DAY
++
+     def week(self, therapist, monday):
+         """`therapist`'s booked appointments for the week starting on `monday`: each day mapped to its appointments by start time, cancelled ones left out."""
+         if monday.weekday() != 0:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 24147fc..9982f60 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -181,6 +181,43 @@ class ScheduleTest(unittest.TestCase):
+                 s.book_series("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9), "standard", 3)
+         self.assertEqual(len(s.appointments), 1)
+ 
++    def test_fully_booked_at_seven_appointments_that_day(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        for hour in range(8, 15):  # seven appointments, 60 minutes apart
++            s.book(at(hour))
++        self.assertTrue(s.is_fully_booked("lena", day))
++
++    def test_not_fully_booked_at_six_appointments(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        for hour in range(8, 14):
++            s.book(at(hour))
++        self.assertFalse(s.is_fully_booked("lena", day))
++
++    def test_fully_booked_counts_appointments_over_the_limit(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        for hour in range(8, 15):
++            s.book(at(hour))
++        s.book(at(15))  # reception booked past the limit
++        self.assertTrue(s.is_fully_booked("lena", day))
++
++    def test_cancelled_appointment_does_not_count_towards_fully_booked(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        booked = [s.book(at(hour)) for hour in range(8, 15)]
++        self.assertTrue(s.is_fully_booked("lena", day))
++        s.cancel(booked[0].id)
++        self.assertFalse(s.is_fully_booked("lena", day))
++
++    def test_fully_booked_is_per_therapist_and_day(self):
++        s = Schedule()
++        for hour in range(8, 15):
++            s.book(at(hour))
++        self.assertFalse(s.is_fully_booked("marco", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 9)))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

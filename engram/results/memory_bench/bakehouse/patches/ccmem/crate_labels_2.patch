@@ -1,0 +1,140 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 924e656..900cb45 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- Packing: `crate_labels` gives one label per customer and product for a delivery day, in route order; 48 characters per line, plain ASCII.
+ - Planned: bake sheet lists products hottest oven first (by `bake_temp`), so the deck oven isn't reheated.
+ - Deliveries now run on Sundays; we are closed on Mondays (Sunday farmers' market).
+ - Order cutoff moved to 13:00 the day before delivery (was 14:00), for the mill's flour order.
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..bc89de4
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,40 @@
++"""Packing labels: one crate label per customer and product for a delivery day."""
++
++import unicodedata
++
++LINE_WIDTH = 48  # the packing label printer prints 48 characters per line
++
++
++def _printable(text):
++    """Plain ASCII for the printer: accents are stripped ('é' -> 'e'), anything else becomes '?'."""
++    decomposed = unicodedata.normalize("NFKD", text)
++    without_marks = "".join(c for c in decomposed if not unicodedata.combining(c))
++    return without_marks.encode("ascii", "replace").decode("ascii")
++
++
++def _line(text):
++    return _printable(text)[:LINE_WIDTH]
++
++
++def crate_labels(orderbook, customers, day):
++    """One label per customer and product ordered for delivery on `day`, in route order.
++
++    Each label is a string of lines: the customer, the product and quantity, and the delivery day.
++    `customers` is the dict from load_customers. Raises KeyError for an order from a customer not in it.
++    """
++    catalog = orderbook.catalog
++    day_text = f"Delivery {day:%a %d %b %Y}"
++    labels = []
++    for code in sorted(orderbook.customers_for(day), key=lambda c: customers[c].route_seq):
++        customer = customers[code]
++        totals = {}
++        for line in orderbook.lines_for(code, day):
++            totals[line.product] = totals.get(line.product, 0) + line.qty
++        for product_code in sorted(totals):
++            product = catalog.get(product_code)
++            labels.append("\n".join([
++                _line(customer.name),
++                _line(f"{totals[product_code]} x {product.name}"),
++                _line(day_text),
++            ]))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..aa436b5
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,76 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import LINE_WIDTH, crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++def customer(code, name, route_seq):
++    return Customer(code, name, "1 High Street", "LK1 1AA", route_seq)
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12),
++            Product("SOU", "White sourdough", 320, batch_size=10),
++        ])
++        self.customers = {
++            "LUMEN": customer("LUMEN", "Café Lumen", 2),
++            "GREENWAY": customer("GREENWAY", "Greenway Grocers", 1),
++        }
++
++    def test_one_label_per_customer_and_product_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY, "LUMEN", "BAG", 24),
++            OrderLine(DAY, "GREENWAY", "BAG", 10),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Greenway Grocers\n10 x Baguette\nDelivery Tue 20 Oct 2026",
++            "Cafe Lumen\n24 x Baguette\nDelivery Tue 20 Oct 2026",
++            "Cafe Lumen\n6 x White sourdough\nDelivery Tue 20 Oct 2026",
++        ])
++
++    def test_repeated_lines_for_one_product_make_one_label(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 12),
++            OrderLine(DAY, "LUMEN", "BAG", 6),
++        ])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [
++            "Cafe Lumen\n18 x Baguette\nDelivery Tue 20 Oct 2026",
++        ])
++
++    def test_other_days_are_left_out(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 12),
++            OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "SOU", 4),
++        ])
++        self.assertEqual(len(crate_labels(book, self.customers, DAY)), 1)
++
++    def test_no_orders_gives_no_labels(self):
++        book = OrderBook(self.catalog, [])
++        self.assertEqual(crate_labels(book, self.customers, DAY), [])
++
++    def test_every_line_fits_the_printer_and_is_ascii(self):
++        long_name = "Très Longue Boulangerie Généreuse de la Vallée du Nord"
++        customers = {"BIG": customer("BIG", long_name, 1)}
++        book = OrderBook(self.catalog, [OrderLine(DAY, "BIG", "SOU", 3)])
++        (label,) = crate_labels(book, customers, DAY)
++        for line in label.split("\n"):
++            self.assertLessEqual(len(line), LINE_WIDTH)
++        label.encode("ascii")
++        self.assertTrue(label.startswith("Tres Longue Boulangerie Genereuse de la Va"))
++
++    def test_customer_missing_from_customers_raises_key_error(self):
++        book = OrderBook(self.catalog, [OrderLine(DAY, "NOBODY", "BAG", 1)])
++        with self.assertRaises(KeyError):
++            crate_labels(book, self.customers, DAY)
++
++
++if __name__ == "__main__":
++    unittest.main()

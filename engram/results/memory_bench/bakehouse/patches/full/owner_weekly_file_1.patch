@@ -1,0 +1,87 @@
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index ecd6081..d1f7c7f 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,7 @@
+ """Reports on a delivery day, for the people who read them."""
+ 
++import csv
++import datetime
+ from collections import Counter
+ 
+ 
+@@ -16,6 +18,30 @@ def top_products(orderbook, start, end, n=5):
+     return [code for code, _ in ranked[:n]]
+ 
+ 
++def week_totals_file(orderbook, week_start, path):
++    """Writes each customer's order total for the seven days from `week_start` to `path`.
++
++    Written for the office PC's German settings: semicolon separators, a comma
++    decimal separator, and a UTF-8 byte-order mark so umlauts display correctly.
++    Customers with no orders that week are left out.
++    """
++    totals = Counter()
++    for offset in range(7):
++        for customer, pence in day_summary(orderbook, week_start + datetime.timedelta(days=offset)).items():
++            totals[customer] += pence
++    with open(path, "w", newline="", encoding="utf-8-sig") as f:
++        writer = csv.writer(f, delimiter=";")
++        writer.writerow(["Customer", "Total (£)"])
++        for customer in sorted(totals):
++            writer.writerow([customer, _pounds_text(totals[customer])])
++
++
++def _pounds_text(pence):
++    """Pounds with a comma decimal separator and two places, e.g. 1234 gives '12,34'."""
++    pounds, rest = divmod(pence, 100)
++    return f"{pounds},{rest:02d}"
++
++
+ def day_summary(orderbook, day):
+     """{customer code: order value in pence} for everything delivered on `day`, before VAT."""
+     totals = {}
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index ab3747f..b287cf1 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -1,13 +1,38 @@
++import csv
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def test_one_row_per_customer_in_german_csv(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320), Product("CRO", "Croissant", 110)])
++        week_start = DAY
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY + datetime.timedelta(days=6), "LUMEN", "CRO", 24),
++            OrderLine(DAY + datetime.timedelta(days=1), "AIDAN", "CRO", 5),
++            OrderLine(DAY + datetime.timedelta(days=7), "AIDAN", "CRO", 99),
++        ])
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "week.csv")
++            week_totals_file(book, week_start, path)
++            with open(path, encoding="utf-8-sig", newline="") as f:
++                rows = list(csv.reader(f, delimiter=";"))
++        self.assertEqual(rows, [
++            ["Customer", "Total (£)"],
++            ["AIDAN", "5,50"],
++            ["LUMEN", "45,60"],
++        ])
++
++
+ class TopProductsTest(unittest.TestCase):
+     def test_most_units_first_within_the_range(self):
+         catalog = Catalog([Product(c, c, 100) for c in ("SOU", "CRO", "BAG", "RYE")])

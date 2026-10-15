@@ -1,0 +1,132 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index d770a02..3d3a474 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -21,7 +21,13 @@
+   "tests/test_schedule.py::ScheduleTest::test_cancel_unknown_appointment_raises",
+   "tests/test_schedule.py::ScheduleTest::test_cancelled_appointment_does_not_block_break",
+   "tests/test_schedule.py::ScheduleTest::test_cancelled_slot_can_be_rebooked",
++  "tests/test_schedule.py::ScheduleTest::test_cancelling_reopens_a_full_day",
++  "tests/test_schedule.py::ScheduleTest::test_closed_day_is_not_fully_booked",
++  "tests/test_schedule.py::ScheduleTest::test_empty_day_is_not_fully_booked",
++  "tests/test_schedule.py::ScheduleTest::test_full_day_is_fully_booked",
++  "tests/test_schedule.py::ScheduleTest::test_one_slot_short_is_not_fully_booked",
+   "tests/test_schedule.py::ScheduleTest::test_other_therapist_is_free",
++  "tests/test_schedule.py::ScheduleTest::test_other_therapists_bookings_do_not_fill_the_day",
+   "tests/test_schedule.py::ScheduleTest::test_outside_opening_hours",
+   "tests/test_schedule.py::ScheduleTest::test_overlap_from_before_is_taken",
+   "tests/test_schedule.py::ScheduleTest::test_same_start_is_taken",
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 33d507c..998854b 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -3,11 +3,14 @@
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SlotTaken
+-from .hours import is_open_between
++from .hours import is_open_between, opening_hours
+ from .model import TREATMENTS
+ 
+ # Time a therapist needs after each appointment to clean up and write notes.
+ BREAK = datetime.timedelta(minutes=10)
++# Shortest bookable treatment; a day with no room for this is fully booked.
++SHORTEST = min(datetime.timedelta(minutes=minutes) for minutes, _ in TREATMENTS.values())
++ONE_MINUTE = datetime.timedelta(minutes=1)
+ 
+ 
+ class Schedule:
+@@ -23,17 +26,40 @@ class Schedule:
+                 f"The practice is closed at {appointment.start:%H:%M} on "
+                 f"{appointment.start:%A} {appointment.start.day} {appointment.start:%B}."
+             )
++        other = self._clash(appointment.therapist, appointment.start, appointment.end)
++        if other is not None:
++            raise SlotTaken(
++                f"{appointment.therapist.capitalize()} has an appointment at {other.start:%H:%M} "
++                "and needs a 10-minute break between appointments. Please choose another time."
++            )
++        self.appointments.append(appointment)
++        return appointment
++
++    def _clash(self, therapist, start, end):
++        """The live appointment of `therapist` that a `start`-`end` booking would collide with, breaks included, or None."""
+         for other in self.appointments:
+-            if other.therapist != appointment.therapist or other.cancelled:
++            if other.therapist != therapist or other.cancelled:
+                 continue
+             # Overlapping, once each appointment is extended by the break on its end.
+-            if appointment.start < other.end + BREAK and other.start < appointment.end + BREAK:
+-                raise SlotTaken(
+-                    f"{appointment.therapist.capitalize()} has an appointment at {other.start:%H:%M} "
+-                    "and needs a 10-minute break between appointments. Please choose another time."
+-                )
+-        self.appointments.append(appointment)
+-        return appointment
++            if start < other.end + BREAK and other.start < end + BREAK:
++                return other
++        return None
++
++    def is_fully_booked(self, therapist, day):
++        """True if `therapist` has no room left on `day` for even the shortest treatment, breaks included.
++
++        Closed days are not fully booked: there is nothing to book, so they are not "full".
++        """
++        hours = opening_hours(day)
++        if hours is None:
++            return False
++        opens, closes = hours
++        start = opens
++        while start + SHORTEST <= closes:
++            if self._clash(therapist, start, start + SHORTEST) is None:
++                return False
++            start += ONE_MINUTE
++        return True
+ 
+     def get(self, appointment_id):
+         for appointment in self.appointments:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index f8120fe..9426f32 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -116,6 +116,40 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().week("lena", datetime.date(2026, 9, 8))
+ 
++    def test_empty_day_is_not_fully_booked(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_closed_day_is_not_fully_booked(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 13)))  # Sunday
++
++    def test_full_day_is_fully_booked(self):
++        # Saturday opens 08:00 and closes 12:00. Back-to-back 30-minute slots with 10-minute breaks
++        # leave no gap for another 30-minute slot once the last one starts at 11:20.
++        s = Schedule()
++        for hour, minute in [(8, 0), (8, 40), (9, 20), (10, 0), (10, 40), (11, 20)]:
++            s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 12, hour, minute), "short"))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 12)))
++
++    def test_one_slot_short_is_not_fully_booked(self):
++        s = Schedule()
++        for hour, minute in [(8, 0), (8, 40), (9, 20), (10, 0), (10, 40)]:
++            s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 12, hour, minute), "short"))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 12)))
++
++    def test_cancelling_reopens_a_full_day(self):
++        s = Schedule()
++        slots = [s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 12, h, m), "short"))
++                 for h, m in [(8, 0), (8, 40), (9, 20), (10, 0), (10, 40), (11, 20)]]
++        s.cancel(slots[2].id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 12)))
++
++    def test_other_therapists_bookings_do_not_fill_the_day(self):
++        s = Schedule()
++        for hour, minute in [(8, 0), (8, 40), (9, 20), (10, 0), (10, 40), (11, 20)]:
++            s.book(Appointment("marco", "Kim Weber", datetime.datetime(2026, 9, 12, hour, minute), "short"))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 12)))
++        self.assertTrue(s.is_fully_booked("marco", datetime.date(2026, 9, 12)))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

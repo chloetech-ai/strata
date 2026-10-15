@@ -1,0 +1,22 @@
+diff --git a/src/bakehouse/orders.py b/src/bakehouse/orders.py
+index ee98ca8..7d812b9 100644
+--- a/src/bakehouse/orders.py
++++ b/src/bakehouse/orders.py
+@@ -68,6 +68,17 @@ def is_delivery_day(day):
+     return day.weekday() not in config.CLOSED_WEEKDAYS
+ 
+ 
++def next_delivery_day(day):
++    """The first date after `day` on which we bake and deliver."""
++    candidate = day + datetime.timedelta(days=1)
++    # Checking one week of dates is enough; CLOSED_WEEKDAYS never closes every day.
++    for _ in range(7):
++        if is_delivery_day(candidate):
++            return candidate
++        candidate += datetime.timedelta(days=1)
++    raise ValueError("no delivery days are configured")
++
++
+ def is_on_time(placed_at, delivery_day):
+     """Whether an order placed at `placed_at` (a datetime) is in time for
+     `delivery_day`: orders must be in by config.ORDER_CUTOFF on the day before."""

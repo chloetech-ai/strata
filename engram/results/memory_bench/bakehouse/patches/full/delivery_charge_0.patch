@@ -1,0 +1,72 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index f593a8e..daf54d5 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -26,6 +26,25 @@ class Invoice:
+         return sum(line.amount for line in self.lines)
+ 
+ 
++DELIVERY_EXEMPT = ("AIDAN",)  # St Aidan's contract price already includes delivery
++NEW_DELIVERY_RATES_FROM = datetime.date(2026, 11, 1)
++
++
++def delivery_charge(customer_code, subtotal, day=None):
++    """Delivery charge in pence for a customer's order value `subtotal` (pence, before VAT).
++
++    From November: £4.50 on orders under £40.00. Before that: £3.00 under £25.00.
++    `day` is the delivery day; without it the November rates apply.
++    """
++    if customer_code in DELIVERY_EXEMPT or subtotal <= 0:
++        return 0
++    if day is not None and day < NEW_DELIVERY_RATES_FROM:
++        threshold, charge = 2500, 300
++    else:
++        threshold, charge = 4000, 450
++    return charge if subtotal < threshold else 0
++
++
+ def invoice_number(year, seq):
+     """Invoice number such as 'LK-2026-0001'; `seq` is the running number, which restarts each year."""
+     if not 1 <= seq <= 9999:
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 4f410c2..410f09b 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, delivery_charge, format_pence, invoice_for, invoice_number
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -36,6 +36,28 @@ class InvoiceForTest(unittest.TestCase):
+         self.assertEqual(invoice.total(), 24 * 110 + 6 * 320)
+ 
+ 
++class DeliveryChargeTest(unittest.TestCase):
++    def test_november_rates(self):
++        november = datetime.date(2026, 11, 2)
++        self.assertEqual(delivery_charge("LUMEN", 3999, november), 450)
++        self.assertEqual(delivery_charge("LUMEN", 4000, november), 0)
++        self.assertEqual(delivery_charge("LUMEN", 2500, november), 450)
++        self.assertEqual(delivery_charge("LUMEN", 3999), 450)  # no day given: November rates
++
++    def test_rates_before_november(self):
++        october = datetime.date(2026, 10, 31)
++        self.assertEqual(delivery_charge("LUMEN", 2499, october), 300)
++        self.assertEqual(delivery_charge("LUMEN", 2500, october), 0)
++        self.assertEqual(delivery_charge("LUMEN", 3000, october), 0)
++
++    def test_st_aidans_never_pays(self):
++        self.assertEqual(delivery_charge("AIDAN", 1000), 0)
++        self.assertEqual(delivery_charge("AIDAN", 1000, datetime.date(2026, 10, 1)), 0)
++
++    def test_no_order_no_charge(self):
++        self.assertEqual(delivery_charge("LUMEN", 0), 0)
++
++
+ class InvoiceNumberTest(unittest.TestCase):
+     def test_year_and_four_digit_sequence(self):
+         self.assertEqual(invoice_number(2026, 1), "LK-2026-0001")

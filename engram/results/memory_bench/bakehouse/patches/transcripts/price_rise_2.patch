@@ -1,0 +1,59 @@
+diff --git a/src/bakehouse/pricing.py b/src/bakehouse/pricing.py
+new file mode 100644
+index 0000000..bcb33fb
+--- /dev/null
++++ b/src/bakehouse/pricing.py
+@@ -0,0 +1,17 @@
++"""January's wholesale price rise."""
++
++RISE_PERCENT = 5  # the rise applied to every wholesale price
++ROUND_STEP = 5  # new prices are rounded up to a multiple of this many pence
++
++
++def new_price(price):
++    """A wholesale price in pence after the rise, rounded up to the next 5p.
++
++    Done in whole pence so no float error creeps in: 95p -> 100p, 320p -> 340p.
++    """
++    return -(-price * (100 + RISE_PERCENT) // (100 * ROUND_STEP)) * ROUND_STEP
++
++
++def new_prices(catalog):
++    """Maps each product code in `catalog` to its new wholesale price in pence."""
++    return {product.code: new_price(product.price) for product in catalog}
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+new file mode 100644
+index 0000000..a931f9a
+--- /dev/null
++++ b/tests/test_pricing.py
+@@ -0,0 +1,30 @@
++import unittest
++
++from bakehouse.pricing import new_price, new_prices
++from bakehouse.products import Catalog, Product
++
++
++class NewPricesTest(unittest.TestCase):
++    def test_rise_is_rounded_up_to_the_next_5p(self):
++        self.assertEqual(new_price(95), 100)  # 99.75p
++        self.assertEqual(new_price(320), 340)  # 336p
++        self.assertEqual(new_price(40), 45)  # 42p
++        self.assertEqual(new_price(35), 40)  # 36.75p
++
++    def test_exact_multiple_of_5p_is_not_rounded_further(self):
++        # 5% of 1000p is 1050p, already a multiple of 5p
++        self.assertEqual(new_price(1000), 1050)
++
++    def test_zero_stays_zero(self):
++        self.assertEqual(new_price(0), 0)
++
++    def test_maps_each_product_code_to_its_new_price(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95), Product("SOU", "White sourdough", 320)])
++        self.assertEqual(new_prices(catalog), {"BAG": 100, "SOU": 340})
++
++    def test_empty_catalog_gives_empty_dict(self):
++        self.assertEqual(new_prices(Catalog()), {})
++
++
++if __name__ == "__main__":
++    unittest.main()

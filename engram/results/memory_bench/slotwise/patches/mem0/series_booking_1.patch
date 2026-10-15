@@ -1,0 +1,248 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..201fe25
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1,7 @@
++{
++  "tests/test_clients.py": true,
++  "tests/test_hours.py": true,
++  "tests/test_model.py": true,
++  "tests/test_schedule.py": true,
++  "tests/test_storage.py": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..0637a08
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1 @@
++[]
+\ No newline at end of file
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 28b672a..cf6ed2a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,7 @@
+ - `Client` and `ClientBook` (`add`, `find_by_phone`) form the client register. `ClientBook.search(text)` finds clients whose name contains the text, ignoring case. Phone numbers are compared as international digits, so '079 123 45 67', '+41 79 123 45 67' and '0041791234567' find the same client.
+ - `Schedule.cancel(appointment_id)` marks an appointment as cancelled (kept for fees) and frees its slot. Saved files without the field load as not cancelled.
+ - Booking errors are now `BookingError` subclasses (`SlotTaken`, `OutsideOpeningHours`) with receptionist-facing messages, replacing `ValueError`.
++- `book_series(schedule, first, count)` books `count` weekly appointments starting with `first`, at the same weekday and time, and returns them. A week the therapist is already booked is skipped and the series continues in the next free week. A series longer than 9 sessions raises `SeriesTooLong`, and nothing is booked.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/slotwise/__init__.py b/src/slotwise/__init__.py
+index 0cfa1e8..16c7eb3 100644
+--- a/src/slotwise/__init__.py
++++ b/src/slotwise/__init__.py
+@@ -1,9 +1,10 @@
+ """slotwise: appointment scheduling for a small physiotherapy practice."""
+ 
+ from .clients import Client, ClientBook
+-from .errors import BookingError, OutsideOpeningHours, SlotTaken
++from .errors import BookingError, OutsideOpeningHours, SeriesTooLong, SlotTaken
+ from .model import TREATMENTS, Appointment
+ from .schedule import Schedule
++from .series import book_series
+ 
+ __all__ = [
+     "TREATMENTS",
+@@ -13,5 +14,7 @@ __all__ = [
+     "ClientBook",
+     "OutsideOpeningHours",
+     "Schedule",
++    "SeriesTooLong",
+     "SlotTaken",
++    "book_series",
+ ]
+diff --git a/src/slotwise/errors.py b/src/slotwise/errors.py
+index d13aa0f..c9e729d 100644
+--- a/src/slotwise/errors.py
++++ b/src/slotwise/errors.py
+@@ -22,3 +22,14 @@ class OutsideOpeningHours(BookingError):
+ 
+     def __init__(self):
+         super().__init__("The practice is closed at that time. Please choose a time when we are open.")
++
++
++class SeriesTooLong(BookingError):
++    """The series asks for more sessions than insurance pays for."""
++
++    def __init__(self, max_sessions):
++        self.max_sessions = max_sessions
++        super().__init__(
++            f"A series can have at most {max_sessions} sessions, because insurance pays for no more. "
++            "Please book fewer sessions."
++        )
+diff --git a/src/slotwise/series.py b/src/slotwise/series.py
+new file mode 100644
+index 0000000..e2b4c9d
+--- /dev/null
++++ b/src/slotwise/series.py
+@@ -0,0 +1,38 @@
++"""Booking a series of weekly appointments."""
++
++import datetime
++
++from .errors import SeriesTooLong, SlotTaken
++from .model import Appointment
++
++# Insurance pays for at most this many sessions per prescription.
++MAX_SERIES = 9
++
++
++def book_series(schedule, first, count):
++    """Books `count` weekly appointments, starting with `first`, and returns them in order.
++
++    Each appointment is at the same weekday and time as `first`, one week later than the
++    previous one. A week the therapist is already booked is skipped, and the series
++    continues in the next free week, so the client still gets all `count` sessions.
++
++    Raises BookingError (or a subclass) if `first` cannot be booked, or if `count` is
++    more than MAX_SERIES. Nothing is booked in that case.
++    """
++    if count < 1:
++        raise ValueError("count must be at least 1")
++    if count > MAX_SERIES:
++        raise SeriesTooLong(MAX_SERIES)
++
++    # Checking the first session up front means a refused series books nothing.
++    schedule.book(first)
++    booked = [first]
++    week = 1
++    while len(booked) < count:
++        start = first.start + datetime.timedelta(weeks=week)
++        week += 1
++        try:
++            booked.append(schedule.book(Appointment(first.therapist, first.client, start, first.treatment)))
++        except SlotTaken:
++            continue
++    return booked
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..cc1c0ab
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,89 @@
++import datetime
++import unittest
++
++from slotwise.errors import BookingError, OutsideOpeningHours, SeriesTooLong
++from slotwise.model import Appointment
++from slotwise.schedule import Schedule
++from slotwise.series import MAX_SERIES, book_series
++
++# Tuesday 8 September 2026, 09:00
++FIRST = datetime.datetime(2026, 9, 8, 9, 0)
++
++
++def first(start=FIRST, therapist="lena", client="Kim Weber", treatment="standard"):
++    return Appointment(therapist, client, start, treatment)
++
++
++def week(n, hour=9, minute=0):
++    return datetime.datetime(2026, 9, 8 + 7 * n, hour, minute)
++
++
++class BookSeriesTest(unittest.TestCase):
++    def test_books_weekly_on_same_weekday_and_time(self):
++        s = Schedule()
++        booked = book_series(s, first(), 3)
++        self.assertEqual([a.start for a in booked], [week(0), week(1), week(2)])
++        self.assertEqual(s.appointments, booked)
++
++    def test_returns_appointments_with_client_therapist_and_treatment(self):
++        s = Schedule()
++        booked = book_series(s, first(treatment="initial"), 2)
++        for a in booked:
++            self.assertEqual((a.therapist, a.client, a.treatment), ("lena", "Kim Weber", "initial"))
++        self.assertEqual(len({a.id for a in booked}), 2)
++
++    def test_first_is_booked_as_given(self):
++        s = Schedule()
++        f = first()
++        booked = book_series(s, f, 2)
++        self.assertIs(booked[0], f)
++
++    def test_taken_week_is_skipped_and_series_continues_at_the_end(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", week(1)))
++        booked = book_series(s, first(), 3)
++        self.assertEqual([a.start for a in booked], [week(0), week(2), week(3)])
++
++    def test_changeover_clash_skips_the_week(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", week(1, hour=9, minute=50)))  # 5 min after 09:45 slot
++        booked = book_series(s, first(), 2)
++        self.assertEqual([a.start for a in booked], [week(0), week(2)])
++
++    def test_other_therapist_does_not_block_a_week(self):
++        s = Schedule()
++        s.book(Appointment("marco", "Jo Li", week(1)))
++        booked = book_series(s, first(), 2)
++        self.assertEqual([a.start for a in booked], [week(0), week(1)])
++
++    def test_cancelled_appointment_does_not_block_a_week(self):
++        s = Schedule()
++        taken = s.book(Appointment("lena", "Jo Li", week(1)))
++        s.cancel(taken.id)
++        booked = book_series(s, first(), 2)
++        self.assertEqual([a.start for a in booked], [week(0), week(1)])
++
++    def test_series_longer_than_max_is_refused_and_books_nothing(self):
++        s = Schedule()
++        with self.assertRaises(SeriesTooLong) as cm:
++            book_series(s, first(), MAX_SERIES + 1)
++        self.assertEqual(s.appointments, [])
++        self.assertIsInstance(cm.exception, BookingError)
++
++    def test_max_length_series_is_allowed(self):
++        s = Schedule()
++        self.assertEqual(len(book_series(s, first(), MAX_SERIES)), MAX_SERIES)
++
++    def test_zero_sessions_is_an_error(self):
++        with self.assertRaises(ValueError):
++            book_series(Schedule(), first(), 0)
++
++    def test_first_outside_opening_hours_books_nothing(self):
++        s = Schedule()
++        with self.assertRaises(OutsideOpeningHours):
++            book_series(s, first(week(0, hour=18, minute=30)), 2)
++        self.assertEqual(s.appointments, [])
++
++
++if __name__ == "__main__":
++    unittest.main()

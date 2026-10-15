@@ -1,0 +1,140 @@
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..da570b5
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,40 @@
++"""Crate labels for packing."""
++
++import unicodedata
++
++# The label printer holds 48 characters per line and cuts off anything longer.
++LINE_WIDTH = 48
++
++
++def _printable(text):
++    """Folds accents to plain ASCII ('Café' -> 'Cafe'); the printer prints anything else as garbage."""
++    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++
++
++def _fit(text):
++    """One printer line: plain ASCII, cut to LINE_WIDTH characters."""
++    return _printable(text)[:LINE_WIDTH].rstrip()
++
++
++def crate_labels(orderbook, customers, day):
++    """One label per customer and product ordered for `day`, as a list of label texts.
++
++    Each label is three lines: the customer's name, the quantity and product name,
++    and then the allergens in capitals if the product has any. `customers` is the
++    dict that load_customers returns.
++    """
++    labels = []
++    for code in orderbook.customers_for(day):
++        quantities = {}
++        for line in orderbook.lines_for(code, day):
++            quantities[line.product] = quantities.get(line.product, 0) + line.qty
++        for product_code in sorted(quantities):
++            product = orderbook.catalog.get(product_code)
++            lines = [
++                _fit(customers[code].name),
++                _fit(f"{quantities[product_code]} x {product.name}"),
++            ]
++            if product.allergens:
++                lines.append(_fit(f"ALLERGENS: {product.allergen_text().upper()}"))
++            labels.append("\n".join(lines))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..db4a8a2
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,88 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import LINE_WIDTH, crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++def catalog():
++    return Catalog([
++        Product("SOU", "White sourdough", 320, 10, allergens=("gluten",)),
++        Product("CRO", "Croissant", 110, 24, allergens=("gluten", "milk")),
++        Product("BKW", "Bakewell slice", 250, 1, allergens=("nuts",)),
++    ])
++
++
++def customers():
++    return {
++        "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++        "AIDAN": Customer("AIDAN", "St Aidan's Primary", "Church Road", "LK3 9ZZ", 2),
++    }
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def test_one_label_per_customer_and_product(self):
++        book = OrderBook(catalog(), [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY, "LUMEN", "CRO", 24),
++            OrderLine(DAY, "AIDAN", "CRO", 48),
++            OrderLine(DAY + datetime.timedelta(days=1), "LUMEN", "SOU", 10),
++        ])
++        self.assertEqual(crate_labels(book, customers(), DAY), [
++            "St Aidan's Primary\n48 x Croissant\nALLERGENS: GLUTEN, MILK",
++            "Cafe Lumen\n24 x Croissant\nALLERGENS: GLUTEN, MILK",
++            "Cafe Lumen\n6 x White sourdough\nALLERGENS: GLUTEN",
++        ])
++
++    def test_labels_are_in_customer_code_then_product_code_order(self):
++        book = OrderBook(catalog(), [
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY, "LUMEN", "CRO", 24),
++            OrderLine(DAY, "AIDAN", "CRO", 48),
++        ])
++        labels = crate_labels(book, customers(), DAY)
++        self.assertEqual([label.split("\n")[0] for label in labels], [
++            "St Aidan's Primary",
++            "Cafe Lumen",
++            "Cafe Lumen",
++        ])
++        self.assertEqual([label.split("\n")[1] for label in labels], [
++            "48 x Croissant",
++            "24 x Croissant",
++            "6 x White sourdough",
++        ])
++
++    def test_repeated_lines_for_one_product_are_summed(self):
++        book = OrderBook(catalog(), [
++            OrderLine(DAY, "LUMEN", "CRO", 12),
++            OrderLine(DAY, "LUMEN", "CRO", 12),
++        ])
++        self.assertEqual(crate_labels(book, customers(), DAY), [
++            "Cafe Lumen\n24 x Croissant\nALLERGENS: GLUTEN, MILK",
++        ])
++
++    def test_product_without_allergens_has_no_allergen_line(self):
++        plain = Catalog([Product("LOA", "Plain loaf", 200, 1)])
++        book = OrderBook(plain, [OrderLine(DAY, "LUMEN", "LOA", 2)])
++        self.assertEqual(crate_labels(book, customers(), DAY), ["Cafe Lumen\n2 x Plain loaf"])
++
++    def test_no_orders_gives_no_labels(self):
++        book = OrderBook(catalog(), [OrderLine(DAY, "LUMEN", "SOU", 6)])
++        self.assertEqual(crate_labels(book, customers(), DAY + datetime.timedelta(days=3)), [])
++
++    def test_labels_are_plain_ascii_and_fit_the_printer(self):
++        long_name = Customer("LONG", "Müller's Très Longue Bäckerei and Café Emporium of the High Street", "", "", 3)
++        book = OrderBook(catalog(), [OrderLine(DAY, "LONG", "BKW", 1)])
++        labels = crate_labels(book, {"LONG": long_name}, DAY)
++        self.assertEqual(len(labels), 1)
++        for line in labels[0].split("\n"):
++            self.assertLessEqual(len(line), LINE_WIDTH)
++            self.assertTrue(all(ord(ch) < 128 for ch in line), line)
++        self.assertEqual(labels[0].split("\n")[0], "Muller's Tres Longue Backerei and Cafe Emporium")
++
++if __name__ == "__main__":
++    unittest.main()

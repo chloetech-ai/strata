@@ -1,0 +1,76 @@
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..71f1129
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,21 @@
++"""The van's drops for a day, in the format Stopwise imports."""
++
++import csv
++
++HEADER = ["Name", "Address", "Postcode", "Notes"]
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes one row per customer with orders on `day`, in driving order (route_seq).
++
++    `customers` is the dict from load_customers. The Notes column is left empty.
++    """
++    drops = sorted(
++        (customers[code] for code in orderbook.customers_for(day)),
++        key=lambda c: c.route_seq,
++    )
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(HEADER)
++        for customer in drops:
++            writer.writerow([customer.name, customer.address, customer.postcode, ""])
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..1090539
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,43 @@
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.delivery import drops_file
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++class DropsFileTest(unittest.TestCase):
++    def test_drops_in_driving_order_with_only_customers_ordering_that_day(self):
++        catalog = Catalog([Product("SOU", "White sourdough", 320)])
++        customers = {
++            "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "88 High Street", "LK1 4HS", 4),
++            "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++            "AIDAN": Customer("AIDAN", "St Aidan's Primary School", "School Road", "LK4 9SA", 5),
++            "OLDMILL": Customer("OLDMILL", "The Old Mill Tearoom", "Old Mill Yard", "LK3 1MY", 3),
++        }
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "AIDAN", "SOU", 2),
++            OrderLine(DAY, "GREENWAY", "SOU", 4),
++            OrderLine(DAY, "LUMEN", "SOU", 6),
++            OrderLine(DAY + datetime.timedelta(days=1), "OLDMILL", "SOU", 1),
++        ])
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "drops.csv")
++            drops_file(book, customers, DAY, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                lines = f.read().splitlines()
++        self.assertEqual(lines, [
++            "Name,Address,Postcode,Notes",
++            "Café Lumen,14 Mill Lane,LK1 2AB,",
++            "Greenway Grocers,88 High Street,LK1 4HS,",
++            "St Aidan's Primary School,School Road,LK4 9SA,",
++        ])
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,129 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 83c7660..cc78dfb 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -14,6 +14,10 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_printing.py::DayPlanTest::test_every_line_fits_the_receipt_printer",
++  "tests/test_printing.py::DayPlanTest::test_leaves_out_cancelled_appointments",
++  "tests/test_printing.py::DayPlanTest::test_lists_appointments_in_time_order",
++  "tests/test_printing.py::DayPlanTest::test_other_therapists_and_days_are_not_listed",
+   "tests/test_reminders.py::AsciiTest::test_other_accents_lose_their_marks",
+   "tests/test_reminders.py::AsciiTest::test_umlauts_become_german_spellings",
+   "tests/test_reminders.py::AsciiTest::test_unknown_characters_become_question_marks",
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5680409..cd660bb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@
+ - `slotwise.reminders.reminder_text(appointment)` builds the SMS reminder: plain ASCII (umlauts as ae/oe/ue), the reception number 044 512 77 30, and at most 160 characters. Cancelled appointments are refused.
+ - `Schedule.book_series(therapist, client, start, treatment, sessions)` books weekly sessions at the same weekday and time. A week whose slot is taken is skipped and a later week is used instead. Series of more than 9 sessions are refused, and a series is either fully booked or not booked at all.
+ - `Schedule.week(therapist, monday)` returns a therapist's non-cancelled appointments for the seven days from `monday`, as a dict from date to a list sorted by start time. Days with no appointments map to an empty list.
++- `slotwise.printing.day_plan(schedule, therapist, day)` returns reception's printable day plan as text: a header, then each non-cancelled appointment by start time. Every line fits the 42-character receipt printer.
+ - `Schedule.cancel(appointment_id)` marks an appointment as cancelled (`status` field) instead of deleting it. Cancelled appointments no longer block their slot or changeover gap, and the status is saved to JSON.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..7ff1c6b
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,34 @@
++"""Printable text for reception."""
++
++import textwrap
++
++# The reception receipt printer fits 42 characters on a line; longer lines wrap into a mess.
++LINE_WIDTH = 42
++
++
++def _wrapped(text, indent=""):
++    return textwrap.wrap(
++        text,
++        width=LINE_WIDTH,
++        initial_indent=indent,
++        subsequent_indent=indent,
++        break_long_words=True,
++        break_on_hyphens=False,
++    )
++
++
++def day_plan(schedule, therapist, day):
++    """Text of `therapist`'s booked appointments on `day`, by start time, with cancelled ones left out.
++
++    Every line fits within LINE_WIDTH characters.
++    """
++    lines = _wrapped(f"Day plan: {therapist.title()}")
++    lines += _wrapped(f"{day:%A %d %B %Y}")
++    lines.append("-" * LINE_WIDTH)
++    appointments = [a for a in schedule.appointments_for(therapist, day) if a.status != "cancelled"]
++    if not appointments:
++        lines.append("No appointments.")
++    for appointment in appointments:
++        lines += _wrapped(f"{appointment.start:%H:%M}-{appointment.end:%H:%M} {appointment.treatment}")
++        lines += _wrapped(appointment.client, indent="  ")
++    return "\n".join(lines)
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..17e0433
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,56 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.printing import LINE_WIDTH, day_plan
++from slotwise.schedule import Schedule
++
++DAY = datetime.date(2026, 10, 15)
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_appointments_in_time_order(self):
++        schedule = Schedule()
++        schedule.book(Appointment("anna", "Maria Muster", datetime.datetime(2026, 10, 15, 14, 0), "short"))
++        schedule.book(Appointment("anna", "Peter Pan", datetime.datetime(2026, 10, 15, 9, 0), "initial"))
++
++        plan = day_plan(schedule, "anna", DAY)
++
++        self.assertEqual(
++            plan.split("\n"),
++            [
++                "Day plan: Anna",
++                "Thursday 15 October 2026",
++                "-" * LINE_WIDTH,
++                "09:00-10:00 initial",
++                "  Peter Pan",
++                "14:00-14:30 short",
++                "  Maria Muster",
++            ],
++        )
++
++    def test_leaves_out_cancelled_appointments(self):
++        schedule = Schedule()
++        appointment = schedule.book(Appointment("anna", "Maria Muster", datetime.datetime(2026, 10, 15, 9, 0)))
++        schedule.cancel(appointment.id)
++
++        self.assertIn("No appointments.", day_plan(schedule, "anna", DAY))
++
++    def test_other_therapists_and_days_are_not_listed(self):
++        schedule = Schedule()
++        schedule.book(Appointment("ben", "Maria Muster", datetime.datetime(2026, 10, 15, 9, 0)))
++        schedule.book(Appointment("anna", "Peter Pan", datetime.datetime(2026, 10, 16, 9, 0)))
++
++        self.assertIn("No appointments.", day_plan(schedule, "anna", DAY))
++
++    def test_every_line_fits_the_receipt_printer(self):
++        schedule = Schedule()
++        long_name = "Maria-Theresia Gertrud Ottilie von Hohenstaufen-Lindqvist-Brändli"
++        schedule.book(Appointment("anna-marie-christine", long_name, datetime.datetime(2026, 10, 15, 9, 0)))
++
++        for line in day_plan(schedule, "anna-marie-christine", DAY).split("\n"):
++            self.assertLessEqual(len(line), LINE_WIDTH, line)
++
++
++if __name__ == "__main__":
++    unittest.main()

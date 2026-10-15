@@ -1,0 +1,72 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index c576cf0..b641142 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -1,5 +1,6 @@
+ """Invoices. All amounts are integer pence."""
+ 
++import csv
+ import datetime
+ from dataclasses import dataclass, field
+ from typing import List
+@@ -47,6 +48,17 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++def export_invoices(invoices, path):
++    """Write one CSV row per invoice for the VAT return: date, customer code and total in pounds
++    (e.g. 1234 pence -> '12.34', no currency sign). Pass only the invoices for the quarter."""
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(["date", "customer", "total"])
++        for invoice in invoices:
++            pounds, pence = divmod(invoice.total(), 100)
++            writer.writerow([invoice.day.isoformat(), invoice.customer, f"{pounds}.{pence:02d}"])
++
++
+ def format_pence(pence):
+     """Format integer pence as pounds, e.g. 1234 -> '£12.34'. Negative amounts get a leading minus."""
+     sign = "-" if pence < 0 else ""
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 62bd57a..170f4fa 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,10 @@
++import csv
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, export_invoices, format_pence, invoice_for, invoice_number
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -64,6 +67,26 @@ class InvoiceNumberTest(unittest.TestCase):
+             invoice_number(2026, 10000)
+ 
+ 
++class ExportInvoicesTest(unittest.TestCase):
++    def test_one_row_per_invoice_with_date_customer_and_total_in_pounds(self):
++        invoices = [
++            Invoice("LUMEN", datetime.date(2026, 10, 20), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)]),
++            Invoice("HARBOUR", datetime.date(2026, 10, 21), [InvoiceLine("SOU", 5, 305)]),
++            Invoice("AIDAN", datetime.date(2026, 10, 22)),
++        ]
++        with tempfile.TemporaryDirectory() as folder:
++            path = os.path.join(folder, "invoices.csv")
++            export_invoices(invoices, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                rows = list(csv.reader(f))
++        self.assertEqual(rows, [
++            ["date", "customer", "total"],
++            ["2026-10-20", "LUMEN", "45.60"],
++            ["2026-10-21", "HARBOUR", "15.25"],
++            ["2026-10-22", "AIDAN", "0.00"],
++        ])
++
++
+ class FormatPenceTest(unittest.TestCase):
+     def test_pounds_and_pence(self):
+         self.assertEqual(format_pence(1234), "£12.34")

@@ -1,0 +1,649 @@
+{
+ "lane": "ccmem",
+ "scenario": "bakehouse",
+ "model": "haiku",
+ "meta": {
+  "lane": "ccmem",
+  "def": {
+   "kind": "plain",
+   "auto_memory": true
+  },
+  "env": {},
+  "claude_version": "2.1.300 (Claude Code)"
+ },
+ "sessions": [
+  "e2122efc-abe9-406b-892d-510844f926b9",
+  "1c333ad3-aaf4-41b3-bce7-d387254194cc",
+  "0534e29c-ed5b-43ad-819f-bc1d6ea0dc6b",
+  "af8b17c1-05ba-43b4-b623-bd20c79b34e0",
+  "b36f601e-0f0a-4c86-9ca3-2408334834b8",
+  "66f338ec-c1c6-48ce-9628-569f439cf7dc",
+  "5461dbea-d73f-4c77-9ab6-f3f1f742c3ef",
+  "9154ed96-1cce-4360-8226-fba64c5877fc"
+ ],
+ "session": "9154ed96-1cce-4360-8226-fba64c5877fc",
+ "turns": [
+  {
+   "block": 1,
+   "session": "e2122efc-abe9-406b-892d-510844f926b9",
+   "prompt": "Hi! bakehouse is the order and production tool I'm building for Larkspur Bakery, a wholesale bakery that delivers bread and pastries every morning to about twenty caf\u00e9s, shops and one primary school. Could you run the tests first? Tomasz, our head baker, says last night's plan told him to bake 2 batches of baguettes for 25 baguettes, and a batch is 12, so I think the batch rounding is broken.",
+   "result": "You were right: batch rounding was broken, and it's fixed. All 15 tests now pass.\n\n**What was wrong:** `batches_needed` in `src/bakehouse/production.py` used floor division (`units // batch_size`), so any partial batch was dropped. 25 baguettes at 12 per batch came out as 2 batches instead of 3, which is exactly what Tomasz saw. The failing tests were `test_partial_batch_rounds_up` and `test_plan_adds_up_customers`.\n\n**The fix:** I changed it to round up, `-(-units // batch_size)`, with a short comment. I haven't committed it.\n\n**Test run:**\n- Before: 15 tests, 2 failures.\n- After: 15 tests, all passing.\n\n**Something to check:** `scripts/print_plan.py` prints only each product's piece count (`print(code, units)`) and never prints the batch count it calls `batches`. If Tomasz reads the printed plan, he won't see the corrected batch numbers there. I haven't changed that, since you didn't ask for it. I can add the batch count to the output if you want.",
+   "cost_usd": 0.0046219,
+   "session_cost_usd": 0.0046219,
+   "steps": 8,
+   "error": false,
+   "wall_s": 22.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "e2122efc-abe9-406b-892d-510844f926b9",
+   "prompt": "Thanks! Some background on who's who, since the names will keep coming up. Greta Vogel owns the bakery and decides prices and which customers we take on. Tomasz starts at 3 a.m. and bakes from the printed plan; he doesn't touch the computer otherwise. Priya does our books and the quarterly VAT return; she works from home a few days a month. Dev drives the van and does the morning run, leaving at 5:30. Code for today: please make `load_catalog` reject a product with a batch size below 1 or a negative price, with a ValueError that names the product code, and add tests.",
+   "result": "`load_catalog` now rejects a product with a batch size below 1 or a negative price, and the error names the product code. All 19 tests pass, including four new ones for these cases.\n\n- **Batch size below 1:** raises `ValueError` such as `product ZER: batch size must be at least 1, got 0`.\n- **Negative price:** raises `ValueError` such as `product NEG: price must not be negative, got -95`.\n- **Price of 0:** still allowed, since you only asked to reject negatives. Say if you want free items blocked too.\n\nThe checks are in `src/bakehouse/products.py`, and the tests are in `tests/test_products.py`. Nothing is committed yet. The current `data/products.csv` passes the new checks, so today's plan script is unaffected.\n\nThanks for the names. I'll use them from here on.",
+   "cost_usd": 0.0026467,
+   "session_cost_usd": 0.0072686,
+   "steps": 6,
+   "error": false,
+   "wall_s": 19.8,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "e2122efc-abe9-406b-892d-510844f926b9",
+   "prompt": "St Aidan's Primary is a nut-free school: one of their pupils has a severe nut allergy and they had to call an ambulance last year, so they must never get anything from us that contains nuts. That will matter once orders go through the tool. For now, please add `Product.has_allergen(name)`, case-insensitive, with a test.",
+   "result": "I added `Product.has_allergen(name)` in `src/bakehouse/products.py`. It matches case-insensitively, and the new test is in `tests/test_products.py`. All 20 tests pass.\n\nRight now the catalog flags two products with nuts: the Bakewell slice (BKW) and the Florentine (FLO). Any St Aidan's order containing either must be blocked once orders go through the tool. The method is only a building block, though. Nothing enforces the rule yet, and the tool does not know which customer is St Aidan's.\n\nThe rule depends on the allergen list in `data/products.csv` being complete. If a recipe contains nuts but its row doesn't list them, `has_allergen` can't catch it. Someone should check each product's allergen column against its recipe before the order tool relies on it.\n\nNothing is committed yet. Do you want me to start on the enforcement next: blocking nut products for St Aidan's orders, and rejecting them with a clear error?",
+   "cost_usd": 0.001646390000000001,
+   "session_cost_usd": 0.008914990000000001,
+   "steps": 4,
+   "error": false,
+   "wall_s": 12.5,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "e2122efc-abe9-406b-892d-510844f926b9",
+   "prompt": "Greenway Grocers opens at 7:00 and wants our bread on the shelves before they open, so however Dev's run is planned, Greenway is always the first drop. Unrelated bits, just so you know: Caf\u00e9 Lumen pays by bank transfer at the end of each month and Harbour Deli pays Dev in cash on delivery; nothing to build for either. Please add a `Customer.__str__` that returns the customer's name, with a test.",
+   "result": "I added `Customer.__str__` in `src/bakehouse/customers.py`, returning the name, plus a test in `tests/test_customers.py`. All 21 tests pass. I noted the payment details for Caf\u00e9 Lumen and Harbour Deli and haven't built anything for them.\n\nOne conflict needs your decision. `data/customers.csv` gives Greenway Grocers `route_seq` 4, but you said Greenway is always the first drop. Nothing in the code uses route order yet, so nothing is broken today. Before the run is planned, though, either the data or the rule has to change. I haven't changed the CSV because I don't know which one is right. Should Greenway be set to 1 and the others moved down?\n\nAlso, the Old Mill's name in the customer file reads \"The Old Mill Tearooom\", with an extra \"o\". I left it as it is, since it may be how they want it printed on invoices.\n\nNothing is committed yet.",
+   "cost_usd": 0.0021135800000000003,
+   "session_cost_usd": 0.011028570000000001,
+   "steps": 6,
+   "error": false,
+   "wall_s": 15.2,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "e2122efc-abe9-406b-892d-510844f926b9",
+   "prompt": "One for later, when we write the bake sheet: Tomasz wants the products listed hottest oven first, because the deck oven only cools down through the night and heating it back up costs him half an hour. No code for that today. Please add a line to the changelog and commit.",
+   "result": "I added the changelog line and committed everything from today as `80318dc` on `main`. The working tree is clean, and all 21 tests passed before the commit.\n\nThe changelog line under \"Unreleased\" says the bake sheet is planned to list products hottest oven first, by `bake_temp`.\n\nThe commit also includes today's code changes, which weren't committed before:\n- the batch rounding fix\n- the catalog validation\n- `Product.has_allergen`\n- `Customer.__str__`\n\nThe changelog doesn't mention those yet, only the planned bake sheet. Should I add lines for them to the changelog as well?\n\nStill open from earlier: the Greenway route order in `data/customers.csv` conflicts with your \"always first\" rule, and the St Aidan's nut rule isn't enforced yet.",
+   "cost_usd": 0.00222873,
+   "session_cost_usd": 0.013257300000000001,
+   "steps": 4,
+   "error": false,
+   "wall_s": 20.1,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "1c333ad3-aaf4-41b3-bce7-d387254194cc",
+   "prompt": "Order entry today. Please make `OrderBook.add` raise a ValueError for a product code that isn't in the catalog, instead of silently skipping the line like it does now, and add `OrderBook.total_for(day, product_code)` returning the units ordered for that day across all customers. Tests for both, please.",
+   "result": "Both changes are in, and the suite passes (25 tests, up from 21). I didn't commit.\n\n**`OrderBook.add`** (`src/bakehouse/orders.py`) now raises `ValueError(\"unknown product code XXX\")` for a product not in the catalog, instead of returning `None` and skipping the line. The quantity check still runs first, and a rejected line is not added to the book.\n\n**`OrderBook.total_for(day, product_code)`** returns the sum of `qty` for that product on that day across all customers, or `0` if nothing is ordered.\n\n**Tests** in `tests/test_orders.py`:\n- an unknown product raises and leaves the book empty\n- the same rejection applies when the book is built from a list in the constructor\n- `total_for` adds up across customers and ignores other days and products\n- `total_for` returns 0 when nothing is ordered\n\n**Effect on existing code:** `load_orders` goes through `add`, so a row with an unknown product code will now fail the whole load rather than being silently dropped. I checked the current `data/orders.csv`: all 9 rows use catalog codes, so `scripts/print_plan.py` still works and its output is unchanged. Any future order file with a typo will now stop the load with an error. If you'd rather the file loader keep skipping and only `add` be strict, that's a small change in `load_orders`.",
+   "cost_usd": 0.005065790000000001,
+   "session_cost_usd": 0.005065790000000001,
+   "steps": 7,
+   "error": false,
+   "wall_s": 28.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "1c333ad3-aaf4-41b3-bce7-d387254194cc",
+   "prompt": "About the cutoff: orders for a delivery day have to be in by 14:00 on the day before, and 14:00 exactly still counts. That's ORDER_CUTOFF in config.py, and `is_on_time` in orders.py checks against it. We don't bake or deliver on Sundays (CLOSED_WEEKDAYS in config.py), so a Saturday order that misses the cutoff waits until Monday. Greenway can still change quantities by phone until 16:00, but that's a favour Greta does them by hand, not something the code needs to know. Could you add tests for is_on_time around the cutoff? Build the times from config.ORDER_CUTOFF instead of writing 14:00 into the tests.",
+   "result": "I added the cutoff tests to `tests/test_orders.py`, and the suite passes (30 tests, up from 25). Every time is built from `config.ORDER_CUTOFF`, so nothing hardcodes 14:00.\n\nThe new tests cover:\n- exactly at the cutoff on the day before: on time\n- one second after: too late\n- one minute after: too late\n- one minute before: on time\n- a Monday delivery, where the deadline is Sunday at the cutoff even though Sunday is a closed day: on time at the cutoff, too late a minute later\n\nI didn't change `orders.py` or `config.py`. The existing `is_on_time` already matched your rule.\n\nTwo things the code doesn't do:\n- **The Saturday-to-Monday rollover isn't in the code.** `is_on_time` only returns True or False. Nothing in the repo moves a late order to the next delivery day, so if that happens, it's done by hand or by a caller that doesn't exist yet.\n- **Greenway's 16:00 phone changes aren't modelled**, as you said. The Monday case above also means that for a Monday delivery the deadline is a Sunday, which the bakery is closed for. The code applies the literal rule, and the test documents that.\n\nI haven't committed anything.",
+   "cost_usd": 0.0033602400000000004,
+   "session_cost_usd": 0.008426030000000001,
+   "steps": 4,
+   "error": false,
+   "wall_s": 23.7,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "1c333ad3-aaf4-41b3-bce7-d387254194cc",
+   "prompt": "Delivery charge, for when we rework the invoices: Greta charges \u00a33.00 delivery on any order under \u00a325.00. That's the value of the customer's order for one delivery day, before VAT. Don't build it yet. (She also grumbles that the cash-and-carry wants a \u00a350 minimum spend now; that's their rule, not ours.) Meanwhile please add `OrderBook.customers_for(day)` returning the sorted codes of the customers with orders on that day.",
+   "result": "I added `OrderBook.customers_for(day)` in `src/bakehouse/orders.py`. It returns the sorted, de-duplicated customer codes with orders for that day, or an empty list if there are none. It has a test in `tests/test_orders.py`, and the suite passes (31 tests).\n\nI did not build the delivery charge. I saved the rule to a project memory so it's there when the invoice rework starts: \u00a33.00 on any customer's order under \u00a325.00 per delivery day, measured before VAT. The memory also records the cash-and-carry's \u00a350 minimum as their rule, so it stays out of bakehouse. Nothing is committed.",
+   "cost_usd": 0.0030906100000000006,
+   "session_cost_usd": 0.011516640000000002,
+   "steps": 7,
+   "error": false,
+   "wall_s": 19.5,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "1c333ad3-aaf4-41b3-bce7-d387254194cc",
+   "prompt": "Crate labels, also for later. The packing room has an old thermal label printer: it only prints plain ASCII (accents and umlauts come out as garbage), 32 characters per line, and it simply cuts off anything past that, so text that's too long has to be shortened to fit. Each crate gets one label per product: first line the customer's name, second line the quantity and the product name, then the allergens. Allergens have to be emphasised on food labels by law and the printer can't do bold, so we print them in capital letters. Today just add `Product.allergen_text()` returning the allergens sorted and joined with ', '.",
+   "result": "I added `Product.allergen_text()` in `src/bakehouse/products.py`. It sorts the allergens case-insensitively, capitalises them, and joins them with `', '`. A product with no allergens returns an empty string. I added two tests to `tests/test_products.py`, and the suite passes (33 tests).\n\nOutput for the current catalog, for example:\n- `RYE`: `RYE, SESAME, WHEAT`\n- `PCH`: `EGGS, MILK, SOYA, WHEAT`\n\nNothing else is built yet. The line-fitting to 32 characters and the ASCII-only output are not handled, because they belong to the label builder. Right now `allergen_text()` only uppercases. All current allergen names are plain ASCII, so the output is printer-safe. A future allergen with an accent would pass through unchanged, and the label builder will need to handle that.\n\nI haven't committed anything.",
+   "cost_usd": 0.002671979999999999,
+   "session_cost_usd": 0.01418862,
+   "steps": 5,
+   "error": false,
+   "wall_s": 18.2,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "1c333ad3-aaf4-41b3-bce7-d387254194cc",
+   "prompt": "Greenway takes sandwich loaves on sale-or-return. When they send unsold ones back the next morning, we credit half the wholesale price per loaf, but never for more than 10% of the loaves we delivered to them that day; returns above that aren't credited. It's only Greenway and only sandwich loaves. Priya will want this as a function at some point. That's it for today, please commit.",
+   "result": "Committed today's work as `4e9e76b` on `main`. The working tree is clean and all 33 tests pass.\n\nThe commit covers:\n- `OrderBook.add` raises `ValueError` for unknown product codes. `load_orders` now fails on unknown codes too. The current `data/orders.csv` has none, so nothing breaks today.\n- `OrderBook.total_for(day, product_code)` and `OrderBook.customers_for(day)`.\n- Tests for the `is_on_time` cutoff boundary, built from `config.ORDER_CUTOFF`.\n- `Product.allergen_text()`, which sorts the allergens, capitalises them and joins them with `', '`.\n\nI didn't build the Greenway returns credit. I saved the rule to memory for Priya, with a note to confirm with Greta how the 10% cap is rounded, since the rule doesn't say. The delivery charge rule is saved there too.",
+   "cost_usd": 0.0032949000000000016,
+   "session_cost_usd": 0.017483520000000002,
+   "steps": 5,
+   "error": false,
+   "wall_s": 21.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "0534e29c-ed5b-43ad-819f-bc1d6ea0dc6b",
+   "prompt": "Tomasz's evening routine: before he goes home he prints the plan for the next day with `python scripts/print_plan.py --day 2026-10-20` (with the right date, obviously). Could you make the script print the product name, units and batches in aligned columns instead of the bare code and units?",
+   "result": "`scripts/print_plan.py` now prints the plan as aligned columns: product name, units and batches, with a header row. I ran it for 2026-10-20:\n\n```\nProduct          Units  Batches\nBaguette            25        3\nCroissant           24        1\nWhite sourdough      6        1\nSandwich loaf       32        2\nWhite roll          60        2\n```\n\nThe change is in `scripts/print_plan.py` only. The name column is left-aligned and the number columns right-aligned, with widths taken from the longest value, so the columns line up whatever the day's order is.\n\nChoices I made:\n- The product code is no longer printed, since you asked for the name in its place.\n- I added the header row because the columns read more clearly with one.\n\nTests: `python3 -m pytest` fails at collection with `No module named 'bakehouse'`, and it fails the same way on the untouched tree. With `PYTHONPATH=src python3 -m pytest -q` all 33 tests pass. I didn't add a test for the script's output. The import path problem is pre-existing and I haven't changed it.",
+   "cost_usd": 0.0041499200000000005,
+   "session_cost_usd": 0.0041499200000000005,
+   "steps": 7,
+   "error": false,
+   "wall_s": 41.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "0534e29c-ed5b-43ad-819f-bc1d6ea0dc6b",
+   "prompt": "Greta wants a quick per-customer view of a day. Please add `day_summary(orderbook, day)` in a new src/bakehouse/reports.py returning {customer code: order value in pence}, with a test. She does all her number-crunching in Excel on the office PC, and that PC's Windows and Excel are set up in German (she grew up in Hamburg), so any CSV meant for her has to use semicolons between fields and a comma as the decimal separator, otherwise Excel dumps everything into one column. No file export today.",
+   "result": "I added `day_summary(orderbook, day)` in `src/bakehouse/reports.py` with a test in `tests/test_reports.py`. The suite passes (36 tests, run with `PYTHONPATH=src`).\n\nIt returns `{customer code: order value in pence}` for the day, sorted by customer code. On the real data for 2026-10-20 it gives:\n\n```\n{'AIDAN': 2100, 'GREENWAY': 8135, 'LUMEN': 4560}\n```\n\nChoices I made:\n- **Value is products only, at wholesale price before VAT.** Delivery charges are left out. The saved delivery rule (\u00a33 under \u00a325 per customer per day) is deferred to the invoice rework, so I didn't add it here. If Greta expects delivery in the figure, that's a small change.\n- **No CSV written.** You said there's no export today, so the German-format CSV is not built. I saved a memory note so that when an export is added it uses semicolons and comma decimals, e.g. `51,35` for 5135 pence.",
+   "cost_usd": 0.004410720000000001,
+   "session_cost_usd": 0.008560640000000001,
+   "steps": 7,
+   "error": false,
+   "wall_s": 33.8,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "0534e29c-ed5b-43ad-819f-bc1d6ea0dc6b",
+   "prompt": "Priya's side works differently: she keeps the accounts in Ledgerly, and Ledgerly only imports a plain comma-separated file with a header row, dates written DD/MM/YYYY and amounts in pounds with a decimal point and two decimals (12.50), never pence. Don't mix that up with Greta's files. Code for today: add `invoice_for(orderbook, customer, day)` in invoice.py that builds an Invoice with one line per product the customer ordered for that day, at catalog prices, with a test.",
+   "result": "I added `invoice_for(orderbook, customer, day)` to `src/bakehouse/invoice.py`, with tests in `tests/test_invoice.py`. The full suite passes (38 tests, run with `PYTHONPATH=src`).\n\nThe function returns an `Invoice` for the customer and day, with one line per product. Quantities are summed across duplicate order lines, and each line uses the catalog's wholesale price in pence. Lines are sorted by product code, matching `plan`. A customer with no orders that day gets an invoice with no lines.\n\nChoices I made:\n- **No delivery charge.** Like `day_summary`, the invoice holds products only. The \u00a33 delivery rule is still deferred to the invoice rework.\n- **No Ledgerly file written.** You asked only for the invoice code today. I saved a memory note with Priya's Ledgerly format (plain commas, a header row, `DD/MM/YYYY` dates, pounds with two decimals) so the export gets it right when it's built. It's separate from Greta's semicolon format.",
+   "cost_usd": 0.004477740000000001,
+   "session_cost_usd": 0.013038380000000002,
+   "steps": 7,
+   "error": false,
+   "wall_s": 32.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "0534e29c-ed5b-43ad-819f-bc1d6ea0dc6b",
+   "prompt": "Dev plans the morning run in an app called Stopwise on his phone. It imports a CSV whose header must be exactly `Name,Address,Postcode,Notes`, with one row per drop in the order he'll drive them. With any other header it refuses the file, and if the rows aren't in driving order it re-optimises the route by itself, which sends him the wrong way round the one-way system. The driving order is route_seq in customers.csv. Today please make `load_customers` reject two customers with the same route_seq.",
+   "result": "`load_customers` now raises a `ValueError` when two customers share a `route_seq`. The message names both customers, e.g. `route_seq 1 is used by both LUMEN and HARBOUR`. A new test in `tests/test_customers.py` covers this with a temporary CSV. The full suite passes (39 tests, run with `PYTHONPATH=src`), and the real `data/customers.csv` still loads its 5 customers.\n\nI haven't touched the Stopwise export, because I don't see that code in this repo. The header requirement (`Name,Address,Postcode,Notes`) and the ordering by `route_seq` belong in whatever writes the CSV for Dev's phone. Once that code exists, the file should also be written in `route_seq` order with that exact header. I saved nothing to memory for this, since the header rule is short and easy to find when the export is built.",
+   "cost_usd": 0.003767150000000004,
+   "session_cost_usd": 0.016805530000000006,
+   "steps": 6,
+   "error": false,
+   "wall_s": 29.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "0534e29c-ed5b-43ad-819f-bc1d6ea0dc6b",
+   "prompt": "Last bit: the Old Mill Tearoom only wants deliveries Wednesday to Saturday over the winter, but they place their own orders, so that's their business and nothing to code. There's a typo in their name in customers.csv ('Tearooom'), please fix it, run the tests and commit.",
+   "result": "I fixed the typo in `data/customers.csv` (`Tearooom` \u2192 `Tearoom`) and committed it as `7c0b455`. The suite passes (39 tests, run with `PYTHONPATH=src`).\n\nThe commit contains only that one-line change. Nothing else is committed: the earlier work is still uncommitted in the working tree, and I left it out because you asked for only this change:\n- `scripts/print_plan.py`: aligned columns\n- `src/bakehouse/reports.py` and `tests/test_reports.py`: `day_summary`\n- `src/bakehouse/invoice.py` and `tests/test_invoice.py`: `invoice_for`\n- `src/bakehouse/customers.py` and `tests/test_customers.py`: duplicate `route_seq` check\n\nShould I commit those too? I can make one commit per piece, or a single commit, as you prefer.",
+   "cost_usd": 0.002178679999999999,
+   "session_cost_usd": 0.018984210000000005,
+   "steps": 3,
+   "error": false,
+   "wall_s": 20.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 4,
+   "session": "af8b17c1-05ba-43b4-b623-bd20c79b34e0",
+   "prompt": "Invoices next. Please add `format_pence(pence)` to invoice.py: 1234 gives '\u00a312.34', 5 gives '\u00a30.05', and negative amounts get a leading minus ('-\u00a33.00'), since a credit note is just an invoice with negative lines. Tests too.",
+   "result": "I added `format_pence(pence)` to `src/bakehouse/invoice.py` with tests in `tests/test_invoice.py`. All 8 invoice tests pass.\n\nThe function works on the absolute value and puts the minus sign in front, so -300 gives '-\u00a33.00' and -5 gives '-\u00a30.05'. The new tests cover 1234, 5, 0, 300, and the negative cases.\n\nI didn't commit anything. `invoice.py` and `test_invoice.py` already had changes in the working tree that I didn't touch, and I edited the file alongside them.",
+   "cost_usd": 0.004297270000000001,
+   "session_cost_usd": 0.004297270000000001,
+   "steps": 9,
+   "error": false,
+   "wall_s": 25.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 4,
+   "session": "af8b17c1-05ba-43b4-b623-bd20c79b34e0",
+   "prompt": "Heads-up on the January price rise: Greta wants all wholesale prices up 4%, each new price rounded to the nearest penny. Flour has gone up 8% since spring and butter even more, so she says 4% is the least she can do. We'll write that in December. For now, please make `Catalog.get` raise a KeyError whose message names the unknown code.",
+   "result": "`Catalog.get` now raises `KeyError` with the unknown code in the message, for example `unknown product code XYZ`. I added a test for it in `tests/test_products.py`. The full suite passes (44 tests).\n\nI didn't build the January price rise, since you said it goes in December. For that change, the 4% needs to round each new price to the nearest penny, which Python's `round` does not always do for halves. Use `Decimal` with `ROUND_HALF_UP`.\n\nI haven't committed anything. `products.py` and `test_products.py` were not in the earlier git status, so these edits are the only changes in those files.",
+   "cost_usd": 0.0029682800000000002,
+   "session_cost_usd": 0.007265550000000001,
+   "steps": 7,
+   "error": false,
+   "wall_s": 23.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 4,
+   "session": "af8b17c1-05ba-43b4-b623-bd20c79b34e0",
+   "prompt": "On the bake sheet Tomasz also wants the dough weight he has to weigh out for each product, in kilos with one decimal (say 5.4 kg), because that's what his scale shows. The dough weight per piece is dough_g in the catalog. Please add `dough_weight_g(product, units)` to production.py returning grams, with a test.",
+   "result": "I added `dough_weight_g(product, units)` to `src/bakehouse/production.py`. It returns `product.dough_g * units` in grams, and I added a test to `tests/test_production.py`. The full suite passes (45 tests).\n\nTwo things I left for you to decide:\n\n- **Kilos with one decimal isn't done yet.** The function returns grams, as you asked. The 5.4 kg display belongs wherever the bake sheet is formatted, and I haven't touched that. Something like `f\"{grams / 1000:.1f} kg\"` would do it, but I'd check how Tomasz wants the rounding to go first, since `.1f` rounds half to even.\n- **Units or whole batches?** The function takes `units`, so it weighs out exactly the pieces passed in. Tomasz bakes whole batches, so if he weighs dough for the full batch, the caller should pass `batches * batch_size` instead of the ordered units. I haven't assumed either way.\n\nNothing is committed.",
+   "cost_usd": 0.002686589999999999,
+   "session_cost_usd": 0.00995214,
+   "steps": 6,
+   "error": false,
+   "wall_s": 22.1,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 4,
+   "session": "af8b17c1-05ba-43b4-b623-bd20c79b34e0",
+   "prompt": "Ana, our part-time baker, will cover Tomasz's shifts while he's on holiday in November. She's fine with the ovens but new to the computer side. Also, Harbour Deli is closed on Tuesdays, so Dev skips them on Tuesdays; they know not to order for Tuesdays, so nothing to code. Could you add a test that `plan` leaves out products nobody ordered for that day?",
+   "result": "I added `test_plan_leaves_out_products_not_ordered_for_that_day` to `tests/test_production.py`. It checks that `plan` omits a product with no orders for the day, and that a day with no orders gives an empty plan. The full suite passes (46 tests).\n\nThe Harbour Deli Tuesday rule needs no code, as you said.\n\nNothing is committed. I can't tell from here whether Ana will be running the scripts herself, so if she is, I can write a short setup note for her, covering how to run the tests and print the bake plan.",
+   "cost_usd": 0.0017551900000000002,
+   "session_cost_usd": 0.01170733,
+   "steps": 3,
+   "error": false,
+   "wall_s": 15.9,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 4,
+   "session": "af8b17c1-05ba-43b4-b623-bd20c79b34e0",
+   "prompt": "Please commit.",
+   "result": "I committed the four files that contain only my changes as `59b419a`: `products.py`, `test_products.py`, `production.py`, and `test_production.py`. The commit covers the `Catalog.get` KeyError, `dough_weight_g`, and the test that `plan` leaves out unordered products.\n\nI left out `invoice.py` and `test_invoice.py`. They already had an uncommitted `invoice_for` and its tests before I started, and my `format_pence` changes are in the same files. Committing them would also commit that other work. I can split out just the `format_pence` hunk if you want it committed separately.\n\nI also left `customers.py`, `test_customers.py`, `scripts/print_plan.py`, `reports.py`, and `test_reports.py` alone, since they aren't mine.",
+   "cost_usd": 0.0036324300000000007,
+   "session_cost_usd": 0.015339760000000001,
+   "steps": 4,
+   "error": false,
+   "wall_s": 24.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 5,
+   "session": "b36f601e-0f0a-4c86-9ca3-2408334834b8",
+   "prompt": "Tomasz got a new platform scale last week and it only shows grams, so on the bake sheet he now wants dough weights in whole grams (like 5400 g) instead of kilos. Flour still comes from the mill in 16 kg sacks, that doesn't change. Please make `dough_weight_g` raise a ValueError for negative units, with a test.",
+   "result": "`dough_weight_g` now raises `ValueError` for negative `units`, and I added a test for it. All 6 tests in `tests/test_production.py` pass.\n\nTwo things I found that you should know about:\n\n- **Grams were already the unit.** `dough_g` in `products.py` is documented as grams per piece, and `dough_weight_g` returns `dough_g * units`, so nothing converts to kilos anywhere in this code. Whole grams also hold, since `dough_g` is an int.\n- **The bake sheet doesn't print dough weights yet.** `scripts/print_plan.py` prints product, units and batches only, and it doesn't call `dough_weight_g`. If the sheet that shows kilos is being produced somewhere else, it isn't in this repo. If you want a dough-weight column in grams on this sheet, I can add it, but I didn't do that since you didn't ask for it.\n\nThe flour sacks are unaffected, since nothing in the code touches flour weights.\n\nThe changes are in `src/bakehouse/production.py` and `tests/test_production.py`. Running the test needs `PYTHONPATH=src`, since `python -m unittest` doesn't find the package otherwise. I left the other uncommitted changes in the working tree alone and didn't commit.",
+   "cost_usd": 0.004426729999999999,
+   "session_cost_usd": 0.004426729999999999,
+   "steps": 9,
+   "error": false,
+   "wall_s": 26.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 5,
+   "session": "b36f601e-0f0a-4c86-9ca3-2408334834b8",
+   "prompt": "Standing orders: most customers order the same things every week. Please add src/bakehouse/standing.py with a `StandingLine(customer, product, weekday, qty)` dataclass and `expand(standing_lines, start, end)` that returns the OrderLines for every matching day from start to end inclusive, plus tests. St Aidan's standing order pauses in the school holidays; the school sends Greta the term dates every September and she removes those weeks by hand, so no holiday logic yet.",
+   "result": "I added `src/bakehouse/standing.py` with the `StandingLine` dataclass and `expand(standing_lines, start, end)`, plus `tests/test_standing.py`. All 5 new tests pass.\n\n- `StandingLine(customer, product, weekday, qty)` uses `weekday` as in `date.weekday()`: 0 is Monday through 6 is Sunday.\n- `expand` walks every day from `start` to `end` inclusive and returns an `OrderLine` for each standing line whose weekday matches. It returns an empty list if `end` is before `start`.\n- The output is plain `OrderLine`s, so `OrderBook.add` still checks quantities and product codes when they're loaded.\n\nI left out holiday logic as you asked. St Aidan's will keep appearing in expanded weeks until Greta removes those dates by hand.\n\nNothing calls `expand` yet, and I didn't add a standing-orders CSV or wire it into `load_orders`. I also didn't commit anything.",
+   "cost_usd": 0.00294977,
+   "session_cost_usd": 0.007376499999999999,
+   "steps": 6,
+   "error": false,
+   "wall_s": 22.5,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 5,
+   "session": "b36f601e-0f0a-4c86-9ca3-2408334834b8",
+   "prompt": "In case you wondered why I keep insisting on integer pence for every amount: two years ago the old spreadsheet added prices up as floats, our VAT return came out \u00a31.37 off, and Priya had to file a correction with HMRC. Greta never wants that again. Separately, please add `OrderBook.lines_for(customer, day)` returning that customer's lines for the day, with a test.",
+   "result": "I added `OrderBook.lines_for(customer, day)` in `src/bakehouse/orders.py`, with a test in `tests/test_orders.py`. It returns that customer's lines for the day, in the order they were added. The orders test module passes (17 tests).\n\nOn pence: the codebase already keeps every amount as integer pence. Product prices are `int` pence, `InvoiceLine.unit_price` and `Invoice.total()` are integer pence, and the daily report totals are in pence. `format_pence` only converts to pounds for display. I found no float arithmetic on money, so nothing needed changing. I also didn't add any new money code, so the rule is still being followed.\n\nI haven't committed anything.",
+   "cost_usd": 0.003067470000000001,
+   "session_cost_usd": 0.01044397,
+   "steps": 6,
+   "error": false,
+   "wall_s": 24.8,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 5,
+   "session": "b36f601e-0f0a-4c86-9ca3-2408334834b8",
+   "prompt": "Two small facts: Stopwise cuts the Notes column off at 60 characters; nothing to do about it, since we don't fill in notes yet. And the Raspberry Pi in the packing room, which Sam set up, runs Python 3.7 with no internet access, so everything has to stay standard library and work on 3.7. Could you check the code for anything that needs a newer Python and fix it?",
+   "result": "I found one thing that needs a newer Python and fixed it. The rest of the code looks compatible with 3.7, but I couldn't run it on 3.7 to confirm.\n\n- **Fixed:** `src/bakehouse/customers.py` used an assignment expression (`:=`), which needs Python 3.8. I split it into two lines with the same behaviour.\n- **Checked by parsing:** every `.py` file under `src`, `scripts` and `tests` parses with the Python 3.7 grammar.\n- **Checked by hand:** every standard-library call in the code (`csv`, `datetime`, `dataclasses`, `typing`, `argparse`, `tempfile`, `unittest`, `os.path`, `sys`) exists in 3.7. `date.fromisoformat` is the newest one, and it arrived in 3.7.\n- **Tests:** all seven test modules pass on Python 3.11.\n\nI couldn't install Python 3.7 here to run the suite on it, because `uv` has no download for it and there's no internet access. Before relying on it, someone should run `python3.7 -m unittest` on the Pi, or in any 3.7 environment, with `PYTHONPATH=src`.\n\nThe code uses only the standard library, so nothing new needed adding. The Stopwise 60-character Notes limit is noted; I didn't change anything for it.",
+   "cost_usd": 0.0049365300000000015,
+   "session_cost_usd": 0.015380500000000002,
+   "steps": 7,
+   "error": false,
+   "wall_s": 43.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 5,
+   "session": "b36f601e-0f0a-4c86-9ca3-2408334834b8",
+   "prompt": "Thanks, please commit.",
+   "result": "I committed the work from this session as `be31896` on `main`. It contains the six files I changed: the dough-weight check, the standing orders module with its tests, and `OrderBook.lines_for` with its test.\n\nI left out the Python 3.7 fix in `src/bakehouse/customers.py`. That file also has changes you or someone else made before this session, and committing it would have included them. Those changes and the 3.7 fix are still uncommitted, along with `invoice.py`, `print_plan.py`, `reports.py`, and the `test_customers.py` and `test_invoice.py` changes. The 3.7 fix is only the walrus-operator line in `load_customers`, so the Pi's Python 3.7 compatibility isn't in the commit yet.\n\nTell me whether to commit `customers.py` with the rest, or to leave the other pre-existing changes for whoever owns them.",
+   "cost_usd": 0.00277351,
+   "session_cost_usd": 0.01815401,
+   "steps": 3,
+   "error": false,
+   "wall_s": 22.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 6,
+   "session": "66f338ec-c1c6-48ce-9628-569f439cf7dc",
+   "prompt": "Greta changed the delivery charge after the latest fuel bill: from November it's \u00a34.50 on any order under \u00a340.00, still the value of the customer's order for one delivery day before VAT. And St Aidan's never pays it, because their contract price already includes delivery. Still no code for that until the invoice rework. Please add a test for `day_summary` with two customers on the same day.",
+   "result": "I added the `day_summary` test to `tests/test_reports.py`. It passes, and the full suite passes too (54 tests).\n\nThe new test puts LUMEN and GREENWAY on the same day, with LUMEN's two lines split around GREENWAY's. It checks that each customer gets their own total: GREENWAY 190 and LUMEN 380 in pence. The existing `test_value_per_customer_in_pence` already covered two customers on one day, so this one adds the interleaved-lines case rather than a new code path.\n\nTests need `PYTHONPATH=src` to import `bakehouse`, e.g. `PYTHONPATH=src python -m unittest discover -s tests`.\n\nI also updated the `delivery-charge-rule` memory to Greta's new rule: \u00a34.50 on orders under \u00a340.00 from November, pre-VAT, with St Aidan's exempt. It still says not to build it until the invoice rework. I didn't change any code for the charge.\n\nI haven't committed anything.",
+   "cost_usd": 0.005781510000000001,
+   "session_cost_usd": 0.005781510000000001,
+   "steps": 10,
+   "error": false,
+   "wall_s": 34.2,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 6,
+   "session": "66f338ec-c1c6-48ce-9628-569f439cf7dc",
+   "prompt": "Good news for packing: Greta bought a new label printer. It does 48 characters per line, but it's still plain ASCII only (accents come out as garbage just like on the old one), and everything else about the labels stays the same. Code for today: please add `OrderBook.remove(day, customer, product)` that removes that line and returns True, or False if there was no such line.",
+   "result": "I added `OrderBook.remove(day, customer, product)` in `src/bakehouse/orders.py`. It returns True when it removes a line and False when no line matches. The full suite passes (56 tests), including two new tests in `tests/test_orders.py` for the removed and missing cases.\n\nOne choice to check: `add` doesn't stop the same customer, day and product from being added twice, so `remove` takes out every matching line, not just the first. If duplicates should be impossible, I can make `add` reject them instead.\n\nI also saved the label printer details as a memory: 48 characters per line, ASCII only. I didn't change any label code, since none exists beyond the allergen text in `products.py`. Wrapping to 48 characters and stripping accents would go in label code once it's written.\n\nNothing is committed.",
+   "cost_usd": 0.005521269999999999,
+   "session_cost_usd": 0.01130278,
+   "steps": 11,
+   "error": false,
+   "wall_s": 29.8,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 6,
+   "session": "66f338ec-c1c6-48ce-9628-569f439cf7dc",
+   "prompt": "Greta asked me why order entry got so strict about unknown product codes, so for the record: last spring a typo in a product code meant Greenway's whole sandwich-loaf order was silently dropped and never baked, and Greta had to drive to the cash-and-carry at 5 a.m. to buy loaves for them. Please add `__len__` to OrderBook, returning the number of lines.",
+   "result": "I added `__len__` to `OrderBook` in `src/bakehouse/orders.py`, returning the number of lines. A new test in `tests/test_orders.py` checks the count for an empty book, after adding two lines, and after a removal. The full suite passes (57 tests).\n\nOne side effect: an empty `OrderBook` is now falsy, so `if book:` would skip it. Nothing in the repo tests a book for truthiness, so nothing changes today.\n\nI also saved the incident as a memory, so the strict product-code check isn't loosened later. Nothing is committed.",
+   "cost_usd": 0.0036538099999999987,
+   "session_cost_usd": 0.014956589999999999,
+   "steps": 8,
+   "error": false,
+   "wall_s": 24.7,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 6,
+   "session": "66f338ec-c1c6-48ce-9628-569f439cf7dc",
+   "prompt": "Greenway asked whether we'd credit more of their returns. Greta said no, the sale-or-return terms stay exactly as they are. Caf\u00e9 Lumen asked for 5% off from December; Greta hasn't decided, so nothing changes for now. Please add `top_products(orderbook, start, end, n=5)` to reports.py returning the n product codes with the most units ordered from start to end inclusive, most first.",
+   "result": "I added `top_products(orderbook, start, end, n=5)` to `src/bakehouse/reports.py`. It counts units per product across all customers for delivery days from `start` to `end` inclusive, and returns the top `n` codes, most units first. Ties are ordered by product code so the result is stable.\n\nI added five tests in `tests/test_reports.py` covering ranking across customers, the inclusive date range, tie-breaking, the default of five, and an empty book. The full suite passes (62 tests).\n\nOn the two customer decisions, I made no code changes, since Greta's answers mean nothing changes. One thing to check: the `greenway-sandwich-loaf-returns` memory still describes the half-credit rule as \"for Priya, not built\". If Greta's \"terms stay exactly as they are\" means that rule is dropped, that memory should be removed or reworded. I haven't edited it because I'm not sure. Caf\u00e9 Lumen's 5% request is undecided, so I didn't record it.\n\nNothing is committed.",
+   "cost_usd": 0.0028512600000000013,
+   "session_cost_usd": 0.01780785,
+   "steps": 5,
+   "error": false,
+   "wall_s": 17.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 6,
+   "session": "66f338ec-c1c6-48ce-9628-569f439cf7dc",
+   "prompt": "Please commit.",
+   "result": "I committed my changes as `711abf0` on `main`. It covers `OrderBook.remove`, `OrderBook.__len__`, `day_summary` and `top_products`, with their tests in `orders.py`, `reports.py`, `test_orders.py` and `test_reports.py`.\n\nI left out five files that were already modified before this session and aren't mine: `scripts/print_plan.py`, `src/bakehouse/customers.py`, `src/bakehouse/invoice.py`, `tests/test_customers.py` and `tests/test_invoice.py`. They're still uncommitted, so someone should review them before they go in.",
+   "cost_usd": 0.00245221,
+   "session_cost_usd": 0.02026006,
+   "steps": 3,
+   "error": false,
+   "wall_s": 17.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 7,
+   "session": "5461dbea-d73f-4c77-9ab6-f3f1f742c3ef",
+   "prompt": "The price rise again: Greta talked to the caf\u00e9s and changed it. It's 5% instead of 4%, and each new price is rounded up to the next 5p, never down, because the caf\u00e9s print price boards and odd pennies look silly on them. Still starting in January. Please add `Product.price_text()` that returns the price formatted with format_pence.",
+   "result": "I added `Product.price_text()`, and it returns the price through `format_pence`, e.g. `320` \u2192 `\"\u00a33.20\"`. The full suite passes (63 tests, including a new one for `price_text`).\n\n- **Change:** `src/bakehouse/products.py` imports `format_pence` from `invoice.py`. `invoice.py` doesn't import products, so there's no import cycle. The test is in `tests/test_products.py`.\n- **Price rise not implemented:** You gave the new rule (5% instead of 4%, each new price rounded up to the next 5p, starting January), but you only asked for `price_text()`. I haven't written the rise calculation. Do you want a function for it, something like `next_price()`, or is the rise applied somewhere else?\n- **Label printer:** `format_pence` produces `\u00a3`, which isn't plain ASCII. If `price_text()` ends up on packing labels, the printer won't handle it, so tell me if that's the plan and I'll look at it.",
+   "cost_usd": 0.006169050000000001,
+   "session_cost_usd": 0.006169050000000001,
+   "steps": 9,
+   "error": false,
+   "wall_s": 36.7,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 7,
+   "session": "5461dbea-d73f-4c77-9ab6-f3f1f742c3ef",
+   "prompt": "Ana covers for Tomasz from 9 November for two weeks; he's back on the 23rd. Greta asked whether the plan could show how many trays go in the oven: one tray holds one batch, so it's the total number of batches. Please add `total_batches(plan_result)` to production.py, with a test.",
+   "result": "I added `total_batches(plan_result)` to `src/bakehouse/production.py`. It sums the batch count across all products in a plan, so one tray per batch gives the number of trays in the oven. The full suite passes (66 tests).\n\nThe function takes the dict that `plan()` returns and adds up the batch count for each product. An empty plan gives 0. I added three tests in `tests/test_production.py`: a sum across products, an empty plan, and a check against a real `plan()` result.\n\nI haven't added the total to the `python -m bakehouse plan` output. Greta asked for the plan to show the number, so say if you want that wired into the CLI.",
+   "cost_usd": 0.0024611100000000007,
+   "session_cost_usd": 0.008630160000000001,
+   "steps": 6,
+   "error": false,
+   "wall_s": 15.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 7,
+   "session": "5461dbea-d73f-4c77-9ab6-f3f1f742c3ef",
+   "prompt": "Greenway's buyer is Marek, and he's the one to email if anything about their deliveries changes, not the shop itself. Caf\u00e9 Lumen has a new manager, Jo. Please add an optional `email` field to Customer (default empty), read from an optional email column in customers.csv, and put Marek's address, marek@greenway-grocers.example, in the file.",
+   "result": "I added an optional `email` field to `Customer`, defaulting to empty. It's read from an optional `email` column in `data/customers.csv`, and Marek's address is now on the Greenway Grocers row. The suite passes (68 tests), including new tests for the Marek address, blank emails, and a CSV with no email column.\n\nJo's address for Caf\u00e9 Lumen isn't in the file. I don't have it, so the Lumen row's email is blank until you give me the address.",
+   "cost_usd": 0.00381105,
+   "session_cost_usd": 0.012441210000000001,
+   "steps": 6,
+   "error": false,
+   "wall_s": 31.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 7,
+   "session": "5461dbea-d73f-4c77-9ab6-f3f1f742c3ef",
+   "prompt": "The school's kitchen manager, Mrs Okonjo, emails their orders on Thursdays for the following week. Please add `OrderBook.days()` returning the sorted distinct delivery days in the book, with a test.",
+   "result": "I added `OrderBook.days()` to `src/bakehouse/orders.py`. It returns the sorted, distinct delivery days that have at least one line in the book, and an empty book gives `[]`. I added two tests in `tests/test_orders.py`, one for sorting and de-duplication and one for the empty book. The full suite passes (70 tests).\n\nMrs Okonjo's Thursday emails don't affect this code. I haven't changed how school orders are loaded or entered.",
+   "cost_usd": 0.0023855100000000004,
+   "session_cost_usd": 0.014826720000000002,
+   "steps": 5,
+   "error": false,
+   "wall_s": 17.8,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 7,
+   "session": "5461dbea-d73f-4c77-9ab6-f3f1f742c3ef",
+   "prompt": "Thanks, please commit.",
+   "result": "Committed as `4b43c3a` on `main`. The working tree is clean and all 70 tests pass.\n\nThe commit also includes two changes that were already uncommitted when this session started, not just the ones from today:\n- The duplicate `route_seq` check in `customers.py`, with its test.\n- `format_pence` and `invoice_for` in `invoice.py`, with their tests.\n\nI included them because `products.py` imports `format_pence` from `invoice.py`, so the commit wouldn't work without it. If you'd rather keep them separate, I can split them into their own commit.",
+   "cost_usd": 0.0024717299999999984,
+   "session_cost_usd": 0.01729845,
+   "steps": 3,
+   "error": false,
+   "wall_s": 20.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 8,
+   "session": "9154ed96-1cce-4360-8226-fba64c5877fc",
+   "prompt": "Harbour Deli opens on Tuesdays now, so Dev can deliver to them every day we deliver. Please add a test for `customers_for` with three customers on one day.",
+   "result": "I added `test_customers_for_three_customers_on_one_day` to `tests/test_orders.py`, right after the existing `customers_for` test. The full suite passes (71 tests).\n\nThe test puts three customers on `DAY` (LUMEN, HARBOUR, AIDAN), with LUMEN ordering twice, and adds a GREENWAY order on the next day. It checks that `customers_for(DAY)` returns `[\"AIDAN\", \"HARBOUR\", \"LUMEN\"]`: sorted, with no duplicates, and the other day's customer left out.\n\nI didn't change any data for Harbour Deli. `data/customers.csv` and the standing orders still say what they said before. If Dev should see Harbour on Tuesdays, that is a separate edit to the delivery schedule, and I can make it if you point me at the right file. Nothing is committed.",
+   "cost_usd": 0.005574160000000001,
+   "session_cost_usd": 0.005574160000000001,
+   "steps": 8,
+   "error": false,
+   "wall_s": 32.5,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 8,
+   "session": "9154ed96-1cce-4360-8226-fba64c5877fc",
+   "prompt": "Potter's Farm Shop joins us next month: code POTTER, name Potter's Farm Shop, address Lower Farm, Ashby Road, postcode LK5 3PF. Dev will drive to them last, so give them route_seq 6. Please add them to customers.csv and check that the customer tests still pass.",
+   "result": "I added Potter's Farm Shop to `data/customers.csv` as route stop 6, after St Aidan's. The customer tests pass (5 of 5), and so does the full suite (71 tests).\n\nThe new row is `POTTER,Potter's Farm Shop,\"Lower Farm, Ashby Road\",LK5 3PF,6,`. I quoted the address because it contains a comma. When loaded, the name, address, postcode and route_seq all come back as you gave them, and the email is blank since you didn't give one.\n\nNothing is committed. The existing tests don't cover a new customer, so this change isn't checked by any test beyond the loader running cleanly.",
+   "cost_usd": 0.00268369,
+   "session_cost_usd": 0.00825785,
+   "steps": 6,
+   "error": false,
+   "wall_s": 24.9,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 8,
+   "session": "9154ed96-1cce-4360-8226-fba64c5877fc",
+   "prompt": "Priya would like invoice numbers like LK-2026-0001: the year, then a four-digit running number that starts again at 1 every year. Please add `invoice_number(year, seq)` to invoice.py returning that string, with a test.",
+   "result": "I added `invoice_number(year, seq)` to `src/bakehouse/invoice.py`. It returns `LK-2026-0001` for `invoice_number(2026, 1)`, and the full suite passes (73 tests).\n\nThe function raises `ValueError` for a sequence outside 1\u20139999. Without that check, a 10000th invoice in a year would come out as five digits and break the format. I picked that behaviour myself, so say if Priya wants something different.\n\nThe tests in `tests/test_invoice.py` cover the format, the four-digit padding at the top of the range, and both ends of the range check. Nothing else calls the function yet. Nothing is stored either, so the running counter that restarts each year still needs to be built, and I haven't made any changes for it. Nothing is committed.",
+   "cost_usd": 0.00270398,
+   "session_cost_usd": 0.01096183,
+   "steps": 7,
+   "error": false,
+   "wall_s": 18.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 8,
+   "session": "9154ed96-1cce-4360-8226-fba64c5877fc",
+   "prompt": "About VAT: almost everything we sell is zero-rated food; only the Florentines count as confectionery at 20%, because they're chocolate-coated. Priya handles that in Ledgerly, so our invoices stay without VAT for now. Please add a test that `invoice_for` ignores other customers' lines.",
+   "result": "I added `test_ignores_other_customers_lines` to `InvoiceForTest` in `tests/test_invoice.py`. It builds a book with LUMEN, GREENWAY and AIDAN lines on the same day and checks that LUMEN's invoice contains only LUMEN's croissants and totals \u00a326.40. The full suite passes (74 tests).\n\nI left VAT alone, as you asked: the invoices still have no VAT line, and Priya handles it in Ledgerly. Nothing is committed.",
+   "cost_usd": 0.0015527800000000001,
+   "session_cost_usd": 0.01251461,
+   "steps": 3,
+   "error": false,
+   "wall_s": 15.2,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 8,
+   "session": "9154ed96-1cce-4360-8226-fba64c5877fc",
+   "prompt": "Dev's van holds 18 crates, and a crate takes 30 rolls or 8 loaves; Greta wonders whether we'll need a second run before Christmas, but not yet. Please add `crates_needed(units, per_crate)` to production.py (whole crates, so round up), with a test, then update the changelog with everything since the last entry and commit.",
+   "result": "I added `crates_needed(units, per_crate)` to `production.py`, rounding up to whole crates, with a test. I also updated the changelog and committed everything as `eefc215`. The full suite passes (75 tests).\n\n- **Crates:** `crates_needed(61, 30)` gives 3 and `crates_needed(17, 8)` gives 3. The 18-crate van capacity isn't in the code, since you said a second run isn't needed yet.\n- **Changelog:** I wrote the entries under Unreleased, covering the commits after `80318dc` (the last change to the changelog) and this session's work. I kept the existing \"Planned\" bake-sheet bullet, but the code doesn't sort the bake sheet by `bake_temp` yet.\n- **Commit:** The commit includes the earlier uncommitted work: POTTER in `customers.csv`, `invoice_number`, and the two invoice tests. It is authored as Dana, with the Co-Authored-By line you specified. The commit message says the changelog was updated \"since 0.1.0's entry\", which is slightly off because the last entry was the Unreleased bullet. I didn't amend it, so say if you want that fixed.",
+   "cost_usd": 0.007572109999999998,
+   "session_cost_usd": 0.02008672,
+   "steps": 13,
+   "error": false,
+   "wall_s": 37.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  }
+ ],
+ "settles": [
+  {},
+  {},
+  {},
+  {},
+  {},
+  {},
+  {},
+  {},
+  {}
+ ],
+ "teammate_commits": [
+  {
+   "after_block": 4,
+   "author": "Sam Okafor",
+   "files": [
+    "src/bakehouse/config.py"
+   ],
+   "commit": "3c5457650cae9db048ba49ba0f6eeca22a8f8fbe"
+  },
+  {
+   "after_block": 6,
+   "author": "Sam Okafor",
+   "files": [
+    "scripts/print_plan.py",
+    "src/bakehouse/__main__.py"
+   ],
+   "commit": "de85623731fc9b75ea30ca072635200bb49e09bc"
+  },
+  {
+   "after_block": 7,
+   "author": "Sam Okafor",
+   "files": [
+    "src/bakehouse/config.py"
+   ],
+   "commit": "2ba4fb835ddaf6a497b1d3a772a6b473559d0ed4"
+  }
+ ],
+ "cost_usd": 0.14086403,
+ "final_session_cost_usd": 0.02008672,
+ "agent_wall_s": 983.3,
+ "wall_s": 983.5,
+ "errors": 0,
+ "memory": {
+  "cost_usd": 0.0
+ },
+ "memory_state": {
+  "auto_memory_files": {
+   "-home-claude-bench-work-bakehouse-ccmem-bakehouse/memory/MEMORY.md": "- [Delivery charge rule](delivery-charge-rule.md) \u2014 \u00a34.50 delivery under \u00a340.00 per customer per day from November, pre-VAT, St Aidan's exempt; deferred to invoice rework\n- [Greenway sandwich loaf returns](greenway-sandwich-loaf-returns.md) \u2014 half wholesale credit per returned SWL, capped at 10% of that day's delivered loaves; for Priya, not built\n- [Greta's Excel CSV format](greta-excel-csv-format.md) \u2014 semicolons and comma decimals for any CSV sent to her; no export yet\n- [Priya's Ledgerly import format](ledgerly-import-format.md) \u2014 plain comma CSV, DD/MM/YYYY dates, pounds with a decimal point; not Greta's format\n- [Label printer](label-printer.md) \u2014 new packing printer: 48 characters per line, plain ASCII only\n- [Unknown product code incident](unknown-product-code-incident.md) \u2014 last spring a typo silently dropped Greenway's loaf order; keep product-code validation loud\n",
+   "-home-claude-bench-work-bakehouse-ccmem-bakehouse/memory/delivery-charge-rule.md": "---\nname: delivery-charge-rule\ndescription: \"Greta's delivery charge rule for invoices (\u00a34.50 under \u00a340.00 per customer per delivery day from November, pre-VAT; St Aidan's exempt) \u2014 not built yet\"\nmetadata:\n  node_type: memory\n  type: project\n  originSessionId: 1c333ad3-aaf4-41b3-bce7-d387254194cc\n  modified: 2026-10-15T07:59:32.232Z\n---\n\nDelivery charge: from November, \u00a34.50 on any customer's order under \u00a340.00 for one delivery day, measured as the order value before VAT. Greta changed this after the latest fuel bill; it replaces the earlier \u00a33.00 under \u00a325.00 rule. St Aidan's never pays it because their contract price already includes delivery, so they are exempt. Not implemented yet; explicitly deferred until the invoice rework.\n\nAlso noted by Greta: the cash-and-carry now wants a \u00a350 minimum spend. That is the cash-and-carry's rule, not the bakery's, so don't encode it in bakehouse.\n\n**Why:** Greta sets the charge; the invoice rework will need it.\n**How to apply:** when reworking invoices, compute the order value per customer per day from the order book, skip St Aidan's, and apply the charge. Don't build it before the invoice rework is requested. `day_summary` in `src/bakehouse/reports.py` returns the pre-VAT product value per customer per day, which is the figure the threshold is measured against.\n",
+   "-home-claude-bench-work-bakehouse-ccmem-bakehouse/memory/greenway-sandwich-loaf-returns.md": "---\nname: greenway-sandwich-loaf-returns\ndescription: \"Greenway sale-or-return credit rule for sandwich loaves (half wholesale per loaf, capped at 10% of that day's delivered loaves) \u2014 not built yet, for Priya\"\nmetadata:\n  node_type: memory\n  type: project\n  originSessionId: 1c333ad3-aaf4-41b3-bce7-d387254194cc\n  modified: 2026-10-15T07:52:04.074Z\n---\n\nGreenway takes sandwich loaves (product SWL) on sale-or-return. Unsold loaves come back the next morning. The credit is half the wholesale price per returned loaf, and never for more than 10% of the loaves delivered to Greenway that day. Returns above the 10% cap get no credit.\n\nThis applies only to Greenway and only to sandwich loaves. Priya will want it as a function later; it is not built yet.\n\n**Why:** the rule is Greta's commercial agreement with Greenway, and it is not in the code.\n**How to apply:** when building the function, take the day's delivered SWL quantity for Greenway from the order book, cap the returned quantity at 10% of it, and credit half the wholesale price on the capped amount. Confirm the rounding of the 10% cap with Greta before relying on it, because the rule doesn't say how to round.\n",
+   "-home-claude-bench-work-bakehouse-ccmem-bakehouse/memory/greta-excel-csv-format.md": "---\nname: greta-excel-csv-format\ndescription: \"CSV exports for Greta must use German Excel format (semicolon fields, comma decimals)\"\nmetadata:\n  node_type: memory\n  type: project\n  originSessionId: 0534e29c-ed5b-43ad-819f-bc1d6ea0dc6b\n  modified: 2026-10-15T07:53:22.660Z\n---\n\nGreta does her number-crunching in Excel on the office PC, which is set up in German. Any CSV meant for her must use `;` between fields and `,` as the decimal separator, or Excel puts everything in one column.\n\n**Why:** the German locale on her PC breaks default CSV (comma-separated, dot decimals).\n\n**How to apply:** when a CSV export is added for her (none existed as of 2026-10-15), write it with semicolons and comma decimals. Money is stored as integer pence, so format as e.g. `51,35` for 5135 pence. Related: [[delivery-charge-rule]].\n",
+   "-home-claude-bench-work-bakehouse-ccmem-bakehouse/memory/label-printer.md": "---\nname: label-printer\ndescription: \"Greta's new packing label printer: 48 characters per line, plain ASCII only; everything else about labels unchanged\"\nmetadata:\n  node_type: memory\n  type: project\n  originSessionId: 66f338ec-c1c6-48ce-9628-569f439cf7dc\n  modified: 2026-10-15T08:00:00.930Z\n---\n\nGreta replaced the label printer. The new one prints 48 characters per line (the old one's width was narrower). It still accepts plain ASCII only: accents come out as garbage, as they did on the old printer. Otherwise label content and format are unchanged.\n\n**Why:** label text is generated for the printer, so width and character set limits apply to any label code.\n**How to apply:** wrap or truncate label lines to 48 characters, and transliterate or strip accented characters (e.g. \"\u00e9\" to \"e\") before printing. Allergen label text is built in `src/bakehouse/products.py`; it is in capitals because the printer can't bold.\n",
+   "-home-claude-bench-work-bakehouse-ccmem-bakehouse/memory/ledgerly-import-format.md": "---\nname: ledgerly-import-format\ndescription: \"Priya's Ledgerly accounts import takes a plain comma CSV with DD/MM/YYYY dates and pound amounts with a decimal point\"\nmetadata:\n  node_type: memory\n  type: project\n  originSessionId: 0534e29c-ed5b-43ad-819f-bc1d6ea0dc6b\n  modified: 2026-10-15T07:53:53.839Z\n---\n\nPriya keeps the accounts in Ledgerly. It only imports a plain comma-separated file with a header row, dates as DD/MM/YYYY, and amounts in pounds with a decimal point and two decimals (12.50), never pence.\n\n**Why:** Ledgerly's importer rejects anything else; this is the opposite of Greta's German Excel format.\n\n**How to apply:** for any export to Priya, use commas, a header row, `DD/MM/YYYY` dates, and amounts converted from integer pence to pounds with two decimals. Do not reuse the semicolon/comma-decimal format from [[greta-excel-csv-format]]. Invoices come from `invoice_for` in `src/bakehouse/invoice.py`.\n",
+   "-home-claude-bench-work-bakehouse-ccmem-bakehouse/memory/unknown-product-code-incident.md": "---\nname: unknown-product-code-incident\ndescription: \"Why order entry rejects unknown product codes loudly: last spring a typo silently dropped Greenway's sandwich-loaf order\"\nmetadata:\n  node_type: memory\n  type: project\n  originSessionId: 66f338ec-c1c6-48ce-9628-569f439cf7dc\n  modified: 2026-10-15T08:00:23.819Z\n---\n\nLast spring a typo in a product code meant Greenway's whole sandwich-loaf order was silently dropped and never baked. Greta had to drive to the cash-and-carry at 5 a.m. to buy loaves for them.\n\n**Why:** this is the reason `OrderBook.add` raises on an unknown product code instead of skipping the line. Greta asked about the strictness, so keep it.\n**How to apply:** don't loosen product-code validation in order entry or CSV loading to \"be friendly\" with bad codes. A bad code should fail visibly, not drop an order quietly.\n"
+  }
+ },
+ "last_session_compactions": 0,
+ "last_session_context_tokens": 51000,
+ "git_log": "eefc215 Dana: Add POTTER customer, invoice_number, crates_needed; update changelog\n2ba4fb8 Sam Okafor: Deliver on Sundays, close on Mondays instead\n4b43c3a Dana: Add price_text, total_batches, customer email, OrderBook.days\nde85623 Sam Okafor: Replace scripts/print_plan.py with `python -m bakehouse plan`\n711abf0 Dana: Add OrderBook.remove/__len__; add day_summary and top_products reports\nbe31896 Dana: Reject negative dough units; add standing orders and OrderBook.lines_for\n3c54576 Sam Okafor: Move the order cutoff to 13:00\n59b419a Dana: Raise KeyError naming unknown product codes; add dough weight and plan test\n7c0b455 Dana: Fix typo in Old Mill Tearoom name\n4e9e76b Dana: Reject unknown product codes; add order totals and allergen label text\n80318dc Dana: Fix batch rounding; validate catalog; add allergen and str helpers\nb35f4c4 Dana: initial version\n",
+ "git_status": "",
+ "transcripts": null
+}

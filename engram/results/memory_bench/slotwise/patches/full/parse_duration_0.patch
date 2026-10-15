@@ -1,0 +1,98 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 0b192c0..a8be1e1 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -6,6 +6,8 @@
+   "tests/test_clients.py::ClientBookTest::test_search_matches_any_part_of_name_ignoring_case",
+   "tests/test_clients.py::ClientBookTest::test_unknown_number",
+   "tests/test_clients.py::NormalizePhoneTest::test_all_formats_match",
++  "tests/test_durations.py::ParseDurationTest::test_accepted_forms",
++  "tests/test_durations.py::ParseDurationTest::test_rejects_empty_zero_and_nonsense",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/src/slotwise/durations.py b/src/slotwise/durations.py
+new file mode 100644
+index 0000000..53a1a44
+--- /dev/null
++++ b/src/slotwise/durations.py
+@@ -0,0 +1,41 @@
++"""Reading appointment lengths typed by reception."""
++
++import re
++
++_DURATION = re.compile(
++    r"""
++    (?P<h>\d+)\s*h\s*(?:(?P<hm>\d+)\s*(?:min|m)?)?   # 1h, 1h30, 1h 30m
++    |(?P<m>\d+)\s*(?:min|m)?                          # 45, 45m, 45 min
++    |(?P<hh>\d+):(?P<mm>\d+)                          # 1:30
++    """,
++    re.VERBOSE,
++)
++
++
++def parse_duration(text):
++    """Minutes for a duration such as '45', '45 min', '1h30' or '1:30'.
++
++    Raises ValueError if the text isn't a duration, or if it is zero.
++    """
++    cleaned = text.strip().lower()
++    match = _DURATION.fullmatch(cleaned)
++    if match is None:
++        raise ValueError(f"{text!r} is not a duration, try something like 45, 1h or 1:30")
++    if match["h"] is not None:
++        minutes = int(match["h"]) * 60 + _minutes_part(match["hm"], text)
++    elif match["m"] is not None:
++        minutes = int(match["m"])
++    else:
++        minutes = int(match["hh"]) * 60 + _minutes_part(match["mm"], text)
++    if minutes == 0:
++        raise ValueError(f"{text!r} is not a duration: it must be longer than zero")
++    return minutes
++
++
++def _minutes_part(digits, text):
++    """The minutes after an hour, which must be below 60; missing means zero."""
++    if digits is None:
++        return 0
++    if int(digits) > 59:
++        raise ValueError(f"{text!r} is not a duration: minutes must be under 60")
++    return int(digits)
+diff --git a/tests/test_durations.py b/tests/test_durations.py
+new file mode 100644
+index 0000000..e0c0cc5
+--- /dev/null
++++ b/tests/test_durations.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from slotwise.durations import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_accepted_forms(self):
++        cases = {
++            "45": 45,
++            "45m": 45,
++            "45 min": 45,
++            "1h": 60,
++            "1h30": 90,
++            "1h 30m": 90,
++            "2h15": 135,
++            "1:30": 90,
++            "  1H30  ": 90,
++            "45 MIN": 45,
++        }
++        for text, minutes in cases.items():
++            with self.subTest(text=text):
++                self.assertEqual(parse_duration(text), minutes)
++
++    def test_rejects_empty_zero_and_nonsense(self):
++        for text in ["", "   ", "0", "0m", "0:00", "abc", "-5", "1h75", "1:60", "1.5h", "45 seconds"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

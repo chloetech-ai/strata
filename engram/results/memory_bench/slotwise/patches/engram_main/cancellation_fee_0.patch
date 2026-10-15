@@ -1,0 +1,95 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 69c1bcf..d060efb 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,18 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_finds_client_in_any_phone_format",
++  "tests/test_clients.py::ClientBookTest::test_invalid_phone_is_rejected_on_add",
++  "tests/test_clients.py::ClientBookTest::test_same_number_cannot_be_added_twice",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_added_order",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_gives_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_number_gives_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_common_shapes_give_the_same_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_letters",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_numbers_without_prefix",
++  "tests/test_fees.py::CancellationFeeTest::test_free_with_48_hours_or_more_notice",
++  "tests/test_fees.py::CancellationFeeTest::test_full_price_under_24_hours",
++  "tests/test_fees.py::CancellationFeeTest::test_half_price_between_24_and_48_hours",
++  "tests/test_fees.py::CancellationFeeTest::test_half_price_rounds_up_to_whole_cent",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..68038a0
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,21 @@
++"""Cancellation fees.
++
++Cancelling less than 48 hours before the appointment costs half the treatment
++price, and less than 24 hours before costs the full price. Cancelling 48 or
++more hours ahead is free.
++"""
++
++import datetime
++
++from .model import Appointment
++
++
++def cancellation_fee(appointment: Appointment, cancelled_at: datetime.datetime) -> int:
++    """Fee in cents for cancelling `appointment` at `cancelled_at`."""
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        # Half the price, rounded half up to a whole cent.
++        return (appointment.price + 1) // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..e1cca0c
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,39 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import TREATMENTS, Appointment
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def setUp(self):
++        self.start = datetime.datetime(2026, 9, 7, 9, 0)
++        self.standard = Appointment("lena", "Kim Weber", self.start, "standard")
++
++    def at(self, hours):
++        return self.start - datetime.timedelta(hours=hours)
++
++    def test_free_with_48_hours_or_more_notice(self):
++        self.assertEqual(cancellation_fee(self.standard, self.at(49)), 0)
++        self.assertEqual(cancellation_fee(self.standard, self.at(48)), 0)
++
++    def test_half_price_between_24_and_48_hours(self):
++        self.assertEqual(cancellation_fee(self.standard, self.at(47)), 4900)
++        self.assertEqual(cancellation_fee(self.standard, self.at(24)), 4900)
++
++    def test_full_price_under_24_hours(self):
++        self.assertEqual(cancellation_fee(self.standard, self.at(23)), 9800)
++        self.assertEqual(cancellation_fee(self.standard, self.at(0)), 9800)
++
++    def test_half_price_rounds_up_to_whole_cent(self):
++        # No current price is odd; this checks the rounding rule with a made-up one.
++        TREATMENTS["odd"] = (45, 9801)
++        try:
++            odd = Appointment("lena", "Kim Weber", self.start, "odd")
++            self.assertEqual(cancellation_fee(odd, self.at(30)), 4901)
++        finally:
++            del TREATMENTS["odd"]
++
++
++if __name__ == "__main__":
++    unittest.main()

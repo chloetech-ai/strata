@@ -1,0 +1,121 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..3327407
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1,9 @@
++{
++  "tests/test_customers.py": true,
++  "tests/test_invoice.py": true,
++  "tests/test_orders.py": true,
++  "tests/test_production.py": true,
++  "tests/test_products.py": true,
++  "tests/test_reports.py": true,
++  "tests/test_standing.py": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..0637a08
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1 @@
++[]
+\ No newline at end of file
+diff --git a/src/bakehouse/seasons.py b/src/bakehouse/seasons.py
+new file mode 100644
+index 0000000..a3efc37
+--- /dev/null
++++ b/src/bakehouse/seasons.py
+@@ -0,0 +1,21 @@
++"""Dates for the baking calendar, such as the hot cross bun season."""
++
++import datetime
++
++
++def easter_sunday(year):
++    """The date of Easter Sunday in the Western church, on the Gregorian calendar.
++
++    Uses the Meeus/Jones/Butcher anonymous algorithm, which is valid for every Gregorian year;
++    the bakery plans within 1900 to 2199."""
++    a = year % 19
++    b, c = divmod(year, 100)
++    d, e = divmod(b, 4)
++    f = (b + 8) // 25
++    g = (b - f + 1) // 3
++    h = (19 * a + b - d - g + 15) % 30
++    i, k = divmod(c, 4)
++    l = (32 + 2 * e + 2 * i - h - k) % 7
++    m = (a + 11 * h + 22 * l) // 451
++    month, day = divmod(h + l - 7 * m + 114, 31)
++    return datetime.date(year, month, day + 1)
+diff --git a/tests/test_seasons.py b/tests/test_seasons.py
+new file mode 100644
+index 0000000..84c6f6b
+--- /dev/null
++++ b/tests/test_seasons.py
+@@ -0,0 +1,32 @@
++import datetime
++import unittest
++
++from bakehouse.seasons import easter_sunday
++
++
++class EasterSundayTest(unittest.TestCase):
++    def test_known_dates(self):
++        cases = {
++            1900: datetime.date(1900, 4, 15),
++            1961: datetime.date(1961, 4, 2),
++            2000: datetime.date(2000, 4, 23),
++            2019: datetime.date(2019, 4, 21),
++            2024: datetime.date(2024, 3, 31),
++            2025: datetime.date(2025, 4, 20),
++        }
++        for year, expected in cases.items():
++            with self.subTest(year=year):
++                self.assertEqual(easter_sunday(year), expected)
++
++    def test_every_year_in_range_is_a_sunday_between_22_march_and_25_april(self):
++        for year in range(1900, 2200):
++            with self.subTest(year=year):
++                easter = easter_sunday(year)
++                self.assertIsInstance(easter, datetime.date)
++                self.assertEqual(easter.weekday(), 6)
++                self.assertGreaterEqual(easter, datetime.date(year, 3, 22))
++                self.assertLessEqual(easter, datetime.date(year, 4, 25))
++
++
++if __name__ == "__main__":
++    unittest.main()

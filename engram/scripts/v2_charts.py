@@ -7,12 +7,17 @@ Reads the committed results and writes PNGs into docs/assets/img:
   results/v2/deep/                      what the query engine found
   results/memory_bench/<scenario>/      Claude Code with each memory system
 
+and the memory systems' results pooled over scenarios into
+results/memory_bench/pooled.{md,json}.
+
   python3 scripts/v2_charts.py
 """
 
 import gzip
 import json
 import os
+import random
+import sys
 from collections import defaultdict
 
 import matplotlib
@@ -97,33 +102,81 @@ LANE_COLORS = {"none": GREY, "ccmem": AMBER, "transcripts": AMBER, "claude-mem":
 
 
 def lanes_chart(scenarios):
-    runs = []
+    data = {}
     for sc in scenarios:
-        p = os.path.join(RES, "memory_bench", sc, "runs.jsonl")
+        p = os.path.join(RES, "memory_bench", sc, "summary.json")
         if os.path.exists(p):
-            runs += [json.loads(l) for l in open(p)]
-    if not runs:
+            data[sc] = [json.loads(l) for l in open(os.path.join(RES, "memory_bench", sc, "runs.jsonl"))]
+    if not data:
         return
-    lanes = [l for l in LANE_NAMES if any(r["lane"] == l for r in runs)]
-    fig, ax = plt.subplots(figsize=(12, 4.6))
-    for i, lane in enumerate(lanes):
-        rs = [r for r in runs if r["lane"] == lane]
-        solved = sum(1 for r in rs if r.get("score", 0) >= 1.0)
-        v = solved / len(rs)
-        ax.bar(i, v, 0.7, color=LANE_COLORS[lane])
-        ax.text(i, v + 0.01, f"{solved}/{len(rs)}", ha="center", fontsize=10)
-    ax.set_xticks(range(len(lanes)), [LANE_NAMES[l] for l in lanes], fontsize=10)
-    ax.set_ylim(0, 1.1)
-    ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0], ["0%", "25%", "50%", "75%", "100%"])
-    ax.set_ylabel("runs solved")
-    ax.grid(axis="y", color="#e5e7eb")
-    ax.set_axisbelow(True)
-    ax.set_title(f"Claude Code with each memory system: follow-up tasks solved ({', '.join(scenarios)})", loc="left", fontweight="bold")
-    fig.text(0.01, -0.06, "Each task run 3 times per lane in a fresh headless session after the lane recorded the project's history. Agent and memory systems: Haiku. Cloud VM, 2026-10-15.", fontsize=9, color="#555")
+    lanes = [l for l in LANE_NAMES if any(r["lane"] == l for rs in data.values() for r in rs)]
+    fig, axes = plt.subplots(1, len(data), figsize=(3.3 * len(data) + 2.2, 0.42 * len(lanes) + 1.4), sharey=True, squeeze=False)
+    ys = list(range(len(lanes)))[::-1]
+    for ax, (sc, runs) in zip(axes[0], data.items()):
+        for y, lane in zip(ys, lanes):
+            rs = [r for r in runs if r["lane"] == lane]
+            if not rs:
+                continue
+            solved = sum(1 for r in rs if r.get("score", 0) >= 1.0)
+            ax.barh(y, solved / len(rs), 0.7, color=LANE_COLORS[lane])
+            ax.text(solved / len(rs) + 0.02, y, f"{solved}/{len(rs)}", va="center", fontsize=9)
+        ax.set_xlim(0, 1.3)
+        ax.set_xticks([0, 0.5, 1.0], ["0%", "50%", "100%"])
+        ax.grid(axis="x", color="#e5e7eb")
+        ax.set_axisbelow(True)
+        ax.set_title(sc, fontsize=12, fontweight="bold")
+    axes[0][0].set_yticks(ys, [LANE_NAMES[l].replace("\n", " ") for l in lanes], fontsize=10)
+    fig.suptitle("Claude Code with each memory system: follow-up runs solved", x=0.01, ha="left", fontweight="bold")
+    fig.text(0.01, -0.03, "Each task run 3 times per lane in a new headless session, after the lane recorded the project's history. Agent and memory systems: Haiku. Cloud VM, 2026-10-15.", fontsize=9, color="#555")
+    fig.tight_layout()
     save(fig, "chart-engram-v2-lanes.png")
+
+
+def pooled(scenarios):
+    """Every lane's runs over all scenarios, against none and Engram main
+    (tasks are strata, so the permutation test shuffles within a task)."""
+    sys.path.insert(0, HERE)
+    import memory_bench as mb  # noqa: E402
+
+    rows, done = [], []
+    for sc in scenarios:
+        p = os.path.join(RES, "memory_bench", sc, "summary.json")
+        if os.path.exists(p):
+            done.append(sc)
+            for line in open(os.path.join(RES, "memory_bench", sc, "runs.jsonl")):
+                r = json.loads(line)
+                r["task"] = f"{sc}/{r['task']}"
+                rows.append(r)
+    if not rows:
+        return
+    rng = random.Random(1)
+    lanes = [l for l in LANE_NAMES if any(r["lane"] == l for r in rows)]
+    out = {"scenarios": done, "lanes": {}}
+    md = [f"# Memory bench: {', '.join(done)} pooled", "",
+          "Solved = score 1.0. p: two-sided; Fisher = Fisher's exact test on solved runs; perm = permutation test of the "
+          "solved-rate difference with lane labels shuffled within each task (20,000 shuffles).", "",
+          "| lane | runs | solved | needs earlier sessions: solved | $/run (agent + memory) | p vs none (Fisher / perm) | p vs engram@main (Fisher / perm) |",
+          "|---|---|---|---|---|---|---|"]
+    for lane in lanes:
+        rs = [r for r in rows if r["lane"] == lane]
+        need = [r for r in rs if r.get("kind") not in ("control", "repo")]
+        solved = sum(r["solved"] for r in rs)
+        cost = sum(r.get("cost_usd") or 0 for r in rs) / len(rs)
+        mem = sum(r.get("memory_cost_usd") or 0 for r in rs) / len(rs)
+        vs = {ref: mb.compare(rows, lane, ref, 20000, rng) for ref in ("none", "engram@main") if ref != lane}
+        out["lanes"][lane] = {"runs": len(rs), "solved": solved, "need_runs": len(need), "need_solved": sum(r["solved"] for r in need),
+                              "cost_usd": cost, "memory_cost_usd": mem, "vs": vs}
+        cell = lambda v: "– / –" if not v else f"{v['fisher_solved_p']:.2g} / {v['perm_solved_p']:.2g}"  # noqa: E731
+        md.append(f"| {lane} | {len(rs)} | {solved}/{len(rs)} ({solved / len(rs):.0%}) | {out['lanes'][lane]['need_solved']}/{len(need)} | "
+                  f"{cost:.3f} + {mem:.3f} | {cell(vs.get('none'))} | {cell(vs.get('engram@main'))} |")
+    base = os.path.join(RES, "memory_bench", "pooled")
+    json.dump(out, open(base + ".json", "w"), indent=1)
+    open(base + ".md", "w").write("\n".join(md) + "\n")
+    print("wrote", base + ".md")
 
 
 if __name__ == "__main__":
     answers_chart()
     evidence_chart()
     lanes_chart(["bakehouse", "stockroom", "slotwise", "kestrel"])
+    pooled(["bakehouse", "stockroom", "slotwise", "kestrel"])

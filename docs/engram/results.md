@@ -52,6 +52,25 @@ The 6,000-character briefing did most of the work: it reached every Engram run. 
 {: .note }
 A longer A/B on multi-day scenarios was run twice. The first run (`engram/results/long/*_v1_leaky`) is kept for the record only: Claude Code's own auto-memory, which lives outside the repository, was not reset between runs, so the runs within a lane were not independent. The rerun with the isolated harness (`engram/results/long/stockroom` and `slotwise`, 240 runs) does not show Engram recovering what compaction dropped. After a hand review of the regex-graded advice answers, stockroom was solved 26/30 with compaction alone, 27/30 with Engram, 30/30 with Engram and graph recall, and 30/30 with the full history; slotwise was 30/30 in every lane. Each compacted lane missed the one conversation-only fact its own last compaction summary dropped. In both Engram lanes the recall gate skipped those prompts and no run called a memory tool, so the differences between lanes come from their summaries. `stockroom/NOTE.md` has the review.
 
+## Memory systems compared
+
+The A/B above compares Engram with nothing. This one puts Claude Code next to the memory systems a user could pick instead, on four projects, and compares Engram's `main` with the October changes (notes kept current, request-aware recall, code anchors and the query engine).
+
+**Method.** Each *lane* is one memory system. It records the project's history with that system on: each block of prompts is a new headless session, as separate working days are, and in one project a teammate's commits land between sessions without the agent being told. The lane's repository and whole home directory (which holds `~/.claude`, Claude Code's own memory, plugins and each system's data) are then frozen. Every follow-up task restores that state and starts a new session; a script grades the result, one check per fact. Each task runs three times per lane. Every `claude` process (and every hook, daemon and worker it starts) sees only `PATH`, its lane's `HOME` and the API address, so lanes cannot see each other or the machine's own setup. The agent and every memory system's own model calls use Haiku. The harness is [`engram/scripts/memory_bench.py`](https://github.com/rkonow/engram/blob/main/engram/scripts/memory_bench.py) and the competitors' setup is in [`engram/eval/competitors`](https://github.com/rkonow/engram/tree/main/engram/eval/competitors).
+
+| lane | what the agent has |
+|---|---|
+| no memory | nothing: Claude Code's auto memory off, no plugins, no hooks |
+| Claude Code auto memory | Claude Code's built-in memory, on as by default: the agent writes notes into `~/.claude/projects/…/memory/` and `MEMORY.md` is loaded into each session |
+| past transcripts | the history's sessions as markdown files in a folder the agent is told it can grep |
+| claude-mem | the [claude-mem](https://github.com/thedotmack/claude-mem) plugin (13.39.0): hooks, a model call per tool use and per turn that writes observations and summaries, SQLite and Chroma search, injected context and MCP search tools |
+| mem0 | [mem0](https://github.com/mem0ai/mem0) (2.2.1) as MCP tools to add and search memories, with a system prompt asking the agent to use them; a model call extracts facts on each add |
+| Engram main | Engram as on `main` |
+| Engram new, no query engine | the October changes with the query engine off |
+| Engram new (async) | the same with the query engine in its default mode, in the background |
+| Engram new (sync) | the query engine before the model starts on each prompt |
+| whole history in context | the history's one long session, forked for each task: an upper bound |
+
 ## This repository's own 26-hour session
 
 The transcript of the session that built Strata and Engram is the most realistic test available: 26.5 hours, 43.6 MB, three projects, and two compactions whose summaries keep 14,202 and 17,998 characters. Replaying it through Engram's capture gives the records the hooks would have stored; questions are asked at the point just before Engram's own work began.
@@ -138,6 +157,8 @@ Preference questions go the other way: the ranker leaves out the turns where a t
 
 **Where the gain comes from.** The planner's searches add depth more than reach: its 27 candidates hold all of a question's evidence for 80% of the 470 questions with evidence, against 78% for plain hybrid search taken to the same depth and 62% for its top 10. What changes the answers is the ranker. It keeps 2.6 records (900 characters) that hold all the evidence for 71% of questions and some of it for 92%.
 
+**LoCoMo.** On every fourth LoCoMo question (500, of which 388 have annotated evidence) the picks, 3.3 records and 800 characters, hold all the evidence for 69% of questions, against 57% for plain hybrid search's top 10 records and 68% for its top 27. The gain is in the questions that need more than one turn: multi-hop 13% → 28%, open-domain 15% → 27%, single-hop 73% → 83%, temporal 64% → 78% (top 10 → picks). LoCoMo was measured for evidence only; the reader study's scripts are written for LongMemEval.
+
 **Cost and time.** Planner and ranker cost $0.003 per question together ($1.47 for 500) and took 16 s at the median, 21 s at p90, with eight questions at a time on the 4-core VM. That is why the engine runs in the background by default and its picks join the session at the next tool call.
 
 **A stronger ranker for hard questions.** The planner called 49% of the questions hard. On every fifth question (100), sending those to `sonnet` instead of Haiku raised the picks holding all the evidence from 66% to 72%, but the answers hardly moved: 73% → 74% from the picks alone, 77% → 76% with the recall, at about five times the cost ($0.015 a question). Haiku stays the default; `hard_model` is there for users who want the stronger ranker.
@@ -169,6 +190,16 @@ A store is filled with LongMemEval turns: 94 needle questions whose evidence ses
 
 Later work removed the biggest remaining cost, which was not the search at all. A write used to make the next query rebuild an HNSW graph over the last memtable chunk (12 ms); memtable segments now scan their vectors instead. A query right after a write fell from 18 to **6.4 ms** at a million records (p99 45 → 16 ms), and the prompt hook, with the knowledge query running beside the main search, takes **24.9 ms** at the median and 38.6 ms at p99.
 
+**What the October changes cost.** `main` (787387d) and the changed build were compiled in separate checkouts on the same M2 MacBook Air and run one at a time on a quiet machine (1-minute load average under 3), with distillation and the query engine off, as in every timing here. One scale run per side:
+
+| records | recall query p50 / p99, main → changed | full hook p50 / p99, main → changed | needles in top 10 |
+|---|---|---|---|
+| 10,000 | 1.23 / 2.5 → 1.27 / 3.2 ms | 14.9 / 17.5 → 15.0 / 18.4 ms | 0.80 → 0.80 |
+| 100,000 | 1.65 / 4.6 → 1.64 / 5.1 ms | 15.8 / 19.6 → 16.5 / 20.4 ms | 0.65 → 0.65 |
+| 1,000,000 | 5.69 / 17.8 → 5.66 / 15.8 ms | 25.2 / 40.1 → 26.0 / 44.6 ms | 0.44 → 0.44 |
+
+At a million records the latency benchmark then ran three times per side, alternating. The prompt hook is 0.6–1.3 ms slower at the median in every pair (24.25–24.96 ms on `main`, 25.54–25.95 ms changed; +1.0 ms, 4%, on average); the cause was not isolated. Its p99 (38.9–41.0 against 40.0–45.6 ms), appends (p50 4.4–4.7 ms on both) and a query right after a write (within 0.2 ms) stay inside the run-to-run spread. The files are in `engram/results/v2/m2/`, with the machine's load before and after each run.
+
 Quality is what degrades with size: the filler here is chat on every subject, while real project history is more homogeneous, so this is a stress test rather than a forecast. Strata's filters (session, time, file, kind) are what keep large stores precise, and `memory_sql` gives the model those filters directly.
 
 ## Reproducing the recorded numbers
@@ -179,15 +210,20 @@ On the changed build, the retrieval benchmarks return the same ranking as `main`
 
 ## Limitations
 
-- **The benchmarks are chats, not coding sessions.** LongMemEval and LoCoMo test personal-assistant memory; the coding evidence is one long session, a handful of live runs and three small A/B projects.
+- **The benchmarks are chats, not coding sessions.** LongMemEval and LoCoMo test personal-assistant memory; the coding evidence is one long session, a handful of live runs and five small A/B projects.
 - **The session probes were written after seeing the answers.** They favour distinctive terms, which is why the vague set exists.
 - **The gate was fitted on chat data,** and its weights depend on the embedder.
 - **The static embedder trades quality for speed.** BGE is better on paraphrases but costs about 50 ms per record.
 - **Redaction is pattern-based.** It catches common key and token formats, not every secret.
+- **One small model everywhere.** In the memory-system comparison the agent, every memory system's own calls, and the query engine are all Haiku; the reader and judge on LongMemEval are too. A stronger agent may need memory less, or use it better.
+- **One of the four comparison projects was written alongside the changes.** Bakehouse was written to exercise what they target (revised decisions, code that changed under a note, requirements a task implies); stockroom, slotwise and kestrel are older. Results are reported per project for that reason.
+- **The competitors ran close to their defaults, with two changes this container forced.** mem0 searches with vectors only (MiniLM), because its optional keyword search and lemmatiser could not be downloaded, and calls Haiku through the `claude` CLI; claude-mem's Stop hook was made synchronous, because Claude Code cancels asynchronous Stop hooks when a headless session exits. Neither was tuned.
+- **Model-calling runs shared a 4-core VM.** Their wall times include load from the runs beside them, so only costs, steps and grades are compared across lanes.
 
 ## Next steps
 
-- A reranker behind the gate, scoring only the candidates of prompts that pass it.
+- A cheaper ranker. The query engine's gain comes from its ranker, not its extra searches, so a local cross-encoder over the recall's own candidates might keep most of it without the 16-second model round trip.
+- Keep stated preferences through the ranker: it drops the turns where a taste was stated, which costs 10 points on LongMemEval's preference questions.
 - Two-speed embeddings: capture with the static model, re-embed with BGE when the machine is idle.
 - Time-aware queries: turn "yesterday" or "before the refactor" into the time and sequence filters Strata already evaluates.
 - Hooks over HTTP to a localhost daemon, saving the process start per event: about 10 ms on macOS, 3 ms on Linux.

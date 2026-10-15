@@ -1,0 +1,119 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..3327407 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,9 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_customers.py": true,
++  "tests/test_invoice.py": true,
++  "tests/test_orders.py": true,
++  "tests/test_production.py": true,
++  "tests/test_products.py": true,
++  "tests/test_reports.py": true,
++  "tests/test_standing.py": true
++}
+\ No newline at end of file
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 91280f6..ee4216f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,7 @@
+ - Customers: route_seq must be unique, and POTTER (Potter's Farm Shop) is added as route 6.
+ - Unknown product codes are rejected; `crates_needed(units, per_crate)` rounds up to whole crates.
+ - Removed the walrus operator so the code runs on Python 3.7.
++- Invoices: `returns_credit` gives Greenway's sandwich-loaf returns half price, up to 10% of loaves delivered.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index 9d67bb0..ddd002f 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -48,6 +48,25 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Credit in pence for the unsold `returned` pieces of `product_code` from one
++    delivery of `delivered` pieces to `customer_code`.
++
++    Only Greenway's sandwich loaves earn credit: half the wholesale price per returned
++    loaf, for at most 10% of the loaves delivered (rounded down). Returns above that
++    cap are not credited. Any other customer or product gets no credit.
++    Raises ValueError if the quantities are negative or more is returned than delivered.
++    """
++    if delivered < 0 or returned < 0:
++        raise ValueError("delivered and returned must not be negative")
++    if returned > delivered:
++        raise ValueError(f"cannot return {returned} of {delivered} delivered")
++    if customer_code != "GREENWAY" or product_code != "SWL":
++        return 0
++    creditable = min(returned, delivered // 10)
++    return creditable * (catalog.get(product_code).price // 2)
++
++
+ def format_pence(pence):
+     """Display an amount in pence as pounds, e.g. 1234 -> '£12.34', -300 -> '-£3.00'."""
+     sign = "-" if pence < 0 else ""
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index db87bbd..99008bd 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -77,6 +77,46 @@ class InvoiceNumberTest(unittest.TestCase):
+             invoice_number(2026, 10000)
+ 
+ 
++class ReturnsCreditTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Product("SWL", "Sandwich loaf", 180, batch_size=16),
++            Product("BAG", "Baguette", 95, batch_size=12),
++        ])
++
++    def test_half_price_per_returned_sandwich_loaf(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 100, 5), 5 * 90)
++
++    def test_returns_up_to_ten_percent_of_delivered_are_credited(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 100, 10), 10 * 90)
++
++    def test_returns_above_ten_percent_are_not_credited(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 100, 14), 10 * 90)
++
++    def test_cap_rounds_down(self):
++        # 10% of 16 is 1.6, so only one loaf is credited
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 16, 3), 90)
++
++    def test_no_returns_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 100, 0), 0)
++
++    def test_other_customers_get_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "LUMEN", "SWL", 100, 5), 0)
++
++    def test_other_products_get_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "BAG", 100, 5), 0)
++
++    def test_negative_quantities_are_rejected(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SWL", -1, 0)
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SWL", 10, -1)
++
++    def test_cannot_return_more_than_delivered(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SWL", 10, 11)
++
++
+ class InvoiceTest(unittest.TestCase):
+     def test_total(self):
+         invoice = Invoice("LUMEN", datetime.date(2026, 10, 20), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)])

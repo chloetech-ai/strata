@@ -1,0 +1,136 @@
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..28ad653
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,39 @@
++"""Crate labels for the packing room."""
++
++import textwrap
++import unicodedata
++
++# The label printer's line length.
++LINE_WIDTH = 48
++
++
++def ascii_only(text):
++    """Plain ASCII version of `text`, with accents removed: 'Café' becomes 'Cafe'."""
++    decomposed = unicodedata.normalize("NFKD", text)
++    return decomposed.encode("ascii", "ignore").decode("ascii")
++
++
++def crate_labels(orderbook, customers, day):
++    """One label per customer and product ordered for delivery on `day`, as a list of strings.
++
++    Line 1 is the customer's name, line 2 the quantity and product name, and the
++    allergens follow in capitals. Name and product lines are cut to LINE_WIDTH.
++    Allergen text is wrapped onto further lines rather than cut, so no allergen is lost.
++    """
++    labels = []
++    for code in orderbook.customers_for(day):
++        name = ascii_only(customers[code].name)
++        totals = {}
++        for line in orderbook.lines_for(code, day):
++            totals[line.product] = totals.get(line.product, 0) + line.qty
++        for product_code in sorted(totals):
++            product = orderbook.catalog.get(product_code)
++            lines = [
++                name[:LINE_WIDTH],
++                f"{totals[product_code]} x {ascii_only(product.name)}"[:LINE_WIDTH],
++            ]
++            allergens = ascii_only(product.allergen_text()).upper()
++            if allergens:
++                lines.extend(textwrap.wrap(allergens, LINE_WIDTH))
++            labels.append("\n".join(lines))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..06ef99b
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,85 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import LINE_WIDTH, ascii_only, crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++OTHER_DAY = datetime.date(2026, 10, 21)
++
++
++def _book(lines, products=None):
++    catalog = Catalog(products or [
++        Product("BAG", "Baguette", 95, allergens=("wheat",)),
++        Product("FLO", "Florentine", 90, allergens=("nuts", "milk")),
++        Product("SOU", "White sourdough", 320),
++    ])
++    return OrderBook(catalog, [OrderLine(*line) for line in lines])
++
++
++CUSTOMERS = {
++    "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++    "HARBOUR": Customer("HARBOUR", "Harbour Deli", "3 Quay Street", "LK2 7QS", 2),
++}
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def test_one_label_per_customer_and_product_for_the_day(self):
++        book = _book([
++            (DAY, "HARBOUR", "BAG", 12),
++            (DAY, "LUMEN", "BAG", 6),
++            (DAY, "LUMEN", "FLO", 4),
++        ])
++        labels = crate_labels(book, CUSTOMERS, DAY)
++        self.assertEqual(labels, [
++            "Harbour Deli\n12 x Baguette\nWHEAT",
++            "Cafe Lumen\n6 x Baguette\nWHEAT",
++            "Cafe Lumen\n4 x Florentine\nMILK, NUTS",
++        ])
++
++    def test_other_days_are_left_out(self):
++        book = _book([(OTHER_DAY, "LUMEN", "BAG", 6)])
++        self.assertEqual(crate_labels(book, CUSTOMERS, DAY), [])
++
++    def test_quantities_for_the_same_product_are_summed(self):
++        book = _book([(DAY, "LUMEN", "BAG", 2), (DAY, "LUMEN", "BAG", 3)])
++        self.assertEqual(crate_labels(book, CUSTOMERS, DAY), ["Cafe Lumen\n5 x Baguette\nWHEAT"])
++
++    def test_product_without_allergens_has_no_allergen_line(self):
++        book = _book([(DAY, "LUMEN", "SOU", 1)])
++        self.assertEqual(crate_labels(book, CUSTOMERS, DAY), ["Cafe Lumen\n1 x White sourdough"])
++
++    def test_accents_are_removed(self):
++        self.assertEqual(ascii_only("Brötchen Café"), "Brotchen Cafe")
++
++    def test_long_name_is_cut_to_line_width(self):
++        customers = {"LONG": Customer("LONG", "A" * 60, "x", "y", 1)}
++        book = _book([(DAY, "LONG", "SOU", 1)])
++        first_line = crate_labels(book, customers, DAY)[0].split("\n")[0]
++        self.assertEqual(first_line, "A" * LINE_WIDTH)
++
++    def test_long_allergen_list_wraps_without_losing_any_allergen(self):
++        many = tuple(f"allergen{i:02d}" for i in range(12))
++        catalog_products = [Product("MIX", "Mixed", 100, allergens=many)]
++        book = _book([(DAY, "LUMEN", "MIX", 1)], products=catalog_products)
++        lines = crate_labels(book, CUSTOMERS, DAY)[0].split("\n")
++        self.assertGreater(len(lines), 3)
++        allergen_text = " ".join(lines[2:])
++        for name in many:
++            self.assertIn(name.upper(), allergen_text)
++
++    def test_every_line_fits_and_is_ascii(self):
++        book = _book([
++            (DAY, "LUMEN", "FLO", 4),
++            (DAY, "LUMEN", "BAG", 6),
++        ])
++        for label in crate_labels(book, CUSTOMERS, DAY):
++            for line in label.split("\n"):
++                self.assertLessEqual(len(line), LINE_WIDTH)
++                line.encode("ascii")
++
++
++if __name__ == "__main__":
++    unittest.main()

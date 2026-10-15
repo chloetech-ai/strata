@@ -1,0 +1,78 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index 9d67bb0..1876200 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -1,5 +1,6 @@
+ """Invoices. All amounts are integer pence."""
+ 
++import csv
+ import datetime
+ from dataclasses import dataclass, field
+ from typing import List
+@@ -48,6 +49,16 @@ def invoice_number(year, seq):
+     return f"LK-{year}-{seq:04d}"
+ 
+ 
++def export_invoices(invoices, path):
++    """Write one row per invoice (date, customer code, total in pence) to a CSV file at
++    `path`, for the VAT return. The caller passes in the quarter's invoices."""
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(["date", "customer", "total_pence"])
++        for invoice in sorted(invoices, key=lambda i: (i.day, i.customer)):
++            writer.writerow([invoice.day.isoformat(), invoice.customer, invoice.total()])
++
++
+ def format_pence(pence):
+     """Display an amount in pence as pounds, e.g. 1234 -> '£12.34', -300 -> '-£3.00'."""
+     sign = "-" if pence < 0 else ""
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index db87bbd..d72a336 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,10 @@
++import csv
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, export_invoices, format_pence, invoice_for, invoice_number
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -77,6 +80,33 @@ class InvoiceNumberTest(unittest.TestCase):
+             invoice_number(2026, 10000)
+ 
+ 
++class ExportInvoicesTest(unittest.TestCase):
++    def test_one_row_per_invoice_sorted_by_day_then_customer(self):
++        invoices = [
++            Invoice("LUMEN", datetime.date(2026, 10, 21), [InvoiceLine("BAG", 3, 95)]),
++            Invoice("GREENWAY", DAY, [InvoiceLine("SOU", 2, 320)]),
++            Invoice("LUMEN", DAY, [InvoiceLine("BAG", 8, 95), InvoiceLine("SOU", 6, 320)]),
++        ]
++        with tempfile.TemporaryDirectory() as folder:
++            path = os.path.join(folder, "invoices.csv")
++            export_invoices(invoices, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                rows = list(csv.reader(f))
++        self.assertEqual(rows, [
++            ["date", "customer", "total_pence"],
++            ["2026-10-20", "GREENWAY", "640"],
++            ["2026-10-20", "LUMEN", str(8 * 95 + 6 * 320)],
++            ["2026-10-21", "LUMEN", "285"],
++        ])
++
++    def test_no_invoices_writes_only_header(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = os.path.join(folder, "invoices.csv")
++            export_invoices([], path)
++            with open(path, newline="", encoding="utf-8") as f:
++                self.assertEqual(list(csv.reader(f)), [["date", "customer", "total_pence"]])
++
++
+ class InvoiceTest(unittest.TestCase):
+     def test_total(self):
+         invoice = Invoice("LUMEN", datetime.date(2026, 10, 20), [InvoiceLine("CRO", 24, 110), InvoiceLine("SOU", 6, 320)])

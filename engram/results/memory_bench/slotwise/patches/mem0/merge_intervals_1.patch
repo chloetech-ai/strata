@@ -1,0 +1,68 @@
+diff --git a/src/slotwise/intervals.py b/src/slotwise/intervals.py
+new file mode 100644
+index 0000000..874166a
+--- /dev/null
++++ b/src/slotwise/intervals.py
+@@ -0,0 +1,16 @@
++"""Helpers for working with (start, end) intervals."""
++
++
++def merge_intervals(intervals):
++    """Merge overlapping or touching (start, end) pairs.
++
++    Accepts ints or datetimes. Returns a new list of (start, end) tuples sorted
++    by start; the input list is not modified.
++    """
++    merged = []
++    for start, end in sorted(intervals):
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..ba492a7
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,40 @@
++import datetime
++import unittest
++
++from slotwise.intervals import merge_intervals
++
++DT = datetime.datetime
++
++
++class MergeIntervalsTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(merge_intervals([]), [])
++
++    def test_disjoint_sorted_by_start(self):
++        self.assertEqual(merge_intervals([(5, 6), (1, 2)]), [(1, 2), (5, 6)])
++
++    def test_overlapping_and_touching_merge(self):
++        self.assertEqual(merge_intervals([(1, 4), (3, 6), (6, 8)]), [(1, 8)])
++
++    def test_contained_interval_does_not_shrink(self):
++        self.assertEqual(merge_intervals([(1, 10), (2, 3)]), [(1, 10)])
++
++    def test_datetimes(self):
++        result = merge_intervals([
++            (DT(2026, 10, 15, 10, 0), DT(2026, 10, 15, 10, 30)),
++            (DT(2026, 10, 15, 9, 0), DT(2026, 10, 15, 10, 0)),
++            (DT(2026, 10, 15, 11, 0), DT(2026, 10, 15, 11, 30)),
++        ])
++        self.assertEqual(result, [
++            (DT(2026, 10, 15, 9, 0), DT(2026, 10, 15, 10, 30)),
++            (DT(2026, 10, 15, 11, 0), DT(2026, 10, 15, 11, 30)),
++        ])
++
++    def test_input_not_modified(self):
++        intervals = [(5, 6), (1, 4), (3, 7)]
++        merge_intervals(intervals)
++        self.assertEqual(intervals, [(5, 6), (1, 4), (3, 7)])
++
++
++if __name__ == "__main__":
++    unittest.main()

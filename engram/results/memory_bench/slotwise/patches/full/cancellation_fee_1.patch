@@ -1,0 +1,90 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 0b192c0..8230949 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -6,6 +6,13 @@
+   "tests/test_clients.py::ClientBookTest::test_search_matches_any_part_of_name_ignoring_case",
+   "tests/test_clients.py::ClientBookTest::test_unknown_number",
+   "tests/test_clients.py::NormalizePhoneTest::test_all_formats_match",
++  "tests/test_fees.py::CancellationFeeTest::test_after_start_is_full_price",
++  "tests/test_fees.py::CancellationFeeTest::test_exactly_24_hours_is_half_price",
++  "tests/test_fees.py::CancellationFeeTest::test_exactly_48_hours_is_free",
++  "tests/test_fees.py::CancellationFeeTest::test_half_price_rounds_down_to_whole_cents",
++  "tests/test_fees.py::CancellationFeeTest::test_more_than_48_hours_is_free",
++  "tests/test_fees.py::CancellationFeeTest::test_under_24_hours_is_full_price",
++  "tests/test_fees.py::CancellationFeeTest::test_under_48_hours_is_half_price",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..00ae172
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,17 @@
++"""Cancellation fees."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours' notice pays the full price, less than 48 hours pays half,
++    and 48 hours or more is free. Half prices round down to whole cents.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..970980d
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,43 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++START = datetime.datetime(2026, 9, 10, 9, 0)  # a Thursday
++
++
++def booked(treatment="standard"):
++    return Appointment("lena", "Kim Weber", START, treatment)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def fee_with_notice(self, hours, treatment="standard"):
++        return cancellation_fee(booked(treatment), START - datetime.timedelta(hours=hours))
++
++    def test_more_than_48_hours_is_free(self):
++        self.assertEqual(self.fee_with_notice(49), 0)
++
++    def test_exactly_48_hours_is_free(self):
++        self.assertEqual(self.fee_with_notice(48), 0)
++
++    def test_under_48_hours_is_half_price(self):
++        self.assertEqual(self.fee_with_notice(47), 4900)  # standard is 9800
++
++    def test_exactly_24_hours_is_half_price(self):
++        self.assertEqual(self.fee_with_notice(24, "initial"), 7250)
++
++    def test_under_24_hours_is_full_price(self):
++        self.assertEqual(self.fee_with_notice(23), 9800)
++
++    def test_after_start_is_full_price(self):
++        self.assertEqual(self.fee_with_notice(-1), 9800)
++
++    def test_half_price_rounds_down_to_whole_cents(self):
++        appointment = booked()
++        appointment.treatment = "short"  # 6800, so half is 3400
++        self.assertEqual(cancellation_fee(appointment, START - datetime.timedelta(hours=30)), 3400)
++
++
++if __name__ == "__main__":
++    unittest.main()

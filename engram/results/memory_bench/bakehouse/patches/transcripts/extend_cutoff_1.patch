@@ -1,0 +1,27 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 05a3f86..69aff97 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@
+ - Standing orders expand weekly lines into dated order lines.
+ - Order book: reject unknown product codes; add `remove`, `days`, `lines_for`, `total_for`, `customers_for` and `len()`.
+ - Order cutoff moved to 13:00.
++- Order cutoff moved to 13:30, giving customers an extra half hour.
+ - Customers: optional `email` column; duplicate `route_seq` values are rejected; Potter's Farm Shop added on route 6.
+ - Products: `price_text` and `allergen_text` helpers.
+ - Production: `total_batches`, `crates_needed` (whole crates, rounded up), and `dough_weight_g` rejects negative units.
+diff --git a/src/bakehouse/config.py b/src/bakehouse/config.py
+index 8636bbf..65ee4fe 100644
+--- a/src/bakehouse/config.py
++++ b/src/bakehouse/config.py
+@@ -5,8 +5,8 @@ import datetime
+ BAKERY_NAME = "Larkspur Bakery"
+ 
+ # Orders for a delivery day must be in by this time on the day before.
+-# 13:00 because the mill now wants our flour order by 13:30.
+-ORDER_CUTOFF = datetime.time(13, 0)
++# 13:30 at Greta's request, giving customers an extra half hour.
++ORDER_CUTOFF = datetime.time(13, 30)
+ 
+ # Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).
+ # Monday since November: we have the stall at the Sunday farmers' market.

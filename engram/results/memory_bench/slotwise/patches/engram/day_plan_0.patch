@@ -1,0 +1,104 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index c7432be..58ffddd 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -9,6 +9,10 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_printing.py::DayPlanTest::test_empty_day",
++  "tests/test_printing.py::DayPlanTest::test_leaves_out_cancelled_and_other_therapists",
++  "tests/test_printing.py::DayPlanTest::test_lists_appointments_in_time_order",
++  "tests/test_printing.py::DayPlanTest::test_no_line_is_wider_than_the_printer",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_back_to_back_is_free",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..8466ce3
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,22 @@
++"""Printable text for the reception's receipt printer."""
++
++import textwrap
++
++# The receipt printer prints 42 characters a line; longer lines wrap into a mess.
++LINE_WIDTH = 42
++
++
++def day_plan(schedule, therapist, day):
++    """Text of `therapist`'s active appointments on `day`, by start time, for reception to print."""
++    lines = [f"Day plan: {therapist}", f"{day:%A %d %B %Y}", ""]
++    appointments = [a for a in schedule.appointments_for(therapist, day) if not a.cancelled]
++    if not appointments:
++        lines.append("No appointments.")
++    for a in appointments:
++        lines.append(f"{a.start:%H:%M}-{a.end:%H:%M} {a.client}, {a.treatment}")
++    return "\n".join(line for text in lines for line in _wrap(text))
++
++
++def _wrap(text):
++    """`text` split into lines that fit the printer, continuation lines indented."""
++    return textwrap.wrap(text, LINE_WIDTH, subsequent_indent="      ") or [""]
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..a4d636d
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,55 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.printing import LINE_WIDTH, day_plan
++from slotwise.schedule import Schedule
++
++DAY = datetime.date(2026, 9, 8)
++
++
++def at(hour, minute=0, therapist="lena", treatment="standard", client="Kim Weber"):
++    return Appointment(therapist, client, datetime.datetime(2026, 9, 8, hour, minute), treatment)
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_appointments_in_time_order(self):
++        s = Schedule()
++        s.book(at(10, client="Jo Li", treatment="short"))
++        s.book(at(9))
++        text = day_plan(s, "lena", DAY)
++        self.assertEqual(
++            text,
++            "Day plan: lena\n"
++            "Tuesday 08 September 2026\n"
++            "\n"
++            "09:00-09:45 Kim Weber, standard\n"
++            "10:00-10:30 Jo Li, short",
++        )
++
++    def test_empty_day(self):
++        self.assertIn("No appointments.", day_plan(Schedule(), "lena", DAY))
++
++    def test_leaves_out_cancelled_and_other_therapists(self):
++        s = Schedule()
++        s.book(at(9))
++        s.book(at(11, client="Jo Li"))
++        s.book(at(12, therapist="sam"))
++        s.cancel(s.appointments[0].id)
++        text = day_plan(s, "lena", DAY)
++        self.assertNotIn("Kim Weber", text)
++        self.assertIn("11:00-11:45 Jo Li, standard", text)
++        self.assertNotIn("sam", text)
++
++    def test_no_line_is_wider_than_the_printer(self):
++        s = Schedule()
++        s.book(at(9, client="Maximiliane Konstantinopoulou-Esterhazy von Berchtesgaden"))
++        s.book(at(11, therapist="Dr. Annemarie Vanderbilt-Hohenstaufen"))
++        for line in day_plan(s, "lena", DAY).split("\n"):
++            self.assertLessEqual(len(line), LINE_WIDTH, line)
++        for line in day_plan(s, "Dr. Annemarie Vanderbilt-Hohenstaufen", DAY).split("\n"):
++            self.assertLessEqual(len(line), LINE_WIDTH, line)
++
++
++if __name__ == "__main__":
++    unittest.main()

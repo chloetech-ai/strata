@@ -1,0 +1,38 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..201fe25 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,7 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_clients.py": true,
++  "tests/test_hours.py": true,
++  "tests/test_model.py": true,
++  "tests/test_schedule.py": true,
++  "tests/test_storage.py": true
++}
+\ No newline at end of file
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..909bc69
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,17 @@
++"""Printable documents for reception."""
++
++from .model import CANCELLED
++
++
++def day_plan(schedule, therapist, day):
++    """Text day plan for `therapist` on `day` (a date), listing booked appointments in start order.
++
++    Cancelled appointments are left out, as they no longer take up the therapist's time.
++    """
++    appointments = [a for a in schedule.appointments_for(therapist, day) if a.status != CANCELLED]
++    lines = [f"{therapist.title()} — {day:%A %d %B %Y}", ""]
++    if not appointments:
++        lines.append("No appointments.")
++    for a in appointments:
++        lines.append(f"{a.start:%H:%M}–{a.end:%H:%M}  {a.client}  ({a.treatment})")
++    return "\n".join(lines) + "\n"

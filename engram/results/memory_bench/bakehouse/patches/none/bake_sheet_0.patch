@@ -1,0 +1,86 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f3e54c7..b243b49 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,7 +18,7 @@
+ - Added Potter's Farm Shop (POTTER) to customers.csv, route 6. Joins next month.
+ - Added `invoice.invoice_number(year, seq)`: invoice numbers such as 'LK-2026-0001'. Sequence must be 1 to 9999.
+ - Added `production.crates_needed(units, per_crate)`: whole crates needed, rounding a partial crate up.
+-- Planned: the bake sheet lists products hottest oven first, to avoid reheating the deck oven after its overnight cool-down.
++- Added `production.bake_sheet(orderbook, day)`: the bake sheet as text, one line per product with name, units, batches and grams of dough to weigh out. Products are listed hottest oven first, to avoid reheating the deck oven after its overnight cool-down.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/bakehouse/production.py b/src/bakehouse/production.py
+index 02ccb26..c835a28 100644
+--- a/src/bakehouse/production.py
++++ b/src/bakehouse/production.py
+@@ -35,3 +35,20 @@ def plan(orderbook, day):
+ def total_batches(plan_result):
+     """Trays for the oven: one tray holds one batch, so this is the batches summed over all products."""
+     return sum(batches for _units, batches in plan_result.values())
++
++
++def bake_sheet(orderbook, day):
++    """The bake sheet for `day` as text: one line per product, hottest oven first.
++
++    Each line gives the product name, units, batches and the grams of dough to weigh out.
++    """
++    rows = plan(orderbook, day)
++    catalog = orderbook.catalog
++    products = sorted((catalog.get(code) for code in rows), key=lambda p: -p.bake_temp)
++    width = max((len(p.name) for p in products), default=0)
++    lines = []
++    for product in products:
++        units, batches = rows[product.code]
++        grams = dough_weight_g(product, units)
++        lines.append(f"{product.name:<{width}}  {units:>5} units  {batches:>3} batches  {grams:>7} g dough")
++    return "\n".join(lines)
+diff --git a/tests/test_production.py b/tests/test_production.py
+index 4a9f54e..556f50d 100644
+--- a/tests/test_production.py
++++ b/tests/test_production.py
+@@ -2,7 +2,7 @@ import datetime
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+-from bakehouse.production import batches_needed, crates_needed, dough_weight_g, plan, total_batches
++from bakehouse.production import bake_sheet, batches_needed, crates_needed, dough_weight_g, plan, total_batches
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -57,6 +57,34 @@ class ProductionTest(unittest.TestCase):
+     def test_total_batches_of_empty_plan_is_zero(self):
+         self.assertEqual(total_batches({}), 0)
+ 
++    def test_bake_sheet_lists_hottest_oven_first(self):
++        catalog = Catalog([
++            Product("BAG", "Baguette", 95, batch_size=12, dough_g=300, bake_temp=240),
++            Product("SOU", "White sourdough", 320, batch_size=10, dough_g=800, bake_temp=230),
++            Product("CRO", "Croissant", 110, batch_size=6, dough_g=90, bake_temp=200),
++        ])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "CRO", 6),
++            OrderLine(DAY, "LUMEN", "SOU", 10),
++            OrderLine(DAY, "GREENWAY", "BAG", 25),
++        ])
++        lines = bake_sheet(book, DAY).split("\n")
++        self.assertEqual(len(lines), 3)
++        self.assertIn("Baguette", lines[0])
++        self.assertIn("25 units", lines[0])
++        self.assertIn("3 batches", lines[0])
++        self.assertIn("7500 g dough", lines[0])
++        self.assertIn("White sourdough", lines[1])
++        self.assertIn("10 units", lines[1])
++        self.assertIn("1 batches", lines[1])
++        self.assertIn("8000 g dough", lines[1])
++        self.assertIn("Croissant", lines[2])
++        self.assertIn("540 g dough", lines[2])
++
++    def test_bake_sheet_is_empty_when_nothing_is_ordered(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12, dough_g=300, bake_temp=240)])
++        self.assertEqual(bake_sheet(OrderBook(catalog), DAY), "")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

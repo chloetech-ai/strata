@@ -1,0 +1,87 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index 7e3854b..39fce8f 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -39,6 +39,26 @@ def invoice_for(orderbook, customer, day):
+     return Invoice(customer, day, lines)
+ 
+ 
++# Sale-or-return applies only to this customer and product.
++RETURNS_CUSTOMER = "GREENWAY"
++RETURNS_PRODUCT = "SWL"
++
++
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Credit in pence for loaves `customer_code` sent back from one delivery.
++
++    Only Greenway's sandwich loaves are sale-or-return: each returned loaf earns half its
++    wholesale price, but at most 10% of the loaves delivered that day are credited
++    (rounded down); returns above that are not credited. Anything else earns no credit.
++    """
++    if delivered < 0 or returned < 0:
++        raise ValueError("delivered and returned must not be negative")
++    if customer_code != RETURNS_CUSTOMER or product_code != RETURNS_PRODUCT:
++        return 0
++    creditable = min(returned, delivered // 10)
++    return creditable * catalog.get(product_code).price // 2
++
++
+ def invoice_number(year, seq):
+     """Invoice number such as 'LK-2026-0001': the year, then a running number that restarts each year."""
+     if not 1 <= seq <= 9999:
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 090f2a6..b661e48 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -64,6 +64,42 @@ class InvoiceNumberTest(unittest.TestCase):
+             invoice_number(2026, 10000)
+ 
+ 
++class ReturnsCreditTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([Product("SWL", "Sandwich loaf", 180), Product("SOU", "White sourdough", 320)])
++
++    def test_half_the_wholesale_price_per_returned_loaf(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 100, 4), 4 * 90)
++
++    def test_returns_above_ten_percent_of_delivered_are_not_credited(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 100, 15), 10 * 90)
++
++    def test_ten_percent_cap_rounds_down(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 25, 5), 2 * 90)
++
++    def test_no_credit_below_ten_delivered(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 9, 5), 0)
++
++    def test_odd_price_rounds_credit_down_to_whole_pence(self):
++        catalog = Catalog([Product("SWL", "Sandwich loaf", 185)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "SWL", 100, 3), 3 * 185 // 2)
++
++    def test_other_customers_earn_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "LUMEN", "SWL", 100, 4), 0)
++
++    def test_other_products_earn_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SOU", 100, 4), 0)
++
++    def test_nothing_returned_gives_no_credit(self):
++        self.assertEqual(returns_credit(self.catalog, "GREENWAY", "SWL", 100, 0), 0)
++
++    def test_negative_counts_are_rejected(self):
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SWL", -1, 0)
++        with self.assertRaises(ValueError):
++            returns_credit(self.catalog, "GREENWAY", "SWL", 10, -1)
++
++
+ class FormatPenceTest(unittest.TestCase):
+     def test_pounds_and_pence(self):
+         self.assertEqual(format_pence(1234), "£12.34")

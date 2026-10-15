@@ -1,0 +1,91 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3996565..9b0b7dc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@
+ - Added `Schedule.week(therapist, monday)`: a therapist's booked appointments for the seven days from `monday`, keyed by date, each day sorted by start time. Cancelled appointments are left out.
+ - Added `Schedule.book_series(therapist, client, start, sessions, treatment="standard")`: weekly appointments at the same weekday and time. A week already taken is skipped and a later week is added, so the client still gets every session. Series are capped at 9 sessions (`SeriesTooLong`, a new `BookingError`).
+ - Added `slotwise.clients`: `Client` (id, name, phone, email) and `ClientBook`, a register with `add(client)` and `find_by_phone(phone)`. Phone numbers are matched after normalizing, so "079 123 45 67", "+41 79 123 45 67" and "0041791234567" all find the same client. National numbers with a leading 0 are read as Swiss. `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case and surrounding spaces.
++- Added `slotwise.fees.cancellation_fee(appointment, cancelled_at)`: the fee in cents. Under 24 hours before the start it is the full price, under 48 hours half the price (rounded down to whole cents), and 48 hours or more before it is free.
+ - Added `slotwise.reminders`: `reminder(appointment)` builds the SMS text. It is plain ASCII (umlauts spelled out, so "Brändli" becomes "Braendli"), includes the reception number 044 512 77 30, and raises `ValueError` rather than exceed 160 characters.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..5230faf
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,20 @@
++"""Cancellation fees, charged when a client cancels close to the appointment."""
++
++import datetime
++
++from .model import Appointment
++
++
++def cancellation_fee(appointment: Appointment, cancelled_at: datetime.datetime) -> int:
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Under 24 hours before the start the fee is the full price, under 48 hours
++    it is half the price (rounded down to whole cents), and 48 hours or more
++    before the start it is free.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..a4046d3
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,47 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++START = datetime.datetime(2026, 9, 8, 10, 0)
++
++
++def appt(treatment="standard"):
++    return Appointment("lena", "Kim Weber", START, treatment)
++
++
++def before(hours):
++    return START - datetime.timedelta(hours=hours)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def test_more_than_48_hours_is_free(self):
++        self.assertEqual(cancellation_fee(appt(), before(72)), 0)
++
++    def test_exactly_48_hours_is_free(self):
++        self.assertEqual(cancellation_fee(appt(), before(48)), 0)
++
++    def test_just_under_48_hours_is_half(self):
++        a = appt()
++        self.assertEqual(cancellation_fee(a, before(48) + datetime.timedelta(minutes=1)), a.price // 2)
++
++    def test_exactly_24_hours_is_half(self):
++        a = appt()
++        self.assertEqual(cancellation_fee(a, before(24)), a.price // 2)
++
++    def test_just_under_24_hours_is_full(self):
++        a = appt()
++        self.assertEqual(cancellation_fee(a, before(24) + datetime.timedelta(minutes=1)), a.price)
++
++    def test_after_start_is_full(self):
++        a = appt()
++        self.assertEqual(cancellation_fee(a, before(-1)), a.price)
++
++    def test_half_fee_uses_the_treatment_price(self):
++        self.assertEqual(cancellation_fee(appt("initial"), before(30)), 7250)
++        self.assertEqual(cancellation_fee(appt("short"), before(30)), 3400)
++
++
++if __name__ == "__main__":
++    unittest.main()

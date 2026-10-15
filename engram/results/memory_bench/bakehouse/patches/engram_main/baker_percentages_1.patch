@@ -1,0 +1,55 @@
+diff --git a/src/bakehouse/recipes.py b/src/bakehouse/recipes.py
+new file mode 100644
+index 0000000..9420c66
+--- /dev/null
++++ b/src/bakehouse/recipes.py
+@@ -0,0 +1,13 @@
++"""Recipe helpers: ingredient weights expressed relative to the flour."""
++
++
++def baker_percentages(recipe):
++    """{ingredient: percent of total flour weight}, rounded to one decimal.
++
++    `recipe` maps ingredient names to grams. Any ingredient whose name contains
++    'flour' (any case) counts as flour, so flour itself shows as a percentage of the total.
++    """
++    flour_g = sum(grams for name, grams in recipe.items() if "flour" in name.lower())
++    if flour_g <= 0:
++        raise ValueError("recipe needs flour to calculate baker's percentages")
++    return {name: round(grams * 100 / flour_g, 1) for name, grams in recipe.items()}
+diff --git a/tests/test_recipes.py b/tests/test_recipes.py
+new file mode 100644
+index 0000000..fae1389
+--- /dev/null
++++ b/tests/test_recipes.py
+@@ -0,0 +1,30 @@
++import unittest
++
++from bakehouse.recipes import baker_percentages
++
++
++class BakerPercentagesTest(unittest.TestCase):
++    def test_percentages_are_of_total_flour(self):
++        recipe = {"strong white flour": 500, "wholemeal flour": 100, "water": 350, "salt": 10}
++        self.assertEqual(
++            baker_percentages(recipe),
++            {"strong white flour": 83.3, "wholemeal flour": 16.7, "water": 58.3, "salt": 1.7},
++        )
++
++    def test_flour_matching_ignores_case(self):
++        self.assertEqual(
++            baker_percentages({"FLOUR": 200, "Water": 140}),
++            {"FLOUR": 100.0, "Water": 70.0},
++        )
++
++    def test_recipe_without_flour_is_rejected(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"water": 350, "salt": 10})
++
++    def test_zero_flour_is_rejected(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"white flour": 0, "water": 350})
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,67 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 2b7f5b6..3327407 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -4,5 +4,6 @@
+   "tests/test_orders.py": true,
+   "tests/test_production.py": true,
+   "tests/test_products.py": true,
+-  "tests/test_reports.py": true
++  "tests/test_reports.py": true,
++  "tests/test_standing.py": true
+ }
+\ No newline at end of file
+diff --git a/src/bakehouse/production.py b/src/bakehouse/production.py
+index 1bad234..56b5645 100644
+--- a/src/bakehouse/production.py
++++ b/src/bakehouse/production.py
+@@ -33,3 +33,16 @@ def plan(orderbook, day):
+ def total_batches(plan_result):
+     """Trays in the oven: the total number of batches across all products in a plan."""
+     return sum(batches for _units, batches in plan_result.values())
++
++
++def bake_sheet(orderbook, day):
++    """The bake sheet for `day` as text: one line per product with its units, batches and dough weight."""
++    rows = plan(orderbook, day)
++    if not rows:
++        return f"Nothing to bake for {day.isoformat()}."
++    lines = []
++    for code, (units, batches) in rows.items():
++        product = orderbook.catalog.get(code)
++        grams = dough_weight_g(product, units)
++        lines.append(f"{product.name}: {units} units, {batches} batches, {grams} g dough")
++    return "\n".join(lines)
+diff --git a/tests/test_production.py b/tests/test_production.py
+index 37ab35b..0c08ec1 100644
+--- a/tests/test_production.py
++++ b/tests/test_production.py
+@@ -2,7 +2,7 @@ import datetime
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+-from bakehouse.production import batches_needed, crates_needed, dough_weight_g, plan, total_batches
++from bakehouse.production import bake_sheet, batches_needed, crates_needed, dough_weight_g, plan, total_batches
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -57,6 +57,19 @@ class ProductionTest(unittest.TestCase):
+         ])
+         self.assertEqual(plan(book, DAY), {"BAG": (5, 1)})
+ 
++    def test_bake_sheet_has_a_line_per_product(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12, dough_g=350), Product("SOU", "White sourdough", 320, batch_size=10, dough_g=800)])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "GREENWAY", "BAG", 20),
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY, "LUMEN", "SOU", 10),
++        ])
++        self.assertEqual(bake_sheet(book, DAY), "Baguette: 25 units, 3 batches, 8750 g dough\nWhite sourdough: 10 units, 1 batches, 8000 g dough")
++
++    def test_bake_sheet_says_so_when_nothing_is_ordered(self):
++        book = OrderBook(Catalog([]))
++        self.assertEqual(bake_sheet(book, DAY), "Nothing to bake for 2026-10-20.")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

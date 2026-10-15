@@ -1,0 +1,108 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index d770a02..c29a702 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -11,6 +11,12 @@
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_accents_are_dropped",
++  "tests/test_reminders.py::ReminderTextTest::test_german_letters_are_spelled_out",
++  "tests/test_reminders.py::ReminderTextTest::test_letters_without_a_latin_equivalent_become_question_marks",
++  "tests/test_reminders.py::ReminderTextTest::test_long_name_drops_the_greeting",
++  "tests/test_reminders.py::ReminderTextTest::test_message_that_cannot_fit_is_refused",
++  "tests/test_reminders.py::ReminderTextTest::test_names_the_client_time_therapist_and_reception",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_break_after_is_enough_at_ten_minutes",
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..0110661
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,36 @@
++"""The reminder SMS sent to clients before their appointment."""
++
++import unicodedata
++
++PRACTICE = "Lindqvist Physio"
++RECEPTION = "044 512 77 30"
++# One SMS segment in the GSM alphabet.
++LIMIT = 160
++
++# German letters have a conventional Latin spelling. NFKD would turn 'ä' into 'a', so these run first.
++_GERMAN = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
++
++
++def _ascii(text):
++    """`text` in plain ASCII: accents dropped, and characters with no Latin equivalent become '?'."""
++    decomposed = unicodedata.normalize("NFKD", text.translate(_GERMAN))
++    unaccented = "".join(c for c in decomposed if not unicodedata.combining(c))
++    return unaccented.encode("ascii", "replace").decode("ascii")
++
++
++def reminder_text(appointment):
++    """The reminder for `appointment`, in ASCII and at most LIMIT characters.
++
++    The greeting with the client's name is dropped if the name makes the message too long.
++    """
++    when = f"{appointment.start:%a} {appointment.start.day} {appointment.start:%b} at {appointment.start:%H:%M}"
++    body = (
++        f"{PRACTICE}: reminder of your appointment on {when} "
++        f"with {appointment.therapist.capitalize()}. Questions? Call {RECEPTION}."
++    )
++    text = _ascii(f"Hi {appointment.client}, {body}")
++    if len(text) > LIMIT:
++        text = _ascii(body)
++    if len(text) > LIMIT:
++        raise ValueError(f"reminder for appointment {appointment.id} is {len(text)} characters, over {LIMIT}")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..45896e9
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,43 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import LIMIT, reminder_text
++
++
++def appointment(client="Kim Weber", therapist="lena"):
++    return Appointment(therapist, client, datetime.datetime(2026, 10, 22, 9, 0))
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_names_the_client_time_therapist_and_reception(self):
++        text = reminder_text(appointment())
++        self.assertEqual(
++            text,
++            "Hi Kim Weber, Lindqvist Physio: reminder of your appointment on Thu 22 Oct at 09:00 "
++            "with Lena. Questions? Call 044 512 77 30.",
++        )
++
++    def test_german_letters_are_spelled_out(self):
++        text = reminder_text(appointment(client="Jürg Müller-Großmann"))
++        self.assertIn("Hi Juerg Mueller-Grossmann,", text)
++        self.assertTrue(text.isascii())
++
++    def test_accents_are_dropped(self):
++        self.assertIn("Hi Renee Gonzalez,", reminder_text(appointment(client="Renée González")))
++
++    def test_letters_without_a_latin_equivalent_become_question_marks(self):
++        self.assertIn("Hi Li ?,", reminder_text(appointment(client="Li 李")))
++
++    def test_long_name_drops_the_greeting(self):
++        text = reminder_text(appointment(client="A" * 150))
++        self.assertTrue(text.startswith("Lindqvist Physio:"))
++        self.assertLessEqual(len(text), LIMIT)
++
++    def test_message_that_cannot_fit_is_refused(self):
++        with self.assertRaises(ValueError):
++            reminder_text(appointment(therapist="x" * 150))
++
++
++if __name__ == "__main__":
++    unittest.main()

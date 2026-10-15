@@ -1,0 +1,43 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 23af53c..43196b5 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,12 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_finds_client_by_any_phone_format",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_any_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_returns_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_second_client_with_same_phone_is_refused",
++  "tests/test_clients.py::ClientBookTest::test_unknown_phone_returns_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_formats_give_the_same_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_non_numbers",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_numbers_without_country_code_or_leading_zero",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..33e2396
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,20 @@
++"""Cancellation fees for Lindqvist Physio."""
++
++import datetime
++
++from .model import Appointment
++
++
++def cancellation_fee(appointment: Appointment, cancelled_at: datetime.datetime) -> int:
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Cancelling 48 hours or more ahead is free, less than 48 hours ahead
++    costs half the treatment price, and less than 24 hours ahead costs
++    the full treatment price.
++    """
++    notice = appointment.start - cancelled_at
++    if notice >= datetime.timedelta(hours=48):
++        return 0
++    if notice >= datetime.timedelta(hours=24):
++        return appointment.price // 2
++    return appointment.price

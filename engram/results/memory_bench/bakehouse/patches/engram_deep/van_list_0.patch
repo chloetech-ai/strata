@@ -1,0 +1,107 @@
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..e3d7912
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,23 @@
++"""The van's run: the drops for a delivery day."""
++
++import csv
++
++# Stopwise refuses any import whose header differs from this exactly.
++DROPS_HEADER = ["Name", "Address", "Postcode", "Notes"]
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes the van's drops for `day` to `path` as a Stopwise CSV, one row per customer
++    who has orders that day, in driving order (route_seq). `customers` is the dict from
++    load_customers."""
++    stops = []
++    for code in orderbook.customers_for(day):
++        if code not in customers:
++            raise ValueError(f"no customer record for code {code}")
++        stops.append(customers[code])
++    stops.sort(key=lambda c: c.route_seq)
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(DROPS_HEADER)
++        for stop in stops:
++            writer.writerow([stop.name, stop.address, stop.postcode, ""])
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..bddd180
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,72 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.delivery import drops_file
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 20)
++
++
++def customer(code, name, route_seq):
++    return Customer(code, name, f"{route_seq} Test Road", "LK1 1AA", route_seq)
++
++
++class DropsFileTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12)])
++        self.customers = {
++            "GREENWAY": customer("GREENWAY", "Greenway Grocers", 1),
++            "LUMEN": customer("LUMEN", "Café Lumen", 2),
++            "OLDMILL": customer("OLDMILL", "The Old Mill Tearoom", 3),
++        }
++
++    def write_and_read(self, book, day=DAY):
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "drops.csv")
++            drops_file(book, self.customers, day, path)
++            with open(path, newline="", encoding="utf-8") as f:
++                return list(csv.reader(f))
++
++    def test_header_and_one_row_per_drop_in_route_order(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "OLDMILL", "BAG", 2),
++            OrderLine(DAY, "GREENWAY", "BAG", 5),
++        ])
++        self.assertEqual(self.write_and_read(book), [
++            ["Name", "Address", "Postcode", "Notes"],
++            ["Greenway Grocers", "1 Test Road", "LK1 1AA", ""],
++            ["The Old Mill Tearoom", "3 Test Road", "LK1 1AA", ""],
++        ])
++
++    def test_customer_with_several_lines_gets_one_row(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 2),
++            OrderLine(DAY, "LUMEN", "BAG", 3),
++        ])
++        self.assertEqual(len(self.write_and_read(book)), 2)
++
++    def test_customers_without_orders_that_day_are_left_out(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 2),
++            OrderLine(DAY + datetime.timedelta(days=1), "GREENWAY", "BAG", 5),
++        ])
++        self.assertEqual(self.write_and_read(book)[1:], [["Café Lumen", "2 Test Road", "LK1 1AA", ""]])
++
++    def test_day_with_no_orders_writes_header_only(self):
++        book = OrderBook(self.catalog)
++        self.assertEqual(self.write_and_read(book), [["Name", "Address", "Postcode", "Notes"]])
++
++    def test_unknown_customer_code_is_rejected(self):
++        book = OrderBook(self.catalog, [OrderLine(DAY, "NOBODY", "BAG", 1)])
++        with tempfile.TemporaryDirectory() as tmp:
++            with self.assertRaisesRegex(ValueError, "NOBODY"):
++                drops_file(book, self.customers, DAY, os.path.join(tmp, "drops.csv"))
++
++
++if __name__ == "__main__":
++    unittest.main()

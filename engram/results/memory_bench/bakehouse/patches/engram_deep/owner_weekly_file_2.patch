@@ -1,0 +1,98 @@
+diff --git a/src/bakehouse/reports.py b/src/bakehouse/reports.py
+index c826c9a..6ee4cd6 100644
+--- a/src/bakehouse/reports.py
++++ b/src/bakehouse/reports.py
+@@ -1,5 +1,8 @@
+ """Reports on the order book for a delivery day."""
+ 
++import csv
++import datetime
++
+ 
+ def day_summary(orderbook, day):
+     """{customer code: order value in pence, before VAT} for everything ordered for `day`."""
+@@ -10,6 +13,23 @@ def day_summary(orderbook, day):
+     return dict(sorted(values.items()))
+ 
+ 
++def week_totals_file(orderbook, week_start, path):
++    """Writes one row per customer ordering in the seven days from `week_start`, with their
++    order value for the week. Written for Greta's German-locale Excel: semicolon separators
++    and a decimal comma, so 1250 pence is written as 12,50."""
++    totals = {}
++    for offset in range(7):
++        day = week_start + datetime.timedelta(days=offset)
++        for customer, pence in day_summary(orderbook, day).items():
++            totals[customer] = totals.get(customer, 0) + pence
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f, delimiter=";")
++        writer.writerow(["Customer", "Total"])
++        for customer in sorted(totals):
++            pence = totals[customer]
++            writer.writerow([customer, f"{pence // 100},{pence % 100:02d}"])
++
++
+ def top_products(orderbook, start, end, n=5):
+     """The `n` product codes with the most units ordered from `start` to `end` inclusive,
+     most first. Ties are broken by product code."""
+diff --git a/tests/test_reports.py b/tests/test_reports.py
+index fad6c74..cd4f165 100644
+--- a/tests/test_reports.py
++++ b/tests/test_reports.py
+@@ -1,9 +1,11 @@
+ import datetime
++import os
++import tempfile
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+-from bakehouse.reports import day_summary, top_products
++from bakehouse.reports import day_summary, top_products, week_totals_file
+ 
+ DAY = datetime.date(2026, 10, 20)
+ 
+@@ -39,6 +41,43 @@ class DaySummaryTest(unittest.TestCase):
+         self.assertEqual(day_summary(book, DAY), {})
+ 
+ 
++class WeekTotalsFileTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12), Product("SOU", "White sourdough", 320, batch_size=10)])
++        self.tmp = tempfile.TemporaryDirectory()
++        self.path = os.path.join(self.tmp.name, "week.csv")
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def read(self):
++        with open(self.path, newline="", encoding="utf-8") as f:
++            return f.read()
++
++    def test_sums_each_customer_over_the_week_in_semicolon_csv_with_decimal_comma(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY, "LUMEN", "BAG", 5),
++            OrderLine(DAY + datetime.timedelta(days=3), "LUMEN", "SOU", 10),
++            OrderLine(DAY + datetime.timedelta(days=1), "GREENWAY", "BAG", 2),
++        ])
++        week_totals_file(book, DAY, self.path)
++        self.assertEqual(self.read(), "Customer;Total\r\nGREENWAY;1,90\r\nLUMEN;36,75\r\n")
++
++    def test_days_outside_the_seven_from_week_start_are_left_out(self):
++        book = OrderBook(self.catalog, [
++            OrderLine(DAY - datetime.timedelta(days=1), "LUMEN", "SOU", 100),
++            OrderLine(DAY, "LUMEN", "BAG", 1),
++            OrderLine(DAY + datetime.timedelta(days=6), "LUMEN", "BAG", 1),
++            OrderLine(DAY + datetime.timedelta(days=7), "LUMEN", "SOU", 100),
++        ])
++        week_totals_file(book, DAY, self.path)
++        self.assertEqual(self.read(), "Customer;Total\r\nLUMEN;1,90\r\n")
++
++    def test_empty_week_writes_only_the_header(self):
++        week_totals_file(OrderBook(self.catalog), DAY, self.path)
++        self.assertEqual(self.read(), "Customer;Total\r\n")
++
++
+ class TopProductsTest(unittest.TestCase):
+     def setUp(self):
+         self.catalog = Catalog([

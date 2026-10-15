@@ -1,0 +1,140 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 924e656..6eca7e4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@
+ - Products: unknown product codes raise a `KeyError` naming the code; `price_text` shows prices as pounds; `dough_g` per piece gives dough weight; negative dough units are rejected.
+ - Orders: `remove`, `len`, `days`, `lines_for`, `total_for`, `customers_for`; unknown product codes are rejected when added; standing weekly orders.
+ - Reports: `day_summary` and `top_products`.
++- Labels: `crate_labels` gives one packing label per customer and product for a delivery day, in route order, wrapped to the 48-character ASCII label printer.
+ - Production: `total_batches`; `plan` leaves out products not ordered for the day; `crates_needed` rounds up to whole crates.
+ - Invoices: `invoice_number` gives `LK-YYYY-NNNN`; `invoice_for` ignores other customers' lines. Invoices still carry no VAT; Ledgerly handles it.
+ 
+diff --git a/src/bakehouse/labels.py b/src/bakehouse/labels.py
+new file mode 100644
+index 0000000..0e303de
+--- /dev/null
++++ b/src/bakehouse/labels.py
+@@ -0,0 +1,34 @@
++"""Crate labels for packing: one label per customer and product on a delivery day."""
++
++import textwrap
++import unicodedata
++
++# The packing label printer prints 48 characters per line, plain ASCII only.
++PRINTER_WIDTH = 48
++
++
++def _printable_lines(text):
++    """`text` as ASCII (accents stripped, e.g. 'é' to 'e') wrapped to the printer width."""
++    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
++    return textwrap.wrap(ascii_text, width=PRINTER_WIDTH) or [""]
++
++
++def crate_labels(orderbook, customers, day):
++    """Label text for everything ordered for delivery on `day`, one label per customer and product.
++
++    Labels are in route order (by `route_seq`), then product code. Each label is the customer's
++    name, then the quantity and product name, one per line. `customers` is the dict that
++    load_customers returns.
++    """
++    totals = {}
++    for line in orderbook.for_day(day):
++        key = (line.customer, line.product)
++        totals[key] = totals.get(key, 0) + line.qty
++    keys = sorted(totals, key=lambda key: (customers[key[0]].route_seq, key[1]))
++    labels = []
++    for customer_code, product_code in keys:
++        customer = customers[customer_code]
++        product = orderbook.catalog.get(product_code)
++        lines = _printable_lines(customer.name) + _printable_lines(f"{totals[(customer_code, product_code)]} x {product.name}")
++        labels.append("\n".join(lines))
++    return labels
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..ac12340
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,82 @@
++import datetime
++import unittest
++
++from bakehouse.customers import Customer
++from bakehouse.labels import PRINTER_WIDTH, crate_labels
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import Catalog, Product
++
++DAY = datetime.date(2026, 10, 16)
++
++
++def _customers():
++    return {
++        "GREENWAY": Customer("GREENWAY", "Greenway Grocers", "88 High Street", "LK1 4HS", 2),
++        "LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1),
++    }
++
++
++def _catalog():
++    return Catalog([
++        Product("RYE", "Seeded rye sourdough", 360),
++        Product("SOU", "White sourdough", 320),
++    ])
++
++
++class CrateLabelsTest(unittest.TestCase):
++    def test_one_label_per_customer_and_product_in_route_order(self):
++        book = OrderBook(_catalog(), [
++            OrderLine(DAY, "GREENWAY", "SOU", 6),
++            OrderLine(DAY, "LUMEN", "SOU", 2),
++            OrderLine(DAY, "LUMEN", "RYE", 4),
++        ])
++        labels = crate_labels(book, _customers(), DAY)
++        self.assertEqual(labels, [
++            "Cafe Lumen\n4 x Seeded rye sourdough",
++            "Cafe Lumen\n2 x White sourdough",
++            "Greenway Grocers\n6 x White sourdough",
++        ])
++
++    def test_quantities_are_summed_per_customer_and_product(self):
++        book = OrderBook(_catalog(), [
++            OrderLine(DAY, "LUMEN", "SOU", 2),
++            OrderLine(DAY, "LUMEN", "SOU", 3),
++        ])
++        self.assertEqual(crate_labels(book, _customers(), DAY), ["Cafe Lumen\n5 x White sourdough"])
++
++    def test_other_days_are_left_out(self):
++        book = OrderBook(_catalog(), [
++            OrderLine(DAY, "LUMEN", "SOU", 2),
++            OrderLine(DAY + datetime.timedelta(days=1), "GREENWAY", "SOU", 6),
++        ])
++        self.assertEqual(crate_labels(book, _customers(), DAY), ["Cafe Lumen\n2 x White sourdough"])
++
++    def test_no_orders_gives_no_labels(self):
++        self.assertEqual(crate_labels(OrderBook(_catalog()), _customers(), DAY), [])
++
++    def test_long_names_wrap_within_printer_width(self):
++        long_name = "The Very Long Name Of A Delicatessen And Tearoom Which Goes On For Ages"
++        customers = {"LONG": Customer("LONG", long_name, "1 Road", "LK1 1AA", 1)}
++        book = OrderBook(_catalog(), [OrderLine(DAY, "LONG", "SOU", 1)])
++        labels = crate_labels(book, customers, DAY)
++        lines = labels[0].split("\n")
++        self.assertGreater(len(lines), 2)
++        for line in lines:
++            self.assertLessEqual(len(line), PRINTER_WIDTH)
++            self.assertTrue(line.isascii())
++        self.assertEqual(" ".join(lines[:-1]), long_name)
++
++    def test_non_ascii_product_name_is_transliterated(self):
++        catalog = Catalog([Product("BRI", "Brioche à la crème", 250)])
++        customers = {"LUMEN": Customer("LUMEN", "Café Lumen", "14 Mill Lane", "LK1 2AB", 1)}
++        book = OrderBook(catalog, [OrderLine(DAY, "LUMEN", "BRI", 1)])
++        self.assertEqual(crate_labels(book, customers, DAY), ["Cafe Lumen\n1 x Brioche a la creme"])
++
++    def test_unknown_customer_raises_key_error_naming_it(self):
++        book = OrderBook(_catalog(), [OrderLine(DAY, "NOBODY", "SOU", 1)])
++        with self.assertRaisesRegex(KeyError, "NOBODY"):
++            crate_labels(book, _customers(), DAY)
++
++
++if __name__ == "__main__":
++    unittest.main()

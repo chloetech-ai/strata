@@ -1,0 +1,61 @@
+diff --git a/src/bakehouse/invoice.py b/src/bakehouse/invoice.py
+index f593a8e..e69b3bf 100644
+--- a/src/bakehouse/invoice.py
++++ b/src/bakehouse/invoice.py
+@@ -4,6 +4,8 @@ import datetime
+ from dataclasses import dataclass, field
+ from typing import List
+ 
++from .orders import sale_or_return_credit
++
+ 
+ @dataclass
+ class InvoiceLine:
+@@ -26,6 +28,12 @@ class Invoice:
+         return sum(line.amount for line in self.lines)
+ 
+ 
++def returns_credit(catalog, customer_code, product_code, delivered, returned):
++    """Credit in pence for `returned` unsold units from one delivery of `delivered` units."""
++    price = catalog.get(product_code).price
++    return sale_or_return_credit(customer_code, product_code, price, delivered, returned)
++
++
+ def invoice_number(year, seq):
+     """Invoice number such as 'LK-2026-0001'; `seq` is the running number, which restarts each year."""
+     if not 1 <= seq <= 9999:
+diff --git a/tests/test_invoice.py b/tests/test_invoice.py
+index 4f410c2..96e2fda 100644
+--- a/tests/test_invoice.py
++++ b/tests/test_invoice.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number
++from bakehouse.invoice import Invoice, InvoiceLine, format_pence, invoice_for, invoice_number, returns_credit
+ from bakehouse.orders import OrderBook, OrderLine
+ from bakehouse.products import Catalog, Product
+ 
+@@ -36,6 +36,21 @@ class InvoiceForTest(unittest.TestCase):
+         self.assertEqual(invoice.total(), 24 * 110 + 6 * 320)
+ 
+ 
++class ReturnsCreditTest(unittest.TestCase):
++    def test_greenway_sandwich_loaves_at_catalog_price(self):
++        catalog = Catalog([Product("SWL", "Sandwich loaf", 180)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "SWL", delivered=32, returned=2), 180)
++
++    def test_cap_applies(self):
++        catalog = Catalog([Product("SWL", "Sandwich loaf", 180)])
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "SWL", delivered=32, returned=10), 3 * 90)
++
++    def test_other_customer_or_product_gets_no_credit(self):
++        catalog = Catalog([Product("SWL", "Sandwich loaf", 180), Product("BAG", "Baguette", 95)])
++        self.assertEqual(returns_credit(catalog, "AIDAN", "SWL", delivered=32, returned=5), 0)
++        self.assertEqual(returns_credit(catalog, "GREENWAY", "BAG", delivered=32, returned=5), 0)
++
++
+ class InvoiceNumberTest(unittest.TestCase):
+     def test_year_and_four_digit_sequence(self):
+         self.assertEqual(invoice_number(2026, 1), "LK-2026-0001")

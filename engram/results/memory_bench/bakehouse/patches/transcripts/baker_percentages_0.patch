@@ -1,0 +1,56 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 05a3f86..16480b6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - Products: `price_text` and `allergen_text` helpers.
+ - Production: `total_batches`, `crates_needed` (whole crates, rounded up), and `dough_weight_g` rejects negative units.
+ - `python -m bakehouse plan` replaces `scripts/print_plan.py`, with aligned columns for product names, units and batches.
++- Recipes: `baker_percentages` gives each ingredient as a percentage of the total flour weight, to one decimal place.
+ - Invoices: `invoice_for` builds one line per product at catalog prices; `day_summary` gives order value per customer; `format_pence` shows pence as pounds; `invoice_number` gives numbers like `LK-2026-0001`.
+ 
+ ## 0.1.0
+diff --git a/src/bakehouse/recipes.py b/src/bakehouse/recipes.py
+new file mode 100644
+index 0000000..dedf84f
+--- /dev/null
++++ b/src/bakehouse/recipes.py
+@@ -0,0 +1,13 @@
++"""Recipe maths: each ingredient as a share of the flour in a dough."""
++
++
++def baker_percentages(recipe):
++    """{ingredient: percent of total flour weight, to one decimal place}.
++
++    `recipe` maps ingredient names to grams. Any ingredient whose name contains
++    'flour' (any case) counts as flour.
++    """
++    flour_g = sum(grams for name, grams in recipe.items() if "flour" in name.lower())
++    if flour_g <= 0:
++        raise ValueError("recipe needs flour weighing more than zero to work out baker's percentages")
++    return {name: round(grams / flour_g * 100, 1) for name, grams in recipe.items()}
+diff --git a/tests/test_recipes.py b/tests/test_recipes.py
+new file mode 100644
+index 0000000..3dc01b3
+--- /dev/null
++++ b/tests/test_recipes.py
+@@ -0,0 +1,19 @@
++import unittest
++
++from bakehouse.recipes import baker_percentages
++
++
++class BakerPercentagesTest(unittest.TestCase):
++    def test_percentages_are_of_total_flour_weight(self):
++        recipe = {"White flour": 500, "Wholemeal flour": 100, "Water": 350, "Salt": 10}
++        self.assertEqual(
++            baker_percentages(recipe),
++            {"White flour": 83.3, "Wholemeal flour": 16.7, "Water": 58.3, "Salt": 1.7},
++        )
++
++    def test_flour_match_ignores_case(self):
++        self.assertEqual(baker_percentages({"FLOUR": 200, "water": 100}), {"FLOUR": 100.0, "water": 50.0})
++
++    def test_recipe_without_flour_is_rejected(self):
++        with self.assertRaises(ValueError):
++            baker_percentages({"Water": 350, "Salt": 10})

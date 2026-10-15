@@ -1,0 +1,87 @@
+diff --git a/src/bakehouse/production.py b/src/bakehouse/production.py
+index 67a124f..664062c 100644
+--- a/src/bakehouse/production.py
++++ b/src/bakehouse/production.py
+@@ -30,6 +30,32 @@ def plan(orderbook, day):
+     }
+ 
+ 
++def _kilos_text(grams):
++    """Kilos to one decimal place, rounding halves up, e.g. 5350 g -> '5.4 kg'."""
++    tenths = (grams + 50) // 100
++    return f"{tenths // 10}.{tenths % 10} kg"
++
++
++def bake_sheet(orderbook, day):
++    """Text bake sheet for `day`: one line per product, hottest oven first."""
++    rows = plan(orderbook, day)
++    if not rows:
++        return f"Nothing to bake for {day.isoformat()}."
++    catalog = orderbook.catalog
++    order = sorted(rows, key=lambda code: (-catalog.get(code).bake_temp, code))
++    width = max(len(catalog.get(code).name) for code in order)
++    lines = [
++        f"Bake sheet for {day:%A %d %B %Y}",
++        f"{'Product':<{width}}  {'Units':>5}  {'Batches':>7}  {'Dough':>8}",
++    ]
++    for code in order:
++        product = catalog.get(code)
++        units, batches = rows[code]
++        dough = _kilos_text(dough_weight_g(product, units))
++        lines.append(f"{product.name:<{width}}  {units:>5}  {batches:>7}  {dough:>8}")
++    return "\n".join(lines)
++
++
+ def total_batches(plan_result):
+     """Trays going in the oven: one tray holds one batch, so this is the batch count across all products."""
+     return sum(batches for _units, batches in plan_result.values())
+diff --git a/tests/test_production.py b/tests/test_production.py
+index 1e45f6c..7a18ea7 100644
+--- a/tests/test_production.py
++++ b/tests/test_production.py
+@@ -2,7 +2,7 @@ import datetime
+ import unittest
+ 
+ from bakehouse.orders import OrderBook, OrderLine
+-from bakehouse.production import batches_needed, crates_needed, dough_weight_g, plan, total_batches
++from bakehouse.production import bake_sheet, batches_needed, crates_needed, dough_weight_g, plan, total_batches
+ from bakehouse.products import Catalog, Product
+ 
+ DAY = datetime.date(2026, 10, 20)
+@@ -56,6 +56,36 @@ class ProductionTest(unittest.TestCase):
+     def test_total_batches_is_zero_for_an_empty_plan(self):
+         self.assertEqual(total_batches({}), 0)
+ 
++    def test_bake_sheet_lists_units_batches_and_dough(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12, dough_g=350, bake_temp=250)])
++        book = OrderBook(catalog, [OrderLine(DAY, "LUMEN", "BAG", 25)])
++        lines = bake_sheet(book, DAY).splitlines()
++        self.assertEqual(lines[0], "Bake sheet for Tuesday 20 October 2026")
++        self.assertEqual(lines[2].split(), ["Baguette", "25", "3", "8.8", "kg"])
++
++    def test_bake_sheet_puts_hottest_oven_first(self):
++        catalog = Catalog([
++            Product("FLO", "Florentine", 90, batch_size=40, dough_g=30, bake_temp=170),
++            Product("BAG", "Baguette", 95, batch_size=12, dough_g=350, bake_temp=250),
++            Product("SOU", "White sourdough", 320, batch_size=10, dough_g=800, bake_temp=240),
++        ])
++        book = OrderBook(catalog, [
++            OrderLine(DAY, "LUMEN", "FLO", 40),
++            OrderLine(DAY, "LUMEN", "SOU", 10),
++            OrderLine(DAY, "LUMEN", "BAG", 12),
++        ])
++        names = [line.split()[0] for line in bake_sheet(book, DAY).splitlines()[2:]]
++        self.assertEqual(names, ["Baguette", "White", "Florentine"])
++
++    def test_bake_sheet_rounds_dough_to_one_decimal_of_a_kilo(self):
++        catalog = Catalog([Product("ROL", "Roll", 35, batch_size=1, dough_g=107, bake_temp=220)])
++        book = OrderBook(catalog, [OrderLine(DAY, "LUMEN", "ROL", 50)])
++        self.assertIn("5.4 kg", bake_sheet(book, DAY))
++
++    def test_bake_sheet_says_so_when_nothing_is_ordered(self):
++        catalog = Catalog([Product("BAG", "Baguette", 95, batch_size=12, dough_g=350, bake_temp=250)])
++        self.assertEqual(bake_sheet(OrderBook(catalog), DAY), "Nothing to bake for 2026-10-20.")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

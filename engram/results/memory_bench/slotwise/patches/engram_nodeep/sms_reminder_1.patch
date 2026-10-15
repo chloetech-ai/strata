@@ -1,0 +1,139 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 23af53c..9c43f0f 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,9 +1,23 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_finds_client_by_any_phone_format",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_any_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_returns_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_second_client_with_same_phone_is_refused",
++  "tests/test_clients.py::ClientBookTest::test_unknown_phone_returns_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_formats_give_the_same_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_non_numbers",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_numbers_without_country_code_or_leading_zero",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_reminders.py::ReminderTextTest::test_is_ascii_and_contains_reception_number",
++  "tests/test_reminders.py::ReminderTextTest::test_long_name_is_shortened_to_fit",
++  "tests/test_reminders.py::ReminderTextTest::test_text",
++  "tests/test_reminders.py::ToAsciiTest::test_other_accents_are_stripped",
++  "tests/test_reminders.py::ToAsciiTest::test_umlauts_become_two_letter_forms",
++  "tests/test_reminders.py::ToAsciiTest::test_unknown_characters_become_question_marks",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_record",
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..2faa6f5
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,50 @@
++"""SMS reminders for appointments."""
++
++import unicodedata
++
++from .model import Appointment
++
++# Clients call this number to move their appointment.
++RECEPTION_PHONE = "044 512 77 30"
++
++# The gateway bills anything longer than one SMS as two.
++MAX_LENGTH = 160
++
++# The gateway only takes plain ASCII. German umlauts get their two-letter
++# forms, because stripping the accent would turn 'Brändli' into 'Brandli'.
++UMLAUTS = {
++    "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
++    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
++}
++
++
++def to_ascii(text):
++    """Converts `text` to plain ASCII. Other accents are stripped, and anything left is '?'."""
++    for char, replacement in UMLAUTS.items():
++        text = text.replace(char, replacement)
++    decomposed = unicodedata.normalize("NFKD", text)
++    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
++    return stripped.encode("ascii", errors="replace").decode("ascii")
++
++
++def reminder_text(appointment: Appointment) -> str:
++    """The reminder SMS for `appointment`, at most MAX_LENGTH ASCII characters.
++
++    If the client's name would push the text over the limit, the name is
++    shortened. The reception number is always kept.
++    """
++    when = f"{appointment.start:%d.%m.%Y} at {appointment.start:%H:%M}"
++    client = to_ascii(appointment.client)
++    therapist = to_ascii(appointment.therapist.capitalize())
++
++    def build(name):
++        return (
++            f"Reminder: {name}, you have an appointment with {therapist} on {when}. "
++            f"To move it, call {RECEPTION_PHONE}."
++        )
++
++    text = build(client)
++    if len(text) > MAX_LENGTH:
++        room = len(client) - (len(text) - MAX_LENGTH)
++        text = build(client[:max(room - 1, 0)].rstrip() + ".")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..d97f2a3
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,49 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import MAX_LENGTH, RECEPTION_PHONE, reminder_text, to_ascii
++
++
++def appointment(client="Kim Weber", therapist="lena"):
++    return Appointment(therapist, client, datetime.datetime(2026, 9, 7, 9, 30))
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_umlauts_become_two_letter_forms(self):
++        self.assertEqual(to_ascii("Brändli"), "Braendli")
++        self.assertEqual(to_ascii("Jürg Böhm Äpfel Öl Groß"), "Juerg Boehm Aepfel Oel Gross")
++
++    def test_other_accents_are_stripped(self):
++        self.assertEqual(to_ascii("José Thérèse"), "Jose Therese")
++
++    def test_unknown_characters_become_question_marks(self):
++        self.assertEqual(to_ascii("Li 李"), "Li ?")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_text(self):
++        self.assertEqual(
++            reminder_text(appointment()),
++            "Reminder: Kim Weber, you have an appointment with Lena on 07.09.2026 at 09:30. "
++            "To move it, call 044 512 77 30.",
++        )
++
++    def test_is_ascii_and_contains_reception_number(self):
++        text = reminder_text(appointment("Jürg Brändli"))
++        self.assertTrue(text.isascii())
++        self.assertIn("Juerg Braendli", text)
++        self.assertIn(RECEPTION_PHONE, text)
++
++    def test_long_name_is_shortened_to_fit(self):
++        name = "Maria-Theresia Brändli-Gschwend-Hürlimann-Zimmermann-Schmid-Müller-Frey-Keller-Weber"
++        text = reminder_text(appointment(name))
++        self.assertLessEqual(len(text), MAX_LENGTH)
++        self.assertTrue(text.startswith("Reminder: Maria-Theresia Braendli-Gschwend"))
++        self.assertTrue(text.endswith(f"To move it, call {RECEPTION_PHONE}."))
++        self.assertNotIn("Keller", text)
++        self.assertIn(f"To move it, call {RECEPTION_PHONE}.", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

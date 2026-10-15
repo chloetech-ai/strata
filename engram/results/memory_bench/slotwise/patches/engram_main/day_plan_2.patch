@@ -1,0 +1,115 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 69c1bcf..23711ac 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,9 +1,22 @@
+ [
++  "tests/test_clients.py::ClientBookTest::test_finds_client_in_any_phone_format",
++  "tests/test_clients.py::ClientBookTest::test_invalid_phone_is_rejected_on_add",
++  "tests/test_clients.py::ClientBookTest::test_same_number_cannot_be_added_twice",
++  "tests/test_clients.py::ClientBookTest::test_search_matches_part_of_name_ignoring_case",
++  "tests/test_clients.py::ClientBookTest::test_search_returns_all_matches_in_added_order",
++  "tests/test_clients.py::ClientBookTest::test_search_with_no_match_gives_empty_list",
++  "tests/test_clients.py::ClientBookTest::test_unknown_number_gives_none",
++  "tests/test_clients.py::NormalizePhoneTest::test_all_common_shapes_give_the_same_number",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_letters",
++  "tests/test_clients.py::NormalizePhoneTest::test_rejects_numbers_without_prefix",
+   "tests/test_hours.py::HoursTest::test_closed_on_sunday",
+   "tests/test_hours.py::HoursTest::test_friday_closes_early",
+   "tests/test_hours.py::HoursTest::test_weekday",
+   "tests/test_model.py::AppointmentTest::test_end_and_price",
+   "tests/test_model.py::AppointmentTest::test_ids_are_unique",
++  "tests/test_printing.py::DayPlanTest::test_every_line_fits_the_printer",
++  "tests/test_printing.py::DayPlanTest::test_free_day_says_so",
++  "tests/test_printing.py::DayPlanTest::test_lists_appointments_in_time_order_without_cancelled_ones",
+   "tests/test_schedule.py::ScheduleTest::test_appointments_for_day_in_order",
+   "tests/test_schedule.py::ScheduleTest::test_book",
+   "tests/test_schedule.py::ScheduleTest::test_cancel_keeps_the_record_and_marks_it",
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..194a5b5
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,25 @@
++"""Printable text for reception's receipt printer."""
++
++# The receipt printer wraps anything longer than this onto the next line.
++WIDTH = 42
++
++
++def day_plan(schedule, therapist, day):
++    """Reception's printed plan for `therapist` on `day`: non-cancelled appointments, one line each."""
++    date = f"{day:%a %d.%m.%Y}"
++    name = _fit(therapist.title(), WIDTH - len(date) - 2)
++    lines = [f"{name}  {date}"]
++    appointments = [a for a in schedule.appointments_for(therapist, day) if not a.cancelled]
++    if not appointments:
++        lines.append("No appointments.")
++    for a in appointments:
++        times = f"{a.start:%H:%M}-{a.end:%H:%M} "
++        treatment = f" {a.treatment}"
++        client = _fit(a.client, WIDTH - len(times) - len(treatment))
++        lines.append(f"{times}{client}{treatment}")
++    return "\n".join(lines)
++
++
++def _fit(text, width=WIDTH):
++    """`text` cut to at most `width` characters."""
++    return text[:width]
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..0d99f97
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,51 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.printing import WIDTH, day_plan
++from slotwise.schedule import Schedule
++
++MONDAY = datetime.date(2026, 10, 12)
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_appointments_in_time_order_without_cancelled_ones(self):
++        schedule = Schedule()
++        schedule.book(Appointment("lena", "Anna Muster", datetime.datetime(2026, 10, 12, 10, 0)))
++        schedule.book(Appointment("lena", "Ben Test", datetime.datetime(2026, 10, 12, 9, 0), "short"))
++        gone = schedule.book(Appointment("lena", "Cara Gone", datetime.datetime(2026, 10, 12, 13, 0)))
++        schedule.cancel(gone.id)
++
++        self.assertEqual(
++            day_plan(schedule, "lena", MONDAY).split("\n"),
++            [
++                "Lena  Mon 12.10.2026",
++                "09:00-09:30 Ben Test short",
++                "10:00-10:45 Anna Muster standard",
++            ],
++        )
++
++    def test_free_day_says_so(self):
++        self.assertEqual(
++            day_plan(Schedule(), "lena", MONDAY).split("\n"),
++            ["Lena  Mon 12.10.2026", "No appointments."],
++        )
++
++    def test_every_line_fits_the_printer(self):
++        schedule = Schedule()
++        schedule.book(
++            Appointment(
++                "maximilian-alexander",
++                "Johanna Maria Elisabeth Gutenberg-Schwarzenbach",
++                datetime.datetime(2026, 10, 12, 9, 0),
++                "initial",
++            )
++        )
++        plan = day_plan(schedule, "maximilian-alexander", MONDAY)
++        for line in plan.split("\n"):
++            self.assertLessEqual(len(line), WIDTH, line)
++        self.assertIn("09:00-10:00 Johanna", plan)
++
++
++if __name__ == "__main__":
++    unittest.main()

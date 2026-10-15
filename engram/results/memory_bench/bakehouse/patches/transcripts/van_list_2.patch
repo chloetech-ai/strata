@@ -1,0 +1,73 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 05a3f86..953d890 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@
+ - Production: `total_batches`, `crates_needed` (whole crates, rounded up), and `dough_weight_g` rejects negative units.
+ - `python -m bakehouse plan` replaces `scripts/print_plan.py`, with aligned columns for product names, units and batches.
+ - Invoices: `invoice_for` builds one line per product at catalog prices; `day_summary` gives order value per customer; `format_pence` shows pence as pounds; `invoice_number` gives numbers like `LK-2026-0001`.
++- Delivery: `drops_file` writes the van's drops for a day, one line per customer with orders, in route order.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/bakehouse/delivery.py b/src/bakehouse/delivery.py
+new file mode 100644
+index 0000000..33fadac
+--- /dev/null
++++ b/src/bakehouse/delivery.py
+@@ -0,0 +1,12 @@
++"""Delivery runs: the van's drops for a day."""
++
++
++def drops_file(orderbook, customers, day, path):
++    """Writes the van's drops for `day` to `path`, one line per customer who has
++    orders that day, in route order. `customers` is the dict from load_customers."""
++    codes = sorted(orderbook.customers_for(day), key=lambda code: customers[code].route_seq)
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(f"Drops for {day.isoformat()}\n")
++        for code in codes:
++            c = customers[code]
++            f.write(f"{c.route_seq}. {c.name}, {c.address}, {c.postcode}\n")
+diff --git a/tests/test_delivery.py b/tests/test_delivery.py
+new file mode 100644
+index 0000000..2d57750
+--- /dev/null
++++ b/tests/test_delivery.py
+@@ -0,0 +1,37 @@
++import datetime
++import os
++import tempfile
++import unittest
++
++from bakehouse.customers import load_customers
++from bakehouse.delivery import drops_file
++from bakehouse.orders import OrderBook, OrderLine
++from bakehouse.products import load_catalog
++
++DATA = os.path.join(os.path.dirname(__file__), "..", "data")
++
++
++class DropsFileTest(unittest.TestCase):
++    def test_lists_only_customers_with_orders_in_route_order(self):
++        catalog = load_catalog(os.path.join(DATA, "products.csv"))
++        customers = load_customers(os.path.join(DATA, "customers.csv"))
++        day = datetime.date(2026, 10, 20)
++        book = OrderBook(catalog, [
++            OrderLine(day, "GREENWAY", "SWL", 32),
++            OrderLine(day, "LUMEN", "CRO", 24),
++            OrderLine(datetime.date(2026, 10, 21), "HARBOUR", "CRO", 6),
++        ])
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "drops.txt")
++            drops_file(book, customers, day, path)
++            with open(path, encoding="utf-8") as f:
++                lines = f.read().splitlines()
++        self.assertEqual(lines[0], "Drops for 2026-10-20")
++        self.assertEqual(lines[1:], [
++            "1. Café Lumen, 14 Mill Lane, LK1 2AB",
++            "4. Greenway Grocers, 88 High Street, LK1 4HS",
++        ])
++
++
++if __name__ == "__main__":
++    unittest.main()

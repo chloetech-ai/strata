@@ -1,0 +1,59 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f13634a..2ea2be0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@
+ - `Schedule.week(therapist, monday)` returns a therapist's non-cancelled appointments for the week as a dict keyed by each date (all seven days, empty lists included), sorted by start time.
+ - New client register in `clients.py`: `Client` dataclass and `ClientBook` with `add(client)` and `find_by_phone(phone)`. Phone numbers are normalized, so `079 123 45 67`, `+41 79 123 45 67` and `0041791234567` all find the same client. Adding a phone number that is already registered raises `ValueError`.
+ - `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case, in the order they were added; a blank query returns `[]`.
++- New `reminders.reminder_text(appointment)` returns the reminder SMS text, naming the client, therapist, date and start time.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..2bbced0
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,12 @@
++"""Text of the reminder SMS sent to clients before their appointment."""
++
++from .model import Appointment
++
++
++def reminder_text(appointment: Appointment) -> str:
++    """Return the reminder SMS for `appointment`, e.g. 'Hi Kim Weber, ... with Lena on Tuesday 08 September at 09:00.'"""
++    return (
++        f"Hi {appointment.client}, this is a reminder of your physiotherapy appointment "
++        f"with {appointment.therapist.title()} on {appointment.start:%A %d %B} "
++        f"at {appointment.start:%H:%M}. See you then."
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..2afbf61
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,23 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import reminder_text
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_names_client_therapist_day_and_time(self):
++        a = Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 9, 0))
++        self.assertEqual(
++            reminder_text(a),
++            "Hi Kim Weber, this is a reminder of your physiotherapy appointment "
++            "with Lena on Tuesday 08 September at 09:00. See you then.",
++        )
++
++    def test_uses_start_time_not_end(self):
++        a = Appointment("tom", "Jo Li", datetime.datetime(2026, 9, 11, 14, 30), "initial")
++        self.assertIn("on Friday 11 September at 14:30.", reminder_text(a))
++
++
++if __name__ == "__main__":
++    unittest.main()

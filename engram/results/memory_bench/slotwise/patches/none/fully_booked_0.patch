@@ -1,0 +1,102 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f13634a..ca1316b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@
+ - `Schedule.cancel(appointment_id)` marks an appointment `cancelled` instead of deleting it; cancelled appointments no longer block their slot. Stored in JSON as `status` (files without it load as `booked`).
+ - `Schedule.week(therapist, monday)` returns a therapist's non-cancelled appointments for the week as a dict keyed by each date (all seven days, empty lists included), sorted by start time.
+ - New client register in `clients.py`: `Client` dataclass and `ClientBook` with `add(client)` and `find_by_phone(phone)`. Phone numbers are normalized, so `079 123 45 67`, `+41 79 123 45 67` and `0041791234567` all find the same client. Adding a phone number that is already registered raises `ValueError`.
++- `Schedule.is_fully_booked(therapist, day)` is true when no treatment (even the shortest) fits in the therapist's free time on `day`, counting turnaround gaps and ignoring cancelled appointments. Closed days return `False`.
+ - `ClientBook.search(text)` returns clients whose name contains `text`, ignoring case, in the order they were added; a blank query returns `[]`.
+ 
+ ## 0.1.0
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 4ac3dc1..994e23e 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -3,7 +3,7 @@
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SlotTaken
+-from .hours import is_open_between
++from .hours import is_open_between, opening_hours
+ from .model import BOOKED, CANCELLED, TREATMENTS
+ 
+ # Time a therapist needs after each appointment to clean up and write notes.
+@@ -57,6 +57,29 @@ class Schedule:
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True if `therapist` has no room for even the shortest treatment on `day`, turnaround included.
++
++        A day the practice is closed is not fully booked, so this returns False for it.
++        """
++        hours = opening_hours(day)
++        if hours is None:
++            return False
++        opens, closes = hours
++        shortest = datetime.timedelta(minutes=min(minutes for minutes, _ in TREATMENTS.values()))
++        # Each booked appointment blocks the therapist from TURNAROUND before it to TURNAROUND after it.
++        blocked = [
++            (a.start - TURNAROUND, a.end + TURNAROUND)
++            for a in self.appointments_for(therapist, day)
++            if a.status != CANCELLED
++        ]
++        free_from = opens
++        for start, end in blocked:
++            if free_from + shortest <= start:
++                return False
++            free_from = max(free_from, end)
++        return free_from + shortest > closes
++
+     def week(self, therapist, monday):
+         """`therapist`'s booked appointments for the week starting on `monday` (a date), keyed by every day of the week."""
+         if monday.weekday() != 0:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index ecfbf1a..f5e901c 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -110,6 +110,42 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().week("lena", datetime.date(2026, 9, 8))
+ 
++    def fill_day(self, s, therapist, day):
++        """Book short treatments at every 5-minute start where one fits, so the day ends up packed."""
++        start = datetime.datetime.combine(day, datetime.time(7, 30))
++        while start < datetime.datetime.combine(day, datetime.time(19, 0)):
++            try:
++                s.book(Appointment(therapist, "Kim Weber", start, "short"))
++            except BookingError:
++                pass
++            start += datetime.timedelta(minutes=5)
++
++    def test_packed_day_is_fully_booked(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)  # Tuesday
++        self.fill_day(s, "lena", day)
++        self.assertTrue(len(s.appointments) > 1)
++        self.assertTrue(s.is_fully_booked("lena", day))
++
++    def test_cancelling_one_frees_the_day(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        self.fill_day(s, "lena", day)
++        s.cancel(s.appointments[len(s.appointments) // 2].id)
++        self.assertFalse(s.is_fully_booked("lena", day))
++
++    def test_empty_day_is_not_fully_booked(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_other_therapist_does_not_fill_day(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        self.fill_day(s, "marco", day)
++        self.assertFalse(s.is_fully_booked("lena", day))
++
++    def test_closed_day_is_not_fully_booked(self):
++        self.assertFalse(Schedule().is_fully_booked("lena", datetime.date(2026, 9, 6)))  # Sunday
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

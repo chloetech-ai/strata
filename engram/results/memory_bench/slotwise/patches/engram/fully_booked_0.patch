@@ -1,0 +1,86 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 12580f0..b9ed850 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,7 @@
+ ## Unreleased
+ 
+ - `Schedule.cancel(appointment_id)` marks an appointment as cancelled. It stays on record and no longer blocks its slot.
++- `Schedule.is_fully_booked(therapist, day)` is true when a therapist has reached the 7-treatment daily cap. For the online booking page only; `book()` does not enforce the cap.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index beea550..fede984 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,9 @@ from .model import TREATMENTS
+ # Time a therapist needs between appointments to clean the table and write notes.
+ CLEANUP_GAP = datetime.timedelta(minutes=10)
+ 
++# Treatments a therapist may do in one day, per the contract. Enforced only by the online booking page.
++DAILY_TREATMENT_CAP = 7
++
+ 
+ class Schedule:
+     def __init__(self):
+@@ -62,6 +65,15 @@ class Schedule:
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+         return {day: [a for a in self.appointments_for(therapist, day) if not a.cancelled] for day in days}
+ 
++    def is_fully_booked(self, therapist, day):
++        """True when `therapist` has reached the daily treatment cap on `day`.
++
++        Counts every active appointment, including ones reception booked over the cap.
++        Only the online booking page uses this; `book()` does not enforce the cap.
++        """
++        active = [a for a in self.appointments_for(therapist, day) if not a.cancelled]
++        return len(active) >= DAILY_TREATMENT_CAP
++
+ 
+ def _closed_message(appointment):
+     day = appointment.start.date()
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index b5630a7..86bb759 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -146,6 +146,39 @@ class ScheduleTest(unittest.TestCase):
+         week = s.week("lena", datetime.date(2026, 9, 14))
+         self.assertEqual(sum(len(v) for v in week.values()), 0)
+ 
++    def test_fully_booked_at_seven_appointments(self):
++        s = Schedule()
++        for hour in range(8, 15):  # 08:00 to 14:00, one every hour
++            s.book(at(hour))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_not_fully_booked_below_seven(self):
++        s = Schedule()
++        for hour in range(8, 14):  # six appointments
++            s.book(at(hour))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_fully_booked_counts_appointments_over_the_cap(self):
++        s = Schedule()
++        for hour in range(8, 15):
++            s.book(at(hour))
++        s.book(at(15))  # reception booked over the cap
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++        self.assertEqual(len(s.appointments), 8)
++
++    def test_cancelled_appointments_do_not_count_towards_the_cap(self):
++        s = Schedule()
++        booked = [s.book(at(hour)) for hour in range(8, 15)]
++        s.cancel(booked[0].id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_fully_booked_is_per_therapist_and_day(self):
++        s = Schedule()
++        for hour in range(8, 15):
++            s.book(at(hour))
++        self.assertFalse(s.is_fully_booked("marco", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 9)))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))
