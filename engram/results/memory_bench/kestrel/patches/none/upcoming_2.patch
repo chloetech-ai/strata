@@ -1,0 +1,60 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ad329e2..a2d10c3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@
+ - `python -m kestrel day THERAPIST_ID DATE --data FILE` lists a therapist's appointments on a local (Auckland) date.
+ - `python -m kestrel patients --data FILE` lists patient IDs and names, sorted by ID.
+ - `Calendar.for_day(therapist_id, day)` returns a therapist's appointments on a local date, sorted by start.
++- `Calendar.upcoming(patient_id, now)` returns a patient's booked appointments starting after `now`, soonest first.
+ - `Calendar.cancel(appointment_id, at)` cancels a booked appointment and records `cancelled_at`.
+ - `Calendar.move` reschedules a booked appointment to a new start time.
+ - `Patient.csc` flags Community Services Card holders (default `False`; older files still load).
+diff --git a/src/kestrel/calendar.py b/src/kestrel/calendar.py
+index 5f48f0c..f2004a1 100644
+--- a/src/kestrel/calendar.py
++++ b/src/kestrel/calendar.py
+@@ -68,5 +68,11 @@ class Calendar:
+         ]
+         return sorted(matches, key=lambda a: a.start)
+ 
++    def upcoming(self, patient_id, now):
++        """A patient's booked appointments starting after `now`, soonest first."""
++        if now.tzinfo is None:
++            raise ValueError("now must be timezone-aware")
++        return [a for a in self.for_patient(patient_id) if a.status == BOOKED and a.start > now]
++
+     def __len__(self):
+         return len(self._appointments)
+diff --git a/tests/test_calendar.py b/tests/test_calendar.py
+index 4c5d095..6a08633 100644
+--- a/tests/test_calendar.py
++++ b/tests/test_calendar.py
+@@ -39,6 +39,27 @@ class CalendarTest(unittest.TestCase):
+         cal = Calendar([appt("a1", utc(2027, 3, 1, 20)), appt("a2", utc(2027, 3, 1, 21), status="cancelled")])
+         self.assertEqual([a.id for a in cal.booked()], ["a1"])
+ 
++    def test_upcoming_booked_after_now_soonest_first(self):
++        now = utc(2027, 3, 1, 12)
++        cal = Calendar([
++            appt("late", utc(2027, 3, 3, 9), patient="KP-000001"),
++            appt("soon", utc(2027, 3, 1, 14), patient="KP-000001"),
++            appt("past", utc(2027, 3, 1, 10), patient="KP-000001"),
++            appt("other", utc(2027, 3, 1, 15), patient="KP-000002"),
++            appt("cancelled", utc(2027, 3, 1, 16), patient="KP-000001", status="cancelled"),
++        ])
++        self.assertEqual([a.id for a in cal.upcoming("kp1", now)], ["soon", "late"])
++
++    def test_upcoming_excludes_start_exactly_at_now(self):
++        now = utc(2027, 3, 1, 12)
++        cal = Calendar([appt("a1", now, patient="KP-000001")])
++        self.assertEqual(cal.upcoming("KP-000001", now), [])
++
++    def test_upcoming_requires_aware_now(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), patient="KP-000001")])
++        with self.assertRaises(ValueError):
++            cal.upcoming("KP-000001", datetime.datetime(2027, 3, 1, 12))
++
+     def test_for_day_uses_local_date_across_utc_midnight(self):
+         # 2026-10-15 is NZDT (UTC+13). 11:30 UTC is 00:30 on the 16th in Auckland,
+         # and 10:59 UTC is 23:59 on the 15th, even though both fall on 15 UTC.

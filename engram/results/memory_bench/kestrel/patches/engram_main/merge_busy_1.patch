@@ -1,0 +1,63 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..0060c1b
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,16 @@
++"""Time intervals as (start, end) pairs."""
++
++
++def merge_busy(intervals):
++    """Merge (start, end) pairs into sorted, non-overlapping pairs.
++
++    The pairs may come in any order. Pairs that overlap or touch
++    (one ends exactly where the next starts) are merged into one.
++    """
++    merged = []
++    for start, end in sorted(intervals):
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..fb86940
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,35 @@
++import unittest
++
++from kestrel.intervals import merge_busy
++
++
++class MergeBusyTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(merge_busy([]), [])
++
++    def test_single_interval(self):
++        self.assertEqual(merge_busy([(9, 10)]), [(9, 10)])
++
++    def test_disjoint_intervals_are_sorted(self):
++        self.assertEqual(merge_busy([(13, 14), (9, 10)]), [(9, 10), (13, 14)])
++
++    def test_overlapping_intervals_merge(self):
++        self.assertEqual(merge_busy([(9, 11), (10, 12)]), [(9, 12)])
++
++    def test_touching_intervals_merge(self):
++        self.assertEqual(merge_busy([(9, 10), (10, 11)]), [(9, 11)])
++
++    def test_contained_interval_does_not_shorten_outer(self):
++        self.assertEqual(merge_busy([(9, 12), (10, 11)]), [(9, 12)])
++
++    def test_any_order(self):
++        intervals = [(15, 16), (9, 10), (10, 11), (14, 15), (11, 12)]
++        self.assertEqual(merge_busy(intervals), [(9, 12), (14, 16)])
++        self.assertEqual(merge_busy(list(reversed(intervals))), [(9, 12), (14, 16)])
++
++    def test_chain_collapses_to_one(self):
++        self.assertEqual(merge_busy([(1, 2), (5, 6), (2, 3), (4, 5), (3, 4)]), [(1, 6)])
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,86 @@
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..ea73aaf
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,19 @@
++"""Checks run before an appointment is saved."""
++
++from .calendar import CLINIC_TZ
++from .models import CANCELLED
++
++MAX_PATIENTS_PER_DAY = 8  # therapists' union agreement
++
++
++def can_book(calendar, therapist, appointment):
++    """True if appointment can be added to calendar for therapist.
++
++    Rejects a start time already taken by one of the therapist's live (not cancelled)
++    appointments, and a day where the therapist already has MAX_PATIENTS_PER_DAY.
++    """
++    day = appointment.start.astimezone(CLINIC_TZ).date()
++    live = [a for a in calendar.for_day(therapist.id, day) if a.status != CANCELLED]
++    if any(a.start == appointment.start for a in live):
++        return False
++    return len(live) < MAX_PATIENTS_PER_DAY
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..8a636e6
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,55 @@
++import datetime
++import unittest
++
++from helpers import appt, utc
++
++from kestrel.booking import MAX_PATIENTS_PER_DAY, can_book
++from kestrel.calendar import Calendar
++from kestrel.models import CANCELLED, Therapist
++
++THERAPIST = Therapist("T1", "Ana Lee", "HB")
++
++
++class CanBookTest(unittest.TestCase):
++    def test_empty_day_allows_booking(self):
++        self.assertTrue(can_book(Calendar(), THERAPIST, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_rejects_start_time_already_taken(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 20), patient="KP-000002")))
++
++    def test_other_therapists_start_time_does_not_block(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), therapist="T2")])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_cancelled_appointment_does_not_block_its_slot(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), status=CANCELLED, cancelled_at=utc(2027, 2, 28))])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_daily_limit_rejects_ninth_patient(self):
++        booked = [appt(f"a{i}", utc(2027, 3, 1, 20 + i // 2, 30 * (i % 2))) for i in range(MAX_PATIENTS_PER_DAY)]
++        cal = Calendar(booked)
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 2, 1))))
++
++    def test_daily_limit_allows_eighth_patient(self):
++        booked = [appt(f"a{i}", utc(2027, 3, 1, 20 + i // 2, 30 * (i % 2))) for i in range(MAX_PATIENTS_PER_DAY - 1)]
++        cal = Calendar(booked)
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 2, 1))))
++
++    def test_cancelled_appointments_do_not_count_towards_limit(self):
++        booked = [appt(f"a{i}", utc(2027, 3, 1, 20 + i // 2, 30 * (i % 2))) for i in range(MAX_PATIENTS_PER_DAY)]
++        cal = Calendar(booked)
++        cal.cancel("a0", utc(2027, 2, 28))
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 2, 1))))
++
++    def test_limit_is_per_therapist(self):
++        booked = [appt(f"a{i}", utc(2027, 3, 1, 20 + i // 2, 30 * (i % 2)), therapist="T2") for i in range(MAX_PATIENTS_PER_DAY)]
++        cal = Calendar(booked)
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 2, 1))))
++
++    def test_limit_uses_clinic_local_day(self):
++        # 23:30 UTC on 1 March is 12:30 on 2 March in Auckland, so it does not count towards 1 March.
++        booked = [appt(f"a{i}", utc(2027, 3, 1, 9, 30 + i)) for i in range(MAX_PATIENTS_PER_DAY)]
++        cal = Calendar(booked)
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 10, 30))))
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 23, 30))))

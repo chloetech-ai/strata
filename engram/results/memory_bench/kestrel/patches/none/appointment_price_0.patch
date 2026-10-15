@@ -1,0 +1,79 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ad329e2..eba2c21 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@
+ - `Appointment.cancelled_at`, saved and loaded by storage.
+ - `kestrel.ids.normalize_patient_id` trims, upper-cases, zero-pads and adds the dash to typed patient IDs, rejecting malformed ones.
+ - `session_price(kind)` returns the price in cents: $95 for an assessment, $70 for a follow-up.
++- `appointment_price(appointment, patient)` returns what the patient pays for the appointment, in cents. It refuses an appointment that belongs to a different patient, and raises `NotImplementedError` for Community Services Card holders until their rate is set.
+ - `make_invoice` builds an invoice for an appointment, dated on its local date. It refuses an appointment that belongs to a different patient.
+ - `therapist_load` counts each therapist's booked appointments per local date over a seven-day week.
+ - Waitlist with urgent-first ordering: urgent entries come first, then the rest, each in request order.
+diff --git a/src/kestrel/pricing.py b/src/kestrel/pricing.py
+index 6af682a..5ceae98 100644
+--- a/src/kestrel/pricing.py
++++ b/src/kestrel/pricing.py
+@@ -14,3 +14,17 @@ def session_price(kind):
+         return PRICES_CENTS[kind]
+     except KeyError:
+         raise ValueError(f"unknown kind {kind!r}") from None
++
++
++def appointment_price(appointment, patient):
++    """What the patient pays for the appointment, in cents.
++
++    Refuses an appointment that belongs to a different patient. Community
++    Services Card holders have a separate rate that has not been set yet, so
++    they are refused rather than charged the standard price.
++    """
++    if appointment.patient_id != patient.id:
++        raise ValueError(f"appointment {appointment.id} is not for patient {patient.id}")
++    if patient.csc:
++        raise NotImplementedError(f"no Community Services Card rate set for {appointment.kind!r}")
++    return session_price(appointment.kind)
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+index 4ae819f..82dcfd3 100644
+--- a/tests/test_pricing.py
++++ b/tests/test_pricing.py
+@@ -1,6 +1,9 @@
+ import unittest
+ 
+-from kestrel.pricing import session_price
++from kestrel.models import Patient
++from kestrel.pricing import appointment_price, session_price
++
++from helpers import appt, utc
+ 
+ 
+ class SessionPriceTest(unittest.TestCase):
+@@ -15,5 +18,29 @@ class SessionPriceTest(unittest.TestCase):
+             session_price("massage")
+ 
+ 
++class AppointmentPriceTest(unittest.TestCase):
++    def setUp(self):
++        self.patient = Patient(id="KP-004211", name="Aroha Ngata", phone="+64211234567")
++
++    def test_assessment_price(self):
++        appointment = appt("A1", utc(2026, 10, 15, 2), kind="assessment", patient="KP-004211")
++        self.assertEqual(appointment_price(appointment, self.patient), 9500)
++
++    def test_followup_price(self):
++        appointment = appt("A1", utc(2026, 10, 15, 2), kind="followup", patient="KP-004211")
++        self.assertEqual(appointment_price(appointment, self.patient), 7000)
++
++    def test_rejects_appointment_for_another_patient(self):
++        appointment = appt("A1", utc(2026, 10, 15, 2), patient="KP-000099")
++        with self.assertRaises(ValueError):
++            appointment_price(appointment, self.patient)
++
++    def test_csc_patient_refused_until_rate_is_set(self):
++        csc_patient = Patient(id="KP-004211", name="Aroha Ngata", phone="+64211234567", csc=True)
++        appointment = appt("A1", utc(2026, 10, 15, 2), kind="followup", patient="KP-004211")
++        with self.assertRaises(NotImplementedError):
++            appointment_price(appointment, csc_patient)
++
++
+ if __name__ == "__main__":
+     unittest.main()

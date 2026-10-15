@@ -1,0 +1,59 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..e7afd94
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,18 @@
++"""Interval helpers."""
++
++import re
++
++_DURATION = re.compile(r"(?:(\d+)h\s*(?:(\d+)m?)?)|(\d+)m")
++
++
++def parse_duration(text):
++    """Turn a typed duration into minutes, e.g. '1h 30m' -> 90, '1h30' -> 90, '45m' -> 45."""
++    match = _DURATION.fullmatch(text.strip())
++    if match is None:
++        raise ValueError(f"not a duration: {text!r}")
++    hours, minutes, minutes_only = match.groups()
++    if minutes_only is not None:
++        return int(minutes_only)
++    if minutes is not None and int(minutes) >= 60:
++        raise ValueError(f"minutes out of range: {text!r}")
++    return int(hours) * 60 + int(minutes or 0)
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..81c14ce
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from kestrel.intervals import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes_only(self):
++        self.assertEqual(parse_duration("45m"), 45)
++
++    def test_hours_only(self):
++        self.assertEqual(parse_duration("1h"), 60)
++
++    def test_hours_and_minutes(self):
++        for text in ["1h30", "1h 30m", "1h30m", "1h 30"]:
++            with self.subTest(text=text):
++                self.assertEqual(parse_duration(text), 90)
++
++    def test_surrounding_whitespace_ignored(self):
++        self.assertEqual(parse_duration("  2h15 "), 135)
++
++    def test_rejects_anything_else(self):
++        for text in ["", "m", "h", "45", "1.5h", "1 h", "-30m", "1h60m", "30 min", "1h 2h", "1H", "1m30m"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

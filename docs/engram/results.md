@@ -7,7 +7,7 @@ nav_order: 2
 # Engram: results
 {: .no_toc }
 
-Engram works as a long-term memory for Claude Code. Every hook event is stored without the model's help. The details a compaction throws away come back when a prompt asks for them, and a new session starts out knowing what earlier sessions decided. Its weak point is the decision to inject: the gate keeps costs down but cannot reliably tell a related record from a relevant one.
+Engram works as a long-term memory for Claude Code. Every hook event is stored without the model's help. The details a compaction throws away come back when a prompt asks for them, and a new session starts out knowing what earlier sessions decided. Its weak point is the decision to inject: the gate keeps costs down but cannot reliably tell a related record from a relevant one. The query engine added in October 2026 lets a small model plan the searches and pick what matters, which raises LongMemEval answers from 72% to 81% and catches requirements a request implies without naming them.
 {: .fs-5 .fw-300 }
 
 1. TOC
@@ -20,6 +20,8 @@ Engram works as a long-term memory for Claude Code. Every hook event is stored w
 | **Store without being asked** | Prompts, tool calls and results, errors, answers, commentary and compaction summaries are captured from hooks. A hook costs 14–26 ms, most of it starting the hook process; a durable append takes about 4.5 ms. The 26-hour session becomes 2,204 records, back-filled in 6 s (on the cloud VM). | The model's reasoning is redacted in transcripts, so the "why" survives only where it was written out. |
 | **Load without being asked, only when it helps** | 13 of 15 lost details came back automatically after a compaction; 8 of 8 questions about the 26-hour history answered in live sessions, against 0 of 4 without Engram. | The gate's precision is modest: 59% against 42% for always injecting on LongMemEval, no gain on LoCoMo. |
 | **Let the model ask precisely** | In a live session the model followed an injected record id with `memory_timeline` and quoted the exact command and output of a previous session. | Whether the model searches depends on the model and the prompt. |
+| **Connect a request to what it implies** | The query engine plans several searches and a second call picks what matters: LongMemEval answers rise from 72.2% to **81.0%** with its picks added; on a task whose request names neither a school's nut-free rule nor the nuts in a product, it was the only Engram setting that left the product out (6 of 6 runs, against 0 of 3 on `main`). | It costs $0.003 and about 16 s a request with Haiku, so it runs in the background. Its ranker drops stated preferences (preference questions 83% → 73%). |
+| **Do better than the alternatives** | Over 150 follow-up runs on four projects, Engram solved 91–96% (by version and mode), against 43% with no memory, 73% with Claude Code's own memory, 77% with grep over past transcripts, 57% with claude-mem and 84% with mem0, and about as many as with the whole history in context. | The October changes are not measurably better than `main` there (144 against 141 runs solved). |
 | **Scale far beyond a context window** | At a million records (about 200 sessions of this repository's size) a recall query takes 5.7 ms at the median and the file holds 3.1 KB per record. | Finding one conversation's needle among generic filler gets harder: recall@10 0.80 at 10k records, 0.44 at 1M. |
 
 ## Claude Code with and without Engram
@@ -70,6 +72,30 @@ The A/B above compares Engram with nothing. This one puts Claude Code next to th
 | Engram new (async) | the same with the query engine in its default mode, in the background |
 | Engram new (sync) | the query engine before the model starts on each prompt |
 | whole history in context | the history's one long session, forked for each task: an upper bound |
+
+![Follow-up runs solved with each memory system, per project](../assets/img/chart-engram-v2-lanes.png)
+
+| lane | bakehouse | stockroom | slotwise | kestrel | all | needs an earlier session | $ per run, agent + memory |
+|---|---|---|---|---|---|---|---|
+| no memory | 18/48 | 14/30 | 12/30 | 20/42 | 64/150 (43%) | 25/111 | 0.005 + 0 |
+| Claude Code auto memory | 33/48 | 23/30 | 24/30 | 29/42 | 109/150 (73%) | 70/111 | 0.006 + 0 |
+| past transcripts | 30/48 | 25/30 | 25/30 | 36/42 | 116/150 (77%) | 77/111 | 0.006 + 0 |
+| claude-mem | 17/48 | 24/30 | 21/30 | 24/42 | 86/150 (57%) | 47/111 | 0.007 + 0.008 |
+| mem0 | 32/48 | 30/30 | 27/30 | 37/42 | 126/150 (84%) | 87/111 | 0.006 + 0.0003 |
+| Engram main | 42/48 | 30/30 | 30/30 | 39/42 | 141/150 (94%) | 102/111 | 0.006 + 0 |
+| Engram new, no query engine | 40/48 | 29/30 | 30/30 | 38/42 | 137/150 (91%) | 98/111 | 0.006 + 0 |
+| Engram new (async, the default) | **45/48** | 30/30 | 30/30 | 39/42 | **144/150 (96%)** | **105/111** | 0.007 + 0.003 |
+| Engram new (sync) | 43/48 | 30/30 | 27/30 | 39/42 | 139/150 (93%) | 100/111 | 0.006 + 0.003 |
+| whole history in context | 40/48 | 30/30 | 30/30 | 39/42 | 139/150 (93%) | 100/111 | 0.016 + 0 |
+
+*"Needs an earlier session" leaves out the controls and the tasks whose convention is in the repository. Bakehouse has 16 tasks, kestrel 14, the others 10, each run three times per lane: 1,500 runs. Every lane's history and runs are in `engram/results/memory_bench/<project>/`, the pooled tests in `pooled.md`.*
+
+**Any memory helps, and Engram leads.** Every Engram lane solved more than any other system, and about as much as having the whole history in context, at two thirds of its cost per run or less. Against no memory, Engram's default solves 144 of 150 runs against 64 (p < 10<sup>−20</sup>). Of the others, mem0 comes closest (126/150; p = 0.009 against Engram `main`); it depends on the agent calling its tools, which it did 1.6 times a run, and it found none of bakehouse's requirements that a task implies without naming them (0 of 12). Claude Code's own memory and grep over past transcripts recover about two thirds of what was only said. claude-mem was the weakest: no better than nothing on bakehouse (17 against 18 of 48), not significantly better on kestrel (24 against 20 of 42), while its observer made the most model calls ($0.60 over the four histories, against $0.15 for Engram `main`).
+
+**The October changes against `main`.** Pooled over the four projects, the default build solves 144 runs against `main`'s 141 (Fisher p = 0.6; permutation within tasks p = 0.10): not a measurable difference on its own. Where the two differ, the query engine is why. One bakehouse task asks to enter a school's order that includes Bakewell slices; the history said months earlier that the school is nut-free, and the catalog lists nuts in the slice. With the query engine (async or sync) all six runs left the slice out, and the agent said why; `main`, the same build with the query engine off, and Claude Code with the whole history in context solved 0, 0 and 1 of 3. This is the link by inference that plain recall misses: the request names neither nuts nor the rule. Without the query engine the new build is level with `main` (137 against 141, p = 0.5). Notes that replace older ones and code anchors did not show up in these grades: `main` already solved every revised-decision task on bakehouse, and its three tasks about code that changed under a note were solved by every lane, including the one with no memory, because the agent reads the code. The default build costs more: the query engine adds $0.003 a run in model calls, about half the agent's own cost, and $0.37 over the four histories against $0.15.
+
+**Async beats sync.** Running the query engine before the model starts cost 10 seconds a run and solved fewer runs (139 against 144). On slotwise it lost all three runs of one task: it picked a note the distiller had written from the assistant's own unanswered questions ("these cancellation fee details are still undecided and must be settled before the fee is built"), and the agent asked instead of building. The distill prompt now leaves such questions out ([check](https://github.com/rkonow/engram/tree/main/engram/results/v2/distill_open_questions): 6 of 6 outputs carried one before, 0 of 6 after); the comparison ran on the build before that fix.
+
 
 ## This repository's own 26-hour session
 

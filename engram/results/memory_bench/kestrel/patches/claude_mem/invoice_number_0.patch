@@ -1,0 +1,85 @@
+diff --git a/src/kestrel/invoices.py b/src/kestrel/invoices.py
+index 6013a52..fbf1f2e 100644
+--- a/src/kestrel/invoices.py
++++ b/src/kestrel/invoices.py
+@@ -2,6 +2,7 @@
+ 
+ from dataclasses import dataclass
+ import datetime
++import re
+ 
+ from .calendar import LOCAL_TZ
+ from .models import ASSESSMENT, FOLLOWUP
+@@ -12,6 +13,23 @@ KIND_DESCRIPTIONS = {
+ }
+ 
+ 
++def next_invoice_number(clinic, year, existing):
++    """Return the next invoice number for a clinic in a year, e.g. 'INV-NG-2027-00001'.
++
++    Numbers are sequential per clinic and year. `existing` holds every invoice
++    number issued so far, for any clinic and year; only those for this clinic
++    and year count. The next number is one above the highest, so a gap left by
++    a deleted invoice is never reused.
++    """
++    pattern = re.compile(rf"INV-{re.escape(clinic)}-{year}-(\d+)")
++    sequences = [
++        int(match.group(1))
++        for number in existing
++        if (match := pattern.fullmatch(number)) is not None
++    ]
++    return f"INV-{clinic}-{year}-{max(sequences, default=0) + 1:05d}"
++
++
+ @dataclass
+ class Invoice:
+     number: str
+diff --git a/tests/test_invoices.py b/tests/test_invoices.py
+index 485b6d3..7bcc584 100644
+--- a/tests/test_invoices.py
++++ b/tests/test_invoices.py
+@@ -2,13 +2,43 @@ import datetime
+ import unittest
+ 
+ from helpers import appt, utc
+-from kestrel.invoices import make_invoice
++from kestrel.invoices import make_invoice, next_invoice_number
+ from kestrel.models import Patient
+ 
+ 
+ PATIENT = Patient(id="KP-004211", name="Aroha Ngata", phone="+64211234567")
+ 
+ 
++class NextInvoiceNumberTest(unittest.TestCase):
++    def test_first_invoice_of_year(self):
++        self.assertEqual(next_invoice_number("NG", 2027, []), "INV-NG-2027-00001")
++
++    def test_one_above_highest_existing(self):
++        existing = ["INV-NG-2027-00001", "INV-NG-2027-00002"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00003")
++
++    def test_uses_highest_not_count(self):
++        # Invoice 2 was deleted; the next number must not reuse anything issued.
++        existing = ["INV-NG-2027-00001", "INV-NG-2027-00003"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00004")
++
++    def test_ignores_other_clinics(self):
++        existing = ["INV-PT-2027-00009", "INV-NG-2027-00002"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00003")
++
++    def test_ignores_other_years(self):
++        existing = ["INV-NG-2026-00040"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00001")
++
++    def test_ignores_clinic_code_that_only_starts_the_same(self):
++        existing = ["INV-NGX-2027-00007"]
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00001")
++
++    def test_accepts_any_iterable(self):
++        existing = (n for n in ["INV-NG-2027-00002"])
++        self.assertEqual(next_invoice_number("NG", 2027, existing), "INV-NG-2027-00003")
++
++
+ class MakeInvoiceTest(unittest.TestCase):
+     def test_copies_details_from_appointment_and_patient(self):
+         a = appt("a1", utc(2027, 3, 1, 9), kind="assessment", patient="KP-004211", clinic="NG")

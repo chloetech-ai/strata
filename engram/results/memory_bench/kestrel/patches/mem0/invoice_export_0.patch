@@ -1,0 +1,121 @@
+diff --git a/src/kestrel/export.py b/src/kestrel/export.py
+new file mode 100644
+index 0000000..9d981be
+--- /dev/null
++++ b/src/kestrel/export.py
+@@ -0,0 +1,32 @@
++"""Monthly export of invoices for the accountant (Xero import)."""
++
++import csv
++import os
++
++HEADER = ["InvoiceNumber", "ContactName", "InvoiceDate", "Description", "Quantity", "UnitAmount"]
++
++
++def export_invoices(invoices, year, month, out_dir):
++    """Write the invoices issued in year-month to out_dir as CSV and return the file path.
++
++    The contact is the patient ID, never the patient name, so no names leave the system.
++    Dates are DD/MM/YYYY and amounts are plain numbers with two decimals.
++    """
++    selected = sorted(
++        (i for i in invoices if i.issued.year == year and i.issued.month == month),
++        key=lambda i: (i.issued, i.number),
++    )
++    path = os.path.join(out_dir, f"kestrel-invoices-{year:04d}-{month:02d}.csv")
++    with open(path, "w", encoding="utf-8", newline="") as f:
++        writer = csv.writer(f)
++        writer.writerow(HEADER)
++        for invoice in selected:
++            writer.writerow([
++                invoice.number,
++                invoice.patient_id,
++                invoice.issued.strftime("%d/%m/%Y"),
++                invoice.description,
++                1,
++                f"{invoice.amount_cents / 100:.2f}",
++            ])
++    return path
+diff --git a/tests/test_export.py b/tests/test_export.py
+new file mode 100644
+index 0000000..c6a1214
+--- /dev/null
++++ b/tests/test_export.py
+@@ -0,0 +1,77 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from helpers import appt, utc
++
++from kestrel.export import export_invoices
++from kestrel.invoices import make_invoice
++from kestrel.models import Patient
++
++PATIENT = Patient(id="KP-004211", name="Test Patient", phone="+64211234567")
++
++
++def invoice(number, start, amount_cents=7000):
++    return make_invoice(appt(number, start), PATIENT, number, amount_cents)
++
++
++class ExportInvoicesTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++
++    def read_rows(self, path):
++        with open(path, encoding="utf-8", newline="") as f:
++            return list(csv.reader(f))
++
++    def test_writes_named_file_with_header_and_returns_path(self):
++        path = export_invoices([invoice("INV-HB-2027-00001", utc(2027, 3, 1, 9))], 2027, 3, self.tmp.name)
++        self.assertEqual(path, os.path.join(self.tmp.name, "kestrel-invoices-2027-03.csv"))
++        self.assertEqual(self.read_rows(path)[0], ["InvoiceNumber", "ContactName", "InvoiceDate", "Description", "Quantity", "UnitAmount"])
++
++    def test_row_values(self):
++        path = export_invoices([invoice("INV-HB-2027-00001", utc(2027, 3, 1, 9), 9500)], 2027, 3, self.tmp.name)
++        self.assertEqual(self.read_rows(path)[1], ["INV-HB-2027-00001", "KP-004211", "01/03/2027", "Follow-up session", "1", "95.00"])
++
++    def test_no_patient_names_in_output(self):
++        path = export_invoices([invoice("INV-HB-2027-00001", utc(2027, 3, 1, 9))], 2027, 3, self.tmp.name)
++        with open(path, encoding="utf-8") as f:
++            self.assertNotIn("Test Patient", f.read())
++
++    def test_only_invoices_from_the_month(self):
++        invoices = [
++            invoice("INV-1", utc(2027, 2, 28, 12)),  # 1 Mar 01:00 local -> March
++            invoice("INV-2", utc(2027, 3, 15, 9)),
++            invoice("INV-3", utc(2027, 4, 1, 1)),    # 1 Apr 14:00 local -> April
++        ]
++        path = export_invoices(invoices, 2027, 3, self.tmp.name)
++        numbers = [row[0] for row in self.read_rows(path)[1:]]
++        self.assertEqual(numbers, ["INV-1", "INV-2"])
++
++    def test_dates_use_local_clinic_date(self):
++        # 2027-03-01 20:00 UTC is 2027-03-02 09:00 in Auckland.
++        path = export_invoices([invoice("INV-1", utc(2027, 3, 1, 20))], 2027, 3, self.tmp.name)
++        self.assertEqual(self.read_rows(path)[1][2], "02/03/2027")
++
++    def test_sorted_by_date_then_number(self):
++        invoices = [
++            invoice("INV-B", utc(2027, 3, 2, 9)),
++            invoice("INV-A", utc(2027, 3, 2, 9)),
++            invoice("INV-C", utc(2027, 3, 1, 9)),
++        ]
++        path = export_invoices(invoices, 2027, 3, self.tmp.name)
++        self.assertEqual([row[0] for row in self.read_rows(path)[1:]], ["INV-C", "INV-A", "INV-B"])
++
++    def test_empty_month_writes_header_only(self):
++        path = export_invoices([invoice("INV-1", utc(2027, 3, 1, 9))], 2027, 4, self.tmp.name)
++        self.assertEqual(len(self.read_rows(path)), 1)
++
++    def test_amounts_have_two_decimals_and_no_currency_sign(self):
++        path = export_invoices([invoice("INV-1", utc(2027, 3, 1, 9), 10550)], 2027, 3, self.tmp.name)
++        self.assertEqual(self.read_rows(path)[1][5], "105.50")
++
++
++if __name__ == "__main__":
++    unittest.main()

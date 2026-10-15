@@ -1,0 +1,92 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6b019d6..fdfc827 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - Waitlist: urgent entries are ordered ahead of the rest.
+ - Legacy import: appointments can be imported from the legacy booking export.
+ - SMS: Bulkie batches are split into calls of at most 50 messages.
++- Reminders: `reminder_text` builds the SMS sent two days before an appointment (clinic, date and time only).
+ - Storage: `save` writes atomically (temp file, fsync, then rename), so a crash cannot leave a half-written file.
+ - CLI: `python -m kestrel day THERAPIST_ID DATE --data FILE` and `python -m kestrel patients --data FILE` (patient IDs and names, sorted by ID).
+ 
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..4dfe610
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,19 @@
++"""Appointment reminder messages."""
++
++from .calendar import CLINIC_TZ
++from .models import CLINICS
++
++
++def reminder_text(appointment):
++    """The SMS sent two days before an appointment.
++
++    Only the clinic name, date and time are included. The treatment, the
++    session kind and the patient's name are deliberately left out (privacy).
++    """
++    start = appointment.start.astimezone(CLINIC_TZ)
++    clinic = CLINICS[appointment.clinic].name
++    when = f"{start:%A} {start.day} {start:%B} at {start:%H:%M}"
++    return (
++        f"Hi from {clinic}. This is a friendly reminder of your appointment "
++        f"on {when}. We look forward to seeing you!"
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..92418b7
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,49 @@
++import datetime
++import unittest
++
++from kestrel.calendar import CLINIC_TZ
++from kestrel.models import Appointment, ASSESSMENT
++from kestrel.reminders import reminder_text
++
++
++def appointment(**overrides):
++    fields = dict(
++        id="A1",
++        patient_id="KP-004211",
++        therapist_id="T1",
++        clinic="HB",
++        start=datetime.datetime(2026, 10, 22, 14, 30, tzinfo=CLINIC_TZ),
++        kind=ASSESSMENT,
++        treatment="lower back pain",
++    )
++    fields.update(overrides)
++    return Appointment(**fields)
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_includes_clinic_date_and_time(self):
++        text = reminder_text(appointment())
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("Thursday 22 October at 14:30", text)
++
++    def test_time_is_clinic_local_not_utc(self):
++        # 01:30 UTC is 14:30 in Auckland (NZDT, UTC+13) in October.
++        start = datetime.datetime(2026, 10, 22, 1, 30, tzinfo=datetime.timezone.utc)
++        self.assertIn("at 14:30", reminder_text(appointment(start=start)))
++
++    def test_excludes_treatment_kind_and_patient(self):
++        text = reminder_text(appointment(treatment="lower back pain", kind=ASSESSMENT))
++        self.assertNotIn("lower back pain", text)
++        self.assertNotIn("assessment", text.lower())
++        self.assertNotIn("KP-004211", text)
++
++    def test_is_one_plain_sms_segment(self):
++        for clinic in ["NG", "HB", "WK"]:
++            with self.subTest(clinic=clinic):
++                text = reminder_text(appointment(clinic=clinic))
++                self.assertLessEqual(len(text), 160)
++                self.assertTrue(text.isascii())
++
++
++if __name__ == "__main__":
++    unittest.main()

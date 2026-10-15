@@ -1,0 +1,56 @@
+diff --git a/src/kestrel/calendar.py b/src/kestrel/calendar.py
+index 5f48f0c..f2004a1 100644
+--- a/src/kestrel/calendar.py
++++ b/src/kestrel/calendar.py
+@@ -68,5 +68,11 @@ class Calendar:
+         ]
+         return sorted(matches, key=lambda a: a.start)
+ 
++    def upcoming(self, patient_id, now):
++        """A patient's booked appointments starting after `now`, soonest first."""
++        if now.tzinfo is None:
++            raise ValueError("now must be timezone-aware")
++        return [a for a in self.for_patient(patient_id) if a.status == BOOKED and a.start > now]
++
+     def __len__(self):
+         return len(self._appointments)
+diff --git a/tests/test_calendar.py b/tests/test_calendar.py
+index 4c5d095..27d1f0f 100644
+--- a/tests/test_calendar.py
++++ b/tests/test_calendar.py
+@@ -156,6 +156,35 @@ class CalendarTest(unittest.TestCase):
+                 with self.assertRaises(ValueError):
+                     cal.move(appointment_id, utc(2027, 3, 2, 9))
+ 
++    def test_upcoming_soonest_first_after_now(self):
++        now = utc(2027, 3, 1, 12)
++        cal = Calendar([
++            appt("late", utc(2027, 3, 3, 9)),
++            appt("soon", utc(2027, 3, 1, 14)),
++            appt("past", utc(2027, 3, 1, 10)),
++            appt("at_now", utc(2027, 3, 1, 12)),
++            appt("other", utc(2027, 3, 2, 9), patient="KP-000002"),
++        ])
++        self.assertEqual([a.id for a in cal.upcoming("KP-000001", now)], ["soon", "late"])
++
++    def test_upcoming_excludes_cancelled(self):
++        now = utc(2027, 3, 1, 12)
++        cal = Calendar([
++            appt("a1", utc(2027, 3, 2, 9)),
++            appt("a2", utc(2027, 3, 3, 9), status="cancelled"),
++        ])
++        self.assertEqual([a.id for a in cal.upcoming("KP-000001", now)], ["a1"])
++
++    def test_upcoming_accepts_messy_patient_id(self):
++        now = utc(2027, 3, 1, 12)
++        cal = Calendar([appt("a1", utc(2027, 3, 2, 9), patient="KP-004211")])
++        self.assertEqual([a.id for a in cal.upcoming(" kp4211 ", now)], ["a1"])
++
++    def test_upcoming_rejects_naive_now(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 2, 9))])
++        with self.assertRaises(ValueError):
++            cal.upcoming("KP-000001", datetime.datetime(2027, 3, 1, 12))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

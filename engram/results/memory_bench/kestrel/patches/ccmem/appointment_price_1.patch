@@ -1,0 +1,90 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 8ff664b..9d58103 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -2,5 +2,16 @@
+   "tests/test_calendar.py::CalendarTest": true,
+   "tests/test_ids.py::NormalizePatientIdTest": true,
+   "tests/test_models.py::AppointmentTest": true,
+-  "tests/test_storage.py::StorageTest": true
++  "tests/test_storage.py::StorageTest": true,
++  "tests/test_calendar.py": true,
++  "tests/test_ids.py": true,
++  "tests/test_invoices.py": true,
++  "tests/test_legacy.py": true,
++  "tests/test_main.py": true,
++  "tests/test_models.py": true,
++  "tests/test_pricing.py": true,
++  "tests/test_reports.py": true,
++  "tests/test_sms.py": true,
++  "tests/test_storage.py": true,
++  "tests/test_waitlist.py": true
+ }
+\ No newline at end of file
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b0609c1..c9c0ffa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@
+ - `reports.therapist_load(calendar, week_start)` counts booked appointments per therapist for each local date in a seven-day week, with zeros for empty days.
+ - `import_legacy(path)` imports appointments from the legacy booking export.
+ - `session_price(kind)` gives the price for an assessment or a follow-up.
++- `appointment_price(appointment, patient)` gives what the patient pays for an appointment, in cents. It uses `session_price` for the appointment's kind and raises `ValueError` if the patient is not the appointment's patient.
+ - `Patient` has a `csc` flag (Community Services Card holder), default `False`. Files saved before the flag existed still load.
+ - `Calendar.all()` sorts appointments by start time.
+ - `Calendar.for_day(therapist_id, day)` matches on the Auckland local date, not the UTC date.
+diff --git a/src/kestrel/pricing.py b/src/kestrel/pricing.py
+index 21cf608..de5ce56 100644
+--- a/src/kestrel/pricing.py
++++ b/src/kestrel/pricing.py
+@@ -17,3 +17,13 @@ def session_price(kind):
+     if kind not in PRICES:
+         raise ValueError(f"unknown kind {kind!r}")
+     return PRICES[kind]
++
++
++def appointment_price(appointment, patient):
++    """What the patient pays for the appointment, in cents.
++
++    Raises ValueError if the patient is not the appointment's patient.
++    """
++    if appointment.patient_id != patient.id:
++        raise ValueError(f"appointment {appointment.id} is not for patient {patient.id}")
++    return session_price(appointment.kind)
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+index 6b68cf3..3fa2402 100644
+--- a/tests/test_pricing.py
++++ b/tests/test_pricing.py
+@@ -1,7 +1,11 @@
+ import unittest
+ 
+-from kestrel.models import ASSESSMENT, FOLLOWUP
+-from kestrel.pricing import session_price
++from kestrel.models import ASSESSMENT, FOLLOWUP, Patient
++from kestrel.pricing import appointment_price, session_price
++
++from helpers import appt, utc
++
++PATIENT = Patient(id="KP-004211", name="Aroha Test", phone="+64211234567")
+ 
+ 
+ class SessionPriceTest(unittest.TestCase):
+@@ -18,5 +22,18 @@ class SessionPriceTest(unittest.TestCase):
+                     session_price(kind)
+ 
+ 
++class AppointmentPriceTest(unittest.TestCase):
++    def test_matches_session_price_for_kind(self):
++        a = appt("A1", utc(2026, 10, 15, 9, 0), kind=ASSESSMENT, patient="KP-004211")
++        b = appt("A2", utc(2026, 10, 15, 10, 0), kind=FOLLOWUP, patient="KP-004211")
++        self.assertEqual(appointment_price(a, PATIENT), session_price(ASSESSMENT))
++        self.assertEqual(appointment_price(b, PATIENT), session_price(FOLLOWUP))
++
++    def test_rejects_appointment_for_another_patient(self):
++        a = appt("A1", utc(2026, 10, 15, 9, 0), patient="KP-000002")
++        with self.assertRaises(ValueError):
++            appointment_price(a, PATIENT)
++
++
+ if __name__ == "__main__":
+     unittest.main()

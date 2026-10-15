@@ -1,0 +1,94 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6b019d6..a1d875a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - Waitlist: urgent entries are ordered ahead of the rest.
+ - Legacy import: appointments can be imported from the legacy booking export.
+ - SMS: Bulkie batches are split into calls of at most 50 messages.
++- SMS: `reminder_text` gives the two-day reminder text (clinic name, local date and time; never the treatment).
+ - Storage: `save` writes atomically (temp file, fsync, then rename), so a crash cannot leave a half-written file.
+ - CLI: `python -m kestrel day THERAPIST_ID DATE --data FILE` and `python -m kestrel patients --data FILE` (patient IDs and names, sorted by ID).
+ 
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..d3fa17b
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,20 @@
++"""Text of the appointment reminder SMS."""
++
++from .calendar import CLINIC_TZ
++from .models import CLINICS
++
++
++def reminder_text(appointment):
++    """The SMS sent two days before an appointment.
++
++    Only the date, time and clinic name go in the message. It must not say what the appointment is for.
++    """
++    local = appointment.start.astimezone(CLINIC_TZ)
++    hour = local.hour % 12 or 12
++    meridiem = f"{local:%p}".lower()
++    when = f"{local:%A} {local.day} {local:%B} at {hour}:{local:%M}{meridiem}"
++    clinic = CLINICS[appointment.clinic].name
++    return (
++        f"Hi there, this is a friendly reminder of your appointment at {clinic} "
++        f"on {when}. If you need to change it, please get in touch with the clinic. See you then!"
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..21ab8a5
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,50 @@
++import datetime
++import unittest
++from zoneinfo import ZoneInfo
++
++from kestrel.models import Appointment, FOLLOWUP
++from kestrel.reminders import reminder_text
++
++AUCKLAND = ZoneInfo("Pacific/Auckland")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def appointment(self, start, clinic="NG", treatment="lower back pain"):
++        return Appointment(
++            id="A1", patient_id="KP-004211", therapist_id="T1", clinic=clinic,
++            start=start, kind=FOLLOWUP, treatment=treatment,
++        )
++
++    def test_includes_clinic_name_local_date_and_time(self):
++        start = datetime.datetime(2026, 10, 20, 9, 30, tzinfo=AUCKLAND)
++        text = reminder_text(self.appointment(start))
++        self.assertIn("Kestrel Physio Northgate", text)
++        self.assertIn("Tuesday 20 October at 9:30am", text)
++
++    def test_converts_utc_start_to_clinic_time(self):
++        # 21:30 UTC on 20 October is 10:30am on 21 October in Auckland (NZDT, UTC+13).
++        start = datetime.datetime(2026, 10, 20, 21, 30, tzinfo=datetime.timezone.utc)
++        text = reminder_text(self.appointment(start, clinic="HB"))
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("Wednesday 21 October at 10:30am", text)
++
++    def test_afternoon_time_uses_pm_and_twelve_hour_clock(self):
++        start = datetime.datetime(2026, 10, 22, 13, 5, tzinfo=AUCKLAND)
++        self.assertIn("at 1:05pm", reminder_text(self.appointment(start, clinic="WK")))
++
++    def test_midday_and_midnight_hours(self):
++        noon = datetime.datetime(2026, 10, 22, 12, 0, tzinfo=AUCKLAND)
++        midnight = datetime.datetime(2026, 10, 22, 0, 15, tzinfo=AUCKLAND)
++        self.assertIn("at 12:00pm", reminder_text(self.appointment(noon)))
++        self.assertIn("at 12:15am", reminder_text(self.appointment(midnight)))
++
++    def test_does_not_mention_treatment_or_kind(self):
++        start = datetime.datetime(2026, 10, 20, 9, 30, tzinfo=AUCKLAND)
++        text = reminder_text(self.appointment(start, treatment="lower back pain"))
++        self.assertNotIn("lower back", text.lower())
++        self.assertNotIn("physio session", text.lower())
++        self.assertNotIn("follow", text.lower())
++
++
++if __name__ == "__main__":
++    unittest.main()

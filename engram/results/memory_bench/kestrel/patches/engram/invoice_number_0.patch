@@ -1,0 +1,91 @@
+diff --git a/src/kestrel/invoices.py b/src/kestrel/invoices.py
+index f768b85..eea2cc3 100644
+--- a/src/kestrel/invoices.py
++++ b/src/kestrel/invoices.py
+@@ -2,6 +2,7 @@
+ 
+ from dataclasses import dataclass
+ import datetime
++import re
+ 
+ from .calendar import LOCAL_TZ
+ from .models import ASSESSMENT, FOLLOWUP
+@@ -24,6 +25,24 @@ DESCRIPTIONS = {
+ }
+ 
+ 
++def next_invoice_number(clinic, year, existing):
++    """Next INV-<clinic>-<year>-<sequence> number, counted per clinic and year.
++
++    `existing` holds invoice numbers from any clinic and year; only those for
++    this clinic and year count, and anything not in the format is ignored.
++    """
++    prefix = f"INV-{clinic}-{year}-"
++    sequences = [
++        int(number[len(prefix):])
++        for number in existing
++        if number.startswith(prefix) and re.fullmatch(r"[0-9]{5}", number[len(prefix):])
++    ]
++    next_sequence = max(sequences, default=0) + 1
++    if next_sequence > 99999:
++        raise ValueError(f"no invoice numbers left for {clinic} in {year}")
++    return f"{prefix}{next_sequence:05d}"
++
++
+ def make_invoice(appointment, patient, number, amount_cents):
+     """Invoice for an appointment, dated on its local (Pacific/Auckland) day."""
+     if patient.id != appointment.patient_id:
+diff --git a/tests/test_invoices.py b/tests/test_invoices.py
+index 7f43282..2d31852 100644
+--- a/tests/test_invoices.py
++++ b/tests/test_invoices.py
+@@ -2,7 +2,7 @@ import datetime
+ import unittest
+ 
+ from helpers import appt, utc
+-from kestrel.invoices import make_invoice
++from kestrel.invoices import make_invoice, next_invoice_number
+ from kestrel.models import ASSESSMENT, FOLLOWUP, Patient
+ 
+ PATIENT = Patient(id="KP-004211", name="Jo Example", phone="+64211234567")
+@@ -55,5 +55,40 @@ class MakeInvoiceTest(unittest.TestCase):
+             make_invoice(a, PATIENT, "INV-HB-2027-00007", 7000)
+ 
+ 
++class NextInvoiceNumberTest(unittest.TestCase):
++    def test_first_invoice_of_the_year_is_00001(self):
++        self.assertEqual(next_invoice_number("HB", 2027, []), "INV-HB-2027-00001")
++
++    def test_follows_highest_sequence_for_clinic_and_year(self):
++        existing = ["INV-HB-2027-00041", "INV-HB-2027-00042", "INV-HB-2027-00007"]
++        self.assertEqual(next_invoice_number("HB", 2027, existing), "INV-HB-2027-00043")
++
++    def test_ignores_other_clinics(self):
++        existing = ["INV-NG-2027-00900", "INV-WK-2027-00500"]
++        self.assertEqual(next_invoice_number("HB", 2027, existing), "INV-HB-2027-00001")
++
++    def test_restarts_at_00001_in_a_new_year(self):
++        existing = ["INV-HB-2026-00880"]
++        self.assertEqual(next_invoice_number("HB", 2027, existing), "INV-HB-2027-00001")
++
++    def test_ignores_numbers_not_in_the_format(self):
++        existing = ["INV-HB-2027-0042", "INV-HB-2027-000x1", "INV-HB-2027-00003", "xINV-HB-2027-00099"]
++        self.assertEqual(next_invoice_number("HB", 2027, existing), "INV-HB-2027-00004")
++
++    def test_does_not_mistake_a_longer_clinic_code_for_this_one(self):
++        existing = ["INV-HBX-2027-00050"]
++        self.assertEqual(next_invoice_number("HB", 2027, existing), "INV-HB-2027-00001")
++
++    def test_does_not_modify_existing(self):
++        existing = ["INV-HB-2027-00001"]
++        next_invoice_number("HB", 2027, existing)
++        self.assertEqual(existing, ["INV-HB-2027-00001"])
++
++    def test_raises_when_sequence_is_exhausted(self):
++        existing = ["INV-HB-2027-99999"]
++        with self.assertRaises(ValueError):
++            next_invoice_number("HB", 2027, existing)
++
++
+ if __name__ == "__main__":
+     unittest.main()

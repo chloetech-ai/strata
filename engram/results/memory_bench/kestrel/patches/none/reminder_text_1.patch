@@ -1,0 +1,91 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ad329e2..5b584d8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ ### Added
+ 
++- `reminder_text(appointment)` returns the friendly SMS sent two days before an appointment, with the clinic, day, date and time in local (Auckland) time, and the treatment if one is recorded.
+ - `python -m kestrel day THERAPIST_ID DATE --data FILE` lists a therapist's appointments on a local (Auckland) date.
+ - `python -m kestrel patients --data FILE` lists patient IDs and names, sorted by ID.
+ - `Calendar.for_day(therapist_id, day)` returns a therapist's appointments on a local date, sorted by start.
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..cf4f86e
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,22 @@
++"""Text of the SMS reminders sent to patients."""
++
++from .calendar import CLINIC_TZ
++from .models import CLINICS
++
++
++def _clock(moment):
++    """A local time in the style "2:30pm" or "9am"."""
++    hour = moment.hour % 12 or 12
++    suffix = "am" if moment.hour < 12 else "pm"
++    if moment.minute:
++        return f"{hour}:{moment.minute:02d}{suffix}"
++    return f"{hour}{suffix}"
++
++
++def reminder_text(appointment):
++    """The SMS sent two days before an appointment, with the time in clinic (Auckland) local time."""
++    local = appointment.start.astimezone(CLINIC_TZ)
++    when = f"{local:%A} {local.day} {local:%B} at {_clock(local)}"
++    clinic = CLINICS[appointment.clinic].name
++    visit = f"physio for {appointment.treatment}" if appointment.treatment else "physio appointment"
++    return f"Hi! Reminder of your {visit} at {clinic} on {when}. To change it, please contact the clinic. See you then!"
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..fd481bf
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,45 @@
++import datetime
++import unittest
++
++from kestrel.reminders import reminder_text
++
++from helpers import appt, utc
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_names_clinic_day_date_and_time_in_local_time(self):
++        # 01:30 UTC on 20 Oct 2026 is 2:30pm in Auckland (NZDT, UTC+13).
++        text = reminder_text(appt("A1", utc(2026, 10, 20, 1, 30), clinic="HB"))
++        self.assertEqual(
++            text,
++            "Hi! Reminder of your physio appointment at Kestrel Physio Harbour on Tuesday 20 October at 2:30pm. "
++            "To change it, please contact the clinic. See you then!",
++        )
++
++    def test_uses_treatment_when_given(self):
++        text = reminder_text(appt("A1", utc(2026, 10, 20, 1, 30), clinic="NG", treatment="lower back pain"))
++        self.assertIn("Reminder of your physio for lower back pain at Kestrel Physio Northgate on Tuesday 20 October", text)
++
++    def test_date_is_local_not_utc(self):
++        # 12:00 UTC on 19 Oct is already 1:00am on 20 Oct in Auckland.
++        text = reminder_text(appt("A1", utc(2026, 10, 19, 12, 0)))
++        self.assertIn("on Tuesday 20 October at 1am.", text)
++
++    def test_whole_hour_has_no_minutes_and_morning_uses_am(self):
++        text = reminder_text(appt("A1", utc(2026, 10, 20, 21, 0)))  # 10:00am NZDT
++        self.assertIn("at 10am.", text)
++
++    def test_midday_and_midnight_twelve_hour_clock(self):
++        noon = reminder_text(appt("A1", utc(2026, 10, 20, 23, 0)))  # 12:00pm NZDT
++        self.assertIn("at 12pm.", noon)
++        midnight = reminder_text(appt("A2", utc(2026, 10, 20, 11, 0)))  # 12:00am NZDT
++        self.assertIn("at 12am.", midnight)
++
++    def test_offset_start_time_is_converted(self):
++        start = datetime.datetime(2026, 10, 20, 9, 15, tzinfo=datetime.timezone(datetime.timedelta(hours=-5)))
++        text = reminder_text(appt("A1", start))  # 14:15 UTC, 3:15am on 21 Oct NZDT
++        self.assertIn("on Wednesday 21 October at 3:15am.", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

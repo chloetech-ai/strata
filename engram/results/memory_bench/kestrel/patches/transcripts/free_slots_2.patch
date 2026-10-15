@@ -1,0 +1,251 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9e5da12..c8be56e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@
+ - `Waitlist` holds patients waiting for an appointment, with `add`, `remove` and `entries`.
+ - `python -m kestrel day THERAPIST_ID DATE --data kestrel.json` prints a therapist's booked appointments on a local date.
+ - `python -m kestrel patients --data kestrel.json` prints patient IDs and names, sorted by ID.
++- `free_slots(calendar, therapist, day, kind)` returns the local start times (sorted `datetime.time`) at which a new appointment of that kind can be booked for a therapist on a local date. It applies clinic opening hours, appointment lengths, the 15-minute notes gap after an assessment, and the limit of 8 appointments per therapist per day.
+ - Storage writes atomically: data goes to a temporary file in the same directory, which then replaces the old file. A crash or failed write leaves the previous file intact. Saved files are now owner-only (mode 0600).
+ 
+ ## 0.1.0
+diff --git a/src/kestrel/slots.py b/src/kestrel/slots.py
+new file mode 100644
+index 0000000..d1633ff
+--- /dev/null
++++ b/src/kestrel/slots.py
+@@ -0,0 +1,83 @@
++"""Finding start times at which a new appointment can be booked."""
++
++import datetime
++
++from .calendar import CLINIC_TZ
++from .models import ASSESSMENT, BOOKED, FOLLOWUP, KINDS
++
++# Every appointment starts on a quarter hour.
++START_STEP = datetime.timedelta(minutes=15)
++
++# How long each kind of appointment takes.
++LENGTHS = {
++    ASSESSMENT: datetime.timedelta(minutes=45),
++    FOLLOWUP: datetime.timedelta(minutes=30),
++}
++
++# Time the therapist needs after an appointment, before the next patient, to write notes.
++NOTES_GAP = {
++    ASSESSMENT: datetime.timedelta(minutes=15),
++    FOLLOWUP: datetime.timedelta(0),
++}
++
++# Union agreement: no therapist sees more patients than this in a day.
++MAX_APPOINTMENTS_PER_DAY = 8
++
++WEEKDAY_HOURS = (datetime.time(7, 30), datetime.time(18, 0))
++SATURDAY_HOURS = (datetime.time(8, 0), datetime.time(12, 0))
++SATURDAY_CLINICS = ("NG",)  # only Northgate opens on Saturdays
++
++
++def _opening_hours(clinic, day):
++    """(open, close) local times for a clinic on a date, or None if it is closed.
++
++    Public holidays are not handled yet.
++    """
++    if day.weekday() < 5:
++        return WEEKDAY_HOURS
++    if day.weekday() == 5 and clinic in SATURDAY_CLINICS:
++        return SATURDAY_HOURS
++    return None
++
++
++def _local_naive(moment):
++    """A timezone-aware datetime as a naive clinic-local wall-clock datetime."""
++    return moment.astimezone(CLINIC_TZ).replace(tzinfo=None)
++
++
++def free_slots(calendar, therapist, day, kind):
++    """Local start times (datetime.time, sorted) at which a new appointment of this kind
++    could be booked for the therapist on a local (Pacific/Auckland) date.
++
++    A slot is free when the new appointment, plus its own notes gap, fits inside
++    the clinic's opening hours and does not touch any booked appointment for the
++    therapist, including that appointment's notes gap. Nothing is returned on a
++    day the clinic is closed or once the therapist has reached the daily limit.
++    """
++    if kind not in KINDS:
++        raise ValueError(f"unknown kind {kind!r}")
++    hours = _opening_hours(therapist.clinic, day)
++    if hours is None:
++        return []
++
++    booked = [a for a in calendar.for_day(therapist.id, day) if a.status == BOOKED]
++    if len(booked) >= MAX_APPOINTMENTS_PER_DAY:
++        return []
++
++    busy = []
++    for a in booked:
++        start = _local_naive(a.start)
++        busy.append((start, start + LENGTHS[a.kind] + NOTES_GAP[a.kind]))
++
++    length = LENGTHS[kind]
++    gap = NOTES_GAP[kind]
++    open_at, close_at = (datetime.datetime.combine(day, t) for t in hours)
++
++    times = []
++    start = open_at
++    while start + length <= close_at:
++        needed_until = start + length + gap
++        if all(needed_until <= busy_start or start >= busy_end for busy_start, busy_end in busy):
++            times.append(start.time())
++        start += START_STEP
++    return times
+diff --git a/tests/test_slots.py b/tests/test_slots.py
+new file mode 100644
+index 0000000..4891279
+--- /dev/null
++++ b/tests/test_slots.py
+@@ -0,0 +1,144 @@
++import datetime
++import unittest
++
++from helpers import appt, utc
++from kestrel.calendar import Calendar
++from kestrel.models import ASSESSMENT, ATTENDED, CANCELLED, FOLLOWUP, Therapist
++from kestrel.slots import free_slots
++
++# 2026-10-12 is a Monday. Mid-October Auckland is NZDT (UTC+13).
++MONDAY = datetime.date(2026, 10, 12)
++SATURDAY = datetime.date(2026, 10, 17)
++SUNDAY = datetime.date(2026, 10, 18)
++
++HB_THERAPIST = Therapist("T1", "Hana", "HB")
++NG_THERAPIST = Therapist("T2", "Ned", "NG")
++
++
++def at(day, hh, mm):
++    """A UTC instant for a given Auckland local date and time (NZDT, UTC+13)."""
++    start = datetime.datetime(day.year, day.month, day.day, hh, mm)
++    return (start - datetime.timedelta(hours=13)).replace(tzinfo=datetime.timezone.utc)
++
++
++def t(hh, mm):
++    return datetime.time(hh, mm)
++
++
++def quarter_hours(first, last):
++    """Every quarter-hour start from first to last inclusive, as times."""
++    out = []
++    current = datetime.datetime(2026, 1, 1, first.hour, first.minute)
++    end = datetime.datetime(2026, 1, 1, last.hour, last.minute)
++    while current <= end:
++        out.append(current.time())
++        current += datetime.timedelta(minutes=15)
++    return out
++
++
++class FreeSlotsOpeningHoursTest(unittest.TestCase):
++    def test_empty_weekday_followup_runs_07_30_to_17_30(self):
++        slots = free_slots(Calendar(), HB_THERAPIST, MONDAY, FOLLOWUP)
++        self.assertEqual(slots, quarter_hours(t(7, 30), t(17, 30)))
++
++    def test_empty_weekday_assessment_must_finish_by_18_00(self):
++        slots = free_slots(Calendar(), HB_THERAPIST, MONDAY, ASSESSMENT)
++        self.assertEqual(slots[0], t(7, 30))
++        self.assertEqual(slots[-1], t(17, 15))
++
++    def test_saturday_only_northgate_open_08_to_12(self):
++        self.assertEqual(free_slots(Calendar(), NG_THERAPIST, SATURDAY, FOLLOWUP),
++                         quarter_hours(t(8, 0), t(11, 30)))
++        self.assertEqual(free_slots(Calendar(), NG_THERAPIST, SATURDAY, ASSESSMENT)[-1], t(11, 15))
++
++    def test_saturday_closed_for_harbour_and_westwick(self):
++        self.assertEqual(free_slots(Calendar(), HB_THERAPIST, SATURDAY, FOLLOWUP), [])
++
++    def test_sunday_closed_everywhere(self):
++        self.assertEqual(free_slots(Calendar(), NG_THERAPIST, SUNDAY, FOLLOWUP), [])
++        self.assertEqual(free_slots(Calendar(), HB_THERAPIST, SUNDAY, ASSESSMENT), [])
++
++    def test_result_is_sorted_times(self):
++        slots = free_slots(Calendar(), HB_THERAPIST, MONDAY, FOLLOWUP)
++        self.assertTrue(all(isinstance(s, datetime.time) for s in slots))
++        self.assertEqual(slots, sorted(slots))
++
++    def test_unknown_kind_raises(self):
++        with self.assertRaises(ValueError):
++            free_slots(Calendar(), HB_THERAPIST, MONDAY, "massage")
++
++
++class FreeSlotsBookingsTest(unittest.TestCase):
++    def test_followup_blocks_only_its_own_30_minutes(self):
++        cal = Calendar([appt("a1", at(MONDAY, 10, 0), kind=FOLLOWUP, therapist="T1")])
++        slots = free_slots(cal, HB_THERAPIST, MONDAY, FOLLOWUP)
++        self.assertNotIn(t(10, 0), slots)
++        self.assertNotIn(t(9, 45), slots)
++        self.assertIn(t(9, 30), slots)
++        self.assertIn(t(10, 30), slots)
++
++    def test_assessment_needs_15_minutes_notes_gap_after_it(self):
++        cal = Calendar([appt("a1", at(MONDAY, 10, 0), kind=ASSESSMENT, therapist="T1")])
++        slots = free_slots(cal, HB_THERAPIST, MONDAY, FOLLOWUP)
++        # 10:00-10:45 assessment plus 15 minutes of notes is busy until 11:00.
++        self.assertIn(t(9, 30), slots)  # followup 09:30-10:00 ends as the assessment starts
++        self.assertNotIn(t(9, 45), slots)
++        self.assertNotIn(t(10, 30), slots)
++        self.assertNotIn(t(10, 45), slots)
++        self.assertIn(t(11, 0), slots)
++
++    def test_new_assessment_before_existing_one_needs_its_own_notes_gap(self):
++        cal = Calendar([appt("a1", at(MONDAY, 10, 0), kind=FOLLOWUP, therapist="T1")])
++        slots = free_slots(cal, HB_THERAPIST, MONDAY, ASSESSMENT)
++        # 09:00-09:45 then 15 minutes of notes ends exactly at 10:00, so it fits.
++        self.assertIn(t(9, 0), slots)
++        self.assertNotIn(t(9, 15), slots)
++
++    def test_existing_assessment_gap_blocks_new_assessment_after(self):
++        cal = Calendar([appt("a1", at(MONDAY, 10, 0), kind=ASSESSMENT, therapist="T1")])
++        slots = free_slots(cal, HB_THERAPIST, MONDAY, ASSESSMENT)
++        self.assertNotIn(t(10, 45), slots)
++        self.assertIn(t(11, 0), slots)
++
++    def test_new_appointment_never_overlaps_booked_one(self):
++        cal = Calendar([appt("a1", at(MONDAY, 10, 0), kind=FOLLOWUP, therapist="T1")])
++        slots = free_slots(cal, HB_THERAPIST, MONDAY, FOLLOWUP)
++        self.assertNotIn(t(10, 15), slots)
++
++    def test_cancelled_attended_and_no_show_do_not_block(self):
++        cal = Calendar([
++            appt("c", at(MONDAY, 10, 0), kind=ASSESSMENT, therapist="T1", status=CANCELLED,
++                 cancelled_at=utc(2026, 10, 1)),
++            appt("v", at(MONDAY, 12, 0), kind=ASSESSMENT, therapist="T1", status=ATTENDED),
++        ])
++        slots = free_slots(cal, HB_THERAPIST, MONDAY, ASSESSMENT)
++        self.assertIn(t(10, 0), slots)
++        self.assertIn(t(12, 0), slots)
++
++    def test_other_therapists_bookings_do_not_block(self):
++        cal = Calendar([appt("a1", at(MONDAY, 10, 0), kind=ASSESSMENT, therapist="T9")])
++        self.assertEqual(free_slots(cal, HB_THERAPIST, MONDAY, ASSESSMENT),
++                         free_slots(Calendar(), HB_THERAPIST, MONDAY, ASSESSMENT))
++
++    def test_booking_is_matched_on_local_date_across_utc_midnight(self):
++        # 09:00 Monday local is Sunday 20:00 UTC, which is still Monday in Auckland.
++        cal = Calendar([appt("a1", utc(2026, 10, 11, 20, 0), kind=FOLLOWUP, therapist="T1")])
++        self.assertNotIn(t(9, 0), free_slots(cal, HB_THERAPIST, MONDAY, FOLLOWUP))
++
++    def test_daily_limit_of_eight_appointments_closes_the_day(self):
++        booked = [appt(f"f{i}", at(MONDAY, 8 + i, 0), kind=FOLLOWUP, therapist="T1") for i in range(8)]
++        self.assertEqual(free_slots(Calendar(booked), HB_THERAPIST, MONDAY, FOLLOWUP), [])
++
++    def test_seven_appointments_still_leaves_room(self):
++        booked = [appt(f"f{i}", at(MONDAY, 8 + i, 0), kind=FOLLOWUP, therapist="T1") for i in range(7)]
++        self.assertIn(t(17, 0), free_slots(Calendar(booked), HB_THERAPIST, MONDAY, FOLLOWUP))
++
++    def test_cancelled_appointments_do_not_count_towards_limit(self):
++        booked = [appt(f"f{i}", at(MONDAY, 8 + i, 0), kind=FOLLOWUP, therapist="T1") for i in range(7)]
++        booked.append(appt("x", at(MONDAY, 17, 0), kind=FOLLOWUP, therapist="T1", status=CANCELLED,
++                           cancelled_at=utc(2026, 10, 1)))
++        self.assertNotEqual(free_slots(Calendar(booked), HB_THERAPIST, MONDAY, FOLLOWUP), [])
++
++
++if __name__ == "__main__":
++    unittest.main()

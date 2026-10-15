@@ -1,0 +1,98 @@
+diff --git a/src/kestrel/fees.py b/src/kestrel/fees.py
+new file mode 100644
+index 0000000..d9faabf
+--- /dev/null
++++ b/src/kestrel/fees.py
+@@ -0,0 +1,30 @@
++"""Cancellation fees."""
++
++import datetime
++
++from kestrel.models import CANCELLED, NO_SHOW
++from kestrel.pricing import session_price
++
++LATE_CANCELLATION_WINDOW = datetime.timedelta(hours=48)
++LATE_CANCELLATION_PERCENT = 50
++
++
++def cancellation_fee(appointment, cancelled_at=None):
++    """Return the fee for this appointment, in cents.
++
++    A cancellation less than 48 hours before the start costs 50% of the
++    session price; a cancellation at least 48 hours ahead costs nothing.
++    A no-show pays the full session price. `cancelled_at` is when the
++    patient cancelled (timezone-aware) and is None for a no-show.
++    """
++    if appointment.status == NO_SHOW:
++        return session_price(appointment.kind)
++    if appointment.status == CANCELLED:
++        if cancelled_at is None:
++            raise ValueError("cancelled_at is required for a cancelled appointment")
++        if cancelled_at.tzinfo is None:
++            raise ValueError("cancelled_at must be timezone-aware")
++        if appointment.start - cancelled_at < LATE_CANCELLATION_WINDOW:
++            return session_price(appointment.kind) * LATE_CANCELLATION_PERCENT // 100
++        return 0
++    raise ValueError(f"no cancellation fee for status {appointment.status!r}")
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..fb022c9
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,56 @@
++import unittest
++
++from helpers import appt, utc
++from kestrel.fees import cancellation_fee
++from kestrel.models import ASSESSMENT, ATTENDED, BOOKED, CANCELLED, FOLLOWUP, NO_SHOW
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def test_cancelled_under_48_hours_before_start_costs_half_the_price(self):
++        a = appt("a1", utc(2026, 10, 20, 9), kind=FOLLOWUP, status=CANCELLED)
++        self.assertEqual(cancellation_fee(a, utc(2026, 10, 18, 10)), 3500)
++
++    def test_initial_assessment_cancelled_late_costs_half_of_95_dollars(self):
++        a = appt("a1", utc(2026, 10, 20, 9), kind=ASSESSMENT, status=CANCELLED)
++        self.assertEqual(cancellation_fee(a, utc(2026, 10, 19, 9)), 4750)
++
++    def test_cancelled_exactly_48_hours_before_start_is_free(self):
++        a = appt("a1", utc(2026, 10, 20, 9), status=CANCELLED)
++        self.assertEqual(cancellation_fee(a, utc(2026, 10, 18, 9)), 0)
++
++    def test_cancelled_well_ahead_is_free(self):
++        a = appt("a1", utc(2026, 10, 20, 9), status=CANCELLED)
++        self.assertEqual(cancellation_fee(a, utc(2026, 10, 1, 9)), 0)
++
++    def test_cancelled_after_start_costs_half_the_price(self):
++        a = appt("a1", utc(2026, 10, 20, 9), status=CANCELLED)
++        self.assertEqual(cancellation_fee(a, utc(2026, 10, 20, 10)), 3500)
++
++    def test_no_show_pays_full_followup_price(self):
++        a = appt("a1", utc(2026, 10, 20, 9), kind=FOLLOWUP, status=NO_SHOW)
++        self.assertEqual(cancellation_fee(a), 7000)
++
++    def test_no_show_pays_full_assessment_price(self):
++        a = appt("a1", utc(2026, 10, 20, 9), kind=ASSESSMENT, status=NO_SHOW)
++        self.assertEqual(cancellation_fee(a, None), 9500)
++
++    def test_cancelled_without_cancelled_at_raises(self):
++        a = appt("a1", utc(2026, 10, 20, 9), status=CANCELLED)
++        with self.assertRaises(ValueError):
++            cancellation_fee(a, None)
++
++    def test_naive_cancelled_at_raises(self):
++        a = appt("a1", utc(2026, 10, 20, 9), status=CANCELLED)
++        with self.assertRaises(ValueError):
++            cancellation_fee(a, utc(2026, 10, 19, 9).replace(tzinfo=None))
++
++    def test_booked_or_attended_has_no_fee(self):
++        for status in [BOOKED, ATTENDED]:
++            with self.subTest(status=status):
++                a = appt("a1", utc(2026, 10, 20, 9), status=status)
++                with self.assertRaises(ValueError):
++                    cancellation_fee(a, None)
++
++
++if __name__ == "__main__":
++    unittest.main()

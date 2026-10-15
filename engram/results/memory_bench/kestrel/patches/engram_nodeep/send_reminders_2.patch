@@ -1,0 +1,103 @@
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..0825ae2
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,29 @@
++"""SMS appointment reminders."""
++
++from kestrel.calendar import LOCAL_TZ
++from kestrel.models import BOOKED, CLINICS
++
++
++def reminder_text(appointment):
++    """The reminder for an appointment: its date, time and clinic name only.
++
++    Reminders leave the system, so they never say what the appointment is for.
++    """
++    local = appointment.start.astimezone(LOCAL_TZ)
++    date = f"{local.strftime('%A')} {local.day} {local.strftime('%B %Y')}"
++    clinic = CLINICS[appointment.clinic].name
++    return f"Reminder: you have an appointment at {clinic} on {date} at {local.strftime('%H:%M')}."
++
++
++def send_reminders(appointments, patients, client):
++    """Text the patient of every booked appointment. Returns the number of messages sent.
++
++    patients maps patient ID to Patient; client is a BulkieClient.
++    """
++    messages = [
++        (patients[appointment.patient_id].phone, reminder_text(appointment))
++        for appointment in appointments
++        if appointment.status == BOOKED
++    ]
++    client.send_batch(messages)
++    return len(messages)
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..d3d920f
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,62 @@
++import unittest
++
++from kestrel.models import CANCELLED, Patient
++from kestrel.reminders import reminder_text, send_reminders
++from kestrel.sms import BulkieClient
++
++from helpers import UTC, appt, utc
++
++
++class FakeTransport:
++    def __init__(self):
++        self.calls = []
++
++    def post(self, path, body):
++        self.calls.append((path, body))
++        return {"ok": True}
++
++
++PATIENTS = {
++    "KP-000001": Patient("KP-000001", "Alex Example", "+64211111111"),
++    "KP-000002": Patient("KP-000002", "Sam Example", "+64222222222"),
++}
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_has_date_time_and_clinic_only(self):
++        # 2026-10-15 01:30 UTC is 14:30 in Auckland (NZDT, UTC+13).
++        a = appt("A1", utc(2026, 10, 15, 1, 30), kind="assessment", clinic="HB", treatment="lower back pain")
++        text = reminder_text(a)
++        self.assertEqual(text, "Reminder: you have an appointment at Kestrel Physio Harbour on Thursday 15 October 2026 at 14:30.")
++        self.assertNotIn("lower back", text)
++        self.assertNotIn("assessment", text.lower())
++
++
++class SendRemindersTest(unittest.TestCase):
++    def test_sends_one_message_per_booked_appointment(self):
++        transport = FakeTransport()
++        appointments = [
++            appt("A1", utc(2026, 10, 15, 1, 30), patient="KP-000001"),
++            appt("A2", utc(2026, 10, 16, 1, 30), patient="KP-000002"),
++            appt("A3", utc(2026, 10, 17, 1, 30), patient="KP-000001", status=CANCELLED, cancelled_at=utc(2026, 10, 1)),
++        ]
++        sent = send_reminders(appointments, PATIENTS, BulkieClient("key", transport))
++        self.assertEqual(sent, 2)
++        self.assertEqual(len(transport.calls), 1)
++        msgs = transport.calls[0][1]["messages"]
++        self.assertEqual([m["to"] for m in msgs], ["+64211111111", "+64222222222"])
++
++    def test_no_booked_appointments_sends_nothing(self):
++        transport = FakeTransport()
++        self.assertEqual(send_reminders([], PATIENTS, BulkieClient("key", transport)), 0)
++        self.assertEqual(transport.calls, [])
++
++    def test_more_than_one_call_still_counts_every_message(self):
++        transport = FakeTransport()
++        appointments = [appt(f"A{i}", utc(2026, 10, 15, 1, 30), patient="KP-000001") for i in range(51)]
++        self.assertEqual(send_reminders(appointments, PATIENTS, BulkieClient("key", transport)), 51)
++        self.assertEqual([len(b["messages"]) for _, b in transport.calls], [50, 1])
++
++
++if __name__ == "__main__":
++    unittest.main()

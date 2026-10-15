@@ -1,0 +1,83 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b0609c1..7be87c2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@
+ - `Calendar.cancel(appointment_id, at)` cancels a booked appointment and records `cancelled_at`.
+ - `Calendar.move(appointment_id, new_start)` reschedules a booked appointment. Cancelled and other non-booked appointments cannot be moved.
+ - `make_invoice(appointment, patient, number, amount_cents)` builds an `Invoice` dated the appointment's local date. The patient name is left out, as the privacy rules require for files that leave the system.
++- `next_invoice_number(clinic, year, existing)` returns the next `INV-<clinic>-<year>-<sequence>` number. The sequence counts per clinic and year, so numbers for other clinics or years in `existing` are ignored.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/kestrel/invoices.py b/src/kestrel/invoices.py
+index 45b096b..17269ab 100644
+--- a/src/kestrel/invoices.py
++++ b/src/kestrel/invoices.py
+@@ -2,6 +2,7 @@
+ 
+ from dataclasses import dataclass
+ import datetime
++import re
+ 
+ from .calendar import CLINIC_TZ
+ from .models import ASSESSMENT, FOLLOWUP, Appointment, Patient
+@@ -23,6 +24,18 @@ class Invoice:
+     description: str = ""
+ 
+ 
++def next_invoice_number(clinic, year, existing):
++    """The next invoice number for a clinic in a year, such as 'INV-HB-2026-00002'.
++
++    Numbers look like INV-<clinic>-<year>-<five-digit sequence>. The sequence
++    counts per clinic and year, so only `existing` numbers for this clinic and
++    year count; the rest are ignored. The first invoice of a year is 00001.
++    """
++    pattern = re.compile(rf"INV-{re.escape(clinic)}-{year:04d}-(\d{{5}})")
++    sequences = [int(m.group(1)) for m in map(pattern.fullmatch, existing) if m]
++    return f"INV-{clinic}-{year:04d}-{max(sequences, default=0) + 1:05d}"
++
++
+ def make_invoice(appointment, patient, number, amount_cents):
+     """An invoice for an appointment, dated on its local (clinic) date.
+ 
+diff --git a/tests/test_invoices.py b/tests/test_invoices.py
+index 90ebaf3..9691633 100644
+--- a/tests/test_invoices.py
++++ b/tests/test_invoices.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from kestrel.invoices import make_invoice
++from kestrel.invoices import make_invoice, next_invoice_number
+ from kestrel.models import ASSESSMENT, FOLLOWUP, Patient
+ 
+ from helpers import appt, utc
+@@ -50,5 +50,26 @@ class MakeInvoiceTest(unittest.TestCase):
+             make_invoice(a, PATIENT, "INV-HB-2026-00001", 7000)
+ 
+ 
++class NextInvoiceNumberTest(unittest.TestCase):
++    def test_first_invoice_of_the_year_is_one(self):
++        self.assertEqual(next_invoice_number("HB", 2026, []), "INV-HB-2026-00001")
++
++    def test_follows_the_highest_sequence_not_the_count(self):
++        existing = ["INV-HB-2026-00001", "INV-HB-2026-00007", "INV-HB-2026-00003"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00008")
++
++    def test_ignores_other_clinics_and_years(self):
++        existing = ["INV-WN-2026-00009", "INV-HB-2025-00012", "INV-HB-2027-00020", "INV-HB-2026-00002"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00003")
++        self.assertEqual(next_invoice_number("HB", 2025, existing), "INV-HB-2025-00013")
++
++    def test_ignores_numbers_that_do_not_match_the_format(self):
++        existing = ["INV-HB-2026-0005", "INV-HB-2026-000050", "INV-HBX-2026-00004", "xINV-HB-2026-00006"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00001")
++
++    def test_clinic_code_is_matched_literally(self):
++        self.assertEqual(next_invoice_number("H.B", 2026, ["INV-HXB-2026-00005"]), "INV-H.B-2026-00001")
++
++
+ if __name__ == "__main__":
+     unittest.main()

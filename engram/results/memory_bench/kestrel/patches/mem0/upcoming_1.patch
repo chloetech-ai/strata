@@ -1,0 +1,47 @@
+diff --git a/src/kestrel/calendar.py b/src/kestrel/calendar.py
+index e3072fb..c1306ba 100644
+--- a/src/kestrel/calendar.py
++++ b/src/kestrel/calendar.py
+@@ -62,5 +62,11 @@ class Calendar:
+     def booked(self):
+         return [a for a in self.all() if a.status == BOOKED]
+ 
++    def upcoming(self, patient_id, now):
++        """A patient's booked appointments starting after `now`, soonest first."""
++        if now.tzinfo is None:
++            raise ValueError("now must be timezone-aware")
++        return [a for a in self.for_patient(patient_id) if a.status == BOOKED and a.start > now]
++
+     def __len__(self):
+         return len(self._appointments)
+diff --git a/tests/test_calendar.py b/tests/test_calendar.py
+index d02cdca..cc8602a 100644
+--- a/tests/test_calendar.py
++++ b/tests/test_calendar.py
+@@ -122,6 +122,26 @@ class CalendarTest(unittest.TestCase):
+                 with self.assertRaises(ValueError):
+                     cal.move(appointment_id, utc(2027, 3, 2, 8))
+ 
++    def test_upcoming_booked_after_now_soonest_first(self):
++        cal = Calendar([
++            appt("a1", utc(2027, 3, 1, 20), patient="KP-004211"),  # past
++            appt("a2", utc(2027, 3, 3, 20), patient="KP-004211"),
++            appt("a3", utc(2027, 3, 2, 20), patient="KP-004211"),
++            appt("a4", utc(2027, 3, 2, 22), patient="KP-004211", status="cancelled"),
++            appt("a5", utc(2027, 3, 2, 21), patient="KP-000007"),  # other patient
++        ])
++        now = utc(2027, 3, 1, 21)
++        self.assertEqual([a.id for a in cal.upcoming("kp4211", now)], ["a3", "a2"])
++
++    def test_upcoming_excludes_start_equal_to_now(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), patient="KP-004211")])
++        self.assertEqual(cal.upcoming("KP-004211", utc(2027, 3, 1, 20)), [])
++
++    def test_upcoming_rejects_naive_now(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), patient="KP-004211")])
++        with self.assertRaises(ValueError):
++            cal.upcoming("KP-004211", datetime.datetime(2027, 3, 1, 8))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

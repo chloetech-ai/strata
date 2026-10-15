@@ -1,0 +1,105 @@
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..bdbdd95
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,23 @@
++"""SMS reminders for booked appointments."""
++
++from .calendar import LOCAL_TZ
++from .models import BOOKED, CLINICS
++
++
++def send_reminders(appointments, patients, client):
++    """Text each patient of a booked appointment, and return how many messages were sent.
++
++    patients maps patient ID to Patient; client is a BulkieClient. The text carries
++    only the date, the time and the clinic name, never what the appointment is for.
++    """
++    messages = []
++    for appointment in appointments:
++        if appointment.status != BOOKED:
++            continue
++        patient = patients[appointment.patient_id]
++        local = appointment.start.astimezone(LOCAL_TZ)
++        clinic = CLINICS[appointment.clinic].name
++        text = f"Reminder: you have an appointment at {clinic} on {local:%A %d %B %Y} at {local:%H:%M}."
++        messages.append((patient.phone, text))
++    client.send_batch(messages)
++    return len(messages)
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..b3aae56
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,70 @@
++import unittest
++
++from helpers import appt, utc
++from kestrel.models import CANCELLED, FOLLOWUP, Patient
++from kestrel.reminders import send_reminders
++
++PATIENTS = {
++    "KP-004211": Patient(id="KP-004211", name="Test Patient", phone="+64211234567"),
++    "KP-000002": Patient(id="KP-000002", name="Other Patient", phone="+64219876543"),
++}
++
++
++class FakeClient:
++    def __init__(self):
++        self.batches = []
++
++    def send_batch(self, messages):
++        self.batches.append(list(messages))
++        return [{"ok": True}]
++
++
++class SendRemindersTest(unittest.TestCase):
++    def test_one_message_per_booked_appointment(self):
++        client = FakeClient()
++        appointments = [
++            appt("A1", utc(2026, 10, 20, 4, 0), patient="KP-004211"),
++            appt("A2", utc(2026, 10, 21, 4, 0), patient="KP-000002"),
++        ]
++        self.assertEqual(send_reminders(appointments, PATIENTS, client), 2)
++        self.assertEqual(len(client.batches), 1)
++        self.assertEqual([phone for phone, _ in client.batches[0]], ["+64211234567", "+64219876543"])
++
++    def test_skips_cancelled_appointments(self):
++        client = FakeClient()
++        cancelled = appt("A1", utc(2026, 10, 20, 4, 0), patient="KP-004211", status=CANCELLED,
++                         cancelled_at=utc(2026, 10, 10, 0, 0))
++        booked = appt("A2", utc(2026, 10, 21, 4, 0), patient="KP-000002")
++        self.assertEqual(send_reminders([cancelled, booked], PATIENTS, client), 1)
++        self.assertEqual([phone for phone, _ in client.batches[0]], ["+64219876543"])
++
++    def test_no_appointments_sends_nothing(self):
++        client = FakeClient()
++        self.assertEqual(send_reminders([], PATIENTS, client), 0)
++        self.assertEqual(client.batches, [[]])
++
++    def test_text_has_date_time_and_clinic_name_only(self):
++        client = FakeClient()
++        a = appt("A1", utc(2026, 10, 20, 4, 0), patient="KP-004211", clinic="HB",
++                 kind=FOLLOWUP, treatment="lower back pain")
++        send_reminders([a], PATIENTS, client)
++        _, text = client.batches[0][0]
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("20 October 2026", text)
++        self.assertIn("at 17:00", text)  # 04:00 UTC is 17:00 in Auckland (NZDT, UTC+13)
++        self.assertNotIn("lower back pain", text)
++        self.assertNotIn("follow", text.lower())
++        self.assertNotIn("Test Patient", text)
++
++    def test_date_is_local_auckland_day(self):
++        client = FakeClient()
++        # 20 Oct 12:30 UTC is 21 Oct 01:30 in Auckland.
++        a = appt("A1", utc(2026, 10, 20, 12, 30), patient="KP-004211")
++        send_reminders([a], PATIENTS, client)
++        _, text = client.batches[0][0]
++        self.assertIn("21 October 2026", text)
++        self.assertIn("at 01:30", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

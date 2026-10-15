@@ -1,0 +1,61 @@
+diff --git a/src/kestrel/calendar.py b/src/kestrel/calendar.py
+index 5e83fe9..eaf6381 100644
+--- a/src/kestrel/calendar.py
++++ b/src/kestrel/calendar.py
+@@ -65,5 +65,11 @@ class Calendar:
+     def booked(self):
+         return [a for a in self.all() if a.status == BOOKED]
+ 
++    def upcoming(self, patient_id, now):
++        """A patient's booked appointments starting after the timezone-aware time `now`, soonest first."""
++        if now.tzinfo is None:
++            raise ValueError("now must be timezone-aware")
++        return [a for a in self.for_patient(patient_id) if a.status == BOOKED and a.start > now]
++
+     def __len__(self):
+         return len(self._appointments)
+diff --git a/tests/test_calendar.py b/tests/test_calendar.py
+index 97e4985..8b50b8e 100644
+--- a/tests/test_calendar.py
++++ b/tests/test_calendar.py
+@@ -58,6 +58,40 @@ class CalendarTest(unittest.TestCase):
+         cal = Calendar([appt("a1", utc(2027, 3, 1, 20)), appt("a2", utc(2027, 3, 1, 21), status="cancelled")])
+         self.assertEqual([a.id for a in cal.booked()], ["a1"])
+ 
++    def test_upcoming_returns_future_booked_soonest_first(self):
++        now = utc(2027, 3, 1, 12)
++        cal = Calendar([
++            appt("late", utc(2027, 3, 3, 9), patient="KP-004211"),
++            appt("soon", utc(2027, 3, 1, 13), patient="KP-004211"),
++            appt("past", utc(2027, 3, 1, 11), patient="KP-004211"),
++            appt("other", utc(2027, 3, 2, 9), patient="KP-000001"),
++        ])
++        self.assertEqual([a.id for a in cal.upcoming("KP-004211", now)], ["soon", "late"])
++
++    def test_upcoming_excludes_appointment_starting_exactly_now(self):
++        now = utc(2027, 3, 1, 12)
++        cal = Calendar([appt("a1", now, patient="KP-004211")])
++        self.assertEqual(cal.upcoming("KP-004211", now), [])
++
++    def test_upcoming_excludes_cancelled_and_not_booked(self):
++        cal = Calendar([
++            appt("a1", utc(2027, 3, 2, 9), patient="KP-004211"),
++            appt("a2", utc(2027, 3, 2, 10), patient="KP-004211", status="cancelled"),
++            appt("a3", utc(2027, 3, 2, 11), patient="KP-004211", status="no_show"),
++        ])
++        self.assertEqual([a.id for a in cal.upcoming("KP-004211", utc(2027, 3, 1, 12))], ["a1"])
++
++    def test_upcoming_accepts_messy_ids(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 2, 9), patient="KP-004211")])
++        for typed in ("kp4211", " KP-004211 ", "Kp-4211"):
++            with self.subTest(typed=typed):
++                self.assertEqual([a.id for a in cal.upcoming(typed, utc(2027, 3, 1, 12))], ["a1"])
++
++    def test_upcoming_rejects_naive_now(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 2, 9), patient="KP-004211")])
++        with self.assertRaises(ValueError):
++            cal.upcoming("KP-004211", datetime.datetime(2027, 3, 1, 12))
++
+     def test_cancel_sets_status_and_time(self):
+         cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
+         cancelled = cal.cancel("a1", utc(2027, 2, 28, 9))

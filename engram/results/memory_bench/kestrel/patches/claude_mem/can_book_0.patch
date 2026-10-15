@@ -1,0 +1,84 @@
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..fcc600d
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,19 @@
++"""Booking checks for the appointment calendar."""
++
++
++def can_book(calendar, therapist, appointment):
++    """True if `appointment` can be added to `calendar` for `therapist`.
++
++    Kestrel never overbooks, so this is False when the appointment is for a
++    different therapist, its id is already in the calendar, or the therapist
++    already has a booked appointment at the same start time. Cancelled
++    appointments do not hold a slot.
++    """
++    if appointment.therapist_id != therapist.id:
++        return False
++    if any(a.id == appointment.id for a in calendar.all()):
++        return False
++    return not any(
++        a.therapist_id == therapist.id and a.start == appointment.start
++        for a in calendar.booked()
++    )
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..6647e47
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,53 @@
++import unittest
++
++from helpers import appt, utc
++from kestrel.booking import can_book
++from kestrel.calendar import LOCAL_TZ, Calendar
++from kestrel.models import Therapist
++
++THERAPIST = Therapist("T1", "Ana Rewi", "HB")
++OTHER = Therapist("T2", "Ben Ito", "HB")
++
++
++class CanBookTest(unittest.TestCase):
++    def test_free_slot(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 21))))
++
++    def test_empty_calendar(self):
++        self.assertTrue(can_book(Calendar(), THERAPIST, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_same_start_as_booked_appointment(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_same_instant_in_another_timezone(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        # 20:00 UTC on 1 Mar is 09:00 on 2 Mar in Auckland (UTC+13).
++        local = appt("new", utc(2027, 3, 1, 20).astimezone(LOCAL_TZ))
++        self.assertFalse(can_book(cal, THERAPIST, local))
++
++    def test_other_therapist_at_same_start_is_fine(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), therapist="T2")])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_cancelled_appointment_does_not_hold_slot(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), status="cancelled")])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_appointment_for_other_therapist_is_refused(self):
++        cal = Calendar()
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 20), therapist="T2")))
++
++    def test_duplicate_id_is_refused(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        self.assertFalse(can_book(cal, THERAPIST, appt("a1", utc(2027, 3, 1, 21))))
++
++    def test_does_not_modify_calendar(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        can_book(cal, THERAPIST, appt("new", utc(2027, 3, 1, 21)))
++        self.assertEqual(len(cal), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

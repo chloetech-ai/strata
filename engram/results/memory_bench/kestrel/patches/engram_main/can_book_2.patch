@@ -1,0 +1,163 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..8a04ee1
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1,14 @@
++{
++  "tests/test_booking.py": true,
++  "tests/test_calendar.py": true,
++  "tests/test_cli.py": true,
++  "tests/test_ids.py": true,
++  "tests/test_invoices.py": true,
++  "tests/test_legacy.py": true,
++  "tests/test_models.py": true,
++  "tests/test_pricing.py": true,
++  "tests/test_reports.py": true,
++  "tests/test_sms.py": true,
++  "tests/test_storage.py": true,
++  "tests/test_waitlist.py": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..0637a08
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1 @@
++[]
+\ No newline at end of file
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..1fcd644
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,36 @@
++"""Checks made before an appointment is saved."""
++
++import datetime
++
++from .models import ASSESSMENT, CANCELLED, FOLLOWUP
++
++# How long each kind of appointment takes.
++DURATIONS = {
++    ASSESSMENT: datetime.timedelta(minutes=45),
++    FOLLOWUP: datetime.timedelta(minutes=30),
++}
++
++
++def _end(appointment):
++    return appointment.start + DURATIONS[appointment.kind]
++
++
++def can_book(calendar, therapist, appointment):
++    """True if the appointment can be added to the calendar for that therapist.
++
++    It must belong to the therapist, have an id the calendar does not already
++    hold, and not overlap any of the therapist's appointments that are not
++    cancelled.
++    """
++    if appointment.therapist_id != therapist.id:
++        return False
++    if any(a.id == appointment.id for a in calendar.all()):
++        return False
++    start, end = appointment.start, _end(appointment)
++    for other in calendar.for_therapist(therapist.id):
++        if other.status == CANCELLED:
++            continue
++        # Half-open intervals: back-to-back appointments do not overlap.
++        if start < _end(other) and other.start < end:
++            return False
++    return True
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..d06372f
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,54 @@
++import unittest
++
++from helpers import appt, utc
++from kestrel.booking import can_book
++from kestrel.calendar import Calendar
++from kestrel.models import Therapist
++
++THERAPIST = Therapist("T1", "Sam", "HB")
++
++
++class CanBookTest(unittest.TestCase):
++    def test_empty_calendar(self):
++        self.assertTrue(can_book(Calendar(), THERAPIST, appt("n", utc(2027, 3, 1, 20))))
++
++    def test_overlapping_start_is_refused(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), kind="followup")])  # 20:00-20:30
++        self.assertFalse(can_book(cal, THERAPIST, appt("n", utc(2027, 3, 1, 20, 15))))
++
++    def test_overlap_from_earlier_assessment_is_refused(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), kind="assessment")])  # 20:00-20:45
++        self.assertFalse(can_book(cal, THERAPIST, appt("n", utc(2027, 3, 1, 20, 40), kind="followup")))
++
++    def test_new_assessment_overlapping_later_booking_is_refused(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20, 30), kind="followup")])  # 20:30-21:00
++        self.assertFalse(can_book(cal, THERAPIST, appt("n", utc(2027, 3, 1, 20, 0), kind="assessment")))
++
++    def test_back_to_back_is_allowed(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), kind="followup")])  # ends 20:30
++        self.assertTrue(can_book(cal, THERAPIST, appt("n", utc(2027, 3, 1, 20, 30))))
++        self.assertTrue(can_book(cal, THERAPIST, appt("n", utc(2027, 3, 1, 19, 30))))
++
++    def test_other_therapists_bookings_do_not_block(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), therapist="T2")])
++        self.assertTrue(can_book(cal, THERAPIST, appt("n", utc(2027, 3, 1, 20))))
++
++    def test_cancelled_booking_does_not_block(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), status="cancelled")])
++        self.assertTrue(can_book(cal, THERAPIST, appt("n", utc(2027, 3, 1, 20))))
++
++    def test_appointment_for_another_therapist_is_refused(self):
++        self.assertFalse(can_book(Calendar(), THERAPIST, appt("n", utc(2027, 3, 1, 20), therapist="T2")))
++
++    def test_duplicate_id_is_refused(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        self.assertFalse(can_book(cal, THERAPIST, appt("a1", utc(2027, 3, 1, 22))))
++
++    def test_does_not_modify_calendar(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        can_book(cal, THERAPIST, appt("n", utc(2027, 3, 1, 20, 10)))
++        self.assertEqual(len(cal), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

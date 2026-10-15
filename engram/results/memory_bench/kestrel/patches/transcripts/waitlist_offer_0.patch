@@ -1,0 +1,47 @@
+diff --git a/src/kestrel/waitlist.py b/src/kestrel/waitlist.py
+index aaedc0c..96dbaf0 100644
+--- a/src/kestrel/waitlist.py
++++ b/src/kestrel/waitlist.py
+@@ -35,3 +35,10 @@ class Waitlist:
+     def entries(self):
+         """Urgent entries first, then everyone else; each group in the order they asked."""
+         return sorted(self._entries.values(), key=lambda e: (not e.urgent, e.requested_at))
++
++    def next_for(self, kind):
++        """The entry to offer a freed slot of this kind to, or None if nobody is waiting for it."""
++        for entry in self.entries():
++            if entry.kind == kind:
++                return entry
++        return None
+diff --git a/tests/test_waitlist.py b/tests/test_waitlist.py
+index d4dfb3c..fb3f547 100644
+--- a/tests/test_waitlist.py
++++ b/tests/test_waitlist.py
+@@ -64,5 +64,27 @@ class WaitlistTest(unittest.TestCase):
+     def test_empty(self):
+         self.assertEqual(Waitlist().entries(), [])
+ 
++    def test_next_for_picks_urgent_then_request_order_within_kind(self):
++        wl = Waitlist()
++        wl.add(entry("KP-000001", utc(2027, 3, 1, 9), kind="intake"))
++        wl.add(entry("KP-000002", utc(2027, 3, 1, 8), kind="intake"))
++        wl.add(entry("KP-000003", utc(2027, 3, 1, 10), kind="intake", urgent=True))
++        self.assertEqual(wl.next_for("intake").patient_id, "KP-000003")
++        wl.remove("KP-000003")
++        self.assertEqual(wl.next_for("intake").patient_id, "KP-000002")
++
++    def test_next_for_ignores_other_kinds(self):
++        wl = Waitlist()
++        wl.add(entry("KP-000001", utc(2027, 3, 1, 8), kind="followup"))
++        wl.add(entry("KP-000002", utc(2027, 3, 1, 9), kind="intake", urgent=True))
++        self.assertEqual(wl.next_for("followup").patient_id, "KP-000001")
++        self.assertEqual(wl.next_for("intake").patient_id, "KP-000002")
++
++    def test_next_for_none_when_nobody_waits_for_kind(self):
++        wl = Waitlist()
++        self.assertIsNone(wl.next_for("followup"))
++        wl.add(entry("KP-000001", utc(2027, 3, 1, 9), kind="intake"))
++        self.assertIsNone(wl.next_for("followup"))
++
+     def test_urgent_defaults_to_false(self):
+         self.assertFalse(WaitlistEntry("KP-000001", "followup", utc(2027, 3, 1, 9)).urgent)

@@ -1,0 +1,59 @@
+diff --git a/src/kestrel/waitlist.py b/src/kestrel/waitlist.py
+index 63955f6..759476b 100644
+--- a/src/kestrel/waitlist.py
++++ b/src/kestrel/waitlist.py
+@@ -37,3 +37,10 @@ class Waitlist:
+     def entries(self):
+         """Urgent entries first, then everyone else; each group in the order they asked."""
+         return sorted(self._entries.values(), key=lambda e: (not e.urgent, e.requested_at))
++
++    def next_for(self, kind):
++        """The entry to offer a freed slot of this kind to, or None if nobody is waiting for it."""
++        for entry in self.entries():
++            if entry.kind == kind:
++                return entry
++        return None
+diff --git a/tests/test_waitlist.py b/tests/test_waitlist.py
+index 2183bd4..2fd600c 100644
+--- a/tests/test_waitlist.py
++++ b/tests/test_waitlist.py
+@@ -72,6 +72,39 @@ class WaitlistTest(unittest.TestCase):
+         with self.assertRaises(KeyError):
+             Waitlist().remove("KP-000009")
+ 
++    def test_next_for_none_when_waitlist_empty(self):
++        self.assertIsNone(Waitlist().next_for(FOLLOWUP))
++
++    def test_next_for_none_when_nobody_waiting_for_kind(self):
++        wl = Waitlist()
++        wl.add(WaitlistEntry("KP-000001", FOLLOWUP, utc(2026, 10, 1)))
++        self.assertIsNone(wl.next_for(ASSESSMENT))
++
++    def test_next_for_picks_earliest_of_that_kind(self):
++        wl = Waitlist()
++        later = WaitlistEntry("KP-000001", FOLLOWUP, utc(2026, 10, 5))
++        earlier = WaitlistEntry("KP-000002", FOLLOWUP, utc(2026, 10, 2))
++        other_kind = WaitlistEntry("KP-000003", ASSESSMENT, utc(2026, 10, 1))
++        for entry in (later, earlier, other_kind):
++            wl.add(entry)
++        self.assertIs(wl.next_for(FOLLOWUP), earlier)
++        self.assertIs(wl.next_for(ASSESSMENT), other_kind)
++
++    def test_next_for_prefers_urgent_of_that_kind(self):
++        wl = Waitlist()
++        early = WaitlistEntry("KP-000001", FOLLOWUP, utc(2026, 10, 1))
++        late_urgent = WaitlistEntry("KP-000002", FOLLOWUP, utc(2026, 10, 9), urgent=True)
++        wl.add(early)
++        wl.add(late_urgent)
++        self.assertIs(wl.next_for(FOLLOWUP), late_urgent)
++
++    def test_next_for_does_not_remove_entry(self):
++        wl = Waitlist()
++        entry = WaitlistEntry("KP-000001", FOLLOWUP, utc(2026, 10, 1))
++        wl.add(entry)
++        wl.next_for(FOLLOWUP)
++        self.assertEqual(wl.entries(), [entry])
++
+     def test_rejects_unknown_kind(self):
+         with self.assertRaises(ValueError):
+             WaitlistEntry("KP-000001", "massage", utc(2026, 10, 1))

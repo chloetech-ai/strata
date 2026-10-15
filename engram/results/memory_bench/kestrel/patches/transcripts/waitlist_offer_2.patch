@@ -1,0 +1,42 @@
+diff --git a/src/kestrel/waitlist.py b/src/kestrel/waitlist.py
+index aaedc0c..0e024b3 100644
+--- a/src/kestrel/waitlist.py
++++ b/src/kestrel/waitlist.py
+@@ -35,3 +35,10 @@ class Waitlist:
+     def entries(self):
+         """Urgent entries first, then everyone else; each group in the order they asked."""
+         return sorted(self._entries.values(), key=lambda e: (not e.urgent, e.requested_at))
++
++    def next_for(self, kind):
++        """The entry to offer a freed slot of this kind to, or None if nobody waits for it."""
++        for entry in self.entries():
++            if entry.kind == kind:
++                return entry
++        return None
+diff --git a/tests/test_waitlist.py b/tests/test_waitlist.py
+index d4dfb3c..729bb5f 100644
+--- a/tests/test_waitlist.py
++++ b/tests/test_waitlist.py
+@@ -64,5 +64,22 @@ class WaitlistTest(unittest.TestCase):
+     def test_empty(self):
+         self.assertEqual(Waitlist().entries(), [])
+ 
++    def test_next_for_picks_urgent_then_request_order_within_kind(self):
++        wl = Waitlist()
++        wl.add(entry("KP-000001", utc(2027, 3, 1, 9), kind="intake"))
++        wl.add(entry("KP-000002", utc(2027, 3, 1, 8), kind="followup"))
++        wl.add(entry("KP-000003", utc(2027, 3, 1, 7), kind="followup"))
++        wl.add(entry("KP-000004", utc(2027, 3, 1, 10), urgent=True, kind="followup"))
++        self.assertEqual(wl.next_for("followup").patient_id, "KP-000004")
++        wl.remove("KP-000004")
++        self.assertEqual(wl.next_for("followup").patient_id, "KP-000003")
++        self.assertEqual(wl.next_for("intake").patient_id, "KP-000001")
++
++    def test_next_for_none_when_nobody_waits_for_kind(self):
++        wl = Waitlist()
++        wl.add(entry("KP-000001", utc(2027, 3, 1, 9), kind="intake"))
++        self.assertIsNone(wl.next_for("followup"))
++        self.assertIsNone(Waitlist().next_for("intake"))
++
+     def test_urgent_defaults_to_false(self):
+         self.assertFalse(WaitlistEntry("KP-000001", "followup", utc(2027, 3, 1, 9)).urgent)

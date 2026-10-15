@@ -1,0 +1,79 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6b019d6..564eec6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- Intervals: `merge_busy` merges (start, end) pairs into sorted, non-overlapping pairs (touching pairs merge).
+ - Calendar: `for_day` lists a therapist's appointments on a local date, and `move` reschedules booked appointments.
+ - Calendar: fixed ordering; patient IDs are normalized on lookup (`normalize_patient_id`).
+ - Appointments can be cancelled; patients have a Community Services Card (CSC) flag.
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..cd0ab99
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,19 @@
++"""Interval helpers."""
++
++
++def merge_busy(intervals):
++    """Merge (start, end) pairs into sorted, non-overlapping pairs.
++
++    Input may be in any order. Pairs that touch (one ends where the next
++    starts) are merged too. Each pair must have start <= end.
++    """
++    pairs = sorted(intervals)
++    merged = []
++    for start, end in pairs:
++        if start > end:
++            raise ValueError(f"interval starts after it ends: {(start, end)!r}")
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..219567b
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,36 @@
++import unittest
++
++from kestrel.intervals import merge_busy
++
++
++class MergeBusyTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(merge_busy([]), [])
++
++    def test_single_pair(self):
++        self.assertEqual(merge_busy([(9, 10)]), [(9, 10)])
++
++    def test_disjoint_pairs_sorted(self):
++        self.assertEqual(merge_busy([(13, 14), (9, 10)]), [(9, 10), (13, 14)])
++
++    def test_overlapping_pairs_merge(self):
++        self.assertEqual(merge_busy([(9, 11), (10, 12)]), [(9, 12)])
++
++    def test_touching_pairs_merge(self):
++        self.assertEqual(merge_busy([(9, 10), (10, 11)]), [(9, 11)])
++
++    def test_contained_pair_is_absorbed(self):
++        self.assertEqual(merge_busy([(9, 12), (10, 11)]), [(9, 12)])
++
++    def test_any_order(self):
++        self.assertEqual(
++            merge_busy([(15, 16), (10, 12), (9, 10), (11, 13)]),
++            [(9, 13), (15, 16)],
++        )
++
++    def test_chain_merges_into_one(self):
++        self.assertEqual(merge_busy([(1, 2), (5, 6), (2, 5)]), [(1, 6)])
++
++    def test_rejects_reversed_pair(self):
++        with self.assertRaises(ValueError):
++            merge_busy([(10, 9)])

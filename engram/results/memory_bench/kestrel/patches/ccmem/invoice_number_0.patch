@@ -1,0 +1,80 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b0609c1..35d1697 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@
+ - `Calendar.cancel(appointment_id, at)` cancels a booked appointment and records `cancelled_at`.
+ - `Calendar.move(appointment_id, new_start)` reschedules a booked appointment. Cancelled and other non-booked appointments cannot be moved.
+ - `make_invoice(appointment, patient, number, amount_cents)` builds an `Invoice` dated the appointment's local date. The patient name is left out, as the privacy rules require for files that leave the system.
++- `next_invoice_number(clinic, year, existing)` returns the next number in the `INV-HB-2026-00001` format, one sequence per clinic per year. Numbers in `existing` from other clinics or years are ignored.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/kestrel/invoices.py b/src/kestrel/invoices.py
+index 45b096b..1840513 100644
+--- a/src/kestrel/invoices.py
++++ b/src/kestrel/invoices.py
+@@ -23,6 +23,22 @@ class Invoice:
+     description: str = ""
+ 
+ 
++def next_invoice_number(clinic, year, existing):
++    """The number for the next invoice from a clinic in a year.
++
++    Numbers look like INV-HB-2026-00001: the clinic code, the year, then a
++    sequence that counts up per clinic per year. `existing` is every invoice
++    number issued so far, from any clinic and year; ones that do not match
++    this clinic and year are ignored.
++    """
++    prefix = f"INV-{clinic}-{year}-"
++    highest = 0
++    for number in existing:
++        if number.startswith(prefix) and number[len(prefix):].isdigit():
++            highest = max(highest, int(number[len(prefix):]))
++    return f"{prefix}{highest + 1:05d}"
++
++
+ def make_invoice(appointment, patient, number, amount_cents):
+     """An invoice for an appointment, dated on its local (clinic) date.
+ 
+diff --git a/tests/test_invoices.py b/tests/test_invoices.py
+index 90ebaf3..a64843c 100644
+--- a/tests/test_invoices.py
++++ b/tests/test_invoices.py
+@@ -1,7 +1,7 @@
+ import datetime
+ import unittest
+ 
+-from kestrel.invoices import make_invoice
++from kestrel.invoices import make_invoice, next_invoice_number
+ from kestrel.models import ASSESSMENT, FOLLOWUP, Patient
+ 
+ from helpers import appt, utc
+@@ -9,6 +9,27 @@ from helpers import appt, utc
+ PATIENT = Patient(id="KP-004211", name="Aroha Test", phone="+64211234567")
+ 
+ 
++class NextInvoiceNumberTest(unittest.TestCase):
++    def test_first_invoice_of_the_year_is_number_one(self):
++        self.assertEqual(next_invoice_number("HB", 2026, []), "INV-HB-2026-00001")
++
++    def test_follows_the_highest_number_issued_for_the_clinic_and_year(self):
++        existing = ["INV-HB-2026-00001", "INV-HB-2026-00007", "INV-HB-2026-00003"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00008")
++
++    def test_ignores_other_clinics_and_years(self):
++        existing = ["INV-WN-2026-00009", "INV-HB-2025-00012", "INV-HB-2027-00020"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00001")
++
++    def test_ignores_malformed_numbers(self):
++        existing = ["INV-HB-2026-", "INV-HB-2026-abc", "INV-HB-2026-00002", "HB-2026-00050"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00003")
++
++    def test_does_not_mistake_a_longer_clinic_code(self):
++        existing = ["INV-HBX-2026-00005"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00001")
++
++
+ class MakeInvoiceTest(unittest.TestCase):
+     def test_copies_appointment_and_patient_details(self):
+         a = appt("A1", utc(2026, 10, 15, 9, 0), kind=ASSESSMENT, patient="KP-004211", clinic="HB", treatment="lower back pain")

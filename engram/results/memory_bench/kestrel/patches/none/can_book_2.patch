@@ -1,0 +1,101 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ad329e2..35e7b08 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,7 @@
+ - `therapist_load` counts each therapist's booked appointments per local date over a seven-day week.
+ - Waitlist with urgent-first ordering: urgent entries come first, then the rest, each in request order.
+ - `import_legacy(path)` imports appointments from the legacy booking system's CSV export.
++- `can_book(calendar, therapist, appointment)` returns False if the therapist already has a booked appointment at the same start time, or if the appointment is for a different therapist.
+ 
+ ### Changed
+ 
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..d7bbe3e
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,21 @@
++"""Checks run before an appointment is saved."""
++
++from .models import BOOKED
++
++
++def can_book(calendar, therapist, appointment):
++    """True if the appointment can be added to the calendar for this therapist.
++
++    The therapist must be the one the appointment is for, and they must not
++    already have a booked appointment starting at the same time. Appointments
++    with the same id as this one are ignored, so re-checking an existing
++    appointment does not conflict with itself.
++    """
++    if appointment.therapist_id != therapist.id:
++        return False
++    for existing in calendar.for_therapist(therapist.id):
++        if existing.id == appointment.id or existing.status != BOOKED:
++            continue
++        if existing.start == appointment.start:
++            return False
++    return True
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..6cfcb97
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,56 @@
++import datetime
++import unittest
++
++from helpers import appt, utc
++from kestrel.booking import can_book
++from kestrel.calendar import Calendar
++from kestrel.models import ATTENDED, CANCELLED, NO_SHOW, Therapist
++
++T1 = Therapist("T1", "Ana", "HB")
++T2 = Therapist("T2", "Ben", "HB")
++
++
++class CanBookTest(unittest.TestCase):
++    def test_free_slot(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 21))))
++
++    def test_same_start_for_same_therapist_conflicts(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        self.assertFalse(can_book(cal, T1, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_same_start_compared_as_instant(self):
++        # 09:00 on 2 March at UTC+13 (NZDT) is 20:00 UTC on 1 March: the same instant.
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20))])
++        nzdt = datetime.timezone(datetime.timedelta(hours=13))
++        same_instant = appt("new", datetime.datetime(2027, 3, 2, 9, 0, tzinfo=nzdt))
++        self.assertFalse(can_book(cal, T1, same_instant))
++
++    def test_other_therapist_does_not_conflict(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), therapist="T2")])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_cancelled_appointment_does_not_conflict(self):
++        cal = Calendar([appt("a1", utc(2027, 3, 1, 20), status=CANCELLED)])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 20))))
++
++    def test_attended_and_no_show_do_not_conflict(self):
++        cal = Calendar([
++            appt("a1", utc(2027, 3, 1, 20), status=ATTENDED),
++            appt("a2", utc(2027, 3, 1, 21), status=NO_SHOW),
++        ])
++        self.assertTrue(can_book(cal, T1, appt("new", utc(2027, 3, 1, 20))))
++        self.assertTrue(can_book(cal, T1, appt("new2", utc(2027, 3, 1, 21))))
++
++    def test_existing_appointment_with_same_id_does_not_conflict_with_itself(self):
++        existing = appt("a1", utc(2027, 3, 1, 20))
++        cal = Calendar([existing])
++        self.assertTrue(can_book(cal, T1, existing))
++
++    def test_appointment_for_different_therapist_is_refused(self):
++        cal = Calendar()
++        self.assertFalse(can_book(cal, T1, appt("new", utc(2027, 3, 1, 20), therapist="T2")))
++
++
++if __name__ == "__main__":
++    unittest.main()

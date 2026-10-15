@@ -1,0 +1,69 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..1b11dc6
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,24 @@
++"""Parsing appointment durations."""
++
++import re
++
++_HOURS_THEN_OPTIONAL_MINUTES = re.compile(r"(\d+)\s*h(?:\s*(\d+)\s*m?)?", re.IGNORECASE)
++_MINUTES = re.compile(r"(\d+)\s*m", re.IGNORECASE)
++
++
++def parse_duration(text):
++    """Turn a typed duration into minutes, e.g. '1h 30m' -> 90.
++
++    Accepts '45m', '1h', '1h30', '1h30m' and '1h 30m' (spaces optional).
++    A bare number of minutes needs the 'm' ('30' is rejected). Raises
++    ValueError for anything else.
++    """
++    stripped = text.strip()
++    match = _HOURS_THEN_OPTIONAL_MINUTES.fullmatch(stripped)
++    if match is not None:
++        hours, minutes = match.groups()
++        return int(hours) * 60 + int(minutes or 0)
++    match = _MINUTES.fullmatch(stripped)
++    if match is not None:
++        return int(match.group(1))
++    raise ValueError(f"not a duration: {text!r}")
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..3996a34
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,33 @@
++import unittest
++
++from kestrel.intervals import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes(self):
++        self.assertEqual(parse_duration("45m"), 45)
++
++    def test_hours(self):
++        self.assertEqual(parse_duration("1h"), 60)
++
++    def test_hours_then_bare_minutes(self):
++        self.assertEqual(parse_duration("1h30"), 90)
++
++    def test_hours_and_minutes(self):
++        self.assertEqual(parse_duration("1h30m"), 90)
++
++    def test_hours_and_minutes_with_space(self):
++        self.assertEqual(parse_duration("1h 30m"), 90)
++
++    def test_surrounding_whitespace(self):
++        self.assertEqual(parse_duration("  1h 30m  "), 90)
++
++    def test_rejects_bare_number(self):
++        with self.assertRaises(ValueError):
++            parse_duration("30")
++
++    def test_rejects_bad_input(self):
++        for bad in ["", "   ", "h", "m", "1.5h", "-45m", "1h-30m", "1h30m15", "45 min", "two hours", "1d"]:
++            with self.subTest(bad=bad):
++                with self.assertRaises(ValueError):
++                    parse_duration(bad)

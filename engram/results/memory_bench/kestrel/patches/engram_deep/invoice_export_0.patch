@@ -1,0 +1,137 @@
+diff --git a/src/kestrel/export.py b/src/kestrel/export.py
+new file mode 100644
+index 0000000..4b8904d
+--- /dev/null
++++ b/src/kestrel/export.py
+@@ -0,0 +1,42 @@
++"""Monthly invoice export for the accountants' Xero import.
++
++Files that leave the system carry only the patient ID, never the patient name
++(Aroha Ngata's privacy rule), so Invoice.patient_name is not written.
++"""
++
++import csv
++import datetime
++import decimal
++import os
++
++# Xero contact column. It holds the patient ID until Mere or Aroha confirm
++# how Xero should match contacts without a name.
++CONTACT_COLUMN = "ContactName"
++
++COLUMNS = ["InvoiceNumber", CONTACT_COLUMN, "InvoiceDate", "Description", "UnitAmount"]
++
++
++def export_invoices(invoices, year, month, out_dir):
++    """Write the invoices issued in year-month to out_dir and return the file path."""
++    chosen = sorted(
++        (i for i in invoices if i.issued.year == year and i.issued.month == month),
++        key=lambda i: i.number,
++    )
++    path = os.path.join(out_dir, f"kestrel-invoices-{year:04d}-{month:02d}.csv")
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(COLUMNS)
++        for i in chosen:
++            writer.writerow([
++                i.number,
++                i.patient_id,
++                i.issued.strftime("%d/%m/%Y"),
++                i.description,
++                _amount(i.amount_cents),
++            ])
++    return path
++
++
++def _amount(cents):
++    """Plain number with two decimals, no dollar sign: 9500 -> '95.00'."""
++    return f"{decimal.Decimal(cents) / 100:.2f}"
+diff --git a/tests/test_export.py b/tests/test_export.py
+new file mode 100644
+index 0000000..a0ba6d2
+--- /dev/null
++++ b/tests/test_export.py
+@@ -0,0 +1,83 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from helpers import appt, utc
++from kestrel.export import export_invoices
++from kestrel.invoices import Invoice
++from kestrel.models import ASSESSMENT, FOLLOWUP
++
++
++def invoice(number, issued, amount_cents=9500, patient_id="KP-004211", description="Initial assessment"):
++    return Invoice(
++        number=number,
++        clinic="NG",
++        patient_id=patient_id,
++        patient_name="Secret Name",
++        issued=issued,
++        amount_cents=amount_cents,
++        description=description,
++    )
++
++
++class ExportInvoicesTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++
++    def read(self, path):
++        with open(path, newline="", encoding="utf-8") as f:
++            return list(csv.reader(f))
++
++    def test_writes_only_invoices_issued_in_that_month(self):
++        invoices = [
++            invoice("INV-NG-2026-00001", datetime.date(2026, 9, 30)),
++            invoice("INV-NG-2026-00002", datetime.date(2026, 10, 1)),
++            invoice("INV-NG-2026-00003", datetime.date(2026, 10, 31)),
++            invoice("INV-NG-2026-00004", datetime.date(2026, 11, 1)),
++        ]
++        rows = self.read(export_invoices(invoices, 2026, 10, self.tmp.name))
++        self.assertEqual([r[0] for r in rows[1:]], ["INV-NG-2026-00002", "INV-NG-2026-00003"])
++
++    def test_header_row_and_file_name(self):
++        path = export_invoices([], 2026, 10, self.tmp.name)
++        self.assertEqual(os.path.basename(path), "kestrel-invoices-2026-10.csv")
++        self.assertEqual(self.read(path)[0], ["InvoiceNumber", "ContactName", "InvoiceDate", "Description", "UnitAmount"])
++
++    def test_date_is_day_month_year(self):
++        path = export_invoices([invoice("INV-NG-2026-00001", datetime.date(2026, 10, 5))], 2026, 10, self.tmp.name)
++        self.assertEqual(self.read(path)[1][2], "05/10/2026")
++
++    def test_amount_is_plain_number_with_two_decimals(self):
++        invoices = [
++            invoice("INV-NG-2026-00001", datetime.date(2026, 10, 5), amount_cents=9500),
++            invoice("INV-NG-2026-00002", datetime.date(2026, 10, 6), amount_cents=7000, description="Follow-up session"),
++            invoice("INV-NG-2026-00003", datetime.date(2026, 10, 7), amount_cents=5),
++        ]
++        rows = self.read(export_invoices(invoices, 2026, 10, self.tmp.name))
++        self.assertEqual([r[4] for r in rows[1:]], ["95.00", "70.00", "0.05"])
++
++    def test_writes_patient_id_and_never_patient_name(self):
++        path = export_invoices([invoice("INV-NG-2026-00001", datetime.date(2026, 10, 5))], 2026, 10, self.tmp.name)
++        with open(path, encoding="utf-8") as f:
++            text = f.read()
++        self.assertIn("KP-004211", text)
++        self.assertNotIn("Secret Name", text)
++
++    def test_description_is_the_fixed_session_text(self):
++        path = export_invoices(
++            [invoice("INV-NG-2026-00001", datetime.date(2026, 10, 5), description="Follow-up session")],
++            2026, 10, self.tmp.name,
++        )
++        self.assertEqual(self.read(path)[1][3], "Follow-up session")
++
++    def test_returns_path_inside_out_dir(self):
++        path = export_invoices([], 2026, 10, self.tmp.name)
++        self.assertEqual(os.path.dirname(path), self.tmp.name)
++        self.assertTrue(os.path.exists(path))
++
++
++if __name__ == "__main__":
++    unittest.main()

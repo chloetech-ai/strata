@@ -1,0 +1,273 @@
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..9e26dfe
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..7d189ea
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1,103 @@
++[
++  "tests/test_booking.py::CanBookTest::test_back_to_back_followups_fit",
++  "tests/test_booking.py::CanBookTest::test_cancelled_appointments_ignored",
++  "tests/test_booking.py::CanBookTest::test_compares_instants_across_timezones",
++  "tests/test_booking.py::CanBookTest::test_empty_calendar",
++  "tests/test_booking.py::CanBookTest::test_gap_needed_after_assessment",
++  "tests/test_booking.py::CanBookTest::test_new_appointment_running_into_existing_clashes",
++  "tests/test_booking.py::CanBookTest::test_new_assessment_needs_gap_before_next_patient",
++  "tests/test_booking.py::CanBookTest::test_no_gap_needed_after_followup",
++  "tests/test_booking.py::CanBookTest::test_other_therapists_ignored",
++  "tests/test_booking.py::CanBookTest::test_same_time_clashes",
++  "tests/test_booking.py::CanBookTest::test_start_inside_existing_appointment_clashes",
++  "tests/test_calendar.py::CalendarTest::test_all_in_start_order",
++  "tests/test_calendar.py::CalendarTest::test_booked",
++  "tests/test_calendar.py::CalendarTest::test_cancel_only_booked_appointments",
++  "tests/test_calendar.py::CalendarTest::test_cancel_requires_aware_time",
++  "tests/test_calendar.py::CalendarTest::test_cancel_sets_status_and_time",
++  "tests/test_calendar.py::CalendarTest::test_cancel_unknown_id",
++  "tests/test_calendar.py::CalendarTest::test_duplicate_id",
++  "tests/test_calendar.py::CalendarTest::test_for_day_only_includes_that_therapist",
++  "tests/test_calendar.py::CalendarTest::test_for_day_uses_auckland_date_across_utc_midnight",
++  "tests/test_calendar.py::CalendarTest::test_for_patient_accepts_messy_ids",
++  "tests/test_calendar.py::CalendarTest::test_for_therapist",
++  "tests/test_calendar.py::CalendarTest::test_move_refuses_attended_and_no_show",
++  "tests/test_calendar.py::CalendarTest::test_move_refuses_cancelled",
++  "tests/test_calendar.py::CalendarTest::test_move_reorders_start_order",
++  "tests/test_calendar.py::CalendarTest::test_move_requires_aware_time",
++  "tests/test_calendar.py::CalendarTest::test_move_sets_new_start",
++  "tests/test_calendar.py::CalendarTest::test_move_unknown_id",
++  "tests/test_cli.py::DayCommandTest::test_bad_date_is_rejected",
++  "tests/test_cli.py::DayCommandTest::test_local_date_not_utc_date",
++  "tests/test_cli.py::DayCommandTest::test_no_appointments_prints_nothing",
++  "tests/test_cli.py::DayCommandTest::test_other_therapist_only_their_bookings",
++  "tests/test_cli.py::DayCommandTest::test_prints_local_time_kind_and_patient_id",
++  "tests/test_cli.py::PatientsCommandTest::test_empty_file_prints_nothing",
++  "tests/test_cli.py::PatientsCommandTest::test_lists_ids_and_names_sorted_by_id",
++  "tests/test_cli.py::PatientsCommandTest::test_missing_data_option_is_rejected",
++  "tests/test_ids.py::NormalizePatientIdTest::test_canonical_form_is_unchanged",
++  "tests/test_ids.py::NormalizePatientIdTest::test_messy_forms",
++  "tests/test_ids.py::NormalizePatientIdTest::test_pads_short_numbers",
++  "tests/test_ids.py::NormalizePatientIdTest::test_rejects_non_patient_ids",
++  "tests/test_invoices.py::MakeInvoiceTest::test_accepts_non_utc_aware_start",
++  "tests/test_invoices.py::MakeInvoiceTest::test_copies_appointment_and_patient_details",
++  "tests/test_invoices.py::MakeInvoiceTest::test_dated_by_local_auckland_date_not_utc",
++  "tests/test_invoices.py::MakeInvoiceTest::test_dated_by_local_date_before_utc_midnight",
++  "tests/test_invoices.py::MakeInvoiceTest::test_description_for_assessment",
++  "tests/test_invoices.py::MakeInvoiceTest::test_description_for_followup",
++  "tests/test_invoices.py::MakeInvoiceTest::test_description_omits_treatment",
++  "tests/test_invoices.py::MakeInvoiceTest::test_rejects_patient_not_on_appointment",
++  "tests/test_legacy.py::ImportLegacyTest::test_cancelled_at_is_unknown",
++  "tests/test_legacy.py::ImportLegacyTest::test_copies_fields",
++  "tests/test_legacy.py::ImportLegacyTest::test_late_evening_stays_on_its_local_day",
++  "tests/test_legacy.py::ImportLegacyTest::test_maps_kinds",
++  "tests/test_legacy.py::ImportLegacyTest::test_maps_states",
++  "tests/test_legacy.py::ImportLegacyTest::test_normalises_patient_ids",
++  "tests/test_legacy.py::ImportLegacyTest::test_reads_every_row",
++  "tests/test_legacy.py::ImportLegacyTest::test_rejects_unknown_codes",
++  "tests/test_legacy.py::ImportLegacyTest::test_times_after_daylight_saving_start",
++  "tests/test_legacy.py::ImportLegacyTest::test_times_are_local_auckland",
++  "tests/test_legacy.py::ImportLegacyTest::test_times_are_timezone_aware",
++  "tests/test_models.py::AppointmentTest::test_rejects_unknown_kind",
++  "tests/test_models.py::AppointmentTest::test_rejects_unknown_status",
++  "tests/test_models.py::AppointmentTest::test_requires_aware_start",
++  "tests/test_pricing.py::SessionPriceTest::test_followup",
++  "tests/test_pricing.py::SessionPriceTest::test_initial_assessment",
++  "tests/test_pricing.py::SessionPriceTest::test_rejects_unknown_kind",
++  "tests/test_reports.py::TherapistLoadTest::test_counts_booked_per_local_day",
++  "tests/test_reports.py::TherapistLoadTest::test_covers_exactly_seven_days",
++  "tests/test_reports.py::TherapistLoadTest::test_empty_calendar",
++  "tests/test_reports.py::TherapistLoadTest::test_excludes_appointments_outside_the_week",
++  "tests/test_reports.py::TherapistLoadTest::test_ignores_cancelled_and_other_statuses",
++  "tests/test_reports.py::TherapistLoadTest::test_per_therapist",
++  "tests/test_sms.py::SendBatchTest::test_accepts_any_iterable",
++  "tests/test_sms.py::SendBatchTest::test_empty_batch_makes_no_calls",
++  "tests/test_sms.py::SendBatchTest::test_exactly_fifty_is_one_call",
++  "tests/test_sms.py::SendBatchTest::test_fifty_one_is_two_calls",
++  "tests/test_sms.py::SendBatchTest::test_large_batch_splits_in_order_without_loss",
++  "tests/test_sms.py::SendBatchTest::test_limit_is_fifty",
++  "tests/test_sms.py::SendBatchTest::test_requires_transport",
++  "tests/test_sms.py::SendBatchTest::test_small_batch_is_one_call",
++  "tests/test_storage.py::StorageTest::test_cancelled_at_round_trip",
++  "tests/test_storage.py::StorageTest::test_csc_round_trip",
++  "tests/test_storage.py::StorageTest::test_failed_rename_keeps_old_file_and_removes_temporary_file",
++  "tests/test_storage.py::StorageTest::test_failed_write_keeps_old_file_and_removes_temporary_file",
++  "tests/test_storage.py::StorageTest::test_loads_patients_saved_before_csc_existed",
++  "tests/test_storage.py::StorageTest::test_round_trip",
++  "tests/test_storage.py::StorageTest::test_save_leaves_no_temporary_files_behind",
++  "tests/test_storage.py::StorageTest::test_save_overwrites_existing_file",
++  "tests/test_storage.py::StorageTest::test_temporary_file_is_created_beside_target",
++  "tests/test_storage.py::StorageTest::test_unserializable_data_keeps_old_file_and_creates_no_temporary_file",
++  "tests/test_waitlist.py::WaitlistEntryTest::test_patient_id_is_normalised",
++  "tests/test_waitlist.py::WaitlistEntryTest::test_requested_at_must_be_timezone_aware",
++  "tests/test_waitlist.py::WaitlistEntryTest::test_unknown_kind",
++  "tests/test_waitlist.py::WaitlistEntryTest::test_urgent_defaults_to_false",
++  "tests/test_waitlist.py::WaitlistTest::test_add_returns_entry",
++  "tests/test_waitlist.py::WaitlistTest::test_empty",
++  "tests/test_waitlist.py::WaitlistTest::test_entries_in_request_order",
++  "tests/test_waitlist.py::WaitlistTest::test_one_entry_per_patient",
++  "tests/test_waitlist.py::WaitlistTest::test_remove_accepts_messy_ids",
++  "tests/test_waitlist.py::WaitlistTest::test_remove_missing_patient",
++  "tests/test_waitlist.py::WaitlistTest::test_removed_patient_can_rejoin",
++  "tests/test_waitlist.py::WaitlistTest::test_urgent_entries_go_first_then_request_order"
++]
+\ No newline at end of file
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..85e5eb6
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,39 @@
++"""Checks made before a booking is saved."""
++
++import datetime
++
++from .models import ASSESSMENT, BOOKED, FOLLOWUP
++
++# How long each kind of appointment takes.
++DURATIONS = {
++    ASSESSMENT: datetime.timedelta(minutes=45),
++    FOLLOWUP: datetime.timedelta(minutes=30),
++}
++
++# Notes time the therapist needs after an assessment, before the next patient.
++POST_ASSESSMENT_GAP = datetime.timedelta(minutes=15)
++
++
++def _busy_until(appointment):
++    """When the therapist is free again after this appointment."""
++    end = appointment.start + DURATIONS[appointment.kind]
++    if appointment.kind == ASSESSMENT:
++        end += POST_ASSESSMENT_GAP
++    return end
++
++
++def can_book(calendar, therapist, appointment):
++    """True if the appointment can be added to the therapist's calendar.
++
++    It cannot be added if its time overlaps a booked appointment for the same
++    therapist, or if it starts before the post-assessment gap of an existing
++    assessment has passed (or vice versa). Cancelled appointments are ignored.
++    """
++    new_start = appointment.start
++    new_busy_until = _busy_until(appointment)
++    for other in calendar.for_therapist(therapist.id):
++        if other.status != BOOKED:
++            continue
++        if new_start < _busy_until(other) and other.start < new_busy_until:
++            return False
++    return True
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..ae56b2a
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,72 @@
++import datetime
++import unittest
++from zoneinfo import ZoneInfo
++
++from helpers import appt, utc
++from kestrel.booking import can_book
++from kestrel.calendar import Calendar
++from kestrel.models import ASSESSMENT, FOLLOWUP, Therapist
++
++THERAPIST = Therapist("T1", "Ana Lee", "HB")
++
++
++def at(hh, mm=0):
++    return utc(2027, 3, 1, hh, mm)
++
++
++class CanBookTest(unittest.TestCase):
++    def test_empty_calendar(self):
++        self.assertTrue(can_book(Calendar(), THERAPIST, appt("new", at(9))))
++
++    def test_same_time_clashes(self):
++        cal = Calendar([appt("a1", at(9), kind=FOLLOWUP)])
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", at(9), kind=FOLLOWUP)))
++
++    def test_start_inside_existing_appointment_clashes(self):
++        cal = Calendar([appt("a1", at(9), kind=FOLLOWUP)])  # 09:00-09:30
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", at(9, 15), kind=FOLLOWUP)))
++
++    def test_new_appointment_running_into_existing_clashes(self):
++        cal = Calendar([appt("a1", at(9, 30), kind=FOLLOWUP)])
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", at(9), kind=ASSESSMENT)))  # 09:00-09:45
++
++    def test_back_to_back_followups_fit(self):
++        cal = Calendar([appt("a1", at(9), kind=FOLLOWUP)])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", at(9, 30), kind=FOLLOWUP)))
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", at(8, 30), kind=FOLLOWUP)))
++
++    def test_no_gap_needed_after_followup(self):
++        cal = Calendar([appt("a1", at(9), kind=FOLLOWUP)])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", at(9, 30), kind=ASSESSMENT)))
++
++    def test_gap_needed_after_assessment(self):
++        cal = Calendar([appt("a1", at(9), kind=ASSESSMENT)])  # 09:00-09:45, notes until 10:00
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", at(9, 45), kind=FOLLOWUP)))
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", at(9, 59), kind=FOLLOWUP)))
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", at(10), kind=FOLLOWUP)))
++
++    def test_new_assessment_needs_gap_before_next_patient(self):
++        cal = Calendar([appt("a1", at(9, 20), kind=FOLLOWUP)])
++        # Assessment 08:30-09:15, then 15 minutes of notes until 09:30: the 09:20 patient clashes.
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", at(8, 30), kind=ASSESSMENT)))
++        cal = Calendar([appt("a1", at(9, 30), kind=FOLLOWUP)])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", at(8, 30), kind=ASSESSMENT)))
++
++    def test_other_therapists_ignored(self):
++        cal = Calendar([appt("a1", at(9), kind=FOLLOWUP, therapist="T2")])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", at(9), kind=FOLLOWUP)))
++
++    def test_cancelled_appointments_ignored(self):
++        cal = Calendar([appt("a1", at(9), kind=FOLLOWUP, status="cancelled")])
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", at(9), kind=FOLLOWUP)))
++
++    def test_compares_instants_across_timezones(self):
++        # 09:00 Auckland (NZDT, UTC+13) is 20:00 UTC the day before.
++        auckland = datetime.datetime(2027, 3, 2, 9, 0, tzinfo=ZoneInfo("Pacific/Auckland"))
++        cal = Calendar([appt("a1", at(20), kind=FOLLOWUP)])
++        self.assertFalse(can_book(cal, THERAPIST, appt("new", auckland, kind=FOLLOWUP)))
++        self.assertTrue(can_book(cal, THERAPIST, appt("new", auckland + datetime.timedelta(hours=1), kind=FOLLOWUP)))
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,136 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ad329e2..92045ba 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,7 @@
+ - `kestrel.ids.normalize_patient_id` trims, upper-cases, zero-pads and adds the dash to typed patient IDs, rejecting malformed ones.
+ - `session_price(kind)` returns the price in cents: $95 for an assessment, $70 for a follow-up.
+ - `make_invoice` builds an invoice for an appointment, dated on its local date. It refuses an appointment that belongs to a different patient.
++- `export_invoices(invoices, year, month, out_dir)` writes the invoices issued in a month to `invoices-YYYY-MM.csv` in `out_dir` (amounts in dollars) and returns the path.
+ - `therapist_load` counts each therapist's booked appointments per local date over a seven-day week.
+ - Waitlist with urgent-first ordering: urgent entries come first, then the rest, each in request order.
+ - `import_legacy(path)` imports appointments from the legacy booking system's CSV export.
+diff --git a/src/kestrel/export.py b/src/kestrel/export.py
+new file mode 100644
+index 0000000..bf65873
+--- /dev/null
++++ b/src/kestrel/export.py
+@@ -0,0 +1,34 @@
++"""Monthly export of invoices for the accountant."""
++
++import csv
++import os
++
++FIELDS = ["number", "issued", "clinic", "patient_id", "patient_name", "description", "amount"]
++
++
++def export_invoices(invoices, year, month, out_dir):
++    """Write the invoices issued in a month to a CSV file and return its path.
++
++    Only invoices whose issue date (Auckland local date) falls in year and month
++    are included, sorted by issue date then invoice number. The amount is written
++    in dollars, e.g. 95.00. The file is named invoices-YYYY-MM.csv inside out_dir.
++    """
++    month_invoices = sorted(
++        (i for i in invoices if i.issued.year == year and i.issued.month == month),
++        key=lambda i: (i.issued, i.number),
++    )
++    path = os.path.join(out_dir, f"invoices-{year:04d}-{month:02d}.csv")
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        writer = csv.DictWriter(f, fieldnames=FIELDS)
++        writer.writeheader()
++        for invoice in month_invoices:
++            writer.writerow({
++                "number": invoice.number,
++                "issued": invoice.issued.isoformat(),
++                "clinic": invoice.clinic,
++                "patient_id": invoice.patient_id,
++                "patient_name": invoice.patient_name,
++                "description": invoice.description,
++                "amount": f"{invoice.amount_cents // 100}.{invoice.amount_cents % 100:02d}",
++            })
++    return path
+diff --git a/tests/test_export.py b/tests/test_export.py
+new file mode 100644
+index 0000000..ed3afc9
+--- /dev/null
++++ b/tests/test_export.py
+@@ -0,0 +1,78 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from kestrel.export import export_invoices
++from kestrel.invoices import Invoice
++
++
++def invoice(number, issued, amount_cents=7000, patient_name="Aroha Ngata", description="Physiotherapy follow-up"):
++    return Invoice(
++        number=number, clinic="HB", patient_id="KP-004211", patient_name=patient_name,
++        issued=issued, amount_cents=amount_cents, description=description,
++    )
++
++
++class ExportInvoicesTest(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.out_dir = self._tmp.name
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def read(self, path):
++        with open(path, newline="", encoding="utf-8") as f:
++            return list(csv.DictReader(f))
++
++    def test_writes_named_file_and_returns_its_path(self):
++        path = export_invoices([], 2026, 10, self.out_dir)
++        self.assertEqual(path, os.path.join(self.out_dir, "invoices-2026-10.csv"))
++        self.assertTrue(os.path.isfile(path))
++
++    def test_empty_month_writes_header_only(self):
++        path = export_invoices([invoice("N1", datetime.date(2026, 9, 30))], 2026, 10, self.out_dir)
++        with open(path, newline="", encoding="utf-8") as f:
++            self.assertEqual(f.read().splitlines(), ["number,issued,clinic,patient_id,patient_name,description,amount"])
++
++    def test_includes_only_invoices_issued_in_the_month(self):
++        invoices = [
++            invoice("N1", datetime.date(2026, 9, 30)),
++            invoice("N2", datetime.date(2026, 10, 1)),
++            invoice("N3", datetime.date(2026, 10, 31)),
++            invoice("N4", datetime.date(2026, 11, 1)),
++            invoice("N5", datetime.date(2025, 10, 15)),
++        ]
++        rows = self.read(export_invoices(invoices, 2026, 10, self.out_dir))
++        self.assertEqual([r["number"] for r in rows], ["N2", "N3"])
++
++    def test_sorted_by_issue_date_then_number(self):
++        invoices = [
++            invoice("N3", datetime.date(2026, 10, 2)),
++            invoice("N2", datetime.date(2026, 10, 2)),
++            invoice("N1", datetime.date(2026, 10, 1)),
++        ]
++        rows = self.read(export_invoices(invoices, 2026, 10, self.out_dir))
++        self.assertEqual([r["number"] for r in rows], ["N1", "N2", "N3"])
++
++    def test_amount_in_dollars_with_cents(self):
++        invoices = [invoice("N1", datetime.date(2026, 10, 1), amount_cents=9500), invoice("N2", datetime.date(2026, 10, 2), amount_cents=7005)]
++        rows = self.read(export_invoices(invoices, 2026, 10, self.out_dir))
++        self.assertEqual([r["amount"] for r in rows], ["95.00", "70.05"])
++
++    def test_row_fields(self):
++        rows = self.read(export_invoices([invoice("INV-HB-2026-00001", datetime.date(2026, 10, 15), patient_name="Aroha Ngata", description="Physiotherapy assessment: lower back pain", amount_cents=9500)], 2026, 10, self.out_dir))
++        self.assertEqual(rows, [{
++            "number": "INV-HB-2026-00001", "issued": "2026-10-15", "clinic": "HB", "patient_id": "KP-004211",
++            "patient_name": "Aroha Ngata", "description": "Physiotherapy assessment: lower back pain", "amount": "95.00",
++        }])
++
++    def test_quotes_names_containing_commas(self):
++        rows = self.read(export_invoices([invoice("N1", datetime.date(2026, 10, 1), patient_name="Ngata, Aroha")], 2026, 10, self.out_dir))
++        self.assertEqual(rows[0]["patient_name"], "Ngata, Aroha")
++
++
++if __name__ == "__main__":
++    unittest.main()

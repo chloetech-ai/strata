@@ -1,0 +1,174 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fcc0c53..efb38e6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@
+ - Fix `Calendar.all()` to sort by start time, as its docstring says, instead of by appointment ID.
+ - Add `session_price`: initial assessment is 9500 cents, follow-up 7000 cents.
+ - Add `make_invoice` for appointments, dated on the local Auckland date.
++- Add `export_invoices(invoices, year, month, out_dir)`, which writes a month's invoices to a CSV file for the accountant and returns its path. Amounts are in dollars.
+ - Add `Calendar.move` to reschedule booked appointments. Cancelled, attended and no-show appointments cannot be moved.
+ - Add `therapist_load(calendar, week_start)`, which counts booked appointments per therapist for each day of a week.
+ - Add `Waitlist`, which lists urgent entries first, then the rest in request order.
+diff --git a/src/kestrel/export.py b/src/kestrel/export.py
+new file mode 100644
+index 0000000..d618200
+--- /dev/null
++++ b/src/kestrel/export.py
+@@ -0,0 +1,35 @@
++"""Monthly export of invoices for the accountant."""
++
++import csv
++import os
++
++FIELDS = ["number", "issued", "clinic", "patient_id", "patient_name", "description", "amount"]
++
++
++def export_invoices(invoices, year, month, out_dir):
++    """Write the invoices issued in a month to a CSV file in out_dir and return its path.
++
++    Invoices are matched on their issued (Auckland local) date and sorted by date, then by
++    invoice number. Amounts are written in dollars, e.g. 95.00. A month with no invoices
++    still gets a file, holding only the header row.
++    """
++    if not 1 <= month <= 12:
++        raise ValueError(f"month must be 1-12, not {month}")
++
++    month_invoices = sorted(
++        (i for i in invoices if i.issued.year == year and i.issued.month == month),
++        key=lambda i: (i.issued, i.number),
++    )
++
++    path = os.path.join(out_dir, f"kestrel-invoices-{year:04d}-{month:02d}.csv")
++    # UTF-8 with a byte order mark so Excel reads macrons in patient names correctly.
++    with open(path, "w", encoding="utf-8-sig", newline="") as f:
++        writer = csv.writer(f)
++        writer.writerow(FIELDS)
++        for i in month_invoices:
++            dollars, cents = divmod(i.amount_cents, 100)
++            writer.writerow([
++                i.number, i.issued.isoformat(), i.clinic, i.patient_id, i.patient_name,
++                i.description, f"{dollars}.{cents:02d}",
++            ])
++    return path
+diff --git a/tests/test_export.py b/tests/test_export.py
+new file mode 100644
+index 0000000..cb7c767
+--- /dev/null
++++ b/tests/test_export.py
+@@ -0,0 +1,115 @@
++import csv
++import datetime
++import os
++import tempfile
++import unittest
++
++from kestrel.export import FIELDS, export_invoices
++from kestrel.invoices import Invoice
++
++
++def invoice(number, issued, amount_cents=9500, patient_name="Aroha Ngata", description="Initial assessment"):
++    return Invoice(
++        number=number, clinic="NG", patient_id="KP-004211", patient_name=patient_name,
++        issued=issued, amount_cents=amount_cents, description=description,
++    )
++
++
++def read_rows(path):
++    with open(path, encoding="utf-8-sig", newline="") as f:
++        return list(csv.reader(f))
++
++
++class ExportInvoicesTest(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.out_dir = self._tmp.name
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_returns_path_to_file_named_by_month(self):
++        path = export_invoices([], 2027, 3, self.out_dir)
++        self.assertEqual(path, os.path.join(self.out_dir, "kestrel-invoices-2027-03.csv"))
++        self.assertTrue(os.path.isfile(path))
++
++    def test_writes_only_invoices_issued_in_that_month_sorted_by_date_then_number(self):
++        invoices = [
++            invoice("INV-NG-2027-00003", datetime.date(2027, 3, 20)),
++            invoice("INV-NG-2027-00002", datetime.date(2027, 4, 1)),
++            invoice("INV-NG-2027-00002", datetime.date(2027, 3, 5)),
++            invoice("INV-NG-2027-00001", datetime.date(2027, 2, 28)),
++            invoice("INV-NG-2027-00004", datetime.date(2027, 3, 5)),
++        ]
++        rows = read_rows(export_invoices(invoices, 2027, 3, self.out_dir))
++        self.assertEqual(rows[0], FIELDS)
++        self.assertEqual([r[0] for r in rows[1:]], [
++            "INV-NG-2027-00002", "INV-NG-2027-00004", "INV-NG-2027-00003",
++        ])
++
++    def test_first_and_last_day_of_month_are_included(self):
++        invoices = [
++            invoice("a", datetime.date(2027, 2, 28)),
++            invoice("b", datetime.date(2027, 3, 1)),
++            invoice("c", datetime.date(2027, 3, 31)),
++            invoice("d", datetime.date(2027, 4, 1)),
++        ]
++        rows = read_rows(export_invoices(invoices, 2027, 3, self.out_dir))
++        self.assertEqual([r[0] for r in rows[1:]], ["b", "c"])
++
++    def test_same_month_of_another_year_is_excluded(self):
++        invoices = [invoice("a", datetime.date(2026, 3, 10)), invoice("b", datetime.date(2027, 3, 10))]
++        rows = read_rows(export_invoices(invoices, 2027, 3, self.out_dir))
++        self.assertEqual([r[0] for r in rows[1:]], ["b"])
++
++    def test_amounts_are_written_in_dollars(self):
++        invoices = [
++            invoice("a", datetime.date(2027, 3, 1), amount_cents=9500),
++            invoice("b", datetime.date(2027, 3, 2), amount_cents=7050),
++            invoice("c", datetime.date(2027, 3, 3), amount_cents=0),
++        ]
++        rows = read_rows(export_invoices(invoices, 2027, 3, self.out_dir))
++        self.assertEqual([r[-1] for r in rows[1:]], ["95.00", "70.50", "0.00"])
++
++    def test_fields_are_written_in_order(self):
++        inv = invoice("INV-NG-2027-00001", datetime.date(2027, 3, 1), amount_cents=7000,
++                      patient_name="Hemi Ratana", description="Follow-up session: lower back pain")
++        rows = read_rows(export_invoices([inv], 2027, 3, self.out_dir))
++        self.assertEqual(rows[1], [
++            "INV-NG-2027-00001", "2027-03-01", "NG", "KP-004211", "Hemi Ratana",
++            "Follow-up session: lower back pain", "70.00",
++        ])
++
++    def test_commas_and_quotes_in_text_are_quoted(self):
++        inv = invoice("a", datetime.date(2027, 3, 1), description='Follow-up, "knee"')
++        rows = read_rows(export_invoices([inv], 2027, 3, self.out_dir))
++        self.assertEqual(rows[1][5], 'Follow-up, "knee"')
++
++    def test_macrons_in_names_survive_round_trip(self):
++        inv = invoice("a", datetime.date(2027, 3, 1), patient_name="Mere Tūhoe-Māori")
++        rows = read_rows(export_invoices([inv], 2027, 3, self.out_dir))
++        self.assertEqual(rows[1][4], "Mere Tūhoe-Māori")
++
++    def test_file_starts_with_byte_order_mark_for_excel(self):
++        path = export_invoices([], 2027, 3, self.out_dir)
++        with open(path, "rb") as f:
++            self.assertTrue(f.read(3) == b"\xef\xbb\xbf")
++
++    def test_month_with_no_invoices_gets_header_only(self):
++        path = export_invoices([invoice("a", datetime.date(2027, 4, 1))], 2027, 3, self.out_dir)
++        self.assertEqual(read_rows(path), [FIELDS])
++
++    def test_rejects_invalid_month(self):
++        for month in (0, 13):
++            with self.subTest(month=month):
++                with self.assertRaises(ValueError):
++                    export_invoices([], 2027, month, self.out_dir)
++
++    def test_accepts_any_iterable(self):
++        invoices = (invoice(f"n{d}", datetime.date(2027, 3, d)) for d in (1, 2))
++        rows = read_rows(export_invoices(invoices, 2027, 3, self.out_dir))
++        self.assertEqual(len(rows), 3)
++
++
++if __name__ == "__main__":
++    unittest.main()

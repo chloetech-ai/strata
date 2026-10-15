@@ -1,0 +1,68 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..fe4feb8
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,23 @@
++import re
++
++_MINUTES = re.compile(r"([0-9]+)m")
++_HOURS = re.compile(r"([0-9]+)h(?:\s*([0-9]+)m?)?")
++
++
++def parse_duration(text):
++    """Return the number of minutes in a duration such as '45m', '1h', '1h30' or '1h 30m'.
++
++    Raises ValueError for anything else.
++    """
++    value = text.strip()
++
++    match = _MINUTES.fullmatch(value)
++    if match:
++        return int(match.group(1))
++
++    match = _HOURS.fullmatch(value)
++    if match:
++        hours, minutes = match.groups()
++        return int(hours) * 60 + int(minutes or 0)
++
++    raise ValueError(f"invalid duration: {text!r}")
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..e1b033d
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,33 @@
++import unittest
++
++from kestrel.intervals import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes(self):
++        self.assertEqual(parse_duration("45m"), 45)
++
++    def test_hours(self):
++        self.assertEqual(parse_duration("1h"), 60)
++
++    def test_hours_and_minutes_without_unit(self):
++        self.assertEqual(parse_duration("1h30"), 90)
++
++    def test_hours_and_minutes_with_space(self):
++        self.assertEqual(parse_duration("1h 30m"), 90)
++
++    def test_hours_and_minutes_with_unit(self):
++        self.assertEqual(parse_duration("1h30m"), 90)
++
++    def test_surrounding_whitespace(self):
++        self.assertEqual(parse_duration(" 45m\n"), 45)
++
++    def test_rejects_other_input(self):
++        for raw in ("", "45", "m", "h", "1.5h", "-30m", "1h60x", "1 h", "45 m", "1h 30m 5s", "1d", "30min"):
++            with self.subTest(raw=raw):
++                with self.assertRaises(ValueError):
++                    parse_duration(raw)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,69 @@
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..ae065a6
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,21 @@
++"""SMS appointment reminders."""
++
++from kestrel.calendar import LOCAL_TZ
++from kestrel.models import CLINICS
++
++# Reminders are texted to patients, so they carry the date, the time and the
++# clinic name only: never the treatment, the appointment kind or the patient's
++# name or ID.
++
++
++def reminder_text(appointment):
++    local = appointment.start.astimezone(LOCAL_TZ)
++    day = f"{local:%A} {local.day} {local:%B}"
++    hour = local.hour % 12 or 12
++    suffix = "am" if local.hour < 12 else "pm"
++    time = f"{hour}:{local.minute:02d}{suffix}"
++    clinic = CLINICS[appointment.clinic].name
++    return (
++        f"Kia ora! This is a friendly reminder of your appointment at {clinic} "
++        f"on {day} at {time}. We look forward to seeing you."
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..ad6b0a4
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,36 @@
++import unittest
++
++from helpers import appt, utc
++from kestrel.models import ASSESSMENT
++from kestrel.reminders import reminder_text
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_gives_local_date_time_and_clinic_name(self):
++        # 14 Oct 21:30 UTC is 15 Oct 10:30 in Auckland (NZDT, UTC+13).
++        a = appt("A1", utc(2026, 10, 14, 21, 30), clinic="HB")
++        text = reminder_text(a)
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("Thursday 15 October", text)
++        self.assertIn("10:30am", text)
++
++    def test_afternoon_time_uses_pm(self):
++        a = appt("A1", utc(2026, 10, 15, 2, 15), clinic="NG")  # 15:15 Auckland
++        self.assertIn("3:15pm", reminder_text(a))
++
++    def test_contains_no_treatment_kind_or_patient_details(self):
++        a = appt(
++            "A1",
++            utc(2026, 10, 14, 21, 30),
++            patient="KP-004211",
++            kind=ASSESSMENT,
++            treatment="lower back pain",
++        )
++        text = reminder_text(a)
++        self.assertNotIn("lower back pain", text)
++        self.assertNotIn("assessment", text.lower())
++        self.assertNotIn("KP-004211", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

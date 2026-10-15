@@ -1,0 +1,101 @@
+diff --git a/src/kestrel/fees.py b/src/kestrel/fees.py
+new file mode 100644
+index 0000000..6417dec
+--- /dev/null
++++ b/src/kestrel/fees.py
+@@ -0,0 +1,31 @@
++"""Fees for cancelled and missed appointments."""
++
++import datetime
++from typing import Optional
++
++from .models import CANCELLED, NO_SHOW
++from .pricing import session_price
++
++# A cancellation made less than this long before the start costs half the session price.
++LATE_CANCELLATION_WINDOW = datetime.timedelta(hours=48)
++
++
++def cancellation_fee(appointment, cancelled_at: Optional[datetime.datetime] = None):
++    """The fee in cents for a cancelled or missed appointment.
++
++    A no-show pays the full session price, and `cancelled_at` is None for it.
++    A cancelled appointment pays half the session price if `cancelled_at` (timezone-aware,
++    when the patient cancelled) is less than 48 hours before the start, and nothing otherwise.
++    """
++    price = session_price(appointment.kind)
++    if appointment.status == NO_SHOW:
++        return price
++    if appointment.status != CANCELLED:
++        raise ValueError(f"no fee for appointment {appointment.id} with status {appointment.status!r}")
++    if cancelled_at is None:
++        raise ValueError(f"cancelled appointment {appointment.id} needs a cancellation time")
++    if cancelled_at.tzinfo is None:
++        raise ValueError("cancellation time must be timezone-aware")
++    if appointment.start - cancelled_at < LATE_CANCELLATION_WINDOW:
++        return price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..960ea34
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,58 @@
++import datetime
++import unittest
++
++from helpers import appt, utc
++from kestrel.fees import cancellation_fee
++from kestrel.models import ASSESSMENT, FOLLOWUP, NO_SHOW, BOOKED, ATTENDED, CANCELLED
++
++NZ = datetime.timezone(datetime.timedelta(hours=13))  # NZDT, UTC+13 in October
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def test_no_show_pays_full_price(self):
++        self.assertEqual(cancellation_fee(appt("a1", utc(2026, 10, 20, 9), kind=ASSESSMENT, status=NO_SHOW)), 9500)
++        self.assertEqual(cancellation_fee(appt("a1", utc(2026, 10, 20, 9), kind=FOLLOWUP, status=NO_SHOW)), 7000)
++
++    def test_cancelled_under_48_hours_before_pays_half(self):
++        start = utc(2026, 10, 20, 9)
++        a = appt("a1", start, kind=ASSESSMENT, status=CANCELLED)
++        self.assertEqual(cancellation_fee(a, start - datetime.timedelta(hours=47, minutes=59)), 4750)
++        self.assertEqual(cancellation_fee(a, start - datetime.timedelta(hours=1)), 4750)
++        self.assertEqual(cancellation_fee(a, start + datetime.timedelta(hours=2)), 4750)
++
++    def test_cancelled_half_price_for_followup(self):
++        start = utc(2026, 10, 20, 9)
++        a = appt("a1", start, kind=FOLLOWUP, status=CANCELLED)
++        self.assertEqual(cancellation_fee(a, start - datetime.timedelta(hours=24)), 3500)
++
++    def test_cancelled_48_hours_or_more_before_is_free(self):
++        start = utc(2026, 10, 20, 9)
++        a = appt("a1", start, kind=FOLLOWUP, status=CANCELLED)
++        self.assertEqual(cancellation_fee(a, start - datetime.timedelta(hours=48)), 0)
++        self.assertEqual(cancellation_fee(a, start - datetime.timedelta(days=7)), 0)
++
++    def test_window_compares_instants_across_time_zones(self):
++        start = utc(2026, 10, 20, 9)  # 22:00 NZDT on 20 October
++        a = appt("a1", start, kind=FOLLOWUP, status=CANCELLED)
++        # 47 hours before the start, written in NZ local time
++        self.assertEqual(cancellation_fee(a, datetime.datetime(2026, 10, 18, 23, 0, tzinfo=NZ)), 3500)
++        # exactly 48 hours before the start, written in NZ local time
++        self.assertEqual(cancellation_fee(a, datetime.datetime(2026, 10, 18, 22, 0, tzinfo=NZ)), 0)
++
++    def test_cancelled_needs_a_timezone_aware_time(self):
++        start = utc(2026, 10, 20, 9)
++        a = appt("a1", start, kind=FOLLOWUP, status=CANCELLED)
++        with self.assertRaises(ValueError):
++            cancellation_fee(a, None)
++        with self.assertRaises(ValueError):
++            cancellation_fee(a, datetime.datetime(2026, 10, 18, 9))
++
++    def test_rejects_statuses_without_a_fee(self):
++        for status in [BOOKED, ATTENDED]:
++            with self.subTest(status=status):
++                with self.assertRaises(ValueError):
++                    cancellation_fee(appt("a1", utc(2026, 10, 20, 9), status=status), utc(2026, 10, 18, 9))
++
++
++if __name__ == "__main__":
++    unittest.main()

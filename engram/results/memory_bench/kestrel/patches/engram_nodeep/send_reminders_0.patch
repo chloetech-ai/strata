@@ -1,0 +1,142 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 93a0ab1..80d44f5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@
+ - `make_invoice`, dated by the appointment's Auckland day.
+ - Import of appointments from the legacy booking export.
+ - SMS batches split at Bulkie's 50-message limit.
++- `send_reminders` texts the patient of each booked appointment its local date, time and clinic name.
+ - `session_price` for assessments and follow-ups.
+ - Appointment cancellation with `cancelled_at`, and a CSC flag on patients.
+ - Day queries, patient ID normalisation and start-order calendar.
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..a331d32
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,22 @@
++"""SMS reminders for booked appointments."""
++
++from .calendar import LOCAL_TZ
++from .models import BOOKED, CLINICS
++
++
++def reminder_text(appointment):
++    """The reminder for one appointment: its local date, time and clinic, and nothing else."""
++    local = appointment.start.astimezone(LOCAL_TZ)
++    clinic = CLINICS[appointment.clinic].name
++    return f"Reminder: you have an appointment at {clinic} on {local:%A %d %B %Y} at {local:%H:%M}."
++
++
++def send_reminders(appointments, patients, client):
++    """Text the patient of every booked appointment and return the number of messages sent.
++
++    patients maps patient ID to Patient. Every message is built before anything is sent,
++    so a missing patient or clinic raises before any message goes out.
++    """
++    messages = [(patients[a.patient_id].phone, reminder_text(a)) for a in appointments if a.status == BOOKED]
++    client.send_batch(messages)
++    return len(messages)
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..0faee29
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,96 @@
++import datetime
++import unittest
++
++from kestrel.models import ATTENDED, CANCELLED, NO_SHOW, Patient
++from kestrel.reminders import reminder_text, send_reminders
++from kestrel.sms import BulkieClient
++
++from helpers import appt, utc
++
++
++class FakeTransport:
++    def __init__(self):
++        self.calls = []
++
++    def post(self, path, body):
++        self.calls.append((path, body))
++        return {"ok": True}
++
++
++def sent_messages(transport):
++    return [(m["to"], m["text"]) for _, body in transport.calls for m in body["messages"]]
++
++
++PATIENTS = {
++    "KP-000001": Patient("KP-000001", "Aroha Test", "+64211111111"),
++    "KP-000002": Patient("KP-000002", "Ben Test", "+64222222222", csc=True),
++}
++
++
++class SendRemindersTest(unittest.TestCase):
++    def test_one_message_per_booked_appointment(self):
++        transport = FakeTransport()
++        appointments = [
++            appt("A1", utc(2026, 10, 20, 2, 0), patient="KP-000001"),
++            appt("A2", utc(2026, 10, 21, 2, 0), patient="KP-000002"),
++        ]
++        count = send_reminders(appointments, PATIENTS, BulkieClient("key", transport))
++        self.assertEqual(count, 2)
++        self.assertEqual([to for to, _ in sent_messages(transport)], ["+64211111111", "+64222222222"])
++
++    def test_skips_appointments_that_are_not_booked(self):
++        transport = FakeTransport()
++        appointments = [
++            appt("A1", utc(2026, 10, 20, 2, 0), patient="KP-000001"),
++            appt("A2", utc(2026, 10, 21, 2, 0), patient="KP-000002", status=CANCELLED, cancelled_at=utc(2026, 10, 14)),
++            appt("A3", utc(2026, 10, 22, 2, 0), patient="KP-000002", status=ATTENDED),
++            appt("A4", utc(2026, 10, 23, 2, 0), patient="KP-000001", status=NO_SHOW),
++        ]
++        count = send_reminders(appointments, PATIENTS, BulkieClient("key", transport))
++        self.assertEqual(count, 1)
++        self.assertEqual(sent_messages(transport), [("+64211111111", reminder_text(appointments[0]))])
++
++    def test_no_booked_appointments_sends_nothing(self):
++        transport = FakeTransport()
++        count = send_reminders([], PATIENTS, BulkieClient("key", transport))
++        self.assertEqual(count, 0)
++        self.assertEqual(transport.calls, [])
++
++    def test_more_than_one_api_call_is_counted_in_full(self):
++        transport = FakeTransport()
++        appointments = [appt(f"A{i}", utc(2026, 10, 20, 2, 0), patient="KP-000001") for i in range(51)]
++        count = send_reminders(appointments, PATIENTS, BulkieClient("key", transport))
++        self.assertEqual(count, 51)
++        self.assertEqual(len(transport.calls), 2)
++
++    def test_unknown_patient_raises_before_anything_is_sent(self):
++        transport = FakeTransport()
++        appointments = [
++            appt("A1", utc(2026, 10, 20, 2, 0), patient="KP-000001"),
++            appt("A2", utc(2026, 10, 21, 2, 0), patient="KP-999999"),
++        ]
++        with self.assertRaises(KeyError):
++            send_reminders(appointments, PATIENTS, BulkieClient("key", transport))
++        self.assertEqual(transport.calls, [])
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_gives_local_date_time_and_clinic(self):
++        # 02:00 UTC on 20 October 2026 is 15:00 NZDT the same day.
++        text = reminder_text(appt("A1", utc(2026, 10, 20, 2, 0), clinic="HB"))
++        self.assertEqual(text, "Reminder: you have an appointment at Kestrel Physio Harbour on Tuesday 20 October 2026 at 15:00.")
++
++    def test_uses_auckland_date_not_utc_date(self):
++        # 11:30 UTC on 20 October is 00:30 on 21 October in Auckland.
++        text = reminder_text(appt("A1", utc(2026, 10, 20, 11, 30), clinic="NG"))
++        self.assertIn("on Wednesday 21 October 2026 at 00:30.", text)
++
++    def test_leaves_out_treatment_and_patient_details(self):
++        text = reminder_text(appt("A1", utc(2026, 10, 20, 2, 0), treatment="lower back pain", clinic="WK"))
++        self.assertNotIn("lower back pain", text)
++        self.assertNotIn("Aroha", text)
++        self.assertNotIn("KP-", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

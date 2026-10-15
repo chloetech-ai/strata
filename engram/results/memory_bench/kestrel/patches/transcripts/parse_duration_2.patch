@@ -1,0 +1,65 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..97977ad
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,21 @@
++"""Reading durations typed in by reception."""
++
++import re
++
++_HOURS = re.compile(r"(\d+)\s*h(?:\s*(\d+)\s*m?)?")
++_MINUTES = re.compile(r"(\d+)\s*m")
++
++
++def parse_duration(text):
++    """Turn a typed duration such as '45m', '1h', '1h30' or '1h 30m' into minutes."""
++    cleaned = text.strip().lower()
++    match = _HOURS.fullmatch(cleaned)
++    if match is not None:
++        hours, minutes = match.group(1), match.group(2) or "0"
++        if int(minutes) > 59:
++            raise ValueError(f"minutes after the hour must be under 60: {text!r}")
++        return int(hours) * 60 + int(minutes)
++    match = _MINUTES.fullmatch(cleaned)
++    if match is not None:
++        return int(match.group(1))
++    raise ValueError(f"not a duration: {text!r}")
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..68991a8
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from kestrel.intervals import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes(self):
++        self.assertEqual(parse_duration("45m"), 45)
++
++    def test_hours(self):
++        self.assertEqual(parse_duration("1h"), 60)
++
++    def test_hours_and_minutes(self):
++        self.assertEqual(parse_duration("1h30"), 90)
++        self.assertEqual(parse_duration("1h 30m"), 90)
++        self.assertEqual(parse_duration("1h30m"), 90)
++
++    def test_surrounding_whitespace_and_case(self):
++        self.assertEqual(parse_duration(" 2H 15M "), 135)
++
++    def test_zero_minutes_after_hour(self):
++        self.assertEqual(parse_duration("2h0"), 120)
++
++    def test_rejects_anything_else(self):
++        for raw in ["", "45", "h", "m", "1.5h", "-30m", "1h90", "1h30s", "1 hour", "1h30m5"]:
++            with self.subTest(raw=raw):
++                with self.assertRaises(ValueError):
++                    parse_duration(raw)
++
++
++if __name__ == "__main__":
++    unittest.main()

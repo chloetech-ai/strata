@@ -1,0 +1,96 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ad329e2..287f438 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,7 @@
+ - `kestrel.ids.normalize_patient_id` trims, upper-cases, zero-pads and adds the dash to typed patient IDs, rejecting malformed ones.
+ - `session_price(kind)` returns the price in cents: $95 for an assessment, $70 for a follow-up.
+ - `make_invoice` builds an invoice for an appointment, dated on its local date. It refuses an appointment that belongs to a different patient.
++- `next_invoice_number(clinic, year, existing)` returns the next number (`INV-HB-2026-00001` style) after the highest one issued for that clinic and year.
+ - `therapist_load` counts each therapist's booked appointments per local date over a seven-day week.
+ - Waitlist with urgent-first ordering: urgent entries come first, then the rest, each in request order.
+ - `import_legacy(path)` imports appointments from the legacy booking system's CSV export.
+diff --git a/src/kestrel/invoices.py b/src/kestrel/invoices.py
+index e59b613..0176b49 100644
+--- a/src/kestrel/invoices.py
++++ b/src/kestrel/invoices.py
+@@ -2,6 +2,7 @@
+ 
+ from dataclasses import dataclass
+ import datetime
++import re
+ 
+ from .calendar import CLINIC_TZ
+ from .models import ASSESSMENT, FOLLOWUP, Appointment, Patient
+@@ -11,6 +12,8 @@ _KIND_LABELS = {
+     FOLLOWUP: "Physiotherapy follow-up",
+ }
+ 
++_SEQUENCE = re.compile(r"[0-9]+")
++
+ 
+ @dataclass
+ class Invoice:
+@@ -23,6 +26,23 @@ class Invoice:
+     description: str = ""
+ 
+ 
++def next_invoice_number(clinic, year, existing):
++    """Return the number for the next invoice for a clinic in a year.
++
++    Numbers look like 'INV-HB-2026-00001'. The sequence continues from the
++    highest number already issued for that clinic and year, and starts at 1
++    when there is none. Numbers for other clinics or years are ignored, as are
++    any that do not match the format.
++    """
++    prefix = f"INV-{clinic}-{year}-"
++    highest = 0
++    for number in existing:
++        sequence = number[len(prefix):] if number.startswith(prefix) else ""
++        if _SEQUENCE.fullmatch(sequence):
++            highest = max(highest, int(sequence))
++    return f"{prefix}{highest + 1:05d}"
++
++
+ def make_invoice(appointment, patient, number, amount_cents):
+     """Invoice a patient for an appointment.
+ 
+diff --git a/tests/test_invoices.py b/tests/test_invoices.py
+index 1f4c516..95340de 100644
+--- a/tests/test_invoices.py
++++ b/tests/test_invoices.py
+@@ -1,12 +1,33 @@
+ import datetime
+ import unittest
+ 
+-from kestrel.invoices import make_invoice
++from kestrel.invoices import make_invoice, next_invoice_number
+ from kestrel.models import Appointment, Patient
+ 
+ from helpers import UTC, appt, utc
+ 
+ 
++class NextInvoiceNumberTest(unittest.TestCase):
++    def test_starts_at_one_when_none_issued(self):
++        self.assertEqual(next_invoice_number("HB", 2026, []), "INV-HB-2026-00001")
++
++    def test_continues_from_highest_number(self):
++        existing = ["INV-HB-2026-00001", "INV-HB-2026-00007", "INV-HB-2026-00003"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00008")
++
++    def test_ignores_other_clinics_and_years(self):
++        existing = ["INV-WN-2026-00009", "INV-HB-2025-00012", "INV-HB-2027-00020"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00001")
++
++    def test_ignores_numbers_that_do_not_match_the_format(self):
++        existing = ["INV-HB-2026-", "INV-HB-2026-00002A", "INV-HB-2026-00004", "XINV-HB-2026-00050"]
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00005")
++
++    def test_accepts_any_iterable(self):
++        existing = (number for number in ["INV-HB-2026-00002"])
++        self.assertEqual(next_invoice_number("HB", 2026, existing), "INV-HB-2026-00003")
++
++
+ class MakeInvoiceTest(unittest.TestCase):
+     def setUp(self):
+         self.patient = Patient(id="KP-004211", name="Aroha Ngata", phone="+64211234567")

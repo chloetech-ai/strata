@@ -1,0 +1,77 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9e5da12..7333e40 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- `reminder_text(appointment)` returns the text of the SMS reminder sent two days before an appointment. It gives the clinic name, date and time (clinic-local) and nothing else: no treatment, no patient name.
+ - `Calendar.cancel(appointment_id, at)` marks an appointment cancelled and records `cancelled_at`.
+ - `session_price(kind)` returns the session price in cents: $95 for an assessment, $70 for a follow-up.
+ - `BulkieClient.send_batch` splits messages into calls of at most 50 (`MAX_BATCH`), since Bulkie rejects a whole call that is over the limit. It now returns one response per call.
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..0568797
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,21 @@
++"""Text of the SMS reminders sent two days before an appointment."""
++
++from .calendar import CLINIC_TZ
++from .models import CLINICS
++
++
++def reminder_text(appointment):
++    """Friendly reminder for an appointment, with only the date, time and clinic name.
++
++    The treatment and the patient's name are deliberately left out, by privacy rule.
++    """
++    local = appointment.start.astimezone(CLINIC_TZ)
++    hour = local.hour % 12 or 12
++    meridiem = "am" if local.hour < 12 else "pm"
++    when = f"{local:%A} {local.day} {local:%B} at {hour}:{local.minute:02d}{meridiem}"
++    clinic = CLINICS[appointment.clinic].name
++    return (
++        f"Hi, this is a friendly reminder of your appointment at {clinic} "
++        f"on {when}. We look forward to seeing you! "
++        f"If you need to change it, please contact the clinic as soon as you can."
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..c64bfc3
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from kestrel.reminders import reminder_text
++
++from helpers import appt, utc
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_gives_clinic_local_date_and_time(self):
++        # 2027-03-01 20:30 UTC is 09:30 on 2 March in Auckland (NZDT, UTC+13).
++        text = reminder_text(appt("a1", utc(2027, 3, 1, 20, 30), clinic="HB"))
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("Tuesday 2 March at 9:30am", text)
++
++    def test_afternoon_time_uses_12_hour_clock(self):
++        text = reminder_text(appt("a1", utc(2027, 3, 1, 2, 5), clinic="NG"))
++        # 02:05 UTC is 15:05 in Auckland.
++        self.assertIn("at 3:05pm", text)
++
++    def test_midnight_is_twelve_am(self):
++        # 11:00 UTC is 00:00 on 2 March in Auckland.
++        text = reminder_text(appt("a1", utc(2027, 3, 1, 11, 0), clinic="WK"))
++        self.assertIn("at 12:00am", text)
++
++    def test_leaves_out_treatment_and_patient_name(self):
++        text = reminder_text(appt("a1", utc(2027, 3, 1, 20), treatment="lower back pain", patient="KP-004211"))
++        self.assertNotIn("lower back pain", text)
++        self.assertNotIn("KP-004211", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

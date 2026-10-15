@@ -1,0 +1,68 @@
+diff --git a/src/kestrel/waitlist.py b/src/kestrel/waitlist.py
+index bad08f4..469edf7 100644
+--- a/src/kestrel/waitlist.py
++++ b/src/kestrel/waitlist.py
+@@ -40,3 +40,10 @@ class Waitlist:
+     def entries(self):
+         """Urgent entries first, then everyone else; each group in the order they asked."""
+         return sorted(self._entries.values(), key=lambda e: (not e.urgent, e.requested_at))
++
++    def next_for(self, kind):
++        """The entry to offer a freed slot of this kind to, or None if nobody is waiting for it."""
++        for entry in self.entries():
++            if entry.kind == kind:
++                return entry
++        return None
+diff --git a/tests/test_waitlist.py b/tests/test_waitlist.py
+index c1a7ee8..bd9575d 100644
+--- a/tests/test_waitlist.py
++++ b/tests/test_waitlist.py
+@@ -109,5 +109,48 @@ class WaitlistTest(unittest.TestCase):
+         self.assertEqual(waitlist.entries(), [rejoined])
+ 
+ 
++class NextForTest(unittest.TestCase):
++    def test_none_when_empty(self):
++        self.assertIsNone(Waitlist().next_for("followup"))
++
++    def test_none_when_nobody_waits_for_that_kind(self):
++        waitlist = Waitlist()
++        waitlist.add(entry("KP-000001", 9, kind="followup"))
++        self.assertIsNone(waitlist.next_for("assessment"))
++
++    def test_first_patient_asking_for_that_kind(self):
++        waitlist = Waitlist()
++        late = entry("KP-000001", 15, kind="assessment")
++        early = entry("KP-000002", 8, kind="followup")
++        earliest_assessment = entry("KP-000003", 10, kind="assessment")
++        for e in (late, early, earliest_assessment):
++            waitlist.add(e)
++        self.assertIs(waitlist.next_for("assessment"), earliest_assessment)
++        self.assertIs(waitlist.next_for("followup"), early)
++
++    def test_urgent_entry_goes_before_earlier_ordinary_one(self):
++        waitlist = Waitlist()
++        early = entry("KP-000001", 8, kind="followup")
++        urgent_late = entry("KP-000002", 16, kind="followup", urgent=True)
++        waitlist.add(early)
++        waitlist.add(urgent_late)
++        self.assertIs(waitlist.next_for("followup"), urgent_late)
++
++    def test_urgent_of_other_kind_is_ignored(self):
++        waitlist = Waitlist()
++        urgent_assessment = entry("KP-000001", 9, kind="assessment", urgent=True)
++        ordinary_followup = entry("KP-000002", 10, kind="followup")
++        waitlist.add(urgent_assessment)
++        waitlist.add(ordinary_followup)
++        self.assertIs(waitlist.next_for("followup"), ordinary_followup)
++
++    def test_does_not_remove_entry(self):
++        waitlist = Waitlist()
++        e = entry("KP-000001", 9)
++        waitlist.add(e)
++        waitlist.next_for("followup")
++        self.assertEqual(waitlist.entries(), [e])
++
++
+ if __name__ == "__main__":
+     unittest.main()

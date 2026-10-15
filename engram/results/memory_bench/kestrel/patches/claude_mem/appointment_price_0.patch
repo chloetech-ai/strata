@@ -1,0 +1,96 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fcc0c53..04af54f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,7 +10,8 @@
+ - Add `Calendar.for_day`, which matches on the Auckland local date.
+ - Add `ids.normalize_patient_id`, which accepts forms such as `kp4211` and `' KP-004211 '`. `Calendar.for_patient` uses it.
+ - Fix `Calendar.all()` to sort by start time, as its docstring says, instead of by appointment ID.
+-- Add `session_price`: initial assessment is 9500 cents, follow-up 7000 cents.
++- Add `session_price`: initial assessment is 10500 cents, follow-up 7800 cents.
++- Add `appointment_price(appointment, patient)`, which returns what the patient pays for an appointment in cents. The patient's CSC flag is not applied yet.
+ - Add `make_invoice` for appointments, dated on the local Auckland date.
+ - Add `Calendar.move` to reschedule booked appointments. Cancelled, attended and no-show appointments cannot be moved.
+ - Add `therapist_load(calendar, week_start)`, which counts booked appointments per therapist for each day of a week.
+diff --git a/src/kestrel/pricing.py b/src/kestrel/pricing.py
+index 27930b1..235d07f 100644
+--- a/src/kestrel/pricing.py
++++ b/src/kestrel/pricing.py
+@@ -1,10 +1,14 @@
+ """Session prices, in cents."""
+ 
++from .models import ASSESSMENT, FOLLOWUP
++
+ _PRICES_CENTS = {
+-    "initial": 9500,  # $95
+-    "follow_up": 7000,  # $70
++    "initial": 10500,  # $105
++    "follow_up": 7800,  # $78
+ }
+ 
++_SESSION_KINDS = {ASSESSMENT: "initial", FOLLOWUP: "follow_up"}
++
+ 
+ def session_price(kind):
+     """Return the price in cents for a session kind: 'initial' or 'follow_up'.
+@@ -15,3 +19,15 @@ def session_price(kind):
+         return _PRICES_CENTS[kind]
+     except KeyError:
+         raise ValueError(f"unknown session kind: {kind!r}") from None
++
++
++def appointment_price(appointment, patient):
++    """Return what the patient pays for the appointment, in cents.
++
++    This is the list price for the appointment's kind. The patient's csc flag
++    is not applied yet. Raises ValueError if the appointment is not the
++    patient's.
++    """
++    if appointment.patient_id != patient.id:
++        raise ValueError(f"appointment {appointment.id!r} is not for patient {patient.id!r}")
++    return session_price(_SESSION_KINDS[appointment.kind])
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+index 5bddec6..15518cc 100644
+--- a/tests/test_pricing.py
++++ b/tests/test_pricing.py
+@@ -1,14 +1,18 @@
+ import unittest
+ 
+-from kestrel.pricing import session_price
++from helpers import appt, utc
++from kestrel.models import Patient
++from kestrel.pricing import appointment_price, session_price
++
++PATIENT = Patient("KP-004211", "Ana Silva", "+64211234567")
+ 
+ 
+ class SessionPriceTest(unittest.TestCase):
+     def test_initial_assessment(self):
+-        self.assertEqual(session_price("initial"), 9500)
++        self.assertEqual(session_price("initial"), 10500)
+ 
+     def test_follow_up(self):
+-        self.assertEqual(session_price("follow_up"), 7000)
++        self.assertEqual(session_price("follow_up"), 7800)
+ 
+     def test_unknown_kind_raises(self):
+         with self.assertRaises(ValueError):
+@@ -21,3 +25,18 @@ class SessionPriceTest(unittest.TestCase):
+     def test_none_kind_raises(self):
+         with self.assertRaises(ValueError):
+             session_price(None)
++
++
++class AppointmentPriceTest(unittest.TestCase):
++    def test_assessment_is_initial_price(self):
++        a = appt("a1", utc(2027, 3, 1, 9), kind="assessment", patient="KP-004211")
++        self.assertEqual(appointment_price(a, PATIENT), 10500)
++
++    def test_follow_up_is_follow_up_price(self):
++        a = appt("a1", utc(2027, 3, 1, 9), kind="followup", patient="KP-004211")
++        self.assertEqual(appointment_price(a, PATIENT), 7800)
++
++    def test_other_patients_appointment_raises(self):
++        a = appt("a1", utc(2027, 3, 1, 9), kind="followup", patient="KP-000001")
++        with self.assertRaises(ValueError):
++            appointment_price(a, PATIENT)

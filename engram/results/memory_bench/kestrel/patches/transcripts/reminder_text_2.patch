@@ -1,0 +1,87 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9e5da12..ea4caba 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - `Calendar.move(appointment_id, new_start)` reschedules a booked appointment. The new start must be timezone-aware.
+ - `therapist_load(calendar, week_start)` counts booked appointments per therapist for each clinic-local day of a week.
+ - `Waitlist` holds patients waiting for an appointment, with `add`, `remove` and `entries`.
++- `reminder_text(appointment)` returns the text of the SMS reminder sent two days before an appointment. It gives the clinic name, the clinic-local day and time, and no treatment or patient name.
+ - `python -m kestrel day THERAPIST_ID DATE --data kestrel.json` prints a therapist's booked appointments on a local date.
+ - `python -m kestrel patients --data kestrel.json` prints patient IDs and names, sorted by ID.
+ - Storage writes atomically: data goes to a temporary file in the same directory, which then replaces the old file. A crash or failed write leaves the previous file intact. Saved files are now owner-only (mode 0600).
+diff --git a/src/kestrel/reminders.py b/src/kestrel/reminders.py
+new file mode 100644
+index 0000000..446e690
+--- /dev/null
++++ b/src/kestrel/reminders.py
+@@ -0,0 +1,22 @@
++"""Text of the SMS reminder sent two days before an appointment."""
++
++from .calendar import CLINIC_TZ
++from .models import CLINICS
++
++
++def reminder_text(appointment):
++    """Return the reminder for an appointment.
++
++    Only the clinic name, date and time go in the text. The treatment and the
++    patient's name are left out on purpose, since the reminder is an SMS.
++    """
++    start = appointment.start.astimezone(CLINIC_TZ)
++    clinic = CLINICS[appointment.clinic].name
++    day = f"{start:%A} {start.day} {start:%B}"
++    hour = start.hour % 12 or 12
++    suffix = "am" if start.hour < 12 else "pm"
++    time = f"{hour}:{start.minute:02d}{suffix}"
++    return (
++        f"{clinic}: friendly reminder of your appointment on {day} at {time}. "
++        "See you then! To change it, please call the clinic."
++    )
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..cf10d3b
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,41 @@
++import datetime
++import unittest
++
++from kestrel.calendar import CLINIC_TZ
++from kestrel.reminders import reminder_text
++
++from helpers import appt
++
++
++class ReminderTextTest(unittest.TestCase):
++    def local(self, y, m, d, hh, mm):
++        return datetime.datetime(y, m, d, hh, mm, tzinfo=CLINIC_TZ)
++
++    def test_gives_clinic_day_and_time(self):
++        a = appt("A1", self.local(2026, 10, 15, 14, 30), clinic="NG")
++        self.assertEqual(
++            reminder_text(a),
++            "Kestrel Physio Northgate: friendly reminder of your appointment on Thursday 15 October at 2:30pm. "
++            "See you then! To change it, please call the clinic.",
++        )
++
++    def test_morning_time_and_utc_start_shown_in_clinic_time(self):
++        # 21:00 UTC on 14 Oct is 10:00am on 15 Oct in Auckland (NZDT, UTC+13).
++        a = appt("A2", datetime.datetime(2026, 10, 14, 21, 0, tzinfo=datetime.timezone.utc), clinic="HB")
++        text = reminder_text(a)
++        self.assertIn("Kestrel Physio Harbour", text)
++        self.assertIn("Thursday 15 October at 10:00am", text)
++
++    def test_midnight_is_12am_and_noon_is_12pm(self):
++        self.assertIn("at 12:00am", reminder_text(appt("A3", self.local(2026, 10, 15, 0, 0))))
++        self.assertIn("at 12:05pm", reminder_text(appt("A4", self.local(2026, 10, 15, 12, 5))))
++
++    def test_omits_treatment_and_patient_details(self):
++        a = appt("A5", self.local(2026, 10, 15, 9, 0), treatment="lower back pain", patient="KP-004211")
++        text = reminder_text(a)
++        self.assertNotIn("lower back pain", text)
++        self.assertNotIn("KP-004211", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

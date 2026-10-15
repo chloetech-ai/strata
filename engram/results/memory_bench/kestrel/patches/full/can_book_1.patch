@@ -1,0 +1,127 @@
+diff --git a/src/kestrel/booking.py b/src/kestrel/booking.py
+new file mode 100644
+index 0000000..806ea7d
+--- /dev/null
++++ b/src/kestrel/booking.py
+@@ -0,0 +1,48 @@
++"""Checks run before a booking is saved."""
++
++import datetime
++
++from .calendar import AUCKLAND
++from .models import ASSESSMENT, BOOKED, FOLLOWUP
++
++DURATIONS = {
++    ASSESSMENT: datetime.timedelta(minutes=45),
++    FOLLOWUP: datetime.timedelta(minutes=30),
++}
++# Notes time the therapist needs after each kind of appointment before the next patient.
++NOTES_GAP = {
++    ASSESSMENT: datetime.timedelta(minutes=15),
++    FOLLOWUP: datetime.timedelta(0),
++}
++START_MINUTES = 15  # appointments start on a quarter hour
++
++
++def can_book(calendar, therapist, appointment):
++    """True if the appointment can be added to the calendar for that therapist, else False.
++
++    Refuses an appointment for another therapist, a start that isn't on a quarter
++    hour, an id already in the calendar, and any overlap with a booked appointment
++    for the same therapist, including the notes gap after an assessment.
++    """
++    if appointment.therapist_id != therapist or appointment.status != BOOKED:
++        return False
++    if any(a.id == appointment.id for a in calendar.all()):
++        return False
++    local = appointment.start.astimezone(AUCKLAND)
++    if local.minute % START_MINUTES or local.second or local.microsecond:
++        return False
++    start, end = _occupied(appointment)
++    for other in calendar.for_therapist(therapist):
++        if other.status != BOOKED:
++            continue
++        other_start, other_end = _occupied(other)
++        if start < other_end and other_start < end:
++            return False
++    return True
++
++
++def _occupied(appointment):
++    """The time an appointment takes up, including its notes gap."""
++    start = appointment.start
++    end = start + DURATIONS[appointment.kind] + NOTES_GAP[appointment.kind]
++    return start, end
+diff --git a/tests/test_booking.py b/tests/test_booking.py
+new file mode 100644
+index 0000000..83958c8
+--- /dev/null
++++ b/tests/test_booking.py
+@@ -0,0 +1,67 @@
++import datetime
++import unittest
++
++from helpers import appt
++from kestrel.booking import can_book
++from kestrel.calendar import AUCKLAND, Calendar
++from kestrel.models import ASSESSMENT, FOLLOWUP
++
++# October 2026 is NZDT (UTC+13).
++def local(hour, minute=0):
++    return datetime.datetime(2026, 10, 13, hour, minute, tzinfo=AUCKLAND)
++
++
++class CanBookTest(unittest.TestCase):
++    def test_empty_calendar(self):
++        self.assertTrue(can_book(Calendar(), "T1", appt("n", local(9), kind=FOLLOWUP, therapist="T1")))
++
++    def test_overlapping_followup_is_refused(self):
++        cal = Calendar([appt("a1", local(9), kind=FOLLOWUP, therapist="T1")])
++        self.assertFalse(can_book(cal, "T1", appt("n", local(9, 15), kind=FOLLOWUP, therapist="T1")))
++
++    def test_back_to_back_followups_are_allowed(self):
++        cal = Calendar([appt("a1", local(9), kind=FOLLOWUP, therapist="T1")])
++        self.assertTrue(can_book(cal, "T1", appt("n", local(9, 30), kind=FOLLOWUP, therapist="T1")))
++
++    def test_followup_after_assessment_needs_the_notes_gap(self):
++        # Assessment 09:00-09:45, then 15 minutes of notes until 10:00.
++        cal = Calendar([appt("a1", local(9), kind=ASSESSMENT, therapist="T1")])
++        self.assertFalse(can_book(cal, "T1", appt("n", local(9, 45), kind=FOLLOWUP, therapist="T1")))
++        self.assertTrue(can_book(cal, "T1", appt("n", local(10), kind=FOLLOWUP, therapist="T1")))
++
++    def test_assessment_after_followup_has_no_gap(self):
++        cal = Calendar([appt("a1", local(9), kind=FOLLOWUP, therapist="T1")])
++        self.assertTrue(can_book(cal, "T1", appt("n", local(9, 30), kind=ASSESSMENT, therapist="T1")))
++
++    def test_new_assessment_must_leave_room_for_its_notes(self):
++        # A 09:15 assessment would run 10:00 and need notes until 10:15, overlapping a 10:00 follow-up.
++        cal = Calendar([appt("a1", local(10), kind=FOLLOWUP, therapist="T1")])
++        self.assertFalse(can_book(cal, "T1", appt("n", local(9, 15), kind=ASSESSMENT, therapist="T1")))
++        self.assertTrue(can_book(cal, "T1", appt("n", local(9), kind=ASSESSMENT, therapist="T1")))
++
++    def test_start_must_be_a_quarter_hour(self):
++        cal = Calendar()
++        self.assertFalse(can_book(cal, "T1", appt("n", local(9, 10), kind=FOLLOWUP, therapist="T1")))
++        self.assertTrue(can_book(cal, "T1", appt("n", local(9, 45), kind=FOLLOWUP, therapist="T1")))
++
++    def test_other_therapists_do_not_block(self):
++        cal = Calendar([appt("a1", local(9), kind=FOLLOWUP, therapist="T2")])
++        self.assertTrue(can_book(cal, "T1", appt("n", local(9), kind=FOLLOWUP, therapist="T1")))
++
++    def test_cancelled_appointments_do_not_block(self):
++        cal = Calendar([appt("a1", local(9), kind=FOLLOWUP, therapist="T1", status="cancelled")])
++        self.assertTrue(can_book(cal, "T1", appt("n", local(9), kind=FOLLOWUP, therapist="T1")))
++
++    def test_appointment_for_another_therapist_is_refused(self):
++        self.assertFalse(can_book(Calendar(), "T1", appt("n", local(9), kind=FOLLOWUP, therapist="T2")))
++
++    def test_duplicate_id_is_refused(self):
++        cal = Calendar([appt("a1", local(14), kind=FOLLOWUP, therapist="T1")])
++        self.assertFalse(can_book(cal, "T1", appt("a1", local(9), kind=FOLLOWUP, therapist="T1")))
++
++    def test_non_booked_appointment_is_refused(self):
++        self.assertFalse(can_book(Calendar(), "T1", appt("n", local(9), kind=FOLLOWUP, therapist="T1", status="cancelled")))
++
++
++if __name__ == "__main__":
++    unittest.main()

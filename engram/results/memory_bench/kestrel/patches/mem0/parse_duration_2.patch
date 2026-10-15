@@ -1,0 +1,66 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..39f038b
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,24 @@
++import re
++
++_DURATION = re.compile(r"(?:(\d+)h ?(?:(\d+)m?)?|(\d+)m)")
++
++
++def parse_duration(text):
++    """Return the number of minutes in a duration such as '45m', '1h', '1h30' or '1h 30m'."""
++    match = _DURATION.fullmatch(text.strip())
++    if match is None:
++        raise ValueError(f"invalid duration: {text!r}")
++
++    hours, minutes, bare_minutes = match.groups()
++    if bare_minutes is not None:
++        total = int(bare_minutes)
++    else:
++        total = int(hours) * 60
++        if minutes is not None:
++            if int(minutes) >= 60:
++                raise ValueError(f"invalid duration: {text!r}")
++            total += int(minutes)
++
++    if total == 0:
++        raise ValueError(f"invalid duration: {text!r}")
++    return total
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..38a812c
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,30 @@
++import unittest
++
++from kestrel.intervals import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_minutes_only(self):
++        self.assertEqual(parse_duration("45m"), 45)
++
++    def test_hours_only(self):
++        self.assertEqual(parse_duration("1h"), 60)
++
++    def test_hours_and_minutes(self):
++        cases = {"1h30": 90, "1h 30m": 90, "1h30m": 90, "2h 5": 125}
++        for raw, expected in cases.items():
++            with self.subTest(raw=raw):
++                self.assertEqual(parse_duration(raw), expected)
++
++    def test_surrounding_whitespace_is_ignored(self):
++        self.assertEqual(parse_duration(" 45m\n"), 45)
++
++    def test_rejects_anything_else(self):
++        for raw in ["", "m", "h", "45", "45min", "1.5h", "-30m", "1h60", "1h 60m", "0m", "0h", "1 h", "1h30m5", "1h 30m extra"]:
++            with self.subTest(raw=raw):
++                with self.assertRaises(ValueError):
++                    parse_duration(raw)
++
++
++if __name__ == "__main__":
++    unittest.main()

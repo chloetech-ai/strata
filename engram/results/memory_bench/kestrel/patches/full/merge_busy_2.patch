@@ -1,0 +1,61 @@
+diff --git a/src/kestrel/intervals.py b/src/kestrel/intervals.py
+new file mode 100644
+index 0000000..1aaed95
+--- /dev/null
++++ b/src/kestrel/intervals.py
+@@ -0,0 +1,18 @@
++"""Time intervals."""
++
++
++def merge_busy(intervals):
++    """Merge (start, end) pairs, given in any order, into sorted non-overlapping pairs.
++
++    Pairs that touch, with one ending exactly where the next starts, are merged too.
++    Raises ValueError for a pair whose end is before its start.
++    """
++    merged = []
++    for start, end in sorted(intervals):
++        if end < start:
++            raise ValueError(f"interval ends before it starts: {(start, end)!r}")
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..d815dda
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,31 @@
++import unittest
++
++from kestrel.intervals import merge_busy
++
++
++class MergeBusyTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(merge_busy([]), [])
++
++    def test_sorts_out_of_order_disjoint_pairs(self):
++        self.assertEqual(merge_busy([(5, 6), (1, 2), (3, 4)]), [(1, 2), (3, 4), (5, 6)])
++
++    def test_merges_overlapping_pairs(self):
++        self.assertEqual(merge_busy([(1, 4), (3, 6), (8, 9)]), [(1, 6), (8, 9)])
++
++    def test_merges_touching_pairs(self):
++        self.assertEqual(merge_busy([(1, 3), (3, 5)]), [(1, 5)])
++
++    def test_contained_pair_does_not_shorten_merged_pair(self):
++        self.assertEqual(merge_busy([(1, 10), (2, 3), (4, 5)]), [(1, 10)])
++
++    def test_chain_of_overlaps_merges_into_one(self):
++        self.assertEqual(merge_busy([(7, 8), (1, 3), (2, 5), (4, 7)]), [(1, 8)])
++
++    def test_rejects_interval_ending_before_it_starts(self):
++        with self.assertRaises(ValueError):
++            merge_busy([(5, 2)])
++
++
++if __name__ == "__main__":
++    unittest.main()
