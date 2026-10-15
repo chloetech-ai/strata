@@ -1,0 +1,68 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 1acfdc9..ac9f8d4 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -13,6 +13,9 @@ CHANGEOVER = datetime.timedelta(minutes=10)
+ MAX_SERIES_SESSIONS = 9
+ # how many weeks a series may run on while looking for free weeks
+ SERIES_SEARCH_WEEKS = 26
++# the therapists' contract caps treatments per day; the online booking page shows a therapist at this
++# count as fully booked. book() does not enforce it, because reception sometimes books over it.
++DAILY_CAP = 7
+ 
+ 
+ class Schedule:
+@@ -99,6 +102,10 @@ class Schedule:
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+         return {day: self.appointments_for(therapist, day) for day in days}
+ 
++    def is_fully_booked(self, therapist, day):
++        """True once `therapist` has reached the daily cap on `day`, so the online booking page greys it out."""
++        return len(self.appointments_for(therapist, day)) >= DAILY_CAP
++
+ 
+ def _closed_message(appointment):
+     day = appointment.start.date()
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 793ccb0..e8da28b 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -107,6 +107,38 @@ class ScheduleTest(unittest.TestCase):
+         week = s.week("lena", datetime.date(2026, 9, 7))
+         self.assertEqual([a.start.hour for a in week[datetime.date(2026, 9, 8)]], [12])
+ 
++    def test_fully_booked_at_seven_appointments_that_day(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        for i in range(6):
++            s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 8) + datetime.timedelta(minutes=55 * i)))
++        self.assertFalse(s.is_fully_booked("lena", day))
++        s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 8) + datetime.timedelta(minutes=55 * 6)))
++        self.assertTrue(s.is_fully_booked("lena", day))
++
++    def test_cap_is_per_therapist_and_per_day(self):
++        s = Schedule()
++        for i in range(7):
++            s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 8) + datetime.timedelta(minutes=55 * i)))
++        self.assertFalse(s.is_fully_booked("maya", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 9)))
++
++    def test_cancelled_appointments_do_not_count_towards_cap(self):
++        s = Schedule()
++        booked = [
++            s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 8) + datetime.timedelta(minutes=55 * i)))
++            for i in range(7)
++        ]
++        s.cancel(booked[0].id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_book_still_accepts_an_eighth_appointment(self):
++        s = Schedule()
++        for i in range(7):
++            s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 8) + datetime.timedelta(minutes=55 * i)))
++        s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 8) + datetime.timedelta(minutes=55 * 7)))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
+     def test_series_books_consecutive_weeks(self):
+         s = Schedule()
+         series = s.book_series("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 9), 3)

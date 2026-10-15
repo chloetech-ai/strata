@@ -1,0 +1,76 @@
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..3b7e171
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,22 @@
++"""Cancellation fees, depending on how much notice the client gives."""
++
++import datetime
++
++# Cancelling less than this long before the appointment costs half the price.
++HALF_FEE_NOTICE = datetime.timedelta(hours=48)
++# Cancelling less than this long before the appointment costs the full price.
++FULL_FEE_NOTICE = datetime.timedelta(hours=24)
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """The fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Free with 48 hours' notice or more, half the price under 48 hours, the full price under 24 hours.
++    Cancelling after the start also costs the full price.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < FULL_FEE_NOTICE:
++        return appointment.price
++    if notice < HALF_FEE_NOTICE:
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..081e0ce
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,42 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++START = datetime.datetime(2026, 10, 19, 10, 0)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def setUp(self):
++        self.appointment = Appointment("kim", "Jo Li", START, "standard")
++
++    def fee_with_notice(self, notice, appointment=None):
++        appointment = appointment or self.appointment
++        return cancellation_fee(appointment, START - notice)
++
++    def test_free_with_48_hours_notice_or_more(self):
++        self.assertEqual(self.fee_with_notice(datetime.timedelta(hours=48)), 0)
++        self.assertEqual(self.fee_with_notice(datetime.timedelta(days=7)), 0)
++
++    def test_half_price_just_under_48_hours(self):
++        self.assertEqual(self.fee_with_notice(datetime.timedelta(hours=48) - datetime.timedelta(minutes=1)), 4900)
++
++    def test_half_price_with_exactly_24_hours_notice(self):
++        self.assertEqual(self.fee_with_notice(datetime.timedelta(hours=24)), 4900)
++
++    def test_full_price_just_under_24_hours(self):
++        self.assertEqual(self.fee_with_notice(datetime.timedelta(hours=24) - datetime.timedelta(minutes=1)), 9800)
++
++    def test_full_price_after_the_start(self):
++        self.assertEqual(self.fee_with_notice(-datetime.timedelta(minutes=5)), 9800)
++
++    def test_fee_follows_the_treatment_price(self):
++        initial = Appointment("kim", "Jo Li", START, "initial")
++        short = Appointment("kim", "Jo Li", START, "short")
++        self.assertEqual(self.fee_with_notice(datetime.timedelta(hours=30), initial), 7250)
++        self.assertEqual(self.fee_with_notice(datetime.timedelta(hours=2), short), 6800)
++
++
++if __name__ == "__main__":
++    unittest.main()

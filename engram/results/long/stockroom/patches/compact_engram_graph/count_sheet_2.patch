@@ -1,0 +1,83 @@
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..0e8dba7
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,26 @@
++"""The printable blind count sheet for the stock-take."""
++
++import re
++
++COUNT_COLUMN_WIDTH = 8
++
++
++def bin_sort_key(location):
++    """Sort bin codes by their numeric parts, so 'B-9-1' comes before 'B-12-3'."""
++    return [(0, int(part)) if part.isdigit() else (1, part)
++            for part in re.split(r"(\d+)", location) if part]
++
++
++def count_sheet(inventory):
++    """One line per catalog item, in walking order (by bin), for a blind count.
++
++    The system's quantity on hand is deliberately left off: the blank column is
++    where people write what they counted.
++    """
++    if inventory.catalog is None:
++        raise ValueError("count sheet needs an inventory with a catalog")
++    items = sorted(inventory.catalog, key=lambda item: (bin_sort_key(item.location), item.sku))
++    lines = []
++    for item in items:
++        lines.append(f"{item.location:<10}  {item.sku:<12}  {item.name:<30}  {'_' * COUNT_COLUMN_WIDTH}")
++    return "\n".join(lines) + "\n" if lines else ""
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..ffb27ea
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,45 @@
++import unittest
++
++from stockroom import Catalog, Inventory, Item
++from stockroom.countsheet import bin_sort_key, count_sheet
++
++
++class CountSheetTest(unittest.TestCase):
++    def test_one_line_per_item_in_bin_order_not_sku_order(self):
++        catalog = Catalog([
++            Item("BR-1042", "Hex bolt M8", "B-12-3"),
++            Item("BR-2000", "Wood screw", "B-9-1"),
++            Item("BR-0500", "Hinge", "A-1-1"),
++        ])
++        lines = count_sheet(Inventory(catalog)).splitlines()
++        self.assertEqual([line.split()[1] for line in lines], ["BR-0500", "BR-2000", "BR-1042"])
++        self.assertEqual(len(lines), 3)
++
++    def test_bins_are_compared_by_their_numbers(self):
++        self.assertLess(bin_sort_key("B-9-1"), bin_sort_key("B-12-3"))
++        self.assertLess(bin_sort_key("B-2"), bin_sort_key("B-10"))
++
++    def test_quantity_on_hand_is_not_shown(self):
++        catalog = Catalog([Item("BR-1042", "Hex bolt M8", "B-12-3")])
++        inventory = Inventory(catalog)
++        inventory.receive("BR-1042", 137, 12)
++        sheet = count_sheet(inventory)
++        self.assertNotIn("137", sheet)
++        self.assertIn("BR-1042", sheet)
++        self.assertIn("Hex bolt M8", sheet)
++
++    def test_count_column_is_blank(self):
++        catalog = Catalog([Item("BR-1042", "Hex bolt M8", "B-12-3")])
++        line = count_sheet(Inventory(catalog)).rstrip("\n")
++        self.assertTrue(line.endswith("________"))
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++    def test_needs_a_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

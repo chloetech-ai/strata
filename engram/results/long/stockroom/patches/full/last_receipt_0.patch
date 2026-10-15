@@ -1,0 +1,53 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 0caec9b..6f048e6 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -56,3 +56,10 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The most recent RECEIPT for a SKU by date; on a tie, the one logged last."""
++        receipts = [m for m in self.movements_for(sku) if m.reason == "RECEIPT"]
++        if not receipts:
++            return None
++        return max(reversed(receipts), key=lambda m: m.date)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 5eee2d4..76725a5 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -25,6 +25,33 @@ class ReasonCodeTest(unittest.TestCase):
+                 Movement("BR-1042", 1, DAY, code)
+ 
+ 
++class LastReceiptTest(unittest.TestCase):
++    def test_none_when_no_receipt(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.issue("BR-1042", 1, DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
++    def test_latest_receipt_by_date(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, datetime.date(2026, 9, 5))
++        inv.receive("BR-1042", 20, 13, datetime.date(2026, 9, 1))
++        self.assertEqual(inv.last_receipt("BR-1042").qty, 10)
++
++    def test_tie_goes_to_last_logged(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 20, 13, DAY)
++        self.assertEqual(inv.last_receipt("BR-1042").qty, 20)
++
++    def test_ignores_other_reasons_and_skus(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.issue("BR-1042", 3, datetime.date(2026, 9, 9))
++        inv.receive("BR-2210", 5, 30, datetime.date(2026, 9, 9))
++        self.assertEqual(inv.last_receipt(" br-1042").qty, 10)
++
++
+ class InventoryTest(unittest.TestCase):
+     def test_receive_and_issue(self):
+         inv = Inventory()

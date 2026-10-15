@@ -1,0 +1,56 @@
+diff --git a/src/stockroom/items.py b/src/stockroom/items.py
+index 832d5cf..947bcc6 100644
+--- a/src/stockroom/items.py
++++ b/src/stockroom/items.py
+@@ -1,6 +1,7 @@
+ """The item catalog."""
+ 
+ from dataclasses import dataclass, replace
++import re
+ 
+ 
+ def normalize_sku(sku):
+@@ -8,6 +9,18 @@ def normalize_sku(sku):
+     return sku.strip().upper()
+ 
+ 
++_LOCATION = re.compile(r"\s*([A-Za-z])-([0-9]+)-([0-9]+)\s*")
++
++
++def parse_location(code):
++    """Split a bin code like 'B-12-3' into ('B', 12, 3): aisle, bay, shelf."""
++    match = _LOCATION.fullmatch(code) if isinstance(code, str) else None
++    if match is None:
++        raise ValueError(f"not a bin code: {code!r}")
++    aisle, bay, shelf = match.groups()
++    return aisle.upper(), int(bay), int(shelf)
++
++
+ @dataclass
+ class Item:
+     sku: str
+diff --git a/tests/test_items.py b/tests/test_items.py
+index fbafcb9..bc747dc 100644
+--- a/tests/test_items.py
++++ b/tests/test_items.py
+@@ -1,6 +1,19 @@
+ import unittest
+ 
+-from stockroom.items import Catalog, Item, normalize_sku
++from stockroom.items import Catalog, Item, normalize_sku, parse_location
++
++
++class ParseLocationTest(unittest.TestCase):
++    def test_splits_bin_code(self):
++        self.assertEqual(parse_location("B-12-3"), ("B", 12, 3))
++
++    def test_accepts_lowercase_and_surrounding_whitespace(self):
++        self.assertEqual(parse_location(" b-12-3\t"), ("B", 12, 3))
++
++    def test_rejects_anything_else(self):
++        for code in ("", "B-12", "B-12-3-1", "BB-12-3", "1-12-3", "B-x-3", "B-12-", "B_12_3", "B-12.5-3", None, 123):
++            with self.assertRaises(ValueError, msg=repr(code)):
++                parse_location(code)
+ 
+ 
+ class NormalizeSkuTest(unittest.TestCase):

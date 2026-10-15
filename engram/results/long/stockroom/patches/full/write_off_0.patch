@@ -1,0 +1,50 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 0caec9b..3f46855 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -49,6 +49,13 @@ class Inventory:
+         movement = Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "SALE", None, note)
+         return self._record(movement)
+ 
++    def write_off(self, sku, qty, date=None, note=""):
++        """Stock lost to breakage or damage."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        movement = Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "DAMAGE", None, note)
++        return self._record(movement)
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 5eee2d4..2e9a851 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -19,6 +19,27 @@ class ReasonCodeTest(unittest.TestCase):
+         for code in ("RECEIPT", "SALE", "RETURN", "DAMAGE", "COUNT"):
+             self.assertEqual(Movement("BR-1042", 1, DAY, code).reason, code)
+ 
++    def test_write_off_uses_damage_and_reduces_stock(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        movement = inv.write_off(" br-1042", 3, DAY, "broken in transit")
++        self.assertEqual(movement.reason, "DAMAGE")
++        self.assertEqual(movement.qty, -3)
++        self.assertEqual(movement.sku, "BR-1042")
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", 0)
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", -2)
++
++    def test_write_off_may_take_stock_negative(self):
++        inv = Inventory()
++        inv.write_off("BR-1042", 4, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -4)
++
+     def test_other_codes_rejected(self):
+         for code in ("", "receipt", "ADJUST", "TRANSFER", None):
+             with self.assertRaises(ValueError):

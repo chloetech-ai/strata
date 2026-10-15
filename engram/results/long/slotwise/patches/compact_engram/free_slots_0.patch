@@ -1,0 +1,105 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 0890672..da9e1dc 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -3,11 +3,13 @@
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SlotTaken
+-from .hours import is_open_between
++from .hours import is_open_between, opening_hours
+ from .model import TREATMENTS
+ 
+ # Time a therapist needs between two appointments to clean up and write notes.
+ GAP = datetime.timedelta(minutes=10)
++# Granularity of the start times offered by free_slots.
++SLOT_STEP = datetime.timedelta(minutes=15)
+ 
+ 
+ class Schedule:
+@@ -59,6 +61,31 @@ class Schedule:
+         ]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def free_slots(self, therapist, day, minutes):
++        """Start times on `day` (every 15 minutes from opening) where a `minutes`-long appointment would fit."""
++        hours = opening_hours(day)
++        if hours is None:
++            return []
++        length = datetime.timedelta(minutes=minutes)
++        slots = []
++        start = hours[0]
++        while start + length <= hours[1]:
++            if self._is_free(therapist, start, start + length):
++                slots.append(start)
++            start += SLOT_STEP
++        return slots
++
++    def _is_free(self, therapist, start, end):
++        """True if `therapist` has no active appointment within GAP of the interval from `start` to `end`."""
++        if not is_open_between(start, end):
++            return False
++        for other in self.appointments:
++            if other.cancelled or other.therapist != therapist:
++                continue
++            if other.start < end + GAP and start < other.end + GAP:
++                return False
++        return True
++
+     def week(self, therapist, monday):
+         """`therapist`'s active appointments for the seven days from `monday`, keyed by date."""
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 36d41f9..ffcd7f4 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -133,6 +133,49 @@ class ScheduleTest(unittest.TestCase):
+         week = s.week("lena", datetime.date(2026, 9, 14))
+         self.assertEqual(sum(len(day) for day in week.values()), 0)
+ 
++    def test_free_slots_on_empty_day_start_at_opening_on_the_grid(self):
++        s = Schedule()
++        slots = s.free_slots("lena", datetime.date(2026, 9, 8), 45)
++        self.assertEqual(slots[0], datetime.datetime(2026, 9, 8, 7, 30))
++        self.assertEqual(slots[1], datetime.datetime(2026, 9, 8, 7, 45))
++        self.assertEqual(slots[-1], datetime.datetime(2026, 9, 8, 18, 15))  # ends 19:00, the closing time
++
++    def test_free_slots_closed_day_is_empty(self):
++        s = Schedule()
++        self.assertEqual(s.free_slots("lena", datetime.date(2026, 9, 13), 30), [])  # Sunday
++
++    def test_free_slots_leaves_out_times_that_overlap_or_break_the_gap(self):
++        s = Schedule()
++        s.book(at(9))  # 09:00 to 09:45, so the next start must be 09:55 or later
++        slots = s.free_slots("lena", datetime.date(2026, 9, 8), 45)
++        self.assertNotIn(datetime.datetime(2026, 9, 8, 8, 45), slots)  # ends 09:30, inside the booking
++        self.assertIn(datetime.datetime(2026, 9, 8, 8, 0), slots)  # ends 08:45, 15 minutes before 09:00
++        self.assertNotIn(datetime.datetime(2026, 9, 8, 8, 15), slots)  # ends 09:00, no gap before 09:00
++        self.assertNotIn(datetime.datetime(2026, 9, 8, 9, 0), slots)
++        self.assertNotIn(datetime.datetime(2026, 9, 8, 9, 45), slots)
++        self.assertIn(datetime.datetime(2026, 9, 8, 10, 0), slots)  # first grid time clear of the gap
++
++    def test_free_slots_match_what_book_accepts(self):
++        s = Schedule()
++        s.book(at(9))
++        s.book(at(12, 30, client="Jo Li"))
++        for slot in s.free_slots("lena", datetime.date(2026, 9, 8), 30):
++            trial = Schedule()
++            trial.appointments = list(s.appointments)
++            trial.book(Appointment("lena", "Ana Ma", slot, "short"))  # must not raise
++
++    def test_free_slots_ignore_cancelled_and_other_therapists(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(10, therapist="marco", client="Jo Li"))
++        s.cancel(a.id)
++        self.assertIn(datetime.datetime(2026, 9, 8, 9, 0), s.free_slots("lena", datetime.date(2026, 9, 8), 45))
++
++    def test_free_slots_for_a_treatment_too_long_for_the_last_hours(self):
++        s = Schedule()
++        slots = s.free_slots("lena", datetime.date(2026, 9, 12), 60)  # Saturday, 08:00 to 12:00
++        self.assertEqual(slots[-1], datetime.datetime(2026, 9, 12, 11, 0))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

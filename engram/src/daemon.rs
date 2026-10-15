@@ -778,6 +778,10 @@ pub fn serve(dir: &Path, project: &str) -> Result<()> {
     }
     let _ = std::fs::remove_file(&paths.socket);
     let daemon = Arc::new(Daemon::open(dir, project)?);
+    // Which project this store records, for `engram ui`.
+    if !project.is_empty() {
+        let _ = std::fs::write(dir.join("project.txt"), format!("{project}\n"));
+    }
     let listener = UnixListener::bind(&paths.socket)?;
     eprintln!("engram: serving {} on {} ({} records, embedder {})", project, paths.socket.display(), daemon.store.len(), daemon.store.embedder.name());
     {

@@ -5,10 +5,12 @@
 //!   engram uninstall [--user]                    remove them again (stores are kept)
 //!   engram hook [--user] <Event>                 (called by Claude Code hooks)
 //!   engram mcp                                   (MCP stdio server, started by Claude Code)
-//!   engram search "query" | sql "SELECT ..." | stats | briefing | stop
+//!   engram search "query" | sql "SELECT ..." | stats | briefing | stop [--all]
 //!   engram remember <kind> "text"
 //!   engram ingest-transcript <file.jsonl>        back-fill from a Claude Code transcript
 //!   engram fetch-model [static|bert]             download the embedding model
+//!   engram doctor                                check the install and the project's store
+//!   engram ui [--port N] [--home DIR]            browse every local store in the inspector
 //!   engram rpc '{"op": ...}'                     send one raw request to the daemon
 //!   engram serve --dir D --project P             (the daemon; started on demand)
 
@@ -18,7 +20,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value as Json};
 
-use engram::{daemon, embed, hook, install, mcp, paths, transcript};
+use engram::{daemon, doctor, embed, hook, install, mcp, paths, transcript, ui};
 
 #[derive(Parser)]
 #[command(name = "engram", version, about = "Automatic long-term context for Claude Code, stored in Strata")]
@@ -86,8 +88,27 @@ enum Cmd {
     /// Write down the decisions, rules, requirements and facts of every
     /// stored turn (for a store recorded before distillation existed).
     Distill,
-    /// Stop the daemon.
-    Stop,
+    /// Stop the daemon (with --all, every running daemon, e.g. after an upgrade).
+    Stop {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Check that Engram is wired into Claude Code and the project's daemon answers.
+    Doctor,
+    /// Serve the inspector over every Engram store on this machine.
+    Ui {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port (the next free one up to 9 above it is used if it is taken).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// Directory holding projects/<store>/ (default: $ENGRAM_HOME or ~/.local/share/engram).
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Do not open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Send one raw JSON request to the daemon and print its JSON response
     /// (the demo inspector's transport).
     Rpc {
@@ -177,8 +198,28 @@ fn main() {
                 }
             }
         }
-        Cmd::Stop => {
+        Cmd::Doctor => std::process::exit(doctor::run(&project)),
+        Cmd::Ui { host, port, home, no_open } => {
+            let home = home.map(|h| h.canonicalize().unwrap_or(h)).unwrap_or_else(paths::engram_home);
+            if let Err(e) = ui::run(ui::Options { host, port, home, open: !no_open, project: project.clone() }) {
+                eprintln!("engram ui: {e}");
+                std::process::exit(1);
+            }
+        }
+        Cmd::Stop { all: false } => {
             send(&project, json!({"op": "shutdown"}), 10);
+        }
+        Cmd::Stop { all: true } => {
+            let mut n = 0;
+            for s in ui::list_stores(&paths::engram_home()) {
+                let sock = paths::StorePaths::new(&s.dir).socket;
+                if std::os::unix::net::UnixStream::connect(&sock).is_ok()
+                    && daemon::request(&s.dir, s.project.as_deref().unwrap_or(""), &json!({"op": "shutdown"}), Duration::from_secs(10)).is_ok()
+                {
+                    n += 1;
+                }
+            }
+            println!("stopped {n} daemon{}; each starts again when a hook or tool needs it", if n == 1 { "" } else { "s" });
         }
         Cmd::IngestTranscript { path } => {
             let events = transcript::read(&path).unwrap_or_else(|e| {

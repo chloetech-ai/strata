@@ -1,0 +1,96 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..deff8ac
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,40 @@
++"""Text of the SMS reminders sent before an appointment."""
++
++import unicodedata
++
++RECEPTION_PHONE = "044 512 77 30"
++SMS_LIMIT = 160
++
++# Letters that do not decompose to an ASCII base letter, so they need their own spelling.
++_SPELLINGS = {
++    "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
++    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
++}
++
++
++def transliterate(text):
++    """Plain ASCII: 'Brändli' -> 'Braendli'. Raises ValueError for anything else."""
++    spelled = "".join(_SPELLINGS.get(ch, ch) for ch in text)
++    decomposed = unicodedata.normalize("NFKD", spelled)
++    ascii_text = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
++    if not ascii_text.isascii():
++        bad = sorted({ch for ch in ascii_text if not ch.isascii()})
++        raise ValueError(f"cannot send {bad} in an SMS: {text!r}")
++    return ascii_text
++
++
++def reminder_text(appointment):
++    """The reminder for `appointment`, in plain ASCII, at most SMS_LIMIT characters.
++
++    Raises ValueError if the text would be longer than one SMS, so reception can
++    check it rather than the gateway billing it as two messages.
++    """
++    when = appointment.start.strftime("%a %d %b %H:%M")
++    text = (
++        f"Lindqvist Physio: reminder for {transliterate(appointment.client)} "
++        f"on {when} with {transliterate(appointment.therapist)}. "
++        f"To move it, call {RECEPTION_PHONE}."
++    )
++    if len(text) > SMS_LIMIT:
++        raise ValueError(f"reminder is {len(text)} characters, the limit is {SMS_LIMIT}: {text!r}")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..dddff30
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,44 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import RECEPTION_PHONE, SMS_LIMIT, reminder_text, transliterate
++
++
++class TransliterateTest(unittest.TestCase):
++    def test_umlauts_and_sharp_s_are_spelled_out(self):
++        self.assertEqual(transliterate("Brändli"), "Braendli")
++        self.assertEqual(transliterate("Ößi Müller Äbi"), "Oessi Mueller Aebi")
++
++    def test_accents_lose_their_marks(self):
++        self.assertEqual(transliterate("Zoë Séguin"), "Zoe Seguin")
++
++    def test_unknown_characters_are_an_error(self):
++        with self.assertRaises(ValueError):
++            transliterate("Łukasz")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def appointment(self, client="Brändli", therapist="Anna Keller"):
++        return Appointment(therapist, client, datetime.datetime(2026, 10, 19, 14, 0))
++
++    def test_reminder_is_plain_ascii_and_names_the_client_and_time(self):
++        text = reminder_text(self.appointment())
++        self.assertTrue(text.isascii())
++        self.assertIn("Braendli", text)
++        self.assertIn("Mon 19 Oct 14:00", text)
++        self.assertIn("Anna Keller", text)
++
++    def test_reminder_includes_reception_phone(self):
++        self.assertIn(RECEPTION_PHONE, reminder_text(self.appointment()))
++
++    def test_reminder_fits_one_sms(self):
++        self.assertLessEqual(len(reminder_text(self.appointment())), SMS_LIMIT)
++
++    def test_too_long_reminder_is_refused(self):
++        with self.assertRaises(ValueError):
++            reminder_text(self.appointment(client="X" * 150))
++
++
++if __name__ == "__main__":
++    unittest.main()

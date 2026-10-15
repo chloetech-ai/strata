@@ -1,0 +1,96 @@
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..2695c49
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,28 @@
++"""The printable blind count sheet for the stock-take.
++
++Lines run in walking order (by bin location), and the sheet never shows
++the quantity on hand, so people count instead of copying the system's number.
++"""
++
++import re
++
++
++def bin_key(location):
++    """Sort key that compares the digit runs of a bin code by value.
++
++    "B-9-1" sorts before "B-12-3". The split always alternates text and
++    digits, so keys compare like with like.
++    """
++    parts = re.split(r"(\d+)", location)
++    return [int(part) if i % 2 else part for i, part in enumerate(parts)]
++
++
++def count_sheet(inventory):
++    """The blind count sheet for every item in the inventory's catalog, as text."""
++    if inventory.catalog is None:
++        raise ValueError("the inventory has no catalog to count against")
++    items = sorted(inventory.catalog, key=lambda item: (bin_key(item.location), item.sku))
++    lines = [f"{'BIN':<10}  {'SKU':<12}  {'ITEM':<30}  {'UNIT':<5}  COUNTED"]
++    for item in items:
++        lines.append(f"{item.location:<10}  {item.sku:<12}  {item.name:<30}  {item.unit:<5}  ")
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..b9e1341
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,56 @@
++import unittest
++
++from stockroom.countsheet import bin_key, count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++def sheet_lines(text):
++    return text.splitlines()
++
++
++class BinKeyTest(unittest.TestCase):
++    def test_compares_digit_runs_by_value(self):
++        self.assertLess(bin_key("B-9-1"), bin_key("B-12-3"))
++        self.assertLess(bin_key("B-2"), bin_key("B-10"))
++
++    def test_orders_by_text_before_digits(self):
++        self.assertLess(bin_key("A-99"), bin_key("B-1"))
++
++
++class CountSheetTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Item("BR-1042", "Brass hinge 75mm", "B-12-3", unit="pcs"),
++            Item("BR-2000", "Pine dowel 6mm", "B-9-1", unit="m"),
++            Item("SC-0007", "Wood screw 4x40", "A-1-1", unit="box"),
++        ])
++        self.inventory = Inventory(self.catalog)
++        self.inventory.receive("BR-1042", 100, 12, note="opening")
++
++    def test_one_line_per_item_plus_header(self):
++        lines = sheet_lines(count_sheet(self.inventory))
++        self.assertEqual(len(lines), 1 + len(self.catalog))
++
++    def test_lines_run_in_bin_order_with_numeric_bins(self):
++        lines = sheet_lines(count_sheet(self.inventory))[1:]
++        self.assertEqual([line.split()[0] for line in lines], ["A-1-1", "B-9-1", "B-12-3"])
++
++    def test_does_not_show_quantity_on_hand(self):
++        text = count_sheet(self.inventory)
++        self.assertNotIn("100", text)
++        self.assertNotIn("on hand", text.lower())
++
++    def test_counted_column_is_empty_on_every_line(self):
++        lines = sheet_lines(count_sheet(self.inventory))
++        column = lines[0].index("COUNTED")
++        for line in lines[1:]:
++            self.assertEqual(line[column:].strip(), "")
++
++    def test_requires_a_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,78 @@
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..09572f7
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,21 @@
++"""Cancellation fees: free if cancelled early, half price, or full price at the last minute."""
++
++import datetime
++
++HALF_FEE_WITHIN = datetime.timedelta(hours=48)
++FULL_FEE_WITHIN = datetime.timedelta(hours=24)
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """The fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours before the start: full price.
++    Less than 48 hours before the start: half price.
++    Otherwise: nothing.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < FULL_FEE_WITHIN:
++        return appointment.price
++    if notice < HALF_FEE_WITHIN:
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..a1e8fb0
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,45 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++START = datetime.datetime(2026, 10, 20, 9, 0)
++
++
++def appointment(treatment="initial"):
++    return Appointment("Anna", "Jo Li", START, treatment)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def test_more_than_48_hours_ahead_is_free(self):
++        cancelled_at = START - datetime.timedelta(hours=49)
++        self.assertEqual(cancellation_fee(appointment(), cancelled_at), 0)
++
++    def test_exactly_48_hours_ahead_is_free(self):
++        cancelled_at = START - datetime.timedelta(hours=48)
++        self.assertEqual(cancellation_fee(appointment(), cancelled_at), 0)
++
++    def test_between_24_and_48_hours_is_half_price(self):
++        cancelled_at = START - datetime.timedelta(hours=30)
++        self.assertEqual(cancellation_fee(appointment("initial"), cancelled_at), 7250)
++        self.assertEqual(cancellation_fee(appointment("standard"), cancelled_at), 4900)
++        self.assertEqual(cancellation_fee(appointment("short"), cancelled_at), 3400)
++
++    def test_exactly_24_hours_ahead_is_half_price(self):
++        cancelled_at = START - datetime.timedelta(hours=24)
++        self.assertEqual(cancellation_fee(appointment("initial"), cancelled_at), 7250)
++
++    def test_less_than_24_hours_ahead_is_full_price(self):
++        cancelled_at = START - datetime.timedelta(hours=23, minutes=59)
++        self.assertEqual(cancellation_fee(appointment("initial"), cancelled_at), 14500)
++        self.assertEqual(cancellation_fee(appointment("standard"), cancelled_at), 9800)
++        self.assertEqual(cancellation_fee(appointment("short"), cancelled_at), 6800)
++
++    def test_cancelling_after_the_start_is_full_price(self):
++        cancelled_at = START + datetime.timedelta(minutes=5)
++        self.assertEqual(cancellation_fee(appointment("standard"), cancelled_at), 9800)
++
++
++if __name__ == "__main__":
++    unittest.main()

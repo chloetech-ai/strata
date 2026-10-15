@@ -1,0 +1,53 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index e816530..43bbfbb 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -60,3 +60,11 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The latest RECEIPT for `sku` by date; among same-day receipts, the one logged last."""
++        sku = normalize_sku(sku)
++        receipts = [m for m in self.movements if m.sku == sku and m.reason == "RECEIPT"]
++        if not receipts:
++            return None
++        return max(reversed(receipts), key=lambda m: m.date)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 09efdac..f1ad76c 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -53,6 +53,32 @@ class InventoryTest(unittest.TestCase):
+         inv.issue("BR-1042", 4, DAY)
+         self.assertEqual([m.qty for m in inv.movements_for("BR-1042")], [10, -4])
+ 
++    def test_last_receipt_is_none_without_receipts(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.issue("BR-1042", 1, DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
++    def test_last_receipt_is_the_latest_receipt_for_the_sku(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, datetime.date(2026, 9, 1))
++        inv.receive("BR-1042", 5, 13, datetime.date(2026, 9, 5))
++        inv.receive("BR-2210", 9, 30, datetime.date(2026, 9, 9))
++        inv.issue("BR-1042", 2, datetime.date(2026, 9, 7))
++        self.assertEqual(inv.last_receipt(" br-1042 ").unit_cost, 13)
++
++    def test_last_receipt_uses_date_not_log_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 13, datetime.date(2026, 9, 5))
++        inv.receive("BR-1042", 10, 12, datetime.date(2026, 9, 1))
++        self.assertEqual(inv.last_receipt("BR-1042").qty, 5)
++
++    def test_last_receipt_prefers_later_log_entry_on_same_day(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 5, 13, DAY)
++        self.assertEqual(inv.last_receipt("BR-1042").qty, 5)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

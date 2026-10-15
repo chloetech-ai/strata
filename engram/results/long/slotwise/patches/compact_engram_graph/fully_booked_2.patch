@@ -1,0 +1,64 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 1acfdc9..474fd35 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -13,6 +13,8 @@ CHANGEOVER = datetime.timedelta(minutes=10)
+ MAX_SERIES_SESSIONS = 9
+ # how many weeks a series may run on while looking for free weeks
+ SERIES_SEARCH_WEEKS = 26
++# the therapists' contract cap; the online booking page treats a day at this count as full
++MAX_TREATMENTS_PER_DAY = 7
+ 
+ 
+ class Schedule:
+@@ -99,6 +101,10 @@ class Schedule:
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+         return {day: self.appointments_for(therapist, day) for day in days}
+ 
++    def is_fully_booked(self, therapist, day):
++        """True once `therapist` has reached the daily cap on `day`. For the online booking page only; `book()` does not enforce it."""
++        return len(self.appointments_for(therapist, day)) >= MAX_TREATMENTS_PER_DAY
++
+ 
+ def _closed_message(appointment):
+     day = appointment.start.date()
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 793ccb0..dab3ddd 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -107,6 +107,35 @@ class ScheduleTest(unittest.TestCase):
+         week = s.week("lena", datetime.date(2026, 9, 7))
+         self.assertEqual([a.start.hour for a in week[datetime.date(2026, 9, 8)]], [12])
+ 
++    def test_day_is_fully_booked_at_seven_appointments(self):
++        s = Schedule()
++        day = datetime.date(2026, 9, 8)
++        for hour in range(8, 15):  # 08:00 to 14:00 starts, 45 minutes each, 10-minute gaps
++            s.book(at(hour))
++        self.assertTrue(s.is_fully_booked("lena", day))
++        self.assertFalse(s.is_fully_booked("marco", day))
++
++    def test_six_appointments_is_not_fully_booked(self):
++        s = Schedule()
++        for hour in range(8, 14):
++            s.book(at(hour))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_cancelled_appointment_does_not_count_towards_full(self):
++        s = Schedule()
++        for hour in range(8, 14):
++            s.book(at(hour))
++        a = s.book(at(14))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++        s.cancel(a.id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_booking_past_seven_is_still_allowed(self):
++        s = Schedule()
++        for hour in range(8, 16):
++            s.book(at(hour))
++        self.assertEqual(len(s.appointments_for("lena", datetime.date(2026, 9, 8))), 8)
++
+     def test_series_books_consecutive_weeks(self):
+         s = Schedule()
+         series = s.book_series("lena", "Kim Weber", datetime.datetime(2026, 9, 8, 9), 3)

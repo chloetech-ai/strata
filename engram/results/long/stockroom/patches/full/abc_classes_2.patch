@@ -1,0 +1,68 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..0ba896e
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,27 @@
++"""ABC analysis of annual consumption value."""
++
++
++def abc_classes(values):
++    """Classify SKUs A, B or C by cumulative share of annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are taken highest value
++    first, and each gets the class of the cumulative share up to and including
++    it: A at most 80% of the total, B at most 95%, otherwise C.
++    """
++    if any(value < 0 for value in values.values()):
++        raise ValueError("consumption values must not be negative")
++    total = sum(values.values())
++    classes = {}
++    running = 0
++    # Ties broken by SKU so the result doesn't depend on dict order.
++    for sku, value in sorted(values.items(), key=lambda kv: (-kv[1], kv[0])):
++        running += value
++        # Compare by multiplying out rather than dividing, to keep the 80% and
++        # 95% boundaries exact.
++        if total == 0 or running * 100 > 95 * total:
++            classes[sku] = "C"
++        elif running * 100 <= 80 * total:
++            classes[sku] = "A"
++        else:
++            classes[sku] = "B"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..240eca0
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: BR-1 (80), BR-2 (15), BR-3 (5); total 100.
++        # Cumulative: 80% (A, boundary included), 95% (B, boundary included), 100% (C).
++        values = {"BR-3": 5, "BR-1": 80, "BR-2": 15}
++        self.assertEqual(abc_classes(values), {"BR-1": "A", "BR-2": "B", "BR-3": "C"})
++
++    def test_top_item_over_80_percent_is_b_not_a(self):
++        # Cumulative 90% for BR-1 is past the A cut-off, so it is B.
++        self.assertEqual(abc_classes({"BR-1": 90, "BR-2": 10}), {"BR-1": "B", "BR-2": "C"})
++
++    def test_zero_total_gives_c(self):
++        self.assertEqual(abc_classes({"BR-1": 0, "BR-2": 0}), {"BR-1": "C", "BR-2": "C"})
++
++    def test_negative_value_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": 10, "BR-2": -1})
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,101 @@
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..2ecf17f
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,28 @@
++"""The blind count sheet for the stock-take: items in walking order, with no on-hand figures."""
++
++
++def _bin_key(location, sku):
++    """Sort key for a bin code like "B-12-3": numeric parts compare as numbers, so B-2-1 comes before B-12-3."""
++    parts = []
++    for part in location.split("-"):
++        if part.isdigit():
++            parts.append((0, int(part), ""))
++        else:
++            parts.append((1, 0, part))
++    return (parts, sku)
++
++
++def count_sheet(inventory):
++    """One line per catalog item, in bin order. The counted column is left blank: the sheet never shows on-hand."""
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog to build a count sheet from")
++    items = sorted(inventory.catalog, key=lambda item: _bin_key(item.location, item.sku))
++    loc_w = max((len(item.location) for item in items), default=0)
++    sku_w = max((len(item.sku) for item in items), default=0)
++    name_w = max((len(item.name) for item in items), default=0)
++    unit_w = max((len(item.unit) for item in items), default=0)
++    lines = []
++    for item in items:
++        lines.append(f"{item.location:<{loc_w}}  {item.sku:<{sku_w}}  {item.name:<{name_w}}  "
++                     f"{item.unit:<{unit_w}}  {'_' * 8}")
++    return "\n".join(lines) + ("\n" if lines else "")
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..f171098
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,61 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Item("BR-1042", "Hex bolt 1/4in", "B-12-3", reorder_point=10),
++            Item("BR-2000", "Wood screw", "B-2-1", reorder_point=5),
++            Item("NA-0007", "Nail", "A-1-1", case_size=100, unit="box"),
++        ])
++        self.inventory = Inventory(self.catalog)
++        self.inventory.receive("BR-1042", 40, 12)
++
++    def lines(self, text):
++        return text.splitlines()
++
++    def test_one_line_per_catalog_item(self):
++        self.assertEqual(len(self.lines(count_sheet(self.inventory))), len(self.catalog))
++
++    def test_sorted_by_bin_with_numeric_parts_compared_as_numbers(self):
++        locations = [line.split()[0] for line in self.lines(count_sheet(self.inventory))]
++        self.assertEqual(locations, ["A-1-1", "B-2-1", "B-12-3"])
++
++    def test_never_shows_on_hand(self):
++        text = count_sheet(self.inventory)
++        self.assertNotIn("40", text)
++        self.assertNotIn("-40", text)
++
++    def test_counted_column_is_blank(self):
++        for line in self.lines(count_sheet(self.inventory)):
++            self.assertTrue(line.endswith("_" * 8), line)
++
++    def test_line_shows_location_sku_name_and_unit(self):
++        first = self.lines(count_sheet(self.inventory))[0]
++        self.assertTrue(first.startswith("A-1-1"))
++        self.assertIn("NA-0007", first)
++        self.assertIn("Nail", first)
++        self.assertIn("box", first)
++
++    def test_sku_order_breaks_ties_within_a_bin(self):
++        catalog = Catalog([
++            Item("BR-2", "Second", "C-1-1"),
++            Item("BR-1", "First", "C-1-1"),
++        ])
++        skus = [line.split()[1] for line in self.lines(count_sheet(Inventory(catalog)))]
++        self.assertEqual(skus, ["BR-1", "BR-2"])
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++    def test_inventory_without_catalog_is_an_error(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,104 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..94169af
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,34 @@
++"""Stock valuation, FIFO: issues are costed against the oldest receipts first."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand, costed FIFO."""
++    sku = normalize_sku(sku)
++    layers = deque()  # [qty, unit_cost] still on hand, oldest first
++    deficit = 0  # units issued beyond the stock we had; they carry no cost
++    # sorted() is stable, so movements on the same day keep their log order
++    for m in sorted(inventory.movements_for(sku), key=lambda m: m.date):
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"movement for {sku} on {m.date} has no unit cost")
++            qty = m.qty
++            # a deficit from earlier issues is made good by incoming stock first
++            covered = min(deficit, qty)
++            deficit -= covered
++            qty -= covered
++            if qty:
++                layers.append([qty, m.unit_cost])
++        else:
++            need = -m.qty
++            while need and layers:
++                take = min(need, layers[0][0])
++                layers[0][0] -= take
++                need -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            deficit += need
++    return sum(qty * cost for qty, cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..01bafd0
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,58 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY1 = datetime.date(2026, 9, 1)
++DAY2 = datetime.date(2026, 9, 2)
++DAY3 = datetime.date(2026, 9, 3)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_no_movements_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_fifo_costs_issues_at_oldest_receipt(self):
++        # Average cost would give 5 * 150 = 750; FIFO leaves 5 @ 200 = 1000.
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, DAY1)
++        inv.receive("BR-1042", 10, 200, DAY2)
++        inv.issue("BR-1042", 15, DAY3)
++        self.assertEqual(stock_value(inv, "BR-1042"), 1000)
++
++    def test_fifo_uses_dates_not_log_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 200, DAY2)  # logged first, but received later
++        inv.receive("BR-1042", 10, 100, DAY1)
++        inv.issue("BR-1042", 5, DAY3)
++        # the 100-cost layer is older: 5 @ 100 left, plus 10 @ 200
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 100 + 10 * 200)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive(" br-1042", 4, 25, DAY1)
++        self.assertEqual(stock_value(inv, "Br-1042 "), 100)
++
++    def test_negative_stock_carries_no_value(self):
++        inv = Inventory()
++        inv.issue("BR-1042", 5, DAY1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_later_receipt_covers_a_deficit_before_valuing(self):
++        inv = Inventory()
++        inv.issue("BR-1042", 5, DAY1)  # sold before it was received
++        inv.receive("BR-1042", 10, 100, DAY2)
++        # on hand is 5, and those 5 are the receipt's stock
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 100)
++        self.assertEqual(inv.on_hand("BR-1042"), 5)
++
++    def test_positive_movement_without_cost_is_rejected(self):
++        inv = Inventory()
++        inv.movements.append(Movement("BR-1042", 3, DAY1, "RETURN"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

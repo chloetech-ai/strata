@@ -1,0 +1,87 @@
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..7132494
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,27 @@
++"""Printable day plan for reception's receipt printer, which fits 42 characters a line."""
++
++import textwrap
++
++LINE_WIDTH = 42
++# "09:00-09:45 " is the time column; names and treatments are indented past it
++TIME_COLUMN = 12
++
++
++def day_plan(schedule, therapist, day):
++    """Text of `therapist`'s live appointments on `day`, one block per appointment, no line wider than LINE_WIDTH."""
++    lines = _wrap(f"{therapist.title()}, {day:%A %d %B %Y}", "", "")
++    lines.append("-" * LINE_WIDTH)
++    appointments = schedule.appointments_for(therapist, day)
++    if not appointments:
++        lines += _wrap("No appointments.", "", "")
++    indent = " " * TIME_COLUMN
++    for appointment in appointments:
++        time = f"{appointment.start:%H:%M}-{appointment.end:%H:%M} "
++        lines += _wrap(appointment.client, time, indent)
++        lines += _wrap(f"{appointment.treatment}, {appointment.minutes} min", indent, indent)
++    return "\n".join(lines)
++
++
++def _wrap(text, first_indent, rest_indent):
++    lines = textwrap.wrap(text, LINE_WIDTH, initial_indent=first_indent, subsequent_indent=rest_indent)
++    return lines or [first_indent.rstrip()]
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..4bcc6cf
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,48 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.printing import LINE_WIDTH, day_plan
++from slotwise.schedule import Schedule
++
++MONDAY = datetime.date(2026, 10, 12)
++
++
++def at(hour, minute=0):
++    return datetime.datetime.combine(MONDAY, datetime.time(hour, minute))
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_appointments_in_time_order(self):
++        schedule = Schedule()
++        schedule.book(Appointment("lena", "Ruth Brändli", at(9), "standard"))
++        schedule.book(Appointment("lena", "Kim Weber", at(7, 30), "short"))
++        self.assertEqual(
++            day_plan(schedule, "lena", MONDAY).splitlines(),
++            [
++                "Lena, Monday 12 October 2026",
++                "-" * 42,
++                "07:30-08:00 Kim Weber",
++                "            short, 30 min",
++                "09:00-09:45 Ruth Brändli",
++                "            standard, 45 min",
++            ],
++        )
++
++    def test_leaves_out_cancelled_and_other_therapists(self):
++        schedule = Schedule()
++        cancelled = schedule.book(Appointment("lena", "Ruth Brändli", at(9)))
++        schedule.cancel(cancelled.id)
++        schedule.book(Appointment("marco", "Kim Weber", at(10)))
++        self.assertIn("No appointments.", day_plan(schedule, "lena", MONDAY))
++
++    def test_no_line_is_wider_than_the_printer(self):
++        schedule = Schedule()
++        schedule.book(Appointment("lena", "Maria-Theresia von Hohenzollern-Sigmaringen Brändli", at(9), "initial"))
++        plan = day_plan(schedule, "lena", MONDAY)
++        self.assertTrue(all(len(line) <= LINE_WIDTH for line in plan.splitlines()))
++        self.assertIn("Maria-Theresia von Hohenzollern-Sigmaringen", plan.replace("\n            ", " "))
++
++
++if __name__ == "__main__":
++    unittest.main()

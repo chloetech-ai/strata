@@ -1,0 +1,78 @@
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..7efa7ff
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,17 @@
++"""Cancellation fees: free with 48 hours' notice, half price under 48 hours, full price under 24 hours."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """The fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours' notice pays the full price, less than 48 hours pays half,
++    and exactly 48 hours or more pays nothing.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..af791d4
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,49 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++START = datetime.datetime(2026, 10, 20, 10, 0)
++
++
++def at(hours_before):
++    return START - datetime.timedelta(hours=hours_before)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def test_more_than_48_hours_notice_is_free(self):
++        appt = Appointment("Anna", "Jo Li", START, "standard")
++        self.assertEqual(cancellation_fee(appt, at(72)), 0)
++        self.assertEqual(cancellation_fee(appt, at(48.5)), 0)
++
++    def test_exactly_48_hours_notice_is_free(self):
++        appt = Appointment("Anna", "Jo Li", START, "standard")
++        self.assertEqual(cancellation_fee(appt, at(48)), 0)
++
++    def test_under_48_hours_pays_half(self):
++        appt = Appointment("Anna", "Jo Li", START, "standard")
++        self.assertEqual(cancellation_fee(appt, at(47)), 4900)
++        self.assertEqual(cancellation_fee(appt, at(24.5)), 4900)
++
++    def test_exactly_24_hours_pays_half(self):
++        appt = Appointment("Anna", "Jo Li", START, "initial")
++        self.assertEqual(cancellation_fee(appt, at(24)), 7250)
++
++    def test_under_24_hours_pays_full_price(self):
++        appt = Appointment("Anna", "Jo Li", START, "short")
++        self.assertEqual(cancellation_fee(appt, at(23)), 6800)
++        self.assertEqual(cancellation_fee(appt, at(0)), 6800)
++
++    def test_cancelling_after_the_start_pays_full_price(self):
++        appt = Appointment("Anna", "Jo Li", START, "standard")
++        self.assertEqual(cancellation_fee(appt, at(-1)), 9800)
++
++    def test_fee_uses_the_treatment_price(self):
++        for treatment, (_, price) in [("initial", (60, 14500)), ("standard", (45, 9800)), ("short", (30, 6800))]:
++            appt = Appointment("Anna", "Jo Li", START, treatment)
++            self.assertEqual(cancellation_fee(appt, at(1)), price)
++
++
++if __name__ == "__main__":
++    unittest.main()

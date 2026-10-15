@@ -1,0 +1,39 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 5745d35..484b56b 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -61,3 +61,8 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The most recently recorded RECEIPT for a SKU, or None if there is none."""
++        receipts = [m for m in self.movements_for(sku) if m.reason == "RECEIPT"]
++        return receipts[-1] if receipts else None
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index c6b2aad..a732e8f 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -22,6 +22,21 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual([m.reason for m in inv.movements], ["RETURN", "DAMAGE", "COUNT"])
+         self.assertEqual(inv.on_hand("BR-1042"), -3)
+ 
++    def test_last_receipt_is_the_latest_receipt_for_the_sku(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        second = inv.receive("br-1042", 5, 13, DAY)
++        inv.issue("BR-1042", 2, DAY)
++        inv.record("BR-1042", 1, "RETURN", DAY)
++        self.assertIs(inv.last_receipt(" BR-1042 "), second)
++
++    def test_last_receipt_is_none_without_receipts(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.record("BR-1042", 3, "COUNT", DAY)
++        inv.receive("BR-2000", 4, 9, DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
+     def test_unknown_reason_code_rejected(self):
+         inv = Inventory()
+         for code in ("sale", "TRANSFER", "", None):

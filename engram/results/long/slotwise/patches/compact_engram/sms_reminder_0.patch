@@ -1,0 +1,101 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..fc6092e
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,33 @@
++"""The text of appointment reminder SMS: plain ASCII, at most 160 characters, with the reception number."""
++
++import unicodedata
++
++RECEPTION_PHONE = "044 512 77 30"
++MAX_LENGTH = 160
++
++# German letters that decomposition cannot handle, so they are spelled out first.
++_LETTERS = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
++
++
++def to_ascii(text):
++    """'Brändli' -> 'Braendli'. Raises ValueError for anything that has no plain ASCII form."""
++    for letter, replacement in _LETTERS.items():
++        text = text.replace(letter, replacement)
++    decomposed = unicodedata.normalize("NFKD", text)
++    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
++    if not stripped.isascii():
++        raise ValueError(f"cannot write {text!r} in plain ASCII")
++    return stripped
++
++
++def reminder_text(appointment):
++    """The reminder SMS for an appointment. Raises ValueError if it would not fit in 160 characters."""
++    when = appointment.start
++    text = (
++        f"Lindqvist Physio: reminder for {to_ascii(appointment.client)}, "
++        f"{when:%d.%m.%Y} at {when:%H:%M} with {to_ascii(appointment.therapist)}. "
++        f"To change it call {RECEPTION_PHONE}."
++    )
++    if len(text) > MAX_LENGTH:
++        raise ValueError(f"reminder is {len(text)} characters, the limit is {MAX_LENGTH}: {text!r}")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..a230a50
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,56 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import MAX_LENGTH, RECEPTION_PHONE, reminder_text, to_ascii
++
++
++def appointment(client="Zoe Braendli", therapist="Anna Keller"):
++    return Appointment(therapist, client, datetime.datetime(2026, 10, 20, 9, 30))
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_umlauts_are_spelled_out(self):
++        self.assertEqual(to_ascii("Brändli"), "Braendli")
++        self.assertEqual(to_ascii("Jörg Müller"), "Joerg Mueller")
++        self.assertEqual(to_ascii("Strauß"), "Strauss")
++
++    def test_other_accents_are_dropped(self):
++        self.assertEqual(to_ascii("Zoë Érard"), "Zoe Erard")
++
++    def test_text_without_special_letters_is_unchanged(self):
++        self.assertEqual(to_ascii("Jo Li"), "Jo Li")
++
++    def test_letters_with_no_ascii_form_are_an_error(self):
++        with self.assertRaises(ValueError):
++            to_ascii("Øyvind")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def test_reminder_names_client_time_therapist_and_reception(self):
++        text = reminder_text(appointment())
++        self.assertEqual(
++            text,
++            "Lindqvist Physio: reminder for Zoe Braendli, 20.10.2026 at 09:30 with Anna Keller. "
++            "To change it call 044 512 77 30.",
++        )
++
++    def test_reminder_is_plain_ascii_with_transliterated_names(self):
++        text = reminder_text(appointment(client="Zoë Brändli", therapist="Jörg Müller"))
++        self.assertTrue(text.isascii())
++        self.assertIn("Zoe Braendli", text)
++        self.assertIn("Joerg Mueller", text)
++
++    def test_reminder_contains_reception_number(self):
++        self.assertIn(RECEPTION_PHONE, reminder_text(appointment()))
++
++    def test_reminder_fits_in_160_characters(self):
++        self.assertLessEqual(len(reminder_text(appointment())), MAX_LENGTH)
++
++    def test_too_long_reminder_is_an_error_for_reception_to_check(self):
++        with self.assertRaises(ValueError):
++            reminder_text(appointment(client="A" * 150))
++
++
++if __name__ == "__main__":
++    unittest.main()

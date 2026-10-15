@@ -1,0 +1,65 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..2f91d2d
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,25 @@
++"""Stock analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs A, B or C by cumulative share of annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are taken highest
++    value first; a SKU is 'A' while the cumulative share up to and including
++    it is at most 80% of the total, 'B' while at most 95%, otherwise 'C'.
++    """
++    if not values:
++        return {}
++    total = sum(values.values())
++    ranked = sorted(values.items(), key=lambda kv: (-kv[1], kv[0]))
++    classes = {}
++    running = 0
++    for sku, value in ranked:
++        running += value
++        if running <= 0.80 * total:
++            classes[sku] = "A"
++        elif running <= 0.95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..076073f
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_at_the_80_and_95_percent_boundaries(self):
++        # Total 100. Running share: 50, 80 (exactly 80%), 95 (exactly 95%), 100.
++        values = {"BR-1": 50, "BR-2": 30, "BR-3": 15, "BR-4": 5}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "A", "BR-3": "B", "BR-4": "C"},
++        )
++
++    def test_input_order_does_not_matter(self):
++        values = {"BR-4": 5, "BR-3": 15, "BR-2": 30, "BR-1": 50}
++        self.assertEqual(abc_classes(values)["BR-2"], "A")
++        self.assertEqual(abc_classes(values)["BR-4"], "C")
++
++    def test_single_sku_reaches_100_percent_so_is_c(self):
++        self.assertEqual(abc_classes({"BR-1": 42}), {"BR-1": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,108 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..8b958f2
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,31 @@
++"""What the stock on hand is worth, valued first in, first out."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand.
++
++    Each positive movement opens a cost layer at its unit cost. Each negative
++    movement uses up the oldest layers first, by movement date. Stock that has
++    gone below zero has no layers left and is valued at zero.
++    """
++    sku = normalize_sku(sku)
++    layers = deque()  # [qty, unit_cost], oldest first
++    # sorted() is stable, so movements on the same day keep their log order.
++    for m in sorted(inventory.movements_for(sku), key=lambda m: m.date):
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"{sku} movement on {m.date} has no unit cost; cannot value it")
++            layers.append([m.qty, m.unit_cost])
++        else:
++            to_issue = -m.qty
++            while to_issue and layers:
++                take = min(to_issue, layers[0][0])
++                layers[0][0] -= take
++                to_issue -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..be70fa0
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,65 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory
++from stockroom.valuation import stock_value
++
++DAY1 = datetime.date(2026, 9, 1)
++DAY2 = datetime.date(2026, 9, 2)
++DAY3 = datetime.date(2026, 9, 3)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_unknown_sku_is_worth_nothing(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt_is_qty_times_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 100, 12, date=DAY1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 1200)
++
++    def test_sales_use_the_oldest_stock_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, date=DAY1)
++        inv.receive("BR-1042", 10, 200, date=DAY2)
++        inv.issue("BR-1042", 15, date=DAY3)
++        # 5 left, all from the second receipt.
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 200)
++
++    def test_fifo_follows_movement_dates_not_log_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 200, date=DAY2)
++        inv.receive("BR-1042", 10, 100, date=DAY1)  # logged later, but older
++        inv.issue("BR-1042", 10, date=DAY3)
++        # The DAY1 receipt at 100 is used up; the DAY2 receipt at 200 remains.
++        self.assertEqual(stock_value(inv, "BR-1042"), 10 * 200)
++
++    def test_sale_spanning_two_layers(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, date=DAY1)
++        inv.receive("BR-1042", 10, 300, date=DAY2)
++        inv.issue("BR-1042", 12, date=DAY3)
++        # 10 at 100 used up, 2 at 300 used; 8 left at 300.
++        self.assertEqual(stock_value(inv, "BR-1042"), 8 * 300)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive("br-1042", 4, 25, date=DAY1)
++        self.assertEqual(stock_value(inv, " BR-1042"), 100)
++
++    def test_stock_gone_negative_is_worth_zero(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, date=DAY1)
++        inv.issue("BR-1042", 8, date=DAY2)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_count_adjustment_without_cost_is_refused(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, date=DAY1)
++        inv.record("BR-1042", 2, "COUNT", date=DAY2)
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

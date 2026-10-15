@@ -1,0 +1,102 @@
+diff --git a/src/slotwise/durations.py b/src/slotwise/durations.py
+new file mode 100644
+index 0000000..d6ffc27
+--- /dev/null
++++ b/src/slotwise/durations.py
+@@ -0,0 +1,44 @@
++"""Reads the durations reception types in, such as '45', '1h30' or '1:30'."""
++
++import re
++
++_PATTERN = re.compile(
++    r"(?:(?P<hours>\d+)\s*h\s*(?P<h_minutes>\d+)?\s*(?:m|min)?"
++    r"|(?P<clock_hours>\d+):(?P<clock_minutes>\d{2})"
++    r"|(?P<minutes>\d+)\s*(?:m|min)?)"
++)
++
++
++def parse_duration(text):
++    """Minutes for a duration like '45', '45 min', '1h', '1h30', '1h 30m' or '1:30'.
++
++    Ignores case and surrounding spaces. Raises ValueError for empty input, zero,
++    or anything else, such as 'abc' or '-5'.
++    """
++    cleaned = text.strip().lower()
++    if not cleaned:
++        raise ValueError("duration is empty")
++    match = _PATTERN.fullmatch(cleaned)
++    if match is None:
++        raise ValueError(f"not a duration: {text!r}")
++
++    if match["hours"] is not None:
++        minutes = int(match["hours"]) * 60
++        if match["h_minutes"] is not None:
++            minutes += _minute_part(match["h_minutes"], text)
++    elif match["clock_hours"] is not None:
++        minutes = int(match["clock_hours"]) * 60 + _minute_part(match["clock_minutes"], text)
++    else:
++        minutes = int(match["minutes"])
++
++    if minutes == 0:
++        raise ValueError(f"duration must be more than zero: {text!r}")
++    return minutes
++
++
++def _minute_part(digits, text):
++    """The minutes after an hour, which must be below 60."""
++    minutes = int(digits)
++    if minutes >= 60:
++        raise ValueError(f"minutes must be below 60: {text!r}")
++    return minutes
+diff --git a/tests/test_durations.py b/tests/test_durations.py
+new file mode 100644
+index 0000000..e71a24b
+--- /dev/null
++++ b/tests/test_durations.py
+@@ -0,0 +1,46 @@
++import unittest
++
++from slotwise.durations import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_accepted_formats(self):
++        cases = {
++            "45": 45,
++            "45m": 45,
++            "45 min": 45,
++            "1h": 60,
++            "1h30": 90,
++            "1h 30m": 90,
++            "2h15": 135,
++            "1:30": 90,
++        }
++        for text, minutes in cases.items():
++            with self.subTest(text=text):
++                self.assertEqual(parse_duration(text), minutes)
++
++    def test_ignores_case_and_surrounding_spaces(self):
++        self.assertEqual(parse_duration("  1H 30M "), 90)
++        self.assertEqual(parse_duration(" 45 MIN "), 45)
++
++    def test_rejects_empty_input(self):
++        for text in ["", "   "]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++    def test_rejects_zero(self):
++        for text in ["0", "0m", "0h", "0:00"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++    def test_rejects_anything_else(self):
++        for text in ["abc", "-5", "1h90", "1:3", "1.5h", "45 seconds"]:
++            with self.subTest(text=text):
++                with self.assertRaises(ValueError):
++                    parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

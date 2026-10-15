@@ -205,18 +205,13 @@ The default embedder is static (Model2Vec potion-retrieval-32M: token lookup and
 
 ## Install and use
 
-```sh
-cd engram
-cargo build --release
-target/release/engram fetch-model
-target/release/engram install --project /path/to/your/project   # --shared writes .claude/settings.json instead
-```
-
-Or for every Claude Code session, one store per project directory (`engram uninstall --user` undoes it):
+[Install on your machine](setup.md) has the whole procedure, remote machines and dev containers included. In short:
 
 ```sh
-cargo install --path . --bin engram --root ~/.local
-engram install --user --distill-model haiku
+git clone https://github.com/rkonow/engram && cd engram && ./install.sh   # every Claude Code session
+./install.sh --project /path/to/your/project                              # or one project
+engram doctor                                                             # check the setup
+engram ui                                                                 # browse what it stored
 ```
 
 ```sh

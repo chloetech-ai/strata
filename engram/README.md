@@ -36,10 +36,15 @@ The model also gets five MCP tools:
 
 ## Install
 
+From the repository root, `./install.sh` does everything below for every
+session (`--project DIR` for one project) and runs `engram doctor`; see
+[Install on your machine](../docs/engram/setup.md). By hand:
+
 ```sh
 cargo build --release                      # in engram/
 target/release/engram fetch-model          # potion-retrieval-32M (static embedder, 129 MB)
 target/release/engram install --project /path/to/your/project
+target/release/engram doctor               # checks hooks, MCP server, model, CLI login and the daemon
 ```
 
 `install` writes four things:
@@ -84,7 +89,8 @@ engram sql "SELECT ts, text FROM memory WHERE kind = 'error' AND MATCH(files, 'e
 engram remember decision "Prices are integer cents"
 engram ingest-transcript ~/.claude/projects/<project>/<session>.jsonl   # back-fill old sessions
 engram distill                                                          # write down knowledge for turns stored before distillation existed
-engram stats | briefing | stop
+engram stats | briefing | stop [--all]
+engram ui                                                               # the inspector over every local store
 ```
 
 `ENGRAM_DISABLE=1` turns the hooks off. `ENGRAM_HOME` and `ENGRAM_MODELS`
@@ -103,8 +109,18 @@ credentials come from the user settings.
 ## Live inspector
 
 ```sh
-demo/run.sh --model <model> --distill-model <small model>   # opens http://127.0.0.1:8765
+engram ui                                                   # your own stores, per project and session
+demo/run.sh --model <model> --distill-model <small model>   # a chat in a scratch project
 ```
+
+`engram ui` serves the inspector from the binary over every store under
+`$ENGRAM_HOME/projects` (`--home` for another directory): pick a store and a
+session, read the session rebuilt from its records with the briefing, each
+recall decision and the distilled notes, and use every panel below on that
+store. It only reads, through each project's daemon, listens on 127.0.0.1
+and wants the token in the URL it prints.
+
+The demo:
 
 A local web app for watching Engram work: chat with Claude Code in a scratch
 project (`~/engram-demo/project`, with its own store; `--data` moves it) and

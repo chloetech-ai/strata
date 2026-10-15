@@ -1,0 +1,71 @@
+diff --git a/src/slotwise/durations.py b/src/slotwise/durations.py
+new file mode 100644
+index 0000000..314a130
+--- /dev/null
++++ b/src/slotwise/durations.py
+@@ -0,0 +1,27 @@
++"""Appointment lengths as receptionists type them, such as '45', '1h30' or '1:30'."""
++
++import re
++
++_CLOCK = re.compile(r"([0-9]+):([0-9]+)")
++_UNITS = re.compile(r"(?:([0-9]+)\s*h)?\s*(?:([0-9]+)\s*(?:min|m)?)?")
++
++
++def parse_duration(text):
++    """Minutes in a length, ignoring case and surrounding spaces. Raises ValueError unless it is a positive length."""
++    cleaned = text.strip().lower()
++    clock = _CLOCK.fullmatch(cleaned)
++    if clock:
++        hours, minutes = int(clock[1]), int(clock[2])
++        if minutes >= 60:
++            raise ValueError(f"Minutes must be under 60 in duration {text!r}")
++    else:
++        units = _UNITS.fullmatch(cleaned)
++        if not units or (units[1] is None and units[2] is None):
++            raise ValueError(f"Cannot read duration {text!r}")
++        hours, minutes = int(units[1] or 0), int(units[2] or 0)
++        if units[1] is not None and minutes >= 60:
++            raise ValueError(f"Minutes must be under 60 in duration {text!r}")
++    total = hours * 60 + minutes
++    if total == 0:
++        raise ValueError(f"Duration must be more than zero: {text!r}")
++    return total
+diff --git a/tests/test_durations.py b/tests/test_durations.py
+new file mode 100644
+index 0000000..500ad46
+--- /dev/null
++++ b/tests/test_durations.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from slotwise.durations import parse_duration
++
++
++class ParseDurationTest(unittest.TestCase):
++    def test_accepted_notations(self):
++        cases = {
++            "45": 45,
++            "45m": 45,
++            "45 min": 45,
++            "1h": 60,
++            "1h30": 90,
++            "1h 30m": 90,
++            "2h15": 135,
++            "1:30": 90,
++        }
++        for text, minutes in cases.items():
++            with self.subTest(text=text):
++                self.assertEqual(parse_duration(text), minutes)
++
++    def test_ignores_case_and_surrounding_spaces(self):
++        self.assertEqual(parse_duration("  1H 30M  "), 90)
++
++    def test_empty_zero_and_unreadable_input_is_refused(self):
++        for text in ["", "   ", "0", "0h", "abc", "-5", "1h30m extra", "1:60"]:
++            with self.subTest(text=text), self.assertRaises(ValueError):
++                parse_duration(text)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,88 @@
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..cfc0f4f
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,28 @@
++"""Printable day plans for the receipt printer, which fits 42 characters a line."""
++
++import textwrap
++
++LINE_WIDTH = 42
++
++
++def _wrapped(text, indent=""):
++    """`text` as lines no wider than LINE_WIDTH; continuation lines start with `indent`."""
++    return textwrap.wrap(
++        text,
++        width=LINE_WIDTH,
++        initial_indent=indent,
++        subsequent_indent=" " * len(indent),
++    )
++
++
++def day_plan(schedule, therapist, day):
++    """The day plan for `therapist` on `day` as plain text, one printer line per row."""
++    lines = _wrapped(f"{therapist.title()}, {day:%A %d %B %Y}")
++    lines.append("-" * LINE_WIDTH)
++    appointments = schedule.appointments_for(therapist, day)
++    if not appointments:
++        lines.append("No appointments")
++    for appointment in appointments:
++        time = f"{appointment.start:%H:%M}-{appointment.end:%H:%M}"
++        lines.extend(_wrapped(f"{appointment.client} ({appointment.treatment})", indent=f"{time}  "))
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..29abcdb
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,48 @@
++import datetime
++import unittest
++
++from slotwise import Appointment, Schedule
++from slotwise.printing import LINE_WIDTH, day_plan
++
++MONDAY = datetime.date(2026, 10, 12)
++
++
++def at(hour, minute=0):
++    return datetime.datetime.combine(MONDAY, datetime.time(hour, minute))
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_the_day_by_start_time(self):
++        s = Schedule()
++        s.book(Appointment("anna", "Jo Li", at(10), "short"))
++        s.book(Appointment("anna", "Kim Weber", at(9), "standard"))
++        self.assertEqual(
++            day_plan(s, "anna", MONDAY),
++            "Anna, Monday 12 October 2026\n"
++            + "-" * LINE_WIDTH + "\n"
++            + "09:00-09:45  Kim Weber (standard)\n"
++            + "10:00-10:30  Jo Li (short)\n",
++        )
++
++    def test_empty_day_says_so(self):
++        plan = day_plan(Schedule(), "anna", MONDAY)
++        self.assertTrue(plan.endswith("No appointments\n"))
++
++    def test_other_therapists_and_cancelled_appointments_are_left_out(self):
++        s = Schedule()
++        s.book(Appointment("ben", "Jo Li", at(9)))
++        cancelled = s.book(Appointment("anna", "Kim Weber", at(11)))
++        s.cancel(cancelled.id)
++        self.assertNotIn("Jo Li", day_plan(s, "anna", MONDAY))
++        self.assertNotIn("Kim Weber", day_plan(s, "anna", MONDAY))
++
++    def test_no_line_is_wider_than_the_printer(self):
++        s = Schedule()
++        s.book(Appointment("anna", "Maria-Theresia von Hohenlohe-Langenburg-Schwarzenberg", at(9), "initial"))
++        for line in day_plan(s, "anna", MONDAY).splitlines():
++            self.assertLessEqual(len(line), LINE_WIDTH)
++        self.assertIn("Schwarzenberg (initial)", " ".join(day_plan(s, "anna", MONDAY).split()))
++
++
++if __name__ == "__main__":
++    unittest.main()

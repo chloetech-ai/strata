@@ -96,7 +96,7 @@ These need no model calls or downloads, only the per-run and per-query files in 
 The runs that call a model were not repeated: Claude Code with and without Engram (`engram/results/ab/`, `engram/results/long/`), the reader study (`engram/results/reader*`), fact extraction and record structure (`engram/results/structure/`), and the probes on the 26-hour session (`engram/results/probes*`), which need that session's transcript. Their counts and costs do not depend on the machine. Where a page quotes a timing from them (the 6 s back-fill of the 26-hour session, BGE's 50 ms per record, the recall step inside the kestrel runs), it says it was measured on the cloud VM.
 
 {: .note }
-The first long-session A/B (`engram/results/long/*_v1_leaky`) is kept for the record only, and its own `NOTE.md` marks it invalid: Claude Code's auto-memory was not reset between runs, so runs within a lane were not independent.
+The first long-session A/B (`engram/results/long/*_v1_leaky`) is kept for the record only, and its own `NOTE.md` marks it invalid: Claude Code's auto-memory was not reset between runs, so runs within a lane were not independent. The clean rerun (`engram/results/long/stockroom` and `slotwise`) used the isolated harness in `engram/scripts/long_session_ab.py`, which resets that memory before each lane's history and restores it before every task.
 
 ## Requirements
 

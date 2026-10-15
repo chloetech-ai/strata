@@ -1,0 +1,76 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..2147ef3
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,27 @@
++"""ABC analysis of stock by annual consumption value."""
++
++
++def abc_classes(values):
++    """Map each SKU to 'A', 'B' or 'C' by its share of the total value.
++
++    SKUs are taken highest value first. A SKU is 'A' while the cumulative share,
++    including itself, is at most 80% of the total, 'B' while it is at most 95%,
++    and 'C' after that. Ties are ordered by SKU so the result is repeatable.
++    """
++    for sku, value in values.items():
++        if value < 0:
++            raise ValueError(f"annual value must not be negative: {sku} {value}")
++    total = sum(values.values())
++    ranked = sorted(values.items(), key=lambda pair: (-pair[1], pair[0]))
++    classes = {}
++    running = 0
++    for sku, value in ranked:
++        running += value
++        # Compare cross-multiplied so the 80% and 95% limits are exact, with no float division.
++        if running * 5 <= total * 4:
++            classes[sku] = "A"
++        elif running * 20 <= total * 19:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..afb853f
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,37 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input_gives_empty_dict(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_follow_cumulative_share(self):
++        # Total 100: running 50 (50%), 75 (75%), 90 (90%), 95 (95%), 100 (100%).
++        values = {"A-1": 50, "A-2": 25, "A-3": 15, "A-4": 5, "A-5": 5}
++        self.assertEqual(abc_classes(values), {
++            "A-1": "A", "A-2": "A", "A-3": "B", "A-4": "B", "A-5": "C",
++        })
++
++    def test_boundary_at_exactly_80_percent_is_a(self):
++        self.assertEqual(abc_classes({"X": 80, "Y": 20}), {"X": "A", "Y": "C"})
++
++    def test_boundary_at_exactly_95_percent_is_b(self):
++        self.assertEqual(abc_classes({"X": 80, "Y": 15, "Z": 5}), {"X": "A", "Y": "B", "Z": "C"})
++
++    def test_single_sku_reaches_100_percent_so_is_c(self):
++        self.assertEqual(abc_classes({"ONLY": 10}), {"ONLY": "C"})
++
++    def test_ties_are_ordered_by_sku(self):
++        # Sorted A, B, C, D by SKU: running 30 and 60 are within 80%, 90 is B, 100 is C.
++        values = {"A": 30, "B": 30, "C": 30, "D": 10}
++        self.assertEqual(abc_classes(values), {"A": "A", "B": "A", "C": "B", "D": "C"})
++
++    def test_negative_value_is_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"X": 10, "Y": -1})
++
++
++if __name__ == "__main__":
++    unittest.main()

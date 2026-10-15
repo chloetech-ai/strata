@@ -1,0 +1,76 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..9f0e7cb
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,31 @@
++"""Analysis helpers."""
++
++
++def abc_classes(values):
++    """ABC classes for SKUs from their annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are ranked by value,
++    highest first (ties broken by SKU). A SKU is 'A' while the running total up
++    to and including it is at most 80% of the grand total, 'B' while it is at
++    most 95%, and 'C' otherwise. Returns a dict mapping SKU to class.
++    """
++    if not values:
++        return {}
++    if any(value < 0 for value in values.values()):
++        raise ValueError("consumption values must not be negative")
++    total = sum(values.values())
++    if total <= 0:
++        raise ValueError("total consumption must be positive")
++    ranked = sorted(values.items(), key=lambda pair: (-pair[1], pair[0]))
++    classes = {}
++    running = 0
++    for sku, value in ranked:
++        running += value
++        # Compare cross-multiplied so the 80% and 95% limits are exact.
++        if running * 100 <= 80 * total:
++            classes[sku] = "A"
++        elif running * 100 <= 95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..8beb0d9
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,33 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input_gives_empty_dict(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Ranked: A 50 (50%), B 30 (80%), C 15 (95%), D 5 (100%).
++        values = {"A": 50, "B": 30, "C": 15, "D": 5}
++        self.assertEqual(abc_classes(values), {"A": "A", "B": "A", "C": "B", "D": "C"})
++
++    def test_ranking_does_not_depend_on_input_order(self):
++        values = {"D": 5, "C": 15, "B": 30, "A": 50}
++        self.assertEqual(abc_classes(values), {"A": "A", "B": "A", "C": "B", "D": "C"})
++
++    def test_ties_are_ordered_by_sku(self):
++        # BR-1 ranks first (50%, 'A'); BR-2 reaches 100% and is 'C'.
++        self.assertEqual(abc_classes({"BR-2": 10, "BR-1": 10}), {"BR-1": "A", "BR-2": "C"})
++
++    def test_negative_value_is_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": 10, "BR-2": -1})
++
++    def test_zero_total_is_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": 0, "BR-2": 0})
++
++
++if __name__ == "__main__":
++    unittest.main()

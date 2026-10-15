@@ -1,0 +1,65 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 1acfdc9..e2624c6 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -13,6 +13,8 @@ CHANGEOVER = datetime.timedelta(minutes=10)
+ MAX_SERIES_SESSIONS = 9
+ # how many weeks a series may run on while looking for free weeks
+ SERIES_SEARCH_WEEKS = 26
++# the therapists' contract caps treatments per day; shown as fully booked online, not enforced in book()
++DAILY_TREATMENT_CAP = 7
+ 
+ 
+ class Schedule:
+@@ -99,6 +101,10 @@ class Schedule:
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+         return {day: self.appointments_for(therapist, day) for day in days}
+ 
++    def is_fully_booked(self, therapist, day):
++        """True when `therapist` has reached the daily treatment cap on `day`, so the online page greys it out."""
++        return len(self.appointments_for(therapist, day)) >= DAILY_TREATMENT_CAP
++
+ 
+ def _closed_message(appointment):
+     day = appointment.start.date()
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 793ccb0..40d5fff 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -144,5 +144,36 @@ class ScheduleTest(unittest.TestCase):
+         self.assertEqual(len(s.appointments), 2)
+ 
+ 
++class FullyBookedTest(unittest.TestCase):
++    def day_with(self, count, therapist="lena"):
++        s = Schedule()
++        for i in range(count):
++            s.book(Appointment(therapist, f"Client {i}", datetime.datetime(2026, 9, 8, 8 + i * 1), "standard"))
++        return s
++
++    def test_six_appointments_is_not_fully_booked(self):
++        s = self.day_with(6)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_seven_appointments_is_fully_booked(self):
++        s = self.day_with(7)
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_cancelled_appointments_do_not_count(self):
++        s = self.day_with(7)
++        s.cancel(s.appointments[0].id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_other_therapist_and_other_day_are_not_affected(self):
++        s = self.day_with(7)
++        self.assertFalse(s.is_fully_booked("marco", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 9)))
++
++    def test_book_still_allows_an_eighth_appointment(self):
++        s = self.day_with(7)
++        s.book(Appointment("lena", "Client 7", datetime.datetime(2026, 9, 8, 17)))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,69 @@
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..cbe5baa
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,17 @@
++"""Cancellation fees."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours before the start: the full price. Less than 48 hours: half the price.
++    Earlier than that: free.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..c0638ce
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,40 @@
++import datetime
++import unittest
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++START = datetime.datetime(2026, 9, 8, 9, 0)
++
++
++def cancel_at(hours_before, treatment="initial"):
++    appointment = Appointment("lena", "Kim Weber", START, treatment)
++    return cancellation_fee(appointment, START - datetime.timedelta(hours=hours_before))
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def test_more_than_48_hours_is_free(self):
++        self.assertEqual(cancel_at(72), 0)
++
++    def test_exactly_48_hours_is_free(self):
++        self.assertEqual(cancel_at(48), 0)
++
++    def test_between_24_and_48_hours_is_half(self):
++        self.assertEqual(cancel_at(36), 7250)  # initial treatment, 145.00 -> 72.50
++
++    def test_exactly_24_hours_is_half(self):
++        self.assertEqual(cancel_at(24), 7250)
++
++    def test_less_than_24_hours_is_full_price(self):
++        self.assertEqual(cancel_at(23), 14500)
++
++    def test_after_start_is_full_price(self):
++        self.assertEqual(cancel_at(-1), 14500)
++
++    def test_half_price_for_other_treatments(self):
++        self.assertEqual(cancel_at(30, "standard"), 4900)
++        self.assertEqual(cancel_at(30, "short"), 3400)
++
++
++if __name__ == "__main__":
++    unittest.main()
