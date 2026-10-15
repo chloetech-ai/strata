@@ -74,7 +74,8 @@ Rewrite them as the smallest set of notes that keeps every detail, number, name,
 - when a later note changes, reverses or replaces an earlier one, keep only the current version, and say briefly what it replaced if that helps (e.g. "30 days, changed from 14");
 - merge notes that say the same thing or parts of one thing; keep notes on different subjects separate;
 - never drop a rule, a requirement for planned work, a constraint or a reason;
-- each note is one or two self-contained sentences that name their subject.
+- each note is one or two self-contained sentences that name their subject;
+- a note that merges with nothing stays as it is: keep it rather than rewording it.
 
 Output one JSON object per line:
 {"keep": "<id>"} for a note that stays exactly as it is;
@@ -228,6 +229,10 @@ pub fn run(store: &Store, cfg: &ConsolidateConfig, cli: &DistillConfig, now: i64
         };
         rep.cost_usd += reply.cost_usd;
         for (draft, replaces) in parse(&reply.text, &ids) {
+            // A note rewritten on its own only churns: keep the original.
+            if replaces.len() < 2 {
+                continue;
+            }
             let olds: Vec<&&Record> = members.iter().filter(|r| replaces.contains(&r.id)).collect();
             // The newest replaced note's session and turn; its context and the
             // anchors of all of them.

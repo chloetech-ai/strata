@@ -57,9 +57,9 @@ One Strata table, `memory`. Each record is one key–value pair with attributes.
 | `importance` | FLOAT | salience prior in [0, 1] |
 | `files` | TEXT | paths the record touches (path components are terms) |
 | `text` | TEXT, stored | the value: one chunk of at most 400 bytes, injected as is |
-| `ctx` | TEXT, stored | the turn's request (≤ 200 characters): part of the lexical key, never shown |
+| `ctx` | TEXT, stored | the turn's request (≤ 200 characters); for notes also the situations they matter in (`When:`) and the code they were written against (`Anchor:`); part of the lexical key, never shown |
 | `body` | TEXT, generated from `text` + `ctx` | the lexical key that `bm25` and `MATCH` search |
-| `emb` | VECTOR(d), HNSW | the dense key: an embedding of `text` alone |
+| `emb` | VECTOR(d), HNSW | the dense key: an embedding of `text` alone (for notes, `text` and its `When:` situations) |
 | `links` | EDGES | edges to the turn a record came from, the files it touches (`f:path`) and the entities it is about (`e:name`), which are records of kind `entity` |
 
 ![One record: a captured event is redacted, trimmed and cut into 400-byte records](../assets/img/engram-record.png)
@@ -98,7 +98,7 @@ Raw records hold what was *said*; a later session needs what was *agreed*: a dec
 
 ![Knowledge records: a small model writes down what each turn agreed](../assets/img/engram-knowledge-records.png)
 
-After each `Stop`, off the prompt's path, the daemon gives the turn (request, commands, reply) to a small model through `claude -p`, with the latest 40 knowledge records for context. The model returns JSON lines:
+After each `Stop`, off the prompt's path, the daemon gives the turn (request, commands, reply) to a small model through `claude -p`, with up to 40 live notes for context: the ones most related to the turn wherever they are in the history, then the newest. Seeing the related ones is what lets the model update a note written weeks ago instead of adding a near-copy next to it. The model returns JSON lines:
 
 | item | stored as | tag |
 |---|---|---|
@@ -110,6 +110,24 @@ After each `Stop`, off the prompt's path, the daemon gives the turn (request, co
 | `done: id` | the planned item is retagged | `done` |
 
 A new item whose analysed terms overlap an existing one by a Jaccard index J ≥ 0.6 is dropped. Distillation costs about **$0.0013 a turn** and 8 s with a small model, and never delays a prompt.
+
+Each note also carries **the situations it will matter in** (`when`), written at the same time: "choosing a library or standard-library module", "parsing a config file" for a note that the client machines run Python 3.8. A later request rarely uses the words of the note it needs; it uses the words of the task. The situations join the note's lexical key and its embedding, so "add a settings.toml loader" finds the Python 3.8 note although they share no word. This is document expansion (doc2query) done once, when the note is written.
+
+### Consolidation
+
+Notes accumulate. Every eight distilled turns (or on `engram consolidate`), the daemon groups live notes that say related things: pairs whose embeddings have a cosine of at least 0.80, or 0.55 when they share an entity, joined strongest first into groups of at most ten. A small model rewrites each group as the smallest set of notes that keeps every detail, number, name and reason that still holds: a later change replaces the earlier version ("30 days, changed from 14"), duplicates merge, notes on different subjects stay apart, and rules, requirements and reasons are never dropped. Each merged note links to the notes it replaces (`supersedes`), which are retagged `superseded` and leave the briefing and recall; a note the model would only reword is kept as it is.
+
+### Notes tied to the code
+
+A note about code goes stale when the code changes. Each note records what it was written against: the commit and branch, a content hash of the files it names or the turn changed (up to six), and the identifiers it mentions (`ROUND_HALF_UP`, `load_config`). When a note is shown (briefing, recall, file notes, the query engine), Engram checks those files in the working tree, reading each once:
+
+| what changed | decision or fact | rule or requirement |
+|---|---|---|
+| nothing | shown as is | shown as is |
+| a file it names, its identifiers still there | "app/billing.py changed since this note; check the current code" | the same |
+| the file is gone, or an identifier it names no longer occurs | **may be out of date**: moved to its own briefing section | **the code may now break it**: stays with the rules, with "the code changed since this was stated; check that it still follows it" |
+
+A rule does not go stale because the code moved away from it: a teammate who switched invoices to banker's rounding did not cancel the client's requirement, so the rule stays where the model will see it, with a warning that the code may now break it.
 
 ## When to load
 
@@ -141,16 +159,20 @@ sequenceDiagram
     E->>S: BM25 top 50 + vector top 50, live window excluded
     E->>E: priors, gate G, pack
     E-->>C: knowledge block + full / brief / no recall
+    E->>E: query engine: plan, search, rank (background)
     C->>E: PreToolUse Edit(path)
     E-->>C: up to 2 earlier errors or decisions about path
-    C->>E: memory_search / memory_timeline / memory_sql (pull)
+    C->>E: PostToolUse
+    E-->>C: the query engine's picks, once ready
+    C->>E: memory_ask / memory_search / memory_timeline / memory_sql (pull)
     E-->>C: results
     C->>E: Stop
+    E-->>C: picks not delivered yet: reconsider once
     E->>S: answer, commentary, episode
-    E->>E: distill the turn (background)
+    E->>E: distill the turn, check notes against code, consolidate every 8 turns (background)
 ```
 
-1. **`SessionStart`: a briefing**, always, at most 6,000 characters: planned work with its requirements, rules, decisions, facts, open tasks, and where the previous session stopped. It opens with an instruction to search memory before a design decision. After a compaction it also recalls the records most relevant to the last two prompts.
+1. **`SessionStart`: a briefing**, always, at most 6,000 characters: planned work with its requirements, rules, decisions, facts, open tasks, and where the previous session stopped, each note checked against the current code. It opens with an instruction to search memory before a design decision. After a compaction it also recalls the records most relevant to the last two prompts.
 2. **`UserPromptSubmit`: knowledge, then gated recall.** Up to four knowledge records not yet shown that match the prompt on their own text, bypassing the gate:
 
    $$
@@ -160,7 +182,9 @@ sequenceDiagram
 
    Then the main search and a three-way gate: strong evidence injects the top records up to 4,000 characters; weak evidence injects three records up to 1,200, marked as a weak match; otherwise nothing.
 3. **`PreToolUse` on `Edit`/`Write`: file notes.** Up to two older errors, decisions or rules anchored to that path, once per file per window.
-4. **Pull: MCP tools.** `memory_search`, `memory_timeline` (the neighbourhood of a hit), `memory_sql` (read-only SQL over `memory`), `memory_remember` and `memory_forget`.
+4. **Pull: MCP tools.** `memory_ask` (the query engine below), `memory_search`, `memory_timeline` (the neighbourhood of a hit), `memory_sql` (read-only SQL over `memory`), `memory_remember` and `memory_forget`.
+
+The briefing also ends with a one-line index of the notes it had no room for ("31 older notes are not shown here, about: …"), so the model knows what to ask for.
 
 ### Ranking
 
@@ -192,6 +216,47 @@ The weights come from a logistic fit on LongMemEval-S (`engram/scripts/fit_gate.
 
 ![The query path: the exclusion predicate runs inside both searches](../assets/img/engram-query-path.png)
 
+## Query understanding
+
+One search, however good its ranking, cannot answer "where does an unknown product code get caught, and why do we raise instead of skipping the line?". The answer is spread over a file, a decision and the error that led to it, and each is found by different words. The query engine turns a request into several searches, runs them all, and has a model pick what answers it.
+
+```mermaid
+flowchart LR
+    R["request<br/>(+ the session's last prompts)"] --> P["<b>planner</b><br/>small model:<br/>1–8 typed searches"]
+    P --> Q1["text"] & Q2["keywords"] & Q3["semantic"] & Q4["notes"] & Q5["entity"] & Q6["file"] & Q7["sql"]
+    R --> B["the request itself:<br/>text + notes"]
+    Q1 & Q2 & Q3 & Q4 & Q5 & Q6 & Q7 & B --> F["reciprocal-rank fusion<br/>30 candidates"]
+    F --> K["<b>ranker</b><br/>small model, or a stronger<br/>one for hard requests"]
+    K --> O["picked records, why each matters,<br/>a short reading, confidence"]
+```
+
+1. **Plan.** The planner sees the request, the session's two previous prompts, the store's size and time span, and the names of the entities and files notes are about. It writes up to eight searches, several of one type if that helps, covering each part of a question and the constraints a task touches without naming them (the machines it runs on, file formats, earlier failed attempts). It also says whether memory can matter at all, and whether the request is hard.
+2. **Search.** Every search runs in parallel, plus two on the request itself, each with the live-window exclusion:
+
+   | type | runs |
+   |---|---|
+   | `text` | the hybrid search above (BM25 and vectors) |
+   | `keywords` | BM25 alone: identifiers, error text |
+   | `semantic` | vectors alone, with a sentence phrased like the record hoped for |
+   | `notes` | decisions, rules, requirements and facts only |
+   | `entity` | records linked to named entities (matched by id, stem or embedding), two hops through the graph |
+   | `file` | records about a path (`MATCH(files, …)`) |
+   | `sql` | a `WHERE` and `ORDER BY` over `memory`, checked to be a single condition |
+
+3. **Fuse.** Lists are merged by reciprocal rank, Σ 1/(61 + rank), so a record found by several searches comes first; the best 30 go on.
+4. **Rank.** The ranker reads the 30 (600 characters each, with kind, date and any staleness label) and picks at most eight, each with why it matters, plus a one-to-three sentence reading that cites ids, and a confidence. Only picks the session has not seen are shown.
+
+It runs in one of four modes (`"deep": {"mode": …}` in the store's `config.json`, or `ENGRAM_DEEP`):
+
+| mode | when it runs | how its result arrives |
+|---|---|---|
+| `off` | never | |
+| `tool` | only when the model calls `memory_ask` (or `engram ask`) | the tool's result |
+| `async` (default) | after every prompt of four words or more, once the store holds 20 records, in the background | with the next tool result; if the turn ends first, its end waits up to 25 s and, when the picks are new and the ranker's confidence is high or medium, asks the model once to reconsider and give its whole answer again |
+| `sync` | the same prompts, before the model starts | in the prompt's context, after a wait of about 5–15 s |
+
+Both model calls go through `claude -p` with no tools, like distillation, and cost about $0.003 a request with a small model. The models are parameters: `planner_model` and `ranker_model` (default `haiku`, or `ENGRAM_DEEP_MODEL` for both), and `hard_model`, a stronger ranker used only when the planner calls a request hard (`ENGRAM_DEEP_HARD_MODEL`). `memory_ask` also takes a `model` for one question, so a user who allows a more expensive model can have it for the questions that need it.
+
 ## Cost and latency targets
 
 | path | target | measured |
@@ -215,11 +280,14 @@ engram ui                                                                 # brow
 ```
 
 ```sh
+engram ask "where do invoice totals get rounded, and why that rounding mode?"   # the query engine
+engram ask --model sonnet "..."                                                  # with a stronger model
 engram search "why did the planner pick post-filtering"
 engram sql "SELECT ts, text FROM memory WHERE kind = 'error' AND MATCH(files, 'exec') ORDER BY ts DESC LIMIT 5"
 engram remember decision "Prices are integer cents"
 engram ingest-transcript ~/.claude/projects/<project>/<session>.jsonl   # back-fill old sessions
 engram distill                                                          # distill turns stored before distillation existed
+engram consolidate                                                      # merge overlapping notes now
 engram stats | briefing | stop
 ```
 
@@ -228,7 +296,10 @@ engram stats | briefing | stop
 | `ENGRAM_DISABLE=1` | turns the hooks off |
 | `ENGRAM_HOME`, `ENGRAM_MODELS` | relocate the store and the models |
 | `ENGRAM_DISTILL=0` | turns distillation off (or `"distill": {"enabled": false}` in the store's `config.json`) |
-| `ENGRAM_DISTILL_MODEL` | the model the distiller uses |
+| `ENGRAM_DISTILL_MODEL` | the model the distiller and consolidation use |
+| `ENGRAM_DEEP` | query engine mode: `off`, `tool`, `async` (default), `sync` |
+| `ENGRAM_DEEP_MODEL`, `ENGRAM_DEEP_PLANNER_MODEL`, `ENGRAM_DEEP_RANKER_MODEL`, `ENGRAM_DEEP_HARD_MODEL` | the query engine's models (default `haiku`; the hard model is unset) |
+| `ENGRAM_CONSOLIDATE=0` | turns consolidation off |
 | `ENGRAM_EMBEDDER` | `static` (default), `bert`, or `hash:<dim>` for a model-free hash embedder |
 
 The full design, including the evaluation plan, is in [`engram/DESIGN.md`](https://github.com/rkonow/engram/blob/main/engram/DESIGN.md).

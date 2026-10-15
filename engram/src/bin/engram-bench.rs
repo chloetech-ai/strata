@@ -1100,6 +1100,9 @@ fn scale_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queries
         let project = home.join("proj");
         std::fs::create_dir_all(&project).unwrap();
         std::env::set_var("ENGRAM_HOME", &home);
+        // Hooks and daemons time the hot path only: no model calls.
+        std::env::set_var("ENGRAM_DEEP", "off");
+        std::env::set_var("ENGRAM_DISTILL", "0");
         let dir = engram::paths::store_dir(&project);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), serde_json::to_string(&json!({"embedder": embedder})).unwrap()).unwrap();
@@ -1281,6 +1284,9 @@ fn latency_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queri
         let project = home.join("proj");
         std::fs::create_dir_all(&project).unwrap();
         std::env::set_var("ENGRAM_HOME", &home);
+        // Hooks and daemons time the hot path only: no model calls.
+        std::env::set_var("ENGRAM_DEEP", "off");
+        std::env::set_var("ENGRAM_DISTILL", "0");
         let dir = engram::paths::store_dir(&project);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), serde_json::to_string(&json!({"embedder": embedder})).unwrap()).unwrap();
