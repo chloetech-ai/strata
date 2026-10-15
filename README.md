@@ -84,6 +84,13 @@ target/release/engram install --project /path/to/your/project
 
 `install` adds the hooks to `.claude/settings.local.json`, the MCP server to `.mcp.json`, and a permission rule for the memory tools. The store lives in `~/.local/share/engram/projects/<project>/`, outside the repository.
 
+To record every Claude Code session instead, each project into its own Strata file, install the binary somewhere stable and use `--user` ([details](engram/README.md#every-session)):
+
+```sh
+cargo install --path . --bin engram --root ~/.local
+engram install --user --distill-model haiku           # engram uninstall --user undoes it
+```
+
 Try it by hand:
 
 ```sh

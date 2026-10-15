@@ -6,8 +6,11 @@
 //!
 //! The model is called through the `claude` CLI in print mode, without
 //! tools, from a scratch directory and with Engram disabled, so the call
-//! records nothing itself. It runs in the daemon after the hook has
-//! answered, so it never delays a prompt.
+//! records nothing itself. By default it also skips the user's settings and
+//! MCP servers: their plugins, hooks and tool definitions would add tens of
+//! thousands of tokens to every call (and another memory plugin would record
+//! it). It runs in the daemon after the hook has answered, so it never
+//! delays a prompt.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -30,11 +33,15 @@ pub struct DistillConfig {
     /// CLI's default. `ENGRAM_DISTILL_MODEL` overrides it.
     pub model: String,
     pub timeout_secs: u64,
+    /// Run without the user's settings and MCP servers
+    /// (`--setting-sources project --strict-mcp-config`). Turn off when the
+    /// CLI's credentials come from the user settings (`apiKeyHelper`, `env`).
+    pub isolated: bool,
 }
 
 impl Default for DistillConfig {
     fn default() -> Self {
-        DistillConfig { enabled: true, command: "claude".into(), model: String::new(), timeout_secs: 120 }
+        DistillConfig { enabled: true, command: "claude".into(), model: String::new(), timeout_secs: 120, isolated: true }
     }
 }
 
@@ -178,6 +185,9 @@ pub fn distill(cfg: &DistillConfig, request: &str, answer: &str, commands: &[Str
     std::fs::create_dir_all(&scratch)?;
     let mut cmd = Command::new(&cfg.command);
     cmd.args(["-p", "--system-prompt", SYSTEM, "--tools", "", "--no-session-persistence", "--output-format", "json"]);
+    if cfg.isolated {
+        cmd.args(["--setting-sources", "project", "--strict-mcp-config"]);
+    }
     let model = cfg.model();
     if !model.is_empty() {
         cmd.args(["--model", &model]);
