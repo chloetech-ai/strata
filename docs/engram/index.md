@@ -253,9 +253,11 @@ It runs in one of four modes (`"deep": {"mode": …}` in the store's `config.jso
 | `off` | never | |
 | `tool` | only when the model calls `memory_ask` (or `engram ask`) | the tool's result |
 | `async` (default) | after every prompt of four words or more, once the store holds 20 records, in the background | with the next tool result; if the turn ends first, its end waits up to 25 s and, when the picks are new and the ranker's confidence is high or medium, asks the model once to reconsider and give its whole answer again |
-| `sync` | the same prompts, before the model starts | in the prompt's context, after a wait (16 s at the median and 21 s at p90 on the cloud VM, eight requests at a time) |
+| `sync` | the same prompts, before the model starts | in the prompt's context, after a wait (12 s at the median and 16 s at p90 in the cloud container, six requests at a time) |
 
-Both model calls go through `claude -p` with no tools, like distillation, and cost about $0.003 a request with a small model ($1.47 for 500 LongMemEval questions). The models are parameters: `planner_model` and `ranker_model` (default `haiku`, or `ENGRAM_DEEP_MODEL` for both), and `hard_model`, a stronger ranker used only when the planner calls a request hard (`ENGRAM_DEEP_HARD_MODEL`). `memory_ask` also takes a `model` for one question, so a user who allows a more expensive model can have it for the questions that need it.
+Both model calls go through `claude -p` with no tools and no prompt caching (each prompt is new, so a cache write would cost more than it saves), like distillation, and together read about 5,800 tokens and write 1,150: $0.0012 a request with a small model ($0.58 for 500 LongMemEval questions).
+
+Two settings make it cheaper. `"planner": "none"` (`ENGRAM_DEEP_PLAN=none`) skips the planning call: the ranker reads the best 30 of the request's own two searches, taken deeper. `"ranker": "local"` (`ENGRAM_DEEP_RANK=local`) replaces the ranking call with a logistic model over twelve features of each candidate (fused rank, similarity, term coverage, kind, length, recency) and keeps the top 5, with no model call; with `planner` also `none` the engine is free. On LongMemEval the default answers best: ranker only loses temporal questions, and the local ranker keeps about a quarter of the gain ([results](results.md#the-query-engine)). The models are parameters: `planner_model` and `ranker_model` (default `haiku`, or `ENGRAM_DEEP_MODEL` for both), and `hard_model`, a stronger ranker used only when the planner calls a request hard (`ENGRAM_DEEP_HARD_MODEL`). `memory_ask` also takes a `model` for one question, so a user who allows a more expensive model can have it for the questions that need it.
 
 ## Cost and latency targets
 
@@ -265,7 +267,7 @@ Both model calls go through `claude -p` with no tools, like distillation, and co
 | `UserPromptSubmit` | < 100 ms p99 at 1M records | 24.9 ms p50, 38.6 ms p99 as a hook process |
 | `SessionStart` | < 150 ms (daemon up), < 1 s with spawn | 50–72 ms including daemon start |
 | ingest | > 1,000 records/s | 48,000–52,000 records/s with the static embedder |
-| query engine (planner and ranker) | off the prompt's path unless `sync` | 16 s p50, 21 s p90, $0.003 per request with Haiku |
+| query engine (planner and ranker) | off the prompt's path unless `sync` | 12 s p50, 16 s p90, $0.0012 per request with Haiku |
 
 The default embedder is static (Model2Vec potion-retrieval-32M: token lookup and mean, 512 dimensions, microseconds per record). BGE-small (384 dimensions) is optional (`--features bert`) and costs about 50 ms per record on a CPU.
 
@@ -300,6 +302,7 @@ engram stats | briefing | stop
 | `ENGRAM_DISTILL_MODEL` | the model the distiller and consolidation use |
 | `ENGRAM_DEEP` | query engine mode: `off`, `tool`, `async` (default), `sync` |
 | `ENGRAM_DEEP_MODEL`, `ENGRAM_DEEP_PLANNER_MODEL`, `ENGRAM_DEEP_RANKER_MODEL`, `ENGRAM_DEEP_HARD_MODEL` | the query engine's models (default `haiku`; the hard model is unset) |
+| `ENGRAM_DEEP_PLAN`, `ENGRAM_DEEP_RANK` | `none` skips the planner; `local` ranks without a model call (defaults: `model`, `model`) |
 | `ENGRAM_CONSOLIDATE=0` | turns consolidation off |
 | `ENGRAM_EMBEDDER` | `static` (default), `bert`, or `hash:<dim>` for a model-free hash embedder |
 

@@ -1,0 +1,39 @@
+{
+  "all": {
+    "base_pack4k": -0.0,
+    "base_pool_all": -0.0,
+    "base_pool_any": -0.0,
+    "base_r_all@10": -0.0,
+    "base_r_any@10": -0.0,
+    "n": 0,
+    "pick_all": -0.0,
+    "pick_any": -0.0,
+    "picked_chars": -0.0,
+    "picks": -0.0,
+    "pool": -0.0,
+    "pool_all": -0.0,
+    "pool_any": -0.0
+  },
+  "by_type": {},
+  "cost_usd": 0.9378838500000014,
+  "dataset": "mab_factconsolidation",
+  "eligible": 0,
+  "embedder": "static:potion-retrieval-32M",
+  "errors": 0,
+  "hard": 0.165,
+  "hard_model": "",
+  "max_picks": 8,
+  "model": "haiku",
+  "ms_p50": 10678.0,
+  "ms_p90": 14890.0,
+  "planner": "model",
+  "questions": 800,
+  "ranker": "model",
+  "seconds": 4578.442546944,
+  "tokens": {
+    "cache_read": 14465,
+    "cache_write": 2752700,
+    "input": 3052,
+    "output": 773788
+  }
+}
