@@ -50,7 +50,7 @@
   {
    "block": 0,
    "prompt": "Great, please commit all of this with a sensible message.",
-   "result": "I committed everything as one commit, `c9aff30`, on `main`. The working tree is clean and all 16 tests pass.\n\nThe commit message covers the three changes:\n- The overlap fix.\n- The `errors.py` hierarchy with receptionist-facing messages.\n- The 10-minute gap before and after each appointment.\n\nThe cancellation fees and the 7-a-day cap were planning notes only, so they aren't in the commit.\n\nThis machine had no git name or email set, so I committed as `rkonow <rkonowkr@gmail.com>` using your account email, and left the git config unchanged. If you want a different author, tell me and I'll amend the commit.",
+   "result": "I committed everything as one commit, `c9aff30`, on `main`. The working tree is clean and all 16 tests pass.\n\nThe commit message covers the three changes:\n- The overlap fix.\n- The `errors.py` hierarchy with receptionist-facing messages.\n- The 10-minute gap before and after each appointment.\n\nThe cancellation fees and the 7-a-day cap were planning notes only, so they aren't in the commit.\n\nThis machine had no git name or email set, so I committed as `rkonow <user@example.com>` using your account email, and left the git config unchanged. If you want a different author, tell me and I'll amend the commit.",
    "cost": 0.026521890000000006,
    "steps": 3,
    "error": false,
@@ -95,7 +95,7 @@
   {
    "block": 1,
    "prompt": "The therapists keep asking for an iCal feed so they can see their appointments on their phones. We actually tried that last year: the phone calendars cached the feed for hours, so cancelled appointments kept showing up, and then the data protection officer stopped it because patient names were ending up on Google's and Apple's servers. So that's off the table. OK, that's all for today, please commit.",
-   "result": "I committed the cancellation and weekly overview work as `eb8bc41`, and the working tree is clean. All 22 tests pass.\n\nThe commit covers `Schedule.cancel()`, the `week()` overview, and the storage change that saves the cancelled flag. Files saved before this change load as not cancelled.\n\nThe commit uses the same git identity as last time, `rkonow <rkonowkr@gmail.com>`.\n\nUnderstood on the iCal feed. The series bookings, the SMS reminders and the cancellation fees are all still planned for next month and need the answers I asked about.",
+   "result": "I committed the cancellation and weekly overview work as `eb8bc41`, and the working tree is clean. All 22 tests pass.\n\nThe commit covers `Schedule.cancel()`, the `week()` overview, and the storage change that saves the cancelled flag. Files saved before this change load as not cancelled.\n\nThe commit uses the same git identity as last time, `rkonow <user@example.com>`.\n\nUnderstood on the iCal feed. The series bookings, the SMS reminders and the cancellation fees are all still planned for next month and need the answers I asked about.",
    "cost": 0.04148215,
    "steps": 3,
    "error": false,
@@ -122,7 +122,7 @@
   {
    "block": 2,
    "prompt": "Thanks, please commit.",
-   "result": "I committed the client register as `4393ded`, and the working tree is clean. All 30 tests pass.\n\nThe commit adds `src/slotwise/clients.py` and `tests/test_clients.py`. It covers the `Client` dataclass, `ClientBook.add()`, phone lookup in any format, and name search.\n\nIt uses the same git identity as before, `rkonow <rkonowkr@gmail.com>`.",
+   "result": "I committed the client register as `4393ded`, and the working tree is clean. All 30 tests pass.\n\nThe commit adds `src/slotwise/clients.py` and `tests/test_clients.py`. It covers the `Client` dataclass, `ClientBook.add()`, phone lookup in any format, and name search.\n\nIt uses the same git identity as before, `rkonow <user@example.com>`.",
    "cost": 0.05303793,
    "steps": 2,
    "error": false,

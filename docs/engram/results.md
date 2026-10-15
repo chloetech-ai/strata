@@ -50,7 +50,7 @@ The 6,000-character briefing did most of the work: it reached every Engram run. 
 **Limits.** Three small projects, one history each, one small model. The tasks were written alongside the histories and aimed at facts they state; real work rarely depends on earlier sessions this often, so the 40-point gain is a gain on such tasks, not on work in general.
 
 {: .note }
-A longer A/B on multi-day scenarios (`engram/results/long/*_v1_leaky`) is kept in the repository for the record only. Claude Code's own auto-memory, which lives outside the repository, was not reset between runs, so the runs within a lane were not independent. The harness now snapshots and restores it; that rerun has not been recorded yet.
+A longer A/B on multi-day scenarios was run twice. The first run (`engram/results/long/*_v1_leaky`) is kept for the record only: Claude Code's own auto-memory, which lives outside the repository, was not reset between runs, so the runs within a lane were not independent. The rerun with the isolated harness (`engram/results/long/stockroom` and `slotwise`, 240 runs) does not show Engram recovering what compaction dropped. After a hand review of the regex-graded advice answers, stockroom was solved 26/30 with compaction alone, 27/30 with Engram, 30/30 with Engram and graph recall, and 30/30 with the full history; slotwise was 30/30 in every lane. Each compacted lane missed the one conversation-only fact its own last compaction summary dropped. In both Engram lanes the recall gate skipped those prompts and no run called a memory tool, so the differences between lanes come from their summaries. `stockroom/NOTE.md` has the review.
 
 ## This repository's own 26-hour session
 

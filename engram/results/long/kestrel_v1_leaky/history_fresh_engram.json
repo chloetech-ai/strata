@@ -248,7 +248,7 @@
   {
    "block": 5,
    "prompt": "Please commit.",
-   "result": "I made two commits on `calendar-day-and-patient-ids`, and I didn't push:\n\n- `82793a3` Add Waitlist for patients waiting for an appointment (`waitlist.py` and its tests)\n- `07ffa2b` Add day command to print a therapist's appointments (`cli.py`, `__main__.py`, `test_cli.py`, README)\n\nBoth are authored as Roberto Konow <rkonowkr@gmail.com>, passed per command since git has no identity configured here. Each has the Co-Authored-By line for Claude (small) The full suite passed (86 tests) before committing.\n\nLeft out: `.mcp.json` and the `__pycache__` folders, which are untracked.",
+   "result": "I made two commits on `calendar-day-and-patient-ids`, and I didn't push:\n\n- `82793a3` Add Waitlist for patients waiting for an appointment (`waitlist.py` and its tests)\n- `07ffa2b` Add day command to print a therapist's appointments (`cli.py`, `__main__.py`, `test_cli.py`, README)\n\nBoth are authored as Roberto Konow <user@example.com>, passed per command since git has no identity configured here. Each has the Co-Authored-By line for Claude (small) The full suite passed (86 tests) before committing.\n\nLeft out: `.mcp.json` and the `__pycache__` folders, which are untracked.",
    "cost": 0.03178893,
    "steps": 3,
    "error": false,
