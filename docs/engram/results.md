@@ -294,15 +294,15 @@ A store is filled with LongMemEval turns: 94 needle questions whose evidence ses
 
 Later work removed the biggest remaining cost, which was not the search at all. A write used to make the next query rebuild an HNSW graph over the last memtable chunk (12 ms); memtable segments now scan their vectors instead. A query right after a write fell from 18 to **6.4 ms** at a million records (p99 45 → 16 ms), and the prompt hook, with the knowledge query running beside the main search, takes **24.9 ms** at the median and 38.6 ms at p99.
 
-**What the October changes cost.** `main` (787387d) and the changed build were compiled in separate checkouts on the same M2 MacBook Air and run one at a time on a quiet machine (1-minute load average under 3), with distillation and the query engine off, as in every timing here. One scale run per side:
+**What the October changes cost.** `main` (787387d) and the final build of the October changes were compiled in separate checkouts and run one at a time in the cloud container (Intel Xeon 2.10 GHz, 4 cores, 15 GiB, Linux), each run starting only when no build, benchmark or model call was running and the 1-minute load average was under 1.0. Distillation and the query engine were off, as in every timing here. One scale run per side:
 
 | records | recall query p50 / p99, main → changed | full hook p50 / p99, main → changed | needles in top 10 |
 |---|---|---|---|
-| 10,000 | 1.23 / 2.5 → 1.27 / 3.2 ms | 14.9 / 17.5 → 15.0 / 18.4 ms | 0.80 → 0.80 |
-| 100,000 | 1.65 / 4.6 → 1.64 / 5.1 ms | 15.8 / 19.6 → 16.5 / 20.4 ms | 0.65 → 0.65 |
-| 1,000,000 | 5.69 / 17.8 → 5.66 / 15.8 ms | 25.2 / 40.1 → 26.0 / 44.6 ms | 0.44 → 0.44 |
+| 10,000 | 2.54 / 4.2 → 2.09 / 3.6 ms | 6.8 / 12.1 → 6.6 / 11.4 ms | 0.80 → 0.80 |
+| 100,000 | 2.97 / 5.0 → 3.32 / 4.8 ms | 8.1 / 12.4 → 8.1 / 17.9 ms | 0.65 → 0.65 |
+| 1,000,000 | 14.7 / 34.5 → 11.2 / 22.6 ms | 19.4 / 39.4 → 16.9 / 30.1 ms | 0.44 → 0.44 |
 
-At a million records the latency benchmark then ran three times per side, alternating. The prompt hook is 0.6–1.3 ms slower at the median in every pair (24.25–24.96 ms on `main`, 25.54–25.95 ms changed; +1.0 ms, 4%, on average); the cause was not isolated. Its p99 (38.9–41.0 against 40.0–45.6 ms), appends (p50 4.4–4.7 ms on both) and a query right after a write (within 0.2 ms) stay inside the run-to-run spread. The files are in `engram/results/v2/m2/`, with the machine's load before and after each run.
+At a million records the latency benchmark then ran three times per side, alternating. The prompt hook's median is 16.0–17.7 ms on `main` and 15.8–17.5 ms changed (16.9 against 16.8 on average), its p99 27–40 against 30–35 ms; appends (p50 0.6–0.8 ms) and a query right after a write (11–15 ms) overlap as well. The changes cost nothing measurable here. An earlier comparison on the M2 MacBook Air, with a build from before the last query engine changes, found the prompt hook about 1 ms (4%) slower at the median in each of three pairs; the container's run-to-run spread, about 2 ms, is larger than that. Against the M2 numbers above, the container searches more slowly (a recall query at a million records takes 11–15 ms against 5.7) and starts hook processes faster (3 ms against 10), and its appends do not wait for a drive cache flush (0.7 ms against 4.5). The files are in `engram/results/v2/cloud/` and `engram/results/v2/m2/`, with the machine's load before and after each run.
 
 Quality is what degrades with size: the filler here is chat on every subject, while real project history is more homogeneous, so this is a stress test rather than a forecast. Strata's filters (session, time, file, kind) are what keep large stores precise, and `memory_sql` gives the model those filters directly.
 

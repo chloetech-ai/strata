@@ -1,0 +1,16 @@
+== 10000 records
+  embedder open 48.6 ms (mapped); reading the table 435.4 ms
+  phases: bm25_top50 0.53, embed_query 0.07, fuse 0.26, idf_count_queries 0.16, idf_dictionary 0.00, pack_format 0.23, search_total 1.81, vector_top50 0.61
+  chunk1024_hnsw: append 0.74, rebuild 18.64, query after write 20.58 (p99 69.79), query after rebuild 2.36
+  chunk1024_flat: append 0.62, rebuild 3.15, query after write 5.52 (p99 12.90), query after rebuild 2.21
+  chunk256_flat: append 0.63, rebuild 1.24, query after write 3.54 (p99 6.05), query after rebuild 2.28
+  chunk64_flat: append 0.88, rebuild 0.59, query after write 3.33 (p99 5.40), query after rebuild 2.80
+  hooks: client_noop 0.54, client_prompt 3.79, client_tool 0.63, process_noop 3.08, process_prompt 6.37, process_tool 3.16
+== 100000 records
+  embedder open 58.6 ms (mapped); reading the table 146.8 ms
+  phases: bm25_top50 1.01, embed_query 0.07, fuse 0.27, idf_count_queries 0.26, idf_dictionary 0.01, pack_format 0.19, search_total 2.51, vector_top50 0.82
+  chunk1024_hnsw: append 0.84, rebuild 20.69, query after write 23.89 (p99 77.41), query after rebuild 3.15
+  chunk1024_flat: append 0.64, rebuild 3.14, query after write 6.17 (p99 13.47), query after rebuild 2.92
+  chunk256_flat: append 0.65, rebuild 1.35, query after write 4.35 (p99 6.95), query after rebuild 3.11
+  chunk64_flat: append 0.68, rebuild 0.59, query after write 3.84 (p99 6.56), query after rebuild 3.36
+  hooks: client_noop 0.57, client_prompt 4.63, client_tool 0.65, process_noop 3.07, process_prompt 7.50, process_tool 3.17
