@@ -30,5 +30,4 @@ Tests on the branch (cargo test --release, after the timed runs)
 
 Note: main's scale run began a few minutes after both release builds finished, so its 5- and
 15-minute averages (7.58, 5.74) still carried the build load. The 1-minute average was 2.22,
-and nothing else was running. Each side ran once; differences of a few percent between main and
-the branch are within run-to-run noise on this machine.
+and nothing else was running. Each side ran once, so no run-to-run spread was measured.
