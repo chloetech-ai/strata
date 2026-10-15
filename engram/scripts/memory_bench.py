@@ -897,6 +897,32 @@ def lane_main(args, sc, name, lock, do_runs):
             kill_home_procs(lane.home)
 
 
+# ---------------------------------------------------------------- regrade
+
+
+def cmd_regrade(args, sc):
+    """Grades the --tasks rows again from their stored answers, after a
+    grader fix. Only for tasks whose grader reads the answer alone (the
+    repository is not restored); each changed row keeps its old score."""
+    if not args.tasks:
+        sys.exit("regrade needs --tasks (graders that read the answer only)")
+    path = os.path.join(args.results, "runs.jsonl")
+    by = {t["id"]: t for t in sc["tasks"]}
+    rows, changed = [json.loads(l) for l in open(path)], 0
+    for r in rows:
+        if r["task"] in args.tasks:
+            score, detail = by[r["task"]]["grade"](None, r.get("answer") or "")
+            if score != r["score"]:
+                r.setdefault("regraded_from", r["score"])
+                changed += 1
+            r.update(score=score, solved=score >= 1.0, checks=detail)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in rows)
+    os.replace(tmp, path)
+    print(f"{changed} rows changed")
+
+
 # ---------------------------------------------------------------- report
 
 
@@ -1000,7 +1026,7 @@ def make_bench_bin(work):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["history", "run", "report", "all"])
+    ap.add_argument("cmd", choices=["history", "run", "report", "all", "regrade"])
     ap.add_argument("--scenario", required=True, help="name under eval/ab/scenarios, or a scenario directory")
     ap.add_argument("--lanes", nargs="+", default=None, help=f"default: {' '.join(DEFAULT_LANES)}")
     ap.add_argument("--model", default="haiku")
@@ -1024,6 +1050,9 @@ def main():
     if args.cmd == "report":
         args.lanes = args.lanes or []
         cmd_report(args, sc)
+        return
+    if args.cmd == "regrade":
+        cmd_regrade(args, sc)
         return
     args.lanes = args.lanes or DEFAULT_LANES
     for name in args.lanes:

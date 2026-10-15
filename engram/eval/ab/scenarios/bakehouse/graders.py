@@ -284,24 +284,33 @@ def grade_relief_baker_note(repo, answer):
 
 
 # Quick questions: the user asks for a fact and nothing else, so nothing makes
-# the agent open config.py. An old value is allowed only when the answer
-# marks it as old ("it used to be 14:00").
-OLD_MARK = r"(?i)used to|previous|no longer|changed|moved|\bwas\b|\bwere\b|\bold\b|formerly|instead of|\bnot\b"
+# the agent open config.py. The answer must give the current value as the
+# answer: the first value it names is the current one, or every mention of
+# the old one is marked as old ("our notes say 2 pm, but that's out of date").
+OLD_MARK = r"(?i)used to|previous|no longer|out of date|outdated|stale|predates|superseded|changed|moved|move from|from 14|\bwas\b|\bwere\b|\bold(er)?\b|formerly|instead of|earlier|before the change|\bnot\b"
+NEW_CUTOFF = r"(?i)\b13[:.h]00\b|\b1\s*(:00\s*)?p\.?m\b|\bone o'?clock\b|\b13h\b"
+OLD_CUTOFF = r"(?i)\b14[:.h]00\b|\b2\s*(:00\s*)?p\.?m\b|\btwo o'?clock\b"
+OLD_CLOSED = r"(?i)closed (on )?Sundays?|Sundays? (we're|we are|is|are) closed|(don't|do not|never)\b[^.]{0,30}\bon Sundays?"
 
 
-def _states_as_current(a, pattern):
-    for m in re.finditer(pattern, a):
-        near = a[max(0, m.start() - 80):m.end() + 40]
-        if not re.search(OLD_MARK, near):
-            return True
-    return False
+def _answers_with(a, new, old):
+    """The current value is the answer: named first, or the old one only as old."""
+    n, o = re.search(new, a), re.search(old, a)
+    if not n:
+        return False
+    if not o or n.start() < o.start():
+        return True
+    for m in re.finditer(old, a):
+        if not re.search(OLD_MARK, a[max(0, m.start() - 80):m.end() + 60]):
+            return False
+    return True
 
 
 def grade_cutoff_quick(repo, answer):
     a = answer or ""
     return checks(
-        says_13_00=re.search(r"(?i)\b13[:.h]00\b|\b1\s*(:00\s*)?p\.?m\b|\bone o'?clock\b|\b13h\b", a) is not None,
-        not_14_00=not _states_as_current(a, r"(?i)\b14[:.h]00\b|\b2\s*(:00\s*)?p\.?m\b|\btwo o'?clock\b"),
+        says_13_00=re.search(NEW_CUTOFF, a) is not None,
+        not_14_00=_answers_with(a, NEW_CUTOFF, OLD_CUTOFF),
     )
 
 
@@ -309,7 +318,7 @@ def grade_closed_day_quick(repo, answer):
     a = answer or ""
     return checks(
         says_monday=re.search(r"(?i)\bMondays?\b", a) is not None,
-        not_sunday=not _states_as_current(a, r"(?i)closed (on )?Sundays?|Sundays? (we're|we are|is|are) closed|(don't|do not|never)\b[^.]{0,30}\bon Sundays?"),
+        not_sunday=_answers_with(a, r"(?i)\bMondays?\b", OLD_CLOSED),
     )
 
 
