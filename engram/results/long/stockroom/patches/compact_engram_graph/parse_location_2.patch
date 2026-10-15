@@ -1,0 +1,68 @@
+diff --git a/src/stockroom/items.py b/src/stockroom/items.py
+index 75f79ae..ece6500 100644
+--- a/src/stockroom/items.py
++++ b/src/stockroom/items.py
+@@ -1,13 +1,29 @@
+ """The item catalog."""
+ 
++import re
+ from dataclasses import dataclass, replace
+ 
++_LOCATION = re.compile(r"([A-Za-z])-([0-9]+)-([0-9]+)")
++
+ 
+ def normalize_sku(sku):
+     """Trim surrounding whitespace and uppercase, so ' br-1042 ' is 'BR-1042'."""
+     return sku.strip().upper()
+ 
+ 
++def parse_location(code):
++    """Split a bin code such as 'b-12-3' into ('B', 12, 3).
++
++    Raises ValueError for anything that is not an aisle letter, a bay number
++    and a shelf number joined by hyphens.
++    """
++    match = _LOCATION.fullmatch(code.strip())
++    if match is None:
++        raise ValueError(f"not a bin code: {code!r}")
++    aisle, bay, shelf = match.groups()
++    return aisle.upper(), int(bay), int(shelf)
++
++
+ @dataclass
+ class Item:
+     sku: str
+diff --git a/tests/test_items.py b/tests/test_items.py
+index 2f51f2b..025218f 100644
+--- a/tests/test_items.py
++++ b/tests/test_items.py
+@@ -1,6 +1,6 @@
+ import unittest
+ 
+-from stockroom.items import Catalog, Item, normalize_sku
++from stockroom.items import Catalog, Item, normalize_sku, parse_location
+ 
+ 
+ class NormalizeSkuTest(unittest.TestCase):
+@@ -25,6 +25,21 @@ class ItemValidationTest(unittest.TestCase):
+         self.assertEqual((item.reorder_point, item.case_size), (0, 1))
+ 
+ 
++class ParseLocationTest(unittest.TestCase):
++    def test_splits_bin_code(self):
++        self.assertEqual(parse_location("B-12-3"), ("B", 12, 3))
++
++    def test_aisle_is_uppercased_and_whitespace_ignored(self):
++        self.assertEqual(parse_location(" b-9-1 "), ("B", 9, 1))
++
++    def test_rejects_anything_else(self):
++        for code in ("", "B-12", "B-12-3-4", "BB-12-3", "1-12-3", "B-x-3",
++                     "B-12-", "B--12-3", "B-+12-3", "B-1２-3", "B 12 3"):
++            with self.subTest(code=code):
++                with self.assertRaises(ValueError):
++                    parse_location(code)
++
++
+ class CatalogTest(unittest.TestCase):
+     def test_messy_sku_matches_normalized_item(self):
+         catalog = Catalog([Item("br-1042", "Hex bolt M8x40", "C-03-2")])

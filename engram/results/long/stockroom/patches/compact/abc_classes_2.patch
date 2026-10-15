@@ -1,0 +1,90 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..280de3b
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,33 @@
++"""ABC analysis: classify SKUs by their share of annual consumption value."""
++
++A_LIMIT = 0.80
++B_LIMIT = 0.95
++
++
++def abc_classes(values):
++    """Map each SKU in `values` (SKU -> annual consumption value) to 'A', 'B' or 'C'.
++
++    SKUs are taken highest value first. A SKU is 'A' while the cumulative share
++    up to and including it is at most 80% of the total, 'B' up to 95%, and 'C'
++    after that.
++    """
++    if not values:
++        return {}
++    if any(v < 0 for v in values.values()):
++        raise ValueError("consumption values must not be negative")
++    total = sum(values.values())
++    if total <= 0:
++        raise ValueError("total consumption must be positive")
++
++    classes = {}
++    running = 0
++    for sku, value in sorted(values.items(), key=lambda item: (-item[1], item[0])):
++        running += value
++        share = running / total
++        if share <= A_LIMIT:
++            classes[sku] = "A"
++        elif share <= B_LIMIT:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..7270781
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,45 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input_gives_empty_dict(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_follow_cumulative_share_highest_first(self):
++        # Totals 100. Running shares: 50%, 75%, 90%, 97%, 100%.
++        values = {"BR-1": 50, "BR-2": 25, "BR-3": 15, "BR-4": 7, "BR-5": 3}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "A", "BR-3": "B", "BR-4": "C", "BR-5": "C"},
++        )
++
++    def test_boundary_shares_are_inclusive(self):
++        # Running shares hit exactly 80% and 95%.
++        values = {"BR-1": 80, "BR-2": 15, "BR-3": 5}
++        self.assertEqual(abc_classes(values), {"BR-1": "A", "BR-2": "B", "BR-3": "C"})
++
++    def test_input_order_does_not_matter(self):
++        values = {"BR-3": 5, "BR-1": 80, "BR-2": 15}
++        self.assertEqual(abc_classes(values)["BR-1"], "A")
++
++    def test_share_crossing_80_percent_is_not_a(self):
++        # BR-1 alone is 85%, past the 80% limit, so it is B even though it is the top SKU.
++        self.assertEqual(abc_classes({"BR-1": 85, "BR-2": 15}), {"BR-1": "B", "BR-2": "C"})
++
++    def test_single_sku_is_c(self):
++        # Its cumulative share is 100%, past the 95% limit.
++        self.assertEqual(abc_classes({"BR-1": 10}), {"BR-1": "C"})
++
++    def test_zero_total_is_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": 0, "BR-2": 0})
++
++    def test_negative_value_is_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": 10, "BR-2": -1})
++
++
++if __name__ == "__main__":
++    unittest.main()

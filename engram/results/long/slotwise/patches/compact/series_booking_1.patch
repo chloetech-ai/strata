@@ -1,0 +1,171 @@
+diff --git a/src/slotwise/__init__.py b/src/slotwise/__init__.py
+index cf178df..a9f6755 100644
+--- a/src/slotwise/__init__.py
++++ b/src/slotwise/__init__.py
+@@ -1,17 +1,20 @@
+ """slotwise: appointment scheduling for a small physiotherapy practice."""
+ 
+ from .clients import Client, ClientBook
+-from .errors import BookingError, OutsideOpeningHours, SlotTaken
++from .errors import BookingError, OutsideOpeningHours, SeriesTooLong, SlotTaken
+ from .model import TREATMENTS, Appointment
+ from .schedule import Schedule
++from .series import book_series
+ 
+ __all__ = [
+     "TREATMENTS",
+     "Appointment",
+     "Schedule",
++    "book_series",
+     "Client",
+     "ClientBook",
+     "BookingError",
+     "SlotTaken",
+     "OutsideOpeningHours",
++    "SeriesTooLong",
+ ]
+diff --git a/src/slotwise/errors.py b/src/slotwise/errors.py
+index fdcd1f6..f5c89bd 100644
+--- a/src/slotwise/errors.py
++++ b/src/slotwise/errors.py
+@@ -11,3 +11,7 @@ class SlotTaken(BookingError):
+ 
+ class OutsideOpeningHours(BookingError):
+     """The appointment does not fall within the practice's opening hours."""
++
++
++class SeriesTooLong(BookingError):
++    """The series has more sessions than the insurer pays for."""
+diff --git a/src/slotwise/series.py b/src/slotwise/series.py
+new file mode 100644
+index 0000000..36101ee
+--- /dev/null
++++ b/src/slotwise/series.py
+@@ -0,0 +1,47 @@
++"""Series bookings: the same treatment every week, at the same weekday and time."""
++
++import datetime
++
++from .errors import BookingError, SeriesTooLong, SlotTaken
++from .model import Appointment
++
++# Insurance pays for at most this many sessions per prescription.
++MAX_SESSIONS = 9
++# How many weeks ahead to look for free weeks when some are taken.
++SEARCH_WEEKS = 26
++
++WEEK = datetime.timedelta(weeks=1)
++
++
++def book_series(schedule, first, count):
++    """Books `count` weekly sessions, starting with `first`, and returns them in date order.
++
++    A week that is already taken is skipped and a later week is booked instead, so the client
++    still gets every session. Either all sessions are booked or none are.
++    """
++    if count > MAX_SESSIONS:
++        raise SeriesTooLong(f"A series can have at most {MAX_SESSIONS} sessions, not {count}.")
++    if count < 1:
++        raise ValueError("A series needs at least one session.")
++
++    booked = []
++    try:
++        booked.append(schedule.book(first))
++        for weeks_ahead in range(1, SEARCH_WEEKS + 1):
++            if len(booked) == count:
++                break
++            start = first.start + weeks_ahead * WEEK
++            try:
++                booked.append(schedule.book(Appointment(first.therapist, first.client, start, first.treatment)))
++            except SlotTaken:
++                continue
++        if len(booked) < count:
++            raise SlotTaken(
++                f"Only {len(booked)} of {count} sessions fit in the next {SEARCH_WEEKS} weeks, "
++                f"so the series was not booked."
++            )
++    except BookingError:
++        for appointment in booked:
++            schedule.appointments.remove(appointment)
++        raise
++    return booked
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..9a89521
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,74 @@
++import datetime
++import unittest
++
++from slotwise.errors import SeriesTooLong, SlotTaken
++from slotwise.model import Appointment
++from slotwise.schedule import Schedule
++from slotwise.series import MAX_SESSIONS, SEARCH_WEEKS, book_series
++
++# 8 Sep 2026 is a Tuesday.
++TUESDAY = datetime.datetime(2026, 9, 8, 9, 0)
++
++
++def first_session(start=TUESDAY):
++    return Appointment("lena", "Kim Weber", start)
++
++
++def weeks_after(start, *weeks):
++    return [start + datetime.timedelta(weeks=n) for n in weeks]
++
++
++class BookSeriesTest(unittest.TestCase):
++    def test_books_weekly_at_the_same_time(self):
++        s = Schedule()
++        booked = book_series(s, first_session(), 3)
++        self.assertEqual([a.start for a in booked], weeks_after(TUESDAY, 0, 1, 2))
++        self.assertEqual(s.appointments, booked)
++
++    def test_every_session_has_its_own_id(self):
++        s = Schedule()
++        booked = book_series(s, first_session(), 3)
++        self.assertEqual(len({a.id for a in booked}), 3)
++
++    def test_taken_week_is_skipped_and_a_week_is_added_at_the_end(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", TUESDAY + datetime.timedelta(weeks=1)))
++        booked = book_series(s, first_session(), 3)
++        self.assertEqual([a.start for a in booked], weeks_after(TUESDAY, 0, 2, 3))
++
++    def test_nine_sessions_are_allowed(self):
++        s = Schedule()
++        self.assertEqual(len(book_series(s, first_session(), MAX_SESSIONS)), 9)
++
++    def test_more_than_nine_sessions_is_refused_and_nothing_is_booked(self):
++        s = Schedule()
++        with self.assertRaises(SeriesTooLong):
++            book_series(s, first_session(), 12)
++        self.assertEqual(s.appointments, [])
++
++    def test_taken_first_session_is_refused_and_nothing_is_booked(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", TUESDAY))
++        with self.assertRaises(SlotTaken):
++            book_series(s, first_session(), 3)
++        self.assertEqual(len(s.appointments), 1)
++
++    def test_not_enough_free_weeks_books_nothing(self):
++        s = Schedule()
++        for n in range(1, SEARCH_WEEKS + 1):
++            s.book(Appointment("lena", "Jo Li", TUESDAY + datetime.timedelta(weeks=n)))
++        before = list(s.appointments)
++        with self.assertRaises(SlotTaken):
++            book_series(s, first_session(), 2)
++        self.assertEqual(s.appointments, before)
++
++    def test_cancelled_session_does_not_block_its_week(self):
++        s = Schedule()
++        other = s.book(Appointment("lena", "Jo Li", TUESDAY + datetime.timedelta(weeks=1)))
++        s.cancel(other.id)
++        booked = book_series(s, first_session(), 2)
++        self.assertEqual([a.start for a in booked], weeks_after(TUESDAY, 0, 1))
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,109 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..3d37b3e
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,31 @@
++"""What the stock on hand is worth, costed first in, first out (FIFO)."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand.
++
++    Each goods-in movement opens a layer at its unit cost. Each goods-out
++    movement uses up the oldest layers first. Stock that was issued beyond
++    what the layers hold (negative stock) has no cost and adds nothing.
++    """
++    sku = normalize_sku(sku)
++    layers = deque()  # [qty, unit_cost], oldest first
++    # Stable sort: movements on the same day keep their logged order.
++    for m in sorted(inventory.movements_for(sku), key=lambda m: m.date):
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"{sku}: goods in on {m.date.isoformat()} have no unit cost")
++            layers.append([m.qty, m.unit_cost])
++            continue
++        remaining = -m.qty
++        while remaining and layers:
++            take = min(remaining, layers[0][0])
++            layers[0][0] -= take
++            remaining -= take
++            if layers[0][0] == 0:
++                layers.popleft()
++    return sum(qty * cost for qty, cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..7ae74f7
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,66 @@
++import datetime
++import unittest
++
++from stockroom import Inventory, Movement
++from stockroom.valuation import stock_value
++
++D1 = datetime.date(2026, 9, 1)
++D2 = datetime.date(2026, 9, 5)
++D3 = datetime.date(2026, 9, 9)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_nothing_received_is_worth_nothing(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt_is_qty_times_unit_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 250, date=D1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 2500)
++
++    def test_sales_take_the_oldest_stock_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, date=D1)
++        inv.receive("BR-1042", 10, 300, date=D2)
++        inv.issue("BR-1042", 15, date=D3)  # 10 at 100, then 5 at 300
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 300)
++
++    def test_a_sale_that_ends_inside_a_layer_leaves_the_rest_of_it(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, date=D1)
++        inv.issue("BR-1042", 4, date=D2)
++        self.assertEqual(stock_value(inv, "BR-1042"), 6 * 100)
++
++    def test_receipts_are_costed_by_date_not_by_logged_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 300, date=D2)
++        inv.receive("BR-1042", 10, 100, date=D1)  # logged later, received earlier
++        inv.issue("BR-1042", 10, date=D3)  # consumes the D1 layer at 100
++        self.assertEqual(stock_value(inv, "BR-1042"), 10 * 300)
++
++    def test_negative_stock_adds_no_value(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, date=D1)
++        inv.issue("BR-1042", 8, date=D2)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 2, 50, date=D1)
++        self.assertEqual(stock_value(inv, " br-1042 "), 100)
++
++    def test_other_skus_are_not_counted(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 2, 50, date=D1)
++        inv.receive("BR-2000", 9, 999, date=D1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 100)
++
++    def test_goods_in_without_a_unit_cost_cannot_be_valued(self):
++        inv = Inventory()
++        inv.movements.append(Movement(sku="BR-1042", qty=3, date=D1, reason="RETURN"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

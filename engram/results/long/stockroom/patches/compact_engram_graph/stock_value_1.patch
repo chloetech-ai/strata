@@ -1,0 +1,117 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..cada00a
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,40 @@
++"""What the stock on hand is worth, valued FIFO (oldest receipts sold first)."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value, in cents, of the stock of `sku` currently on hand.
++
++    Receipts form cost layers, and each sale or other goods out consumes the
++    oldest layers first. Movements are taken in date order; ties keep log order.
++    Goods out that exceed the stock on hand leave a deficit, and later goods in
++    cover that deficit before they add any value, since their cost was never
++    attached to the sale. So the value is zero whenever on hand is negative.
++    """
++    sku = normalize_sku(sku)
++    movements = sorted(inventory.movements_for(sku), key=lambda m: m.date)
++    layers = deque()  # [qty, unit_cost] pairs, oldest first
++    deficit = 0
++    for m in movements:
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"no unit cost for {m.reason} of {sku}")
++            qty = m.qty
++            covered = min(qty, deficit)
++            deficit -= covered
++            qty -= covered
++            if qty:
++                layers.append([qty, m.unit_cost])
++        else:
++            qty = -m.qty
++            while qty and layers:
++                take = min(qty, layers[0][0])
++                layers[0][0] -= take
++                qty -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            deficit += qty
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..aa6b2e8
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,65 @@
++import datetime
++import unittest
++
++from stockroom import Inventory, Movement
++from stockroom.valuation import stock_value
++
++D1 = datetime.date(2026, 9, 1)
++D2 = datetime.date(2026, 9, 2)
++D3 = datetime.date(2026, 9, 3)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_unknown_sku_is_worth_nothing(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_receipts_are_valued_at_their_unit_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 500, date=D1)
++        inv.receive("BR-1042", 5, 700, date=D2)
++        self.assertEqual(stock_value(inv, "BR-1042"), 10 * 500 + 5 * 700)
++
++    def test_sales_consume_the_oldest_receipts_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 500, date=D1)
++        inv.receive("BR-1042", 10, 700, date=D2)
++        inv.issue("BR-1042", 15, date=D3)
++        self.assertEqual(inv.on_hand("BR-1042"), 5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 700)
++
++    def test_fifo_follows_dates_not_log_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 700, date=D2)
++        inv.receive("BR-1042", 10, 500, date=D1)
++        inv.issue("BR-1042", 10, date=D3)
++        self.assertEqual(stock_value(inv, "BR-1042"), 10 * 700)
++
++    def test_negative_stock_is_worth_nothing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 500, date=D1)
++        inv.issue("BR-1042", 15, date=D2)
++        self.assertEqual(inv.on_hand("BR-1042"), -5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_goods_in_cover_an_earlier_shortfall_before_adding_value(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 500, date=D1)
++        inv.issue("BR-1042", 15, date=D2)
++        inv.receive("BR-1042", 10, 700, date=D3)
++        self.assertEqual(inv.on_hand("BR-1042"), 5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 700)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 500, date=D1)
++        self.assertEqual(stock_value(inv, " br-1042 "), 10 * 500)
++
++    def test_goods_in_without_a_unit_cost_are_an_error(self):
++        inv = Inventory()
++        inv.movements.append(Movement("BR-1042", 4, D1, "COUNT"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

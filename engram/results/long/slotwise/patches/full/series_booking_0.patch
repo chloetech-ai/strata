@@ -1,0 +1,154 @@
+diff --git a/src/slotwise/__init__.py b/src/slotwise/__init__.py
+index 78d2e46..8e500e8 100644
+--- a/src/slotwise/__init__.py
++++ b/src/slotwise/__init__.py
+@@ -1,7 +1,19 @@
+ """slotwise: appointment scheduling for a small physiotherapy practice."""
+ 
+-from .errors import AlreadyCancelled, BookingError, OutsideOpeningHours, SlotTaken
++from .errors import AlreadyCancelled, BookingError, NotEnoughFreeWeeks, OutsideOpeningHours, SeriesTooLong, SlotTaken
+ from .model import TREATMENTS, Appointment
+ from .schedule import Schedule
++from .series import book_series
+ 
+-__all__ = ["TREATMENTS", "Appointment", "AlreadyCancelled", "BookingError", "OutsideOpeningHours", "Schedule", "SlotTaken"]
++__all__ = [
++    "TREATMENTS",
++    "Appointment",
++    "AlreadyCancelled",
++    "BookingError",
++    "NotEnoughFreeWeeks",
++    "OutsideOpeningHours",
++    "Schedule",
++    "SeriesTooLong",
++    "SlotTaken",
++    "book_series",
++]
+diff --git a/src/slotwise/errors.py b/src/slotwise/errors.py
+index 02cc847..1301206 100644
+--- a/src/slotwise/errors.py
++++ b/src/slotwise/errors.py
+@@ -15,3 +15,11 @@ class OutsideOpeningHours(BookingError):
+ 
+ class AlreadyCancelled(BookingError):
+     """The appointment was cancelled earlier, so it can't be cancelled again."""
++
++
++class SeriesTooLong(BookingError):
++    """A series may have at most 9 sessions, because the insurer pays for no more."""
++
++
++class NotEnoughFreeWeeks(BookingError):
++    """Not enough free weeks were found in the search window to book the whole series."""
+diff --git a/src/slotwise/series.py b/src/slotwise/series.py
+new file mode 100644
+index 0000000..47d49fa
+--- /dev/null
++++ b/src/slotwise/series.py
+@@ -0,0 +1,38 @@
++"""Weekly series of sessions, as prescribed by a doctor."""
++
++import datetime
++
++from .errors import BookingError, NotEnoughFreeWeeks, SeriesTooLong
++from .model import Appointment
++
++MAX_SESSIONS = 9  # the insurer pays for no more per prescription
++SEARCH_WEEKS = 12  # how far ahead a series may run to find free weeks
++
++
++def book_series(schedule, first, count):
++    """Books `count` weekly sessions like `first`, starting with `first`'s week.
++
++    A week that is already taken is skipped and the series continues in a later week.
++    Either all `count` sessions are booked or none are, and the booked appointments are returned.
++    """
++    if count > MAX_SESSIONS:
++        raise SeriesTooLong(f"A series can have at most {MAX_SESSIONS} sessions, not {count}.")
++    booked = []
++    for week in range(SEARCH_WEEKS):
++        if len(booked) == count:
++            break
++        candidate = Appointment(
++            first.therapist, first.client, first.start + datetime.timedelta(weeks=week), first.treatment
++        )
++        try:
++            booked.append(schedule.book(candidate))
++        except BookingError:
++            continue
++    if len(booked) < count:
++        for appointment in booked:
++            schedule.appointments.remove(appointment)
++        raise NotEnoughFreeWeeks(
++            f"Only {len(booked)} of {count} sessions fit within {SEARCH_WEEKS} weeks, so none were booked. "
++            "Please choose another start date."
++        )
++    return booked
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..bf367f8
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,62 @@
++import datetime
++import unittest
++
++from slotwise.errors import NotEnoughFreeWeeks, SeriesTooLong
++from slotwise.model import Appointment
++from slotwise.schedule import Schedule
++from slotwise.series import book_series
++
++MONDAY = datetime.datetime(2026, 9, 7, 9, 0)  # Monday 7 September 2026, 09:00
++
++
++def first(therapist="lena", client="Kim Weber", start=MONDAY):
++    return Appointment(therapist, client, start, "standard")
++
++
++class BookSeriesTest(unittest.TestCase):
++    def test_books_consecutive_weeks_at_same_time(self):
++        s = Schedule()
++        booked = book_series(s, first(), 4)
++        self.assertEqual([a.start for a in booked], [MONDAY + datetime.timedelta(weeks=i) for i in range(4)])
++        self.assertEqual(len(s.appointments), 4)
++
++    def test_nine_is_allowed(self):
++        s = Schedule()
++        self.assertEqual(len(book_series(s, first(), 9)), 9)
++
++    def test_more_than_nine_is_refused_and_books_nothing(self):
++        s = Schedule()
++        with self.assertRaises(SeriesTooLong):
++            book_series(s, first(), 12)
++        self.assertEqual(s.appointments, [])
++
++    def test_taken_week_is_skipped_and_series_continues_later(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", MONDAY + datetime.timedelta(weeks=1), "standard"))
++        booked = book_series(s, first(), 3)
++        self.assertEqual([a.start for a in booked], [
++            MONDAY,
++            MONDAY + datetime.timedelta(weeks=2),
++            MONDAY + datetime.timedelta(weeks=3),
++        ])
++
++    def test_too_few_free_weeks_books_nothing(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", MONDAY, "standard"))
++        before = list(s.appointments)
++        # within the 12-week window only week 5 is free, which is one short of the 2 needed
++        for week in range(1, 12):
++            if week != 5:
++                s.book(Appointment("lena", "Jo Li", MONDAY + datetime.timedelta(weeks=week), "standard"))
++        with self.assertRaises(NotEnoughFreeWeeks):
++            book_series(s, first(), 2)
++        self.assertEqual(len(s.appointments), len(before) + 10)
++
++    def test_other_therapist_does_not_block_series(self):
++        s = Schedule()
++        s.book(Appointment("marco", "Jo Li", MONDAY, "standard"))
++        self.assertEqual(len(book_series(s, first(), 2)), 2)
++
++
++if __name__ == "__main__":
++    unittest.main()

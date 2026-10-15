@@ -1,0 +1,141 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index db76d81..0b1c7e5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,7 @@
+ - `BookingError` hierarchy (`SlotTaken`, `OutsideOpeningHours`) replaces `ValueError` for refused bookings, with receptionist-friendly messages.
+ - `Schedule.cancel()` marks an appointment cancelled, keeps the record, and frees its slot.
+ - `Schedule.week()` returns a therapist's active appointments for a Monday-to-Sunday week, grouped by day.
++- `Schedule.free_slots()` lists start times on a 15-minute grid where an appointment of a given length could be booked.
+ - Bookings need a 10-minute gap before and after each of a therapist's appointments.
+ - Fixed overlap check missing appointments that start before an existing one and run into it.
+ 
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index e63e5e3..ca10a0c 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -8,6 +8,8 @@ from .model import TREATMENTS
+ 
+ # Time a therapist needs between appointments to clean up and write notes.
+ GAP = datetime.timedelta(minutes=10)
++# Grid on which free slots are offered.
++STEP = datetime.timedelta(minutes=15)
+ 
+ 
+ def _day(day):
+@@ -23,24 +25,54 @@ class Schedule:
+         if appointment.treatment not in TREATMENTS:
+             options = ", ".join(sorted(TREATMENTS))
+             raise BookingError(f"We don't offer '{appointment.treatment}'. Choose one of: {options}.")
+-        if not is_open_between(appointment.start, appointment.end):
+-            raise OutsideOpeningHours(self._closed_message(appointment))
++        self._check_free(appointment.therapist, appointment.start, appointment.end)
++        self.appointments.append(appointment)
++        return appointment
++
++    def free_slots(self, therapist, day, minutes):
++        """Start times on `day` at which a `minutes`-long appointment for `therapist` could be booked.
++
++        Times run on a 15-minute grid from opening time.
++        """
++        if minutes <= 0:
++            raise ValueError("minutes must be positive")
++        hours = opening_hours(day)
++        if hours is None:
++            return []
++        length = datetime.timedelta(minutes=minutes)
++        slots = []
++        start = hours[0]
++        while start + length <= hours[1]:
++            if self._is_free(therapist, start, start + length):
++                slots.append(start)
++            start += STEP
++        return slots
++
++    def _is_free(self, therapist, start, end):
++        try:
++            self._check_free(therapist, start, end)
++        except BookingError:
++            return False
++        return True
++
++    def _check_free(self, therapist, start, end):
++        """Raises BookingError unless the practice is open and `therapist` is free from `start` to `end`."""
++        if not is_open_between(start, end):
++            raise OutsideOpeningHours(self._closed_message(start))
+         for other in self.appointments:
+-            if other.cancelled or other.therapist != appointment.therapist:
++            if other.cancelled or other.therapist != therapist:
+                 continue
+-            if appointment.start < other.end + GAP and other.start < appointment.end + GAP:
++            if start < other.end + GAP and other.start < end + GAP:
+                 raise SlotTaken(
+-                    f"{appointment.therapist} is booked from {other.start:%H:%M} to {other.end:%H:%M} "
++                    f"{therapist} is booked from {other.start:%H:%M} to {other.end:%H:%M} "
+                     f"on {_day(other.start)}, and needs {GAP.seconds // 60} minutes between appointments. "
+                     "Please choose another time."
+                 )
+-        self.appointments.append(appointment)
+-        return appointment
+ 
+     @staticmethod
+-    def _closed_message(appointment):
+-        day = _day(appointment.start)
+-        hours = opening_hours(appointment.start.date())
++    def _closed_message(start):
++        day = _day(start)
++        hours = opening_hours(start.date())
+         if hours is None:
+             return f"The practice is closed on {day}. Please choose another day."
+         opens, closes = hours
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index a1dae1e..c4f2b64 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -118,6 +118,46 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Schedule().week("lena", datetime.date(2026, 9, 8))
+ 
++    def test_free_slots_on_empty_day_run_to_closing(self):
++        s = Schedule()
++        slots = s.free_slots("lena", datetime.date(2026, 9, 8), 60)  # Tuesday, open 07:30-19:00
++        self.assertEqual(slots[0], datetime.datetime(2026, 9, 8, 7, 30))
++        self.assertEqual(slots[-1], datetime.datetime(2026, 9, 8, 18, 0))
++        self.assertEqual(len(slots), 43)  # 07:30 to 18:00 in 15-minute steps
++        self.assertTrue(all((t.minute % 15) == 0 for t in slots))
++
++    def test_free_slots_respect_booking_gap_and_existing(self):
++        s = Schedule()
++        s.book(at(9))  # 09:00-09:45, blocks 08:50-09:55 for a new booking
++        slots = s.free_slots("lena", datetime.date(2026, 9, 8), 45)
++        hours = [(t.hour, t.minute) for t in slots if t.hour in (8, 9, 10)]
++        self.assertEqual(hours, [(8, 0), (10, 0), (10, 15), (10, 30), (10, 45)])
++
++    def test_free_slots_ignore_cancelled_and_other_therapists(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        s.book(at(10, therapist="marco", client="Jo Li"))
++        slots = s.free_slots("lena", datetime.date(2026, 9, 8), 45)
++        self.assertIn(datetime.datetime(2026, 9, 8, 9, 0), slots)
++
++    def test_free_slots_closed_day_is_empty(self):
++        self.assertEqual(Schedule().free_slots("lena", datetime.date(2026, 9, 13), 45), [])
++
++    def test_free_slots_match_book(self):
++        s = Schedule()
++        s.book(at(9))
++        s.book(at(12, 30, therapist="lena", client="Jo Li"))
++        day = datetime.date(2026, 9, 8)
++        for slot in s.free_slots("lena", day, 45):
++            probe = Schedule()
++            probe.appointments = list(s.appointments)
++            probe.book(Appointment("lena", "X", slot, "standard"))  # must not raise
++
++    def test_free_slots_rejects_non_positive_length(self):
++        with self.assertRaises(ValueError):
++            Schedule().free_slots("lena", datetime.date(2026, 9, 8), 0)
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

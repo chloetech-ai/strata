@@ -1,0 +1,67 @@
+diff --git a/src/stockroom/items.py b/src/stockroom/items.py
+index edc9e66..aca3921 100644
+--- a/src/stockroom/items.py
++++ b/src/stockroom/items.py
+@@ -1,13 +1,25 @@
+ """The item catalog."""
+ 
++import re
+ from dataclasses import dataclass, replace
+ 
++_LOCATION = re.compile(r"([A-Za-z])-([0-9]+)-([0-9]+)")
++
+ 
+ def normalize_sku(sku):
+     """Canonical form of a SKU: surrounding whitespace trimmed, uppercased."""
+     return sku.strip().upper()
+ 
+ 
++def parse_location(code):
++    """Split a bin code like 'B-12-3' into ('B', 12, 3): aisle letter, bay and shelf numbers."""
++    match = _LOCATION.fullmatch(code.strip())
++    if match is None:
++        raise ValueError(f"bin code must look like 'B-12-3', got {code!r}")
++    aisle, bay, shelf = match.groups()
++    return aisle.upper(), int(bay), int(shelf)
++
++
+ @dataclass
+ class Item:
+     sku: str
+diff --git a/tests/test_items.py b/tests/test_items.py
+index 65da48f..0544e60 100644
+--- a/tests/test_items.py
++++ b/tests/test_items.py
+@@ -1,6 +1,6 @@
+ import unittest
+ 
+-from stockroom.items import Catalog, Item, normalize_sku
++from stockroom.items import Catalog, Item, normalize_sku, parse_location
+ 
+ 
+ class NormalizeSkuTest(unittest.TestCase):
+@@ -10,6 +10,24 @@ class NormalizeSkuTest(unittest.TestCase):
+         self.assertEqual(normalize_sku("Br-1042 "), "BR-1042")
+ 
+ 
++class ParseLocationTest(unittest.TestCase):
++    def test_splits_aisle_bay_shelf(self):
++        self.assertEqual(parse_location("B-12-3"), ("B", 12, 3))
++
++    def test_lowercase_aisle_is_uppercased(self):
++        self.assertEqual(parse_location("c-03-2"), ("C", 3, 2))
++
++    def test_surrounding_whitespace_ignored(self):
++        self.assertEqual(parse_location("  A-1-1\t"), ("A", 1, 1))
++
++    def test_bad_codes_rejected(self):
++        for code in ("", "B-12", "B-12-3-4", "BB-1-1", "1-12-3", "B-x-3",
++                     "B--3", "B-12-", "B 12 3", "B-1.5-3", "B-+1-3", "B-12-3 extra"):
++            with self.subTest(code=code):
++                with self.assertRaises(ValueError):
++                    parse_location(code)
++
++
+ class ItemValidationTest(unittest.TestCase):
+     def test_case_size_below_one_rejected(self):
+         for size in (0, -6):

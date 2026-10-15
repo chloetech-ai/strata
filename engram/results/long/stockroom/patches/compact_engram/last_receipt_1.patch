@@ -1,0 +1,54 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 5745d35..30e05c0 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -61,3 +61,11 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The latest RECEIPT for a SKU by date; on the same date, the one logged last. None if there is none."""
++        receipts = [m for m in self.movements_for(sku) if m.reason == "RECEIPT"]
++        if not receipts:
++            return None
++        # max() keeps the first of equal keys, so scan from the end to prefer the last logged.
++        return max(reversed(receipts), key=lambda m: m.date)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index c6b2aad..45b4b67 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -65,6 +65,33 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual([m.qty for m in inv.movements_for("BR-1042")], [10, -4])
+         self.assertEqual([m.qty for m in inv.movements_for(" br-1042 ")], [10, -4])
+ 
++    def test_last_receipt_is_none_without_receipts(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.record("BR-1042", 2, "RETURN", DAY)
++        inv.issue("BR-1042", 1, DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
++    def test_last_receipt_is_latest_by_date(self):
++        inv = Inventory()
++        newer = inv.receive("BR-1042", 10, 12, datetime.date(2026, 9, 5))
++        inv.receive("BR-1042", 4, 11, datetime.date(2026, 9, 1))
++        self.assertIs(inv.last_receipt("BR-1042"), newer)
++
++    def test_last_receipt_ties_go_to_last_logged(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        second = inv.receive("BR-1042", 4, 11, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), second)
++
++    def test_last_receipt_ignores_other_reasons_and_skus(self):
++        inv = Inventory()
++        receipt = inv.receive(" br-1042", 10, 12, DAY)
++        inv.issue("BR-1042", 3, datetime.date(2026, 9, 9))
++        inv.receive("BR-2210", 5, 30, datetime.date(2026, 9, 9))
++        self.assertIs(inv.last_receipt("BR-1042"), receipt)
++        self.assertIsNone(inv.last_receipt("BR-9999"))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

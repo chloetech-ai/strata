@@ -1,0 +1,47 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index f0a25f4..e1511e7 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -47,6 +47,12 @@ class Inventory:
+             raise ValueError("quantity must be positive")
+         return self._record(Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "SALE", None, note))
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock broken or damaged. Never refuses, even if it takes stock below zero."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self._record(Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "DAMAGE"))
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index eb20107..a387506 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -43,6 +43,25 @@ class InventoryTest(unittest.TestCase):
+         for code in ["RECEIPT", "SALE", "RETURN", "DAMAGE", "COUNT"]:
+             self.assertEqual(Movement("BR-1042", 1, DAY, code).reason, code)
+ 
++    def test_write_off_records_damage(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.write_off("BR-1042", 3, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++        self.assertEqual([(m.reason, m.qty) for m in inv.movements], [("RECEIPT", 10), ("DAMAGE", -3)])
++
++    def test_write_off_never_refuses_negative_stock(self):
++        inv = Inventory()
++        inv.write_off("BR-1042", 4, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -4)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        for qty in [0, -2]:
++            with self.assertRaises(ValueError):
++                inv.write_off("BR-1042", qty, DAY)
++        self.assertEqual(inv.movements, [])
++
+     def test_sku_spelling_is_normalized(self):
+         inv = Inventory()
+         inv.receive(" br-1042", 10, 12, DAY)

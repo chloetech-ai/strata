@@ -1,0 +1,113 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 0890672..1fd062f 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -1,5 +1,6 @@
+ """Booking appointments."""
+ 
++import dataclasses
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SlotTaken
+@@ -16,6 +17,22 @@ class Schedule:
+ 
+     def book(self, appointment):
+         """Adds `appointment` if the practice is open and the therapist is free."""
++        self._check_slot(appointment)
++        self.appointments.append(appointment)
++        return appointment
++
++    def reschedule(self, appointment_id, new_start):
++        """Moves the appointment to `new_start`, keeping its length. Same checks as `book`."""
++        appointment = self.get(appointment_id)
++        if appointment.cancelled:
++            raise BookingError(f"{appointment.client}'s appointment is cancelled, so it cannot be moved")
++        moved = dataclasses.replace(appointment, start=new_start)
++        self._check_slot(moved, ignore=appointment)
++        appointment.start = new_start
++        return appointment
++
++    def _check_slot(self, appointment, ignore=None):
++        """Raises a BookingError if `appointment` cannot go in its slot. `ignore` is left out of the checks."""
+         if appointment.treatment not in TREATMENTS:
+             raise BookingError(f"'{appointment.treatment}' is not one of our treatments")
+         if not is_open_between(appointment.start, appointment.end):
+@@ -24,7 +41,7 @@ class Schedule:
+                 f"The practice is closed from {appointment.start:%H:%M} to {appointment.end:%H:%M} on {day}"
+             )
+         for other in self.appointments:
+-            if other.cancelled or other.therapist != appointment.therapist:
++            if other is ignore or other.cancelled or other.therapist != appointment.therapist:
+                 continue
+             if other.start < appointment.end and appointment.start < other.end:
+                 raise SlotTaken(
+@@ -36,8 +53,6 @@ class Schedule:
+                     f"{appointment.therapist.title()} needs {GAP.seconds // 60} minutes between appointments, "
+                     f"and {other.client} is booked from {other.start:%H:%M} to {other.end:%H:%M}"
+                 )
+-        self.appointments.append(appointment)
+-        return appointment
+ 
+     def get(self, appointment_id):
+         for appointment in self.appointments:
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 36d41f9..9eb8358 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -96,6 +96,56 @@ class ScheduleTest(unittest.TestCase):
+         s.book(at(9, 50, client="Jo Li"))
+         self.assertEqual(len(s.appointments), 2)
+ 
++    def test_reschedule_moves_the_appointment_and_keeps_its_length(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 15, 0))
++        self.assertIs(s.get(a.id), a)
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 15, 0))
++        self.assertEqual(a.end, datetime.datetime(2026, 9, 8, 15, 45))
++
++    def test_reschedule_to_a_slot_just_vacated_by_itself_is_allowed(self):
++        s = Schedule()
++        a = s.book(at(9))  # 09:00 to 09:45
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 9, 5))
++        self.assertEqual(a.start.time(), datetime.time(9, 5))
++
++    def test_reschedule_into_a_taken_slot_is_refused_and_leaves_it_where_it_was(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(14, client="Jo Li"))
++        with self.assertRaisesRegex(SlotTaken, "Lena already has Jo Li from 14:00 to 14:45"):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 14, 20))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_respects_the_gap(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(14, client="Jo Li"))  # 14:00 to 14:45
++        with self.assertRaisesRegex(SlotTaken, "needs 10 minutes between appointments"):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 13, 10))  # ends 13:55, 5 minutes before
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_respects_opening_hours(self):
++        s = Schedule()
++        a = s.book(at(9))
++        with self.assertRaises(OutsideOpeningHours):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 18, 30))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_a_cancelled_appointment_is_refused(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        with self.assertRaisesRegex(BookingError, "is cancelled, so it cannot be moved"):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 15, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_unknown_id_raises_key_error(self):
++        s = Schedule()
++        with self.assertRaises(KeyError):
++            s.reschedule(999999, datetime.datetime(2026, 9, 8, 9, 0))
++
+     def test_cancel_unknown_id_raises_key_error(self):
+         s = Schedule()
+         with self.assertRaises(KeyError):

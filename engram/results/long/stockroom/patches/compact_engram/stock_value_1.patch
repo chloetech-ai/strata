@@ -1,0 +1,111 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..f2008d9
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,29 @@
++"""What the stock on hand is worth, costed first in, first out (FIFO)."""
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand.
++
++    Goods in open cost layers at their unit cost. Goods out (sales, damage and so on)
++    take the oldest layers first. Movements are taken in date order, so a back-dated
++    receipt sits ahead of stock received later. Goods out beyond the layers (negative
++    stock) leave nothing to value. Raises ValueError if goods still on hand came in
++    without a unit cost, because their value is unknown.
++    """
++    layers = []  # [qty, unit_cost] pairs, oldest first; unit_cost is None when unknown
++    for m in sorted(inventory.movements_for(sku), key=lambda m: m.date):
++        if m.qty > 0:
++            layers.append([m.qty, m.unit_cost])
++            continue
++        remaining = -m.qty
++        while remaining and layers:
++            take = min(remaining, layers[0][0])
++            layers[0][0] -= take
++            remaining -= take
++            if layers[0][0] == 0:
++                del layers[0]
++    if any(unit_cost is None for _, unit_cost in layers):
++        raise ValueError(f"stock of {normalize_sku(sku)} came in without a unit cost; cannot value it")
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..f671986
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,70 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory
++from stockroom.valuation import stock_value
++
++D1 = datetime.date(2026, 9, 1)
++D2 = datetime.date(2026, 9, 2)
++D3 = datetime.date(2026, 9, 3)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_unknown_sku_is_worth_nothing(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt_is_qty_times_unit_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 100, 1250, date=D1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 125000)
++
++    def test_sale_takes_oldest_layer_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, date=D1)
++        inv.receive("BR-1042", 10, 200, date=D2)
++        inv.issue("BR-1042", 15, date=D3)
++        # 10 at 100 are gone; 5 left from the 200 layer.
++        self.assertEqual(stock_value(inv, "BR-1042"), 1000)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive("br-1042", 4, 500, date=D1)
++        self.assertEqual(stock_value(inv, " BR-1042"), 2000)
++
++    def test_return_opens_a_layer_at_its_unit_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, date=D1)
++        inv.record("BR-1042", 2, "RETURN", date=D2, unit_cost=300)
++        self.assertEqual(stock_value(inv, "BR-1042"), 10 * 100 + 2 * 300)
++
++    def test_back_dated_receipt_is_costed_before_later_stock(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 200, date=D2)
++        inv.receive("BR-1042", 5, 100, date=D1)  # logged later, but older
++        inv.issue("BR-1042", 5, date=D3)
++        # FIFO by date: the 100-cost receipt goes out, the 200-cost layer stays.
++        self.assertEqual(stock_value(inv, "BR-1042"), 1000)
++
++    def test_goods_out_beyond_stock_leave_nothing_to_value(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 3, 100, date=D1)
++        inv.issue("BR-1042", 5, date=D2)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_stock_without_unit_cost_cannot_be_valued(self):
++        inv = Inventory()
++        inv.record("BR-1042", 4, "COUNT", date=D1)
++        with self.assertRaises(ValueError) as cm:
++            stock_value(inv, "BR-1042")
++        self.assertIn("BR-1042", str(cm.exception))
++
++    def test_costless_stock_that_has_gone_out_is_not_a_problem(self):
++        inv = Inventory()
++        inv.record("BR-1042", 4, "COUNT", date=D1)
++        inv.issue("BR-1042", 4, date=D2)
++        inv.receive("BR-1042", 1, 700, date=D3)
++        self.assertEqual(stock_value(inv, "BR-1042"), 700)
++
++
++if __name__ == "__main__":
++    unittest.main()

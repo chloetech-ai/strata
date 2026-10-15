@@ -1,0 +1,150 @@
+diff --git a/src/slotwise/series.py b/src/slotwise/series.py
+new file mode 100644
+index 0000000..f228464
+--- /dev/null
++++ b/src/slotwise/series.py
+@@ -0,0 +1,46 @@
++"""Booking a series of weekly sessions, as doctors prescribe them."""
++
++import datetime
++
++from .errors import BookingError, OutsideOpeningHours, SlotTaken
++from .model import Appointment
++
++# The insurance pays for at most this many sessions per prescription.
++MAX_SESSIONS = 9
++# How many weeks after the first session a series may run to find free weeks.
++SEARCH_WEEKS = 12
++
++
++def book_series(schedule, first, count):
++    """Books `count` weekly sessions starting with `first`, and returns them in date order.
++
++    Each session is at the same weekday and time as `first`. A week that is already taken
++    is skipped, and the session moves to the next free week within SEARCH_WEEKS.
++    The series is all-or-nothing: if it cannot be fully placed, nothing is booked.
++    """
++    if count < 1:
++        raise ValueError(f"a series needs at least one session, not {count}")
++    if count > MAX_SESSIONS:
++        raise BookingError(f"A series can have at most {MAX_SESSIONS} sessions, not {count}")
++
++    booked = [schedule.book(first)]
++    try:
++        week = 1
++        while len(booked) < count:
++            if week > SEARCH_WEEKS:
++                raise BookingError(
++                    f"Could not book all {count} sessions for {first.client}: only {len(booked)} "
++                    f"fit within {SEARCH_WEEKS} weeks of {first.start:%d %B %Y}"
++                )
++            start = first.start + datetime.timedelta(weeks=week)
++            week += 1
++            session = Appointment(first.therapist, first.client, start, first.treatment)
++            try:
++                booked.append(schedule.book(session))
++            except (SlotTaken, OutsideOpeningHours):
++                continue
++    except BookingError:
++        for appointment in booked:
++            schedule.appointments.remove(appointment)
++        raise
++    return booked
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..a4d6e21
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,92 @@
++import datetime
++import unittest
++
++from slotwise.errors import BookingError, SlotTaken
++from slotwise.model import Appointment
++from slotwise.schedule import Schedule
++from slotwise.series import MAX_SESSIONS, SEARCH_WEEKS, book_series
++
++# 8 Sep 2026 is a Tuesday.
++FIRST = datetime.datetime(2026, 9, 8, 9, 0)
++
++
++def first(therapist="lena", client="Kim Weber"):
++    return Appointment(therapist, client, FIRST, "standard")
++
++
++def week_of(n):
++    return FIRST + datetime.timedelta(weeks=n)
++
++
++class BookSeriesTest(unittest.TestCase):
++    def test_books_weekly_sessions_at_the_same_weekday_and_time(self):
++        s = Schedule()
++        booked = book_series(s, first(), 3)
++        self.assertEqual([a.start for a in booked], [week_of(0), week_of(1), week_of(2)])
++        self.assertEqual(len(s.appointments), 3)
++
++    def test_sessions_keep_therapist_client_and_treatment(self):
++        s = Schedule()
++        booked = book_series(s, first(), 2)
++        for a in booked:
++            self.assertEqual((a.therapist, a.client, a.treatment), ("lena", "Kim Weber", "standard"))
++
++    def test_each_session_gets_its_own_id(self):
++        s = Schedule()
++        booked = book_series(s, first(), 4)
++        self.assertEqual(len({a.id for a in booked}), 4)
++
++    def test_taken_week_is_skipped_and_a_week_added_at_the_end(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", week_of(1), "standard"))
++        booked = book_series(s, first(), 3)
++        self.assertEqual([a.start for a in booked], [week_of(0), week_of(2), week_of(3)])
++
++    def test_several_taken_weeks_in_a_row_are_skipped(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", week_of(1), "standard"))
++        s.book(Appointment("lena", "Jo Li", week_of(2), "standard"))
++        booked = book_series(s, first(), 2)
++        self.assertEqual([a.start for a in booked], [week_of(0), week_of(3)])
++
++    def test_another_therapist_in_the_same_week_is_not_a_clash(self):
++        s = Schedule()
++        s.book(Appointment("ben", "Jo Li", week_of(1), "standard"))
++        booked = book_series(s, first(), 2)
++        self.assertEqual([a.start for a in booked], [week_of(0), week_of(1)])
++
++    def test_series_longer_than_the_limit_is_refused_and_nothing_is_booked(self):
++        s = Schedule()
++        with self.assertRaises(BookingError):
++            book_series(s, first(), MAX_SESSIONS + 1)
++        self.assertEqual(s.appointments, [])
++
++    def test_nine_sessions_is_allowed(self):
++        s = Schedule()
++        self.assertEqual(len(book_series(s, first(), MAX_SESSIONS)), 9)
++
++    def test_zero_sessions_is_an_error(self):
++        with self.assertRaises(ValueError):
++            book_series(Schedule(), first(), 0)
++
++    def test_series_that_cannot_be_fully_placed_books_nothing(self):
++        s = Schedule()
++        # Every week in the search window is taken except the first, so only one session fits.
++        for n in range(1, SEARCH_WEEKS + 1):
++            s.book(Appointment("lena", "Jo Li", week_of(n), "standard"))
++        before = list(s.appointments)
++        with self.assertRaises(BookingError) as cm:
++            book_series(s, first(), 2)
++        self.assertIn("only 1 fit within", str(cm.exception))
++        self.assertEqual(s.appointments, before)
++
++    def test_first_session_clash_is_raised_unchanged(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Jo Li", FIRST, "standard"))
++        with self.assertRaises(SlotTaken):
++            book_series(s, first(), 2)
++        self.assertEqual(len(s.appointments), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

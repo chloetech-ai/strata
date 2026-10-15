@@ -1,0 +1,75 @@
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..4381558
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,18 @@
++"""Cancellation fees: how much a client pays for cancelling an appointment."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """The fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours before the start: the full price.
++    Less than 48 hours before the start: half the price.
++    Otherwise: nothing. Exactly 48 hours before is free; exactly 24 hours is half.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..d67a786
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,45 @@
++import datetime
++import unittest
++
++from slotwise import Appointment
++from slotwise.fees import cancellation_fee
++
++START = datetime.datetime(2026, 10, 20, 10, 0)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def fee(self, hours_before, treatment="standard"):
++        appointment = Appointment("Anna", "Jo Li", START, treatment)
++        cancelled_at = START - datetime.timedelta(hours=hours_before)
++        return cancellation_fee(appointment, cancelled_at)
++
++    def test_a_week_ahead_is_free(self):
++        self.assertEqual(self.fee(24 * 7), 0)
++
++    def test_more_than_48_hours_ahead_is_free(self):
++        self.assertEqual(self.fee(49), 0)
++
++    def test_exactly_48_hours_ahead_is_free(self):
++        self.assertEqual(self.fee(48), 0)
++
++    def test_just_under_48_hours_is_half_price(self):
++        self.assertEqual(self.fee(47.99), 9800 // 2)
++
++    def test_exactly_24_hours_is_half_price(self):
++        self.assertEqual(self.fee(24), 9800 // 2)
++
++    def test_just_under_24_hours_is_full_price(self):
++        self.assertEqual(self.fee(23.99), 9800)
++
++    def test_after_the_start_is_full_price(self):
++        self.assertEqual(self.fee(-1), 9800)
++
++    def test_fee_uses_the_treatment_price(self):
++        self.assertEqual(self.fee(2, "initial"), 14500)
++        self.assertEqual(self.fee(30, "initial"), 7250)
++        self.assertEqual(self.fee(2, "short"), 6800)
++        self.assertEqual(self.fee(30, "short"), 3400)
++
++
++if __name__ == "__main__":
++    unittest.main()

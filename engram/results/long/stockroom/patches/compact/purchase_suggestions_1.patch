@@ -1,0 +1,75 @@
+diff --git a/src/stockroom/reorder.py b/src/stockroom/reorder.py
+index 4672674..d9c2174 100644
+--- a/src/stockroom/reorder.py
++++ b/src/stockroom/reorder.py
+@@ -8,3 +8,20 @@ def needs_reorder(inventory):
+         if inventory.on_hand(item.sku) <= item.reorder_point:
+             out.append(item.sku)
+     return out
++
++
++def suggest_orders(inventory):
++    """Quantity to order for each SKU needing reorder, as {sku: qty}.
++
++    Orders up to three times the reorder point, rounded up to whole cases.
++    SKUs that would order nothing are left out.
++    """
++    orders = {}
++    for sku in needs_reorder(inventory):
++        item = inventory.catalog.get(sku)
++        need = 3 * item.reorder_point - inventory.on_hand(sku)
++        if need <= 0:
++            continue
++        cases = -(-need // item.case_size)  # ceiling division on integers
++        orders[sku] = cases * item.case_size
++    return orders
+diff --git a/tests/test_reorder.py b/tests/test_reorder.py
+index 62219cf..45a071e 100644
+--- a/tests/test_reorder.py
++++ b/tests/test_reorder.py
+@@ -2,7 +2,7 @@ import unittest
+ 
+ from stockroom.inventory import Inventory
+ from stockroom.items import Catalog, Item
+-from stockroom.reorder import needs_reorder
++from stockroom.reorder import needs_reorder, suggest_orders
+ 
+ 
+ def make_inventory():
+@@ -28,6 +28,36 @@ class ReorderTest(unittest.TestCase):
+     def test_enough_stock(self):
+         self.assertNotIn("BR-3", needs_reorder(make_inventory()))
+ 
++    def test_suggests_up_to_three_times_reorder_point(self):
++        orders = suggest_orders(make_inventory())
++        self.assertEqual(orders, {"BR-1": 25, "BR-2": 20})
++
++    def test_rounds_up_to_whole_cases(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10, case_size=12)])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 5, 10)
++        # need is 3*10 - 5 = 25, which is three cases of 12 (36)
++        self.assertEqual(suggest_orders(inv), {"BR-1": 36})
++
++    def test_exact_multiple_of_case_is_not_rounded(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10, case_size=5)])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 5, 10)
++        # need is 3*10 - 5 = 25, already a multiple of 5
++        self.assertEqual(suggest_orders(inv), {"BR-1": 25})
++
++    def test_negative_stock_orders_more(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10)])
++        inv = Inventory(catalog)
++        inv.issue("BR-1", 4)  # on hand is -4
++        self.assertEqual(suggest_orders(inv), {"BR-1": 34})
++
++    def test_no_suggestion_when_nothing_needed(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=0)])
++        inv = Inventory(catalog)
++        self.assertEqual(suggest_orders(inv), {})
++        self.assertEqual(suggest_orders(make_inventory()).get("BR-3"), None)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

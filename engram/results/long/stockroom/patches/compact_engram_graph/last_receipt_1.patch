@@ -1,0 +1,47 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index e816530..9285f51 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -60,3 +60,11 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The most recently logged RECEIPT for a SKU, or None."""
++        sku = normalize_sku(sku)
++        for m in reversed(self.movements):
++            if m.sku == sku and m.reason == "RECEIPT":
++                return m
++        return None
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 09efdac..8d407b9 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -53,6 +53,26 @@ class InventoryTest(unittest.TestCase):
+         inv.issue("BR-1042", 4, DAY)
+         self.assertEqual([m.qty for m in inv.movements_for("BR-1042")], [10, -4])
+ 
++    def test_last_receipt_is_the_latest_logged_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 5, 15, DAY + datetime.timedelta(days=1))
++        inv.issue("BR-1042", 4, DAY)
++        self.assertEqual(inv.last_receipt("BR-1042").unit_cost, 15)
++
++    def test_last_receipt_ignores_other_reasons_and_skus(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.issue("BR-1042", 4, DAY)
++        inv.receive("BR-2210", 5, 30, DAY)
++        self.assertEqual(inv.last_receipt(" br-1042 ").qty, 10)
++
++    def test_last_receipt_is_none_without_receipts(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.issue("BR-1042", 1, DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

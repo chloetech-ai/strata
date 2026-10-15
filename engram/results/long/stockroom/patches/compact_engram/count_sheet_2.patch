@@ -1,0 +1,82 @@
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..63e7fe8
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,23 @@
++"""The blind count sheet for the stock-take: one line per catalog item, in walking order."""
++
++
++def _bin_key(location):
++    """Sort key for a bin code "aisle-bay-shelf", comparing numeric parts as numbers."""
++    key = []
++    for part in location.split("-"):
++        if part.isdigit():
++            key.append((0, int(part), ""))
++        else:
++            key.append((1, 0, part))
++    return key
++
++
++def count_sheet(inventory):
++    """Printable count sheet as text. Never shows quantities on hand: counters must count, not copy."""
++    if inventory.catalog is None:
++        raise ValueError("count sheet needs an inventory with a catalog")
++    items = sorted(inventory.catalog, key=lambda item: _bin_key(item.location))
++    lines = []
++    for item in items:
++        lines.append(f"{item.location:<10}  {item.sku:<12}  {item.name:<30}  {item.unit:<5}  ________")
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..b869af3
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,47 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Item("BR-1042", "Hex bolt M8", "B-12-3", unit="pcs"),
++            Item("BR-2000", "Wood screw", "B-2-1", unit="box"),
++            Item("NA-0007", "Door hinge", "A-1-1"),
++        ])
++        self.inventory = Inventory(self.catalog)
++        self.inventory.receive("BR-1042", 7777, 12)
++
++    def test_one_line_per_catalog_item(self):
++        lines = count_sheet(self.inventory).splitlines()
++        self.assertEqual(len(lines), len(self.catalog))
++
++    def test_bins_sort_numerically_not_as_text(self):
++        lines = count_sheet(self.inventory).splitlines()
++        skus = [line.split()[1] for line in lines]
++        # A plain string sort would put "B-12-3" before "B-2-1"; numeric parts must win here.
++        self.assertEqual(skus, ["NA-0007", "BR-2000", "BR-1042"])
++
++    def test_sheet_never_shows_quantity_on_hand(self):
++        text = count_sheet(self.inventory)
++        self.assertNotIn("7777", text)
++
++    def test_items_with_no_movements_are_listed(self):
++        text = count_sheet(self.inventory)
++        self.assertIn("NA-0007", text)
++        self.assertIn("Door hinge", text)
++
++    def test_counted_column_is_blank(self):
++        for line in count_sheet(self.inventory).splitlines():
++            self.assertTrue(line.endswith("________"))
++
++    def test_inventory_without_catalog_is_an_error(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

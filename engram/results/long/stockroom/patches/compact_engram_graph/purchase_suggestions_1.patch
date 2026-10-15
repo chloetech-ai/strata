@@ -1,0 +1,70 @@
+diff --git a/src/stockroom/reorder.py b/src/stockroom/reorder.py
+index 4672674..18bef32 100644
+--- a/src/stockroom/reorder.py
++++ b/src/stockroom/reorder.py
+@@ -8,3 +8,20 @@ def needs_reorder(inventory):
+         if inventory.on_hand(item.sku) <= item.reorder_point:
+             out.append(item.sku)
+     return out
++
++
++def suggest_orders(inventory):
++    """Map each SKU to order to the quantity to order.
++
++    An order brings stock back up to three times the reorder point, rounded up
++    to whole cases because the supplier only ships full cases. SKUs that need
++    nothing are left out.
++    """
++    orders = {}
++    for sku in needs_reorder(inventory):
++        item = inventory.catalog.get(sku)
++        shortfall = 3 * item.reorder_point - inventory.on_hand(sku)
++        cases = -(-shortfall // item.case_size)  # ceiling division
++        if cases > 0:
++            orders[sku] = cases * item.case_size
++    return orders
+diff --git a/tests/test_reorder.py b/tests/test_reorder.py
+index 62219cf..73ea696 100644
+--- a/tests/test_reorder.py
++++ b/tests/test_reorder.py
+@@ -2,7 +2,7 @@ import unittest
+ 
+ from stockroom.inventory import Inventory
+ from stockroom.items import Catalog, Item
+-from stockroom.reorder import needs_reorder
++from stockroom.reorder import needs_reorder, suggest_orders
+ 
+ 
+ def make_inventory():
+@@ -28,6 +28,31 @@ class ReorderTest(unittest.TestCase):
+     def test_enough_stock(self):
+         self.assertNotIn("BR-3", needs_reorder(make_inventory()))
+ 
++    def test_suggests_up_to_three_times_reorder_point(self):
++        orders = suggest_orders(make_inventory())
++        self.assertEqual(orders["BR-1"], 25)  # 30 wanted, 5 on hand
++
++    def test_rounds_up_to_whole_cases(self):
++        catalog = Catalog([Item("BR-2", "Nut", "A-01-2", reorder_point=10, case_size=6)])
++        inv = Inventory(catalog)
++        inv.receive("BR-2", 10, 10)
++        self.assertEqual(suggest_orders(inv), {"BR-2": 24})  # 20 short, 4 cases of 6
++
++    def test_items_that_need_nothing_are_left_out(self):
++        orders = suggest_orders(make_inventory())
++        self.assertNotIn("BR-3", orders)
++        self.assertEqual(set(orders), {"BR-1", "BR-2"})
++
++    def test_zero_reorder_point_with_no_stock_orders_nothing(self):
++        catalog = Catalog([Item("BR-4", "Plug", "A-02-1")])
++        self.assertEqual(suggest_orders(Inventory(catalog)), {})
++
++    def test_negative_stock_is_made_up_too(self):
++        catalog = Catalog([Item("BR-5", "Tape", "A-03-1", reorder_point=4)])
++        inv = Inventory(catalog)
++        inv.issue("BR-5", 2)  # on hand -2
++        self.assertEqual(suggest_orders(inv), {"BR-5": 14})  # 12 wanted, 14 short
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

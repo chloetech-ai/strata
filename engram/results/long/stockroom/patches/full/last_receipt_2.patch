@@ -1,0 +1,40 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 0caec9b..2aff27b 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -56,3 +56,9 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """Most recent RECEIPT for `sku` by date; ties go to the later-logged one, or None."""
++        sku = normalize_sku(sku)
++        receipts = [m for m in self.movements if m.sku == sku and m.reason == "RECEIPT"]
++        return max(reversed(receipts), key=lambda m: m.date, default=None)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 5eee2d4..6a418c5 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -49,6 +49,21 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual(inv.movements[0].sku, "BR-1042")
+         self.assertEqual(len(inv.movements_for(" BR-1042\t")), 2)
+ 
++    def test_last_receipt(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.receive("BR-1042", 10, 12, DAY)
++        later = inv.receive("BR-1042", 5, 13, DAY + datetime.timedelta(days=3))
++        inv.receive("BR-1042", 4, 14, DAY + datetime.timedelta(days=1))
++        inv.issue("BR-1042", 2, DAY + datetime.timedelta(days=9))
++        self.assertIs(inv.last_receipt(" br-1042"), later)
++
++    def test_last_receipt_ties_go_to_later_logged(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        second = inv.receive("BR-1042", 5, 13, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), second)
++
+     def test_movements_for(self):
+         inv = Inventory()
+         inv.receive("BR-1042", 10, 12, DAY)

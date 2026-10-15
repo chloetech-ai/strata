@@ -1,0 +1,89 @@
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..c4c7155
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,34 @@
++"""Printable day plans for the receipt printer, which fits 42 characters a line."""
++
++import textwrap
++import unicodedata
++
++WIDTH = 42
++
++_UMLAUTS = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
++
++
++def _ascii(text):
++    """The printer has no umlauts, so they are spelled out; other accents lose their accent."""
++    for char, replacement in _UMLAUTS.items():
++        text = text.replace(char, replacement)
++    decomposed = unicodedata.normalize("NFKD", text)
++    return decomposed.encode("ascii", "ignore").decode("ascii")
++
++
++def _wrap(text, indent=""):
++    return textwrap.wrap(_ascii(text), WIDTH, initial_indent=indent, subsequent_indent=" " * len(indent))
++
++
++def day_plan(schedule, therapist, day):
++    """The day's active appointments for `therapist` as printable text, one entry per appointment."""
++    lines = _wrap(f"{therapist.capitalize()} - {day:%a %d.%m.%Y}")
++    lines.append("-" * WIDTH)
++    appointments = [a for a in schedule.appointments_for(therapist, day) if not a.cancelled]
++    if not appointments:
++        lines.append("No appointments.")
++    for a in appointments:
++        time_range = f"{a.start:%H:%M}-{a.end:%H:%M}"
++        lines += _wrap(f"{time_range}  {a.treatment}")
++        lines += _wrap(a.client, indent="      ")
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..a564446
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,43 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.printing import WIDTH, day_plan
++from slotwise.schedule import Schedule
++
++MONDAY = datetime.date(2026, 9, 7)
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_active_appointments_in_order(self):
++        s = Schedule()
++        s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 14, 0), "standard"))
++        s.book(Appointment("lena", "Zoë Brändli", datetime.datetime(2026, 9, 7, 8, 0), "initial"))
++        text = day_plan(s, "lena", MONDAY)
++        self.assertEqual(
++            text,
++            "Lena - Mon 07.09.2026\n"
++            "------------------------------------------\n"
++            "08:00-09:00  initial\n"
++            "      Zoe Braendli\n"
++            "14:00-14:45  standard\n"
++            "      Kim Weber\n",
++        )
++
++    def test_cancelled_appointments_are_left_out(self):
++        s = Schedule()
++        a = s.book(Appointment("lena", "Kim Weber", datetime.datetime(2026, 9, 7, 9, 0)))
++        s.cancel(a.id)
++        self.assertIn("No appointments.", day_plan(s, "lena", MONDAY))
++
++    def test_no_line_is_wider_than_the_printer(self):
++        s = Schedule()
++        long_name = "Maria-Theresia von Hohenstaufen-Liechtenstein-Wassermann Gonzalez"
++        s.book(Appointment("lena", long_name, datetime.datetime(2026, 9, 7, 9, 0), "initial"))
++        lines = day_plan(s, "lena", MONDAY).splitlines()
++        self.assertTrue(all(len(line) <= WIDTH for line in lines), lines)
++        self.assertIn("Gonzalez", " ".join(lines))
++
++
++if __name__ == "__main__":
++    unittest.main()

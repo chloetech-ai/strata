@@ -1,0 +1,47 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 5745d35..310706f 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -54,6 +54,12 @@ class Inventory:
+             raise ValueError("quantity must be positive")
+         return self.record(sku, -qty, "SALE", date, note)
+ 
++    def write_off(self, sku, qty, date=None):
++        """Goods out as broken or damaged; `qty` is positive, the movement is negative."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self.record(sku, -qty, "DAMAGE", date)
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index c6b2aad..274c47c 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -49,6 +49,25 @@ class InventoryTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             inv.issue("BR-1042", -5)
+ 
++    def test_write_off_records_damage_out(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        writeoff = inv.write_off(" br-1042", 3, DAY)
++        self.assertEqual((writeoff.sku, writeoff.qty, writeoff.reason), ("BR-1042", -3, "DAMAGE"))
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        for qty in (0, -2):
++            with self.assertRaises(ValueError):
++                inv.write_off("BR-1042", qty, DAY)
++        self.assertEqual(inv.movements, [])
++
++    def test_write_off_does_not_refuse_negative_stock(self):
++        inv = Inventory()
++        inv.write_off("BR-1042", 5, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -5)
++
+     def test_messy_sku_is_normalized(self):
+         inv = Inventory()
+         inv.receive(" br-1042", 100, 12, DAY)

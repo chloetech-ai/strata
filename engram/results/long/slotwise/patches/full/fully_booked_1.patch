@@ -1,0 +1,56 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index e63e5e3..0b1e1b5 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,9 @@ from .model import TREATMENTS
+ # Time a therapist needs between appointments to clean up and write notes.
+ GAP = datetime.timedelta(minutes=10)
+ 
++# Most treatments a therapist works in a day, per their contract. Online booking stops at this cap.
++DAILY_CAP = 7
++
+ 
+ def _day(day):
+     return day.strftime("%A %d %B").replace(" 0", " ")
+@@ -73,6 +76,11 @@ class Schedule:
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+         return {day: [a for a in self.appointments_for(therapist, day) if not a.cancelled] for day in days}
+ 
++    def is_fully_booked(self, therapist, day):
++        """True when `therapist` has reached the daily cap of active appointments on `day`."""
++        active = [a for a in self.appointments_for(therapist, day) if not a.cancelled]
++        return len(active) >= DAILY_CAP
++
+     def appointments_for(self, therapist, day):
+         """`therapist`'s appointments on `day`, by start time."""
+         mine = [a for a in self.appointments if a.therapist == therapist and a.start.date() == day]
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index a1dae1e..9c6a584 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -89,6 +89,25 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(KeyError):
+             Schedule().cancel(12345)
+ 
++    def test_fully_booked_at_daily_cap(self):
++        s = Schedule()
++        for hour in range(8, 15):  # seven appointments, 08:00 to 14:00 starts
++            s.book(at(hour, client=f"Client {hour}"))
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++        self.assertFalse(s.is_fully_booked("marco", datetime.date(2026, 9, 8)))
++
++    def test_six_appointments_is_not_fully_booked(self):
++        s = Schedule()
++        for hour in range(8, 14):
++            s.book(at(hour, client=f"Client {hour}"))
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_cancelled_appointment_frees_a_place(self):
++        s = Schedule()
++        booked = [s.book(at(hour, client=f"Client {hour}")) for hour in range(8, 15)]
++        s.cancel(booked[0].id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
+     def test_other_therapist_is_free(self):
+         s = Schedule()
+         s.book(at(9))

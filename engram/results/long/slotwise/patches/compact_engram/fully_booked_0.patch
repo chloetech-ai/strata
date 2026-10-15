@@ -1,0 +1,76 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 0890672..95b0481 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -9,6 +9,10 @@ from .model import TREATMENTS
+ # Time a therapist needs between two appointments to clean up and write notes.
+ GAP = datetime.timedelta(minutes=10)
+ 
++# The contract's daily cap. Shown as fully booked online, but book() does not enforce it,
++# because reception sometimes books past it when the therapist agrees.
++DAILY_LIMIT = 7
++
+ 
+ class Schedule:
+     def __init__(self):
+@@ -59,6 +63,10 @@ class Schedule:
+         ]
+         return sorted(mine, key=lambda a: a.start)
+ 
++    def is_fully_booked(self, therapist, day):
++        """True when `therapist` has reached the daily limit on `day`, so the online page greys it out."""
++        return len(self.appointments_for(therapist, day)) >= DAILY_LIMIT
++
+     def week(self, therapist, monday):
+         """`therapist`'s active appointments for the seven days from `monday`, keyed by date."""
+         days = [monday + datetime.timedelta(days=i) for i in range(7)]
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 36d41f9..9f6a095 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -133,6 +133,45 @@ class ScheduleTest(unittest.TestCase):
+         week = s.week("lena", datetime.date(2026, 9, 14))
+         self.assertEqual(sum(len(day) for day in week.values()), 0)
+ 
++    def book_short_days(self, s, count, therapist="lena", day=8):
++        # 30-minute appointments, 40 minutes apart, from 08:00
++        for i in range(count):
++            start = datetime.datetime(2026, 9, day, 8) + datetime.timedelta(minutes=40 * i)
++            s.book(Appointment(therapist, f"Client {i}", start, "short"))
++
++    def test_day_with_six_appointments_is_not_fully_booked(self):
++        s = Schedule()
++        self.book_short_days(s, 6)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_seven_appointments_is_fully_booked(self):
++        s = Schedule()
++        self.book_short_days(s, 7)
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_cap_is_not_enforced_by_book(self):
++        s = Schedule()
++        self.book_short_days(s, 8)
++        self.assertTrue(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++        self.assertEqual(len(s.appointments), 8)
++
++    def test_cancelled_appointments_do_not_count_towards_the_cap(self):
++        s = Schedule()
++        self.book_short_days(s, 7)
++        s.cancel(s.appointments[0].id)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_other_therapists_and_other_days_do_not_count(self):
++        s = Schedule()
++        self.book_short_days(s, 6)
++        self.book_short_days(s, 1, therapist="marco")
++        self.book_short_days(s, 1, day=9)
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
++    def test_empty_day_is_not_fully_booked(self):
++        s = Schedule()
++        self.assertFalse(s.is_fully_booked("lena", datetime.date(2026, 9, 8)))
++
+     def test_appointments_for_day_in_order(self):
+         s = Schedule()
+         s.book(at(14))

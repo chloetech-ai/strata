@@ -1,0 +1,78 @@
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..64efe85
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,18 @@
++"""Cancellation fees, worked out here so reception doesn't have to do it by hand."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours before: the full treatment price. Less than 48 hours: half the price.
++    Earlier than that: nothing. Exactly 24 or 48 hours counts as the later band.
++    Half of an odd number of cents is rounded down.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return appointment.price // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..335d987
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,48 @@
++import datetime
++import unittest
++from unittest import mock
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import TREATMENTS, Appointment
++
++START = datetime.datetime(2026, 11, 2, 10, 0)
++
++
++def appointment(treatment="standard"):
++    return Appointment("lena", "Ruth Brändli", START, treatment)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def cancel_hours_before(self, hours, treatment="standard"):
++        return cancellation_fee(appointment(treatment), START - datetime.timedelta(hours=hours))
++
++    def test_more_than_48_hours_before_is_free(self):
++        self.assertEqual(self.cancel_hours_before(72), 0)
++
++    def test_exactly_48_hours_before_is_free(self):
++        self.assertEqual(self.cancel_hours_before(48), 0)
++
++    def test_under_48_hours_before_is_half_price(self):
++        self.assertEqual(self.cancel_hours_before(47), 4900)
++
++    def test_exactly_24_hours_before_is_half_price(self):
++        self.assertEqual(self.cancel_hours_before(24), 4900)
++
++    def test_under_24_hours_before_is_full_price(self):
++        self.assertEqual(self.cancel_hours_before(23), 9800)
++
++    def test_after_the_start_is_full_price(self):
++        self.assertEqual(self.cancel_hours_before(-1), 9800)
++
++    def test_fee_follows_the_treatment_price(self):
++        self.assertEqual(self.cancel_hours_before(1, treatment="initial"), 14500)
++        self.assertEqual(self.cancel_hours_before(30, treatment="short"), 3400)
++
++    def test_half_of_an_odd_number_of_cents_rounds_down(self):
++        with mock.patch.dict(TREATMENTS, {"odd": (45, 9801)}):
++            fee = cancellation_fee(appointment("odd"), START - datetime.timedelta(hours=30))
++        self.assertEqual(fee, 4900)
++
++
++if __name__ == "__main__":
++    unittest.main()

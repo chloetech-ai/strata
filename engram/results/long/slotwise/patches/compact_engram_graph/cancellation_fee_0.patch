@@ -1,0 +1,69 @@
+diff --git a/src/slotwise/fees.py b/src/slotwise/fees.py
+new file mode 100644
+index 0000000..be1eea8
+--- /dev/null
++++ b/src/slotwise/fees.py
+@@ -0,0 +1,17 @@
++"""Cancellation fees: how much a client pays for cancelling an appointment."""
++
++import datetime
++
++
++def cancellation_fee(appointment, cancelled_at):
++    """Fee in cents for cancelling `appointment` at `cancelled_at`.
++
++    Less than 24 hours before: the full price. Less than 48 hours before: half
++    the price, rounded up to the next cent. Earlier than that: nothing.
++    """
++    notice = appointment.start - cancelled_at
++    if notice < datetime.timedelta(hours=24):
++        return appointment.price
++    if notice < datetime.timedelta(hours=48):
++        return (appointment.price + 1) // 2
++    return 0
+diff --git a/tests/test_fees.py b/tests/test_fees.py
+new file mode 100644
+index 0000000..3595560
+--- /dev/null
++++ b/tests/test_fees.py
+@@ -0,0 +1,40 @@
++import datetime
++import unittest
++import unittest.mock
++
++from slotwise.fees import cancellation_fee
++from slotwise.model import Appointment
++
++START = datetime.datetime(2026, 10, 20, 9, 0)
++
++
++def appointment(treatment="standard"):
++    return Appointment("Lena", "Ruth Brändli", START, treatment)
++
++
++class CancellationFeeTest(unittest.TestCase):
++    def test_cancelled_earlier_than_48_hours_is_free(self):
++        self.assertEqual(cancellation_fee(appointment(), START - datetime.timedelta(hours=49)), 0)
++        self.assertEqual(cancellation_fee(appointment(), START - datetime.timedelta(hours=48)), 0)
++
++    def test_cancelled_under_48_hours_pays_half(self):
++        self.assertEqual(cancellation_fee(appointment(), START - datetime.timedelta(hours=47)), 4900)
++        self.assertEqual(cancellation_fee(appointment(), START - datetime.timedelta(hours=24)), 4900)
++
++    def test_cancelled_under_24_hours_pays_full_price(self):
++        self.assertEqual(cancellation_fee(appointment(), START - datetime.timedelta(hours=23)), 9800)
++        self.assertEqual(cancellation_fee(appointment(), START - datetime.timedelta(minutes=1)), 9800)
++
++    def test_fee_follows_treatment_price(self):
++        at = START - datetime.timedelta(hours=1)
++        self.assertEqual(cancellation_fee(appointment("initial"), at), 14500)
++        self.assertEqual(cancellation_fee(appointment("short"), at), 6800)
++        self.assertEqual(cancellation_fee(appointment("short"), START - datetime.timedelta(hours=30)), 3400)
++
++    def test_odd_cent_half_is_rounded_up(self):
++        with unittest.mock.patch.dict("slotwise.model.TREATMENTS", {"standard": (45, 9801)}):
++            self.assertEqual(cancellation_fee(appointment(), START - datetime.timedelta(hours=30)), 4901)
++
++
++if __name__ == "__main__":
++    unittest.main()

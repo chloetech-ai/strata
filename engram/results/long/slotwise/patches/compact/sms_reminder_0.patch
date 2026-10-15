@@ -1,0 +1,115 @@
+diff --git a/src/slotwise/reminders.py b/src/slotwise/reminders.py
+new file mode 100644
+index 0000000..55a7c51
+--- /dev/null
++++ b/src/slotwise/reminders.py
+@@ -0,0 +1,47 @@
++"""Reminder SMS texts.
++
++The SMS gateway only takes plain ASCII and a reminder must fit in one 160-character SMS.
++"""
++
++import unicodedata
++
++from .model import Appointment
++
++# The reception number, which must appear in every reminder so people can call to move
++# their appointment.
++RECEPTION_NUMBER = "044 512 77 30"
++
++MAX_LENGTH = 160
++
++# German letters that NFKD cannot split into a base letter and an accent.
++_GERMAN = {
++    "ä": "ae", "ö": "oe", "ü": "ue",
++    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
++    "ß": "ss",
++}
++
++
++def to_ascii(text):
++    """Turns 'Brändli' into 'Braendli' and drops other accents, e.g. 'é' into 'e'."""
++    for char, replacement in _GERMAN.items():
++        text = text.replace(char, replacement)
++    decomposed = unicodedata.normalize("NFKD", text)
++    stripped = "".join(char for char in decomposed if not unicodedata.combining(char))
++    stripped.encode("ascii")  # raises UnicodeEncodeError for anything else
++    return stripped
++
++
++def reminder_text(appointment):
++    """The reminder SMS for `appointment`, in plain ASCII and at most 160 characters.
++
++    The patient's name is left out, because the SMS gateway is a third-party service.
++    """
++    when = appointment.start
++    text = (
++        f"Lindqvist Physio: Termin am {when:%d.%m.} um {when:%H:%M} "
++        f"bei {to_ascii(appointment.therapist)}. "
++        f"Verschieben: {RECEPTION_NUMBER}"
++    )
++    if len(text) > MAX_LENGTH:
++        raise ValueError(f"reminder is {len(text)} characters, the limit is {MAX_LENGTH}")
++    return text
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..3f8cb79
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,56 @@
++import datetime
++import unittest
++
++from slotwise.model import Appointment
++from slotwise.reminders import RECEPTION_NUMBER, reminder_text, to_ascii
++
++
++class ToAsciiTest(unittest.TestCase):
++    def test_umlauts_are_spelled_out(self):
++        self.assertEqual(to_ascii("Brändli"), "Braendli")
++        self.assertEqual(to_ascii("Jörg Müller"), "Joerg Mueller")
++        self.assertEqual(to_ascii("Strauß"), "Strauss")
++
++    def test_other_accents_are_dropped(self):
++        self.assertEqual(to_ascii("Hélène Dubois"), "Helene Dubois")
++
++    def test_plain_ascii_is_unchanged(self):
++        self.assertEqual(to_ascii("Kim Weber"), "Kim Weber")
++
++
++class ReminderTextTest(unittest.TestCase):
++    def setUp(self):
++        self.appointment = Appointment(
++            therapist="Brändli",
++            client="Kim Weber",
++            start=datetime.datetime(2026, 10, 12, 14, 30),
++        )
++
++    def test_reminder_has_date_time_and_therapist(self):
++        text = reminder_text(self.appointment)
++        self.assertIn("12.10.", text)
++        self.assertIn("14:30", text)
++        self.assertIn("Braendli", text)
++
++    def test_reminder_has_reception_number(self):
++        self.assertIn(RECEPTION_NUMBER, reminder_text(self.appointment))
++
++    def test_reminder_is_plain_ascii(self):
++        text = reminder_text(self.appointment)
++        text.encode("ascii")
++
++    def test_reminder_leaves_out_the_patient_name(self):
++        self.assertNotIn("Kim", reminder_text(self.appointment))
++
++    def test_reminder_fits_in_one_sms(self):
++        self.appointment.therapist = "Maximilian-Konstantin Brändlinger-Schoenenberger"
++        self.assertLessEqual(len(reminder_text(self.appointment)), 160)
++
++    def test_too_long_reminder_is_refused(self):
++        self.appointment.therapist = "X" * 200
++        with self.assertRaises(ValueError):
++            reminder_text(self.appointment)
++
++
++if __name__ == "__main__":
++    unittest.main()

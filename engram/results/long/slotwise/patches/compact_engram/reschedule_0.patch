@@ -1,0 +1,132 @@
+diff --git a/src/slotwise/schedule.py b/src/slotwise/schedule.py
+index 0890672..6634d6e 100644
+--- a/src/slotwise/schedule.py
++++ b/src/slotwise/schedule.py
+@@ -1,5 +1,6 @@
+ """Booking appointments."""
+ 
++import dataclasses
+ import datetime
+ 
+ from .errors import BookingError, OutsideOpeningHours, SlotTaken
+@@ -16,6 +17,15 @@ class Schedule:
+ 
+     def book(self, appointment):
+         """Adds `appointment` if the practice is open and the therapist is free."""
++        self._check(appointment)
++        self.appointments.append(appointment)
++        return appointment
++
++    def _check(self, appointment, ignore=None):
++        """Raises unless `appointment` is a treatment we offer, in opening hours, and free for its therapist.
++
++        `ignore` is an existing appointment to leave out of the clash checks, used when moving it.
++        """
+         if appointment.treatment not in TREATMENTS:
+             raise BookingError(f"'{appointment.treatment}' is not one of our treatments")
+         if not is_open_between(appointment.start, appointment.end):
+@@ -24,7 +34,7 @@ class Schedule:
+                 f"The practice is closed from {appointment.start:%H:%M} to {appointment.end:%H:%M} on {day}"
+             )
+         for other in self.appointments:
+-            if other.cancelled or other.therapist != appointment.therapist:
++            if other is ignore or other.cancelled or other.therapist != appointment.therapist:
+                 continue
+             if other.start < appointment.end and appointment.start < other.end:
+                 raise SlotTaken(
+@@ -36,8 +46,6 @@ class Schedule:
+                     f"{appointment.therapist.title()} needs {GAP.seconds // 60} minutes between appointments, "
+                     f"and {other.client} is booked from {other.start:%H:%M} to {other.end:%H:%M}"
+                 )
+-        self.appointments.append(appointment)
+-        return appointment
+ 
+     def get(self, appointment_id):
+         for appointment in self.appointments:
+@@ -51,6 +59,16 @@ class Schedule:
+         appointment.cancelled = True
+         return appointment
+ 
++    def reschedule(self, appointment_id, new_start):
++        """Moves the appointment to `new_start`, keeping its treatment, if the new time passes the same checks as booking."""
++        appointment = self.get(appointment_id)
++        if appointment.cancelled:
++            raise BookingError(f"{appointment.client}'s appointment is cancelled, so it cannot be moved")
++        moved = dataclasses.replace(appointment, start=new_start)
++        self._check(moved, ignore=appointment)
++        appointment.start = new_start
++        return appointment
++
+     def appointments_for(self, therapist, day):
+         """`therapist`'s active appointments on `day`, by start time."""
+         mine = [
+diff --git a/tests/test_schedule.py b/tests/test_schedule.py
+index 36d41f9..abbfafd 100644
+--- a/tests/test_schedule.py
++++ b/tests/test_schedule.py
+@@ -101,6 +101,65 @@ class ScheduleTest(unittest.TestCase):
+         with self.assertRaises(KeyError):
+             s.cancel(999999)
+ 
++    def test_reschedule_moves_the_appointment_and_keeps_its_treatment(self):
++        s = Schedule()
++        a = s.book(at(9, treatment="initial"))
++        moved = s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertIs(moved, a)
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.end, datetime.datetime(2026, 9, 8, 12, 0))
++        self.assertEqual(a.treatment, "initial")
++
++    def test_reschedule_may_overlap_its_own_old_time(self):
++        s = Schedule()
++        a = s.book(at(9))  # 09:00 to 09:45
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 9, 20))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 20))
++
++    def test_reschedule_into_a_taken_slot_is_refused_and_leaves_the_appointment_alone(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.book(at(11, client="Jo Li"))
++        with self.assertRaisesRegex(SlotTaken, "Lena already has Jo Li from 11:00 to 11:45"):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_keeps_the_gap_to_other_appointments(self):
++        s = Schedule()
++        a = s.book(at(9))  # 09:00 to 09:45
++        s.book(at(11, client="Jo Li"))
++        with self.assertRaisesRegex(SlotTaken, "needs 10 minutes between appointments"):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 10, 10))  # ends 10:55, 5 minutes before Jo Li
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_outside_opening_hours_is_refused(self):
++        s = Schedule()
++        a = s.book(at(9))
++        with self.assertRaises(OutsideOpeningHours):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 23, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_ignores_cancelled_appointments_in_the_way(self):
++        s = Schedule()
++        a = s.book(at(9))
++        cancelled = s.book(at(11, client="Jo Li"))
++        s.cancel(cancelled.id)
++        s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 11, 0))
++
++    def test_reschedule_cancelled_appointment_is_a_booking_error(self):
++        s = Schedule()
++        a = s.book(at(9))
++        s.cancel(a.id)
++        with self.assertRaises(BookingError):
++            s.reschedule(a.id, datetime.datetime(2026, 9, 8, 11, 0))
++        self.assertEqual(a.start, datetime.datetime(2026, 9, 8, 9, 0))
++
++    def test_reschedule_unknown_id_raises_key_error(self):
++        s = Schedule()
++        with self.assertRaises(KeyError):
++            s.reschedule(999999, datetime.datetime(2026, 9, 8, 11, 0))
++
+     def test_cancelled_appointment_is_left_out_of_the_day(self):
+         s = Schedule()
+         a = s.book(at(9))

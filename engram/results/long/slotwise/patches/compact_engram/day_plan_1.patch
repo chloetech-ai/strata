@@ -1,0 +1,105 @@
+diff --git a/src/slotwise/printing.py b/src/slotwise/printing.py
+new file mode 100644
+index 0000000..dc941b9
+--- /dev/null
++++ b/src/slotwise/printing.py
+@@ -0,0 +1,29 @@
++"""Printable day plans for reception's receipt printer, which fits 42 characters a line."""
++
++import textwrap
++
++LINE_WIDTH = 42
++TIME_COLUMN = 13  # "09:00-10:00  " is 13 characters, so names start after it
++
++
++def _wrap(text, first_indent="", later_indent=""):
++    return textwrap.wrap(
++        text,
++        width=LINE_WIDTH,
++        initial_indent=first_indent,
++        subsequent_indent=later_indent,
++        break_long_words=True,
++    ) or [first_indent.rstrip()]
++
++
++def day_plan(schedule, therapist, day):
++    """The day's active appointments for `therapist` as plain text, one block per appointment."""
++    lines = _wrap(f"{therapist.title()} - {day:%A %d %B %Y}")
++    appointments = schedule.appointments_for(therapist, day)
++    if not appointments:
++        lines.append("No appointments")
++    for appointment in appointments:
++        time = f"{appointment.start:%H:%M}-{appointment.end:%H:%M}  "
++        lines.extend(_wrap(appointment.client, time, " " * TIME_COLUMN))
++        lines.extend(_wrap(appointment.treatment, " " * TIME_COLUMN, " " * TIME_COLUMN))
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_printing.py b/tests/test_printing.py
+new file mode 100644
+index 0000000..4e62419
+--- /dev/null
++++ b/tests/test_printing.py
+@@ -0,0 +1,64 @@
++import datetime
++import unittest
++
++from slotwise import Appointment, Schedule
++from slotwise.printing import LINE_WIDTH, day_plan
++
++DAY = datetime.date(2026, 10, 14)
++
++
++def at(hour, minute=0):
++    return datetime.datetime.combine(DAY, datetime.time(hour, minute))
++
++
++class DayPlanTest(unittest.TestCase):
++    def test_lists_appointments_in_time_order(self):
++        schedule = Schedule()
++        schedule.book(Appointment("anna", "Kim Weber", at(11), "short"))
++        schedule.book(Appointment("anna", "Jo Li", at(9), "initial"))
++        plan = day_plan(schedule, "anna", DAY)
++        self.assertEqual(
++            plan,
++            "Anna - Wednesday 14 October 2026\n"
++            "09:00-10:00  Jo Li\n"
++            "             initial\n"
++            "11:00-11:30  Kim Weber\n"
++            "             short\n",
++        )
++
++    def test_no_appointments(self):
++        plan = day_plan(Schedule(), "anna", DAY)
++        self.assertEqual(plan, "Anna - Wednesday 14 October 2026\nNo appointments\n")
++
++    def test_cancelled_and_other_therapists_are_left_out(self):
++        schedule = Schedule()
++        cancelled = schedule.book(Appointment("anna", "Kim Weber", at(9)))
++        schedule.cancel(cancelled.id)
++        schedule.book(Appointment("ben", "Jo Li", at(11)))
++        plan = day_plan(schedule, "anna", DAY)
++        self.assertIn("No appointments", plan)
++        self.assertNotIn("Jo Li", plan)
++
++    def test_long_client_name_wraps_without_exceeding_line_width(self):
++        schedule = Schedule()
++        name = "Maria-Elisabeth Gonzalez-Hernandez-Schmidt-Muller"
++        schedule.book(Appointment("anna", name, at(9)))
++        lines = day_plan(schedule, "anna", DAY).splitlines()
++        self.assertTrue(all(len(line) <= LINE_WIDTH for line in lines))
++        self.assertTrue(lines[1].startswith("09:00-09:45  "))
++        self.assertEqual(lines[-1], " " * 13 + "standard")
++        name_lines = lines[1:-1]
++        self.assertGreater(len(name_lines), 1)
++        self.assertTrue(all(line.startswith(" " * 13) for line in name_lines[1:]))
++        self.assertEqual("".join(line[13:] for line in name_lines), name)
++
++    def test_every_line_fits_the_receipt_printer(self):
++        schedule = Schedule()
++        schedule.book(Appointment("anna", "Maria-Elisabeth Gonzalez-Hernandez-Schmidt-Muller", at(9), "initial"))
++        schedule.book(Appointment("anna", "Jo Li", at(11), "short"))
++        plan = day_plan(schedule, "anna", DAY)
++        self.assertTrue(all(len(line) <= LINE_WIDTH for line in plan.splitlines()))
++
++
++if __name__ == "__main__":
++    unittest.main()

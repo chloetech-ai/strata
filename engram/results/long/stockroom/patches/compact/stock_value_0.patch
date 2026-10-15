@@ -1,0 +1,120 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..c183394
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,29 @@
++"""What the stock on hand is worth, costed FIFO (oldest receipts go out first)."""
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand, costed FIFO.
++
++    Each positive movement opens a cost layer at its `unit_cost`; each negative
++    movement takes units from the oldest layers first. Shortfall from negative
++    stock has no layer to draw on, so it adds nothing to the value.
++    """
++    sku = normalize_sku(sku)
++    layers = []  # [qty, unit_cost] pairs, oldest first
++    # sorted() is stable, so movements on the same day keep their log order.
++    for m in sorted(inventory.movements_for(sku), key=lambda m: m.date):
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"{m.reason} of {m.qty} on {m.date} has no unit cost")
++            layers.append([m.qty, m.unit_cost])
++            continue
++        need = -m.qty
++        while need and layers:
++            take = min(need, layers[0][0])
++            layers[0][0] -= take
++            need -= take
++            if layers[0][0] == 0:
++                layers.pop(0)
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..41f382c
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,79 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY1 = datetime.date(2026, 10, 1)
++DAY2 = datetime.date(2026, 10, 2)
++DAY3 = datetime.date(2026, 10, 3)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_single_receipt_is_qty_times_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, date=DAY1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_sale_takes_oldest_layer_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, date=DAY1)
++        inv.receive("BR-1042", 10, 15, date=DAY2)
++        inv.issue("BR-1042", 15, date=DAY3)
++        # 5 left from the second receipt at 15 each
++        self.assertEqual(stock_value(inv, "BR-1042"), 75)
++
++    def test_sale_spanning_two_layers(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, date=DAY1)
++        inv.receive("BR-1042", 10, 15, date=DAY2)
++        inv.issue("BR-1042", 5, date=DAY3)
++        # 5 at 12 and 10 at 15 remain
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 12 + 10 * 15)
++
++    def test_everything_sold_is_worth_nothing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, date=DAY1)
++        inv.issue("BR-1042", 10, date=DAY2)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_negative_stock_adds_no_value(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 12, date=DAY1)
++        inv.issue("BR-1042", 8, date=DAY2)
++        self.assertEqual(inv.on_hand("BR-1042"), -3)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_fifo_uses_dates_not_log_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 15, date=DAY2)
++        inv.receive("BR-1042", 10, 12, date=DAY1)
++        inv.issue("BR-1042", 10, date=DAY3)
++        # the day-1 receipt at 12 went out first, leaving 10 at 15
++        self.assertEqual(stock_value(inv, "BR-1042"), 150)
++
++    def test_unknown_sku_is_zero(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, date=DAY1)
++        self.assertEqual(stock_value(inv, "BR-9999"), 0)
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive("br-1042", 10, 12, date=DAY1)
++        self.assertEqual(stock_value(inv, " BR-1042 "), 120)
++
++    def test_other_skus_do_not_count(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, date=DAY1)
++        inv.receive("BR-2000", 7, 3, date=DAY1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_positive_movement_without_cost_is_an_error(self):
++        inv = Inventory()
++        inv._record(Movement("BR-1042", 2, DAY1, "RETURN"))
++        with self.assertRaisesRegex(ValueError, "no unit cost"):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

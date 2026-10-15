@@ -1,0 +1,90 @@
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..54e5a24
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,27 @@
++"""Printable blind count sheet for the stock-take.
++
++Lines are in walking order (by bin location) and the sheet never shows the
++quantity on hand, so people have to count rather than copy the system figure.
++"""
++
++HEADER = ("Bin", "SKU", "Description", "Unit", "Counted")
++WRITE_IN = "__________"
++
++
++def _bin_key(location):
++    # Compare bin codes part by part, numbers as numbers, so B-9-1 sorts before B-12-3.
++    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in location.split("-"))
++
++
++def count_sheet(inventory):
++    """The blind count sheet for every catalog item, as text."""
++    if inventory.catalog is None:
++        raise ValueError("count sheet needs an inventory with a catalog")
++    items = sorted(inventory.catalog, key=lambda item: (_bin_key(item.location), item.sku))
++    rows = [HEADER] + [(item.location, item.sku, item.name, item.unit, WRITE_IN) for item in items]
++    widths = [max(len(row[col]) for row in rows) for col in range(len(HEADER) - 1)]
++    lines = []
++    for row in rows:
++        cells = [cell.ljust(width) for cell, width in zip(row, widths)] + [row[-1]]
++        lines.append("  ".join(cells).rstrip())
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..a7bb4d7
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,51 @@
++import datetime
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++DAY = datetime.date(2026, 9, 1)
++
++
++def make_inventory():
++    catalog = Catalog([
++        Item("BR-1042", "Hex bolt M8x40", "B-12-3", unit="pcs"),
++        Item("BR-2210", "Wood screw", "B-9-1", unit="box"),
++        Item("BR-3300", "Washer", "B-12-3", unit="pcs"),
++        Item("BR-0500", "Anchor", "A-1-1", unit="pcs"),
++    ])
++    inv = Inventory(catalog)
++    inv.receive("BR-1042", 4321, 12, DAY)
++    return inv
++
++
++class CountSheetTest(unittest.TestCase):
++    def data_lines(self, text):
++        return text.splitlines()[1:]
++
++    def test_one_line_per_catalog_item_plus_header(self):
++        lines = count_sheet(make_inventory()).splitlines()
++        self.assertEqual(len(lines), 5)
++        self.assertTrue(lines[0].startswith("Bin"))
++
++    def test_walking_order_by_bin_location_numerically(self):
++        skus = [line.split()[1] for line in self.data_lines(count_sheet(make_inventory()))]
++        # A-1-1, then B-9-1 before B-12-3; the two B-12-3 items are tied on location and sorted by SKU
++        self.assertEqual(skus, ["BR-0500", "BR-2210", "BR-1042", "BR-3300"])
++
++    def test_never_shows_on_hand(self):
++        text = count_sheet(make_inventory())
++        self.assertNotIn("4321", text)
++
++    def test_counted_column_is_blank_write_in(self):
++        for line in self.data_lines(count_sheet(make_inventory())):
++            self.assertTrue(line.endswith("__________"))
++
++    def test_needs_a_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

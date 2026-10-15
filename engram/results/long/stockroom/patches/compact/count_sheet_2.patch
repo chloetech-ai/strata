@@ -1,0 +1,87 @@
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..0332452
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,32 @@
++"""The blind count sheet: what to count and where, without what the system thinks is there."""
++
++import re
++
++
++HEADER = f"{'BIN':<10}  {'SKU':<10}  {'ITEM':<30}  COUNTED"
++
++
++def count_sheet(inventory):
++    """Text sheet with one line per catalog item, sorted by bin location.
++
++    The system quantity is deliberately left out; the COUNTED column is blank
++    for whoever is doing the count to fill in.
++    """
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog")
++    items = sorted(inventory.catalog, key=lambda item: (_location_key(item.location), item.sku))
++    lines = [HEADER.rstrip()]
++    for item in items:
++        lines.append(f"{item.location:<10}  {item.sku:<10}  {item.name:<30}".rstrip())
++    return "\n".join(lines) + "\n"
++
++
++def _location_key(location):
++    """Sort key that orders digit runs by value, so B-2-1 comes before B-10-1."""
++    key = []
++    for part in re.split(r"(\d+)", location):
++        if part.isdigit():
++            key.append((0, int(part), ""))
++        elif part:
++            key.append((1, 0, part))
++    return key
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..8ced989
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,43 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def make_inventory(self):
++        catalog = Catalog([
++            Item("BR-1042", "Hex bolt M8", "B-10-1"),
++            Item("BR-2000", "Wood screw 4x40", "B-2-1"),
++            Item("BR-0007", "Door hinge", "A-1-1"),
++        ])
++        return Inventory(catalog)
++
++    def test_one_line_per_catalog_item_after_header(self):
++        inv = self.make_inventory()
++        lines = count_sheet(inv).splitlines()
++        self.assertEqual(len(lines), 1 + len(inv.catalog))
++
++    def test_sorted_by_bin_location_numerically(self):
++        lines = count_sheet(self.make_inventory()).splitlines()[1:]
++        self.assertEqual([line.split()[0] for line in lines], ["A-1-1", "B-2-1", "B-10-1"])
++
++    def test_system_quantity_is_not_printed(self):
++        inv = self.make_inventory()
++        inv.receive("BR-1042", 9876, 12)
++        sheet = count_sheet(inv)
++        self.assertNotIn("9876", sheet)
++        self.assertNotIn("-9876", sheet)
++
++    def test_items_with_no_stock_are_listed(self):
++        lines = count_sheet(self.make_inventory()).splitlines()
++        self.assertTrue(any("BR-0007" in line and "Door hinge" in line for line in lines))
++
++    def test_requires_a_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,60 @@
+diff --git a/src/slotwise/intervals.py b/src/slotwise/intervals.py
+new file mode 100644
+index 0000000..3f9daa2
+--- /dev/null
++++ b/src/slotwise/intervals.py
+@@ -0,0 +1,12 @@
++"""Merging of time intervals."""
++
++
++def merge_intervals(intervals):
++    """Merges (start, end) pairs that overlap or touch, sorted by start. The input is left unchanged."""
++    merged = []
++    for start, end in sorted(intervals):
++        if merged and start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++        else:
++            merged.append((start, end))
++    return merged
+diff --git a/tests/test_intervals.py b/tests/test_intervals.py
+new file mode 100644
+index 0000000..fedab68
+--- /dev/null
++++ b/tests/test_intervals.py
+@@ -0,0 +1,36 @@
++import datetime
++import unittest
++
++from slotwise.intervals import merge_intervals
++
++DT = datetime.datetime
++
++
++class MergeIntervalsTest(unittest.TestCase):
++    def test_overlapping_and_touching_are_merged(self):
++        self.assertEqual(merge_intervals([(1, 3), (2, 5), (5, 7)]), [(1, 7)])
++
++    def test_contained_interval_is_absorbed(self):
++        self.assertEqual(merge_intervals([(1, 10), (3, 4)]), [(1, 10)])
++
++    def test_disjoint_stay_separate_and_sorted(self):
++        self.assertEqual(merge_intervals([(8, 9), (1, 2), (4, 5)]), [(1, 2), (4, 5), (8, 9)])
++
++    def test_unsorted_input_with_chain_of_overlaps(self):
++        self.assertEqual(merge_intervals([(6, 8), (0, 2), (1, 4), (7, 9)]), [(0, 4), (6, 9)])
++
++    def test_datetimes(self):
++        intervals = [(DT(2026, 9, 8, 9, 0), DT(2026, 9, 8, 9, 45)), (DT(2026, 9, 8, 9, 30), DT(2026, 9, 8, 10, 0))]
++        self.assertEqual(merge_intervals(intervals), [(DT(2026, 9, 8, 9, 0), DT(2026, 9, 8, 10, 0))])
++
++    def test_empty(self):
++        self.assertEqual(merge_intervals([]), [])
++
++    def test_input_is_not_modified(self):
++        intervals = [(5, 7), (1, 3), (2, 4)]
++        merge_intervals(intervals)
++        self.assertEqual(intervals, [(5, 7), (1, 3), (2, 4)])
++
++
++if __name__ == "__main__":
++    unittest.main()

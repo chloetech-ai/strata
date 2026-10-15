@@ -1,0 +1,68 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..e15cb9f
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,27 @@
++"""ABC analysis of stock by annual consumption value."""
++
++
++def abc_classes(values):
++    """Classify SKUs A, B or C by their share of the total value.
++
++    `values` maps SKU to annual consumption value. SKUs are ranked highest
++    value first, and a SKU is 'A' while the running share up to and including
++    it is at most 80% of the total, 'B' up to 95%, and 'C' otherwise. Ties are
++    ordered by SKU so the result is deterministic.
++    """
++    if any(value < 0 for value in values.values()):
++        raise ValueError("consumption values must not be negative")
++    total = sum(values.values())
++    classes = {}
++    running = 0
++    for sku, value in sorted(values.items(), key=lambda pair: (-pair[1], pair[0])):
++        running += value
++        if total == 0:
++            classes[sku] = "C"
++        elif running <= 0.80 * total:
++            classes[sku] = "A"
++        elif running <= 0.95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..81dbcbe
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_classes_by_cumulative_share(self):
++        # Total 100. Running shares: 50 (50%), 75 (75%), 90 (90%), 95 (95%), 100.
++        values = {"BR-1": 50, "BR-2": 25, "BR-3": 15, "BR-4": 5, "BR-5": 5}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "A", "BR-3": "B", "BR-4": "B", "BR-5": "C"},
++        )
++
++    def test_boundary_is_inclusive(self):
++        # Running share hits exactly 80% at BR-1 and 95% at BR-2.
++        values = {"BR-1": 80, "BR-2": 15, "BR-3": 5}
++        self.assertEqual(abc_classes(values), {"BR-1": "A", "BR-2": "B", "BR-3": "C"})
++
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_negative_value_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": 10, "BR-2": -1})
++
++
++if __name__ == "__main__":
++    unittest.main()

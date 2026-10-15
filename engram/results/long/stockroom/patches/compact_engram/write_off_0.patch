@@ -1,0 +1,53 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 5745d35..a7d03df 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -54,6 +54,12 @@ class Inventory:
+             raise ValueError("quantity must be positive")
+         return self.record(sku, -qty, "SALE", date, note)
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock that got broken or damaged; `qty` is positive, the movement is recorded as DAMAGE."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self.record(sku, -qty, "DAMAGE", date)
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index c6b2aad..0a746bc 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -57,6 +57,31 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual(inv.on_hand("br-1042"), 70)
+         self.assertEqual({m.sku for m in inv.movements}, {"BR-1042"})
+ 
++    def test_write_off_records_damage_and_reduces_stock(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        move = inv.write_off("BR-1042", 3, DAY)
++        self.assertEqual((move.qty, move.reason, move.date), (-3, "DAMAGE", DAY))
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_does_not_refuse_negative_stock(self):
++        inv = Inventory()
++        inv.write_off("BR-1042", 2, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -2)
++
++    def test_write_off_rejects_non_positive_qty(self):
++        inv = Inventory()
++        for qty in (0, -1):
++            with self.assertRaises(ValueError):
++                inv.write_off("BR-1042", qty, DAY)
++        self.assertEqual(inv.movements, [])
++
++    def test_write_off_normalizes_sku(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 12, DAY)
++        inv.write_off(" br-1042 ", 1, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 4)
++
+     def test_movements_for(self):
+         inv = Inventory()
+         inv.receive("BR-1042", 10, 12, DAY)

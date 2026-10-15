@@ -1,0 +1,36 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index f0a25f4..9dcba79 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -54,3 +54,8 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The most recently recorded receipt for a SKU, or None."""
++        receipts = [m for m in self.movements_for(sku) if m.reason == "RECEIPT"]
++        return receipts[-1] if receipts else None
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index eb20107..e8465b8 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -43,6 +43,18 @@ class InventoryTest(unittest.TestCase):
+         for code in ["RECEIPT", "SALE", "RETURN", "DAMAGE", "COUNT"]:
+             self.assertEqual(Movement("BR-1042", 1, DAY, code).reason, code)
+ 
++    def test_last_receipt(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.issue("BR-1042", 4, DAY)
++        second = inv.receive("br-1042", 6, 15, DAY)
++        inv.receive("BR-2210", 5, 30, DAY)
++        self.assertIs(inv.last_receipt(" BR-1042"), second)
++        inv.issue("BR-1042", 2, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), second)
++        self.assertIsNone(Inventory().last_receipt("BR-9999"))
++
+     def test_sku_spelling_is_normalized(self):
+         inv = Inventory()
+         inv.receive(" br-1042", 10, 12, DAY)
