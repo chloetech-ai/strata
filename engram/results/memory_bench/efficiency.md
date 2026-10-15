@@ -1,6 +1,6 @@
 # Memory bench: what memory costs a run
 
-Runs that logged where memory reached the agent: the fourth repeat of every task, and all four in the lanes added with it. Memory context = characters that hooks injected, memory tools returned, or the agent read from the memory's files, per run (mean). Agent input = tokens the agent read per run, cached or not (median). Memory model tokens = the memory system's own model calls per run (input + output, mean). Wall time includes load from the lanes running beside it.
+Runs that logged where memory reached the agent: the fourth repeat of every task, and all four in the lanes added with it. Memory context = characters that hooks injected, memory tools returned, or the agent read from the memory's files, per run (mean). Agent input = tokens the agent read per run, cached or not (median). Memory model tokens = the memory system's own model calls per run (input + output, mean). For `full` the history is the forked session's own context, so it shows in agent input, not memory context. Wall time includes load from the lanes running beside it.
 
 | lane | runs | solved | memory context, chars | agent input, tokens (p50) | memory model tokens | $ per run, agent + memory | wall s p50 / p95 |
 |---|---|---|---|---|---|---|---|

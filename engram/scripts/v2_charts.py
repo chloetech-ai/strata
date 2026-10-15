@@ -43,12 +43,12 @@ def save(fig, name):
 
 
 def answers_chart():
-    s = json.load(open(os.path.join(RES, "v2", "reader", "summary.json")))["configs"]
+    s = json.load(open(os.path.join(RES, "v2", "reader", "summary_variants.json")))["configs"]
     rows = [
         ("no memory", "none", GREY),
         ("Engram main: 4,000-character recall", "win400", BLUE),
-        ("query engine's picks only", "deep_haiku", TEAL),
-        ("Engram main + query engine", "win400_deep_haiku", DARK),
+        ("query engine's picks only", "deep_v6pref", TEAL),
+        ("Engram main + query engine", "win400_deep_v6pref", DARK),
         ("the evidence sessions, whole (oracle)", "oracle", GREEN),
     ]
     fig, ax = plt.subplots(figsize=(10, 3.9))
@@ -63,12 +63,12 @@ def answers_chart():
     ax.grid(axis="x", color="#e5e7eb")
     ax.set_axisbelow(True)
     ax.set_title("LongMemEval-S: questions answered correctly, by context", loc="left", fontweight="bold")
-    fig.text(0.01, -0.04, "500 questions; reader and judge Haiku (LongMemEval's grading prompts). Average context size in brackets. Cloud VM, 2026-10-15.", fontsize=9, color="#555")
+    fig.text(0.01, -0.04, "500 questions; planner, ranker, reader and judge Haiku (LongMemEval's grading prompts). Average context size in brackets. Cloud container, 2026-10-15.", fontsize=9, color="#555")
     save(fig, "chart-engram-v2-answers.png")
 
 
 def evidence_chart():
-    rows = [json.loads(l) for l in gzip.open(os.path.join(RES, "v2", "deep", "longmemeval_s_deep_haiku.rows.jsonl.gz"), "rt")]
+    rows = [json.loads(l) for l in gzip.open(os.path.join(RES, "v2", "deep", "longmemeval_s_deep_v6pref.rows.jsonl.gz"), "rt")]
     rows = [r for r in rows if not r["abstention"] and r["n_evidence"] > 0]
     by = defaultdict(list)
     for r in rows:
@@ -77,7 +77,7 @@ def evidence_chart():
     order = ["all", "multi-session", "temporal-reasoning", "knowledge-update", "single-session-user", "single-session-assistant", "single-session-preference"]
     names = {"all": "all", "multi-session": "multi-\nsession", "temporal-reasoning": "temporal", "knowledge-update": "knowledge\nupdate",
              "single-session-user": "user\nfact", "single-session-assistant": "assistant\nfact", "single-session-preference": "preference"}
-    series = [("plain search, top 10 records", "base_r_all@10", BLUE), ("query engine, 30 candidates", "pool_all", PURPLE), ("query engine, its picks (2.6 records)", "pick_all", DARK)]
+    series = [("plain search, top 10 records", "base_r_all@10", BLUE), ("query engine, its 27 candidates", "pool_all", PURPLE), ("query engine, its picks (2.8 records)", "pick_all", DARK)]
     fig, ax = plt.subplots(figsize=(11, 4.3))
     w = 0.26
     for i, (label, key, color) in enumerate(series):

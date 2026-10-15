@@ -1,0 +1,638 @@
+{
+ "reader": "haiku",
+ "judge": "haiku",
+ "questions": 500,
+ "note": "Every context read in the cloud container on 2026-10-15, from verdicts_small.jsonl. deep_<tag>: the query engine's picks from results/v2/deep/longmemeval_s_deep_<tag>; win400_deep_<tag>: Engram main's recall (win400) followed by those picks. haiku = first run (model calls inherited the session's memory); v2clean, v6old = first ranker prompt, clean; v6pref = the default prompt; v3 = longer prompt, dropped; rankonly = no planner; local5 = local ranker.",
+ "configs": {
+  "none": {
+   "n": 500,
+   "accuracy": 0.086,
+   "context_chars": 0.0,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.0
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.0
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.05357142857142857
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.3333333333333333
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.0
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.0
+    }
+   }
+  },
+  "win400": {
+   "n": 500,
+   "accuracy": 0.722,
+   "context_chars": 3526.554,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8611111111111112
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.5289256198347108
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.75
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8333333333333334
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.84375
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.6692913385826772
+    }
+   }
+  },
+  "oracle": {
+   "n": 500,
+   "accuracy": 0.898,
+   "context_chars": 26737.754,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9166666666666666
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.7851239669421488
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9821428571428571
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.953125
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.937007874015748
+    }
+   }
+  },
+  "deep_haiku": {
+   "n": 500,
+   "accuracy": 0.768,
+   "context_chars": 878.942,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9305555555555556
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.5537190082644629
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9107142857142857
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.7
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.875
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7322834645669292
+    }
+   }
+  },
+  "deep_reading_haiku": {
+   "n": 500,
+   "accuracy": 0.752,
+   "context_chars": 1208.39,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8472222222222222
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.5041322314049587
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9642857142857143
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.6
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.8125
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7952755905511811
+    }
+   }
+  },
+  "win400_deep_haiku": {
+   "n": 500,
+   "accuracy": 0.81,
+   "context_chars": 4470.368,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9333333333333333
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9166666666666666
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.628099173553719
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.8928571428571429
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.7333333333333333
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.90625
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.8267716535433071
+    }
+   }
+  },
+  "deep_v2clean": {
+   "n": 500,
+   "accuracy": 0.782,
+   "context_chars": 890.264,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9333333333333333
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8611111111111112
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.5619834710743802
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9107142857142857
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.7666666666666667
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.890625
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.8031496062992126
+    }
+   }
+  },
+  "win400_deep_v2clean": {
+   "n": 500,
+   "accuracy": 0.816,
+   "context_chars": 4482.778,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9166666666666666
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.6446280991735537
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9285714285714286
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.7333333333333333
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.859375
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.8267716535433071
+    }
+   }
+  },
+  "deep_local5": {
+   "n": 500,
+   "accuracy": 0.686,
+   "context_chars": 1635.514,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9166666666666666
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.4628099173553719
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.5535714285714286
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.7
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.890625
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.6535433070866141
+    }
+   }
+  },
+  "win400_deep_local5": {
+   "n": 500,
+   "accuracy": 0.744,
+   "context_chars": 5230.068,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9166666666666666
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.5289256198347108
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.7678571428571429
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.921875
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.6850393700787402
+    }
+   }
+  },
+  "deep_rankonly": {
+   "n": 500,
+   "accuracy": 0.778,
+   "context_chars": 918.57,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8888888888888888
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.6115702479338843
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.8214285714285714
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.9375
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7165354330708661
+    }
+   }
+  },
+  "win400_deep_rankonly": {
+   "n": 500,
+   "accuracy": 0.786,
+   "context_chars": 4512.036,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8888888888888888
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.6198347107438017
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9464285714285714
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.890625
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7165354330708661
+    }
+   }
+  },
+  "deep_v3": {
+   "n": 500,
+   "accuracy": 0.772,
+   "context_chars": 903.382,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8333333333333334
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.5702479338842975
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.8571428571428571
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.7666666666666667
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.859375
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.8031496062992126
+    }
+   }
+  },
+  "win400_deep_v3": {
+   "n": 500,
+   "accuracy": 0.794,
+   "context_chars": 4497.12,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9333333333333333
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8333333333333334
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.6198347107438017
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.8392857142857143
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.953125
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.8031496062992126
+    }
+   }
+  },
+  "deep_v6old": {
+   "n": 500,
+   "accuracy": 0.802,
+   "context_chars": 924.306,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9333333333333333
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9027777777777778
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.5950413223140496
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9285714285714286
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8333333333333334
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.90625
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7952755905511811
+    }
+   }
+  },
+  "win400_deep_v6old": {
+   "n": 500,
+   "accuracy": 0.812,
+   "context_chars": 4517.092,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.9166666666666666
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.6446280991735537
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9642857142857143
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.7666666666666667
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.859375
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7952755905511811
+    }
+   }
+  },
+  "deep_v6pref": {
+   "n": 500,
+   "accuracy": 0.79,
+   "context_chars": 941.158,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8472222222222222
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.5785123966942148
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9464285714285714
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.8333333333333334
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.890625
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.7874015748031497
+    }
+   }
+  },
+  "win400_deep_v6pref": {
+   "n": 500,
+   "accuracy": 0.818,
+   "context_chars": 4535.032,
+   "by_type": {
+    "abstention": {
+     "n": 30,
+     "accuracy": 0.9666666666666667
+    },
+    "knowledge-update": {
+     "n": 72,
+     "accuracy": 0.8333333333333334
+    },
+    "multi-session": {
+     "n": 121,
+     "accuracy": 0.628099173553719
+    },
+    "single-session-assistant": {
+     "n": 56,
+     "accuracy": 0.9642857142857143
+    },
+    "single-session-preference": {
+     "n": 30,
+     "accuracy": 0.9
+    },
+    "single-session-user": {
+     "n": 64,
+     "accuracy": 0.9375
+    },
+    "temporal-reasoning": {
+     "n": 127,
+     "accuracy": 0.8110236220472441
+    }
+   }
+  }
+ }
+}
