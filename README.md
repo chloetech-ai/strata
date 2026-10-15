@@ -8,6 +8,8 @@ Underneath sits **Strata**, a single-file search database in the spirit of SQLit
 
 📖 **Full documentation:** [`docs/`](docs/index.md) (also publishable as a GitHub Pages site).
 
+🚀 **Try it:** `git clone https://github.com/rkonow/engram && cd engram && ./install.sh` sets Engram up for every Claude Code session on a Mac or Linux machine ([quick start](#quick-start)). To have a coding agent do it, tell it: *"Clone https://github.com/rkonow/engram and set Engram up for my Claude Code by following its AGENTS.md."* [`AGENTS.md`](AGENTS.md) gives an agent the steps, the checks and what to ask you first.
+
 ![A new Claude Code session answers from Engram's memory: the storage decision, its reason, and the receipt-printer constraint, all stated in an earlier session](docs/assets/img/inspector-new-session.png)
 
 *The Engram live inspector. Left: a fresh Claude Code session is asked what was decided earlier, and answers from the briefing Engram injected. Right: the records the hooks stored and the decisions, rules and planned work a small model distilled from the first session.*
@@ -83,6 +85,8 @@ git clone https://github.com/rkonow/engram && cd engram
 
 `install.sh` builds Engram, installs it to `~/.local/bin/engram`, downloads the embedding model (129 MB), wires the hooks and the MCP server into Claude Code (`engram install --user`, or `--project`), and runs `engram doctor` to check the result. Each project directory gets its own store under `~/.local/share/engram/projects/`, outside the repository. Run it again after `git pull` to upgrade; `engram uninstall --user` removes it and keeps the stores. [Install on your machine](docs/engram/setup.md) covers the details, remote machines, dev containers and troubleshooting.
 
+An agent can do all of this: [`AGENTS.md`](AGENTS.md) has its instructions, including which steps need you (choosing the scope, and `claude auth login` if the CLI is logged out). Engram takes effect in new Claude Code sessions.
+
 Then browse what it stored, per project and per session:
 
 ```sh
@@ -120,6 +124,7 @@ target/release/strata db.strata "SELECT category, COUNT(*) FROM docs WHERE MATCH
 | [`strata/`](strata/) | the database: storage engine, segments, text / structured / vector / graph indexes, SQL binder, planner and executor, baselines and benchmarks; [`src/postings/`](strata/src/postings/) holds the compressed posting lists and set algorithms, the Pyramid, Loom and Entropic designs, and their testbed (`strata-posting-bench`) |
 | [`docs/`](docs/) | this documentation, as Markdown and as a GitHub Pages site |
 | [`install.sh`](install.sh) | builds Engram, installs it to `~/.local/bin` and wires it into Claude Code |
+| [`AGENTS.md`](AGENTS.md) | instructions for a coding agent setting Engram up or working on this repository (`CLAUDE.md` imports it) |
 
 Each crate also carries its own design document ([Strata](strata/DESIGN.md), [Engram](engram/DESIGN.md)) and full HTML reports with every chart and table ([Strata](strata/report/strata.html), [Strata graphs](strata/report/graph.html), [Engram](engram/report/engram.html), [record structure](engram/report/structure.html), [posting lists](strata/report/postings/report.html), [designs](strata/report/postings/designs.html)).
 
