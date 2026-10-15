@@ -17,8 +17,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Instant;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 
@@ -219,7 +221,7 @@ Several searches of the same type are fine. Types:
 - {"type": "notes", "q": "<what a decision, rule, requirement or fact would say>"}: only the written-down notes.
 - {"type": "entity", "names": ["<a thing notes are about>", ...], "q": "<what you want about them>"}: records linked to those things, and their neighbours.
 - {"type": "file", "path": "<file path>", "q": "<what you want about it>"}: records about a file.
-- {"type": "sql", "where": "<condition>", "order": "<ordering>"}: a filter over memory(id, session, kind, tag, turn, seq, ts, importance, files, text, ctx); conditions may use MATCH(body, 'word AND word'), MATCH(files, 'name'), kind IN ('error', 'decision'), ts >= <unix seconds>; order is e.g. seq DESC or bm25(body, 'words') DESC.
+- {"type": "sql", "where": "<condition>", "order": "<ordering>"}: a filter over memory(id, session, kind, tag, turn, seq, ts, importance, files, text, ctx); body is the full-text index over text and ctx; conditions may use MATCH(body, 'word AND word'), MATCH(files, 'name'), kind IN ('error', 'decision'), ts >= <unix seconds>; order is e.g. seq DESC or bm25(body, 'words') DESC.
 Any search may add "kinds": [...] (prompt, answer, tool_call, tool_result, error, episode, summary, decision, preference, fact, todo, note).
 
 Output {"need_memory": true or false, "difficulty": "easy" or "hard", "queries": [1 to {max} searches]}. need_memory is false only when earlier sessions cannot matter (a greeting, thanks, "commit this"). difficulty is hard when the request needs several facts combined or reasoning across sessions."#;
@@ -273,6 +275,13 @@ pub fn parse_plan(text: &str, max: usize) -> Plan {
 }
 
 /// A WHERE or ORDER BY fragment that cannot end the statement or comment out the rest.
+/// Full-text calls name the indexed field `body`; the planner sometimes names
+/// the stored columns it covers (`text`, `ctx`), which have no index.
+fn text_to_body(sql: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\b(match|bm25)\s*\(\s*(?:text|ctx)\s*,").unwrap()).replace_all(sql, "$1(body,").into_owned()
+}
+
 fn safe_sql(s: &str) -> bool {
     let l = s.to_lowercase();
     s.len() <= 600 && !s.contains(';') && !s.contains("--") && !s.contains("/*") && !l.contains(" limit ") && !l.contains("select ")
@@ -396,8 +405,8 @@ pub fn run_query(store: &Store, q: &Query, filter: &Filter, n: usize) -> Result<
         }
         "sql" => {
             let mut conds = f.conds();
-            conds.push(format!("({})", q.sql_where));
-            let order = if q.sql_order.is_empty() { "seq DESC".to_string() } else { q.sql_order.clone() };
+            conds.push(format!("({})", text_to_body(&q.sql_where)));
+            let order = if q.sql_order.is_empty() { "seq DESC".to_string() } else { text_to_body(&q.sql_order) };
             let rs = store.query(&format!("SELECT {COLUMNS} FROM memory WHERE {} ORDER BY {order} LIMIT {n}", conds.join(" AND ")))?;
             rs.rows.iter().filter_map(|r| row_record(r)).collect()
         }
@@ -758,6 +767,10 @@ mod tests {
             assert!(got.iter().all(|r| r.kind != Kind::Entity), "{k}");
         }
         assert_eq!(run_query(&s, &q("sql"), &f, 5).unwrap()[0].kind, Kind::Error);
+        // A full-text call on the stored column searches the index instead.
+        let on_text = Query { sql_where: "MATCH(text, 'tomllib')".into(), sql_order: "bm25(text, 'tomllib') DESC".into(), ..q("sql") };
+        assert_eq!(run_query(&s, &on_text, &f, 5).unwrap().len(), 2);
+        assert_eq!(text_to_body("kind = 'x' AND match ( ctx , 'a')"), "kind = 'x' AND match(body, 'a')");
         let plan = Plan { need: true, queries: vec![q("entity"), q("sql")], ..Default::default() };
         let (cands, errors) = gather(&s, &DeepConfig::default(), "read the depot config", &plan, &f);
         assert!(errors.is_empty(), "{errors:?}");
