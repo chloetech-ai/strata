@@ -45,9 +45,9 @@ place).
 
 `run` records the history first where it is missing; `all` is `run` then
 `report`. Results go to --results (default results/memory_bench/<scenario>/):
-runs.jsonl (one row per run), history_<lane>.json, patches/<lane>/,
-summary.json and summary.md. Work (repositories, homes, snapshots, logs) goes
-to --work/<scenario>/<lane>/.
+runs.jsonl (one row per run), history_<lane>.json, patches/<lane>/ (packed
+into patches.tar.gz in the committed results), summary.json and summary.md.
+Work (repositories, homes, snapshots, logs) goes to --work/<scenario>/<lane>/.
 """
 
 import argparse

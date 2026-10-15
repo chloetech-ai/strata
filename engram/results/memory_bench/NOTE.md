@@ -31,3 +31,10 @@ first graded too strictly: an answer that gave the new value and also
 mentioned the old one as out of date failed. The graders were fixed and
 `memory_bench.py regrade` re-scored the stored answers; 13 rows changed, and
 each keeps its first score in `regraded_from`.
+
+# Patches
+
+Each run's diff of the repository (`patches/<lane>/<task>_<repeat>.patch`, as
+the harness writes it) is packed into one `patches.tar.gz` per project here, to
+keep the 2,080 runs' 2,600 small files out of the file list:
+`tar -xzf <project>/patches.tar.gz -C <project>` restores them.
