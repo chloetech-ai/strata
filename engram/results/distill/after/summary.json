@@ -1,0 +1,88 @@
+{
+ "outputs": 60,
+ "passed": 58,
+ "cost_usd": 0.0316065,
+ "cases": {
+  "open_questions": {
+   "runs": 5,
+   "passed": 5,
+   "about": "The assistant's unanswered questions are not requirements; the stated fee tiers are.",
+   "failures": []
+  },
+  "rule_with_reason": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A rule the user sets is kept with its reason.",
+   "failures": []
+  },
+  "decision_with_reason": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A decision is kept with the reason given.",
+   "failures": []
+  },
+  "assistant_convention": {
+   "runs": 5,
+   "passed": 5,
+   "about": "The assistant's own working habits are not project rules.",
+   "failures": []
+  },
+  "suggestion_not_taken": {
+   "runs": 5,
+   "passed": 4,
+   "about": "A suggestion the user turned down is not a plan.",
+   "failures": [
+    [
+     "forbidden decision /add(ing)? redis|use redis/: For the order page slowness, the user rejected adding Redis caching or anything else new, so the fix is limited to the N"
+    ]
+   ]
+  },
+  "update_replaces": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A change to a noted rule is written as its replacement.",
+   "failures": []
+  },
+  "done": {
+   "runs": 5,
+   "passed": 5,
+   "about": "Planned work that the exchange completed is marked done.",
+   "failures": []
+  },
+  "environment_fact": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A fact about the environment is kept.",
+   "failures": []
+  },
+  "stale_status": {
+   "runs": 5,
+   "passed": 4,
+   "about": "Status that will soon be stale is left out.",
+   "failures": [
+    [
+     "forbidden /pushed/ in: The refunds feature is developed on the git branch `feature/refunds`, which is pushed to the `origin` remote.",
+     "forbidden /feature/refunds/ in: The refunds feature is developed on the git branch `feature/refunds`, which is pushed to the `origin` remote."
+    ]
+   ]
+  },
+  "secret": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A secret never reaches a note.",
+   "failures": []
+  },
+  "small_talk": {
+   "runs": 5,
+   "passed": 5,
+   "about": "Nothing worth keeping.",
+   "failures": []
+  },
+  "failed_approach": {
+   "runs": 5,
+   "passed": 5,
+   "about": "An approach that failed is kept with why.",
+   "failures": []
+  }
+ }
+}

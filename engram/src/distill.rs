@@ -83,7 +83,7 @@ const PROMPT: &str = r#"Here is one exchange from a software project.
 
 Write down what someone working on this project in a later session would need to know and could not easily see in the code:
 - decisions, with the reason given;
-- rules, constraints and conventions the user, the team or a client set: what must or must not be done, formats, naming, processes. Keep every rule stated, with its reason, even if the current code already follows it: the code shows what was done, not that it must stay that way;
+- rules, constraints and conventions the user, the team or a client set (never the assistant: only they can make a project rule): what must or must not be done, formats, naming, processes. Keep every rule stated, with its reason, even if the current code already follows it: the code shows what was done, not that it must stay that way;
 - requirements for work the user announced or planned but that is not done yet, with every detail given (formats, names, numbers);
 - facts about the project or its environment that were stated or discovered (how to run or test it, quirks, people, external systems), and approaches that were tried and failed, with why.
 
@@ -95,8 +95,8 @@ The already-noted items above are the notes most related to this exchange (not a
 
 Leave out:
 - anything already noted above, unless this exchange changes it;
-- status that will soon be stale (test counts, what is committed or pushed, which branch is checked out);
-- the assistant's own working conventions (commit message trailers, tool usage) and its suggestions the user did not take up;
+- status that will soon be stale (test counts and results, what was committed or pushed and to which branch);
+- the assistant's own habits and conventions, even when it says it always follows them ("as usual I'll ...": commit message style, formatting, tool usage), and its suggestions the user did not take up;
 - questions the assistant asked and assumptions it made that the user has not answered or confirmed: they are not requirements, and never write one up as something that must be settled before the work can start;
 - details of the code that reading it shows (signatures, what a function does).
 
@@ -114,6 +114,7 @@ pub struct Distilled {
     pub replaced: Vec<String>,
     pub done: Vec<String>,
     pub cost_usd: f64,
+    pub usage: llm::Usage,
 }
 
 /// The label a noted record carries in the prompt.
@@ -189,6 +190,7 @@ pub fn distill(cfg: &DistillConfig, request: &str, answer: &str, commands: &[Str
     let r = llm::complete(&cfg.cli(&model, cfg.timeout_secs), SYSTEM, &prompt)?;
     let mut d = parse(&r.text);
     d.cost_usd = r.cost_usd;
+    d.usage = r.usage;
     Ok(d)
 }
 

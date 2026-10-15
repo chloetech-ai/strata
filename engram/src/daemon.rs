@@ -555,7 +555,7 @@ impl Daemon {
                 }
                 self.store.warm();
                 self.log(&json!({"ts": now(), "event": "distill", "session": sid, "turn": turn, "items": n, "kept": kept,
-                    "replaced": replaced, "done": done, "cost_usd": d.cost_usd, "ms": t0.elapsed().as_millis() as u64}));
+                    "replaced": replaced, "done": done, "cost_usd": d.cost_usd, "tokens": d.usage.json(), "ms": t0.elapsed().as_millis() as u64}));
             }
             Err(e) => self.log(&json!({"ts": now(), "event": "distill", "session": sid, "turn": turn, "error": e.to_string()})),
         }
@@ -577,7 +577,7 @@ impl Daemon {
         match crate::consolidate::run(&self.store, &self.cfg.consolidate, &self.distill_cfg(), now()) {
             Ok(r) => {
                 let j = json!({"ts": now(), "event": "consolidate", "live_before": r.live_before, "groups": r.groups, "replaced": r.replaced,
-                    "written": r.written, "cost_usd": r.cost_usd, "errors": r.errors, "ms": t0.elapsed().as_millis() as u64});
+                    "written": r.written, "cost_usd": r.cost_usd, "tokens": r.usage.json(), "errors": r.errors, "ms": t0.elapsed().as_millis() as u64});
                 self.log(&j);
                 j
             }
@@ -717,12 +717,8 @@ impl Daemon {
         if !res.plan.need {
             res.plan.need = true;
             let (cands, _) = crate::deep::gather(&self.store, &cfg, &q, &res.plan, &filter);
-            let (picks, answer, conf, model, cost, e) = crate::deep::rank(&cfg, &distill, &q, &cands, &HashMap::new(), false, now());
-            let by: HashMap<&str, &Record> = cands.iter().map(|c| (c.record.id.as_str(), &c.record)).collect();
-            res.picks = picks.into_iter().filter_map(|(id, why)| by.get(id.as_str()).map(|r| ((*r).clone(), why))).collect();
-            (res.answer, res.confidence, res.ranker_model, res.error) = (answer, conf, model, e);
-            res.cost_usd += cost;
-            res.candidates = cands;
+            let r = crate::deep::rank(&self.store, &cfg, &distill, &q, &cands, &HashMap::new(), false, now());
+            res.adopt(r, cands);
         }
         let mut text = crate::deep::format(&res, &HashSet::new(), now(), Some(project));
         if text.is_empty() {

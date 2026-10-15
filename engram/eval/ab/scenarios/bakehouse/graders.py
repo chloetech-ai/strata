@@ -283,6 +283,36 @@ def grade_relief_baker_note(repo, answer):
     )
 
 
+# Quick questions: the user asks for a fact and nothing else, so nothing makes
+# the agent open config.py. An old value is allowed only when the answer
+# marks it as old ("it used to be 14:00").
+OLD_MARK = r"(?i)used to|previous|no longer|changed|moved|\bwas\b|\bwere\b|\bold\b|formerly|instead of|\bnot\b"
+
+
+def _states_as_current(a, pattern):
+    for m in re.finditer(pattern, a):
+        near = a[max(0, m.start() - 80):m.end() + 40]
+        if not re.search(OLD_MARK, near):
+            return True
+    return False
+
+
+def grade_cutoff_quick(repo, answer):
+    a = answer or ""
+    return checks(
+        says_13_00=re.search(r"(?i)\b13[:.h]00\b|\b1\s*(:00\s*)?p\.?m\b|\bone o'?clock\b|\b13h\b", a) is not None,
+        not_14_00=not _states_as_current(a, r"(?i)\b14[:.h]00\b|\b2\s*(:00\s*)?p\.?m\b|\btwo o'?clock\b"),
+    )
+
+
+def grade_closed_day_quick(repo, answer):
+    a = answer or ""
+    return checks(
+        says_monday=re.search(r"(?i)\bMondays?\b", a) is not None,
+        not_sunday=not _states_as_current(a, r"(?i)closed (on )?Sundays?|Sundays? (we're|we are|is|are) closed|(don't|do not|never)\b[^.]{0,30}\bon Sundays?"),
+    )
+
+
 # ------------------------------------------------------------ inference hops
 
 
@@ -495,6 +525,8 @@ GRADERS = {
     "extend_cutoff": grade_extend_cutoff,
     "next_delivery_day": grade_next_delivery_day,
     "relief_baker_note": grade_relief_baker_note,
+    "cutoff_quick": grade_cutoff_quick,
+    "closed_day_quick": grade_closed_day_quick,
     "owner_weekly_file": grade_owner_weekly_file,
     "vat_export": grade_vat_export,
     "van_list": grade_van_list,

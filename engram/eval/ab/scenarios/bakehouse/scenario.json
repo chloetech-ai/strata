@@ -132,6 +132,18 @@
    "prompt": "Ana is covering Tomasz's shifts from Monday. Write me the short note I'll give her: the exact command she types in the evening to print the next day's bake plan. Just the note, no code changes."
   },
   {
+   "id": "cutoff_quick",
+   "kind": "stale",
+   "needs": "the current cutoff (13:00 in config.py since Sam's commit after block 4), not the 14:00 said in block 2; a quick question that does not ask to look at the code",
+   "prompt": "Quick question, I'm on the phone with a customer: what time do they need to get their order in by for next-day delivery these days? Just tell me, don't change anything."
+  },
+  {
+   "id": "closed_day_quick",
+   "kind": "stale",
+   "needs": "the current closed day (Monday since Sam's commit after block 7), not the Sunday said in block 2; a quick question that does not ask to look at the code",
+   "prompt": "Remind me, which day of the week are we closed now? A customer wants a delivery that day. Just tell me, don't change anything."
+  },
+  {
    "id": "owner_weekly_file",
    "kind": "inference",
    "needs": "owner = Greta (block 1); Greta's Excel is German, so semicolons and decimal commas (block 3)",

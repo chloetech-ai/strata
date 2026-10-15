@@ -53,6 +53,7 @@ to --work/<scenario>/<lane>/.
 import argparse
 import concurrent.futures as cf
 import glob
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -107,6 +108,12 @@ LANES = {
     "full": {"kind": "full"},
 }
 DEFAULT_LANES = ["none", "ccmem", "transcripts", "claude-mem", "mem0", "engram@main", "engram", "engram+deep", "full"]
+
+
+# Runs the real CLI unchanged and keeps a copy of each result message.
+MODEL_LOG_WRAPPER = """#!/bin/bash
+exec "{real}" "$@" > >(tee >(grep --line-buffered '"type":"result"' >> "{log}"))
+"""
 
 
 def slug(name):
@@ -280,23 +287,47 @@ def transcript_events(home, session, since=None):
     return out
 
 
+def _content_chars(content):
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(len(c.get("text", "")) if isinstance(c, dict) and c.get("type") == "text" else len(json.dumps(c)) for c in content)
+    return len(json.dumps(content or ""))
+
+
 def transcript_stats(events, memory_paths=()):
     """Tool calls, context injected by hooks, auto-memory attachments and
-    compactions, from transcript events."""
+    compactions, from transcript events. `memory_chars` is everything the
+    memory system put in front of the agent, by route: hook context (per hook
+    event), a Stop hook that sent the agent back with more records, results of
+    memory tools (mcp__*), results of tool calls on memory paths (auto-memory
+    files, exported transcripts) and auto-memory attachments."""
     tools, path_hits, hook_ctx, attach, compactions, ctx = [], 0, defaultdict(int), defaultdict(int), 0, 0
+    mem = defaultdict(int)
+    kind_of = {}
     for ev in events:
         msg = ev.get("message") or {}
         if ev.get("type") == "assistant" and isinstance(msg.get("content"), list):
             for c in msg["content"]:
                 if c.get("type") == "tool_use":
-                    tools.append(c.get("name", ""))
+                    name = c.get("name", "")
+                    tools.append(name)
                     blob = json.dumps(c.get("input"))
-                    path_hits += any(p in blob for p in memory_paths)
+                    on_path = any(p in blob for p in memory_paths)
+                    path_hits += on_path
+                    if name.startswith("mcp__"):
+                        kind_of[c.get("id")] = "memory_tools"
+                    elif on_path:
+                        kind_of[c.get("id")] = "memory_paths"
             u = msg.get("usage") or {}
             if u:
                 ctx = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
         elif ev.get("type") == "user" and ev.get("isCompactSummary"):
             compactions += 1
+        elif ev.get("type") == "user" and isinstance(msg.get("content"), list):
+            for c in msg["content"]:
+                if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("tool_use_id") in kind_of:
+                    mem[kind_of[c["tool_use_id"]]] += _content_chars(c.get("content"))
         elif ev.get("type") == "attachment":
             a = ev.get("attachment") or {}
             t = a.get("type", "")
@@ -304,18 +335,25 @@ def transcript_stats(events, memory_paths=()):
             size = len(content if isinstance(content, str) else json.dumps(content or ""))
             if t == "hook_additional_context":
                 hook_ctx[a.get("hookEvent") or a.get("hookName") or "?"] += size
+                mem["hook:" + (a.get("hookEvent") or a.get("hookName") or "?")] += size
             elif t == "hook_system_message":
                 hook_ctx["system_message"] += size
+                mem["hook:system_message"] += size
+            elif t == "hook_blocking_error":
+                b = (a.get("blockingError") or {}).get("blockingError") or ""
+                hook_ctx["stop_block"] += len(b)
+                mem["hook:stop_block"] += len(b)
             elif "memory" in t.lower() or "claude_md" in t.lower() or "nested" in t.lower():
                 attach[t] += len(json.dumps(a))
+                mem["attachments"] += len(json.dumps(a))
     return {"tools": tools, "memory_path_tool_calls": path_hits, "hook_context_chars": dict(hook_ctx), "memory_attachments": dict(attach),
-            "compactions": compactions, "context_tokens": ctx}
+            "compactions": compactions, "context_tokens": ctx, "memory_chars": dict(mem)}
 
 
 def result_cost_log(path, offset=0):
     """Cost of the Claude Code result messages appended to `path` after
     `offset` (cumulative per session, so each session counts its increase)."""
-    out = {"calls": 0, "sessions": 0, "cost_usd": 0.0, "models": {}}
+    out = {"calls": 0, "sessions": 0, "cost_usd": 0.0, "models": {}, "tokens": {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0}}
     if not path or not os.path.exists(path):
         return out
     last = {}
@@ -333,6 +371,10 @@ def result_cost_log(path, offset=0):
             prev = last.get(sid)
             out["cost_usd"] += cost - prev if prev is not None and cost >= prev else cost
             last[sid] = cost
+            # `usage` is per call (per turn of a long-running session), unlike the cumulative cost.
+            u = ev.get("usage") or {}
+            for k, src in (("input", "input_tokens"), ("cache_read", "cache_read_input_tokens"), ("cache_write", "cache_creation_input_tokens"), ("output", "output_tokens")):
+                out["tokens"][k] += u.get(src) or 0
             for m, u in (ev.get("modelUsage") or {}).items():
                 out["models"][m] = out["models"].get(m, 0) + 1
     out["sessions"] = len(last)
@@ -483,6 +525,18 @@ class Lane:
                 raise RuntimeError(f"engram install failed: {p.stdout}{p.stderr}")
             with open(os.path.join(self.repo, ".git", "info", "exclude"), "a") as f:
                 f.write(".claude/settings.local.json\n.mcp.json\n")
+            # Engram calls `claude` from PATH for its own model calls; this
+            # wrapper (first on PATH, unlike the agent's absolute path) keeps
+            # each result message, as claude-mem's does, for their tokens.
+            wrap_dir = os.path.join(self.home, ".local", "bin")
+            os.makedirs(wrap_dir, exist_ok=True)
+            log = os.path.join(self.home, ".engram-bench", "model-results.jsonl")
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            wrapper = os.path.join(wrap_dir, "claude")
+            with open(wrapper, "w") as f:
+                f.write(MODEL_LOG_WRAPPER.format(real=os.path.realpath(os.path.join(self.args.bench_bin, "claude")), log=log))
+            os.chmod(wrapper, 0o755)
+            meta["engram"]["model_log"] = log
         elif self.kind == "claude-mem":
             setup = load_module(os.path.join(COMPETITORS, "claude_mem", "setup.py"), "claude_mem_setup")
             info = setup.install(self.home, version=self.d.get("version", setup.VERSION), model=self.args.distill_model,
@@ -572,6 +626,8 @@ class Lane:
 
     def memory_offsets(self):
         offs = {"engram": {p: fsize(p) for p in glob.glob(os.path.join(self.engram_home, "projects", "*", "events.log"))}}
+        if self.kind == "engram" and (self.meta.get("engram") or {}).get("model_log"):
+            offs["engram_model"] = fsize(self.meta["engram"]["model_log"])
         if self.kind == "claude-mem":
             offs["claude_mem"] = fsize(self.meta["claude_mem"]["observer_log"])
         if self.kind == "mem0":
@@ -619,14 +675,20 @@ class Lane:
             for k in ("events", "cost_by_event", "errors"):
                 ev[k] = dict(ev[k])
             out["engram"] = ev
+            if "engram_model" in offs:
+                c = result_cost_log(self.meta["engram"]["model_log"], offs["engram_model"])
+                out["engram_calls"] = c
+                out["tokens"] = c["tokens"]
         elif self.kind == "claude-mem":
             c = result_cost_log(self.meta["claude_mem"]["observer_log"], offs.get("claude_mem", 0))
             out["cost_usd"] = c["cost_usd"]
             out["claude_mem"] = c
+            out["tokens"] = c["tokens"]
         elif self.kind == "mem0":
             c = result_cost_log(self.meta["mem0"]["llm_log"], offs.get("mem0", 0))
             out["cost_usd"] = c["cost_usd"]
             out["mem0"] = c
+            out["tokens"] = c["tokens"]
         return out
 
     def memory_state(self):
@@ -774,7 +836,12 @@ class Lane:
         score, detail = task["grade"](self.repo, out.get("result") or "")
         self.save_patch(task["id"], rep)
         sid = out.get("session_id")
-        ts = transcript_stats(transcript_events(self.home, sid, since=out["t0"] - 5 if self.kind == "full" else None), self.memory_paths())
+        events = transcript_events(self.home, sid, since=out["t0"] - 5 if self.kind == "full" else None)
+        ts = transcript_stats(events, self.memory_paths())
+        # The run's transcript, for later questions about what the agent saw.
+        with gzip.open(os.path.join(self.logs, f"{label}.transcript.jsonl.gz"), "wt") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
         u = out.get("usage") or {}
         mem = self.memory_activity(offs, "run")
         raw_cost = out.get("total_cost_usd")
@@ -792,6 +859,7 @@ class Lane:
             "tools": ts["tools"], "memory_tool_calls": sum(1 for t in ts["tools"] if t.startswith("mcp__")),
             "memory_tools": sorted({t for t in ts["tools"] if t.startswith("mcp__")}), "memory_path_tool_calls": ts["memory_path_tool_calls"],
             "hook_context_chars": ts["hook_context_chars"], "memory_attachments": ts["memory_attachments"], "compactions": ts["compactions"],
+            "memory_chars": ts["memory_chars"], "memory_tokens": mem.get("tokens"),
             "memory_cost_usd": mem["cost_usd"], "memory": {k: v for k, v in mem.items() if k != "cost_usd"}, "settle": settle, "session_id": sid,
         }
         with lock:

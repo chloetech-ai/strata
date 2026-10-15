@@ -63,6 +63,12 @@ pub struct DeepConfig {
     /// it found something the turn did not see.
     pub stop_wait_secs: u64,
     pub stop_recheck: bool,
+    /// `model`: a model writes the searches; `none`: only the request's own
+    /// keyword-and-vector and notes searches run, deeper (`ENGRAM_DEEP_PLAN`).
+    pub planner: String,
+    /// `model`: a model picks the records and writes a reading of them;
+    /// `local`: they are scored here, with no model call (`ENGRAM_DEEP_RANK`).
+    pub ranker: String,
 }
 
 impl Default for DeepConfig {
@@ -81,6 +87,8 @@ impl Default for DeepConfig {
             min_words: 4,
             stop_wait_secs: 25,
             stop_recheck: true,
+            planner: "model".into(),
+            ranker: "model".into(),
         }
     }
 }
@@ -106,6 +114,12 @@ impl DeepConfig {
         if let Some(m) = env("ENGRAM_DEEP_HARD_MODEL") {
             c.hard_model = m;
         }
+        if let Some(m) = env("ENGRAM_DEEP_PLAN") {
+            c.planner = m;
+        }
+        if let Some(m) = env("ENGRAM_DEEP_RANK") {
+            c.ranker = m;
+        }
         c
     }
 
@@ -113,7 +127,7 @@ impl DeepConfig {
         matches!(self.mode.as_str(), "async" | "sync")
     }
 
-    /// Whether a prompt is worth the two model calls.
+    /// Whether a prompt is worth a search (and its model calls).
     pub fn wants(&self, prompt: &str, records: u64) -> bool {
         let p = prompt.trim();
         self.automatic() && records >= self.min_records && !p.starts_with('/') && p.split_whitespace().count() >= self.min_words
@@ -150,6 +164,7 @@ pub struct Plan {
     pub hard: bool,
     pub queries: Vec<Query>,
     pub cost_usd: f64,
+    pub usage: llm::Usage,
     pub ms: u64,
     pub error: Option<String>,
 }
@@ -172,6 +187,7 @@ pub struct DeepResult {
     pub confidence: String,
     pub ranker_model: String,
     pub cost_usd: f64,
+    pub usage: llm::Usage,
     pub ms: u64,
     pub error: Option<String>,
 }
@@ -218,9 +234,9 @@ Records found in the memory of earlier sessions (id in brackets; a label in squa
 
 {cands}
 
-Pick the records an assistant working on this request should see: those that state facts, decisions, rules, requirements or earlier results it needs, including constraints that apply although the request does not mention them. Leave out records that are merely on the same topic. When two records disagree, the later one usually holds; pick it and say so. Order the picks by importance, at most {k}.
+Pick the records an assistant working on this request should see: those that state facts, decisions, rules, requirements or earlier results it needs, including constraints that apply although the request does not mention them. When the request asks for suggestions, recommendations or advice, also pick what the user said about their own tastes, habits, experience, plans and things they have, even when those records do not answer the request: the assistant should tailor its answer to them. Leave out records that are merely on the same topic. When two records disagree, the later one usually holds; pick it and say so. Do not warn that records are old unless a later record contradicts them. Order the picks by importance, at most {k}.
 
-Output {"relevant": [{"id": "<id>", "why": "<under 20 words: what it tells the assistant>"}], "answer": "<for a question about earlier work or conversations, 1 to 3 sentences answering it from the picked records, citing ids; otherwise the one or two things the assistant must keep in mind; empty if nothing applies>", "confidence": "high" or "medium" or "low" or "none"}"#;
+Output {"relevant": [{"id": "<id>", "why": "<under 20 words: what it tells the assistant>"}], "answer": "<for a question about earlier work or conversations, 1 to 3 sentences answering it from the picked records, citing ids; for a request for suggestions or advice, what the user's own preferences and circumstances mean for it; otherwise the one or two things the assistant must keep in mind; empty if nothing applies>", "confidence": "high" or "medium" or "low" or "none"}"#;
 
 fn kinds_of(v: &Json) -> Vec<Kind> {
     v.get("kinds").and_then(|k| k.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().and_then(Kind::parse)).filter(|k| *k != Kind::Entity).collect()).unwrap_or_default()
@@ -312,6 +328,7 @@ pub fn plan(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str,
         Ok(r) => {
             let mut p = parse_plan(&r.text, cfg.max_queries);
             p.cost_usd = r.cost_usd;
+            p.usage = r.usage;
             p.ms = r.ms;
             p
         }
@@ -397,8 +414,10 @@ pub fn gather(store: &Store, cfg: &DeepConfig, request: &str, plan: &Plan, filte
         Query { kind: "notes".into(), q: clip(request, 2000), names: vec![], path: String::new(), sql_where: String::new(), sql_order: String::new(), kinds: vec![] },
     ];
     queries.extend(plan.queries.iter().cloned());
+    // Without planned searches the request's own two fill the pool.
+    let depth = if plan.queries.is_empty() { cfg.candidates.max(cfg.per_query) } else { cfg.per_query };
     let lists: Vec<(String, Result<Vec<Record>>)> = std::thread::scope(|s| {
-        let hs: Vec<_> = queries.iter().map(|q| (q.label(), s.spawn(move || run_query(store, q, filter, cfg.per_query)))).collect();
+        let hs: Vec<_> = queries.iter().map(|q| (q.label(), s.spawn(move || run_query(store, q, filter, depth)))).collect();
         hs.into_iter().map(|(l, h)| (l, h.join().unwrap_or_else(|_| Err(crate::err("search panicked"))))).collect()
     });
     let mut by: HashMap<String, Cand> = HashMap::new();
@@ -449,8 +468,25 @@ fn describe(r: &Record, terms: &HashSet<String>, now: i64, label: &str, max: usi
     s
 }
 
-/// Asks the ranker to pick from the candidates.
-pub fn rank(cfg: &DeepConfig, cli: &DistillConfig, request: &str, cands: &[Cand], labels: &HashMap<String, String>, hard: bool, now: i64) -> (Vec<(String, String)>, String, String, String, f64, Option<String>) {
+/// What the ranker picked, most important first, with why, its reading of
+/// them, and what it cost.
+#[derive(Clone, Debug, Default)]
+pub struct Ranked {
+    pub picks: Vec<(String, String)>,
+    pub answer: String,
+    pub confidence: String,
+    pub model: String,
+    pub cost_usd: f64,
+    pub usage: llm::Usage,
+    pub error: Option<String>,
+}
+
+/// Picks from the candidates: by a model, or with `ranker = "local"` by
+/// [`local_scores`].
+pub fn rank(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, cands: &[Cand], labels: &HashMap<String, String>, hard: bool, now: i64) -> Ranked {
+    if cfg.ranker == "local" {
+        return rank_local(store, cfg, request, cands);
+    }
     let mut terms: HashSet<String> = strata::text::analyze_query(request).into_iter().collect();
     for c in cands {
         for s in &c.sources {
@@ -462,13 +498,16 @@ pub fn rank(cfg: &DeepConfig, cli: &DistillConfig, request: &str, cands: &[Cand]
     let text: Vec<String> = cands.iter().map(|c| describe(&c.record, &terms, now, labels.get(&c.record.id).map(|s| s.as_str()).unwrap_or(""), 600)).collect();
     let prompt = RANK_PROMPT.replace("{request}", &clip(request, 4000)).replace("{cands}", &text.join("\n\n")).replace("{k}", &cfg.max_picks.to_string());
     let model = if hard && !cfg.hard_model.is_empty() { cfg.hard_model.clone() } else { cfg.ranker_model.clone() };
+    let mut out = Ranked { model: model.clone(), confidence: "none".into(), ..Default::default() };
     match llm::complete(&cli.cli(&model, cfg.timeout_secs), RANK_SYSTEM, &prompt) {
         Ok(r) => {
+            out.cost_usd = r.cost_usd;
+            out.usage = r.usage;
             let Some(v) = llm::json_object(&r.text) else {
-                return (Vec::new(), String::new(), "none".into(), model, r.cost_usd, Some("no JSON in the ranker's reply".into()));
+                out.error = Some("no JSON in the ranker's reply".into());
+                return out;
             };
             let known: HashSet<&str> = cands.iter().map(|c| c.record.id.as_str()).collect();
-            let mut picks: Vec<(String, String)> = Vec::new();
             for p in v.get("relevant").and_then(|x| x.as_array()).into_iter().flatten() {
                 let (id, why) = match p {
                     Json::String(s) => (s.trim().trim_matches(|c| c == '[' || c == ']').to_string(), String::new()),
@@ -477,18 +516,101 @@ pub fn rank(cfg: &DeepConfig, cli: &DistillConfig, request: &str, cands: &[Cand]
                         p.get("why").and_then(|x| x.as_str()).unwrap_or("").trim().to_string(),
                     ),
                 };
-                if known.contains(id.as_str()) && !picks.iter().any(|(i, _)| *i == id) {
-                    picks.push((id, clip(&why, 200)));
+                if known.contains(id.as_str()) && !out.picks.iter().any(|(i, _)| *i == id) {
+                    out.picks.push((id, clip(&why, 200)));
                 }
-                if picks.len() >= cfg.max_picks {
+                if out.picks.len() >= cfg.max_picks {
                     break;
                 }
             }
-            let answer = v.get("answer").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let conf = v.get("confidence").and_then(|x| x.as_str()).unwrap_or("low").trim().to_lowercase();
-            (picks, clip(&answer, 800), conf, model, r.cost_usd, None)
+            out.answer = clip(v.get("answer").and_then(|x| x.as_str()).unwrap_or("").trim(), 800);
+            out.confidence = v.get("confidence").and_then(|x| x.as_str()).unwrap_or("low").trim().to_lowercase();
         }
-        Err(e) => (Vec::new(), String::new(), "none".into(), model, 0.0, Some(e.to_string())),
+        Err(e) => out.error = Some(e.to_string()),
+    }
+    out
+}
+
+/// Features the local ranker scores a candidate by, in [`FEATURES`] order.
+pub const FEATURES: [&str; 12] =
+    ["fused", "rank", "cos", "cover_idf", "cover", "note", "prompt", "answer", "tool", "len", "both", "newer"];
+
+/// Weights of [`FEATURES`] and the intercept, fitted by logistic regression
+/// on which candidates held a question's evidence in LongMemEval-S
+/// (`scripts/local_ranker.py`; LoCoMo held out). Those histories have no
+/// notes or tool records, so their weights are 0.
+pub const LOCAL_WEIGHTS: [f64; 13] = [5.308, 1.224, 2.521, 1.815, -0.761, 0.000, 1.151, -1.151, 0.000, 4.442, 0.000, -0.612, -10.910];
+
+/// How many candidates the local ranker picks. Its probabilities are low
+/// for every candidate (few hold evidence), so a fixed count beats a
+/// threshold: the top 5 hold all of a question's evidence 67% of the time
+/// against 49% for the fused order's top 5 (cross-validated).
+pub const LOCAL_PICKS: usize = 5;
+
+/// Each candidate's features (see [`FEATURES`]), in candidate order.
+pub fn features(store: &Store, request: &str, cands: &[Cand]) -> Vec<[f64; 12]> {
+    let terms = strata::text::analyze_query(request);
+    let idf = if terms.is_empty() { Vec::new() } else { store.idf(&terms).unwrap_or_else(|_| vec![1.0; terms.len()]) };
+    let idf_total: f64 = idf.iter().sum();
+    let qv = store.embedder.embed_query(request);
+    let texts: Vec<String> = cands.iter().map(|c| c.record.embed_text()).collect();
+    let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+    let vecs = if refs.is_empty() { Vec::new() } else { store.embedder.embed(&refs) };
+    let top = cands.iter().map(|c| c.score).fold(0.0, f64::max);
+    let mut seqs: Vec<i64> = cands.iter().map(|c| c.record.seq).collect();
+    seqs.sort_unstable();
+    cands
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let r = &c.record;
+            let have: HashSet<String> = strata::text::analyze(&format!("{}\n{}", r.text, r.ctx)).into_iter().collect();
+            let got: f64 = terms.iter().zip(&idf).filter(|(t, _)| have.contains(*t)).map(|(_, w)| w).sum();
+            let n_got = terms.iter().filter(|t| have.contains(*t)).count();
+            let cos: f64 = vecs.get(i).map(|v| v.iter().zip(&qv).map(|(a, b)| (*a as f64) * (*b as f64)).sum()).unwrap_or(0.0);
+            let newer = seqs.iter().position(|s| *s == r.seq).unwrap_or(0) as f64 / (seqs.len().max(2) - 1) as f64;
+            [
+                if top > 0.0 { c.score / top } else { 0.0 },
+                1.0 / (1.0 + i as f64),
+                cos,
+                if idf_total > 0.0 { got / idf_total } else { 0.0 },
+                if terms.is_empty() { 0.0 } else { n_got as f64 / terms.len() as f64 },
+                r.kind.is_knowledge() as u8 as f64,
+                (r.kind == Kind::Prompt) as u8 as f64,
+                (r.kind == Kind::Answer) as u8 as f64,
+                matches!(r.kind, Kind::ToolCall | Kind::ToolResult | Kind::Error) as u8 as f64,
+                ((r.text.len() + 1) as f64).ln() / 10.0,
+                (c.sources.len() > 1) as u8 as f64,
+                newer,
+            ]
+        })
+        .collect()
+}
+
+/// Probability the local model gives each candidate.
+pub fn local_scores(store: &Store, request: &str, cands: &[Cand]) -> Vec<f64> {
+    features(store, request, cands)
+        .iter()
+        .map(|f| {
+            let z: f64 = f.iter().zip(&LOCAL_WEIGHTS).map(|(x, w)| x * w).sum::<f64>() + LOCAL_WEIGHTS[FEATURES.len()];
+            1.0 / (1.0 + (-z).exp())
+        })
+        .collect()
+}
+
+/// The local ranker: its top [`LOCAL_PICKS`] candidates (at most
+/// `max_picks`), best first. No model call, so no reading of them.
+fn rank_local(store: &Store, cfg: &DeepConfig, request: &str, cands: &[Cand]) -> Ranked {
+    let scores = local_scores(store, request, cands);
+    let mut order: Vec<usize> = (0..cands.len()).collect();
+    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+    order.truncate(LOCAL_PICKS.min(cfg.max_picks));
+    let best = order.first().map(|i| scores[*i]).unwrap_or(0.0);
+    Ranked {
+        picks: order.iter().map(|i| (cands[*i].record.id.clone(), String::new())).collect(),
+        confidence: if best >= 0.5 { "high" } else if best >= 0.2 { "medium" } else { "low" }.into(),
+        model: "local".into(),
+        ..Default::default()
     }
 }
 
@@ -497,9 +619,10 @@ pub fn rank(cfg: &DeepConfig, cli: &DistillConfig, request: &str, cands: &[Cand]
 /// whose code changed. `now` is the time of the request.
 pub fn run(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, recent: &[String], filter: &Filter, project: Option<&Path>, now: i64) -> DeepResult {
     let t0 = Instant::now();
-    let plan = plan(store, cfg, cli, request, recent, now);
+    let plan = if cfg.planner == "none" { Plan { need: true, ..Default::default() } } else { plan(store, cfg, cli, request, recent, now) };
     let mut out = DeepResult { plan, ..Default::default() };
     out.cost_usd = out.plan.cost_usd;
+    out.usage = out.plan.usage;
     if !out.plan.need {
         out.confidence = "none".into();
         out.ms = t0.elapsed().as_millis() as u64;
@@ -526,17 +649,25 @@ pub fn run(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, 
         out.ms = t0.elapsed().as_millis() as u64;
         return out;
     }
-    let (picks, answer, conf, model, cost, err) = rank(cfg, cli, request, &cands, &labels, out.plan.hard, now);
-    let by: HashMap<&str, &Record> = cands.iter().map(|c| (c.record.id.as_str(), &c.record)).collect();
-    out.picks = picks.into_iter().filter_map(|(id, why)| by.get(id.as_str()).map(|r| ((*r).clone(), why))).collect();
-    out.answer = answer;
-    out.confidence = conf;
-    out.ranker_model = model;
-    out.cost_usd += cost;
-    out.error = err;
-    out.candidates = cands;
+    let r = rank(store, cfg, cli, request, &cands, &labels, out.plan.hard, now);
+    out.adopt(r, cands);
     out.ms = t0.elapsed().as_millis() as u64;
     out
+}
+
+impl DeepResult {
+    /// Takes the ranker's picks (records from `cands`), reading and cost.
+    pub fn adopt(&mut self, r: Ranked, cands: Vec<Cand>) {
+        let by: HashMap<&str, &Record> = cands.iter().map(|c| (c.record.id.as_str(), &c.record)).collect();
+        self.picks = r.picks.into_iter().filter_map(|(id, why)| by.get(id.as_str()).map(|rec| ((*rec).clone(), why))).collect();
+        self.answer = r.answer;
+        self.confidence = r.confidence;
+        self.ranker_model = r.model;
+        self.cost_usd += r.cost_usd;
+        self.usage.add(r.usage);
+        self.error = r.error;
+        self.candidates = cands;
+    }
 }
 
 /// The context block for a result: the picked records not shown already
@@ -580,7 +711,7 @@ pub fn log_json(res: &DeepResult) -> Json {
     json!({
         "need": res.plan.need, "hard": res.plan.hard, "queries": res.plan.queries.iter().map(|q| q.label()).collect::<Vec<_>>(),
         "candidates": res.candidates.len(), "picks": res.ids(), "confidence": res.confidence, "ranker_model": res.ranker_model,
-        "cost_usd": res.cost_usd, "plan_ms": res.plan.ms, "ms": res.ms, "error": res.error.clone().or(res.plan.error.clone()),
+        "cost_usd": res.cost_usd, "tokens": res.usage.json(), "plan_ms": res.plan.ms, "ms": res.ms, "error": res.error.clone().or(res.plan.error.clone()),
     })
 }
 

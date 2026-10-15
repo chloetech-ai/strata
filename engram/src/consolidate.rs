@@ -61,6 +61,7 @@ pub struct Report {
     pub replaced: usize,
     pub written: usize,
     pub cost_usd: f64,
+    pub usage: llm::Usage,
     pub errors: Vec<String>,
 }
 
@@ -228,6 +229,7 @@ pub fn run(store: &Store, cfg: &ConsolidateConfig, cli: &DistillConfig, now: i64
             }
         };
         rep.cost_usd += reply.cost_usd;
+        rep.usage.add(reply.usage);
         for (draft, replaces) in parse(&reply.text, &ids) {
             // A note rewritten on its own only churns: keep the original.
             if replaces.len() < 2 {

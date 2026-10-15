@@ -1,0 +1,106 @@
+{
+ "outputs": 60,
+ "passed": 54,
+ "cost_usd": 0.035021000000000004,
+ "cases": {
+  "open_questions": {
+   "runs": 5,
+   "passed": 5,
+   "about": "The assistant's unanswered questions are not requirements; the stated fee tiers are.",
+   "failures": []
+  },
+  "rule_with_reason": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A rule the user sets is kept with its reason.",
+   "failures": []
+  },
+  "decision_with_reason": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A decision is kept with the reason given.",
+   "failures": []
+  },
+  "assistant_convention": {
+   "runs": 5,
+   "passed": 4,
+   "about": "The assistant's own working habits are not project rules.",
+   "failures": [
+    [
+     "forbidden /conventional/ in: Commit messages in this project use conventional prefixes such as `feat:` and `fix:`, and code is formatted with black b",
+     "forbidden /feat:/ in: Commit messages in this project use conventional prefixes such as `feat:` and `fix:`, and code is formatted with black b",
+     "forbidden /black/ in: Commit messages in this project use conventional prefixes such as `feat:` and `fix:`, and code is formatted with black b"
+    ]
+   ]
+  },
+  "suggestion_not_taken": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A suggestion the user turned down is not a plan.",
+   "failures": []
+  },
+  "update_replaces": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A change to a noted rule is written as its replacement.",
+   "failures": []
+  },
+  "done": {
+   "runs": 5,
+   "passed": 4,
+   "about": "Planned work that the exchange completed is marked done.",
+   "failures": [
+    [
+     "n:9 not marked done"
+    ]
+   ]
+  },
+  "environment_fact": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A fact about the environment is kept.",
+   "failures": []
+  },
+  "stale_status": {
+   "runs": 5,
+   "passed": 1,
+   "about": "Status that will soon be stale is left out.",
+   "failures": [
+    [
+     "forbidden /pushed/ in: Refund work is developed on the `feature/refunds` branch, which is pushed to the `origin` remote.",
+     "forbidden /feature/refunds/ in: Refund work is developed on the `feature/refunds` branch, which is pushed to the `origin` remote."
+    ],
+    [
+     "forbidden /pushed/ in: Refunds work is developed on the branch `feature/refunds`, which is pushed to the `origin` remote.",
+     "forbidden /feature/refunds/ in: Refunds work is developed on the branch `feature/refunds`, which is pushed to the `origin` remote."
+    ],
+    [
+     "forbidden /pushed/ in: Refund work is developed on the `feature/refunds` branch, which is pushed to the `origin` remote.",
+     "forbidden /feature/refunds/ in: Refund work is developed on the `feature/refunds` branch, which is pushed to the `origin` remote."
+    ],
+    [
+     "forbidden /pushed/ in: Refunds work is developed on the `feature/refunds` branch, which is pushed to the `origin` remote.",
+     "forbidden /feature/refunds/ in: Refunds work is developed on the `feature/refunds` branch, which is pushed to the `origin` remote."
+    ]
+   ]
+  },
+  "secret": {
+   "runs": 5,
+   "passed": 5,
+   "about": "A secret never reaches a note.",
+   "failures": []
+  },
+  "small_talk": {
+   "runs": 5,
+   "passed": 5,
+   "about": "Nothing worth keeping.",
+   "failures": []
+  },
+  "failed_approach": {
+   "runs": 5,
+   "passed": 5,
+   "about": "An approach that failed is kept with why.",
+   "failures": []
+  }
+ }
+}

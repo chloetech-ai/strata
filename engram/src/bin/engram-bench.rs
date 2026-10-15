@@ -90,8 +90,33 @@ enum Cmd {
         hard_model: String,
         #[arg(long, default_value_t = 8)]
         max_picks: usize,
+        /// `model` (planned searches) or `none` (the question's own searches only).
+        #[arg(long, default_value = "model")]
+        planner: String,
+        /// `model` or `local` (scored without a model call).
+        #[arg(long, default_value = "model")]
+        ranker: String,
+        /// Also writes each candidate's local-ranker features and whether it
+        /// held evidence, for fitting the local ranker (scripts/local_ranker.py).
+        #[arg(long)]
+        features: Option<PathBuf>,
         #[arg(long, default_value = "")]
         tag: String,
+    },
+    /// Distils each exchange of a test set with Engram's prompt, several
+    /// times, and writes every output (graded by scripts/distill_eval.py).
+    Distill {
+        /// JSON lines: id, request, answer, commands, known ([id, kind, text]).
+        #[arg(long, default_value = "eval/distill/cases.jsonl")]
+        cases: PathBuf,
+        #[arg(long, default_value = "haiku")]
+        model: String,
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+        #[arg(long, default_value_t = 6)]
+        threads: usize,
+        #[arg(long, default_value = "results/distill/outputs.jsonl")]
+        out: PathBuf,
     },
     /// Ingest, storage and latency as the store grows (LongMemEval turns as records).
     Scale {
@@ -572,7 +597,10 @@ fn main() {
             }
             eprintln!("{} texts in {:.1} ms", texts.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
-        Cmd::Deep { data, embedder, out, every, qevery, limit, threads, model, hard_model, max_picks, tag } => deep_cmd(&data, &embedder, &out, every, qevery, limit, threads, &model, &hard_model, max_picks, &tag),
+        Cmd::Distill { cases, model, repeats, threads, out } => distill_cmd(&cases, &model, repeats, threads, &out),
+        Cmd::Deep { data, embedder, out, every, qevery, limit, threads, model, hard_model, max_picks, planner, ranker, features, tag } => {
+            deep_cmd(&data, &embedder, &out, every, qevery, limit, threads, &model, &hard_model, max_picks, &planner, &ranker, features.as_deref(), &tag)
+        }
         Cmd::Scale { data, sizes, embedder, out, queries, hooks, hook_gap_ms } => scale_cmd(&data, &sizes, &embedder, &out, queries, hooks, hook_gap_ms),
         Cmd::Latency { data, sizes, embedder, out, queries, rounds, hooks, knowledge } => latency_cmd(&data, &sizes, &embedder, &out, queries, rounds, hooks, knowledge),
         Cmd::Probes { transcript, probes, points, embedder, project, out, cache, dump_missing, dump_probes, per_turn, max_records } => {
@@ -726,6 +754,65 @@ fn main() {
     }
 }
 
+// ---------------------------------------------------------------- distill
+
+fn distill_cmd(cases: &Path, model: &str, repeats: usize, threads: usize, out: &Path) {
+    use engram::distill::{self, DistillConfig};
+    let t0 = Instant::now();
+    let cases: Vec<Json> = std::fs::read_to_string(cases).expect("read cases").lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).expect("case")).collect();
+    let cfg = DistillConfig { model: model.into(), ..Default::default() };
+    let jobs: Vec<(usize, usize)> = (0..cases.len()).flat_map(|i| (0..repeats).map(move |r| (i, r))).collect();
+    let next = AtomicUsize::new(0);
+    let rows: Mutex<Vec<Json>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            let (cases, jobs, next, rows, cfg) = (&cases, &jobs, &next, &rows, &cfg);
+            s.spawn(move || loop {
+                let k = next.fetch_add(1, Ordering::SeqCst);
+                if k >= jobs.len() {
+                    break;
+                }
+                let (i, rep) = jobs[k];
+                let c = &cases[i];
+                let st = |k: &str| c[k].as_str().unwrap_or("").to_string();
+                let commands: Vec<String> = c["commands"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+                let known: Vec<(String, Kind, String)> = c["known"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| {
+                                let kind = match x[1].as_str()? {
+                                    "rule" => Kind::Preference,
+                                    "requirement" => Kind::Todo,
+                                    k => Kind::parse(k)?,
+                                };
+                                Some((x[0].as_str()?.to_string(), kind, x[2].as_str()?.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let row = match distill::distill(cfg, &st("request"), &st("answer"), &commands, &known) {
+                    Ok(d) => json!({
+                        "id": st("id"), "repeat": rep, "cost_usd": d.cost_usd, "tokens": d.usage.json(),
+                        "items": d.drafts.iter().map(|x| json!({"kind": distill::label(x.kind), "text": x.text, "replaces": x.links.iter().filter(|l| l.label == "supersedes").map(|l| l.to.as_str()).collect::<Vec<_>>(), "entities": x.entities, "when": x.when})).collect::<Vec<_>>(),
+                        "done": d.done, "error": null,
+                    }),
+                    Err(e) => json!({"id": st("id"), "repeat": rep, "items": [], "done": [], "error": e.to_string()}),
+                };
+                rows.lock().unwrap().push(row);
+            });
+        }
+    });
+    let mut rows = rows.into_inner().unwrap();
+    rows.sort_by(|a, b| (a["id"].as_str(), a["repeat"].as_u64()).cmp(&(b["id"].as_str(), b["repeat"].as_u64())));
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(out, rows.iter().map(|r| serde_json::to_string(r).unwrap() + "\n").collect::<String>()).unwrap();
+    let cost: f64 = rows.iter().filter_map(|r| r["cost_usd"].as_f64()).sum();
+    eprintln!("{} outputs ({} cases × {repeats}) in {:.0} s, ${cost:.4}: {}", rows.len(), cases.len(), t0.elapsed().as_secs_f64(), out.display());
+}
+
 // ---------------------------------------------------------------- deep
 
 /// A record as a reader context shows it (the layout of engram-structure's dumps).
@@ -735,7 +822,10 @@ fn reader_block(r: &Record) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, qevery: usize, limit: Option<usize>, threads: usize, model: &str, hard_model: &str, max_picks: usize, tag: &str) {
+fn deep_cmd(
+    data: &Path, embedder: &str, out: &Path, every: usize, qevery: usize, limit: Option<usize>, threads: usize, model: &str, hard_model: &str, max_picks: usize, planner: &str, ranker: &str,
+    features: Option<&Path>, tag: &str,
+) {
     use engram::deep::{self, DeepConfig};
     let t0 = Instant::now();
     let e: Arc<dyn Embedder> = open_embedder(embedder);
@@ -747,15 +837,26 @@ fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, qevery: usize
         units.truncate(n);
     }
     let dataset = units.first().map(|u| u.dataset.clone()).unwrap_or_default();
-    let cfg = DeepConfig { mode: "tool".into(), planner_model: model.into(), ranker_model: model.into(), hard_model: hard_model.into(), max_picks, ..Default::default() };
+    let cfg = DeepConfig {
+        mode: "tool".into(),
+        planner_model: model.into(),
+        ranker_model: model.into(),
+        hard_model: hard_model.into(),
+        max_picks,
+        planner: planner.into(),
+        ranker: ranker.into(),
+        ..Default::default()
+    };
     let cli = engram::distill::DistillConfig::default();
     let jobs: Vec<(usize, usize)> = units.iter().enumerate().flat_map(|(i, u)| (0..u.questions.len()).filter(move |j| j % qevery.max(1) == 0).map(move |j| (i, j))).collect();
     let next = AtomicUsize::new(0);
     let rows: Mutex<Vec<Json>> = Mutex::new(Vec::new());
     let ctxs: Mutex<Vec<Json>> = Mutex::new(Vec::new());
+    let feats: Mutex<Vec<Json>> = Mutex::new(Vec::new());
+    let want_features = features.is_some();
     std::thread::scope(|s| {
         for t in 0..threads.max(1) {
-            let (units, jobs, next, rows, ctxs, e, cfg, cli) = (&units, &jobs, &next, &rows, &ctxs, &e, &cfg, &cli);
+            let (units, jobs, next, rows, ctxs, feats, e, cfg, cli) = (&units, &jobs, &next, &rows, &ctxs, &feats, &e, &cfg, &cli);
             s.spawn(move || loop {
                 let k = next.fetch_add(1, Ordering::SeqCst);
                 if k >= jobs.len() {
@@ -781,6 +882,12 @@ fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, qevery: usize
                     let got: HashSet<&str> = tags.iter().copied().filter(|t| ev.contains(t)).collect();
                     ((!got.is_empty()) as u8 as f64, (!ev.is_empty() && got.len() == ev.len()) as u8 as f64)
                 };
+                if want_features {
+                    let fs = deep::features(&store, &q.question, &res.candidates);
+                    let picked: HashSet<&str> = res.picks.iter().map(|(r, _)| r.id.as_str()).collect();
+                    let cands: Vec<Json> = res.candidates.iter().zip(fs).map(|(c, f)| json!({"f": f.to_vec(), "y": ev.contains(c.record.tag.as_str()) as u8, "picked": picked.contains(c.record.id.as_str()) as u8})).collect();
+                    feats.lock().unwrap().push(json!({"qid": q.qid, "qtype": q.question_type, "abstention": q.abstention, "n_evidence": ev.len(), "cands": cands}));
+                }
                 let pool: Vec<&str> = res.candidates.iter().map(|c| c.record.tag.as_str()).collect();
                 let picks: Vec<&str> = res.picks.iter().map(|(r, _)| r.tag.as_str()).collect();
                 let base10: Vec<&str> = hits.iter().take(10).map(|h| h.record.tag.as_str()).collect();
@@ -802,9 +909,11 @@ fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, qevery: usize
                     "pool": pool.len(), "picks": picks.len(), "picked_chars": picked.len(),
                     "queries": res.plan.queries.iter().map(|q| q.label()).collect::<Vec<_>>(), "hard": res.plan.hard as u8, "need": res.plan.need,
                     "confidence": res.confidence, "answer": res.answer, "gold": q.answer_text(), "ranker_model": res.ranker_model,
-                    "cost_usd": res.cost_usd, "plan_ms": res.plan.ms, "ms": res.ms, "error": res.error.clone().or(res.plan.error.clone()),
+                    "cost_usd": res.cost_usd, "tokens": res.usage.json(), "plan_ms": res.plan.ms, "ms": res.ms, "error": res.error.clone().or(res.plan.error.clone()),
                 });
-                ctxs.lock().unwrap().push(json!({"qid": q.qid, "context": picked.trim_end(), "reading": reading.trim_end(), "chars": picked.len()}));
+                // The plain hybrid search's top 10, for reading without the query engine.
+                let top10: String = hits.iter().take(10).map(|h| reader_block(&h.record) + "\n\n").collect();
+                ctxs.lock().unwrap().push(json!({"qid": q.qid, "context": picked.trim_end(), "reading": reading.trim_end(), "chars": picked.len(), "base10": top10.trim_end()}));
                 let n = {
                     let mut g = rows.lock().unwrap();
                     g.push(row);
@@ -835,10 +944,12 @@ fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, qevery: usize
     let by_type: serde_json::Map<String, Json> = types.iter().map(|ty| (ty.clone(), agg(&eligible.iter().copied().filter(|r| r["qtype"] == ty.as_str()).collect::<Vec<_>>()))).collect();
     let mut ms: Vec<f64> = rows.iter().filter_map(|r| r["ms"].as_f64()).collect();
     let all: Vec<&Json> = rows.iter().collect();
+    let tok = |k: &str| rows.iter().filter_map(|r| r["tokens"][k].as_u64()).sum::<u64>();
     let summary = json!({
-        "dataset": dataset, "embedder": e.name(), "model": model, "hard_model": hard_model, "max_picks": max_picks,
+        "dataset": dataset, "embedder": e.name(), "model": model, "hard_model": hard_model, "max_picks": max_picks, "planner": planner, "ranker": ranker,
         "questions": rows.len(), "eligible": eligible.len(), "seconds": t0.elapsed().as_secs_f64(),
         "cost_usd": rows.iter().filter_map(|r| r["cost_usd"].as_f64()).sum::<f64>(),
+        "tokens": {"input": tok("input"), "cache_read": tok("cache_read"), "cache_write": tok("cache_write"), "output": tok("output")},
         "ms_p50": pct(&mut ms, 0.5), "ms_p90": pct(&mut ms, 0.9),
         "errors": rows.iter().filter(|r| !r["error"].is_null()).count(),
         "hard": mean(&all, "hard"), "all": agg(&eligible), "by_type": by_type,
@@ -849,6 +960,9 @@ fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, qevery: usize
     let lines = |v: &[Json]| v.iter().map(|r| serde_json::to_string(r).unwrap() + "\n").collect::<String>();
     std::fs::write(out.join(format!("{base}.rows.jsonl")), lines(&rows)).unwrap();
     std::fs::write(out.join(format!("{base}.contexts.jsonl")), lines(&ctxs.into_inner().unwrap())).unwrap();
+    if let Some(p) = features {
+        std::fs::write(p, lines(&feats.into_inner().unwrap())).unwrap();
+    }
     let a = &summary["all"];
     let f = |k: &str| a[k].as_f64().unwrap_or(0.0);
     eprintln!("{base}: {} questions ({} with evidence) in {:.0} s, ${:.3}", rows.len(), eligible.len(), t0.elapsed().as_secs_f64(), summary["cost_usd"].as_f64().unwrap_or(0.0));
