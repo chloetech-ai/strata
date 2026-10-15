@@ -1,7 +1,9 @@
 //! engram: automatic long-term context for Claude Code, stored in Strata.
 //!
 //!   engram install [--project DIR] [--shared]   wire hooks + MCP into a project
-//!   engram hook <Event>                          (called by Claude Code hooks)
+//!   engram install --user                        ... or into every Claude Code session
+//!   engram uninstall [--user]                    remove them again (stores are kept)
+//!   engram hook [--user] <Event>                 (called by Claude Code hooks)
 //!   engram mcp                                   (MCP stdio server, started by Claude Code)
 //!   engram search "query" | sql "SELECT ..." | stats | briefing | stop
 //!   engram remember <kind> "text"
@@ -35,12 +37,29 @@ enum Cmd {
         /// Write hooks to .claude/settings.json (committed) instead of settings.local.json.
         #[arg(long)]
         shared: bool,
+        /// Install for every Claude Code session: hooks in ~/.claude/settings.json,
+        /// the MCP server at user scope. Each project still gets its own store.
+        #[arg(long, conflicts_with = "shared")]
+        user: bool,
         /// Path of the engram binary to call (default: this one).
         #[arg(long)]
         exe: Option<String>,
+        /// Model to distill turns with (sets ENGRAM_DISTILL_MODEL in the settings' env).
+        #[arg(long)]
+        distill_model: Option<String>,
+    },
+    /// Remove what `install` wrote (the project's, or with --user the user-level one); stores are kept.
+    Uninstall {
+        #[arg(long)]
+        user: bool,
     },
     /// Handle a Claude Code hook event (payload on stdin).
-    Hook { event: String },
+    Hook {
+        /// Called from the user settings: step aside in a project with its own install.
+        #[arg(long)]
+        user: bool,
+        event: String,
+    },
     /// Run the MCP server on stdio.
     Mcp,
     /// Run the daemon in the foreground.
@@ -111,7 +130,7 @@ fn main() {
     let project = cli.project.clone().unwrap_or_else(|| paths::project_dir(None));
     let project = project.canonicalize().unwrap_or(project);
     match cli.cmd {
-        Cmd::Hook { event } => std::process::exit(hook::run(&event)),
+        Cmd::Hook { event, user } => std::process::exit(hook::run(&event, user)),
         Cmd::Mcp => std::process::exit(mcp::run()),
         Cmd::Serve { dir } => {
             let dir = dir.unwrap_or_else(|| paths::store_dir(&project));
@@ -120,9 +139,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Cmd::Install { shared, exe } => {
+        Cmd::Install { shared, user, exe, distill_model } => {
             let exe = exe.unwrap_or_else(|| std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "engram".into()));
-            match install::install(&project, &exe, shared) {
+            let dm = distill_model.as_deref();
+            match if user { install::install_user(&exe, dm) } else { install::install(&project, &exe, shared, dm) } {
                 Ok(s) => println!("{s}"),
                 Err(e) => {
                     eprintln!("engram install: {e}");
@@ -130,6 +150,13 @@ fn main() {
                 }
             }
         }
+        Cmd::Uninstall { user } => match if user { install::uninstall_user() } else { install::uninstall(&project) } {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("engram uninstall: {e}");
+                std::process::exit(1);
+            }
+        },
         Cmd::Search { query, limit, kinds } => text(&send(&project, json!({"op": "search", "query": query, "limit": limit, "kinds": kinds, "include_current": true}), 30)),
         Cmd::Sql { sql } => text(&send(&project, json!({"op": "sql", "sql": sql}), 30)),
         Cmd::Remember { kind, text: t } => text(&send(&project, json!({"op": "remember", "kind": kind, "text": t}), 30)),

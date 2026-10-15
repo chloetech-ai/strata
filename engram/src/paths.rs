@@ -14,6 +14,18 @@ pub fn engram_home() -> PathBuf {
     PathBuf::from(home).join(".local/share/engram")
 }
 
+/// Claude Code's user settings: `$CLAUDE_CONFIG_DIR/settings.json`, else
+/// `~/.claude/settings.json`.
+pub fn user_settings() -> PathBuf {
+    if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !d.is_empty() {
+            return PathBuf::from(d).join("settings.json");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".claude/settings.json")
+}
+
 /// A short, stable directory name for a project: its last path component
 /// plus a hash of the full path (Unix socket paths are limited to 107 bytes).
 pub fn project_slug(project: &Path) -> String {
