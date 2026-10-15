@@ -11,6 +11,7 @@ pub mod benchdata;
 pub mod capture;
 pub mod daemon;
 pub mod distill;
+pub mod doctor;
 pub mod embed;
 pub mod hook;
 pub mod inspect;
@@ -22,6 +23,7 @@ pub mod record;
 pub mod redact;
 pub mod store;
 pub mod transcript;
+pub mod ui;
 
 #[derive(Debug)]
 pub struct Error(pub String);

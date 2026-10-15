@@ -167,6 +167,25 @@ td .clip { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vert
 .box { background: var(--panel2); border-radius: 6px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto; font-size: 13px; }
 .links { display: flex; flex-wrap: wrap; gap: 4px; }
 
+/* The header can wrap to two lines; the columns take the rest and scroll inside. */
+body { display: flex; flex-direction: column; }
+main { flex: 1; min-height: 0; height: auto; grid-template-rows: minmax(0, 1fr); }
+#chat, #insp { min-height: 0; }
+
+/* engram ui: browsing the stores on this machine instead of chatting */
+#stores { display: none; }
+.browse #stores { display: block; flex: 1.2; min-width: 0; }
+.browse #compose, .browse #newsess { display: none; }
+.browse #chatbar { flex-wrap: wrap; }
+.msg-user .when { display: block; font-size: 11px; color: var(--faint); margin-bottom: 2px; }
+.bubble.narration { color: var(--muted); font-size: 13px; }
+.thead { font-size: 11.5px; color: var(--faint); margin: 18px 0 4px; display: flex; gap: 8px; align-items: center; }
+.thead::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.marker { font-size: 12px; color: var(--k-summary); border: 1px dashed var(--k-summary); border-radius: 6px; padding: 4px 10px; margin: 8px 0; cursor: pointer; }
+.slist { display: flex; flex-direction: column; gap: 8px; }
+.slist .card .t { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.more { margin: 10px 0; }
+
 @media (max-width: 900px) {
   main { grid-template-columns: 1fr; grid-template-rows: 55% 45%; }
   #chat { border-right: none; border-bottom: 1px solid var(--line); }
@@ -181,6 +200,7 @@ td .clip { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vert
 <main>
   <section id="chat">
     <div id="chatbar">
+      <select id="stores" title="Engram store: one per project directory"></select>
       <select id="sessions" title="Claude Code session"></select>
       <button id="newsess" title="Start a new Claude Code session. Its context starts empty; Engram's memory carries over.">New session</button>
     </div>
@@ -308,8 +328,11 @@ const fmtTs = ts => ts ? new Date(ts * 1000).toLocaleTimeString() : "";
 const fmtBytes = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(2) + " MB";
 const parseLinks = s => { try { return (JSON.parse(s || "[]") || []).map(e => Array.isArray(e) ? {label: e[0], to: e[1]} : {label: "", to: e}); } catch { return []; } };
 
+// `engram ui` serves several stores; every call names the one on screen.
+const URLP = new URLSearchParams(location.search);
+const api = p => S.store ? p + (p.includes("?") ? "&" : "?") + "store=" + encodeURIComponent(S.store) : p;
 async function post(url, body) {
-  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const r = await fetch(api(url), {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
   return r.json();
 }
 const rpc = req => post("/api/rpc", req);
@@ -321,7 +344,8 @@ async function sql(text, extra = {}) {
 const rowsAsObjects = r => r.rows.map(row => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
 
 // ------------------------------------------------------------------ state
-const S = {seq: 0, log: 0, records: new Map(), busy: false, info: null, session: null, turnEl: null, turnStartSeq: 0, turnKey: null, lastStats: null};
+const S = {seq: 0, log: 0, records: new Map(), busy: false, info: null, session: null, turnEl: null, turnStartSeq: 0, turnKey: null, lastStats: null,
+  store: URLP.get("store"), browse: false};
 
 function vecStrip(values, big = false) {
   if (!values) return "";
@@ -336,8 +360,9 @@ function vecStrip(values, big = false) {
 
 // ------------------------------------------------------------------ header
 async function loadInfo() {
-  const i = await (await fetch("/api/info")).json();
+  const i = await (await fetch(api("/api/info"))).json();
   S.info = i;
+  if (i.mode === "browse") return browseInfo(i);
   const st = i.stats || {};
   S.lastStats = st;
   $("#meta").innerHTML = `
@@ -351,6 +376,240 @@ async function loadInfo() {
     `<option value="${esc(s.id)}">${esc(short(s.id))} · ${esc(s.title)}</option>`).join("");
   S.session = i.current;
   sel.value = i.current || "";
+}
+
+// ------------------------------------------------------------------ browse (engram ui)
+// `engram ui` serves the stores on this machine: pick a store (one per
+// project directory) and a session, and read the session as a conversation
+// rebuilt from its records, with what Engram recalled and wrote down.
+const fmtDate = ts => ts ? new Date(ts * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}) : "";
+const ago = ts => {
+  if (!ts) return "";
+  const s = Date.now() / 1000 - ts;
+  return s < 90 ? "just now" : s < 5400 ? Math.round(s / 60) + " min ago" : s < 129600 ? Math.round(s / 3600) + " h ago" : Math.round(s / 86400) + " d ago";
+};
+const storeName = s => s.project ? s.project.replace(/\/+$/, "").split("/").pop() || s.project : s.id;
+const CONV_MAX = 3000;
+
+async function browseInfo(i) {
+  S.browse = true;
+  document.body.classList.add("browse");
+  S.store = i.store_id || null;
+  const st = i.stats || {};
+  S.lastStats = st;
+  const stores = i.stores || [];
+  $("#stores").innerHTML = stores.length
+    ? stores.map(s => `<option value="${esc(s.id)}" title="${esc(s.project || s.dir)}">${esc(storeName(s))} · ${fmtBytes(s.bytes)} · ${esc(ago(s.modified))}${s.running ? " · daemon running" : ""}</option>`).join("")
+    : `<option value="">no stores</option>`;
+  $("#stores").value = S.store || "";
+  const cur = stores.find(s => s.id === S.store);
+  if (!cur) {
+    $("#meta").innerHTML = `<span>No Engram stores in <span class="mono">${esc(i.home)}/projects</span></span>`;
+    $("#sessions").innerHTML = "";
+    $("#log").innerHTML = `<div class="empty"><p><b>No Engram stores found.</b></p><p>Engram keeps one store per project directory under <span class="mono">${esc(i.home)}/projects</span>.
+      Install it (<code>engram install --user</code>), run a Claude Code session, and reload this page. <code>engram ui --home DIR</code> browses stores kept elsewhere (the demo's are in <span class="mono">~/engram-demo/engram</span>).</p></div>`;
+    return;
+  }
+  $("#meta").innerHTML = `
+    <span><span class="dot" id="busydot"></span><b id="m-records">${st.records ?? "?"}</b> records</span>
+    <span><b>${st.sessions ?? "?"}</b> sessions</span>
+    <span>embedder <b>${esc(st.embedder || "?")}</b></span>
+    <span class="mono" title="project directory">${esc(cur.project || "project unknown")}</span>
+    <span class="mono" title="Strata file">${esc(i.store)}</span>` + (st.error ? `<span class="err">${esc(st.error)}</span>` : "");
+  // The live feed starts at the store's latest records rather than its first.
+  S.seq = Math.max(0, (st.last_seq || 0) - 150);
+  S.log = Math.max(0, (i.events_bytes || 0) - 20000);
+  await loadSessions(i.sessions || []);
+  const want = URLP.get("session");
+  selectSession(want && S.sessions.some(s => s.id === want) ? want : null);
+}
+
+async function loadSessions(fromState) {
+  const none = {columns: [], rows: []};
+  const counts = await sql("SELECT session, COUNT(*) FROM memory WHERE kind != 'entity' GROUP BY session ORDER BY 2 DESC LIMIT 1000", {max_rows: 1000}).catch(() => none);
+  const prompts = rowsAsObjects(await sql("SELECT session, ts, text FROM memory WHERE kind = 'prompt' ORDER BY seq ASC LIMIT 5000", {max_rows: 5000}).catch(() => none));
+  const recent = rowsAsObjects(await sql("SELECT session, ts FROM memory ORDER BY seq DESC LIMIT 3000", {max_rows: 3000}).catch(() => none));
+  const first = {}, last = {};
+  for (const p of prompts) first[p.session] ??= p;
+  for (const r of recent) last[r.session] ??= r.ts;
+  const state = Object.fromEntries(fromState.map(s => [s.id, s]));
+  S.sessions = counts.rows.map(([id, n]) => ({id, records: n, title: first[id]?.text || "", started: first[id]?.ts || 0,
+    last: Math.max(state[id]?.last_seen || 0, last[id] || 0)})).sort((a, b) => b.last - a.last || b.records - a.records);
+  $("#sessions").innerHTML = `<option value="">All sessions (${S.sessions.length})</option>` + S.sessions.map(s =>
+    `<option value="${esc(s.id)}">${esc(short(s.id))} · ${esc(ago(s.last))} · ${s.records} records${s.title ? " · " + esc(s.title.slice(0, 60)) : ""}</option>`).join("");
+}
+
+function selectSession(sid) {
+  S.session = sid;
+  $("#sessions").value = sid || "";
+  const u = new URL(location.href);
+  if (S.store) u.searchParams.set("store", S.store);
+  if (sid) u.searchParams.set("session", sid); else u.searchParams.delete("session");
+  history.replaceState(null, "", u);
+  if (sid) loadConversation(sid); else sessionList();
+}
+
+function sessionList() {
+  S.conv = null;
+  $("#log").innerHTML = `<p class="hint" style="margin-top:0">Sessions recorded in this store, most recent first. Pick one to read it as a conversation:
+    prompts, answers and tool calls, what Engram recalled on each prompt, and what it wrote down.</p><div class="slist">` +
+    S.sessions.map(s => `<div class="card" data-sid="${esc(s.id)}"><div class="h"><span class="mono">${esc(short(s.id))}</span>
+      <span class="hint">${esc(fmtDate(s.started || s.last))}${s.last ? " · last active " + esc(ago(s.last)) : ""} · ${s.records} records</span></div>
+      <div class="t">${esc(s.title || "(no prompt recorded)")}</div></div>`).join("") + `</div>`;
+  $$("#log .card[data-sid]").forEach(c => c.onclick = () => selectSession(c.dataset.sid));
+}
+
+async function loadConversation(sid) {
+  const log = $("#log");
+  log.innerHTML = `<p class="hint">Loading…</p>`;
+  let recs, events;
+  try {
+    // Tool results are left out (they are most of a store); each tool call loads its own when opened.
+    recs = rowsAsObjects(await sql(`SELECT id, kind, tag, turn, seq, ts, text FROM memory WHERE session = ${q1(sid)} AND kind != 'tool_result' ORDER BY seq DESC LIMIT ${CONV_MAX}`, {max_rows: CONV_MAX}));
+    events = (await (await fetch(api(`/api/events?session=${encodeURIComponent(sid)}`))).json()).events || [];
+  } catch (e) { log.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  if (S.session !== sid) return;
+  recs.reverse();
+  log.innerHTML = recs.length === CONV_MAX ? `<p class="hint">Showing the last ${CONV_MAX} records of this session; the Table tab has the rest.</p>` : "";
+  S.conv = {session: sid, turn: null, el: null, kind: null, tag: null, node: null, maxSeq: 0, tools: []};
+  const ev = events.filter(e => e.event === "recall" || e.event === "distill").sort((a, b) => a.ts - b.ts);
+  if (recs.length) {
+    const t0 = recs[0].ts;
+    while (ev.length && ev[0].ts < t0) ev.shift(); // events older than the records shown
+  }
+  let k = 0;
+  for (const r of recs) {
+    while (k < ev.length && ev[k].ts < r.ts) convEvent(ev[k++]);
+    convRecord(r);
+  }
+  while (k < ev.length) convEvent(ev[k++]);
+  if (!recs.length) log.insertAdjacentHTML("beforeend", `<p class="hint">No records for this session.</p>`);
+  log.scrollTop = log.scrollHeight;
+}
+
+function convTurn(r) {
+  const c = S.conv;
+  if (c.el && c.turn === r.turn && !(r.kind === "prompt" && c.kind !== "prompt")) return;
+  const log = $("#log");
+  log.insertAdjacentHTML("beforeend", `<div class="thead">turn ${esc(r.turn)} · ${esc(fmtDate(r.ts))}</div>`);
+  const t = document.createElement("div");
+  t.className = "turn";
+  t.innerHTML = `<div class="user"></div><div class="engrams"></div><div class="flow"></div><div class="stored"></div><div class="foot tfoot"></div>`;
+  log.appendChild(t);
+  Object.assign(c, {el: t, turn: r.turn, kind: null, tag: null, node: null});
+}
+
+function convRecord(r) {
+  const c = S.conv;
+  if (!c || r.seq <= c.maxSeq) return;
+  c.maxSeq = r.seq;
+  convTurn(r);
+  const t = c.el, flow = $(".flow", t);
+  const cont = c.kind === r.kind && c.tag === r.tag && c.node; // the next chunk of the same text
+  if (r.kind === "prompt") {
+    if (cont) c.node.lastChild.textContent += "\n" + r.text;
+    else {
+      const u = document.createElement("div");
+      u.className = "msg-user";
+      u.innerHTML = `<span class="when">${esc(fmtTs(r.ts))} · <a data-open="${esc(r.id)}">${esc(r.id)}</a></span><span></span>`;
+      u.lastChild.textContent = r.text;
+      $(".user", t).appendChild(u);
+      wireOpen(u);
+      c.node = u;
+    }
+  } else if (r.kind === "answer") {
+    if (cont) { c.node.dataset.raw += "\n" + r.text; c.node.innerHTML = md(c.node.dataset.raw); }
+    else {
+      const b = document.createElement("div");
+      b.className = "bubble" + (r.tag === "narration" ? " narration" : "");
+      b.dataset.raw = r.text;
+      b.innerHTML = md(r.text);
+      flow.appendChild(b);
+      c.node = b;
+    }
+  } else if (r.kind === "tool_call" || r.kind === "error") {
+    if (cont && r.kind === "error") { $(".in", c.node).textContent += "\n" + r.text; }
+    else {
+      const el = document.createElement("details");
+      const name = r.tag && r.tag !== "-" ? r.tag : r.kind;
+      el.className = "tool" + (r.kind === "error" ? " err" : "") + (name.startsWith("mcp__engram") ? " mem" : "");
+      el.innerHTML = `<summary><span class="tname"></span><span class="targ"></span><span class="hint st">${r.kind === "error" ? "error" : ""}</span></summary>
+        <div class="body"><pre class="in"></pre><pre class="out" style="margin-top:6px"></pre><div class="foot"><a data-open="${esc(r.id)}">${esc(r.id)} ›</a></div></div>`;
+      $(".tname", el).textContent = name.replace("mcp__engram__", "engram · ");
+      $(".targ", el).textContent = r.text.split("\n")[0].slice(0, 200);
+      $(".in", el).textContent = r.text;
+      if (r.kind === "tool_call") {
+        el.dataset.seq = r.seq;
+        el.addEventListener("toggle", () => el.open && toolResults(el), {once: false});
+        c.tools.push(el);
+      }
+      flow.appendChild(el);
+      wireOpen(el);
+      c.node = el;
+    }
+  } else if (r.kind === "summary") {
+    if (!cont) {
+      const m = document.createElement("div");
+      m.className = "marker";
+      m.textContent = "Compaction: the conversation was summarized here. Open the stored summary ›";
+      m.onclick = () => openRecord(r.id);
+      flow.appendChild(m);
+      c.node = m;
+    }
+  } else if (r.kind === "episode") {
+    const f = document.createElement("div");
+    f.className = "foot";
+    f.innerHTML = `Episode card stored: <a data-open="${esc(r.id)}">${esc(r.id)}</a>`;
+    $(".tfoot", t).before(f);
+    wireOpen(f);
+    c.node = null;
+  } else {
+    const stored = $(".stored", t);
+    if (!stored.childElementCount) stored.insertAdjacentHTML("beforeend", `<span>Engram stored:</span>`);
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.title = r.text.slice(0, 300);
+    chip.innerHTML = `<i style="background:${kc(r.kind)}"></i>${esc(r.kind)}${r.tag && r.tag !== "-" ? " · " + esc(r.tag) : ""}`;
+    chip.onclick = () => openRecord(r.id);
+    stored.appendChild(chip);
+    c.node = null;
+  }
+  c.kind = r.kind;
+  c.tag = r.tag;
+}
+
+function convEvent(e) {
+  const c = S.conv;
+  if (!c) return;
+  if (!c.el) convTurn({turn: "?", ts: e.ts, kind: "event"});
+  if (e.event === "recall") {
+    const d = document.createElement("div");
+    d.className = "foot";
+    const n = (e.injected || []).length, kn = (e.knowledge || []).length;
+    d.innerHTML = `Engram recall: <b>${esc(e.decision)}</b> · gate ${(+e.gate || 0).toFixed(2)} · ${e.candidates} candidates · ${(+e.ms || 0).toFixed(1)} ms · ` +
+      (n ? `${n} record${n === 1 ? "" : "s"} injected (${e.chars} chars): ` + e.injected.map(i => `<a data-open="${esc(i)}">${esc(i)}</a>`).join(", ") : "no history injected") +
+      (kn ? ` · ${kn} note${kn === 1 ? "" : "s"}: ` + e.knowledge.map(i => `<a data-open="${esc(i)}">${esc(i)}</a>`).join(", ") : "");
+    $(".engrams", c.el).appendChild(d);
+    wireOpen(d);
+  } else if (e.event === "distill") {
+    const f = $(".tfoot", c.el);
+    f.textContent += (f.textContent ? " · " : "") + (e.error ? `distill failed: ${e.error}` : `distilled ${e.kept} note${e.kept === 1 ? "" : "s"} in ${((e.ms || 0) / 1000).toFixed(1)} s ($${(e.cost_usd || 0).toFixed(4)})`) +
+      (e.replaced?.length ? `, superseded ${e.replaced.length}` : "") + (e.done?.length ? `, closed ${e.done.length}` : "");
+  }
+}
+
+// The results a tool call got: the tool_result records between it and the next record shown.
+async function toolResults(el) {
+  if (el.dataset.loaded) return;
+  el.dataset.loaded = "1";
+  const c = S.conv, i = c.tools.indexOf(el), from = +el.dataset.seq;
+  const to = c.tools[i + 1] ? +c.tools[i + 1].dataset.seq : from + 60;
+  const out = $(".out", el);
+  out.textContent = "…";
+  try {
+    const r = rowsAsObjects(await sql(`SELECT seq, text FROM memory WHERE session = ${q1(c.session)} AND kind = 'tool_result' AND seq > ${from} AND seq < ${to} ORDER BY seq ASC LIMIT 40`, {max_rows: 40}));
+    out.textContent = r.length ? r.map(x => x.text).join("\n") : "(no result stored)";
+  } catch (e) { out.textContent = e.message; }
 }
 
 // ------------------------------------------------------------------ chat
@@ -578,9 +837,10 @@ function eventToTurn(e) {
 let knowDirty = false;
 async function poll() {
   try {
-    const r = await (await fetch(`/api/live?seq=${S.seq}&log=${S.log}`)).json();
+    const r = await (await fetch(api(`/api/live?seq=${S.seq}&log=${S.log}`))).json();
     const recs = r.records && !r.records.error ? rowsAsObjects(r.records) : [];
-    const first = S.seq === 0 && S.log === 0;
+    const first = !S.polled;
+    S.polled = true;
     const feed = $("#feed");
     for (const x of recs) {
       S.records.set(x.id, x);
@@ -589,11 +849,17 @@ async function poll() {
       if (KNOWLEDGE.includes(x.kind)) knowDirty = true;
     }
     if (!first) attachToTurn(recs);
+    // engram ui: a session on screen grows as it runs.
+    const conv = S.browse && S.conv && S.conv.session === S.session ? S.conv : null;
+    const atEnd = conv && $("#log").scrollHeight - $("#log").scrollTop - $("#log").clientHeight < 200;
+    if (conv) for (const x of recs) if (x.session === conv.session && x.kind !== "tool_result") convRecord(x);
     for (const e of r.events || []) {
       if (!first || (r.events.indexOf(e) >= r.events.length - 30)) feed.prepend(eventItem(e));
       if (!first) eventToTurn(e);
+      if (conv && !first && e.session === conv.session) convEvent(e);
       if (e.event === "distill") knowDirty = true;
     }
+    if (atEnd) $("#log").scrollTop = $("#log").scrollHeight;
     S.log = r.log_offset;
     if (first) $$("#feed .flash").forEach(x => x.classList.remove("flash"));
     while (feed.childElementCount > 600) feed.lastChild.remove();
@@ -1075,7 +1341,12 @@ $("#send").onclick = send;
 $("#stop").onclick = () => post("/api/stop", {});
 $("#input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
 $("#newsess").onclick = newSession;
-$("#sessions").onchange = e => { S.session = e.target.value || null; post("/api/session", {session: S.session}); };
+$("#sessions").onchange = e => {
+  if (S.browse) return selectSession(e.target.value || null);
+  S.session = e.target.value || null;
+  post("/api/session", {session: S.session});
+};
+$("#stores").onchange = e => { location.search = "?store=" + encodeURIComponent(e.target.value); };
 $("#live-tools").onchange = applyLiveFilters;
 $("#live-events").onchange = applyLiveFilters;
 $("#know-refresh").onclick = loadKnowledge;
@@ -1101,7 +1372,8 @@ $("#sql").onkeydown = e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) 
 $("#d-close").onclick = () => $("#drawer").classList.remove("open");
 document.addEventListener("keydown", e => { if (e.key === "Escape") $("#drawer").classList.remove("open"); });
 setExample(0);
-emptyChat();
+if (document.body.classList.contains("browse")) $("#log").innerHTML = `<p class="hint">Opening the store (its daemon may need a moment to start)…</p>`;
+else emptyChat();
 loadInfo().then(poll);
 </script>
 </body>
