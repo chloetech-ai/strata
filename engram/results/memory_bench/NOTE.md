@@ -15,3 +15,19 @@ completed. No run that completed was removed or re-run. All 1,500 rows have
 
 `pooled.md` and `pooled.json` (from `scripts/v2_charts.py`) pool the four
 projects, with tasks as strata for the permutation test.
+
+## Round 2
+
+The fourth repeat and the two new lanes (`engram+v5`, the final build's
+default; `engram+rank`, the same with `ENGRAM_DEEP_PLAN=none`) ran from 14:45
+to 16:20 UTC. The account hit its usage limit again from 15:47 to 15:50: 131
+runs on stockroom, slotwise and kestrel failed the same way. They were
+removed and re-run as above. The first attempt at kestrel's `engram+rank`
+history failed before it started (its binary was still being copied) and
+was recorded again from scratch.
+
+Bakehouse's two quick questions (`cutoff_quick`, `closed_day_quick`) were
+first graded too strictly: an answer that gave the new value and also
+mentioned the old one as out of date failed. The graders were fixed and
+`memory_bench.py regrade` re-scored the stored answers; 13 rows changed, and
+each keeps its first score in `regraded_from`.
