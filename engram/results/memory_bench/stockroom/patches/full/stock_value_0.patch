@@ -1,0 +1,122 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index bda73d3..9e6b235 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -27,5 +27,11 @@
+   "tests/test_storage.py::StorageTest::test_load_normalizes_sku",
+   "tests/test_storage.py::StorageTest::test_load_old_file_infers_reason_from_sign",
+   "tests/test_storage.py::StorageTest::test_load_rejects_unknown_reason",
+-  "tests/test_storage.py::StorageTest::test_roundtrip"
++  "tests/test_storage.py::StorageTest::test_roundtrip",
++  "tests/test_valuation.py::StockValueTest::test_damage_consumes_oldest_layer",
++  "tests/test_valuation.py::StockValueTest::test_empty_is_zero",
++  "tests/test_valuation.py::StockValueTest::test_fifo_takes_oldest_receipts_first",
++  "tests/test_valuation.py::StockValueTest::test_negative_stock_is_settled_by_next_receipt",
++  "tests/test_valuation.py::StockValueTest::test_other_skus_ignored",
++  "tests/test_valuation.py::StockValueTest::test_receipts_valued_in_date_order_not_log_order"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..bad9dd4
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,35 @@
++"""Stock valuation at FIFO cost."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` on hand, costed first in, first out.
++
++    Each receipt is a layer of (quantity, unit cost). Issues take from the oldest
++    layers. A negative balance is not valued; the next receipts settle it first.
++    """
++    sku = normalize_sku(sku)
++    layers = deque()  # [quantity, unit_cost], oldest first
++    owed = 0  # units issued without stock to take them from
++    # sorted() is stable, so movements on the same day keep their log order.
++    for m in sorted(inventory.movements_for(sku), key=lambda m: m.date):
++        if m.qty > 0:
++            qty = m.qty
++            settled = min(owed, qty)
++            owed -= settled
++            qty -= settled
++            if qty:
++                layers.append([qty, m.unit_cost or 0])
++        else:
++            remaining = -m.qty
++            while remaining and layers:
++                take = min(remaining, layers[0][0])
++                layers[0][0] -= take
++                remaining -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            owed += remaining
++    return sum(qty * cost for qty, cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..953d946
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,57 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory
++from stockroom.valuation import stock_value
++
++D1 = datetime.date(2026, 9, 1)
++D2 = datetime.date(2026, 9, 2)
++D3 = datetime.date(2026, 9, 3)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_fifo_takes_oldest_receipts_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 10, D1)
++        inv.receive("BR-1042", 10, 20, D2)
++        inv.issue("BR-1042", 15, D3)
++        # 5 left, all from the second receipt at 20 each
++        self.assertEqual(stock_value(inv, "BR-1042"), 100)
++
++    def test_other_skus_ignored(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 10, D1)
++        inv.receive("BR-2210", 5, 30, D1)
++        self.assertEqual(stock_value(inv, "br-1042 "), 100)
++
++    def test_receipts_valued_in_date_order_not_log_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 20, D2)
++        inv.receive("BR-1042", 10, 10, D1)
++        inv.issue("BR-1042", 5, D3)
++        # The 10-cost receipt is older, so the sale takes from it: 5 left at 10 + 10 at 20
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 10 + 10 * 20)
++
++    def test_negative_stock_is_settled_by_next_receipt(self):
++        inv = Inventory()
++        inv.issue("BR-1042", 5, D1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++        inv.receive("BR-1042", 10, 12, D2)
++        # on hand is 5, and those 5 are valued at 12 each
++        self.assertEqual(inv.on_hand("BR-1042"), 5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 60)
++
++    def test_damage_consumes_oldest_layer(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 10, D1)
++        inv.receive("BR-1042", 10, 20, D2)
++        inv.adjust("BR-1042", -12, "DAMAGE", D3)
++        # 12 out: all 10 from the first layer, 2 from the second
++        self.assertEqual(stock_value(inv, "BR-1042"), 8 * 20)
++
++
++if __name__ == "__main__":
++    unittest.main()

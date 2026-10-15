@@ -1,0 +1,67 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..a794299
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,26 @@
++"""Stock analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs by ABC analysis of their annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are sorted by value,
++    highest first, and walked with a running total. A SKU is 'A' if the
++    cumulative share up to and including it is at most 80% of the grand
++    total, 'B' if at most 95%, otherwise 'C'. Returns a dict of SKU to class.
++    """
++    if not values:
++        return {}
++    total = sum(values.values())
++    ranked = sorted(values.items(), key=lambda pair: (-pair[1], pair[0]))
++    out = {}
++    cumulative = 0
++    for sku, value in ranked:
++        cumulative += value
++        if cumulative <= 0.80 * total:
++            out[sku] = "A"
++        elif cumulative <= 0.95 * total:
++            out[sku] = "B"
++        else:
++            out[sku] = "C"
++    return out
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..f307fec
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,29 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: A 50 (50%), B 30 (80%), C 15 (95%), D 5 (100%)
++        values = {"D": 5, "A": 50, "C": 15, "B": 30}
++        self.assertEqual(
++            abc_classes(values),
++            {"A": "A", "B": "A", "C": "B", "D": "C"},
++        )
++
++    def test_boundary_is_inclusive(self):
++        # Cumulative share reaches exactly 80% at the second SKU, so it is A.
++        values = {"X": 40, "Y": 40, "Z": 20}
++        self.assertEqual(abc_classes(values), {"X": "A", "Y": "A", "Z": "C"})
++
++    def test_last_sku_is_always_c(self):
++        # Its cumulative share is 100%, which is above both thresholds.
++        self.assertEqual(abc_classes({"ONLY": 7}), {"ONLY": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

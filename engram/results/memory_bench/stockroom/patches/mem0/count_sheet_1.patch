@@ -1,0 +1,73 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 3fb4efb..4ffa0fc 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -9,6 +9,8 @@
+   "tests/test_cli.py::CliTest::test_receive_rejects_bad_unit_cost",
+   "tests/test_cli.py::CliTest::test_receive_rejects_zero_quantity",
+   "tests/test_cli.py::CliTest::test_receive_upgrades_legacy_log",
++  "tests/test_countsheet.py::CountSheetTest::test_blind_count_omits_quantity_on_hand",
++  "tests/test_countsheet.py::CountSheetTest::test_one_line_per_item_in_bin_order",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue",
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..d428b3b
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,16 @@
++"""The printable count sheet for a stock-take."""
++
++COUNT_BLANK = "_" * 8
++
++
++def count_sheet(inventory):
++    """Blind count sheet as text, one line per catalog item in bin walking order.
++
++    The system's quantity on hand is deliberately left off: staff must count the
++    stock themselves, so the counted-quantity column is left empty.
++    """
++    items = sorted(inventory.catalog, key=lambda item: (item.location, item.sku))
++    lines = [f"{'BIN':<8} {'SKU':<10} {'ITEM':<30} {'UNIT':<5} {'COUNTED':<8}"]
++    for item in items:
++        lines.append(f"{item.location:<8} {item.sku:<10} {item.name:<30} {item.unit:<5} {COUNT_BLANK}")
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..078525a
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++def make_inventory():
++    catalog = Catalog([
++        Item("BR-2", "Nut", "C-03-1"),
++        Item("BR-1", "Bolt", "A-01-1", reorder_point=10),
++        Item("BR-3", "Washer", "B-02-4"),
++    ])
++    inv = Inventory(catalog)
++    inv.receive("BR-1", 5, 10)
++    return inv
++
++
++class CountSheetTest(unittest.TestCase):
++    def test_one_line_per_item_in_bin_order(self):
++        lines = count_sheet(make_inventory()).splitlines()
++        self.assertEqual(len(lines), 4)  # header plus three items
++        self.assertEqual([line.split()[1] for line in lines[1:]], ["BR-1", "BR-3", "BR-2"])
++
++    def test_blind_count_omits_quantity_on_hand(self):
++        text = count_sheet(make_inventory())
++        self.assertNotIn("5", text.split("\n", 1)[1])
++        self.assertIn("________", text)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,69 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..f1c084b
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,23 @@
++"""Inventory analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B or C by annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are sorted highest
++    value first and a running total is kept. A SKU is 'A' if the cumulative
++    share up to and including it is at most 80% of the grand total, 'B' if
++    at most 95%, otherwise 'C'.
++    """
++    total = sum(values.values())
++    classes = {}
++    running = 0
++    for sku, value in sorted(values.items(), key=lambda kv: kv[1], reverse=True):
++        running += value
++        if running <= 0.8 * total:
++            classes[sku] = "A"
++        elif running <= 0.95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..3d100cd
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,34 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        values = {"S1": 50, "S2": 30, "S3": 15, "S4": 4, "S5": 1}
++        # Cumulative shares: 50%, 80%, 95%, 99%, 100%.
++        self.assertEqual(
++            abc_classes(values),
++            {"S1": "A", "S2": "A", "S3": "B", "S4": "C", "S5": "C"},
++        )
++
++    def test_boundary_is_inclusive(self):
++        values = {"X": 80, "Y": 15, "Z": 5}
++        # X reaches exactly 80%, Y reaches exactly 95%.
++        self.assertEqual(abc_classes(values), {"X": "A", "Y": "B", "Z": "C"})
++
++    def test_order_does_not_depend_on_input_order(self):
++        values = {"S5": 1, "S1": 50, "S3": 15, "S2": 30, "S4": 4}
++        self.assertEqual(abc_classes(values)["S1"], "A")
++        self.assertEqual(abc_classes(values)["S4"], "C")
++
++    def test_single_sku_reaches_full_share_so_is_c(self):
++        # Its cumulative share is 100%, which is above 95%.
++        self.assertEqual(abc_classes({"ONLY": 7}), {"ONLY": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

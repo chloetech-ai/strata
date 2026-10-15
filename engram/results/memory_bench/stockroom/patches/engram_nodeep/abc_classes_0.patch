@@ -1,0 +1,65 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..b1b804c
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,28 @@
++"""Inventory analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B or C by annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are taken from
++    highest to lowest value (ties keep their input order). A SKU is 'A' if
++    the cumulative share of the grand total up to and including it is at
++    most 80%, 'B' if at most 95%, and 'C' otherwise.
++    """
++    for value in values.values():
++        if value < 0:
++            raise ValueError("consumption value cannot be negative")
++
++    total = sum(values.values())
++    running = 0
++    classes = {}
++    ranked = sorted(values.items(), key=lambda pair: pair[1], reverse=True)
++    for sku, value in ranked:
++        running += value
++        if running <= 0.8 * total:
++            classes[sku] = "A"
++        elif running <= 0.95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..d0f21f7
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,25 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_classes_by_cumulative_share(self):
++        # Sorted: 50 (50%), 30 (80%), 15 (95%), 5 (100%)
++        values = {"W": 5, "X": 50, "Y": 30, "Z": 15}
++        self.assertEqual(abc_classes(values), {"X": "A", "Y": "A", "Z": "B", "W": "C"})
++
++    def test_boundaries_are_inclusive(self):
++        values = {"P": 80, "Q": 15, "R": 5}
++        self.assertEqual(abc_classes(values), {"P": "A", "Q": "B", "R": "C"})
++
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_rejects_negative_value(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": 10, "BR-2": -1})
++
++
++if __name__ == "__main__":
++    unittest.main()

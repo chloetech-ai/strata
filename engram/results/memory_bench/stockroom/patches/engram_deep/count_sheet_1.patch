@@ -1,0 +1,100 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index fee495d..b21f961 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -10,6 +10,12 @@
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity",
+   "tests/test_cli.py::CliTest::test_sku_variants_hit_same_stock",
+   "tests/test_cli.py::CliTest::test_unknown_sku_has_zero_on_hand",
++  "tests/test_countsheet.py::CountSheetTest::test_items_without_stock_records_are_listed",
++  "tests/test_countsheet.py::CountSheetTest::test_never_shows_quantity_on_hand",
++  "tests/test_countsheet.py::CountSheetTest::test_one_line_per_catalog_item",
++  "tests/test_countsheet.py::CountSheetTest::test_requires_catalog",
++  "tests/test_countsheet.py::CountSheetTest::test_same_bin_ordered_by_sku",
++  "tests/test_countsheet.py::CountSheetTest::test_walking_order_by_bin_location",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue",
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..caad5c1
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,25 @@
++"""The printable stock-take count sheet."""
++
++
++def _walking_key(location):
++    """Sort key for an "aisle-bay-shelf" bin code, so B-2-1 comes before B-12-3."""
++    return tuple(
++        (0, int(part), "") if part.isdigit() else (1, 0, part.upper())
++        for part in location.split("-")
++    )
++
++
++def count_sheet(inventory):
++    """One line per catalog item, in walking order by bin location.
++
++    The sheet is a blind count: it never shows the quantity on hand, only a
++    blank column where the counted figure is written in.
++    """
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog")
++    items = sorted(inventory.catalog, key=lambda item: (_walking_key(item.location), item.sku))
++    lines = []
++    for item in items:
++        line = f"{item.location:<10} {item.sku:<12} {item.name:<30} {item.unit:<5} "
++        lines.append(line.rstrip())
++    return "\n".join(lines)
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..dc7b6e3
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,46 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Item("BR-1042", "Hex bolt M8x40", "B-12-3"),
++            Item("NT-0007", "Hex nut M8", "B-2-1"),
++            Item("WS-0300", "Wood screw 4x40", "A-10-1"),
++        ])
++        self.inventory = Inventory(self.catalog)
++
++    def test_one_line_per_catalog_item(self):
++        self.assertEqual(len(count_sheet(self.inventory).splitlines()), len(self.catalog))
++
++    def test_walking_order_by_bin_location(self):
++        lines = count_sheet(self.inventory).splitlines()
++        self.assertEqual([line.split()[0] for line in lines], ["A-10-1", "B-2-1", "B-12-3"])
++
++    def test_same_bin_ordered_by_sku(self):
++        catalog = Catalog([Item("BR-2", "Nut", "C-01-1"), Item("BR-1", "Bolt", "C-01-1")])
++        lines = count_sheet(Inventory(catalog)).splitlines()
++        self.assertEqual([line.split()[1] for line in lines], ["BR-1", "BR-2"])
++
++    def test_never_shows_quantity_on_hand(self):
++        self.inventory.receive("BR-1042", 9173, 25)
++        self.inventory.issue("NT-0007", 4)
++        sheet = count_sheet(self.inventory)
++        self.assertNotIn("9173", sheet)
++        self.assertNotIn("-4", sheet)
++
++    def test_items_without_stock_records_are_listed(self):
++        lines = count_sheet(self.inventory).splitlines()
++        self.assertTrue(any("WS-0300" in line for line in lines))
++
++    def test_requires_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,80 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 291fa70..88cb25e 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -14,6 +14,9 @@
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue_set_reason",
+   "tests/test_inventory.py::InventoryTest::test_sku_spellings_share_one_record",
+   "tests/test_inventory.py::InventoryTest::test_unknown_reason_rejected",
++  "tests/test_inventory.py::InventoryTest::test_write_off_defaults_to_today",
++  "tests/test_inventory.py::InventoryTest::test_write_off_quantity_must_be_positive",
++  "tests/test_inventory.py::InventoryTest::test_write_off_records_damage",
+   "tests/test_items.py::CatalogTest::test_add_and_get",
+   "tests/test_items.py::CatalogTest::test_add_normalizes_sku",
+   "tests/test_items.py::CatalogTest::test_duplicate_sku_rejected",
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index dd02a80..3b9778e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,7 @@
+ ## Unreleased
+ 
+ - Command line: `onhand`, `moves` and `receive` subcommands on the CSV movement log.
++- `Inventory.write_off(sku, qty, date=None)` records broken or damaged stock as a DAMAGE movement.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 6ebac3e..a1b00ab 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -48,6 +48,13 @@ class Inventory:
+         movement = Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "SALE", None, note)
+         return self._record(movement)
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock that got broken or damaged, taken off the shelf."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        movement = Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "DAMAGE")
++        return self._record(movement)
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index a586cc3..ce237f7 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -49,6 +49,31 @@ class InventoryTest(unittest.TestCase):
+         for reason in REASONS:
+             self.assertEqual(Movement("BR-1042", 1, DAY, reason).reason, reason)
+ 
++    def test_write_off_records_damage(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        movement = inv.write_off(" br-1042 ", 3, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++        self.assertEqual(movement.reason, "DAMAGE")
++        self.assertEqual(movement.sku, "BR-1042")
++        self.assertEqual(movement.qty, -3)
++        self.assertEqual(movement.date, DAY)
++        self.assertIsNone(movement.unit_cost)
++
++    def test_write_off_defaults_to_today(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        movement = inv.write_off("BR-1042", 1)
++        self.assertEqual(movement.date, datetime.date.today())
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        for qty in [0, -2]:
++            with self.assertRaises(ValueError):
++                inv.write_off("BR-1042", qty, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 10)
++
+     def test_unknown_reason_rejected(self):
+         for reason in ["", "sale", "ADJUST", "WRITE-OFF"]:
+             with self.assertRaises(ValueError):

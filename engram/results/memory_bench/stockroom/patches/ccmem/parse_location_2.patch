@@ -1,0 +1,90 @@
+diff --git a/src/stockroom/items.py b/src/stockroom/items.py
+index cd7f6d1..8566764 100644
+--- a/src/stockroom/items.py
++++ b/src/stockroom/items.py
+@@ -1,13 +1,31 @@
+ """The item catalog."""
+ 
++import re
+ from dataclasses import dataclass, replace
+ 
++_LOCATION = re.compile(r"([A-Za-z])-([0-9]+)-([0-9]+)")
++
+ 
+ def normalize_sku(sku):
+     """Canonical SKU form: surrounding whitespace trimmed, uppercased."""
+     return sku.strip().upper()
+ 
+ 
++def parse_location(code):
++    """Split a bin code like 'B-12-3' into ('B', 12, 3).
++
++    The aisle is a single letter, returned uppercase; bay and shelf are
++    integers. Surrounding whitespace is ignored. Anything else raises ValueError.
++    """
++    if not isinstance(code, str):
++        raise ValueError(f"location must be a string, got {code!r}")
++    match = _LOCATION.fullmatch(code.strip())
++    if match is None:
++        raise ValueError(f"invalid bin location {code!r}; expected aisle-bay-shelf like 'B-12-3'")
++    aisle, bay, shelf = match.groups()
++    return aisle.upper(), int(bay), int(shelf)
++
++
+ @dataclass
+ class Item:
+     sku: str
+diff --git a/tests/test_items.py b/tests/test_items.py
+index ec7b22a..3644bf9 100644
+--- a/tests/test_items.py
++++ b/tests/test_items.py
+@@ -1,6 +1,6 @@
+ import unittest
+ 
+-from stockroom.items import Catalog, Item, normalize_sku
++from stockroom.items import Catalog, Item, normalize_sku, parse_location
+ 
+ 
+ class NormalizeSkuTest(unittest.TestCase):
+@@ -9,6 +9,41 @@ class NormalizeSkuTest(unittest.TestCase):
+             self.assertEqual(normalize_sku(raw), "BR-1042")
+ 
+ 
++class ParseLocationTest(unittest.TestCase):
++    def test_splits_bin_code(self):
++        self.assertEqual(parse_location("B-12-3"), ("B", 12, 3))
++
++    def test_aisle_is_uppercased_and_whitespace_ignored(self):
++        self.assertEqual(parse_location(" b-12-3\t"), ("B", 12, 3))
++
++    def test_rejects_malformed_codes(self):
++        bad = [
++            "",
++            "B-12",
++            "B-12-3-4",
++            "BB-12-3",
++            "1-12-3",
++            "-12-3",
++            "B--3",
++            "B-12-",
++            "B-x-3",
++            "B-+1-3",
++            "B-1_0-3",
++            "B 12 3",
++            "B-12 -3",
++            "B-12.5-3",
++            "B-١٢-3",
++        ]
++        for code in bad:
++            with self.subTest(code=code):
++                with self.assertRaises(ValueError):
++                    parse_location(code)
++
++    def test_rejects_non_string(self):
++        with self.assertRaises(ValueError):
++            parse_location(None)
++
++
+ class CatalogTest(unittest.TestCase):
+     def test_lookup_ignores_case_and_whitespace(self):
+         catalog = Catalog([Item("BR-1042", "Hex bolt M8x40", "C-03-2")])

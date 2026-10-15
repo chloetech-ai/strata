@@ -1,0 +1,58 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index fee495d..cc73b73 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -15,6 +15,8 @@
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue",
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue_set_reason",
+   "tests/test_inventory.py::InventoryTest::test_sku_variants_hit_same_stock",
++  "tests/test_inventory.py::InventoryTest::test_write_off_quantity_must_be_positive",
++  "tests/test_inventory.py::InventoryTest::test_write_off_records_damage_out",
+   "tests/test_inventory.py::MovementTest::test_accepts_bookkeeping_reason_codes",
+   "tests/test_inventory.py::MovementTest::test_rejects_other_reason_codes",
+   "tests/test_items.py::CatalogTest::test_add_and_get",
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index d09ffb2..52cec62 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -51,6 +51,13 @@ class Inventory:
+                             None, note)
+         return self._record(movement)
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock broken or damaged, taken out of the books."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        movement = Movement(normalize_sku(sku), -qty, date or datetime.date.today(), "DAMAGE")
++        return self._record(movement)
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index e1364d4..f051e2d 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -46,6 +46,22 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual(inv.on_hand("  br-1042"), 60)
+         self.assertEqual([m.qty for m in inv.movements_for("bR-1042")], [100, -30, -10])
+ 
++    def test_write_off_records_damage_out(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        movement = inv.write_off(" br-1042 ", 3, DAY)
++        self.assertEqual(movement.reason, "DAMAGE")
++        self.assertEqual(movement.sku, "BR-1042")
++        self.assertEqual(movement.qty, -3)
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", 0)
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", -2)
++
+     def test_movements_for(self):
+         inv = Inventory()
+         inv.receive("BR-1042", 10, 12, DAY)

@@ -1,0 +1,60 @@
+diff --git a/src/stockroom/reorder.py b/src/stockroom/reorder.py
+index 4672674..caf2534 100644
+--- a/src/stockroom/reorder.py
++++ b/src/stockroom/reorder.py
+@@ -8,3 +8,20 @@ def needs_reorder(inventory):
+         if inventory.on_hand(item.sku) <= item.reorder_point:
+             out.append(item.sku)
+     return out
++
++
++def suggest_orders(inventory):
++    """Order quantity for each SKU that needs reorder.
++
++    Orders enough to bring stock back up to three times the reorder point,
++    rounded up to whole cases. SKUs that need nothing are left out.
++    """
++    orders = {}
++    for sku in needs_reorder(inventory):
++        item = inventory.catalog.get(sku)
++        shortfall = 3 * item.reorder_point - inventory.on_hand(sku)
++        cases = -(-shortfall // item.case_size)  # ceiling division
++        quantity = cases * item.case_size
++        if quantity > 0:
++            orders[sku] = quantity
++    return orders
+diff --git a/tests/test_reorder.py b/tests/test_reorder.py
+index 62219cf..bc5c18d 100644
+--- a/tests/test_reorder.py
++++ b/tests/test_reorder.py
+@@ -2,7 +2,7 @@ import unittest
+ 
+ from stockroom.inventory import Inventory
+ from stockroom.items import Catalog, Item
+-from stockroom.reorder import needs_reorder
++from stockroom.reorder import needs_reorder, suggest_orders
+ 
+ 
+ def make_inventory():
+@@ -28,6 +28,21 @@ class ReorderTest(unittest.TestCase):
+     def test_enough_stock(self):
+         self.assertNotIn("BR-3", needs_reorder(make_inventory()))
+ 
++    def test_suggested_quantity_reaches_three_times_reorder_point(self):
++        self.assertEqual(suggest_orders(make_inventory())["BR-1"], 25)  # 30 - 5
++
++    def test_suggestion_rounds_up_to_whole_cases(self):
++        inv = Inventory(Catalog([Item("BR-4", "Screw", "A-01-4", reorder_point=10, case_size=12)]))
++        inv.receive("BR-4", 7, 10)
++        self.assertEqual(suggest_orders(inv)["BR-4"], 24)  # shortfall 23 -> 2 cases of 12
++
++    def test_no_suggestion_for_stock_above_reorder_point(self):
++        self.assertNotIn("BR-3", suggest_orders(make_inventory()))
++
++    def test_no_suggestion_when_nothing_to_order(self):
++        inv = Inventory(Catalog([Item("BR-5", "Pin", "A-01-5")]))
++        self.assertEqual(suggest_orders(inv), {})
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

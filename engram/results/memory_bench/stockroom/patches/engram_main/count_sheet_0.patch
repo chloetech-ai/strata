@@ -1,0 +1,99 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 291fa70..78abacf 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -7,6 +7,12 @@
+   "tests/test_cli.py::CliTest::test_receive_creates_log_then_onhand_reads_it",
+   "tests/test_cli.py::CliTest::test_receive_refuses_legacy_log_without_reason_column",
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity",
++  "tests/test_countsheet.py::CountSheetTest::test_blind_count_does_not_show_on_hand",
++  "tests/test_countsheet.py::CountSheetTest::test_each_line_ends_with_empty_count_column",
++  "tests/test_countsheet.py::CountSheetTest::test_empty_catalog_gives_empty_sheet",
++  "tests/test_countsheet.py::CountSheetTest::test_missing_catalog_is_an_error",
++  "tests/test_countsheet.py::CountSheetTest::test_one_line_per_item_in_bin_order",
++  "tests/test_countsheet.py::CountSheetTest::test_sku_and_name_and_unit_appear",
+   "tests/test_inventory.py::InventoryTest::test_movement_accepts_bookkeeping_codes",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..dd5eab6
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,22 @@
++"""The printable stock-take count sheet.
++
++A blind count: the sheet never shows the quantity on hand, only an empty
++column for the counted quantity, so counters have to count rather than copy.
++Lines are in bin-location walking order, not SKU order.
++"""
++
++COUNT_WIDTH = 10
++
++
++def count_sheet(inventory):
++    """One text line per catalog item, sorted by bin location then SKU."""
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog to count against")
++    items = sorted(inventory.catalog, key=lambda item: (item.location, item.sku))
++    lines = []
++    for item in items:
++        lines.append(
++            f"{item.location:<10} {item.sku:<14} {item.name:<32} {item.unit:<5} "
++            f"{'_' * COUNT_WIDTH}"
++        )
++    return "\n".join(lines) + ("\n" if lines else "")
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..bda4389
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,48 @@
++import unittest
++
++from stockroom import Catalog, Inventory, Item
++from stockroom.countsheet import count_sheet
++
++
++class CountSheetTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Item("br-2000", "Wood screw 8x1", "C-03-1", unit="box"),
++            Item("BR-1042", "Hex bolt 1/4in", "B-12-3"),
++            Item("BR-0007", "Claw hammer", "A-01-2"),
++        ])
++        self.inventory = Inventory(self.catalog)
++        self.inventory.receive("BR-1042", 37, 125)
++
++    def test_one_line_per_item_in_bin_order(self):
++        lines = count_sheet(self.inventory).splitlines()
++        self.assertEqual(len(lines), 3)
++        self.assertTrue(lines[0].startswith("A-01-2"))
++        self.assertTrue(lines[1].startswith("B-12-3"))
++        self.assertTrue(lines[2].startswith("C-03-1"))
++
++    def test_blind_count_does_not_show_on_hand(self):
++        sheet = count_sheet(self.inventory)
++        self.assertNotIn("37", sheet)
++        self.assertEqual(self.inventory.on_hand("BR-1042"), 37)
++
++    def test_each_line_ends_with_empty_count_column(self):
++        for line in count_sheet(self.inventory).splitlines():
++            self.assertTrue(line.endswith("_" * 10), line)
++
++    def test_sku_and_name_and_unit_appear(self):
++        sheet = count_sheet(self.inventory)
++        self.assertIn("BR-2000", sheet)
++        self.assertIn("Hex bolt 1/4in", sheet)
++        self.assertIn("box", sheet)
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++    def test_missing_catalog_is_an_error(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

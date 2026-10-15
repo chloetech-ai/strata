@@ -1,0 +1,104 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index fee495d..182734b 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -10,6 +10,13 @@
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity",
+   "tests/test_cli.py::CliTest::test_sku_variants_hit_same_stock",
+   "tests/test_cli.py::CliTest::test_unknown_sku_has_zero_on_hand",
++  "tests/test_countsheet.py::CountSheetTest::test_counted_column_is_blank",
++  "tests/test_countsheet.py::CountSheetTest::test_empty_catalog_gives_empty_sheet",
++  "tests/test_countsheet.py::CountSheetTest::test_lines_follow_bin_walking_order_not_sku",
++  "tests/test_countsheet.py::CountSheetTest::test_never_shows_on_hand_quantity",
++  "tests/test_countsheet.py::CountSheetTest::test_one_line_per_catalog_item",
++  "tests/test_countsheet.py::CountSheetTest::test_requires_a_catalog",
++  "tests/test_countsheet.py::CountSheetTest::test_same_bin_is_ordered_by_sku",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue",
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..6656ba0
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,27 @@
++"""Printable blind count sheet for the stock-take."""
++
++
++def _bin_key(location):
++    """Sort key for an "aisle-bay-shelf" code so that B-2-1 comes before B-10-1."""
++    key = []
++    for part in location.split("-"):
++        if part.isdigit():
++            key.append((0, int(part), ""))
++        else:
++            key.append((1, 0, part))
++    return key
++
++
++def count_sheet(inventory):
++    """Return the count sheet as text, one line per catalog item in bin walking order.
++
++    This is a blind count: on-hand quantities are never printed. The last column
++    is left empty for the counter to write the counted figure in.
++    """
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog")
++    items = sorted(inventory.catalog, key=lambda item: (_bin_key(item.location), item.sku))
++    lines = []
++    for item in items:
++        lines.append(f"{item.location:<10} {item.sku:<12} {item.name:<30} {item.unit:<5} {'':<8}")
++    return "\n".join(lines)
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..8f58267
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,47 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def test_lines_follow_bin_walking_order_not_sku(self):
++        catalog = Catalog([
++            Item("BR-1", "Bolt", "B-10-1"),
++            Item("BR-2", "Nut", "B-2-1"),
++            Item("BR-3", "Washer", "A-09-4"),
++        ])
++        lines = count_sheet(Inventory(catalog)).split("\n")
++        self.assertEqual([line.split()[1] for line in lines], ["BR-3", "BR-2", "BR-1"])
++
++    def test_same_bin_is_ordered_by_sku(self):
++        catalog = Catalog([Item("BR-2", "Nut", "A-01-1"), Item("BR-1", "Bolt", "A-01-1")])
++        lines = count_sheet(Inventory(catalog)).split("\n")
++        self.assertEqual([line.split()[1] for line in lines], ["BR-1", "BR-2"])
++
++    def test_one_line_per_catalog_item(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1"), Item("BR-2", "Nut", "A-01-2")])
++        self.assertEqual(len(count_sheet(Inventory(catalog)).split("\n")), 2)
++
++    def test_never_shows_on_hand_quantity(self):
++        catalog = Catalog([Item("BR-1042", "Hex bolt M8x40", "C-03-2", reorder_point=5)])
++        inv = Inventory(catalog)
++        inv.receive("br-1042", 37, 250)
++        self.assertNotIn("37", count_sheet(inv))
++
++    def test_counted_column_is_blank(self):
++        catalog = Catalog([Item("BR-1042", "Hex bolt M8x40", "C-03-2", unit="pcs")])
++        line = count_sheet(Inventory(catalog))
++        self.assertEqual(line.rstrip(), "C-03-2     BR-1042      Hex bolt M8x40                 pcs")
++
++    def test_requires_a_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++
++if __name__ == "__main__":
++    unittest.main()

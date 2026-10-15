@@ -1,0 +1,69 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cd71951..5ad72aa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,7 @@
+ ## Unreleased
+ 
+ - Command line: `python -m stockroom onhand SKU --log FILE`, `receive SKU QTY UNIT_COST --log FILE` and `moves SKU --log FILE`.
++- `count_sheet(inventory)` returns the stock-take count sheet as text, one tab-separated line per catalog item.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..1229cc4
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,11 @@
++"""The count sheet for a stock-take: one line per catalog item, to write the counted quantity on."""
++
++
++def count_sheet(inventory):
++    """Tab-separated lines: SKU, location, name, unit, quantity on hand, and an empty
++    column for the counted quantity. Items come in catalog (SKU) order."""
++    lines = []
++    for item in inventory.catalog:
++        on_hand = inventory.on_hand(item.sku)
++        lines.append(f"{item.sku}\t{item.location}\t{item.name}\t{item.unit}\t{on_hand}\t")
++    return "".join(f"{line}\n" for line in lines)
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..a05cb28
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,34 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def test_one_line_per_item_in_sku_order(self):
++        catalog = Catalog([
++            Item("BR-2", "Nut", "A-01-2", unit="pcs"),
++            Item("BR-1", "Bolt", "A-01-1", unit="pcs"),
++        ])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 5, 10)
++        inv.receive("BR-2", 12, 10)
++        inv.issue("BR-2", 2)
++
++        self.assertEqual(
++            count_sheet(inv),
++            "BR-1\tA-01-1\tBolt\tpcs\t5\t\n"
++            "BR-2\tA-01-2\tNut\tpcs\t10\t\n",
++        )
++
++    def test_item_with_no_movements_shows_zero(self):
++        inv = Inventory(Catalog([Item("BR-1", "Bolt", "A-01-1")]))
++        self.assertEqual(count_sheet(inv), "BR-1\tA-01-1\tBolt\tpcs\t0\t\n")
++
++    def test_empty_catalog_gives_empty_sheet(self):
++        self.assertEqual(count_sheet(Inventory(Catalog())), "")
++
++
++if __name__ == "__main__":
++    unittest.main()

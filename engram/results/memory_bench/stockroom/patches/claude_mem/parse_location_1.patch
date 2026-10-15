@@ -1,0 +1,65 @@
+diff --git a/src/stockroom/items.py b/src/stockroom/items.py
+index 387e4c5..ec6c865 100644
+--- a/src/stockroom/items.py
++++ b/src/stockroom/items.py
+@@ -1,13 +1,29 @@
+ """The item catalog."""
+ 
++import re
+ from dataclasses import dataclass
+ 
++_BIN_CODE = re.compile(r"([A-Za-z])-([0-9]+)-([0-9]+)")
++
+ 
+ def normalize_sku(sku):
+     """Canonical SKU form: surrounding whitespace trimmed, uppercased."""
+     return sku.strip().upper()
+ 
+ 
++def parse_location(code):
++    """Split a bin code like 'B-12-3' into ('B', 12, 3).
++
++    The aisle is a single letter, returned uppercase. Bay and shelf are integers.
++    Surrounding whitespace is ignored; anything else raises ValueError.
++    """
++    match = _BIN_CODE.fullmatch(code.strip())
++    if match is None:
++        raise ValueError(f"bin code must look like 'B-12-3', got {code!r}")
++    aisle, bay, shelf = match.groups()
++    return aisle.upper(), int(bay), int(shelf)
++
++
+ @dataclass
+ class Item:
+     sku: str
+diff --git a/tests/test_items.py b/tests/test_items.py
+index 2b2e699..f047c63 100644
+--- a/tests/test_items.py
++++ b/tests/test_items.py
+@@ -1,6 +1,25 @@
+ import unittest
+ 
+-from stockroom.items import Catalog, Item, normalize_sku
++from stockroom.items import Catalog, Item, normalize_sku, parse_location
++
++
++class ParseLocationTest(unittest.TestCase):
++    def test_splits_bin_code(self):
++        self.assertEqual(parse_location("B-12-3"), ("B", 12, 3))
++
++    def test_lowercase_aisle_returned_uppercase(self):
++        self.assertEqual(parse_location("b-12-3"), ("B", 12, 3))
++
++    def test_surrounding_whitespace_ignored(self):
++        self.assertEqual(parse_location("  B-12-3\n"), ("B", 12, 3))
++
++    def test_rejects_malformed_codes(self):
++        for code in ["", "B-12", "B-12-3-4", "BB-12-3", "1-12-3", "B-x-3",
++                     "B-12-", "-12-3", "B-12-3.5", "B-+12-3", "B-1_2-3",
++                     "B 12 3", "B-12 -3"]:
++            with self.subTest(code=code):
++                with self.assertRaises(ValueError):
++                    parse_location(code)
+ 
+ 
+ class NormalizeSkuTest(unittest.TestCase):

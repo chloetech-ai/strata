@@ -1,0 +1,74 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..b6eea9e
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,22 @@
++"""Inventory analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B or C by share of total annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are sorted highest
++    value first, and each gets the class of its cumulative share including
++    itself: A up to 80% of the grand total, B up to 95%, C otherwise.
++    """
++    total = sum(values.values())
++    classes = {}
++    cumulative = 0
++    for sku, value in sorted(values.items(), key=lambda kv: (-kv[1], kv[0])):
++        cumulative += value
++        if cumulative <= 0.80 * total:
++            classes[sku] = "A"
++        elif cumulative <= 0.95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..e15db27
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,40 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        values = {"BR-1": 50, "BR-2": 30, "BR-3": 15, "BR-4": 5}
++        # Cumulative shares: 50%, 80%, 95%, 100%.
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "A", "BR-3": "B", "BR-4": "C"},
++        )
++
++    def test_boundary_is_inclusive(self):
++        values = {"BR-1": 80, "BR-2": 15, "BR-3": 5}
++        # Cumulative 80% lands exactly on the A boundary, 95% on the B one.
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "B", "BR-3": "C"},
++        )
++
++    def test_top_sku_over_80_percent_is_b(self):
++        values = {"BR-1": 90, "BR-2": 10}
++        self.assertEqual(abc_classes(values), {"BR-1": "B", "BR-2": "C"})
++
++    def test_input_order_does_not_matter(self):
++        values = {"BR-3": 5, "BR-1": 50, "BR-4": 5, "BR-2": 40}
++        # Cumulative: 50% (A), 90% (B), 95% (B), 100% (C).
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "B", "BR-3": "B", "BR-4": "C"},
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()

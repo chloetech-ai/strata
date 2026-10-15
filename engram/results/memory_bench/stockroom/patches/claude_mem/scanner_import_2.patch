@@ -1,0 +1,114 @@
+diff --git a/src/stockroom/scanner.py b/src/stockroom/scanner.py
+new file mode 100644
+index 0000000..d192b97
+--- /dev/null
++++ b/src/stockroom/scanner.py
+@@ -0,0 +1,38 @@
++"""Import counts from handheld scanner files.
++
++A scanner file is plain text with no header, one line per scanned bin:
++
++    bin;sku;qty
++
++A SKU may appear on several lines (for example when it overflows into a
++second bin), so quantities are summed per SKU.
++"""
++
++from collections import defaultdict
++
++from .items import normalize_sku
++
++
++def read_scanner_file(path):
++    """Return {SKU: counted quantity}, summed across all lines for that SKU."""
++    counts = defaultdict(int)
++    with open(path, encoding="utf-8", newline="") as handle:
++        for number, line in enumerate(handle, start=1):
++            line = line.strip()
++            if not line:
++                continue
++            fields = line.split(";")
++            if len(fields) != 3:
++                raise ValueError(f"{path}:{number}: expected bin;sku;qty, got {line!r}")
++            _bin, sku, qty = (field.strip() for field in fields)
++            sku = normalize_sku(sku)
++            if not sku:
++                raise ValueError(f"{path}:{number}: missing SKU")
++            try:
++                quantity = int(qty)
++            except ValueError:
++                raise ValueError(f"{path}:{number}: quantity must be a whole number, got {qty!r}") from None
++            if quantity < 0:
++                raise ValueError(f"{path}:{number}: quantity must not be negative, got {quantity}")
++            counts[sku] += quantity
++    return dict(counts)
+diff --git a/tests/test_scanner.py b/tests/test_scanner.py
+new file mode 100644
+index 0000000..c7d5a29
+--- /dev/null
++++ b/tests/test_scanner.py
+@@ -0,0 +1,64 @@
++import os
++import tempfile
++import unittest
++
++from stockroom.scanner import read_scanner_file
++
++
++class ReadScannerFileTest(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self._tmp.cleanup)
++
++    def write(self, text, newline="\n"):
++        path = os.path.join(self._tmp.name, "scan.txt")
++        with open(path, "w", encoding="utf-8", newline=newline) as handle:
++            handle.write(text)
++        return path
++
++    def test_reads_one_line_per_sku(self):
++        path = self.write("A-01-1;BR-1042;12\nB-07-3;NT-200;5\n")
++        self.assertEqual(read_scanner_file(path), {"BR-1042": 12, "NT-200": 5})
++
++    def test_sums_sku_split_across_bins(self):
++        path = self.write("A-01-1;BR-1042;12\nC-02-2;BR-1042;7\nA-01-1;BR-1042;1\n")
++        self.assertEqual(read_scanner_file(path), {"BR-1042": 20})
++
++    def test_normalizes_sku_so_variants_are_summed(self):
++        path = self.write("A-01-1; br-1042 ;4\nC-02-2;BR-1042;3\n")
++        self.assertEqual(read_scanner_file(path), {"BR-1042": 7})
++
++    def test_crlf_and_blank_lines_are_ignored(self):
++        path = self.write("A-01-1;BR-1042;2\r\n\r\nB-07-3;NT-200;9\r\n", newline="")
++        self.assertEqual(read_scanner_file(path), {"BR-1042": 2, "NT-200": 9})
++
++    def test_zero_quantity_is_kept(self):
++        path = self.write("A-01-1;BR-1042;0\n")
++        self.assertEqual(read_scanner_file(path), {"BR-1042": 0})
++
++    def test_empty_file_gives_empty_dict(self):
++        self.assertEqual(read_scanner_file(self.write("")), {})
++
++    def test_wrong_field_count_reports_line(self):
++        path = self.write("A-01-1;BR-1042;2\nA-01-1,BR-1042,2\n")
++        with self.assertRaisesRegex(ValueError, r":2: expected bin;sku;qty"):
++            read_scanner_file(path)
++
++    def test_non_integer_quantity_rejected(self):
++        path = self.write("A-01-1;BR-1042;1.5\n")
++        with self.assertRaisesRegex(ValueError, r":1: quantity must be a whole number"):
++            read_scanner_file(path)
++
++    def test_negative_quantity_rejected(self):
++        path = self.write("A-01-1;BR-1042;-3\n")
++        with self.assertRaisesRegex(ValueError, r":1: quantity must not be negative"):
++            read_scanner_file(path)
++
++    def test_missing_sku_rejected(self):
++        path = self.write("A-01-1;  ;3\n")
++        with self.assertRaisesRegex(ValueError, r":1: missing SKU"):
++            read_scanner_file(path)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,82 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..d3620ee
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,24 @@
++"""What the stock on hand is worth."""
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand.
++
++    Costed at moving average: a receipt adds its unit cost to the stock, and
++    every other movement is valued at the average cost held when it happens.
++    Movements are taken in log order. Stock that is not on hand is worth 0.
++    """
++    quantity = 0
++    value = 0  # cents
++    for m in inventory.movements_for(sku):
++        average = value / quantity if quantity > 0 else 0
++        if m.qty > 0 and m.unit_cost is not None:
++            value += m.qty * m.unit_cost
++        elif m.qty > 0:
++            value += round(m.qty * average)
++        else:
++            value -= round(-m.qty * average)
++        quantity += m.qty
++        if quantity <= 0:
++            value = 0
++    return value
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..3286502
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,46 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_nothing_on_hand_is_worth_nothing(self):
++        inv = Inventory()
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++        inv.receive("BR-1042", 5, 12, DAY)
++        inv.issue("BR-1042", 5, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_receipts_at_their_unit_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_issues_leave_stock_at_average_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 14, DAY)
++        inv.issue("BR-1042", 5, DAY)  # average is 260 / 20 = 13, so 5 * 13 leaves
++        self.assertEqual(stock_value(inv, "BR-1042"), 195)
++
++    def test_movement_without_cost_is_valued_at_average(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 14, DAY)
++        inv.issue("BR-1042", 5, DAY)
++        inv._record(Movement("BR-1042", 5, DAY, "COUNT"))  # 5 * 13 comes back
++        self.assertEqual(stock_value(inv, "BR-1042"), 260)
++
++    def test_sku_is_normalized_and_other_skus_ignored(self):
++        inv = Inventory()
++        inv.receive(" br-1042 ", 10, 12, DAY)
++        inv.receive("BR-9999", 10, 50, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++
++if __name__ == "__main__":
++    unittest.main()

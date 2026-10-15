@@ -1,0 +1,92 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..dca5705 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,3 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_analysis.py::AbcClassesTest::test_single_sku_is_a": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index fee495d..aa0e5b9 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,9 @@
+ [
++  "tests/test_analysis.py::AbcClassesTest::test_classes_by_cumulative_share",
++  "tests/test_analysis.py::AbcClassesTest::test_empty_input",
++  "tests/test_analysis.py::AbcClassesTest::test_result_does_not_depend_on_input_order",
++  "tests/test_analysis.py::AbcClassesTest::test_single_sku_is_a",
++  "tests/test_analysis.py::AbcClassesTest::test_single_sku_is_c",
+   "tests/test_cli.py::CliTest::test_moves_for_unknown_sku_prints_nothing",
+   "tests/test_cli.py::CliTest::test_moves_lists_one_line_per_movement_for_the_sku",
+   "tests/test_cli.py::CliTest::test_moves_on_missing_log_is_an_error",
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..7bdfea9
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,24 @@
++"""ABC analysis of stock by annual consumption value."""
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B or C by their share of total annual value.
++
++    `values` maps SKU to annual consumption value. SKUs are taken highest
++    value first (ties broken by SKU). A SKU is 'A' while the running total up
++    to and including it is at most 80% of the grand total, 'B' while it is at
++    most 95%, and 'C' otherwise.
++    """
++    total = sum(values.values())
++    classes = {}
++    running = 0
++    for sku, value in sorted(values.items(), key=lambda kv: (-kv[1], kv[0])):
++        running += value
++        # Compare without dividing so the 80% and 95% boundaries are exact.
++        if running * 100 <= 80 * total:
++            classes[sku] = "A"
++        elif running * 100 <= 95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..5a3e512
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,31 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_single_sku_is_c(self):
++        # Its share is 100%, which is above both the 80% and 95% cut-offs.
++        self.assertEqual(abc_classes({"BR-1042": 5}), {"BR-1042": "C"})
++
++    def test_classes_by_cumulative_share(self):
++        values = {"A1": 50, "B1": 30, "C1": 15, "D1": 5}
++        # Running shares: 50%, 80%, 95%, 100%. Boundaries are inclusive.
++        self.assertEqual(
++            abc_classes(values),
++            {"A1": "A", "B1": "A", "C1": "B", "D1": "C"},
++        )
++
++    def test_result_does_not_depend_on_input_order(self):
++        values = {"D1": 5, "C1": 15, "B1": 30, "A1": 50}
++        self.assertEqual(
++            abc_classes(values),
++            {"A1": "A", "B1": "A", "C1": "B", "D1": "C"},
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()

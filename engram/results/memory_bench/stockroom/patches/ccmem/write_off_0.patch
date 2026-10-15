@@ -1,0 +1,47 @@
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index aef508a..180e236 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -55,6 +55,12 @@ class Inventory:
+             raise ValueError("quantity must not be zero")
+         return self._record(Movement(normalize_sku(sku), qty, date or datetime.date.today(), reason, None, note))
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock lost to breakage or damage; `qty` is positive, recorded as a DAMAGE movement."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self.adjust(sku, -qty, "DAMAGE", date)
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 5aa3ccb..a6157f2 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -32,6 +32,25 @@ class ReasonCodeTest(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Inventory().adjust("BR-1042", 0, "COUNT", DAY)
+ 
++    def test_write_off_records_damage_and_reduces_stock(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        m = inv.write_off("BR-1042", 3, DAY)
++        self.assertEqual((m.qty, m.reason, m.date), (-3, "DAMAGE", DAY))
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_rejects_non_positive_quantity(self):
++        inv = Inventory()
++        for bad in [0, -2]:
++            with self.assertRaises(ValueError):
++                inv.write_off("BR-1042", bad, DAY)
++        self.assertEqual(inv.movements, [])
++
++    def test_write_off_does_not_refuse_when_short(self):
++        inv = Inventory()
++        inv.write_off("BR-1042", 2, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -2)
++
+     def test_movement_rejects_unknown_code(self):
+         for bad in ["", "receipt", "LOSS", None]:
+             with self.assertRaises(ValueError):

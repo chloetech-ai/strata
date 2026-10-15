@@ -1,0 +1,82 @@
+diff --git a/src/stockroom/scanner.py b/src/stockroom/scanner.py
+new file mode 100644
+index 0000000..cf8bfd6
+--- /dev/null
++++ b/src/stockroom/scanner.py
+@@ -0,0 +1,28 @@
++"""Reading the handheld scanners' plain-text count export."""
++
++from .items import normalize_sku
++
++
++def read_scanner_file(path):
++    """Counted quantity per SKU from a scanner export.
++
++    The file is semicolon-separated with no header, one ``bin;sku;qty`` line
++    per count. A SKU may appear on several lines (overflow bins), so its
++    quantities are added up. Returns a dict of normalized SKU to total qty.
++    """
++    counts = {}
++    with open(path, encoding="utf-8") as f:
++        for number, line in enumerate(f, start=1):
++            if not line.strip():
++                continue
++            fields = line.split(";")
++            if len(fields) != 3:
++                raise ValueError(f"{path}:{number}: expected bin;sku;qty, got {line.rstrip()!r}")
++            _, sku, qty = fields
++            try:
++                qty = int(qty)
++            except ValueError:
++                raise ValueError(f"{path}:{number}: quantity is not a whole number: {qty.strip()!r}")
++            sku = normalize_sku(sku)
++            counts[sku] = counts.get(sku, 0) + qty
++    return counts
+diff --git a/tests/test_scanner.py b/tests/test_scanner.py
+new file mode 100644
+index 0000000..704bdc4
+--- /dev/null
++++ b/tests/test_scanner.py
+@@ -0,0 +1,42 @@
++import os
++import tempfile
++import unittest
++
++from stockroom.scanner import read_scanner_file
++
++
++class ReadScannerFileTest(unittest.TestCase):
++    def read(self, text):
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "scan.txt")
++            with open(path, "w", encoding="utf-8") as f:
++                f.write(text)
++            return read_scanner_file(path)
++
++    def test_reads_counts_per_sku(self):
++        counts = self.read("A-1;BR-1042;12\nA-2;BR-2000;5\n")
++        self.assertEqual(counts, {"BR-1042": 12, "BR-2000": 5})
++
++    def test_sums_sku_on_several_lines(self):
++        counts = self.read("B-1;BR-1042;10\nOVERFLOW-3;BR-1042;4\n")
++        self.assertEqual(counts, {"BR-1042": 14})
++
++    def test_normalizes_sku(self):
++        counts = self.read("A-1; br-1042 ;3\nA-2;BR-1042;2\n")
++        self.assertEqual(counts, {"BR-1042": 5})
++
++    def test_skips_blank_lines_and_tolerates_crlf(self):
++        counts = self.read("A-1;BR-1042;3\r\n\r\nA-2;BR-1042;1\r\n")
++        self.assertEqual(counts, {"BR-1042": 4})
++
++    def test_rejects_wrong_field_count_with_line_number(self):
++        with self.assertRaisesRegex(ValueError, ":2: expected bin;sku;qty"):
++            self.read("A-1;BR-1042;3\nBR-1042;3\n")
++
++    def test_rejects_non_integer_quantity_with_line_number(self):
++        with self.assertRaisesRegex(ValueError, ":1: quantity is not a whole number"):
++            self.read("A-1;BR-1042;three\n")
++
++
++if __name__ == "__main__":
++    unittest.main()

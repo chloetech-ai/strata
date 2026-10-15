@@ -1,0 +1,195 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 9e26dfe..b1a6e3c 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1 +1,11 @@
+-{}
+\ No newline at end of file
++{
++  "tests/test_cli.py::CliTest": true,
++  "tests/test_inventory.py::ReasonCodeTest": true,
++  "tests/test_inventory.py::InventoryTest": true,
++  "tests/test_items.py::NormalizeSkuTest": true,
++  "tests/test_items.py::CatalogTest": true,
++  "tests/test_items.py::ItemValidationTest": true,
++  "tests/test_reorder.py::ReorderTest": true,
++  "tests/test_storage.py::StorageTest": true,
++  "tests/test_valuation.py::StockValueTest": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 83a3ba7..6c80428 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,15 @@
+ [
++  "tests/test_cli.py::CliTest::test_moves_missing_log_is_an_error",
++  "tests/test_cli.py::CliTest::test_moves_prints_one_line_per_movement",
++  "tests/test_cli.py::CliTest::test_moves_unknown_sku_prints_nothing",
++  "tests/test_cli.py::CliTest::test_onhand_missing_log_is_an_error",
++  "tests/test_cli.py::CliTest::test_onhand_prints_quantity",
++  "tests/test_cli.py::CliTest::test_onhand_unknown_sku_is_zero",
++  "tests/test_cli.py::CliTest::test_receive_appends_to_existing_log",
++  "tests/test_cli.py::CliTest::test_receive_appends_to_old_log_without_reason_column",
++  "tests/test_cli.py::CliTest::test_receive_creates_log_with_header",
++  "tests/test_cli.py::CliTest::test_receive_rejects_negative_unit_cost",
++  "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_qty",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue",
+@@ -14,10 +25,26 @@
+   "tests/test_items.py::CatalogTest::test_duplicate_sku_rejected_across_spellings",
+   "tests/test_items.py::CatalogTest::test_iterates_by_sku",
+   "tests/test_items.py::CatalogTest::test_lookup_ignores_case_and_whitespace",
++  "tests/test_items.py::ItemValidationTest::test_accepts_zero_reorder_point_and_single_piece_case",
++  "tests/test_items.py::ItemValidationTest::test_catalog_add_rejects_invalid_item",
++  "tests/test_items.py::ItemValidationTest::test_rejects_case_size_below_one",
++  "tests/test_items.py::ItemValidationTest::test_rejects_negative_reorder_point",
+   "tests/test_items.py::NormalizeSkuTest::test_trims_and_uppercases",
+   "tests/test_reorder.py::ReorderTest::test_at_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
+   "tests/test_storage.py::StorageTest::test_loading_normalizes_sku",
+-  "tests/test_storage.py::StorageTest::test_roundtrip"
++  "tests/test_storage.py::StorageTest::test_old_file_without_reason_column_infers_reason_from_sign",
++  "tests/test_storage.py::StorageTest::test_roundtrip",
++  "tests/test_storage.py::StorageTest::test_roundtrip_keeps_adjustment_reasons",
++  "tests/test_valuation.py::StockValueTest::test_adjustments_with_cost_are_layers",
++  "tests/test_valuation.py::StockValueTest::test_empty_stock_is_worth_nothing",
++  "tests/test_valuation.py::StockValueTest::test_issue_spanning_two_layers",
++  "tests/test_valuation.py::StockValueTest::test_issues_consume_oldest_layer_first",
++  "tests/test_valuation.py::StockValueTest::test_later_receipt_pays_off_negative_stock_before_costing",
++  "tests/test_valuation.py::StockValueTest::test_negative_stock_is_worth_nothing",
++  "tests/test_valuation.py::StockValueTest::test_only_the_requested_sku_counts",
++  "tests/test_valuation.py::StockValueTest::test_out_of_order_dates_are_costed_chronologically",
++  "tests/test_valuation.py::StockValueTest::test_positive_adjustment_without_cost_cannot_be_valued",
++  "tests/test_valuation.py::StockValueTest::test_single_receipt"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..56eaf6c
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,36 @@
++"""Value of stock on hand, costed first in, first out."""
++
++import collections
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand.
++
++    Each issue takes goods from the oldest open receipt layer first, so what is
++    left is costed at the most recent receipts. Issues beyond the stock received
++    (negative stock) have no layer to take from; the next receipt pays them off
++    before it adds to the layers.
++    """
++    layers = collections.deque()  # [qty, unit_cost], oldest first
++    owed = 0  # units issued beyond the stock received so far
++    for m in sorted(inventory.movements_for(sku), key=lambda m: m.date):
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(
++                    f"no unit cost recorded for {m.reason} of {m.sku} on {m.date.isoformat()}")
++            qty = m.qty
++            paid = min(owed, qty)
++            owed -= paid
++            qty -= paid
++            if qty:
++                layers.append([qty, m.unit_cost])
++        else:
++            need = -m.qty
++            while need and layers:
++                take = min(need, layers[0][0])
++                layers[0][0] -= take
++                need -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            owed += need
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..5522f69
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,79 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory
++from stockroom.valuation import stock_value
++
++D1 = datetime.date(2026, 9, 1)
++D2 = datetime.date(2026, 9, 2)
++D3 = datetime.date(2026, 9, 3)
++D4 = datetime.date(2026, 9, 4)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_stock_is_worth_nothing(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_issues_consume_oldest_layer_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.receive("BR-1042", 10, 15, D2)
++        inv.issue("BR-1042", 4, D3)  # 4 x 12 leave; 6 x 12 and 10 x 15 remain
++        self.assertEqual(stock_value(inv, "BR-1042"), 6 * 12 + 10 * 15)
++
++    def test_issue_spanning_two_layers(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.receive("BR-1042", 10, 15, D2)
++        inv.issue("BR-1042", 13, D3)  # all 10 x 12, then 3 x 15 leave
++        self.assertEqual(stock_value(inv, "BR-1042"), 7 * 15)
++
++    def test_negative_stock_is_worth_nothing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.issue("BR-1042", 15, D2)
++        self.assertEqual(inv.on_hand("BR-1042"), -5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_later_receipt_pays_off_negative_stock_before_costing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.issue("BR-1042", 15, D2)  # 5 short
++        inv.receive("BR-1042", 10, 20, D3)  # 5 of these cover the shortfall
++        self.assertEqual(inv.on_hand("BR-1042"), 5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 20)
++
++    def test_adjustments_with_cost_are_layers(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.adjust("BR-1042", -3, "DAMAGE", D2)  # oldest layer loses 3
++        self.assertEqual(stock_value(inv, "BR-1042"), 7 * 12)
++
++    def test_positive_adjustment_without_cost_cannot_be_valued(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.adjust("BR-1042", 2, "COUNT", D2)
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++    def test_only_the_requested_sku_counts(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.receive("BR-2210", 5, 30, D1)
++        self.assertEqual(stock_value(inv, " br-2210 "), 150)
++
++    def test_out_of_order_dates_are_costed_chronologically(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 15, D2)  # logged first, but received later
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.issue("BR-1042", 10, D3)  # takes the D1 layer at 12
++        self.assertEqual(stock_value(inv, "BR-1042"), 10 * 15)
++
++
++if __name__ == "__main__":
++    unittest.main()

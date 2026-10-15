@@ -253,9 +253,9 @@ It runs in one of four modes (`"deep": {"mode": …}` in the store's `config.jso
 | `off` | never | |
 | `tool` | only when the model calls `memory_ask` (or `engram ask`) | the tool's result |
 | `async` (default) | after every prompt of four words or more, once the store holds 20 records, in the background | with the next tool result; if the turn ends first, its end waits up to 25 s and, when the picks are new and the ranker's confidence is high or medium, asks the model once to reconsider and give its whole answer again |
-| `sync` | the same prompts, before the model starts | in the prompt's context, after a wait of about 5–15 s |
+| `sync` | the same prompts, before the model starts | in the prompt's context, after a wait (16 s at the median and 21 s at p90 on the cloud VM, eight requests at a time) |
 
-Both model calls go through `claude -p` with no tools, like distillation, and cost about $0.003 a request with a small model. The models are parameters: `planner_model` and `ranker_model` (default `haiku`, or `ENGRAM_DEEP_MODEL` for both), and `hard_model`, a stronger ranker used only when the planner calls a request hard (`ENGRAM_DEEP_HARD_MODEL`). `memory_ask` also takes a `model` for one question, so a user who allows a more expensive model can have it for the questions that need it.
+Both model calls go through `claude -p` with no tools, like distillation, and cost about $0.003 a request with a small model ($1.47 for 500 LongMemEval questions). The models are parameters: `planner_model` and `ranker_model` (default `haiku`, or `ENGRAM_DEEP_MODEL` for both), and `hard_model`, a stronger ranker used only when the planner calls a request hard (`ENGRAM_DEEP_HARD_MODEL`). `memory_ask` also takes a `model` for one question, so a user who allows a more expensive model can have it for the questions that need it.
 
 ## Cost and latency targets
 
@@ -265,6 +265,7 @@ Both model calls go through `claude -p` with no tools, like distillation, and co
 | `UserPromptSubmit` | < 100 ms p99 at 1M records | 24.9 ms p50, 38.6 ms p99 as a hook process |
 | `SessionStart` | < 150 ms (daemon up), < 1 s with spawn | 50–72 ms including daemon start |
 | ingest | > 1,000 records/s | 48,000–52,000 records/s with the static embedder |
+| query engine (planner and ranker) | off the prompt's path unless `sync` | 16 s p50, 21 s p90, $0.003 per request with Haiku |
 
 The default embedder is static (Model2Vec potion-retrieval-32M: token lookup and mean, 512 dimensions, microseconds per record). BGE-small (384 dimensions) is optional (`--features bert`) and costs about 50 ms per record on a CPU.
 

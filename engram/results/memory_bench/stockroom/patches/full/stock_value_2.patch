@@ -1,0 +1,135 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index bda73d3..00367c5 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -27,5 +27,13 @@
+   "tests/test_storage.py::StorageTest::test_load_normalizes_sku",
+   "tests/test_storage.py::StorageTest::test_load_old_file_infers_reason_from_sign",
+   "tests/test_storage.py::StorageTest::test_load_rejects_unknown_reason",
+-  "tests/test_storage.py::StorageTest::test_roundtrip"
++  "tests/test_storage.py::StorageTest::test_roundtrip",
++  "tests/test_valuation.py::StockValueTest::test_adjustments_consume_fifo",
++  "tests/test_valuation.py::StockValueTest::test_empty_is_zero",
++  "tests/test_valuation.py::StockValueTest::test_fifo_sells_oldest_cost_first",
++  "tests/test_valuation.py::StockValueTest::test_only_the_given_sku_is_counted",
++  "tests/test_valuation.py::StockValueTest::test_positive_adjustment_without_cost_is_rejected",
++  "tests/test_valuation.py::StockValueTest::test_sale_below_zero_adds_no_value_until_receipt",
++  "tests/test_valuation.py::StockValueTest::test_single_receipt",
++  "tests/test_valuation.py::StockValueTest::test_uses_date_order_not_log_order"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..b98924e
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,36 @@
++"""Stock valuation at FIFO cost."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value, in cents, of the stock of `sku` on hand, costed FIFO.
++
++    Movements are taken in date order (log order within a day). Outflows
++    use up the oldest receipts first. Stock sold below zero is owed back
++    to future receipts, so it doesn't add value until those arrive.
++    """
++    sku = normalize_sku(sku)
++    layers = deque()  # [qty, unit_cost] per receipt still on hand, oldest first
++    deficit = 0  # units sold beyond the stock on hand
++    for m in sorted(inventory.movements_for(sku), key=lambda m: m.date):
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(
++                    "%s movement on %s has no unit cost, so it can't be valued" % (m.reason, m.date))
++            cover = min(deficit, m.qty)
++            deficit -= cover
++            if m.qty > cover:
++                layers.append([m.qty - cover, m.unit_cost])
++        else:
++            need = -m.qty
++            while need and layers:
++                take = min(need, layers[0][0])
++                layers[0][0] -= take
++                need -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            deficit += need
++    return sum(qty * cost for qty, cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..3358d3b
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,67 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory
++from stockroom.valuation import stock_value
++
++D1 = datetime.date(2026, 9, 1)
++D2 = datetime.date(2026, 9, 2)
++D3 = datetime.date(2026, 9, 3)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_fifo_sells_oldest_cost_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.receive("BR-1042", 10, 15, D2)
++        inv.issue("BR-1042", 15, D3)
++        # 5 left at 15; the 10 at 12 were sold first
++        self.assertEqual(stock_value(inv, "BR-1042"), 75)
++
++    def test_uses_date_order_not_log_order(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 15, D2)
++        inv.receive("BR-1042", 10, 12, D1)  # logged later, but older
++        inv.issue("BR-1042", 10, D3)
++        self.assertEqual(stock_value(inv, "BR-1042"), 150)
++
++    def test_adjustments_consume_fifo(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.receive("BR-1042", 10, 15, D2)
++        inv.adjust("BR-1042", -12, "DAMAGE", D3)
++        # all 10 at 12 and 2 at 15 are gone; 8 at 15 remain
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_sale_below_zero_adds_no_value_until_receipt(self):
++        inv = Inventory()
++        inv.issue("BR-1042", 5, D1)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++        inv.receive("BR-1042", 10, 12, D2)
++        # 5 of the receipt went to cover the sale, 5 are on hand
++        self.assertEqual(stock_value(inv, "BR-1042"), 60)
++        self.assertEqual(inv.on_hand("BR-1042"), 5)
++
++    def test_positive_adjustment_without_cost_is_rejected(self):
++        inv = Inventory()
++        inv.adjust("BR-1042", 3, "COUNT", D1)
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++    def test_only_the_given_sku_is_counted(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, D1)
++        inv.receive("BR-2210", 5, 30, D1)
++        self.assertEqual(stock_value(inv, " br-1042"), 120)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,90 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index bda73d3..a62ecfa 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,9 @@
+ [
++  "tests/test_analysis.py::AbcClassesTest::test_boundaries_are_inclusive",
++  "tests/test_analysis.py::AbcClassesTest::test_classes_by_cumulative_share",
++  "tests/test_analysis.py::AbcClassesTest::test_empty_input",
++  "tests/test_analysis.py::AbcClassesTest::test_negative_or_zero_total_rejected",
++  "tests/test_analysis.py::AbcClassesTest::test_ties_are_ordered_by_sku",
+   "tests/test_cli.py::CliTest::test_moves_lists_one_line_per_movement",
+   "tests/test_cli.py::CliTest::test_onhand_with_missing_log_is_zero",
+   "tests/test_cli.py::CliTest::test_receive_appends_to_existing_log",
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..a1f54ab
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,31 @@
++"""Stock analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs by annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are sorted by value,
++    highest first, and classed by the running share of the grand total:
++    'A' up to and including 80%, 'B' up to and including 95%, otherwise 'C'.
++    """
++    if not values:
++        return {}
++    if any(v < 0 for v in values.values()):
++        raise ValueError("consumption values must not be negative")
++    total = sum(values.values())
++    if total == 0:
++        raise ValueError("total consumption value must be positive")
++
++    classes = {}
++    running = 0
++    # Ties go in SKU order so the result doesn't depend on dict order.
++    for sku, value in sorted(values.items(), key=lambda kv: (-kv[1], kv[0])):
++        running += value
++        # Compare without dividing: running / total <= 0.80 is running * 100 <= 80 * total.
++        if running * 100 <= 80 * total:
++            classes[sku] = "A"
++        elif running * 100 <= 95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..ebb7f84
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,33 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: BR-1 50%, BR-2 30% (cum 80%), BR-3 15% (cum 95%), BR-4 5% (cum 100%).
++        values = {"BR-1": 50, "BR-2": 30, "BR-3": 15, "BR-4": 5}
++        self.assertEqual(abc_classes(values), {"BR-1": "A", "BR-2": "A", "BR-3": "B", "BR-4": "C"})
++
++    def test_boundaries_are_inclusive(self):
++        # Exactly 80% and exactly 95% cumulative land in A and B.
++        values = {"X": 80, "Y": 15, "Z": 5}
++        self.assertEqual(abc_classes(values), {"X": "A", "Y": "B", "Z": "C"})
++
++    def test_ties_are_ordered_by_sku(self):
++        values = {"BR-2": 10, "BR-1": 10}
++        # BR-1 is 50% cumulative (A); BR-2 reaches 100% (C).
++        self.assertEqual(abc_classes(values), {"BR-1": "A", "BR-2": "C"})
++
++    def test_negative_or_zero_total_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": -1, "BR-2": 5})
++        with self.assertRaises(ValueError):
++            abc_classes({"BR-1": 0, "BR-2": 0})
++
++
++if __name__ == "__main__":
++    unittest.main()

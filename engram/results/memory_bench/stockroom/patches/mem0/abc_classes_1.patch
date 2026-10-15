@@ -1,0 +1,74 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..f81dba1
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,26 @@
++"""ABC analysis of stock by annual consumption value."""
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B or C by cumulative share of annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are taken highest value
++    first (ties broken by SKU). A SKU is 'A' if the cumulative share up to and
++    including it is at most 80% of the grand total, 'B' if at most 95%, and
++    'C' otherwise.
++    """
++    if not values:
++        return {}
++    total = sum(values.values())
++    ranked = sorted(values.items(), key=lambda pair: (-pair[1], pair[0]))
++    classes = {}
++    running = 0
++    for sku, value in ranked:
++        running += value
++        if running <= 0.80 * total:
++            classes[sku] = "A"
++        elif running <= 0.95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..76cb367
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,36 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_single_sku_is_c(self):
++        # Its cumulative share is 100%, which is above 95%.
++        self.assertEqual(abc_classes({"BR-1": 7}), {"BR-1": "C"})
++
++    def test_classes_by_cumulative_share(self):
++        # Cumulative shares: 50%, 80%, 95%, 100%. Each boundary is inclusive.
++        values = {"BR-3": 15, "BR-1": 50, "BR-4": 5, "BR-2": 30}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "A", "BR-3": "B", "BR-4": "C"},
++        )
++
++    def test_just_over_80_percent_is_b(self):
++        # 50 alone is 50%; 50 + 31 = 81% exceeds 80%, so the second SKU is B.
++        values = {"BR-1": 50, "BR-2": 31, "BR-3": 19}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "B", "BR-3": "C"},
++        )
++
++    def test_ties_are_ordered_by_sku(self):
++        values = {"BR-2": 10, "BR-1": 10}
++        self.assertEqual(abc_classes(values), {"BR-1": "A", "BR-2": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

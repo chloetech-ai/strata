@@ -1,0 +1,81 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..3b98c44
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,32 @@
++"""ABC analysis of stock by annual consumption value."""
++
++from fractions import Fraction
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B, or C by their share of total consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are sorted by value,
++    highest first, and a running total is kept. A SKU is 'A' if the cumulative
++    share up to and including it is at most 80% of the grand total, 'B' if at
++    most 95%, otherwise 'C'. Ties are ordered by SKU so the result is stable.
++    Comparisons use exact fractions to avoid float rounding at the boundaries.
++    """
++    if not values:
++        return {}
++    exact = {sku: Fraction(value) for sku, value in values.items()}
++    total = sum(exact.values())
++    ordered = sorted(exact, key=lambda sku: (-exact[sku], sku))
++
++    classes = {}
++    running = Fraction(0)
++    for sku in ordered:
++        running += exact[sku]
++        # running / total <= 0.8 is written as running * 100 <= 80 * total.
++        if running * 100 <= 80 * total:
++            classes[sku] = "A"
++        elif running * 100 <= 95 * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..0661a12
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,37 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: A 50 (50%), B 30 (80%), C 15 (95%), D 5 (100%).
++        values = {"A": 50, "B": 30, "C": 15, "D": 5}
++        self.assertEqual(
++            abc_classes(values),
++            {"A": "A", "B": "A", "C": "B", "D": "C"},
++        )
++
++    def test_boundary_at_80_and_95_percent_is_inclusive(self):
++        # Cumulative shares are exactly 80% after X and exactly 95% after Y.
++        values = {"X": 80, "Y": 15, "Z": 5}
++        self.assertEqual(
++            abc_classes(values),
++            {"X": "A", "Y": "B", "Z": "C"},
++        )
++
++    def test_single_sku_is_c(self):
++        # Its cumulative share is 100%, which is above 95%.
++        self.assertEqual(abc_classes({"ONLY": 12.5}), {"ONLY": "C"})
++
++    def test_input_order_does_not_matter(self):
++        values = {"C": 15, "A": 50, "D": 5, "B": 30}
++        self.assertEqual(abc_classes(values)["A"], "A")
++        self.assertEqual(abc_classes(values)["D"], "C")
++
++
++if __name__ == "__main__":
++    unittest.main()

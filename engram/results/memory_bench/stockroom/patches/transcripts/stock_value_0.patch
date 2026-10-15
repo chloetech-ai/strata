@@ -1,0 +1,100 @@
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..ee5878e
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,32 @@
++"""Stock valuation, FIFO: issues consume the oldest receipts first."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand, costed FIFO.
++
++    Movements are taken in the order they were logged. Each receipt opens a
++    cost layer; each outflow consumes layers oldest first. Outflow beyond the
++    stock held (negative stock) has no layer to consume, so it adds no cost.
++    """
++    sku = normalize_sku(sku)
++    layers = deque()  # [qty, unit_cost] pairs, oldest first
++    for m in inventory.movements:
++        if m.sku != sku:
++            continue
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"{sku}: incoming movement has no unit cost")
++            layers.append([m.qty, m.unit_cost])
++            continue
++        remaining = -m.qty
++        while remaining and layers:
++            take = min(remaining, layers[0][0])
++            layers[0][0] -= take
++            remaining -= take
++            if layers[0][0] == 0:
++                layers.popleft()
++    return sum(qty * cost for qty, cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..6fcd798
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,56 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_issues_consume_oldest_receipts_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 15, DAY)
++        inv.issue("BR-1042", 12, DAY)
++        # 10 @ 12 consumed, then 2 @ 15 consumed; 8 @ 15 left.
++        self.assertEqual(stock_value(inv, "BR-1042"), 120)
++
++    def test_partial_layer_is_costed_at_its_own_price(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 15, DAY)
++        inv.issue("BR-1042", 4, DAY)
++        # 6 @ 12 + 10 @ 15
++        self.assertEqual(stock_value(inv, "BR-1042"), 6 * 12 + 10 * 15)
++
++    def test_negative_stock_adds_no_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 12, DAY)
++        inv.issue("BR-1042", 8, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -3)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_other_skus_are_ignored(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-9999", 4, 100, DAY)
++        self.assertEqual(stock_value(inv, "br-1042 "), 120)
++
++    def test_receipt_without_cost_is_rejected(self):
++        inv = Inventory()
++        inv._record(Movement("BR-1042", 3, DAY, "COUNT"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

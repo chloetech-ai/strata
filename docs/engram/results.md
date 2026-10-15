@@ -106,6 +106,42 @@ What a record should hold (its key, its value, its size, and whether a model sho
 
 **Does it change the answers?** A small model answered all 500 LongMemEval questions from each context, graded with LongMemEval's own prompts. Memory takes it from 7% (it can only decline) to **71–75%**; an oracle retriever reaches 92%. When the answer string was in the context, 92–94% of answers were right; when it was not, 0–4%. Reading the *whole* 170,000-token history answers 84% on a subset, against 72% for Engram's 4,000-character context, but costs $0.17 per question against $0.0007, about 240 times more.
 
+## The query engine
+
+The [query engine](index.md#query-understanding) has a small model turn a request into several typed searches, fuses what they return, and has a second call pick the records that matter. It was measured on all 500 LongMemEval-S questions, each against its own store, with Haiku as planner, ranker, reader and judge (LongMemEval's grading prompts), on the cloud VM.
+
+![Questions answered correctly on LongMemEval-S, by the context the reader was given](../assets/img/chart-engram-v2-answers.png)
+
+| context given to the reader | correct | characters |
+|---|---|---|
+| none | 8.6% | 0 |
+| Engram main: its 4,000-character recall | 72.2% | 3,527 |
+| the query engine's picks alone | 76.8% | 879 |
+| the picks, plus the ranker's short reading of them | 75.2% | 1,208 |
+| Engram's recall plus the query engine's picks | **81.0%** | 4,470 |
+| the evidence sessions, whole (oracle) | 89.8% | 26,738 |
+
+Adding the picks to the recall fixed 60 answers and broke 16 (McNemar's exact test, p = 4 × 10<sup>−7</sup>). The picks alone beat the recall with a quarter of its characters (54 fixed, 31 broken, p = 0.017). The ranker's reading adds nothing over the picks themselves (p = 0.37). The gain is largest where an answer needs several turns:
+
+| question type (n) | Engram main | + query engine | oracle |
+|---|---|---|---|
+| temporal reasoning (133) | 68.4% | **83.5%** | 94.0% |
+| multi-session (133) | 56.4% | **65.4%** | 79.7% |
+| single-session, assistant said it (56) | 75.0% | **89.3%** | 98.2% |
+| single-session, user said it (70) | 85.7% | 91.4% | 95.7% |
+| knowledge update (78) | 87.2% | 91.0% | 92.3% |
+| preference (30) | **83.3%** | 73.3% | 80.0% |
+
+Preference questions go the other way: the ranker leaves out the turns where a taste was stated, because they do not look like answers.
+
+![Questions whose every evidence turn was found, by question type](../assets/img/chart-engram-v2-evidence.png)
+
+**Where the gain comes from.** The planner's searches add depth more than reach: its 27 candidates hold all of a question's evidence for 80% of the 470 questions with evidence, against 78% for plain hybrid search taken to the same depth and 62% for its top 10. What changes the answers is the ranker. It keeps 2.6 records (900 characters) that hold all the evidence for 71% of questions and some of it for 92%.
+
+**Cost and time.** Planner and ranker cost $0.003 per question together ($1.47 for 500) and took 16 s at the median, 21 s at p90, with eight questions at a time on the 4-core VM. That is why the engine runs in the background by default and its picks join the session at the next tool call.
+
+**A stronger ranker for hard questions.** The planner called 49% of the questions hard. On every fifth question (100), sending those to `sonnet` instead of Haiku raised the picks holding all the evidence from 66% to 72%, but the answers hardly moved: 73% → 74% from the picks alone, 77% → 76% with the recall, at about five times the cost ($0.015 a question). Haiku stays the default; `hard_model` is there for users who want the stronger ranker.
+
 ## The gate
 
 Compared with injecting the full budget on every prompt, the gate fitted on LongMemEval:
@@ -134,6 +170,12 @@ A store is filled with LongMemEval turns: 94 needle questions whose evidence ses
 Later work removed the biggest remaining cost, which was not the search at all. A write used to make the next query rebuild an HNSW graph over the last memtable chunk (12 ms); memtable segments now scan their vectors instead. A query right after a write fell from 18 to **6.4 ms** at a million records (p99 45 → 16 ms), and the prompt hook, with the knowledge query running beside the main search, takes **24.9 ms** at the median and 38.6 ms at p99.
 
 Quality is what degrades with size: the filler here is chat on every subject, while real project history is more homogeneous, so this is a stress test rather than a forecast. Strata's filters (session, time, file, kind) are what keep large stores precise, and `memory_sql` gives the model those filters directly.
+
+## Reproducing the recorded numbers
+
+Before anything changed, every committed benchmark that needs no session transcript was rerun on `main` (787387d) on the cloud VM; [`engram/results/v2/baseline/REPORT.md`](https://github.com/rkonow/engram/blob/main/engram/results/v2/baseline/REPORT.md) has every table. Retrieval, the gate and the record-structure study reproduced exactly or within 0.007 (the docs' own MacBook rerun matches to the last digit; the committed `_c400` files are slightly older than the code), and the scale benchmark's quality numbers were identical at all three sizes. The reader study reproduces within 0.006 when the same model judges, but `haiku` now resolves to a newer model than the recorded runs used, which answers better: 8.6% / 72.2% / 89.8% with no memory, Engram's context and the oracle, against 11.0% / 68.2% / 81.0% recorded. New numbers on this page are compared with these reruns, not with the recorded runs.
+
+On the changed build, the retrieval benchmarks return the same ranking as `main` for every question of both datasets: the October changes leave the per-prompt recall as it was, and their effect shows only where notes, anchors and the query engine are used.
 
 ## Limitations
 

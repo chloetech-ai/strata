@@ -1,0 +1,90 @@
+diff --git a/src/stockroom/reorder.py b/src/stockroom/reorder.py
+index 4672674..33aee51 100644
+--- a/src/stockroom/reorder.py
++++ b/src/stockroom/reorder.py
+@@ -1,5 +1,7 @@
+ """Reorder checks."""
+ 
++TARGET_MULTIPLE = 3  # restock up to this many times the reorder point
++
+ 
+ def needs_reorder(inventory):
+     """SKUs whose quantity on hand is at or below their reorder point."""
+@@ -8,3 +10,20 @@ def needs_reorder(inventory):
+         if inventory.on_hand(item.sku) <= item.reorder_point:
+             out.append(item.sku)
+     return out
++
++
++def suggest_orders(inventory):
++    """Map each SKU that needs reordering to the quantity to order.
++
++    The target is three times the reorder point. The shortfall is rounded up
++    to whole cases, because the supplier ships only full cases.
++    """
++    orders = {}
++    for sku in needs_reorder(inventory):
++        item = inventory.catalog.get(sku)
++        shortfall = TARGET_MULTIPLE * item.reorder_point - inventory.on_hand(sku)
++        if shortfall <= 0:
++            continue
++        cases = -(-shortfall // item.case_size)  # ceiling division
++        orders[sku] = cases * item.case_size
++    return orders
+diff --git a/tests/test_reorder.py b/tests/test_reorder.py
+index 62219cf..b6b45e6 100644
+--- a/tests/test_reorder.py
++++ b/tests/test_reorder.py
+@@ -2,7 +2,7 @@ import unittest
+ 
+ from stockroom.inventory import Inventory
+ from stockroom.items import Catalog, Item
+-from stockroom.reorder import needs_reorder
++from stockroom.reorder import needs_reorder, suggest_orders
+ 
+ 
+ def make_inventory():
+@@ -29,5 +29,43 @@ class ReorderTest(unittest.TestCase):
+         self.assertNotIn("BR-3", needs_reorder(make_inventory()))
+ 
+ 
++class SuggestOrdersTest(unittest.TestCase):
++    def test_orders_up_to_three_times_reorder_point(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10)])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 5, 10)
++        self.assertEqual(suggest_orders(inv), {"BR-1": 25})
++
++    def test_rounds_shortfall_up_to_whole_cases(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10, case_size=12)])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 5, 10)
++        # shortfall is 25, which rounds up to 3 cases of 12
++        self.assertEqual(suggest_orders(inv), {"BR-1": 36})
++
++    def test_exact_case_multiple_is_not_rounded(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10, case_size=5)])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 5, 10)
++        self.assertEqual(suggest_orders(inv), {"BR-1": 25})
++
++    def test_negative_stock_increases_order(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10)])
++        inv = Inventory(catalog)
++        inv.issue("BR-1", 4)
++        self.assertEqual(suggest_orders(inv), {"BR-1": 34})
++
++    def test_skips_skus_that_do_not_need_reorder(self):
++        orders = suggest_orders(make_inventory())
++        self.assertNotIn("BR-3", orders)
++        self.assertEqual(set(orders), {"BR-1", "BR-2"})
++
++    def test_skips_zero_quantity_orders(self):
++        # reorder point 0 and nothing on hand: shortfall is 0, so nothing to order
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=0)])
++        inv = Inventory(catalog)
++        self.assertEqual(suggest_orders(inv), {})
++
++
+ if __name__ == "__main__":
+     unittest.main()

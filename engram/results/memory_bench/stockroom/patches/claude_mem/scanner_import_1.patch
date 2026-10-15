@@ -1,0 +1,111 @@
+diff --git a/src/stockroom/scanner.py b/src/stockroom/scanner.py
+new file mode 100644
+index 0000000..1210a33
+--- /dev/null
++++ b/src/stockroom/scanner.py
+@@ -0,0 +1,42 @@
++"""Reading counts from handheld scanner files.
++
++A scanner file is plain text, one count per line, with no header:
++
++    bin;sku;qty
++
++A SKU may appear on several lines (for example when it overflows into a
++second bin), so the quantities are summed per SKU.
++"""
++
++import re
++
++from .items import normalize_sku
++
++_QTY = re.compile(r"[0-9]+")
++
++
++def read_scanner_file(path):
++    """Return the counted quantity per SKU, as a dict of SKU to int.
++
++    Blank lines are skipped. The bin column is checked for presence but not
++    returned, since the count is per SKU. Raises ValueError with the file
++    and line number for a malformed line.
++    """
++    counts = {}
++    with open(path, newline="", encoding="utf-8-sig") as f:
++        for lineno, line in enumerate(f, start=1):
++            if not line.strip():
++                continue
++            fields = line.rstrip("\r\n").split(";")
++            if len(fields) != 3:
++                raise ValueError(
++                    f"{path}:{lineno}: expected 3 fields (bin;sku;qty), got {len(fields)}")
++            _bin, sku, qty = fields
++            sku = normalize_sku(sku)
++            if not sku:
++                raise ValueError(f"{path}:{lineno}: missing SKU")
++            qty = qty.strip()
++            if not _QTY.fullmatch(qty):
++                raise ValueError(f"{path}:{lineno}: quantity must be a whole number, got {qty!r}")
++            counts[sku] = counts.get(sku, 0) + int(qty)
++    return counts
+diff --git a/tests/test_scanner.py b/tests/test_scanner.py
+new file mode 100644
+index 0000000..092f499
+--- /dev/null
++++ b/tests/test_scanner.py
+@@ -0,0 +1,57 @@
++import os
++import tempfile
++import unittest
++
++from stockroom.scanner import read_scanner_file
++
++
++class ReadScannerFileTest(unittest.TestCase):
++    def _read(self, text):
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "scan.txt")
++            with open(path, "w", encoding="utf-8", newline="") as f:
++                f.write(text)
++            return read_scanner_file(path)
++
++    def test_counts_per_sku(self):
++        counts = self._read("A-01;BR-1042;12\nB-07;BR-2000;5\n")
++        self.assertEqual(counts, {"BR-1042": 12, "BR-2000": 5})
++
++    def test_same_sku_in_overflow_bins_is_summed(self):
++        counts = self._read("A-01;BR-1042;12\nB-07;BR-1042;30\nA-02;BR-1042;0\n")
++        self.assertEqual(counts, {"BR-1042": 42})
++
++    def test_sku_is_normalized(self):
++        counts = self._read("A-01; br-1042 ;3\nB-07;BR-1042;4\n")
++        self.assertEqual(counts, {"BR-1042": 7})
++
++    def test_crlf_and_blank_lines(self):
++        counts = self._read("A-01;BR-1042;12\r\n\r\nB-07;BR-2000;5\r\n")
++        self.assertEqual(counts, {"BR-1042": 12, "BR-2000": 5})
++
++    def test_utf8_bom_is_ignored(self):
++        counts = self._read("﻿A-01;BR-1042;12\n")
++        self.assertEqual(counts, {"BR-1042": 12})
++
++    def test_zero_count_is_kept(self):
++        self.assertEqual(self._read("A-01;BR-1042;0\n"), {"BR-1042": 0})
++
++    def test_wrong_field_count_reports_line(self):
++        with self.assertRaisesRegex(ValueError, ":2: expected 3 fields"):
++            self._read("A-01;BR-1042;12\nA-01,BR-2000,5\n")
++
++    def test_non_integer_quantity_rejected(self):
++        with self.assertRaisesRegex(ValueError, ":1: quantity must be a whole number"):
++            self._read("A-01;BR-1042;1.5\n")
++
++    def test_negative_quantity_rejected(self):
++        with self.assertRaisesRegex(ValueError, "quantity must be a whole number"):
++            self._read("A-01;BR-1042;-3\n")
++
++    def test_blank_sku_rejected(self):
++        with self.assertRaisesRegex(ValueError, "missing SKU"):
++            self._read("A-01;  ;3\n")
++
++
++if __name__ == "__main__":
++    unittest.main()

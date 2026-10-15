@@ -1,0 +1,159 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 860c2a2..818ac85 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -35,5 +35,16 @@
+   "tests/test_storage.py::StorageTest::test_load_legacy_file_without_reason_column",
+   "tests/test_storage.py::StorageTest::test_load_legacy_zero_quantity_is_rejected",
+   "tests/test_storage.py::StorageTest::test_load_rejects_unknown_reason",
+-  "tests/test_storage.py::StorageTest::test_roundtrip"
++  "tests/test_storage.py::StorageTest::test_roundtrip",
++  "tests/test_valuation.py::StockValueTest::test_empty_is_zero",
++  "tests/test_valuation.py::StockValueTest::test_negative_on_hand_is_worth_nothing",
++  "tests/test_valuation.py::StockValueTest::test_other_reasons_consume_lots_too",
++  "tests/test_valuation.py::StockValueTest::test_other_skus_are_ignored",
++  "tests/test_valuation.py::StockValueTest::test_partial_lot_left_after_sale",
++  "tests/test_valuation.py::StockValueTest::test_return_adds_stock_at_its_unit_cost",
++  "tests/test_valuation.py::StockValueTest::test_return_without_cost_is_rejected",
++  "tests/test_valuation.py::StockValueTest::test_sales_consume_oldest_lots_first",
++  "tests/test_valuation.py::StockValueTest::test_shortfall_is_settled_by_later_receipts",
++  "tests/test_valuation.py::StockValueTest::test_single_receipt",
++  "tests/test_valuation.py::StockValueTest::test_sku_variants_hit_the_same_stock"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..b8ca73f
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,40 @@
++"""Value of stock on hand, costed first in, first out."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` currently on hand.
++
++    Receipts are kept as lots in the order they were logged. Each outgoing
++    movement uses up the oldest lots first, so what remains is costed at the
++    most recent receipts. Units sold beyond the stock received have no lot to
++    take cost from; they are carried forward and settled by the next receipts,
++    so on-hand can be negative and its value is simply the cost of the lots left.
++    """
++    sku = normalize_sku(sku)
++    lots = deque()  # [qty, unit_cost] pairs, oldest first
++    short = 0  # units sold beyond the stock received so far
++    for m in inventory.movements:
++        if m.sku != sku:
++            continue
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"movement of {sku} without a unit cost cannot be valued")
++            settled = min(short, m.qty)
++            short -= settled
++            if m.qty > settled:
++                lots.append([m.qty - settled, m.unit_cost])
++            continue
++        remaining = -m.qty
++        while remaining and lots:
++            lot = lots[0]
++            used = min(lot[0], remaining)
++            lot[0] -= used
++            remaining -= used
++            if lot[0] == 0:
++                lots.popleft()
++        short += remaining
++    return sum(qty * unit_cost for qty, unit_cost in lots)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..6a6e9e5
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,84 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 1250, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 12500)
++
++    def test_sales_consume_oldest_lots_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, DAY)
++        inv.receive("BR-1042", 10, 300, DAY)
++        inv.issue("BR-1042", 15, DAY)  # all 10 at 100, then 5 at 300
++        # 5 left, all from the 300-cent lot
++        self.assertEqual(inv.on_hand("BR-1042"), 5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 1500)
++
++    def test_partial_lot_left_after_sale(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 4, 100, DAY)
++        inv.receive("BR-1042", 4, 250, DAY)
++        inv.issue("BR-1042", 2, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 2 * 100 + 4 * 250)
++
++    def test_other_reasons_consume_lots_too(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, DAY)
++        inv.receive("BR-1042", 5, 200, DAY)
++        inv._record(Movement("BR-1042", -5, DAY, "DAMAGE"))
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 200)
++
++    def test_return_adds_stock_at_its_unit_cost(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, DAY)
++        inv._record(Movement("BR-1042", 2, DAY, "RETURN", 400))
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 100 + 2 * 400)
++
++    def test_return_without_cost_is_rejected(self):
++        inv = Inventory()
++        inv._record(Movement("BR-1042", 2, DAY, "RETURN"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++    def test_negative_on_hand_is_worth_nothing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 3, 100, DAY)
++        inv.issue("BR-1042", 5, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -2)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_shortfall_is_settled_by_later_receipts(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 3, 100, DAY)
++        inv.issue("BR-1042", 5, DAY)  # 2 units short
++        inv.receive("BR-1042", 10, 300, DAY)  # first 2 settle the shortfall
++        self.assertEqual(inv.on_hand("BR-1042"), 8)
++        self.assertEqual(stock_value(inv, "BR-1042"), 8 * 300)
++
++    def test_other_skus_are_ignored(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 100, DAY)
++        inv.receive("BR-2210", 7, 999, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 1000)
++
++    def test_sku_variants_hit_the_same_stock(self):
++        inv = Inventory()
++        inv.receive(" br-1042", 10, 100, DAY)
++        inv.issue("Br-1042 ", 4, DAY)
++        self.assertEqual(stock_value(inv, "  BR-1042"), 600)
++        self.assertEqual(stock_value(inv, "br-1042 "), 600)
++
++
++if __name__ == "__main__":
++    unittest.main()

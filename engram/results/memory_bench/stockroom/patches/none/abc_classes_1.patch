@@ -1,0 +1,60 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..9e8a48b
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,23 @@
++"""Inventory analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B, or C by annual consumption value.
++
++    SKUs are sorted highest value first. A SKU is 'A' while the cumulative
++    value up to and including it is at most 80% of the total, 'B' while it
++    is at most 95%, and 'C' otherwise.
++    """
++    total = sum(values.values())
++    ranked = sorted(values.items(), key=lambda pair: (-pair[1], pair[0]))
++    out = {}
++    running = 0
++    for sku, value in ranked:
++        running += value
++        if running <= 0.80 * total:
++            out[sku] = "A"
++        elif running <= 0.95 * total:
++            out[sku] = "B"
++        else:
++            out[sku] = "C"
++    return out
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..71e4c06
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,25 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        values = {"D": 5, "A": 50, "C": 15, "B": 30}
++        # Sorted: A 50 (50%), B 30 (80%), C 15 (95%), D 5 (100%)
++        self.assertEqual(
++            abc_classes(values),
++            {"A": "A", "B": "A", "C": "B", "D": "C"},
++        )
++
++    def test_boundaries_are_inclusive(self):
++        # Cumulative shares land exactly on 80% and 95%.
++        values = {"A": 80, "B": 15, "C": 5}
++        self.assertEqual(abc_classes(values), {"A": "A", "B": "B", "C": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

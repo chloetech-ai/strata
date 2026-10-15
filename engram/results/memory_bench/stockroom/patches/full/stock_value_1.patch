@@ -1,0 +1,117 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index bda73d3..1831fcb 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -27,5 +27,12 @@
+   "tests/test_storage.py::StorageTest::test_load_normalizes_sku",
+   "tests/test_storage.py::StorageTest::test_load_old_file_infers_reason_from_sign",
+   "tests/test_storage.py::StorageTest::test_load_rejects_unknown_reason",
+-  "tests/test_storage.py::StorageTest::test_roundtrip"
++  "tests/test_storage.py::StorageTest::test_roundtrip",
++  "tests/test_valuation.py::StockValueTest::test_empty_is_zero",
++  "tests/test_valuation.py::StockValueTest::test_fifo_not_average",
++  "tests/test_valuation.py::StockValueTest::test_later_receipt_pays_off_deficit_first",
++  "tests/test_valuation.py::StockValueTest::test_negative_stock_values_nothing_below_zero",
++  "tests/test_valuation.py::StockValueTest::test_positive_adjustment_without_cost_is_refused",
++  "tests/test_valuation.py::StockValueTest::test_sale_spans_layers",
++  "tests/test_valuation.py::StockValueTest::test_sku_is_normalized"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..561e957
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,30 @@
++"""Stock valuation, FIFO: stock-outs use up the oldest receipts first."""
++
++from collections import deque
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` on hand, costed first in, first out."""
++    layers = deque()  # [qty, unit_cost] for stock still on hand, oldest first
++    deficit = 0  # units sold or issued beyond the stock we had; see below
++    for m in inventory.movements_for(sku):
++        if m.qty > 0:
++            qty = m.qty
++            # A receipt first pays off any earlier deficit at no cost of its own.
++            covered = min(deficit, qty)
++            deficit -= covered
++            qty -= covered
++            if qty:
++                if m.unit_cost is None:
++                    raise ValueError("no unit cost for %s stock added by %s" % (sku, m.reason))
++                layers.append([qty, m.unit_cost])
++        else:
++            need = -m.qty
++            while need and layers:
++                take = min(need, layers[0][0])
++                layers[0][0] -= take
++                need -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            deficit += need
++    return sum(qty * cost for qty, cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..c0acbb0
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,56 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_empty_is_zero(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_fifo_not_average(self):
++        # Average cost would be (10*12 + 10*20) / 20 = 16 per unit, so 15 units = 240.
++        # FIFO keeps the 10 newest-cost units and the 5 oldest-cost units left.
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 20, DAY)
++        inv.issue("BR-1042", 5, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 12 + 10 * 20)
++
++    def test_sale_spans_layers(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 10, 20, DAY)
++        inv.issue("BR-1042", 15, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 20)
++
++    def test_negative_stock_values_nothing_below_zero(self):
++        inv = Inventory()
++        inv.issue("BR-1042", 5, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_later_receipt_pays_off_deficit_first(self):
++        inv = Inventory()
++        inv.issue("BR-1042", 5, DAY)
++        inv.receive("BR-1042", 10, 12, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 5)
++        self.assertEqual(stock_value(inv, "BR-1042"), 5 * 12)
++
++    def test_positive_adjustment_without_cost_is_refused(self):
++        inv = Inventory()
++        inv.adjust("BR-1042", 3, "RETURN", DAY)
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++    def test_sku_is_normalized(self):
++        inv = Inventory()
++        inv.receive(" br-1042", 4, 12, DAY)
++        self.assertEqual(stock_value(inv, "Br-1042 "), 4 * 12)
++
++
++if __name__ == "__main__":
++    unittest.main()

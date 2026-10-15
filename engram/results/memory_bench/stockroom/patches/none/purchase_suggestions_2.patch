@@ -1,0 +1,69 @@
+diff --git a/src/stockroom/reorder.py b/src/stockroom/reorder.py
+index 4672674..dffd321 100644
+--- a/src/stockroom/reorder.py
++++ b/src/stockroom/reorder.py
+@@ -8,3 +8,19 @@ def needs_reorder(inventory):
+         if inventory.on_hand(item.sku) <= item.reorder_point:
+             out.append(item.sku)
+     return out
++
++
++def suggest_orders(inventory):
++    """Map each SKU needing reorder to the quantity to order.
++
++    The quantity is the fewest whole cases that take stock above the reorder
++    point again.
++    """
++    orders = {}
++    for item in inventory.catalog:
++        on_hand = inventory.on_hand(item.sku)
++        if on_hand <= item.reorder_point:
++            short = item.reorder_point - on_hand + 1  # units needed to get above the point
++            cases = -(-short // item.case_size)  # ceiling division
++            orders[item.sku] = cases * item.case_size
++    return orders
+diff --git a/tests/test_reorder.py b/tests/test_reorder.py
+index 62219cf..b9a93ea 100644
+--- a/tests/test_reorder.py
++++ b/tests/test_reorder.py
+@@ -2,7 +2,7 @@ import unittest
+ 
+ from stockroom.inventory import Inventory
+ from stockroom.items import Catalog, Item
+-from stockroom.reorder import needs_reorder
++from stockroom.reorder import needs_reorder, suggest_orders
+ 
+ 
+ def make_inventory():
+@@ -28,6 +28,31 @@ class ReorderTest(unittest.TestCase):
+     def test_enough_stock(self):
+         self.assertNotIn("BR-3", needs_reorder(make_inventory()))
+ 
++    def test_suggest_orders_one_unit_cases(self):
++        # BR-1: 5 on hand, point 10 -> 6 needed to get above 10
++        # BR-2: 10 on hand, point 10 -> 1 needed
++        self.assertEqual(suggest_orders(make_inventory()), {"BR-1": 6, "BR-2": 1})
++
++    def test_suggest_orders_rounds_up_to_whole_cases(self):
++        catalog = Catalog([Item("BR-9", "Pin", "A-02-1", reorder_point=50, case_size=100)])
++        inv = Inventory(catalog)
++        inv.receive("BR-9", 20, 5)
++        # 20 on hand, point 50 -> 31 needed, one case of 100 covers it
++        self.assertEqual(suggest_orders(inv), {"BR-9": 100})
++
++    def test_suggest_orders_multiple_cases(self):
++        catalog = Catalog([Item("BR-9", "Pin", "A-02-1", reorder_point=50, case_size=10)])
++        inv = Inventory(catalog)
++        inv.receive("BR-9", 45, 5)
++        # 45 on hand, point 50 -> 6 needed -> 1 case of 10
++        self.assertEqual(suggest_orders(inv), {"BR-9": 10})
++        inv.issue("BR-9", 40)
++        # 5 on hand -> 46 needed -> 5 cases of 10
++        self.assertEqual(suggest_orders(inv), {"BR-9": 50})
++
++    def test_suggest_orders_omits_items_with_enough_stock(self):
++        self.assertNotIn("BR-3", suggest_orders(make_inventory()))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

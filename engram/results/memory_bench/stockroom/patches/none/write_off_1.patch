@@ -1,0 +1,56 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cd71951..85d6722 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- `Inventory.write_off(sku, qty, date=None)` records broken or damaged stock as a `DAMAGE` movement.
+ - Command line: `python -m stockroom onhand SKU --log FILE`, `receive SKU QTY UNIT_COST --log FILE` and `moves SKU --log FILE`.
+ 
+ ## 0.1.0
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 6c1193e..8944564 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -53,6 +53,15 @@ class Inventory:
+             reason="SALE", note=note,
+         ))
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock that got broken or damaged and can't be sold."""
++        if qty <= 0:
++            raise ValueError("quantity must be positive")
++        return self._record(Movement(
++            sku=normalize_sku(sku), qty=-qty, date=date or datetime.date.today(),
++            reason="DAMAGE",
++        ))
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 12a58fb..ba8f7cb 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -23,6 +23,19 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual(inv.receive("BR-1042", 10, 12, DAY).reason, "RECEIPT")
+         self.assertEqual(inv.issue("BR-1042", 3, DAY).reason, "SALE")
+ 
++    def test_write_off_records_damage_and_reduces_stock(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        m = inv.write_off(" br-1042 ", 4, DAY)
++        self.assertEqual((m.sku, m.qty, m.reason, m.date), ("BR-1042", -4, "DAMAGE", DAY))
++        self.assertEqual(inv.on_hand("BR-1042"), 6)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", 0)
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", -2)
+ 
+     def test_receive_and_issue(self):
+         inv = Inventory()

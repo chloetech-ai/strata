@@ -1,0 +1,95 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7c2f4a9..6835886 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## Unreleased
+ 
++- `stockroom.countsheet.count_sheet(inventory)` builds the stock-take sheet: one line per catalog item in bin-location order, with a blank column for the counted quantity. Quantities on hand are not printed.
+ - Command line: `python -m stockroom onhand SKU --log FILE` prints the quantity on hand;
+   `python -m stockroom receive SKU QTY UNIT_COST --log FILE` appends a receipt (unit cost in cents);
+   `python -m stockroom moves SKU --log FILE` prints each movement as date, reason and quantity, tab-separated.
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..e8548aa
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,17 @@
++"""The stock-take count sheet: a blind count, so quantities on hand are never printed."""
++
++
++def _bin_key(location):
++    """Walk order for bin codes like "B-12-3": numeric parts compare as numbers, so B-2-1 comes before B-12-3."""
++    return tuple((0, int(part), "") if part.isdigit() else (1, 0, part) for part in location.split("-"))
++
++
++def count_sheet(inventory):
++    """One line per catalog item, in bin-location order, with a blank column to write the counted quantity in."""
++    if inventory.catalog is None:
++        raise ValueError("inventory has no catalog to build a count sheet from")
++    items = sorted(inventory.catalog, key=lambda item: (_bin_key(item.location), item.sku))
++    lines = []
++    for item in items:
++        lines.append(f"{item.location:<10} {item.sku:<12} {item.name:<30} {item.unit:<6} ________")
++    return "\n".join(lines)
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..39fc4d8
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,54 @@
++import unittest
++
++from stockroom.countsheet import count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++def make_inventory():
++    catalog = Catalog([
++        Item("BR-1", "Bolt", "B-12-3", reorder_point=10),
++        Item("BR-2", "Nut", "A-01-2", reorder_point=10, unit="box"),
++        Item("BR-3", "Washer", "B-2-1", reorder_point=10),
++    ])
++    inv = Inventory(catalog)
++    inv.receive("BR-1", 5, 10)
++    inv.receive("BR-2", 1234, 10)
++    inv.receive("BR-3", 50, 10)
++    return inv
++
++
++class CountSheetTest(unittest.TestCase):
++    def test_one_line_per_catalog_item(self):
++        self.assertEqual(len(count_sheet(make_inventory()).splitlines()), 3)
++
++    def test_sorted_by_bin_location_with_numeric_parts(self):
++        lines = count_sheet(make_inventory()).splitlines()
++        self.assertTrue(lines[0].startswith("A-01-2"))
++        self.assertTrue(lines[1].startswith("B-2-1"))
++        self.assertTrue(lines[2].startswith("B-12-3"))
++
++    def test_shows_sku_name_unit_and_blank_count_column(self):
++        line = count_sheet(make_inventory()).splitlines()[0]
++        self.assertIn("BR-2", line)
++        self.assertIn("Nut", line)
++        self.assertIn("box", line)
++        self.assertTrue(line.endswith("________"))
++
++    def test_never_prints_quantities_on_hand(self):
++        sheet = count_sheet(make_inventory())
++        self.assertNotIn("1234", sheet)
++        self.assertNotIn("50", sheet)
++        self.assertNotIn("1229", sheet)
++
++    def test_items_without_stock_are_listed(self):
++        inv = Inventory(Catalog([Item("BR-9", "Spare", "C-1-1")]))
++        self.assertEqual(len(count_sheet(inv).splitlines()), 1)
++
++    def test_no_catalog_is_an_error(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

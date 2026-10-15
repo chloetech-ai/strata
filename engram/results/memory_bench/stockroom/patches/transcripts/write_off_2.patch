@@ -1,0 +1,51 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 77f499c..381f265 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,7 @@
+ ## Unreleased
+ 
+ - Command line: `onhand SKU --log FILE`, `receive SKU QTY UNIT_COST --log FILE` and `moves SKU --log FILE`.
++- `Inventory.write_off(sku, qty, date=None)` records broken or damaged stock with the DAMAGE reason.
+ 
+ ## 0.1.0
+ 
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index 1302897..8ee52d4 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -46,6 +46,10 @@ class Inventory:
+             raise ValueError("quantity must be positive")
+         return self._record(Movement(normalize_sku(sku), -qty, date or datetime.date.today(), reason, None, note))
+ 
++    def write_off(self, sku, qty, date=None):
++        """Stock that got broken or damaged: goods out with the DAMAGE reason."""
++        return self.issue(sku, qty, date, reason="DAMAGE")
++
+     def on_hand(self, sku):
+         sku = normalize_sku(sku)
+         return sum(m.qty for m in self.movements if m.sku == sku)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 715820e..9ecad28 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -49,6 +49,19 @@ class InventoryTest(unittest.TestCase):
+         self.assertEqual([m.reason for m in inv.movements], ["RETURN", "DAMAGE", "COUNT"])
+         self.assertEqual(inv.on_hand("BR-1042"), -2)
+ 
++    def test_write_off_records_damage(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        m = inv.write_off(" br-1042", 3, DAY)
++        self.assertEqual((m.sku, m.qty, m.reason, m.date), ("BR-1042", -3, "DAMAGE", DAY))
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++
++    def test_write_off_quantity_must_be_positive(self):
++        inv = Inventory()
++        with self.assertRaises(ValueError):
++            inv.write_off("BR-1042", 0)
++        self.assertEqual(inv.movements, [])
++
+     def test_unknown_reason_rejected_and_not_recorded(self):
+         inv = Inventory()
+         with self.assertRaises(ValueError):

@@ -1,0 +1,150 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index fee495d..2ba6f62 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -32,5 +32,15 @@
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
+   "tests/test_storage.py::StorageTest::test_legacy_file_without_reason_column",
+   "tests/test_storage.py::StorageTest::test_reason_roundtrip_keeps_other_codes",
+-  "tests/test_storage.py::StorageTest::test_roundtrip"
++  "tests/test_storage.py::StorageTest::test_roundtrip",
++  "tests/test_valuation.py::StockValueTest::test_all_sold_is_worth_nothing",
++  "tests/test_valuation.py::StockValueTest::test_inflow_without_unit_cost_is_refused",
++  "tests/test_valuation.py::StockValueTest::test_issue_across_several_layers",
++  "tests/test_valuation.py::StockValueTest::test_issues_take_oldest_cost_first",
++  "tests/test_valuation.py::StockValueTest::test_later_receipt_settles_negative_stock_first",
++  "tests/test_valuation.py::StockValueTest::test_negative_stock_is_worth_nothing_and_does_not_raise",
++  "tests/test_valuation.py::StockValueTest::test_no_stock_is_worth_nothing",
++  "tests/test_valuation.py::StockValueTest::test_other_skus_are_not_counted",
++  "tests/test_valuation.py::StockValueTest::test_single_receipt",
++  "tests/test_valuation.py::StockValueTest::test_sku_variants_hit_same_stock"
+ ]
+\ No newline at end of file
+diff --git a/src/stockroom/valuation.py b/src/stockroom/valuation.py
+new file mode 100644
+index 0000000..20f5430
+--- /dev/null
++++ b/src/stockroom/valuation.py
+@@ -0,0 +1,39 @@
++"""What the stock on hand is worth."""
++
++from collections import deque
++
++from .items import normalize_sku
++
++
++def stock_value(inventory, sku):
++    """Value in cents of the stock of `sku` on hand, costed first in, first out.
++
++    Each receipt opens a cost layer at its unit_cost, and each outflow uses up
++    the oldest layers first. Sales are never refused, so stock can go negative:
++    the units short are owed, and the next receipts pay them off before adding
++    to the layers. Those units have no cost of their own, so the value is only
++    what is actually held and never goes negative.
++    """
++    sku = normalize_sku(sku)
++    layers = deque()  # [qty, unit_cost] pairs, oldest first
++    owed = 0  # units issued beyond what was on hand
++    for m in inventory.movements_for(sku):
++        if m.qty > 0:
++            if m.unit_cost is None:
++                raise ValueError(f"{sku}: inflow on {m.date} has no unit cost")
++            qty = m.qty
++            paid = min(owed, qty)
++            owed -= paid
++            qty -= paid
++            if qty:
++                layers.append([qty, m.unit_cost])
++        else:
++            remaining = -m.qty
++            while remaining and layers:
++                take = min(remaining, layers[0][0])
++                layers[0][0] -= take
++                remaining -= take
++                if layers[0][0] == 0:
++                    layers.popleft()
++            owed += remaining
++    return sum(qty * unit_cost for qty, unit_cost in layers)
+diff --git a/tests/test_valuation.py b/tests/test_valuation.py
+new file mode 100644
+index 0000000..0cecb53
+--- /dev/null
++++ b/tests/test_valuation.py
+@@ -0,0 +1,77 @@
++import datetime
++import unittest
++
++from stockroom.inventory import Inventory, Movement
++from stockroom.valuation import stock_value
++
++DAY = datetime.date(2026, 9, 1)
++
++
++class StockValueTest(unittest.TestCase):
++    def test_no_stock_is_worth_nothing(self):
++        self.assertEqual(stock_value(Inventory(), "BR-1042"), 0)
++
++    def test_single_receipt(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 100, 12, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 1200)
++
++    def test_issues_take_oldest_cost_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 10, DAY)
++        inv.receive("BR-1042", 10, 20, DAY)
++        inv.issue("BR-1042", 15, DAY)
++        # 5 left, all from the second receipt at 20 cents
++        self.assertEqual(stock_value(inv, "BR-1042"), 100)
++
++    def test_issue_across_several_layers(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 10, DAY)
++        inv.receive("BR-1042", 5, 20, DAY)
++        inv.receive("BR-1042", 5, 30, DAY)
++        inv.issue("BR-1042", 12, DAY)
++        # 3 left from the third receipt at 30 cents
++        self.assertEqual(stock_value(inv, "BR-1042"), 90)
++
++    def test_all_sold_is_worth_nothing(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.issue("BR-1042", 10, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_sku_variants_hit_same_stock(self):
++        inv = Inventory()
++        inv.receive("br-1042", 4, 25, DAY)
++        self.assertEqual(stock_value(inv, " BR-1042 "), 100)
++        self.assertEqual(stock_value(inv, "Br-1042"), 100)
++
++    def test_other_skus_are_not_counted(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 4, 25, DAY)
++        inv.receive("BR-9999", 4, 1000, DAY)
++        self.assertEqual(stock_value(inv, "BR-1042"), 100)
++
++    def test_negative_stock_is_worth_nothing_and_does_not_raise(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, DAY)
++        inv.issue("BR-1042", 8, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), -3)
++        self.assertEqual(stock_value(inv, "BR-1042"), 0)
++
++    def test_later_receipt_settles_negative_stock_first(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 5, 100, DAY)
++        inv.issue("BR-1042", 8, DAY)
++        inv.receive("BR-1042", 10, 200, DAY)
++        self.assertEqual(inv.on_hand("BR-1042"), 7)
++        self.assertEqual(stock_value(inv, "BR-1042"), 7 * 200)
++
++    def test_inflow_without_unit_cost_is_refused(self):
++        inv = Inventory()
++        inv.movements.append(Movement("BR-1042", 3, DAY, "RETURN"))
++        with self.assertRaises(ValueError):
++            stock_value(inv, "BR-1042")
++
++
++if __name__ == "__main__":
++    unittest.main()

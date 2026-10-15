@@ -1,0 +1,101 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index bda73d3..326ec6c 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -4,6 +4,11 @@
+   "tests/test_cli.py::CliTest::test_receive_appends_to_existing_log",
+   "tests/test_cli.py::CliTest::test_receive_creates_log_and_onhand_reads_it",
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity",
++  "tests/test_countsheet.py::CountSheetTest::test_counted_column_left_blank",
++  "tests/test_countsheet.py::CountSheetTest::test_needs_catalog",
++  "tests/test_countsheet.py::CountSheetTest::test_no_quantities_on_hand_shown",
++  "tests/test_countsheet.py::CountSheetTest::test_one_line_per_item_after_header",
++  "tests/test_countsheet.py::CountSheetTest::test_walking_order_by_location_numerically",
+   "tests/test_inventory.py::InventoryTest::test_adjust_accepts_other_reason_codes",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+diff --git a/src/stockroom/countsheet.py b/src/stockroom/countsheet.py
+new file mode 100644
+index 0000000..5a50a95
+--- /dev/null
++++ b/src/stockroom/countsheet.py
+@@ -0,0 +1,27 @@
++"""Printable blind count sheet for the stock-take, in walking order."""
++
++import re
++
++HEADER = "%-12s %-12s %-30s %-6s %s" % ("LOCATION", "SKU", "NAME", "UNIT", "COUNTED")
++
++
++def _walk_key(item):
++    # Compare bin codes with their numbers as numbers, so B-2-1 comes before B-12-3.
++    # re.split with a capture group alternates text and digits, so the same
++    # position always holds the same type when keys are compared.
++    parts = re.split(r"(\d+)", item.location)
++    key = [int(p) if i % 2 else p for i, p in enumerate(parts)]
++    return key, item.sku
++
++
++def count_sheet(inventory):
++    """The count sheet as text, one line per catalog item.
++
++    Shows no quantities on hand, so the counter has to count the stock.
++    """
++    if inventory.catalog is None:
++        raise ValueError("count sheet needs a catalog")
++    lines = [HEADER]
++    for item in sorted(inventory.catalog, key=_walk_key):
++        lines.append("%-12s %-12s %-30s %-6s " % (item.location, item.sku, item.name, item.unit))
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_countsheet.py b/tests/test_countsheet.py
+new file mode 100644
+index 0000000..5e4d130
+--- /dev/null
++++ b/tests/test_countsheet.py
+@@ -0,0 +1,46 @@
++import datetime
++import unittest
++
++from stockroom.countsheet import HEADER, count_sheet
++from stockroom.inventory import Inventory
++from stockroom.items import Catalog, Item
++
++
++class CountSheetTest(unittest.TestCase):
++    def setUp(self):
++        self.catalog = Catalog([
++            Item("BR-1042", "Hex bolt M8x40", "B-12-3"),
++            Item("BR-2210", "Nut M8", "B-2-1"),
++            Item("BR-0007", "Washer", "A-01-1"),
++        ])
++        self.inv = Inventory(self.catalog)
++        self.inv.receive("BR-1042", 1234, 12, datetime.date(2026, 9, 1))
++
++    def data_lines(self):
++        return count_sheet(self.inv).splitlines()[1:]
++
++    def test_one_line_per_item_after_header(self):
++        lines = count_sheet(self.inv).splitlines()
++        self.assertEqual(len(lines), 1 + len(self.catalog))
++
++    def test_walking_order_by_location_numerically(self):
++        skus = [line.split()[1] for line in self.data_lines()]
++        self.assertEqual(skus, ["BR-0007", "BR-2210", "BR-1042"])
++
++    def test_no_quantities_on_hand_shown(self):
++        sheet = count_sheet(self.inv)
++        self.assertNotIn("1234", sheet)
++        self.assertNotIn("1,234", sheet)
++
++    def test_counted_column_left_blank(self):
++        counted_at = HEADER.index("COUNTED")
++        for line in self.data_lines():
++            self.assertEqual(line[counted_at:].strip(), "", line)
++
++    def test_needs_catalog(self):
++        with self.assertRaises(ValueError):
++            count_sheet(Inventory())
++
++
++if __name__ == "__main__":
++    unittest.main()

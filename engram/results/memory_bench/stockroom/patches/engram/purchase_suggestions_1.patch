@@ -1,0 +1,99 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 860c2a2..99f26c4 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -32,6 +32,12 @@
+   "tests/test_reorder.py::ReorderTest::test_below_reorder_point",
+   "tests/test_reorder.py::ReorderTest::test_counts_stock_received_under_sku_variants",
+   "tests/test_reorder.py::ReorderTest::test_enough_stock",
++  "tests/test_reorder.py::ReorderTest::test_only_skus_needing_reorder_are_suggested",
++  "tests/test_reorder.py::ReorderTest::test_rounds_up_to_whole_cases",
++  "tests/test_reorder.py::ReorderTest::test_suggestions_count_stock_received_under_sku_variants",
++  "tests/test_reorder.py::ReorderTest::test_suggests_up_to_three_times_reorder_point",
++  "tests/test_reorder.py::ReorderTest::test_whole_case_shortfall_is_not_rounded_further",
++  "tests/test_reorder.py::ReorderTest::test_zero_reorder_point_with_no_stock_orders_nothing",
+   "tests/test_storage.py::StorageTest::test_load_legacy_file_without_reason_column",
+   "tests/test_storage.py::StorageTest::test_load_legacy_zero_quantity_is_rejected",
+   "tests/test_storage.py::StorageTest::test_load_rejects_unknown_reason",
+diff --git a/src/stockroom/reorder.py b/src/stockroom/reorder.py
+index 4672674..e0c79ef 100644
+--- a/src/stockroom/reorder.py
++++ b/src/stockroom/reorder.py
+@@ -8,3 +8,21 @@ def needs_reorder(inventory):
+         if inventory.on_hand(item.sku) <= item.reorder_point:
+             out.append(item.sku)
+     return out
++
++
++def suggest_orders(inventory):
++    """Map each SKU needing reorder to the quantity to order.
++
++    Orders enough to bring stock on hand back up to three times the reorder
++    point, rounded up to whole cases because the supplier ships full cases.
++    SKUs that would order nothing are left out.
++    """
++    orders = {}
++    for sku in needs_reorder(inventory):
++        item = inventory.catalog.get(sku)
++        shortfall = 3 * item.reorder_point - inventory.on_hand(sku)
++        cases = -(-shortfall // item.case_size)  # ceiling division
++        qty = cases * item.case_size
++        if qty > 0:
++            orders[sku] = qty
++    return orders
+diff --git a/tests/test_reorder.py b/tests/test_reorder.py
+index 01d9a77..47d2d13 100644
+--- a/tests/test_reorder.py
++++ b/tests/test_reorder.py
+@@ -2,7 +2,7 @@ import unittest
+ 
+ from stockroom.inventory import Inventory
+ from stockroom.items import Catalog, Item
+-from stockroom.reorder import needs_reorder
++from stockroom.reorder import needs_reorder, suggest_orders
+ 
+ 
+ def make_inventory():
+@@ -35,6 +35,42 @@ class ReorderTest(unittest.TestCase):
+         inv.issue("Br-1", 5)
+         self.assertEqual(needs_reorder(inv), ["BR-1"])
+ 
++    def test_suggests_up_to_three_times_reorder_point(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10)])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 4, 10)
++        self.assertEqual(suggest_orders(inv), {"BR-1": 26})
++
++    def test_rounds_up_to_whole_cases(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10, case_size=12)])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 4, 10)
++        # shortfall is 26, which needs three cases of 12
++        self.assertEqual(suggest_orders(inv), {"BR-1": 36})
++
++    def test_whole_case_shortfall_is_not_rounded_further(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10, case_size=6)])
++        inv = Inventory(catalog)
++        inv.receive("BR-1", 6, 10)
++        # shortfall is 24, exactly four cases of 6
++        self.assertEqual(suggest_orders(inv), {"BR-1": 24})
++
++    def test_only_skus_needing_reorder_are_suggested(self):
++        self.assertEqual(suggest_orders(make_inventory()), {"BR-1": 25, "BR-2": 20})
++
++    def test_zero_reorder_point_with_no_stock_orders_nothing(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=0)])
++        inv = Inventory(catalog)
++        self.assertEqual(suggest_orders(inv), {})
++
++    def test_suggestions_count_stock_received_under_sku_variants(self):
++        catalog = Catalog([Item("BR-1", "Bolt", "A-01-1", reorder_point=10)])
++        inv = Inventory(catalog)
++        inv.receive(" br-1 ", 12, 10)
++        inv.issue("Br-1", 5)
++        # 7 on hand, shortfall is 23
++        self.assertEqual(suggest_orders(inv), {"BR-1": 23})
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,63 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..e31b490
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,23 @@
++"""Inventory analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B or C by cumulative share of annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are sorted highest
++    value first and accumulated; a SKU is 'A' if the cumulative share up to
++    and including it is at most 80%, 'B' if at most 95%, otherwise 'C'.
++    """
++    total = sum(values.values())
++    out = {}
++    running = 0
++    for sku, value in sorted(values.items(), key=lambda kv: (-kv[1], kv[0])):
++        running += value
++        # Compare cross-multiplied to avoid dividing by the total.
++        if running * 5 <= total * 4:
++            out[sku] = "A"
++        elif running * 20 <= total * 19:
++            out[sku] = "B"
++        else:
++            out[sku] = "C"
++    return out
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..968c1d1
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: X 50 (50%), Y 30 (80%), Z 15 (95%), W 5 (100%)
++        values = {"W": 5, "X": 50, "Y": 30, "Z": 15}
++        self.assertEqual(
++            abc_classes(values),
++            {"X": "A", "Y": "A", "Z": "B", "W": "C"},
++        )
++
++    def test_boundary_at_80_and_95_percent_is_inclusive(self):
++        # Cumulative shares: 80% exactly after P, 95% exactly after Q
++        values = {"P": 80, "Q": 15, "R": 5}
++        self.assertEqual(abc_classes(values), {"P": "A", "Q": "B", "R": "C"})
++
++    def test_single_sku_cumulative_share_is_100_percent_so_c(self):
++        self.assertEqual(abc_classes({"ONLY": 12}), {"ONLY": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,64 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..e25f608
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,24 @@
++"""Inventory analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs by annual consumption value.
++
++    `values` maps SKU to annual consumption value. SKUs are sorted highest
++    value first, and each gets the class of its cumulative share of the grand
++    total up to and including it: 'A' at most 80%, 'B' at most 95%, else 'C'.
++    """
++    total = sum(values.values())
++    ranked = sorted(values.items(), key=lambda pair: pair[1], reverse=True)
++    out = {}
++    running = 0
++    for sku, value in ranked:
++        running += value
++        share = running / total
++        if share <= 0.80:
++            out[sku] = "A"
++        elif share <= 0.95:
++            out[sku] = "B"
++        else:
++            out[sku] = "C"
++    return out
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..accf612
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: X=50 (50%), Y=30 (80%), Z=15 (95%), W=5 (100%)
++        values = {"W": 5, "X": 50, "Y": 30, "Z": 15}
++        self.assertEqual(
++            abc_classes(values),
++            {"X": "A", "Y": "A", "Z": "B", "W": "C"},
++        )
++
++    def test_boundaries_are_inclusive(self):
++        # Cumulative shares are exactly 80% and 95%.
++        values = {"P": 80, "Q": 15, "R": 5}
++        self.assertEqual(abc_classes(values), {"P": "A", "Q": "B", "R": "C"})
++
++    def test_single_sku_is_c_since_share_is_100_percent(self):
++        self.assertEqual(abc_classes({"ONLY": 7}), {"ONLY": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

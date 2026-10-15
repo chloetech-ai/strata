@@ -1,0 +1,72 @@
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..2e77871
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,27 @@
++"""Inventory analysis."""
++
++
++def abc_classes(values):
++    """Classify SKUs into ABC classes by annual consumption value.
++
++    SKUs are sorted by value, highest first. A running total is kept and a
++    SKU is 'A' if the cumulative share up to and including it is at most 80%
++    of the grand total, 'B' if at most 95%, otherwise 'C'.
++    """
++    if not values:
++        return {}
++    total = sum(values.values())
++    if total <= 0:
++        raise ValueError("total consumption value must be positive")
++    out = {}
++    running = 0
++    for sku, value in sorted(values.items(), key=lambda kv: (-kv[1], kv[0])):
++        running += value
++        share = running / total
++        if share <= 0.80:
++            out[sku] = "A"
++        elif share <= 0.95:
++            out[sku] = "B"
++        else:
++            out[sku] = "C"
++    return out
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..d7b0202
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,33 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: X=50 (50%), Y=30 (80%), Z=15 (95%), W=5 (100%)
++        values = {"W": 5, "X": 50, "Y": 30, "Z": 15}
++        self.assertEqual(
++            abc_classes(values),
++            {"X": "A", "Y": "A", "Z": "B", "W": "C"},
++        )
++
++    def test_boundary_is_inclusive(self):
++        # Cumulative share hits exactly 80% at P and exactly 95% at Q.
++        values = {"P": 80, "Q": 15, "R": 5}
++        self.assertEqual(abc_classes(values), {"P": "A", "Q": "B", "R": "C"})
++
++    def test_single_sku_is_c(self):
++        # Its cumulative share is 100%, which is above 95%.
++        self.assertEqual(abc_classes({"ONLY": 7}), {"ONLY": "C"})
++
++    def test_zero_total_is_rejected(self):
++        with self.assertRaises(ValueError):
++            abc_classes({"A1": 0, "A2": 0})
++
++
++if __name__ == "__main__":
++    unittest.main()

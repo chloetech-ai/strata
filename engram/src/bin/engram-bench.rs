@@ -74,6 +74,9 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 1)]
         every: usize,
+        /// Only every n-th question of each unit.
+        #[arg(long, default_value_t = 1)]
+        qevery: usize,
         #[arg(long)]
         limit: Option<usize>,
         /// Questions in flight at once (each waits on two model calls).
@@ -569,7 +572,7 @@ fn main() {
             }
             eprintln!("{} texts in {:.1} ms", texts.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
-        Cmd::Deep { data, embedder, out, every, limit, threads, model, hard_model, max_picks, tag } => deep_cmd(&data, &embedder, &out, every, limit, threads, &model, &hard_model, max_picks, &tag),
+        Cmd::Deep { data, embedder, out, every, qevery, limit, threads, model, hard_model, max_picks, tag } => deep_cmd(&data, &embedder, &out, every, qevery, limit, threads, &model, &hard_model, max_picks, &tag),
         Cmd::Scale { data, sizes, embedder, out, queries, hooks, hook_gap_ms } => scale_cmd(&data, &sizes, &embedder, &out, queries, hooks, hook_gap_ms),
         Cmd::Latency { data, sizes, embedder, out, queries, rounds, hooks, knowledge } => latency_cmd(&data, &sizes, &embedder, &out, queries, rounds, hooks, knowledge),
         Cmd::Probes { transcript, probes, points, embedder, project, out, cache, dump_missing, dump_probes, per_turn, max_records } => {
@@ -732,7 +735,7 @@ fn reader_block(r: &Record) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, limit: Option<usize>, threads: usize, model: &str, hard_model: &str, max_picks: usize, tag: &str) {
+fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, qevery: usize, limit: Option<usize>, threads: usize, model: &str, hard_model: &str, max_picks: usize, tag: &str) {
     use engram::deep::{self, DeepConfig};
     let t0 = Instant::now();
     let e: Arc<dyn Embedder> = open_embedder(embedder);
@@ -746,7 +749,7 @@ fn deep_cmd(data: &Path, embedder: &str, out: &Path, every: usize, limit: Option
     let dataset = units.first().map(|u| u.dataset.clone()).unwrap_or_default();
     let cfg = DeepConfig { mode: "tool".into(), planner_model: model.into(), ranker_model: model.into(), hard_model: hard_model.into(), max_picks, ..Default::default() };
     let cli = engram::distill::DistillConfig::default();
-    let jobs: Vec<(usize, usize)> = units.iter().enumerate().flat_map(|(i, u)| (0..u.questions.len()).map(move |j| (i, j))).collect();
+    let jobs: Vec<(usize, usize)> = units.iter().enumerate().flat_map(|(i, u)| (0..u.questions.len()).filter(move |j| j % qevery.max(1) == 0).map(move |j| (i, j))).collect();
     let next = AtomicUsize::new(0);
     let rows: Mutex<Vec<Json>> = Mutex::new(Vec::new());
     let ctxs: Mutex<Vec<Json>> = Mutex::new(Vec::new());

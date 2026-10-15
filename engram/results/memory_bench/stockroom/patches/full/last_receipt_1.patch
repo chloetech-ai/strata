@@ -1,0 +1,60 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index bda73d3..10f6d10 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -5,6 +5,9 @@
+   "tests/test_cli.py::CliTest::test_receive_creates_log_and_onhand_reads_it",
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity",
+   "tests/test_inventory.py::InventoryTest::test_adjust_accepts_other_reason_codes",
++  "tests/test_inventory.py::InventoryTest::test_last_receipt",
++  "tests/test_inventory.py::InventoryTest::test_last_receipt_ignores_other_reasons_and_skus",
++  "tests/test_inventory.py::InventoryTest::test_last_receipt_same_date_takes_later_entry",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue",
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index bca8c16..f85e9d2 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -63,3 +63,10 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """The RECEIPT with the latest date for a SKU; ties go to the later log entry."""
++        receipts = [m for m in self.movements_for(sku) if m.reason == "RECEIPT"]
++        if not receipts:
++            return None
++        return max(reversed(receipts), key=lambda m: m.date)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index d02de00..a95b0d1 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -51,6 +51,26 @@ class InventoryTest(unittest.TestCase):
+                 inv.adjust("BR-1042", 1, code, DAY)
+         self.assertEqual(inv.movements, [])
+ 
++    def test_last_receipt(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.receive("BR-1042", 10, 12, datetime.date(2026, 9, 1))
++        inv.receive("BR-1042", 5, 14, datetime.date(2026, 9, 5))
++        inv.issue("BR-1042", 3, datetime.date(2026, 9, 9))
++        self.assertEqual(inv.last_receipt(" br-1042").unit_cost, 14)
++
++    def test_last_receipt_ignores_other_reasons_and_skus(self):
++        inv = Inventory()
++        inv.receive("BR-2210", 5, 30, DAY)
++        inv.adjust("BR-1042", 2, "RETURN", DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
++    def test_last_receipt_same_date_takes_later_entry(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        inv.receive("BR-1042", 5, 13, DAY)
++        self.assertEqual(inv.last_receipt("BR-1042").unit_cost, 13)
++
+     def test_movements_for(self):
+         inv = Inventory()
+         inv.receive("BR-1042", 10, 12, DAY)

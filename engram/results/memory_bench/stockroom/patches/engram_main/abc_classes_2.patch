@@ -1,0 +1,102 @@
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+index 16ea9b2..1cde05b 100644
+--- a/.pytest_cache/v/cache/lastfailed
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -1,3 +1,4 @@
+ {
+-  "tests/test_reorder.py::ReorderTest::test_at_reorder_point": true
++  "tests/test_reorder.py::ReorderTest::test_at_reorder_point": true,
++  "tests/test_analysis.py::AbcClassesTest::test_single_sku_is_a": true
+ }
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index 291fa70..26b96d8 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -1,4 +1,10 @@
+ [
++  "tests/test_analysis.py::AbcClassesTest::test_boundaries_are_inclusive",
++  "tests/test_analysis.py::AbcClassesTest::test_classes_by_cumulative_share",
++  "tests/test_analysis.py::AbcClassesTest::test_empty_input",
++  "tests/test_analysis.py::AbcClassesTest::test_order_of_input_does_not_matter",
++  "tests/test_analysis.py::AbcClassesTest::test_single_sku_is_a",
++  "tests/test_analysis.py::AbcClassesTest::test_single_sku_is_c",
+   "tests/test_cli.py::CliTest::test_moves_for_unknown_sku_prints_nothing",
+   "tests/test_cli.py::CliTest::test_moves_lists_each_movement_for_the_sku",
+   "tests/test_cli.py::CliTest::test_onhand_for_unknown_sku_is_zero",
+diff --git a/src/stockroom/analysis.py b/src/stockroom/analysis.py
+new file mode 100644
+index 0000000..cb6ade2
+--- /dev/null
++++ b/src/stockroom/analysis.py
+@@ -0,0 +1,27 @@
++"""ABC analysis of annual consumption value."""
++
++A_SHARE = 0.80
++B_SHARE = 0.95
++
++
++def abc_classes(values):
++    """Classify SKUs as A, B or C by annual consumption value.
++
++    SKUs are walked from highest to lowest value, with ties broken by SKU.
++    A SKU is 'A' if the running total up to and including it is at most 80%
++    of the grand total, 'B' if at most 95%, otherwise 'C'.
++    """
++    if not values:
++        return {}
++    total = sum(values.values())
++    classes = {}
++    running = 0
++    for sku, value in sorted(values.items(), key=lambda pair: (-pair[1], pair[0])):
++        running += value
++        if running <= A_SHARE * total:
++            classes[sku] = "A"
++        elif running <= B_SHARE * total:
++            classes[sku] = "B"
++        else:
++            classes[sku] = "C"
++    return classes
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..aeb76a1
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,37 @@
++import unittest
++
++from stockroom.analysis import abc_classes
++
++
++class AbcClassesTest(unittest.TestCase):
++    def test_empty_input(self):
++        self.assertEqual(abc_classes({}), {})
++
++    def test_classes_by_cumulative_share(self):
++        # Sorted: 50 (50%), 30 (80%), 15 (95%), 5 (100%)
++        values = {"BR-1": 50, "BR-2": 30, "BR-3": 15, "BR-4": 5}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "A", "BR-3": "B", "BR-4": "C"},
++        )
++
++    def test_boundaries_are_inclusive(self):
++        # Exactly 80% lands in A and exactly 95% lands in B.
++        values = {"BR-1": 80, "BR-2": 15, "BR-3": 5}
++        self.assertEqual(
++            abc_classes(values),
++            {"BR-1": "A", "BR-2": "B", "BR-3": "C"},
++        )
++
++    def test_order_of_input_does_not_matter(self):
++        values = {"BR-4": 5, "BR-3": 15, "BR-2": 30, "BR-1": 50}
++        self.assertEqual(abc_classes(values)["BR-1"], "A")
++        self.assertEqual(abc_classes(values)["BR-4"], "C")
++
++    def test_single_sku_is_c(self):
++        # Its cumulative share is 100%, which is above both thresholds.
++        self.assertEqual(abc_classes({"BR-1": 42}), {"BR-1": "C"})
++
++
++if __name__ == "__main__":
++    unittest.main()

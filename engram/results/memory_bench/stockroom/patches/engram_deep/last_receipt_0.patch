@@ -1,0 +1,67 @@
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+index fee495d..49c5c42 100644
+--- a/.pytest_cache/v/cache/nodeids
++++ b/.pytest_cache/v/cache/nodeids
+@@ -10,6 +10,10 @@
+   "tests/test_cli.py::CliTest::test_receive_rejects_non_positive_quantity",
+   "tests/test_cli.py::CliTest::test_sku_variants_hit_same_stock",
+   "tests/test_cli.py::CliTest::test_unknown_sku_has_zero_on_hand",
++  "tests/test_inventory.py::InventoryTest::test_last_receipt_is_none_without_receipts",
++  "tests/test_inventory.py::InventoryTest::test_last_receipt_normalizes_sku",
++  "tests/test_inventory.py::InventoryTest::test_last_receipt_picks_latest_date_not_latest_position",
++  "tests/test_inventory.py::InventoryTest::test_last_receipt_tie_goes_to_later_logged",
+   "tests/test_inventory.py::InventoryTest::test_movements_for",
+   "tests/test_inventory.py::InventoryTest::test_quantities_must_be_positive",
+   "tests/test_inventory.py::InventoryTest::test_receive_and_issue",
+diff --git a/src/stockroom/inventory.py b/src/stockroom/inventory.py
+index d09ffb2..7734c53 100644
+--- a/src/stockroom/inventory.py
++++ b/src/stockroom/inventory.py
+@@ -58,3 +58,10 @@ class Inventory:
+     def movements_for(self, sku):
+         sku = normalize_sku(sku)
+         return [m for m in self.movements if m.sku == sku]
++
++    def last_receipt(self, sku):
++        """Latest RECEIPT for `sku` by date, or None. On a date tie, the later-logged one wins."""
++        receipts = [m for m in self.movements_for(sku) if m.reason == "RECEIPT"]
++        if not receipts:
++            return None
++        return max(reversed(receipts), key=lambda m: m.date)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index e1364d4..94edaf2 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -53,6 +53,32 @@ class InventoryTest(unittest.TestCase):
+         inv.issue("BR-1042", 4, DAY)
+         self.assertEqual([m.qty for m in inv.movements_for("BR-1042")], [10, -4])
+ 
++    def test_last_receipt_is_none_without_receipts(self):
++        inv = Inventory()
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++        inv.receive("BR-2210", 5, 30, DAY)
++        inv.issue("BR-1042", 4, DAY)
++        self.assertIsNone(inv.last_receipt("BR-1042"))
++
++    def test_last_receipt_picks_latest_date_not_latest_position(self):
++        inv = Inventory()
++        later = datetime.date(2026, 9, 5)
++        inv.receive("BR-1042", 10, 12, later)
++        inv.receive("BR-1042", 20, 12, DAY)
++        inv.issue("BR-1042", 4, later)
++        self.assertEqual(inv.last_receipt("BR-1042").qty, 10)
++
++    def test_last_receipt_tie_goes_to_later_logged(self):
++        inv = Inventory()
++        inv.receive("BR-1042", 10, 12, DAY)
++        second = inv.receive("BR-1042", 20, 12, DAY)
++        self.assertIs(inv.last_receipt("BR-1042"), second)
++
++    def test_last_receipt_normalizes_sku(self):
++        inv = Inventory()
++        first = inv.receive("br-1042", 10, 12, DAY)
++        self.assertIs(inv.last_receipt(" BR-1042 "), first)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
