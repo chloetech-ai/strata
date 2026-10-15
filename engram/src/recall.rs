@@ -479,7 +479,7 @@ pub fn fmt_recall_checked(items: &[(Record, String)], now: i64, weak: bool, mut 
     };
     for (r, snip) in items {
         let label = match check.as_deref_mut() {
-            Some(c) if r.kind.is_knowledge() => c.check_ctx(&r.ctx).label(),
+            Some(c) if r.kind.is_knowledge() => c.check_record(&r).label(),
             _ => String::new(),
         };
         s += "\n";
@@ -611,7 +611,7 @@ pub fn fmt_knowledge_checked(items: &[(Record, f64, f64)], now: i64, mut check: 
     let mut s = String::from("Engram notes from earlier sessions that may bear on this request (decisions, rules and requirements agreed before; check them before deciding):\n");
     for (r, _, _) in items {
         let t = r.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let fresh = check.as_deref_mut().map(|c| c.check_ctx(&r.ctx).label()).unwrap_or_default();
+        let fresh = check.as_deref_mut().map(|c| c.check_record(&r).label()).unwrap_or_default();
         s += &format!("- [{}] {t} ({}, {}){fresh}\n", note_label(r), r.id, fmt_ago(r.ts, now));
     }
     s
@@ -667,7 +667,7 @@ pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, 
                 continue;
             }
             let fresh = match check.as_deref_mut() {
-                Some(c) if r.kind.is_knowledge() => c.check_ctx(&r.ctx),
+                Some(c) if r.kind.is_knowledge() => c.check_record(&r),
                 _ => crate::anchor::Freshness::Current,
             };
             if fresh.is_stale() {

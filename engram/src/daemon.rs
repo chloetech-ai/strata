@@ -134,6 +134,10 @@ pub struct Daemon {
     distilled_since: std::sync::atomic::AtomicUsize,
     /// Query-understanding searches by session.
     deep_jobs: Mutex<HashMap<String, DeepJob>>,
+    /// The settings Claude Code's hooks last ran with (their environment):
+    /// they win over the daemon's own, which may have been started from a
+    /// shell or the MCP server without them.
+    from_hooks: Mutex<(String, Option<crate::deep::DeepConfig>)>,
     last_activity: AtomicI64,
 }
 
@@ -149,7 +153,7 @@ impl Daemon {
         let store = Arc::new(Store::open(&paths.db, embedder, StoreOptions { sync: cfg.sync, ..Default::default() })?);
         let state: State = std::fs::read_to_string(&paths.state).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         Ok(Daemon { paths, project: project.to_string(), store, cfg, state: Mutex::new(state), dirty: Default::default(), pending: Default::default(),
-            distilling: Mutex::new(()), distilled_since: Default::default(), deep_jobs: Mutex::new(HashMap::new()), last_activity: AtomicI64::new(now()) })
+            distilling: Mutex::new(()), distilled_since: Default::default(), deep_jobs: Mutex::new(HashMap::new()), from_hooks: Mutex::new((String::new(), None)), last_activity: AtomicI64::new(now()) })
     }
 
     fn save_state(&self, st: &State) {
@@ -188,7 +192,10 @@ impl Daemon {
         let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let res = match op {
             "ping" => Ok((json!({"ok": true, "pid": std::process::id(), "records": self.store.len()}), None)),
-            "hook" => self.hook(req.get("event").and_then(|v| v.as_str()).unwrap_or(""), req.get("payload").unwrap_or(&Json::Null)),
+            "hook" => {
+                self.note_hook_settings(req);
+                self.hook(req.get("event").and_then(|v| v.as_str()).unwrap_or(""), req.get("payload").unwrap_or(&Json::Null))
+            }
             "search" => self.op_search(req).map(|r| (r, None)),
             "timeline" => self.op_timeline(req).map(|r| (r, None)),
             "sql" => self.op_sql(req).map(|r| (r, None)),
@@ -252,6 +259,8 @@ impl Daemon {
 
     fn hook(self: &Arc<Self>, event: &str, p: &Json) -> Result<(Json, Option<Deferred>)> {
         let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let deep_cfg = self.deep_cfg();
+        let mode = deep_cfg.mode.clone();
         let ctx_out = |event: &str, text: String| -> Json {
             if text.is_empty() {
                 json!({"output": null})
@@ -309,10 +318,10 @@ impl Daemon {
                 // storing it afterwards keeps the write (and the memtable
                 // rebuild it causes) off the prompt's critical path.
                 let mut text = self.recall_for(&sid, &prompt, false)?.map(|x| x.0).unwrap_or_default();
-                let deep = self.cfg.deep.wants(&prompt, self.store.len());
-                let deep_async = deep && self.cfg.deep.mode == "async";
-                if deep && self.cfg.deep.mode == "sync" {
-                    let (t, _) = self.deep_for(&sid, &prompt, &recent);
+                let deep = deep_cfg.wants(&prompt, self.store.len());
+                let deep_async = deep && mode == "async";
+                if deep && mode == "sync" {
+                    let (t, _) = self.deep_for(&sid, &prompt, &recent, "sync");
                     if !t.is_empty() {
                         text = if text.is_empty() { t } else { format!("{text}\n\n{t}") };
                     }
@@ -334,7 +343,7 @@ impl Daemon {
                         }
                         me.store.warm();
                         if deep_async {
-                            let (t, res) = me.deep_for(&sid, &prompt, &recent);
+                            let (t, res) = me.deep_for(&sid, &prompt, &recent, "async");
                             let mut jobs = me.deep_jobs.lock().unwrap();
                             if let Some(j) = jobs.get_mut(&sid).filter(|j| j.turn == turn) {
                                 j.done = true;
@@ -394,7 +403,7 @@ impl Daemon {
                 // A search still running for this turn: wait for it, and if it
                 // found records the turn did not see, ask the model once to
                 // reconsider with them.
-                if !active && self.cfg.deep.mode == "async" && self.cfg.deep.stop_recheck {
+                if !active && mode == "async" && deep_cfg.stop_recheck {
                     if let Some(t) = self.take_deep(&sid, cur, true) {
                         self.log(&json!({"ts": now(), "event": "deep_recheck", "session": sid, "turn": cur, "chars": t.len()}));
                         let reason = format!(
@@ -496,7 +505,7 @@ impl Daemon {
         known.sort_by_key(|r| -r.seq);
         let listed: Vec<(String, Kind, String)> = known.iter().rev().map(|r| (r.id.clone(), r.kind, r.text.clone())).collect();
         let t0 = Instant::now();
-        match crate::distill::distill(&self.cfg.distill, prompt, answer, commands, &listed) {
+        match crate::distill::distill(&self.distill_cfg(), prompt, answer, commands, &listed) {
             Ok(d) => {
                 let is_known = |id: &String| known.iter().any(|r| &r.id == id);
                 let replaced: Vec<String> = d.replaced.into_iter().filter(|id| is_known(id)).collect();
@@ -565,7 +574,7 @@ impl Daemon {
     /// Merges related notes (the caller holds the distillation lock).
     fn consolidate_now(&self) -> Json {
         let t0 = Instant::now();
-        match crate::consolidate::run(&self.store, &self.cfg.consolidate, &self.cfg.distill, now()) {
+        match crate::consolidate::run(&self.store, &self.cfg.consolidate, &self.distill_cfg(), now()) {
             Ok(r) => {
                 let j = json!({"ts": now(), "event": "consolidate", "live_before": r.live_before, "groups": r.groups, "replaced": r.replaced,
                     "written": r.written, "cost_usd": r.cost_usd, "errors": r.errors, "ms": t0.elapsed().as_millis() as u64});
@@ -589,13 +598,41 @@ impl Daemon {
     }
 
     /// Checks notes' anchors against this project's working tree.
+    /// Remembers the settings a hook ran with (see `from_hooks`).
+    fn note_hook_settings(&self, req: &Json) {
+        let model = req.get("distill_model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let deep = req.get("deep").cloned().and_then(|d| serde_json::from_value::<crate::deep::DeepConfig>(d).ok());
+        let mut h = self.from_hooks.lock().unwrap();
+        if !model.is_empty() {
+            h.0 = model;
+        }
+        if deep.is_some() {
+            h.1 = deep;
+        }
+    }
+
+    /// The distiller's settings, with the model the hooks asked for.
+    fn distill_cfg(&self) -> crate::distill::DistillConfig {
+        let mut c = self.cfg.distill.clone();
+        let h = self.from_hooks.lock().unwrap();
+        if !h.0.is_empty() && std::env::var("ENGRAM_DISTILL_MODEL").map_or(true, |m| m.is_empty()) {
+            c.model = h.0.clone();
+        }
+        c
+    }
+
+    /// Query-understanding settings: as the hooks resolved them, else the daemon's.
+    fn deep_cfg(&self) -> crate::deep::DeepConfig {
+        self.from_hooks.lock().unwrap().1.clone().unwrap_or_else(|| self.cfg.deep.clone())
+    }
+
     fn checker(&self) -> Checker {
         Checker::new(Path::new(&self.project))
     }
 
     /// Runs query understanding for a prompt of a session: the context
     /// block (records not shown to the session yet) and the result.
-    fn deep_for(&self, sid: &str, prompt: &str, recent: &[String]) -> (String, Option<crate::deep::DeepResult>) {
+    fn deep_for(&self, sid: &str, prompt: &str, recent: &[String], mode: &str) -> (String, Option<crate::deep::DeepResult>) {
         let (w, shown) = {
             let st = self.state.lock().unwrap();
             let s = st.sessions.get(sid).cloned().unwrap_or_default();
@@ -603,20 +640,20 @@ impl Daemon {
         };
         let filter = Filter { exclude_window: Some((sid.to_string(), w)), ..Default::default() };
         let project = Path::new(&self.project);
-        let res = crate::deep::run(&self.store, &self.cfg.deep, &self.cfg.distill, prompt, recent, &filter, Some(project));
+        let res = crate::deep::run(&self.store, &self.deep_cfg(), &self.distill_cfg(), prompt, recent, &filter, Some(project), now());
         let text = crate::deep::format(&res, &shown, now(), Some(project));
         let mut log = crate::deep::log_json(&res);
         log["ts"] = json!(now());
         log["event"] = json!("deep");
         log["session"] = json!(sid);
-        log["mode"] = json!(self.cfg.deep.mode);
+        log["mode"] = json!(mode);
         log["chars"] = json!(text.len());
         self.log(&log);
         if !text.is_empty() {
             let ids = res.ids();
             let mut st = self.state.lock().unwrap();
             if let Some(s) = st.sessions.get_mut(sid) {
-                if self.cfg.deep.mode == "sync" {
+                if mode == "sync" {
                     s.injected.extend(ids);
                 }
             }
@@ -629,7 +666,7 @@ impl Daemon {
     /// waits for a running one (up to `stop_wait_secs`) and returns it only
     /// when its confidence is high or medium.
     fn take_deep(&self, sid: &str, turn: i64, wait: bool) -> Option<String> {
-        let until = Instant::now() + Duration::from_secs(if wait { self.cfg.deep.stop_wait_secs } else { 0 });
+        let until = Instant::now() + Duration::from_secs(if wait { self.deep_cfg().stop_wait_secs } else { 0 });
         loop {
             {
                 let mut jobs = self.deep_jobs.lock().unwrap();
@@ -662,7 +699,7 @@ impl Daemon {
         if q.is_empty() {
             return Err(err("question is empty"));
         }
-        let mut cfg = self.cfg.deep.clone();
+        let mut cfg = self.deep_cfg();
         if let Some(m) = req.get("model").and_then(|v| v.as_str()).filter(|m| !m.is_empty()) {
             cfg.planner_model = m.to_string();
             cfg.ranker_model = m.to_string();
@@ -673,13 +710,14 @@ impl Daemon {
             filter.exclude_window = Some((active.clone(), w));
         }
         let project = Path::new(&self.project);
-        let mut res = crate::deep::run(&self.store, &cfg, &self.cfg.distill, &q, &[], &filter, Some(project));
+        let distill = self.distill_cfg();
+        let mut res = crate::deep::run(&self.store, &cfg, &distill, &q, &[], &filter, Some(project), now());
         // A question asked on purpose gets an answer even when the planner
         // thought memory could not matter.
         if !res.plan.need {
             res.plan.need = true;
             let (cands, _) = crate::deep::gather(&self.store, &cfg, &q, &res.plan, &filter);
-            let (picks, answer, conf, model, cost, e) = crate::deep::rank(&cfg, &self.cfg.distill, &q, &cands, &HashMap::new(), false, now());
+            let (picks, answer, conf, model, cost, e) = crate::deep::rank(&cfg, &distill, &q, &cands, &HashMap::new(), false, now());
             let by: HashMap<&str, &Record> = cands.iter().map(|c| (c.record.id.as_str(), &c.record)).collect();
             res.picks = picks.into_iter().filter_map(|(id, why)| by.get(id.as_str()).map(|r| ((*r).clone(), why))).collect();
             (res.answer, res.confidence, res.ranker_model, res.error) = (answer, conf, model, e);
@@ -855,7 +893,7 @@ impl Daemon {
         let mut ck = self.checker();
         for r in recs.iter().take(2) {
             let snip: String = r.text.chars().take(500).collect();
-            let label = if r.kind.is_knowledge() { ck.check_ctx(&r.ctx).label() } else { String::new() };
+            let label = if r.kind.is_knowledge() { ck.check_record(&r).label() } else { String::new() };
             s += &format!("\n{}\n", recall::fmt_record_labeled(r, &snip, now(), &label));
         }
         Ok(s)

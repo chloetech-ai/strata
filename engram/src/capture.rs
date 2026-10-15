@@ -127,11 +127,34 @@ pub fn preference_sentences(prompt: &str) -> Vec<String> {
         Regex::new(r"(?i)\b(always|never|don'?t ever|do not ever|from now on|going forward|make sure (?:to|that|you)|please (?:always|never|don'?t|do not)|i (?:prefer|want you to|don'?t want)|remember (?:that|to)|keep in mind|by default|should (?:always|never)|must (?:always|never|not))\b").unwrap()
     });
     let mut out = Vec::new();
-    for s in prompt.split(|c| c == '\n' || c == '.' || c == '!' || c == '?').map(str::trim) {
+    for s in sentences(prompt) {
         if s.len() >= 12 && s.len() <= 400 && re.is_match(s) {
             out.push(s.to_string());
         }
     }
+    out
+}
+
+/// `text` split into sentences: at line breaks, `!`, `?`, and a `.` that
+/// ends a word (not the one in "3.8" or "config.py").
+fn sentences(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut it = text.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        let next = it.peek().map(|x| x.1);
+        let end = match c {
+            '\n' | '!' | '?' => true,
+            '.' => next.map_or(true, char::is_whitespace),
+            _ => false,
+        };
+        if end {
+            out.push(text[start..i].trim());
+            start = i + c.len_utf8();
+        }
+    }
+    out.push(text[start..].trim());
+    out.retain(|s| !s.is_empty());
     out
 }
 
@@ -455,6 +478,7 @@ mod tests {
         let p = preference_sentences("Fix the test. From now on, always run clippy before committing! Thanks");
         assert_eq!(p, vec!["From now on, always run clippy before committing"]);
         assert!(preference_sentences("Implement the parser").is_empty());
+        assert_eq!(preference_sentences("The PCs run Python 3.8, so never use tomllib in config.py. Thanks"), vec!["The PCs run Python 3.8, so never use tomllib in config.py"]);
         assert!(past_reference("What did we decide about the planner earlier?"));
         assert!(!past_reference("Add a unit test for chunk()"));
     }

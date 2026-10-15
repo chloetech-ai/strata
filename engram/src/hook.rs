@@ -50,8 +50,12 @@ pub fn run(event: &str, user: bool) -> i32 {
         return 0;
     }
     let dir = paths::store_dir(&project);
-    let req = json!({"op": "hook", "event": event, "payload": payload});
-    let wait = if matches!(event.as_str(), "UserPromptSubmit" | "Stop") { budget(&event, &deep_config(&dir)) } else { budget(&event, &crate::deep::DeepConfig::default()) };
+    let deep = deep_config(&dir);
+    // The session's settings travel with each request: the daemon may have
+    // been started from elsewhere (a shell, the MCP server) without them.
+    let distill_model = std::env::var("ENGRAM_DISTILL_MODEL").unwrap_or_default();
+    let req = json!({"op": "hook", "event": event, "payload": payload, "deep": deep, "distill_model": distill_model});
+    let wait = budget(&event, &deep);
     match daemon::request(&dir, &project.to_string_lossy(), &req, wait) {
         Ok(resp) => {
             if let Some(out) = resp.get("output").filter(|o| !o.is_null()) {

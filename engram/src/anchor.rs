@@ -40,7 +40,14 @@ impl Anchor {
     /// `Anchor: head=… branch=… files=a.py#h1,b.py#h2 idents=x,y`
     pub fn to_line(&self) -> String {
         let files: Vec<String> = self.files.iter().map(|(p, h)| format!("{p}#{h}")).collect();
-        format!("Anchor: head={} branch={} files={} idents={}", self.head, self.branch, files.join(","), self.idents.join(","))
+        let mut parts = vec![format!("head={}", self.head), format!("branch={}", self.branch)];
+        if !files.is_empty() {
+            parts.push(format!("files={}", files.join(",")));
+        }
+        if !self.idents.is_empty() {
+            parts.push(format!("idents={}", self.idents.join(",")));
+        }
+        format!("Anchor: {}", parts.join(" "))
     }
 
     /// The anchor in a record's context, if any.
@@ -235,6 +242,9 @@ pub enum Freshness {
     Changed(Vec<String>),
     /// The note probably describes code that is no longer there.
     Stale(String),
+    /// A rule or requirement whose code moved away from what it was stated
+    /// against: the rule still holds, the code may now break it.
+    Drifted(String),
 }
 
 impl Freshness {
@@ -244,6 +254,7 @@ impl Freshness {
             Freshness::Current => String::new(),
             Freshness::Changed(f) => format!(" [{} changed since this note; check the current code]", f.join(", ")),
             Freshness::Stale(why) => format!(" [may be out of date: {why}; check the current code before relying on it]"),
+            Freshness::Drifted(why) => format!(" [the code changed since this was stated ({why}); check that it still follows it]"),
         }
     }
     pub fn is_stale(&self) -> bool {
@@ -272,6 +283,16 @@ impl Checker {
             self.files.insert(rel.to_string(), v.clone());
         }
         v
+    }
+
+    /// How a note stands against the current code. Rules and requirements
+    /// never go stale with the code: a change that removed what they were
+    /// stated against is reported as drift.
+    pub fn check_record(&mut self, r: &crate::record::Record) -> Freshness {
+        match self.check_ctx(&r.ctx) {
+            Freshness::Stale(why) if matches!(r.kind, crate::record::Kind::Preference | crate::record::Kind::Todo) => Freshness::Drifted(why),
+            f => f,
+        }
     }
 
     /// How a record with context `ctx` stands against the current code.
@@ -367,6 +388,23 @@ mod tests {
         // A deletion.
         std::fs::remove_file(p.join("src/client.py")).unwrap();
         assert!(Checker::new(p).check(&a).label().contains("no longer exists"));
+    }
+
+    #[test]
+    fn rules_drift_instead_of_going_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        std::fs::write(p.join("src/pay.py"), "MODE = ROUND_HALF_UP\n").unwrap();
+        let a = make(p, "Totals use ROUND_HALF_UP", &["src/pay.py".to_string()], &[]);
+        assert!(!a.to_line().contains("idents= "));
+        std::fs::write(p.join("src/pay.py"), "MODE = ROUND_HALF_EVEN\n").unwrap();
+        let rule = crate::record::Record::from_draft(crate::record::Draft::new(crate::record::Kind::Preference, "Totals use ROUND_HALF_UP").ctx(&a.to_line()), "s", 1, 1, 1);
+        let fact = crate::record::Record { kind: crate::record::Kind::Fact, ..rule.clone() };
+        let mut ck = Checker::new(p);
+        assert!(ck.check_record(&fact).is_stale());
+        let f = ck.check_record(&rule);
+        assert!(!f.is_stale() && f.label().contains("still follows"), "{f:?}");
     }
 
     #[test]

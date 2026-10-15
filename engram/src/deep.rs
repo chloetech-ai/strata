@@ -134,7 +134,7 @@ pub struct Query {
 }
 
 impl Query {
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self.kind.as_str() {
             "entity" => format!("entity:{}", self.names.join("|")),
             "file" => format!("file:{}", self.path),
@@ -182,19 +182,19 @@ impl DeepResult {
     }
 }
 
-const PLAN_SYSTEM: &str = "You turn a developer's request into searches over a software project's memory of earlier work sessions. Output one JSON object and nothing else.";
+const PLAN_SYSTEM: &str = "You turn a user's request into searches over an assistant's memory of earlier sessions with that user (usually work sessions in a software project). Output one JSON object and nothing else.";
 
-const PLAN_PROMPT: &str = r#"A coding assistant is about to work on this request in a software project:
+const PLAN_PROMPT: &str = r#"An assistant is about to work on this request (usually in a software project; sometimes it is a question about earlier conversations with the user):
 <request>
 {request}
 </request>
 {recent}
-The project's memory holds records of earlier sessions: user prompts, assistant answers, tool calls and their results, errors, one episode summary per turn, compaction summaries, and notes written down from conversations: decisions with their reasons, rules, requirements for planned work, and facts. It now holds {overview}.
+Memory holds records of earlier sessions: user prompts, assistant answers, tool calls and their results, errors, one episode summary per turn, compaction summaries, and notes written down from conversations: decisions with their reasons, rules, requirements for planned work, and facts. It now holds {overview}.
 Things the notes are about: {entities}
 Files the notes mention: {files}
 
 Write the searches that would find what earlier sessions said that bears on this request:
-- the facts it needs, and for a question about earlier work, the records that answer each part of it (one search per part);
+- the facts it needs, and for a question about earlier work or conversations, the records that answer each part of it (one search per part; for a question about how things changed or how many times something happened, search for every occurrence, not only the latest);
 - decisions, rules and requirements that constrain how to do it, including ones the request does not mention: think about what the task touches (the machines and environment it runs on, file formats, people and systems involved, conventions, limits, earlier failed attempts) and search for those too, in the words earlier sessions would have used.
 Several searches of the same type are fine. Types:
 - {"type": "text", "q": "<natural language>"}: keyword and semantic search together, over everything.
@@ -208,19 +208,19 @@ Any search may add "kinds": [...] (prompt, answer, tool_call, tool_result, error
 
 Output {"need_memory": true or false, "difficulty": "easy" or "hard", "queries": [1 to {max} searches]}. need_memory is false only when earlier sessions cannot matter (a greeting, thanks, "commit this"). difficulty is hard when the request needs several facts combined or reasoning across sessions."#;
 
-const RANK_SYSTEM: &str = "You judge which records from a software project's memory of earlier sessions bear on a developer's request. Output one JSON object and nothing else.";
+const RANK_SYSTEM: &str = "You judge which records from an assistant's memory of earlier sessions (usually work sessions in a software project) bear on a user's request. Output one JSON object and nothing else.";
 
 const RANK_PROMPT: &str = r#"<request>
 {request}
 </request>
 
-Records found in the project's memory of earlier sessions (id in brackets; a label in square brackets after a note says the code it describes changed since):
+Records found in the memory of earlier sessions (id in brackets; a label in square brackets after a note says the code it describes changed since):
 
 {cands}
 
-Pick the records a coding assistant working on this request should see: those that state facts, decisions, rules, requirements or earlier results it needs, including constraints that apply although the request does not mention them. Leave out records that are merely on the same topic. When two records disagree, the later one usually holds; pick it and say so. Order the picks by importance, at most {k}.
+Pick the records an assistant working on this request should see: those that state facts, decisions, rules, requirements or earlier results it needs, including constraints that apply although the request does not mention them. Leave out records that are merely on the same topic. When two records disagree, the later one usually holds; pick it and say so. Order the picks by importance, at most {k}.
 
-Output {"relevant": [{"id": "<id>", "why": "<under 20 words: what it tells the assistant>"}], "answer": "<for a question about earlier work, 1 to 3 sentences answering it from the picked records, citing ids; otherwise the one or two things the assistant must keep in mind; empty if nothing applies>", "confidence": "high" or "medium" or "low" or "none"}"#;
+Output {"relevant": [{"id": "<id>", "why": "<under 20 words: what it tells the assistant>"}], "answer": "<for a question about earlier work or conversations, 1 to 3 sentences answering it from the picked records, citing ids; otherwise the one or two things the assistant must keep in mind; empty if nothing applies>", "confidence": "high" or "medium" or "low" or "none"}"#;
 
 fn kinds_of(v: &Json) -> Vec<Kind> {
     v.get("kinds").and_then(|k| k.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().and_then(Kind::parse)).filter(|k| *k != Kind::Entity).collect()).unwrap_or_default()
@@ -263,7 +263,7 @@ fn safe_sql(s: &str) -> bool {
 }
 
 /// What memory holds, for the planner: size, time span, entity and file names.
-pub fn overview(store: &Store) -> (String, String, String) {
+pub fn overview(store: &Store, now: i64) -> (String, String, String) {
     let n = store.len();
     let sessions = store.query("SELECT session, COUNT(*) FROM memory WHERE kind != 'entity' GROUP BY session ORDER BY 2 DESC LIMIT 1000").map(|r| r.rows.len()).unwrap_or(0);
     let notes = store
@@ -273,7 +273,7 @@ pub fn overview(store: &Store) -> (String, String, String) {
     let span = |order: &str| store.query(&format!("SELECT ts FROM memory WHERE kind != 'entity' ORDER BY ts {order} LIMIT 1")).ok().and_then(|r| r.rows.first().and_then(|x| x[0].as_i64()));
     let mut ov = format!("{n} records from {sessions} session{} ({notes} written-down notes)", if sessions == 1 { "" } else { "s" });
     if let (Some(a), Some(b)) = (span("ASC"), span("DESC")) {
-        ov += &format!(", from {} to {}, now {}", recall::fmt_time(a), recall::fmt_time(b), recall::fmt_time(crate::now()));
+        ov += &format!(", from {} to {}, now {}", recall::fmt_time(a), recall::fmt_time(b), recall::fmt_time(now));
     }
     let names = store.query("SELECT id, text FROM memory WHERE kind = 'entity' ORDER BY seq DESC LIMIT 160").map(|r| r.rows).unwrap_or_default();
     let mut ents = Vec::new();
@@ -294,8 +294,8 @@ pub fn overview(store: &Store) -> (String, String, String) {
 }
 
 /// Asks the planner for searches.
-pub fn plan(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, recent: &[String]) -> Plan {
-    let (ov, ents, files) = overview(store);
+pub fn plan(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, recent: &[String], now: i64) -> Plan {
+    let (ov, ents, files) = overview(store, now);
     let recent = if recent.is_empty() {
         String::new()
     } else {
@@ -494,10 +494,10 @@ pub fn rank(cfg: &DeepConfig, cli: &DistillConfig, request: &str, cands: &[Cand]
 
 /// Plans, searches and ranks for one request. `recent` holds earlier
 /// requests of the session; `project` (for anchored notes) labels notes
-/// whose code changed.
-pub fn run(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, recent: &[String], filter: &Filter, project: Option<&Path>) -> DeepResult {
+/// whose code changed. `now` is the time of the request.
+pub fn run(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, recent: &[String], filter: &Filter, project: Option<&Path>, now: i64) -> DeepResult {
     let t0 = Instant::now();
-    let plan = plan(store, cfg, cli, request, recent);
+    let plan = plan(store, cfg, cli, request, recent, now);
     let mut out = DeepResult { plan, ..Default::default() };
     out.cost_usd = out.plan.cost_usd;
     if !out.plan.need {
@@ -514,7 +514,7 @@ pub fn run(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, 
         let mut ck = Checker::new(p);
         for c in &cands {
             if c.record.kind.is_knowledge() {
-                let l = ck.check_ctx(&c.record.ctx).label();
+                let l = ck.check_record(&c.record).label();
                 if !l.is_empty() {
                     labels.insert(c.record.id.clone(), l);
                 }
@@ -526,7 +526,7 @@ pub fn run(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, 
         out.ms = t0.elapsed().as_millis() as u64;
         return out;
     }
-    let (picks, answer, conf, model, cost, err) = rank(cfg, cli, request, &cands, &labels, out.plan.hard, crate::now());
+    let (picks, answer, conf, model, cost, err) = rank(cfg, cli, request, &cands, &labels, out.plan.hard, now);
     let by: HashMap<&str, &Record> = cands.iter().map(|c| (c.record.id.as_str(), &c.record)).collect();
     out.picks = picks.into_iter().filter_map(|(id, why)| by.get(id.as_str()).map(|r| ((*r).clone(), why))).collect();
     out.answer = answer;
@@ -555,7 +555,7 @@ pub fn format(res: &DeepResult, shown: &HashSet<String>, now: i64, project: Opti
     let terms: HashSet<String> = HashSet::new();
     for (r, why) in &new {
         let label = match (&mut ck, r.kind.is_knowledge()) {
-            (Some(c), true) => c.check_ctx(&r.ctx).label(),
+            (Some(c), true) => c.check_record(&r).label(),
             _ => String::new(),
         };
         s += &format!("\n{}", describe(r, &terms, now, &label, 700));
