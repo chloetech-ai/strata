@@ -1,0 +1,141 @@
+{
+ "questions": 100,
+ "binary": true,
+ "base": "engram_qe",
+ "configs": {
+  "engram_qe": {
+   "config": "engram_qe",
+   "score": 0.79,
+   "ci95": [
+    0.71,
+    0.87
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.56
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.9090909090909091
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.84
+    }
+   }
+  },
+  "engram_search": {
+   "config": "engram_search",
+   "score": 0.69,
+   "ci95": [
+    0.6,
+    0.78
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.4
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.64
+    }
+   },
+   "vs_base": {
+    "diff": -0.1,
+    "ci95": [
+     -0.18,
+     -0.02
+    ],
+    "p": 0.0308837890625,
+    "better": 4,
+    "worse": 14
+   }
+  },
+  "mem0": {
+   "config": "mem0",
+   "score": 0.79,
+   "ci95": [
+    0.71,
+    0.87
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.6
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.8
+    }
+   },
+   "vs_base": {
+    "diff": 0.0,
+    "ci95": [
+     -0.08,
+     0.08
+    ],
+    "p": 1.0,
+    "better": 9,
+    "worse": 9
+   }
+  }
+ }
+}

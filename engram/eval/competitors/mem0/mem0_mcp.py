@@ -58,11 +58,12 @@ class ClaudeCliLLM(LLMBase):
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", STATE), "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
         if os.environ.get("ANTHROPIC_BASE_URL"):
             env["ANTHROPIC_BASE_URL"] = os.environ["ANTHROPIC_BASE_URL"]
-        cmd = [CLAUDE, "-p", prompt, "--model", self.config.model or MODEL, "--tools", "", "--no-session-persistence",
+        # the prompt goes on stdin: one argument is capped at 128 KB, and a long message group exceeds it
+        cmd = [CLAUDE, "-p", "--model", self.config.model or MODEL, "--tools", "", "--no-session-persistence",
                "--output-format", "json", "--system-prompt", system or "You are a helpful assistant."]
         os.makedirs(STATE, exist_ok=True)
         t0 = time.time()
-        p = subprocess.run(cmd, cwd=STATE, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+        p = subprocess.run(cmd, cwd=STATE, env=env, input=prompt, capture_output=True, text=True, timeout=300)
         try:
             out = json.loads(p.stdout)
         except json.JSONDecodeError:

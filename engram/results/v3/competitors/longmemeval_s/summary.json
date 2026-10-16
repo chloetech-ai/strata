@@ -1,0 +1,118 @@
+{
+ "reader": "small",
+ "judge": "small",
+ "questions": 100,
+ "configs": {
+  "mem0": {
+   "n": 100,
+   "accuracy": 0.79,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.6
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.8
+    }
+   },
+   "context_chars": 4420.78,
+   "reader_tokens": 2156.18,
+   "cost_usd": 0.0889487
+  },
+  "engram_search": {
+   "n": 100,
+   "accuracy": 0.69,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.4
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.64
+    }
+   },
+   "context_chars": 3527.06,
+   "reader_tokens": 1790.42,
+   "cost_usd": 0.0834727
+  },
+  "engram_qe": {
+   "n": 100,
+   "accuracy": 0.79,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.56
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.9090909090909091
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.84
+    }
+   },
+   "context_chars": 4510.21,
+   "reader_tokens": 2143.46,
+   "cost_usd": 0.0950602
+  }
+ }
+}
