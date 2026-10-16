@@ -11,6 +11,9 @@ scripts read like Engram's contexts:
       --work /home/claude/bench/competitors/longmemeval_s --out results/v3/competitors/longmemeval_s/mem0.contexts.jsonl
   python3 scripts/competitor_contexts.py hindsight --url http://127.0.0.1:8888 --data beam_100k.jsonl ...
 
+Hindsight's servers: eval/competitors/hindsight/serve.sh load (fill the banks with
+--ingest-only), then migrate.py and serve.sh final (recall on port 8890).
+
 mem0: the open-source library with eval/competitors/mem0/mem0_mcp.py's model
 and embedder (Haiku through `claude -p`; all-MiniLM-L6-v2 as ONNX) and a local
 Qdrant per history. One add() per session (LongMemEval) or per BEAM message
