@@ -1,0 +1,331 @@
+{
+ "lane": "claude-mem",
+ "scenario": "stockroom",
+ "model": "haiku",
+ "meta": {
+  "lane": "claude-mem",
+  "def": {
+   "kind": "claude-mem",
+   "version": "13.39.0",
+   "mcp": [
+    "mcp__plugin_claude-mem_mcp-search"
+   ]
+  },
+  "env": {
+   "UV_CACHE_DIR": "/home/claude/bench/shared/uv-cache",
+   "UV_OFFLINE": "1"
+  },
+  "claude_mem": {
+   "version": "13.39.0",
+   "port": 24168,
+   "model": "haiku",
+   "plugin_dirs": [
+    "/home/claude/bench/work/stockroom/claude_mem/home/.claude/plugins/cache/thedotmack/claude-mem/13.39.0"
+   ],
+   "wrapper": "/home/claude/bench/work/stockroom/claude_mem/home/.claude-mem-bench/claude",
+   "real_claude": "/opt/claude-code/bin/claude",
+   "env": {
+    "UV_CACHE_DIR": "/home/claude/bench/shared/uv-cache",
+    "UV_OFFLINE": "1"
+   },
+   "observer_log": "/home/claude/bench/work/stockroom/claude_mem/home/.claude-mem-bench/observer-results.jsonl"
+  },
+  "claude_version": "2.1.300 (Claude Code)"
+ },
+ "sessions": [
+  "7671a33c-67ae-4d51-8d25-f22dd5d6f18c",
+  "3ff5402b-1c23-42fc-9f11-698eeddc9878",
+  "4888b34a-a18c-4069-822c-69fe49ab3e21"
+ ],
+ "session": "4888b34a-a18c-4069-822c-69fe49ab3e21",
+ "turns": [
+  {
+   "block": 1,
+   "session": "7671a33c-67ae-4d51-8d25-f22dd5d6f18c",
+   "prompt": "Hi! stockroom is the stock-keeping library we're building for Brandt & Sons, a hardware wholesaler with two shops. Could you run the tests first? I think the reorder check is broken.",
+   "result": "The reorder check was broken, and I've fixed it. The full suite now passes: 10 tests, 0 failures.\n\n**Test run:** Before the fix, 9 of 10 tests passed. `test_at_reorder_point` failed: BR-2 has exactly 10 on hand with a reorder point of 10, and `needs_reorder` didn't flag it. The cause was `<` in `src/stockroom/reorder.py`. The docstring and the test both say \"at or below\", so I changed it to `<=`.\n\n**Decision for you:** `reorder_point` defaults to 0, so an item with zero stock and no reorder point set is now flagged. Before, it wasn't. If you have discontinued or never-stocked SKUs at the default, they will start appearing in reorder lists. The fix is correct for items with a real reorder point, but you may want to filter those out or give them explicit reorder points.\n\n**Other notes:**\n- The repo has no test config, so I ran the suite with `PYTHONPATH=src python3 -m unittest discover -s tests`. If you use pytest or a CI config, let me know and I'll check against that.\n- The change is uncommitted; `git status` shows only `src/stockroom/reorder.py` modified. I didn't add a CHANGELOG entry under \"Unreleased\". Let me know if you want me to commit or add one.",
+   "cost_usd": 0.00473062,
+   "session_cost_usd": 0.00473062,
+   "steps": 6,
+   "error": false,
+   "wall_s": 54.1,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "7671a33c-67ae-4d51-8d25-f22dd5d6f18c",
+   "prompt": "Staff type SKUs every which way at the counter: 'br-1042', ' BR-1042', 'Br-1042 '. Please add a `normalize_sku` helper in items.py (trim, uppercase) and make every public Catalog and Inventory method that takes a SKU go through it. Tests too, please.",
+   "result": "SKU lookups now ignore case and surrounding whitespace everywhere a SKU goes in. All 16 tests pass, including the new ones.\n\n**What changed**\n- **`normalize_sku(sku)`** in `items.py` trims and uppercases.\n- **`Catalog`**: `add`, `get` and `in` all normalize. Duplicate detection also normalizes, so `'br-1042 '` is rejected when `BR-1042` already exists.\n- **`Inventory`**: `on_hand` and `movements_for` normalize their lookup. `receive` and `issue` store the canonical SKU, because the `Movement` dataclass normalizes its `sku` field.\n- **`Item`** normalizes its own `sku` in `__post_init__`, so the catalog never holds a non-canonical SKU.\n- **Tests** cover the normalizer, catalog lookup and duplicate detection across variants, and stock totals across variants.\n\n**Choices I made that you may want to change**\n- I normalized in the dataclasses' `__post_init__`, not only in the public methods. The side effect is that `Item` and `Movement` objects always hold canonical SKUs, and `load_movements` from CSV also gets normalized without any change to `storage.py`.\n- An empty or whitespace-only SKU normalizes to `\"\"` and is accepted. I didn't add validation because you didn't ask for it. Staff typing a blank would create a SKU named `\"\"`, so a check that rejects empty SKUs may be worth adding.\n- `reorder.py` still has the `<=` fix from before, and the working tree has five modified files. Nothing is committed. I haven't touched the CHANGELOG.",
+   "cost_usd": 0.006710540000000001,
+   "session_cost_usd": 0.01144116,
+   "steps": 10,
+   "error": false,
+   "wall_s": 61.7,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "7671a33c-67ae-4d51-8d25-f22dd5d6f18c",
+   "prompt": "Next, every movement needs a reason code. Brandt's bookkeeping uses exactly these five: RECEIPT, SALE, RETURN, DAMAGE, COUNT. Add a `reason` field to Movement, have receive() use RECEIPT and issue() use SALE, and reject any other code. And keep the code plain: their back-office PC is stuck on Python 3.8 because the scanner vendor's sync tool only runs there, so nothing that needs a newer Python.",
+   "result": "Every movement now carries one of the five reason codes, and `receive()` and `issue()` set `RECEIPT` and `SALE`. All 19 tests pass on Python 3.13.\n\n**What changed**\n- **`inventory.py`**: `REASONS` holds the five codes. `Movement` has a required `reason` field, placed after `date`. Any other value raises `ValueError`, and the match is exact, so `\"sale\"` and `\" SALE\"` are rejected.\n- **`storage.py`**: the CSV gets a `reason` column. Loading builds `Movement` with keyword arguments, so the new field's position doesn't matter there.\n- **Tests**: cover the two default codes, the rejection of bad codes, and that all five are accepted. The CSV round-trip checks the reason column.\n\n**Python 3.8**\n- I couldn't run the tests on 3.8 because this sandbox has no network and no 3.8 interpreter.\n- Instead, I parsed every source and test file with Python 3.8's grammar, and all of them pass. I also grepped for newer-only constructs (builtin generics like `list[str]`, `X | None`, `match`, `removeprefix`, walrus). None were found.\n- Only a real 3.8 run on the back-office PC will fully confirm this. It's worth running the tests there once.\n\n**Things you should decide**\n- **Old CSV logs will fail to load.** Files written before this change have no `reason` column, so `load_movements` raises `KeyError`. The 0.1.0 release already writes that log, so any existing file needs a one-time migration. Those old rows can't be labeled reliably from the data, so the choice is yours: label them `RECEIPT` or `SALE` based on quantity sign, or mark them as a separate code.\n- **RETURN, DAMAGE and COUNT can't be recorded yet.** The only public methods are `receive()` and `issue()`, which fix the codes. I didn't add a general method because you specified only those two. Tell me the signature you want, for example `record(sku, qty, reason, ...)`.\n- **`Movement` gained a required argument.** Any code outside this repo that builds `Movement` positionally will break. I don't know of any such code.\n\nNothing is",
+   "cost_usd": 0.00872014,
+   "session_cost_usd": 0.0201613,
+   "steps": 12,
+   "error": false,
+   "wall_s": 84.5,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "7671a33c-67ae-4d51-8d25-f22dd5d6f18c",
+   "prompt": "Two things for later, no code for either today. When we get to stock valuation, it has to be FIFO. Their auditor flagged the average-cost figures from the old spreadsheet last year and they had to restate the accounts. Second, please never make issue() refuse to take stock below zero. The old system did exactly that, and because the till only posts the sale after the customer has paid, the error just meant the sale silently vanished from the log. Negative stock is fine, they correct it at the next count.",
+   "result": "Noted both, with no code changes.\n\n1. **Stock valuation will use FIFO**, not average cost. The auditor flagged the average-cost figures and the accounts were restated. When we build valuation, each issue should consume the oldest receipts first, at their `unit_cost`.\n2. **`issue()` will never refuse a quantity that takes stock below zero.** The till posts a sale only after payment, so a refusal drops the sale from the log without anyone noticing. Negative stock is allowed and gets corrected at the next count.\n\nBoth are saved to the project's to-do list, so they'll show up at the start of the next session. Nothing is committed, and the working tree is as it was after the reason-code change.\n\nPoint 2 is a constraint on the code we already have. `issue()` currently doesn't check stock, so it already behaves this way. I'll keep it that way when I touch `issue()` later.",
+   "cost_usd": 0.0024394099999999995,
+   "session_cost_usd": 0.02260071,
+   "steps": 4,
+   "error": false,
+   "wall_s": 32.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "7671a33c-67ae-4d51-8d25-f22dd5d6f18c",
+   "prompt": "For the stock-take in December we'll need a printable count sheet. Brandt wants the lines in walking order, so sorted by bin location rather than by SKU, and it has to be a blind count: the sheet must not show what the system thinks is on hand, only an empty column where people write what they counted. The auditor insists on that so people actually count instead of copying the number. We'll build it in a later session.",
+   "result": "I've recorded the count sheet as a to-do for a later session, with no code written today.\n\nThe requirements, as saved:\n- **Walking order:** lines sorted by bin location, not SKU. `Catalog` currently iterates by SKU, so the sheet will need its own sort on `Item.location`.\n- **Blind count:** the sheet must never print the system's on-hand quantity. Each line gets only an empty column for the counted figure. The on-hand value shouldn't be in the output at all, not just hidden.\n\nBoth are in the project's to-do list, next to the FIFO and negative-stock items. Nothing is committed, and the working tree is unchanged from the reason-code change.",
+   "cost_usd": 0.0014494,
+   "session_cost_usd": 0.02405011,
+   "steps": 2,
+   "error": false,
+   "wall_s": 24.2,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "7671a33c-67ae-4d51-8d25-f22dd5d6f18c",
+   "prompt": "Great, please commit all of this with a sensible message.",
+   "result": "I committed everything as `3a703c4` on a new branch, `sku-normalization-reason-codes`. The working tree is clean, and all 19 tests pass.\n\nThe commit message is \"Normalize SKUs, add reason codes, fix reorder threshold\", and it covers the three changes:\n- SKUs are trimmed and uppercased everywhere they're accepted.\n- Movements carry one of the five reason codes, and the CSV log has a reason column.\n- The reorder check now flags items at their reorder point, not only below it.\n\nI put all three in one commit because you asked for one. If you'd rather review them separately, I can split them.\n\nI created a branch because `main` is the default branch, and I haven't pushed anything. Say the word if you want the branch pushed or a PR opened.",
+   "cost_usd": 0.0034272499999999997,
+   "session_cost_usd": 0.02747736,
+   "steps": 3,
+   "error": false,
+   "wall_s": 41.0,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "3ff5402b-1c23-42fc-9f11-698eeddc9878",
+   "prompt": "The CSV storage doesn't keep the new reason codes yet. Please add a reason column to save_movements/load_movements, and make old files without that column still load: a positive quantity was a RECEIPT, a negative one a SALE.",
+   "result": "Old CSV files without a `reason` column now load. Positive quantities come back as RECEIPT and negative ones as SALE. All 22 tests pass (19 existing plus 3 new).\n\nYour report said the CSV storage doesn't keep reason codes, but at HEAD `save_movements` already writes a `reason` column and `load_movements` reads it. The real gap was on load: an old file with no `reason` column raised `KeyError`. I didn't change the save side.\n\nChanges:\n\n- **`src/stockroom/storage.py`**: `load_movements` reads `reason` with `row.get`. If the column is missing or blank, it infers the reason from the sign of `qty`. Otherwise it keeps the stored value.\n- **`tests/test_storage.py`**: three tests.\n  - Round-trip of all reason codes (RECEIPT, SALE, RETURN, DAMAGE).\n  - A file with no reason column loads with the inferred codes and the right on-hand total.\n  - A file with a blank reason cell gets the same inference.\n\nChoices I made that you may want to change:\n\n- A blank `reason` cell in a file that does have the column is also inferred. Drop the `if not reason` branch if you want blanks to raise an error.\n- A zero quantity maps to SALE, since you only specified positive and negative. Zero shouldn't occur, because `receive` and `issue` reject it.\n\nI haven't committed. Run it with `PYTHONPATH=src python -m unittest discover -s tests`.",
+   "cost_usd": 0.0069632800000000005,
+   "session_cost_usd": 0.0069632800000000005,
+   "steps": 11,
+   "error": false,
+   "wall_s": 81.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "3ff5402b-1c23-42fc-9f11-698eeddc9878",
+   "prompt": "Also, Item should reject a case_size below 1 and a negative reorder_point. That matters soon: next sprint we'll turn needs_reorder into actual purchase suggestions. Brandt orders enough to get back up to three times the reorder point, rounded up to whole cases since the supplier only ships full cases. Don't build the suggestions yet, just the validation.",
+   "result": "`Item` now rejects a `case_size` below 1 and a negative `reorder_point`, with a `ValueError` naming the bad value. The full suite passes (27 tests, up from 22).\n\nThe check is in `Item.__post_init__` in `src/stockroom/items.py`, so it covers every construction path, including `Catalog`. I added tests in `tests/test_items.py` for zero and negative `case_size`, a negative `reorder_point`, and the boundary values that should still be allowed (`reorder_point=0`, `case_size=1`).\n\nI didn't build the Brandt suggestion logic, and I didn't change `reorder.py`. I haven't committed these changes either.",
+   "cost_usd": 0.002492619999999999,
+   "session_cost_usd": 0.0094559,
+   "steps": 5,
+   "error": false,
+   "wall_s": 43.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "3ff5402b-1c23-42fc-9f11-698eeddc9878",
+   "prompt": "One more for when we write the importer for the handheld scanners, after the count sheet: the scanners export a plain text file, semicolon-separated, no header line, columns bin;sku;qty. A SKU can be on several lines when some of it sits in an overflow bin, and then the quantities have to be added up.",
+   "result": "I've noted the scanner importer as a to-do in the stockroom-later list, to build after the December count sheet. I haven't written any importer code yet, since you said it's for later.\n\nWhat's recorded:\n- Plain text, semicolon-separated, no header line.\n- Columns are `bin;sku;qty`.\n- A SKU can appear on several lines (overflow bins), so quantities are summed per SKU.\n\nTwo things to settle when we build it:\n- **Bin codes.** The catalog uses bin codes like `B-12-3`, and the scanners write the bin in the first column. Should the importer check that each bin code is well formed, or accept whatever the scanner writes?\n- **SKUs not in the catalog.** Should the importer stop on an unknown SKU, or report it and carry on with the rest?",
+   "cost_usd": 0.0018243700000000005,
+   "session_cost_usd": 0.01128027,
+   "steps": 3,
+   "error": false,
+   "wall_s": 30.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "3ff5402b-1c23-42fc-9f11-698eeddc9878",
+   "prompt": "That's it for today, please commit.",
+   "result": "Committed as `a43133c` on `sku-normalization-reason-codes`. The working tree is clean.\n\nThe commit covers:\n- **CSV load:** old files without a `reason` column load, with RECEIPT for positive quantities and SALE otherwise.\n- **Item validation:** `case_size` below 1 and a negative `reorder_point` are rejected.\n- **Tests:** 27 unit tests pass.\n\nThe scanner importer is recorded in the stockroom-later list and not started. The two open questions are on the list too: bin-code validation, and what to do with SKUs not in the catalog.",
+   "cost_usd": 0.001661929999999999,
+   "session_cost_usd": 0.0129422,
+   "steps": 3,
+   "error": false,
+   "wall_s": 30.7,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "4888b34a-a18c-4069-822c-69fe49ab3e21",
+   "prompt": "Let's add a small command line. `python -m stockroom onhand SKU --log movements.csv` prints the quantity on hand, and `python -m stockroom receive SKU QTY UNIT_COST --log movements.csv` appends a receipt to the log, creating the file if it doesn't exist yet.",
+   "result": "The CLI is in place: `onhand` and `receive` both work with `--log`. The full suite passes: 37 tests, the 27 existing plus 10 new. I haven't committed anything.\n\n**Changes**\n- `src/stockroom/__main__.py` (new): the two subcommands, argument checks, and error reporting.\n- `src/stockroom/storage.py`: new `append_movement()`, which writes one row and creates the file with its header if needed. The row-building code is shared with `save_movements`.\n- `tests/test_cli.py` (new): covers create, append, SKU normalization, bad input, missing log, and old-format logs.\n- README and CHANGELOG: usage notes and an Unreleased entry.\n\n**Decisions I made that you may want to change**\n- **`UNIT_COST` is in dollars**, e.g. `12.50`, and is stored as cents, since `Inventory.receive` takes cents. Values with more than two decimal places are rejected. If you meant raw cents, that's a one-line change.\n- **`onhand` on a missing log is an error** (exit 1), not a `0`. This avoids hiding a mistyped filename. `receive` is the command that creates the log.\n- **`receive` prints nothing on success**, following the usual Unix convention.\n- **Old-format logs are migrated on first append.** A log written before reason codes has no `reason` column, so appending a new row would misalign it. In that case `receive` rewrites the file in the current layout, inferring the reason from the sign as `load_movements` already does. This changes the existing file's text, though not its meaning.\n\n**Running it:** there's no `pyproject.toml`, so `python -m stockroom` needs `src` on the path, e.g. `PYTHONPATH=src python -m stockroom onhand BR-1042 --log movements.csv`. Adding a package entry point would be a separate change.\n\nThe open items in your to-do list (FIFO valuation, `issue()` never refusing, the count sheet, the scanner importer) don't touch this work, so I left them alone.",
+   "cost_usd": 0.014149769999999999,
+   "session_cost_usd": 0.014149769999999999,
+   "steps": 11,
+   "error": false,
+   "wall_s": 113.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "4888b34a-a18c-4069-822c-69fe49ab3e21",
+   "prompt": "Also add `python -m stockroom moves SKU --log movements.csv`, printing one line per movement with date, reason and quantity.",
+   "result": "I added `python -m stockroom moves SKU --log movements.csv`. All 41 tests pass: the 37 from before plus 4 new ones for `moves`.\n\nEach movement prints as one line: date, reason and quantity, separated by tabs, in the order they appear in the log. For example:\n\n```\n2026-10-15\tRECEIPT\t100\n2026-10-16\tSALE\t-7\n```\n\nChoices I made:\n- **Tab-separated, not aligned columns**, so the output is easy to pipe into other tools. Say if you'd prefer aligned columns.\n- **An unknown SKU prints nothing and exits 0**, the same as an empty history. A missing log is an error, the same as `onhand`.\n- **SKUs match case- and whitespace-insensitively**, the same as the other commands.\n\nThe README and CHANGELOG are updated. Nothing is committed yet.",
+   "cost_usd": 0.004102020000000001,
+   "session_cost_usd": 0.01825179,
+   "steps": 5,
+   "error": false,
+   "wall_s": 41.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "4888b34a-a18c-4069-822c-69fe49ab3e21",
+   "prompt": "Thanks, please commit.",
+   "result": "Committed as `3aee68c` on `sku-normalization-reason-codes`, on top of `a43133c`. The working tree is clean.\n\nThe commit includes the `onhand`, `receive` and `moves` commands, the append helper in `storage.py`, the new tests, and the README and CHANGELOG updates. It carries the `Co-Authored-By: Claude Haiku 5.5` line. I did not push.",
+   "cost_usd": 0.0013853799999999986,
+   "session_cost_usd": 0.01963717,
+   "steps": 2,
+   "error": false,
+   "wall_s": 25.1,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  }
+ ],
+ "settles": [
+  {
+   "claude_mem_drain_s": 15.6,
+   "claude_mem_queue_left": 0
+  },
+  {
+   "claude_mem_drain_s": 14.0,
+   "claude_mem_queue_left": 0
+  },
+  {
+   "claude_mem_drain_s": 17.1,
+   "claude_mem_queue_left": 0
+  },
+  {
+   "claude_mem_drain_s": 10.7,
+   "claude_mem_queue_left": null
+  }
+ ],
+ "teammate_commits": [],
+ "cost_usd": 0.060056729999999996,
+ "final_session_cost_usd": 0.01963717,
+ "agent_wall_s": 663.9,
+ "wall_s": 886.9,
+ "errors": 0,
+ "memory": {
+  "cost_usd": 0.08871758000000005,
+  "claude_mem": {
+   "calls": 77,
+   "sessions": 3,
+   "cost_usd": 0.08871758000000005,
+   "models": {
+    "claude-haiku-5-5": 77
+   }
+  }
+ },
+ "memory_state": {
+  "auto_memory_files": {},
+  "claude_mem": {
+   "observations": 47,
+   "summaries": 3,
+   "prompts": 13,
+   "observation_titles": [
+    "Reorder check uses strict less-than, contradicting its documented at-or-below rule",
+    "Test suite run confirms reorder boundary failure: 9 of 10 tests pass",
+    "Reorder check now flags SKUs at their reorder point",
+    "Full unit test suite passes after reorder boundary fix",
+    "Reorder fix also flags zero-stock items that have the default reorder point of 0",
+    "SKUs normalized to trimmed uppercase in catalog items and lookups",
+    "Inventory movements and queries now normalize SKUs to canonical form",
+    "Tests added for SKU normalization in items and catalog",
+    "Inventory tests added for SKU variant handling and canonical movement storage",
+    "Full suite passes at 16 tests after SKU normalization and reorder fixes",
+    "Movement gains a required reason code validated against REASONS",
+    "Inventory receive and issue now pass reason codes into Movement",
+    "CSV movement log now stores and loads the reason code",
+    "CSV round-trip test now checks that reason codes survive save and load",
+    "New reason-code tests reference Movement without importing it",
+    "Movement import added to inventory tests, resolving the NameError risk",
+    "All 19 tests pass on Python 3.13, but Python 3.8 verification is blocked by offline uv",
+    "Static check finds no Python 3.9+ syntax or APIs in library and test sources",
+    "Public API can only record RECEIPT and SALE reason codes",
+    "Stock valuation must use FIFO rather than average cost",
+    "issue() must never refuse a quantity that drives stock negative",
+    "December stock-take will use a blind count sheet in bin-location order",
+    "Changes committed to sku-normalization-reason-codes branch",
+    "load_movements has no fallback for CSV files missing the reason column",
+    "unittest discover with -t . fails because tests/ is not an importable package",
+    "load_movements falls back to quantity sign when reason is missing or blank",
+    "Storage tests added for reason-code round-trip and legacy CSV loading",
+    "Movement import added to test_storage.py, resolving NameError in reason-code round-trip test",
+    "Full unit suite now passes 22 tests including legacy CSV and reason-code round-trip cases",
+    "Item.case_size is defined but not referenced anywhere outside items.py",
+    "Item validation rejects negative reorder_point and case_size below 1",
+    "Item validation tests added for negative reorder_point and non-positive case_size",
+    "Full unit suite passes at 27 tests after item validation additions",
+    "Handheld scanner importer planned to read semicolon-separated bin;sku;qty files and sum per SKU",
+    "Commit a43133c adds legacy reason inference and Item bounds validation",
+    "Stockroom package has no CLI entry point yet",
+    "CSV log loader fails on a missing file, and the saver rewrites the whole file",
+    "CSV storage gains append_movement for single-row receipts with file creation",
+    "Command line added: onhand and receive subcommands via python -m stockroom",
+    "CLI test suite added covering receive, onhand, unit-cost parsing, and legacy log append",
+    "CLI verified end to end: unit tests pass at 37 and receive/onhand work from a temp directory",
+    "README and CHANGELOG document the new onhand and receive command line",
+    "Log-existence check extracted into load_existing_log; new cmd_moves handler added",
+    "moves subcommand registered in the CLI parser",
+    "CLI tests added for the moves subcommand",
+    "Test suite at 41 passing; README and CHANGELOG now cover the moves subcommand",
+    "CLI work committed as 3aee68c on top of a43133c"
+   ],
+   "summary_learned": [
+    "`load_movements` raises on a missing file, and `save_movements` truncates and rewrites the full log, so receive needed a new single-row append path. Logs written before reason codes lack a `reason` column, so appending a current-layout row to them would misalign the file. The local interpreter is Python 3.13.16.",
+    "Movement listing reuses load_existing_log, so the missing-log error is shared with onhand. Inventory.movements_for applies the same SKU normalization as the other commands. Legacy-layout logs without a reason column still list correctly, with the reason inferred from the quantity sign.",
+    "The log can't be appended to with the existing save function, so a single-row append path was needed. Logs written before reason codes lack a reason column, so they must be migrated before the first append. Running the CLI requires PYTHONPATH=src because there is no pyproject.toml. csv.DictWriter writes CRLF line endings by default."
+   ],
+   "models": [
+    "claude-haiku-5-5"
+   ],
+   "chroma_dir_bytes": 2424996
+  }
+ },
+ "last_session_compactions": 0,
+ "last_session_context_tokens": 44644,
+ "git_log": "3aee68c Dana: Add command line: onhand, receive and moves subcommands\na43133c Dana: Infer reason for CSV rows without one, validate Item case_size and reorder_point\n3a703c4 Dana: Normalize SKUs, add reason codes, fix reorder threshold\na49e13d Dana: initial version\n",
+ "git_status": "",
+ "transcripts": null
+}

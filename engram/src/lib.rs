@@ -7,15 +7,19 @@
 //! and returns it as context the model sees. An MCP server ([`mcp`]) gives
 //! the model search, timeline and SQL tools over the same store.
 
+pub mod anchor;
 pub mod benchdata;
 pub mod capture;
+pub mod consolidate;
 pub mod daemon;
+pub mod deep;
 pub mod distill;
 pub mod doctor;
 pub mod embed;
 pub mod hook;
 pub mod inspect;
 pub mod install;
+pub mod llm;
 pub mod mcp;
 pub mod paths;
 pub mod recall;

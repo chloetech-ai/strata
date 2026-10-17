@@ -1,0 +1,3725 @@
+{
+ "scenario": "bakehouse",
+ "lanes": {
+  "none": {
+   "runs": 72,
+   "solved": 31,
+   "solved_rate": 0.4305555555555556,
+   "score": 0.5907407407407407,
+   "cost_usd": 0.004397955694444445,
+   "memory_cost_usd": 0.0,
+   "steps": 7.222222222222222,
+   "wall_s": 22.677777777777777,
+   "memory_tool_calls": 0.0,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.13163243,
+    "memory_cost_usd": 0.0,
+    "wall_s": 945.0,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 0,
+     "score": 0.29166666666666663
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 0,
+     "score": 0.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 3,
+     "score": 0.36666666666666664
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 0,
+     "score": 0.5
+    }
+   },
+   "vs": {
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       31,
+       63
+      ],
+      "fisher_solved_p": 2.5138767245083643e-08,
+      "score_diff": -0.345138888888889,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.4444444444444444,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       0,
+       8
+      ],
+      "fisher_solved_p": 0.0024471635150166877,
+      "score_diff": -0.43229166666666674,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.5,
+      "perm_solved_p": 0.00029997000299970003
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       0,
+       4
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": -1.0,
+      "perm_score_p": 0.029897010298970104,
+      "solved_diff": -1.0,
+      "perm_solved_p": 0.028597140285971403
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       3,
+       15
+      ],
+      "fisher_solved_p": 3.852063781352152e-05,
+      "score_diff": -0.6208333333333333,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.75,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       0,
+       8
+      ],
+      "fisher_solved_p": 0.00015540015540015518,
+      "score_diff": -0.5,
+      "perm_score_p": 0.0004999500049995,
+      "solved_diff": -1.0,
+      "perm_solved_p": 0.00019998000199980003
+     }
+    }
+   }
+  },
+  "ccmem": {
+   "runs": 72,
+   "solved": 52,
+   "solved_rate": 0.7222222222222222,
+   "score": 0.8356481481481481,
+   "cost_usd": 0.005180021111111111,
+   "memory_cost_usd": 0.0,
+   "steps": 7.958333333333333,
+   "wall_s": 25.130555555555556,
+   "memory_tool_calls": 0.0,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.14086403,
+    "memory_cost_usd": 0.0,
+    "wall_s": 983.5,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 8,
+     "score": 0.6770833333333334
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 8,
+     "score": 0.7083333333333334
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 4,
+     "score": 0.75
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       52,
+       31
+      ],
+      "fisher_solved_p": 0.0006842476655283064,
+      "score_diff": 0.24490740740740746,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.29166666666666663,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       8,
+       0
+      ],
+      "fisher_solved_p": 0.0024471635150166877,
+      "score_diff": 0.38541666666666674,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5,
+      "perm_solved_p": 0.00039996000399960006
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       0
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": 1.0,
+      "perm_score_p": 0.028397160283971604,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0282971702829717
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       8,
+       3
+      ],
+      "fisher_solved_p": 0.13505182892424905,
+      "score_diff": 0.34166666666666673,
+      "perm_score_p": 0.0004999500049995,
+      "solved_diff": 0.3125,
+      "perm_solved_p": 0.012898710128987101
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       4,
+       0
+      ],
+      "fisher_solved_p": 0.07692307692307682,
+      "score_diff": 0.25,
+      "perm_score_p": 0.030796920307969204,
+      "solved_diff": 0.5,
+      "perm_solved_p": 0.027297270272972702
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       52,
+       63
+      ],
+      "fisher_solved_p": 0.03651716672570659,
+      "score_diff": -0.10023148148148153,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.1527777777777778,
+      "perm_solved_p": 0.00029997000299970003
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": -0.046875,
+      "perm_score_p": 0.5642435756424358,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       8,
+       15
+      ],
+      "fisher_solved_p": 0.015498702261772515,
+      "score_diff": -0.2791666666666667,
+      "perm_score_p": 0.0017998200179982,
+      "solved_diff": -0.4375,
+      "perm_solved_p": 0.0016998300169983002
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       4,
+       8
+      ],
+      "fisher_solved_p": 0.07692307692307682,
+      "score_diff": -0.25,
+      "perm_score_p": 0.027097290270972903,
+      "solved_diff": -0.5,
+      "perm_solved_p": 0.025897410258974102
+     }
+    }
+   }
+  },
+  "transcripts": {
+   "runs": 72,
+   "solved": 48,
+   "solved_rate": 0.6666666666666666,
+   "score": 0.7722222222222223,
+   "cost_usd": 0.005217072916666667,
+   "memory_cost_usd": 0.0,
+   "steps": 7.819444444444445,
+   "wall_s": 24.416666666666668,
+   "memory_tool_calls": 0.0,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.12410506,
+    "memory_cost_usd": 0.0,
+    "wall_s": 857.8,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 1,
+     "score": 0.34375
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 1,
+     "score": 0.25
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 13,
+     "score": 0.9125
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 5,
+     "score": 0.8125
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       48,
+       31
+      ],
+      "fisher_solved_p": 0.0071574766474176085,
+      "score_diff": 0.18148148148148158,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.23611111111111105,
+      "perm_solved_p": 0.00019998000199980003
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       1,
+       0
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.05208333333333337,
+      "perm_score_p": 0.5154484551544846,
+      "solved_diff": 0.0625,
+      "perm_solved_p": 1.0
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       1,
+       0
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.25,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.25,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       13,
+       3
+      ],
+      "fisher_solved_p": 0.0010922232881362278,
+      "score_diff": 0.5458333333333334,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.625,
+      "perm_solved_p": 0.0012998700129987
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       5,
+       0
+      ],
+      "fisher_solved_p": 0.025641025641025595,
+      "score_diff": 0.3125,
+      "perm_score_p": 0.0327967203279672,
+      "solved_diff": 0.625,
+      "perm_solved_p": 0.0316968303169683
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       48,
+       63
+      ],
+      "fisher_solved_p": 0.00501174970967958,
+      "score_diff": -0.16365740740740742,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.20833333333333337,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       1,
+       8
+      ],
+      "fisher_solved_p": 0.015498702261772569,
+      "score_diff": -0.38020833333333337,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.4375,
+      "perm_solved_p": 0.0025997400259974
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       1,
+       4
+      ],
+      "fisher_solved_p": 0.14285714285714302,
+      "score_diff": -0.75,
+      "perm_score_p": 0.14528547145285473,
+      "solved_diff": -0.75,
+      "perm_solved_p": 0.14508549145085492
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       13,
+       15
+      ],
+      "fisher_solved_p": 0.5995550611790883,
+      "score_diff": -0.07500000000000007,
+      "perm_score_p": 0.24727527247275272,
+      "solved_diff": -0.125,
+      "perm_solved_p": 0.6071392860713929
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       5,
+       8
+      ],
+      "fisher_solved_p": 0.19999999999999943,
+      "score_diff": -0.1875,
+      "perm_score_p": 0.21997800219978003,
+      "solved_diff": -0.375,
+      "perm_solved_p": 0.2161783821617838
+     }
+    }
+   }
+  },
+  "claude-mem": {
+   "runs": 72,
+   "solved": 31,
+   "solved_rate": 0.4305555555555556,
+   "score": 0.6203703703703703,
+   "cost_usd": 0.005816806527777778,
+   "memory_cost_usd": 0.008314873611111112,
+   "steps": 7.222222222222222,
+   "wall_s": 36.75694444444444,
+   "memory_tool_calls": 0.09722222222222222,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.14329082,
+    "memory_cost_usd": 0.2636787500000003,
+    "wall_s": 1767.7,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 0,
+     "score": 0.3125
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 0,
+     "score": 0.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 3,
+     "score": 0.47916666666666663
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 0,
+     "score": 0.5
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       31,
+       31
+      ],
+      "fisher_solved_p": 0.9999999999999349,
+      "score_diff": 0.029629629629629672,
+      "perm_score_p": 0.2653734626537346,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       0,
+       0
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.02083333333333337,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       0,
+       0
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       3,
+       3
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.11249999999999999,
+      "perm_score_p": 0.2876712328767123,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       0,
+       0
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       31,
+       63
+      ],
+      "fisher_solved_p": 2.5138767245083643e-08,
+      "score_diff": -0.3155092592592593,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.4444444444444444,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       0,
+       8
+      ],
+      "fisher_solved_p": 0.0024471635150166877,
+      "score_diff": -0.41145833333333337,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.5,
+      "perm_solved_p": 0.00039996000399960006
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       0,
+       4
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": -1.0,
+      "perm_score_p": 0.026997300269973004,
+      "solved_diff": -1.0,
+      "perm_solved_p": 0.0313968603139686
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       3,
+       15
+      ],
+      "fisher_solved_p": 3.852063781352152e-05,
+      "score_diff": -0.5083333333333334,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.75,
+      "perm_solved_p": 0.00019998000199980003
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       0,
+       8
+      ],
+      "fisher_solved_p": 0.00015540015540015518,
+      "score_diff": -0.5,
+      "perm_score_p": 0.0005999400059994001,
+      "solved_diff": -1.0,
+      "perm_solved_p": 0.0005999400059994001
+     }
+    }
+   }
+  },
+  "mem0": {
+   "runs": 72,
+   "solved": 52,
+   "solved_rate": 0.7222222222222222,
+   "score": 0.8226851851851852,
+   "cost_usd": 0.0055065566666666664,
+   "memory_cost_usd": 0.00034456111111111115,
+   "steps": 9.527777777777779,
+   "wall_s": 32.54027777777778,
+   "memory_tool_calls": 1.6666666666666667,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.14303380000000002,
+    "memory_cost_usd": 0.027289299999999996,
+    "wall_s": 1604.2,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 1,
+     "score": 0.32291666666666663
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 11,
+     "score": 0.8791666666666667
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       52,
+       31
+      ],
+      "fisher_solved_p": 0.0006842476655283064,
+      "score_diff": 0.2319444444444445,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.29166666666666663,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       1,
+       0
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.03125,
+      "perm_score_p": 0.7117288271172882,
+      "solved_diff": 0.0625,
+      "perm_solved_p": 1.0
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       0
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": 1.0,
+      "perm_score_p": 0.027897210278972105,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.030596940305969402
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       11,
+       3
+      ],
+      "fisher_solved_p": 0.011342206655585758,
+      "score_diff": 0.5125,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5,
+      "perm_solved_p": 0.0017998200179982
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       0
+      ],
+      "fisher_solved_p": 0.00015540015540015518,
+      "score_diff": 0.5,
+      "perm_score_p": 0.0006999300069993001,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.00039996000399960006
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       52,
+       63
+      ],
+      "fisher_solved_p": 0.03651716672570659,
+      "score_diff": -0.11319444444444449,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": -0.1527777777777778,
+      "perm_solved_p": 0.0004999500049995
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       1,
+       8
+      ],
+      "fisher_solved_p": 0.015498702261772569,
+      "score_diff": -0.40104166666666674,
+      "perm_score_p": 0.00019998000199980003,
+      "solved_diff": -0.4375,
+      "perm_solved_p": 0.0018998100189981002
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       11,
+       15
+      ],
+      "fisher_solved_p": 0.17191941663577073,
+      "score_diff": -0.10833333333333339,
+      "perm_score_p": 0.10428957104289571,
+      "solved_diff": -0.25,
+      "perm_solved_p": 0.12378762123787622
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  },
+  "engram@main": {
+   "runs": 72,
+   "solved": 63,
+   "solved_rate": 0.875,
+   "score": 0.9358796296296297,
+   "cost_usd": 0.00536066,
+   "memory_cost_usd": 0.0,
+   "steps": 6.444444444444445,
+   "wall_s": 22.827777777777776,
+   "memory_tool_calls": 0.19444444444444445,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.14896589000000002,
+    "memory_cost_usd": 0.059161500000000006,
+    "wall_s": 1022.4,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 8,
+     "score": 0.7239583333333334
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 15,
+     "score": 0.9875
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       63,
+       31
+      ],
+      "fisher_solved_p": 2.5138767245083643e-08,
+      "score_diff": 0.345138888888889,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.4444444444444444,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       8,
+       0
+      ],
+      "fisher_solved_p": 0.0024471635150166877,
+      "score_diff": 0.43229166666666674,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5,
+      "perm_solved_p": 0.0007999200079992001
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       0
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": 1.0,
+      "perm_score_p": 0.029897010298970104,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.029897010298970104
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       15,
+       3
+      ],
+      "fisher_solved_p": 3.852063781352152e-05,
+      "score_diff": 0.6208333333333333,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.75,
+      "perm_solved_p": 0.00019998000199980003
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       0
+      ],
+      "fisher_solved_p": 0.00015540015540015518,
+      "score_diff": 0.5,
+      "perm_score_p": 0.00029997000299970003,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0006999300069993001
+     }
+    }
+   }
+  },
+  "engram": {
+   "runs": 48,
+   "solved": 45,
+   "solved_rate": 0.9375,
+   "score": 0.9479166666666666,
+   "cost_usd": 0.0070725379166666665,
+   "memory_cost_usd": 0.0028364716666666664,
+   "steps": 8.375,
+   "wall_s": 29.98125,
+   "memory_tool_calls": 0.10416666666666667,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.21700483,
+    "memory_cost_usd": 0.16084209999999996,
+    "wall_s": 1391.4,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 6,
+     "solved": 6,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 12,
+     "solved": 9,
+     "score": 0.7916666666666666
+    },
+    "recall": {
+     "runs": 3,
+     "solved": 3,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 12,
+     "solved": 12,
+     "score": 1.0
+    },
+    "stale": {
+     "runs": 9,
+     "solved": 9,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 6,
+     "solved": 6,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 16,
+      "runs": [
+       48,
+       64
+      ],
+      "solved": [
+       45,
+       23
+      ],
+      "fisher_solved_p": 9.860406858006146e-11,
+      "score_diff": 0.4083333333333333,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.578125,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       9,
+       0
+      ],
+      "fisher_solved_p": 3.185220576524963e-05,
+      "score_diff": 0.5,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.75,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       3,
+       4
+      ],
+      "solved": [
+       3,
+       0
+      ],
+      "fisher_solved_p": 0.02857142857142855,
+      "score_diff": 1.0,
+      "perm_score_p": 0.026497350264973504,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.025197480251974803
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       12,
+       3
+      ],
+      "fisher_solved_p": 1.538372786185424e-05,
+      "score_diff": 0.6333333333333333,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.8125,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "stale": {
+      "tasks": 3,
+      "runs": [
+       9,
+       12
+      ],
+      "solved": [
+       9,
+       12
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       0
+      ],
+      "fisher_solved_p": 0.0003330003330003327,
+      "score_diff": 0.5,
+      "perm_score_p": 0.0008999100089991,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0011998800119988001
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 16,
+      "runs": [
+       48,
+       64
+      ],
+      "solved": [
+       45,
+       55
+      ],
+      "fisher_solved_p": 0.22878371398969843,
+      "score_diff": 0.020052083333333304,
+      "perm_score_p": 0.3240675932406759,
+      "solved_diff": 0.078125,
+      "perm_solved_p": 0.015498450154984501
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       9,
+       8
+      ],
+      "fisher_solved_p": 0.25300207039337796,
+      "score_diff": 0.06770833333333326,
+      "perm_score_p": 0.37136286371362864,
+      "solved_diff": 0.25,
+      "perm_solved_p": 0.030796920307969204
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       3,
+       4
+      ],
+      "solved": [
+       3,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       12,
+       15
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.012499999999999956,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0625,
+      "perm_solved_p": 1.0
+     },
+     "stale": {
+      "tasks": 3,
+      "runs": [
+       9,
+       12
+      ],
+      "solved": [
+       9,
+       12
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  },
+  "engram+deep": {
+   "runs": 48,
+   "solved": 43,
+   "solved_rate": 0.8958333333333334,
+   "score": 0.9604166666666667,
+   "cost_usd": 0.006447363958333334,
+   "memory_cost_usd": 0.002608225625,
+   "steps": 7.25,
+   "wall_s": 41.739583333333336,
+   "memory_tool_calls": 0.020833333333333332,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.1733364,
+    "memory_cost_usd": 0.1565107,
+    "wall_s": 1681.0,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 6,
+     "solved": 6,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 12,
+     "solved": 9,
+     "score": 0.875
+    },
+    "recall": {
+     "runs": 3,
+     "solved": 3,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 12,
+     "solved": 10,
+     "score": 0.9666666666666667
+    },
+    "stale": {
+     "runs": 9,
+     "solved": 9,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 6,
+     "solved": 6,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 16,
+      "runs": [
+       48,
+       64
+      ],
+      "solved": [
+       43,
+       23
+      ],
+      "fisher_solved_p": 6.405756576453135e-09,
+      "score_diff": 0.4208333333333334,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5364583333333334,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       9,
+       0
+      ],
+      "fisher_solved_p": 3.185220576524963e-05,
+      "score_diff": 0.5833333333333334,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.75,
+      "perm_solved_p": 0.00029997000299970003
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       3,
+       4
+      ],
+      "solved": [
+       3,
+       0
+      ],
+      "fisher_solved_p": 0.02857142857142855,
+      "score_diff": 1.0,
+      "perm_score_p": 0.027697230276972302,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.027197280271972803
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       10,
+       3
+      ],
+      "fisher_solved_p": 0.0016242652667474355,
+      "score_diff": 0.6000000000000001,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.6458333333333334,
+      "perm_solved_p": 0.0005999400059994001
+     },
+     "stale": {
+      "tasks": 3,
+      "runs": [
+       9,
+       12
+      ],
+      "solved": [
+       9,
+       12
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       0
+      ],
+      "fisher_solved_p": 0.0003330003330003327,
+      "score_diff": 0.5,
+      "perm_score_p": 0.0007999200079992001,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0005999400059994001
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 16,
+      "runs": [
+       48,
+       64
+      ],
+      "solved": [
+       43,
+       55
+      ],
+      "fisher_solved_p": 0.7739295087490627,
+      "score_diff": 0.03255208333333337,
+      "perm_score_p": 0.10278972102789721,
+      "solved_diff": 0.03645833333333337,
+      "perm_solved_p": 0.6074392560743925
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       9,
+       8
+      ],
+      "fisher_solved_p": 0.25300207039337796,
+      "score_diff": 0.15104166666666663,
+      "perm_score_p": 0.0425957404259574,
+      "solved_diff": 0.25,
+      "perm_solved_p": 0.029497050294970503
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       3,
+       4
+      ],
+      "solved": [
+       3,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       10,
+       15
+      ],
+      "fisher_solved_p": 0.5604395604395642,
+      "score_diff": -0.02083333333333337,
+      "perm_score_p": 0.4894510548945106,
+      "solved_diff": -0.10416666666666663,
+      "perm_solved_p": 0.47925207479252074
+     },
+     "stale": {
+      "tasks": 3,
+      "runs": [
+       9,
+       12
+      ],
+      "solved": [
+       9,
+       12
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  },
+  "engram+nodeep": {
+   "runs": 48,
+   "solved": 40,
+   "solved_rate": 0.8333333333333334,
+   "score": 0.9097222222222222,
+   "cost_usd": 0.005783946875,
+   "memory_cost_usd": 0.0003031854166666667,
+   "steps": 6.75,
+   "wall_s": 25.889583333333334,
+   "memory_tool_calls": 0.1875,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.16867748,
+    "memory_cost_usd": 0.0700432,
+    "wall_s": 1075.4,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 6,
+     "solved": 6,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 12,
+     "solved": 6,
+     "score": 0.75
+    },
+    "recall": {
+     "runs": 3,
+     "solved": 3,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 12,
+     "solved": 10,
+     "score": 0.8888888888888888
+    },
+    "stale": {
+     "runs": 9,
+     "solved": 9,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 6,
+     "solved": 6,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 16,
+      "runs": [
+       48,
+       64
+      ],
+      "solved": [
+       40,
+       23
+      ],
+      "fisher_solved_p": 4.4005420137202954e-07,
+      "score_diff": 0.3701388888888889,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.47395833333333337,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       6,
+       0
+      ],
+      "fisher_solved_p": 0.0024526198439241897,
+      "score_diff": 0.45833333333333337,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5,
+      "perm_solved_p": 0.0008999100089991
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       3,
+       4
+      ],
+      "solved": [
+       3,
+       0
+      ],
+      "fisher_solved_p": 0.02857142857142855,
+      "score_diff": 1.0,
+      "perm_score_p": 0.028997100289971003,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.029597040295970403
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       10,
+       3
+      ],
+      "fisher_solved_p": 0.0016242652667474355,
+      "score_diff": 0.5222222222222221,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.6458333333333334,
+      "perm_solved_p": 0.0004999500049995
+     },
+     "stale": {
+      "tasks": 3,
+      "runs": [
+       9,
+       12
+      ],
+      "solved": [
+       9,
+       12
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       0
+      ],
+      "fisher_solved_p": 0.0003330003330003327,
+      "score_diff": 0.5,
+      "perm_score_p": 0.000999900009999,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0010998900109989002
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 16,
+      "runs": [
+       48,
+       64
+      ],
+      "solved": [
+       40,
+       55
+      ],
+      "fisher_solved_p": 0.792463515640938,
+      "score_diff": -0.018142361111111116,
+      "perm_score_p": 0.36206379362063795,
+      "solved_diff": -0.02604166666666663,
+      "perm_solved_p": 0.557044295570443
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.02604166666666663,
+      "perm_score_p": 0.48285171482851713,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       3,
+       4
+      ],
+      "solved": [
+       3,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       12,
+       16
+      ],
+      "solved": [
+       10,
+       15
+      ],
+      "fisher_solved_p": 0.5604395604395642,
+      "score_diff": -0.0986111111111112,
+      "perm_score_p": 0.13708629137086292,
+      "solved_diff": -0.10416666666666663,
+      "perm_solved_p": 0.5528447155284472
+     },
+     "stale": {
+      "tasks": 3,
+      "runs": [
+       9,
+       12
+      ],
+      "solved": [
+       9,
+       12
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       6,
+       8
+      ],
+      "solved": [
+       6,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  },
+  "full": {
+   "runs": 72,
+   "solved": 62,
+   "solved_rate": 0.8611111111111112,
+   "score": 0.9467592592592593,
+   "cost_usd": 0.04244633125,
+   "memory_cost_usd": 0.0,
+   "steps": 3.875,
+   "wall_s": 17.813888888888886,
+   "memory_tool_calls": 0.0,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.18511169000000005,
+    "memory_cost_usd": 0.0,
+    "wall_s": 761.7,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 10,
+     "score": 0.8958333333333334
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 15,
+     "score": 0.9583333333333334
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 17,
+     "score": 0.925
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       62,
+       31
+      ],
+      "fisher_solved_p": 8.718313581021843e-08,
+      "score_diff": 0.3560185185185186,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.4305555555555556,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       10,
+       0
+      ],
+      "fisher_solved_p": 0.00024826296529155,
+      "score_diff": 0.6041666666666667,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.625,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       0
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": 1.0,
+      "perm_score_p": 0.028097190280971903,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.027297270272972702
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       15,
+       3
+      ],
+      "fisher_solved_p": 3.852063781352152e-05,
+      "score_diff": 0.5916666666666668,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.75,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       17,
+       20
+      ],
+      "fisher_solved_p": 0.2307692307692346,
+      "score_diff": -0.07499999999999996,
+      "perm_score_p": 0.14288571142885712,
+      "solved_diff": -0.15000000000000002,
+      "perm_solved_p": 0.1466853314668533
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       0
+      ],
+      "fisher_solved_p": 0.00015540015540015518,
+      "score_diff": 0.5,
+      "perm_score_p": 0.00029997000299970003,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.00039996000399960006
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       62,
+       63
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.010879629629629628,
+      "perm_score_p": 0.5781421857814218,
+      "solved_diff": -0.01388888888888884,
+      "perm_solved_p": 1.0
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       10,
+       8
+      ],
+      "fisher_solved_p": 0.7223934721942993,
+      "score_diff": 0.171875,
+      "perm_score_p": 0.0018998100189981002,
+      "solved_diff": 0.125,
+      "perm_solved_p": 0.4216578342165783
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       15,
+       15
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": -0.029166666666666674,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       17,
+       20
+      ],
+      "fisher_solved_p": 0.2307692307692346,
+      "score_diff": -0.07499999999999996,
+      "perm_score_p": 0.1416858314168583,
+      "solved_diff": -0.15000000000000002,
+      "perm_solved_p": 0.14488551144885511
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  },
+  "engram+rank": {
+   "runs": 72,
+   "solved": 70,
+   "solved_rate": 0.9722222222222222,
+   "score": 0.9791666666666666,
+   "cost_usd": 0.006237600833333333,
+   "memory_cost_usd": 0.0012815916666666666,
+   "steps": 7.0,
+   "wall_s": 24.141666666666666,
+   "memory_tool_calls": 0.125,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.19045122,
+    "memory_cost_usd": 0.08779899999999997,
+    "wall_s": 893.3,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 14,
+     "score": 0.90625
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 16,
+     "score": 1.0
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       70,
+       31
+      ],
+      "fisher_solved_p": 1.1921048939880042e-13,
+      "score_diff": 0.38842592592592595,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5416666666666666,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       14,
+       0
+      ],
+      "fisher_solved_p": 5.090833191214291e-07,
+      "score_diff": 0.6145833333333334,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.875,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       0
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": 1.0,
+      "perm_score_p": 0.030496950304969503,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0292970702929707
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       16,
+       3
+      ],
+      "fisher_solved_p": 3.2241943544357134e-06,
+      "score_diff": 0.6333333333333333,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.8125,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       0
+      ],
+      "fisher_solved_p": 0.00015540015540015518,
+      "score_diff": 0.5,
+      "perm_score_p": 0.0006999300069993001,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0005999400059994001
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       70,
+       63
+      ],
+      "fisher_solved_p": 0.05544450912325662,
+      "score_diff": 0.04328703703703696,
+      "perm_score_p": 0.021097890210978902,
+      "solved_diff": 0.09722222222222221,
+      "perm_solved_p": 0.0026997300269973002
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       14,
+       8
+      ],
+      "fisher_solved_p": 0.053802131192468405,
+      "score_diff": 0.18229166666666663,
+      "perm_score_p": 0.034096590340965904,
+      "solved_diff": 0.375,
+      "perm_solved_p": 0.0051994800519948
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       16,
+       15
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.012499999999999956,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0625,
+      "perm_solved_p": 1.0
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  },
+  "engram+v5": {
+   "runs": 72,
+   "solved": 69,
+   "solved_rate": 0.9583333333333334,
+   "score": 0.9837962962962963,
+   "cost_usd": 0.006720893472222222,
+   "memory_cost_usd": 0.0018577347222222223,
+   "steps": 7.916666666666667,
+   "wall_s": 27.23611111111111,
+   "memory_tool_calls": 0.18055555555555555,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.19450306,
+    "memory_cost_usd": 0.11024350000000002,
+    "wall_s": 984.9,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 13,
+     "score": 0.9270833333333334
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 16,
+     "score": 1.0
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       69,
+       31
+      ],
+      "fisher_solved_p": 1.2251491106685367e-12,
+      "score_diff": 0.3930555555555556,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5277777777777778,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       13,
+       0
+      ],
+      "fisher_solved_p": 3.224194354435702e-06,
+      "score_diff": 0.6354166666666667,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.8125,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       0
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": 1.0,
+      "perm_score_p": 0.028397160283971604,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0301969803019698
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       16,
+       3
+      ],
+      "fisher_solved_p": 3.2241943544357134e-06,
+      "score_diff": 0.6333333333333333,
+      "perm_score_p": 0.00019998000199980003,
+      "solved_diff": 0.8125,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       0
+      ],
+      "fisher_solved_p": 0.00015540015540015518,
+      "score_diff": 0.5,
+      "perm_score_p": 0.0005999400059994001,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0004999500049995
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       69,
+       63
+      ],
+      "fisher_solved_p": 0.12892705428436663,
+      "score_diff": 0.04791666666666661,
+      "perm_score_p": 0.0036996300369963003,
+      "solved_diff": 0.08333333333333337,
+      "perm_solved_p": 0.016698330166983303
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       13,
+       8
+      ],
+      "fisher_solved_p": 0.13505182892424902,
+      "score_diff": 0.203125,
+      "perm_score_p": 0.0053994600539946005,
+      "solved_diff": 0.3125,
+      "perm_solved_p": 0.027797220277972202
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       16,
+       15
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.012499999999999956,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0625,
+      "perm_solved_p": 1.0
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  },
+  "engram+v7": {
+   "runs": 72,
+   "solved": 67,
+   "solved_rate": 0.9305555555555556,
+   "score": 0.9486111111111111,
+   "cost_usd": 0.006697036805555555,
+   "memory_cost_usd": 0.0020549333333333333,
+   "steps": 7.694444444444445,
+   "wall_s": 27.331944444444446,
+   "memory_tool_calls": 0.18055555555555555,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.21201467000000002,
+    "memory_cost_usd": 0.11208750000000002,
+    "wall_s": 887.9,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 12,
+     "score": 0.78125
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 15,
+     "score": 0.9875
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "none": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       67,
+       31
+      ],
+      "fisher_solved_p": 6.150986335608827e-11,
+      "score_diff": 0.3578703703703704,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.5,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       12,
+       0
+      ],
+      "fisher_solved_p": 1.612097177217861e-05,
+      "score_diff": 0.48958333333333337,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.75,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       0
+      ],
+      "fisher_solved_p": 0.028571428571428588,
+      "score_diff": 1.0,
+      "perm_score_p": 0.027897210278972105,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.026797320267973202
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       15,
+       3
+      ],
+      "fisher_solved_p": 3.852063781352152e-05,
+      "score_diff": 0.6208333333333333,
+      "perm_score_p": 9.999000099990002e-05,
+      "solved_diff": 0.75,
+      "perm_solved_p": 9.999000099990002e-05
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       0
+      ],
+      "fisher_solved_p": 0.00015540015540015518,
+      "score_diff": 0.5,
+      "perm_score_p": 0.0004999500049995,
+      "solved_diff": 1.0,
+      "perm_solved_p": 0.0007999200079992001
+     }
+    },
+    "engram@main": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       67,
+       63
+      ],
+      "fisher_solved_p": 0.39968295134206905,
+      "score_diff": 0.0127314814814814,
+      "perm_score_p": 0.4657534246575342,
+      "solved_diff": 0.05555555555555558,
+      "perm_solved_p": 0.1212878712128787
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       12,
+       8
+      ],
+      "fisher_solved_p": 0.27336976672954094,
+      "score_diff": 0.05729166666666663,
+      "perm_score_p": 0.41005899410058994,
+      "solved_diff": 0.25,
+      "perm_solved_p": 0.029797020297970205
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       15,
+       15
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  }
+ },
+ "tasks": {
+  "delivery_charge": {
+   "kind": "revised",
+   "needs": "the delivery charge as revised in block 6 (4.50 under 40.00, St Aidan's exempt), not block 2's 3.00 under 25.00",
+   "none": 0.0,
+   "ccmem": 1.0,
+   "transcripts": 0.8333333333333334,
+   "claude-mem": 0.25,
+   "mem0": 0.6666666666666666,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 0.5555555555555555,
+   "full": 0.8333333333333334,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "price_rise": {
+   "kind": "revised",
+   "needs": "the January price rise as revised in block 7 (5%, rounded up to the next 5p), not block 4's 4% to the nearest penny",
+   "none": 0.0,
+   "ccmem": 0.08333333333333333,
+   "transcripts": 1.0,
+   "claude-mem": 0.5,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "bake_sheet": {
+   "kind": "revised",
+   "needs": "bake sheet order (hottest oven first, block 1) and dough weights in whole grams (block 5, revising block 4's kilos with one decimal)",
+   "none": 0.9166666666666666,
+   "ccmem": 1.0,
+   "transcripts": 0.9166666666666666,
+   "claude-mem": 0.6666666666666666,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "crate_labels": {
+   "kind": "revised",
+   "needs": "label printer facts: 48 characters per line (block 6, revising block 2's 32), still ASCII only, layout and allergens in capitals (block 2)",
+   "none": 0.55,
+   "ccmem": 0.75,
+   "transcripts": 0.9,
+   "claude-mem": 0.5,
+   "mem0": 0.8500000000000001,
+   "engram@main": 0.95,
+   "engram": 1.0,
+   "engram+deep": 0.8666666666666667,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 0.95
+  },
+  "extend_cutoff": {
+   "kind": "stale",
+   "needs": "the current cutoff (13:00 in config.py since Sam's commit after block 4), not the 14:00 said in block 2",
+   "none": 1.0,
+   "ccmem": 1.0,
+   "transcripts": 1.0,
+   "claude-mem": 1.0,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 0.625,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "next_delivery_day": {
+   "kind": "stale",
+   "needs": "the current closed day (Monday since Sam's commit after block 7), not the Sunday said in block 2",
+   "none": 1.0,
+   "ccmem": 1.0,
+   "transcripts": 1.0,
+   "claude-mem": 1.0,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "relief_baker_note": {
+   "kind": "stale",
+   "needs": "the current plan command (python -m bakehouse plan --day, Sam's commit after block 6), not block 3's scripts/print_plan.py",
+   "none": 1.0,
+   "ccmem": 1.0,
+   "transcripts": 1.0,
+   "claude-mem": 1.0,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "cutoff_quick": {
+   "kind": "stale",
+   "needs": "the current cutoff (13:00 in config.py since Sam's commit after block 4), not the 14:00 said in block 2; a quick question that does not ask to look at the code",
+   "none": 1.0,
+   "ccmem": 1.0,
+   "transcripts": 1.0,
+   "claude-mem": 1.0,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": null,
+   "engram+deep": null,
+   "engram+nodeep": null,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "closed_day_quick": {
+   "kind": "stale",
+   "needs": "the current closed day (Monday since Sam's commit after block 7), not the Sunday said in block 2; a quick question that does not ask to look at the code",
+   "none": 1.0,
+   "ccmem": 1.0,
+   "transcripts": 1.0,
+   "claude-mem": 1.0,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": null,
+   "engram+deep": null,
+   "engram+nodeep": null,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "owner_weekly_file": {
+   "kind": "inference",
+   "needs": "owner = Greta (block 1); Greta's Excel is German, so semicolons and decimal commas (block 3)",
+   "none": 0.3333333333333333,
+   "ccmem": 1.0,
+   "transcripts": 0.3333333333333333,
+   "claude-mem": 0.3333333333333333,
+   "mem0": 0.5,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "vat_export": {
+   "kind": "inference",
+   "needs": "the VAT return is Priya's (block 1); her Ledgerly import format: commas, header, DD/MM/YYYY, pounds with two decimals (block 3)",
+   "none": 0.5,
+   "ccmem": 1.0,
+   "transcripts": 0.5833333333333333,
+   "claude-mem": 0.5833333333333333,
+   "mem0": 0.3333333333333333,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "van_list": {
+   "kind": "inference",
+   "needs": "the van is Dev's (block 1); his Stopwise app needs header Name,Address,Postcode,Notes in driving order (block 3); Greenway is always the first drop (block 1)",
+   "none": 0.0,
+   "ccmem": 0.375,
+   "transcripts": 0.125,
+   "claude-mem": 0.0,
+   "mem0": 0.125,
+   "engram@main": 0.5625,
+   "engram": 0.16666666666666666,
+   "engram+deep": 0.5,
+   "engram+nodeep": 0.6666666666666666,
+   "full": 0.75,
+   "engram+rank": 0.625,
+   "engram+v5": 0.875,
+   "engram+v7": 0.125
+  },
+  "school_order": {
+   "kind": "inference",
+   "needs": "St Aidan's is nut-free (block 1) and the Bakewell slice contains nuts (catalog), so that line must not be entered",
+   "none": 0.3333333333333333,
+   "ccmem": 0.3333333333333333,
+   "transcripts": 0.3333333333333333,
+   "claude-mem": 0.3333333333333333,
+   "mem0": 0.3333333333333333,
+   "engram@main": 0.3333333333333333,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 0.3333333333333333,
+   "full": 0.8333333333333333,
+   "engram+rank": 1.0,
+   "engram+v5": 0.8333333333333334,
+   "engram+v7": 1.0
+  },
+  "returns_credit": {
+   "kind": "recall",
+   "needs": "Greenway's sale-or-return terms (block 2, confirmed unchanged in block 6): half price, at most 10% of the delivery, sandwich loaves and Greenway only",
+   "none": 0.0,
+   "ccmem": 1.0,
+   "transcripts": 0.25,
+   "claude-mem": 0.0,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "pence_why": {
+   "kind": "where_why",
+   "needs": "location: Invoice.total in invoice.py; reason (block 5): the old spreadsheet's floats put the VAT return 1.37 off and Priya had to file a correction with HMRC",
+   "none": 0.5,
+   "ccmem": 0.5,
+   "transcripts": 0.75,
+   "claude-mem": 0.5,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "unknown_code_why": {
+   "kind": "where_why",
+   "needs": "location: OrderBook.add in orders.py; reason (block 6): a mistyped code silently dropped Greenway's sandwich-loaf order and Greta had to buy loaves at the cash-and-carry",
+   "none": 0.5,
+   "ccmem": 1.0,
+   "transcripts": 0.875,
+   "claude-mem": 0.5,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "easter_sunday": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "none": 1.0,
+   "ccmem": 1.0,
+   "transcripts": 1.0,
+   "claude-mem": 1.0,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  },
+  "baker_percentages": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "none": 1.0,
+   "ccmem": 1.0,
+   "transcripts": 1.0,
+   "claude-mem": 1.0,
+   "mem0": 1.0,
+   "engram@main": 1.0,
+   "engram": 1.0,
+   "engram+deep": 1.0,
+   "engram+nodeep": 1.0,
+   "full": 1.0,
+   "engram+rank": 1.0,
+   "engram+v5": 1.0,
+   "engram+v7": 1.0
+  }
+ }
+}

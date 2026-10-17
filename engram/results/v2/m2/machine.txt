@@ -1,0 +1,48 @@
+Machine: Roberto's MacBook Air
+cpu: Apple M2 (4 performance + 4 efficiency cores)
+hw.memsize: 25769803776 bytes (24 GiB)
+ProductName:		macOS
+ProductVersion:		26.0.1
+BuildVersion:		25A362
+rustc: rustc 1.92.0 (ded5c06cf 2025-12-08)
+
+Checkouts
+main:   787387dd5be9b24e912dee449212e51d7fd29ca4 (main as of PR #8)
+branch: 65d2332 claude/project-thread-v6u255 (65d23327ac8db9d4fa3ef8e11b18e540f70eaef4)
+Build: cargo build --release --bins in each checkout's engram/ (separate target dirs).
+
+Runs (one at a time, main first, under caffeinate -i, ENGRAM_MODELS=/Users/rkonow/code2/bench-data/models, ENGRAM_DISABLE unset)
+data: /Users/rkonow/code2/bench-data/memory/longmemeval_s.jsonl; embedder: static (potion-retrieval-32M); sizes 10000,100000,1000000; default options otherwise
+Before each run: no cargo/rustc/engram-bench/node build processes, and the 1-minute load average under 3.0.
+Load averages (1, 5, 15 min) at the start and end of each run:
+  main scale | 2026-10-15T07:57:06Z | waited 60s | quiet | 2.22 7.58 5.74
+  main scale | end 2026-10-15T08:01:40Z | exit 0 | 1.64 4.06 4.63
+  main latency | 2026-10-15T08:01:40Z | waited 0s | quiet | 1.64 4.06 4.63
+  main latency | end 2026-10-15T08:11:37Z | exit 0 | 1.54 2.01 3.17
+  branch scale | 2026-10-15T08:11:59Z | waited 0s | quiet | 1.45 1.96 3.13
+  branch scale | end 2026-10-15T08:16:30Z | exit 0 | 1.67 1.93 2.80
+  branch latency | 2026-10-15T08:16:30Z | waited 0s | quiet | 1.67 1.93 2.80
+  branch latency | end 2026-10-15T08:26:27Z | exit 0 | 1.39 1.58 2.14
+
+Tests on the branch (cargo test --release, after the timed runs)
+  strata: 221 passed, 0 failed, 14 ignored
+  engram: 38 passed, 0 failed, 0 ignored
+
+Note: main's scale run began a few minutes after both release builds finished, so its 5- and
+15-minute averages (7.58, 5.74) still carried the build load. The 1-minute average was 2.22,
+and nothing else was running. Each side ran once, so no run-to-run spread was measured.
+
+Follow-up: latency bench at 1M records only (--sizes 1000000), two more runs per side,
+alternating main, branch, main, branch, same commands and quiet-machine check, under caffeinate -i.
+Output: {main,branch}/latency_1m_r2 and latency_1m_r3 (r1 is {main,branch}/latency).
+Load averages (1, 5, 15 min) at the start and end of each run:
+  main latency_1m_r2 | 2026-10-15T08:35:55Z | waited 30s | quiet | 2.69 6.04 4.94
+  main latency_1m_r2 | end 2026-10-15T08:41:17Z | exit 0 | 1.48 3.15 3.92
+  branch latency_1m_r2 | 2026-10-15T08:41:17Z | waited 0s | quiet | 1.48 3.15 3.92
+  branch latency_1m_r2 | end 2026-10-15T08:46:37Z | exit 0 | 1.94 2.19 3.20
+  main latency_1m_r3 | 2026-10-15T08:46:37Z | waited 0s | quiet | 1.94 2.19 3.20
+  main latency_1m_r3 | end 2026-10-15T08:51:57Z | exit 0 | 1.21 1.79 2.72
+  branch latency_1m_r3 | 2026-10-15T08:51:57Z | waited 0s | quiet | 1.21 1.79 2.72
+  branch latency_1m_r3 | end 2026-10-15T08:57:18Z | exit 0 | 1.74 1.86 2.48
+main r2 began about 3 minutes after the test suites finished (08:32:58Z); its 5-minute average
+(6.04) still carried that load, and its 1-minute average was 2.69.

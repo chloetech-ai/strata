@@ -1,0 +1,55 @@
+  10/500 questions, 44 s
+  20/500 questions, 69 s
+  30/500 questions, 97 s
+  40/500 questions, 125 s
+  50/500 questions, 155 s
+  60/500 questions, 175 s
+  70/500 questions, 199 s
+  80/500 questions, 228 s
+  90/500 questions, 253 s
+  100/500 questions, 281 s
+  110/500 questions, 304 s
+  120/500 questions, 334 s
+  130/500 questions, 355 s
+  140/500 questions, 387 s
+  150/500 questions, 409 s
+  160/500 questions, 433 s
+  170/500 questions, 457 s
+  180/500 questions, 477 s
+  190/500 questions, 501 s
+  200/500 questions, 523 s
+  210/500 questions, 546 s
+  220/500 questions, 566 s
+  230/500 questions, 586 s
+  240/500 questions, 607 s
+  250/500 questions, 629 s
+  260/500 questions, 648 s
+  270/500 questions, 673 s
+  280/500 questions, 697 s
+  290/500 questions, 718 s
+  300/500 questions, 743 s
+  310/500 questions, 768 s
+  320/500 questions, 787 s
+  330/500 questions, 807 s
+  340/500 questions, 829 s
+  350/500 questions, 850 s
+  360/500 questions, 869 s
+  370/500 questions, 887 s
+  380/500 questions, 910 s
+  390/500 questions, 926 s
+  400/500 questions, 942 s
+  410/500 questions, 960 s
+  420/500 questions, 976 s
+  430/500 questions, 997 s
+  440/500 questions, 1013 s
+  450/500 questions, 1029 s
+  460/500 questions, 1050 s
+  470/500 questions, 1065 s
+  480/500 questions, 1081 s
+  490/500 questions, 1099 s
+  500/500 questions, 1116 s
+longmemeval_s_deep_haiku: 500 questions (470 with evidence) in 1116 s, $1.475
+  hybrid top-10   any 0.872 all 0.617
+  hybrid top-pool any 0.938 all 0.781
+  deep pool       any 0.953 all 0.796 (27.1 records)
+  deep picks      any 0.923 all 0.713 (2.6 records, 903 chars)

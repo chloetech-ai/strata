@@ -1,0 +1,485 @@
+{
+ "bench": "beam",
+ "data": "beam_100k.jsonl",
+ "reader": "haiku",
+ "judge": "haiku",
+ "questions": 400,
+ "configs": {
+  "none": {
+   "n": 400,
+   "score": 0.10375,
+   "mean_over_types": 0.10375000000000001,
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 1.0
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.0
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.0
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.0
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.0375
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.0
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.0
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.0
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.0
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.0
+    }
+   },
+   "by_unit": {
+    "beam100K-1": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-10": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-11": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-12": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-13": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-14": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-15": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-16": {
+     "n": 20,
+     "score": 0.15
+    },
+    "beam100K-17": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-18": {
+     "n": 20,
+     "score": 0.125
+    },
+    "beam100K-19": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-2": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-20": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-3": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-4": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-5": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-6": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-7": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-8": {
+     "n": 20,
+     "score": 0.1
+    },
+    "beam100K-9": {
+     "n": 20,
+     "score": 0.1
+    }
+   },
+   "context_chars": 0.0,
+   "reader_tokens": 544.385,
+   "cost_usd": 0.412449
+  },
+  "hybrid": {
+   "n": 400,
+   "score": 0.36307738095238096,
+   "mean_over_types": 0.36307738095238096,
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.825
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.140625
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.11916666666666667
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.503125
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.28125
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.3875
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.37354166666666666
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.5770833333333333
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.11723214285714285
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.30625
+    }
+   },
+   "by_unit": {
+    "beam100K-1": {
+     "n": 20,
+     "score": 0.34833333333333333
+    },
+    "beam100K-10": {
+     "n": 20,
+     "score": 0.38458333333333333
+    },
+    "beam100K-11": {
+     "n": 20,
+     "score": 0.35333333333333333
+    },
+    "beam100K-12": {
+     "n": 20,
+     "score": 0.25125000000000003
+    },
+    "beam100K-13": {
+     "n": 20,
+     "score": 0.255
+    },
+    "beam100K-14": {
+     "n": 20,
+     "score": 0.35416666666666663
+    },
+    "beam100K-15": {
+     "n": 20,
+     "score": 0.45083333333333336
+    },
+    "beam100K-16": {
+     "n": 20,
+     "score": 0.45446428571428565
+    },
+    "beam100K-17": {
+     "n": 20,
+     "score": 0.2975
+    },
+    "beam100K-18": {
+     "n": 20,
+     "score": 0.2875
+    },
+    "beam100K-19": {
+     "n": 20,
+     "score": 0.31416666666666665
+    },
+    "beam100K-2": {
+     "n": 20,
+     "score": 0.5483333333333333
+    },
+    "beam100K-20": {
+     "n": 20,
+     "score": 0.24500000000000002
+    },
+    "beam100K-3": {
+     "n": 20,
+     "score": 0.3725
+    },
+    "beam100K-4": {
+     "n": 20,
+     "score": 0.3825
+    },
+    "beam100K-5": {
+     "n": 20,
+     "score": 0.4
+    },
+    "beam100K-6": {
+     "n": 20,
+     "score": 0.4058333333333334
+    },
+    "beam100K-7": {
+     "n": 20,
+     "score": 0.3325
+    },
+    "beam100K-8": {
+     "n": 20,
+     "score": 0.35375
+    },
+    "beam100K-9": {
+     "n": 20,
+     "score": 0.47000000000000003
+    }
+   },
+   "context_chars": 3383.2925,
+   "reader_tokens": 1786.0125,
+   "cost_usd": 0.62320485
+  },
+  "engine": {
+   "n": 400,
+   "score": 0.4319578373015873,
+   "mean_over_types": 0.4319578373015873,
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.8
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.159375
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.2939980158730159
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.6265625
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.51875
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.3625
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.3439583333333333
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.6416666666666667
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.18526785714285715
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.3875
+    }
+   },
+   "by_unit": {
+    "beam100K-1": {
+     "n": 20,
+     "score": 0.3591666666666667
+    },
+    "beam100K-10": {
+     "n": 20,
+     "score": 0.3779166666666667
+    },
+    "beam100K-11": {
+     "n": 20,
+     "score": 0.4458333333333333
+    },
+    "beam100K-12": {
+     "n": 20,
+     "score": 0.26026785714285716
+    },
+    "beam100K-13": {
+     "n": 20,
+     "score": 0.33208333333333334
+    },
+    "beam100K-14": {
+     "n": 20,
+     "score": 0.4554166666666667
+    },
+    "beam100K-15": {
+     "n": 20,
+     "score": 0.5316666666666666
+    },
+    "beam100K-16": {
+     "n": 20,
+     "score": 0.4538690476190476
+    },
+    "beam100K-17": {
+     "n": 20,
+     "score": 0.33875
+    },
+    "beam100K-18": {
+     "n": 20,
+     "score": 0.4104166666666667
+    },
+    "beam100K-19": {
+     "n": 20,
+     "score": 0.39571428571428574
+    },
+    "beam100K-2": {
+     "n": 20,
+     "score": 0.5025000000000001
+    },
+    "beam100K-20": {
+     "n": 20,
+     "score": 0.39916666666666667
+    },
+    "beam100K-3": {
+     "n": 20,
+     "score": 0.5579166666666666
+    },
+    "beam100K-4": {
+     "n": 20,
+     "score": 0.5726388888888889
+    },
+    "beam100K-5": {
+     "n": 20,
+     "score": 0.5666666666666667
+    },
+    "beam100K-6": {
+     "n": 20,
+     "score": 0.3433333333333333
+    },
+    "beam100K-7": {
+     "n": 20,
+     "score": 0.47333333333333333
+    },
+    "beam100K-8": {
+     "n": 20,
+     "score": 0.43208333333333326
+    },
+    "beam100K-9": {
+     "n": 20,
+     "score": 0.4304166666666666
+    }
+   },
+   "context_chars": 1603.6525,
+   "reader_tokens": 1137.2125,
+   "cost_usd": 0.55897606
+  },
+  "full": {
+   "n": 60,
+   "score": 0.4805555555555555,
+   "mean_over_types": 0.4805555555555555,
+   "by_type": {
+    "abstention": {
+     "n": 12,
+     "score": 0.75
+    },
+    "event_ordering": {
+     "n": 12,
+     "score": 0.35833333333333334
+    },
+    "instruction_following": {
+     "n": 12,
+     "score": 0.5208333333333334
+    },
+    "multi_session_reasoning": {
+     "n": 12,
+     "score": 0.375
+    },
+    "summarization": {
+     "n": 12,
+     "score": 0.3986111111111111
+    }
+   },
+   "by_unit": {
+    "beam100K-1": {
+     "n": 5,
+     "score": 0.5266666666666666
+    },
+    "beam100K-13": {
+     "n": 5,
+     "score": 0.41
+    },
+    "beam100K-14": {
+     "n": 5,
+     "score": 0.6
+    },
+    "beam100K-15": {
+     "n": 5,
+     "score": 0.6333333333333333
+    },
+    "beam100K-17": {
+     "n": 5,
+     "score": 0.44000000000000006
+    },
+    "beam100K-2": {
+     "n": 5,
+     "score": 0.6133333333333333
+    },
+    "beam100K-3": {
+     "n": 5,
+     "score": 0.5916666666666667
+    },
+    "beam100K-5": {
+     "n": 5,
+     "score": 0.6666666666666667
+    },
+    "beam100K-6": {
+     "n": 5,
+     "score": 0.35
+    },
+    "beam100K-7": {
+     "n": 5,
+     "score": 0.13999999999999999
+    },
+    "beam100K-8": {
+     "n": 5,
+     "score": 0.335
+    },
+    "beam100K-9": {
+     "n": 5,
+     "score": 0.45999999999999996
+    }
+   },
+   "context_chars": 517110.6666666667,
+   "reader_tokens": 188257.7,
+   "cost_usd": 11.454869799999999
+  }
+ }
+}

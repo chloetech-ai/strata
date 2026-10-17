@@ -1,0 +1,201 @@
+{
+ "name": "bakehouse",
+ "history": [
+  [
+   "Hi! bakehouse is the order and production tool I'm building for Larkspur Bakery, a wholesale bakery that delivers bread and pastries every morning to about twenty cafés, shops and one primary school. Could you run the tests first? Tomasz, our head baker, says last night's plan told him to bake 2 batches of baguettes for 25 baguettes, and a batch is 12, so I think the batch rounding is broken.",
+   "Thanks! Some background on who's who, since the names will keep coming up. Greta Vogel owns the bakery and decides prices and which customers we take on. Tomasz starts at 3 a.m. and bakes from the printed plan; he doesn't touch the computer otherwise. Priya does our books and the quarterly VAT return; she works from home a few days a month. Dev drives the van and does the morning run, leaving at 5:30. Code for today: please make `load_catalog` reject a product with a batch size below 1 or a negative price, with a ValueError that names the product code, and add tests.",
+   "St Aidan's Primary is a nut-free school: one of their pupils has a severe nut allergy and they had to call an ambulance last year, so they must never get anything from us that contains nuts. That will matter once orders go through the tool. For now, please add `Product.has_allergen(name)`, case-insensitive, with a test.",
+   "Greenway Grocers opens at 7:00 and wants our bread on the shelves before they open, so however Dev's run is planned, Greenway is always the first drop. Unrelated bits, just so you know: Café Lumen pays by bank transfer at the end of each month and Harbour Deli pays Dev in cash on delivery; nothing to build for either. Please add a `Customer.__str__` that returns the customer's name, with a test.",
+   "One for later, when we write the bake sheet: Tomasz wants the products listed hottest oven first, because the deck oven only cools down through the night and heating it back up costs him half an hour. No code for that today. Please add a line to the changelog and commit."
+  ],
+  [
+   "Order entry today. Please make `OrderBook.add` raise a ValueError for a product code that isn't in the catalog, instead of silently skipping the line like it does now, and add `OrderBook.total_for(day, product_code)` returning the units ordered for that day across all customers. Tests for both, please.",
+   "About the cutoff: orders for a delivery day have to be in by 14:00 on the day before, and 14:00 exactly still counts. That's ORDER_CUTOFF in config.py, and `is_on_time` in orders.py checks against it. We don't bake or deliver on Sundays (CLOSED_WEEKDAYS in config.py), so a Saturday order that misses the cutoff waits until Monday. Greenway can still change quantities by phone until 16:00, but that's a favour Greta does them by hand, not something the code needs to know. Could you add tests for is_on_time around the cutoff? Build the times from config.ORDER_CUTOFF instead of writing 14:00 into the tests.",
+   "Delivery charge, for when we rework the invoices: Greta charges £3.00 delivery on any order under £25.00. That's the value of the customer's order for one delivery day, before VAT. Don't build it yet. (She also grumbles that the cash-and-carry wants a £50 minimum spend now; that's their rule, not ours.) Meanwhile please add `OrderBook.customers_for(day)` returning the sorted codes of the customers with orders on that day.",
+   "Crate labels, also for later. The packing room has an old thermal label printer: it only prints plain ASCII (accents and umlauts come out as garbage), 32 characters per line, and it simply cuts off anything past that, so text that's too long has to be shortened to fit. Each crate gets one label per product: first line the customer's name, second line the quantity and the product name, then the allergens. Allergens have to be emphasised on food labels by law and the printer can't do bold, so we print them in capital letters. Today just add `Product.allergen_text()` returning the allergens sorted and joined with ', '.",
+   "Greenway takes sandwich loaves on sale-or-return. When they send unsold ones back the next morning, we credit half the wholesale price per loaf, but never for more than 10% of the loaves we delivered to them that day; returns above that aren't credited. It's only Greenway and only sandwich loaves. Priya will want this as a function at some point. That's it for today, please commit."
+  ],
+  [
+   "Tomasz's evening routine: before he goes home he prints the plan for the next day with `python scripts/print_plan.py --day 2026-10-20` (with the right date, obviously). Could you make the script print the product name, units and batches in aligned columns instead of the bare code and units?",
+   "Greta wants a quick per-customer view of a day. Please add `day_summary(orderbook, day)` in a new src/bakehouse/reports.py returning {customer code: order value in pence}, with a test. She does all her number-crunching in Excel on the office PC, and that PC's Windows and Excel are set up in German (she grew up in Hamburg), so any CSV meant for her has to use semicolons between fields and a comma as the decimal separator, otherwise Excel dumps everything into one column. No file export today.",
+   "Priya's side works differently: she keeps the accounts in Ledgerly, and Ledgerly only imports a plain comma-separated file with a header row, dates written DD/MM/YYYY and amounts in pounds with a decimal point and two decimals (12.50), never pence. Don't mix that up with Greta's files. Code for today: add `invoice_for(orderbook, customer, day)` in invoice.py that builds an Invoice with one line per product the customer ordered for that day, at catalog prices, with a test.",
+   "Dev plans the morning run in an app called Stopwise on his phone. It imports a CSV whose header must be exactly `Name,Address,Postcode,Notes`, with one row per drop in the order he'll drive them. With any other header it refuses the file, and if the rows aren't in driving order it re-optimises the route by itself, which sends him the wrong way round the one-way system. The driving order is route_seq in customers.csv. Today please make `load_customers` reject two customers with the same route_seq.",
+   "Last bit: the Old Mill Tearoom only wants deliveries Wednesday to Saturday over the winter, but they place their own orders, so that's their business and nothing to code. There's a typo in their name in customers.csv ('Tearooom'), please fix it, run the tests and commit."
+  ],
+  [
+   "Invoices next. Please add `format_pence(pence)` to invoice.py: 1234 gives '£12.34', 5 gives '£0.05', and negative amounts get a leading minus ('-£3.00'), since a credit note is just an invoice with negative lines. Tests too.",
+   "Heads-up on the January price rise: Greta wants all wholesale prices up 4%, each new price rounded to the nearest penny. Flour has gone up 8% since spring and butter even more, so she says 4% is the least she can do. We'll write that in December. For now, please make `Catalog.get` raise a KeyError whose message names the unknown code.",
+   "On the bake sheet Tomasz also wants the dough weight he has to weigh out for each product, in kilos with one decimal (say 5.4 kg), because that's what his scale shows. The dough weight per piece is dough_g in the catalog. Please add `dough_weight_g(product, units)` to production.py returning grams, with a test.",
+   "Ana, our part-time baker, will cover Tomasz's shifts while he's on holiday in November. She's fine with the ovens but new to the computer side. Also, Harbour Deli is closed on Tuesdays, so Dev skips them on Tuesdays; they know not to order for Tuesdays, so nothing to code. Could you add a test that `plan` leaves out products nobody ordered for that day?",
+   "Please commit."
+  ],
+  [
+   "Tomasz got a new platform scale last week and it only shows grams, so on the bake sheet he now wants dough weights in whole grams (like 5400 g) instead of kilos. Flour still comes from the mill in 16 kg sacks, that doesn't change. Please make `dough_weight_g` raise a ValueError for negative units, with a test.",
+   "Standing orders: most customers order the same things every week. Please add src/bakehouse/standing.py with a `StandingLine(customer, product, weekday, qty)` dataclass and `expand(standing_lines, start, end)` that returns the OrderLines for every matching day from start to end inclusive, plus tests. St Aidan's standing order pauses in the school holidays; the school sends Greta the term dates every September and she removes those weeks by hand, so no holiday logic yet.",
+   "In case you wondered why I keep insisting on integer pence for every amount: two years ago the old spreadsheet added prices up as floats, our VAT return came out £1.37 off, and Priya had to file a correction with HMRC. Greta never wants that again. Separately, please add `OrderBook.lines_for(customer, day)` returning that customer's lines for the day, with a test.",
+   "Two small facts: Stopwise cuts the Notes column off at 60 characters; nothing to do about it, since we don't fill in notes yet. And the Raspberry Pi in the packing room, which Sam set up, runs Python 3.7 with no internet access, so everything has to stay standard library and work on 3.7. Could you check the code for anything that needs a newer Python and fix it?",
+   "Thanks, please commit."
+  ],
+  [
+   "Greta changed the delivery charge after the latest fuel bill: from November it's £4.50 on any order under £40.00, still the value of the customer's order for one delivery day before VAT. And St Aidan's never pays it, because their contract price already includes delivery. Still no code for that until the invoice rework. Please add a test for `day_summary` with two customers on the same day.",
+   "Good news for packing: Greta bought a new label printer. It does 48 characters per line, but it's still plain ASCII only (accents come out as garbage just like on the old one), and everything else about the labels stays the same. Code for today: please add `OrderBook.remove(day, customer, product)` that removes that line and returns True, or False if there was no such line.",
+   "Greta asked me why order entry got so strict about unknown product codes, so for the record: last spring a typo in a product code meant Greenway's whole sandwich-loaf order was silently dropped and never baked, and Greta had to drive to the cash-and-carry at 5 a.m. to buy loaves for them. Please add `__len__` to OrderBook, returning the number of lines.",
+   "Greenway asked whether we'd credit more of their returns. Greta said no, the sale-or-return terms stay exactly as they are. Café Lumen asked for 5% off from December; Greta hasn't decided, so nothing changes for now. Please add `top_products(orderbook, start, end, n=5)` to reports.py returning the n product codes with the most units ordered from start to end inclusive, most first.",
+   "Please commit."
+  ],
+  [
+   "The price rise again: Greta talked to the cafés and changed it. It's 5% instead of 4%, and each new price is rounded up to the next 5p, never down, because the cafés print price boards and odd pennies look silly on them. Still starting in January. Please add `Product.price_text()` that returns the price formatted with format_pence.",
+   "Ana covers for Tomasz from 9 November for two weeks; he's back on the 23rd. Greta asked whether the plan could show how many trays go in the oven: one tray holds one batch, so it's the total number of batches. Please add `total_batches(plan_result)` to production.py, with a test.",
+   "Greenway's buyer is Marek, and he's the one to email if anything about their deliveries changes, not the shop itself. Café Lumen has a new manager, Jo. Please add an optional `email` field to Customer (default empty), read from an optional email column in customers.csv, and put Marek's address, marek@greenway-grocers.example, in the file.",
+   "The school's kitchen manager, Mrs Okonjo, emails their orders on Thursdays for the following week. Please add `OrderBook.days()` returning the sorted distinct delivery days in the book, with a test.",
+   "Thanks, please commit."
+  ],
+  [
+   "Harbour Deli opens on Tuesdays now, so Dev can deliver to them every day we deliver. Please add a test for `customers_for` with three customers on one day.",
+   "Potter's Farm Shop joins us next month: code POTTER, name Potter's Farm Shop, address Lower Farm, Ashby Road, postcode LK5 3PF. Dev will drive to them last, so give them route_seq 6. Please add them to customers.csv and check that the customer tests still pass.",
+   "Priya would like invoice numbers like LK-2026-0001: the year, then a four-digit running number that starts again at 1 every year. Please add `invoice_number(year, seq)` to invoice.py returning that string, with a test.",
+   "About VAT: almost everything we sell is zero-rated food; only the Florentines count as confectionery at 20%, because they're chocolate-coated. Priya handles that in Ledgerly, so our invoices stay without VAT for now. Please add a test that `invoice_for` ignores other customers' lines.",
+   "Dev's van holds 18 crates, and a crate takes 30 rolls or 8 loaves; Greta wonders whether we'll need a second run before Christmas, but not yet. Please add `crates_needed(units, per_crate)` to production.py (whole crates, so round up), with a test, then update the changelog with everything since the last entry and commit."
+  ]
+ ],
+ "teammate_commits": [
+  {
+   "after_block": 4,
+   "author": "Sam Okafor",
+   "email": "sam.okafor@example.com",
+   "message": "Move the order cutoff to 13:00\n\nThe mill moved its own order deadline to 13:30, and Tomasz needs the\nnext day's totals before he phones the flour order through. Agreed with\nGreta on Friday; customers were told by email.",
+   "files": {
+    "src/bakehouse/config.py": "\"\"\"Bakery-wide settings.\"\"\"\n\nimport datetime\n\nBAKERY_NAME = \"Larkspur Bakery\"\n\n# Orders for a delivery day must be in by this time on the day before.\n# 13:00 because the mill now wants our flour order by 13:30.\nORDER_CUTOFF = datetime.time(13, 0)\n\n# Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).\nCLOSED_WEEKDAYS = (6,)\n"
+   }
+  },
+  {
+   "after_block": 6,
+   "author": "Sam Okafor",
+   "email": "sam.okafor@example.com",
+   "message": "Replace scripts/print_plan.py with `python -m bakehouse plan`\n\nThe cron job on the packing Pi kept breaking whenever the checkout moved,\nbecause it called the script by its path. The package now has a `plan`\nsubcommand that finds data/ by itself:\n\n    PYTHONPATH=src python -m bakehouse plan --day 2026-11-03\n\nThe Pi's crontab sets PYTHONPATH. scripts/print_plan.py is gone.",
+   "files": {
+    "src/bakehouse/__main__.py": "\"\"\"Command line for the bakery.\n\n    PYTHONPATH=src python -m bakehouse plan --day 2026-11-03\n\nprints the bake plan for a delivery day from data/products.csv and\ndata/orders.csv. It finds data/ by itself, so it works from any directory.\n\"\"\"\n\nimport argparse\nimport datetime\nimport os\nimport sys\n\nfrom .orders import load_orders\nfrom .production import plan\nfrom .products import load_catalog\n\nDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), \"..\", \"..\", \"data\")\n\n\ndef cmd_plan(args):\n    catalog = load_catalog(os.path.join(args.data, \"products.csv\"))\n    book = load_orders(os.path.join(args.data, \"orders.csv\"), catalog)\n    rows = plan(book, args.day)\n    if not rows:\n        print(f\"Nothing to bake for {args.day.isoformat()}.\")\n        return 0\n    print(f\"Bake plan for {args.day:%A %d %B %Y}\")\n    width = max(len(catalog.get(code).name) for code in rows)\n    print(f\"{'Product':<{width}}  {'Units':>5}  {'Batches':>7}\")\n    for code, (units, batches) in rows.items():\n        print(f\"{catalog.get(code).name:<{width}}  {units:>5}  {batches:>7}\")\n    return 0\n\n\ndef main(argv=None):\n    parser = argparse.ArgumentParser(prog=\"python -m bakehouse\")\n    sub = parser.add_subparsers(dest=\"command\")\n    p = sub.add_parser(\"plan\", help=\"print the bake plan for a delivery day\")\n    p.add_argument(\"--day\", required=True, type=datetime.date.fromisoformat, help=\"delivery day, YYYY-MM-DD\")\n    p.add_argument(\"--data\", default=DATA, help=\"folder with products.csv and orders.csv\")\n    p.set_defaults(func=cmd_plan)\n    args = parser.parse_args(argv)\n    if not getattr(args, \"func\", None):\n        parser.print_help()\n        return 2\n    return args.func(args)\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
+    "scripts/print_plan.py": null
+   }
+  },
+  {
+   "after_block": 7,
+   "author": "Sam Okafor",
+   "email": "sam.okafor@example.com",
+   "message": "Deliver on Sundays, close on Mondays instead\n\nFrom November we run the stall at the Sunday farmers' market, so Greta\nmoved the bakery's day off from Sunday to Monday. Orders that miss\nSaturday's cutoff now go out on Sunday.",
+   "files": {
+    "src/bakehouse/config.py": "\"\"\"Bakery-wide settings.\"\"\"\n\nimport datetime\n\nBAKERY_NAME = \"Larkspur Bakery\"\n\n# Orders for a delivery day must be in by this time on the day before.\n# 13:00 because the mill now wants our flour order by 13:30.\nORDER_CUTOFF = datetime.time(13, 0)\n\n# Weekdays on which we neither bake nor deliver (Monday is 0, Sunday is 6).\n# Monday since November: we have the stall at the Sunday farmers' market.\nCLOSED_WEEKDAYS = (0,)\n"
+   }
+  }
+ ],
+ "tasks": [
+  {
+   "id": "delivery_charge",
+   "kind": "revised",
+   "needs": "the delivery charge as revised in block 6 (4.50 under 40.00, St Aidan's exempt), not block 2's 3.00 under 25.00",
+   "prompt": "Time to add the delivery charge to invoicing. Add `delivery_charge(customer_code, subtotal)` to src/bakehouse/invoice.py: given a customer code and the value in pence of that customer's order for one delivery day (before VAT), return the delivery charge in pence."
+  },
+  {
+   "id": "price_rise",
+   "kind": "revised",
+   "needs": "the January price rise as revised in block 7 (5%, rounded up to the next 5p), not block 4's 4% to the nearest penny",
+   "prompt": "Let's prepare January's price list. Add `new_prices(catalog)` in src/bakehouse/pricing.py that returns a dict mapping each product code to its new wholesale price in pence."
+  },
+  {
+   "id": "bake_sheet",
+   "kind": "revised",
+   "needs": "bake sheet order (hottest oven first, block 1) and dough weights in whole grams (block 5, revising block 4's kilos with one decimal)",
+   "prompt": "Tomasz needs a proper bake sheet. Add `bake_sheet(orderbook, day)` to src/bakehouse/production.py that returns the sheet as text: one line per product to bake that day, with the product name, units, batches and the dough weight to weigh out."
+  },
+  {
+   "id": "crate_labels",
+   "kind": "revised",
+   "needs": "label printer facts: 48 characters per line (block 6, revising block 2's 32), still ASCII only, layout and allergens in capitals (block 2)",
+   "prompt": "Packing needs the crate labels for a delivery day. Add `crate_labels(orderbook, customers, day)` in src/bakehouse/labels.py that returns a list with the text of each label, one label per customer and product ordered for that day. `customers` is the dict that load_customers returns."
+  },
+  {
+   "id": "extend_cutoff",
+   "kind": "stale",
+   "needs": "the current cutoff (13:00 in config.py since Sam's commit after block 4), not the 14:00 said in block 2",
+   "prompt": "Greta wants to give customers an extra half hour to get their orders in for the next day. Please make that change."
+  },
+  {
+   "id": "next_delivery_day",
+   "kind": "stale",
+   "needs": "the current closed day (Monday since Sam's commit after block 7), not the Sunday said in block 2",
+   "prompt": "Add `next_delivery_day(day)` in src/bakehouse/orders.py returning the first date after `day` on which we deliver."
+  },
+  {
+   "id": "relief_baker_note",
+   "kind": "stale",
+   "needs": "the current plan command (python -m bakehouse plan --day, Sam's commit after block 6), not block 3's scripts/print_plan.py",
+   "prompt": "Ana is covering Tomasz's shifts from Monday. Write me the short note I'll give her: the exact command she types in the evening to print the next day's bake plan. Just the note, no code changes."
+  },
+  {
+   "id": "cutoff_quick",
+   "kind": "stale",
+   "needs": "the current cutoff (13:00 in config.py since Sam's commit after block 4), not the 14:00 said in block 2; a quick question that does not ask to look at the code",
+   "prompt": "Quick question, I'm on the phone with a customer: what time do they need to get their order in by for next-day delivery these days? Just tell me, don't change anything."
+  },
+  {
+   "id": "closed_day_quick",
+   "kind": "stale",
+   "needs": "the current closed day (Monday since Sam's commit after block 7), not the Sunday said in block 2; a quick question that does not ask to look at the code",
+   "prompt": "Remind me, which day of the week are we closed now? A customer wants a delivery that day. Just tell me, don't change anything."
+  },
+  {
+   "id": "owner_weekly_file",
+   "kind": "inference",
+   "needs": "owner = Greta (block 1); Greta's Excel is German, so semicolons and decimal commas (block 3)",
+   "prompt": "The owner would like each customer's order total for a week as a file she can open on her office computer. Add `week_totals_file(orderbook, week_start, path)` in src/bakehouse/reports.py that writes one row per customer with their total in pounds for the seven days starting at `week_start`."
+  },
+  {
+   "id": "vat_export",
+   "kind": "inference",
+   "needs": "the VAT return is Priya's (block 1); her Ledgerly import format: commas, header, DD/MM/YYYY, pounds with two decimals (block 3)",
+   "prompt": "The quarter ends soon. Add `export_invoices(invoices, path)` in src/bakehouse/invoice.py that writes the quarter's invoices to a file for the VAT return, one row per invoice with its date, customer code and total."
+  },
+  {
+   "id": "van_list",
+   "kind": "inference",
+   "needs": "the van is Dev's (block 1); his Stopwise app needs header Name,Address,Postcode,Notes in driving order (block 3); Greenway is always the first drop (block 1)",
+   "prompt": "Add `drops_file(orderbook, customers, day, path)` in src/bakehouse/delivery.py that writes the list of the van's drops for that day (only customers with orders that day). `customers` is the dict that load_customers returns."
+  },
+  {
+   "id": "school_order",
+   "kind": "inference",
+   "needs": "St Aidan's is nut-free (block 1) and the Bakewell slice contains nuts (catalog), so that line must not be entered",
+   "prompt": "St Aidan's kitchen emailed their order for Friday 2026-11-20: 60 white rolls, 40 Bakewell slices and 6 sandwich loaves. Please enter it in data/orders.csv."
+  },
+  {
+   "id": "returns_credit",
+   "kind": "recall",
+   "needs": "Greenway's sale-or-return terms (block 2, confirmed unchanged in block 6): half price, at most 10% of the delivery, sandwich loaves and Greenway only",
+   "prompt": "Greenway sent back some unsold loaves again. Add `returns_credit(catalog, customer_code, product_code, delivered, returned)` to src/bakehouse/invoice.py returning the credit in pence for one delivery."
+  },
+  {
+   "id": "pence_why",
+   "kind": "where_why",
+   "needs": "location: Invoice.total in invoice.py; reason (block 5): the old spreadsheet's floats put the VAT return 1.37 off and Priya had to file a correction with HMRC",
+   "prompt": "Quick question: where in the code do invoice totals get added up, and why do we insist on keeping money as integer pence rather than pounds? Short answer, no changes."
+  },
+  {
+   "id": "unknown_code_why",
+   "kind": "where_why",
+   "needs": "location: OrderBook.add in orders.py; reason (block 6): a mistyped code silently dropped Greenway's sandwich-loaf order and Greta had to buy loaves at the cash-and-carry",
+   "prompt": "Where does an order line with a product code we don't sell get caught, and why do we raise an error there instead of just skipping the line? Short answer, no changes."
+  },
+  {
+   "id": "easter_sunday",
+   "kind": "control",
+   "needs": "nothing (control)",
+   "prompt": "For planning the hot cross bun season, add `easter_sunday(year)` in src/bakehouse/seasons.py returning the date of Easter Sunday (Western church, Gregorian calendar) as a datetime.date, for any year from 1900 to 2199. Add a test."
+  },
+  {
+   "id": "baker_percentages",
+   "kind": "control",
+   "needs": "nothing (control)",
+   "prompt": "Add `baker_percentages(recipe)` in src/bakehouse/recipes.py. `recipe` maps ingredient names to grams; return a dict giving each ingredient's weight as a percentage of the total flour weight, rounded to one decimal. Every ingredient whose name contains 'flour' (any case) counts as flour. Raise ValueError if there is no flour. Add a test."
+  }
+ ]
+}

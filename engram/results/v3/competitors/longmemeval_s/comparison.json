@@ -1,0 +1,477 @@
+{
+ "questions": 100,
+ "binary": true,
+ "base": "engram_qe",
+ "configs": {
+  "engram_qe": {
+   "config": "engram_qe",
+   "score": 0.79,
+   "ci95": [
+    0.71,
+    0.87
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.56
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.9090909090909091
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.84
+    }
+   }
+  },
+  "mem0": {
+   "config": "mem0",
+   "score": 0.79,
+   "ci95": [
+    0.71,
+    0.87
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.6
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.8
+    }
+   },
+   "vs_base": {
+    "diff": 0.0,
+    "ci95": [
+     -0.08,
+     0.08
+    ],
+    "p": 1.0,
+    "better": 9,
+    "worse": 9
+   }
+  },
+  "mem0-hybrid": {
+   "config": "mem0-hybrid",
+   "score": 0.78,
+   "ci95": [
+    0.7,
+    0.86
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.56
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.8
+    }
+   },
+   "vs_base": {
+    "diff": -0.01,
+    "ci95": [
+     -0.1,
+     0.08
+    ],
+    "p": 1.0,
+    "better": 9,
+    "worse": 10
+   }
+  },
+  "hindsight": {
+   "config": "hindsight",
+   "score": 0.88,
+   "ci95": [
+    0.81,
+    0.94
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 1.0
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.72
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 1.0
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.8333333333333334
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 1.0
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.84
+    }
+   },
+   "vs_base": {
+    "diff": 0.09,
+    "ci95": [
+     0.02,
+     0.16
+    ],
+    "p": 0.0224609375,
+    "better": 11,
+    "worse": 2
+   }
+  },
+  "hindsight-small": {
+   "config": "hindsight-small",
+   "score": 0.78,
+   "ci95": [
+    0.7,
+    0.86
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.6
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.7272727272727273
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.84
+    }
+   },
+   "vs_base": {
+    "diff": -0.01,
+    "ci95": [
+     -0.1,
+     0.07
+    ],
+    "p": 1.0,
+    "better": 9,
+    "worse": 10
+   }
+  },
+  "engram_search": {
+   "config": "engram_search",
+   "score": 0.69,
+   "ci95": [
+    0.6,
+    0.78
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.4
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.64
+    }
+   },
+   "vs_base": {
+    "diff": -0.1,
+    "ci95": [
+     -0.18,
+     -0.02
+    ],
+    "p": 0.0308837890625,
+    "better": 4,
+    "worse": 14
+   }
+  },
+  "hindsight-prov": {
+   "config": "hindsight-prov",
+   "score": 0.86,
+   "ci95": [
+    0.79,
+    0.92
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 0.8333333333333334
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 1.0
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.72
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 1.0
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.88
+    }
+   },
+   "vs_base": {
+    "diff": 0.07,
+    "ci95": [
+     -0.01,
+     0.15
+    ],
+    "p": 0.143463134765625,
+    "better": 12,
+    "worse": 5
+   }
+  },
+  "hindsight-prov-small": {
+   "config": "hindsight-prov-small",
+   "score": 0.67,
+   "ci95": [
+    0.57,
+    0.76
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.4
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 0.7272727272727273
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.6923076923076923
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.68
+    }
+   },
+   "vs_base": {
+    "diff": -0.12,
+    "ci95": [
+     -0.21,
+     -0.03
+    ],
+    "p": 0.022655844688415527,
+    "better": 6,
+    "worse": 18
+   }
+  },
+  "full": {
+   "config": "full",
+   "score": 0.87,
+   "ci95": [
+    0.8,
+    0.93
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.68
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 1.0
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.96
+    }
+   },
+   "vs_base": {
+    "diff": 0.08,
+    "ci95": [
+     0.01,
+     0.16
+    ],
+    "p": 0.057373046875,
+    "better": 11,
+    "worse": 3
+   }
+  },
+  "oracle": {
+   "config": "oracle",
+   "score": 0.88,
+   "ci95": [
+    0.81,
+    0.94
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "score": 0.8333333333333334
+    },
+    "knowledge-update": {
+     "n": 14,
+     "score": 0.7857142857142857
+    },
+    "multi-session": {
+     "n": 25,
+     "score": 0.8
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "score": 1.0
+    },
+    "single-session-preference": {
+     "n": 6,
+     "score": 0.8333333333333334
+    },
+    "single-session-user": {
+     "n": 13,
+     "score": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "score": 0.96
+    }
+   },
+   "vs_base": {
+    "diff": 0.09,
+    "ci95": [
+     0.0,
+     0.18
+    ],
+    "p": 0.0783538818359375,
+    "better": 15,
+    "worse": 6
+   }
+  }
+ }
+}

@@ -1,0 +1,292 @@
+{
+ "lane": "engram@main",
+ "scenario": "slotwise",
+ "model": "haiku",
+ "meta": {
+  "lane": "engram@main",
+  "def": {
+   "kind": "engram",
+   "binary": "/home/claude/engram-main/engram/target/release/engram",
+   "mcp": [
+    "mcp__engram"
+   ]
+  },
+  "env": {},
+  "engram": {
+   "source": "/home/claude/engram-main/engram/target/release/engram",
+   "sha256": "62b64b12d9b4a7f021168a390e2966acb3de822295c1925e03f4b9503fc394a1",
+   "version": "engram 0.1.0",
+   "source_rev": "787387dd5be9b24e912dee449212e51d7fd29ca4",
+   "source_dirty": false
+  },
+  "claude_version": "2.1.300 (Claude Code)"
+ },
+ "sessions": [
+  "2bfb5cf7-55af-42ab-8829-1599f3aa3baa",
+  "cbd23fc5-f2fb-45ae-b704-a3e4f5404ab4",
+  "b1ad62c1-2d49-45be-8ca4-60d0664b0757"
+ ],
+ "session": "b1ad62c1-2d49-45be-8ca4-60d0664b0757",
+ "turns": [
+  {
+   "block": 1,
+   "session": "2bfb5cf7-55af-42ab-8829-1599f3aa3baa",
+   "prompt": "Hi! slotwise is the appointment library we're building for Lindqvist Physio, a practice with four therapists. Could you run the test suite first? I think the overlap check is broken.",
+   "result": "The overlap check was broken, and I've fixed it. The suite now passes, 12 of 12.\n\n**Test run before the fix:** 11 passed, 1 failed. `test_overlap_from_before_is_taken` failed because booking 08:30 was allowed when the same therapist already had a 09:00 appointment (standard, 45 min).\n\n**Cause:** `Schedule.book` in `src/slotwise/schedule.py` only rejected a new booking whose start fell inside an existing appointment (`other.start <= appointment.start < other.end`). It missed a new booking that started earlier and ran into an existing one.\n\n**Fix:** I changed that line to the standard interval-overlap test, using the `end` property that `Appointment` already has:\n\n```python\nif other.start < appointment.end and appointment.start < other.end:\n```\n\nThis is the only change. It is uncommitted in the working tree; I haven't committed it.\n\n**Notes:**\n- The repo has no build or test config, so I ran `PYTHONPATH=src python3 -m pytest -q tests`.\n- I didn't add a regression test for the case where a new booking ends inside an existing one. The existing tests cover only the start-inside case plus the one that was failing. That case is worth adding if you want it pinned down.",
+   "cost_usd": 0.00416012,
+   "session_cost_usd": 0.00416012,
+   "steps": 8,
+   "error": false,
+   "wall_s": 27.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "2bfb5cf7-55af-42ab-8829-1599f3aa3baa",
+   "prompt": "Thanks. The front-desk app will catch our exceptions and show the message to the receptionist, so let's have one hierarchy: a `BookingError` base class in a new errors.py, with `SlotTaken` and `OutsideOpeningHours` subclasses. Use them everywhere instead of ValueError, with messages a receptionist understands.",
+   "result": "The booking errors now use one hierarchy, and no `ValueError` remains in `src/` or `tests/`. All 15 tests pass.\n\n**Hierarchy, in `src/slotwise/errors.py`:**\n- `BookingError(Exception)` is the base class.\n- `SlotTaken(BookingError)` is raised when the therapist already has an overlapping appointment.\n- `OutsideOpeningHours(BookingError)` is raised when the practice is closed for any part of the requested time.\n\n**Receptionist messages** (checked by running the code):\n- Overlap: `Lena is already booked from 09:00 to 09:45, so that time is taken.`\n- Outside hours on a weekday: `The practice is open 07:30 to 19:00 on Tuesdays, so 18:30 to 19:15 can't be booked.`\n- Closed day: `The practice is closed on Sundays, so 09:00 to 09:45 can't be booked.`\n\n**Choices I made that you may want to change:**\n- **Unknown treatment** raises plain `BookingError`, since you named only two subclasses. The message is `We don't offer 'massage'. Choose one of: initial, standard, short.` If you want a third subclass, that's a small addition.\n- **Messages** are built in `schedule.py`, not in `errors.py`. The exception classes take a plain message string.\n- **`Schedule.get`** still raises `KeyError`. It isn't a booking refusal, so I left it alone.\n- **Engram memory** had no earlier record of an agreed exception design, so I went with your description.\n\n**Tests:** I updated the existing `assertRaises(ValueError)` checks to the specific classes. I also added tests that pin down the message text for overlap, outside hours, and unknown treatment.\n\nNothing is committed. The changes are in `src/slotwise/errors.py`, `src/slotwise/schedule.py`, and `tests/test_schedule.py`, along with the overlap fix from earlier.",
+   "cost_usd": 0.0069719199999999995,
+   "session_cost_usd": 0.01113204,
+   "steps": 15,
+   "error": false,
+   "wall_s": 38.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "2bfb5cf7-55af-42ab-8829-1599f3aa3baa",
+   "prompt": "Therapists need 10 minutes between two appointments to clean the table and write their notes. Please make book() enforce that gap for the same therapist, both before and after the new appointment, with tests.",
+   "result": "`book()` now enforces a 10-minute gap between a therapist's appointments, before and after the new one. All 21 tests pass.\n\n**How it works:** In `src/slotwise/schedule.py`, a new `GAP` constant (10 minutes) widens each of the same therapist's existing appointments by the gap on both sides. The overlap test then runs against the widened times. A new appointment is allowed only if it starts at least 10 minutes after an existing one ends, or ends at least 10 minutes before one starts. Exactly 10 minutes is allowed. Other therapists are unaffected.\n\n**Refused bookings** raise `SlotTaken`, with this receptionist message: `Lena is booked from 09:00 to 09:45, and needs 10 minutes between appointments, so that time is taken.` The minute count comes from `GAP`, so the message stays correct if the gap changes.\n\n**Tests added** in `tests/test_schedule.py`:\n- A booking 5 minutes after an existing one is refused.\n- A booking that ends 5 minutes before an existing one starts is refused.\n- A booking exactly 10 minutes after, and one exactly 10 minutes before, are both allowed.\n- The message names the existing booking and the rule.\n- The gap applies only to the same therapist.\n\n**Caveats:**\n- Memory had no earlier record of the gap rule, so I took it from your description.\n- The gap applies only between appointments. It doesn't add time before the first appointment of the day or after the last one.\n- Nothing is committed.",
+   "cost_usd": 0.0043231699999999994,
+   "session_cost_usd": 0.015455209999999999,
+   "steps": 9,
+   "error": false,
+   "wall_s": 26.8,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "2bfb5cf7-55af-42ab-8829-1599f3aa3baa",
+   "prompt": "Some background for next sprint, nothing to code today: we'll add cancellation fees. If a client cancels less than 48 hours before the appointment they pay half the treatment price, less than 24 hours before it's the full price, earlier than that it's free. Their old receptionist worked this out by hand and kept getting it wrong, which is why they want it in the library.",
+   "result": "I've noted the cancellation-fee rules in project memory for next sprint. I haven't changed any code.\n\n**The rules as you described them:**\n\n| Time between cancellation and appointment | Fee |\n|---|---|\n| 48 hours or more | Free |\n| Between 24 and 48 hours | Half the treatment price |\n| Less than 24 hours | Full treatment price |\n\n**Questions to settle when we start:**\n- **Exact boundaries.** I read \"less than 48 hours\" as strict, so exactly 48 hours is free and exactly 24 hours is half. Please confirm.\n- **Clock for the cutoff.** Is the 48- or 24-hour limit measured from the moment the client cancels, or from the moment the receptionist records it?\n- **No-shows.** Does a client who doesn't come and doesn't cancel pay the full price? The rules you gave don't cover this.\n- **Rounding.** All three treatment prices are even numbers of cents, so half is exact today. The code should still say what happens if a price changes.\n- **Storage.** Should the fee be stored on the appointment when it's cancelled, or worked out again each time it's shown? Storing it means a later price change won't alter past fees.",
+   "cost_usd": 0.0016031299999999995,
+   "session_cost_usd": 0.017058339999999998,
+   "steps": 2,
+   "error": false,
+   "wall_s": 13.3,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "2bfb5cf7-55af-42ab-8829-1599f3aa3baa",
+   "prompt": "One more for later: the therapists' contract caps them at 7 treatments a day. Don't build that into book(), because reception sometimes goes over it when the therapist agrees. But the online booking page we start in a few weeks has to treat a therapist who has 7 appointments that day as fully booked.",
+   "result": "I've noted this in project memory for the online booking work. I haven't written any code.\n\n**What we'll build later:** The cap stays out of `book()`, so reception can still book past 7 when a therapist agrees. The online page will check the day's count separately and show a therapist with 7 appointments as fully booked.\n\n**Questions to settle when we start:**\n- **What counts toward the 7.** I'd count every appointment on that day for that therapist, and not cancelled ones. Please confirm.\n- **Day boundary.** Appointments are assigned to a day by their start time. An appointment that runs past midnight can't happen here, since the practice closes by 19:00.\n- **What the online page shows.** Should a fully booked therapist be hidden from the online page, or shown as unavailable for that day? Should the page also say why, for example \"fully booked for this day\"?\n- **Existing bookings over the cap.** If reception already booked 8 for a therapist, the page would still show that day as fully booked. That seems right, but please confirm.",
+   "cost_usd": 0.0015870599999999978,
+   "session_cost_usd": 0.018645399999999996,
+   "steps": 2,
+   "error": false,
+   "wall_s": 8.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 1,
+   "session": "2bfb5cf7-55af-42ab-8829-1599f3aa3baa",
+   "prompt": "Great, please commit all of this with a sensible message.",
+   "result": "I committed the changes on a new branch, `booking-errors-and-gap`, as `a1ecca4`. The working tree is clean and all 21 tests pass.\n\nThe commit message is:\n\n> Add booking error hierarchy and 10-minute appointment gap\n>\n> - Add BookingError with SlotTaken and OutsideOpeningHours subclasses in errors.py, replacing ValueError in Schedule.book. Messages are written for receptionists because the front-desk app shows them directly.\n> - Fix the overlap check so a booking that starts earlier and runs into an existing appointment is refused.\n> - Require 10 minutes between a therapist's own appointments, before and after each new booking, for cleaning and notes. Other therapists are unaffected.\n\nIt ends with the Co-Authored-By line you specified. I committed on a branch rather than `main`, since `main` is the default branch. I haven't pushed it or opened a PR. I can do either if you want.\n\nThe cancellation-fee and daily-cap notes are only in project memory, not in the repo, because they're planned work with no code yet.",
+   "cost_usd": 0.0025319,
+   "session_cost_usd": 0.021177299999999996,
+   "steps": 3,
+   "error": false,
+   "wall_s": 17.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "cbd23fc5-f2fb-45ae-b704-a3e4f5404ab4",
+   "prompt": "Let's add `Schedule.cancel(appointment_id)`. It should mark the appointment as cancelled rather than delete it, since we'll need the record for the fees, and a cancelled appointment must no longer block its slot.",
+   "result": "`Schedule.cancel(appointment_id)` is in place. The suite passes (26 tests, up from 21), and nothing is committed.\n\n- **Cancel marks, doesn't delete.** `cancel` sets a new `cancelled` flag on the `Appointment` and returns it. The record stays in `schedule.appointments`, so the fee can be calculated later.\n- **Cancelled appointments free their slot.** `book()` skips cancelled appointments in its overlap and 10-minute gap check, so a slot can be rebooked immediately.\n- **Unknown ids raise `KeyError`,** the same as `get`, since a missing lookup isn't a booking refusal.\n- **Persistence.** `storage.save` writes the flag and `load` reads it, defaulting to `False` for older files without it. Without this, a cancellation would be lost on reload.\n- **Tests added** in `tests/test_schedule.py` and `tests/test_storage.py`: the record is kept and marked, the slot is freed, the 10-minute gap no longer blocks, an unknown id raises `KeyError`, and the flag survives a save/load round trip.\n\nDecision for you: `appointments_for` still returns cancelled appointments, so a day view would show them. I left that alone because the flag is there for the fee work. If the day view should hide them, it's a one-line filter.\n\nCancellation fees are not built, as planned. The open questions from the earlier session (strict limits, when the clock starts, no-show pricing, rounding) still need your answers first.",
+   "cost_usd": 0.0063213,
+   "session_cost_usd": 0.0063213,
+   "steps": 12,
+   "error": false,
+   "wall_s": 27.9,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "cbd23fc5-f2fb-45ae-b704-a3e4f5404ab4",
+   "prompt": "Next, `Schedule.week(therapist, monday)`, returning that therapist's appointments for the week as a dict from date to a list sorted by time, without cancelled ones. Reception wants it for their weekly overview. They print their day plans on a tiny receipt printer by the way, 42 characters a line, anything longer wraps into a mess. The printable day plan is a separate job though, later.",
+   "result": "`Schedule.week(therapist, monday)` is in `src/slotwise/schedule.py`. The suite passes (28 tests, up from 26), and nothing is committed.\n\n- **Returns all seven days.** The dict has a key for each date from `monday` through the following Sunday, so a free day shows as an empty list. The overview can print every day without checking for missing keys. If you'd rather have only days with bookings, that's a one-line change.\n- **Reuses `appointments_for`.** Each day's list comes from it, with cancelled appointments filtered out, so the time ordering and therapist filtering stay in one place.\n- **No check that `monday` is a Monday.** Any date works, and it starts the seven days from whatever is passed. I left out validation to keep the change small; tell me if you want a `ValueError` for non-Mondays.\n- **Tests** cover grouping and time order, plus excluding cancelled appointments and other therapists.\n\nThe receipt-printer width (42 characters) doesn't affect this change, since `week` returns data, not text. I'll keep it in mind for the printable day plan.",
+   "cost_usd": 0.004454610000000001,
+   "session_cost_usd": 0.010775910000000001,
+   "steps": 8,
+   "error": false,
+   "wall_s": 26.7,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "cbd23fc5-f2fb-45ae-b704-a3e4f5404ab4",
+   "prompt": "So you can plan ahead: next month we need series bookings, because doctors prescribe a series of sessions. Weekly, same weekday and time. If one of those weeks is already taken, skip it and add a week at the end, so the client still gets all their sessions. And never more than 9 sessions in one series: the insurance only pays for 9 per prescription, and reception keeps trying to book 12.",
+   "result": "Nothing is built yet, since you're planning ahead for next month. Here's what I'd design, and the questions to settle first.\n\n**What I'd build**\n\n- `Schedule.book_series(therapist, client, first_start, treatment, sessions)`, where `sessions` is the number of sessions to book. Each session is one week after the last, at the same weekday and time.\n- **The 9 limit is enforced in `schedule.py`.** A request for more than 9 raises a `BookingError` with a receptionist-facing message such as \"A series can have at most 9 sessions, because the insurance pays for 9 per prescription. Book the rest as a new series after\u2026\". I wouldn't silently cap it at 9, since reception would then think they booked 12.\n- **Skipped weeks are filled at the end.** Each taken week (`SlotTaken`) is skipped, and the series keeps searching forward until it has booked `sessions` appointments. The 9 counts booked sessions, not weeks searched.\n- **All or nothing.** If the series can't reach its full count, nothing is booked, and the message says which week ran out. A partial series would leave the client with fewer sessions than the prescription without anyone noticing.\n- **A series id on each appointment**, so the sessions stay linked for cancellation and reporting. It's a new field, so `storage.py` needs to save and load it, defaulting to nothing for old files.\n\n**Questions for you**\n\n1. **Is the 9 per prescription or per client?** If a client gets a second prescription, two series could add up to more than 9 for the insurer. Tracking it per client and prescription needs a prescription id, which the model doesn't have yet.\n2. **What counts as \"taken\" when searching for a week?** I'd skip on `SlotTaken` only. A week that's outside opening hours (a public holiday, say) would probably need to be skipped too. Should that be skipped, or should it fail the series?\n3. **How far can the search go?** Without a limit, a busy therapist could push a series months out. I'd suggest a cap, like 12 weeks of searching,",
+   "cost_usd": 0.0018833900000000004,
+   "session_cost_usd": 0.012659300000000002,
+   "steps": 1,
+   "error": false,
+   "wall_s": 16.7,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "cbd23fc5-f2fb-45ae-b704-a3e4f5404ab4",
+   "prompt": "And for the SMS reminders that come after that: their SMS gateway only takes plain ASCII. Umlauts and accents arrive as question marks, so 'Br\u00e4ndli' has to go out as 'Braendli'. A reminder can be at most 160 characters, otherwise it's billed as two messages, and every reminder must include the reception's number, 044 512 77 30, so people can call to move their appointment.",
+   "result": "Nothing is built yet. I'm reading this as a requirement for the reminder work after the series bookings, so I haven't changed any code.\n\nHere's how I'd handle the three rules:\n\n- **ASCII transliteration.** Umlauts become digraphs (\u00e4\u2192ae, \u00f6\u2192oe, \u00fc\u2192ue, \u00df\u2192ss), so 'Br\u00e4ndli' becomes 'Braendli' as you specified. Other accents are stripped (\u00e9\u2192e, Zo\u00eb\u2192Zoe). The stored client name stays unchanged; only the reminder text is converted.\n- **160-character limit.** The builder checks the final text's length and raises an error if it's too long, rather than sending a truncated message. Long client names are the main risk, so I'd test with the longest realistic name.\n- **Phone number.** The reminder always includes \"044 512 77 30\" and asks the client to call to move the appointment. This is a fixed string in the reminder template, so no reminder can omit it.\n\nTwo points I found while thinking this through:\n\n1. **ASCII isn't the same as the 160 limit.** Most SMS gateways count GSM 03.38 characters. Characters like `[ ] { } \\ ^ ~ |` and `\u20ac` each take two units, so a message of plain ASCII can still exceed 160 and be billed as two. I'd reject those characters in the reminder text too, not just non-ASCII ones. Can you confirm whether the gateway counts GSM-7 or raw characters?\n2. **Characters with no ASCII equivalent** (for example, a name in another script). Should the reminder use '?', initials, or should the reminder fail so reception can fix the name?\n\nI also need a few things from you before I write this:\n\n- **The reminder wording.** Is it German, English, or both, and do you have a sample? The text has to fit the 160 limit with the phone number and a long name.\n- **Long names.** If the name pushes the message over 160, should we shorten the name (for example, first name and initial) or refuse to send and flag the appointment?\n\nOnce you answer these, I can build `build_reminder(appointment)` in a new module, with tests that cover umlauts, the longest realistic name, and the phone num",
+   "cost_usd": 0.002125470000000001,
+   "session_cost_usd": 0.014784770000000003,
+   "steps": 1,
+   "error": false,
+   "wall_s": 15.2,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 2,
+   "session": "cbd23fc5-f2fb-45ae-b704-a3e4f5404ab4",
+   "prompt": "The therapists keep asking for an iCal feed so they can see their appointments on their phones. We actually tried that last year: the phone calendars cached the feed for hours, so cancelled appointments kept showing up, and then the data protection officer stopped it because patient names were ending up on Google's and Apple's servers. So that's off the table. OK, that's all for today, please commit.",
+   "result": "Committed as `ce28041` \"Add Schedule.cancel and Schedule.week\" on `booking-errors-and-gap`. The working tree is clean and the 28 tests pass.\n\nThe commit covers:\n- `Schedule.cancel(appointment_id)`, which marks the appointment cancelled and keeps the record. Cancelled appointments no longer block their slot or the 10-minute gap.\n- The cancelled flag saved and loaded by `storage.py`, defaulting to `False` for older files.\n- `Schedule.week(therapist, monday)`, which returns the seven days from the Monday, with cancelled appointments left out.\n\nOn the iCal feed: I'll leave it off the list. Nothing in the code needs changing for it. The series bookings, SMS reminders and cancellation fees are still open as planned, with the questions from earlier still waiting for your answers.",
+   "cost_usd": 0.003146549999999998,
+   "session_cost_usd": 0.01793132,
+   "steps": 3,
+   "error": false,
+   "wall_s": 14.4,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "b1ad62c1-2d49-45be-8ca4-60d0664b0757",
+   "prompt": "New topic: we need a client register. Add `clients.py` with a `Client` dataclass (id, name, phone, email) and a `ClientBook` with `add(client)` and `find_by_phone(phone)`. Phone numbers come in all shapes, and '079 123 45 67', '+41 79 123 45 67' and '0041791234567' must all find the same client.",
+   "result": "I added the client register in `src/slotwise/clients.py` with tests in `tests/test_clients.py`. The full suite passes (35 tests). I haven't committed anything.\n\n- **`Client`** is a dataclass with `id`, `name`, `phone` and `email`. The phone is stored as the caller gave it.\n- **`normalize_phone(phone)`** strips spaces, brackets, dots and dashes, then converts to `+` followed by digits. A leading `00` becomes `+`, a leading `0` becomes `+41`, and a `+` is kept. All three of your examples give `+41791234567`.\n- **`ClientBook.add(client)`** indexes the client by its normalized number.\n- **`ClientBook.find_by_phone(phone)`** returns the matching `Client`, or `None` if nobody has that number.\n\nI made three choices you may want to change:\n- **Swiss default:** numbers starting with `0` are read as Swiss (+41). The practice is in Switzerland (the reception number is 044), but say if you want another default.\n- **Rejected inputs:** a number with no `+`, `00` or `0` prefix, or with letters in it, raises `ValueError`. Both `add` and `find_by_phone` raise. I didn't want `791234567` guessed as a Swiss number.\n- **Duplicate numbers:** `add` raises `ValueError` if the number is already registered. This stops a second client silently overwriting the first. If a family can share one phone, this needs changing.\n\nI also added a line under \"Unreleased\" in `CHANGELOG.md` and stored the phone rules in memory.",
+   "cost_usd": 0.00788448,
+   "session_cost_usd": 0.00788448,
+   "steps": 11,
+   "error": false,
+   "wall_s": 36.0,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "b1ad62c1-2d49-45be-8ca4-60d0664b0757",
+   "prompt": "Also add `ClientBook.search(text)` for name search: case-insensitive, matching any part of the name.",
+   "result": "I added `ClientBook.search(text)` to `src/slotwise/clients.py`. It returns every client whose name contains the text, ignoring case, in the order they were added. The full suite passes (38 tests, including 3 new search tests). I haven't committed anything.\n\nChoices I made:\n- **Case folding:** it uses `casefold()` rather than `lower()`, so \"br\u00e4ndli\" matches \"Br\u00e4ndli\" and German `\u00df` compares correctly.\n- **Accents are not ignored:** \"Brandli\" will not find \"Br\u00e4ndli\". Say if you want accent-insensitive matching.\n- **Empty text:** `search(\"\")` returns all clients. Say if you'd rather it return nothing.\n- **No match:** it returns an empty list, not `None`.",
+   "cost_usd": 0.002114999999999999,
+   "session_cost_usd": 0.009999479999999998,
+   "steps": 4,
+   "error": false,
+   "wall_s": 11.6,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  },
+  {
+   "block": 3,
+   "session": "b1ad62c1-2d49-45be-8ca4-60d0664b0757",
+   "prompt": "Thanks, please commit.",
+   "result": "Committed as `4135ce2` on `booking-errors-and-gap`: \"Add client register with phone and name lookup\". The commit has the new `src/slotwise/clients.py` and `tests/test_clients.py`, plus the `CHANGELOG.md` entry. The working tree is clean, and the test suite passes after the commit.\n\nThe commit message ends with the `Co-Authored-By: Claude Haiku 5.5` line you specified.\n\nTwo things I left alone:\n- `.pytest_cache/` and `.mcp.json` are untracked or ignored and were not included.\n- The branch is still `booking-errors-and-gap`, not `main`. I haven't pushed it or opened a PR.",
+   "cost_usd": 0.0026907700000000003,
+   "session_cost_usd": 0.012690249999999998,
+   "steps": 3,
+   "error": false,
+   "wall_s": 11.7,
+   "models": [
+    "claude-haiku-5-5"
+   ]
+  }
+ ],
+ "settles": [
+  {
+   "engram_stop_s": 6.1
+  },
+  {
+   "engram_stop_s": 8.0
+  },
+  {
+   "engram_stop_s": 7.0
+  },
+  {
+   "engram_stop_s": 1.0
+  }
+ ],
+ "teammate_commits": [],
+ "cost_usd": 0.05179887,
+ "final_session_cost_usd": 0.012690249999999998,
+ "agent_wall_s": 292.3,
+ "wall_s": 316.6,
+ "errors": 0,
+ "memory": {
+  "cost_usd": 0.020128800000000002,
+  "engram": {
+   "injected_chars": 4488,
+   "recalls": 14,
+   "decisions": [
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Skip",
+    "Inject"
+   ],
+   "briefing_chars": 57554,
+   "distills": 14,
+   "distill_errors": 0,
+   "events": {
+    "SessionStart": 14,
+    "recall": 14,
+    "distill": 14
+   },
+   "cost_by_event": {
+    "distill": 0.020128800000000002
+   },
+   "errors": {}
+  }
+ },
+ "memory_state": {
+  "auto_memory_files": {},
+  "engram_stats": "{\n  \"by_kind\": {\n    \"answer\": 107,\n    \"decision\": 19,\n    \"entity\": 68,\n    \"episode\": 14,\n    \"error\": 17,\n    \"fact\": 6,\n    \"note\": 1,\n    \"preference\": 10,\n    \"prompt\": 15,\n    \"todo\": 11,\n    \"tool_call\": 61,\n    \"tool_result\": 86\n  },\n  \"embedder\": \"static:potion-retrieval-32M\",\n  \"file_bytes\": 1941504,\n  \"last_seq\": 415,\n  \"memtable_docs\": 0,\n  \"records\": 415,\n  \"segments\": 15,\n  \"sessions\": 3,\n  \"store\": \"/home/claude/bench/work/slotwise/engram_main/home/engram/projects/slotwise-bb2d0c68/memory.strata\",\n  \"wal_bytes\": 16\n}\n"
+ },
+ "last_session_compactions": 0,
+ "last_session_context_tokens": 39351,
+ "git_log": "4135ce2 Dana: Add client register with phone and name lookup\nce28041 Dana: Add Schedule.cancel and Schedule.week\na1ecca4 Dana: Add booking error hierarchy and 10-minute appointment gap\n0568b78 Dana: initial version\n",
+ "git_status": "",
+ "transcripts": null
+}

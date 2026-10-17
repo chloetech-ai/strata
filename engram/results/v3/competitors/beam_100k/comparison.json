@@ -1,0 +1,463 @@
+{
+ "questions": 400,
+ "binary": false,
+ "base": "engram_qe",
+ "configs": {
+  "engram_qe": {
+   "config": "engram_qe",
+   "score": 0.4305282738095238,
+   "ci95": [
+    0.3904107142857143,
+    0.4706845238095238
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.7375
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.25
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.21848214285714285
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.6411458333333333
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.5375
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.4
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.3379166666666667
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.6625
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.17023809523809524
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.35
+    }
+   }
+  },
+  "mem0": {
+   "config": "mem0",
+   "score": 0.418797123015873,
+   "ci95": [
+    0.37793750000000004,
+    0.4596066468253968
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.575
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.19375
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.22756944444444444
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.5973958333333333
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.425
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.5625
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.3247916666666667
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.7145833333333333
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.23613095238095236
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.33125
+    }
+   },
+   "vs_base": {
+    "diff": -0.011731150793650794,
+    "ci95": [
+     -0.052585317460317464,
+     0.029692460317460315
+    ],
+    "p": 0.5756424357564244
+   }
+  },
+  "mem0-hybrid": {
+   "config": "mem0-hybrid",
+   "score": 0.41437202380952376,
+   "ci95": [
+    0.37378124999999995,
+    0.4548824404761905
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.6125
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.271875
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.15958333333333335
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.5973958333333333
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.36875
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.55
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.37354166666666666
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.7
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.22257440476190476
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.2875
+    }
+   },
+   "vs_base": {
+    "diff": -0.016156249999999997,
+    "ci95": [
+     -0.05870238095238095,
+     0.025827380952380952
+    ],
+    "p": 0.45965403459654036
+   }
+  },
+  "hindsight": {
+   "config": "hindsight",
+   "score": 0.4673154761904762,
+   "ci95": [
+    0.4274285714285714,
+    0.5074047619047619
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.625
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.23125
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.28604166666666664
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.6729166666666667
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.6
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.4125
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.3786309523809524
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.7166666666666667
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.3751488095238095
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.375
+    }
+   },
+   "vs_base": {
+    "diff": 0.03678720238095238,
+    "ci95": [
+     -0.00438392857142857,
+     0.07815029761904763
+    ],
+    "p": 0.09099090090990901
+   }
+  },
+  "hindsight-small": {
+   "config": "hindsight-small",
+   "score": 0.3975188492063492,
+   "ci95": [
+    0.3578958333333333,
+    0.43695833333333334
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.7125
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.19375
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.1773611111111111
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.5208333333333333
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.475
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.4375
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.3304464285714286
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.675
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.20279761904761906
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.25
+    }
+   },
+   "vs_base": {
+    "diff": -0.0330094246031746,
+    "ci95": [
+     -0.07314583333333333,
+     0.0066855158730158735
+    ],
+    "p": 0.10978902109789021
+   }
+  },
+  "engram_search": {
+   "config": "engram_search",
+   "score": 0.36631498015873015,
+   "ci95": [
+    0.3263417658730159,
+    0.4075327380952381
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.8375
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.215625
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.1597123015873016
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.5114583333333333
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.26875
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.43125
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.2975
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.5375
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.08510416666666668
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.31875
+    }
+   },
+   "vs_base": {
+    "diff": -0.06421329365079365,
+    "ci95": [
+     -0.10439781746031747,
+     -0.024232638888888887
+    ],
+    "p": 0.0014998500149985001
+   }
+  },
+  "hindsight-prov": {
+   "config": "hindsight-prov",
+   "score": 0.4526145833333333,
+   "ci95": [
+    0.413,
+    0.4915
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.7375
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.196875
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.3158333333333333
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.4765625
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.54375
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.45
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.4423511904761905
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.6895833333333333
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.3674404761904762
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.30625
+    }
+   },
+   "vs_base": {
+    "diff": 0.022086309523809522,
+    "ci95": [
+     -0.0194375,
+     0.06324107142857142
+    ],
+    "p": 0.2913708629137086
+   }
+  },
+  "hindsight-prov-small": {
+   "config": "hindsight-prov-small",
+   "score": 0.2998829365079365,
+   "ci95": [
+    0.2608134920634921,
+    0.3388720238095238
+   ],
+   "by_type": {
+    "abstention": {
+     "n": 40,
+     "score": 0.725
+    },
+    "contradiction_resolution": {
+     "n": 40,
+     "score": 0.125
+    },
+    "event_ordering": {
+     "n": 40,
+     "score": 0.19198412698412698
+    },
+    "information_extraction": {
+     "n": 40,
+     "score": 0.1625
+    },
+    "instruction_following": {
+     "n": 40,
+     "score": 0.35
+    },
+    "knowledge_update": {
+     "n": 40,
+     "score": 0.275
+    },
+    "multi_session_reasoning": {
+     "n": 40,
+     "score": 0.260625
+    },
+    "preference_following": {
+     "n": 40,
+     "score": 0.6416666666666667
+    },
+    "summarization": {
+     "n": 40,
+     "score": 0.17955357142857142
+    },
+    "temporal_reasoning": {
+     "n": 40,
+     "score": 0.0875
+    }
+   },
+   "vs_base": {
+    "diff": -0.1306453373015873,
+    "ci95": [
+     -0.17310813492063493,
+     -0.08826289682539683
+    ],
+    "p": 9.999000099990002e-05
+   }
+  }
+ }
+}

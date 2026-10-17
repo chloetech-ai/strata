@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Engram, long-term memory for Claude Code: where it wins, where it loses, and what it saves on coding sessions.">
+<title>Engram for Claude Code</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one 1040px column. Bars are drawn to scale; the context column is the recurring motif. */
+:root {
+  --paper: #f1f3f6;
+  --panel: #ffffff;
+  --ink: #111923;
+  --ink-2: #4c5867;
+  --rule: #d6dde5;
+  --accent: #2a3ecf;
+  --accent-ink: #ffffff;
+  --accent-wash: #e3e7fb;
+  --other: #a4aebb;
+  --loss: #a4520a;
+  --loss-wash: #f7ebdc;
+  --display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0d1218; --panel: #141b24; --ink: #e6ebf1; --ink-2: #9ba8b7; --rule: #29333f;
+    --accent: #8796ff; --accent-ink: #0d1218; --accent-wash: #1d2452;
+    --other: #5b6777; --loss: #f0a457; --loss-wash: #2d2113;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0d1218; --panel: #141b24; --ink: #e6ebf1; --ink-2: #9ba8b7; --rule: #29333f;
+  --accent: #8796ff; --accent-ink: #0d1218; --accent-wash: #1d2452;
+  --other: #5b6777; --loss: #f0a457; --loss-wash: #2d2113;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { color-scheme: light; }
+body { margin: 0; }
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 16px/1.6 var(--body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1040px; margin: 0 auto; }
+a { color: var(--accent); text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; letter-spacing: -0.02em; }
+h2 { font-size: clamp(1.7rem, 3.4vw, 2.3rem); line-height: 1.12; font-weight: 750; }
+h3 { font-size: 1.1rem; line-height: 1.3; font-weight: 700; letter-spacing: -0.01em; }
+p { margin: 0; }
+.num, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.eyebrow { font: 500 0.75rem/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-2); }
+.lede { color: var(--ink-2); max-width: 64ch; }
+section { padding-block: 56px; border-top: 1px solid var(--rule); display: grid; gap: 28px; }
+.head { display: grid; gap: 12px; }
+
+/* top bar */
+.top { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; padding-block: 20px; }
+.mark { font: 800 1.25rem/1 var(--display); letter-spacing: -0.03em; color: var(--ink); text-decoration: none; display: flex; gap: 10px; align-items: center; }
+.mark i { display: grid; gap: 2px; width: 18px; }
+.mark i b { display: block; height: 3px; background: var(--other); border-radius: 1px; }
+.mark i b:nth-child(3) { background: var(--accent); }
+.top nav { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.9rem; }
+.top nav a { color: var(--ink-2); text-decoration: none; }
+.top nav a:hover { color: var(--ink); }
+
+/* hero */
+.hero { padding-block: 40px 56px; display: grid; gap: 28px; }
+.hero h1 { font-size: clamp(2.4rem, 6.4vw, 4.4rem); line-height: 1.02; font-weight: 800; max-width: 14ch; }
+.hero .lede { font-size: 1.12rem; }
+.ctx { display: grid; gap: 10px; background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 20px; }
+.ctx-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
+.ctx-label { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 16px; font-size: 0.92rem; }
+.ctx-label span:last-child { font-family: var(--mono); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.ctx-track { height: 30px; border-radius: 4px; background: repeating-linear-gradient(90deg, var(--other) 0 2px, transparent 2px 7px); opacity: 0.9; }
+.ctx-track.eng { background: transparent; border: 1px dashed var(--rule); position: relative; }
+.ctx-track.eng b { position: absolute; inset: -1px auto -1px -1px; width: 3.6%; min-width: 6px; background: var(--accent); border-radius: 4px; }
+.ctx small { color: var(--ink-2); font-size: 0.85rem; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 28px; }
+.stat { display: grid; gap: 4px; border-top: 2px solid var(--ink); padding-top: 10px; }
+.stat strong { font: 750 1.9rem/1.1 var(--display); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--ink-2); font-size: 0.92rem; }
+.cta { display: flex; flex-wrap: wrap; gap: 10px; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 16px; border-radius: 6px; font-weight: 600; font-size: 0.95rem; text-decoration: none; border: 1px solid var(--rule); color: var(--ink); background: var(--panel); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+
+/* A/B bar chart */
+.chart { display: grid; gap: 8px; background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 20px; }
+.chart-head, .bar-row { display: grid; grid-template-columns: minmax(120px, 13rem) minmax(0, 1fr) 5.2rem 4.4rem; gap: 12px; align-items: center; }
+.chart-head { font: 500 0.72rem/1.2 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); padding-bottom: 4px; border-bottom: 1px solid var(--rule); }
+.chart-head span:nth-child(n+3), .bar-row .v { text-align: right; }
+.bar-row { font-size: 0.93rem; }
+.bar-row .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 0.88rem; }
+.bar-row .v.cost { color: var(--ink-2); }
+.track { height: 18px; background: var(--paper); border-radius: 3px; position: relative; overflow: hidden; }
+.track b { position: absolute; inset: 0 auto 0 0; background: var(--other); border-radius: 3px; }
+.bar-row.us { font-weight: 600; }
+.bar-row.us .track b { background: var(--accent); }
+.bar-row.ref .track b { background: repeating-linear-gradient(135deg, var(--other) 0 4px, transparent 4px 8px); border: 1px solid var(--other); }
+.chart .foot { color: var(--ink-2); font-size: 0.85rem; padding-top: 6px; }
+
+/* wins grid */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 14px; }
+.card { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 20px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.card .big { font: 750 2rem/1.05 var(--display); color: var(--accent); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.card p { color: var(--ink-2); font-size: 0.94rem; }
+
+/* tables */
+.table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; min-width: 680px; font-size: 0.92rem; }
+th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font: 500 0.72rem/1.3 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); }
+td.n, th.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+tr.us td { background: var(--accent-wash); font-weight: 600; }
+td small { display: block; color: var(--ink-2); font-weight: 400; font-size: 0.8rem; }
+.note { color: var(--ink-2); font-size: 0.86rem; max-width: 80ch; }
+
+/* search engine section */
+.kinds { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 185px), 1fr)); gap: 12px; }
+.kind { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.kind .k { font: 600 0.78rem/1.2 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.kind p { font-size: 0.92rem; }
+.kind small { color: var(--ink-2); font-size: 0.84rem; line-height: 1.45; }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 12px 28px; counter-reset: step; }
+.steps li { counter-increment: step; display: grid; grid-template-columns: 2.2rem minmax(0, 1fr); gap: 10px; font-size: 0.94rem; color: var(--ink-2); }
+.steps li::before { content: counter(step); font: 700 1.05rem/2.2rem var(--display); width: 2.2rem; height: 2.2rem; border-radius: 50%; text-align: center; background: var(--accent); color: var(--accent-ink); }
+.steps strong { color: var(--ink); }
+.sub { display: grid; gap: 10px; }
+.figs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 16px 28px; }
+.fig { display: grid; gap: 4px; border-top: 2px solid var(--accent); padding-top: 10px; align-content: start; }
+.fig strong { font: 750 1.6rem/1.1 var(--display); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.fig span { color: var(--ink-2); font-size: 0.9rem; }
+
+/* losses */
+.losses { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 0 32px; }
+.loss { display: grid; grid-template-columns: 5.6rem minmax(0, 1fr); gap: 14px; padding-block: 16px; border-bottom: 1px solid var(--rule); }
+.loss .tag { font: 600 0.95rem/1.2 var(--mono); color: var(--loss); background: var(--loss-wash); border-radius: 4px; padding: 6px 4px; text-align: center; align-self: start; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.loss h3 { margin-bottom: 4px; }
+.loss p { color: var(--ink-2); font-size: 0.93rem; }
+
+/* calculator */
+.calc { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 16px; align-items: start; }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 20px; display: grid; gap: 16px; min-width: 0; }
+.presets { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { font: 500 0.85rem/1 var(--body); padding: 8px 12px; border-radius: 999px; border: 1px solid var(--rule); background: var(--paper); color: var(--ink); cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.field { display: grid; gap: 6px; }
+.field label { display: flex; justify-content: space-between; gap: 12px; font-size: 0.9rem; font-weight: 500; }
+.field label output { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 500; }
+.field small { color: var(--ink-2); font-size: 0.8rem; line-height: 1.4; }
+input[type="range"] { width: 100%; accent-color: var(--accent); }
+select, input[type="number"] { font: 500 0.95rem var(--body); padding: 8px 10px; border-radius: 6px; border: 1px solid var(--rule); background: var(--paper); color: var(--ink); width: 100%; }
+details { border-top: 1px solid var(--rule); padding-top: 12px; }
+summary { cursor: pointer; font-weight: 500; font-size: 0.9rem; color: var(--ink-2); }
+details[open] summary { margin-bottom: 14px; }
+details .field + .field { margin-top: 14px; }
+.result { display: grid; gap: 14px; }
+.save { display: grid; gap: 2px; }
+.save strong { font: 800 clamp(2.2rem, 5vw, 3.2rem)/1 var(--display); letter-spacing: -0.03em; color: var(--accent); font-variant-numeric: tabular-nums; }
+.save span { color: var(--ink-2); font-size: 0.92rem; }
+.cmp { display: grid; gap: 10px; }
+.cmp-row { display: grid; gap: 4px; }
+.cmp-row .lab { display: flex; justify-content: space-between; gap: 10px; font-size: 0.9rem; }
+.cmp-row .lab span:last-child { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.cmp .track { height: 14px; }
+.cmp .track i { position: absolute; inset: 0 auto 0 0; background: var(--other); opacity: 0.45; border-radius: 3px; }
+.cmp-row.us .track b { background: var(--accent); }
+.kv { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px 16px; font-size: 0.9rem; align-items: baseline; }
+.kv .h { font: 500 0.7rem/1.2 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); text-align: right; }
+.kv .h:first-child { text-align: left; }
+.kv .n { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.kv .rule { grid-column: 1 / -1; border-top: 1px solid var(--rule); }
+.measured { background: var(--accent-wash); border-radius: 10px; padding: 18px 20px; display: grid; gap: 8px; }
+.measured p { font-size: 0.92rem; }
+.assume { display: grid; gap: 6px; padding-left: 18px; margin: 0; color: var(--ink-2); font-size: 0.88rem; }
+
+footer { border-top: 1px solid var(--rule); padding-block: 32px 48px; display: grid; gap: 10px; color: var(--ink-2); font-size: 0.86rem; }
+footer p { max-width: 90ch; }
+
+@media (max-width: 760px) {
+  .calc { grid-template-columns: minmax(0, 1fr); }
+  .chart-head, .bar-row { grid-template-columns: minmax(0, 1fr) 4.6rem 3.8rem; }
+  .chart-head span:nth-child(2) { display: none; }
+  .bar-row .track { grid-column: 1 / -1; grid-row: 2; }
+  .bar-row { row-gap: 4px; padding-bottom: 4px; }
+  section { padding-block: 44px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .track b, .ctx-track.eng b { transition: width 0.35s ease; }
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="top">
+    <a class="mark" href="#top" aria-label="Engram"><i aria-hidden="true"><b></b><b></b><b></b><b></b></i>Engram</a>
+    <nav aria-label="Sections">
+      <a href="#wins">Where it wins</a>
+      <a href="#same-reader">Head to head</a>
+      <a href="#engine">How it searches</a>
+      <a href="#losses">Where it loses</a>
+      <a href="#cost">What it saves</a>
+      <a href="../">Documentation</a>
+      <a href="https://github.com/rkonow/engram">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="hero" id="top">
+    <p class="eyebrow">Long-term memory for Claude Code</p>
+    <h1>Keep every session. Re-read only what matters.</h1>
+    <p class="lede">Engram records every session of a project on your machine, without a model call, and at each prompt hands the agent the few thousand tokens that answer it. On 208 coding follow-ups it solved as many tasks as keeping the whole history in context, for about a quarter of the cost per run.</p>
+
+    <figure class="ctx" style="margin:0" aria-label="Context re-read on every step, to scale">
+      <div class="ctx-row">
+        <div class="ctx-label"><span>Whole history kept in context</span><span>85,800 tokens</span></div>
+        <div class="ctx-track"></div>
+      </div>
+      <div class="ctx-row">
+        <div class="ctx-label"><span><strong>Engram's injection</strong></span><span>3,100 tokens</span></div>
+        <div class="ctx-track eng"><b></b></div>
+      </div>
+      <small>Drawn to scale. The history is the mean of the four test projects (55,000 to 121,000 tokens); the injection is Engram's mean per run (12,400 characters). Every step of a session re-reads what is in context.</small>
+    </figure>
+
+    <div class="stats">
+      <div class="stat"><strong>196 of 208</strong><span>coding follow-ups solved. Whole history in context: 194. Next best memory, mem0: 178.</span></div>
+      <div class="stat"><strong>$0.009</strong><span>a run, Engram's own model calls included. Whole history: $0.032.</span></div>
+      <div class="stat"><strong>$0</strong><span>in model calls to store a history. Hindsight: about $1. mem0: $0.13.</span></div>
+    </div>
+    <div class="cta">
+      <a class="btn primary" href="../engram/setup.html">Install guide</a>
+      <a class="btn" href="../engram/results.html">Every result and its method</a>
+    </div>
+  </div>
+
+  <section id="wins">
+    <div class="head">
+      <p class="eyebrow">Where it wins</p>
+      <h2>On coding work it beats every memory system we ran</h2>
+      <p class="lede">Four projects, each built over a recorded history of sessions; in one, a teammate's commits land in between. Then 52 follow-up tasks, most of which need something only said in an earlier session: a decision, a customer's rule, a changed convention. Each memory system ran every task four times in a new session, with the same agent, and a script graded the result.</p>
+    </div>
+
+    <figure class="chart" style="margin:0" aria-label="Follow-up runs solved out of 208, per memory system">
+      <div class="chart-head"><span>Memory system</span><span>Runs solved, out of 208</span><span>Solved</span><span>$ / run</span></div>
+      <div class="bar-row us"><span>Engram</span><div class="track"><b style="width:94.2%"></b></div><span class="v">196 · 94%</span><span class="v cost">0.009</span></div>
+      <div class="bar-row ref"><span>Whole history in context</span><div class="track"><b style="width:93.3%"></b></div><span class="v">194 · 93%</span><span class="v cost">0.032</span></div>
+      <div class="bar-row"><span>mem0</span><div class="track"><b style="width:85.6%"></b></div><span class="v">178 · 86%</span><span class="v cost">0.006</span></div>
+      <div class="bar-row"><span>Past transcripts + grep</span><div class="track"><b style="width:77.9%"></b></div><span class="v">162 · 78%</span><span class="v cost">0.006</span></div>
+      <div class="bar-row"><span>Claude Code auto memory</span><div class="track"><b style="width:74.0%"></b></div><span class="v">154 · 74%</span><span class="v cost">0.006</span></div>
+      <div class="bar-row"><span>claude-mem</span><div class="track"><b style="width:60.1%"></b></div><span class="v">125 · 60%</span><span class="v cost">0.015</span></div>
+      <div class="bar-row"><span>No memory</span><div class="track"><b style="width:44.2%"></b></div><span class="v">92 · 44%</span><span class="v cost">0.005</span></div>
+      <p class="foot">The agent and every memory system's own model calls use Haiku; cost is per run, agent plus memory. Engram is the shipped build. The previous release solved 195 and two variants of the new build 201. mem0 is behind even the previous release (p = 0.009); the gap to the whole history is noise.</p>
+    </figure>
+
+    <div class="cards">
+      <article class="card">
+        <span class="big">12–14 of 16</span>
+        <h3>It catches what a request implies</h3>
+        <p>A task asks to enter a school's order with Bakewell slices. Months earlier the history says the school is nut-free, and the catalog lists nuts in the slice. The new builds left the slice out in 11 of 12 runs and said why. On these 16 runs: previous release 8, whole history 10, mem0 1.</p>
+      </article>
+      <article class="card">
+        <span class="big">$0 to store</span>
+        <h3>It pays per question, not per history</h3>
+        <p>Engram stores raw records without a model call. Hindsight spent about $1.00 of model calls per LongMemEval history and mem0 $0.13. Engram's query engine spends $0.0012 a question, in the background, and in Claude Code its distiller about $0.001 a turn (counted in the costs above).</p>
+      </article>
+      <article class="card">
+        <span class="big">79.0% · 43.1</span>
+        <h3>Level or ahead at the same context size</h3>
+        <p>Same reader, judge and questions, with 1,600 to 4,900 characters of context each: on LongMemEval-S and BEAM 100K, mem0 scores 79.0% and 41.9, Hindsight 78.0% and 39.8. Engram also declines what it cannot answer more often: BEAM abstention 73.8 against Hindsight's 62.5.</p>
+      </article>
+      <article class="card">
+        <span class="big">81.8%</span>
+        <h3>LongMemEval-S, up from 72.2%</h3>
+        <p>On all 500 questions, adding the query engine's picks to plain search gains 9.6 points (p = 10<sup>−8</sup>). The same reader given only the sessions that hold the answer reaches 89.8%, so the gap left is 8 points.</p>
+      </article>
+      <article class="card">
+        <span class="big">35.7 at 1M</span>
+        <h3>It holds up over a million tokens</h3>
+        <p>BEAM at 100K, 500K and 1M tokens: 43.2, 40.2 and 35.7, against 36.3, 33.5 and 32.2 for plain search and about 10 with no memory. The BEAM paper's best method reports 35.8, 35.9 and 33.6, with a different reader.</p>
+      </article>
+      <article class="card">
+        <span class="big">5.7 ms</span>
+        <h3>Fast enough to run on every prompt</h3>
+        <p>A recall query over a million records takes 5.7 ms at the median on an M2 MacBook Air, and the file holds 3.1 KB a record. The prompt hook takes 17 ms at that size in the cloud container.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="same-reader">
+    <div class="head">
+      <p class="eyebrow">Head to head</p>
+      <h2>Same reader, same questions, same judge</h2>
+      <p class="lede">Each system's own retrieval on LongMemEval-S (every fifth question, 100) and BEAM 100K (400 questions), with Haiku as each system's model, the reader and the judge. Hindsight and mem0 were run as vectorize-io's agent-memory-benchmark runs them.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>System</th><th class="n">LongMemEval-S</th><th class="n">BEAM 100K</th><th class="n">Text to the reader, chars</th><th class="n">Model calls to store a history</th></tr>
+        </thead>
+        <tbody>
+          <tr class="us"><td>Engram, query engine</td><td class="n">79.0%</td><td class="n">43.1</td><td class="n">4,500 / 1,600</td><td class="n">$0</td></tr>
+          <tr><td>mem0 2.2.1</td><td class="n">79.0%</td><td class="n">41.9</td><td class="n">4,400 / 4,900</td><td class="n">$0.13 / $0.22</td></tr>
+          <tr><td>Hindsight 1.0.0 at Engram's context size</td><td class="n">78.0%</td><td class="n">39.8</td><td class="n">4,600 / 4,300</td><td class="n">about $1.00 / $1.20</td></tr>
+          <tr><td>Hindsight 1.0.0 at its benchmark budgets<small>38 to 75 times more text per question</small></td><td class="n">88.0%</td><td class="n">46.7</td><td class="n">170,000 / 121,000</td><td class="n">about $1.00 / $1.20</td></tr>
+          <tr><td>Whole history in context<small>$0.17 a question to read</small></td><td class="n">87.0%</td><td class="n">–</td><td class="n">498,000 / –</td><td class="n">$0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Two numbers per cell are LongMemEval-S / BEAM 100K. Engram's plain search, without the query engine, scores 69.0% and 36.6. Mem0's optional keyword search and entity extras change nothing (78.0% and 41.4). Measured 2026-10-16 in the cloud container (4 CPUs).</p>
+  </section>
+
+  <section id="engine">
+    <div class="head">
+      <p class="eyebrow">How it searches</p>
+      <h2>Every kind of search, and a planner that picks among them</h2>
+      <p class="lede">Engram runs on Strata, an embedded search database built alongside it. One file per project indexes every record as full text, structured fields, vectors and a graph at once, and one SQL statement can combine them. For each request, Engram decides which searches are worth running and how to run each one.</p>
+    </div>
+    <div class="kinds">
+      <div class="kind"><span class="k">Full text</span><p>BM25 ranking with Block-Max WAND, plus boolean and phrase queries.</p><small>Finds the exact error message or function name.</small></div>
+      <div class="kind"><span class="k">Semantic</span><p>Embeddings from a small local model, searched with an HNSW vector index.</p><small>Finds the same idea said in other words.</small></div>
+      <div class="kind"><span class="k">Hybrid</span><p>Keyword and vector rankings mixed into one list, weighted by kind and age.</p><small>What runs on every prompt.</small></div>
+      <div class="kind"><span class="k">Structured</span><p>SQL filters and facets over session, kind, time, files and importance.</p><small>"Decisions from last week that touch billing.py."</small></div>
+      <div class="kind"><span class="k">Graph</span><p>Notes link to what they are about, such as a customer or a file, and the search walks to their neighbours.</p><small>On citation search, Strata's graph doubled what vectors found: nDCG@20 0.123 to 0.253.</small></div>
+    </div>
+    <ol class="steps">
+      <li><div><strong>Plan.</strong> A small model reads the request and writes up to eight searches across those kinds: keywords for a name, a sentence phrased like the record it hopes to find, a SQL filter for a time range, the graph around a customer.</div></li>
+      <li><div><strong>Run.</strong> Strata's cost-based planner picks how to evaluate each search from exact statistics. A filtered vector search becomes an exact scan, IVF, HNSW with the filter inside, or post-filtering, whichever is cheapest for that filter near that query.</div></li>
+      <li><div><strong>Pick.</strong> A second call keeps only what answers the request: 2.8 records and 960 characters on average, which hold all the evidence for 76% of LongMemEval questions.</div></li>
+    </ol>
+    <div class="sub">
+      <h3>Fast and small because it works on bits</h3>
+      <p class="lede">Every index is a compact structure read in place through mmap, with nothing to deserialise. Posting lists use Loom and Pyramid, two formats designed for Strata that line dense runs of documents up on machine words. Columns are bit-packed in 128-document blocks with min/max zone maps, filters probe bitsets of accepted values in 4 to 5 ns, and vectors are scanned as 8-bit codes with SIMD integer dot products.</p>
+    </div>
+    <div class="figs">
+      <div class="fig"><strong>1.7–3.2×</strong><span>faster BM25 top-10 than Tantivy, and 43–200× faster than SQLite's FTS5.</span></div>
+      <div class="fig"><strong>0.05–0.10 ms</strong><span>for a vector top-10 with HNSW. SQLite scanning the same vectors takes 7.7 ms to 0.7 s.</span></div>
+      <div class="fig"><strong>1.8–6.1×</strong><span>faster filtered vector search than the best fixed strategy, by choosing per query, at recall@10 0.991–0.998.</span></div>
+      <div class="fig"><strong>2.4–3.0×</strong><span>faster conjunctions than partitioned Elias-Fano at the same size, and 3.8–7.7× faster unions (Loom).</span></div>
+      <div class="fig"><strong>12.2–12.7 bits</strong><span>per posting, docID and frequency included. The TREC-COVID text index is 44.5 MiB, against 60.0 for Tantivy and 70.0 for FTS5.</span></div>
+      <div class="fig"><strong>14 ns</strong><span>per 1,024-dimension dot product on 8-bit codes with NEON, reading 4× less than float32.</span></div>
+    </div>
+    <p class="note">Measured on the M2 MacBook Air with Strata's BEIR benchmarks. Where it is slower: building the HNSW graph makes loading 1.7–5.9× slower than SQLite, Tantivy counts facets 1.1–2.1× faster on three of four collections, and Tantivy's cold structured filters are 1.4–3.4× faster. Details are in <a href="../strata/results.html">Strata's results</a> and <a href="../posting-lists.html">the posting-list study</a>.</p>
+  </section>
+
+  <section id="losses">
+    <div class="head">
+      <p class="eyebrow">Where it loses</p>
+      <h2>What it does not do well yet</h2>
+      <p class="lede">These are measured too, in the same runs. Most come down to one thing: Engram picks a few records per question, so anything that needs many messages at once, or a second search, suffers.</p>
+    </div>
+    <div class="losses">
+      <div class="loss"><span class="tag">−9.0</span><div><h3>Hindsight at full budget scores higher</h3><p>88.0% against 79.0% on LongMemEval-S (p = 0.02) and 46.7 against 43.1 on BEAM (p = 0.09). It hands the reader 38 to 75 times more text, near what the whole history scores, after about $1 of model calls per history.</p></div></div>
+      <div class="loss"><span class="tag">17%</span><div><h3>Questions that chain two facts</h3><p>When one answer says what to look up next ("the citizenship of X's spouse"), Engram answers 17% and the whole history in context 71%. A second round of searches is the missing step.</p></div></div>
+      <div class="loss"><span class="tag">17.0</span><div><h3>Answers spread over many messages</h3><p>BEAM summaries: Engram 17.0, Hindsight 37.5, the whole history 40 on a sample. Contradiction resolution stays at 14 to 26 at every history length.</p></div></div>
+      <div class="loss"><span class="tag">40 vs 56</span><div><h3>Facts that were overwritten</h3><p>mem0 rewrites facts when it stores them and does better on BEAM's knowledge updates: 56 against 40. Engram stores the raw record and has to find the latest one.</p></div></div>
+      <div class="loss"><span class="tag">43/400</span><div><h3>The planner can skip memory</h3><p>On FactConsolidation it judged 43 of 400 questions to be general knowledge ("What is the capital of Japan?") and searched nothing, in a benchmark whose facts are deliberately counterfactual: 85.3% against 95.5% for plain search. In Claude Code the per-prompt recall still runs beside it.</p></div></div>
+      <div class="loss"><span class="tag">59%</span><div><h3>The injection gate is imprecise</h3><p>59% of its injections hold evidence (42% when always injecting). In a multi-day test it skipped the prompts where a compaction had dropped a fact, so it brought nothing back: 27 of 30 against 26 with compaction alone.</p></div></div>
+      <div class="loss"><span class="tag">91–95%</span><div><h3>Vendors report higher scores</h3><p>On LongMemEval-S, OMEGA reports 95.4%, Mastra 94.9%, Hindsight 91.4%; on BEAM 100K, Exabase 76.9 and Hindsight 73.4. These are self-reported, with bigger answer models than Haiku, and we have not reproduced them. In our harness Hindsight scored 88.0% and 46.7.</p></div></div>
+      <div class="loss"><span class="tag">p = 0.25</span><div><h3>The evidence has limits</h3><p>The coding test is four projects we wrote, with one agent model. The new build is level with the previous release overall (196 to 201 of 208 against 195); its gain is on requirements a request implies.</p></div></div>
+    </div>
+  </section>
+
+  <section id="cost">
+    <div class="head">
+      <p class="eyebrow">What it saves</p>
+      <h2>Replace a big context with a small one</h2>
+      <p class="lede">Every model call in a coding session re-reads everything in context: a long session kept alive for its history, or docs and old transcripts pasted in. Engram lets that context go and injects about 3,100 tokens per prompt instead. The estimate below counts what the big context costs on every call against what Engram's injections cost, at Anthropic's current list prices.</p>
+    </div>
+
+    <div class="calc">
+      <form class="panel" id="calc" aria-label="Cost estimate inputs">
+        <div class="presets" role="group" aria-label="Example sessions">
+          <button type="button" class="chip" data-h="150000" data-s="100" data-p="10" aria-pressed="true">Long session kept alive</button>
+          <button type="button" class="chip" data-h="60000" data-s="60" data-p="6" aria-pressed="false">Docs pasted in</button>
+          <button type="button" class="chip" data-h="600000" data-s="150" data-p="15" aria-pressed="false">Near the 1M window</button>
+        </div>
+        <div class="field">
+          <label for="m">Agent model</label>
+          <select id="m">
+            <option value="opus55" selected>Claude Opus 5.5 ($4 in, $0.20 cached)</option>
+            <option value="sonnet55">Claude Sonnet 5.5 ($2 in, $0.10 cached)</option>
+            <option value="fable51">Claude Fable 5.1 ($10 in, $0.25 cached)</option>
+            <option value="opus5">Claude Opus 5 ($5 in, $0.50 cached)</option>
+            <option value="haiku55">Claude Haiku 5.5 ($0.10 in, 5× over 100K)</option>
+            <option value="haiku45">Claude Haiku 4.5 ($1 in, $0.10 cached)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="h">Big context kept in the window <output for="h" id="ho"></output></label>
+          <input type="range" id="h" min="10000" max="900000" step="10000" value="150000">
+          <small>History, docs or transcripts carried on every call.</small>
+        </div>
+        <div class="field">
+          <label for="s">Model calls per session <output for="s" id="so"></output></label>
+          <input type="range" id="s" min="10" max="400" step="10" value="100">
+          <small>Each tool step is a call that re-reads the context.</small>
+        </div>
+        <div class="field">
+          <label for="p">Prompts per session <output for="p" id="po"></output></label>
+          <input type="range" id="p" min="1" max="40" step="1" value="10">
+          <small>Engram injects at each prompt, and each injection stays for the rest of the session.</small>
+        </div>
+        <div class="field">
+          <label for="c">Calls that hit the prompt cache <output for="c" id="co"></output></label>
+          <input type="range" id="c" min="0" max="99" step="1" value="90">
+          <small>A pause over five minutes or a compaction makes the next call write the cache again, at 1.25× the input price.</small>
+        </div>
+        <div class="field">
+          <label for="n">Sessions per month <output for="n" id="no"></output></label>
+          <input type="range" id="n" min="10" max="5000" step="10" value="400">
+          <small>For example 10 developers with 40 sessions each.</small>
+        </div>
+        <details>
+          <summary>The rest of the session, the same either way</summary>
+          <div class="field">
+            <label for="r">Other context per call <output for="r" id="ro"></output></label>
+            <input type="range" id="r" min="10000" max="200000" step="5000" value="40000">
+            <small>System prompt, tools, code read and the session's own work.</small>
+          </div>
+          <div class="field">
+            <label for="o">Output per call <output for="o" id="oo"></output></label>
+            <input type="range" id="o" min="100" max="3000" step="100" value="400">
+          </div>
+        </details>
+      </form>
+
+      <div class="result">
+        <div class="panel" aria-live="polite">
+          <div class="save"><strong id="monthly">–</strong><span id="monthly-note">saved a month</span></div>
+          <div class="cmp">
+            <div class="cmp-row"><div class="lab"><span>Big context, per session</span><span id="bigTotal">–</span></div><div class="track"><b id="bigBar"></b></div></div>
+            <div class="cmp-row us"><div class="lab"><span><strong>With Engram</strong>, per session</span><span id="engTotal">–</span></div><div class="track"><b id="engBar"></b></div></div>
+          </div>
+          <div class="kv">
+            <span class="h">Per session</span><span class="h">Big context</span><span class="h">Engram</span>
+            <span class="rule"></span>
+            <span>Context tokens re-read</span><span class="n" id="tokBig">–</span><span class="n" id="tokEng">–</span>
+            <span>Cost of that context</span><span class="n" id="ctxBig">–</span><span class="n" id="ctxEng">–</span>
+            <span>Engram's own model calls</span><span class="n">–</span><span class="n" id="engCalls">–</span>
+            <span>Rest of the session</span><span class="n" id="restBig">–</span><span class="n" id="restEng">–</span>
+            <span class="rule"></span>
+            <span><strong>Whole session</strong></span><span class="n" id="allBig">–</span><span class="n" id="allEng">–</span>
+          </div>
+          <p class="note" id="tierNote" hidden>On Haiku 5.5 a call whose prompt is over 100,000 tokens pays five times the rate on every token, output included, so the big context also raises the cost of the rest of the session.</p>
+        </div>
+
+        <div class="measured">
+          <p class="eyebrow">Measured, not estimated</p>
+          <p>In the coding test above (Haiku agent, cloud container), a run with the whole history in context cost $0.016 while the history was in the prompt cache and about $0.07 when it was not. Engram's shipped build cost $0.0087 a run, its own model calls included, and solved 196 runs to the whole history's 194.</p>
+          <p>On a Claude subscription the same tokens count against your usage limits instead of a bill.</p>
+        </div>
+
+        <ul class="assume">
+          <li>Engram's injection: 3,100 tokens a prompt, its mean in the coding test. Its own model calls: $0.0019 a prompt (distiller and query engine on Haiku), measured there.</li>
+          <li>The percentage saved on the context alone is about the ratio of tokens, whatever the price or the cache rate.</li>
+          <li>Quality held on coding follow-ups. On chat questions that need many messages at once, the whole history still answers more (see the losses above).</li>
+          <li>Prices: Anthropic's list prices, read 2026-10-17. Cache reads are 0.05× input on Opus 5.5 and Sonnet 5.5 and 0.025× on Fable 5.1.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Measured 2026-10-15 and 2026-10-16 in a cloud container (4 CPUs, 16 GB), except where a number names the M2 MacBook Air. Haiku is the agent, reader and judge throughout. The cost figures in the calculator are estimates; everything else on this page is measured.</p>
+    <p>Sources: <a href="../engram/results.html">results page</a>, <a href="https://github.com/rkonow/engram/blob/main/engram/results/v3/competitors/README.md">Hindsight and mem0 write-up</a>, <a href="https://github.com/rkonow/engram/pull/9">pull request #9</a>, <a href="https://github.com/rkonow/engram">rkonow/engram</a>.</p>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var PRICES = {
+    opus55:  { name: "Opus 5.5",   in: 4,    w: 5,     hit: 0.20, out: 20 },
+    sonnet55:{ name: "Sonnet 5.5", in: 2,    w: 2.5,   hit: 0.10, out: 10 },
+    fable51: { name: "Fable 5.1",  in: 10,   w: 12.5,  hit: 0.25, out: 50 },
+    opus5:   { name: "Opus 5",     in: 5,    w: 6.25,  hit: 0.50, out: 25 },
+    haiku55: { name: "Haiku 5.5",  tiers: [
+      { in: 0.10, w: 0.125, hit: 0.01, out: 0.50 },
+      { in: 0.50, w: 0.625, hit: 0.05, out: 2.50 } ] },
+    haiku45: { name: "Haiku 4.5",  in: 1,    w: 1.25,  hit: 0.10, out: 5 }
+  };
+  var ENGRAM_TOKENS = 3100;      // mean injection per prompt, coding test
+  var ENGRAM_CALLS = 0.0019;     // $ per prompt, Engram's own model calls, coding test
+
+  function rates(key, prompt) {
+    var p = PRICES[key];
+    if (p.tiers) return prompt > 100000 ? p.tiers[1] : p.tiers[0];
+    return p;
+  }
+  function perTok(r, hit) { return (hit * r.hit + (1 - hit) * r.w) / 1e6; }
+
+  function estimate(v) {
+    var avgE = ENGRAM_TOKENS * (v.p + 1) / 2;
+    var rb = rates(v.m, v.h + v.r), re = rates(v.m, avgE + v.r);
+    var big = {
+      tok: v.s * v.h,
+      ctx: v.s * v.h * perTok(rb, v.c),
+      calls: 0,
+      rest: v.s * (v.r * perTok(rb, v.c) + v.o * rb.out / 1e6)
+    };
+    var eng = {
+      tok: v.s * avgE,
+      ctx: v.s * avgE * perTok(re, v.c),
+      calls: v.p * ENGRAM_CALLS,
+      rest: v.s * (v.r * perTok(re, v.c) + v.o * re.out / 1e6)
+    };
+    big.all = big.ctx + big.rest;
+    eng.all = eng.ctx + eng.calls + eng.rest;
+    return { big: big, eng: eng, tier: rb !== re };
+  }
+
+  function money(x) {
+    if (x >= 1000) return "$" + Math.round(x).toLocaleString("en-US");
+    if (x >= 10) return "$" + x.toFixed(1);
+    if (x >= 0.1) return "$" + x.toFixed(2);
+    return "$" + x.toFixed(3);
+  }
+  function toks(x) {
+    if (x >= 1e6) return (x / 1e6).toFixed(x >= 1e7 ? 0 : 1) + "M";
+    if (x >= 1e3) return Math.round(x / 1e3) + "K";
+    return String(Math.round(x));
+  }
+  var $ = function (id) { return document.getElementById(id); };
+  var ids = ["m", "h", "s", "p", "c", "n", "r", "o"];
+
+  function read() {
+    return {
+      m: $("m").value, h: +$("h").value, s: +$("s").value, p: +$("p").value,
+      c: +$("c").value / 100, n: +$("n").value, r: +$("r").value, o: +$("o").value
+    };
+  }
+
+  function render() {
+    var v = read(), e = estimate(v);
+    $("ho").textContent = toks(v.h) + " tokens";
+    $("so").textContent = v.s;
+    $("po").textContent = v.p;
+    $("co").textContent = Math.round(v.c * 100) + "%";
+    $("no").textContent = v.n.toLocaleString("en-US");
+    $("ro").textContent = toks(v.r) + " tokens";
+    $("oo").textContent = v.o.toLocaleString("en-US") + " tokens";
+
+    var saved = (e.big.all - e.eng.all) * v.n;
+    var pctAll = 100 * (1 - e.eng.all / e.big.all);
+    var pctCtx = 100 * (1 - (e.eng.ctx + e.eng.calls) / e.big.ctx);
+    if (saved >= 0) {
+      $("monthly").textContent = money(saved);
+      $("monthly-note").textContent = "saved a month over " + v.n.toLocaleString("en-US") + " sessions: " +
+        Math.round(pctAll) + "% of the session bill, " + Math.round(pctCtx) + "% of what the context costs";
+    } else {
+      $("monthly").textContent = money(-saved);
+      $("monthly-note").textContent = "more a month: with a context this small, Engram's injections and model calls cost more than they replace";
+    }
+    $("bigTotal").textContent = money(e.big.all);
+    $("engTotal").textContent = money(e.eng.all);
+    var max = Math.max(e.big.all, e.eng.all);
+    $("bigBar").style.width = (100 * e.big.all / max) + "%";
+    $("engBar").style.width = (100 * e.eng.all / max) + "%";
+    $("tokBig").textContent = toks(e.big.tok);
+    $("tokEng").textContent = toks(e.eng.tok);
+    $("ctxBig").textContent = money(e.big.ctx);
+    $("ctxEng").textContent = money(e.eng.ctx);
+    $("engCalls").textContent = money(e.eng.calls);
+    $("restBig").textContent = money(e.big.rest);
+    $("restEng").textContent = money(e.eng.rest);
+    $("allBig").textContent = money(e.big.all);
+    $("allEng").textContent = money(e.eng.all);
+    $("tierNote").hidden = !e.tier;
+  }
+
+  ids.forEach(function (id) {
+    $(id).addEventListener("input", function () {
+      if (id === "h" || id === "s" || id === "p") {
+        document.querySelectorAll(".chip").forEach(function (c) { c.setAttribute("aria-pressed", "false"); });
+      }
+      render();
+    });
+  });
+  document.querySelectorAll(".chip").forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      $("h").value = chip.dataset.h; $("s").value = chip.dataset.s; $("p").value = chip.dataset.p;
+      document.querySelectorAll(".chip").forEach(function (c) { c.setAttribute("aria-pressed", String(c === chip)); });
+      render();
+    });
+  });
+  $("calc").addEventListener("submit", function (ev) { ev.preventDefault(); });
+  render();
+})();
+</script>
+</body>
+</html>

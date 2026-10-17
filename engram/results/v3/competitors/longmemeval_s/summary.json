@@ -1,0 +1,377 @@
+{
+ "reader": "small",
+ "judge": "small",
+ "questions": 100,
+ "configs": {
+  "engram_qe": {
+   "n": 100,
+   "accuracy": 0.79,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.56
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.9090909090909091
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.84
+    }
+   },
+   "context_chars": 4510.21,
+   "reader_tokens": 2143.46,
+   "cost_usd": 0.0950602
+  },
+  "engram_search": {
+   "n": 100,
+   "accuracy": 0.69,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.4
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.64
+    }
+   },
+   "context_chars": 3527.06,
+   "reader_tokens": 1790.42,
+   "cost_usd": 0.0834727
+  },
+  "mem0": {
+   "n": 100,
+   "accuracy": 0.79,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.6
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.8
+    }
+   },
+   "context_chars": 4420.78,
+   "reader_tokens": 2156.18,
+   "cost_usd": 0.0889487
+  },
+  "mem0-hybrid": {
+   "n": 100,
+   "accuracy": 0.78,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.56
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.8181818181818182
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.8
+    }
+   },
+   "context_chars": 4455.12,
+   "reader_tokens": 2173.22,
+   "cost_usd": 0.0889752
+  },
+  "hindsight": {
+   "n": 100,
+   "accuracy": 0.88,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 1.0
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.72
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 1.0
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.8333333333333334
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 1.0
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.84
+    }
+   },
+   "context_chars": 169866.83,
+   "reader_tokens": 69821.23,
+   "cost_usd": 1.4517199
+  },
+  "hindsight-small": {
+   "n": 100,
+   "accuracy": 0.78,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.6
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.7272727272727273
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.5
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.84
+    }
+   },
+   "context_chars": 4607.36,
+   "reader_tokens": 2660.66,
+   "cost_usd": 0.1050435
+  },
+  "hindsight-prov": {
+   "n": 100,
+   "accuracy": 0.86,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 0.8333333333333334
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 1.0
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.72
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 1.0
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.88
+    }
+   },
+   "context_chars": 166329.25,
+   "reader_tokens": 67716.51,
+   "cost_usd": 1.4106918000000002
+  },
+  "hindsight-prov-small": {
+   "n": 100,
+   "accuracy": 0.67,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.4
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 0.7272727272727273
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.6923076923076923
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.68
+    }
+   },
+   "context_chars": 4649.98,
+   "reader_tokens": 2658.15,
+   "cost_usd": 0.1002866
+  },
+  "full": {
+   "n": 100,
+   "accuracy": 0.87,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 1.0
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.9285714285714286
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.68
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 1.0
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.6666666666666666
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.96
+    }
+   },
+   "context_chars": 497624.71,
+   "reader_tokens": 168406.45,
+   "cost_usd": 17.05428624
+  },
+  "oracle": {
+   "n": 100,
+   "accuracy": 0.88,
+   "by_type": {
+    "abstention": {
+     "n": 6,
+     "accuracy": 0.8333333333333334
+    },
+    "knowledge-update": {
+     "n": 14,
+     "accuracy": 0.7857142857142857
+    },
+    "multi-session": {
+     "n": 25,
+     "accuracy": 0.8
+    },
+    "single-session-assistant": {
+     "n": 11,
+     "accuracy": 1.0
+    },
+    "single-session-preference": {
+     "n": 6,
+     "accuracy": 0.8333333333333334
+    },
+    "single-session-user": {
+     "n": 13,
+     "accuracy": 0.9230769230769231
+    },
+    "temporal-reasoning": {
+     "n": 25,
+     "accuracy": 0.96
+    }
+   },
+   "context_chars": 27547.89,
+   "reader_tokens": 9884.88,
+   "cost_usd": 0.24638556
+  }
+ }
+}

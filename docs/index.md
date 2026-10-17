@@ -11,7 +11,7 @@ permalink: /
 Long-term memory for coding agents, built on Strata, an embedded search database with SQL.
 {: .fs-6 .fw-300 }
 
-[How Engram works](engram/index.md){: .btn .btn-primary .mr-2 } [Install it](engram/setup.md){: .btn .mr-2 } [Strata's query language](strata/query-language.md){: .btn .mr-2 } [Source on GitHub](https://github.com/rkonow/engram){: .btn }
+[How Engram works](engram/index.md){: .btn .btn-primary .mr-2 } [Install it](engram/setup.md){: .btn .mr-2 } [Why Engram](why/){: .btn .mr-2 } [Strata's query language](strata/query-language.md){: .btn .mr-2 } [Source on GitHub](https://github.com/rkonow/engram){: .btn }
 
 ---
 

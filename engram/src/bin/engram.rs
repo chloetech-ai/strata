@@ -77,6 +77,17 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         kinds: Vec<String>,
     },
+    /// Answer a question about earlier work: a model plans several searches,
+    /// they run, and a second model call picks the records that answer it.
+    Ask {
+        question: String,
+        /// Model for planning and ranking (default: the configured one).
+        #[arg(long)]
+        model: Option<String>,
+        /// Print the JSON result (picked ids, answer, confidence, cost).
+        #[arg(long)]
+        json: bool,
+    },
     /// Run read-only SQL over the memory table.
     Sql { sql: String },
     /// Store a decision, preference, fact, todo or note.
@@ -88,6 +99,8 @@ enum Cmd {
     /// Write down the decisions, rules, requirements and facts of every
     /// stored turn (for a store recorded before distillation existed).
     Distill,
+    /// Merge related notes now (it also runs on its own every few turns).
+    Consolidate,
     /// Stop the daemon (with --all, every running daemon, e.g. after an upgrade).
     Stop {
         #[arg(long)]
@@ -179,11 +192,20 @@ fn main() {
             }
         },
         Cmd::Search { query, limit, kinds } => text(&send(&project, json!({"op": "search", "query": query, "limit": limit, "kinds": kinds, "include_current": true}), 30)),
+        Cmd::Ask { question, model, json: as_json } => {
+            let r = send(&project, json!({"op": "ask", "question": question, "model": model, "include_current": true}), 300);
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&r).unwrap());
+            } else {
+                text(&r);
+            }
+        }
         Cmd::Sql { sql } => text(&send(&project, json!({"op": "sql", "sql": sql}), 30)),
         Cmd::Remember { kind, text: t } => text(&send(&project, json!({"op": "remember", "kind": kind, "text": t}), 30)),
         Cmd::Stats => println!("{}", serde_json::to_string_pretty(&send(&project, json!({"op": "stats"}), 30)).unwrap()),
         Cmd::Briefing => text(&send(&project, json!({"op": "briefing", "session": ""}), 30)),
         Cmd::Distill => println!("{}", send(&project, json!({"op": "distill_backfill"}), 6 * 3600)),
+        Cmd::Consolidate => println!("{}", send(&project, json!({"op": "consolidate"}), 3600)["report"]),
         Cmd::Rpc { request, timeout } => {
             let req: Json = serde_json::from_str(&request).unwrap_or_else(|e| {
                 eprintln!("engram: request is not JSON: {e}");

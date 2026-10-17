@@ -167,6 +167,18 @@ python3 scripts/ab_eval.py run --scenario stockroom --model <model> --repeats 5
 python3 scripts/ab_stats.py stockroom=results/ab/stockroom/runs.jsonl slotwise=results/ab/slotwise/runs.jsonl --out results/ab/stats.json
 ```
 
+The query engine (planner, searches, ranker) on a benchmark, and Claude
+Code with each memory system (none, Claude Code's auto memory, past
+transcripts, claude-mem, mem0, Engram) on the same scenarios; the
+competitors' setup is in `eval/competitors`:
+
+```sh
+target/release/engram-bench deep --data /home/user/data/memory/longmemeval_s.jsonl --out results/v2/deep --tag haiku
+target/release/engram-bench deep --data /home/user/data/memory/longmemeval_s.jsonl --every 5 --hard-model sonnet --tag haiku_sonnet_hard
+python3 scripts/memory_bench.py all --scenario bakehouse --repeats 3   # every lane; see eval/competitors/README.md
+python3 scripts/v2_charts.py
+```
+
 Results are in `results/`. `report/engram.html` covers the system and
 `report/structure.html` the record structure (`scripts/build_report.py`,
 `scripts/build_structure_report.py`).

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::anchor::Checker;
 use crate::capture::past_reference;
 use crate::record::{Kind, Record};
 use crate::store::{Filter, Hit, Reach, Store};
@@ -443,16 +444,26 @@ fn short(session: &str) -> String {
 
 /// One injected record: a provenance line and its snippet.
 pub fn fmt_record(r: &Record, snip: &str, now: i64) -> String {
+    fmt_record_labeled(r, snip, now, "")
+}
+
+/// One injected record with a freshness label after its provenance line.
+pub fn fmt_record_labeled(r: &Record, snip: &str, now: i64, label: &str) -> String {
     let mut head = format!("[{}] {} · session {} turn {} · {}", r.id, fmt_time(r.ts), short(&r.session), r.turn, r.kind.as_str());
     if r.tag != "-" && !r.tag.is_empty() {
         head += &format!(" ({})", r.tag);
     }
-    head += &format!(" · {}", fmt_ago(r.ts, now));
+    head += &format!(" · {}{label}", fmt_ago(r.ts, now));
     format!("{head}\n{}", snip.trim())
 }
 
 /// The recall block for a prompt (`weak`: a low-confidence match).
 pub fn fmt_recall_as(items: &[(Record, String)], now: i64, weak: bool) -> String {
+    fmt_recall_checked(items, now, weak, None)
+}
+
+/// The recall block, notes labelled when their code changed since.
+pub fn fmt_recall_checked(items: &[(Record, String)], now: i64, weak: bool, mut check: Option<&mut Checker>) -> String {
     let mut s = if weak {
         format!(
             "Engram found {} possibly related record{} from earlier work in this project (a weak match, outside the current context window). They may be irrelevant or outdated.\n",
@@ -467,8 +478,12 @@ pub fn fmt_recall_as(items: &[(Record, String)], now: i64, weak: bool) -> String
         )
     };
     for (r, snip) in items {
+        let label = match check.as_deref_mut() {
+            Some(c) if r.kind.is_knowledge() => c.check_record(&r).label(),
+            _ => String::new(),
+        };
         s += "\n";
-        s += &fmt_record(r, snip, now);
+        s += &fmt_record_labeled(r, snip, now, &label);
         s += "\n";
     }
     s += "\nThe memory_timeline tool shows what surrounded a record id; memory_search finds more.";
@@ -544,7 +559,8 @@ pub fn knowledge(store: &Store, query: &str, filter: &Filter, skip: &HashSet<Str
         .into_values()
         .filter(|(r, _)| !skip.contains(&r.id) && r.tag != "superseded" && r.tag != "done" && todo_open(r))
         .map(|(r, c)| {
-            let have = analyzed(&r.text);
+            // A note's `When:` line counts: it names the requests it bears on.
+            let have = analyzed(&r.key_text());
             let got: f64 = terms.iter().zip(&idf).filter(|(t, _)| have.contains(*t)).map(|(_, w)| w).sum();
             let cov = if total > 0.0 { got / total } else { 0.0 };
             (r, c, cov)
@@ -556,17 +572,47 @@ pub fn knowledge(store: &Store, query: &str, filter: &Filter, skip: &HashSet<Str
     Ok(out)
 }
 
+/// The live notes most related to `text` (by vector and BM25, no
+/// thresholds), best first: what the distiller is shown, so that it can
+/// update an old note instead of only the newest ones.
+pub fn related(store: &Store, text: &str, n: usize) -> Result<Vec<Record>> {
+    let f = Filter { kinds: KNOWLEDGE.to_vec(), ..Default::default() };
+    let live = |r: &Record| r.tag != "superseded" && r.tag != "done" && r.tag != "cue" && (r.kind != Kind::Todo || r.tag == "planned");
+    let mut score: HashMap<String, (Record, f64)> = HashMap::new();
+    for (i, (r, _)) in store.vector_top(&store.embedder.embed_query(text), n * 2, &f)?.into_iter().enumerate() {
+        score.entry(r.id.clone()).or_insert((r, 0.0)).1 += 1.0 / (10.0 + i as f64);
+    }
+    if !strata::text::analyze_query(text).is_empty() {
+        for (i, (r, _)) in store.bm25_top(text, n * 2, &f)?.into_iter().enumerate() {
+            score.entry(r.id.clone()).or_insert((r, 0.0)).1 += 1.0 / (10.0 + i as f64);
+        }
+    }
+    let mut v: Vec<(Record, f64)> = score.into_values().filter(|(r, _)| live(r)).collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Ok(v.into_iter().take(n).map(|x| x.0).collect())
+}
+
+fn note_label(r: &Record) -> &'static str {
+    match r.kind {
+        Kind::Todo => "planned",
+        Kind::Preference => "rule",
+        k => k.as_str(),
+    }
+}
+
 /// The knowledge block of a prompt's context.
 pub fn fmt_knowledge(items: &[(Record, f64, f64)], now: i64) -> String {
+    fmt_knowledge_checked(items, now, None)
+}
+
+/// The knowledge block, each note labelled when the code it is anchored to
+/// changed since.
+pub fn fmt_knowledge_checked(items: &[(Record, f64, f64)], now: i64, mut check: Option<&mut Checker>) -> String {
     let mut s = String::from("Engram notes from earlier sessions that may bear on this request (decisions, rules and requirements agreed before; check them before deciding):\n");
     for (r, _, _) in items {
-        let label = match r.kind {
-            Kind::Todo => "planned",
-            Kind::Preference => "rule",
-            k => k.as_str(),
-        };
         let t = r.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        s += &format!("- [{label}] {t} ({}, {})\n", r.id, fmt_ago(r.ts, now));
+        let fresh = check.as_deref_mut().map(|c| c.check_record(&r).label()).unwrap_or_default();
+        s += &format!("- [{}] {t} ({}, {}){fresh}\n", note_label(r), r.id, fmt_ago(r.ts, now));
     }
     s
 }
@@ -576,6 +622,12 @@ pub fn fmt_knowledge(items: &[(Record, f64, f64)], now: i64) -> String {
 /// session left off, and how to search the rest. Returns the text and the
 /// ids it shows, so that per-prompt recall does not repeat them.
 pub fn briefing(store: &Store, current_session: &str, max_chars: usize, now: i64) -> Result<(String, Vec<String>)> {
+    briefing_checked(store, current_session, max_chars, now, None)
+}
+
+/// The briefing, with notes whose code changed since moved to a section of
+/// their own and labelled, and an index of what else the notes are about.
+pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, now: i64, mut check: Option<&mut Checker>) -> Result<(String, Vec<String>)> {
     let total = store.len();
     if total == 0 {
         return Ok((String::new(), Vec::new()));
@@ -589,8 +641,8 @@ pub fn briefing(store: &Store, current_session: &str, max_chars: usize, now: i64
         s += &format!(", last activity {}", fmt_ago(r.ts, now));
     }
     s += ". Requirements, decisions and conventions agreed in earlier conversations are often not in the code: \
-          before a design decision, and whenever a task refers to earlier work, search memory (memory_search; memory_timeline \
-          shows a record's surroundings, memory_sql runs structured queries). memory_remember stores a new decision or fact.\n";
+          before a design decision, and whenever a task refers to earlier work, search memory (memory_ask answers a question about earlier work by running several searches; \
+          memory_search is one quick search; memory_timeline shows a record's surroundings; memory_sql runs structured queries). memory_remember stores a new decision or fact.\n";
     let clip = |t: &str, n: usize| -> String {
         let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
         if t.chars().count() > n {
@@ -605,17 +657,28 @@ pub fn briefing(store: &Store, current_session: &str, max_chars: usize, now: i64
     let distilled = !store.query("SELECT id FROM memory WHERE tag = 'distilled' LIMIT 1")?.rows.is_empty();
     let mut seen: HashSet<String> = HashSet::new();
     let mut ids = Vec::new();
+    let mut stale: Vec<(Record, String)> = Vec::new();
+    let mut unshown: Vec<Record> = Vec::new();
     // Most recent first, oldest shown first; one line per record, while the budget lasts.
-    let mut section = |title: &str, recs: Vec<Record>, n: usize, keep: usize, s: &mut String| {
+    let mut section = |title: &str, recs: Vec<Record>, n: usize, keep: usize, s: &mut String, stale: &mut Vec<(Record, String)>, unshown: &mut Vec<Record>| {
         let mut lines = Vec::new();
         for r in recs {
             if r.tag == "superseded" || r.tag == "done" || (distilled && r.tag == "cue") || !seen.insert(norm(&r.text)) {
                 continue;
             }
-            lines.push((r.id.clone(), format!("- {} ({}, {})\n", clip(&r.text, n), r.id, fmt_ago(r.ts, now))));
-            if lines.len() == keep {
-                break;
+            let fresh = match check.as_deref_mut() {
+                Some(c) if r.kind.is_knowledge() => c.check_record(&r),
+                _ => crate::anchor::Freshness::Current,
+            };
+            if fresh.is_stale() {
+                stale.push((r, fresh.label()));
+                continue;
             }
+            if lines.len() == keep {
+                unshown.push(r);
+                continue;
+            }
+            lines.push((r.id.clone(), format!("- {} ({}, {}){}\n", clip(&r.text, n), r.id, fmt_ago(r.ts, now), fresh.label())));
         }
         lines.reverse();
         let head = format!("\n{title}\n");
@@ -632,14 +695,55 @@ pub fn briefing(store: &Store, current_session: &str, max_chars: usize, now: i64
             ids.push(id);
         }
     };
-    let planned: Vec<Record> = store.latest(&[Kind::Todo], 40, &none)?.into_iter().filter(|r| r.tag == "planned").collect();
-    section("Planned work, with the requirements agreed for it:", planned, 400, 10, &mut s);
-    section("Rules and conventions:", store.latest(&[Kind::Preference], 30, &none)?, 260, 12, &mut s);
-    section("Decisions:", store.latest(&[Kind::Decision], 30, &none)?, 260, 10, &mut s);
-    section("Facts about the project:", store.latest(&[Kind::Fact, Kind::Note], 30, &none)?, 260, 10, &mut s);
+    let planned: Vec<Record> = store.latest(&[Kind::Todo], 60, &none)?.into_iter().filter(|r| r.tag == "planned").collect();
+    section("Planned work, with the requirements agreed for it:", planned, 400, 10, &mut s, &mut stale, &mut unshown);
+    section("Rules and conventions:", store.latest(&[Kind::Preference], 80, &none)?, 260, 14, &mut s, &mut stale, &mut unshown);
+    section("Decisions:", store.latest(&[Kind::Decision], 80, &none)?, 260, 10, &mut s, &mut stale, &mut unshown);
+    section("Facts about the project:", store.latest(&[Kind::Fact, Kind::Note], 80, &none)?, 260, 10, &mut s, &mut stale, &mut unshown);
+    let mut stale_ids: Vec<String> = Vec::new();
+    if !stale.is_empty() {
+        let head = "\nNotes that may be out of date (the code they describe has changed since they were written; check it before relying on them):\n";
+        let mut added = false;
+        for (r, label) in stale.iter().take(6) {
+            let line = format!("- {} ({}, {}){label}\n", clip(&r.text, 220), r.id, fmt_ago(r.ts, now));
+            if s.len() + line.len() + if added { 0 } else { head.len() } > max_chars {
+                continue;
+            }
+            if !added {
+                s += head;
+                added = true;
+            }
+            s += &line;
+            stale_ids.push(r.id.clone());
+        }
+    }
     let checkpoint: Vec<Record> = store.latest(&[Kind::Todo], 10, &none)?.into_iter().filter(|r| r.tag != "planned" && r.tag != "done").take(1).collect();
-    section("Open tasks at the last checkpoint:", checkpoint, 500, 1, &mut s);
-    section("Where the most recent earlier session left off:", store.latest(&[Kind::Episode], 3, &prev)?, 300, 3, &mut s);
+    section("Open tasks at the last checkpoint:", checkpoint, 500, 1, &mut s, &mut stale, &mut unshown);
+    section("Where the most recent earlier session left off:", store.latest(&[Kind::Episode], 3, &prev)?, 300, 3, &mut s, &mut stale, &mut unshown);
+    ids.extend(stale_ids);
+    // What the notes left out are about, so the model knows what to ask for.
+    let unshown: Vec<Record> = unshown.into_iter().filter(|r| r.kind.is_knowledge()).collect();
+    if !unshown.is_empty() {
+        let mut count: HashMap<String, usize> = HashMap::new();
+        for r in &unshown {
+            for e in r.linked("about") {
+                if let Some(name) = e.strip_prefix("e:") {
+                    *count.entry(name.to_string()).or_default() += 1;
+                }
+            }
+        }
+        let mut top: Vec<(String, usize)> = count.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let names: Vec<String> = top.iter().take(20).map(|(n, c)| if *c > 1 { format!("{n} ({c})") } else { n.clone() }).collect();
+        let mut line = format!("\n{} older note{} not shown here", unshown.len(), if unshown.len() == 1 { " is" } else { "s are" });
+        if !names.is_empty() {
+            line += &format!(", about: {}", names.join(", "));
+        }
+        line += ". memory_ask or memory_search finds them.\n";
+        if s.len() + line.len() <= max_chars + 400 {
+            s += &line;
+        }
+    }
     Ok((s, ids))
 }
 

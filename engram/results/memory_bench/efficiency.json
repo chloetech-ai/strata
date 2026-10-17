@@ -1,0 +1,112 @@
+{
+ "none": {
+  "runs": 58,
+  "solved": 28,
+  "memory_chars": 0.0,
+  "agent_input_tokens_p50": 124500,
+  "memory_model_tokens": 0.0,
+  "cost_usd": 0.0048474253448275864,
+  "memory_cost_usd": 0.0,
+  "wall_s_p50": 24.2,
+  "wall_s_p95": 45.5
+ },
+ "ccmem": {
+  "runs": 58,
+  "solved": 45,
+  "memory_chars": 1083.9310344827586,
+  "agent_input_tokens_p50": 148317,
+  "memory_model_tokens": 0.0,
+  "cost_usd": 0.005371324310344827,
+  "memory_cost_usd": 0.0,
+  "wall_s_p50": 27.1,
+  "wall_s_p95": 52.2
+ },
+ "transcripts": {
+  "runs": 58,
+  "solved": 46,
+  "memory_chars": 4023.8793103448274,
+  "agent_input_tokens_p50": 141318,
+  "memory_model_tokens": 0.0,
+  "cost_usd": 0.005994972068965517,
+  "memory_cost_usd": 0.0,
+  "wall_s_p50": 25.1,
+  "wall_s_p95": 61.7
+ },
+ "claude-mem": {
+  "runs": 58,
+  "solved": 39,
+  "memory_chars": 17039.844827586207,
+  "agent_input_tokens_p50": 170823,
+  "memory_model_tokens": 145606.6724137931,
+  "cost_usd": 0.006723542586206897,
+  "memory_cost_usd": 0.008215686379310345,
+  "wall_s_p50": 36.1,
+  "wall_s_p95": 71.4
+ },
+ "mem0": {
+  "runs": 58,
+  "solved": 52,
+  "memory_chars": 3150.9655172413795,
+  "agent_input_tokens_p50": 158207,
+  "memory_model_tokens": 3991.2241379310344,
+  "cost_usd": 0.00576188775862069,
+  "memory_cost_usd": 0.00030108793103448276,
+  "wall_s_p50": 37.4,
+  "wall_s_p95": 73.8
+ },
+ "engram@main": {
+  "runs": 58,
+  "solved": 54,
+  "memory_chars": 9770.0,
+  "agent_input_tokens_p50": 141692,
+  "memory_model_tokens": 0.0,
+  "cost_usd": 0.005615568965517242,
+  "memory_cost_usd": 0.0,
+  "wall_s_p50": 27.9,
+  "wall_s_p95": 46.9
+ },
+ "engram+v7": {
+  "runs": 208,
+  "solved": 196,
+  "memory_chars": 12504.125,
+  "agent_input_tokens_p50": 158526,
+  "memory_model_tokens": 10627.923076923076,
+  "cost_usd": 0.006812544038461539,
+  "memory_cost_usd": 0.0019440096153846152,
+  "wall_s_p50": 25.4,
+  "wall_s_p95": 49.1
+ },
+ "engram+v5": {
+  "runs": 208,
+  "solved": 201,
+  "memory_chars": 12400.774038461539,
+  "agent_input_tokens_p50": 151820,
+  "memory_model_tokens": 10340.740384615385,
+  "cost_usd": 0.006828773942307693,
+  "memory_cost_usd": 0.0018610971153846154,
+  "wall_s_p50": 25.6,
+  "wall_s_p95": 52.0
+ },
+ "engram+rank": {
+  "runs": 208,
+  "solved": 201,
+  "memory_chars": 12343.711538461539,
+  "agent_input_tokens_p50": 144022,
+  "memory_model_tokens": 7510.427884615385,
+  "cost_usd": 0.0066040478846153845,
+  "memory_cost_usd": 0.0012868947115384616,
+  "wall_s_p50": 24.9,
+  "wall_s_p95": 50.9
+ },
+ "full": {
+  "runs": 58,
+  "solved": 55,
+  "memory_chars": 0.0,
+  "agent_input_tokens_p50": 178930,
+  "memory_model_tokens": 0.0,
+  "cost_usd": 0.0711724722413793,
+  "memory_cost_usd": 0.0,
+  "wall_s_p50": 18.8,
+  "wall_s_p95": 38.9
+ }
+}
