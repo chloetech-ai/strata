@@ -8,6 +8,8 @@ Underneath sits **Strata**, a single-file search database in the spirit of SQLit
 
 📖 **Full documentation:** [`docs/`](docs/index.md) (also publishable as a GitHub Pages site).
 
+🧭 **Why Engram, in two pages:** where it wins, where it loses, how it searches and what it saves on coding sessions, with a cost calculator: [`docs/why/`](docs/why/index.html), live at [rkonow.github.io/engram/why/](https://rkonow.github.io/engram/why/).
+
 🚀 **Try it:** `git clone https://github.com/rkonow/engram && cd engram && ./install.sh` sets Engram up for every Claude Code session on a Mac or Linux machine ([quick start](#quick-start)). To have a coding agent do it, tell it: *"Clone https://github.com/rkonow/engram and set Engram up for my Claude Code by following its AGENTS.md."* [`AGENTS.md`](AGENTS.md) gives an agent the steps, the checks and what to ask you first.
 
 ![A new Claude Code session answers from Engram's memory: the storage decision, its reason, and the receipt-printer constraint, all stated in an earlier session](docs/assets/img/inspector-new-session.png)
