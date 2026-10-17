@@ -187,6 +187,17 @@ details .field + .field { margin-top: 14px; }
 .measured p { font-size: 0.92rem; }
 .assume { display: grid; gap: 6px; padding-left: 18px; margin: 0; color: var(--ink-2); font-size: 0.88rem; }
 
+/* install section */
+.install { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; align-items: start; }
+.code { margin: 0; background: var(--paper); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; overflow-x: auto; font: 400 0.86rem/1.7 var(--mono); color: var(--ink); }
+.code .c { color: var(--ink-2); }
+.ask { margin: 0; background: var(--accent-wash); border-radius: 8px; padding: 14px 16px; font-size: 1rem; line-height: 1.55; }
+.copy { justify-self: start; font: 600 0.88rem/1 var(--body); padding: 9px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+.gets { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 14px 28px; }
+.get { display: grid; gap: 4px; align-content: start; }
+.get p { color: var(--ink-2); font-size: 0.92rem; }
+.get code, .panel code, .note code { font: 400 0.86em var(--mono); background: var(--paper); border: 1px solid var(--rule); border-radius: 4px; padding: 0 4px; }
+
 footer { border-top: 1px solid var(--rule); padding-block: 32px 48px; display: grid; gap: 10px; color: var(--ink-2); font-size: 0.86rem; }
 footer p { max-width: 90ch; }
 
@@ -214,6 +225,7 @@ footer p { max-width: 90ch; }
       <a href="#engine">How it searches</a>
       <a href="#losses">Where it loses</a>
       <a href="#cost">What it saves</a>
+      <a href="#install">Install</a>
       <a href="../">Documentation</a>
       <a href="https://github.com/rkonow/engram">GitHub</a>
     </nav>
@@ -242,7 +254,7 @@ footer p { max-width: 90ch; }
       <div class="stat"><strong>$0</strong><span>in model calls to store a history. Hindsight: about $1. mem0: $0.13.</span></div>
     </div>
     <div class="cta">
-      <a class="btn primary" href="../engram/setup.html">Install guide</a>
+      <a class="btn primary" href="#install">Install in one command</a>
       <a class="btn" href="../engram/results.html">Every result and its method</a>
     </div>
   </div>
@@ -474,6 +486,35 @@ footer p { max-width: 90ch; }
     </div>
   </section>
 
+  <section id="install">
+    <div class="head">
+      <p class="eyebrow">Install</p>
+      <h2>One command, and every new Claude Code session remembers</h2>
+      <p class="lede">Engram plugs into Claude Code's own hooks and MCP, so nothing changes in how you work. One script builds it, downloads its 129 MB embedding model, wires it into Claude Code for every session or for one project, and checks the result.</p>
+    </div>
+    <div class="install">
+      <div class="panel">
+        <h3>Run it yourself</h3>
+<pre class="code">git clone https://github.com/rkonow/engram
+cd engram &amp;&amp; ./install.sh
+<span class="c"># or only for one project:</span>
+./install.sh --project ~/code/app</pre>
+        <p class="note">It needs macOS or Linux (Windows through WSL 2), Rust, a C compiler, curl and the Claude Code CLI logged in. The first build takes a few minutes. Run it again after <code>git pull</code> to upgrade. <a href="../engram/setup.html">The install guide</a> covers remote machines, dev containers and troubleshooting.</p>
+      </div>
+      <div class="panel">
+        <h3>Or ask Claude Code to do it</h3>
+        <p class="ask" id="ask-text">Clone https://github.com/rkonow/engram and set Engram up for my Claude Code by following its AGENTS.md.</p>
+        <button type="button" class="copy" id="copy-ask">Copy the sentence</button>
+        <p class="note">Paste it into any session. The agent checks the prerequisites without installing anything unasked, asks whether you want every session or one project, runs the installer and reports anything that failed.</p>
+      </div>
+    </div>
+    <div class="gets">
+      <div class="get"><h3>Nothing to remember to save</h3><p>Every prompt, tool call, error and answer is recorded by the hooks. A new session starts out knowing what earlier sessions decided.</p></div>
+      <div class="get"><h3>It stays on your machine</h3><p>One store file per project under <code>~/.local/share/engram/projects/</code>. Its only model calls are Haiku, through your own Claude Code login.</p></div>
+      <div class="get"><h3>Checked, visible, reversible</h3><p><code>engram doctor</code> checks every piece and says how to fix what fails. <code>engram ui</code> shows what was stored. <code>engram uninstall --user</code> removes it and keeps the stores.</p></div>
+    </div>
+  </section>
+
   <footer>
     <p>Measured 2026-10-15 and 2026-10-16 in a cloud container (4 CPUs, 16 GB), except where a number names the M2 MacBook Air. Haiku is the agent, reader and judge throughout. The cost figures in the calculator are estimates; everything else on this page is measured.</p>
     <p>Sources: <a href="../engram/results.html">results page</a>, <a href="https://github.com/rkonow/engram/blob/main/engram/results/v3/competitors/README.md">Hindsight and mem0 write-up</a>, <a href="https://github.com/rkonow/engram/pull/9">pull request #9</a>, <a href="https://github.com/rkonow/engram">rkonow/engram</a>.</p>
@@ -597,6 +638,18 @@ footer p { max-width: 90ch; }
     });
   });
   $("calc").addEventListener("submit", function (ev) { ev.preventDefault(); });
+  var copyBtn = $("copy-ask");
+  copyBtn.addEventListener("click", function () {
+    var text = $("ask-text").textContent;
+    function selectIt() {
+      var range = document.createRange(); range.selectNodeContents($("ask-text"));
+      var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      copyBtn.textContent = "Selected: press Ctrl+C or Cmd+C";
+    }
+    try {
+      navigator.clipboard.writeText(text).then(function () { copyBtn.textContent = "Copied"; }, selectIt);
+    } catch (e) { selectIt(); }
+  });
   render();
 })();
 </script>
