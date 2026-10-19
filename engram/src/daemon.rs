@@ -815,13 +815,12 @@ impl Daemon {
         // when the gate holds back the rest: a request that does not sound
         // like earlier work can still be bound by what was agreed.
         // The two searches are independent (only packing needs both), so
-        // they run side by side, on one snapshot.
+        // they run side by side when a core is free, on one snapshot.
         let store = self.store.pinned();
-        let (known, searched) = std::thread::scope(|sc| {
-            let k = sc.spawn(|| if self.cfg.knowledge.enabled { recall::knowledge(&store, &query, &filter, &skip, &self.cfg.knowledge) } else { Ok(Vec::new()) });
-            let m = recall::search(&store, &query, &filter, &self.cfg.rank);
-            (k.join().unwrap_or_else(|_| Err(crate::err("knowledge search panicked"))), m)
-        });
+        let (known, searched) = recall::both(
+            || if self.cfg.knowledge.enabled { recall::knowledge(&store, &query, &filter, &skip, &self.cfg.knowledge) } else { Ok(Vec::new()) },
+            || recall::search(&store, &query, &filter, &self.cfg.rank),
+        );
         let known = known?;
         let (hits, ev) = searched?;
         let mut ids: Vec<String> = known.iter().map(|(r, _, _)| r.id.clone()).collect();

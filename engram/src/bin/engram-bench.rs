@@ -1612,14 +1612,10 @@ fn latency_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queri
 }
 
 /// The prompt hook's searches for one prompt: knowledge and hybrid search
-/// side by side, then packing.
+/// side by side when a core is free (as the daemon runs them), then packing.
 fn prompt_searches(store: &Store, q: &str, filter: &Filter, rank: &RankParams, kp: &recall::KnowledgeParams) {
     let skip = HashSet::new();
-    let (known, searched) = std::thread::scope(|sc| {
-        let k = sc.spawn(|| recall::knowledge(store, q, filter, &skip, kp));
-        let m = recall::search(store, q, filter, rank);
-        (k.join().unwrap(), m)
-    });
+    let (known, searched) = recall::both(|| recall::knowledge(store, q, filter, &skip, kp), || recall::search(store, q, filter, rank));
     known.unwrap();
     let (hits, _) = searched.unwrap();
     let _ = recall::pack(&hits, q, &skip, &PackParams::default());
