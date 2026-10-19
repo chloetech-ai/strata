@@ -1,10 +1,7 @@
 //! Hybrid retrieval with priors, the injection gate, snippets and the
 //! text Engram injects.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -212,58 +209,12 @@ fn analyzed(text: &str) -> HashSet<String> {
     strata::text::analyze(text).into_iter().collect()
 }
 
-/// Threads running [`both`] now, across requests.
-static SEARCHING: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    /// This thread is counted in `SEARCHING`.
-    static COUNTED: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Counts this thread in `SEARCHING` until dropped, once however deeply
-/// `both` is nested.
-struct Searching(bool);
-
-impl Searching {
-    fn enter() -> Searching {
-        let first = !COUNTED.replace(true);
-        if first {
-            SEARCHING.fetch_add(1, Ordering::AcqRel);
-        }
-        Searching(first)
-    }
-}
-
-impl Drop for Searching {
-    fn drop(&mut self) {
-        if self.0 {
-            COUNTED.set(false);
-            SEARCHING.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
-
-fn cores() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-}
-
-/// Runs `a` and `b`: side by side (`a` on another thread) while a core is
-/// free, one after the other on this thread when every core is already
-/// searching, since splitting a request then only slows the others down.
-pub fn both<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B) -> (A, B) {
-    let _me = Searching::enter();
-    if SEARCHING.load(Ordering::Acquire) >= cores() {
-        return (a(), b());
-    }
-    std::thread::scope(|s| {
-        let h = s.spawn(|| {
-            let _me = Searching::enter();
-            a()
-        });
-        let b = b();
-        (h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), b)
-    })
+/// Runs `a` and `b` on the search pool, one thread per core (rayon's): side
+/// by side while a pool thread is free, one after the other once every
+/// core is busy with other requests, where splitting a request would only
+/// slow the others down. A caller outside the pool waits for both.
+pub fn both<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {
+    rayon::join(a, b)
 }
 
 /// Hybrid search: BM25 and vector candidates, min-max fused, with priors.
