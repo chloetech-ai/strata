@@ -65,7 +65,11 @@ socket.
   returns (Strata's `publish_snapshots`), including the last memtable
   chunk's in-memory segment, so a reader never builds an index or waits for
   one. Chunks hold 256 records and scan their vectors instead of building a
-  graph (Strata's `mem_build` option), so that build stays cheap.
+  graph (Strata's `mem_build` option), so that build stays cheap. In the
+  cloud container at 1M records, with four prompt clients and a tool hook
+  every 10 ms, the daemon answers 146–149 prompts a second at a 56–57 ms
+  p99, against 87–112 prompts and 81–120 ms when readers built the segment
+  (`results/concurrency/`).
 - **One snapshot per request.** The searches behind one prompt (BM25 and
   vectors, main and knowledge queries, the query engine's searches) share a
   snapshot, so they agree however much is written meanwhile. They run side
