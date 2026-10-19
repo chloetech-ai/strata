@@ -449,7 +449,6 @@ dependencies = [
  "clap",
  "libc",
  "memmap2",
- "rayon",
  "regex",
  "serde",
  "serde_json",

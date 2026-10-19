@@ -1,7 +1,10 @@
 //! Hybrid retrieval with priors, the injection gate, snippets and the
 //! text Engram injects.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -209,12 +212,60 @@ fn analyzed(text: &str) -> HashSet<String> {
     strata::text::analyze(text).into_iter().collect()
 }
 
-/// Runs `a` and `b` on the search pool, one thread per core (rayon's): side
-/// by side while a pool thread is free, one after the other once every
-/// core is busy with other requests, where splitting a request would only
-/// slow the others down. A caller outside the pool waits for both.
-pub fn both<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {
-    rayon::join(a, b)
+/// Requests running [`both`] now.
+static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// The threads this thread's part of a request may use; 0 outside one.
+    static SHARE: Cell<usize> = const { Cell::new(0) };
+}
+
+fn cores() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// A request's share of the cores: divided among the requests running when
+/// it starts.
+struct Request;
+
+impl Request {
+    fn start() -> Request {
+        let n = REQUESTS.fetch_add(1, Ordering::AcqRel) + 1;
+        SHARE.set((cores() / n).max(1));
+        Request
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        SHARE.set(0);
+        REQUESTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Runs `a` and `b` side by side (`a` on another thread) when the request's
+/// share of the cores allows, else one after the other. A lone request
+/// splits across every core; with every core busy, splitting a request
+/// would only slow the others down.
+pub fn both<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B) -> (A, B) {
+    let _request = (SHARE.get() == 0).then(Request::start);
+    let share = SHARE.get();
+    if share < 2 {
+        return (a(), b());
+    }
+    let theirs = share / 2;
+    SHARE.set(share - theirs);
+    let out = std::thread::scope(|s| {
+        let h = s.spawn(move || {
+            SHARE.set(theirs);
+            a()
+        });
+        let b = b();
+        (h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), b)
+    });
+    SHARE.set(share);
+    out
 }
 
 /// Hybrid search: BM25 and vector candidates, min-max fused, with priors.
@@ -769,6 +820,22 @@ pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parts of a request divide its share of the cores between them,
+    /// and a request (even one that panics) gives its share back.
+    #[test]
+    fn requests_divide_their_share() {
+        let ((sa, (x, y)), sb) = both(|| (SHARE.get(), both(|| SHARE.get(), || SHARE.get())), || SHARE.get());
+        assert!(sa >= 1 && sb >= 1 && sa + sb <= cores().max(2), "{sa} + {sb}");
+        if sa >= 2 {
+            assert_eq!(x + y, sa);
+        } else {
+            assert_eq!((x, y), (1, 1));
+        }
+        assert_eq!(SHARE.get(), 0);
+        assert!(std::panic::catch_unwind(|| both(|| panic!("a search failed"), || 1)).is_err());
+        assert_eq!(SHARE.get(), 0);
+    }
 
     #[test]
     fn time_formats() {

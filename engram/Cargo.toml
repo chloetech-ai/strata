@@ -13,8 +13,6 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 memmap2 = "0.9"
 regex = "1"
-# The search pool: a prompt's searches run side by side on free cores.
-rayon = "1"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # BGE-small through candle (feature `bert`): better vectors, ~50 ms per record on CPU.
 candle-core = { version = "0.9", optional = true }
