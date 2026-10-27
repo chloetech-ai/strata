@@ -62,7 +62,7 @@ FROM <table>
 | `INT`, `FLOAT` | frame-of-reference column with zone maps, range histogram | `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN` |
 | `KEYWORD` | dictionary codes and one docID list per value | `=`, `!=`, `IN`, `NOT IN`; `GROUP BY` |
 | `TEXT` | inverted index (optionally with positions); may be generated from other text fields | `MATCH` |
-| `VECTOR(d)` | float32 rows plus 8-bit codes (or 1-bit codes, `"codes": "binary"`), with HNSW, IVF or flat search | ordering by `similarity` / `distance`; a similarity graph |
+| `VECTOR(d)` | float32 rows plus 8-bit codes (or 1-bit codes, `"codes": "binary"`), with HNSW, IVF or flat search; may be declared as a model's embedding of other fields ([embedded vector fields](server.md#embedded-vector-fields)) | ordering by `similarity` / `distance`; a similarity graph |
 | `SPARSE` | inverted index of learned term weights (SPLADE and similar) | ordering by `similarity` |
 | `EDGES` | out-edge CSR and reverse index per segment | `REACHABLE`, `PATH`, `ppr` |
 

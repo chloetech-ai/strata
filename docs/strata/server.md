@@ -21,7 +21,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 # open http://127.0.0.1:7700
 ```
 
-`--demo N` creates a product catalogue of *N* rows (titles, descriptions, brands, categories, tags, prices, ratings, sales and a 64-dimension vector) to try things on. Its vectors are hashed bags of words, not a learned model, so "similar" means "shares words".
+`--demo N` creates a product catalogue of *N* rows (titles, descriptions, brands, categories, tags, prices, ratings, sales and a 64-dimension vector) to try things on. Its `emb` field is declared as the `hash:64` model's embedding of the title and description ([below](#embedded-vector-fields)): hashed bags of words, not a learned model, so "similar" means "shares words".
 
 | flag | default | effect |
 |---|---|---|
@@ -35,7 +35,8 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--timeout-ms N` | 5000 | default query deadline |
 | `--max-concurrent N` | 64 | queries running at once; more wait for a slot until their deadline |
 | `--model ID` | `claude-haiku-5-5` | the agent's default model |
-| `--hash-embedder` | off | answer `{"embed": "text"}` parameters with hashed bag-of-words vectors |
+| `--models DIR` | `$STRATA_MODELS`, else `~/.local/share/strata/models` | where the models of [embedded vector fields](#embedded-vector-fields) are |
+| `--copy-from PATH` | | fill the new database (`--db` with `--schema`) with this database's rows, re-embedding the vector fields whose embedding changed |
 
 A schema file is Strata's schema as JSON. `GET /v1/schema` returns it in the same form:
 
@@ -56,9 +57,54 @@ A schema file is Strata's schema as JSON. `GET /v1/schema` returns it in the sam
 
 The [query language](query-language.md#columns-and-types) page describes the types.
 
+## Embedded vector fields
+
+A `VECTOR` field can say what its vectors are: a model's embedding of other fields.
+
+```json
+{"name": "emb_title", "ty": {"Vector": {"dim": 512, "index": "Flat"}}, "stored": false, "indexed": true,
+ "embed": {"from": ["title"], "model": "potion-retrieval-32M"}},
+{"name": "emb_both", "ty": {"Vector": {"dim": 512, "index": "Flat"}}, "stored": false, "indexed": true,
+ "embed": {"from": ["title", "description"], "model": "potion-retrieval-32M"}}
+```
+
+The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text embedded is their non-empty values joined by newlines, as for a generated field. The declaration is kept in the database, returned by `/v1/schema` and shown by the UI ("emb_title ← title") and the agent. When the server starts it opens each field's model from `--models` and logs what each field is. With the model open:
+
+- writes that leave the vector out get it computed: `/v1/write` documents (embedded before they queue for the writer, on all cores) and SQL `INSERT`; a vector a write supplies is kept as given;
+- an `UPDATE` that changes a source recomputes the vector; merges do not (they keep the stored vectors);
+- a parameter `{"embed": "some text", "field": "emb_title"}` is the text's vector by that field's model, so queries and rows are always embedded alike (`field` defaults to the first embedded field with a model); the UI's "Similar to: a description" uses the chosen vector field's model.
+
+Several fields can embed different sources side by side, and a query picks one: `ORDER BY similarity(emb_title, :q)`, or both fused, `rrf(similarity(emb_title, :q), similarity(emb_both, :p))`. Each 512-dimension field costs about 0.5 KB a row as 8-bit codes, plus its HNSW graph.
+
+A field may also name a model the server cannot run, such as `cohere/embed-english-v3.0` for vectors computed elsewhere: that documents what the vectors are, writes must supply them, and text cannot be searched against them (only rows, with `vector_of`). The BEIR collections of the evaluation declare their Cohere vectors this way.
+
+| model | what it is | |
+|---|---|---|
+| `potion-retrieval-32M` | Model2Vec (a static token table, averaged), 512 dimensions; the model engram uses | tens of microseconds a row on one core |
+| `potion-base-8M` | Model2Vec, 256 dimensions | smallest |
+| `bge-small-en-v1.5` | BERT encoder, 384 dimensions | build with `--features bert`; milliseconds a row |
+| `snowflake-arctic-embed-m-v1.5` | BERT encoder, 768 dimensions | build with `--features bert`; slower, better |
+| `hash:N` | hashed bag of words, *N* dimensions | no files; tests and the demo |
+
+`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory.
+
+**Changing your mind.** Vectors are stored, so changing a field's sources or model means re-embedding. Create a database with the new schema and fill it from the old one:
+
+```sh
+strata-server --db products-v2.strata --schema v2.json --copy-from products.strata
+```
+
+Rows are copied field by field by name; a vector field is copied when the old one has the same dimensions, sources and model, and embedded anew otherwise; fields the new schema drops are left out. `Db::load_from` does the same from Rust.
+
+**Which fields to embed.** Embed the text that carries what people search for, usually title and description; keep brand, price, category and dates out of the vector and filter on them instead. Whether the title alone, the description alone or both work best depends on the data and the queries, so measure it: `strata-embed-eval` (in `strata/`) loads a BEIR collection into fields embedding its titles, its texts and both, by one model, and reports nDCG@10 and recall@100 for each, with BM25, hybrid and the collection's Cohere vectors as references.
+
+```sh
+cd strata && STRATA_DATA=~/data/beir cargo run --release --bin strata-embed-eval -- --dataset scifact --model potion-retrieval-32M
+```
+
 ## HTTP API
 
-Every request and answer is JSON. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key"}` for a stored row's vector (more like this), or `{"embed": "text"}` when the server has an embedder.
+Every request and answer is JSON. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model.
 
 | route | body | answer |
 |---|---|---|
