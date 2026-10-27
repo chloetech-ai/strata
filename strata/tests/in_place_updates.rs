@@ -76,7 +76,7 @@ fn check(db: &Db, docs: &[Document]) {
 /// Sets `rating` (and every third time `year`) of `n` documents from
 /// `start`, stepping through the collection, in `docs` and the database.
 fn set_some(db: &Db, docs: &mut [Document], start: usize, n: usize, salt: i64) {
-    let mut t = db.storage().begin().unwrap();
+    let mut t = retry(|| db.storage().begin());
     for k in 0..n {
         let i = (start + k * 37) % docs.len();
         let id = docs[i][col::ID].clone();
@@ -90,6 +90,17 @@ fn set_some(db: &Db, docs: &mut [Document], start: usize, n: usize, salt: i64) {
         }
     }
     t.commit().unwrap();
+}
+
+/// `f` until the writer is free: a merge running beside the writes holds
+/// it while it commits, and `begin` and `flush` answer `Busy` meanwhile.
+fn retry<T>(mut f: impl FnMut() -> strata::Result<T>) -> T {
+    loop {
+        match f() {
+            Err(strata::Error::Busy(_)) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            r => return r.unwrap(),
+        }
+    }
 }
 
 fn run(name: &str, layout: Layout) {
@@ -173,7 +184,7 @@ fn sets_during_merges_are_kept() {
         for round in 0..40 {
             set_some(&db, &mut model, round * 7, 25, round as i64);
             if round % 10 == 9 {
-                db.storage().flush().unwrap();
+                retry(|| db.storage().flush());
             }
         }
     });

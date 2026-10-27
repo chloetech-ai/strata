@@ -21,7 +21,7 @@ use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
 use crate::storage::{SegmentView, Snapshot, Updates};
-use crate::text::{self, Bm25Params, CollectionStats, TextFieldReader, TopKAlgo};
+use crate::text::{self, Bm25Params, CollectionStats, FilterStrategy, TextFieldReader, TopKAlgo};
 use crate::value::Value;
 use crate::vector::{self, SearchParams, VectorReader};
 
@@ -109,7 +109,7 @@ impl SegmentReaders {
         let f = &self.schema.fields[field];
         opened(&self.text[field], || {
             Ok(match f.ty {
-                FieldType::Text { .. } if f.indexed => Some(TextFieldReader::open(&self.seg, &f.name)?),
+                FieldType::Text { .. } | FieldType::Sparse if f.indexed => Some(TextFieldReader::open(&self.seg, &f.name)?),
                 _ => None,
             })
         })
@@ -849,11 +849,38 @@ impl<'a> Executor<'a> {
         match score {
             Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, k),
             Score::Similarity { field, vector, opts } => self.vector_top(*field, vector, opts, p, k),
+            Score::Sparse { field, terms, opts } => self.sparse_top(*field, terms, opts, p, k),
             Score::Column { field } => self.by_column(*field, true, p, Some(k), None),
             Score::Decay { field, decay, .. } => self.decay_top(*field, decay, p, k),
             Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, k),
             _ => Err(err("fusion inputs must be bm25, similarity, ppr, hops, decay or a column")),
         }
+    }
+
+    /// Top-`k` of a SPARSE field by the dot product with `terms`: the
+    /// text index's top-k over the weights (no collection statistics, so
+    /// shards and segments score alike).
+    fn sparse_top(&mut self, field: usize, terms: &[(String, f32)], opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (_, algo) = self.bm25_params(opts);
+        let per = self.per_segment(|ex, s, l| {
+            let t = ex.text(s, field)?;
+            let candidates = terms.iter().map(|(w, _)| t.doc_freq(w) as f64).sum::<f64>() * 0.3;
+            let mode = match ex.opts.filter_mode {
+                Some(m) => m,
+                None => {
+                    let est = SegEst { ex, s, params: None, local_sel: None };
+                    ex.planner(&est).filter_mode(p, candidates)
+                }
+            };
+            let f = ex.seg_filter_l(s, p, mode, l)?;
+            let hits = t.top_k_dot(terms, k, f.as_dyn(), algo, FilterStrategy::Auto);
+            l.plan.push(format!("seg {}: sparse {algo:?}, {} terms, filter {mode:?}", s.ord, terms.len()));
+            Ok(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }).collect::<Vec<_>>())
+        })?;
+        Ok(merge_top(per.concat(), k))
     }
 
     /// BM25 statistics over every segment of the snapshot.
@@ -1194,6 +1221,13 @@ impl<'a> Executor<'a> {
                     out[range].copy_from_slice(&sc);
                 }
             }
+            Score::Sparse { field, terms, .. } => {
+                for (seg, range) in by_seg {
+                    let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
+                    let sc = self.text(self.seg_by_ord(seg), *field)?.score_dot(terms, &docs);
+                    out[range].copy_from_slice(&sc);
+                }
+            }
             Score::Similarity { field, vector, .. } => {
                 for (seg, range) in by_seg {
                     let vr = self.vector(self.seg_by_ord(seg), *field)?;
@@ -1354,7 +1388,7 @@ impl<'a> Executor<'a> {
             FieldType::Vector { .. } => s.r.vector(field).ok().flatten().map_or(Value::Null, |v| Value::Vector(v.vector(d).into())),
             FieldType::Int | FieldType::Float => s.r.numeric(field).ok().flatten().map_or(Value::Null, |n| n.col().get(d)),
             FieldType::Keyword => s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Value::Null, |v| Value::Str(v.to_string())),
-            FieldType::Text { .. } => Value::Null,
+            FieldType::Text { .. } | FieldType::Sparse => Value::Null,
             FieldType::Edges => s.r.graph(field).ok().flatten().map_or(Value::Null, |g| g.edges_value(d)),
         }
     }

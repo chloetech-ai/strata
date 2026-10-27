@@ -129,6 +129,31 @@ impl TextFieldBuilder {
         self.scratch = scratch;
     }
 
+    /// Adds the next document as distinct terms with their frequencies (a
+    /// sparse field's quantised weights, see [`super::sparse`]); its length
+    /// is its number of terms.
+    pub fn add_weighted(&mut self, terms: &[(String, u32)]) {
+        let doc = self.norms.len() as DocId;
+        for (t, f) in terms {
+            let id = match self.term_ids.get(t.as_str()) {
+                Some(&id) => id,
+                None => {
+                    let id = self.terms.len() as u32;
+                    self.term_ids.insert(t.clone(), id);
+                    self.terms.push(t.clone());
+                    self.postings.push(TermPostings::default());
+                    id
+                }
+            };
+            let p = &mut self.postings[id as usize];
+            p.docs.push(doc);
+            p.freqs.push(*f);
+        }
+        let len = terms.len() as u32;
+        self.norms.push(encode_norm(len));
+        self.total_len += len as u64;
+    }
+
     /// Writes the sections.
     pub fn write(self, out: &mut SegmentWriter) -> Result<()> {
         self.write_as(out, self.format, self.loom_min_df)

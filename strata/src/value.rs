@@ -101,6 +101,10 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
                 crate::graph::parse_edges(v, crate::graph::int_keys(schema))?;
                 true
             }
+            (FieldType::Sparse, Value::Str(_)) => {
+                crate::text::sparse::parse(v)?;
+                true
+            }
             _ => false,
         };
         if !ok {

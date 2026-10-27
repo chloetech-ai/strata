@@ -13,6 +13,9 @@
 //!   the int8 kernel (VNNI or NEON; see `notes/vector.md`).
 //! * [`dot_f32_4x4`]: a 4×4 block of float32 dot products sharing loads, for
 //!   k-means and brute-force ground truth.
+//! * [`dot_bits_u8`]: a binary code against a query of a byte per
+//!   dimension (AVX-512BW masked loads and `vpsadbw`; elsewhere popcounts
+//!   of the query's bit planes).
 //!
 //! The SIMD paths are chosen at compile time (`-C target-cpu=native`); every
 //! kernel has a portable scalar version, used on other targets and as the
@@ -144,6 +147,52 @@ pub fn dot_u8_f32_scalar(a: &[u8], w: &[f32]) -> f32 {
     acc.iter().sum::<f32>() + tail
 }
 
+/// Score of a binary code (see [`crate::vector::bits`]): the sum of
+/// `u[j] - 128` over the set bits `j` of `code`. `code` is little-endian u64
+/// words; `u` holds a byte per dimension, 64 per word, and `planes` its
+/// eight bit planes per word (`planes[8w + p]`, for the portable path).
+/// AVX-512 loads the bytes of `u` under the code as a mask and sums them
+/// with `vpsadbw`; elsewhere each plane is ANDed with the code and counted.
+#[inline]
+pub fn dot_bits_u8(code: &[u8], u: &[u8], planes: &[u64]) -> i32 {
+    assert!(code.len().is_multiple_of(8) && u.len() >= code.len() * 8 && planes.len() >= code.len());
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    // SAFETY: `code` holds `words` u64s and `u` 64 bytes per word.
+    unsafe {
+        dot_bits_avx512(code.as_ptr(), u.as_ptr(), code.len() / 8)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
+    dot_bits_planes(code, planes)
+}
+
+/// [`dot_bits_u8`] by bit planes: nine popcounts per 64 dimensions.
+pub fn dot_bits_planes(code: &[u8], planes: &[u64]) -> i32 {
+    let mut s = 0i64;
+    for (w, c) in code.chunks_exact(8).enumerate() {
+        let c = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+        let p = &planes[8 * w..8 * w + 8];
+        let mut t = 0i64;
+        for (b, &plane) in p.iter().enumerate() {
+            t += ((plane & c).count_ones() as i64) << b;
+        }
+        s += t - 128 * c.count_ones() as i64;
+    }
+    s as i32
+}
+
+/// Reference [`dot_bits_u8`], one set bit at a time.
+pub fn dot_bits_u8_scalar(code: &[u8], u: &[u8]) -> i32 {
+    let mut s = 0i32;
+    for (i, &byte) in code.iter().enumerate() {
+        for b in 0..8 {
+            if byte >> b & 1 == 1 {
+                s += u[8 * i + b] as i32 - 128;
+            }
+        }
+    }
+    s
+}
+
 /// All 16 dot products `a[i] · b[j]` of four vectors against four others
 /// (equal lengths). Each loaded chunk feeds four FMAs, so this runs near the
 /// FMA throughput instead of the load throughput.
@@ -216,6 +265,21 @@ unsafe fn dot_f32_avx512(a: *const f32, b: *const f32, n: usize) -> f32 {
         s[1] = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, a.add(i)), _mm512_maskz_loadu_ps(m, b.add(i)), s[1]);
     }
     _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(s[0], s[1]), _mm512_add_ps(s[2], s[3])))
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[inline]
+unsafe fn dot_bits_avx512(code: *const u8, u: *const u8, words: usize) -> i32 {
+    let zero = _mm512_setzero_si512();
+    let mut acc = [zero; 2];
+    let mut set = 0u64;
+    for w in 0..words {
+        let m = (code.add(8 * w) as *const u64).read_unaligned();
+        let x = _mm512_maskz_loadu_epi8(m, u.add(64 * w) as *const i8);
+        acc[w & 1] = _mm512_add_epi64(acc[w & 1], _mm512_sad_epu8(x, zero));
+        set += m.count_ones() as u64;
+    }
+    (_mm512_reduce_add_epi64(_mm512_add_epi64(acc[0], acc[1])) - 128 * set as i64) as i32
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"))]
@@ -527,6 +591,25 @@ mod tests {
                 for j in 0..4 {
                     assert!(close(m[i][j], dot_f32_scalar(&vs[i], &vs[4 + j]), n as f32), "4x4 n={n}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_kernels_match_scalar() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        for words in [1, 2, 3, 6, 12, 16, 17] {
+            let u: Vec<u8> = (0..64 * words).map(|_| rng.gen()).collect();
+            let mut planes = vec![0u64; 8 * words];
+            for (j, &x) in u.iter().enumerate() {
+                for p in 0..8 {
+                    planes[j / 64 * 8 + p] |= ((x >> p & 1) as u64) << (j % 64);
+                }
+            }
+            for code in [vec![0u8; 8 * words], vec![255u8; 8 * words], (0..8 * words).map(|_| rng.gen()).collect()] {
+                let want = dot_bits_u8_scalar(&code, &u);
+                assert_eq!(dot_bits_u8(&code, &u, &planes), want, "{words} words");
+                assert_eq!(dot_bits_planes(&code, &planes), want, "{words} words");
             }
         }
     }

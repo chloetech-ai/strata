@@ -40,7 +40,7 @@ enum Kind {
 impl Kind {
     fn of(ty: &FieldType) -> Option<Kind> {
         match ty {
-            FieldType::Text { .. } | FieldType::Keyword | FieldType::Edges => Some(Kind::Str),
+            FieldType::Text { .. } | FieldType::Keyword | FieldType::Edges | FieldType::Sparse => Some(Kind::Str),
             FieldType::Int => Some(Kind::Int),
             FieldType::Float => Some(Kind::Float),
             FieldType::Vector { .. } => None,

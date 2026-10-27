@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// How a vector field is indexed (every vector field also keeps float32
-/// vectors and SQ8 codes in the forward index, so `Flat` adds nothing).
+/// vectors and compressed codes in the forward index, so `Flat` adds
+/// nothing).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VectorIndexKind {
     Flat,
@@ -14,6 +15,46 @@ pub enum VectorIndexKind {
     Ivf { nlist: usize },
     /// Hierarchical navigable small world graph.
     Hnsw { m: usize, ef_construction: usize },
+}
+
+/// The compressed codes a vector field is searched with before the best
+/// candidates are rescored with its float32 vectors (see
+/// [`crate::vector::codes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorCodes {
+    /// A byte per dimension: a quarter of the float32 vectors.
+    #[default]
+    Sq8,
+    /// A bit per dimension: 1/32 of the float32 vectors. Searches rescore
+    /// [`crate::vector::codes::BINARY_RERANK`] times more candidates.
+    Binary,
+}
+
+impl VectorCodes {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VectorCodes::Sq8 => "sq8",
+            VectorCodes::Binary => "binary",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<VectorCodes> {
+        [VectorCodes::Sq8, VectorCodes::Binary].into_iter().find(|k| k.as_str().eq_ignore_ascii_case(s))
+    }
+
+    /// Bytes per code row of `dim` dimensions: SQ8 rows are padded to 64
+    /// bytes, binary rows to 8.
+    pub fn stride(&self, dim: usize) -> usize {
+        match self {
+            VectorCodes::Sq8 => dim.next_multiple_of(64),
+            VectorCodes::Binary => crate::vector::bits::stride(dim),
+        }
+    }
+
+    fn is_sq8(&self) -> bool {
+        *self == VectorCodes::Sq8
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -29,6 +70,11 @@ pub enum FieldType {
     /// Outgoing edges to other rows of the table, by primary key: a JSON
     /// array (see [`crate::graph`]). Indexed: out-edges and a reverse index.
     Edges,
+    /// Learned sparse term weights (SPLADE, BGE-M3 sparse): a JSON object
+    /// `{"term": weight}`; similarity is the dot product (see
+    /// [`crate::text::sparse`]). Indexed: a text index of the terms with
+    /// the weights as frequencies.
+    Sparse,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -52,11 +98,19 @@ pub struct Field {
     /// ranges are runs of codes), and stored.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multi: bool,
+    /// A VECTOR field's compressed codes (default SQ8).
+    #[serde(default, skip_serializing_if = "VectorCodes::is_sq8")]
+    pub codes: VectorCodes,
 }
 
 impl Field {
     pub fn new(name: &str, ty: FieldType) -> Self {
-        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false }
+        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false, codes: VectorCodes::Sq8 }
+    }
+    /// Sets a VECTOR field's compressed codes.
+    pub fn codes(mut self, codes: VectorCodes) -> Self {
+        self.codes = codes;
+        self
     }
     /// Makes a KEYWORD or INT field multi-valued.
     pub fn multi(mut self) -> Self {
@@ -108,6 +162,9 @@ impl Schema {
             if f.multi && (!matches!(f.ty, FieldType::Keyword | FieldType::Int) || !f.stored || s.primary_key == Some(i)) {
                 return Err(Error::Schema(format!("multi-valued field {} must be a stored KEYWORD or INT, not the primary key", f.name)));
             }
+        }
+        if let Some(f) = s.fields.iter().find(|f| !f.codes.is_sq8() && !matches!(f.ty, FieldType::Vector { .. })) {
+            return Err(Error::Schema(format!("field {} has vector codes but is not a VECTOR", f.name)));
         }
         if s.primary_key.is_none() {
             if let Some(f) = s.fields.iter().find(|f| f.ty == FieldType::Edges) {

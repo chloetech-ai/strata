@@ -41,7 +41,7 @@ use crate::error::{corrupt, Result};
 use crate::segment::DocId;
 use crate::vector::build::Rows;
 use crate::vector::kernels::{self, dot_f32};
-use crate::vector::sq8::QueryCode;
+use crate::vector::codes::QueryCode;
 use crate::vector::topk::{Members, TopK};
 use crate::vector::{io, Codes, SearchStats};
 
@@ -510,10 +510,7 @@ impl HnswView {
                 let mut scores = [0i32; 4];
                 let take = (fresh.len() - i).min(4);
                 if take == 4 {
-                    scores = kernels::dot_u8_i8_x4(
-                        [codes.row(fresh[i]), codes.row(fresh[i + 1]), codes.row(fresh[i + 2]), codes.row(fresh[i + 3])],
-                        &q.q8,
-                    );
+                    scores = q.dot4([codes.row(fresh[i]), codes.row(fresh[i + 1]), codes.row(fresh[i + 2]), codes.row(fresh[i + 3])]);
                 } else {
                     for j in 0..take {
                         scores[j] = q.dot(codes.row(fresh[i + j]));

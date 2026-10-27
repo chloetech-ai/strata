@@ -134,6 +134,9 @@ pub enum Score {
     /// Dot product with `vector` (cosine for unit vectors). `distance(...)`
     /// binds to this with the sort direction flipped.
     Similarity { field: usize, vector: Arc<[f32]>, opts: Opts },
+    /// Dot product of a SPARSE field's term weights with `terms`' (also
+    /// `similarity(...)` in SQL).
+    Sparse { field: usize, terms: Vec<(String, f32)>, opts: Opts },
     /// Reciprocal rank fusion: `Σ 1 / (k + rank_i)` over the inputs' rankings
     /// of their top `depth` rows.
     Rrf { inputs: Vec<Score>, k: f64, depth: usize },
@@ -167,16 +170,16 @@ impl Score {
 
     pub fn opts(&self) -> Option<&Opts> {
         match self {
-            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } | Score::Decay { opts, .. } => Some(opts),
+            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } | Score::Sparse { opts, .. } | Score::Decay { opts, .. } => Some(opts),
             _ => None,
         }
     }
 
     /// Whether the score ranks by relevance to the query (BM25,
-    /// similarity, graph), as opposed to a row's own values (a column, a
+    /// similarity, sparse, graph), as opposed to a row's own values (a column, a
     /// decay), which only boost rows found by relevance.
     pub fn is_relevance(&self) -> bool {
-        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Ppr { .. } | Score::Hops { .. })
+        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Ppr { .. } | Score::Hops { .. })
     }
 }
 

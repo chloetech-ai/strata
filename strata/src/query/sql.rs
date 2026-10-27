@@ -5,7 +5,8 @@
 //! [WHERE <pred>] [GROUP BY <keyword>] [ORDER BY <score> [ASC|DESC]]
 //! [LIMIT n [OFFSET m]]`, where predicates combine `MATCH(field, q)`,
 //! comparisons, `BETWEEN`, `IN` with AND/OR/NOT, and scores are `bm25`,
-//! `similarity`, `distance`, `rrf`, weighted sums of those, or a column.
+//! `similarity` (on a VECTOR or a SPARSE field), `distance`, `decay`, `rrf`,
+//! weighted sums and products of those, or a column.
 //! Parameters (`:name`) are bound from [`Params`].
 //!
 //! Writes ([`bind_write`]): `INSERT INTO t (cols) VALUES (...), ...`,
@@ -491,7 +492,14 @@ impl<'a> Binder<'a> {
                     }
                     "similarity" | "distance" => {
                         let [field, v] = args.as_slice() else { return Err(err("similarity(field, vector)")) };
-                        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. }), "VECTOR")?;
+                        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. } | FieldType::Sparse), "VECTOR or SPARSE")?;
+                        if self.schema.fields[field].ty == FieldType::Sparse {
+                            if fname(f) == "distance" {
+                                return Err(err("a SPARSE field takes similarity(...), not distance(...)"));
+                            }
+                            let terms = crate::text::sparse::parse(&self.literal(v)?).map_err(|e| err(format!("similarity({}, ..): {e}", self.schema.fields[field].name)))?;
+                            return Ok(Score::Sparse { field, terms, opts });
+                        }
                         let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
                         let vector = self.vector(v)?;
                         if vector.len() != dim {
@@ -552,7 +560,7 @@ impl<'a> Binder<'a> {
             _ => {
                 let s = self.score(e)?;
                 match s {
-                    Score::Bm25 { .. } | Score::Similarity { .. } | Score::Column { .. } | Score::Decay { .. } | Score::Ppr { .. } | Score::Hops { .. } => Ok(vec![s]),
+                    Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Column { .. } | Score::Decay { .. } | Score::Ppr { .. } | Score::Hops { .. } => Ok(vec![s]),
                     _ => Err(err("a product multiplies bm25, similarity, ppr, a column or decay, not sums or fusions")),
                 }
             }
@@ -793,6 +801,10 @@ impl<'a> Binder<'a> {
             (FieldType::Vector { .. }, _) => Value::Vector(self.vector(e)?),
             (_, v @ Value::List(_)) if field.multi => v,
             (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
+            (FieldType::Sparse, v @ Value::Str(_)) => {
+                crate::text::sparse::parse(&v)?;
+                v
+            }
             (FieldType::Keyword | FieldType::Int | FieldType::Float, _) if field.multi => Value::List(vec![self.field_value(f, e)?]),
             _ => self.field_value(f, e)?,
         })

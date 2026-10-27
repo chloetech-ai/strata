@@ -11,6 +11,11 @@
 //! Upper bounds: a list's from its impact frontier (exact), a block's from
 //! its impact (largest tf, smallest norm). Both hold for any parameters.
 //!
+//! The same machinery ranks learned sparse fields ([`crate::text::sparse`])
+//! by the dot product `Σ_t q_t · w_t`: there a posting's frequency is the
+//! document's quantised weight for the term, and a term scores linearly
+//! (`weight · tf`) instead of saturating.
+//!
 //! All three algorithms visit documents in docID order and keep the first of
 //! equal-scored documents, so they return the same top-k up to float
 //! rounding (sums are taken in different orders).
@@ -122,9 +127,12 @@ pub fn drive_cost(algo: TopKAlgo) -> f64 {
 const BOUND_SLACK: f32 = 1.0 + 1e-5;
 
 /// One query term: its cursor, weight `m · idf · (k1 + 1)` and list bound.
+/// A posting scores `weight · tf / (sat · tf + k[norm])`: BM25 with `sat`
+/// 1, a linear `weight · tf` with `sat` 0 and every `k` 1 (sparse fields).
 struct TermScorer<'a> {
     cur: PostingCursor<'a>,
     weight: f32,
+    sat: f32,
     max: f32,
     /// The block bound last computed, valid for targets below `block_end`
     /// (one past the block's last docID; 0 before the first call).
@@ -136,7 +144,7 @@ impl TermScorer<'_> {
     #[inline]
     fn score(&mut self, k: &[f32; 256], norm: u8) -> f32 {
         let tf = self.cur.freq() as f32;
-        self.weight * tf / (tf + k[norm as usize])
+        self.weight * tf / (self.sat * tf + k[norm as usize])
     }
 
     #[inline]
@@ -145,7 +153,7 @@ impl TermScorer<'_> {
             return self.max;
         }
         let tf = (imp >> 8) as f32;
-        self.weight * tf / (tf + k[(imp & 0xff) as usize]) * BOUND_SLACK
+        self.weight * tf / (self.sat * tf + k[(imp & 0xff) as usize]) * BOUND_SLACK
     }
 
     /// Bound of the block holding the first posting `>= target` (targets
@@ -257,9 +265,33 @@ impl TextFieldReader {
             let cur = self.cursor(&info);
             let max = cur.frontier().iter().map(|&(tf, n)| weight * tf as f32 / (tf as f32 + k[n as usize])).fold(0.0, f32::max)
                 * BOUND_SLACK;
-            scorers.push(TermScorer { cur, weight, max, block_end: 0, block_max: 0.0 });
+            scorers.push(TermScorer { cur, weight, sat: 1.0, max, block_end: 0, block_max: 0.0 });
         }
         Query { scorers, k, norms: &self.norms }
+    }
+
+    /// The linear query of a sparse field: `terms` with their query
+    /// weights (repeated terms add up; weights at or below 0 are dropped).
+    fn query_dot<'a>(&'a self, terms: &[(String, f32)]) -> Query<'a> {
+        let mut uniq: Vec<(&str, f32)> = Vec::new();
+        for (t, w) in terms {
+            match uniq.iter_mut().find(|(u, _)| *u == t.as_str()) {
+                Some(e) => e.1 += w,
+                None => uniq.push((t, *w)),
+            }
+        }
+        let mut scorers = Vec::new();
+        for (t, w) in uniq {
+            if w <= 0.0 {
+                continue;
+            }
+            let Some(info) = self.term_info(t) else { continue };
+            let weight = w / super::sparse::SCALE;
+            let cur = self.cursor(&info);
+            let max = cur.frontier().iter().map(|&(tf, _)| weight * tf as f32).fold(0.0, f32::max) * BOUND_SLACK;
+            scorers.push(TermScorer { cur, weight, sat: 0.0, max, block_end: 0, block_max: 0.0 });
+        }
+        Query { scorers, k: [1.0; 256], norms: &self.norms }
     }
 
     /// Disjunctive BM25 top-`k` of the analysed `terms` (repeated terms
@@ -290,7 +322,22 @@ impl TextFieldReader {
         algo: TopKAlgo,
         strategy: FilterStrategy,
     ) -> Vec<(DocId, f32)> {
-        let mut q = self.query(terms, stats, params);
+        self.run(self.query(terms, stats, params), k, filter, algo, strategy)
+    }
+
+    /// Top-`k` of a sparse field by the dot product of each document's
+    /// term weights with `terms`' (see [`crate::text::sparse`]); filters as
+    /// in [`top_k_with`](Self::top_k_with).
+    pub fn top_k_dot(&self, terms: &[(String, f32)], k: usize, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
+        self.run(self.query_dot(terms), k, filter, algo, strategy)
+    }
+
+    /// Exact dot product of a sparse field's documents `docs` with `terms`.
+    pub fn score_dot(&self, terms: &[(String, f32)], docs: &[DocId]) -> Vec<f32> {
+        self.score_with(self.query_dot(terms), docs)
+    }
+
+    fn run(&self, mut q: Query<'_>, k: usize, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
         let mut top = TopK::new(k);
         if k == 0 || q.scorers.is_empty() {
             return Vec::new();
@@ -322,10 +369,13 @@ impl TextFieldReader {
     /// Exact BM25 of each of `docs` (0 for documents without the terms), in
     /// the order given; sorted input reads each list once.
     pub fn score(&self, terms: &[String], stats: &CollectionStats, params: Bm25Params, docs: &[DocId]) -> Vec<f32> {
+        self.score_with(self.query(terms, stats, params), docs)
+    }
+
+    fn score_with(&self, mut q: Query<'_>, docs: &[DocId]) -> Vec<f32> {
         let mut out = vec![0f32; docs.len()];
         let mut idx: Vec<usize> = (0..docs.len()).collect();
         idx.sort_by_key(|&i| docs[i]);
-        let mut q = self.query(terms, stats, params);
         for i in idx {
             let d = docs[i];
             if (d as usize) < q.norms.len() {

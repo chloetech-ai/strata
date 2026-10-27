@@ -44,6 +44,6 @@ pub mod vector;
 pub mod workload;
 
 pub use error::{Error, Result};
-pub use schema::{Field, FieldType, Schema, VectorIndexKind};
+pub use schema::{Field, FieldType, Schema, VectorCodes, VectorIndexKind};
 pub use segment::DocId;
 pub use value::{Document, Value};
