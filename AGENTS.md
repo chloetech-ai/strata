@@ -90,16 +90,22 @@ editing their settings by hand.
 | `engram/` | the memory system (Rust crate): hooks client, per-project daemon, MCP server, recall, distiller, `engram ui`, `engram doctor` |
 | `engram/demo/index.html` | the inspector page; it is compiled into the binary with `include_str!`, so rebuild after editing it |
 | `strata/` | the database (Rust crate), including the posting-list study in `src/postings/` |
+| `strata-server/` | Strata over HTTP JSON and gRPC, a coordinator over shards, and the query UI (`ui/index.html`, compiled in with `include_str!`) |
+| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, and a server smoke test |
 | `docs/` | the documentation site (Jekyll, just-the-docs); `docs/demo/inspector.html` is a separate static copy of the inspector |
 | `install.sh` | the installer described above |
 
-Build and test each crate from its own directory (`engram` depends on
-`strata` by path):
+Build and test each crate from its own directory (`engram` and
+`strata-server` depend on `strata` by path):
 
 ```bash
 cd strata && cargo test --release
 cd engram && cargo test --release
+cd strata-server && cargo test --release
 ```
+
+CI also runs `cargo clippy --release --all-targets -- -A clippy::style -A
+clippy::complexity -A clippy::perf -D warnings` in each crate.
 
 Benchmark numbers in `docs/`, the reports and `*/results/` are measured, not
 edited: change them only by re-running the benchmark, and name the machine a

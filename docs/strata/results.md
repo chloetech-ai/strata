@@ -17,7 +17,7 @@ The design holds up. One file, with ACID commits and a SQL front end, serves ful
 
 | goal | met | missed |
 |---|---|---|
-| **One embedded file for three index families** | Every query of the workload, and ten compound statements, run as SQL against one file. Durable commits take 4.1 ms, nearly all of it macOS's `F_FULLFSYNC`; every crash test recovered a committed prefix; snapshots cost at most 0.13 µs; the file is near SQLite's size. | SQL covers single-table `SELECT` only; writes go through the Rust API. Building the HNSW graph makes loads 1.7–5.9× slower than SQLite's (0.2–0.5× without it). |
+| **One embedded file for three index families** | Every query of the workload, and ten compound statements, run as SQL against one file. Durable commits take 4.1 ms, nearly all of it macOS's `F_FULLFSYNC`; every crash test recovered a committed prefix; snapshots cost at most 0.13 µs; the file is near SQLite's size. | SQL covers one table, without joins. Building the HNSW graph makes loads 1.7–5.9× slower than SQLite's (0.2–0.5× without it). |
 | **Faster than the specialised engines** | Warm BM25 is 1.7–3.2× faster than Tantivy and conjunctions 2.7–4.1× faster; Strata wins 24 of 28 warm text and filter comparisons. Vector queries take 0.05–0.10 ms against SQLite's 7.7 ms to 0.7 s scans, and are 28–63× faster cold. | Tantivy counts facets 1.1–2.1× faster on three of the four collections. Cold structured filters are 1.4–3.4× slower than Tantivy's. |
 | **Hybrid ranking as one plan** | RRF and weighted fusion are single SQL expressions under the same filter as their inputs. Weighted fusion adds 0.02–0.04 nDCG@10 over vectors alone on three collections, at 0.2–0.8 ms. | The top-100 shortcut recovers 89–95% of the exact fused top 10. The best weight differs by collection (0.1–0.3), and nothing picks it automatically. |
 | **A planner that adapts per query** | For filtered vector search, 1.8–6.1× faster than the best fixed strategy on the three larger collections, with recall@10 0.991–0.998. For filtered BM25 and filters alone, geometric-mean regret is 1.06–1.18. | It spends 1.0–1.6× an oracle's time. On SciFact, always pre-filtering takes 17% less time. |
@@ -115,6 +115,23 @@ The quantised dot product costs 14 ns per vector with NEON `usdot` (9.8 ns when 
 
 Cold, access patterns decide. With the kernel's default read-ahead, one HNSW query reads 9,672 pages (136 ms). Advising the graph and its codes `MADV_RANDOM` cuts that to 4,836 pages (113 ms), and prefetching each hop's neighbours to 28 ms. IVF reads its clusters sequentially, so it is fastest with read-ahead: 26 ms, or 10 ms with prefetching.
 
+## Compressed vectors
+
+A `VECTOR` field can keep 1-bit codes instead of 8-bit ones (`"codes": "binary"`), and searches then rescore 8 times as many candidates in float32. This was measured separately from the rest of this page: 500,000 synthetic 768-dimension unit vectors (1,000 centres sharing a common direction, as learned embeddings do), 200 queries, one search thread, on the 4-core cloud container (Intel Xeon at 2.80 GHz with AVX-512 VNNI and BW), not the M2.
+
+| codes | index | rescored | codes in memory | recall@10 | p50 |
+|---|---|---|---|---|---|
+| 8-bit | flat | 40 | 384 MB | 1.000 | 60.0 ms |
+| 1-bit | flat | 320 | 48 MB | 0.994 | 17.2 ms |
+| 8-bit | IVF, nprobe 32 | 40 | 384 MB | 1.000 | 1.80 ms |
+| 1-bit | IVF, nprobe 32 | 320 | 48 MB | 0.994 | 0.89 ms |
+| 8-bit | HNSW, ef 320 | 40 | 384 MB | 0.993 | 0.86 ms |
+| 1-bit | HNSW, breadth 320 | 320 | 48 MB | 0.985–0.991 | 0.87–0.95 ms |
+
+Binary codes hold an eighth of the memory of 8-bit codes (a 32nd of the float32 vectors, 1,536 MB here, which are read only for the rescored candidates). The flat scan gets 3.5× faster and IVF 2.0× faster for 0.006 of recall; HNSW is level. HNSW searches as wide as the candidates it rescores, so the 1-bit rows walk the graph 320 wide and are compared with 8-bit codes at ef 320; at the default ef of 64, 8-bit HNSW reaches 0.868 on this data. The two 1-bit HNSW figures come from two builds.
+
+The data is synthetic because the container could not download embeddings. How much recall binary codes cost depends on the embedding model, so measure it on the collection before choosing them. [`strata/notes/vector.md`](https://github.com/rkonow/engram/blob/main/strata/notes/vector.md#binary-codes) has every depth and the kernels; the numbers are in `strata/results/vector/`.
+
 ## Filtered vector search and the planner
 
 Filtered vector search is where one fixed strategy cannot win:
@@ -165,6 +182,6 @@ Ten statements combine the workload's shapes: phrases with negation, prefixes, `
 - **I/O planning:** let the planner choose page-cache hints per query, and keep read-ahead on the docID-to-key half of the key index, which would close the cold filter gap.
 - **Correlation-aware estimates:** sample multi-predicate conjunctions the way the vector planner samples near the query.
 - **Fusion without tuning:** fit the weighted-fusion weight per collection from score distributions, or learn it from clicks.
-- **Writes in SQL** over the existing transaction API, then incremental HNSW merges so that merges stop rebuilding the graph.
+- **Incremental HNSW merges**, so that merges stop rebuilding the graph.
 
 The long-form report, with every table and an interactive chart for each collection, is [Strata: the database and its evaluation](../reports/strata.html). [Reproducing the results](../reproduce.md#strata) has the commands.

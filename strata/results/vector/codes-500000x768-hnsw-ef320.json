@@ -1,0 +1,48 @@
+{
+  "data": {
+    "clusters": 1000,
+    "dim": 768,
+    "n": 500000,
+    "queries": 200,
+    "synthetic": true
+  },
+  "machine": {
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "sq8_kernel": "vnni"
+  },
+  "params": {
+    "ef": 320,
+    "nprobe": 32,
+    "threads_build": 4,
+    "threads_search": 1
+  },
+  "runs": [
+    {
+      "build_s": 364.615989216,
+      "code_bytes": 384000000,
+      "codes": "sq8",
+      "f32_bytes": 1536000000,
+      "index": "hnsw",
+      "mean_ms": 0.96211414,
+      "p50_ms": 0.8638889999999999,
+      "p99_ms": 2.1651890000000003,
+      "recall_at_10": 0.9930000000000001,
+      "rerank": 40,
+      "rescored": 40.0
+    },
+    {
+      "build_s": 377.359924279,
+      "code_bytes": 48000000,
+      "codes": "binary",
+      "f32_bytes": 1536000000,
+      "index": "hnsw",
+      "mean_ms": 0.9510948050000003,
+      "p50_ms": 0.872789,
+      "p99_ms": 1.628523,
+      "recall_at_10": 0.9850000000000004,
+      "rerank": 40,
+      "rescored": 320.0
+    }
+  ]
+}
