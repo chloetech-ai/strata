@@ -1,0 +1,6 @@
+# Build Strata's SIMD kernels for the machine that compiles the server
+# (AVX-512 VNNI on recent x86_64, NEON dot products on aarch64): without it
+# the vector kernels fall back to portable code. A binary built this way may
+# not run on an older CPU; build on (or for) the machine that serves.
+[build]
+rustflags = ["-C", "target-cpu=native"]

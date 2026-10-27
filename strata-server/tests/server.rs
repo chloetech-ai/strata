@@ -190,6 +190,54 @@ async fn writes_over_http() {
     assert_eq!(status, 400);
 }
 
+/// Concurrent writers, and merges committing beside them, all get through:
+/// a write waits for the writer instead of failing as busy.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_writes_wait_for_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(create(dir.path(), "c.strata", |i| i < 500));
+    let schema = db.schema().clone();
+    let svc = Arc::new(Service::new(Backend::Local(db.clone()), schema, agent_config("http://unused"), 16, Duration::from_secs(30)));
+    let base = http(svc, None).await;
+    let c = reqwest::Client::new();
+    let sold = |r: &Json| r["rows"][0][0].as_i64().unwrap();
+    let count = json!({"sql": "SELECT sold FROM products WHERE id = 'p0000003'"});
+    let sold0 = sold(&post(&c, &format!("{base}/v1/query"), count.clone()).await.1);
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let maintenance = {
+        let (db, stop) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let policy = strata::storage::MergePolicy { merge_factor: 2, floor_docs: 100_000, ..Default::default() };
+            while !stop.load(Ordering::Relaxed) {
+                let _ = db.storage().flush();
+                let _ = db.storage().merge(&policy);
+            }
+        })
+    };
+    let writers: Vec<_> = (0..12)
+        .map(|w| {
+            let (c, base) = (c.clone(), base.clone());
+            tokio::spawn(async move {
+                for i in 0..10 {
+                    let (status, r) = if (w + i) % 2 == 0 {
+                        post(&c, &format!("{base}/v1/write"), json!({"ops": [{"op": "add", "key": "p0000003", "field": "sold", "value": 1}]})).await
+                    } else {
+                        post(&c, &format!("{base}/v1/sql"), json!({"sql": "UPDATE products SET sold = sold + 1 WHERE id = 'p0000003'"})).await
+                    };
+                    assert_eq!((status, r["written"].as_u64()), (200, Some(1)), "{r}");
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.await.unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    maintenance.join().unwrap();
+    assert_eq!(sold(&post(&c, &format!("{base}/v1/query"), count).await.1), sold0 + 120);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_token_guards_the_api() {
     let dir = tempfile::tempdir().unwrap();
@@ -344,4 +392,52 @@ async fn agent_runs_queries_and_answers() {
     let (status, r) = post(&c, &format!("{base}/v1/agent"), json!({"question": "hi"})).await;
     assert_eq!(status, 400);
     assert!(r["error"].as_str().unwrap().contains("API key"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sparse_and_binary_vector_fields_over_http() {
+    use strata::{Field, FieldType, Schema, VectorCodes, VectorIndexKind};
+    let schema = Schema::new(
+        "notes",
+        vec![
+            Field::new("id", FieldType::Keyword),
+            Field::new("splade", FieldType::Sparse),
+            Field::new("emb", FieldType::Vector { dim: 8, index: VectorIndexKind::Flat }).codes(VectorCodes::Binary),
+        ],
+        Some("id"),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions { publish_snapshots: true, ..DbOptions::default() };
+    let db = Db::create(&dir.path().join("s.strata"), schema, opts).unwrap();
+    let base = http(service(db, "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let unit = |i: usize| (0..8).map(|j| if j == i % 8 { 1.0 } else { 0.1 }).collect::<Vec<f32>>();
+    let docs: Vec<Json> = (0..40)
+        .map(|i| json!({"id": format!("n{i:02}"), "splade": {"common": 0.5, format!("tok{}", i % 5): 1.0 + i as f64 / 100.0}, "emb": unit(i)}))
+        .collect();
+    let ops: Vec<Json> = docs.into_iter().map(|d| json!({"op": "insert", "doc": d})).collect();
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({ "ops": ops })).await;
+    assert_eq!((status, r["written"].clone()), (200, json!(40)), "{r}");
+
+    let (status, r) = post(
+        &c,
+        &format!("{base}/v1/query"),
+        json!({"sql": "SELECT id, score() FROM notes ORDER BY similarity(splade, :w) DESC LIMIT 3", "params": {"w": {"tok3": 2.0, "common": 1.0}}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{r}");
+    // tok3 is on n03, n08, ..., n38; the larger weight wins: n38 first.
+    assert_eq!(r["keys"], json!(["n38", "n33", "n28"]));
+    assert!((r["scores"][0].as_f64().unwrap() - (2.0 * 1.38 + 0.5)).abs() < 2e-3, "{r}");
+
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id FROM notes ORDER BY similarity(emb, :v) DESC LIMIT 5", "params": {"v": unit(2)}})).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["keys"].as_array().unwrap().len(), 5);
+    assert!(r["keys"].as_array().unwrap().iter().all(|k| k.as_str().unwrap()[1..].parse::<usize>().unwrap() % 8 == 2), "{r}");
+
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({"ops": [{"op": "insert", "doc": {"id": "bad", "splade": {"x": -1}}}]})).await;
+    assert_eq!(status, 400, "{r}");
+    let metrics = c.get(format!("{base}/metrics")).send().await.unwrap().text().await.unwrap();
+    assert!(metrics.contains(r#"kind="sparse",outcome="ok"} 1"#), "{metrics}");
 }

@@ -46,6 +46,7 @@ fn field_line(svc: &Service, f: &strata::Field, i: usize) -> String {
         FieldType::Float => "FLOAT".to_string(),
         FieldType::Vector { dim, .. } => format!("VECTOR({dim})"),
         FieldType::Edges => "EDGES".to_string(),
+        FieldType::Sparse => "SPARSE (learned term weights)".to_string(),
     };
     let mut notes = Vec::new();
     if svc.schema.primary_key == Some(i) {
@@ -80,6 +81,13 @@ fn system_prompt(svc: &Service, docs: u64) -> String {
         (Some(v), None) => format!("- similarity({v}, :p) ranks by vector similarity. Bind :p in `params` as {{\"vector_of\": \"<key>\"}}, the vector of that row (\"more like this\")."),
         (None, _) => "- The table has no VECTOR field.".to_string(),
     };
+    let sparse_help = match s.fields.iter().find(|f| f.ty == FieldType::Sparse) {
+        Some(f) => format!(
+            "\n- similarity({}, :w) ranks by learned term weights (a dot product). Bind :w in `params` as an object of lower-case terms and weights, e.g. {{\"boots\": 1.0, \"hiking\": 0.7}}.",
+            f.name
+        ),
+        None => String::new(),
+    };
     format!(
         r#"You answer questions about the data in one Strata table by querying it with SQL through the run_sql tool. Strata is a search database: a single table queried with SELECT plus search functions.
 
@@ -91,7 +99,7 @@ SELECT <fields | * | score() | COUNT(*)> FROM {table} [WHERE <predicate>] [GROUP
 - MATCH(text_field, 'query') is a boolean full-text filter: terms, "phrases", AND, OR, NOT, -term, prefix*, parentheses; words side by side mean AND.
 - bm25(text_field, 'words') ranks by text relevance (a row scores if it has any of the words). Put the user's key words here.
 - Comparisons (=, <, <=, >, >=, !=), BETWEEN, IN (...), AND, OR, NOT on KEYWORD, INT and FLOAT fields.
-{vector_help}
+{vector_help}{sparse_help}
 - rrf(score1, score2) fuses two rankings by rank; 0.7 * bm25(...) + 0.3 * similarity(...) is a weighted sum of normalised scores.
 - decay(numeric_field, origin, scale) is 1 at the origin and 0.5 at origin ± scale (options: offset => d, decay => 0.5, shape => 'exp' | 'gauss' | 'linear'; origin may be now() for Unix-second timestamps). Multiply to boost relevance: ORDER BY bm25(body, 'boots') * decay(year, 2026, 2) DESC.
 - ORDER BY a numeric field sorts by it (ORDER BY price ASC). score() returns the ranking score.

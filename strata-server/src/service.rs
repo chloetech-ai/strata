@@ -139,14 +139,14 @@ impl Service {
         let m = j.as_object().ok_or_else(|| ApiError::bad("params must be an object"))?;
         for (k, v) in m {
             let value = match v {
-                Json::Object(o) if o.contains_key("vector_of") => {
+                Json::Object(o) if o.contains_key("vector_of") && o.keys().all(|k| k == "vector_of" || k == "field") => {
                     let field = match o.get("field").and_then(|f| f.as_str()) {
                         Some(f) => f.to_string(),
                         None => self.vector_field().ok_or_else(|| ApiError::bad("the table has no VECTOR field"))?,
                     };
                     self.vector_of(&o["vector_of"], &field).await?
                 }
-                Json::Object(o) if o.contains_key("embed") => {
+                Json::Object(o) if o.len() == 1 && o.get("embed").is_some_and(|e| e.is_string()) => {
                     let e = self.embedder.as_ref().ok_or_else(|| ApiError::bad("this server has no embedder; pass the vector"))?;
                     let text = o["embed"].as_str().ok_or_else(|| ApiError::bad("embed takes a string"))?;
                     Value::Vector((e.embed)(text, e.dim).into())
@@ -253,10 +253,12 @@ impl Service {
             return Ok(SqlAnswer::Rows(a));
         }
         let t0 = Instant::now();
+        let deadline = t0 + if timeout_ms > 0 { Duration::from_millis(timeout_ms) } else { self.timeout };
         let n = match &self.backend {
             Backend::Local(db) => {
                 let (db, sql, params) = (db.clone(), sql.to_string(), params.clone());
-                match tokio::task::spawn_blocking(move || db.sql(&sql, &params)).await.map_err(ApiError::internal)?? {
+                let r = tokio::task::spawn_blocking(move || wait_for_writer(deadline, || Ok(db.sql(&sql, &params)?)));
+                match r.await.map_err(ApiError::internal)?? {
                     SqlResult::Written(n) => n,
                     SqlResult::Rows(_) => unreachable!("bound as a write"),
                 }
@@ -272,8 +274,8 @@ impl Service {
     pub async fn write_ops(self: &Arc<Self>, ops: Vec<Json>) -> Result<u64, ApiError> {
         let n = match &self.backend {
             Backend::Local(db) => {
-                let db = db.clone();
-                tokio::task::spawn_blocking(move || apply_ops(&db, &ops)).await.map_err(ApiError::internal)??
+                let (db, deadline) = (db.clone(), Instant::now() + self.timeout);
+                tokio::task::spawn_blocking(move || wait_for_writer(deadline, || apply_ops(&db, &ops))).await.map_err(ApiError::internal)??
             }
             Backend::Cluster(c) => c.write_ops(ops).await?,
         };
@@ -338,6 +340,18 @@ pub fn op_key(schema: &Schema, op: &Json) -> Result<Value, ApiError> {
 }
 
 /// Applies `ops` to `db` in one transaction; returns how many wrote.
+/// Runs `write` until it gets the writer or `deadline` passes: Strata
+/// answers `Busy` (503) rather than queueing while another write, or a
+/// background merge's commit, holds it. A busy write has changed nothing.
+fn wait_for_writer<T>(deadline: Instant, mut write: impl FnMut() -> Result<T, ApiError>) -> Result<T, ApiError> {
+    loop {
+        match write() {
+            Err(e) if e.status == 503 && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
+            r => return r,
+        }
+    }
+}
+
 pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<u64, ApiError> {
     let schema = db.schema().clone();
     let mut t = db.storage().begin()?;

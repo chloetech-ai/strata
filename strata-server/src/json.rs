@@ -1,9 +1,11 @@
 //! Strata values and results as JSON.
 //!
-//! Values: `null`, numbers, strings, and arrays. An array is a vector when
-//! the field is a VECTOR field, a list when it is multi-valued. Parameters
-//! have no field, so an array of numbers is a vector and any other array a
-//! list.
+//! Values: `null`, numbers, strings, arrays and objects. An array is a
+//! vector when the field is a VECTOR field, a list when it is multi-valued.
+//! An object of numbers is a SPARSE field's term weights (held as its JSON
+//! text, which SPARSE fields also accept). Parameters have no field, so an
+//! array of numbers is a vector, any other array a list, and an object of
+//! numbers sparse weights.
 
 use serde_json::{json, Map, Value as Json};
 use strata::query::exec::ResultSet;
@@ -39,7 +41,8 @@ pub fn param(j: &Json) -> Result<Value, ApiError> {
             Value::Vector(xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect::<Vec<_>>().into())
         }
         Json::Array(xs) => Value::List(xs.iter().map(param).collect::<Result<_, _>>()?),
-        Json::Object(_) => return Err(ApiError::bad("parameters are numbers, strings, nulls or arrays")),
+        Json::Object(m) if m.values().all(|w| w.is_number()) => Value::Str(j.to_string()),
+        Json::Object(_) => return Err(ApiError::bad("parameters are numbers, strings, nulls, arrays or objects of term weights")),
     })
 }
 
@@ -84,6 +87,14 @@ pub fn field_value(schema: &Schema, f: usize, j: &Json) -> Result<Value, ApiErro
         (FieldType::Float, Json::Number(n)) => Value::Float(n.as_f64().ok_or_else(bad)?),
         (FieldType::Keyword, Json::Number(n)) if schema.primary_key == Some(f) => Value::Str(n.to_string()),
         (FieldType::Text { .. } | FieldType::Keyword | FieldType::Edges, Json::String(s)) => Value::Str(s.clone()),
+        (FieldType::Sparse, Json::Object(_) | Json::String(_)) => {
+            let v = match j {
+                Json::String(s) => Value::Str(s.clone()),
+                o => Value::Str(o.to_string()),
+            };
+            strata::text::sparse::parse(&v).map_err(|e| ApiError::bad(format!("bad value for {}: {e}", field.name)))?;
+            v
+        }
         _ => return Err(bad()),
     })
 }

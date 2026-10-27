@@ -45,6 +45,7 @@ pub fn kind(q: &Select) -> &'static str {
         Some(OrderBy::Score { score, .. }) => match score {
             Score::Bm25 { .. } => "bm25",
             Score::Similarity { .. } => "vector",
+            Score::Sparse { .. } => "sparse",
             Score::Rrf { .. } | Score::Weighted(_) => "hybrid",
             Score::Column { .. } => "column",
             Score::Decay { .. } => "decay",
