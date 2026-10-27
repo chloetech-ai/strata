@@ -99,7 +99,7 @@ fn wal_path(p: &Path) -> PathBuf {
 }
 
 fn serve_opts() -> DbOptions {
-    DbOptions { publish_snapshots: true, ..DbOptions::default() }
+    server::db_options(false)
 }
 
 struct Built {
