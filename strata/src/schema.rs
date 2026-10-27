@@ -101,11 +101,33 @@ pub struct Field {
     /// A VECTOR field's compressed codes (default SQ8).
     #[serde(default, skip_serializing_if = "VectorCodes::is_sq8")]
     pub codes: VectorCodes,
+    /// What a VECTOR field's vectors are: a model's embedding of other
+    /// fields. Recorded so readers know what a vector means; a database
+    /// given the model ([`crate::db::Db::set_embedder`]) also computes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed: Option<Embed>,
+}
+
+/// A VECTOR field that is the embedding of other fields: `model`'s vector
+/// of their non-empty values joined by newlines (the text a generated
+/// field holds). Writes that leave the vector out get it computed, and
+/// rewrites that change a source recompute it; a vector a write supplies
+/// is kept as given. Queries embed their text with the same model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Embed {
+    /// Stored or generated TEXT or KEYWORD fields.
+    pub from: Vec<String>,
+    /// The model, by the name [`crate::embed::open`] finds it under, such
+    /// as `potion-retrieval-32M`, `bge-small-en-v1.5` or `hash:64`; or the
+    /// name of a model the database cannot run (vectors computed
+    /// elsewhere, such as `cohere/embed-english-v3.0`), which only
+    /// documents the field.
+    pub model: String,
 }
 
 impl Field {
     pub fn new(name: &str, ty: FieldType) -> Self {
-        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false, codes: VectorCodes::Sq8 }
+        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false, codes: VectorCodes::Sq8, embed: None }
     }
     /// Sets a VECTOR field's compressed codes.
     pub fn codes(mut self, codes: VectorCodes) -> Self {
@@ -119,6 +141,11 @@ impl Field {
     }
     pub fn generated(mut self, sources: &[&str]) -> Self {
         self.generated_from = sources.iter().map(|s| s.to_string()).collect();
+        self
+    }
+    /// Makes a VECTOR field `model`'s embedding of `sources` ([`Embed`]).
+    pub fn embedded(mut self, model: &str, sources: &[&str]) -> Self {
+        self.embed = Some(Embed { from: sources.iter().map(|s| s.to_string()).collect(), model: model.to_string() });
         self
     }
     pub fn stored_only(mut self) -> Self {
@@ -163,6 +190,22 @@ impl Schema {
                 return Err(Error::Schema(format!("multi-valued field {} must be a stored KEYWORD or INT, not the primary key", f.name)));
             }
         }
+        for f in s.fields.iter() {
+            let Some(e) = &f.embed else { continue };
+            let bad = |m: String| Err(Error::Schema(format!("field {}: {m}", f.name)));
+            if !matches!(f.ty, FieldType::Vector { .. }) {
+                return bad("only a VECTOR field can be embedded".into());
+            }
+            if e.from.is_empty() || e.model.is_empty() {
+                return bad("an embedded field needs source fields and a model".into());
+            }
+            for src in &e.from {
+                let ok = s.field(src).is_some_and(|g| (g.stored || !g.generated_from.is_empty()) && matches!(g.ty, FieldType::Text { .. } | FieldType::Keyword) && !g.multi);
+                if !ok {
+                    return bad(format!("source {src} must be a stored or generated TEXT or KEYWORD field"));
+                }
+            }
+        }
         if let Some(f) = s.fields.iter().find(|f| !f.codes.is_sq8() && !matches!(f.ty, FieldType::Vector { .. })) {
             return Err(Error::Schema(format!("field {} has vector codes but is not a VECTOR", f.name)));
         }
@@ -194,13 +237,19 @@ impl Schema {
             if f.generated_from.is_empty() {
                 continue;
             }
-            let parts: Vec<&str> = f
-                .generated_from
-                .iter()
-                .filter_map(|src| self.field_index(src).and_then(|j| doc[j].as_str()))
-                .filter(|s| !s.is_empty())
-                .collect();
-            doc[i] = Value::Str(parts.join("\n"));
+            doc[i] = Value::Str(self.joined(&f.generated_from, doc));
         }
+    }
+
+    /// The text embedded field `f` is the embedding of, in `doc` (generated
+    /// fields filled in).
+    pub fn embed_text(&self, f: usize, doc: &[crate::value::Value]) -> String {
+        self.fields[f].embed.as_ref().map(|e| self.joined(&e.from, doc)).unwrap_or_default()
+    }
+
+    /// The non-empty values of `sources` in `doc`, joined by newlines.
+    fn joined(&self, sources: &[String], doc: &[crate::value::Value]) -> String {
+        let parts: Vec<&str> = sources.iter().filter_map(|src| self.field_index(src).and_then(|j| doc[j].as_str())).filter(|s| !s.is_empty()).collect();
+        parts.join("\n")
     }
 }

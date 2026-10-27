@@ -443,18 +443,13 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 name = "engram"
 version = "0.1.0"
 dependencies = [
- "candle-core",
- "candle-nn",
- "candle-transformers",
  "clap",
  "libc",
- "memmap2",
  "regex",
  "serde",
  "serde_json",
  "strata",
  "tempfile",
- "tokenizers",
 ]
 
 [[package]]
@@ -1407,6 +1402,9 @@ name = "strata"
 version = "0.1.0"
 dependencies = [
  "bitpacking",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
  "clap",
  "crc32fast",
  "libc",
@@ -1419,6 +1417,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlparser",
+ "tokenizers",
 ]
 
 [[package]]

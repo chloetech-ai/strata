@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use crate::error::Result;
+use crate::embed::Embedder;
+use crate::error::{Error, Result};
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
 use crate::query::exec::{ExecOptions, Executor, ResultSet, SegmentReaders};
 use crate::query::stats::TermStats;
@@ -37,6 +38,8 @@ pub struct Db {
     /// in-memory ones get a fresh id per rebuild.
     readers: RwLock<HashMap<u64, (usize, Arc<SegmentReaders>)>>,
     pub exec: ExecOptions,
+    /// Models of embedded VECTOR fields, by field index ([`Db::set_embedder`]).
+    embedders: RwLock<Vec<Option<Arc<dyn Embedder>>>>,
 }
 
 impl Db {
@@ -49,7 +52,8 @@ impl Db {
     }
 
     fn wrap(storage: Database) -> Db {
-        Db { storage, readers: RwLock::new(HashMap::new()), exec: ExecOptions::default() }
+        let n = storage.schema().fields.len();
+        Db { storage, readers: RwLock::new(HashMap::new()), exec: ExecOptions::default(), embedders: RwLock::new(vec![None; n]) }
     }
 
     pub fn storage(&self) -> &Database {
@@ -64,13 +68,177 @@ impl Db {
         self.storage.snapshot()
     }
 
-    /// Bulk-loads documents (generated columns are filled in).
+    /// Bulk-loads documents (generated columns are filled in, and embedded
+    /// vectors the documents leave out are computed).
     pub fn load(&self, docs: impl IntoIterator<Item = Document>) -> Result<()> {
         let schema = self.schema().clone();
-        self.storage.bulk_load(docs.into_iter().map(move |mut d| {
-            schema.fill_generated(&mut d);
-            d
+        let mut docs = docs.into_iter();
+        if !self.embeds() {
+            return self.storage.bulk_load(docs.map(move |mut d| {
+                schema.fill_generated(&mut d);
+                d
+            }));
+        }
+        // Embedded in batches, so that a model sees many texts at once.
+        let mut ready = Vec::new().into_iter();
+        self.storage.bulk_load(std::iter::from_fn(|| loop {
+            if let Some(d) = ready.next() {
+                return Some(d);
+            }
+            let mut batch: Vec<Document> = docs.by_ref().take(EMBED_BATCH).collect();
+            if batch.is_empty() {
+                return None;
+            }
+            batch.iter_mut().for_each(|d| schema.fill_generated(d));
+            self.embed_missing(&mut batch);
+            ready = batch.into_iter();
         }))
+    }
+
+    /// Every live document of `snap` as merges rebuild them (stored fields,
+    /// vectors, values written in place, generated text), segment by
+    /// segment. Fields neither stored nor recoverable from an index are null.
+    pub fn documents<'a>(&self, snap: &'a Snapshot) -> impl Iterator<Item = Result<Document>> + 'a {
+        let (mut seg, mut next) = (0usize, 0 as DocId);
+        let mut ready = Vec::new().into_iter();
+        std::iter::from_fn(move || loop {
+            if let Some(d) = ready.next() {
+                return Some(Ok(d));
+            }
+            let v = snap.segments().get(seg)?;
+            let n = v.file.n_docs() as DocId;
+            if next >= n {
+                (seg, next) = (seg + 1, 0);
+                continue;
+            }
+            let end = n.min(next.saturating_add(4096));
+            let live: Vec<DocId> = (next..end).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
+            next = end;
+            match StoredSource.documents(snap.schema(), &v.file, &live) {
+                Ok(mut docs) => {
+                    if let Some(u) = &v.updates {
+                        for (doc, &d) in docs.iter_mut().zip(&live) {
+                            u.apply(d, doc);
+                        }
+                    }
+                    ready = docs.into_iter();
+                }
+                Err(e) => {
+                    seg = usize::MAX;
+                    return Some(Err(e));
+                }
+            }
+        })
+    }
+
+    /// Bulk-loads the rows of `other`, a database with another schema,
+    /// matching fields by name: to add, drop or re-embed fields, create a
+    /// database with the new schema and load the old one into it. A VECTOR
+    /// field is copied when the old field has the same dimensions and
+    /// embedding ([`crate::schema::Embed`]); otherwise this database embeds
+    /// it anew (given the model, [`Db::set_embedder`]). Returns the rows
+    /// loaded.
+    pub fn load_from(&self, other: &Db) -> Result<u64> {
+        let (old, new) = (other.schema(), self.schema());
+        let map: Vec<Option<usize>> = new
+            .fields
+            .iter()
+            .map(|f| {
+                let j = old.field_index(&f.name)?;
+                let g = &old.fields[j];
+                let keep = match (&f.ty, &g.ty) {
+                    (FieldType::Vector { dim: a, .. }, FieldType::Vector { dim: b, .. }) => a == b && f.embed == g.embed,
+                    (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b) && f.multi == g.multi,
+                };
+                keep.then_some(j)
+            })
+            .collect();
+        let snap = other.snapshot();
+        let mut failed = None;
+        let mut n = 0u64;
+        let docs = other.documents(&snap).map_while(|d| match d {
+            Ok(d) => {
+                n += 1;
+                Some(map.iter().map(|j| j.map_or(Value::Null, |j| d[j].clone())).collect())
+            }
+            Err(e) => {
+                failed = Some(e);
+                None
+            }
+        });
+        self.load(docs)?;
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(n),
+        }
+    }
+
+    /// Gives embedded VECTOR field `field` ([`crate::schema::Embed`]) its
+    /// model. Writes through this `Db` that leave the vector out get it
+    /// computed ([`Db::load`], SQL `INSERT` and `UPDATE`,
+    /// [`Db::embed_missing`] before a [`crate::storage::WriteTxn`]).
+    pub fn set_embedder(&self, field: &str, e: Arc<dyn Embedder>) -> Result<()> {
+        let schema = self.schema();
+        let i = schema.field_index(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let f = &schema.fields[i];
+        let (FieldType::Vector { dim, .. }, Some(spec)) = (&f.ty, &f.embed) else {
+            return Err(Error::Schema(format!("field {field} is not an embedded VECTOR field")));
+        };
+        if e.dim() != *dim {
+            return Err(Error::Schema(format!("model {} makes {}-dimension vectors; field {field} holds {dim}", spec.model, e.dim())));
+        }
+        self.embedders.write().unwrap_or_else(|e| e.into_inner())[i] = Some(e);
+        Ok(())
+    }
+
+    /// The model of embedded field `field`, if it has one.
+    pub fn embedder(&self, field: &str) -> Option<Arc<dyn Embedder>> {
+        let i = self.schema().field_index(field)?;
+        self.embedders.read().unwrap_or_else(|e| e.into_inner())[i].clone()
+    }
+
+    /// Opens the model of every embedded field from `models`
+    /// ([`crate::embed::open`]); returns the fields whose model did not
+    /// open, with the reason. Their vectors must come with the writes.
+    pub fn open_embedders(&self, models: &std::path::Path) -> Vec<(String, Error)> {
+        let mut failed = Vec::new();
+        for f in &self.schema().fields {
+            let Some(spec) = &f.embed else { continue };
+            if let Err(e) = crate::embed::open(&spec.model, models).and_then(|m| self.set_embedder(&f.name, m)) {
+                failed.push((f.name.clone(), e));
+            }
+        }
+        failed
+    }
+
+    fn embeds(&self) -> bool {
+        self.embedders.read().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.is_some())
+    }
+
+    /// Computes the embedded vectors `docs` leave out (null) from their
+    /// sources, one batch per field split across the cores. A document
+    /// whose sources are all empty gets no vector. Generated fields must be
+    /// filled in first.
+    pub fn embed_missing(&self, docs: &mut [Document]) {
+        let embedders = self.embedders.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let schema = self.schema();
+        for (f, e) in embedders.iter().enumerate() {
+            let Some(e) = e else { continue };
+            let mut todo = Vec::new();
+            let mut texts = Vec::new();
+            for (j, d) in docs.iter().enumerate() {
+                if matches!(d[f], Value::Null) {
+                    let t = schema.embed_text(f, d);
+                    if !t.is_empty() {
+                        todo.push(j);
+                        texts.push(t);
+                    }
+                }
+            }
+            for (j, v) in todo.into_iter().zip(embed_all(e.as_ref(), &texts)) {
+                docs[j][f] = Value::Vector(v.into());
+            }
+        }
     }
 
     pub fn query(&self, sql: &str, params: &Params) -> Result<ResultSet> {
@@ -103,9 +271,10 @@ impl Db {
         let mut t = self.storage.begin()?;
         let mut n = 0u64;
         match write {
-            Write::Insert { docs, replace } => {
-                for mut d in docs {
-                    schema.fill_generated(&mut d);
+            Write::Insert { mut docs, replace } => {
+                docs.iter_mut().for_each(|d| schema.fill_generated(d));
+                self.embed_missing(&mut docs);
+                for d in docs {
                     if replace {
                         t.upsert(d)?;
                     } else {
@@ -131,6 +300,19 @@ impl Db {
                         return Err(crate::Error::Query(format!("UPDATE of non-numeric fields rewrites documents, and {} is not stored", f.name)));
                     }
                 }
+                // A rewrite that changes a source of an embedded field
+                // recomputes its vector, unless it sets the vector itself.
+                let stale: Vec<usize> = {
+                    let embedders = self.embedders.read().unwrap_or_else(|e| e.into_inner());
+                    (0..schema.fields.len())
+                        .filter(|&f| embedders[f].is_some() && !sets.iter().any(|(g, _)| *g == f))
+                        .filter(|&f| {
+                            let from = &schema.fields[f].embed.as_ref().expect("embedded").from;
+                            sets.iter().any(|(g, _)| from.iter().any(|s| schema.field_index(s) == Some(*g)) || generated_from_set(&schema, from, *g))
+                        })
+                        .collect()
+                };
+                let mut rewrites = Vec::new();
                 for row in self.execute(&self.snapshot(), &select, &self.exec)?.rows {
                     let new = |f: usize, a: &Assign| match a {
                         Assign::Value(v) => v.clone(),
@@ -149,10 +331,17 @@ impl Db {
                         for (f, a) in &sets {
                             doc[*f] = new(*f, a);
                         }
+                        for &f in &stale {
+                            doc[f] = Value::Null;
+                        }
                         schema.fill_generated(&mut doc);
-                        t.upsert(doc)?;
+                        rewrites.push(doc);
                     }
                     n += 1;
+                }
+                self.embed_missing(&mut rewrites);
+                for doc in rewrites {
+                    t.upsert(doc)?;
                 }
             }
         }
@@ -246,6 +435,27 @@ impl Db {
     pub fn clear_readers(&self) {
         self.readers.write().unwrap_or_else(|e| e.into_inner()).clear();
     }
+}
+
+/// Documents [`Db::load`] embeds at a time.
+const EMBED_BATCH: usize = 4096;
+
+/// Whether field `g` is a source of a generated field among `from`.
+fn generated_from_set(schema: &Schema, from: &[String], g: usize) -> bool {
+    from.iter().filter_map(|s| schema.field(s)).any(|f| f.generated_from.iter().any(|x| schema.field_index(x) == Some(g)))
+}
+
+/// `e`'s vectors of `texts`, split across the cores.
+fn embed_all(e: &dyn Embedder, texts: &[String]) -> Vec<Vec<f32>> {
+    let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(refs.len() / 64).max(1);
+    if threads == 1 {
+        return e.embed(&refs);
+    }
+    std::thread::scope(|s| {
+        let parts: Vec<_> = refs.chunks(refs.len().div_ceil(threads)).map(|c| s.spawn(move || e.embed(c))).collect();
+        parts.into_iter().flat_map(|p| p.join().expect("embedding thread")).collect()
+    })
 }
 
 fn with_source(mut opts: DbOptions) -> DbOptions {
