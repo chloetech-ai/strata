@@ -126,6 +126,11 @@ pub fn drive_cost(algo: TopKAlgo) -> f64 {
 /// different orders) never prunes a document that would qualify.
 const BOUND_SLACK: f32 = 1.0 + 1e-5;
 
+// A document's score is the sum of its terms' scores, added in f64: exact
+// for terms of any plausible spread, so a score does not depend on the
+// order in which a traversal met the terms (one segment and two shards,
+// or two algorithms, give a document the same f32 score, and tie alike).
+
 /// One query term: its cursor, weight `m · idf · (k1 + 1)` and list bound.
 /// A posting scores `weight · tf / (sat · tf + k[norm])`: BM25 with `sat`
 /// 1, a linear `weight · tf` with `sat` 0 and every `k` 1 (sparse fields).
@@ -169,10 +174,13 @@ impl TermScorer<'_> {
     }
 }
 
-/// The best `k` (score, doc) pairs; ties keep the earlier document.
+/// The best `k` (score, doc) pairs; ties keep the earlier document, or,
+/// with `ties`, every document tied with the `k`-th stays as well.
 struct TopK {
     k: usize,
     heap: BinaryHeap<Entry>,
+    /// Pairs left out of the heap with the score of its worst, when kept.
+    ties: Option<Vec<Entry>>,
 }
 
 /// Heap order: the greatest entry is the worst (lowest score, then highest
@@ -196,31 +204,54 @@ impl PartialOrd for Entry {
 
 impl TopK {
     fn new(k: usize) -> Self {
-        TopK { k, heap: BinaryHeap::with_capacity(k + 1) }
+        TopK { k, heap: BinaryHeap::with_capacity(k + 1), ties: None }
     }
 
-    /// Scores must exceed this to enter.
+    fn with_ties(k: usize) -> Self {
+        TopK { ties: Some(Vec::new()), ..TopK::new(k) }
+    }
+
+    /// Scores must exceed this to enter (to be kept, with ties).
     #[inline]
     fn threshold(&self) -> f32 {
         if self.heap.len() < self.k {
-            f32::NEG_INFINITY
-        } else {
-            self.heap.peek().map_or(f32::NEG_INFINITY, |e| e.0)
+            return f32::NEG_INFINITY;
         }
+        let worst = self.heap.peek().map_or(f32::NEG_INFINITY, |e| e.0);
+        // A score equal to the worst is kept with ties, so only lower
+        // bounds may be skipped.
+        if self.ties.is_some() { worst.next_down() } else { worst }
     }
 
     #[inline]
     fn insert(&mut self, doc: DocId, score: f32) {
         if self.heap.len() < self.k {
             self.heap.push(Entry(score, doc));
-        } else if score > self.threshold() {
-            self.heap.pop();
+            return;
+        }
+        let Some(worst) = self.heap.peek().map(|e| e.0) else { return };
+        if score > worst {
+            let out = self.heap.pop().expect("a full heap");
             self.heap.push(Entry(score, doc));
+            if let Some(ties) = &mut self.ties {
+                if self.heap.peek().is_some_and(|e| e.0 == out.0) {
+                    ties.push(out);
+                } else {
+                    ties.clear();
+                }
+            }
+        } else if score == worst {
+            if let Some(ties) = &mut self.ties {
+                ties.push(Entry(score, doc));
+            }
         }
     }
 
+    /// By decreasing score, the kept ties last.
     fn into_sorted(self) -> Vec<(DocId, f32)> {
-        self.heap.into_sorted_vec().into_iter().map(|e| (e.1, e.0)).collect()
+        let mut v = self.heap.into_sorted_vec();
+        v.extend(self.ties.unwrap_or_default());
+        v.into_iter().map(|e| (e.1, e.0)).collect()
     }
 }
 
@@ -322,14 +353,29 @@ impl TextFieldReader {
         algo: TopKAlgo,
         strategy: FilterStrategy,
     ) -> Vec<(DocId, f32)> {
-        self.run(self.query(terms, stats, params), k, filter, algo, strategy)
+        self.run(self.query(terms, stats, params), TopK::new(k), filter, algo, strategy)
+    }
+
+    /// [`top_k`](Self::top_k), plus every document whose score equals the
+    /// `k`-th's, in no particular order after the others: all candidates
+    /// for a cut at `k` that breaks ties by something else (a key).
+    pub fn top_k_ties(
+        &self,
+        terms: &[String],
+        stats: &CollectionStats,
+        params: Bm25Params,
+        k: usize,
+        filter: Option<&dyn DocFilter>,
+        algo: TopKAlgo,
+    ) -> Vec<(DocId, f32)> {
+        self.run(self.query(terms, stats, params), TopK::with_ties(k), filter, algo, FilterStrategy::Auto)
     }
 
     /// Top-`k` of a sparse field by the dot product of each document's
     /// term weights with `terms`' (see [`crate::text::sparse`]); filters as
     /// in [`top_k_with`](Self::top_k_with).
     pub fn top_k_dot(&self, terms: &[(String, f32)], k: usize, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
-        self.run(self.query_dot(terms), k, filter, algo, strategy)
+        self.run(self.query_dot(terms), TopK::new(k), filter, algo, strategy)
     }
 
     /// Exact dot product of a sparse field's documents `docs` with `terms`.
@@ -337,9 +383,8 @@ impl TextFieldReader {
         self.score_with(self.query_dot(terms), docs)
     }
 
-    fn run(&self, mut q: Query<'_>, k: usize, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
-        let mut top = TopK::new(k);
-        if k == 0 || q.scorers.is_empty() {
+    fn run(&self, mut q: Query<'_>, mut top: TopK, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
+        if top.k == 0 || q.scorers.is_empty() {
             return Vec::new();
         }
         if let Some(f) = filter {
@@ -393,16 +438,16 @@ impl Query<'_> {
     #[inline]
     fn score_doc(&mut self, d: DocId) -> (f32, bool, bool) {
         let norm = self.norms[d as usize];
-        let (mut s, mut any, mut live) = (0.0, false, false);
+        let (mut s, mut any, mut live) = (0.0f64, false, false);
         for sc in &mut self.scorers {
             let x = sc.cur.seek(d);
             if x == d {
-                s += sc.score(&self.k, norm);
+                s += sc.score(&self.k, norm) as f64;
                 any = true;
             }
             live |= x != END;
         }
-        (s, any, live)
+        (s as f32, any, live)
     }
 
     fn drive(&mut self, members: impl Iterator<Item = DocId>, top: &mut TopK) {
@@ -429,14 +474,14 @@ impl Query<'_> {
             }
             if filter.is_none_or(|f| f.contains(d)) {
                 let norm = self.norms[d as usize];
-                let mut s = 0.0;
+                let mut s = 0.0f64;
                 for (i, x) in docs.iter_mut().enumerate() {
                     if *x == d {
-                        s += sc[i].score(&self.k, norm);
+                        s += sc[i].score(&self.k, norm) as f64;
                         *x = sc[i].cur.next();
                     }
                 }
-                top.insert(d, s);
+                top.insert(d, s as f32);
             } else {
                 for (i, x) in docs.iter_mut().enumerate() {
                     if *x == d {
@@ -483,16 +528,16 @@ impl Query<'_> {
                 continue;
             }
             let norm = self.norms[d as usize];
-            let mut s = 0.0;
+            let mut s = 0.0f64;
             for i in ne..n {
                 if docs[i] == d {
-                    s += sc[i].score(&self.k, norm);
+                    s += sc[i].score(&self.k, norm) as f64;
                     docs[i] = sc[i].cur.next();
                 }
             }
             let mut alive = true;
             for i in (0..ne).rev() {
-                if s + ub[i] <= theta {
+                if s as f32 + ub[i] <= theta {
                     alive = false;
                     break;
                 }
@@ -500,11 +545,11 @@ impl Query<'_> {
                     docs[i] = sc[i].cur.seek(d);
                 }
                 if docs[i] == d {
-                    s += sc[i].score(&self.k, norm);
+                    s += sc[i].score(&self.k, norm) as f64;
                 }
             }
             if alive {
-                top.insert(d, s);
+                top.insert(d, s as f32);
             }
         }
     }
@@ -548,16 +593,16 @@ impl Query<'_> {
                     // replacing block bounds by scores while it can qualify.
                     if filter.is_none_or(|f| f.contains(pivot_doc)) {
                         let norm = self.norms[pivot_doc as usize];
-                        let (mut s, mut bound) = (0.0, block_upper);
+                        let (mut s, mut bound) = (0.0f64, block_upper);
                         for &i in &order[..=pivot] {
                             let x = sc[i].score(&self.k, norm);
-                            s += x;
+                            s += x as f64;
                             bound -= sc[i].block_max - x;
                             if bound <= theta {
                                 break;
                             }
                         }
-                        top.insert(pivot_doc, s);
+                        top.insert(pivot_doc, s as f32);
                     }
                     for &i in &order[..=pivot] {
                         docs[i] = sc[i].cur.next();

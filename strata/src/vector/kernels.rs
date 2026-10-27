@@ -13,9 +13,10 @@
 //!   the int8 kernel (VNNI or NEON; see `notes/vector.md`).
 //! * [`dot_f32_4x4`]: a 4×4 block of float32 dot products sharing loads, for
 //!   k-means and brute-force ground truth.
-//! * [`dot_bits_u8`]: a binary code against a query of a byte per
-//!   dimension (AVX-512BW masked loads and `vpsadbw`; elsewhere popcounts
-//!   of the query's bit planes).
+//! * [`dot_bits_u8`], [`dot_bits_u8_x4`]: a binary code against a query of
+//!   a byte per dimension (AVX-512BW masked loads and `vpsadbw`; on aarch64
+//!   the code's bits spread to byte masks with `tbl` and `cmtst`, then
+//!   `sdot`; elsewhere popcounts of the query's bit planes).
 //!
 //! The SIMD paths are chosen at compile time (`-C target-cpu=native`); every
 //! kernel has a portable scalar version, used on other targets and as the
@@ -147,22 +148,56 @@ pub fn dot_u8_f32_scalar(a: &[u8], w: &[f32]) -> f32 {
     acc.iter().sum::<f32>() + tail
 }
 
-/// Score of a binary code (see [`crate::vector::bits`]): the sum of
-/// `u[j] - 128` over the set bits `j` of `code`. `code` is little-endian u64
-/// words; `u` holds a byte per dimension, 64 per word, and `planes` its
-/// eight bit planes per word (`planes[8w + p]`, for the portable path).
-/// AVX-512 loads the bytes of `u` under the code as a mask and sums them
-/// with `vpsadbw`; elsewhere each plane is ANDed with the code and counted.
+/// A query for [`dot_bits_u8`]: the same weights three ways, one per kernel.
+#[derive(Clone, Copy, Debug)]
+pub struct BitsWeights<'a> {
+    /// A byte per dimension, `v[j] + 128`, 64 per code word (AVX-512).
+    pub u: &'a [u8],
+    /// The signed weights `v[j]`, 64 per code word (NEON).
+    pub v: &'a [i8],
+    /// The eight bit planes of `u` per word, `planes[8w + p]` (portable).
+    pub planes: &'a [u64],
+}
+
+/// Score of a binary code (see [`crate::vector::bits`]): the sum of the
+/// weights `v[j] = u[j] - 128` over the set bits `j` of `code`, a row of
+/// little-endian u64 words. AVX-512 loads the bytes of `u` under the code as
+/// a mask and sums them with `vpsadbw`. NEON spreads each 16 bits of the code
+/// to 16 byte masks (0 or -1: `tbl` repeats each byte 8 times, `cmtst` picks
+/// one bit per lane) and sums mask times `v` with `sdot`, 64 dimensions in
+/// 13 instructions. Elsewhere each bit plane of `u` is ANDed with the code
+/// and counted.
 #[inline]
-pub fn dot_bits_u8(code: &[u8], u: &[u8], planes: &[u64]) -> i32 {
-    assert!(code.len().is_multiple_of(8) && u.len() >= code.len() * 8 && planes.len() >= code.len());
+pub fn dot_bits_u8(code: &[u8], q: BitsWeights) -> i32 {
+    let words = code.len() / 8;
+    assert!(code.len().is_multiple_of(8) && q.u.len() >= 64 * words && q.v.len() >= 64 * words && q.planes.len() >= 8 * words);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
     // SAFETY: `code` holds `words` u64s and `u` 64 bytes per word.
     unsafe {
-        dot_bits_avx512(code.as_ptr(), u.as_ptr(), code.len() / 8)
+        dot_bits_avx512(code.as_ptr(), q.u.as_ptr(), words)
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
-    dot_bits_planes(code, planes)
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    // SAFETY: `code` holds `words` u64s and `v` 64 bytes per word.
+    unsafe {
+        dot_bits_neon([code.as_ptr()], q.v.as_ptr(), words)[0]
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512bw"), all(target_arch = "aarch64", target_feature = "dotprod"))))]
+    dot_bits_planes(code, q.planes)
+}
+
+/// [`dot_bits_u8`] of four code rows (of equal length), loading the query
+/// once per word for all four on aarch64.
+#[inline]
+pub fn dot_bits_u8_x4(codes: [&[u8]; 4], q: BitsWeights) -> [i32; 4] {
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    {
+        let words = codes[0].len() / 8;
+        assert!(codes.iter().all(|c| c.len() == 8 * words) && q.v.len() >= 64 * words);
+        // SAFETY: every row holds `words` u64s and `v` 64 bytes per word.
+        unsafe { dot_bits_neon(codes.map(|c| c.as_ptr()), q.v.as_ptr(), words) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+    codes.map(|c| dot_bits_u8(c, q))
 }
 
 /// [`dot_bits_u8`] by bit planes: nine popcounts per 64 dimensions.
@@ -280,6 +315,53 @@ unsafe fn dot_bits_avx512(code: *const u8, u: *const u8, words: usize) -> i32 {
         set += m.count_ones() as u64;
     }
     (_mm512_reduce_add_epi64(_mm512_add_epi64(acc[0], acc[1])) - 128 * set as i64) as i32
+}
+
+/// `acc` plus, per 32-bit lane, the dot product of four signed bytes with
+/// four others (`sdot`; the intrinsic is not stable yet).
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn sdot(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    std::arch::asm!("sdot {0:v}.4s, {1:v}.16b, {2:v}.16b", inout(vreg) acc, in(vreg) a, in(vreg) b, options(pure, nomem, nostack, preserves_flags));
+    acc
+}
+
+/// [`dot_bits_u8`] of `R` rows. For lanes `16k..16k+16` of a 64-bit word,
+/// `tbl` repeats code bytes `2k` and `2k+1` eight times each and `cmtst`
+/// against bits 1, 2, ..., 128 gives -1 where the dimension's bit is set, so
+/// `sdot` of the mask with the weights adds `-v[j]` over the set bits.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn dot_bits_neon<const R: usize>(codes: [*const u8; R], v: *const i8, words: usize) -> [i32; R] {
+    const SPREAD: [[u8; 16]; 4] = {
+        let mut t = [[0u8; 16]; 4];
+        let mut k = 0;
+        while k < 4 {
+            let mut i = 0;
+            while i < 16 {
+                t[k][i] = (2 * k + i / 8) as u8;
+                i += 1;
+            }
+            k += 1;
+        }
+        t
+    };
+    const SELECT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let spread = SPREAD.map(|t| vld1q_u8(t.as_ptr()));
+    let select = vld1q_u8(SELECT.as_ptr());
+    // Two chains per row, so one row alone is not bound by sdot's latency.
+    let mut acc = [[vdupq_n_s32(0); 2]; R];
+    for w in 0..words {
+        let q = [0, 1, 2, 3].map(|k| vld1q_s8(v.add(64 * w + 16 * k)));
+        for (r, a) in acc.iter_mut().enumerate() {
+            let c = vreinterpretq_u8_u64(vld1q_dup_u64(codes[r].add(8 * w) as *const u64));
+            for k in 0..4 {
+                let m = vtstq_u8(vqtbl1q_u8(c, spread[k]), select);
+                a[k & 1] = sdot(a[k & 1], vreinterpretq_s8_u8(m), q[k]);
+            }
+        }
+    }
+    acc.map(|a| -vaddvq_s32(vaddq_s32(a[0], a[1])))
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"))]
@@ -606,11 +688,16 @@ mod tests {
                     planes[j / 64 * 8 + p] |= ((x >> p & 1) as u64) << (j % 64);
                 }
             }
-            for code in [vec![0u8; 8 * words], vec![255u8; 8 * words], (0..8 * words).map(|_| rng.gen()).collect()] {
-                let want = dot_bits_u8_scalar(&code, &u);
-                assert_eq!(dot_bits_u8(&code, &u, &planes), want, "{words} words");
-                assert_eq!(dot_bits_planes(&code, &planes), want, "{words} words");
+            let v: Vec<i8> = u.iter().map(|&x| (x as i32 - 128) as i8).collect();
+            let q = BitsWeights { u: &u, v: &v, planes: &planes };
+            let codes: Vec<Vec<u8>> = vec![vec![0u8; 8 * words], vec![255u8; 8 * words], (0..8 * words).map(|_| rng.gen()).collect(), (0..8 * words).map(|_| rng.gen()).collect()];
+            for code in &codes {
+                let want = dot_bits_u8_scalar(code, &u);
+                assert_eq!(dot_bits_u8(code, q), want, "{words} words");
+                assert_eq!(dot_bits_planes(code, &planes), want, "{words} words");
             }
+            let four = dot_bits_u8_x4([&codes[0], &codes[1], &codes[2], &codes[3]], q);
+            assert_eq!(four, [0, 1, 2, 3].map(|i| dot_bits_u8_scalar(&codes[i], &u)), "{words} words, four rows");
         }
     }
 

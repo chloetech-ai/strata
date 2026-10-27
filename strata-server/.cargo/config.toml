@@ -1,6 +1,12 @@
 # Build Strata's SIMD kernels for the machine that compiles the server
-# (AVX-512 VNNI on recent x86_64, NEON dot products on aarch64): without it
-# the vector kernels fall back to portable code. A binary built this way may
-# not run on an older CPU; build on (or for) the machine that serves.
-[build]
+# (AVX2 and AVX-512 VNNI on recent x86_64): without it the vector kernels
+# fall back to portable code. A binary built this way may not run on an
+# older CPU; build on (or for) the machine that serves.
+#
+# Not on aarch64: its default target CPU already has NEON and dot products
+# (Apple's is the M1), and target-cpu=native there can fail ring's
+# compile-time check of the CPU features it expects (it does on GitHub's
+# macOS runners). RUSTFLAGS="-C target-cpu=native" adds i8mm on an M2 or
+# later.
+[target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=native"]

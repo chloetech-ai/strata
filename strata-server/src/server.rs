@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use strata::db::Db;
 use strata::schema::Schema;
+use strata::segment::build::BuildOptions;
 use strata::storage::{DbOptions, Layout, MergePolicy};
 use tokio::net::TcpListener;
 
@@ -36,8 +37,17 @@ pub struct Options {
     pub hash_embedder: bool,
 }
 
-fn opts(directory: bool) -> DbOptions {
-    DbOptions { publish_snapshots: true, layout: if directory { Layout::Directory } else { Layout::SingleFile }, ..DbOptions::default() }
+/// How the server opens a database. Each write publishes its snapshot,
+/// rebuilding the newest in-memory chunk (up to 1,024 rows): those chunks
+/// keep their vectors flat, since a graph over so few rows costs more to
+/// build at every write than an exact scan of them costs a query.
+pub fn db_options(directory: bool) -> DbOptions {
+    DbOptions {
+        publish_snapshots: true,
+        mem_build: Some(BuildOptions::default().set("vector.index", "flat")),
+        layout: if directory { Layout::Directory } else { Layout::SingleFile },
+        ..DbOptions::default()
+    }
 }
 
 /// Opens or creates the database, or connects to the shards.
@@ -51,9 +61,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     } else {
         let path = o.db.clone().ok_or("pass --db PATH (or --shards to coordinate shard servers)")?;
         let db = if path.exists() {
-            Db::open(&path, opts(o.directory)).map_err(|e| format!("open {}: {e}", path.display()))?
+            Db::open(&path, db_options(o.directory)).map_err(|e| format!("open {}: {e}", path.display()))?
         } else if let Some(n) = o.demo {
-            let db = Db::create(&path, demo::schema(n), opts(o.directory)).map_err(|e| e.to_string())?;
+            let db = Db::create(&path, demo::schema(n), db_options(o.directory)).map_err(|e| e.to_string())?;
             let keep = |i: usize| match o.demo_shard {
                 Some((s, of)) => shard_of(&strata::Value::Str(format!("p{i:07}")), of) == s,
                 None => true,
@@ -63,7 +73,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         } else if let Some(s) = &o.schema {
             let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
             let schema: Schema = serde_json::from_str(&text).map_err(|e| format!("schema {}: {e}", s.display()))?;
-            Db::create(&path, schema, opts(o.directory)).map_err(|e| e.to_string())?
+            Db::create(&path, schema, db_options(o.directory)).map_err(|e| e.to_string())?
         } else {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
@@ -104,7 +114,16 @@ pub async fn serve_http(svc: Arc<Service>, listener: TcpListener, token: Option<
 }
 
 pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener) -> Result<(), tonic::transport::Error> {
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    use tokio_stream::StreamExt;
+    // A gRPC answer is several small writes (headers, data, trailers); with
+    // Nagle's algorithm on, the last waits for the client's delayed ACK and
+    // every call to a shard took 40 ms longer.
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(|s| {
+        if let Ok(s) = &s {
+            let _ = s.set_nodelay(true);
+        }
+        s
+    });
     tonic::transport::Server::builder()
         .add_service(pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(256 << 20).max_encoding_message_size(256 << 20))
         .serve_with_incoming_shutdown(incoming, shutdown())

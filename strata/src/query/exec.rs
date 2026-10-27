@@ -20,7 +20,7 @@ use crate::query::stats::{FieldStats, TermStats};
 use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
-use crate::storage::{SegmentView, Snapshot, Updates};
+use crate::storage::{KeyRef, SegmentView, Snapshot, Updates};
 use crate::text::{self, Bm25Params, CollectionStats, FilterStrategy, TextFieldReader, TopKAlgo};
 use crate::value::Value;
 use crate::vector::{self, SearchParams, VectorReader};
@@ -791,8 +791,8 @@ impl<'a> Executor<'a> {
     }
 
     /// The `k` rows of the filter with the largest decay of `field` (rows
-    /// without a value score 0).
-    fn decay_top(&mut self, field: usize, f: &Decay, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+    /// without a value score 0), rows tied on it by key.
+    fn decay_top(&mut self, field: usize, f: &Decay, p: &Pred, k: usize, key_desc: bool) -> Result<Vec<Hit>> {
         let mut cands = Vec::new();
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
@@ -811,7 +811,7 @@ impl<'a> Executor<'a> {
             let cut = cands[k - 1].score;
             cands.retain(|h| h.score >= cut);
         }
-        self.sort_by_score_then_key(&mut cands, true, false);
+        self.sort_by_score_then_key(&mut cands, true, key_desc);
         cands.truncate(k);
         Ok(cands)
     }
@@ -826,7 +826,7 @@ impl<'a> Executor<'a> {
             Score::Rrf { inputs, k: rk, depth } => {
                 let mut lists = Vec::new();
                 for s in inputs {
-                    lists.push(self.leaf_top(s, p, *depth)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>());
+                    lists.push(self.input_top(s, p, *depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>());
                 }
                 self.stats.plan.push(format!("rrf: {} inputs, depth {depth}, k {rk}", inputs.len()));
                 let mut hits: Vec<Hit> = fusion::rrf(&lists, *rk).into_iter().map(|((seg, doc), score)| Hit { seg, doc, score }).collect();
@@ -836,7 +836,9 @@ impl<'a> Executor<'a> {
             }
             Score::Weighted(terms) => self.weighted(terms, p, k)?,
             Score::Product(factors) => self.product(factors, p, k)?,
-            leaf => self.leaf_top(leaf, p, k)?,
+            // Cut and ordered like a fusion input, so that rows tied on
+            // score come in key order on one database and over shards.
+            leaf => self.input_top(leaf, p, k, matches!(tb, Some(Tiebreak::Key { desc: true })))?,
         };
         if let Some(Tiebreak::Key { desc }) = tb {
             self.sort_by_score_then_key(&mut hits, true, *desc);
@@ -845,13 +847,69 @@ impl<'a> Executor<'a> {
         Ok(hits)
     }
 
+    /// The top `depth` rows of a single score (a query's ranking, or one
+    /// input of a fused score), rows tied on score ordered by key as
+    /// [`crate::cluster::merge`] orders them over shards. Rows tied with the
+    /// `depth`-th are read to the end of the tie, so that one database and
+    /// its shards cut at the same rows and rank them alike.
+    fn input_top(&mut self, score: &Score, p: &Pred, depth: usize, key_desc: bool) -> Result<Vec<Hit>> {
+        let mut hits = match score {
+            // Scans of every row: they keep the whole tie at the cut and
+            // order it by key themselves.
+            Score::Column { field } => return self.by_column(*field, true, p, Some(depth), Some(&Tiebreak::Key { desc: key_desc })),
+            Score::Decay { field, decay, .. } => return self.decay_top(*field, decay, p, depth, key_desc),
+            // These keep every row tied with the depth-th.
+            Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, depth)?,
+            Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, depth, true)?,
+            _ => {
+                let mut want = depth + 1;
+                loop {
+                    let hits = self.leaf_top(score, p, want)?;
+                    if depth == 0 || hits.len() < want || hits[want - 1].score != hits[depth - 1].score {
+                        break hits;
+                    }
+                    want = want.saturating_mul(2);
+                }
+            }
+        };
+        self.order_ties_by_key(&mut hits, key_desc);
+        hits.truncate(depth);
+        Ok(hits)
+    }
+
+    /// Orders each run of rows with equal scores by key, as
+    /// [`cmp_values`] orders keys; rows that tie with no other keep their
+    /// place and have no key read.
+    fn order_ties_by_key(&self, hits: &mut [Hit], key_desc: bool) {
+        let mut i = 0;
+        while i < hits.len() {
+            let j = i + hits[i..].iter().take_while(|h| h.score == hits[i].score).count();
+            if j - i > 1 {
+                // Borrowed keys: a tie can hold thousands of rows.
+                let mut keyed: Vec<(Option<KeyRef<'_>>, Hit)> = hits[i..j].iter().map(|h| (self.snap.pk(h.seg).map(|p| p.key_ref(h.doc)), *h)).collect();
+                keyed.sort_by(|(a, _), (b, _)| {
+                    let c = match (a, b) {
+                        (Some(KeyRef::Str(x)), Some(KeyRef::Str(y))) => x.cmp(y),
+                        (Some(KeyRef::Int(x)), Some(KeyRef::Int(y))) => x.cmp(y),
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    if key_desc { c.reverse() } else { c }
+                });
+                for (h, (_, k)) in hits[i..j].iter_mut().zip(keyed) {
+                    *h = k;
+                }
+            }
+            i = j;
+        }
+    }
+
     fn leaf_top(&mut self, score: &Score, p: &Pred, k: usize) -> Result<Vec<Hit>> {
         match score {
-            Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, k),
+            Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, k, false),
             Score::Similarity { field, vector, opts } => self.vector_top(*field, vector, opts, p, k),
             Score::Sparse { field, terms, opts } => self.sparse_top(*field, terms, opts, p, k),
             Score::Column { field } => self.by_column(*field, true, p, Some(k), None),
-            Score::Decay { field, decay, .. } => self.decay_top(*field, decay, p, k),
+            Score::Decay { field, decay, .. } => self.decay_top(*field, decay, p, k, false),
             Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, k),
             _ => Err(err("fusion inputs must be bm25, similarity, ppr, hops, decay or a column")),
         }
@@ -938,7 +996,9 @@ impl<'a> Executor<'a> {
         (params, algo)
     }
 
-    fn bm25_top(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+    /// The top `k` rows by BM25; with `ties`, also every row tied with the
+    /// `k`-th.
+    fn bm25_top(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize, ties: bool) -> Result<Vec<Hit>> {
         let terms = query_terms(query, opts);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -957,11 +1017,14 @@ impl<'a> Executor<'a> {
                 }
             };
             let f = ex.seg_filter_l(s, p, mode, l)?;
-            let hits = t.top_k(&terms, &stats, params, k, f.as_dyn(), algo);
+            let hits = if ties { t.top_k_ties(&terms, &stats, params, k, f.as_dyn(), algo) } else { t.top_k(&terms, &stats, params, k, f.as_dyn(), algo) };
             l.plan.push(format!("seg {}: bm25 {algo:?}, filter {mode:?}", s.ord));
             Ok(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }).collect::<Vec<_>>())
         })?;
-        Ok(merge_top(per.concat(), k))
+        let mut hits = merge_top(per.concat(), usize::MAX);
+        let keep = if ties && k > 0 && hits.len() > k { k + hits[k..].iter().take_while(|h| h.score == hits[k - 1].score).count() } else { k };
+        hits.truncate(keep);
+        Ok(hits)
     }
 
     fn search_params(&self, opts: &Opts) -> SearchParams {
@@ -1090,7 +1153,7 @@ impl<'a> Executor<'a> {
             }
         } else {
             for (_, s) in terms {
-                cands.extend(self.leaf_top(s, p, depth)?.into_iter().map(|h| (h.seg, h.doc)));
+                cands.extend(self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)));
             }
             cands.sort_unstable();
             cands.dedup();
@@ -1102,8 +1165,11 @@ impl<'a> Executor<'a> {
             scores.push(self.exact_scores(s, &cands)?);
         }
         let weights: Vec<f64> = terms.iter().map(|(w, _)| *w).collect();
-        let fused = fusion::weighted(&weights, &scores, norm);
-        Ok(fused.into_iter().take(k).map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect())
+        let mut hits: Vec<Hit> = fusion::weighted(&weights, &scores, norm).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect();
+        // Rows tied on the fused score go to the smaller key, as over shards.
+        self.order_ties_by_key(&mut hits, false);
+        hits.truncate(k);
+        Ok(hits)
     }
 
     /// `a * b * ...`: the top `depth` rows of each relevance factor (of
@@ -1113,7 +1179,7 @@ impl<'a> Executor<'a> {
         let any_relevance = factors.iter().any(Score::is_relevance);
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         for f in factors.iter().filter(|f| f.is_relevance() || !any_relevance) {
-            cands.extend(self.leaf_top(f, p, depth)?.into_iter().map(|h| (h.seg, h.doc)));
+            cands.extend(self.input_top(f, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)));
         }
         cands.sort_unstable();
         cands.dedup();
@@ -1156,7 +1222,7 @@ impl<'a> Executor<'a> {
         };
         let mut lists = Vec::with_capacity(inputs.len());
         for s in &inputs {
-            lists.push(if generates(s) { self.leaf_top(s, p, depth)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>() } else { Vec::new() });
+            lists.push(if generates(s) { self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>() } else { Vec::new() });
         }
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         if exact {
