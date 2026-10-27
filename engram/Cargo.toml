@@ -16,6 +16,8 @@ regex = "1"
 [features]
 # BGE-small through candle: better vectors, ~50 ms per record on CPU.
 bert = ["strata/bert"]
+# `bert` with matrix products in Apple's Accelerate framework (macOS only).
+accelerate = ["strata/accelerate"]
 
 [dev-dependencies]
 tempfile = "3"

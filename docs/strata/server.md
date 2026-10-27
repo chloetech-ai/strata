@@ -86,6 +86,8 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 | `snowflake-arctic-embed-m-v1.5` | BERT encoder, 768 dimensions | build with `--features bert`; slower, better |
 | `hash:N` | hashed bag of words, *N* dimensions | no files; tests and the demo |
 
+On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
+
 `strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory.
 
 **Changing your mind.** Vectors are stored, so changing a field's sources or model means re-embedding. Create a database with the new schema and fill it from the old one:

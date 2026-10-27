@@ -34,6 +34,8 @@ candle-transformers = { version = "0.9", optional = true }
 default = ["embed"]
 embed = ["dep:tokenizers"]
 bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+# `bert` with matrix products in Apple's Accelerate framework (macOS only).
+accelerate = ["bert", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 # SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
 baselines = ["dep:rusqlite", "dep:tantivy"]
 
