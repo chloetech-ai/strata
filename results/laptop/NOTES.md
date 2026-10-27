@@ -190,3 +190,64 @@ All pass. Against the first run: strata gains one test (258 against 257, in
 `strata-server-bench` target, which the first test run (at 4f3f628) predates. The load average
 rose to 22–34 while the tests ran (the build, test threads and macOS daemons), so
 these wall times are rough.
+
+## Step 2: 1-bit kernel timing (synthetic, 500,000 × 768, 1000 clusters, 200 queries)
+
+In `strata/`, under `caffeinate -i`, after the build and once the 1-minute load
+average was below 6:
+
+    cargo run --release --bin strata-codes-bench -- --kinds flat,ivf,hnsw --out results/vector/m2-neon
+
+Started 19:14:15 UTC at 9fd0d05, load 4.99 (5- and 15-minute averages 20.6 and
+17.2, still falling from the tests), 376 s, load 6.20 at the end. Exit 0.
+JSON: `strata/results/vector/m2-neon/codes-500000x768.json`.
+
+Printed table (ef 64, as the first run's step 3 run 1):
+
+```text
+data: 500000 × 768 in 12.7 s
+exact top-10 in 0.6 s
+codes  index  rerank rescored   code MB    f32 MB build s recall@10   p50 ms   p99 ms
+sq8    flat       10       10     384.0    1536.0     1.1     0.974    7.217    7.950
+sq8    flat       20       20     384.0    1536.0     1.1     1.000    7.253    7.933
+sq8    flat       40       40     384.0    1536.0     1.1     1.000    7.240    7.843
+binary flat       10       80      48.0    1536.0     3.9     0.783    6.845    7.106
+binary flat       20      160      48.0    1536.0     3.9     0.917    6.881    7.173
+binary flat       40      320      48.0    1536.0     3.9     0.994    7.004    7.280
+sq8    ivf        10       10     384.0    1536.0    40.4     0.974    0.239    0.332
+sq8    ivf        20       20     384.0    1536.0    40.4     1.000    0.243    0.360
+sq8    ivf        40       40     384.0    1536.0    40.4     1.000    0.246    0.348
+binary ivf        10       80      48.0    1536.0    43.8     0.783    0.247    0.302
+binary ivf        20      160      48.0    1536.0    43.8     0.917    0.251    0.331
+binary ivf        40      320      48.0    1536.0    43.8     0.994    0.275    0.391
+sq8    hnsw       10       10     384.0    1536.0   131.2     0.864    0.087    0.157
+sq8    hnsw       20       20     384.0    1536.0   131.2     0.883    0.086    0.154
+sq8    hnsw       40       40     384.0    1536.0   131.2     0.883    0.089    0.159
+binary hnsw       10       80      48.0    1536.0   123.6     0.649    0.099    0.170
+binary hnsw       20      160      48.0    1536.0   123.6     0.861    0.149    0.276
+binary hnsw       40      320      48.0    1536.0   123.6     0.991    0.219    0.433
+```
+
+First run (no 1-bit NEON kernel) against this one, p50 / p99 in ms:
+
+| codes | index | rerank | first run p50 | re-run p50 | first run p99 | re-run p99 | recall@10 first → re-run |
+|---|---|---:|---:|---:|---:|---:|---|
+| binary | flat | 10 | 14.926 | 6.845 | 17.017 | 7.106 | 0.783 → 0.783 |
+| binary | flat | 20 | 14.995 | 6.881 | 16.011 | 7.173 | 0.917 → 0.917 |
+| binary | flat | 40 | 15.052 | 7.004 | 29.871 | 7.280 | 0.994 → 0.994 |
+| sq8 | flat | 10 | 7.552 | 7.217 | 8.747 | 7.950 | 0.974 → 0.974 |
+| binary | ivf | 40 | 0.461 | 0.275 | 0.611 | 0.391 | 0.994 → 0.994 |
+| sq8 | ivf | 40 | 0.250 | 0.246 | 0.440 | 0.348 | 1.000 → 1.000 |
+| binary | hnsw | 40 | 0.298 | 0.219 | 0.639 | 0.433 | 0.982 → 0.991 |
+| sq8 | hnsw | 40 | 0.096 | 0.089 | 0.178 | 0.159 | 0.858 → 0.883 |
+
+- The 1-bit flat scan is now 2.2× faster (p50 15.0 → 6.8 ms) and slightly faster
+  than the SQ8 flat scan (7.2 ms), where before it took twice as long. Its
+  recall is unchanged, as expected from a kernel change.
+- 1-bit IVF drops from 0.42–0.46 ms to 0.25–0.28 ms p50, close to SQ8 IVF.
+- SQ8 rows move by 0–5%, within run-to-run noise; the SQ8 kernel is unchanged.
+- HNSW recall differs between the runs for both code kinds (SQ8 0.838–0.858 →
+  0.864–0.883; 1-bit at rerank 10 0.671 → 0.649, at rerank 40 0.982 → 0.991).
+  The graph is built with 4 threads, so it is not the same graph from run to
+  run; the build times (131 s and 124 s here, 136 s and 145 s before) differ too.
+  Flat and IVF recall are identical to the first run.
