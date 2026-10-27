@@ -314,6 +314,17 @@ impl DocFilter for ProbeFilter {
     }
 }
 
+/// What per-segment work records, taken into the executor afterwards (so
+/// that segments can run on several threads).
+#[derive(Default)]
+struct Local {
+    plan: Vec<String>,
+    filter_docs: u64,
+    scored: u64,
+    /// Filters materialised, by segment ordinal.
+    sets: Vec<(usize, Arc<DocSet>)>,
+}
+
 pub struct Executor<'a> {
     schema: &'a Schema,
     snap: &'a Snapshot,
@@ -459,11 +470,18 @@ impl<'a> Executor<'a> {
 
     /// The segment's filter in the given mode, deleted documents excluded.
     fn seg_filter(&mut self, s: &'a Seg, p: &Pred, mode: FilterMode) -> Result<SegFilter> {
+        let mut l = Local::default();
+        let r = self.seg_filter_l(s, p, mode, &mut l);
+        self.absorb(l);
+        r
+    }
+
+    fn seg_filter_l(&self, s: &'a Seg, p: &Pred, mode: FilterMode, l: &mut Local) -> Result<SegFilter> {
         if *p == Pred::True || mode == FilterMode::None {
             return Ok(match &s.view.live {
                 None => SegFilter::All,
-                Some(_) if mode == FilterMode::Materialize => SegFilter::Set(self.filter_set(s, p)?),
-                Some(l) => SegFilter::Probe(ProbeFilter { root: ProbeNode::Const(true), live: Some(l.clone()), card: l.cardinality() }),
+                Some(_) if mode == FilterMode::Materialize => SegFilter::Set(self.filter_set_l(s, p, l)?),
+                Some(lv) => SegFilter::Probe(ProbeFilter { root: ProbeNode::Const(true), live: Some(lv.clone()), card: lv.cardinality() }),
             });
         }
         match mode {
@@ -475,24 +493,88 @@ impl<'a> Executor<'a> {
                 };
                 Ok(SegFilter::Probe(ProbeFilter { root, live: s.view.live.clone(), card }))
             }
-            _ => Ok(SegFilter::Set(self.filter_set(s, p)?)),
+            _ => Ok(SegFilter::Set(self.filter_set_l(s, p, l)?)),
         }
     }
 
     /// The materialised filter of a segment, live documents only (cached).
     fn filter_set(&mut self, s: &'a Seg, p: &Pred) -> Result<Arc<DocSet>> {
-        if let Some(set) = self.sets.get(&s.ord) {
+        let mut l = Local::default();
+        let r = self.filter_set_l(s, p, &mut l);
+        self.absorb(l);
+        r
+    }
+
+    fn filter_set_l(&self, s: &'a Seg, p: &Pred, l: &mut Local) -> Result<Arc<DocSet>> {
+        if let Some(set) = self.sets.get(&s.ord).or_else(|| l.sets.iter().find(|(o, _)| *o == s.ord).map(|(_, x)| x)) {
             return Ok(set.clone());
         }
         let mut set = self.materialize(s, p)?;
         if let Some(live) = &s.view.live {
             set = DocSet::from_sorted(set.iter().filter(|&d| live.contains(d)).collect(), s.r.n_docs);
         }
-        self.stats.filter_docs += set.len() as u64;
-        self.stats.plan.push(format!("seg {}: filter materialised, {} docs", s.ord, set.len()));
+        l.filter_docs += set.len() as u64;
+        l.plan.push(format!("seg {}: filter materialised, {} docs", s.ord, set.len()));
         let set = Arc::new(set);
-        self.sets.insert(s.ord, set.clone());
+        l.sets.push((s.ord, set.clone()));
         Ok(set)
+    }
+
+    /// Takes in what per-segment work recorded.
+    fn absorb(&mut self, l: Local) {
+        self.stats.plan.extend(l.plan);
+        self.stats.filter_docs += l.filter_docs;
+        self.stats.scored += l.scored;
+        for (ord, set) in l.sets {
+            self.sets.entry(ord).or_insert(set);
+        }
+    }
+
+    /// Runs `f` on every segment, on up to [`ExecOptions::threads`] threads
+    /// (largest segments first), and returns the results in segment order
+    /// with what each recorded taken in.
+    fn per_segment<T: Send>(&mut self, f: impl Fn(&Self, &'a Seg<'a>, &mut Local) -> Result<T> + Sync) -> Result<Vec<T>>
+    where
+        Self: Sync,
+    {
+        let segs: Vec<&'a Seg<'a>> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
+        let threads = self.opts.threads.clamp(1, segs.len().max(1));
+        let mut outs: Vec<Option<(Result<T>, Local)>> = (0..segs.len()).map(|_| None).collect();
+        if threads == 1 {
+            for (i, s) in segs.iter().enumerate() {
+                let mut l = Local::default();
+                let r = self.check_deadline().and_then(|_| f(self, s, &mut l));
+                outs[i] = Some((r, l));
+            }
+        } else {
+            let mut order: Vec<usize> = (0..segs.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(segs[i].view.n_live));
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<std::sync::Mutex<Option<(Result<T>, Local)>>> = (0..segs.len()).map(|_| std::sync::Mutex::new(None)).collect();
+            let this = &*self;
+            std::thread::scope(|sc| {
+                for _ in 0..threads {
+                    sc.spawn(|| loop {
+                        let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&i) = order.get(j) else { break };
+                        let mut l = Local::default();
+                        let r = this.check_deadline().and_then(|_| f(this, segs[i], &mut l));
+                        *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((r, l));
+                    });
+                }
+            });
+            for (o, m) in outs.iter_mut().zip(slots) {
+                *o = m.into_inner().unwrap_or_else(|e| e.into_inner());
+            }
+            self.stats.plan.push(format!("{} segments on {threads} threads", segs.len()));
+        }
+        let mut res = Vec::with_capacity(outs.len());
+        for o in outs {
+            let (r, l) = o.expect("every segment ran");
+            self.absorb(l);
+            res.push(r?);
+        }
+        Ok(res)
     }
 
     fn materialize(&self, s: &'a Seg, p: &Pred) -> Result<DocSet> {
@@ -763,26 +845,23 @@ impl<'a> Executor<'a> {
         }
         let stats = self.collection_stats(field, &terms)?;
         let (params, algo) = self.bm25_params(opts);
-        let mut all = Vec::new();
-        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
-            self.check_deadline()?;
-            let t = self.text(s, field)?;
+        let per = self.per_segment(|ex, s, l| {
+            let t = ex.text(s, field)?;
             // Block-Max WAND fully scores a fraction of the postings it meets.
             let candidates = terms.iter().map(|w| t.doc_freq(w) as f64).sum::<f64>() * 0.3;
-            let mode = match self.opts.filter_mode {
+            let mode = match ex.opts.filter_mode {
                 Some(m) => m,
                 None => {
-                    let est = SegEst { ex: self, s, params: None, local_sel: None };
-                    self.planner(&est).filter_mode(p, candidates)
+                    let est = SegEst { ex, s, params: None, local_sel: None };
+                    ex.planner(&est).filter_mode(p, candidates)
                 }
             };
-            let f = self.seg_filter(s, p, mode)?;
+            let f = ex.seg_filter_l(s, p, mode, l)?;
             let hits = t.top_k(&terms, &stats, params, k, f.as_dyn(), algo);
-            self.stats.plan.push(format!("seg {}: bm25 {algo:?}, filter {mode:?}", s.ord));
-            all.extend(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }));
-        }
-        Ok(merge_top(all, k))
+            l.plan.push(format!("seg {}: bm25 {algo:?}, filter {mode:?}", s.ord));
+            Ok(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }).collect::<Vec<_>>())
+        })?;
+        Ok(merge_top(per.concat(), k))
     }
 
     fn search_params(&self, opts: &Opts) -> SearchParams {
@@ -811,21 +890,18 @@ impl<'a> Executor<'a> {
             Some(other) => return Err(err(format!("unknown vector strategy {other}"))),
             None => self.opts.vector,
         };
-        let mut all = Vec::new();
-        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
-            self.check_deadline()?;
-            let vr = self.vector(s, field)?;
+        let per = self.per_segment(|ex, s, l| {
+            let vr = ex.vector(s, field)?;
             let has_index = vr.index_kind() != "flat";
             let (strategy, mode) = {
-                let est = SegEst { ex: self, s, params: Some((field, base.clone())), local_sel: None };
-                let planner = self.planner(&est);
+                let est = SegEst { ex, s, params: Some((field, base.clone())), local_sel: None };
+                let planner = ex.planner(&est);
                 match forced {
                     Some(VectorStrategy::PreFilter) | Some(VectorStrategy::Flat) => (forced.unwrap(), FilterMode::Materialize),
                     Some(st) => {
                         let e = planner.estimate(p);
                         let mode = if *p == Pred::True { FilterMode::None } else if e.probeable { FilterMode::Probe } else { FilterMode::Materialize };
-                        (st, self.opts.filter_mode.unwrap_or(mode))
+                        (st, ex.opts.filter_mode.unwrap_or(mode))
                     }
                     None => {
                         let global = planner.estimate(p).card / est.n_docs().max(1.0);
@@ -833,25 +909,25 @@ impl<'a> Executor<'a> {
                         // An index strategy chosen on the global selectivity is
                         // re-checked against the selectivity near the query.
                         if st != VectorStrategy::PreFilter && has_index && *p != Pred::True {
-                            if let Some(l) = self.local_selectivity(s, vr, q, p, &base, global)? {
-                                let est = SegEst { ex: self, s, params: Some((field, base.clone())), local_sel: Some(l) };
-                                (st, mode, _) = self.planner(&est).vector_plan(field, p, k, has_index);
-                                self.stats.plan.push(format!("seg {}: selectivity {global:.4} global, {l:.4} near the query", s.ord));
+                            if let Some(ls) = ex.local_selectivity(s, vr, q, p, &base, global, l)? {
+                                let est = SegEst { ex, s, params: Some((field, base.clone())), local_sel: Some(ls) };
+                                (st, mode, _) = ex.planner(&est).vector_plan(field, p, k, has_index);
+                                l.plan.push(format!("seg {}: selectivity {global:.4} global, {ls:.4} near the query", s.ord));
                             }
                         }
-                        (st, self.opts.filter_mode.unwrap_or(mode))
+                        (st, ex.opts.filter_mode.unwrap_or(mode))
                     }
                 }
             };
-            let f = self.seg_filter(s, p, if *p == Pred::True { FilterMode::None } else { mode })?;
+            let f = ex.seg_filter_l(s, p, if *p == Pred::True { FilterMode::None } else { mode }, l)?;
             let mut sp = base.clone();
             sp.strategy = to_vector_strategy(strategy, vr.index_kind(), f.as_dyn().is_some());
             let out = vr.search(q, k, &sp, f.as_dyn());
-            self.stats.scored += out.stats.candidates as u64;
-            self.stats.plan.push(format!("seg {}: vector {:?} ({:?} ran), filter {mode:?}", s.ord, strategy, out.stats.strategy));
-            all.extend(out.hits.into_iter().map(|h| Hit { seg: s.ord, doc: h.doc, score: h.score as f64 }));
-        }
-        Ok(merge_top(all, k))
+            l.scored += out.stats.candidates as u64;
+            l.plan.push(format!("seg {}: vector {:?} ({:?} ran), filter {mode:?}", s.ord, strategy, out.stats.strategy));
+            Ok(out.hits.into_iter().map(|h| Hit { seg: s.ord, doc: h.doc, score: h.score as f64 }).collect::<Vec<_>>())
+        })?;
+        Ok(merge_top(per.concat(), k))
     }
 
     /// The fraction of the query's nearest neighbours that pass the filter,
@@ -861,7 +937,8 @@ impl<'a> Executor<'a> {
     /// its global one, and the local one decides how far an index search
     /// must go to collect k matches. Only measured when the global
     /// selectivity leaves the choice open.
-    fn local_selectivity(&mut self, s: &'a Seg, vr: &VectorReader, q: &[f32], p: &Pred, base: &SearchParams, global: f64) -> Result<Option<f64>> {
+    #[allow(clippy::too_many_arguments)]
+    fn local_selectivity(&self, s: &'a Seg, vr: &VectorReader, q: &[f32], p: &Pred, base: &SearchParams, global: f64, l: &mut Local) -> Result<Option<f64>> {
         if !(0.0005..0.6).contains(&global) {
             return Ok(None);
         }
@@ -869,7 +946,7 @@ impl<'a> Executor<'a> {
             let est = SegEst { ex: self, s, params: None, local_sel: None };
             self.planner(&est).estimate(p).probeable
         };
-        let f = self.seg_filter(s, p, if probeable { FilterMode::Probe } else { FilterMode::Materialize })?;
+        let f = self.seg_filter_l(s, p, if probeable { FilterMode::Probe } else { FilterMode::Materialize }, l)?;
         let sample = |m: usize| {
             let mut sp = base.clone();
             sp.strategy = to_vector_strategy(VectorStrategy::InIndex, vr.index_kind(), false);

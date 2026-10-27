@@ -64,6 +64,10 @@ pub(crate) struct VectorBuilder {
     dim: usize,
     stride: usize,
     kind: Kind,
+    /// Segments with more vectors than this build IVF instead of HNSW
+    /// (`vector.hnsw.max_docs`): an HNSW graph's build time grows faster
+    /// than the segment, and is paid again at every merge.
+    hnsw_max_docs: Option<usize>,
     threads: usize,
     seed: u64,
     /// Float32 rows as little-endian bytes, so the buffer becomes the
@@ -111,6 +115,7 @@ impl VectorBuilder {
             dim: *dim,
             stride: strides(*dim).0,
             kind,
+            hnsw_max_docs: parse(opts, "vector.hnsw.max_docs")?,
             threads: parse(opts, "vector.threads")?.unwrap_or(1),
             seed: parse(opts, "vector.seed")?.unwrap_or(0x5EE_D0F5_747A),
             rows: Vec::new(),
@@ -146,10 +151,14 @@ impl FieldIndexBuilder for VectorBuilder {
     }
 
     fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
-        let VectorBuilder { field, dim, stride, kind, threads, seed, rows, present, n, missing } = *self;
+        let VectorBuilder { field, dim, stride, kind, hnsw_max_docs, threads, seed, rows, present, n, missing } = *self;
         let code_stride = strides(dim).1;
         let is_present = |d: u32| present[d as usize / 64] >> (d % 64) & 1 == 1;
         let ids: Vec<u32> = (0..n as u32).filter(|&d| is_present(d)).collect();
+        let kind = match kind {
+            Kind::Hnsw { .. } if hnsw_max_docs.is_some_and(|m| ids.len() > m) => Kind::Ivf { nlist: None, iters: 10, sample: 64 },
+            k => k,
+        };
         // SAFETY: f32 has no invalid bit patterns; `align_to` only yields the
         // aligned middle part, and we require it to be everything.
         let (head, data, tail) = unsafe { rows.align_to::<f32>() };
