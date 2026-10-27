@@ -58,6 +58,7 @@ impl Coordinator {
             let ch = Channel::from_shared(url.clone())
                 .map_err(|e| ApiError::bad(format!("bad shard URL {url}: {e}")))?
                 .connect_timeout(Duration::from_secs(5))
+                .tcp_nodelay(true)
                 .connect_lazy();
             clients.push(StrataClient::new(ch).max_decoding_message_size(256 << 20));
         }

@@ -104,7 +104,16 @@ pub async fn serve_http(svc: Arc<Service>, listener: TcpListener, token: Option<
 }
 
 pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener) -> Result<(), tonic::transport::Error> {
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    use tokio_stream::StreamExt;
+    // A gRPC answer is several small writes (headers, data, trailers); with
+    // Nagle's algorithm on, the last waits for the client's delayed ACK and
+    // every call to a shard took 40 ms longer.
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(|s| {
+        if let Ok(s) = &s {
+            let _ = s.set_nodelay(true);
+        }
+        s
+    });
     tonic::transport::Server::builder()
         .add_service(pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(256 << 20).max_encoding_message_size(256 << 20))
         .serve_with_incoming_shutdown(incoming, shutdown())
