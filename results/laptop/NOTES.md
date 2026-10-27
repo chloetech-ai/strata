@@ -398,3 +398,25 @@ different neighbours, which is not a tie.
   scores. It is one run, though, and the same kinds are as fast or faster at 16
   clients (bm25 server p50 0.300 → 0.288 ms), so a repeat would be needed to
   confirm it.
+
+# Third run, after the BM25 tie fix
+
+Tree: `claude/laptop-report` at 5eaa2be, the merge of
+`origin/claude/project-thread-2f1ge7` at 1017948 ("strata: keep BM25 ties in
+one pass, and score a document the same everywhere") into the re-run's 8c4d8a9.
+1017948 is the only change since the re-run: the text index keeps the tie at the
+k-th score in one traversal instead of the executor searching again for twice as
+many rows, and term scores are summed in f64. Same machine and toolchain as above.
+
+## Step 1: tests (`cargo test --release --test text_topk --test cluster_split`)
+
+In `strata/`, under `caffeinate -i`, 2026-10-27 20:28 UTC, load 2.70 at the start.
+101 s wall including the release build of the changed crate. Exit 0.
+
+| test binary | passed | failed | ignored |
+|---|---:|---:|---:|
+| `tests/text_topk.rs` | 5 | 0 | 0 |
+| `tests/cluster_split.rs` | 4 | 0 | 0 |
+
+`text_topk` includes the new `ties_kept_alike` test from 1017948. The full suites
+were not re-run here (they pass in CI on macOS).
