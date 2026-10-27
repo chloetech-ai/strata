@@ -106,6 +106,46 @@ fn algorithms_agree_scifact() {
     check(&texts, 80, 2);
 }
 
+/// Short texts over few words tie heavily. Every algorithm gives a
+/// document the same score, bit for bit, and `top_k_ties` keeps exactly
+/// the documents scoring at least the `k`-th's.
+#[test]
+fn ties_kept_alike() {
+    let mut rng = StdRng::seed_from_u64(5);
+    let texts: Vec<String> = (0..4000).map(|_| (0..rng.gen_range(1..5)).map(|_| format!("t{}", rng.gen_range(0..12))).collect::<Vec<_>>().join(" ")).collect();
+    let n = texts.len() as u32;
+    let half = DocSet::from_sorted((0..n).filter(|d| d % 2 == 0).collect(), n);
+    for (format, min_df) in configs() {
+        let seg = build(&texts, format, min_df, false);
+        let r = TextFieldReader::open(&seg, "body").unwrap();
+        for qi in 0..60 {
+            let q: Vec<String> = (0..1 + qi % 3).map(|j| format!("t{}", (qi * 7 + j * 5) % 13)).collect();
+            let stats = r.stats(&q);
+            let p = Bm25Params::default();
+            for filter in [None, Some(&half as &dyn DocFilter)] {
+                let all = r.top_k(&q, &stats, p, n as usize, filter, TopKAlgo::Exhaustive);
+                for k in [1, 10, 100] {
+                    let mut want: Vec<(u32, u32)> = match all.get(k - 1) {
+                        Some(&(_, cut)) => all.iter().filter(|x| x.1 >= cut).map(|&(d, s)| (d, s.to_bits())).collect(),
+                        None => all.iter().map(|&(d, s)| (d, s.to_bits())).collect(),
+                    };
+                    want.sort();
+                    for algo in ALGOS {
+                        let got = r.top_k_ties(&q, &stats, p, k, filter, algo);
+                        assert!(got.windows(2).all(|w| w[0].1 >= w[1].1), "{algo:?} k={k} {q:?}: not by decreasing score");
+                        let mut got: Vec<(u32, u32)> = got.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                        got.sort();
+                        assert_eq!(got, want, "{format:?}/{min_df} {algo:?} k={k} {q:?} filter {}", filter.is_some());
+                        let plain = r.top_k(&q, &stats, p, k, filter, algo);
+                        assert_eq!(plain.len(), k.min(all.len()));
+                        assert!(plain.iter().all(|&(d, s)| want.binary_search(&(d, s.to_bits())).is_ok()), "{algo:?} k={k} {q:?}: top_k scores");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Two segments scored with summed statistics rank like one segment.
 #[test]
 fn statistics_summed_over_segments() {
