@@ -1,0 +1,405 @@
+//! The operations both front ends serve, over a local database or, as a
+//! coordinator, over shard servers.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value as Json};
+use strata::db::{Db, SqlResult};
+use strata::query::exec::{ExecOptions, ResultSet};
+use strata::query::stats::TermStats;
+use strata::query::{bind, Params};
+use strata::schema::Schema;
+use strata::storage::Snapshot;
+use strata::value::Value;
+use tokio::sync::Semaphore;
+
+use crate::coord::Coordinator;
+use crate::metrics::{self, Metrics};
+use crate::{json as js, ApiError};
+
+pub enum Backend {
+    Local(Arc<Db>),
+    Cluster(Arc<Coordinator>),
+}
+
+/// A SELECT to run.
+#[derive(Clone, Default)]
+pub struct QueryReq {
+    pub sql: String,
+    pub params: Params,
+    /// 0: the server's default.
+    pub timeout_ms: u64,
+    /// Return results a coordinator can merge ([`ExecOptions::shard`]).
+    pub shard: bool,
+    /// Statistics summed over shards, for global BM25 scores.
+    pub stats: Option<TermStats>,
+    /// A snapshot lease; 0 for the latest version.
+    pub snapshot: u64,
+}
+
+pub struct Answer {
+    pub rs: ResultSet,
+    pub took_ms: f64,
+    pub kind: &'static str,
+}
+
+/// Turns text into a vector for `{"embed": "..."}` parameters.
+pub struct Embedder {
+    /// What it is, for `/v1/schema` and the agent.
+    pub name: String,
+    pub dim: usize,
+    pub embed: fn(&str, usize) -> Vec<f32>,
+}
+
+/// The agent's model settings ([`crate::agent`]).
+#[derive(Clone)]
+pub struct AgentConfig {
+    pub api_key: Option<String>,
+    pub model: String,
+    pub base_url: String,
+}
+
+pub struct Service {
+    pub backend: Backend,
+    pub schema: Schema,
+    pub metrics: Metrics,
+    pub agent: AgentConfig,
+    pub embedder: Option<Embedder>,
+    /// Default query deadline.
+    pub timeout: Duration,
+    pub lease_ttl: Duration,
+    leases: Mutex<HashMap<u64, (Snapshot, Instant)>>,
+    next_lease: AtomicU64,
+    /// Queries allowed to run at once; the rest wait until their deadline.
+    admission: Semaphore,
+    cores: usize,
+    running: AtomicUsize,
+}
+
+impl Service {
+    pub fn new(backend: Backend, schema: Schema, agent: AgentConfig, max_concurrent: usize, timeout: Duration) -> Service {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Service {
+            backend,
+            schema,
+            metrics: Metrics::default(),
+            agent,
+            embedder: None,
+            timeout,
+            lease_ttl: Duration::from_secs(60),
+            leases: Mutex::new(HashMap::new()),
+            next_lease: AtomicU64::new(1),
+            admission: Semaphore::new(max_concurrent.max(1)),
+            cores,
+            running: AtomicUsize::new(0),
+        }
+    }
+
+    fn local(&self) -> Option<&Arc<Db>> {
+        match &self.backend {
+            Backend::Local(db) => Some(db),
+            Backend::Cluster(_) => None,
+        }
+    }
+
+    /// Pins the current version for `lease_ttl`; returns the lease.
+    pub fn lease(&self) -> Result<(u64, u64), ApiError> {
+        let db = self.local().ok_or_else(|| ApiError::bad("a coordinator holds no snapshots"))?;
+        let snap = db.snapshot();
+        let txn = snap.txn();
+        let id = self.next_lease.fetch_add(1, Ordering::Relaxed);
+        let mut l = self.leases.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        l.retain(|_, (_, t)| *t > now);
+        l.insert(id, (snap, now + self.lease_ttl));
+        Ok((id, txn))
+    }
+
+    fn snapshot(&self, db: &Db, lease: u64) -> Result<Snapshot, ApiError> {
+        if lease == 0 {
+            return Ok(db.snapshot());
+        }
+        let l = self.leases.lock().unwrap_or_else(|e| e.into_inner());
+        match l.get(&lease) {
+            Some((s, t)) if *t > Instant::now() => Ok(s.clone()),
+            _ => Err(ApiError::bad(format!("snapshot lease {lease} is unknown or expired"))),
+        }
+    }
+
+    /// Parameters from JSON. Besides plain values (see [`js::param`]), a
+    /// parameter may be `{"vector_of": key, "field": "emb"}`, the vector of
+    /// a stored document (field: the first VECTOR field if left out), or
+    /// `{"embed": "text"}`, the embedder's vector of the text.
+    pub async fn params(self: &Arc<Self>, j: Option<&Json>) -> Result<Params, ApiError> {
+        let mut p = Params::new();
+        let Some(j) = j.filter(|j| !j.is_null()) else { return Ok(p) };
+        let m = j.as_object().ok_or_else(|| ApiError::bad("params must be an object"))?;
+        for (k, v) in m {
+            let value = match v {
+                Json::Object(o) if o.contains_key("vector_of") => {
+                    let field = match o.get("field").and_then(|f| f.as_str()) {
+                        Some(f) => f.to_string(),
+                        None => self.vector_field().ok_or_else(|| ApiError::bad("the table has no VECTOR field"))?,
+                    };
+                    self.vector_of(&o["vector_of"], &field).await?
+                }
+                Json::Object(o) if o.contains_key("embed") => {
+                    let e = self.embedder.as_ref().ok_or_else(|| ApiError::bad("this server has no embedder; pass the vector"))?;
+                    let text = o["embed"].as_str().ok_or_else(|| ApiError::bad("embed takes a string"))?;
+                    Value::Vector((e.embed)(text, e.dim).into())
+                }
+                v => js::param(v)?,
+            };
+            p = p.set(k, value);
+        }
+        Ok(p)
+    }
+
+    pub fn vector_field(&self) -> Option<String> {
+        self.schema.fields.iter().find(|f| matches!(f.ty, strata::FieldType::Vector { .. })).map(|f| f.name.clone())
+    }
+
+    /// The vector `field` of the document `key`.
+    pub async fn vector_of(self: &Arc<Self>, key: &Json, field: &str) -> Result<Value, ApiError> {
+        let pk = self.schema.primary_key.ok_or_else(|| ApiError::bad("vector_of needs a primary key"))?;
+        let f = self.schema.field_index(field).ok_or_else(|| ApiError::bad(format!("no field {field}")))?;
+        if !matches!(self.schema.fields[f].ty, strata::FieldType::Vector { .. }) {
+            return Err(ApiError::bad(format!("{field} is not a VECTOR field")));
+        }
+        let sql = format!("SELECT {field} FROM {} WHERE {} = :k LIMIT 1", self.schema.table, self.schema.fields[pk].name);
+        let params = Params::new().set("k", js::field_value(&self.schema, pk, key)?);
+        let a = self.query(QueryReq { sql, params, ..Default::default() }).await?;
+        match a.rs.rows.into_iter().next().and_then(|r| r.into_iter().next()) {
+            Some(v @ Value::Vector(_)) => Ok(v),
+            Some(_) => Err(ApiError::bad(format!("document {key} has no {field}"))),
+            None => Err(ApiError::bad(format!("no document {key}"))),
+        }
+    }
+
+    pub async fn query(self: &Arc<Self>, req: QueryReq) -> Result<Answer, ApiError> {
+        let t0 = Instant::now();
+        let timeout = if req.timeout_ms > 0 { Duration::from_millis(req.timeout_ms) } else { self.timeout };
+        let select = match bind(&req.sql, &self.schema, &req.params) {
+            Ok(s) => s,
+            Err(e) => {
+                self.metrics.query("invalid", "error", t0.elapsed().as_secs_f64() * 1e3);
+                return Err(e.into());
+            }
+        };
+        let kind = metrics::kind(&select);
+        let Ok(permit) = tokio::time::timeout(timeout, self.admission.acquire()).await else {
+            self.metrics.rejected();
+            return Err(ApiError { status: 503, message: "too many queries running; try again".into() });
+        };
+        let res = match &self.backend {
+            Backend::Local(db) => match self.snapshot(db, req.snapshot) {
+                Ok(snap) => {
+                    let running = self.running.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Each running query gets its share of the cores for its
+                    // segments (as engram's recall does).
+                    let opts = ExecOptions {
+                        stats: req.stats.map(Arc::new),
+                        shard: req.shard,
+                        threads: (self.cores / running).max(1),
+                        deadline: Some(t0 + timeout),
+                        ..db.exec.clone()
+                    };
+                    let db = db.clone();
+                    let r = tokio::task::spawn_blocking(move || db.execute(&snap, &select, &opts)).await;
+                    self.running.fetch_sub(1, Ordering::Relaxed);
+                    match r {
+                        Ok(r) => r.map_err(ApiError::from),
+                        Err(e) => Err(ApiError::internal(e)),
+                    }
+                }
+                Err(e) => Err(e),
+            },
+            Backend::Cluster(c) => c.query(&req, &select, t0 + timeout).await,
+        };
+        drop(permit);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let outcome = match &res {
+            Ok(_) => "ok",
+            Err(e) if e.status == 504 => "timeout",
+            Err(_) => "error",
+        };
+        self.metrics.query(kind, outcome, ms);
+        res.map(|rs| Answer { rs, took_ms: ms, kind })
+    }
+
+    /// The statistics `sql` scores with, and a lease on the snapshot they
+    /// came from (0 from a coordinator, which sums its shards').
+    pub async fn term_stats(self: &Arc<Self>, sql: &str, params: &Params) -> Result<(TermStats, u64), ApiError> {
+        let select = bind(sql, &self.schema, params)?;
+        match &self.backend {
+            Backend::Local(db) => {
+                let (lease, _) = self.lease()?;
+                let snap = self.snapshot(db, lease)?;
+                let db = db.clone();
+                let stats = tokio::task::spawn_blocking(move || db.term_stats(&snap, &select)).await.map_err(ApiError::internal)??;
+                Ok((stats, lease))
+            }
+            Backend::Cluster(c) => Ok((c.term_stats(sql, params, Instant::now() + self.timeout).await?.0, 0)),
+        }
+    }
+
+    /// Any statement: rows for a SELECT, the documents written otherwise.
+    pub async fn sql(self: &Arc<Self>, sql: &str, params: &Params, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+        if strata::query::bind_write(sql, &self.schema, params)?.is_none() {
+            let a = self.query(QueryReq { sql: sql.into(), params: params.clone(), timeout_ms, ..Default::default() }).await?;
+            return Ok(SqlAnswer::Rows(a));
+        }
+        let t0 = Instant::now();
+        let n = match &self.backend {
+            Backend::Local(db) => {
+                let (db, sql, params) = (db.clone(), sql.to_string(), params.clone());
+                match tokio::task::spawn_blocking(move || db.sql(&sql, &params)).await.map_err(ApiError::internal)?? {
+                    SqlResult::Written(n) => n,
+                    SqlResult::Rows(_) => unreachable!("bound as a write"),
+                }
+            }
+            Backend::Cluster(c) => c.sql(sql, params).await?,
+        };
+        self.metrics.write(n);
+        Ok(SqlAnswer::Written { n, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
+    }
+
+    /// Applies write operations (see the proto's WriteRequest) in one
+    /// transaction per server.
+    pub async fn write_ops(self: &Arc<Self>, ops: Vec<Json>) -> Result<u64, ApiError> {
+        let n = match &self.backend {
+            Backend::Local(db) => {
+                let db = db.clone();
+                tokio::task::spawn_blocking(move || apply_ops(&db, &ops)).await.map_err(ApiError::internal)??
+            }
+            Backend::Cluster(c) => c.write_ops(ops).await?,
+        };
+        self.metrics.write(n);
+        Ok(n)
+    }
+
+    pub async fn health(self: &Arc<Self>) -> Json {
+        match &self.backend {
+            Backend::Local(db) => {
+                let s = db.snapshot();
+                json!({"status": "ok", "role": "shard", "docs": s.n_live_docs(), "segments": s.segments().len(), "txn": s.txn()})
+            }
+            Backend::Cluster(c) => c.health().await,
+        }
+    }
+
+    /// Storage statistics (local) and query counters.
+    pub async fn stats(self: &Arc<Self>) -> Json {
+        let storage = match &self.backend {
+            Backend::Local(db) => serde_json::to_value(db.storage().file_stats()).unwrap_or(Json::Null),
+            Backend::Cluster(_) => Json::Null,
+        };
+        json!({"health": self.health().await, "storage": storage, "metrics": self.metrics.summary()})
+    }
+
+    pub async fn prometheus(self: &Arc<Self>) -> String {
+        let h = self.health().await;
+        self.metrics.render(h["docs"].as_u64().unwrap_or(0), h["segments"].as_u64().unwrap_or(0))
+    }
+}
+
+pub enum SqlAnswer {
+    Rows(Answer),
+    Written { n: u64, took_ms: f64 },
+}
+
+/// The shard of `key` among `n`: FNV-1a of its text (an integer key as
+/// decimal digits), modulo `n`. Loaders must split documents the same way.
+pub fn shard_of(key: &Value, n: usize) -> usize {
+    let text = match key {
+        Value::Str(s) => s.clone(),
+        Value::Int(x) => x.to_string(),
+        v => format!("{v:?}"),
+    };
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h % n.max(1) as u64) as usize
+}
+
+/// The primary key an operation names (`key`, or the document's).
+pub fn op_key(schema: &Schema, op: &Json) -> Result<Value, ApiError> {
+    let pk = schema.primary_key.ok_or_else(|| ApiError::bad("writes by key need a primary key"))?;
+    match (op.get("key"), op.get("doc")) {
+        (Some(k), _) => js::field_value(schema, pk, k),
+        (None, Some(d)) => js::field_value(schema, pk, d.get(&schema.fields[pk].name).unwrap_or(&Json::Null)),
+        _ => Err(ApiError::bad("an operation needs a key or a doc")),
+    }
+}
+
+/// Applies `ops` to `db` in one transaction; returns how many wrote.
+pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<u64, ApiError> {
+    let schema = db.schema().clone();
+    let mut t = db.storage().begin()?;
+    let mut n = 0u64;
+    // Values this batch set, for `add` to build on.
+    let mut seen: HashMap<(String, String), f64> = HashMap::new();
+    for op in ops {
+        let kind = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
+        let doc = || js::document(&schema, op.get("doc").unwrap_or(&Json::Null));
+        let field = || op.get("field").and_then(|f| f.as_str()).ok_or_else(|| ApiError::bad(format!("{kind} needs a field")));
+        let wrote = match kind {
+            "insert" => {
+                t.insert(doc()?)?;
+                true
+            }
+            "upsert" => {
+                t.upsert(doc()?)?;
+                true
+            }
+            "upsert_if_newer" => {
+                let v = op.get("version").and_then(|v| v.as_str()).ok_or_else(|| ApiError::bad("upsert_if_newer needs a version field"))?;
+                t.upsert_if_newer(doc()?, v)?
+            }
+            "delete" => t.delete(&op_key(&schema, op)?)?,
+            "set" | "add" => {
+                let key = op_key(&schema, op)?;
+                let f = field()?;
+                let fi = schema.field_index(f).ok_or_else(|| ApiError::bad(format!("no field {f}")))?;
+                let raw = op.get("value").unwrap_or(&Json::Null);
+                let value = if kind == "add" {
+                    let x = raw.as_f64().ok_or_else(|| ApiError::bad("add needs a numeric value"))?;
+                    let slot = (format!("{key:?}"), f.to_string());
+                    let base = match seen.get(&slot) {
+                        Some(b) => *b,
+                        None => current(db, &schema, &key, fi)?,
+                    };
+                    seen.insert(slot, base + x);
+                    match schema.fields[fi].ty {
+                        strata::FieldType::Int => Value::Int((base + x) as i64),
+                        _ => Value::Float(base + x),
+                    }
+                } else {
+                    let v = js::field_value(&schema, fi, raw)?;
+                    if let Some(x) = v.as_f64() {
+                        seen.insert((format!("{key:?}"), f.to_string()), x);
+                    }
+                    v
+                };
+                t.set(&key, f, value)?
+            }
+            other => return Err(ApiError::bad(format!("unknown write op {other:?}"))),
+        };
+        n += wrote as u64;
+    }
+    t.commit()?;
+    Ok(n)
+}
+
+/// Numeric field `f` of the live document `key` (0 if it has none).
+fn current(db: &Db, schema: &Schema, key: &Value, f: usize) -> Result<f64, ApiError> {
+    let pk = schema.primary_key.expect("checked by op_key");
+    let sql = format!("SELECT {} FROM {} WHERE {} = :k", schema.fields[f].name, schema.table, schema.fields[pk].name);
+    let r = db.query(&sql, &Params::new().set("k", key.clone()))?;
+    Ok(r.rows.first().and_then(|r| r[0].as_f64()).unwrap_or(0.0))
+}

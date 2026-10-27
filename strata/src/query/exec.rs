@@ -209,7 +209,7 @@ impl Default for ExecOptions {
 }
 
 /// What execution did, for EXPLAIN-style reporting and experiments.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExecStats {
     /// One line per segment and operator.
     pub plan: Vec<String>,
