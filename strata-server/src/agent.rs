@@ -93,6 +93,7 @@ SELECT <fields | * | score() | COUNT(*)> FROM {table} [WHERE <predicate>] [GROUP
 - Comparisons (=, <, <=, >, >=, !=), BETWEEN, IN (...), AND, OR, NOT on KEYWORD, INT and FLOAT fields.
 {vector_help}
 - rrf(score1, score2) fuses two rankings by rank; 0.7 * bm25(...) + 0.3 * similarity(...) is a weighted sum of normalised scores.
+- decay(numeric_field, origin, scale) is 1 at the origin and 0.5 at origin ± scale (options: offset => d, decay => 0.5, shape => 'exp' | 'gauss' | 'linear'; origin may be now() for Unix-second timestamps). Multiply to boost relevance: ORDER BY bm25(body, 'boots') * decay(year, 2026, 2) DESC.
 - ORDER BY a numeric field sorts by it (ORDER BY price ASC). score() returns the ranking score.
 - Facets: SELECT f, COUNT(*) FROM {table} WHERE ... GROUP BY f ORDER BY 2 DESC LIMIT 10, where f is a KEYWORD field (or a multi-valued INT field). COUNT(*) alone counts rows.
 - Not supported: JOIN, other aggregates (SUM, AVG, MIN, MAX), expressions in SELECT, ORDER BY two scores. For a minimum or maximum, ORDER BY the field and LIMIT 1. For an average, fetch the rows and compute it yourself only if there are few.

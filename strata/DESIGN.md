@@ -307,6 +307,20 @@ GROUP BY category ORDER BY 2 DESC LIMIT 5;
   each input's top 100, re-scored exactly by every input and min-max
   normalised (`norm => 'none'` keeps raw scores, `exact => 1` scores every
   row passing `WHERE`).
+* `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`:
+  a numeric column's closeness to `origin`, as Elasticsearch's decay
+  functions: `d = max(0, |x − origin| − offset)` maps to 1 at `d = 0` and
+  to `decay` at `d = scale`, falling exponentially, as a Gaussian
+  (`'gauss'`) or linearly (`'linear'`, reaching 0 at `scale / (1 −
+  decay)`). Rows without a value score 0. `now()` as the origin is the
+  current Unix time in seconds. Usable alone, in sums and in `rrf`.
+* Products of scores boost relevance by a row's own values:
+  `ORDER BY bm25(body, :t) * decay(published, now(), 2592000)` (half the boost at 30 days) or
+  `similarity(emb, :q) * rating`. Candidates are the top `depth` (100)
+  rows of each relevance factor (BM25, similarity, graph scores; of every
+  factor when there is none), scored exactly by every factor; shards
+  return each factor's raw scores and the coordinator multiplies them over
+  the same candidates, so a split collection ranks as the whole one.
 * Options as named arguments, e.g. `similarity(emb, :q, nprobe => 32)`,
   `bm25(body, :t, k1 => 0.9, stopwords => 0)`.
 

@@ -156,6 +156,13 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
             <span class="seg" id="bFuse"><button data-v="rrf" aria-pressed="true">rank fusion (RRF)</button><button data-v="weighted" aria-pressed="false">weighted sum</button></span></div>
           <div class="grow slider hidden" id="bWeightBox"><span class="small muted">text</span><input type="range" id="bWeight" min="0" max="100" value="50"><span class="small muted">similarity</span><span class="small" id="bWeightVal">0.50 / 0.50</span></div>
         </div>
+        <div class="row" id="bBoostRow">
+          <div style="width:170px"><label class="lbl" for="bBoostField">Boost rows whose</label><select id="bBoostField"></select></div>
+          <div style="width:140px"><label class="lbl" for="bBoostOrigin">is close to</label><input id="bBoostOrigin" type="text" placeholder="e.g. 2026 or now" disabled></div>
+          <div style="width:140px"><label class="lbl" for="bBoostScale">half the boost at ±</label><input id="bBoostScale" type="text" placeholder="e.g. 2" disabled></div>
+          <div style="width:130px"><label class="lbl" for="bBoostShape">falling</label><select id="bBoostShape" disabled><option value="exp">exponentially</option><option value="gauss">like a bell</option><option value="linear">linearly</option></select></div>
+          <div class="grow small muted" id="bBoostNote" style="align-self:flex-end;padding-bottom:8px"></div>
+        </div>
         <div class="row" style="margin-top:14px"><h2 style="margin:0">Filters</h2><button class="btn small" id="bAddFilter">+ filter</button></div>
         <div id="bFilters" style="margin-top:8px"></div>
         <div class="row">
@@ -318,6 +325,9 @@ function setupBuilder() {
   $("bVecField").replaceChildren(...vecFields.map((f) => opt(f.name)));
   if (!S.embedder) $("bVecMode").querySelector('option[value="text"]').remove();
   $("bSort").replaceChildren(opt("", "relevance / none"), ...S.fields.filter((f) => isNum(f) && !f.multi).map((f) => opt(f.name)));
+  $("bBoostField").replaceChildren(opt("", "no boost"), ...S.fields.filter((f) => isNum(f) && !f.multi).map((f) => opt(f.name)));
+  $("bBoostField").addEventListener("input", () => { for (const id of ["bBoostOrigin", "bBoostScale", "bBoostShape"]) $(id).disabled = !$("bBoostField").value; updateSql(); });
+  for (const id of ["bBoostOrigin", "bBoostScale", "bBoostShape"]) $(id).addEventListener("input", updateSql);
   $("bFacet").replaceChildren(opt("", "nothing"), ...S.fields.filter((f) => (f.kind === "keyword" && f.name !== S.pk) || (f.kind === "int" && f.multi)).map((f) => opt(f.name)));
   const selectable = S.fields.filter((f) => f.kind !== "vector" && (f.stored || f.name === S.pk));
   if (!B.cols) B.cols = new Set(selectable.slice(0, 8).map((f) => f.name));
@@ -400,13 +410,25 @@ function builderQuery() {
   if (vm && vv) { vecScore = `similarity(${vf}, :q)`; params.q = vm === "row" ? { vector_of: vv, field: $("bVecField").value } : { embed: vv }; }
   let order = null;
   $("bFuseRow").classList.toggle("hidden", !(textScore && vecScore));
-  if (textScore && vecScore) {
+  // The boost: decay(field, origin, scale) multiplies a single ranking.
+  let boost = null; $("bBoostNote").textContent = "";
+  const bf = $("bBoostField").value, bo = $("bBoostOrigin").value.trim(), bs = $("bBoostScale").value.trim();
+  if (bf) {
+    const num = (v) => /^-?\d+(\.\d+)?$/.test(v);
+    const origin = bo.toLowerCase() === "now" ? "now()" : num(bo) ? bo : null;
+    if (!origin || !num(bs) || Number(bs) <= 0) $("bBoostNote").textContent = "Give a number (or now) and a scale above 0.";
+    else if (textScore && vecScore) $("bBoostNote").textContent = "A boost multiplies one ranking: clear the text or the similarity.";
+    else boost = `decay(${ident(bf)}, ${origin}, ${bs}${$("bBoostShape").value !== "exp" ? `, shape => '${$("bBoostShape").value}'` : ""})`;
+  }
+  if (boost && !(textScore && vecScore)) {
+    order = `${textScore || vecScore ? (textScore || vecScore) + " * " : ""}${boost} DESC`;
+  } else if (textScore && vecScore) {
     if (B.fuse === "rrf") order = `rrf(${textScore}, ${vecScore}) DESC`;
     else { const w = $("bWeight").value / 100; $("bWeightVal").textContent = `${(1 - w).toFixed(2)} / ${w.toFixed(2)}`; order = `${(1 - w).toFixed(2)} * ${textScore} + ${w.toFixed(2)} * ${vecScore} DESC`; }
   } else if (textScore || vecScore) order = `${textScore || vecScore} DESC`;
   else if ($("bSort").value) order = `${ident($("bSort").value)} ${$("bDir").value}`;
   const cols = S.fields.filter((f) => B.cols.has(f.name)).map((f) => ident(f.name));
-  if (order && (textScore || vecScore)) cols.push("score()");
+  if (order && (textScore || vecScore || boost)) cols.push("score()");
   const limit = Math.max(1, Math.min(1000, parseInt($("bLimit").value, 10) || 20));
   const w = where.length ? `\nWHERE ${where.join("\n  AND ")}` : "";
   const sql = `SELECT ${cols.length ? cols.join(", ") : "*"}\nFROM ${T}${w}${order ? `\nORDER BY ${order}` : ""}\nLIMIT ${limit}`;

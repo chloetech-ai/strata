@@ -47,6 +47,8 @@ pub fn kind(q: &Select) -> &'static str {
             Score::Similarity { .. } => "vector",
             Score::Rrf { .. } | Score::Weighted(_) => "hybrid",
             Score::Column { .. } => "column",
+            Score::Decay { .. } => "decay",
+            Score::Product(_) => "boosted",
             Score::Ppr { .. } | Score::Hops { .. } => "graph",
         },
         _ => "filter",

@@ -71,7 +71,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     let key_desc = matches!(q.tiebreak, Some(Tiebreak::Key { desc: true }));
     let (mut rows, want) = match &q.order {
         None => (rows, q.limit),
-        Some(OrderBy::Score { score: score @ (Score::Rrf { .. } | Score::Weighted(_)), .. }) => (fuse(score, rows)?, Some(q.limit.unwrap_or(DEFAULT_K))),
+        Some(OrderBy::Score { score: score @ (Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_)), .. }) => (fuse(score, rows)?, Some(q.limit.unwrap_or(DEFAULT_K))),
         Some(OrderBy::Score { score, desc }) => {
             let desc = *desc || !matches!(score, Score::Column { .. });
             rows.sort_by(|a, b| by_score(a.score, b.score, desc).then_with(|| by_key(&a.key, &b.key, key_desc)));
@@ -80,7 +80,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         }
         Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
     };
-    if matches!(&q.order, Some(OrderBy::Score { score: Score::Rrf { .. } | Score::Weighted(_), .. })) {
+    if matches!(&q.order, Some(OrderBy::Score { score: Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_), .. })) {
         rows.sort_by(|a, b| by_score(a.score, b.score, true).then_with(|| by_key(&a.key, &b.key, key_desc)));
     }
     let end = want.map_or(rows.len(), |w| (w + q.offset).min(rows.len()));
@@ -136,7 +136,7 @@ fn fused_opt<'a>(terms: &'a [(f64, Score)], key: &str) -> Option<&'a Value> {
 /// shards, then RRF or the weighted sum over the union.
 fn fuse(score: &Score, rows: Vec<Row>) -> Result<Vec<Row>> {
     let n_inputs = match score {
-        Score::Rrf { inputs, .. } => inputs.len(),
+        Score::Rrf { inputs, .. } | Score::Product(inputs) => inputs.len(),
         Score::Weighted(t) => t.len(),
         _ => unreachable!(),
     };
@@ -148,6 +148,10 @@ fn fuse(score: &Score, rows: Vec<Row>) -> Result<Vec<Row>> {
         Score::Weighted(t) => (
             fused_opt(t, "depth").and_then(|v| v.as_f64()).map_or(crate::query::exec::ExecOptions::default().fusion_depth, |d| d as usize),
             fused_opt(t, "exact").and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+        ),
+        Score::Product(f) => (
+            f.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(crate::query::exec::ExecOptions::default().fusion_depth, |d| d as usize),
+            false,
         ),
         _ => unreachable!(),
     };
@@ -178,6 +182,18 @@ fn fuse(score: &Score, rows: Vec<Row>) -> Result<Vec<Row>> {
             let scores: Vec<Vec<f32>> =
                 (0..n_inputs).map(|j| cands.iter().map(|&i| rows[i].inputs[j].map_or(f32::NEG_INFINITY, |x| x as f32)).collect()).collect();
             fusion::weighted(&weights, &scores, norm).into_iter().map(|(c, s)| (cands[c], s)).collect()
+        }
+        Score::Product(factors) => {
+            // Candidates from the relevance factors (lists of the others
+            // are empty, see `fusion_candidates`).
+            let any_relevance = factors.iter().any(Score::is_relevance);
+            let mut cands: Vec<usize> =
+                lists.iter().zip(factors).filter(|(_, f)| f.is_relevance() || !any_relevance).flat_map(|(l, _)| l.iter().copied()).collect();
+            cands.sort_unstable();
+            cands.dedup();
+            let scores: Vec<Vec<f32>> =
+                (0..n_inputs).map(|j| cands.iter().map(|&i| rows[i].inputs[j].map_or(f32::NEG_INFINITY, |x| x as f32)).collect()).collect();
+            fusion::weighted(&vec![1.0; n_inputs], &scores, Norm::Product).into_iter().map(|(c, s)| (cands[c], s)).collect()
         }
         _ => unreachable!(),
     };

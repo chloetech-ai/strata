@@ -27,7 +27,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
-use crate::query::logical::{Direction, GraphKind, GraphQuery, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::logical::{Decay, DecayShape, Direction, GraphKind, GraphQuery, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
 
@@ -473,7 +473,13 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: BinaryOperator::Minus, right } => {
                 Ok(Score::Weighted([self.weighted(left, 1.0)?, self.weighted(right, -1.0)?].concat()))
             }
-            Expr::BinaryOp { op: BinaryOperator::Multiply, .. } => Ok(Score::Weighted(self.weighted(e, 1.0)?)),
+            Expr::BinaryOp { op: BinaryOperator::Multiply, .. } => {
+                let mut terms = self.weighted(e, 1.0)?;
+                match terms.as_slice() {
+                    [(w, Score::Product(_))] if *w == 1.0 => Ok(terms.pop().unwrap().1),
+                    _ => Ok(Score::Weighted(terms)),
+                }
+            }
             Expr::Function(f) => {
                 let (args, opts) = self.args(f)?;
                 match fname(f).as_str() {
@@ -502,6 +508,7 @@ impl<'a> Binder<'a> {
                         Ok(Score::Rrf { inputs, k: num("k", 60.0), depth: num("depth", 100.0) as usize })
                     }
                     "ppr" => Ok(Score::Ppr { graph: self.graph(f, "ppr")? }),
+                    "decay" => self.decay(f),
                     n => Err(err(format!("unknown score function {n}"))),
                 }
             }
@@ -525,11 +532,65 @@ impl<'a> Binder<'a> {
                 } else if let Some(c) = self.number(right) {
                     self.weighted(left, w * c)
                 } else {
-                    Err(err("weights must be numeric constants"))
+                    Ok(vec![(w, Score::Product(self.factors(e)?))])
                 }
             }
             _ => Ok(vec![(w, self.score(e)?)]),
         }
+    }
+
+    /// The factors of a product of scores, `a * b * ...`.
+    fn factors(&self, e: &Expr) -> Result<Vec<Score>> {
+        match e {
+            Expr::Nested(inner) => self.factors(inner),
+            Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } => {
+                if self.number(left).is_some() || self.number(right).is_some() {
+                    return Err(err("a product of scores takes no constant factors (they do not change the order)"));
+                }
+                Ok([self.factors(left)?, self.factors(right)?].concat())
+            }
+            _ => {
+                let s = self.score(e)?;
+                match s {
+                    Score::Bm25 { .. } | Score::Similarity { .. } | Score::Column { .. } | Score::Decay { .. } | Score::Ppr { .. } | Score::Hops { .. } => Ok(vec![s]),
+                    _ => Err(err("a product multiplies bm25, similarity, ppr, a column or decay, not sums or fusions")),
+                }
+            }
+        }
+    }
+
+    /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
+    /// 'exp' | 'gauss' | 'linear')`; the origin may be `now()` (seconds
+    /// since the Unix epoch).
+    fn decay(&self, f: &sql::Function) -> Result<Score> {
+        let (args, opts) = self.args(f)?;
+        let usage = "decay(field, origin, scale, offset => .., decay => .., shape => 'exp' | 'gauss' | 'linear')";
+        let [field, origin, scale] = args.as_slice() else { return Err(err(usage)) };
+        let field = self.numeric_field(field)?;
+        if self.schema.fields[field].multi {
+            return Err(err(format!("cannot decay multi-valued field {}", self.schema.fields[field].name)));
+        }
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let origin = match origin {
+            Expr::Function(g) if fname(g) == "now" => now(),
+            e => match self.literal(e)? {
+                Value::Str(s) if s.eq_ignore_ascii_case("now") => now(),
+                v => v.as_f64().ok_or_else(|| err("decay origin must be a number or now()"))?,
+            },
+        };
+        let scale = self.num_lit(scale)?;
+        let num = |k: &str, d: f64| opts.get(k).map_or(Ok(d), |v| v.as_f64().ok_or_else(|| err(format!("decay {k} must be a number"))));
+        let (offset, decay) = (num("offset", 0.0)?, num("decay", 0.5)?);
+        if scale <= 0.0 || offset < 0.0 || !(decay > 0.0 && decay < 1.0) {
+            return Err(err("decay needs scale > 0, offset >= 0 and 0 < decay < 1"));
+        }
+        let shape = match opts.get("shape").map(|v| v.as_str().unwrap_or("").to_ascii_lowercase()).as_deref() {
+            None | Some("exp") => DecayShape::Exp,
+            Some("gauss") => DecayShape::Gauss,
+            Some("linear") => DecayShape::Linear,
+            Some(s) => return Err(err(format!("unknown decay shape {s:?}: exp, gauss or linear"))),
+        };
+        Ok(Score::Decay { field, decay: Decay { origin, scale, offset, decay, shape }, opts })
     }
 
     fn pred(&self, e: &Expr) -> Result<Pred> {
@@ -855,13 +916,16 @@ mod tests {
         let s = bind("SELECT id FROM docs WHERE rating BETWEEN 2.0 AND 2.0 ORDER BY rating DESC, id LIMIT 10", &schema(), &q()).unwrap();
         assert_eq!(s.tiebreak, Some(Tiebreak::Key { desc: false }));
         assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Column { field: 6 }, desc: true })));
+        // A product of scores (a boost), not a weighted sum.
+        let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true }) if f.len() == 2), "{:?}", s.order);
 
         for bad in [
             "SELECT id FROM other",
             "SELECT id FROM docs WHERE MATCH(year, 'x')",
             "SELECT id FROM docs WHERE category > 'c01'",
             "SELECT id FROM docs ORDER BY similarity(emb, :missing)",
-            "SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q)",
+            "SELECT id FROM docs ORDER BY bm25(body, :t) * 2 * similarity(emb, :q)",
             "SELECT id FROM docs ORDER BY year, rating",
             "DELETE FROM docs",
         ] {

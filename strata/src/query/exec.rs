@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::forward::{self, DocStore, KeywordColumn, NumericColumn, RangeIndex, RangeStrategy};
 use crate::graph::GraphReader;
 use crate::query::fusion::{self, Norm};
-use crate::query::logical::{OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak};
+use crate::query::logical::{Decay, OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::stats::{FieldStats, TermStats};
 use crate::query::logical::Seeds;
@@ -790,10 +790,36 @@ impl<'a> Executor<'a> {
         Ok(cands)
     }
 
+    /// The `k` rows of the filter with the largest decay of `field` (rows
+    /// without a value score 0).
+    fn decay_top(&mut self, field: usize, f: &Decay, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        let mut cands = Vec::new();
+        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
+        for s in segs {
+            self.check_deadline()?;
+            let col = self.numeric(s, field)?.col();
+            let set = self.filter_set(s, p)?;
+            for d in set.iter() {
+                let score = self.num_value(s, field, col, d).map_or(0.0, |v| f.eval(v));
+                cands.push(Hit { seg: s.ord, doc: d, score });
+            }
+        }
+        self.stats.scored += cands.len() as u64;
+        self.stats.plan.push(format!("decay {:?} of {} around {}, scale {}", f.shape, self.schema.fields[field].name, f.origin, f.scale));
+        if k > 0 && k < cands.len() {
+            cands.select_nth_unstable_by(k - 1, |a, b| b.score.partial_cmp(&a.score).unwrap());
+            let cut = cands[k - 1].score;
+            cands.retain(|h| h.score >= cut);
+        }
+        self.sort_by_score_then_key(&mut cands, true, false);
+        cands.truncate(k);
+        Ok(cands)
+    }
+
     // ---- ranked ----------------------------------------------------------
 
     fn ranked(&mut self, score: &Score, p: &Pred, k: usize, tb: Option<&Tiebreak>) -> Result<Vec<Hit>> {
-        if self.opts.shard && matches!(score, Score::Rrf { .. } | Score::Weighted(_)) {
+        if self.opts.shard && matches!(score, Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_)) {
             return self.fusion_candidates(score, p);
         }
         let mut hits = match score {
@@ -809,6 +835,7 @@ impl<'a> Executor<'a> {
                 hits
             }
             Score::Weighted(terms) => self.weighted(terms, p, k)?,
+            Score::Product(factors) => self.product(factors, p, k)?,
             leaf => self.leaf_top(leaf, p, k)?,
         };
         if let Some(Tiebreak::Key { desc }) = tb {
@@ -823,8 +850,9 @@ impl<'a> Executor<'a> {
             Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, k),
             Score::Similarity { field, vector, opts } => self.vector_top(*field, vector, opts, p, k),
             Score::Column { field } => self.by_column(*field, true, p, Some(k), None),
+            Score::Decay { field, decay, .. } => self.decay_top(*field, decay, p, k),
             Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, k),
-            _ => Err(err("fusion inputs must be bm25, similarity, ppr, hops or a column")),
+            _ => Err(err("fusion inputs must be bm25, similarity, ppr, hops, decay or a column")),
         }
     }
 
@@ -1051,6 +1079,30 @@ impl<'a> Executor<'a> {
         Ok(fused.into_iter().take(k).map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect())
     }
 
+    /// `a * b * ...`: the top `depth` rows of each relevance factor (of
+    /// every factor if none is), scored exactly by every factor.
+    fn product(&mut self, factors: &[Score], p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        let depth = factors.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(self.opts.fusion_depth, |d| d as usize);
+        let any_relevance = factors.iter().any(Score::is_relevance);
+        let mut cands: Vec<(usize, DocId)> = Vec::new();
+        for f in factors.iter().filter(|f| f.is_relevance() || !any_relevance) {
+            cands.extend(self.leaf_top(f, p, depth)?.into_iter().map(|h| (h.seg, h.doc)));
+        }
+        cands.sort_unstable();
+        cands.dedup();
+        self.stats.scored += cands.len() as u64;
+        self.stats.plan.push(format!("product: {} candidates from {} factors, depth {depth}", cands.len(), factors.len()));
+        let mut scores = Vec::with_capacity(factors.len());
+        for f in factors {
+            scores.push(self.exact_scores(f, &cands)?);
+        }
+        let ones = vec![1.0; factors.len()];
+        let mut hits: Vec<Hit> = fusion::weighted(&ones, &scores, Norm::Product).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect();
+        self.sort_by_score_then_key(&mut hits, true, false);
+        hits.truncate(k);
+        Ok(hits)
+    }
+
     /// Shard mode: every candidate of a fused score with each input's exact
     /// score, ordered by the fused score over this shard's candidates. The
     /// coordinator takes each input's top `depth` over all shards and fuses
@@ -1064,11 +1116,20 @@ impl<'a> Executor<'a> {
                 let depth = opt("depth").and_then(|v| v.as_f64()).map(|d| d as usize).unwrap_or(self.opts.fusion_depth);
                 (terms.iter().map(|(_, s)| s).collect(), depth, exact)
             }
+            Score::Product(factors) => {
+                let depth = factors.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(self.opts.fusion_depth, |d| d as usize);
+                (factors.iter().collect(), depth, false)
+            }
             _ => unreachable!("fused scores only"),
+        };
+        // A product's candidates come from its relevance factors only.
+        let generates = |s: &Score| match score {
+            Score::Product(factors) => s.is_relevance() || !factors.iter().any(Score::is_relevance),
+            _ => true,
         };
         let mut lists = Vec::with_capacity(inputs.len());
         for s in &inputs {
-            lists.push(self.leaf_top(s, p, depth)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>());
+            lists.push(if generates(s) { self.leaf_top(s, p, depth)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>() } else { Vec::new() });
         }
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         if exact {
@@ -1103,6 +1164,10 @@ impl<'a> Executor<'a> {
                 };
                 let weights: Vec<f64> = terms.iter().map(|(w, _)| *w).collect();
                 fusion::weighted(&weights, &scores, norm).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect()
+            }
+            Score::Product(_) => {
+                let ones = vec![1.0; inputs.len()];
+                fusion::weighted(&ones, &scores, Norm::Product).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect()
             }
             _ => unreachable!(),
         };
@@ -1146,12 +1211,21 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+            Score::Decay { field, decay, .. } => {
+                for (seg, range) in by_seg {
+                    let s = self.seg_by_ord(seg);
+                    let col = self.numeric(s, *field)?.col();
+                    for i in range {
+                        out[i] = self.num_value(s, *field, col, cands[i].1).map_or(0.0, |v| decay.eval(v)) as f32;
+                    }
+                }
+            }
             Score::Ppr { .. } | Score::Hops { .. } => {
                 for (i, c) in cands.iter().enumerate() {
                     out[i] = self.graph_score(score, c.0, c.1) as f32;
                 }
             }
-            _ => return Err(err("weighted inputs must be bm25, similarity, ppr, hops or a column")),
+            _ => return Err(err("weighted inputs must be bm25, similarity, ppr, hops, decay or a column")),
         }
         Ok(out)
     }

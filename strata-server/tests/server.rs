@@ -102,6 +102,9 @@ fn queries() -> Vec<(&'static str, Json)> {
         ("SELECT brand, COUNT(*) FROM products WHERE MATCH(body, 'waterproof') GROUP BY brand ORDER BY 2 DESC, 1 LIMIT 8", none.clone()),
         ("SELECT tags, COUNT(*) FROM products GROUP BY tags ORDER BY 2 DESC, 1 LIMIT 10", none.clone()),
         ("SELECT COUNT(*) FROM products WHERE MATCH(body, 'leather OR suede') AND price BETWEEN 20 AND 300", none.clone()),
+        ("SELECT id, year, score() FROM products ORDER BY bm25(body, 'waterproof jacket') * decay(year, 2026, 2) DESC LIMIT 10", none.clone()),
+        ("SELECT id, price, score() FROM products WHERE category = 'kitchen' ORDER BY decay(price, 50, 20, shape => 'gauss') DESC LIMIT 10", none.clone()),
+        ("SELECT id, score() FROM products ORDER BY similarity(emb, :q) * decay(rating, 5, 1) DESC LIMIT 10", like.clone()),
     ]
 }
 

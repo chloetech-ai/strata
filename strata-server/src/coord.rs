@@ -104,7 +104,7 @@ impl Coordinator {
     }
 
     pub async fn query(&self, req: &QueryReq, select: &Select, deadline: Instant) -> Result<strata::query::exec::ResultSet, ApiError> {
-        let ranked_text = matches!(crate::metrics::kind(select), "bm25" | "hybrid");
+        let ranked_text = matches!(crate::metrics::kind(select), "bm25" | "hybrid" | "boosted");
         let (stats, leases) = match &req.stats {
             Some(s) => (Some(s.clone()), vec![0; self.clients.len()]),
             None if ranked_text && self.clients.len() > 1 => {
