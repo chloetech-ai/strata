@@ -1,0 +1,47 @@
+{
+  "dataset": "trec-covid",
+  "dimensions": 512,
+  "documents": 171332,
+  "documents_without_title": 7,
+  "load_and_embed_seconds": 25.546261875,
+  "model": "potion-retrieval-32M",
+  "queries": 50,
+  "rankings": [
+    {
+      "ndcg_at_10": 0.6576891890697582,
+      "order_by": "bm25(body, :t)",
+      "ranking": "bm25 (title + text)",
+      "recall_at_100": 0.1266327846475585
+    },
+    {
+      "ndcg_at_10": 0.5040402002003516,
+      "order_by": "similarity(emb_title, :q)",
+      "ranking": "potion-retrieval-32M vector of title",
+      "recall_at_100": 0.07009580571919032
+    },
+    {
+      "ndcg_at_10": 0.4822765453278054,
+      "order_by": "similarity(emb_text, :q)",
+      "ranking": "potion-retrieval-32M vector of text",
+      "recall_at_100": 0.07245125094975877
+    },
+    {
+      "ndcg_at_10": 0.4462550548596449,
+      "order_by": "similarity(emb_both, :q)",
+      "ranking": "potion-retrieval-32M vector of title + text",
+      "recall_at_100": 0.07473230999244912
+    },
+    {
+      "ndcg_at_10": 0.6539323928350774,
+      "order_by": "rrf(bm25(body, :t), similarity(emb_both, :q))",
+      "ranking": "rrf(bm25, potion-retrieval-32M vector of title + text)",
+      "recall_at_100": 0.1098838003858877
+    },
+    {
+      "ndcg_at_10": 0.8178235282455403,
+      "order_by": "similarity(cohere, :q)",
+      "ranking": "reference: Cohere embed-english-v3 vector of title + text",
+      "recall_at_100": 0.15944851464183274
+    }
+  ]
+}

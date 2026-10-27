@@ -6,3 +6,5 @@ accelerate build start 2026-10-27 16:39:07 PDT at 547d474
 accelerate build end   2026-10-27 16:40:37 PDT wall 90 s
 scifact bge-small-en-v1.5-accelerate start 2026-10-27 16:40:37 PDT load: { 12.19 14.02 16.93 } (accelerate)
 scifact bge-small-en-v1.5-accelerate end   2026-10-27 16:57:32 PDT (finished; see load_and_embed_seconds in its JSON)
+trec-covid potion-retrieval-32M start 2026-10-27 16:57:45 PDT load: { 36.12 43.85 37.85 } (accelerate)
+trec-covid potion-retrieval-32M end   2026-10-27 16:58:13 PDT load: { 26.68 41.02 37.00 } exit 0 wall 28 s
