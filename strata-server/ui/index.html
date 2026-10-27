@@ -1057,19 +1057,23 @@ function drawGraph(box) {
     if (e.label) line.append(sv("title", {}, e.label));
     svg.append(line);
   }
-  const labels = nodes.length <= 70;
+  // Labels for every node only while they fit; otherwise the start, the first ring and the selected node.
+  const all = nodes.length <= 24, top = G.q.find === "ppr" ? new Set(nodes.filter((n) => !n.seed).sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8).map((n) => n.key)) : null;
+  const labelled = (n) => all || n.seed || G.sel === n.key || (top ? top.has(n.key) : G.q.find === "path" || (n.hops != null && n.hops <= 1 && nodes.length <= 60));
   for (const n of nodes) {
     const p = pos.get(n.key);
     const g = sv("g", { class: "node" + (n.seed ? " seed" : "") + (G.sel === n.key ? " sel" : ""), transform: `translate(${p.x},${p.y})`, tabindex: "0" });
     g.append(sv("circle", { r: rad(n) }), sv("title", {}, `${n.key}${n.label !== n.key ? ": " + n.label : ""}`));
-    if (labels || n.seed || G.sel === n.key) g.append(sv("text", { x: rad(n) + 3, y: 4 }, n.label.length > 28 ? n.label.slice(0, 27) + "…" : n.label));
+    // Nodes near the right edge put their label on the left so it is not cut off.
+    const left = p.x > W - 180;
+    if (labelled(n)) g.append(sv("text", { x: left ? -rad(n) - 3 : rad(n) + 3, y: 4, "text-anchor": left ? "end" : "start" }, n.label.length > 28 ? n.label.slice(0, 27) + "…" : n.label));
     const pick = () => { G.sel = n.key; drawGraph(box); };
     g.addEventListener("click", pick); g.addEventListener("keydown", (e) => { if (e.key === "Enter") pick(); });
     svg.append(g);
   }
   const legend = el("div", { class: "legend" },
     el("span", {}, el("i", { class: "seed" }), "where it started"), el("span", {}, el("i"), "found"),
-    el("span", { text: `${nodes.length} rows · ${edges.length} links drawn` }),
+    el("span", { text: `${nodes.length} rows · ${edges.length} links drawn` + (all ? "" : " · hover or click a dot for its name") }),
     G.q.vec ? el("span", { text: "similarity links aren't stored, so rings show the hop distance only" }) : G.q.find === "ppr" ? el("span", { text: "bigger: higher PageRank" }) : G.q.find === "reach" ? el("span", { text: "rings: hops from the start" }) : null);
   const parts = [el("h2", { text: "Graph" }), legend, svg];
   const sel = G.sel && G.nodes.get(G.sel);
@@ -1098,6 +1102,8 @@ async function expandNode(n, box) {
 // Examples are written against this table's fields and words from its rows,
 // so "Try it" finds something.
 let SAMPLE = null, HELP = null;
+// English words of five letters or more that searches drop.
+const STOP = new Set("about above after again against because before being below between could doing during further having other ought their theirs there these those through under until where which while would should yours yourself yourselves ourselves themselves herself himself itself what".split(" "));
 async function loadSamples() {
   if (SAMPLE) return SAMPLE;
   const T = ident(S.table), K = S.pk ? ident(S.pk) : null;
@@ -1113,30 +1119,43 @@ async function loadSamples() {
     num ? q(`SELECT AVG(${ident(num.name)}), MIN(${ident(num.name)}), MAX(${ident(num.name)}) FROM ${T}`) : null,
     edges && K ? q(`SELECT ${K}, ${ident(edges.name)} FROM ${T} LIMIT 200`) : null,
   ]);
-  // Frequent longer words are likely to find rows.
-  const counts = new Map(); let phrase = null;
-  for (const r of rows ? rows.rows : []) for (const v of r.slice(K ? 1 : 0)) {
-    const ws = String(v ?? "").toLowerCase().match(/[a-z]+/g) || [];
-    ws.forEach((w, i) => {
-      if (w.length >= 5) counts.set(w, (counts.get(w) || 0) + 1);
-      if (!phrase && w.length >= 4 && ws[i + 1] && ws[i + 1].length >= 4) phrase = `${w} ${ws[i + 1]}`;
-    });
+  // Words in several sample rows, but not in most, are likely to find rows.
+  const counts = new Map(), docs = []; let phrase = null;
+  for (const r of rows ? rows.rows : []) {
+    const ws = r.slice(K ? 1 : 0).flatMap((v) => String(v ?? "").toLowerCase().match(/[a-z]+/g) || []);
+    docs.push(new Set(ws));
+    ws.forEach((w, i) => { if (!phrase && w.length >= 4 && !STOP.has(w) && ws[i + 1] && ws[i + 1].length >= 4 && !STOP.has(ws[i + 1])) phrase = `${w} ${ws[i + 1]}`; });
+    for (const w of new Set(ws)) if (w.length >= 5 && !STOP.has(w)) counts.set(w, (counts.get(w) || 0) + 1);
   }
-  const words = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([w]) => w);
+  const most = Math.max(2, docs.length * 0.6);
+  let words = [...counts.entries()].filter(([, n]) => n >= 2 && n <= most).sort((a, b) => b[1] - a[1]).map(([w]) => w);
+  if (words.length < 3) words = [...words, ...[...counts.keys()].filter((w) => !words.includes(w))];
   while (words.length < 3) words.push(["data", "model", "search"][words.length]);
+  // The word to leave out: one some row with the first two words lacks.
+  const without = words.slice(2).find((w) => docs.some((d) => (d.has(words[0]) || d.has(words[1])) && !d.has(w)));
+  if (without) words = [words[0], words[1], without, ...words.slice(2).filter((w) => w !== without)];
   const keys = rows && K ? rows.rows.map((r) => r[0]) : [];
   // A row with links, and a row two hops from it, for the path example.
   let linked = null, far = null;
   if (er) {
-    const r = er.rows.find((x) => x[1] && x[1] !== "[]");
-    if (r) {
+    const nLinks = (v) => { try { return JSON.parse(v).length; } catch { return 0; } };
+    const r = [...er.rows].sort((a, b) => nLinks(b[1]) - nLinks(a[1]))[0];
+    if (r && nLinks(r[1]) > 0) {
       linked = r[0];
-      const f = await q(`SELECT ${K} FROM ${T} WHERE REACHABLE(${ident(edges.name)}, :k, hops => 2, min_hops => 2) LIMIT 1`, { k: linked });
+      const f = await q(`SELECT ${K} FROM ${T} WHERE REACHABLE(${ident(edges.name)}, :k, hops => 3, min_hops => 3, dir => 'both') LIMIT 1`, { k: linked });
       far = f && f.rows.length ? f.rows[0][0] : null;
     }
   }
   const round = (x) => x == null ? 0 : Math.abs(x) >= 10 ? Math.round(x) : Math.round(x * 100) / 100;
-  const typo = words[0].length > 4 ? words[0].slice(0, 2) + words[0][3] + words[0][2] + words[0].slice(4) : words[0] + "s";
+  // A typo (two letters swapped) in a longer word that word~ still finds.
+  let typo = null;
+  const tf = S.fields.find((f) => f.kind === "text" && f.indexed && f.generated) || S.fields.find((f) => f.kind === "text" && f.indexed);
+  for (const w of [...words].sort((a, b) => b.length - a.length).filter((w) => w.length >= 6).slice(0, 3)) {
+    const t = w.slice(0, 2) + w[3] + w[2] + w.slice(4);
+    const c = tf ? await q(`SELECT COUNT(*) FROM ${T} WHERE MATCH(${ident(tf.name)}, :t)`, { t: t + "~" }) : null;
+    if (c && c.rows[0][0] > 0) { typo = t; break; }
+  }
+  typo = typo || (words[0].length > 5 ? words[0].slice(0, 2) + words[0][3] + words[0][2] + words[0].slice(4) : words[0] + "s");
   SAMPLE = {
     words, phrase: phrase || `${words[0]} ${words[1]}`, typo, keys, linked: linked ?? keys[0], far,
     values: kv ? kv.rows.map((r) => r[0]) : [], avg: nv ? round(nv.rows[0][0]) : 0, min: nv ? round(nv.rows[0][1]) : 0, max: nv ? round(nv.rows[0][2]) : 0,
