@@ -126,6 +126,10 @@ impl Naive {
                     })
                     .collect()
             }
+            BoolQuery::Fuzzy { term, edits } => {
+                let a: Vec<char> = term.chars().collect();
+                self.index.iter().filter(|(t, _)| strata::text::fuzzy::within(&a, t, *edits).is_some()).flat_map(|(_, ps)| ps.iter().map(|x| x.0)).collect()
+            }
             BoolQuery::And(cs) => cs.iter().fold((0..self.n).collect(), |acc, c| acc.intersection(&self.eval(c)).copied().collect()),
             BoolQuery::Or(cs) => cs.iter().fold(BTreeSet::new(), |acc, c| acc.union(&self.eval(c)).copied().collect()),
             BoolQuery::Not(c) => {

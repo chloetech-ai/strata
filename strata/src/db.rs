@@ -83,7 +83,16 @@ impl Db {
 
     /// Runs a query against a given snapshot (several queries that must
     /// see the same version share one).
+    ///
+    /// A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs
+    /// as several single-table queries on the same snapshot.
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
+        if crate::query::compound::is_compound(sql, snap.schema()) {
+            return crate::query::compound::run(sql, snap.schema(), params, &mut |text, p| {
+                let select = bind(text, snap.schema(), p)?;
+                self.execute(snap, &select, opts)
+            });
+        }
         let select = bind(sql, snap.schema(), params)?;
         self.execute(snap, &select, opts)
     }
@@ -169,8 +178,13 @@ impl Db {
     /// for a coordinator to sum over shards and pass back through
     /// [`ExecOptions::stats`] ([`crate::cluster`]).
     pub fn term_stats(&self, snap: &Snapshot, select: &Select) -> Result<TermStats> {
+        self.term_stats_with(snap, select, &self.exec)
+    }
+
+    /// [`Db::term_stats`] with options (their synonyms widen the terms).
+    pub fn term_stats_with(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions) -> Result<TermStats> {
         let readers = self.readers(snap)?;
-        Executor::new(snap, &readers, &self.exec).term_stats(select)
+        Executor::new(snap, &readers, opts).term_stats(select)
     }
 
     /// Builds a segment image of `docs` for this schema into `dest` (a new

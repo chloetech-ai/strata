@@ -387,8 +387,8 @@ impl<'a> Binder<'a> {
             Expr::Tuple(items) => Ok(Seeds::Keys(items.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
             Expr::Array(a) => Ok(Seeds::Keys(a.elem.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
             // A list-valued parameter is a list of keys.
-            _ => match self.literal(e) {
-                Ok(Value::List(xs)) => {
+            _ => match self.literal(e).map(as_list) {
+                Ok(Ok(xs)) => {
                     let pk = self.schema.primary_key.ok_or_else(|| err("graph queries need a primary key"))?;
                     Ok(Seeds::Keys(xs.into_iter().map(|x| self.coerce(pk, x)).collect::<Result<_>>()?))
                 }
@@ -784,13 +784,13 @@ impl<'a> Binder<'a> {
                 // A list-valued parameter stands for its values (`IN (:ids)`).
                 let mut values = Vec::with_capacity(list.len());
                 for v in list {
-                    match self.literal(v)? {
-                        Value::List(xs) => {
+                    match as_list(self.literal(v)?) {
+                        Ok(xs) => {
                             for x in xs {
                                 values.push(self.coerce(f, x)?);
                             }
                         }
-                        x => values.push(self.coerce(f, x)?),
+                        Err(x) => values.push(self.coerce(f, x)?),
                     }
                 }
                 let p = if values.is_empty() { Pred::False } else { Pred::In { field: f, values } };
@@ -1045,6 +1045,17 @@ fn next_down(x: f64) -> f64 {
     -next_up(-x)
 }
 
+/// The values of a list-valued parameter. A JSON list of numbers arrives as
+/// a vector of f32, so a vector of whole numbers that f32 holds exactly
+/// counts as a list of integers.
+fn as_list(v: Value) -> std::result::Result<Vec<Value>, Value> {
+    match v {
+        Value::List(xs) => Ok(xs),
+        Value::Vector(xs) if xs.iter().all(|x| x.fract() == 0.0 && x.abs() < 16_777_216.0) => Ok(xs.iter().map(|&x| Value::Int(x as i64)).collect()),
+        v => Err(v),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,7 +1116,7 @@ mod tests {
     fn binds_facets_and_rejects_errors() {
         let s = bind("SELECT category, COUNT(*) FROM docs WHERE MATCH(body, 'x') GROUP BY category ORDER BY 2 DESC LIMIT 5", &schema(), &q())
             .unwrap();
-        assert_eq!(s.group_by, Some(5));
+        assert_eq!(s.group_by, vec![5]);
         assert_eq!(s.order, Some(OrderBy::Count { desc: true }));
         assert_eq!(s.projection[1].1, Projection::Count);
         let s = bind("SELECT category, COUNT(*) FROM docs GROUP BY category ORDER BY 2 DESC, 1 LIMIT 5", &schema(), &q()).unwrap();

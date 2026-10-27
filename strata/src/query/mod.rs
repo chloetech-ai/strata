@@ -6,6 +6,7 @@
 //! * [`stats`]: collection statistics exchanged with a coordinator.
 
 pub mod agg;
+pub mod compound;
 pub mod exec;
 pub mod fusion;
 pub mod logical;

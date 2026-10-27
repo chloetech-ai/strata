@@ -35,8 +35,11 @@ pub struct Metrics {
 
 /// The kind of a query, as its ranking or shape.
 pub fn kind(q: &Select) -> &'static str {
-    if q.group_by.is_some() {
-        return "facet";
+    if !q.group_by.is_empty() {
+        return if q.projection.iter().all(|(_, p)| matches!(p, Projection::Field(_) | Projection::Count)) { "facet" } else { "aggregate" };
+    }
+    if q.projection.iter().any(|(_, p)| matches!(p, Projection::Agg { .. })) {
+        return "aggregate";
     }
     if q.projection.iter().all(|(_, p)| matches!(p, Projection::Count)) {
         return "count";

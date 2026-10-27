@@ -56,6 +56,10 @@ struct Args {
     /// Serve {"embed": "text"} parameters with hashed bag-of-words vectors.
     #[arg(long)]
     hash_embedder: bool,
+    /// Synonyms for `synonyms => 1` searches, one rule per line in Solr's
+    /// format (`laptop, notebook` or `tv => television`); the UI edits it.
+    #[arg(long)]
+    synonyms: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -78,6 +82,7 @@ async fn main() {
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()),
         api_base: a.api_base,
         hash_embedder: a.hash_embedder,
+        synonyms: a.synonyms,
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));

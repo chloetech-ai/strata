@@ -79,5 +79,8 @@ jobs:
           curl -sf -X POST http://127.0.0.1:7700/v1/query -H 'content-type: application/json' \
             -d '{"sql": "SELECT category, COUNT(*) FROM products GROUP BY category ORDER BY 2 DESC LIMIT 5"}' \
             | grep -q '"rows"'
+          curl -sf -X POST http://127.0.0.1:7700/v1/query -H 'content-type: application/json' \
+            -d '{"sql": "WITH top AS (SELECT id FROM products ORDER BY bm25(body, '"'"'jaket'"'"', fuzzy => 1) DESC LIMIT 50) SELECT category, COUNT(*), AVG(price) FROM top GROUP BY category"}' \
+            | grep -q '"rows"'
           curl -sf http://127.0.0.1:7700/metrics | grep -q strata_queries_total
           curl -sf http://127.0.0.1:7700/ | grep -qi '<html'
