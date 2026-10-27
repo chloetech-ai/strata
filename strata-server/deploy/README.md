@@ -41,3 +41,23 @@ strata-server/deploy/kind-test.sh coordinator 2
 strata-server/deploy/kind-test.sh bench two --collection quora --out /data/results \
     --single http://strata-single:7700 --coordinator http://strata-coordinator:7700 --label "2 shards"
 ```
+
+Then, from the same client, the failure and resharding tests (each a
+per-second timeline while one action happens; pin the client with
+`BENCH_NODE` to a node you are not about to freeze):
+
+```bash
+T=strata-server/deploy/kind-test.sh
+Q="--collection quora --out /data/results --concurrency 4"      # bash (word splitting)
+C="--coordinator http://strata-coordinator:7700"
+BENCH_NODE=strata-worker $T bench crash $Q $C --watch 40 --label "watch crash" &
+sleep 15; $T crash strata-shards-2-1; wait          # also: delete POD, pause POD 20
+$T shards 3                                         # the new set beside the old
+$T bench warm $Q --single http://strata-shards-3-0.strata-shards-3:7700 --watch 20 --label warm   # warm each new shard
+$T coordinator 3                                    # move the coordinator (under a --watch run)
+$T delay strata-shards-3-0 5                        # +5 ms to every packet sent to that shard; 0 removes it
+```
+
+The `--watch` output prints one line a second (answers, errors, p50, p99,
+the first error). Results of a full run on a Mac are in
+[`../results/k8s-mac/README.md`](../results/k8s-mac/README.md).

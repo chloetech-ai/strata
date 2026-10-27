@@ -1,0 +1,385 @@
+{
+  "collection": "quora",
+  "coordinator": "http://strata-coordinator:7700",
+  "label": "watch crash",
+  "machine": {
+    "arch": "aarch64",
+    "cores": 4,
+    "cpu": null,
+    "memory_gb": 9.4,
+    "os": "Linux 5.15.49-linuxkit-pr"
+  },
+  "queries": 300,
+  "single": null,
+  "watch": [
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.600834,
+      "ok": 1901,
+      "p50_ms": 1.9535,
+      "p99_ms": 5.284792,
+      "second": 0
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.908250000000001,
+      "ok": 2125,
+      "p50_ms": 1.745166,
+      "p99_ms": 4.510875,
+      "second": 1
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.050667,
+      "ok": 2096,
+      "p50_ms": 1.761708,
+      "p99_ms": 4.547042,
+      "second": 2
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.2059999999999995,
+      "ok": 2034,
+      "p50_ms": 1.7888330000000001,
+      "p99_ms": 4.7275,
+      "second": 3
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.104375,
+      "ok": 2081,
+      "p50_ms": 1.7806250000000001,
+      "p99_ms": 4.407167,
+      "second": 4
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 19.390042,
+      "ok": 1898,
+      "p50_ms": 1.8996659999999999,
+      "p99_ms": 5.469708,
+      "second": 5
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.788417,
+      "ok": 1959,
+      "p50_ms": 1.87375,
+      "p99_ms": 4.7234169999999995,
+      "second": 6
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.160874999999999,
+      "ok": 1905,
+      "p50_ms": 1.945333,
+      "p99_ms": 4.714125,
+      "second": 7
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.702166,
+      "ok": 1810,
+      "p50_ms": 2.0386670000000002,
+      "p99_ms": 4.979417,
+      "second": 8
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.451250000000001,
+      "ok": 1821,
+      "p50_ms": 2.051417,
+      "p99_ms": 5.058667,
+      "second": 9
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 12.079834,
+      "ok": 1608,
+      "p50_ms": 2.28,
+      "p99_ms": 7.1384170000000005,
+      "second": 10
+    },
+    {
+      "errors": 2273,
+      "first_error": "502 Bad Gateway: {\"error\":\"shard http://strata-shards-2-1.strata-shards-2:7701: transport error\"}",
+      "max_ms": 7.557875,
+      "ok": 39,
+      "p50_ms": 3.1265,
+      "p99_ms": 7.557875,
+      "second": 11
+    },
+    {
+      "errors": 151,
+      "first_error": "503 Service Unavailable: {\"error\":\"shard http://strata-shards-2-1.strata-shards-2:7701: dns error\"}",
+      "max_ms": 36.702833999999996,
+      "ok": 5,
+      "p50_ms": 5.216417,
+      "p99_ms": 36.702833999999996,
+      "second": 12
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 190.35670900000002,
+      "ok": 101,
+      "p50_ms": 2.2298750000000003,
+      "p99_ms": 186.007584,
+      "second": 13
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 88.284125,
+      "ok": 151,
+      "p50_ms": 1.7099579999999999,
+      "p99_ms": 88.092583,
+      "second": 14
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 65.562667,
+      "ok": 197,
+      "p50_ms": 1.693708,
+      "p99_ms": 63.342791999999996,
+      "second": 15
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 51.789834,
+      "ok": 265,
+      "p50_ms": 1.534666,
+      "p99_ms": 44.672292,
+      "second": 16
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 39.445375,
+      "ok": 348,
+      "p50_ms": 1.932167,
+      "p99_ms": 37.427292,
+      "second": 17
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 49.05225,
+      "ok": 398,
+      "p50_ms": 2.121084,
+      "p99_ms": 35.96525,
+      "second": 18
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 42.035000000000004,
+      "ok": 478,
+      "p50_ms": 1.769708,
+      "p99_ms": 34.755874999999996,
+      "second": 19
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 33.890167,
+      "ok": 507,
+      "p50_ms": 1.881542,
+      "p99_ms": 32.183249999999994,
+      "second": 20
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 29.0405,
+      "ok": 1330,
+      "p50_ms": 1.913542,
+      "p99_ms": 24.639875,
+      "second": 21
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.179625,
+      "ok": 1624,
+      "p50_ms": 2.264833,
+      "p99_ms": 6.335958,
+      "second": 22
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.497458,
+      "ok": 1589,
+      "p50_ms": 2.31725,
+      "p99_ms": 5.78925,
+      "second": 23
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 100.081542,
+      "ok": 1184,
+      "p50_ms": 2.513167,
+      "p99_ms": 18.898000000000003,
+      "second": 24
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.076291,
+      "ok": 1486,
+      "p50_ms": 2.4547499999999998,
+      "p99_ms": 7.0356250000000005,
+      "second": 25
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 12.921166,
+      "ok": 1501,
+      "p50_ms": 2.504875,
+      "p99_ms": 6.095458,
+      "second": 26
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.7055,
+      "ok": 1563,
+      "p50_ms": 2.343583,
+      "p99_ms": 6.2165,
+      "second": 27
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.428583,
+      "ok": 1489,
+      "p50_ms": 2.5274590000000003,
+      "p99_ms": 5.995833,
+      "second": 28
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.753833,
+      "ok": 1575,
+      "p50_ms": 2.2981249999999998,
+      "p99_ms": 6.206375,
+      "second": 29
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.615792,
+      "ok": 1518,
+      "p50_ms": 2.3920410000000003,
+      "p99_ms": 6.744833000000001,
+      "second": 30
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 12.076625,
+      "ok": 1402,
+      "p50_ms": 2.611417,
+      "p99_ms": 7.325292,
+      "second": 31
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.304042,
+      "ok": 1536,
+      "p50_ms": 2.3692499999999996,
+      "p99_ms": 6.396958000000001,
+      "second": 32
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.819833,
+      "ok": 1489,
+      "p50_ms": 2.460125,
+      "p99_ms": 6.619083000000001,
+      "second": 33
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.952667,
+      "ok": 1529,
+      "p50_ms": 2.402625,
+      "p99_ms": 6.122624999999999,
+      "second": 34
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 14.58725,
+      "ok": 1482,
+      "p50_ms": 2.396791,
+      "p99_ms": 6.776166999999999,
+      "second": 35
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.059084,
+      "ok": 1491,
+      "p50_ms": 2.446083,
+      "p99_ms": 6.483334,
+      "second": 36
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.832875,
+      "ok": 1599,
+      "p50_ms": 2.316417,
+      "p99_ms": 5.832625,
+      "second": 37
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.686375,
+      "ok": 1489,
+      "p50_ms": 2.459541,
+      "p99_ms": 6.573792,
+      "second": 38
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.634917000000002,
+      "ok": 1626,
+      "p50_ms": 2.295875,
+      "p99_ms": 5.394375,
+      "second": 39
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 3.6543330000000003,
+      "ok": 4,
+      "p50_ms": 3.033417,
+      "p99_ms": 3.6543330000000003,
+      "second": 40
+    }
+  ]
+}
