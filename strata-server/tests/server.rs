@@ -238,6 +238,40 @@ async fn concurrent_writes_wait_for_the_writer() {
     assert_eq!(sold(&post(&c, &format!("{base}/v1/query"), count).await.1), sold0 + 120);
 }
 
+/// Write requests that wait together share one commit; one that fails is
+/// not applied at all, and the others sharing its commit still are.
+#[tokio::test(flavor = "multi_thread")]
+async fn grouped_writes_fail_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(create(dir.path(), "g.strata", |i| i < 200));
+    let svc = Arc::new(Service::new(Backend::Local(db.clone()), db.schema().clone(), agent_config("http://unused"), 16, Duration::from_secs(30)));
+    let base = http(svc, None).await;
+    let c = reqwest::Client::new();
+    let sold = |r: &Json| r["rows"][0][0].as_i64().unwrap();
+    let count = json!({"sql": "SELECT sold FROM products WHERE id = 'p0000004'"});
+    let sold0 = sold(&post(&c, &format!("{base}/v1/query"), count.clone()).await.1);
+    let requests: Vec<_> = (0..64)
+        .map(|i| {
+            let (c, base) = (c.clone(), base.clone());
+            tokio::spawn(async move {
+                let mut ops = vec![json!({"op": "add", "key": "p0000004", "field": "sold", "value": 1})];
+                if i % 8 == 0 {
+                    // A key that is already live: this request fails as a whole.
+                    ops.push(json!({"op": "insert", "doc": {"id": "p0000001", "title": "again"}}));
+                }
+                post(&c, &format!("{base}/v1/write"), json!({"ops": ops})).await.0
+            })
+        })
+        .collect();
+    let mut statuses = Vec::new();
+    for r in requests {
+        statuses.push(r.await.unwrap());
+    }
+    assert_eq!(statuses.iter().filter(|&&s| s == 200).count(), 56, "{statuses:?}");
+    assert_eq!(statuses.iter().filter(|&&s| s == 400).count(), 8, "{statuses:?}");
+    assert_eq!(sold(&post(&c, &format!("{base}/v1/query"), count).await.1), sold0 + 56);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_token_guards_the_api() {
     let dir = tempfile::tempdir().unwrap();

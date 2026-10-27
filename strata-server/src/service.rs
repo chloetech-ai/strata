@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
@@ -12,7 +12,7 @@ use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::stats::TermStats;
 use strata::query::{bind, Params};
 use strata::schema::Schema;
-use strata::storage::Snapshot;
+use strata::storage::{Snapshot, WriteTxn};
 use strata::value::Value;
 use tokio::sync::Semaphore;
 
@@ -77,11 +77,22 @@ pub struct Service {
     admission: Semaphore,
     cores: usize,
     running: AtomicUsize,
+    /// The queue of a local database's writer thread ([`writer`]).
+    writes: Option<mpsc::Sender<Queued>>,
 }
 
 impl Service {
     pub fn new(backend: Backend, schema: Schema, agent: AgentConfig, max_concurrent: usize, timeout: Duration) -> Service {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let writes = match &backend {
+            Backend::Local(db) => {
+                let (tx, rx) = mpsc::channel();
+                let db = db.clone();
+                std::thread::Builder::new().name("strata-writer".into()).spawn(move || writer(&db, rx)).expect("spawn the writer thread");
+                Some(tx)
+            }
+            Backend::Cluster(_) => None,
+        };
         Service {
             backend,
             schema,
@@ -95,7 +106,16 @@ impl Service {
             admission: Semaphore::new(max_concurrent.max(1)),
             cores,
             running: AtomicUsize::new(0),
+            writes,
         }
+    }
+
+    /// Hands a write to the writer thread and waits for its commit.
+    async fn write(&self, job: WriteJob, deadline: Instant) -> Result<u64, ApiError> {
+        let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tx.send(Queued { job, deadline, reply }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
+        rx.await.map_err(|_| ApiError::internal("the writer thread stopped"))?
     }
 
     fn local(&self) -> Option<&Arc<Db>> {
@@ -255,14 +275,7 @@ impl Service {
         let t0 = Instant::now();
         let deadline = t0 + if timeout_ms > 0 { Duration::from_millis(timeout_ms) } else { self.timeout };
         let n = match &self.backend {
-            Backend::Local(db) => {
-                let (db, sql, params) = (db.clone(), sql.to_string(), params.clone());
-                let r = tokio::task::spawn_blocking(move || wait_for_writer(deadline, || Ok(db.sql(&sql, &params)?)));
-                match r.await.map_err(ApiError::internal)?? {
-                    SqlResult::Written(n) => n,
-                    SqlResult::Rows(_) => unreachable!("bound as a write"),
-                }
-            }
+            Backend::Local(_) => self.write(WriteJob::Sql(sql.to_string(), params.clone()), deadline).await?,
             Backend::Cluster(c) => c.sql(sql, params).await?,
         };
         self.metrics.write(n);
@@ -270,13 +283,11 @@ impl Service {
     }
 
     /// Applies write operations (see the proto's WriteRequest) in one
-    /// transaction per server.
+    /// transaction per server, which other requests waiting at the same
+    /// time may share (see [`writer`]).
     pub async fn write_ops(self: &Arc<Self>, ops: Vec<Json>) -> Result<u64, ApiError> {
         let n = match &self.backend {
-            Backend::Local(db) => {
-                let (db, deadline) = (db.clone(), Instant::now() + self.timeout);
-                tokio::task::spawn_blocking(move || wait_for_writer(deadline, || apply_ops(&db, &ops))).await.map_err(ApiError::internal)??
-            }
+            Backend::Local(_) => self.write(WriteJob::Ops(ops), Instant::now() + self.timeout).await?,
             Backend::Cluster(c) => c.write_ops(ops).await?,
         };
         self.metrics.write(n);
@@ -339,7 +350,94 @@ pub fn op_key(schema: &Schema, op: &Json) -> Result<Value, ApiError> {
     }
 }
 
-/// Applies `ops` to `db` in one transaction; returns how many wrote.
+/// A write request for the writer thread.
+enum WriteJob {
+    /// Operations of `/v1/write` (or gRPC `Write`).
+    Ops(Vec<Json>),
+    /// An `INSERT`, `UPDATE` or `DELETE`.
+    Sql(String, Params),
+}
+
+struct Queued {
+    job: WriteJob,
+    deadline: Instant,
+    reply: tokio::sync::oneshot::Sender<Result<u64, ApiError>>,
+}
+
+/// Operations one shared transaction takes at most.
+const GROUP_OPS: usize = 4096;
+
+/// The writer of a local database: one thread applying write requests in
+/// the order they arrive. Requests of operations that wait together share
+/// one transaction, so one commit and one disk flush serve them all (group
+/// commit); if one of them fails, each runs again alone, so that only it
+/// fails. SQL writes find their rows by reading the database, which does
+/// not show a transaction's own changes, so they commit alone.
+fn writer(db: &Db, rx: mpsc::Receiver<Queued>) {
+    let mut next = None;
+    loop {
+        let Some(first) = next.take().or_else(|| rx.recv().ok()) else { return };
+        let mut group = vec![first];
+        if matches!(group[0].job, WriteJob::Ops(_)) {
+            let mut n = group[0].ops().len();
+            while n < GROUP_OPS {
+                match rx.try_recv() {
+                    Ok(q) if matches!(q.job, WriteJob::Ops(_)) => {
+                        n += q.ops().len();
+                        group.push(q);
+                    }
+                    Ok(q) => {
+                        next = Some(q);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // A request still queued at its deadline is refused unapplied.
+        let now = Instant::now();
+        let (late, group): (Vec<Queued>, Vec<Queued>) = group.into_iter().partition(|q| q.deadline <= now);
+        for q in late {
+            let _ = q.reply.send(Err(ApiError { status: 503, message: "the deadline passed while waiting for the writer".into() }));
+        }
+        let Some(deadline) = group.iter().map(|q| q.deadline).max() else { continue };
+        if let [Queued { job: WriteJob::Sql(sql, params), .. }] = &group[..] {
+            let r = wait_for_writer(deadline, || match db.sql(sql, params)? {
+                SqlResult::Written(n) => Ok(n),
+                SqlResult::Rows(_) => Err(ApiError::bad("not a write statement")),
+            });
+            let _ = group.into_iter().next().expect("one").reply.send(r);
+            continue;
+        }
+        let requests: Vec<&[Json]> = group.iter().map(|q| q.ops()).collect();
+        match wait_for_writer(deadline, || apply_requests(db, &requests)) {
+            Ok(counts) => {
+                for (q, n) in group.into_iter().zip(counts) {
+                    let _ = q.reply.send(Ok(n));
+                }
+            }
+            Err(e) if group.len() == 1 => {
+                let _ = group.into_iter().next().expect("one").reply.send(Err(e));
+            }
+            Err(_) => {
+                for q in group {
+                    let r = wait_for_writer(q.deadline, || apply_ops(db, q.ops()));
+                    let _ = q.reply.send(r);
+                }
+            }
+        }
+    }
+}
+
+impl Queued {
+    fn ops(&self) -> &[Json] {
+        match &self.job {
+            WriteJob::Ops(ops) => ops,
+            WriteJob::Sql(..) => &[],
+        }
+    }
+}
+
 /// Runs `write` until it gets the writer or `deadline` passes: Strata
 /// answers `Busy` (503) rather than queueing while another write, or a
 /// background merge's commit, holds it. A busy write has changed nothing.
@@ -352,12 +450,28 @@ fn wait_for_writer<T>(deadline: Instant, mut write: impl FnMut() -> Result<T, Ap
     }
 }
 
+/// Applies `ops` to `db` in one transaction; returns how many wrote.
 pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<u64, ApiError> {
+    Ok(apply_requests(db, &[ops])?[0])
+}
+
+/// Applies several requests' operations in one transaction; returns the
+/// rows each wrote.
+fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<Vec<u64>, ApiError> {
     let schema = db.schema().clone();
     let mut t = db.storage().begin()?;
-    let mut n = 0u64;
-    // Values this batch set, for `add` to build on.
+    // Values this transaction set, for `add` to build on.
     let mut seen: HashMap<(String, String), f64> = HashMap::new();
+    let mut counts = Vec::with_capacity(requests.len());
+    for ops in requests {
+        counts.push(apply_into(db, &schema, &mut t, &mut seen, ops)?);
+    }
+    t.commit()?;
+    Ok(counts)
+}
+
+fn apply_into(db: &Db, schema: &Schema, t: &mut WriteTxn<'_>, seen: &mut HashMap<(String, String), f64>, ops: &[Json]) -> Result<u64, ApiError> {
+    let mut n = 0u64;
     for op in ops {
         let kind = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
         let doc = || js::document(&schema, op.get("doc").unwrap_or(&Json::Null));
@@ -406,7 +520,6 @@ pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<u64, ApiError> {
         };
         n += wrote as u64;
     }
-    t.commit()?;
     Ok(n)
 }
 
