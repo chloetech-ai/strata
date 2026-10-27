@@ -1,0 +1,85 @@
+quora: 522931 documents, 1024 dimensions, loaded in 1.0 s
+8-bit codes: 522931 docs, 2819.6 MB, built in 200.5 s
+1-bit codes: 522931 docs, 2351.1 MB, built in 201.4 s
+shard 0 of 2: 261563 docs, 1411.7 MB, built in 103.5 s
+shard 1 of 2: 261368 docs, 1410.6 MB, built in 103.1 s
+exact float32 top 10 of 300 queries in 2.2 s
+8-bit codes, HNSW ef 64 (default)    recall@10 0.990  p50 0.103 ms  p99 0.149 ms
+8-bit codes, HNSW ef 320             recall@10 0.996  p50 0.330 ms  p99 0.474 ms
+8-bit codes, exact scan              recall@10 1.000  p50 13.703 ms  p99 16.571 ms
+1-bit codes, HNSW (breadth 320)      recall@10 0.995  p50 0.389 ms  p99 2.382 ms
+1-bit codes, exact scan              recall@10 1.000  p50 22.623 ms  p99 23.450 ms
+one database bm25                     c=1       4029 q/s  p50   0.208 ms  p99   0.977 ms  server p50   0.119 ms  errors 0
+one database bm25                     c=4      12472 q/s  p50   0.259 ms  p99   1.358 ms  server p50   0.178 ms  errors 0
+one database bm25                     c=16     17611 q/s  p50   0.712 ms  p99   3.950 ms  server p50   0.300 ms  errors 0
+one database bm25 + filter            c=1       2708 q/s  p50   0.306 ms  p99   1.322 ms  server p50   0.218 ms  errors 0
+one database bm25 + filter            c=4       8289 q/s  p50   0.391 ms  p99   1.857 ms  server p50   0.311 ms  errors 0
+one database bm25 + filter            c=16     12390 q/s  p50   1.045 ms  p99   4.967 ms  server p50   0.621 ms  errors 0
+one database vector                   c=1       3966 q/s  p50   0.249 ms  p99   0.376 ms  server p50   0.126 ms  errors 0
+one database vector                   c=4      10545 q/s  p50   0.355 ms  p99   0.719 ms  server p50   0.194 ms  errors 0
+one database vector                   c=16     14102 q/s  p50   0.949 ms  p99   4.469 ms  server p50   0.284 ms  errors 0
+one database vector + filter          c=1       2887 q/s  p50   0.338 ms  p99   0.505 ms  server p50   0.201 ms  errors 0
+one database vector + filter          c=4       7230 q/s  p50   0.525 ms  p99   1.004 ms  server p50   0.339 ms  errors 0
+one database vector + filter          c=16      8510 q/s  p50   1.565 ms  p99   7.881 ms  server p50   0.667 ms  errors 0
+one database hybrid (RRF)             c=1       1672 q/s  p50   0.544 ms  p99   1.449 ms  server p50   0.403 ms  errors 0
+one database hybrid (RRF)             c=4       4007 q/s  p50   0.899 ms  p99   2.486 ms  server p50   0.670 ms  errors 0
+one database hybrid (RRF)             c=16      5519 q/s  p50   2.214 ms  p99  14.875 ms  server p50   1.184 ms  errors 0
+one database hybrid (weighted)        c=1       1575 q/s  p50   0.581 ms  p99   1.518 ms  server p50   0.438 ms  errors 0
+one database hybrid (weighted)        c=4       3791 q/s  p50   0.955 ms  p99   2.614 ms  server p50   0.724 ms  errors 0
+one database hybrid (weighted)        c=16      5311 q/s  p50   2.375 ms  p99  13.572 ms  server p50   1.359 ms  errors 0
+one database boosted (bm25 × decay)   c=1       2493 q/s  p50   0.342 ms  p99   1.271 ms  server p50   0.249 ms  errors 0
+one database boosted (bm25 × decay)   c=4       6951 q/s  p50   0.487 ms  p99   1.881 ms  server p50   0.374 ms  errors 0
+one database boosted (bm25 × decay)   c=16     11224 q/s  p50   1.190 ms  p99   4.965 ms  server p50   0.719 ms  errors 0
+one database facet                    c=1      11738 q/s  p50   0.074 ms  p99   0.233 ms  server p50   0.038 ms  errors 0
+one database facet                    c=4      23188 q/s  p50   0.151 ms  p99   0.432 ms  server p50   0.071 ms  errors 0
+one database facet                    c=16     34130 q/s  p50   0.426 ms  p99   1.357 ms  server p50   0.111 ms  errors 0
+one database key lookup               c=1      15882 q/s  p50   0.060 ms  p99   0.097 ms  server p50   0.027 ms  errors 0
+one database key lookup               c=4      30960 q/s  p50   0.121 ms  p99   0.255 ms  server p50   0.047 ms  errors 0
+one database key lookup               c=16     43807 q/s  p50   0.344 ms  p99   0.804 ms  server p50   0.072 ms  errors 0
+1-bit codes  vector                   c=1       1786 q/s  p50   0.553 ms  p99   0.766 ms  server p50   0.414 ms  errors 0
+1-bit codes  vector                   c=4       4809 q/s  p50   0.807 ms  p99   1.349 ms  server p50   0.611 ms  errors 0
+1-bit codes  vector                   c=16      6688 q/s  p50   2.050 ms  p99   8.617 ms  server p50   1.210 ms  errors 0
+1-bit codes  vector + filter          c=1        819 q/s  p50   1.216 ms  p99   1.584 ms  server p50   1.069 ms  errors 0
+1-bit codes  vector + filter          c=4       2021 q/s  p50   1.941 ms  p99   3.081 ms  server p50   1.724 ms  errors 0
+1-bit codes  vector + filter          c=16      2820 q/s  p50   4.052 ms  p99  40.523 ms  server p50   3.172 ms  errors 0
+1-bit codes  hybrid (RRF)             c=1        737 q/s  p50   1.284 ms  p99   2.149 ms  server p50   1.133 ms  errors 0
+1-bit codes  hybrid (RRF)             c=4       1988 q/s  p50   1.932 ms  p99   3.423 ms  server p50   1.716 ms  errors 0
+1-bit codes  hybrid (RRF)             c=16      2662 q/s  p50   4.237 ms  p99  43.006 ms  server p50   3.317 ms  errors 0
+1-bit codes  hybrid (weighted)        c=1        724 q/s  p50   1.331 ms  p99   2.226 ms  server p50   1.176 ms  errors 0
+1-bit codes  hybrid (weighted)        c=4       1838 q/s  p50   2.071 ms  p99   3.681 ms  server p50   1.849 ms  errors 0
+1-bit codes  hybrid (weighted)        c=16      2491 q/s  p50   4.454 ms  p99  47.177 ms  server p50   3.494 ms  errors 0
+write in-place update (one per request)  c=1       189 writes/s  p50 5.040 ms  p99 8.149 ms  errors 0
+write in-place update (one per request)  c=4       198 writes/s  p50 5.086 ms  p99 214.941 ms  errors 0
+write in-place update (one per request)  c=16      197 writes/s  p50 5.759 ms  p99 711.558 ms  errors 0
+write SQL UPDATE by key                  c=1       171 writes/s  p50 5.914 ms  p99 7.682 ms  errors 0
+write SQL UPDATE by key                  c=4       188 writes/s  p50 5.442 ms  p99 181.833 ms  errors 0
+write SQL UPDATE by key                  c=16      194 writes/s  p50 6.076 ms  p99 670.370 ms  errors 0
+write inserts, 100 per request: 1213 docs/s, p50 82.6 ms per request, errors 0
+2 shards     bm25                     c=1       2407 q/s  p50   0.388 ms  p99   0.843 ms  server p50   0.331 ms  errors 0
+2 shards     bm25                     c=4       4660 q/s  p50   0.825 ms  p99   1.500 ms  server p50   0.737 ms  errors 0
+2 shards     bm25                     c=16      3828 q/s  p50   4.068 ms  p99   6.211 ms  server p50   3.427 ms  errors 0
+2 shards     bm25 + filter            c=1       1261 q/s  p50   0.747 ms  p99   1.443 ms  server p50   0.658 ms  errors 0
+2 shards     bm25 + filter            c=4       2617 q/s  p50   1.384 ms  p99   3.392 ms  server p50   1.280 ms  errors 0
+2 shards     bm25 + filter            c=16      2255 q/s  p50   7.024 ms  p99  10.342 ms  server p50   5.946 ms  errors 0
+2 shards     vector                   c=1       2667 q/s  p50   0.361 ms  p99   0.621 ms  server p50   0.255 ms  errors 0
+2 shards     vector                   c=4       5484 q/s  p50   0.708 ms  p99   1.173 ms  server p50   0.536 ms  errors 0
+2 shards     vector                   c=16      6141 q/s  p50   2.524 ms  p99   4.497 ms  server p50   1.855 ms  errors 0
+2 shards     vector + filter          c=1       1851 q/s  p50   0.526 ms  p99   0.860 ms  server p50   0.384 ms  errors 0
+2 shards     vector + filter          c=4       3011 q/s  p50   1.308 ms  p99   2.029 ms  server p50   1.006 ms  errors 0
+2 shards     vector + filter          c=16      2772 q/s  p50   5.353 ms  p99  14.840 ms  server p50   4.242 ms  errors 0
+2 shards     hybrid (RRF)             c=1        550 q/s  p50   1.755 ms  p99   2.806 ms  server p50   1.558 ms  errors 0
+2 shards     hybrid (RRF)             c=4        973 q/s  p50   4.018 ms  p99   6.628 ms  server p50   3.573 ms  errors 0
+2 shards     hybrid (RRF)             c=16       970 q/s  p50  15.674 ms  p99  33.071 ms  server p50  13.489 ms  errors 0
+2 shards     hybrid (weighted)        c=1        533 q/s  p50   1.806 ms  p99   2.835 ms  server p50   1.602 ms  errors 0
+2 shards     hybrid (weighted)        c=4        841 q/s  p50   4.586 ms  p99   7.237 ms  server p50   4.167 ms  errors 0
+2 shards     hybrid (weighted)        c=16       888 q/s  p50  17.387 ms  p99  31.972 ms  server p50  14.872 ms  errors 0
+2 shards     boosted (bm25 × decay)   c=1        725 q/s  p50   1.308 ms  p99   2.292 ms  server p50   1.184 ms  errors 0
+2 shards     boosted (bm25 × decay)   c=4       1190 q/s  p50   3.336 ms  p99   4.873 ms  server p50   3.129 ms  errors 0
+2 shards     boosted (bm25 × decay)   c=16      1380 q/s  p50  11.412 ms  p99  17.162 ms  server p50   9.715 ms  errors 0
+2 shards     facet                    c=1       4119 q/s  p50   0.229 ms  p99   0.493 ms  server p50   0.181 ms  errors 0
+2 shards     facet                    c=4       6964 q/s  p50   0.558 ms  p99   0.950 ms  server p50   0.443 ms  errors 0
+2 shards     facet                    c=16      9480 q/s  p50   1.649 ms  p99   2.719 ms  server p50   1.200 ms  errors 0
+2 shards     key lookup               c=1       6139 q/s  p50   0.152 ms  p99   0.323 ms  server p50   0.108 ms  errors 0
+2 shards     key lookup               c=4      10320 q/s  p50   0.375 ms  p99   0.640 ms  server p50   0.279 ms  errors 0
+2 shards     key lookup               c=16     13861 q/s  p50   1.133 ms  p99   1.831 ms  server p50   0.799 ms  errors 0
+wrote results/bench/quora.json

@@ -124,3 +124,41 @@ Observations:
   row is 1.5–8× faster, so the aarch64 Hamming-scan path may be worth a look.
 - HNSW builds take 136–146 s on the M2 against 362–377 s on the cloud. HNSW
   queries are 3–5× faster at p50.
+
+## Step 4: end-to-end benchmark (`strata-server-bench`, quora)
+
+Run from `strata-server/` at cb1e924 (this branch after merging 2360e07
+"strata-server-bench: end-to-end benchmark on a BEIR collection"), exactly as
+the file's header says for a laptop run:
+
+    STRATA_DATA=/Users/rkonow/code2/bench-data/beir caffeinate -i cargo run --release \
+        --bin strata-server-bench -- --collection quora --work /Users/rkonow/code2/bench-work/server-quora
+
+Defaults: 300 queries, 4 build threads, clients 1/4/16, 8 s per kind and client
+count, 2 shards. Started 17:49:37 UTC (load 4.52), finished 18:10:20 UTC, wall
+1243 s (20.7 min), exit 0, no errors in any phase. The load average at the end
+was 8.79 because the clients run in the same process and share the 8 cores with
+the server. Working databases take 10 GB in `--work`, outside the repo.
+
+- JSON: `strata-server/results/bench/quora.json`
+- printed tables: `results/laptop/strata-server-bench-quora.md`
+- progress lines as printed: `results/laptop/strata-server-bench-quora.log`
+
+Things worth a look in the report:
+- **Size.** The 8-bit database is 2,820 MB (5,392 B/doc) and the 1-bit one
+  2,351 MB, because float32 vectors (2,142 MB) dominate both files. The 1-bit codes
+  cut what a search keeps in memory from 536 MB to 67 MB, but the file shrinks
+  only 17%.
+- **Vector recall on real vectors.** 8-bit HNSW at ef 64 gives 0.990 at p50 0.10 ms.
+  1-bit HNSW (breadth 320) gives 0.995 at p50 0.39 ms, but its p99 is 2.4 ms.
+- **Writes are bound by fsync.** About 190 writes/s at every client count, with
+  p50 about 5 ms, which fits macOS `F_FULLFSYNC`. p99 rises to 215 ms at 4 clients
+  and 712 ms at 16, so concurrent writers queue rather than share a commit.
+- **Two shards on one machine are slower than one database.** BM25 at 16
+  clients: 3,828 q/s against 17,611, and hybrid RRF at 16 clients: 970 against
+  5,519. Expected with gRPC over localhost and everything on 8 cores.
+- **Shard agreement.** BM25 has the same top 10 in only 20 of 50 queries but the
+  same scores in 50 of 50, so these are tie swaps. Hybrid RRF agrees in 20 of 50,
+  and its recall@10 drops from 0.972 (one database) to 0.942 (shards).
+- With 1-bit codes, the filtered-vector and hybrid p99 at 16 clients is
+  40–47 ms, against 8–15 ms with 8-bit codes.
