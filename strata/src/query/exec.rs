@@ -5,7 +5,7 @@
 mod graph;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -14,19 +14,24 @@ use crate::error::{Error, Result};
 use crate::forward::{self, DocStore, KeywordColumn, NumericColumn, RangeIndex, RangeStrategy};
 use crate::graph::GraphReader;
 use crate::query::fusion::{self, Norm};
-use crate::query::logical::{Decay, OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak};
+use crate::query::agg;
+use crate::query::logical::{Decay, Expand, OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::stats::{FieldStats, TermStats};
 use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
 use crate::storage::{KeyRef, SegmentView, Snapshot, Updates};
-use crate::text::{self, Bm25Params, CollectionStats, FilterStrategy, TextFieldReader, TopKAlgo};
+use crate::text::{self, Bm25Params, BoolQuery, CollectionStats, FilterStrategy, Synonyms, TextFieldReader, TopKAlgo};
 use crate::value::Value;
 use crate::vector::{self, SearchParams, VectorReader};
 
 /// Rows returned by ranked queries without a LIMIT.
 pub const DEFAULT_K: usize = 100;
+
+/// Terms a typo-tolerant word adds to a ranked query at most (the nearest,
+/// then the most frequent), as Elasticsearch's `max_expansions`.
+pub const MAX_FUZZY_TERMS: usize = 50;
 
 /// Readers of one segment's indexes, by schema field. Each opens on first
 /// use (opening only parses headers: every structure is a zero-copy view),
@@ -187,6 +192,8 @@ pub struct ExecOptions {
     /// Fail with `Error::Timeout` once this has passed (checked between
     /// segments).
     pub deadline: Option<Instant>,
+    /// The synonym list `synonyms => 1` expands searches with.
+    pub synonyms: Option<Arc<Synonyms>>,
 }
 
 impl Default for ExecOptions {
@@ -204,6 +211,7 @@ impl Default for ExecOptions {
             shard: false,
             threads: 1,
             deadline: None,
+            synonyms: None,
         }
     }
 }
@@ -342,6 +350,18 @@ pub struct Executor<'a> {
     /// Shard mode: the fused query's candidates, each input's scores of
     /// them, and whether each is in each input's top `depth`.
     parts: Option<(Vec<(usize, DocId)>, Vec<Vec<f32>>, Vec<Vec<bool>>)>,
+    /// Expanded searches, worked out once for every segment.
+    expanded: Mutex<Expanded>,
+}
+
+/// Searches with their synonyms and typos resolved to indexed terms.
+#[derive(Default)]
+struct Expanded {
+    /// `MATCH` queries by field, text and options.
+    matches: HashMap<(usize, String, Expand), Arc<BoolQuery>>,
+    /// Indexed terms near a term: (term, documents, edits), by field, term
+    /// and edits.
+    near: HashMap<(usize, String, u8), Arc<Vec<(String, u64, u8)>>>,
 }
 
 fn err(m: impl Into<String>) -> Error {
@@ -369,6 +389,7 @@ impl<'a> Executor<'a> {
             graphs: Vec::new(),
             readers_all: readers.to_vec(),
             parts: None,
+            expanded: Mutex::new(Expanded::default()),
         }
     }
 
@@ -380,7 +401,7 @@ impl<'a> Executor<'a> {
         bm25_leaves(q, &mut leaves);
         let mut out = TermStats::default();
         for (field, text, opts) in leaves {
-            let terms = query_terms(text, opts);
+            let terms: Vec<String> = self.bm25_terms(field, text, opts)?.into_iter().map(|(t, _)| t).collect();
             let c = self.local_stats(field, &terms)?;
             out.merge_field(&self.schema.fields[field].name, FieldStats::from_collection(&c));
         }
@@ -394,8 +415,12 @@ impl<'a> Executor<'a> {
         }
         self.run_graphs(&q.graphs)?;
         let empty = |columns, rows, stats| ResultSet { columns, rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
-        if let Some(g) = q.group_by {
-            let rows = self.facets(q, g)?;
+        if !q.group_by.is_empty() || agg::is_general(q, |f| self.facet_field(f)) {
+            let needed = agg::needed(q);
+            let groups = if agg::is_general(q, |f| self.facet_field(f)) { self.aggregate(q, &needed)? } else { self.facets(q, q.group_by[0], &needed)? };
+            // Shards return every group with partial aggregates, for the
+            // coordinator to combine.
+            let rows = if self.opts.shard { groups.partial_rows() } else { agg::finish(q, groups, &needed) };
             return Ok(empty(columns, rows, self.stats));
         }
         let has_count = q.projection.iter().any(|(_, p)| *p == Projection::Count);
@@ -430,8 +455,8 @@ impl<'a> Executor<'a> {
     /// The rows of a query without facets or counts, in order, before
     /// OFFSET (graph seeds from a subquery use these).
     fn select_hits(&mut self, q: &Select) -> Result<Vec<Hit>> {
-        if q.group_by.is_some() || q.projection.iter().any(|(_, p)| *p == Projection::Count) {
-            return Err(err("a seed subquery returns rows, not counts"));
+        if !q.group_by.is_empty() || q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. })) {
+            return Err(err("a seed subquery returns rows, not counts or aggregates"));
         }
         self.run_graphs(&q.graphs)?;
         let hits = self.ordered_hits(q)?;
@@ -614,8 +639,8 @@ impl<'a> Executor<'a> {
         Ok(match p {
             Pred::True => DocSet::all(n),
             Pred::False => DocSet::empty(n),
-            Pred::Match { field, query } => {
-                let q = text::parse_match(query)?;
+            Pred::Match { field, query, expand } => {
+                let q = self.match_query(*field, query, expand)?;
                 self.text(s, *field)?.eval(&q, None)
             }
             Pred::Range { field, lo, hi } if self.schema.fields[*field].multi => {
@@ -971,6 +996,195 @@ impl<'a> Executor<'a> {
         Ok(st)
     }
 
+    fn synonyms(&self) -> Result<&Synonyms> {
+        self.opts.synonyms.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+            err("synonyms => 1, but no synonym list is loaded (strata-server --synonyms FILE, or PUT /v1/synonyms)")
+        })
+    }
+
+    /// The indexed terms of `field` within `edits` edits of `term` in any
+    /// segment, with their document counts and distances.
+    fn near_terms(&self, field: usize, term: &str, edits: u8) -> Result<Arc<Vec<(String, u64, u8)>>> {
+        let key = (field, term.to_string(), edits);
+        if let Some(v) = self.expanded.lock().unwrap_or_else(|e| e.into_inner()).near.get(&key) {
+            return Ok(v.clone());
+        }
+        let mut found: HashMap<String, (u64, u8)> = HashMap::new();
+        for s in &self.segs {
+            for (t, info, d) in self.text(unsafe_extend(s), field)?.fuzzy_terms(term, edits) {
+                found.entry(t).or_insert((0, d)).0 += info.df as u64;
+            }
+        }
+        let mut v: Vec<(String, u64, u8)> = found.into_iter().map(|(t, (df, d))| (t, df, d)).collect();
+        v.sort_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+        let v = Arc::new(v);
+        self.expanded.lock().unwrap_or_else(|e| e.into_inner()).near.insert(key, v.clone());
+        Ok(v)
+    }
+
+    /// A `MATCH` query with its synonyms and typos expanded to the indexed
+    /// terms of every segment (so each segment evaluates the same terms).
+    fn match_query(&self, field: usize, query: &str, expand: &Expand) -> Result<Arc<BoolQuery>> {
+        let key = (field, query.to_string(), *expand);
+        if let Some(q) = self.expanded.lock().unwrap_or_else(|e| e.into_inner()).matches.get(&key) {
+            return Ok(q.clone());
+        }
+        let mut q = text::parse_match(query)?;
+        if !expand.is_none() {
+            let syn = if expand.synonyms { Some(self.synonyms()?) } else { None };
+            let edits = |t: &str| expand.fuzzy.map_or(0, |f| f.edits(t.chars().count()));
+            q = text::query::expand(q, syn, &edits);
+        }
+        let mut failed = None;
+        q = text::query::resolve_fuzzy(q, &mut |t, e| match self.near_terms(field, t, e) {
+            Ok(v) => v.iter().map(|x| x.0.clone()).collect(),
+            Err(e) => {
+                failed = Some(e);
+                Vec::new()
+            }
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        let q = Arc::new(q);
+        self.expanded.lock().unwrap_or_else(|e| e.into_inner()).matches.insert(key, q.clone());
+        Ok(q)
+    }
+
+    /// The weighted terms of `bm25(field, text, ...)`: the query's own
+    /// (weight 1), then its synonyms' (1) and its typo-tolerant words'
+    /// nearest indexed terms (`1 − edits / length`).
+    fn bm25_terms(&self, field: usize, text: &str, opts: &Opts) -> Result<Vec<(String, f32)>> {
+        let base = query_terms(text, opts);
+        let expand = Expand::from_opts(opts).map_err(err)?;
+        let mut out: Vec<(String, f32)> = base.iter().map(|t| (t.clone(), 1.0)).collect();
+        let add = |t: &str, w: f32, out: &mut Vec<(String, f32)>| {
+            if !out.iter().any(|(x, _)| x == t) {
+                out.push((t.to_string(), w));
+            }
+        };
+        if expand.synonyms {
+            let syn = self.synonyms()?;
+            for i in 0..base.len() {
+                for len in 1..=syn.max_len().min(base.len() - i) {
+                    for alt in syn.get(&base[i..i + len]) {
+                        for t in alt {
+                            add(t, 1.0, &mut out);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(fz) = expand.fuzzy {
+            for t in &base {
+                let len = t.chars().count();
+                let e = fz.edits(len);
+                if e == 0 {
+                    continue;
+                }
+                for (near, _, d) in self.near_terms(field, t, e)?.iter().filter(|x| x.2 > 0).take(MAX_FUZZY_TERMS) {
+                    add(near, text::fuzzy::weight(*d, len), &mut out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether facets can count `field`'s values (a keyword column).
+    fn facet_field(&self, field: usize) -> bool {
+        let f = &self.schema.fields[field];
+        f.ty == FieldType::Keyword || (f.ty == FieldType::Int && f.multi)
+    }
+
+    /// Document `d`'s values of `field` for aggregates: one for a
+    /// single-valued field (none when missing), each of a multi-valued
+    /// field's (from `multi`, the documents' value codes).
+    fn agg_values(&self, s: &'a Seg, field: usize, d: DocId, multi: &HashMap<usize, HashMap<DocId, Vec<u32>>>, out: &mut Vec<Value>) -> Result<()> {
+        out.clear();
+        let f = &self.schema.fields[field];
+        if let Some(codes) = multi.get(&field) {
+            let kw = self.keyword(s, field)?;
+            for &c in codes.get(&d).map_or(&[][..], |v| v.as_slice()) {
+                let v = kw.value(c);
+                out.push(if f.ty == FieldType::Int { forward::int_of_key(v).map_or(Value::Null, Value::Int) } else { Value::Str(v.to_string()) });
+            }
+            return Ok(());
+        }
+        let v = match f.ty {
+            FieldType::Keyword => self.keyword(s, field)?.value_of_doc(d).map_or(Value::Null, |v| Value::Str(v.to_string())),
+            _ => match self.updates(s, field).and_then(|u| u.get(field, d)) {
+                Some(v) => v.clone(),
+                None => self.numeric(s, field)?.col().get(d),
+            },
+        };
+        if !matches!(v, Value::Null) {
+            out.push(v);
+        }
+        Ok(())
+    }
+
+    /// Groups and aggregates, document by document (anything beyond a
+    /// facet's counts).
+    fn aggregate(&mut self, q: &Select, needed: &[Projection]) -> Result<agg::Groups> {
+        let mut fields: Vec<usize> = q.group_by.clone();
+        for p in needed {
+            if let Projection::Agg { field, .. } = p {
+                if !fields.contains(field) {
+                    fields.push(*field);
+                }
+            }
+        }
+        let mut groups = agg::Groups::default();
+        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
+        let (mut vals, mut gv) = (Vec::new(), Vec::new());
+        for s in segs {
+            self.check_deadline()?;
+            let set = self.filter_set(s, &q.filter)?;
+            self.stats.plan.push(format!("seg {}: aggregate {} rows into groups of {}", s.ord, set.len(), q.group_by.len()));
+            // Multi-valued fields: each document's value codes, from the postings.
+            let mut multi: HashMap<usize, HashMap<DocId, Vec<u32>>> = HashMap::new();
+            for &f in &fields {
+                if self.schema.fields[f].multi {
+                    let kw = self.keyword(s, f)?;
+                    let mut m: HashMap<DocId, Vec<u32>> = HashMap::new();
+                    for c in 0..kw.n_values() as u32 {
+                        for d in kw.docs_code(c).intersect(&set).iter() {
+                            m.entry(d).or_default().push(c);
+                        }
+                    }
+                    multi.insert(f, m);
+                }
+            }
+            for d in set.iter() {
+                // A document belongs to one group per combination of its
+                // group values.
+                let mut keys: Vec<Vec<agg::Part>> = vec![Vec::new()];
+                for &g in &q.group_by {
+                    self.agg_values(s, g, d, &multi, &mut gv)?;
+                    if gv.is_empty() {
+                        gv.push(Value::Null);
+                    }
+                    keys = keys.into_iter().flat_map(|k| gv.iter().map(move |v| [k.clone(), vec![agg::Part::of(v)]].concat())).collect();
+                }
+                for key in keys {
+                    let accs = groups.entry(key, needed);
+                    for (a, p) in accs.iter_mut().zip(needed) {
+                        match p {
+                            Projection::Agg { field, .. } => {
+                                self.agg_values(s, *field, d, &multi, &mut vals)?;
+                                for v in &vals {
+                                    a.add(v);
+                                }
+                            }
+                            _ => a.add_row(),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(groups)
+    }
+
     /// `Error::Timeout` once [`ExecOptions::deadline`] has passed.
     fn check_deadline(&self) -> Result<()> {
         match self.opts.deadline {
@@ -999,16 +1213,22 @@ impl<'a> Executor<'a> {
     /// The top `k` rows by BM25; with `ties`, also every row tied with the
     /// `k`-th.
     fn bm25_top(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize, ties: bool) -> Result<Vec<Hit>> {
-        let terms = query_terms(query, opts);
+        let terms = self.bm25_terms(field, query, opts)?;
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let stats = self.collection_stats(field, &terms)?;
+        let names: Vec<String> = terms.iter().map(|(t, _)| t.clone()).collect();
+        let n_base = query_terms(query, opts).len();
+        if terms.len() > n_base {
+            let added: Vec<&str> = names[n_base..].iter().map(|t| t.as_str()).collect();
+            self.stats.plan.push(format!("bm25 expanded with {} terms: {}", added.len(), added.join(", ")));
+        }
+        let stats = self.collection_stats(field, &names)?;
         let (params, algo) = self.bm25_params(opts);
         let per = self.per_segment(|ex, s, l| {
             let t = ex.text(s, field)?;
             // Block-Max WAND fully scores a fraction of the postings it meets.
-            let candidates = terms.iter().map(|w| t.doc_freq(w) as f64).sum::<f64>() * 0.3;
+            let candidates = names.iter().map(|w| t.doc_freq(w) as f64).sum::<f64>() * 0.3;
             let mode = match ex.opts.filter_mode {
                 Some(m) => m,
                 None => {
@@ -1017,7 +1237,7 @@ impl<'a> Executor<'a> {
                 }
             };
             let f = ex.seg_filter_l(s, p, mode, l)?;
-            let hits = if ties { t.top_k_ties(&terms, &stats, params, k, f.as_dyn(), algo) } else { t.top_k(&terms, &stats, params, k, f.as_dyn(), algo) };
+            let hits = t.top_k_weighted(&terms, &stats, params, k, f.as_dyn(), algo, ties);
             l.plan.push(format!("seg {}: bm25 {algo:?}, filter {mode:?}", s.ord));
             Ok(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }).collect::<Vec<_>>())
         })?;
@@ -1277,13 +1497,14 @@ impl<'a> Executor<'a> {
         let by_seg = group_by_seg(cands);
         match score {
             Score::Bm25 { field, text: q, opts } => {
-                let terms = query_terms(q, opts);
-                let stats = self.collection_stats(*field, &terms)?;
+                let terms = self.bm25_terms(*field, q, opts)?;
+                let names: Vec<String> = terms.iter().map(|(t, _)| t.clone()).collect();
+                let stats = self.collection_stats(*field, &names)?;
                 let (params, _) = self.bm25_params(opts);
                 for (seg, range) in by_seg {
                     let s = self.seg_by_ord(seg);
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
-                    let sc = self.text(s, *field)?.score(&terms, &stats, params, &docs);
+                    let sc = self.text(s, *field)?.score_weighted(&terms, &stats, params, &docs);
                     out[range].copy_from_slice(&sc);
                 }
             }
@@ -1336,7 +1557,9 @@ impl<'a> Executor<'a> {
 
     // ---- facets ----------------------------------------------------------
 
-    fn facets(&mut self, q: &Select, g: usize) -> Result<Vec<Vec<Value>>> {
+    /// The groups of one keyword field and their counts, from the field's
+    /// facet counters (no per-document work).
+    fn facets(&mut self, q: &Select, g: usize, needed: &[Projection]) -> Result<agg::Groups> {
         let mut counts: HashMap<String, u64> = HashMap::new();
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
@@ -1354,35 +1577,16 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        let mut groups: Vec<(String, u64)> = counts.into_iter().collect();
-        let value_desc = matches!(q.tiebreak, Some(Tiebreak::GroupValue { desc: true }));
-        match q.order {
-            Some(OrderBy::GroupValue { desc }) => groups.sort_by(|a, b| if desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) }),
-            Some(OrderBy::Count { desc: false }) => {
-                groups.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| if value_desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) }))
-            }
-            _ => groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| if value_desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) })),
-        }
-        let (skip, take) = if self.opts.shard { (0, usize::MAX) } else { (q.offset, q.limit.unwrap_or(usize::MAX)) };
-        // Groups of a multi-valued INT field sort as int_key strings, which
-        // is numeric order, and print as integers.
+        // A multi-valued INT field's values are int_key strings.
         let ints = self.schema.fields[g].ty == FieldType::Int;
-        let rows = groups
-            .into_iter()
-            .skip(skip)
-            .take(take)
-            .map(|(v, c)| {
-                q.projection
-                    .iter()
-                    .map(|(_, p)| match p {
-                        Projection::Count => Value::Int(c as i64),
-                        _ if ints => forward::int_of_key(&v).map_or(Value::Null, Value::Int),
-                        _ => Value::Str(v.clone()),
-                    })
-                    .collect()
-            })
-            .collect();
-        Ok(rows)
+        let mut groups = agg::Groups::default();
+        for (v, c) in counts {
+            let key = if ints { forward::int_of_key(&v).map_or(agg::Part::Null, agg::Part::Int) } else { agg::Part::Str(v) };
+            for a in groups.entry(vec![key], needed) {
+                *a = agg::Acc::Count(c as i64);
+            }
+        }
+        Ok(groups)
     }
 
     // ---- output ----------------------------------------------------------
@@ -1432,7 +1636,7 @@ impl<'a> Executor<'a> {
             for (_, p) in &q.projection {
                 row.push(match p {
                     Projection::Score => Value::Float(h.score),
-                    Projection::Count => Value::Null,
+                    Projection::Count | Projection::Agg { .. } => Value::Null,
                     Projection::Hops(g) => self.hops_of(*g, h.seg, h.doc).map_or(Value::Null, |x| Value::Int(x as i64)),
                     Projection::Field(i) if Some(*i) == self.schema.primary_key => self.key(h),
                     Projection::Field(i) if self.updates(s, *i).is_some_and(|u| u.get(*i, h.doc).is_some()) => {
@@ -1557,14 +1761,14 @@ impl Estimator for SegEst<'_, '_> {
     fn n_docs(&self) -> f64 {
         self.s.view.n_live as f64
     }
-    fn match_count(&self, field: usize, query: &str) -> f64 {
-        match (self.s.r.text(field).ok().flatten(), text::parse_match(query)) {
+    fn match_count(&self, field: usize, query: &str, expand: &Expand) -> f64 {
+        match (self.s.r.text(field).ok().flatten(), self.ex.match_query(field, query, expand)) {
             (Some(t), Ok(q)) => t.estimate(&q),
             _ => self.n_docs(),
         }
     }
-    fn match_postings(&self, field: usize, query: &str) -> f64 {
-        match (self.s.r.text(field).ok().flatten(), text::parse_match(query)) {
+    fn match_postings(&self, field: usize, query: &str, expand: &Expand) -> f64 {
+        match (self.s.r.text(field).ok().flatten(), self.ex.match_query(field, query, expand)) {
             (Some(t), Ok(q)) => t.eval_cost(&q),
             _ => self.n_docs(),
         }
