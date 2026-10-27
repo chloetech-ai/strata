@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The Strata scale probe (notes/scale.md): MS MARCO v2.1 passages with Arctic
 # Embed M v1.5 vectors cut to 256-d, loaded, merged and queried at 1M, 2M and
-# 5M passages, then 5M at 57, 19, 7 and 3 segments.
+# 5M passages, then 5M at 57, 19, 7 and 5 segments.
 #
 # Usage, from strata/: scripts/scale_probe.sh [phase ...]
 #   phases: gt growth seg-load seg-merge (default: all, in that order;
+#   seg-merge is merge19 merge7 merge5, which can also run alone;
 #   seg-merge needs only meta.json and centroids.f32 of $DATA, so the
 #   passages can be removed after seg-load where disk is short)
 # Inputs (prepared first):
@@ -61,7 +62,7 @@ for phase in "${phases[@]}"; do
     ;;
   seg-load)
     # 5M passages in 57 segments of 87,720 (113.5M / 2M-document segments =
-    # 57), then (seg-merge) merged down to 19, 7 and 3 segments.
+    # 57), then (seg-merge) merged down to 19, 7 and 5 segments.
     db=$DB_DIR/seg.strata
     rm -f "$db" "$db-wal"
     say "segments: load 0..5000000 in 57 segments"
@@ -69,18 +70,33 @@ for phase in "${phases[@]}"; do
     say "segments: queries at 57 segments"
     q "$db" 5000000 "segments 57"
     ;;
-  seg-merge)
+  seg-merge) "$0" merge19 merge7 merge5 ;;
+  merge19)
+    # Each merge stage ends with a vacuum: pages a commit frees are reusable
+    # only two commits later and a segment needs one contiguous extent, so
+    # the file grows past the live data (1.8x after the 2M growth merge).
     db=$DB_DIR/seg.strata
     say "segments: merge to 19 (factor 3, at most 270K per merge)"
     $BIN merge --db "$db" --merge-factor 3 --max-merged-docs 270000 --threads "$THREADS" --out "$OUT" --label "segments 19"
+    $BIN vacuum --db "$db" --out "$OUT" --label "segments 19"
     q "$db" 5000000 "segments 19"
-    say "segments: merge to 7 (default policy: factor 8, at most 2M)"
-    $BIN merge --db "$db" --threads "$THREADS" --out "$OUT" --label "segments 7"
+    ;;
+  merge7)
+    # Merges stay near 1M documents: a merge holds its documents and the
+    # new segment in memory, and the default 2M cap does not fit 15 GB.
+    db=$DB_DIR/seg.strata
+    say "segments: merge to 7 (factor 4, at most 1.1M per merge)"
+    $BIN merge --db "$db" --merge-factor 4 --max-merged-docs 1100000 --threads "$THREADS" --out "$OUT" --label "segments 7"
+    $BIN vacuum --db "$db" --out "$OUT" --label "segments 7"
     q "$db" 5000000 "segments 7"
-    say "segments: merge to 3 (factor 5, at most 2M)"
-    $BIN merge --db "$db" --merge-factor 5 --threads "$THREADS" --out "$OUT" --label "segments 3"
-    q "$db" 5000000 "segments 3"
-    $BIN stats --db "$db" --out "$OUT" --label "segments 3 final"
+    ;;
+  merge5)
+    db=$DB_DIR/seg.strata
+    say "segments: merge to 5 (factor 3, at most 1.1M)"
+    $BIN merge --db "$db" --merge-factor 3 --max-merged-docs 1100000 --threads "$THREADS" --out "$OUT" --label "segments 5"
+    $BIN vacuum --db "$db" --out "$OUT" --label "segments 5"
+    q "$db" 5000000 "segments 5"
+    $BIN stats --db "$db" --out "$OUT" --label "segments 5 final"
     ;;
   *) echo "unknown phase $phase" >&2; exit 2 ;;
   esac

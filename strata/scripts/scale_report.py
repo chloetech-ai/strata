@@ -12,6 +12,11 @@ def gib(b):
     return f"{b / 2**30:.2f}"
 
 
+def heap(s):
+    """Peak anonymous memory; steps run before it was sampled show '-'."""
+    return f"{s['peak_anon_mib']:,.0f}" if "peak_anon_mib" in s else "-"
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "results/scale/steps.jsonl"
     steps = [json.loads(l) for l in open(path) if l.strip()]
@@ -30,9 +35,17 @@ def main():
               f"{b.get('emb (vector)', 0):.0f} | {b.get('body (text)', 0):.0f} | {b.get('doc store', 0):.0f} | {s['peak_rss_mib']:,.0f} | "
               f"{a['segments']} | {gib(a['live_pages'] * 4096)} | {a['bytes_per_doc']:,.0f} |")
 
+    print("\n## Vacuums\n")
+    print("| step | seconds | GiB returned | file GiB before → after |")
+    print("|---|---|---|---|")
+    for s in steps:
+        if s["step"] == "vacuum":
+            print(f"| {s['label']} | {s['seconds']:.1f} | {gib(s['bytes_returned'])} | {gib(s['before']['file_bytes'])} → {gib(s['after']['file_bytes'])} |")
+
     print("\n## Merges\n")
-    print("| step | policy | merges | docs rewritten | seconds | rewritten docs/s | HNSW s | text s | reading inputs s | peak RSS MiB | segments before → after | file GiB after |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("Peak RSS counts the table's file pages that the step read through its mapping; peak heap is anonymous memory only.\n")
+    print("| step | policy | merges | docs rewritten | seconds | rewritten docs/s | HNSW s | text s | reading inputs s | peak RSS MiB | peak heap MiB | segments before → after | file GiB after |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for s in steps:
         if s["step"] != "merge":
             continue
@@ -40,7 +53,7 @@ def main():
         rate = m["docs_merged"] / m["seconds"] if m["seconds"] > 0 else 0
         print(f"| {s['label']} | factor {p['merge_factor']}, ≤ {p['max_merged_docs']:,} | {m['merges']} | {m['docs_merged']:,} | {m['seconds']:.0f} | {rate:,.0f} | "
               f"{b.get('emb (vector)', 0):.0f} | {b.get('body (text)', 0):.0f} | {s['rebuild_docs_seconds']:.0f} | {s['peak_rss_mib']:,.0f} | "
-              f"{s['before']['segments']} → {s['after']['segments']} | {gib(s['after']['file_bytes'])} |")
+              f"{heap(s)} | {s['before']['segments']} → {s['after']['segments']} | {gib(s['after']['file_bytes'])} |")
 
     queries = [s for s in steps if s["step"] == "query"]
     print("\n## Warm latency, one query at a time (p50 / p99 ms)\n")

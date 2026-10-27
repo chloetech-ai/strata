@@ -11,6 +11,7 @@
 //!   `--parallel` threads (`ExecOptions::segments`, merged by score); and
 //!   throughput with `--clients` concurrent callers.
 //! * `stats`: file size, segments, bytes by component.
+//! * `vacuum`: returns free space to the file system, timed.
 //!
 //! Every line names the machine. Run from `strata/` with `scripts/scale_probe.sh`.
 
@@ -19,7 +20,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -109,10 +110,34 @@ enum Cmd {
         #[arg(long)]
         db: PathBuf,
     },
+    /// Returns free space to the file system (`Database::vacuum`).
+    Vacuum {
+        #[arg(long)]
+        db: PathBuf,
+    },
+}
+
+/// Highest anonymous resident memory seen, in KiB. `ru_maxrss` also counts
+/// the file pages a step maps (queries and merges read the whole table
+/// through the mapping), so heap use is sampled separately.
+static PEAK_ANON_KIB: AtomicU64 = AtomicU64::new(0);
+
+fn sample_anon() {
+    let read = || -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        s.lines().find(|l| l.starts_with("RssAnon:"))?.split_whitespace().nth(1)?.parse().ok()
+    };
+    std::thread::spawn(move || loop {
+        if let Some(k) = read() {
+            PEAK_ANON_KIB.fetch_max(k, Ordering::Relaxed);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
 }
 
 fn main() {
     let args = Args::parse();
+    sample_anon();
     let t = Instant::now();
     let result = match &args.cmd {
         Cmd::Load { data, db, start, end, segment_docs } => load(&args, data, db, *start, *end, *segment_docs),
@@ -123,6 +148,7 @@ fn main() {
             query(db, data, queries, gt.as_deref(), *n, *n_slow, *parallel, *clients, kinds)
         }
         Cmd::Stats { db } => Db::open(db, opts(&args, 100_000)).map_err(|e| e.into()).map(|d| stats(&d, db)),
+        Cmd::Vacuum { db } => vacuum(&args, db),
     };
     let mut doc = match result {
         Ok(d) => d,
@@ -136,12 +162,14 @@ fn main() {
         Cmd::Merge { .. } => "merge",
         Cmd::Query { .. } => "query",
         Cmd::Stats { .. } => "stats",
+        Cmd::Vacuum { .. } => "vacuum",
     };
     let obj = doc.as_object_mut().unwrap();
     obj.insert("step".into(), json!(step));
     obj.insert("label".into(), json!(args.label));
     obj.insert("wall_seconds".into(), json!(t.elapsed().as_secs_f64()));
     obj.insert("peak_rss_mib".into(), json!(peak_rss_mib()));
+    obj.insert("peak_anon_mib".into(), json!(PEAK_ANON_KIB.load(Ordering::Relaxed) as f64 / 1024.0));
     obj.insert("machine".into(), machine());
     obj.insert("unix_time".into(), json!(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())));
     if let Some(dir) = args.out.parent() {
@@ -149,7 +177,13 @@ fn main() {
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&args.out).expect("results file");
     writeln!(f, "{}", serde_json::to_string(&doc).unwrap()).expect("write results");
-    eprintln!("{step} {}: {:.1}s, peak RSS {:.0} MiB", args.label, t.elapsed().as_secs_f64(), peak_rss_mib());
+    eprintln!(
+        "{step} {}: {:.1}s, peak RSS {:.0} MiB (anonymous {:.0} MiB)",
+        args.label,
+        t.elapsed().as_secs_f64(),
+        peak_rss_mib(),
+        PEAK_ANON_KIB.load(Ordering::Relaxed) as f64 / 1024.0
+    );
 }
 
 fn opts(args: &Args, segment_docs: usize) -> DbOptions {
@@ -355,6 +389,16 @@ fn merge(args: &Args, path: &Path, policy: MergePolicy) -> Res<Json> {
     }))
 }
 
+fn vacuum(args: &Args, path: &Path) -> Res<Json> {
+    let db = Db::open(path, opts(args, 100_000))?;
+    let before = stats(&db, path);
+    let t = Instant::now();
+    let shrank = db.storage().vacuum()?;
+    let seconds = t.elapsed().as_secs_f64();
+    eprintln!("vacuum: {:.2} GiB returned in {seconds:.1}s", shrank as f64 / (1u64 << 30) as f64);
+    Ok(json!({"seconds": seconds, "bytes_returned": shrank, "before": before, "after": stats(&db, path)}))
+}
+
 fn stats(db: &Db, path: &Path) -> Json {
     let snap = db.snapshot();
     let fs = db.storage().file_stats();
@@ -382,6 +426,7 @@ fn stats(db: &Db, path: &Path) -> Json {
         "disk_bytes": db_bytes(path),
         "live_pages": fs.live_pages,
         "free_pages": fs.free_pages,
+        "pending_pages": fs.pending_pages,
         "bytes_per_doc": fs.live_pages as f64 * 4096.0 / n.max(1) as f64,
         "components": comp,
     })
