@@ -12,4 +12,4 @@ pub mod sql;
 pub mod stats;
 
 pub use logical::{Direction, GraphKind, GraphQuery, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
-pub use sql::{bind, Params};
+pub use sql::{bind, bind_write, Assign, Params, Write};

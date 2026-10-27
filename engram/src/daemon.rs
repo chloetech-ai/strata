@@ -973,6 +973,7 @@ impl Daemon {
                         }
                     }
                     strata::Value::Vector(v) => format!("vector({})", v.len()),
+                    strata::Value::List(xs) => format!("list({})", xs.len()),
                 })
                 .collect();
             text += &cells.join(" | ");

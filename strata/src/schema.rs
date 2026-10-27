@@ -46,11 +46,22 @@ pub struct Field {
     /// it from the stored sources, so it need not be stored itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_from: Vec<String>,
+    /// A KEYWORD or INT field holding any number of values per document
+    /// (`Value::List`); a predicate matches when any value matches. Indexed
+    /// as a keyword column (INT values in an order-preserving encoding, so
+    /// ranges are runs of codes), and stored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi: bool,
 }
 
 impl Field {
     pub fn new(name: &str, ty: FieldType) -> Self {
-        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new() }
+        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false }
+    }
+    /// Makes a KEYWORD or INT field multi-valued.
+    pub fn multi(mut self) -> Self {
+        self.multi = true;
+        self
     }
     pub fn generated(mut self, sources: &[&str]) -> Self {
         self.generated_from = sources.iter().map(|s| s.to_string()).collect();
@@ -91,6 +102,11 @@ impl Schema {
                 if !ok || !matches!(f.ty, FieldType::Text { .. }) {
                     return Err(Error::Schema(format!("{} must be TEXT generated from stored text fields", f.name)));
                 }
+            }
+        }
+        for (i, f) in s.fields.iter().enumerate() {
+            if f.multi && (!matches!(f.ty, FieldType::Keyword | FieldType::Int) || !f.stored || s.primary_key == Some(i)) {
+                return Err(Error::Schema(format!("multi-valued field {} must be a stored KEYWORD or INT, not the primary key", f.name)));
             }
         }
         if s.primary_key.is_none() {

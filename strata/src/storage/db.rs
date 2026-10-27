@@ -39,7 +39,8 @@ use crate::storage::merge::{MergePolicy, MergeStats, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
 use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
-use crate::storage::state::{Key, Memtable, SegHandle, State};
+use crate::storage::state::{Key, Loc, Memtable, SegHandle, State};
+use crate::storage::updates::Updates;
 use crate::storage::wal::{Op, Wal};
 use crate::value::{validate, Document, Value};
 
@@ -307,8 +308,10 @@ impl Database {
             version: 0,
             mem: Memtable::new(opts.memtable_chunk_docs, 0),
             pending: Default::default(),
+            pending_updates: Default::default(),
             n_pending: 0,
             live_cache: HashMap::new(),
+            updates_cache: HashMap::new(),
             mem_live: Vec::new(),
             memsegs: Vec::new(),
             cached: None,
@@ -365,7 +368,7 @@ impl Database {
     pub fn begin(&self) -> Result<WriteTxn<'_>> {
         let wal = self.try_writer()?;
         self.check_poisoned()?;
-        Ok(WriteTxn { db: self, wal, ops: Vec::new(), touched: HashMap::new() })
+        Ok(WriteTxn { db: self, wal, ops: Vec::new(), touched: HashMap::new(), written: HashMap::new(), sets: HashMap::new() })
     }
 
     /// The current version. Never waits for a writer; the first snapshot
@@ -430,29 +433,36 @@ impl Database {
 
     fn flush_locked(&self, wal: &mut Wal) -> Result<()> {
         self.check_poisoned()?;
-        let (chunks, deleted, pending, txn) = {
+        let (chunks, deleted, pending, mem_updates, pending_updates, txn) = {
             let st = lock(&self.state);
-            if st.mem.len == 0 && st.pending.is_empty() {
+            if st.mem.len == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
                 return Ok(());
             }
-            (st.mem.chunks.clone(), st.mem.deleted.clone(), st.pending.clone(), st.txn)
+            (st.mem.chunks.clone(), st.mem.deleted.clone(), st.pending.clone(), st.mem.updates.clone(), st.pending_updates.clone(), st.txn)
         };
         let live: Vec<Document> = chunks
             .iter()
             .flat_map(|c| c.iter())
             .enumerate()
             .filter(|(i, _)| deleted[i / 64] >> (i % 64) & 1 == 0)
-            .map(|(_, d)| d.clone())
+            .map(|(i, d)| {
+                let mut d = d.clone();
+                mem_updates.apply(i as DocId, &mut d);
+                d
+            })
             .collect();
         drop(chunks);
         let mut vw = VersionWriter::begin(self);
         vw.manifest.wal_txn = txn;
         for chunk in live.chunks(self.opts.segment_max_docs.max(1)) {
             let image = build_segment(&self.schema, chunk, &self.opts.build)?;
-            vw.add_segment(None, &image, chunk.len() as u32, None)?;
+            vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
         }
         for (&id, docs) in &pending {
             vw.add_deletes(id, docs)?;
+        }
+        for (&id, (_, ups)) in &pending_updates {
+            vw.add_updates(id, ups)?;
         }
         let c = vw.commit()?;
         self.publish(c, |st| {
@@ -460,6 +470,8 @@ impl Database {
             st.mem_live.clear();
             st.memsegs.clear();
             st.pending.clear();
+            st.pending_updates.clear();
+            st.updates_cache.clear();
             st.n_pending = 0;
         })?;
         wal.reset(self.opts.sync).map_err(|e| self.poison(e))
@@ -490,13 +502,13 @@ impl Database {
             chunk.push(doc);
             if chunk.len() == max {
                 let image = build_segment(&self.schema, &chunk, &self.opts.build)?;
-                vw.add_segment(None, &image, chunk.len() as u32, None)?;
+                vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
                 chunk.clear();
             }
         }
         if !chunk.is_empty() {
             let image = build_segment(&self.schema, &chunk, &self.opts.build)?;
-            vw.add_segment(None, &image, chunk.len() as u32, None)?;
+            vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
         }
         if vw.segments_added == 0 {
             return Ok(());
@@ -513,10 +525,10 @@ impl Database {
         let (h, pending) = {
             let st = lock(&self.state);
             let h = st.handles.iter().find(|h| h.meta.id == id).cloned().ok_or_else(|| Error::Schema(format!("no segment {id}")))?;
-            (h, st.pending.get(&id).map_or(0, |p| p.len()))
+            (h, st.pending.get(&id).map_or(0, |p| p.len()) + st.pending_updates.get(&id).map_or(0, |p| p.1.len()))
         };
-        if h.meta.n_deleted > 0 || pending > 0 {
-            return Err(Error::Schema(format!("segment {id} has deleted documents; merge it first")));
+        if h.meta.n_deleted > 0 || h.updates.is_some() || pending > 0 {
+            return Err(Error::Schema(format!("segment {id} has deleted or updated documents; merge it first")));
         }
         let image = if self.dir.is_some() { h.map.clone() } else { h.map.slice(h.meta.extent.range()) };
         let mut f = OpenOptions::new().write(true).create_new(true).open(dest)?;
@@ -558,7 +570,7 @@ impl Database {
         let mut vw = VersionWriter::begin(self);
         let first = vw.manifest.next_segment_id;
         for (bytes, n) in &loaded {
-            vw.add_segment(None, bytes, *n, None)?;
+            vw.add_segment(None, bytes, *n, None, None)?;
         }
         let ids: Vec<u64> = (first..vw.manifest.next_segment_id).collect();
         if ids.is_empty() {
@@ -604,9 +616,15 @@ impl Database {
             let v = snap.segments().iter().find(|v| v.id == id).expect("selected from this snapshot");
             let n = v.file.n_docs() as DocId;
             let live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
-            let got = source.documents(&self.schema, &v.file, &live)?;
+            let mut got = source.documents(&self.schema, &v.file, &live)?;
             if got.len() != live.len() {
                 return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
+            }
+            // The merged segment holds the values written in place.
+            if let Some(u) = &v.updates {
+                for (doc, &d) in got.iter_mut().zip(&live) {
+                    u.apply(d, doc);
+                }
             }
             stats.docs_dropped += (n as usize - live.len()) as u64;
             docs.extend(got);
@@ -619,14 +637,26 @@ impl Database {
         let _wal = lock(&self.writer);
         self.check_poisoned()?;
         // Documents of the inputs deleted after the snapshot, as docIDs of
-        // the merged segment (inputs are concatenated in order).
+        // the merged segment (inputs are concatenated in order), and values
+        // written in place after it.
         let mut deleted = Vec::new();
+        let mut updated = Updates::default();
         {
-            let st = lock(&self.state);
+            let mut st = lock(&self.state);
             let mut base = 0u32;
             for (id, live) in &inputs {
-                let h = st.handles.iter().find(|h| h.meta.id == *id).ok_or_else(|| corrupt("merge input vanished"))?;
-                deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(h, d)).map(|(j, _)| base + j as u32));
+                let h = st.handles.iter().find(|h| h.meta.id == *id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
+                deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| base + j as u32));
+                let then = snap.segments().iter().find(|v| v.id == *id).and_then(|v| v.updates.clone());
+                if let Some(now) = st.updates_of(&h) {
+                    for (f, d, v) in now.iter() {
+                        if then.as_ref().and_then(|t| t.get(f, d)) != Some(v) {
+                            if let Ok(j) = live.binary_search(&d) {
+                                updated.set(f, base + j as u32, v.clone());
+                            }
+                        }
+                    }
+                }
                 base += live.len() as u32;
             }
         }
@@ -638,7 +668,7 @@ impl Database {
         }
         if let Some(image) = image {
             let dels = (!deleted.is_empty()).then(|| LiveDocs::with_deleted(None, n_new, deleted.iter().copied()));
-            vw.add_segment(Some(pos), &image, n_new, dels.as_ref())?;
+            vw.add_segment(Some(pos), &image, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
         }
         let c = vw.commit()?;
         stats.bytes_written += c.bytes_written;
@@ -649,6 +679,10 @@ impl Database {
                 if let Some(p) = st.pending.remove(id) {
                     st.n_pending -= p.len();
                 }
+                if let Some((_, u)) = st.pending_updates.remove(id) {
+                    st.n_pending -= u.len();
+                }
+                st.updates_cache.remove(id);
             }
         })?;
         stats.merges += 1;
@@ -724,7 +758,8 @@ impl Database {
                 delete_set_bytes: s.deletes.map_or(0, |e| e.len),
             })
             .collect();
-        let seg_pages: u64 = st.manifest.segments.iter().map(|s| s.extent.pages() + s.deletes.map_or(0, |e| e.pages())).sum();
+        let seg_pages: u64 =
+            st.manifest.segments.iter().map(|s| s.extent.pages() + s.deletes.map_or(0, |e| e.pages()) + s.updates.map_or(0, |e| e.pages())).sum();
         FileStats {
             file_bytes: self.file.metadata().map_or(st.file_pages * PAGE, |m| m.len()),
             page_count: st.meta.page_count,
@@ -787,6 +822,12 @@ impl Database {
                     return Err(corrupt(format!("segment {} has {n} deletes, manifest says {}", s.id, s.n_deleted)));
                 }
             }
+            if let Some(e) = s.updates {
+                claim("updates", e.page, e.pages())?;
+                if crc32fast::hash(&map[e.range()]) != s.updates_crc {
+                    return Err(corrupt(format!("updates of segment {} fail their checksum", s.id)));
+                }
+            }
             if let Some(pk) = &h.pk {
                 for d in 0..s.n_docs {
                     if !pk.lookup_all(&pk.key(d)).any(|x| x == d) {
@@ -831,6 +872,11 @@ impl Database {
                 let n: u32 = h.base.as_ref().map_or(0, |b| b.deleted_words().iter().map(|w| w.count_ones()).sum());
                 if n != s.n_deleted {
                     return Err(corrupt(format!("segment {} has {n} deletes, manifest says {}", s.id, s.n_deleted)));
+                }
+            }
+            if let Some(uf) = &s.updates_file {
+                if crc32fast::hash(&std::fs::read(d.join(uf))?) != s.updates_crc {
+                    return Err(corrupt(format!("{uf} fails its checksum")));
                 }
             }
             if let Some(pk) = &h.pk {
@@ -917,6 +963,33 @@ impl Database {
         self.schema.primary_key.ok_or_else(|| Error::Schema("table has no primary key".into()))
     }
 
+    /// INT field `f` of the live document with primary key `key`: the
+    /// value written in place if any, else the document's.
+    fn live_int(&self, key: &Value, f: usize) -> Result<Option<i64>> {
+        let st = lock(&self.state);
+        let (h, d) = match st.find_live(key) {
+            None => return Ok(None),
+            Some(Loc::Mem(i)) => {
+                return Ok(match st.mem.updates.get(f, i) {
+                    Some(v) => v.as_i64(),
+                    None => st.mem.chunks[i as usize / st.mem.chunk][i as usize % st.mem.chunk][f].as_i64(),
+                })
+            }
+            Some(Loc::Disk(id, d)) => (st.handles.iter().find(|h| h.meta.id == id).cloned().expect("segment of a live key"), d),
+        };
+        let written = st.pending_updates.get(&h.meta.id).and_then(|(_, u)| u.get(f, d)).or_else(|| h.updates.as_ref().and_then(|u| u.get(f, d)));
+        if let Some(v) = written {
+            return Ok(v.as_i64());
+        }
+        drop(st);
+        let field = &self.schema.fields[f];
+        Ok(if field.indexed {
+            crate::forward::NumericColumn::open(&h.file, &field.name)?.get(d).as_i64()
+        } else {
+            crate::forward::DocStore::open(&h.file, &self.schema)?.get_fields(d, &[f]).pop().and_then(|v| v.as_i64())
+        })
+    }
+
     /// Checks that `key` has the primary key's type.
     fn key_of(&self, key: &Value) -> Result<Key> {
         let pk = self.primary_key()?;
@@ -966,6 +1039,10 @@ pub struct WriteTxn<'a> {
     ops: Vec<Op>,
     /// Keys this transaction made live (true) or deleted (false).
     touched: HashMap<Key, bool>,
+    /// Documents this transaction wrote, by key, as they now stand.
+    written: HashMap<Key, Arc<Document>>,
+    /// Fields this transaction set in place on documents it did not write.
+    sets: HashMap<(Key, usize), Value>,
 }
 
 impl WriteTxn<'_> {
@@ -977,7 +1054,11 @@ impl WriteTxn<'_> {
             if self.is_live(&key, &doc[pk]) {
                 return Err(Error::Schema(format!("duplicate primary key {:?}", doc[pk])));
             }
-            self.touched.insert(key, true);
+            self.touched.insert(key.clone(), true);
+            let doc = Arc::new(doc);
+            self.written.insert(key, doc.clone());
+            self.ops.push(Op::Insert(doc));
+            return Ok(());
         }
         self.ops.push(Op::Insert(Arc::new(doc)));
         Ok(())
@@ -988,9 +1069,40 @@ impl WriteTxn<'_> {
         validate(&self.db.schema, &doc)?;
         let pk = self.db.primary_key()?;
         self.delete(&doc[pk].clone())?;
-        self.touched.insert(Key::of(&doc[pk]).expect("validated key"), true);
-        self.ops.push(Op::Insert(Arc::new(doc)));
+        let key = Key::of(&doc[pk]).expect("validated key");
+        self.touched.insert(key.clone(), true);
+        let doc = Arc::new(doc);
+        self.written.insert(key, doc.clone());
+        self.ops.push(Op::Insert(doc));
         Ok(())
+    }
+
+    /// Upserts `doc` only if its INT field `version` is greater than the
+    /// live document's, or no document has its key: external versions, so
+    /// that writers whose updates arrive out of order keep the newest.
+    /// Returns whether it was written.
+    pub fn upsert_if_newer(&mut self, doc: Document, version: &str) -> Result<bool> {
+        validate(&self.db.schema, &doc)?;
+        let pk = self.db.primary_key()?;
+        let vf = self.db.schema.fields.iter().position(|f| f.name == version).ok_or_else(|| Error::Schema(format!("no field {version}")))?;
+        if self.db.schema.fields[vf].ty != FieldType::Int || self.db.schema.fields[vf].multi {
+            return Err(Error::Schema(format!("version field {version} must be a single-valued INT")));
+        }
+        let new = doc[vf].as_i64().ok_or_else(|| Error::Schema(format!("document has no {version}")))?;
+        let key = Key::of(&doc[pk]).expect("validated key");
+        let old = match (self.touched.get(&key), self.written.get(&key)) {
+            (Some(true), Some(d)) => d[vf].as_i64(),
+            (Some(false), _) => None,
+            _ => match self.sets.get(&(key.clone(), vf)) {
+                Some(v) => v.as_i64(),
+                None => self.db.live_int(&doc[pk], vf)?,
+            },
+        };
+        if old.is_some_and(|o| o >= new) {
+            return Ok(false);
+        }
+        self.upsert(doc)?;
+        Ok(true)
     }
 
     /// Deletes the live document with this primary key; false if none.
@@ -999,8 +1111,40 @@ impl WriteTxn<'_> {
         if !self.is_live(&k, key) {
             return Ok(false);
         }
-        self.touched.insert(k, false);
+        self.touched.insert(k.clone(), false);
+        self.written.remove(&k);
         self.ops.push(Op::Delete(key.clone()));
+        Ok(true)
+    }
+
+    /// Sets a numeric field of the live document with this primary key in
+    /// place, without rewriting the document: its text and vectors stay as
+    /// they are. The field must be a single-valued INT or FLOAT. False if no
+    /// document has the key.
+    pub fn set(&mut self, key: &Value, field: &str, value: Value) -> Result<bool> {
+        let k = self.db.key_of(key)?;
+        let i = self.db.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let f = &self.db.schema.fields[i];
+        let value = match (&f.ty, value) {
+            _ if f.multi || Some(i) == self.db.schema.primary_key => {
+                return Err(Error::Schema(format!("{field} cannot be set in place: it is multi-valued or the key")))
+            }
+            (FieldType::Int, v @ (Value::Int(_) | Value::Null)) => v,
+            (FieldType::Float, Value::Int(x)) => Value::Float(x as f64),
+            (FieldType::Float, v @ (Value::Float(_) | Value::Null)) => v,
+            (FieldType::Int | FieldType::Float, v) => return Err(Error::Schema(format!("bad value for {field}: {v:?}"))),
+            _ => return Err(Error::Schema(format!("{field} is not a numeric field; only INT and FLOAT are set in place"))),
+        };
+        if !self.is_live(&k, key) {
+            return Ok(false);
+        }
+        match self.written.get_mut(&k) {
+            Some(d) => Arc::make_mut(d)[i] = value.clone(),
+            None => {
+                self.sets.insert((k, i), value.clone());
+            }
+        }
+        self.ops.push(Op::Set { key: key.clone(), field: i as u16, value });
         Ok(true)
     }
 
@@ -1115,7 +1259,7 @@ impl<'a> VersionWriter<'a> {
     }
 
     /// Adds a segment at position `pos` (default: last).
-    fn add_segment(&mut self, pos: Option<usize>, image: &[u8], n_docs: u32, deleted: Option<&LiveDocs>) -> Result<()> {
+    fn add_segment(&mut self, pos: Option<usize>, image: &[u8], n_docs: u32, deleted: Option<&LiveDocs>, updates: Option<&Updates>) -> Result<()> {
         let id = self.manifest.next_segment_id;
         self.manifest.next_segment_id += 1;
         let (extent, file) = self.write_as(image, dir::segment_name(id))?;
@@ -1127,7 +1271,27 @@ impl<'a> VersionWriter<'a> {
             deletes_crc = crc32fast::hash(&b);
             n_deleted = l.n_deleted();
         }
-        let meta = SegmentMeta { id, extent, crc: crc32fast::hash(image), n_docs, n_deleted, deletes, deletes_crc, txn: self.txn, file, deletes_file };
+        let (mut upd, mut updates_crc, mut updates_file) = (None, 0, None);
+        if let Some(u) = updates {
+            let b = u.encode();
+            let (e, f) = self.write_as(&b, dir::updates_name(id, self.txn))?;
+            (upd, updates_file, updates_crc) = (Some(e), f, crc32fast::hash(&b));
+        }
+        let meta = SegmentMeta {
+            id,
+            extent,
+            crc: crc32fast::hash(image),
+            n_docs,
+            n_deleted,
+            deletes,
+            deletes_crc,
+            txn: self.txn,
+            file,
+            deletes_file,
+            updates: upd,
+            updates_file,
+            updates_crc,
+        };
         let segs = &mut self.manifest.segments;
         segs.insert(pos.unwrap_or(segs.len()), meta);
         self.segments_added += 1;
@@ -1153,6 +1317,24 @@ impl<'a> VersionWriter<'a> {
         Ok(())
     }
 
+    /// Replaces a segment's in-place updates with its current ones plus
+    /// `newer`.
+    fn add_updates(&mut self, id: u64, newer: &Updates) -> Result<()> {
+        let h = lock(&self.db.state).handles.iter().find(|h| h.meta.id == id).cloned().expect("segment of a pending update");
+        let b = Updates::merged(h.updates.as_deref(), newer).encode();
+        let (e, file) = self.write_as(&b, dir::updates_name(id, self.txn))?;
+        let s = self.manifest.segments.iter_mut().find(|s| s.id == id).expect("segment in manifest");
+        match (s.updates, s.updates_file.take()) {
+            (_, Some(old)) => self.obsolete.push(old),
+            (Some(old), None) => self.fl.defer(self.txn, old),
+            _ => {}
+        }
+        s.updates_file = file;
+        s.updates = Some(e);
+        s.updates_crc = crc32fast::hash(&b);
+        Ok(())
+    }
+
     /// Copies extents into free runs below them, highest first. Returns how
     /// many moved.
     fn relocate_down(&mut self) -> Result<usize> {
@@ -1160,14 +1342,16 @@ impl<'a> VersionWriter<'a> {
             return Ok(0);
         }
         let map = lock(&self.db.state).map.clone();
-        let mut extents: Vec<(Extent, usize, bool)> = Vec::new();
+        // (extent, segment, what): 0 the image, 1 the delete set, 2 updates.
+        let mut extents: Vec<(Extent, usize, u8)> = Vec::new();
         for (i, s) in self.manifest.segments.iter().enumerate() {
-            extents.push((s.extent, i, false));
-            extents.extend(s.deletes.map(|e| (e, i, true)));
+            extents.push((s.extent, i, 0));
+            extents.extend(s.deletes.map(|e| (e, i, 1)));
+            extents.extend(s.updates.map(|e| (e, i, 2)));
         }
         extents.sort_by_key(|&(e, _, _)| std::cmp::Reverse(e.page));
         let mut moved = 0;
-        for (e, i, is_deletes) in extents {
+        for (e, i, what) in extents {
             let Some(page) = self.fl.alloc_below(e.pages(), e.page) else { continue };
             // Copy out of the mapping first: on macOS, a pwrite whose source
             // is a mapping of the same file can deadlock in the kernel.
@@ -1177,7 +1361,9 @@ impl<'a> VersionWriter<'a> {
             self.fl.defer(self.txn, e);
             let to = Extent { page, len: e.len };
             let s = &mut self.manifest.segments[i];
-            if is_deletes {
+            if what == 2 {
+                s.updates = Some(to);
+            } else if what == 1 {
                 s.deletes = Some(to);
             } else {
                 s.extent = to;
@@ -1193,9 +1379,13 @@ impl<'a> VersionWriter<'a> {
         if self.db.dir.is_some() {
             self.obsolete.extend(s.file);
             self.obsolete.extend(s.deletes_file);
+            self.obsolete.extend(s.updates_file);
             return;
         }
         self.fl.defer(self.txn, s.extent);
+        if let Some(u) = s.updates {
+            self.fl.defer(self.txn, u);
+        }
         if let Some(d) = s.deletes {
             self.fl.defer(self.txn, d);
         }

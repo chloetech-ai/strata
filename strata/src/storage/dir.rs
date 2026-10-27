@@ -8,6 +8,7 @@
 //! <dir>/MANIFEST-<txn>                the manifest CURRENT names (JSON)
 //! <dir>/seg-<id>.strata               one segment image
 //! <dir>/del-<id>-<txn>.bits           a segment's delete set
+//! <dir>/upd-<id>-<txn>.bin            a segment's in-place updates
 //! <dir>/wal                           the write-ahead log
 //! ```
 //!
@@ -53,6 +54,10 @@ pub fn segment_name(id: u64) -> String {
 
 pub fn deletes_name(id: u64, txn: u64) -> String {
     format!("del-{id:010}-{txn:020}.bits")
+}
+
+pub fn updates_name(id: u64, txn: u64) -> String {
+    format!("upd-{id:010}-{txn:020}.bin")
 }
 
 /// Writes a new file (it must not exist) and syncs it when `sync`.
@@ -104,6 +109,7 @@ pub fn referenced(cur: &Current, manifest: &Manifest) -> HashSet<String> {
     for s in &manifest.segments {
         keep.extend(s.file.iter().cloned());
         keep.extend(s.deletes_file.iter().cloned());
+        keep.extend(s.updates_file.iter().cloned());
     }
     keep
 }
@@ -114,7 +120,7 @@ pub fn orphans(dir: &Path, keep: &HashSet<String>) -> Result<Vec<(PathBuf, u64)>
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
-        let ours = name.starts_with("seg-") || name.starts_with("del-") || name.starts_with("MANIFEST-") || name == "CURRENT.tmp";
+        let ours = ["seg-", "del-", "upd-", "MANIFEST-"].iter().any(|p| name.starts_with(p)) || name == "CURRENT.tmp";
         if ours && !keep.contains(&name) {
             out.push((e.path(), e.metadata().map_or(0, |m| m.len())));
         }

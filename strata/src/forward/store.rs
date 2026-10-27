@@ -32,6 +32,9 @@ enum Kind {
     Str = 0,
     Int = 1,
     Float = 2,
+    /// Multi-valued fields: a count, then each value.
+    Strs = 3,
+    Ints = 4,
 }
 
 impl Kind {
@@ -47,7 +50,19 @@ impl Kind {
 
 /// The stored, non-vector fields of `schema`: (field index, kind).
 fn stored_fields(schema: &Schema) -> Vec<(usize, Kind)> {
-    schema.fields.iter().enumerate().filter(|(_, f)| f.stored).filter_map(|(i, f)| Kind::of(&f.ty).map(|k| (i, k))).collect()
+    schema
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.stored)
+        .filter_map(|(i, f)| {
+            Kind::of(&f.ty).map(|k| match (f.multi, k) {
+                (true, Kind::Str) => (i, Kind::Strs),
+                (true, Kind::Int) => (i, Kind::Ints),
+                (_, k) => (i, k),
+            })
+        })
+        .collect()
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -89,6 +104,19 @@ fn encode_row(fields: &[(usize, Kind)], doc: &Document, out: &mut Vec<u8>) {
             }
             (Kind::Int, Value::Int(x)) => put_varint(out, ((x << 1) ^ (x >> 63)) as u64),
             (Kind::Float, v) => out.extend_from_slice(&v.as_f64().unwrap_or(f64::NAN).to_le_bytes()),
+            (Kind::Strs, v) => {
+                put_varint(out, v.items().len() as u64);
+                for s in v.items().iter().filter_map(|x| x.as_str()) {
+                    put_varint(out, s.len() as u64);
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
+            (Kind::Ints, v) => {
+                put_varint(out, v.items().len() as u64);
+                for x in v.items().iter().filter_map(|x| x.as_i64()) {
+                    put_varint(out, ((x << 1) ^ (x >> 63)) as u64);
+                }
+            }
             // `validate` rejects other combinations before building.
             _ => unreachable!("value of the wrong type for a stored field"),
         }
@@ -301,6 +329,23 @@ impl DocStore {
                     p += 8;
                     if let Some(k) = wanted {
                         out[k] = Value::Float(x);
+                    }
+                }
+                Kind::Strs | Kind::Ints => {
+                    let n = get_varint(r, &mut p)? as usize;
+                    let mut xs = Vec::with_capacity(n.min(1024));
+                    for _ in 0..n {
+                        if kind == Kind::Strs {
+                            let l = get_varint(r, &mut p)? as usize;
+                            xs.push(Value::Str(String::from_utf8(r.get(p..p + l)?.to_vec()).ok()?));
+                            p += l;
+                        } else {
+                            let z = get_varint(r, &mut p)?;
+                            xs.push(Value::Int((z >> 1) as i64 ^ -((z & 1) as i64)));
+                        }
+                    }
+                    if let Some(k) = wanted {
+                        out[k] = Value::List(xs);
                     }
                 }
             }

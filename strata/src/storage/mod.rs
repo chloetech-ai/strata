@@ -8,6 +8,7 @@
 //! * [`manifest`]: one on-disk version (schema, segments, delete sets).
 //! * [`wal`]: the `-wal` sidecar.
 //! * [`live`]: delete sets as live-document filters.
+//! * [`updates`]: in-place updates of numeric fields.
 //! * [`pk`]: the primary-key index section.
 //! * [`merge`]: the tiered merge policy.
 //! * [`Database`], [`WriteTxn`], [`Snapshot`]: the API.
@@ -22,6 +23,7 @@ pub mod pager;
 pub mod pk;
 mod snapshot;
 mod state;
+pub mod updates;
 pub mod wal;
 
 use std::sync::{Mutex, MutexGuard};
@@ -31,6 +33,7 @@ pub use live::LiveDocs;
 pub use merge::{MergePolicy, MergeStats, SegmentInfo};
 pub use pk::{build_pk_index, key_hash, KeyRef, PkIndex};
 pub use snapshot::{SegmentView, Snapshot};
+pub use updates::Updates;
 
 /// Locks a mutex, ignoring poisoning: every critical section leaves the
 /// state consistent before anything that can panic.

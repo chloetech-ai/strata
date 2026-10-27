@@ -15,6 +15,9 @@ pub enum Value {
     Str(String),
     /// Shared so that bulk loads can hand out vectors without copying.
     Vector(Arc<[f32]>),
+    /// The values of a multi-valued KEYWORD or INT field
+    /// ([`crate::schema::Field::multi`]).
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -41,6 +44,15 @@ impl Value {
         match self {
             Value::Vector(v) => Some(v),
             _ => None,
+        }
+    }
+    /// The values of a list, or the value itself as a list of one (`Null`
+    /// as none).
+    pub fn items(&self) -> &[Value] {
+        match self {
+            Value::List(v) => v,
+            Value::Null => &[],
+            v => std::slice::from_ref(v),
         }
     }
 }
@@ -72,6 +84,13 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
         return Err(Error::Schema(format!("document has {} values, table has {} fields", doc.len(), schema.fields.len())));
     }
     for (f, v) in schema.fields.iter().zip(doc) {
+        if f.multi {
+            let ok = v.items().iter().all(|x| matches!((&f.ty, x), (FieldType::Keyword, Value::Str(_)) | (FieldType::Int, Value::Int(_))));
+            if !ok {
+                return Err(Error::Schema(format!("bad value for multi-valued field {}: {:?}", f.name, short(v))));
+            }
+            continue;
+        }
         let ok = match (&f.ty, v) {
             (_, Value::Null) => schema.primary_key.map_or(true, |pk| schema.fields[pk].name != f.name),
             (FieldType::Text { .. } | FieldType::Keyword, Value::Str(_)) => true,

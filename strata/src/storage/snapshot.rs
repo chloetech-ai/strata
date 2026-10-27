@@ -23,6 +23,7 @@ use crate::storage::live::LiveDocs;
 use crate::storage::lock;
 use crate::storage::pk::PkIndex;
 use crate::storage::state::{SegHandle, State};
+use crate::storage::updates::Updates;
 use crate::value::{Document, Value};
 
 /// One segment as seen by a snapshot.
@@ -36,6 +37,8 @@ pub struct SegmentView {
     pub live: Option<Arc<dyn DocFilter>>,
     pub n_live: u32,
     pub in_memory: bool,
+    /// Numeric fields updated in place; `None` when there are none.
+    pub updates: Option<Arc<Updates>>,
 }
 
 /// A consistent, immutable view of the database. Cheap to clone.
@@ -189,6 +192,7 @@ pub(crate) struct MemPart {
     pub n_live: u32,
     /// Already built, if the cache held this prefix.
     pub seg: Option<MemSeg>,
+    pub updates: Option<Arc<Updates>>,
 }
 
 /// Everything a snapshot needs, taken under the state lock.
@@ -196,7 +200,7 @@ pub(crate) struct Capture {
     pub version: u64,
     txn: u64,
     pin: Pin,
-    disk: Vec<(Arc<SegHandle>, Option<Arc<LiveDocs>>, u32)>,
+    disk: Vec<(Arc<SegHandle>, Option<Arc<LiveDocs>>, u32, Option<Arc<Updates>>)>,
     pub mem: Vec<MemPart>,
 }
 
@@ -205,7 +209,7 @@ impl State {
     /// memtable unless `with_mem`).
     pub(crate) fn capture(&mut self, pins: &Arc<Pins>, with_mem: bool) -> Capture {
         let mut disk = Vec::with_capacity(self.handles.len());
-        for h in &self.handles {
+        for h in &self.handles.clone() {
             let id = h.meta.id;
             let live = match self.pending.get(&id) {
                 None => h.base.clone(),
@@ -219,7 +223,8 @@ impl State {
                 }
             };
             let n_live = live.as_ref().map_or(h.meta.n_docs, |l| l.n_live());
-            disk.push((h.clone(), live, n_live));
+            let updates = self.updates_of(h);
+            disk.push((h.clone(), live, n_live, updates));
         }
         let gen = self.mem.gen;
         let n_chunks = if with_mem { self.mem.chunks.len() } else { 0 };
@@ -243,7 +248,8 @@ impl State {
             }
             let seg = self.memseg(gen, k, len);
             let docs = self.mem.chunks[k].clone();
-            mem.push(MemPart { gen, chunk: k, len, docs, live, n_live: (len - n_deleted) as u32, seg });
+            let updates = Some(self.mem.updates.slice((k * self.mem.chunk) as DocId, len as u32)).filter(|u| !u.is_empty()).map(Arc::new);
+            mem.push(MemPart { gen, chunk: k, len, docs, live, n_live: (len - n_deleted) as u32, seg, updates });
         }
         Capture { version: self.version, txn: self.txn, pin: pins.pin(self.txn), disk, mem }
     }
@@ -283,7 +289,7 @@ impl Capture {
         let mut segments = Vec::with_capacity(self.disk.len() + 1);
         let mut pks = Vec::with_capacity(self.disk.len() + 1);
         let mut maps: Vec<OwnedBytes> = Vec::new();
-        for (h, live, n_live) in self.disk {
+        for (h, live, n_live, updates) in self.disk {
             if !maps.iter().any(|m| m.as_ptr() == h.map.as_ptr()) {
                 maps.push(h.map.clone());
             }
@@ -294,6 +300,7 @@ impl Capture {
                 live: live.map(|l| l as Arc<dyn DocFilter>),
                 n_live,
                 in_memory: false,
+                updates,
             });
         }
         for m in self.mem {
@@ -305,6 +312,7 @@ impl Capture {
                 live: m.live.map(|l| l as Arc<dyn DocFilter>),
                 n_live: m.n_live,
                 in_memory: true,
+                updates: m.updates,
             });
         }
         let n_live = segments.iter().map(|s| s.n_live as u64).sum();

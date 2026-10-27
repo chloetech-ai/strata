@@ -20,7 +20,7 @@ use crate::query::stats::{FieldStats, TermStats};
 use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
-use crate::storage::{SegmentView, Snapshot};
+use crate::storage::{SegmentView, Snapshot, Updates};
 use crate::text::{self, Bm25Params, CollectionStats, TextFieldReader, TopKAlgo};
 use crate::value::Value;
 use crate::vector::{self, SearchParams, VectorReader};
@@ -119,7 +119,7 @@ impl SegmentReaders {
         let f = &self.schema.fields[field];
         opened(&self.numeric[field], || {
             Ok(match f.ty {
-                FieldType::Int | FieldType::Float if f.indexed => Some(match RangeIndex::open_if_present(&self.seg, &f.name)? {
+                FieldType::Int | FieldType::Float if f.indexed && !f.multi => Some(match RangeIndex::open_if_present(&self.seg, &f.name)? {
                     Some(idx) => Numeric::Indexed(idx),
                     None => Numeric::Plain(NumericColumn::open(&self.seg, &f.name)?),
                 }),
@@ -133,6 +133,8 @@ impl SegmentReaders {
         opened(&self.keyword[field], || {
             Ok(match f.ty {
                 FieldType::Keyword if f.indexed => Some(KeywordColumn::open(&self.seg, &f.name)?),
+                // Multi-valued INT fields are keyword columns of int_key strings.
+                FieldType::Int if f.indexed && f.multi => Some(KeywordColumn::open(&self.seg, &f.name)?),
                 _ => None,
             })
         })
@@ -458,6 +460,36 @@ impl<'a> Executor<'a> {
     fn keyword(&self, s: &'a Seg, field: usize) -> Result<&'a KeywordColumn> {
         s.r.keyword(field)?.ok_or_else(|| err(format!("{} has no keyword index", self.schema.fields[field].name)))
     }
+
+    /// Segment `s`'s values of `field` written in place, if any.
+    fn updates(&self, s: &'a Seg, field: usize) -> Option<&'a Updates> {
+        s.view.updates.as_deref().filter(|u| u.has(field))
+    }
+
+    /// Document `d`'s value of numeric `field`: written in place, else
+    /// the column's.
+    fn num_value(&self, s: &'a Seg, field: usize, col: &NumericColumn, d: DocId) -> Option<f64> {
+        match self.updates(s, field).and_then(|u| u.get(field, d)) {
+            Some(v) => v.as_f64(),
+            None => col.get_f64(d),
+        }
+    }
+
+    /// `set`, the documents whose column value of `field` passes `keep`,
+    /// corrected for the values written in place.
+    fn patch(&self, s: &'a Seg, field: usize, set: DocSet, keep: impl Fn(f64) -> bool) -> DocSet {
+        let Some(u) = self.updates(s, field) else { return set };
+        let n = s.r.n_docs;
+        let (mut add, mut drop) = (Vec::new(), Vec::new());
+        for (d, v) in u.field(field) {
+            if v.as_f64().is_some_and(&keep) {
+                add.push(d);
+            } else {
+                drop.push(d);
+            }
+        }
+        set.union(&DocSet::from_sorted(add, n)).intersect(&DocSet::from_sorted(drop, n).complement())
+    }
     fn vector(&self, s: &'a Seg, field: usize) -> Result<&'a VectorReader> {
         s.r.vector(field)?.ok_or_else(|| err(format!("{} has no vectors", self.schema.fields[field].name)))
     }
@@ -586,9 +618,14 @@ impl<'a> Executor<'a> {
                 let q = text::parse_match(query)?;
                 self.text(s, *field)?.eval(&q, None)
             }
+            Pred::Range { field, lo, hi } if self.schema.fields[*field].multi => {
+                let kw = self.keyword(s, *field)?;
+                kw.docs_codes(&kw.int_codes(*lo, *hi).collect::<Vec<u32>>())
+            }
             Pred::Range { field, lo, hi } => {
                 let num = self.numeric(s, *field)?;
-                forward::eval_range(num.col(), num.index(), *lo, *hi, self.opts.range)
+                let set = forward::eval_range(num.col(), num.index(), *lo, *hi, self.opts.range);
+                self.patch(s, *field, set, |x| *lo <= x && x <= *hi)
             }
             Pred::In { field, values } => self.materialize_in(s, *field, values)?,
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
@@ -629,18 +666,21 @@ impl<'a> Executor<'a> {
     }
 
     fn materialize_in(&self, s: &'a Seg, field: usize, values: &[Value]) -> Result<DocSet> {
-        match self.schema.fields[field].ty {
-            FieldType::Keyword => {
-                let vs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+        let f = &self.schema.fields[field];
+        match f.ty {
+            _ if f.ty == FieldType::Keyword || f.multi => {
+                let keys: Vec<_> = values.iter().filter_map(forward::key_of).collect();
+                let vs: Vec<&str> = keys.iter().map(|k| k.as_ref()).collect();
                 Ok(self.keyword(s, field)?.docs_in(&vs))
             }
             _ => {
                 let num = self.numeric(s, field)?;
                 let mut acc = DocSet::empty(s.r.n_docs);
-                for v in values.iter().filter_map(|v| v.as_f64()) {
+                let xs: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
+                for &v in &xs {
                     acc = acc.union(&forward::eval_range(num.col(), num.index(), v, v, self.opts.range));
                 }
-                Ok(acc)
+                Ok(self.patch(s, field, acc, |x| xs.contains(&x)))
             }
         }
     }
@@ -650,6 +690,11 @@ impl<'a> Executor<'a> {
             Pred::True => ProbeNode::Const(true),
             Pred::False => ProbeNode::Const(false),
             Pred::Match { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
+            // Multi-valued fields are probed through their postings, fields
+            // with values written in place through the corrected set.
+            Pred::Range { field, .. } | Pred::In { field, .. } if self.schema.fields[*field].multi || self.updates(s, *field).is_some() => {
+                ProbeNode::Leaf(Box::new(self.materialize(s, p)?))
+            }
             Pred::Range { field, lo, hi } => ProbeNode::Leaf(Box::new(self.numeric(s, *field)?.col().filter(*lo, *hi))),
             Pred::In { field, values } => match self.schema.fields[*field].ty {
                 FieldType::Keyword => {
@@ -683,7 +728,7 @@ impl<'a> Executor<'a> {
             self.check_deadline()?;
             total += match (p, &s.view.live) {
                 (Pred::True, None) => s.r.n_docs as u64,
-                (Pred::Range { field, lo, hi }, None) => {
+                (Pred::Range { field, lo, hi }, None) if !self.schema.fields[*field].multi && self.updates(s, *field).is_none() => {
                     let num = self.numeric(s, *field)?;
                     self.stats.plan.push(format!("seg {}: count from the range index", s.ord));
                     forward::count_range(num.col(), num.index(), *lo, *hi, self.opts.range) as u64
@@ -723,7 +768,7 @@ impl<'a> Executor<'a> {
             let col = self.numeric(s, field)?.col();
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
-                if let Some(v) = col.get_f64(d) {
+                if let Some(v) = self.num_value(s, field, col, d) {
                     cands.push(Hit { seg: s.ord, doc: d, score: v });
                 }
             }
@@ -1094,9 +1139,10 @@ impl<'a> Executor<'a> {
             }
             Score::Column { field } => {
                 for (seg, range) in by_seg {
-                    let col = self.numeric(self.seg_by_ord(seg), *field)?.col();
+                    let s = self.seg_by_ord(seg);
+                    let col = self.numeric(s, *field)?.col();
                     for i in range {
-                        out[i] = col.get_f64(cands[i].1).unwrap_or(f64::NEG_INFINITY) as f32;
+                        out[i] = self.num_value(s, *field, col, cands[i].1).unwrap_or(f64::NEG_INFINITY) as f32;
                     }
                 }
             }
@@ -1125,6 +1171,9 @@ impl<'a> Executor<'a> {
             let kw = self.keyword(s, g)?;
             let strategy = kw.choose_facet_strategy(&set);
             self.stats.plan.push(format!("seg {}: facet {strategy:?} over {} docs", s.ord, set.len()));
+            if kw.is_multi() {
+                self.stats.plan.push(format!("seg {}: multi-valued, each value of a document counts", s.ord));
+            }
             for (code, c) in kw.facet_code_counts(&set, strategy).into_iter().enumerate() {
                 if c > 0 {
                     *counts.entry(kw.value(code as u32).to_string()).or_insert(0) += c;
@@ -1141,6 +1190,9 @@ impl<'a> Executor<'a> {
             _ => groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| if value_desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) })),
         }
         let (skip, take) = if self.opts.shard { (0, usize::MAX) } else { (q.offset, q.limit.unwrap_or(usize::MAX)) };
+        // Groups of a multi-valued INT field sort as int_key strings, which
+        // is numeric order, and print as integers.
+        let ints = self.schema.fields[g].ty == FieldType::Int;
         let rows = groups
             .into_iter()
             .skip(skip)
@@ -1150,6 +1202,7 @@ impl<'a> Executor<'a> {
                     .iter()
                     .map(|(_, p)| match p {
                         Projection::Count => Value::Int(c as i64),
+                        _ if ints => forward::int_of_key(&v).map_or(Value::Null, Value::Int),
                         _ => Value::Str(v.clone()),
                     })
                     .collect()
@@ -1183,7 +1236,14 @@ impl<'a> Executor<'a> {
             .projection
             .iter()
             .filter_map(|(_, p)| match p {
-                Projection::Field(i) if self.schema.fields[*i].stored && Some(*i) != self.schema.primary_key => Some(*i),
+                // Vectors live in their index, not the doc store.
+                Projection::Field(i)
+                    if self.schema.fields[*i].stored
+                        && Some(*i) != self.schema.primary_key
+                        && !matches!(self.schema.fields[*i].ty, FieldType::Vector { .. }) =>
+                {
+                    Some(*i)
+                }
                 _ => None,
             })
             .collect();
@@ -1201,6 +1261,9 @@ impl<'a> Executor<'a> {
                     Projection::Count => Value::Null,
                     Projection::Hops(g) => self.hops_of(*g, h.seg, h.doc).map_or(Value::Null, |x| Value::Int(x as i64)),
                     Projection::Field(i) if Some(*i) == self.schema.primary_key => self.key(h),
+                    Projection::Field(i) if self.updates(s, *i).is_some_and(|u| u.get(*i, h.doc).is_some()) => {
+                        self.updates(s, *i).and_then(|u| u.get(*i, h.doc)).cloned().unwrap_or(Value::Null)
+                    }
                     Projection::Field(i) => match stored.iter().position(|x| x == i) {
                         Some(j) => fetched.get(j).cloned().unwrap_or(Value::Null),
                         None => self.unstored_value(s, *i, h.doc),
@@ -1333,6 +1396,9 @@ impl Estimator for SegEst<'_, '_> {
         }
     }
     fn range_count(&self, field: usize, lo: f64, hi: f64) -> f64 {
+        if self.ex.schema.fields[field].multi {
+            return self.s.r.keyword(field).ok().flatten().map_or(self.n_docs(), |kw| kw.int_codes(lo, hi).map(|c| kw.count_code(c) as f64).sum());
+        }
         self.s.r.numeric(field).ok().flatten().map_or(self.n_docs(), |n| n.col().estimate(lo, hi))
     }
     fn range_cost(&self, field: usize, lo: f64, hi: f64) -> Option<f64> {
@@ -1341,7 +1407,7 @@ impl Estimator for SegEst<'_, '_> {
     }
     fn in_count(&self, field: usize, values: &[Value]) -> f64 {
         if let Some(kw) = self.s.r.keyword(field).ok().flatten() {
-            return values.iter().filter_map(|v| v.as_str()).map(|v| kw.count(v) as f64).sum();
+            return values.iter().filter_map(forward::key_of).map(|v| kw.count(&v) as f64).sum();
         }
         values.iter().filter_map(|v| v.as_f64()).map(|v| self.range_count(field, v, v)).sum()
     }

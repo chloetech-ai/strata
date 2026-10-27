@@ -8,6 +8,11 @@
 //! `similarity`, `distance`, `rrf`, weighted sums of those, or a column.
 //! Parameters (`:name`) are bound from [`Params`].
 //!
+//! Writes ([`bind_write`]): `INSERT INTO t (cols) VALUES (...), ...`,
+//! `INSERT OR REPLACE` (an upsert), `UPDATE t SET f = v, g = g + 1 [WHERE
+//! ...]` and `DELETE FROM t [WHERE ...]`. Lists are `ARRAY[...]`; vectors are
+//! parameters, `ARRAY[...]` or a JSON array string.
+//!
 //! Graph queries over EDGES fields (DESIGN.md §6.1): the predicates
 //! `REACHABLE(field, seeds, ...)` and `PATH(field, from, to, ...)`, the score
 //! `ppr(field, seeds, ...)` and the column `hops()`. Seeds are a key, a
@@ -46,6 +51,109 @@ impl Params {
 
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
+}
+
+/// A bound INSERT, UPDATE or DELETE.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Write {
+    /// Documents in schema order (unnamed columns NULL); `replace` upserts.
+    Insert { docs: Vec<Vec<Value>>, replace: bool },
+    /// The documents `select` returns (their primary keys) get `sets`.
+    Update { select: Select, sets: Vec<(usize, Assign)> },
+    /// The documents `select` returns are deleted.
+    Delete { select: Select },
+}
+
+/// The right-hand side of `SET field = ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Assign {
+    Value(Value),
+    /// `field = field + x` (or `- x`).
+    Add(f64),
+}
+
+/// Parses and binds one INSERT, UPDATE or DELETE; `None` for a SELECT.
+pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Option<Write>> {
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql_text).map_err(|e| err(e.to_string()))?;
+    let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
+    let b = Binder::new(schema, params);
+    let table = |name: &str| {
+        if name.eq_ignore_ascii_case(&schema.table) {
+            Ok(())
+        } else {
+            Err(err(format!("no such table: {name}")))
+        }
+    };
+    // The documents a WHERE clause selects, as a query for their keys and
+    // every field (an UPDATE may rewrite them).
+    let selecting = |selection: &Option<Expr>| -> Result<Select> {
+        let cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        let text = match selection {
+            Some(e) => format!("SELECT {} FROM {} WHERE {e}", cols.join(", "), schema.table),
+            None => format!("SELECT {} FROM {}", cols.join(", "), schema.table),
+        };
+        bind(&text, schema, params)
+    };
+    Ok(Some(match stmt {
+        sql::Statement::Query(_) => return Ok(None),
+        sql::Statement::Insert(ins) => {
+            match &ins.table {
+                sql::TableObject::TableName(n) => table(&n.to_string())?,
+                _ => return Err(err("INSERT needs a table name")),
+            }
+            let replace = ins.replace_into || matches!(ins.or, Some(sql::SqliteOnConflict::Replace)) || ins.on.is_some();
+            let cols: Vec<usize> = if ins.columns.is_empty() {
+                (0..schema.fields.len()).collect()
+            } else {
+                ins.columns.iter().map(|c| schema.field_index(&c.value).ok_or_else(|| err(format!("no such column: {}", c.value)))).collect::<Result<_>>()?
+            };
+            let Some(sql::SetExpr::Values(values)) = ins.source.as_ref().map(|q| q.body.as_ref()) else {
+                return Err(err("INSERT needs VALUES"));
+            };
+            let mut docs = Vec::with_capacity(values.rows.len());
+            for row in &values.rows {
+                if row.len() != cols.len() {
+                    return Err(err(format!("{} values for {} columns", row.len(), cols.len())));
+                }
+                let mut doc = vec![Value::Null; schema.fields.len()];
+                for (&f, e) in cols.iter().zip(row) {
+                    doc[f] = b.write_value(f, e)?;
+                }
+                docs.push(doc);
+            }
+            Write::Insert { docs, replace }
+        }
+        sql::Statement::Update { table: t, assignments, selection, .. } => {
+            table(&t.relation.to_string())?;
+            let mut sets = Vec::new();
+            for a in assignments {
+                let sql::AssignmentTarget::ColumnName(name) = &a.target else { return Err(err("SET one column at a time")) };
+                let f = schema.field_index(&name.to_string()).ok_or_else(|| err(format!("no such column: {name}")))?;
+                if Some(f) == schema.primary_key {
+                    return Err(err("the primary key cannot be updated; delete and insert instead"));
+                }
+                let assign = match &a.value {
+                    Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if b.field_of(left).ok() == Some(f) => {
+                        let x = b.num_lit(right)?;
+                        Assign::Add(if *op == BinaryOperator::Minus { -x } else { x })
+                    }
+                    e => Assign::Value(b.write_value(f, e)?),
+                };
+                if matches!(assign, Assign::Add(_)) && !matches!(schema.fields[f].ty, FieldType::Int | FieldType::Float) {
+                    return Err(err(format!("{name} is not numeric")));
+                }
+                sets.push((f, assign));
+            }
+            Write::Update { select: selecting(selection)?, sets }
+        }
+        sql::Statement::Delete(d) => {
+            let (sql::FromTable::WithFromKeyword(from) | sql::FromTable::WithoutKeyword(from)) = &d.from;
+            let [t] = from.as_slice() else { return Err(err("DELETE from exactly one table")) };
+            table(&t.relation.to_string())?;
+            Write::Delete { select: selecting(&d.selection)? }
+        }
+        _ => return Err(err("only SELECT, INSERT, UPDATE and DELETE are supported")),
+    }))
 }
 
 /// Parses and binds one SELECT statement.
@@ -87,8 +195,9 @@ impl<'a> Binder<'a> {
             sql::GroupByExpr::Expressions(es, _) if es.is_empty() => None,
             sql::GroupByExpr::Expressions(es, _) if es.len() == 1 => {
                 let f = self.field_of(&es[0])?;
-                if self.schema.fields[f].ty != FieldType::Keyword {
-                    return Err(err("GROUP BY needs a KEYWORD field"));
+                let fld = &self.schema.fields[f];
+                if fld.ty != FieldType::Keyword && !(fld.ty == FieldType::Int && fld.multi) {
+                    return Err(err("GROUP BY needs a KEYWORD field or a multi-valued INT field"));
                 }
                 Some(f)
             }
@@ -350,6 +459,9 @@ impl<'a> Binder<'a> {
             Expr::Nested(inner) => self.score(inner),
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 let f = self.field_of(e)?;
+                if self.schema.fields[f].multi {
+                    return Err(err(format!("cannot order by multi-valued field {}", self.schema.fields[f].name)));
+                }
                 match self.schema.fields[f].ty {
                     FieldType::Int | FieldType::Float => Ok(Score::Column { field: f }),
                     _ => Err(err("ORDER BY a column needs a numeric field")),
@@ -598,6 +710,31 @@ impl<'a> Binder<'a> {
             (FieldType::Float, v @ (Value::Int(_) | Value::Float(_))) => Ok(Value::Float(v.as_f64().unwrap())),
             (t, v) => Err(err(format!("value {v:?} does not fit a {t:?} field"))),
         }
+    }
+
+    /// A value written to field `f`: a literal or parameter of its type,
+    /// `ARRAY[...]` for lists and vectors.
+    fn write_value(&self, f: usize, e: &Expr) -> Result<Value> {
+        let field = &self.schema.fields[f];
+        if let Expr::Array(a) = e {
+            return match &field.ty {
+                FieldType::Vector { .. } => {
+                    let xs: Vec<f32> = a.elem.iter().map(|x| self.num_lit(x).map(|v| v as f32)).collect::<Result<_>>()?;
+                    Ok(Value::Vector(xs.into()))
+                }
+                _ if field.multi => Ok(Value::List(a.elem.iter().map(|x| self.field_value(f, x)).collect::<Result<_>>()?)),
+                _ => Err(err(format!("{} does not take a list", field.name))),
+            };
+        }
+        let v = self.literal(e)?;
+        Ok(match (&field.ty, v) {
+            (_, Value::Null) => Value::Null,
+            (FieldType::Vector { .. }, _) => Value::Vector(self.vector(e)?),
+            (_, v @ Value::List(_)) if field.multi => v,
+            (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
+            (FieldType::Keyword | FieldType::Int | FieldType::Float, _) if field.multi => Value::List(vec![self.field_value(f, e)?]),
+            _ => self.field_value(f, e)?,
+        })
     }
 
     fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {

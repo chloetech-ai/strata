@@ -14,19 +14,28 @@ use crate::error::Result;
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
 use crate::query::exec::{ExecOptions, Executor, ResultSet, SegmentReaders};
 use crate::query::stats::TermStats;
-use crate::query::{bind, Params, Select};
+use crate::query::{bind, bind_write, Assign, Params, Select, Write};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, Snapshot};
 use crate::value::{Document, Value};
 use crate::vector::VectorReader;
 
+/// What [`Db::sql`] returns.
+#[derive(Debug)]
+pub enum SqlResult {
+    Rows(ResultSet),
+    /// Documents inserted, updated or deleted.
+    Written(u64),
+}
+
 pub struct Db {
     storage: Database,
-    /// Readers by segment id. On-disk segments keep their id for life
-    /// (deletes travel with the snapshot, not the readers); in-memory ones
-    /// get a fresh id per rebuild.
-    readers: RwLock<HashMap<u64, Arc<SegmentReaders>>>,
+    /// Readers by segment id, with the address of the image they read.
+    /// On-disk segments keep their id for life (deletes travel with the
+    /// snapshot, not the readers), but a vacuum can move their bytes;
+    /// in-memory ones get a fresh id per rebuild.
+    readers: RwLock<HashMap<u64, (usize, Arc<SegmentReaders>)>>,
     pub exec: ExecOptions,
 }
 
@@ -77,6 +86,78 @@ impl Db {
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         let select = bind(sql, snap.schema(), params)?;
         self.execute(snap, &select, opts)
+    }
+
+    /// Runs any statement: a SELECT returns its rows, an INSERT, UPDATE or
+    /// DELETE the number of documents it wrote, in one transaction.
+    ///
+    /// UPDATE sets numeric fields in place ([`crate::storage::WriteTxn::set`])
+    /// and rewrites the whole document for any other field, which needs every
+    /// text field stored or generated. The rows to change are read after the
+    /// transaction takes the writer lock, so no other write lands between.
+    pub fn sql(&self, sql: &str, params: &Params) -> Result<SqlResult> {
+        let Some(write) = bind_write(sql, self.schema(), params)? else {
+            return self.query(sql, params).map(SqlResult::Rows);
+        };
+        let schema = self.schema().clone();
+        let mut t = self.storage.begin()?;
+        let mut n = 0u64;
+        match write {
+            Write::Insert { docs, replace } => {
+                for mut d in docs {
+                    schema.fill_generated(&mut d);
+                    if replace {
+                        t.upsert(d)?;
+                    } else {
+                        t.insert(d)?;
+                    }
+                    n += 1;
+                }
+            }
+            Write::Delete { select } => {
+                let pk = schema.primary_key.ok_or_else(|| crate::Error::Query("DELETE needs a primary key".into()))?;
+                for row in self.execute(&self.snapshot(), &select, &self.exec)?.rows {
+                    n += t.delete(&row[pk])? as u64;
+                }
+            }
+            Write::Update { select, sets } => {
+                let pk = schema.primary_key.ok_or_else(|| crate::Error::Query("UPDATE needs a primary key".into()))?;
+                let in_place = |f: usize| {
+                    let fld = &schema.fields[f];
+                    matches!(fld.ty, FieldType::Int | FieldType::Float) && !fld.multi
+                };
+                if !sets.iter().all(|(f, _)| in_place(*f)) {
+                    if let Some(f) = schema.fields.iter().find(|f| matches!(f.ty, FieldType::Text { .. }) && !f.stored && f.generated_from.is_empty()) {
+                        return Err(crate::Error::Query(format!("UPDATE of non-numeric fields rewrites documents, and {} is not stored", f.name)));
+                    }
+                }
+                for row in self.execute(&self.snapshot(), &select, &self.exec)?.rows {
+                    let new = |f: usize, a: &Assign| match a {
+                        Assign::Value(v) => v.clone(),
+                        // NULL counts as zero.
+                        Assign::Add(x) => match schema.fields[f].ty {
+                            FieldType::Int => Value::Int(row[f].as_i64().unwrap_or(0) + *x as i64),
+                            _ => Value::Float(row[f].as_f64().unwrap_or(0.0) + x),
+                        },
+                    };
+                    if sets.iter().all(|(f, _)| in_place(*f)) {
+                        for (f, a) in &sets {
+                            t.set(&row[pk], &schema.fields[*f].name, new(*f, a))?;
+                        }
+                    } else {
+                        let mut doc = row.clone();
+                        for (f, a) in &sets {
+                            doc[*f] = new(*f, a);
+                        }
+                        schema.fill_generated(&mut doc);
+                        t.upsert(doc)?;
+                    }
+                    n += 1;
+                }
+            }
+        }
+        t.commit()?;
+        Ok(SqlResult::Written(n))
     }
 
     pub fn execute(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions) -> Result<ResultSet> {
@@ -133,20 +214,22 @@ impl Db {
 
     /// Readers for every segment of `snap`, opened on first use.
     pub fn readers(&self, snap: &Snapshot) -> Result<Vec<Arc<SegmentReaders>>> {
+        let at = |v: &crate::storage::SegmentView| v.file.image().as_ptr() as usize;
         {
             let cache = self.readers.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(all) = snap.segments().iter().map(|v| cache.get(&v.id).cloned()).collect() {
+            let hit = |v: &crate::storage::SegmentView| cache.get(&v.id).filter(|(p, _)| *p == at(v)).map(|(_, r)| r.clone());
+            if let Some(all) = snap.segments().iter().map(hit).collect() {
                 return Ok(all);
             }
         }
         let mut cache = self.readers.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(snap.segments().len());
         for v in snap.segments() {
-            let r = match cache.get(&v.id) {
-                Some(r) => r.clone(),
+            let r = match cache.get(&v.id).filter(|(p, _)| *p == at(v)) {
+                Some((_, r)) => r.clone(),
                 None => {
                     let r = Arc::new(SegmentReaders::open(&v.file, snap.schema())?);
-                    cache.insert(v.id, r.clone());
+                    cache.insert(v.id, (at(v), r.clone()));
                     r
                 }
             };
