@@ -16,7 +16,14 @@
 //!   long tail) share one sorted docID array (4 bytes per document, where a
 //!   Pyramid's fixed cost is a few hundred bytes per list), located by a
 //!   `u32` offset per value unless every value has exactly one document.
+//! * `kw.<field>.multi`: present when the field is multi-valued
+//!   ([`Field::multi`]). The postings then hold every (value, document)
+//!   pair, the code column only each document's first value, so filters and
+//!   facets go through the postings. INT values are stored as [`int_key`]
+//!   strings, whose byte order is numeric order, so a range is a run of
+//!   codes.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::postings::bytes::{ByteReader, ByteWriter, Slice};
@@ -35,6 +42,27 @@ use crate::value::Value;
 pub const DEFAULT_RARE: usize = 64;
 
 const VERSION: u64 = 1;
+
+/// An INT value as a keyword: 16 hex digits of the value with its sign bit
+/// flipped, so that byte order is numeric order.
+pub fn int_key(x: i64) -> String {
+    format!("{:016x}", (x as u64) ^ (1 << 63))
+}
+
+/// The INT value of an [`int_key`].
+pub fn int_of_key(s: &str) -> Option<i64> {
+    u64::from_str_radix(s, 16).ok().map(|u| (u ^ (1 << 63)) as i64)
+}
+
+/// The keyword a predicate value matches in a keyword column: a string
+/// itself, an integer as its [`int_key`].
+pub fn key_of(v: &Value) -> Option<Cow<'_, str>> {
+    match v {
+        Value::Str(s) => Some(Cow::Borrowed(s)),
+        Value::Int(x) => Some(Cow::Owned(int_key(*x))),
+        _ => None,
+    }
+}
 
 /// How [`KeywordColumn::facet_counts`] counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,26 +84,43 @@ pub(crate) struct KeywordBuilder {
     ids: HashMap<String, u32>,
     /// Provisional id (first-seen order) per document.
     docs: Vec<Option<u32>>,
+    multi: bool,
+    /// A multi-valued field's values after each document's first.
+    extra: Vec<(DocId, u32)>,
 }
 
 impl KeywordBuilder {
     pub fn new(field: &Field, opts: &BuildOptions) -> Result<Self> {
         let rare = super::usize_option(opts, "forward.kw_rare", DEFAULT_RARE)?;
-        Ok(KeywordBuilder { name: field.name.clone(), rare, ids: HashMap::new(), docs: Vec::new() })
+        Ok(KeywordBuilder { name: field.name.clone(), rare, ids: HashMap::new(), docs: Vec::new(), multi: field.multi, extra: Vec::new() })
+    }
+
+    fn id(&mut self, v: &Value) -> Result<u32> {
+        let key = match (v, self.multi) {
+            (Value::Str(_), _) | (Value::Int(_), true) => key_of(v).expect("string or integer"),
+            _ => return Err(Error::Schema(format!("{}: not a string", self.name))),
+        };
+        let next = self.ids.len() as u32;
+        Ok(match self.ids.get(key.as_ref()) {
+            Some(&id) => id,
+            None => *self.ids.entry(key.into_owned()).or_insert(next),
+        })
     }
 }
 
 impl FieldIndexBuilder for KeywordBuilder {
     fn add(&mut self, doc: DocId, value: &Value) -> Result<()> {
         self.docs.resize(doc as usize, None);
-        self.docs.push(match value {
-            Value::Null => None,
-            Value::Str(s) => {
-                let next = self.ids.len() as u32;
-                Some(*self.ids.entry(s.clone()).or_insert(next))
+        let items = if self.multi { value.items() } else if value == &Value::Null { &[] } else { std::slice::from_ref(value) };
+        let mut first = None;
+        for v in items {
+            let id = self.id(v)?;
+            match first {
+                None => first = Some(id),
+                Some(_) => self.extra.push((doc, id)),
             }
-            _ => return Err(Error::Schema(format!("{}: not a string", self.name))),
-        });
+        }
+        self.docs.push(first);
         Ok(())
     }
 
@@ -111,22 +156,27 @@ impl FieldIndexBuilder for KeywordBuilder {
         out.put(format!("kw.{}.codes", self.name), w.finish());
 
         // Postings: documents grouped by code (counting sort keeps them
-        // sorted), rare values in one array, the others as Pyramids.
+        // sorted), rare values in one array, the others as Pyramids. A
+        // multi-valued field adds its other (document, code) pairs.
         let nv = values.len();
+        let mut pairs: Vec<(u32, u32)> = codes.iter().enumerate().filter_map(|(d, c)| c.map(|c| (d as u32, c))).collect();
+        if self.multi {
+            pairs.extend(self.extra.iter().map(|&(d, id)| (d, code_of[id as usize])));
+            pairs.sort_unstable();
+            pairs.dedup();
+        }
         let mut start = vec![0usize; nv + 1];
-        for c in codes.iter().flatten() {
-            start[*c as usize + 1] += 1;
+        for &(_, c) in &pairs {
+            start[c as usize + 1] += 1;
         }
         for i in 0..nv {
             start[i + 1] += start[i];
         }
         let mut grouped = vec![0u32; start[nv]];
         let mut fill = start.clone();
-        for (d, c) in codes.iter().enumerate() {
-            if let Some(c) = c {
-                grouped[fill[*c as usize]] = d as u32;
-                fill[*c as usize] += 1;
-            }
+        for &(d, c) in &pairs {
+            grouped[fill[c as usize]] = d;
+            fill[c as usize] += 1;
         }
         let mut rare_offs = Vec::with_capacity(nv + 1);
         let mut rare = Vec::new();
@@ -154,6 +204,11 @@ impl FieldIndexBuilder for KeywordBuilder {
         w.array(&pyr_codes);
         write_lists(&mut w, &lists);
         out.put(format!("kw.{}.post", self.name), w.finish());
+        if self.multi {
+            let mut w = ByteWriter::new();
+            w.u64(VERSION);
+            out.put(format!("kw.{}.multi", self.name), w.finish());
+        }
         Ok(())
     }
 }
@@ -183,6 +238,9 @@ pub struct KeywordColumn {
     /// `lists`.
     pyr_codes: Slice<u32>,
     lists: ListTable,
+    /// Multi-valued: documents can have several codes, and `codes` holds
+    /// only the first.
+    multi: bool,
 }
 
 impl KeywordColumn {
@@ -218,7 +276,39 @@ impl KeywordColumn {
         {
             return Err(corrupt(format!("bad keyword column {field}")));
         }
-        Ok(KeywordColumn { name: field.to_string(), n: seg.n_docs(), dict_offs, dict_bytes, codes, rare_offs, rare, pyr_codes, lists })
+        let multi = seg.section(&format!("kw.{field}.multi")).is_some();
+        Ok(KeywordColumn { name: field.to_string(), n: seg.n_docs(), dict_offs, dict_bytes, codes, rare_offs, rare, pyr_codes, lists, multi })
+    }
+
+    /// Whether documents can have several values (filters and facets must
+    /// then use the postings, not the code column).
+    pub fn is_multi(&self) -> bool {
+        self.multi
+    }
+
+    /// The first code whose value is not below `value`.
+    pub fn lower_bound(&self, value: &str) -> u32 {
+        let (mut lo, mut hi) = (0usize, self.n_values());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.value_bytes(mid as u32) < value.as_bytes() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo as u32
+    }
+
+    /// Codes of the INT values in `lo..=hi` of a multi-valued INT field.
+    pub fn int_codes(&self, lo: f64, hi: f64) -> std::ops::Range<u32> {
+        let (lo, hi) = (lo.ceil(), hi.floor());
+        if lo > hi || lo >= i64::MAX as f64 || hi < i64::MIN as f64 {
+            return 0..0;
+        }
+        let a = self.lower_bound(&int_key(lo.max(i64::MIN as f64) as i64));
+        let b = if hi >= i64::MAX as f64 { self.n_values() as u32 } else { self.lower_bound(&int_key(hi as i64 + 1)) };
+        a..b.max(a)
     }
 
     pub fn name(&self) -> &str {
@@ -343,11 +433,16 @@ impl KeywordColumn {
         let mut codes: Vec<u32> = values.iter().filter_map(|v| self.code(v)).collect();
         codes.sort_unstable();
         codes.dedup();
+        self.docs_codes(&codes)
+    }
+
+    /// Documents with any of `codes` (sorted, distinct).
+    pub fn docs_codes(&self, codes: &[u32]) -> DocSet {
         let n = self.n as u32;
         let total: usize = codes.iter().map(|&c| self.count_code(c)).sum();
         if total > self.n / 32 {
             let mut words = vec![0u64; self.n.div_ceil(64)];
-            for &c in &codes {
+            for &c in codes {
                 match self.list(c) {
                     List::Pyramid(p) => p.or_into_bits(&mut words),
                     List::Rare(d) => d.iter().for_each(|&d| words[d as usize / 64] |= 1 << (d % 64)),
@@ -357,7 +452,7 @@ impl KeywordColumn {
         }
         let mut pyrs = Vec::new();
         let mut rare = Vec::new();
-        for &c in &codes {
+        for &c in codes {
             match self.list(c) {
                 List::Pyramid(p) => pyrs.push(p),
                 List::Rare(d) => rare.extend_from_slice(d),
@@ -366,7 +461,12 @@ impl KeywordColumn {
         let mut out = Vec::with_capacity(total);
         Pyramid::union(&pyrs, &mut out);
         rare.sort_unstable();
-        DocSet::from_sorted(merge_sorted(out, rare), n)
+        let mut all = merge_sorted(out, rare);
+        if self.multi {
+            // A document can be on several of the lists.
+            all.dedup();
+        }
+        DocSet::from_sorted(all, n)
     }
 
     /// A membership probe for `value`: O(1) in its Pyramid list (a binary
@@ -410,6 +510,7 @@ impl KeywordColumn {
     /// Count per code of the documents of `docs`.
     pub fn facet_code_counts(&self, docs: &DocSet, strategy: FacetStrategy) -> Vec<u64> {
         let strategy = match strategy {
+            _ if self.multi => FacetStrategy::Postings,
             FacetStrategy::Auto => self.choose_facet_strategy(docs),
             s => s,
         };
@@ -427,6 +528,9 @@ impl KeywordColumn {
     /// the bitset of a sorted result. Postings win for large results over
     /// few, dense values.
     pub fn choose_facet_strategy(&self, docs: &DocSet) -> FacetStrategy {
+        if self.multi {
+            return FacetStrategy::Postings;
+        }
         if self.lists.len() == 0 {
             return FacetStrategy::Codes;
         }

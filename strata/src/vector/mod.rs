@@ -8,6 +8,8 @@
 //! | `vec.<f>.f32` | float32 vectors, `n × stride` (rows padded to 16 floats) |
 //! | `vec.<f>.sq8` | SQ8 codes, `n × code_stride` (rows padded to 64 bytes) |
 //! | `vec.<f>.sq8p` | per-dimension SQ8 minimum and scale |
+//! | `vec.<f>.bin` | binary codes instead of SQ8 ones, when the field asks for them (rows padded to 8 bytes) |
+//! | `vec.<f>.binp` | per-dimension threshold and spread of the binary codes |
 //! | `vec.<f>.present` | bitset of documents with a vector (only if some lack one) |
 //!
 //! plus the sections of its index: IVF (`ivf_centroids`, `ivf_dir`, `ivf`) or
@@ -16,7 +18,12 @@
 //!
 //! **Search** scores SQ8 codes with an int8-quantised query (AVX-512 VNNI or
 //! NEON `usdot`), keeps the best `rerank` candidates and re-ranks them with
-//! float32. The [`Strategy`] decides which codes are scored:
+//! float32. A field with binary codes ([`crate::schema::VectorCodes`]) is
+//! searched the same way over a bit per dimension ([`bits`]) and keeps
+//! [`codes::BINARY_RERANK`]` × rerank` candidates. Only the codes (and the
+//! index) need to stay in memory: the float32 rows are read for the
+//! candidates alone, so they can stay on disk. The [`Strategy`] decides which
+//! codes are scored:
 //!
 //! * `Flat`: every code (a pre-filter scan when there is a filter).
 //! * `Ivf`: the clusters closest to the query; with a filter, each probed
@@ -28,6 +35,8 @@
 //!   candidates, then the filter; retried with 4× more if short.
 //! * `Auto`: the cheapest by the [`CostModel`].
 
+pub mod bits;
+pub mod codes;
 pub mod cost;
 pub mod exact;
 pub mod kernels;
@@ -43,7 +52,7 @@ use crate::postings::bytes::{ByteReader, Slice};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{corrupt, Result};
-use crate::schema::Field;
+use crate::schema::{Field, VectorCodes};
 use crate::segment::build::BuildOptions;
 use crate::segment::{DocFilter, DocId, FieldIndexBuilder, SegmentFile};
 
@@ -52,8 +61,10 @@ pub use ivf::{default_nlist, filtered_probe_weight, filtered_probes};
 
 use hnsw::HnswView;
 use ivf::IvfView;
-use kernels::{dot_f32, dot_u8_i8_x4, prefetch};
-use sq8::{QueryCode, Sq8};
+use bits::Bits;
+use codes::{Quantiser, QueryCode, BINARY_RERANK};
+use kernels::{dot_f32, prefetch};
+use sq8::Sq8;
 use topk::{Members, TopK};
 
 /// Builder for a VECTOR field (see `build.rs` for the build options).
@@ -78,8 +89,11 @@ pub struct VectorInfo {
     pub index: String,
     /// Floats per stored vector row.
     pub stride_f32: usize,
-    /// Bytes per SQ8 code row.
+    /// Bytes per code row.
     pub stride_u8: usize,
+    /// The codes kept (SQ8 unless the field asks for binary ones).
+    #[serde(default, skip_serializing_if = "is_sq8")]
+    pub codes: VectorCodes,
     pub nlist: Option<usize>,
     pub train_points: Option<usize>,
     pub iters: Option<usize>,
@@ -87,6 +101,10 @@ pub struct VectorInfo {
     pub ef_construction: Option<usize>,
     pub entry: Option<u32>,
     pub max_level: Option<usize>,
+}
+
+fn is_sq8(c: &VectorCodes) -> bool {
+    *c == VectorCodes::Sq8
 }
 
 /// One search result.
@@ -128,8 +146,9 @@ impl Strategy {
     }
 }
 
-/// Search knobs. `rerank` is the number of SQ8 candidates re-ranked with
-/// float32 (at least `k`); HNSW searches with `max(ef, rerank)`.
+/// Search knobs. `rerank` is the number of candidates re-ranked with
+/// float32 (at least `k`; times [`BINARY_RERANK`] over binary codes); HNSW
+/// searches with `max(ef, rerank)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SearchParams {
     pub strategy: Strategy,
@@ -149,7 +168,7 @@ impl Default for SearchParams {
 pub struct SearchStats {
     /// The strategy that ran (never `Auto`).
     pub strategy: Strategy,
-    /// SQ8 codes scored.
+    /// Codes scored (SQ8 or binary).
     pub sq8_distances: usize,
     /// Of those, codes scored in contiguous runs (flat scan, unfiltered IVF
     /// clusters) rather than at scattered positions.
@@ -193,7 +212,7 @@ pub enum HnswFilterMode {
     TwoHop,
 }
 
-/// SQ8 code rows by docID.
+/// Code rows by docID.
 pub(crate) struct Codes<'a> {
     data: &'a [u8],
     stride: usize,
@@ -228,7 +247,7 @@ pub(crate) fn score_rows(block: &[u8], stride: usize, count: usize, pos: Option<
                 prefetch(row(j).as_ptr(), stride);
             }
         }
-        let s = dot_u8_i8_x4([row(i), row(i + 1), row(i + 2), row(i + 3)], &q.q8);
+        let s = q.dot4([row(i), row(i + 1), row(i + 2), row(i + 3)]);
         for (j, s) in s.into_iter().enumerate() {
             f(i + j, s);
         }
@@ -245,7 +264,7 @@ pub struct VectorReader {
     info: VectorInfo,
     vectors: Slice<f32>,
     codes: Slice<u8>,
-    sq8: Sq8,
+    quant: Quantiser,
     present: Option<Slice<u64>>,
     ivf: Option<IvfView>,
     hnsw: Option<HnswView>,
@@ -259,19 +278,27 @@ impl VectorReader {
     pub fn open(seg: &SegmentFile, field: &str) -> Result<Self> {
         let info: VectorInfo = serde_json::from_slice(&seg.require(&section(field, "meta"))?).map_err(corrupt)?;
         let (n, dim) = (info.n, info.dim);
-        if (info.stride_f32, info.stride_u8) != build::strides(dim) || n != seg.n_docs() {
+        if (info.stride_f32, info.stride_u8) != (build::strides(dim).0, info.codes.stride(dim)) || n != seg.n_docs() {
             return Err(corrupt(format!("vector field {field}: header does not match the segment")));
         }
+        let (codes_part, params_part) = match info.codes {
+            VectorCodes::Sq8 => ("sq8", "sq8p"),
+            VectorCodes::Binary => ("bin", "binp"),
+        };
         let vectors: Slice<f32> = Slice::view(seg.require(&section(field, "f32"))?).map_err(corrupt)?;
-        let codes: Slice<u8> = Slice::view(seg.require(&section(field, "sq8"))?).map_err(corrupt)?;
+        let codes: Slice<u8> = Slice::view(seg.require(&section(field, codes_part))?).map_err(corrupt)?;
         if vectors.len() != n * info.stride_f32 || codes.len() != n * info.stride_u8 {
             return Err(corrupt(format!("vector field {field}: sections have the wrong size")));
         }
-        let mut r = ByteReader::new(seg.require(&section(field, "sq8p"))?);
-        let sq8 = Sq8 { min: r.array().map_err(corrupt)?, scale: r.array().map_err(corrupt)? };
-        if sq8.min.len() != dim || sq8.scale.len() != dim {
-            return Err(corrupt(format!("vector field {field}: bad SQ8 parameters")));
+        let mut r = ByteReader::new(seg.require(&section(field, params_part))?);
+        let (a, b): (Slice<f32>, Slice<f32>) = (r.array().map_err(corrupt)?, r.array().map_err(corrupt)?);
+        if a.len() != dim || b.len() != dim {
+            return Err(corrupt(format!("vector field {field}: bad code parameters")));
         }
+        let quant = match info.codes {
+            VectorCodes::Sq8 => Quantiser::Sq8(Sq8 { min: a, scale: b }),
+            VectorCodes::Binary => Quantiser::Bits(Bits { mean: a, spread: b }),
+        };
         let present = match seg.section(&section(field, "present")) {
             Some(b) => {
                 let p: Slice<u64> = Slice::view(b).map_err(corrupt)?;
@@ -303,7 +330,7 @@ impl VectorReader {
             other => return Err(corrupt(format!("unknown vector index {other}"))),
         }
         let shape = IndexShape { n: n - info.missing, kind: info.index.clone(), nlist: info.nlist.unwrap_or(1), hnsw_m: info.m.unwrap_or(16) };
-        Ok(VectorReader { info, vectors, codes, sq8, present, ivf, hnsw, shape, cost: CostModel::default(), io_hints: false, hnsw_filter: HnswFilterMode::Traverse })
+        Ok(VectorReader { info, vectors, codes, quant, present, ivf, hnsw, shape, cost: CostModel::default(), io_hints: false, hnsw_filter: HnswFilterMode::Traverse })
     }
 
     pub fn dim(&self) -> usize {
@@ -370,21 +397,38 @@ impl VectorReader {
         dot_f32(self.vector(doc), query)
     }
 
-    /// The SQ8 codes of `doc` (padded to the code stride).
+    /// The codes of `doc` (padded to the code stride).
     pub fn codes(&self, doc: DocId) -> &[u8] {
         Codes { data: &self.codes, stride: self.info.stride_u8 }.row(doc)
     }
 
-    /// The SQ8 quantiser (per-dimension minimum and scale).
-    pub fn sq8(&self) -> &Sq8 {
-        &self.sq8
+    /// The SQ8 quantiser (per-dimension minimum and scale), if the field
+    /// keeps SQ8 codes.
+    pub fn sq8(&self) -> Option<&Sq8> {
+        match &self.quant {
+            Quantiser::Sq8(s) => Some(s),
+            Quantiser::Bits(_) => None,
+        }
+    }
+
+    /// The field's quantiser.
+    pub fn quantiser(&self) -> &Quantiser {
+        &self.quant
+    }
+
+    /// Bytes of codes, the part of the field a search reads in full.
+    pub fn code_bytes(&self) -> usize {
+        self.codes.len()
     }
 
     /// True when every array is a view of the segment's bytes (no copies).
     pub fn is_zero_copy(&self) -> bool {
         matches!(self.vectors, Slice::Shared { .. })
             && matches!(self.codes, Slice::Shared { .. })
-            && matches!(self.sq8.min, Slice::Shared { .. })
+            && match &self.quant {
+                Quantiser::Sq8(s) => matches!(s.min, Slice::Shared { .. }),
+                Quantiser::Bits(b) => matches!(b.mean, Slice::Shared { .. }),
+            }
             && self.present.as_ref().is_none_or(|p| matches!(p, Slice::Shared { .. }))
             && self.ivf.as_ref().is_none_or(|v| v.is_shared())
             && self.hnsw.as_ref().is_none_or(|v| v.is_shared())
@@ -419,8 +463,8 @@ impl VectorReader {
         }
         let mut qf = query.to_vec();
         qf.resize(self.info.stride_f32, 0.0);
-        let qc = self.sq8.prepare(query, self.info.stride_u8);
-        let r = params.rerank.max(k);
+        let qc = self.quant.prepare(query, self.info.stride_u8);
+        let r = params.rerank.max(k) * self.oversample();
         let members = filter.map(Members::of);
         // IVF and HNSW test far more documents than a sparse filter has
         // members: probe a bitset rather than search a sorted list.
@@ -462,11 +506,20 @@ impl VectorReader {
         all
     }
 
+    /// How many times more candidates the codes need rescored: 1 for SQ8,
+    /// [`BINARY_RERANK`] for binary codes.
+    fn oversample(&self) -> usize {
+        match self.info.codes {
+            VectorCodes::Sq8 => 1,
+            VectorCodes::Binary => BINARY_RERANK,
+        }
+    }
+
     fn code_rows(&self) -> Codes<'_> {
         Codes { data: &self.codes, stride: self.info.stride_u8 }
     }
 
-    /// SQ8 scan of every document, or of a filter's members.
+    /// Code scan of every document, or of a filter's members.
     fn scan(&self, q: &QueryCode, r: usize, members: Option<Members>, stats: &mut SearchStats) -> Vec<(i32, DocId)> {
         let mut top = TopK::new(r);
         let n = self.info.n as u32;
@@ -539,6 +592,9 @@ impl VectorReader {
     #[allow(clippy::too_many_arguments)]
     fn post_filter(&self, q: &QueryCode, qf: &[f32], k: usize, r: usize, p: &SearchParams, m: Members, s: f64, stats: &mut SearchStats) -> Vec<(i32, DocId)> {
         let n = self.shape.n;
+        // Binary codes order candidates more loosely: keep as many members
+        // as they rescore.
+        let k = k * self.oversample();
         let mut kp = ((k as f64 * self.cost.post_margin / s).ceil() as usize).max(r).min(n);
         loop {
             let cands = match self.info.index.as_str() {
@@ -557,7 +613,8 @@ impl VectorReader {
         }
     }
 
-    /// Float32 scores of the candidates (best SQ8 first), best `k` kept.
+    /// Float32 scores of the candidates (best code score first), best `k`
+    /// kept.
     fn rerank(&self, query: &[f32], cands: &[(i32, DocId)], k: usize, stats: &mut SearchStats) -> Vec<Hit> {
         let row_bytes = self.info.stride_f32 * 4;
         if self.io_hints {

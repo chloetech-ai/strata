@@ -36,6 +36,25 @@ pub struct SegmentMeta {
     pub deletes_crc: u32,
     /// The commit that wrote the segment.
     pub txn: u64,
+    /// Directory layout: the segment's own file in the database directory
+    /// (`extent` then spans the whole file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Directory layout: the delete set's file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletes_file: Option<String>,
+    /// In-place updates of numeric fields ([`crate::storage::updates`]),
+    /// as an extent or (directory layout) a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates: Option<Extent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates_file: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub updates_crc: u32,
+}
+
+fn is_zero(x: &u32) -> bool {
+    *x == 0
 }
 
 impl SegmentMeta {

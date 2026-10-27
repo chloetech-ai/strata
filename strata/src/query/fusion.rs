@@ -34,6 +34,8 @@ pub enum Norm {
     /// `(s − min) / (max − min)` over the candidates, per input (as in
     /// relative-score fusion); constant inputs map to 1.
     MinMax,
+    /// Not a sum: the product of raw scores, each raised to its weight.
+    Product,
 }
 
 /// Weighted fusion of exact scores: `scores[i][j]` is input `i`'s score of
@@ -41,17 +43,25 @@ pub enum Norm {
 pub fn weighted(weights: &[f64], scores: &[Vec<f32>], norm: Norm) -> Vec<(usize, f64)> {
     assert_eq!(weights.len(), scores.len());
     let n = scores.first().map_or(0, |s| s.len());
-    let mut fused = vec![0.0f64; n];
+    let mut fused = vec![if norm == Norm::Product { 1.0 } else { 0.0f64 }; n];
     for (w, s) in weights.iter().zip(scores) {
         assert_eq!(s.len(), n);
         let (lo, hi) = s.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| (lo.min(x as f64), hi.max(x as f64)));
         for (f, &x) in fused.iter_mut().zip(s) {
             let v = match norm {
-                Norm::None => x as f64,
+                Norm::None | Norm::Product => x as f64,
                 Norm::MinMax if hi > lo => (x as f64 - lo) / (hi - lo),
                 Norm::MinMax => 1.0,
             };
-            *f += w * v;
+            if norm == Norm::Product {
+                *f *= if *w == 1.0 { v } else { v.powf(*w) };
+                // A missing value (−∞) times 0.
+                if f.is_nan() {
+                    *f = f64::NEG_INFINITY;
+                }
+            } else {
+                *f += w * v;
+            }
         }
     }
     let mut out: Vec<(usize, f64)> = fused.into_iter().enumerate().collect();

@@ -62,10 +62,15 @@ FROM <table>
 | `INT`, `FLOAT` | frame-of-reference column with zone maps, range histogram | `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN` |
 | `KEYWORD` | dictionary codes and one docID list per value | `=`, `!=`, `IN`, `NOT IN`; `GROUP BY` |
 | `TEXT` | inverted index (optionally with positions); may be generated from other text fields | `MATCH` |
-| `VECTOR(d)` | float32 and 8-bit codes, with HNSW, IVF or flat search | ordering by `similarity` / `distance`; a similarity graph |
+| `VECTOR(d)` | float32 rows plus 8-bit codes (or 1-bit codes, `"codes": "binary"`), with HNSW, IVF or flat search | ordering by `similarity` / `distance`; a similarity graph |
+| `SPARSE` | inverted index of learned term weights (SPLADE and similar) | ordering by `similarity` |
 | `EDGES` | out-edge CSR and reverse index per segment | `REACHABLE`, `PATH`, `ppr` |
 
 Predicates combine with `AND`, `OR`, `NOT` and parentheses, across all of these.
+
+`KEYWORD` and `INT` fields may be multi-valued (`"multi": true` in the schema): a row holds a list, such as `ARRAY['red', 'blue']`, and a filter matches a row if any of its values matches. A facet counts each distinct value once per row.
+
+A `SPARSE` value is a JSON object of terms and non-negative weights, `{"tok": 1.25, "##en": 0.4}`, as a learned sparse model (SPLADE, BGE-M3's sparse output, OpenSearch's neural sparse models) writes it. Terms are taken as given, not analysed, and weights are stored in steps of 1/1024.
 
 ## Full text: `MATCH`
 
@@ -114,6 +119,19 @@ The dot product (cosine for unit vectors) and the distance between a row's vecto
 | `nprobe` | IVF clusters probed |
 | `rerank` | how many candidates are re-scored in float32 |
 
+A `VECTOR` field keeps, besides its float32 rows, a compact code per row that the search scans: 8 bits per dimension by default, or 1 bit per dimension with `"codes": "binary"` in the field's schema (or the build option `vector.codes = 'binary'`). Binary codes are 32 times smaller than the vectors and 8 times smaller than 8-bit codes; to make up for the coarser scores, the search re-scores 8 times as many candidates in float32. On synthetic 768-dimensional data that kept recall@10 at 0.985–0.994 with flat, IVF and HNSW search, at an eighth of the memory ([results](results.md#compressed-vectors)); check recall on your own embeddings before choosing them, since some models lose more to one-bit codes than others.
+
+### `similarity(field, weights)` on a `SPARSE` field
+
+The dot product of a row's term weights with the query's, `Σ q_t · w_t` over the terms both have. The query is a JSON object of term weights, bound as a parameter or written as a string:
+
+```sql
+SELECT id, score() FROM docs
+ORDER BY similarity(splade, '{"vaccine": 1.4, "mrna": 2.1, "efficacy": 0.6}') DESC LIMIT 10;
+```
+
+It runs on the same machinery as `bm25` (MaxScore, Block-Max WAND, the filter strategies), so `algo => 'maxscore' | 'bmw' | 'exhaustive'` applies, and it fuses with other scores in `rrf`, weighted sums and products. `distance` is not defined on a `SPARSE` field.
+
 ### `rrf(s1, s2, …)`: reciprocal rank fusion
 
 Each input ranks the rows that pass `WHERE`, to a depth of 100 by default, and a row's fused score is
@@ -133,6 +151,32 @@ $$
 $$
 
 Options, given on any input: `depth => 100` (candidates per input), `norm => 'none'` (keep raw scores), `exact => 1` (score every row that passes `WHERE` instead of the top-100 union). The top-100 shortcut recovers 89–95% of the exact fused top 10 ([results](results.md#hybrid-ranking)).
+
+### `decay(field, origin, scale, …)`: closeness to a value
+
+A numeric column's closeness to `origin`, as in Elasticsearch's decay functions. With `d = max(0, |x − origin| − offset)`, the score is 1 at `d = 0` and `decay` at `d = scale`:
+
+| `shape` | score |
+|---|---|
+| `'exp'` (default) | `decay^(d / scale)` |
+| `'gauss'` | `decay^((d / scale)²)` |
+| `'linear'` | `max(0, 1 − (1 − decay) · d / scale)`, reaching 0 at `scale / (1 − decay)` |
+
+Options: `offset => 0`, `decay => 0.5`, `shape => 'exp'`. Rows without a value score 0. `now()` as the origin is the current Unix time in seconds, so `decay(published, now(), 86400)` halves a row's score for each day of age. `decay` ranks on its own, inside `rrf` and weighted sums, and in products.
+
+### Products: boosting relevance by a row's values
+
+Multiplying scores boosts relevance by what a row holds:
+
+```sql
+-- fresh news first: BM25 halved at 30 days old
+SELECT id FROM news ORDER BY bm25(body, :t) * decay(published, now(), 2592000) DESC LIMIT 10;
+
+-- similar products, weighted by their rating
+SELECT id FROM products ORDER BY similarity(emb, :q) * rating DESC LIMIT 10;
+```
+
+A product's factors are scores (`bm25`, `similarity`, `ppr`, `decay`) and numeric columns. Candidates are the top `depth` (100) rows of each relevance factor (`bm25`, `similarity`, graph scores; of every factor when there is none), scored exactly by every factor. Over shards, each shard returns its factors' raw scores and the coordinator multiplies them, so a split collection ranks like the whole one.
 
 ### A column
 
@@ -204,7 +248,22 @@ target/release/strata db.strata --param t='rapid covid tests' < queries.sql
 | `--plan` | prints the plan lines the executor recorded for each statement |
 | `--repeat n` | runs each statement *n* times and reports the median time |
 
-From Rust, `Db::query` takes the SQL and a `Params` map. Writes go through the transaction API (`Database::begin`, `WriteTxn::insert`, `delete`, `commit`); `INSERT`, `UPDATE` and `DELETE` in SQL are not implemented yet.
+From Rust, `Db::query` takes a `SELECT` and a `Params` map, and `Db::sql` takes any statement, writes included. Over the network, [strata-server](server.md) serves the same SQL.
+
+## Writes
+
+```sql
+INSERT INTO products (id, title, price, tags, emb) VALUES ('p1', 'red mug', 12.5, ARRAY['kitchen', 'gift'], :v);
+INSERT OR REPLACE INTO products (id, title, price) VALUES ('p1', 'red mug, large', 14.0);
+UPDATE products SET stock = stock - 1, price = 11.0 WHERE id = 'p1';
+DELETE FROM products WHERE MATCH(title, 'discontinued');
+```
+
+- **`INSERT`** fails on a primary key that already exists; **`INSERT OR REPLACE`** replaces that row (an upsert). Lists are `ARRAY[…]`; a vector is a parameter, `ARRAY[…]` or a JSON array string; a `SPARSE` value is a JSON object string.
+- **`UPDATE`** takes any `WHERE`. Setting only single-valued `INT` and `FLOAT` fields (`SET clicks = clicks + 1`) changes them in place, without rewriting the row, which suits counters and prices that change often. Setting any other field rewrites the row, which needs every text field stored or generated.
+- **`DELETE`** takes any `WHERE`.
+
+Each statement is one transaction, and returns the number of rows it wrote. From Rust, the transaction API (`Database::begin`, `WriteTxn::insert`, `upsert`, `set`, `delete`, `commit`) groups several writes into one; `WriteTxn::upsert_if_newer` keeps whichever version of a row has the highest version number, for replaying a feed out of order.
 
 ## Reading a plan
 

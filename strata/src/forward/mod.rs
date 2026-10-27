@@ -34,7 +34,7 @@ mod range;
 mod store;
 
 pub use blocks::{KeyRange, BLOCK};
-pub use keyword::{CodeSetFilter, FacetStrategy, KeywordColumn, KeywordFilter, KeywordSizes, DEFAULT_RARE};
+pub use keyword::{int_key, int_of_key, key_of, CodeSetFilter, FacetStrategy, KeywordColumn, KeywordFilter, KeywordSizes, DEFAULT_RARE};
 pub use numeric::{float_key, ColumnRangeFilter, Histogram, NumericColumn, NumericKind, DEFAULT_BUCKETS, MAX_SCALE};
 pub use range::{choose_range_strategy, count_range, eval_range, range_costs, RangeIndex, RangePlan, RangeStrategy};
 pub use store::{DocStore, DEFAULT_BLOCK};
@@ -49,6 +49,8 @@ use crate::value::Document;
 pub fn field_builder(field: &Field, opts: &BuildOptions) -> Result<Box<dyn FieldIndexBuilder>> {
     match field.ty {
         FieldType::Keyword => Ok(Box::new(keyword::KeywordBuilder::new(field, opts)?)),
+        // Multi-valued INT fields are indexed as keywords (see keyword.rs).
+        FieldType::Int if field.multi => Ok(Box::new(keyword::KeywordBuilder::new(field, opts)?)),
         FieldType::Int | FieldType::Float => Ok(Box::new(numeric::NumericBuilder::new(field, opts)?)),
         _ => Err(Error::Schema(format!("field {} has no forward column", field.name))),
     }

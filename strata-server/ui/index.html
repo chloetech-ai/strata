@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata query console</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --panel-2: #f1f1ee; --line: #e2e2dc; --text: #1d1d1b; --muted: #6b6b66;
+  --accent: #2f6f5e; --accent-ink: #ffffff; --accent-soft: #e3efe9; --warn: #9a5b00; --warn-soft: #fbf0dd;
+  --err: #a8322d; --err-soft: #f8e4e2; --code-bg: #f3f3ef; --chip: #ecebe6; --shadow: 0 1px 2px rgba(0,0,0,.05);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151614; --panel: #1d1f1c; --panel-2: #242622; --line: #33362f; --text: #e8e8e3; --muted: #9a9b94;
+    --accent: #6cc2a6; --accent-ink: #0f1a16; --accent-soft: #20342d; --warn: #e0a84a; --warn-soft: #3a2f1c;
+    --err: #ec8a83; --err-soft: #3b2220; --code-bg: #20221f; --chip: #2b2e29; --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151614; --panel: #1d1f1c; --panel-2: #242622; --line: #33362f; --text: #e8e8e3; --muted: #9a9b94;
+  --accent: #6cc2a6; --accent-ink: #0f1a16; --accent-soft: #20342d; --warn: #e0a84a; --warn-soft: #3a2f1c;
+  --err: #ec8a83; --err-soft: #3b2220; --code-bg: #20221f; --chip: #2b2e29; --shadow: none;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 var(--sans); }
+button, input, select, textarea { font: inherit; color: inherit; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+header .logo { font-weight: 700; letter-spacing: .02em; }
+header .meta { color: var(--muted); font-size: 13px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+.dot.ok { background: var(--accent); } .dot.bad { background: var(--err); }
+header .spacer { flex: 1; }
+.layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); min-height: calc(100vh - 49px); }
+aside { border-right: 1px solid var(--line); background: var(--panel); padding: 14px; overflow: auto; }
+main { padding: 16px; min-width: 0; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+.field { padding: 6px 8px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+.field:hover { background: var(--panel-2); }
+.field .name { font-family: var(--mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+.badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--chip); color: var(--muted); white-space: nowrap; }
+.badge.pk { background: var(--accent-soft); color: var(--accent); }
+.values { margin: 2px 0 6px 8px; display: flex; flex-wrap: wrap; gap: 4px; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+.tab { padding: 8px 14px; border: 0; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: var(--muted); font-weight: 500; }
+.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; box-shadow: var(--shadow); margin-bottom: 14px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.row + .row { margin-top: 10px; }
+label.lbl { font-size: 12px; color: var(--muted); display: block; margin-bottom: 3px; }
+.grow { flex: 1 1 220px; min-width: 0; }
+input[type=text], input[type=number], input[type=password], select, textarea {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; width: 100%; outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+textarea { font-family: var(--mono); font-size: 13px; resize: vertical; }
+.btn { border: 1px solid var(--line); background: var(--panel); padding: 7px 12px; border-radius: 7px; cursor: pointer; white-space: nowrap; }
+.btn:hover { background: var(--panel-2); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.05); }
+.btn.small { padding: 3px 8px; font-size: 12px; }
+.btn.link { border: 0; background: none; color: var(--accent); padding: 2px 4px; }
+.btn:disabled { opacity: .55; cursor: default; }
+.chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; background: var(--chip); font-size: 12px; cursor: pointer; border: 1px solid transparent; }
+.chip:hover { border-color: var(--accent); }
+.chip .n { color: var(--muted); }
+.filter-row { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr) minmax(0, 1.5fr) auto; gap: 6px; margin-bottom: 6px; }
+pre.sql { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 0; font: 13px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; }
+.kw { color: var(--accent); font-weight: 600; }
+.str { color: var(--warn); }
+.status { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+.status b { color: var(--text); font-weight: 600; }
+.error { background: var(--err-soft); color: var(--err); border-radius: 8px; padding: 10px 12px; font-family: var(--mono); font-size: 13px; white-space: pre-wrap; }
+.note { background: var(--warn-soft); color: var(--warn); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+.table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); max-height: 62vh; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { position: sticky; top: 0; background: var(--panel-2); font-weight: 600; font-family: var(--mono); font-size: 12px; z-index: 1; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 12.5px; }
+td.key { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+td .clip { max-width: 420px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
+td .clip.open { display: block; -webkit-line-clamp: unset; }
+td .null { color: var(--muted); font-style: italic; }
+tr:hover td { background: var(--panel-2); }
+details.plan summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); border-radius: 8px; padding: 10px; overflow: auto; margin: 8px 0 0; }
+.facets { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.answer { font-size: 15px; line-height: 1.6; }
+.answer p { margin: 0 0 10px; } .answer ul, .answer ol { margin: 0 0 10px; padding-left: 22px; }
+.answer code { font-family: var(--mono); font-size: 13px; background: var(--code-bg); padding: 1px 4px; border-radius: 4px; }
+.step { border-left: 3px solid var(--line); padding: 6px 0 6px 12px; margin: 8px 0; }
+.step.ok { border-left-color: var(--accent); } .step.bad { border-left-color: var(--err); }
+.step .head { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; margin-bottom: 4px; flex-wrap: wrap; }
+.muted { color: var(--muted); } .small { font-size: 12px; }
+.hidden { display: none !important; }
+.slider { display: flex; align-items: center; gap: 8px; }
+.slider input { flex: 1; accent-color: var(--accent); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.seg button { border: 0; background: var(--panel); padding: 6px 10px; cursor: pointer; color: var(--muted); }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.cols { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.cols label { font-family: var(--mono); font-size: 12.5px; display: inline-flex; gap: 4px; align-items: center; }
+.history { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.history button { text-align: left; font: 12px/1.4 var(--mono); border: 0; background: none; color: var(--muted); cursor: pointer; padding: 3px 4px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history button:hover { background: var(--panel-2); color: var(--text); }
+@media (max-width: 760px) {
+  .layout { grid-template-columns: 1fr; }
+  aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 40vh; }
+  main { padding: 12px 16px; }
+  .filter-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .filter-row button { justify-self: start; }
+  header { flex-wrap: wrap; }
+}
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">Strata</span>
+  <span class="meta"><span class="dot" id="dot"></span><span id="table">connecting…</span><span id="counts"></span></span>
+  <span class="spacer"></span>
+  <span id="tokenBox" class="row hidden"><input id="token" type="password" placeholder="API token" style="width:180px"><button class="btn small" id="tokenSave">Use token</button></span>
+  <button class="btn small" id="theme" title="Switch light and dark">◐</button>
+</header>
+<div class="layout">
+  <aside>
+    <h2>Fields</h2>
+    <div id="fields"></div>
+    <p class="muted small" id="fieldsHelp">Click a keyword field to see its most common values; click a value to filter on it.</p>
+    <h2 style="margin-top:16px">Recent queries</h2>
+    <div class="history" id="history"></div>
+  </aside>
+  <main>
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" data-tab="build" aria-selected="true">Build</button>
+      <button class="tab" role="tab" data-tab="sql" aria-selected="false">SQL</button>
+      <button class="tab" role="tab" data-tab="ask" aria-selected="false">Ask an agent</button>
+    </div>
+
+    <section id="tab-build">
+      <div class="card">
+        <div class="row">
+          <div class="grow"><label class="lbl" for="bText">Search text</label><input id="bText" type="text" placeholder="e.g. waterproof hiking boots"></div>
+          <div style="width:170px"><label class="lbl" for="bTextField">in</label><select id="bTextField"></select></div>
+          <div><label class="lbl">&nbsp;</label><label class="small"><input type="checkbox" id="bMatchAll"> every word must appear</label></div>
+        </div>
+        <div class="row" id="bVecRow">
+          <div style="width:170px"><label class="lbl" for="bVecMode">Similar to</label>
+            <select id="bVecMode"><option value="">nothing</option><option value="row">a row (its key)</option><option value="text">a description</option></select></div>
+          <div class="grow"><label class="lbl" for="bVecValue">&nbsp;</label><input id="bVecValue" type="text" placeholder="" disabled></div>
+          <div style="width:150px"><label class="lbl" for="bVecField">vector field</label><select id="bVecField"></select></div>
+        </div>
+        <div class="row hidden" id="bFuseRow">
+          <div><label class="lbl">Combine text and similarity</label>
+            <span class="seg" id="bFuse"><button data-v="rrf" aria-pressed="true">rank fusion (RRF)</button><button data-v="weighted" aria-pressed="false">weighted sum</button></span></div>
+          <div class="grow slider hidden" id="bWeightBox"><span class="small muted">text</span><input type="range" id="bWeight" min="0" max="100" value="50"><span class="small muted">similarity</span><span class="small" id="bWeightVal">0.50 / 0.50</span></div>
+        </div>
+        <div class="row" id="bBoostRow">
+          <div style="width:170px"><label class="lbl" for="bBoostField">Boost rows whose</label><select id="bBoostField"></select></div>
+          <div style="width:140px"><label class="lbl" for="bBoostOrigin">is close to</label><input id="bBoostOrigin" type="text" placeholder="e.g. 2026 or now" disabled></div>
+          <div style="width:140px"><label class="lbl" for="bBoostScale">half the boost at ±</label><input id="bBoostScale" type="text" placeholder="e.g. 2" disabled></div>
+          <div style="width:130px"><label class="lbl" for="bBoostShape">falling</label><select id="bBoostShape" disabled><option value="exp">exponentially</option><option value="gauss">like a bell</option><option value="linear">linearly</option></select></div>
+          <div class="grow small muted" id="bBoostNote" style="align-self:flex-end;padding-bottom:8px"></div>
+        </div>
+        <div class="row" style="margin-top:14px"><h2 style="margin:0">Filters</h2><button class="btn small" id="bAddFilter">+ filter</button></div>
+        <div id="bFilters" style="margin-top:8px"></div>
+        <div class="row">
+          <div style="width:200px"><label class="lbl" for="bSort">Sort by (without search)</label><select id="bSort"></select></div>
+          <div style="width:110px"><label class="lbl" for="bDir">order</label><select id="bDir"><option value="DESC">high first</option><option value="ASC">low first</option></select></div>
+          <div style="width:170px"><label class="lbl" for="bFacet">Count values of</label><select id="bFacet"></select></div>
+          <div style="width:90px"><label class="lbl" for="bLimit">Rows</label><input id="bLimit" type="number" value="20" min="1" max="1000"></div>
+        </div>
+        <div class="row"><div class="grow"><label class="lbl">Columns</label><div class="cols" id="bCols"></div></div></div>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px"><h2 style="margin:0">SQL</h2>
+          <span class="row"><button class="btn small" id="bToEditor">Edit as SQL</button><button class="btn primary" id="bRun">Run</button></span></div>
+        <pre class="sql" id="bSql"></pre>
+        <div class="small muted" id="bParams" style="margin-top:6px"></div>
+      </div>
+    </section>
+
+    <section id="tab-sql" class="hidden">
+      <div class="card">
+        <label class="lbl" for="sqlText">SQL <span class="muted">(Ctrl+Enter or ⌘+Enter runs; INSERT, UPDATE and DELETE write)</span></label>
+        <textarea id="sqlText" rows="6" spellcheck="false"></textarea>
+        <div class="row" style="margin-top:8px">
+          <div class="grow"><label class="lbl" for="sqlParams">Parameters (JSON), e.g. {"q": {"vector_of": "p0000042"}}</label>
+            <input id="sqlParams" type="text" placeholder="{}" spellcheck="false" style="font-family:var(--mono);font-size:13px"></div>
+          <div><label class="lbl">&nbsp;</label><span class="row"><button class="btn" id="sqlExplain">Explain</button><button class="btn primary" id="sqlRun">Run</button></span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-ask" class="hidden">
+      <div class="card">
+        <label class="lbl" for="askQ">Question about the data</label>
+        <textarea id="askQ" rows="3" style="font-family:var(--sans);font-size:14px" placeholder="e.g. Which waterproof hiking boots under $150 have the best reviews?"></textarea>
+        <div class="row" style="margin-top:8px">
+          <div style="width:240px"><label class="lbl" for="askModel">Model</label><select id="askModel"></select></div>
+          <div style="width:130px"><label class="lbl" for="askEffort">Effort</label>
+            <select id="askEffort"><option value="">model default</option><option>low</option><option>medium</option><option>high</option></select></div>
+          <div class="grow" id="askKeyBox"><label class="lbl" for="askKey">Anthropic API key <span class="muted">(sent to this server for this request; kept in this browser only if you tick remember)</span></label>
+            <div class="row"><input id="askKey" type="password" placeholder="sk-ant-…" class="grow" autocomplete="off"><label class="small"><input type="checkbox" id="askRemember"> remember</label></div></div>
+          <div><label class="lbl">&nbsp;</label><button class="btn primary" id="askRun">Ask</button></div>
+        </div>
+        <p class="small muted" id="askNote" style="margin:8px 0 0">The agent reads the schema, writes read-only SQL, runs it here and answers from the rows it saw. Every query it ran is listed with its answer.</p>
+      </div>
+      <div id="askOut"></div>
+    </section>
+
+    <div id="results"></div>
+  </main>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return e;
+};
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("strata." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch {} },
+  del(k) { try { localStorage.removeItem("strata." + k); } catch {} },
+};
+
+// ---- connection -------------------------------------------------------------
+let token = new URLSearchParams(location.search).get("token") || (() => { try { return sessionStorage.getItem("strata.token"); } catch { return null; } })();
+if (token) { try { sessionStorage.setItem("strata.token", token); } catch {} }
+async function api(path, body) {
+  const opts = { method: body === undefined ? "GET" : "POST", headers: {} };
+  if (body !== undefined) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
+  if (token) opts.headers.authorization = "Bearer " + token;
+  const r = await fetch(path, opts);
+  let j; try { j = await r.json(); } catch { j = {}; }
+  if (r.status === 401) { $("tokenBox").classList.remove("hidden"); }
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+$("tokenSave").onclick = () => { token = $("token").value.trim(); try { sessionStorage.setItem("strata.token", token); } catch {} $("tokenBox").classList.add("hidden"); init(); };
+
+// ---- theme --------------------------------------------------------------------
+const applyTheme = (t) => { if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; };
+applyTheme(store.get("theme", null));
+$("theme").onclick = () => {
+  const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  const t = dark ? "light" : "dark"; applyTheme(t); store.set("theme", t);
+};
+
+// ---- schema -------------------------------------------------------------------
+let S = null; // {table, fields:[{name, ty, stored, indexed, multi, kind, dim}], pk, embedder}
+const kindOf = (ty) => typeof ty === "string" ? ty.toLowerCase() : Object.keys(ty)[0].toLowerCase();
+function fieldBadge(f) {
+  let t = f.kind === "vector" ? `vector ${f.dim}` : f.kind;
+  if (f.multi) t += " list";
+  return t;
+}
+const isNum = (f) => f.kind === "int" || f.kind === "float";
+const sqlStr = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+const ident = (n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) ? n : '"' + n.replace(/"/g, '""') + '"';
+
+async function loadSchema() {
+  const j = await api("/v1/schema");
+  const s = j.schema;
+  S = {
+    table: s.table, pk: j.primary_key, embedder: j.embedder,
+    fields: s.fields.map((f) => ({ name: f.name, kind: kindOf(f.ty), dim: f.ty.Vector ? f.ty.Vector.dim : null, stored: f.stored, indexed: f.indexed, multi: !!f.multi, generated: (f.generated_from || []).length > 0 })),
+  };
+  $("table").textContent = S.table;
+  renderFields();
+  setupBuilder();
+}
+
+function renderFields() {
+  const box = $("fields"); box.replaceChildren();
+  for (const f of S.fields) {
+    const badges = [el("span", { class: "badge" + (f.name === S.pk ? " pk" : ""), text: f.name === S.pk ? "key" : fieldBadge(f) })];
+    if (f.kind === "text" && !f.stored) badges.unshift(el("span", { class: "badge", text: "search only" }));
+    if (f.kind === "text" && !f.indexed) badges.unshift(el("span", { class: "badge", text: "stored only" }));
+    const vals = el("div", { class: "values hidden" });
+    const row = el("div", { class: "field", title: f.name },
+      el("span", { class: "name", text: f.name }), el("span", { class: "row", style: "gap:4px;flex-wrap:nowrap" }, badges));
+    row.onclick = async () => {
+      if (f.kind === "keyword" || (f.kind === "int" && f.multi)) {
+        if (!vals.classList.contains("hidden")) { vals.classList.add("hidden"); return; }
+        vals.classList.remove("hidden"); vals.replaceChildren(el("span", { class: "small muted", text: "counting…" }));
+        try {
+          const r = await api("/v1/query", { sql: `SELECT ${ident(f.name)}, COUNT(*) FROM ${ident(S.table)} GROUP BY ${ident(f.name)} ORDER BY 2 DESC LIMIT 12` });
+          vals.replaceChildren(...r.rows.map(([v, n]) => el("span", { class: "chip", onclick: (e) => { e.stopPropagation(); addFilter(f.name, "=", String(v)); showTab("build"); } }, String(v), el("span", { class: "n", text: n }))));
+        } catch (e) { vals.replaceChildren(el("span", { class: "small muted", text: e.message })); }
+      } else {
+        insertIntoEditor(ident(f.name));
+      }
+    };
+    box.append(row, vals);
+  }
+}
+
+// ---- tabs ---------------------------------------------------------------------
+function showTab(name) {
+  for (const t of document.querySelectorAll(".tab")) t.setAttribute("aria-selected", String(t.dataset.tab === name));
+  for (const n of ["build", "sql", "ask"]) $("tab-" + n).classList.toggle("hidden", n !== name);
+  $("results").classList.toggle("hidden", name === "ask");
+  store.set("tab", name);
+}
+for (const t of document.querySelectorAll(".tab")) t.onclick = () => showTab(t.dataset.tab);
+
+// ---- builder ------------------------------------------------------------------
+const B = { filters: [], fuse: "rrf", cols: null };
+function opt(v, t) { return el("option", { value: v, text: t ?? v }); }
+function setupBuilder() {
+  const textFields = S.fields.filter((f) => f.kind === "text" && f.indexed);
+  $("bTextField").replaceChildren(...textFields.map((f) => opt(f.name, f.name + (f.generated ? " (all text)" : ""))));
+  const gen = textFields.find((f) => f.generated); if (gen) $("bTextField").value = gen.name;
+  const vecFields = S.fields.filter((f) => f.kind === "vector");
+  $("bVecRow").classList.toggle("hidden", vecFields.length === 0 || !S.pk);
+  $("bVecField").replaceChildren(...vecFields.map((f) => opt(f.name)));
+  if (!S.embedder) $("bVecMode").querySelector('option[value="text"]').remove();
+  $("bSort").replaceChildren(opt("", "relevance / none"), ...S.fields.filter((f) => isNum(f) && !f.multi).map((f) => opt(f.name)));
+  $("bBoostField").replaceChildren(opt("", "no boost"), ...S.fields.filter((f) => isNum(f) && !f.multi).map((f) => opt(f.name)));
+  $("bBoostField").addEventListener("input", () => { for (const id of ["bBoostOrigin", "bBoostScale", "bBoostShape"]) $(id).disabled = !$("bBoostField").value; updateSql(); });
+  for (const id of ["bBoostOrigin", "bBoostScale", "bBoostShape"]) $(id).addEventListener("input", updateSql);
+  $("bFacet").replaceChildren(opt("", "nothing"), ...S.fields.filter((f) => (f.kind === "keyword" && f.name !== S.pk) || (f.kind === "int" && f.multi)).map((f) => opt(f.name)));
+  const selectable = S.fields.filter((f) => f.kind !== "vector" && (f.stored || f.name === S.pk));
+  if (!B.cols) B.cols = new Set(selectable.slice(0, 8).map((f) => f.name));
+  $("bCols").replaceChildren(...selectable.map((f) => {
+    const cb = el("input", { type: "checkbox" }); cb.checked = B.cols.has(f.name);
+    cb.onchange = () => { cb.checked ? B.cols.add(f.name) : B.cols.delete(f.name); updateSql(); };
+    return el("label", {}, cb, f.name);
+  }));
+  for (const id of ["bText", "bTextField", "bMatchAll", "bVecValue", "bVecField", "bSort", "bDir", "bFacet", "bLimit"]) $(id).addEventListener("input", updateSql);
+  $("bVecMode").addEventListener("input", () => {
+    const m = $("bVecMode").value; $("bVecValue").disabled = !m;
+    $("bVecValue").placeholder = m === "row" ? `a ${S.pk}, e.g. one from the results` : m === "text" ? "describe what you want" : "";
+    updateSql();
+  });
+  for (const b of $("bFuse").querySelectorAll("button")) b.onclick = () => {
+    B.fuse = b.dataset.v; for (const x of $("bFuse").querySelectorAll("button")) x.setAttribute("aria-pressed", String(x === b));
+    $("bWeightBox").classList.toggle("hidden", B.fuse !== "weighted"); updateSql();
+  };
+  $("bWeight").addEventListener("input", updateSql);
+  renderFilters(); updateSql();
+}
+function opsFor(f) {
+  if (!f) return ["="];
+  if (f.kind === "text") return ["matches"];
+  if (isNum(f) && !f.multi) return ["=", "!=", "<", "<=", ">", ">=", "between", "in"];
+  if (f.multi) return ["has", "has any of", "has none of"];
+  return ["=", "!=", "in", "not in"];
+}
+function addFilter(field, op, value) {
+  const f = S.fields.find((x) => x.name === field) || filterable()[0];
+  B.filters.push({ field: f.name, op: op && opsFor(f).includes(op) ? op : (f.multi ? "has" : opsFor(f)[0]), value: value ?? "" });
+  renderFilters(); updateSql();
+}
+const filterable = () => S.fields.filter((f) => f.kind !== "vector" && f.kind !== "edges" && f.indexed);
+function renderFilters() {
+  const box = $("bFilters"); box.replaceChildren();
+  B.filters.forEach((flt, i) => {
+    const fsel = el("select", {}, ...filterable().map((f) => opt(f.name)));
+    fsel.value = flt.field;
+    const f = S.fields.find((x) => x.name === flt.field);
+    const osel = el("select", {}, ...opsFor(f).map((o) => opt(o)));
+    osel.value = flt.op;
+    const val = el("input", { type: "text", value: flt.value, placeholder: flt.op === "between" ? "low, high" : /in|any|none/.test(flt.op) ? "a, b, c" : "value" });
+    fsel.oninput = () => { flt.field = fsel.value; const nf = S.fields.find((x) => x.name === flt.field); flt.op = opsFor(nf)[0]; renderFilters(); updateSql(); };
+    osel.oninput = () => { flt.op = osel.value; renderFilters(); updateSql(); };
+    val.oninput = () => { flt.value = val.value; updateSql(); };
+    box.append(el("div", { class: "filter-row" }, fsel, osel, val, el("button", { class: "btn small", title: "Remove", onclick: () => { B.filters.splice(i, 1); renderFilters(); updateSql(); } }, "✕")));
+  });
+}
+$("bAddFilter").onclick = () => addFilter(filterable()[0].name);
+
+function literal(f, v) {
+  v = v.trim();
+  if (isNum(f) || (f.multi && f.kind === "int")) return /^-?\d+(\.\d+)?([eE]-?\d+)?$/.test(v) ? v : null;
+  return sqlStr(v);
+}
+function filterSql(flt) {
+  const f = S.fields.find((x) => x.name === flt.field); if (!f) return null;
+  const n = ident(f.name);
+  const list = () => flt.value.split(",").map((v) => literal(f, v)).filter((x) => x != null && x !== "''");
+  if (flt.op === "matches") return flt.value.trim() ? `MATCH(${n}, ${sqlStr(flt.value.trim())})` : null;
+  if (flt.op === "between") { const [a, b] = flt.value.split(",").map((v) => literal(f, v || "")); return a && b ? `${n} BETWEEN ${a} AND ${b}` : null; }
+  if (["in", "not in", "has any of", "has none of"].includes(flt.op)) {
+    const l = list(); if (!l.length) return null;
+    return `${n} ${flt.op === "not in" || flt.op === "has none of" ? "NOT IN" : "IN"} (${l.join(", ")})`;
+  }
+  const v = literal(f, flt.value); if (v == null || v === "''") return null;
+  return `${n} ${flt.op === "has" ? "=" : flt.op} ${v}`;
+}
+function builderQuery() {
+  const T = ident(S.table);
+  const text = $("bText").value.trim(), tf = ident($("bTextField").value || "");
+  const vm = $("bVecMode").value, vv = $("bVecValue").value.trim(), vf = ident($("bVecField").value || "");
+  const where = [];
+  if (text && $("bMatchAll").checked) where.push(`MATCH(${tf}, ${sqlStr(text)})`);
+  for (const flt of B.filters) { const s = filterSql(flt); if (s) where.push(s); }
+  const params = {};
+  const textScore = text ? `bm25(${tf}, ${sqlStr(text)})` : null;
+  let vecScore = null;
+  if (vm && vv) { vecScore = `similarity(${vf}, :q)`; params.q = vm === "row" ? { vector_of: vv, field: $("bVecField").value } : { embed: vv }; }
+  let order = null;
+  $("bFuseRow").classList.toggle("hidden", !(textScore && vecScore));
+  // The boost: decay(field, origin, scale) multiplies a single ranking.
+  let boost = null; $("bBoostNote").textContent = "";
+  const bf = $("bBoostField").value, bo = $("bBoostOrigin").value.trim(), bs = $("bBoostScale").value.trim();
+  if (bf) {
+    const num = (v) => /^-?\d+(\.\d+)?$/.test(v);
+    const origin = bo.toLowerCase() === "now" ? "now()" : num(bo) ? bo : null;
+    if (!origin || !num(bs) || Number(bs) <= 0) $("bBoostNote").textContent = "Give a number (or now) and a scale above 0.";
+    else if (textScore && vecScore) $("bBoostNote").textContent = "A boost multiplies one ranking: clear the text or the similarity.";
+    else boost = `decay(${ident(bf)}, ${origin}, ${bs}${$("bBoostShape").value !== "exp" ? `, shape => '${$("bBoostShape").value}'` : ""})`;
+  }
+  if (boost && !(textScore && vecScore)) {
+    order = `${textScore || vecScore ? (textScore || vecScore) + " * " : ""}${boost} DESC`;
+  } else if (textScore && vecScore) {
+    if (B.fuse === "rrf") order = `rrf(${textScore}, ${vecScore}) DESC`;
+    else { const w = $("bWeight").value / 100; $("bWeightVal").textContent = `${(1 - w).toFixed(2)} / ${w.toFixed(2)}`; order = `${(1 - w).toFixed(2)} * ${textScore} + ${w.toFixed(2)} * ${vecScore} DESC`; }
+  } else if (textScore || vecScore) order = `${textScore || vecScore} DESC`;
+  else if ($("bSort").value) order = `${ident($("bSort").value)} ${$("bDir").value}`;
+  const cols = S.fields.filter((f) => B.cols.has(f.name)).map((f) => ident(f.name));
+  if (order && (textScore || vecScore || boost)) cols.push("score()");
+  const limit = Math.max(1, Math.min(1000, parseInt($("bLimit").value, 10) || 20));
+  const w = where.length ? `\nWHERE ${where.join("\n  AND ")}` : "";
+  const sql = `SELECT ${cols.length ? cols.join(", ") : "*"}\nFROM ${T}${w}${order ? `\nORDER BY ${order}` : ""}\nLIMIT ${limit}`;
+  const facet = $("bFacet").value ? `SELECT ${ident($("bFacet").value)}, COUNT(*) FROM ${T}${w.replace(/\n/g, " ")} GROUP BY ${ident($("bFacet").value)} ORDER BY 2 DESC LIMIT 15` : null;
+  return { sql, params, facet };
+}
+function highlight(sql) {
+  const out = []; const re = /('(?:[^']|'')*')|\b(SELECT|FROM|WHERE|AND|OR|NOT|IN|BETWEEN|ORDER BY|GROUP BY|LIMIT|OFFSET|DESC|ASC|MATCH|COUNT|INSERT|INTO|VALUES|UPDATE|SET|DELETE)\b/g;
+  let last = 0, m;
+  while ((m = re.exec(sql))) {
+    if (m.index > last) out.push(document.createTextNode(sql.slice(last, m.index)));
+    out.push(el("span", { class: m[1] ? "str" : "kw", text: m[0] })); last = re.lastIndex;
+  }
+  out.push(document.createTextNode(sql.slice(last)));
+  return out;
+}
+function updateSql() {
+  const q = builderQuery();
+  $("bSql").replaceChildren(...highlight(q.sql));
+  $("bParams").textContent = Object.keys(q.params).length ? "parameters: " + JSON.stringify(q.params) : "";
+}
+$("bRun").onclick = () => { const q = builderQuery(); runQuery(q.sql, q.params, q.facet); };
+$("bToEditor").onclick = () => { const q = builderQuery(); $("sqlText").value = q.sql; $("sqlParams").value = Object.keys(q.params).length ? JSON.stringify(q.params) : ""; showTab("sql"); $("sqlText").focus(); };
+$("bText").addEventListener("keydown", (e) => { if (e.key === "Enter") $("bRun").click(); });
+$("bVecValue").addEventListener("keydown", (e) => { if (e.key === "Enter") $("bRun").click(); });
+
+// ---- SQL editor -----------------------------------------------------------------
+function insertIntoEditor(text) {
+  const t = $("sqlText"); const s = t.selectionStart ?? t.value.length;
+  t.value = t.value.slice(0, s) + text + t.value.slice(t.selectionEnd ?? s); t.focus(); t.selectionStart = t.selectionEnd = s + text.length;
+}
+function editorParams() {
+  const raw = $("sqlParams").value.trim(); if (!raw) return {};
+  return JSON.parse(raw);
+}
+$("sqlRun").onclick = () => { let p; try { p = editorParams(); } catch (e) { return showError("Parameters are not valid JSON: " + e.message); } runQuery($("sqlText").value, p, null, true); };
+$("sqlExplain").onclick = async () => {
+  let p; try { p = editorParams(); } catch (e) { return showError("Parameters are not valid JSON: " + e.message); }
+  const out = $("results"); out.replaceChildren(el("p", { class: "muted", text: "explaining…" }));
+  try {
+    const j = await api("/v1/explain", { sql: $("sqlText").value, params: p });
+    out.replaceChildren(el("div", { class: "card" },
+      el("div", { class: "status" }, el("span", {}, "kind ", el("b", { text: j.kind })), el("span", {}, el("b", { text: fmtMs(j.took_ms) })), el("span", {}, el("b", { text: j.rows }), " rows"), el("span", {}, el("b", { text: j.filter_docs }), " passed the filter"), el("span", {}, el("b", { text: j.scored }), " scored")),
+      el("h2", { text: "Plan" }), el("pre", { class: "sql", text: j.plan.join("\n") }),
+      el("details", { class: "plan", style: "margin-top:12px" }, el("summary", { text: "The query as bound to the schema" }), el("pre", { style: "max-height:40vh", text: j.logical }))));
+  } catch (e) { showError(e.message); }
+};
+$("sqlText").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("sqlRun").click(); } });
+
+// ---- running and showing results -------------------------------------------------
+const fmtMs = (ms) => ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : ms < 100 ? `${ms.toFixed(1)} ms` : `${Math.round(ms)} ms`;
+function showError(msg) { $("results").replaceChildren(el("div", { class: "error", text: msg })); }
+function remember(sql, params) {
+  const h = store.get("history", []).filter((x) => x.sql !== sql);
+  h.unshift({ sql, params }); store.set("history", h.slice(0, 15)); renderHistory();
+}
+function renderHistory() {
+  const h = store.get("history", []);
+  $("history").replaceChildren(...(h.length ? h.map((x) => el("button", { title: x.sql, onclick: () => { $("sqlText").value = x.sql; $("sqlParams").value = x.params && Object.keys(x.params).length ? JSON.stringify(x.params) : ""; showTab("sql"); } }, x.sql.replace(/\s+/g, " "))) : [el("span", { class: "small muted", text: "Queries you run appear here." })]));
+}
+async function runQuery(sql, params, facetSql, anyStatement) {
+  const out = $("results");
+  out.replaceChildren(el("p", { class: "muted", text: "running…" }));
+  try {
+    const [j, facet] = await Promise.all([
+      api(anyStatement ? "/v1/sql" : "/v1/query", { sql, params }),
+      facetSql ? api("/v1/query", { sql: facetSql }).catch((e) => ({ error: e.message })) : null,
+    ]);
+    remember(sql, params);
+    if (j.written !== undefined) {
+      out.replaceChildren(el("div", { class: "card" }, el("div", { class: "status" }, el("span", {}, el("b", { text: j.written }), " rows written"), el("span", {}, el("b", { text: fmtMs(j.took_ms) })))));
+      refreshHealth(); return;
+    }
+    renderResult(j, facet);
+  } catch (e) { showError(e.message); }
+}
+function cell(v, f) {
+  if (v === null || v === undefined) return el("td", {}, el("span", { class: "null", text: "null" }));
+  if (Array.isArray(v)) return el("td", {}, el("span", { class: "row", style: "gap:4px" }, v.map((x) => el("span", { class: "chip", style: "cursor:default", text: String(x) }))));
+  if (typeof v === "number") return el("td", { class: "num", text: Number.isInteger(v) ? String(v) : v.toFixed(Math.abs(v) < 1 ? 4 : 2) });
+  const s = String(v);
+  if (f && f.name === S.pk) {
+    const td = el("td", { class: "key" }, s);
+    if (S.fields.some((x) => x.kind === "vector")) td.append(" ", el("button", { class: "btn link small", title: "Find rows like this one", onclick: () => moreLike(s) }, "similar"));
+    return td;
+  }
+  const c = el("div", { class: "clip", text: s, title: "Click to expand" });
+  c.onclick = () => c.classList.toggle("open");
+  return el("td", {}, c);
+}
+function moreLike(key) {
+  $("bVecMode").value = "row"; $("bVecValue").disabled = false; $("bVecValue").value = key; $("bText").value = "";
+  showTab("build"); updateSql(); $("bRun").click();
+}
+function renderResult(j, facet) {
+  const out = $("results");
+  const status = el("div", { class: "status" },
+    el("span", {}, el("b", { text: j.rows.length }), " rows"),
+    el("span", {}, el("b", { text: fmtMs(j.took_ms) })),
+    j.stats && j.stats.filter_docs ? el("span", {}, el("b", { text: j.stats.filter_docs.toLocaleString() }), " passed the filter") : null,
+    j.stats && j.stats.scored ? el("span", {}, el("b", { text: j.stats.scored.toLocaleString() }), " scored") : null);
+  const parts = [status];
+  if (facet) {
+    if (facet.error) parts.push(el("div", { class: "note", text: "Facet: " + facet.error }));
+    else parts.push(el("div", { class: "facets" }, el("span", { class: "small muted", style: "align-self:center", text: facet.columns[0] + ":" }),
+      facet.rows.map(([v, n]) => el("span", { class: "chip", title: "Filter on this value", onclick: () => { addFilter(facet.columns[0], "=", String(v)); $("bRun").click(); } }, String(v), el("span", { class: "n", text: n.toLocaleString() })))));
+  }
+  if (j.rows.length) {
+    const fields = j.columns.map((c) => S.fields.find((f) => f.name === c));
+    const head = el("tr", {}, j.columns.map((c) => el("th", { text: c })));
+    const body = j.rows.map((r) => el("tr", {}, r.map((v, i) => cell(v, fields[i]))));
+    parts.push(el("div", { class: "table-wrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
+  } else parts.push(el("p", { class: "muted", text: "No rows." }));
+  if (j.stats && j.stats.plan && j.stats.plan.length) parts.push(el("details", { class: "plan", style: "margin-top:10px" }, el("summary", { text: "How it ran (plan)" }), el("pre", { text: j.stats.plan.join("\n") })));
+  out.replaceChildren(...parts);
+}
+
+// ---- agent ----------------------------------------------------------------------
+let serverKey = false;
+async function loadConfig() {
+  const c = await api("/v1/config");
+  serverKey = c.agent.server_key;
+  const models = [...new Set([c.agent.model, ...c.agent.models])];
+  $("askModel").replaceChildren(...models.map((m) => opt(m, m + (m === c.agent.model ? " (default)" : ""))));
+  $("askModel").value = store.get("model", c.agent.model);
+  if (!models.includes($("askModel").value)) $("askModel").value = c.agent.model;
+  $("askKeyBox").classList.toggle("hidden", serverKey);
+  const k = store.get("apiKey", ""); if (k) { $("askKey").value = k; $("askRemember").checked = true; }
+}
+function renderMarkdown(text) {
+  // Paragraphs, lists, `code` and ```sql blocks; everything as text nodes.
+  const box = el("div", { class: "answer" });
+  const blocks = text.split(/```(?:\w+)?\n?([\s\S]*?)```/g);
+  blocks.forEach((b, i) => {
+    if (i % 2 === 1) {
+      const sql = b.trim();
+      box.append(el("div", { class: "row", style: "justify-content:flex-end;margin-bottom:4px" }, el("button", { class: "btn small", onclick: () => openInEditor(sql) }, "Open in editor")), el("pre", { class: "sql", style: "margin-bottom:10px" }, ...highlight(sql)));
+      return;
+    }
+    let list = null;
+    for (const para of b.split(/\n{2,}/)) {
+      const lines = para.split("\n").filter((l) => l.trim());
+      if (!lines.length) continue;
+      if (lines.every((l) => /^\s*([-*]|\d+\.)\s+/.test(l))) {
+        list = el(/^\s*\d/.test(lines[0]) ? "ol" : "ul");
+        for (const l of lines) list.append(el("li", {}, inline(l.replace(/^\s*([-*]|\d+\.)\s+/, ""))));
+        box.append(list);
+      } else box.append(el("p", {}, inline(lines.join(" "))));
+    }
+  });
+  return box;
+}
+function inline(s) {
+  const out = []; const re = /`([^`]+)`|\*\*([^*]+)\*\*/g; let last = 0, m;
+  while ((m = re.exec(s))) {
+    if (m.index > last) out.push(s.slice(last, m.index));
+    out.push(m[1] ? el("code", { text: m[1] }) : el("b", { text: m[2] })); last = re.lastIndex;
+  }
+  out.push(s.slice(last)); return out;
+}
+function openInEditor(sql, params) { $("sqlText").value = sql; $("sqlParams").value = params && Object.keys(params).length ? JSON.stringify(params) : ""; showTab("sql"); $("sqlRun").click(); }
+$("askRun").onclick = async () => {
+  const q = $("askQ").value.trim(); if (!q) return;
+  const key = $("askKey").value.trim();
+  if ($("askRemember").checked && key) store.set("apiKey", key); else store.del("apiKey");
+  store.set("model", $("askModel").value);
+  const out = $("askOut"); const btn = $("askRun"); btn.disabled = true;
+  const t0 = performance.now();
+  const tick = el("span", { class: "muted", text: "thinking…" });
+  const timer = setInterval(() => { tick.textContent = `thinking… ${((performance.now() - t0) / 1000).toFixed(0)} s`; }, 500);
+  out.replaceChildren(el("div", { class: "card" }, tick));
+  try {
+    const j = await api("/v1/agent", { question: q, model: $("askModel").value, effort: $("askEffort").value, api_key: serverKey ? undefined : key });
+    const steps = j.steps.map((s, i) => el("div", { class: "step " + (s.ok ? "ok" : "bad") },
+      el("div", { class: "head" }, el("span", { text: `query ${i + 1}` }), s.ok ? el("span", { text: `${s.rows} rows · ${fmtMs(s.took_ms)} · ${s.kind}` }) : el("span", { style: "color:var(--err)", text: "failed" }),
+        el("button", { class: "btn small", onclick: () => openInEditor(s.sql, s.params) }, "Open in editor")),
+      el("pre", { class: "sql" }, ...highlight(s.sql || "")),
+      s.ok ? null : el("div", { class: "small", style: "color:var(--err);margin-top:4px", text: s.error })));
+    const u = j.usage;
+    out.replaceChildren(
+      el("div", { class: "card" }, renderMarkdown(j.answer),
+        el("div", { class: "status", style: "margin:8px 0 0" }, el("span", {}, el("b", { text: j.model })), el("span", {}, el("b", { text: fmtMs(j.took_ms) })),
+          el("span", {}, el("b", { text: j.steps.length }), " queries"), el("span", { text: `${(u.input_tokens + u.cache_read_input_tokens).toLocaleString()} tokens in, ${u.output_tokens.toLocaleString()} out` }))),
+      j.steps.length ? el("div", { class: "card" }, el("h2", { text: "Queries the agent ran" }), steps) : null);
+  } catch (e) { out.replaceChildren(el("div", { class: "error", text: e.message })); }
+  finally { clearInterval(timer); btn.disabled = false; }
+};
+$("askQ").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("askRun").click(); });
+
+// ---- start ------------------------------------------------------------------------
+async function refreshHealth() {
+  try {
+    const h = await api("/v1/health");
+    $("dot").className = "dot " + (h.status === "ok" ? "ok" : "bad");
+    const plural = (n, w) => `${Number(n).toLocaleString()} ${w}${n == 1 ? "" : "s"}`;
+    $("counts").textContent = `${plural(h.docs, "row")} · ${plural(h.segments, "segment")}${h.role === "coordinator" ? ` · ${plural(h.shards.length, "shard")}` : ""}`;
+  } catch (e) { $("dot").className = "dot bad"; $("counts").textContent = e.message; }
+}
+async function init() {
+  try {
+    await refreshHealth();
+    await loadSchema();
+    await loadConfig();
+    renderHistory();
+    if (!$("sqlText").value) $("sqlText").value = `SELECT * FROM ${ident(S.table)} LIMIT 10`;
+    showTab(store.get("tab", "build"));
+    $("results").replaceChildren(el("p", { class: "muted", text: "Build a query above, or press Run to see some rows." }));
+  } catch (e) { $("table").textContent = "not connected"; showError(e.message); }
+}
+init();
+setInterval(refreshHealth, 15000);
+</script>
+</body>
+</html>

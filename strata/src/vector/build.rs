@@ -5,6 +5,7 @@
 //! | key | default | meaning |
 //! |---|---|---|
 //! | `vector.index` | schema's kind | `flat`, `ivf` or `hnsw` |
+//! | `vector.codes` | schema's codes (`sq8`) | `sq8` or `binary` |
 //! | `vector.ivf.nlist` | schema's `nlist`, else ≈ 4·√n | number of clusters |
 //! | `vector.ivf.iters` | 10 | k-means iterations |
 //! | `vector.ivf.sample` | 64 | k-means training points per cluster |
@@ -18,12 +19,14 @@
 use crate::postings::bytes::ByteWriter;
 
 use crate::error::{Error, Result};
-use crate::schema::{Field, FieldType, VectorIndexKind};
+use crate::schema::{Field, FieldType, VectorCodes, VectorIndexKind};
 use crate::segment::build::BuildOptions;
 use crate::segment::{DocId, FieldIndexBuilder, SegmentWriter};
 use crate::value::Value;
 use crate::vector::hnsw::{self, HnswConfig};
 use crate::vector::ivf::{self, IvfConfig};
+use crate::vector::bits::Bits;
+use crate::vector::codes::Quantiser;
 use crate::vector::sq8::Sq8;
 use crate::vector::{section, VectorInfo};
 
@@ -42,8 +45,9 @@ impl Rows<'_> {
     }
 }
 
-/// Row strides: float32 rows padded to 16 floats and code rows to 64 bytes,
-/// so every row starts on a cache line and kernels need no tail handling.
+/// Row strides: float32 rows padded to 16 floats and SQ8 code rows to 64
+/// bytes, so every row starts on a cache line and kernels need no tail
+/// handling (binary code rows: [`VectorCodes::stride`]).
 pub(crate) fn strides(dim: usize) -> (usize, usize) {
     (dim.next_multiple_of(16), dim.next_multiple_of(64))
 }
@@ -64,6 +68,11 @@ pub(crate) struct VectorBuilder {
     dim: usize,
     stride: usize,
     kind: Kind,
+    codes: VectorCodes,
+    /// Segments with more vectors than this build IVF instead of HNSW
+    /// (`vector.hnsw.max_docs`): an HNSW graph's build time grows faster
+    /// than the segment, and is paid again at every merge.
+    hnsw_max_docs: Option<usize>,
     threads: usize,
     seed: u64,
     /// Float32 rows as little-endian bytes, so the buffer becomes the
@@ -111,6 +120,11 @@ impl VectorBuilder {
             dim: *dim,
             stride: strides(*dim).0,
             kind,
+            codes: match opts.get("vector.codes") {
+                None => field.codes,
+                Some(c) => VectorCodes::parse(c).ok_or_else(|| Error::Schema(format!("unknown vector codes {c:?}")))?,
+            },
+            hnsw_max_docs: parse(opts, "vector.hnsw.max_docs")?,
             threads: parse(opts, "vector.threads")?.unwrap_or(1),
             seed: parse(opts, "vector.seed")?.unwrap_or(0x5EE_D0F5_747A),
             rows: Vec::new(),
@@ -146,21 +160,29 @@ impl FieldIndexBuilder for VectorBuilder {
     }
 
     fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
-        let VectorBuilder { field, dim, stride, kind, threads, seed, rows, present, n, missing } = *self;
-        let code_stride = strides(dim).1;
+        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, rows, present, n, missing } = *self;
+        let code_stride = code_kind.stride(dim);
         let is_present = |d: u32| present[d as usize / 64] >> (d % 64) & 1 == 1;
         let ids: Vec<u32> = (0..n as u32).filter(|&d| is_present(d)).collect();
+        let kind = match kind {
+            Kind::Hnsw { .. } if hnsw_max_docs.is_some_and(|m| ids.len() > m) => Kind::Ivf { nlist: None, iters: 10, sample: 64 },
+            k => k,
+        };
         // SAFETY: f32 has no invalid bit patterns; `align_to` only yields the
         // aligned middle part, and we require it to be everything.
         let (head, data, tail) = unsafe { rows.align_to::<f32>() };
         assert!(head.is_empty() && tail.is_empty(), "allocator returned a misaligned vector buffer");
         let view = Rows { data, dim, stride, n };
 
-        let sq = Sq8::fit(dim, ids.iter().map(|&d| &view.row(d as usize)[..dim]));
+        let present_rows = ids.iter().map(|&d| &view.row(d as usize)[..dim]);
+        let quant = match code_kind {
+            VectorCodes::Sq8 => Quantiser::Sq8(Sq8::fit(dim, present_rows)),
+            VectorCodes::Binary => Quantiser::Bits(Bits::fit(dim, present_rows)),
+        };
         let mut codes = vec![0u8; n * code_stride];
         for &d in &ids {
             let d = d as usize;
-            sq.encode(&view.row(d)[..dim], &mut codes[d * code_stride..(d + 1) * code_stride]);
+            quant.encode(&view.row(d)[..dim], &mut codes[d * code_stride..(d + 1) * code_stride]);
         }
 
         let mut info = VectorInfo {
@@ -170,6 +192,7 @@ impl FieldIndexBuilder for VectorBuilder {
             index: "flat".into(),
             stride_f32: stride,
             stride_u8: code_stride,
+            codes: code_kind,
             nlist: None,
             train_points: None,
             iters: None,
@@ -205,17 +228,27 @@ impl FieldIndexBuilder for VectorBuilder {
         }
 
         let mut p = ByteWriter::new();
-        p.array(&sq.min);
-        p.array(&sq.scale);
+        let (codes_part, params_part) = match &quant {
+            Quantiser::Sq8(sq) => {
+                p.array(&sq.min);
+                p.array(&sq.scale);
+                ("sq8", "sq8p")
+            }
+            Quantiser::Bits(b) => {
+                p.array(&b.mean);
+                p.array(&b.spread);
+                ("bin", "binp")
+            }
+        };
         out.put(section(&field, "meta"), serde_json::to_vec(&info).expect("serialisable"));
-        out.put(section(&field, "sq8p"), p.finish());
+        out.put(section(&field, params_part), p.finish());
         if missing > 0 {
             out.put(section(&field, "present"), present.iter().flat_map(|w| w.to_le_bytes()).collect());
         }
         for (name, bytes) in index_sections {
             out.put(name, bytes);
         }
-        out.put(section(&field, "sq8"), codes);
+        out.put(section(&field, codes_part), codes);
         out.put(section(&field, "f32"), rows);
         Ok(())
     }

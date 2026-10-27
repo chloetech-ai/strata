@@ -134,6 +134,9 @@ pub enum Score {
     /// Dot product with `vector` (cosine for unit vectors). `distance(...)`
     /// binds to this with the sort direction flipped.
     Similarity { field: usize, vector: Arc<[f32]>, opts: Opts },
+    /// Dot product of a SPARSE field's term weights with `terms`' (also
+    /// `similarity(...)` in SQL).
+    Sparse { field: usize, terms: Vec<(String, f32)>, opts: Opts },
     /// Reciprocal rank fusion: `Σ 1 / (k + rank_i)` over the inputs' rankings
     /// of their top `depth` rows.
     Rrf { inputs: Vec<Score>, k: f64, depth: usize },
@@ -146,13 +149,20 @@ pub enum Score {
     /// Hop distance in `Select::graphs[graph]`, nearest first (as
     /// `-hops`) or farthest first.
     Hops { graph: usize, far_first: bool },
+    /// A numeric column's closeness to an origin, from 1 at the origin down
+    /// towards 0 ([`Decay`]); 0 for rows without a value.
+    Decay { field: usize, decay: Decay, opts: Opts },
+    /// The product of scores (`bm25(..) * decay(..)`): candidates are the
+    /// top `depth` rows of each relevance factor (BM25, similarity, graph;
+    /// of every factor when there is none), scored exactly by every factor.
+    Product(Vec<Score>),
 }
 
 impl Score {
     /// Every leaf (BM25, similarity or column) of the expression.
     pub fn leaves(&self) -> Vec<&Score> {
         match self {
-            Score::Rrf { inputs, .. } => inputs.iter().flat_map(|s| s.leaves()).collect(),
+            Score::Rrf { inputs, .. } | Score::Product(inputs) => inputs.iter().flat_map(|s| s.leaves()).collect(),
             Score::Weighted(ts) => ts.iter().flat_map(|(_, s)| s.leaves()).collect(),
             s => vec![s],
         }
@@ -160,8 +170,55 @@ impl Score {
 
     pub fn opts(&self) -> Option<&Opts> {
         match self {
-            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } => Some(opts),
+            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } | Score::Sparse { opts, .. } | Score::Decay { opts, .. } => Some(opts),
             _ => None,
+        }
+    }
+
+    /// Whether the score ranks by relevance to the query (BM25,
+    /// similarity, sparse, graph), as opposed to a row's own values (a column, a
+    /// decay), which only boost rows found by relevance.
+    pub fn is_relevance(&self) -> bool {
+        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Ppr { .. } | Score::Hops { .. })
+    }
+}
+
+/// How a decay function falls off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecayShape {
+    /// `exp(λ·d)`: halves (by default) every `scale`.
+    Exp,
+    /// A Gaussian of the distance: flat near the origin, then steep.
+    Gauss,
+    /// Straight down to 0 at `scale / (1 − decay)`.
+    Linear,
+}
+
+/// `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`,
+/// as Elasticsearch's decay functions: the distance `d = max(0, |x −
+/// origin| − offset)` maps to 1 at `d = 0` and to `decay` at `d = scale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Decay {
+    pub origin: f64,
+    pub scale: f64,
+    pub offset: f64,
+    pub decay: f64,
+    pub shape: DecayShape,
+}
+
+impl Decay {
+    pub fn eval(&self, x: f64) -> f64 {
+        let d = ((x - self.origin).abs() - self.offset).max(0.0);
+        match self.shape {
+            DecayShape::Exp => (self.decay.ln() / self.scale * d).exp(),
+            DecayShape::Gauss => {
+                let var = -self.scale * self.scale / (2.0 * self.decay.ln());
+                (-d * d / (2.0 * var)).exp()
+            }
+            DecayShape::Linear => {
+                let s = self.scale / (1.0 - self.decay);
+                ((s - d) / s).max(0.0)
+            }
         }
     }
 }

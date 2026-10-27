@@ -1,0 +1,87 @@
+// Strata over gRPC. The HTTP JSON API (`/v1/...`) mirrors these calls.
+// Statistics, fusion parts and plans travel as JSON bytes: they are
+// Strata's own serde types, shared with the HTTP API.
+syntax = "proto3";
+
+package strata.v1;
+
+service Strata {
+  // Runs a SELECT. With `shard`, returns results a coordinator can merge.
+  rpc Query(QueryRequest) returns (QueryResponse);
+  // The BM25 statistics a SELECT scores with, and a snapshot lease for the
+  // query round that follows.
+  rpc TermStats(QueryRequest) returns (TermStatsResponse);
+  // Runs an INSERT, UPDATE or DELETE, or a batch of write operations.
+  rpc Write(WriteRequest) returns (WriteResponse);
+  // The table's schema as JSON.
+  rpc Schema(Empty) returns (SchemaResponse);
+  rpc Health(Empty) returns (HealthResponse);
+}
+
+message Empty {}
+
+message Value {
+  oneof kind {
+    bool null = 1;
+    int64 int = 2;
+    double float = 3;
+    string str = 4;
+    Floats vector = 5;
+    Values list = 6;
+  }
+}
+
+message Floats { repeated float v = 1; }
+message Values { repeated Value v = 1; }
+message Row { repeated Value v = 1; }
+
+message QueryRequest {
+  string sql = 1;
+  map<string, Value> params = 2;
+  // 0: the server's default.
+  uint32 timeout_ms = 3;
+  bool shard = 4;
+  // Summed statistics from TermStats (JSON), empty for local ones.
+  bytes stats_json = 5;
+  // A snapshot lease from TermStats or /v1/snapshot; 0 for the latest.
+  uint64 snapshot = 6;
+}
+
+message QueryResponse {
+  repeated string columns = 1;
+  repeated Row rows = 2;
+  repeated Value keys = 3;
+  repeated double scores = 4;
+  // FusionParts (JSON) in shard mode.
+  bytes parts_json = 5;
+  // ExecStats (JSON): plan lines and counters.
+  bytes stats_json = 6;
+  double took_ms = 7;
+}
+
+message TermStatsResponse {
+  bytes stats_json = 1;
+  uint64 snapshot = 2;
+}
+
+message WriteRequest {
+  string sql = 1;
+  map<string, Value> params = 2;
+  // Or write operations as JSON, as POST /v1/write takes them:
+  // [{"op": "insert" | "upsert", "doc": {...}},
+  //  {"op": "upsert_if_newer", "doc": {...}, "version": "field"},
+  //  {"op": "delete", "key": ...},
+  //  {"op": "set" | "add", "key": ..., "field": "...", "value": ...}].
+  bytes ops_json = 3;
+}
+
+message WriteResponse { uint64 written = 1; }
+
+message SchemaResponse { string schema_json = 1; }
+
+message HealthResponse {
+  string status = 1;
+  uint64 docs = 2;
+  uint64 segments = 3;
+  uint64 txn = 4;
+}

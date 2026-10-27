@@ -1,5 +1,5 @@
-//! The database: one file plus a `-wal` sidecar, one writer, any number of
-//! snapshot readers.
+//! The database: one file plus a `-wal` sidecar (or a directory of files,
+//! [`Layout::Directory`]), one writer, any number of snapshot readers.
 //!
 //! * Write transactions append to the WAL and `fsync` at commit; their
 //!   documents and deletes land in the memtable, visible to the next
@@ -31,13 +31,16 @@ use crate::schema::{FieldType, Schema};
 use crate::segment::build::{build_segment, BuildOptions};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::freelist::FreeList;
+use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
 use crate::storage::manifest::{Manifest, SegmentMeta};
 use crate::storage::merge::{MergePolicy, MergeStats, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
+use crate::postings::bytes::OwnedBytes;
 use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
-use crate::storage::state::{Key, Memtable, SegHandle, State};
+use crate::storage::state::{Key, Loc, Memtable, SegHandle, State};
+use crate::storage::updates::Updates;
 use crate::storage::wal::{Op, Wal};
 use crate::value::{validate, Document, Value};
 
@@ -89,6 +92,21 @@ pub struct DbOptions {
     /// memtable segment or waits for another reader's build; each write
     /// pays for the build instead of the first query after it.
     pub publish_snapshots: bool,
+    /// How a database created with these options is laid out on disk (an
+    /// existing one opens in the layout it has).
+    pub layout: Layout,
+}
+
+/// How a database is laid out on disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum Layout {
+    /// One file of pages plus a `-wal` sidecar: extents, two meta slots and
+    /// the shadow-paging commit.
+    #[default]
+    SingleFile,
+    /// A directory with one file per segment and delete set, and versioned
+    /// manifests named by `CURRENT` ([`crate::storage::dir`]).
+    Directory,
 }
 
 impl Default for DbOptions {
@@ -104,6 +122,7 @@ impl Default for DbOptions {
             read_ahead: true,
             random_hints: true,
             publish_snapshots: false,
+            layout: Layout::SingleFile,
         }
     }
 }
@@ -141,7 +160,10 @@ pub struct Database {
     wal_path: PathBuf,
     opts: DbOptions,
     schema: Arc<Schema>,
+    /// The database file, or the directory layout's `LOCK` file.
     file: File,
+    /// The directory, in the directory layout.
+    dir: Option<PathBuf>,
     /// The single-writer lock; it owns the WAL.
     writer: Mutex<Wal>,
     state: Mutex<State>,
@@ -158,8 +180,12 @@ pub struct Database {
 }
 
 impl Database {
-    /// Creates a new database file (it must not exist) and its WAL.
+    /// Creates a new database (the path must not exist) in the layout
+    /// `opts.layout` names, and its WAL.
     pub fn create(path: &Path, schema: Schema, opts: DbOptions) -> Result<Database> {
+        if opts.layout == Layout::Directory {
+            return Database::create_dir(path, schema, opts);
+        }
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
         lock_exclusive(&file)?;
         let db_id: u64 = rand::random();
@@ -189,12 +215,50 @@ impl Database {
     }
 
     /// Opens an existing database, recovering from a crash: the newest valid
-    /// meta slot names the on-disk version, and committed WAL transactions
-    /// not yet in it are replayed into the memtable.
+    /// meta slot (or `CURRENT`) names the on-disk version, and committed WAL
+    /// transactions not yet in it are replayed into the memtable.
     pub fn open(path: &Path, opts: DbOptions) -> Result<Database> {
+        if path.is_dir() {
+            let lockf = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path.join(dir::LOCK))?;
+            lock_exclusive(&lockf)?;
+            return Database::load_dir(path, lockf, opts);
+        }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         lock_exclusive(&file)?;
         Database::load(path, file, opts)
+    }
+
+    fn create_dir(path: &Path, schema: Schema, opts: DbOptions) -> Result<Database> {
+        std::fs::create_dir(path)?;
+        let lockf = OpenOptions::new().read(true).write(true).create_new(true).open(path.join(dir::LOCK))?;
+        lock_exclusive(&lockf)?;
+        let db_id: u64 = rand::random();
+        let manifest = Manifest { schema, txn: 1, wal_txn: 0, next_segment_id: 1, segments: Vec::new() };
+        let mbytes = manifest.encode();
+        let name = dir::manifest_name(1);
+        dir::write_file(path, &name, &mbytes, true)?;
+        dir::write_current(path, &Current { db_id, txn: 1, manifest: name, crc: crc32fast::hash(&mbytes) }, true)?;
+        Wal::create(&path.join(dir::WAL), db_id, true)?;
+        dir::sync_dir(path)?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        File::open(parent)?.sync_all()?;
+        Database::load_dir(path, lockf, opts)
+    }
+
+    fn load_dir(path: &Path, lockf: File, opts: DbOptions) -> Result<Database> {
+        let (cur, manifest) = dir::read_current(path)?;
+        // Files a crash left behind: written for a commit that did not
+        // finish, or no longer named after one that did.
+        for (f, _) in dir::orphans(path, &dir::referenced(&cur, &manifest))? {
+            std::fs::remove_file(f)?;
+        }
+        let handles = manifest
+            .segments
+            .iter()
+            .map(|m| SegHandle::open_in(path, m, opts.read_ahead, opts.read_ahead && opts.random_hints).map(Arc::new))
+            .collect::<Result<_>>()?;
+        let meta = dir_meta(&cur);
+        Database::assemble(path, path.join(dir::WAL), Some(path.to_path_buf()), lockf, opts, manifest, meta, 0, FreeList::new(META_PAGES), OwnedBytes::empty(), handles)
     }
 
     fn load(path: &Path, file: File, opts: DbOptions) -> Result<Database> {
@@ -211,7 +275,25 @@ impl Database {
         }
         let map = pager::map_file(&file, opts.read_ahead)?;
         let handles = manifest.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints).map(Arc::new)).collect::<Result<_>>()?;
-        let wal_path = wal_path(path);
+        Database::assemble(path, wal_path(path), None, file, opts, manifest, meta, slot, freelist, map, handles)
+    }
+
+    /// The open database around an on-disk version: replays the WAL into
+    /// the memtable.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        path: &Path,
+        wal_path: PathBuf,
+        dir: Option<PathBuf>,
+        file: File,
+        opts: DbOptions,
+        manifest: Manifest,
+        meta: Meta,
+        slot: usize,
+        freelist: FreeList,
+        map: OwnedBytes,
+        handles: Vec<Arc<SegHandle>>,
+    ) -> Result<Database> {
         let (mut wal, txns) = Wal::open(&wal_path, meta.db_id, opts.sync)?;
         let schema = Arc::new(manifest.schema.clone());
         let mut st = State {
@@ -226,8 +308,10 @@ impl Database {
             version: 0,
             mem: Memtable::new(opts.memtable_chunk_docs, 0),
             pending: Default::default(),
+            pending_updates: Default::default(),
             n_pending: 0,
             live_cache: HashMap::new(),
+            updates_cache: HashMap::new(),
             mem_live: Vec::new(),
             memsegs: Vec::new(),
             cached: None,
@@ -253,6 +337,7 @@ impl Database {
             opts,
             schema,
             file,
+            dir,
             writer: Mutex::new(wal),
             state: Mutex::new(st),
             build_lock: Mutex::new(()),
@@ -283,7 +368,7 @@ impl Database {
     pub fn begin(&self) -> Result<WriteTxn<'_>> {
         let wal = self.try_writer()?;
         self.check_poisoned()?;
-        Ok(WriteTxn { db: self, wal, ops: Vec::new(), touched: HashMap::new() })
+        Ok(WriteTxn { db: self, wal, ops: Vec::new(), touched: HashMap::new(), written: HashMap::new(), sets: HashMap::new() })
     }
 
     /// The current version. Never waits for a writer; the first snapshot
@@ -348,29 +433,36 @@ impl Database {
 
     fn flush_locked(&self, wal: &mut Wal) -> Result<()> {
         self.check_poisoned()?;
-        let (chunks, deleted, pending, txn) = {
+        let (chunks, deleted, pending, mem_updates, pending_updates, txn) = {
             let st = lock(&self.state);
-            if st.mem.len == 0 && st.pending.is_empty() {
+            if st.mem.len == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
                 return Ok(());
             }
-            (st.mem.chunks.clone(), st.mem.deleted.clone(), st.pending.clone(), st.txn)
+            (st.mem.chunks.clone(), st.mem.deleted.clone(), st.pending.clone(), st.mem.updates.clone(), st.pending_updates.clone(), st.txn)
         };
         let live: Vec<Document> = chunks
             .iter()
             .flat_map(|c| c.iter())
             .enumerate()
             .filter(|(i, _)| deleted[i / 64] >> (i % 64) & 1 == 0)
-            .map(|(_, d)| d.clone())
+            .map(|(i, d)| {
+                let mut d = d.clone();
+                mem_updates.apply(i as DocId, &mut d);
+                d
+            })
             .collect();
         drop(chunks);
         let mut vw = VersionWriter::begin(self);
         vw.manifest.wal_txn = txn;
         for chunk in live.chunks(self.opts.segment_max_docs.max(1)) {
             let image = build_segment(&self.schema, chunk, &self.opts.build)?;
-            vw.add_segment(None, &image, chunk.len() as u32, None)?;
+            vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
         }
         for (&id, docs) in &pending {
             vw.add_deletes(id, docs)?;
+        }
+        for (&id, (_, ups)) in &pending_updates {
+            vw.add_updates(id, ups)?;
         }
         let c = vw.commit()?;
         self.publish(c, |st| {
@@ -378,6 +470,8 @@ impl Database {
             st.mem_live.clear();
             st.memsegs.clear();
             st.pending.clear();
+            st.pending_updates.clear();
+            st.updates_cache.clear();
             st.n_pending = 0;
         })?;
         wal.reset(self.opts.sync).map_err(|e| self.poison(e))
@@ -408,19 +502,83 @@ impl Database {
             chunk.push(doc);
             if chunk.len() == max {
                 let image = build_segment(&self.schema, &chunk, &self.opts.build)?;
-                vw.add_segment(None, &image, chunk.len() as u32, None)?;
+                vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
                 chunk.clear();
             }
         }
         if !chunk.is_empty() {
             let image = build_segment(&self.schema, &chunk, &self.opts.build)?;
-            vw.add_segment(None, &image, chunk.len() as u32, None)?;
+            vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
         }
         if vw.segments_added == 0 {
             return Ok(());
         }
         let c = vw.commit()?;
         self.publish(c, |_| {})
+    }
+
+    /// Writes segment `id`'s image to `dest` (a new file), for another
+    /// database to attach ([`Database::attach_segments`]): the same bytes in
+    /// either layout. An image carries no delete set, so a segment with
+    /// deleted documents must be merged first.
+    pub fn export_segment(&self, id: u64, dest: &Path) -> Result<()> {
+        let (h, pending) = {
+            let st = lock(&self.state);
+            let h = st.handles.iter().find(|h| h.meta.id == id).cloned().ok_or_else(|| Error::Schema(format!("no segment {id}")))?;
+            (h, st.pending.get(&id).map_or(0, |p| p.len()) + st.pending_updates.get(&id).map_or(0, |p| p.1.len()))
+        };
+        if h.meta.n_deleted > 0 || h.updates.is_some() || pending > 0 {
+            return Err(Error::Schema(format!("segment {id} has deleted or updated documents; merge it first")));
+        }
+        let image = if self.dir.is_some() { h.map.clone() } else { h.map.slice(h.meta.extent.range()) };
+        let mut f = OpenOptions::new().write(true).create_new(true).open(dest)?;
+        std::io::Write::write_all(&mut f, &image)?;
+        f.sync_data()?;
+        Ok(())
+    }
+
+    /// Adds segment images built elsewhere (by [`Database::export_segment`]
+    /// or [`crate::segment::build::build_segment`] with this schema) in one
+    /// commit, after flushing the memtable. Their primary keys must be new.
+    /// Returns the new segments' ids.
+    pub fn attach_segments(&self, images: &[PathBuf]) -> Result<Vec<u64>> {
+        let mut wal = self.try_writer()?;
+        // As for bulk loads: WAL deletes are replayed against the on-disk
+        // version, so segments added behind the WAL's back must follow it.
+        self.flush_locked(&mut wal)?;
+        let pk = self.schema.primary_key;
+        let mut seen = HashSet::new();
+        let mut loaded = Vec::with_capacity(images.len());
+        for path in images {
+            let bytes = std::fs::read(path)?;
+            let file = SegmentFile::open(OwnedBytes::new(bytes.clone())).map_err(|e| Error::Schema(format!("{}: {e}", path.display())))?;
+            let keys = crate::storage::pk::PkIndex::open(&file)?;
+            if pk.is_some() != keys.is_some() {
+                return Err(Error::Schema(format!("{}: primary key index does not match the table", path.display())));
+            }
+            if let Some(keys) = keys {
+                let st = lock(&self.state);
+                for d in 0..file.n_docs() as DocId {
+                    let k = keys.key(d);
+                    if !seen.insert(Key::of(&k).ok_or_else(|| corrupt("bad key"))?) || st.find_live(&k).is_some() {
+                        return Err(Error::Schema(format!("{}: duplicate primary key {k:?}", path.display())));
+                    }
+                }
+            }
+            loaded.push((bytes, file.n_docs() as u32));
+        }
+        let mut vw = VersionWriter::begin(self);
+        let first = vw.manifest.next_segment_id;
+        for (bytes, n) in &loaded {
+            vw.add_segment(None, bytes, *n, None, None)?;
+        }
+        let ids: Vec<u64> = (first..vw.manifest.next_segment_id).collect();
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        let c = vw.commit()?;
+        self.publish(c, |_| {})?;
+        Ok(ids)
     }
 
     /// Merges on-disk segments as `policy` selects until it selects nothing.
@@ -458,9 +616,15 @@ impl Database {
             let v = snap.segments().iter().find(|v| v.id == id).expect("selected from this snapshot");
             let n = v.file.n_docs() as DocId;
             let live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
-            let got = source.documents(&self.schema, &v.file, &live)?;
+            let mut got = source.documents(&self.schema, &v.file, &live)?;
             if got.len() != live.len() {
                 return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
+            }
+            // The merged segment holds the values written in place.
+            if let Some(u) = &v.updates {
+                for (doc, &d) in got.iter_mut().zip(&live) {
+                    u.apply(d, doc);
+                }
             }
             stats.docs_dropped += (n as usize - live.len()) as u64;
             docs.extend(got);
@@ -473,14 +637,26 @@ impl Database {
         let _wal = lock(&self.writer);
         self.check_poisoned()?;
         // Documents of the inputs deleted after the snapshot, as docIDs of
-        // the merged segment (inputs are concatenated in order).
+        // the merged segment (inputs are concatenated in order), and values
+        // written in place after it.
         let mut deleted = Vec::new();
+        let mut updated = Updates::default();
         {
-            let st = lock(&self.state);
+            let mut st = lock(&self.state);
             let mut base = 0u32;
             for (id, live) in &inputs {
-                let h = st.handles.iter().find(|h| h.meta.id == *id).ok_or_else(|| corrupt("merge input vanished"))?;
-                deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(h, d)).map(|(j, _)| base + j as u32));
+                let h = st.handles.iter().find(|h| h.meta.id == *id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
+                deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| base + j as u32));
+                let then = snap.segments().iter().find(|v| v.id == *id).and_then(|v| v.updates.clone());
+                if let Some(now) = st.updates_of(&h) {
+                    for (f, d, v) in now.iter() {
+                        if then.as_ref().and_then(|t| t.get(f, d)) != Some(v) {
+                            if let Ok(j) = live.binary_search(&d) {
+                                updated.set(f, base + j as u32, v.clone());
+                            }
+                        }
+                    }
+                }
                 base += live.len() as u32;
             }
         }
@@ -492,7 +668,7 @@ impl Database {
         }
         if let Some(image) = image {
             let dels = (!deleted.is_empty()).then(|| LiveDocs::with_deleted(None, n_new, deleted.iter().copied()));
-            vw.add_segment(Some(pos), &image, n_new, dels.as_ref())?;
+            vw.add_segment(Some(pos), &image, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
         }
         let c = vw.commit()?;
         stats.bytes_written += c.bytes_written;
@@ -503,6 +679,10 @@ impl Database {
                 if let Some(p) = st.pending.remove(id) {
                     st.n_pending -= p.len();
                 }
+                if let Some((_, u)) = st.pending_updates.remove(id) {
+                    st.n_pending -= u.len();
+                }
+                st.updates_cache.remove(id);
             }
         })?;
         stats.merges += 1;
@@ -519,6 +699,20 @@ impl Database {
     pub fn vacuum(&self) -> Result<u64> {
         let _wal = self.try_writer()?;
         self.check_poisoned()?;
+        if let Some(d) = &self.dir {
+            // Each segment is its own file, so there is nothing to compact:
+            // only files a crash or a failed unlink left behind.
+            let keep = {
+                let st = lock(&self.state);
+                dir::referenced(&Current { db_id: st.meta.db_id, txn: st.meta.txn, manifest: dir::manifest_name(st.manifest.txn), crc: st.meta.manifest_crc }, &st.manifest)
+            };
+            let mut freed = 0;
+            for (f, len) in dir::orphans(d, &keep)? {
+                std::fs::remove_file(f)?;
+                freed += len;
+            }
+            return Ok(freed);
+        }
         let before = lock(&self.state).meta.page_count;
         let mut idle = 0;
         while idle < 2 {
@@ -534,6 +728,24 @@ impl Database {
 
     pub fn file_stats(&self) -> FileStats {
         let st = lock(&self.state);
+        if let Some(d) = &self.dir {
+            return FileStats {
+                file_bytes: dir::size(d),
+                page_count: 0,
+                live_pages: 0,
+                free_pages: 0,
+                pending_pages: 0,
+                wal_bytes: std::fs::metadata(&self.wal_path).map_or(0, |m| m.len()),
+                memtable_docs: st.mem.len - st.mem.n_deleted,
+                pending_deletes: st.n_pending,
+                segments: st
+                    .manifest
+                    .segments
+                    .iter()
+                    .map(|s| SegmentStats { id: s.id, n_docs: s.n_docs, n_deleted: s.n_deleted, bytes: s.extent.len, delete_set_bytes: s.deletes.map_or(0, |e| e.len) })
+                    .collect(),
+            };
+        }
         let segments: Vec<SegmentStats> = st
             .manifest
             .segments
@@ -546,7 +758,8 @@ impl Database {
                 delete_set_bytes: s.deletes.map_or(0, |e| e.len),
             })
             .collect();
-        let seg_pages: u64 = st.manifest.segments.iter().map(|s| s.extent.pages() + s.deletes.map_or(0, |e| e.pages())).sum();
+        let seg_pages: u64 =
+            st.manifest.segments.iter().map(|s| s.extent.pages() + s.deletes.map_or(0, |e| e.pages()) + s.updates.map_or(0, |e| e.pages())).sum();
         FileStats {
             file_bytes: self.file.metadata().map_or(st.file_pages * PAGE, |m| m.len()),
             page_count: st.meta.page_count,
@@ -567,6 +780,9 @@ impl Database {
     /// while a write is in progress.
     pub fn check(&self) -> Result<()> {
         let _w = self.try_writer()?;
+        if let Some(d) = &self.dir {
+            return self.check_dir(d);
+        }
         // The writer lock keeps the version still; copy it so readers are
         // not held up while every byte is checksummed.
         let (st_meta, st_manifest, freelist, handles, map) = {
@@ -606,6 +822,12 @@ impl Database {
                     return Err(corrupt(format!("segment {} has {n} deletes, manifest says {}", s.id, s.n_deleted)));
                 }
             }
+            if let Some(e) = s.updates {
+                claim("updates", e.page, e.pages())?;
+                if crc32fast::hash(&map[e.range()]) != s.updates_crc {
+                    return Err(corrupt(format!("updates of segment {} fail their checksum", s.id)));
+                }
+            }
             if let Some(pk) = &h.pk {
                 for d in 0..s.n_docs {
                     if !pk.lookup_all(&pk.key(d)).any(|x| x == d) {
@@ -622,6 +844,51 @@ impl Database {
         }
         match used.iter().position(|u| !u) {
             Some(p) => Err(corrupt(format!("page {p} is neither used nor free"))),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Database::check`] in the directory layout: `CURRENT` names the open
+    /// version, every file matches its checksum, every key is found, and no
+    /// file is left over.
+    fn check_dir(&self, d: &Path) -> Result<()> {
+        let (manifest, handles, meta) = {
+            let st = lock(&self.state);
+            (st.manifest.clone(), st.handles.clone(), st.meta)
+        };
+        let (cur, on_disk) = dir::read_current(d)?;
+        if on_disk != manifest || cur.txn != meta.txn {
+            return Err(corrupt("on-disk version differs from the open one"));
+        }
+        for (s, h) in manifest.segments.iter().zip(&handles) {
+            let name = s.file.as_deref().ok_or_else(|| corrupt(format!("segment {} has no file", s.id)))?;
+            if crc32fast::hash(&std::fs::read(d.join(name))?) != s.crc {
+                return Err(corrupt(format!("{name} fails its checksum")));
+            }
+            if let Some(df) = &s.deletes_file {
+                if crc32fast::hash(&std::fs::read(d.join(df))?) != s.deletes_crc {
+                    return Err(corrupt(format!("{df} fails its checksum")));
+                }
+                let n: u32 = h.base.as_ref().map_or(0, |b| b.deleted_words().iter().map(|w| w.count_ones()).sum());
+                if n != s.n_deleted {
+                    return Err(corrupt(format!("segment {} has {n} deletes, manifest says {}", s.id, s.n_deleted)));
+                }
+            }
+            if let Some(uf) = &s.updates_file {
+                if crc32fast::hash(&std::fs::read(d.join(uf))?) != s.updates_crc {
+                    return Err(corrupt(format!("{uf} fails its checksum")));
+                }
+            }
+            if let Some(pk) = &h.pk {
+                for doc in 0..s.n_docs {
+                    if !pk.lookup_all(&pk.key(doc)).any(|x| x == doc) {
+                        return Err(corrupt(format!("segment {} key of document {doc} not found", s.id)));
+                    }
+                }
+            }
+        }
+        match dir::orphans(d, &dir::referenced(&cur, &manifest))?.first() {
+            Some((f, _)) => Err(corrupt(format!("{} is named by no version", f.display()))),
             None => Ok(()),
         }
     }
@@ -652,17 +919,21 @@ impl Database {
             let st = lock(&self.state);
             (st.handles.clone(), st.map.clone())
         };
-        let map = if c.meta.page_count * PAGE > map.len() as u64 { pager::map_file(&self.file, self.opts.read_ahead).map_err(|e| self.poison(e))? } else { map };
+        let grown = self.dir.is_none() && c.meta.page_count * PAGE > map.len() as u64;
+        let map = if grown { pager::map_file(&self.file, self.opts.read_ahead).map_err(|e| self.poison(e))? } else { map };
+        let hints = self.opts.read_ahead && self.opts.random_hints;
         let handles = c
             .manifest
             .segments
             .iter()
-            .map(|m| match old.iter().find(|h| h.meta == *m) {
-                Some(h) => Ok(h.clone()),
-                None => SegHandle::open(&map, m, self.opts.read_ahead && self.opts.random_hints).map(Arc::new),
+            .map(|m| match (old.iter().find(|h| h.meta == *m), &self.dir) {
+                (Some(h), _) => Ok(h.clone()),
+                (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints).map(Arc::new),
+                (None, None) => SegHandle::open(&map, m, hints).map(Arc::new),
             })
             .collect::<Result<Vec<_>>>()
             .map_err(|e| self.poison(e))?;
+        let obsolete = c.obsolete;
         {
             let mut st = lock(&self.state);
             st.txn = c.meta.txn;
@@ -678,11 +949,45 @@ impl Database {
             st.changed();
         }
         self.republish();
+        // Directory layout: files the new version no longer names. Open
+        // snapshots keep reading them through their mappings.
+        if let Some(d) = &self.dir {
+            for f in obsolete {
+                let _ = std::fs::remove_file(d.join(f));
+            }
+        }
         Ok(())
     }
 
     fn primary_key(&self) -> Result<usize> {
         self.schema.primary_key.ok_or_else(|| Error::Schema("table has no primary key".into()))
+    }
+
+    /// INT field `f` of the live document with primary key `key`: the
+    /// value written in place if any, else the document's.
+    fn live_int(&self, key: &Value, f: usize) -> Result<Option<i64>> {
+        let st = lock(&self.state);
+        let (h, d) = match st.find_live(key) {
+            None => return Ok(None),
+            Some(Loc::Mem(i)) => {
+                return Ok(match st.mem.updates.get(f, i) {
+                    Some(v) => v.as_i64(),
+                    None => st.mem.chunks[i as usize / st.mem.chunk][i as usize % st.mem.chunk][f].as_i64(),
+                })
+            }
+            Some(Loc::Disk(id, d)) => (st.handles.iter().find(|h| h.meta.id == id).cloned().expect("segment of a live key"), d),
+        };
+        let written = st.pending_updates.get(&h.meta.id).and_then(|(_, u)| u.get(f, d)).or_else(|| h.updates.as_ref().and_then(|u| u.get(f, d)));
+        if let Some(v) = written {
+            return Ok(v.as_i64());
+        }
+        drop(st);
+        let field = &self.schema.fields[f];
+        Ok(if field.indexed {
+            crate::forward::NumericColumn::open(&h.file, &field.name)?.get(d).as_i64()
+        } else {
+            crate::forward::DocStore::open(&h.file, &self.schema)?.get_fields(d, &[f]).pop().and_then(|v| v.as_i64())
+        })
     }
 
     /// Checks that `key` has the primary key's type.
@@ -734,6 +1039,10 @@ pub struct WriteTxn<'a> {
     ops: Vec<Op>,
     /// Keys this transaction made live (true) or deleted (false).
     touched: HashMap<Key, bool>,
+    /// Documents this transaction wrote, by key, as they now stand.
+    written: HashMap<Key, Arc<Document>>,
+    /// Fields this transaction set in place on documents it did not write.
+    sets: HashMap<(Key, usize), Value>,
 }
 
 impl WriteTxn<'_> {
@@ -745,7 +1054,11 @@ impl WriteTxn<'_> {
             if self.is_live(&key, &doc[pk]) {
                 return Err(Error::Schema(format!("duplicate primary key {:?}", doc[pk])));
             }
-            self.touched.insert(key, true);
+            self.touched.insert(key.clone(), true);
+            let doc = Arc::new(doc);
+            self.written.insert(key, doc.clone());
+            self.ops.push(Op::Insert(doc));
+            return Ok(());
         }
         self.ops.push(Op::Insert(Arc::new(doc)));
         Ok(())
@@ -756,9 +1069,40 @@ impl WriteTxn<'_> {
         validate(&self.db.schema, &doc)?;
         let pk = self.db.primary_key()?;
         self.delete(&doc[pk].clone())?;
-        self.touched.insert(Key::of(&doc[pk]).expect("validated key"), true);
-        self.ops.push(Op::Insert(Arc::new(doc)));
+        let key = Key::of(&doc[pk]).expect("validated key");
+        self.touched.insert(key.clone(), true);
+        let doc = Arc::new(doc);
+        self.written.insert(key, doc.clone());
+        self.ops.push(Op::Insert(doc));
         Ok(())
+    }
+
+    /// Upserts `doc` only if its INT field `version` is greater than the
+    /// live document's, or no document has its key: external versions, so
+    /// that writers whose updates arrive out of order keep the newest.
+    /// Returns whether it was written.
+    pub fn upsert_if_newer(&mut self, doc: Document, version: &str) -> Result<bool> {
+        validate(&self.db.schema, &doc)?;
+        let pk = self.db.primary_key()?;
+        let vf = self.db.schema.fields.iter().position(|f| f.name == version).ok_or_else(|| Error::Schema(format!("no field {version}")))?;
+        if self.db.schema.fields[vf].ty != FieldType::Int || self.db.schema.fields[vf].multi {
+            return Err(Error::Schema(format!("version field {version} must be a single-valued INT")));
+        }
+        let new = doc[vf].as_i64().ok_or_else(|| Error::Schema(format!("document has no {version}")))?;
+        let key = Key::of(&doc[pk]).expect("validated key");
+        let old = match (self.touched.get(&key), self.written.get(&key)) {
+            (Some(true), Some(d)) => d[vf].as_i64(),
+            (Some(false), _) => None,
+            _ => match self.sets.get(&(key.clone(), vf)) {
+                Some(v) => v.as_i64(),
+                None => self.db.live_int(&doc[pk], vf)?,
+            },
+        };
+        if old.is_some_and(|o| o >= new) {
+            return Ok(false);
+        }
+        self.upsert(doc)?;
+        Ok(true)
     }
 
     /// Deletes the live document with this primary key; false if none.
@@ -767,8 +1111,40 @@ impl WriteTxn<'_> {
         if !self.is_live(&k, key) {
             return Ok(false);
         }
-        self.touched.insert(k, false);
+        self.touched.insert(k.clone(), false);
+        self.written.remove(&k);
         self.ops.push(Op::Delete(key.clone()));
+        Ok(true)
+    }
+
+    /// Sets a numeric field of the live document with this primary key in
+    /// place, without rewriting the document: its text and vectors stay as
+    /// they are. The field must be a single-valued INT or FLOAT. False if no
+    /// document has the key.
+    pub fn set(&mut self, key: &Value, field: &str, value: Value) -> Result<bool> {
+        let k = self.db.key_of(key)?;
+        let i = self.db.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let f = &self.db.schema.fields[i];
+        let value = match (&f.ty, value) {
+            _ if f.multi || Some(i) == self.db.schema.primary_key => {
+                return Err(Error::Schema(format!("{field} cannot be set in place: it is multi-valued or the key")))
+            }
+            (FieldType::Int, v @ (Value::Int(_) | Value::Null)) => v,
+            (FieldType::Float, Value::Int(x)) => Value::Float(x as f64),
+            (FieldType::Float, v @ (Value::Float(_) | Value::Null)) => v,
+            (FieldType::Int | FieldType::Float, v) => return Err(Error::Schema(format!("bad value for {field}: {v:?}"))),
+            _ => return Err(Error::Schema(format!("{field} is not a numeric field; only INT and FLOAT are set in place"))),
+        };
+        if !self.is_live(&k, key) {
+            return Ok(false);
+        }
+        match self.written.get_mut(&k) {
+            Some(d) => Arc::make_mut(d)[i] = value.clone(),
+            None => {
+                self.sets.insert((k, i), value.clone());
+            }
+        }
+        self.ops.push(Op::Set { key: key.clone(), field: i as u16, value });
         Ok(true)
     }
 
@@ -807,6 +1183,8 @@ struct Committed {
     fl: FreeList,
     file_pages: u64,
     bytes_written: u64,
+    /// Directory layout: files to unlink once the version is published.
+    obsolete: Vec<String>,
 }
 
 /// Builds the next on-disk version (shadow paging). Holds working copies
@@ -823,6 +1201,8 @@ struct VersionWriter<'a> {
     file_pages: u64,
     bytes_written: u64,
     segments_added: usize,
+    /// Directory layout: files the new version stops naming.
+    obsolete: Vec<String>,
 }
 
 impl<'a> VersionWriter<'a> {
@@ -843,6 +1223,20 @@ impl<'a> VersionWriter<'a> {
             file_pages: st.file_pages,
             bytes_written: 0,
             segments_added: 0,
+            obsolete: Vec::new(),
+        }
+    }
+
+    /// Writes `bytes` as file `name` in the directory layout, or into a new
+    /// extent of the single file.
+    fn write_as(&mut self, bytes: &[u8], name: String) -> Result<(Extent, Option<String>)> {
+        match &self.db.dir {
+            Some(d) => {
+                dir::write_file(d, &name, bytes, self.db.opts.sync)?;
+                self.bytes_written += bytes.len() as u64;
+                Ok((Extent { page: 0, len: bytes.len() as u64 }, Some(name)))
+            }
+            None => Ok((self.write(bytes)?, None)),
         }
     }
 
@@ -865,18 +1259,39 @@ impl<'a> VersionWriter<'a> {
     }
 
     /// Adds a segment at position `pos` (default: last).
-    fn add_segment(&mut self, pos: Option<usize>, image: &[u8], n_docs: u32, deleted: Option<&LiveDocs>) -> Result<()> {
-        let extent = self.write(image)?;
-        let (mut deletes, mut deletes_crc, mut n_deleted) = (None, 0, 0);
+    fn add_segment(&mut self, pos: Option<usize>, image: &[u8], n_docs: u32, deleted: Option<&LiveDocs>, updates: Option<&Updates>) -> Result<()> {
+        let id = self.manifest.next_segment_id;
+        self.manifest.next_segment_id += 1;
+        let (extent, file) = self.write_as(image, dir::segment_name(id))?;
+        let (mut deletes, mut deletes_crc, mut n_deleted, mut deletes_file) = (None, 0, 0, None);
         if let Some(l) = deleted.filter(|l| l.n_deleted() > 0) {
             let b = l.encode();
-            deletes = Some(self.write(&b)?);
+            let (e, f) = self.write_as(&b, dir::deletes_name(id, self.txn))?;
+            (deletes, deletes_file) = (Some(e), f);
             deletes_crc = crc32fast::hash(&b);
             n_deleted = l.n_deleted();
         }
-        let id = self.manifest.next_segment_id;
-        self.manifest.next_segment_id += 1;
-        let meta = SegmentMeta { id, extent, crc: crc32fast::hash(image), n_docs, n_deleted, deletes, deletes_crc, txn: self.txn };
+        let (mut upd, mut updates_crc, mut updates_file) = (None, 0, None);
+        if let Some(u) = updates {
+            let b = u.encode();
+            let (e, f) = self.write_as(&b, dir::updates_name(id, self.txn))?;
+            (upd, updates_file, updates_crc) = (Some(e), f, crc32fast::hash(&b));
+        }
+        let meta = SegmentMeta {
+            id,
+            extent,
+            crc: crc32fast::hash(image),
+            n_docs,
+            n_deleted,
+            deletes,
+            deletes_crc,
+            txn: self.txn,
+            file,
+            deletes_file,
+            updates: upd,
+            updates_file,
+            updates_crc,
+        };
         let segs = &mut self.manifest.segments;
         segs.insert(pos.unwrap_or(segs.len()), meta);
         self.segments_added += 1;
@@ -888,29 +1303,55 @@ impl<'a> VersionWriter<'a> {
         let h = lock(&self.db.state).handles.iter().find(|h| h.meta.id == id).cloned().expect("segment of a pending delete");
         let live = LiveDocs::with_deleted(h.base.as_deref(), h.meta.n_docs, docs.iter().copied());
         let b = live.encode();
-        let e = self.write(&b)?;
+        let (e, file) = self.write_as(&b, dir::deletes_name(id, self.txn))?;
         let s = self.manifest.segments.iter_mut().find(|s| s.id == id).expect("segment in manifest");
-        if let Some(old) = s.deletes {
-            self.fl.defer(self.txn, old);
+        match (s.deletes, s.deletes_file.take()) {
+            (_, Some(old)) => self.obsolete.push(old),
+            (Some(old), None) => self.fl.defer(self.txn, old),
+            _ => {}
         }
+        s.deletes_file = file;
         s.deletes = Some(e);
         s.deletes_crc = crc32fast::hash(&b);
         s.n_deleted = live.n_deleted();
         Ok(())
     }
 
+    /// Replaces a segment's in-place updates with its current ones plus
+    /// `newer`.
+    fn add_updates(&mut self, id: u64, newer: &Updates) -> Result<()> {
+        let h = lock(&self.db.state).handles.iter().find(|h| h.meta.id == id).cloned().expect("segment of a pending update");
+        let b = Updates::merged(h.updates.as_deref(), newer).encode();
+        let (e, file) = self.write_as(&b, dir::updates_name(id, self.txn))?;
+        let s = self.manifest.segments.iter_mut().find(|s| s.id == id).expect("segment in manifest");
+        match (s.updates, s.updates_file.take()) {
+            (_, Some(old)) => self.obsolete.push(old),
+            (Some(old), None) => self.fl.defer(self.txn, old),
+            _ => {}
+        }
+        s.updates_file = file;
+        s.updates = Some(e);
+        s.updates_crc = crc32fast::hash(&b);
+        Ok(())
+    }
+
     /// Copies extents into free runs below them, highest first. Returns how
     /// many moved.
     fn relocate_down(&mut self) -> Result<usize> {
+        if self.db.dir.is_some() {
+            return Ok(0);
+        }
         let map = lock(&self.db.state).map.clone();
-        let mut extents: Vec<(Extent, usize, bool)> = Vec::new();
+        // (extent, segment, what): 0 the image, 1 the delete set, 2 updates.
+        let mut extents: Vec<(Extent, usize, u8)> = Vec::new();
         for (i, s) in self.manifest.segments.iter().enumerate() {
-            extents.push((s.extent, i, false));
-            extents.extend(s.deletes.map(|e| (e, i, true)));
+            extents.push((s.extent, i, 0));
+            extents.extend(s.deletes.map(|e| (e, i, 1)));
+            extents.extend(s.updates.map(|e| (e, i, 2)));
         }
         extents.sort_by_key(|&(e, _, _)| std::cmp::Reverse(e.page));
         let mut moved = 0;
-        for (e, i, is_deletes) in extents {
+        for (e, i, what) in extents {
             let Some(page) = self.fl.alloc_below(e.pages(), e.page) else { continue };
             // Copy out of the mapping first: on macOS, a pwrite whose source
             // is a mapping of the same file can deadlock in the kernel.
@@ -920,7 +1361,9 @@ impl<'a> VersionWriter<'a> {
             self.fl.defer(self.txn, e);
             let to = Extent { page, len: e.len };
             let s = &mut self.manifest.segments[i];
-            if is_deletes {
+            if what == 2 {
+                s.updates = Some(to);
+            } else if what == 1 {
                 s.deletes = Some(to);
             } else {
                 s.extent = to;
@@ -933,7 +1376,16 @@ impl<'a> VersionWriter<'a> {
     fn remove_segment(&mut self, id: u64) {
         let i = self.manifest.segments.iter().position(|s| s.id == id).expect("segment in manifest");
         let s = self.manifest.segments.remove(i);
+        if self.db.dir.is_some() {
+            self.obsolete.extend(s.file);
+            self.obsolete.extend(s.deletes_file);
+            self.obsolete.extend(s.updates_file);
+            return;
+        }
         self.fl.defer(self.txn, s.extent);
+        if let Some(u) = s.updates {
+            self.fl.defer(self.txn, u);
+        }
         if let Some(d) = s.deletes {
             self.fl.defer(self.txn, d);
         }
@@ -942,6 +1394,9 @@ impl<'a> VersionWriter<'a> {
     /// Writes the manifest and freelist, syncs, then writes the other meta
     /// slot and syncs again.
     fn commit(mut self) -> Result<Committed> {
+        if let Some(d) = self.db.dir.clone() {
+            return self.commit_dir(&d);
+        }
         let db = self.db;
         let c = self.txn;
         self.fl.defer(c, self.meta.manifest);
@@ -977,8 +1432,40 @@ impl<'a> VersionWriter<'a> {
         if self.fl.page_count() < self.file_pages && db.file.set_len(self.fl.page_count() * PAGE).is_ok() {
             self.file_pages = self.fl.page_count();
         }
-        Ok(Committed { meta, slot, manifest: self.manifest, fl: self.fl, file_pages: self.file_pages, bytes_written: self.bytes_written })
+        Ok(Committed { meta, slot, manifest: self.manifest, fl: self.fl, file_pages: self.file_pages, bytes_written: self.bytes_written, obsolete: Vec::new() })
     }
+
+    /// Directory layout: writes the manifest file, then points `CURRENT` at
+    /// it with an atomic rename.
+    fn commit_dir(mut self, d: &Path) -> Result<Committed> {
+        let db = self.db;
+        let c = self.txn;
+        let previous = dir::manifest_name(lock(&db.state).manifest.txn);
+        self.manifest.txn = c;
+        let mbytes = self.manifest.encode();
+        let name = dir::manifest_name(c);
+        dir::write_file(d, &name, &mbytes, db.opts.sync)?;
+        self.bytes_written += mbytes.len() as u64;
+        let cur = Current { db_id: self.meta.db_id, txn: c, manifest: name, crc: crc32fast::hash(&mbytes) };
+        // Past the rename the on-disk version may already be the new one.
+        dir::write_current(d, &cur, db.opts.sync).map_err(|e| db.poison(e))?;
+        self.obsolete.push(previous);
+        Ok(Committed {
+            meta: dir_meta(&cur),
+            slot: self.slot,
+            manifest: self.manifest,
+            fl: self.fl,
+            file_pages: 0,
+            bytes_written: self.bytes_written,
+            obsolete: self.obsolete,
+        })
+    }
+}
+
+/// The meta of a directory-layout version (it has no pages).
+fn dir_meta(cur: &Current) -> Meta {
+    let none = Extent { page: 0, len: 0 };
+    Meta { db_id: cur.db_id, txn: cur.txn, manifest: none, manifest_crc: cur.crc, freelist: none, freelist_crc: 0, page_count: 0 }
 }
 
 /// Allocates the freelist's own extent and encodes the freelist after that

@@ -161,3 +161,71 @@ pub fn load(name: &str, limit: Option<usize>) -> Result<Collection> {
     }
     Ok(Collection { name: name.to_string(), dim: meta.dim, docs, queries, qrels })
 }
+
+/// A synthetic collection in the BEIR table's layout, for tests, demos and
+/// smoke benchmarks where no prepared collection is at hand: `n` documents
+/// whose words follow Zipf's law over a 5,000-word vocabulary, mixed with
+/// words of one of 32 topics, and unit vectors of `dim` dimensions near
+/// their topic's centre. The same seed gives the same collection. The
+/// `body` field is left `Null` for [`crate::db::Db::load`] to generate.
+pub fn synthetic(n: usize, dim: usize, seed: u64) -> Vec<Document> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand_distr::{Distribution, Normal, Zipf};
+
+    const TOPICS: usize = 32;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let syllables = ["ka", "lo", "mi", "ne", "ru", "ta", "vo", "si", "pe", "da", "go", "fu", "zi", "ba", "che", "wa"];
+    let vocab: Vec<String> = (0..5000)
+        .map(|i| {
+            let mut w = String::new();
+            let mut x = i + 17;
+            while x > 0 || w.len() < 4 {
+                w.push_str(syllables[x % syllables.len()]);
+                x /= syllables.len();
+            }
+            w
+        })
+        .collect();
+    let zipf_words = Zipf::new(vocab.len() as u64, 1.07).expect("valid zipf");
+    let zipf_cat = Zipf::new(64, 1.0).expect("valid zipf");
+    let normal = Normal::new(0.0f32, 1.0).expect("valid normal");
+    let centres: Vec<Vec<f32>> = (0..TOPICS).map(|_| unit((0..dim).map(|_| normal.sample(&mut rng)).collect())).collect();
+    let topic_words: Vec<Vec<&str>> = (0..TOPICS).map(|t| (0..40).map(|j| vocab[(t * 131 + j * 37 + 500) % vocab.len()].as_str()).collect()).collect();
+    let mut docs = Vec::with_capacity(n);
+    for i in 0..n {
+        let topic = rng.gen_range(0..TOPICS);
+        let words = |len: usize, rng: &mut StdRng| -> String {
+            (0..len)
+                .map(|_| {
+                    if rng.gen_bool(0.25) {
+                        topic_words[topic][rng.gen_range(0..topic_words[topic].len())]
+                    } else {
+                        vocab[zipf_words.sample(rng) as usize - 1].as_str()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let title = words(rng.gen_range(3..9), &mut rng);
+        let text = words(rng.gen_range(20..120), &mut rng);
+        let emb: Vec<f32> = centres[topic].iter().map(|c| c + 0.6 * normal.sample(&mut rng) / (dim as f32).sqrt()).collect();
+        docs.push(vec![
+            Value::Str(format!("d{i:07}")),
+            Value::Str(title),
+            Value::Str(text),
+            Value::Null,
+            Value::Int(rng.gen_range(1990..=2024)),
+            Value::Str(format!("c{:02}", zipf_cat.sample(&mut rng) as u64 - 1)),
+            Value::Float((rng.gen_range(0.0..5.0f64) * 100.0).round() / 100.0),
+            Value::Str(format!("t{topic:02}")),
+            Value::Vector(Arc::from(unit(emb))),
+        ]);
+    }
+    docs
+}
+
+fn unit(mut v: Vec<f32>) -> Vec<f32> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    v.iter_mut().for_each(|x| *x /= n);
+    v
+}

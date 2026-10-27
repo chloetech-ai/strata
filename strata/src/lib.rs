@@ -16,6 +16,7 @@
 //!   compared with), their set-operation algorithms, and the testbed of the
 //!   `strata-posting-bench` binary.
 //! * [`query`]: SQL front end, planner and executor.
+//! * [`cluster`]: merging the answers of shards of one collection.
 //! * [`data`], [`metrics`]: BEIR loaders and retrieval metrics for the
 //!   evaluation.
 //! * [`workload`]: the query workloads shared with the baselines, and the
@@ -24,6 +25,7 @@
 
 #[cfg(feature = "baselines")]
 pub mod baselines;
+pub mod cluster;
 pub mod data;
 pub mod db;
 pub mod error;
@@ -42,6 +44,6 @@ pub mod vector;
 pub mod workload;
 
 pub use error::{Error, Result};
-pub use schema::{Field, FieldType, Schema, VectorIndexKind};
+pub use schema::{Field, FieldType, Schema, VectorCodes, VectorIndexKind};
 pub use segment::DocId;
 pub use value::{Document, Value};

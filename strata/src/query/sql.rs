@@ -5,8 +5,14 @@
 //! [WHERE <pred>] [GROUP BY <keyword>] [ORDER BY <score> [ASC|DESC]]
 //! [LIMIT n [OFFSET m]]`, where predicates combine `MATCH(field, q)`,
 //! comparisons, `BETWEEN`, `IN` with AND/OR/NOT, and scores are `bm25`,
-//! `similarity`, `distance`, `rrf`, weighted sums of those, or a column.
+//! `similarity` (on a VECTOR or a SPARSE field), `distance`, `decay`, `rrf`,
+//! weighted sums and products of those, or a column.
 //! Parameters (`:name`) are bound from [`Params`].
+//!
+//! Writes ([`bind_write`]): `INSERT INTO t (cols) VALUES (...), ...`,
+//! `INSERT OR REPLACE` (an upsert), `UPDATE t SET f = v, g = g + 1 [WHERE
+//! ...]` and `DELETE FROM t [WHERE ...]`. Lists are `ARRAY[...]`; vectors are
+//! parameters, `ARRAY[...]` or a JSON array string.
 //!
 //! Graph queries over EDGES fields (DESIGN.md §6.1): the predicates
 //! `REACHABLE(field, seeds, ...)` and `PATH(field, from, to, ...)`, the score
@@ -22,7 +28,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
-use crate::query::logical::{Direction, GraphKind, GraphQuery, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::logical::{Decay, DecayShape, Direction, GraphKind, GraphQuery, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
 
@@ -46,6 +52,109 @@ impl Params {
 
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
+}
+
+/// A bound INSERT, UPDATE or DELETE.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Write {
+    /// Documents in schema order (unnamed columns NULL); `replace` upserts.
+    Insert { docs: Vec<Vec<Value>>, replace: bool },
+    /// The documents `select` returns (their primary keys) get `sets`.
+    Update { select: Select, sets: Vec<(usize, Assign)> },
+    /// The documents `select` returns are deleted.
+    Delete { select: Select },
+}
+
+/// The right-hand side of `SET field = ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Assign {
+    Value(Value),
+    /// `field = field + x` (or `- x`).
+    Add(f64),
+}
+
+/// Parses and binds one INSERT, UPDATE or DELETE; `None` for a SELECT.
+pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Option<Write>> {
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql_text).map_err(|e| err(e.to_string()))?;
+    let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
+    let b = Binder::new(schema, params);
+    let table = |name: &str| {
+        if name.eq_ignore_ascii_case(&schema.table) {
+            Ok(())
+        } else {
+            Err(err(format!("no such table: {name}")))
+        }
+    };
+    // The documents a WHERE clause selects, as a query for their keys and
+    // every field (an UPDATE may rewrite them).
+    let selecting = |selection: &Option<Expr>| -> Result<Select> {
+        let cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        let text = match selection {
+            Some(e) => format!("SELECT {} FROM {} WHERE {e}", cols.join(", "), schema.table),
+            None => format!("SELECT {} FROM {}", cols.join(", "), schema.table),
+        };
+        bind(&text, schema, params)
+    };
+    Ok(Some(match stmt {
+        sql::Statement::Query(_) => return Ok(None),
+        sql::Statement::Insert(ins) => {
+            match &ins.table {
+                sql::TableObject::TableName(n) => table(&n.to_string())?,
+                _ => return Err(err("INSERT needs a table name")),
+            }
+            let replace = ins.replace_into || matches!(ins.or, Some(sql::SqliteOnConflict::Replace)) || ins.on.is_some();
+            let cols: Vec<usize> = if ins.columns.is_empty() {
+                (0..schema.fields.len()).collect()
+            } else {
+                ins.columns.iter().map(|c| schema.field_index(&c.value).ok_or_else(|| err(format!("no such column: {}", c.value)))).collect::<Result<_>>()?
+            };
+            let Some(sql::SetExpr::Values(values)) = ins.source.as_ref().map(|q| q.body.as_ref()) else {
+                return Err(err("INSERT needs VALUES"));
+            };
+            let mut docs = Vec::with_capacity(values.rows.len());
+            for row in &values.rows {
+                if row.len() != cols.len() {
+                    return Err(err(format!("{} values for {} columns", row.len(), cols.len())));
+                }
+                let mut doc = vec![Value::Null; schema.fields.len()];
+                for (&f, e) in cols.iter().zip(row) {
+                    doc[f] = b.write_value(f, e)?;
+                }
+                docs.push(doc);
+            }
+            Write::Insert { docs, replace }
+        }
+        sql::Statement::Update { table: t, assignments, selection, .. } => {
+            table(&t.relation.to_string())?;
+            let mut sets = Vec::new();
+            for a in assignments {
+                let sql::AssignmentTarget::ColumnName(name) = &a.target else { return Err(err("SET one column at a time")) };
+                let f = schema.field_index(&name.to_string()).ok_or_else(|| err(format!("no such column: {name}")))?;
+                if Some(f) == schema.primary_key {
+                    return Err(err("the primary key cannot be updated; delete and insert instead"));
+                }
+                let assign = match &a.value {
+                    Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if b.field_of(left).ok() == Some(f) => {
+                        let x = b.num_lit(right)?;
+                        Assign::Add(if *op == BinaryOperator::Minus { -x } else { x })
+                    }
+                    e => Assign::Value(b.write_value(f, e)?),
+                };
+                if matches!(assign, Assign::Add(_)) && !matches!(schema.fields[f].ty, FieldType::Int | FieldType::Float) {
+                    return Err(err(format!("{name} is not numeric")));
+                }
+                sets.push((f, assign));
+            }
+            Write::Update { select: selecting(selection)?, sets }
+        }
+        sql::Statement::Delete(d) => {
+            let (sql::FromTable::WithFromKeyword(from) | sql::FromTable::WithoutKeyword(from)) = &d.from;
+            let [t] = from.as_slice() else { return Err(err("DELETE from exactly one table")) };
+            table(&t.relation.to_string())?;
+            Write::Delete { select: selecting(&d.selection)? }
+        }
+        _ => return Err(err("only SELECT, INSERT, UPDATE and DELETE are supported")),
+    }))
 }
 
 /// Parses and binds one SELECT statement.
@@ -87,8 +196,9 @@ impl<'a> Binder<'a> {
             sql::GroupByExpr::Expressions(es, _) if es.is_empty() => None,
             sql::GroupByExpr::Expressions(es, _) if es.len() == 1 => {
                 let f = self.field_of(&es[0])?;
-                if self.schema.fields[f].ty != FieldType::Keyword {
-                    return Err(err("GROUP BY needs a KEYWORD field"));
+                let fld = &self.schema.fields[f];
+                if fld.ty != FieldType::Keyword && !(fld.ty == FieldType::Int && fld.multi) {
+                    return Err(err("GROUP BY needs a KEYWORD field or a multi-valued INT field"));
                 }
                 Some(f)
             }
@@ -350,6 +460,9 @@ impl<'a> Binder<'a> {
             Expr::Nested(inner) => self.score(inner),
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 let f = self.field_of(e)?;
+                if self.schema.fields[f].multi {
+                    return Err(err(format!("cannot order by multi-valued field {}", self.schema.fields[f].name)));
+                }
                 match self.schema.fields[f].ty {
                     FieldType::Int | FieldType::Float => Ok(Score::Column { field: f }),
                     _ => Err(err("ORDER BY a column needs a numeric field")),
@@ -361,7 +474,13 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: BinaryOperator::Minus, right } => {
                 Ok(Score::Weighted([self.weighted(left, 1.0)?, self.weighted(right, -1.0)?].concat()))
             }
-            Expr::BinaryOp { op: BinaryOperator::Multiply, .. } => Ok(Score::Weighted(self.weighted(e, 1.0)?)),
+            Expr::BinaryOp { op: BinaryOperator::Multiply, .. } => {
+                let mut terms = self.weighted(e, 1.0)?;
+                match terms.as_slice() {
+                    [(w, Score::Product(_))] if *w == 1.0 => Ok(terms.pop().unwrap().1),
+                    _ => Ok(Score::Weighted(terms)),
+                }
+            }
             Expr::Function(f) => {
                 let (args, opts) = self.args(f)?;
                 match fname(f).as_str() {
@@ -373,7 +492,14 @@ impl<'a> Binder<'a> {
                     }
                     "similarity" | "distance" => {
                         let [field, v] = args.as_slice() else { return Err(err("similarity(field, vector)")) };
-                        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. }), "VECTOR")?;
+                        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. } | FieldType::Sparse), "VECTOR or SPARSE")?;
+                        if self.schema.fields[field].ty == FieldType::Sparse {
+                            if fname(f) == "distance" {
+                                return Err(err("a SPARSE field takes similarity(...), not distance(...)"));
+                            }
+                            let terms = crate::text::sparse::parse(&self.literal(v)?).map_err(|e| err(format!("similarity({}, ..): {e}", self.schema.fields[field].name)))?;
+                            return Ok(Score::Sparse { field, terms, opts });
+                        }
                         let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
                         let vector = self.vector(v)?;
                         if vector.len() != dim {
@@ -390,6 +516,7 @@ impl<'a> Binder<'a> {
                         Ok(Score::Rrf { inputs, k: num("k", 60.0), depth: num("depth", 100.0) as usize })
                     }
                     "ppr" => Ok(Score::Ppr { graph: self.graph(f, "ppr")? }),
+                    "decay" => self.decay(f),
                     n => Err(err(format!("unknown score function {n}"))),
                 }
             }
@@ -413,11 +540,65 @@ impl<'a> Binder<'a> {
                 } else if let Some(c) = self.number(right) {
                     self.weighted(left, w * c)
                 } else {
-                    Err(err("weights must be numeric constants"))
+                    Ok(vec![(w, Score::Product(self.factors(e)?))])
                 }
             }
             _ => Ok(vec![(w, self.score(e)?)]),
         }
+    }
+
+    /// The factors of a product of scores, `a * b * ...`.
+    fn factors(&self, e: &Expr) -> Result<Vec<Score>> {
+        match e {
+            Expr::Nested(inner) => self.factors(inner),
+            Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } => {
+                if self.number(left).is_some() || self.number(right).is_some() {
+                    return Err(err("a product of scores takes no constant factors (they do not change the order)"));
+                }
+                Ok([self.factors(left)?, self.factors(right)?].concat())
+            }
+            _ => {
+                let s = self.score(e)?;
+                match s {
+                    Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Column { .. } | Score::Decay { .. } | Score::Ppr { .. } | Score::Hops { .. } => Ok(vec![s]),
+                    _ => Err(err("a product multiplies bm25, similarity, ppr, a column or decay, not sums or fusions")),
+                }
+            }
+        }
+    }
+
+    /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
+    /// 'exp' | 'gauss' | 'linear')`; the origin may be `now()` (seconds
+    /// since the Unix epoch).
+    fn decay(&self, f: &sql::Function) -> Result<Score> {
+        let (args, opts) = self.args(f)?;
+        let usage = "decay(field, origin, scale, offset => .., decay => .., shape => 'exp' | 'gauss' | 'linear')";
+        let [field, origin, scale] = args.as_slice() else { return Err(err(usage)) };
+        let field = self.numeric_field(field)?;
+        if self.schema.fields[field].multi {
+            return Err(err(format!("cannot decay multi-valued field {}", self.schema.fields[field].name)));
+        }
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let origin = match origin {
+            Expr::Function(g) if fname(g) == "now" => now(),
+            e => match self.literal(e)? {
+                Value::Str(s) if s.eq_ignore_ascii_case("now") => now(),
+                v => v.as_f64().ok_or_else(|| err("decay origin must be a number or now()"))?,
+            },
+        };
+        let scale = self.num_lit(scale)?;
+        let num = |k: &str, d: f64| opts.get(k).map_or(Ok(d), |v| v.as_f64().ok_or_else(|| err(format!("decay {k} must be a number"))));
+        let (offset, decay) = (num("offset", 0.0)?, num("decay", 0.5)?);
+        if scale <= 0.0 || offset < 0.0 || !(decay > 0.0 && decay < 1.0) {
+            return Err(err("decay needs scale > 0, offset >= 0 and 0 < decay < 1"));
+        }
+        let shape = match opts.get("shape").map(|v| v.as_str().unwrap_or("").to_ascii_lowercase()).as_deref() {
+            None | Some("exp") => DecayShape::Exp,
+            Some("gauss") => DecayShape::Gauss,
+            Some("linear") => DecayShape::Linear,
+            Some(s) => return Err(err(format!("unknown decay shape {s:?}: exp, gauss or linear"))),
+        };
+        Ok(Score::Decay { field, decay: Decay { origin, scale, offset, decay, shape }, opts })
     }
 
     fn pred(&self, e: &Expr) -> Result<Pred> {
@@ -600,6 +781,35 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// A value written to field `f`: a literal or parameter of its type,
+    /// `ARRAY[...]` for lists and vectors.
+    fn write_value(&self, f: usize, e: &Expr) -> Result<Value> {
+        let field = &self.schema.fields[f];
+        if let Expr::Array(a) = e {
+            return match &field.ty {
+                FieldType::Vector { .. } => {
+                    let xs: Vec<f32> = a.elem.iter().map(|x| self.num_lit(x).map(|v| v as f32)).collect::<Result<_>>()?;
+                    Ok(Value::Vector(xs.into()))
+                }
+                _ if field.multi => Ok(Value::List(a.elem.iter().map(|x| self.field_value(f, x)).collect::<Result<_>>()?)),
+                _ => Err(err(format!("{} does not take a list", field.name))),
+            };
+        }
+        let v = self.literal(e)?;
+        Ok(match (&field.ty, v) {
+            (_, Value::Null) => Value::Null,
+            (FieldType::Vector { .. }, _) => Value::Vector(self.vector(e)?),
+            (_, v @ Value::List(_)) if field.multi => v,
+            (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
+            (FieldType::Sparse, v @ Value::Str(_)) => {
+                crate::text::sparse::parse(&v)?;
+                v
+            }
+            (FieldType::Keyword | FieldType::Int | FieldType::Float, _) if field.multi => Value::List(vec![self.field_value(f, e)?]),
+            _ => self.field_value(f, e)?,
+        })
+    }
+
     fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {
         match self.literal(e)? {
             Value::Vector(v) => Ok(v),
@@ -718,13 +928,16 @@ mod tests {
         let s = bind("SELECT id FROM docs WHERE rating BETWEEN 2.0 AND 2.0 ORDER BY rating DESC, id LIMIT 10", &schema(), &q()).unwrap();
         assert_eq!(s.tiebreak, Some(Tiebreak::Key { desc: false }));
         assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Column { field: 6 }, desc: true })));
+        // A product of scores (a boost), not a weighted sum.
+        let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true }) if f.len() == 2), "{:?}", s.order);
 
         for bad in [
             "SELECT id FROM other",
             "SELECT id FROM docs WHERE MATCH(year, 'x')",
             "SELECT id FROM docs WHERE category > 'c01'",
             "SELECT id FROM docs ORDER BY similarity(emb, :missing)",
-            "SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q)",
+            "SELECT id FROM docs ORDER BY bm25(body, :t) * 2 * similarity(emb, :q)",
             "SELECT id FROM docs ORDER BY year, rating",
             "DELETE FROM docs",
         ] {

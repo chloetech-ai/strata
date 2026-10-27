@@ -11,7 +11,7 @@
 //! each 64-byte aligned:
 //!
 //! ```text
-//! cluster c: docIDs (u32, ascending) | pad to 64 | SQ8 code rows (stride bytes each)
+//! cluster c: docIDs (u32, ascending) | pad to 64 | code rows (stride bytes each, SQ8 or binary)
 //! ```
 //!
 //! so probing a cluster is one sequential read, and a filter is applied to
@@ -29,7 +29,8 @@ use rand::{Rng, SeedableRng};
 use crate::error::{corrupt, Result};
 use crate::segment::DocId;
 use crate::vector::build::Rows;
-use crate::vector::sq8::{QueryCode, Sq8};
+use crate::vector::codes::QueryCode;
+use crate::vector::sq8::Sq8;
 use crate::vector::topk::{Members, TopK};
 use crate::vector::{exact, io, score_rows, SearchStats};
 
@@ -49,7 +50,6 @@ pub(crate) struct BuiltIvf {
     pub nlist: usize,
     dim: usize,
     stride: usize,
-    code_stride: usize,
     centroids: Vec<f32>,
     pub offsets: Vec<u64>,
     pub sizes: Vec<u32>,
@@ -69,8 +69,9 @@ impl BuiltIvf {
     pub fn centroid_bytes(&self) -> Vec<u8> {
         let rows: Vec<&[f32]> = self.centroids.chunks_exact(self.stride).map(|c| &c[..self.dim]).collect();
         let sq = Sq8::fit(self.dim, rows.iter().copied());
-        let mut codes = vec![0u8; self.nlist * self.code_stride];
-        for (c, r) in codes.chunks_exact_mut(self.code_stride).zip(&rows) {
+        let cs = centroid_stride(self.dim);
+        let mut codes = vec![0u8; self.nlist * cs];
+        for (c, r) in codes.chunks_exact_mut(cs).zip(&rows) {
             sq.encode(r, c);
         }
         let mut w = ByteWriter::new();
@@ -79,6 +80,12 @@ impl BuiltIvf {
         w.array(&codes);
         w.finish()
     }
+}
+
+/// Bytes per centroid code row: centroids are SQ8 codes whatever codes the
+/// documents have.
+fn centroid_stride(dim: usize) -> usize {
+    dim.next_multiple_of(64)
 }
 
 /// Default number of lists: about 4·√n.
@@ -119,7 +126,7 @@ fn assign(rows: &Rows, points: &[u32], centroids: &[f32], threads: usize) -> Vec
 }
 
 /// Trains the centroids and lays out the clusters. `codes` are the forward
-/// SQ8 rows (`code_stride` bytes each), copied into cluster order.
+/// code rows (`code_stride` bytes each), copied into cluster order.
 pub(crate) fn build(rows: &Rows, ids: &[u32], codes: &[u8], code_stride: usize, cfg: &IvfConfig) -> BuiltIvf {
     let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
     let nlist = cfg.nlist.clamp(1, ids.len().max(1));
@@ -189,7 +196,7 @@ pub(crate) fn build(rows: &Rows, ids: &[u32], codes: &[u8], code_stride: usize, 
             lists[cb + i * code_stride..cb + (i + 1) * code_stride].copy_from_slice(src);
         }
     }
-    BuiltIvf { nlist, dim: rows.dim, stride, code_stride, centroids, offsets, sizes, lists, train_points }
+    BuiltIvf { nlist, dim: rows.dim, stride, centroids, offsets, sizes, lists, train_points }
 }
 
 /// How much a probed cluster counts towards `nprobe` in a filtered search:
@@ -224,6 +231,7 @@ pub fn filtered_probes(nprobe: usize, selectivity: f64, nlist: usize) -> usize {
 pub(crate) struct IvfView {
     nlist: usize,
     code_stride: usize,
+    centroid_stride: usize,
     centroid_sq8: Sq8,
     centroids: Slice<u8>,
     offsets: Slice<u64>,
@@ -241,7 +249,8 @@ impl IvfView {
         let mut r = ByteReader::new(dir);
         let offsets: Slice<u64> = r.array().map_err(corrupt)?;
         let sizes: Slice<u32> = r.array().map_err(corrupt)?;
-        if centroid_sq8.dim() != dim || centroids.len() != nlist * code_stride || offsets.len() != nlist + 1 || sizes.len() != nlist {
+        let centroid_stride = centroid_stride(dim);
+        if centroid_sq8.dim() != dim || centroids.len() != nlist * centroid_stride || offsets.len() != nlist + 1 || sizes.len() != nlist {
             return Err(corrupt("ivf directory does not match nlist"));
         }
         for c in 0..nlist {
@@ -255,7 +264,7 @@ impl IvfView {
         }
         let words: Slice<u32> = Slice::view(lists.clone()).map_err(corrupt)?;
         let bytes: Slice<u8> = Slice::view(lists).map_err(corrupt)?;
-        Ok(IvfView { nlist, code_stride, centroid_sq8, centroids, offsets, sizes, bytes, words })
+        Ok(IvfView { nlist, code_stride, centroid_stride, centroid_sq8, centroids, offsets, sizes, bytes, words })
     }
 
     pub fn is_shared(&self) -> bool {
@@ -271,7 +280,7 @@ impl IvfView {
         (&self.words[o / 4..o / 4 + n], &self.bytes[cb..cb + n * self.code_stride])
     }
 
-    /// The best `r` codes by SQ8 score among the probed clusters, best first.
+    /// The best `r` codes by code score among the probed clusters, best first.
     ///
     /// Clusters are probed in decreasing centroid similarity to `qf` (SQ8
     /// scores): unfiltered, the `nprobe` closest; filtered, each cluster's
@@ -294,9 +303,9 @@ impl IvfView {
         if hints {
             io::will_need_range(self.centroids.as_ptr(), self.centroids.len());
         }
-        let cq = self.centroid_sq8.prepare(qf, self.code_stride);
+        let cq = QueryCode::Sq8(self.centroid_sq8.prepare(qf, self.centroid_stride));
         let mut order: Vec<(i32, u32)> = Vec::with_capacity(self.nlist);
-        score_rows(&self.centroids, self.code_stride, self.nlist, None, &cq, |c, s| order.push((s, c as u32)));
+        score_rows(&self.centroids, self.centroid_stride, self.nlist, None, &cq, |c, s| order.push((s, c as u32)));
         stats.centroids += self.nlist;
         let cmp = |a: &(i32, u32), b: &(i32, u32)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
         // Sort only the clusters expected to be probed; the rest on demand.

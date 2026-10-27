@@ -32,12 +32,16 @@ const HEADER: u64 = 16;
 const INSERT: u8 = 1;
 const DELETE: u8 = 2;
 const COMMIT: u8 = 3;
+const SET: u8 = 4;
 
 /// One logged operation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     Insert(Arc<Document>),
     Delete(Value),
+    /// Sets a numeric field of the live document with this key, in place
+    /// ([`crate::storage::updates`]).
+    Set { key: Value, field: u16, value: Value },
 }
 
 /// A committed transaction read back from the log.
@@ -141,6 +145,12 @@ fn encode_txn(txn: u64, ops: &[Op]) -> Vec<u8> {
                 body.push(DELETE);
                 put_value(&mut body, key);
             }
+            Op::Set { key, field, value } => {
+                body.push(SET);
+                put_value(&mut body, key);
+                body.extend_from_slice(&field.to_le_bytes());
+                put_value(&mut body, value);
+            }
         }
         frame(&mut out, &body);
     }
@@ -182,6 +192,15 @@ fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
                 Ok(v) => ops.push(Op::Delete(v)),
                 Err(_) => break,
             },
+            SET => {
+                let key = get_value(&mut r);
+                let field = r.u16();
+                let value = get_value(&mut r);
+                match (key, field, value) {
+                    (Ok(key), Ok(field), Ok(value)) => ops.push(Op::Set { key, field, value }),
+                    _ => break,
+                }
+            }
             COMMIT => {
                 let (Ok(txn), Ok(n)) = (r.u64(), r.u32()) else { break };
                 if n as usize != ops.len() || txns.last().is_some_and(|t: &WalTxn| t.txn >= txn) {
@@ -201,6 +220,7 @@ const INT: u8 = 1;
 const FLOAT: u8 = 2;
 const STR: u8 = 3;
 const VECTOR: u8 = 4;
+const LIST: u8 = 5;
 
 fn put_value(out: &mut Vec<u8>, v: &Value) {
     match v {
@@ -217,6 +237,13 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
             out.push(STR);
             out.extend_from_slice(&(s.len() as u32).to_le_bytes());
             out.extend_from_slice(s.as_bytes());
+        }
+        Value::List(xs) => {
+            out.push(LIST);
+            out.extend_from_slice(&(xs.len() as u32).to_le_bytes());
+            for x in xs {
+                put_value(out, x);
+            }
         }
         Value::Vector(x) => {
             out.push(VECTOR);
@@ -252,6 +279,9 @@ impl<'a> Reader<'a> {
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -273,6 +303,14 @@ fn get_value(r: &mut Reader) -> Result<Value> {
             let n = r.u32()? as usize;
             let b = r.take(n.checked_mul(4).ok_or_else(|| corrupt("vector length"))?)?;
             Value::Vector(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        }
+        LIST => {
+            let n = r.u32()? as usize;
+            let mut xs = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                xs.push(get_value(r)?);
+            }
+            Value::List(xs)
         }
         t => return Err(corrupt(format!("unknown value tag {t}"))),
     })
@@ -307,7 +345,7 @@ mod tests {
             (3, vec![Op::Insert(doc(1)), Op::Insert(doc(2))]),
             (4, vec![Op::Delete(Value::Str("key1".into()))]),
             (5, vec![]),
-            (7, vec![Op::Delete(Value::Int(9)), Op::Insert(doc(3))]),
+            (7, vec![Op::Delete(Value::Int(9)), Op::Insert(doc(3)), Op::Set { key: Value::Int(3), field: 2, value: Value::Float(0.5) }]),
         ]
     }
 
