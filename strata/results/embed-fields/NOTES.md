@@ -58,3 +58,4 @@ caffeinate -i target/release/strata-embed-eval --dataset D --model M \
 | dataset | model | load + embed 3 fields | wall |
 |---|---|---|---|
 | scifact | potion-retrieval-32M | 1.2 s | 2 s |
+| scifact | bge-small-en-v1.5 | 1,893.4 s | 1,904 s |

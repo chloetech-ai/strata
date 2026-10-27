@@ -1,2 +1,4 @@
 scifact potion-retrieval-32M start 2026-10-27 16:05:36 PDT load: { 5.92 33.98 26.18 }
 scifact potion-retrieval-32M end   2026-10-27 16:05:38 PDT load: { 5.92 33.98 26.18 } exit 0 wall 2 s
+scifact bge-small-en-v1.5 start 2026-10-27 16:06:04 PDT load: { 5.30 31.59 25.54 }
+scifact bge-small-en-v1.5 end   2026-10-27 16:37:48 PDT load: { 17.33 17.96 18.82 } exit 0 wall 1904 s
