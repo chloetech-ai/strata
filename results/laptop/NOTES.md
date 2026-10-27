@@ -184,8 +184,9 @@ first run, so only the changed crates recompiled.
 | strata-server | 8 | 0 | 0 | 5 | 38 s | 35 s | 22.36 |
 | engram | 42 | 0 | 0 | 6 | 129 s | 2 m 05 s | 23.89 |
 
-All pass. Against the first run: strata gains one test (258 against 257) and
-strata-server one test binary and one test (8 against 7), from the new
-`strata/tests/cluster_split.rs` and the strata-server changes. The load average
+All pass. Against the first run: strata gains one test (258 against 257, in
+`strata/tests/cluster_split.rs`) and strata-server one test (8 against 7, in
+`strata-server/tests/server.rs`). The extra strata-server test binary is the
+`strata-server-bench` target, which the first test run (at 4f3f628) predates. The load average
 rose to 22–34 while the tests ran (the build, test threads and macOS daemons), so
 these wall times are rough.
