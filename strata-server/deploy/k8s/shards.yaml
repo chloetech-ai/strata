@@ -1,0 +1,63 @@
+# A set of N shards: pod i serves /data/<collection>.shard<i>of<N>.strata
+# (as strata-server-bench --build-only splits it) over gRPC, to the
+# coordinator. The set's name carries N, so a set of another size can start
+# beside it before the coordinator moves over; `deploy/kind-test.sh shards N`
+# writes this file for another N.
+apiVersion: v1
+kind: Service
+metadata:
+  name: strata-shards-2
+  namespace: strata
+spec:
+  clusterIP: None
+  selector: {app: strata-shard, shards: "2"}
+  ports:
+    - {name: grpc, port: 7701}
+    - {name: http, port: 7700}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: strata-shards-2
+  namespace: strata
+spec:
+  serviceName: strata-shards-2
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: strata-shard, shards: "2"}
+  template:
+    metadata:
+      labels: {app: strata-shard, shards: "2"}
+    spec:
+      # One shard per node where there are enough nodes.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: strata-shard, shards: "2"}
+      containers:
+        - name: strata
+          image: strata-server:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: COLLECTION, value: quora}
+            - {name: SHARDS, value: "2"}
+          # The pod's ordinal (strata-shards-2-<i>) picks its file.
+          command: ["sh", "-c"]
+          args:
+            - exec strata-server --db /data/${COLLECTION}.shard${HOSTNAME##*-}of${SHARDS}.strata --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701
+          ports:
+            - {name: http, containerPort: 7700}
+            - {name: grpc, containerPort: 7701}
+          readinessProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 250m, memory: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          hostPath: {path: /data, type: Directory}

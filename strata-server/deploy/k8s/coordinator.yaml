@@ -1,0 +1,39 @@
+# The coordinator: answers queries over HTTP by asking every shard of a set
+# over gRPC and merging. It holds no data, so it can run several replicas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: strata-coordinator
+  namespace: strata
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: strata-coordinator}
+  template:
+    metadata:
+      labels: {app: strata-coordinator}
+    spec:
+      containers:
+        - name: strata
+          image: strata-server:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen=0.0.0.0:7700
+            - --shards=http://strata-shards-2-0.strata-shards-2:7701,http://strata-shards-2-1.strata-shards-2:7701
+          ports:
+            - {name: http, containerPort: 7700}
+          readinessProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: strata-coordinator
+  namespace: strata
+spec:
+  selector: {app: strata-coordinator}
+  ports:
+    - {name: http, port: 7700}
