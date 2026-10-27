@@ -10,3 +10,5 @@ trec-covid potion-retrieval-32M start 2026-10-27 16:57:45 PDT load: { 36.12 43.8
 trec-covid potion-retrieval-32M end   2026-10-27 16:58:13 PDT load: { 26.68 41.02 37.00 } exit 0 wall 28 s
 nfcorpus potion-retrieval-32M start 2026-10-27 16:58:14 PDT load: { 24.70 40.37 36.80 } (accelerate)
 nfcorpus potion-retrieval-32M end   2026-10-27 16:58:15 PDT load: { 24.70 40.37 36.80 } exit 0 wall 1 s
+scidocs potion-retrieval-32M start 2026-10-27 16:58:16 PDT load: { 24.70 40.37 36.80 } (accelerate)
+scidocs potion-retrieval-32M end   2026-10-27 16:58:22 PDT load: { 23.52 39.87 36.64 } exit 0 wall 6 s
