@@ -162,3 +162,30 @@ Things worth a look in the report:
   and its recall@10 drops from 0.972 (one database) to 0.942 (shards).
 - With 1-bit codes, the filtered-vector and hybrid p99 at 16 clients is
   40–47 ms, against 8–15 ms with 8-bit codes.
+
+# Re-run after fixes
+
+Tree: `claude/laptop-report` at 021f92b, the merge of
+`origin/claude/project-thread-2f1ge7` at 76970b5 into the first run's 107b978.
+New since the first run: a NEON kernel for 1-bit vector codes (bb44dd9), rows
+tied on score cut and ordered by key (4dfb665), group commit for writes
+(9081bde), flat vectors in in-memory chunks (76970b5). Same machine and
+toolchain as above.
+
+## Step 1: tests (`cargo test --release`)
+
+One crate at a time, each under `caffeinate -i`, 2026-10-27 19:03–19:12 UTC.
+Wall time includes the release build; the target directories were warm from the
+first run, so only the changed crates recompiled.
+
+| crate | passed | failed | ignored | test binaries | wall | of which compile | load at start |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| strata | 258 | 0 | 14 | 37 | 353 s | 4 m 41 s | 2.08 |
+| strata-server | 8 | 0 | 0 | 5 | 38 s | 35 s | 22.36 |
+| engram | 42 | 0 | 0 | 6 | 129 s | 2 m 05 s | 23.89 |
+
+All pass. Against the first run: strata gains one test (258 against 257) and
+strata-server one test binary and one test (8 against 7), from the new
+`strata/tests/cluster_split.rs` and the strata-server changes. The load average
+rose to 22–34 while the tests ran (the build, test threads and macOS daemons), so
+these wall times are rough.
