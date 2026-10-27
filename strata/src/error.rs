@@ -12,6 +12,8 @@ pub enum Error {
     Query(String),
     /// Another writer holds the database, or a transaction was misused.
     Busy(String),
+    /// A query ran past its deadline.
+    Timeout(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -24,6 +26,7 @@ impl fmt::Display for Error {
             Error::Schema(m) => write!(f, "schema error: {m}"),
             Error::Query(m) => write!(f, "query error: {m}"),
             Error::Busy(m) => write!(f, "busy: {m}"),
+            Error::Timeout(m) => write!(f, "timeout: {m}"),
         }
     }
 }

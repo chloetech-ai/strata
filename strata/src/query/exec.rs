@@ -4,10 +4,11 @@
 
 mod graph;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::forward::{self, DocStore, KeywordColumn, NumericColumn, RangeIndex, RangeStrategy};
@@ -15,6 +16,8 @@ use crate::graph::GraphReader;
 use crate::query::fusion::{self, Norm};
 use crate::query::logical::{OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
+use crate::query::stats::{FieldStats, TermStats};
+use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
 use crate::storage::{SegmentView, Snapshot};
@@ -166,6 +169,22 @@ pub struct ExecOptions {
     pub bm25_algo: TopKAlgo,
     /// Candidates per input for fusion (`rrf` uses its own `depth`).
     pub fusion_depth: usize,
+    /// Collection statistics to score BM25 with instead of this database's
+    /// own, so that a shard of a larger collection scores like the whole
+    /// of it ([`crate::query::stats`]). Terms missing from it use local
+    /// counts.
+    pub stats: Option<Arc<TermStats>>,
+    /// Answer as one shard of a larger collection, for a coordinator to
+    /// merge ([`crate::cluster::merge`]): OFFSET is folded into LIMIT,
+    /// facets and counts return every group, and fused scores return every
+    /// candidate with each input's raw score ([`FusionParts`]).
+    pub shard: bool,
+    /// Threads a query may use to search its segments in parallel (1: the
+    /// calling thread only).
+    pub threads: usize,
+    /// Fail with `Error::Timeout` once this has passed (checked between
+    /// segments).
+    pub deadline: Option<Instant>,
 }
 
 impl Default for ExecOptions {
@@ -179,6 +198,10 @@ impl Default for ExecOptions {
             bm25: Bm25Params::default(),
             bm25_algo: TopKAlgo::MaxScore,
             fusion_depth: 100,
+            stats: None,
+            shard: false,
+            threads: 1,
+            deadline: None,
         }
     }
 }
@@ -198,7 +221,29 @@ pub struct ExecStats {
 pub struct ResultSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+    /// The primary key of each row (`Null` in a table without one); empty
+    /// for facet and count queries.
+    pub keys: Vec<Value>,
+    /// The score each row was ordered by (0 for unordered rows); empty for
+    /// facet and count queries.
+    pub scores: Vec<f64>,
+    /// With [`ExecOptions::shard`] and a fused score: every input's score
+    /// of every row, for the coordinator to fuse.
+    pub parts: Option<FusionParts>,
     pub stats: ExecStats,
+}
+
+/// The inputs of a fused score (RRF or weighted sum), row by row, so that a
+/// coordinator can fuse candidates from several shards once
+/// ([`crate::cluster::merge`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FusionParts {
+    /// `scores[row][input]`: the input's exact score of the row (`None`
+    /// where it has none, e.g. a missing column value).
+    pub scores: Vec<Vec<Option<f64>>>,
+    /// `ranked[row][input]`: whether the row is among the input's top
+    /// `depth` rows in this shard.
+    pub ranked: Vec<Vec<bool>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -281,6 +326,9 @@ pub struct Executor<'a> {
     graphs: Vec<graph::GraphOut>,
     /// Every segment's readers, for subqueries.
     readers_all: Vec<Arc<SegmentReaders>>,
+    /// Shard mode: the fused query's candidates, each input's scores of
+    /// them, and whether each is in each input's top `depth`.
+    parts: Option<(Vec<(usize, DocId)>, Vec<Vec<f32>>, Vec<Vec<bool>>)>,
 }
 
 fn err(m: impl Into<String>) -> Error {
@@ -298,15 +346,44 @@ impl<'a> Executor<'a> {
             .filter(|(_, (v, _))| v.file.n_docs() > 0)
             .map(|(ord, (view, r))| Seg { ord, view, r: r.clone() })
             .collect();
-        Executor { schema: snap.schema(), snap, segs, opts, stats: ExecStats::default(), sets: HashMap::new(), graphs: Vec::new(), readers_all: readers.to_vec() }
+        Executor {
+            schema: snap.schema(),
+            snap,
+            segs,
+            opts,
+            stats: ExecStats::default(),
+            sets: HashMap::new(),
+            graphs: Vec::new(),
+            readers_all: readers.to_vec(),
+            parts: None,
+        }
+    }
+
+    /// This database's BM25 statistics for every term `q` scores with
+    /// (subqueries of graph seeds included), for a coordinator to sum over
+    /// shards and send back as [`ExecOptions::stats`].
+    pub fn term_stats(self, q: &Select) -> Result<TermStats> {
+        let mut leaves = Vec::new();
+        bm25_leaves(q, &mut leaves);
+        let mut out = TermStats::default();
+        for (field, text, opts) in leaves {
+            let terms = query_terms(text, opts);
+            let c = self.local_stats(field, &terms)?;
+            out.merge_field(&self.schema.fields[field].name, FieldStats::from_collection(&c));
+        }
+        Ok(out)
     }
 
     pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
         let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
+        if self.opts.shard && has_graphs(q) {
+            return Err(err("graph queries cannot be split across shards: edges cross them"));
+        }
         self.run_graphs(&q.graphs)?;
+        let empty = |columns, rows, stats| ResultSet { columns, rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
         if let Some(g) = q.group_by {
             let rows = self.facets(q, g)?;
-            return Ok(ResultSet { columns, rows, stats: self.stats });
+            return Ok(empty(columns, rows, self.stats));
         }
         let has_count = q.projection.iter().any(|(_, p)| *p == Projection::Count);
         if has_count {
@@ -314,13 +391,27 @@ impl<'a> Executor<'a> {
                 return Err(err("COUNT(*) with other columns needs GROUP BY"));
             }
             let n = self.count(&q.filter)? as i64;
-            let rows = if q.offset == 0 && q.limit != Some(0) { vec![vec![Value::Int(n); columns.len()]] } else { Vec::new() };
-            return Ok(ResultSet { columns, rows, stats: self.stats });
+            let one = self.opts.shard || (q.offset == 0 && q.limit != Some(0));
+            let rows = if one { vec![vec![Value::Int(n); columns.len()]] } else { Vec::new() };
+            return Ok(empty(columns, rows, self.stats));
         }
         let hits = self.ordered_hits(q)?;
-        let hits: Vec<Hit> = hits.into_iter().skip(q.offset).collect();
+        let skip = if self.opts.shard { 0 } else { q.offset };
+        let hits: Vec<Hit> = hits.into_iter().skip(skip).collect();
         let rows = self.project(q, &hits)?;
-        Ok(ResultSet { columns, rows, stats: self.stats })
+        let keys = hits.iter().map(|h| self.key(h)).collect();
+        let scores = hits.iter().map(|h| h.score).collect();
+        let parts = self.parts.take().map(|(cands, scores, ranked)| {
+            let at: HashMap<(usize, DocId), usize> = cands.iter().enumerate().map(|(i, c)| (*c, i)).collect();
+            let mut out = FusionParts::default();
+            for h in &hits {
+                let i = at[&(h.seg, h.doc)];
+                out.scores.push(scores.iter().map(|s| Some(s[i] as f64).filter(|x| x.is_finite())).collect());
+                out.ranked.push(ranked.iter().map(|r| r[i]).collect());
+            }
+            out
+        });
+        Ok(ResultSet { columns, rows, keys, scores, parts, stats: self.stats })
     }
 
     /// The rows of a query without facets or counts, in order, before
@@ -507,6 +598,7 @@ impl<'a> Executor<'a> {
         let mut total = 0u64;
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
+            self.check_deadline()?;
             total += match (p, &s.view.live) {
                 (Pred::True, None) => s.r.n_docs as u64,
                 (Pred::Range { field, lo, hi }, None) => {
@@ -524,6 +616,7 @@ impl<'a> Executor<'a> {
         let mut out = Vec::new();
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
+            self.check_deadline()?;
             if want.is_some_and(|w| out.len() >= w) {
                 break;
             }
@@ -544,6 +637,7 @@ impl<'a> Executor<'a> {
         let mut cands = Vec::new();
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
+            self.check_deadline()?;
             let col = self.numeric(s, field)?.col();
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
@@ -572,6 +666,9 @@ impl<'a> Executor<'a> {
     // ---- ranked ----------------------------------------------------------
 
     fn ranked(&mut self, score: &Score, p: &Pred, k: usize, tb: Option<&Tiebreak>) -> Result<Vec<Hit>> {
+        if self.opts.shard && matches!(score, Score::Rrf { .. } | Score::Weighted(_)) {
+            return self.fusion_candidates(score, p);
+        }
         let mut hits = match score {
             Score::Rrf { inputs, k: rk, depth } => {
                 let mut lists = Vec::new();
@@ -604,8 +701,8 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Collection-wide BM25 statistics over every segment of the snapshot.
-    fn collection_stats(&self, field: usize, terms: &[String]) -> Result<CollectionStats> {
+    /// BM25 statistics over every segment of the snapshot.
+    fn local_stats(&self, field: usize, terms: &[String]) -> Result<CollectionStats> {
         let mut st = CollectionStats { n_docs: 0, total_len: 0, df: HashMap::new() };
         for s in &self.segs {
             let t = self.text(unsafe_extend(s), field)?;
@@ -616,6 +713,30 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(st)
+    }
+
+    /// The statistics BM25 scores with: the snapshot's own, or the
+    /// collection's from [`ExecOptions::stats`] where it has them.
+    fn collection_stats(&self, field: usize, terms: &[String]) -> Result<CollectionStats> {
+        let mut st = self.local_stats(field, terms)?;
+        if let Some(g) = self.opts.stats.as_ref().and_then(|s| s.fields.get(&self.schema.fields[field].name)) {
+            st.n_docs = g.n_docs;
+            st.total_len = g.total_len;
+            for w in terms {
+                if let Some(&df) = g.df.get(w) {
+                    st.df.insert(w.clone(), df);
+                }
+            }
+        }
+        Ok(st)
+    }
+
+    /// `Error::Timeout` once [`ExecOptions::deadline`] has passed.
+    fn check_deadline(&self) -> Result<()> {
+        match self.opts.deadline {
+            Some(d) if Instant::now() >= d => Err(Error::Timeout("the query ran past its deadline".into())),
+            _ => Ok(()),
+        }
     }
 
     fn bm25_params(&self, opts: &Opts) -> (Bm25Params, TopKAlgo) {
@@ -645,6 +766,7 @@ impl<'a> Executor<'a> {
         let mut all = Vec::new();
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
+            self.check_deadline()?;
             let t = self.text(s, field)?;
             // Block-Max WAND fully scores a fraction of the postings it meets.
             let candidates = terms.iter().map(|w| t.doc_freq(w) as f64).sum::<f64>() * 0.3;
@@ -692,6 +814,7 @@ impl<'a> Executor<'a> {
         let mut all = Vec::new();
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
+            self.check_deadline()?;
             let vr = self.vector(s, field)?;
             let has_index = vr.index_kind() != "flat";
             let (strategy, mode) = {
@@ -784,6 +907,7 @@ impl<'a> Executor<'a> {
         if exact {
             let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
             for s in segs {
+                self.check_deadline()?;
                 let set = self.filter_set(s, p)?;
                 cands.extend(set.iter().map(|d| (s.ord, d)));
             }
@@ -803,6 +927,68 @@ impl<'a> Executor<'a> {
         let weights: Vec<f64> = terms.iter().map(|(w, _)| *w).collect();
         let fused = fusion::weighted(&weights, &scores, norm);
         Ok(fused.into_iter().take(k).map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect())
+    }
+
+    /// Shard mode: every candidate of a fused score with each input's exact
+    /// score, ordered by the fused score over this shard's candidates. The
+    /// coordinator takes each input's top `depth` over all shards and fuses
+    /// those, which is what one database holding every shard would do.
+    fn fusion_candidates(&mut self, score: &Score, p: &Pred) -> Result<Vec<Hit>> {
+        let (inputs, depth, exact): (Vec<&Score>, usize, bool) = match score {
+            Score::Rrf { inputs, depth, .. } => (inputs.iter().collect(), *depth, false),
+            Score::Weighted(terms) => {
+                let opt = |key: &str| terms.iter().find_map(|(_, s)| s.opts().and_then(|o| o.get(key)).cloned());
+                let exact = opt("exact").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+                let depth = opt("depth").and_then(|v| v.as_f64()).map(|d| d as usize).unwrap_or(self.opts.fusion_depth);
+                (terms.iter().map(|(_, s)| s).collect(), depth, exact)
+            }
+            _ => unreachable!("fused scores only"),
+        };
+        let mut lists = Vec::with_capacity(inputs.len());
+        for s in &inputs {
+            lists.push(self.leaf_top(s, p, depth)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>());
+        }
+        let mut cands: Vec<(usize, DocId)> = Vec::new();
+        if exact {
+            let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
+            for s in segs {
+                self.check_deadline()?;
+                let set = self.filter_set(s, p)?;
+                cands.extend(set.iter().map(|d| (s.ord, d)));
+            }
+        } else {
+            cands = lists.concat();
+            cands.sort_unstable();
+            cands.dedup();
+        }
+        let mut scores = Vec::with_capacity(inputs.len());
+        for s in &inputs {
+            scores.push(self.exact_scores(s, &cands)?);
+        }
+        let ranked: Vec<Vec<bool>> = lists
+            .iter()
+            .map(|l| {
+                let set: HashSet<&(usize, DocId)> = l.iter().collect();
+                cands.iter().map(|c| set.contains(c)).collect()
+            })
+            .collect();
+        let mut hits: Vec<Hit> = match score {
+            Score::Rrf { k, .. } => fusion::rrf(&lists, *k).into_iter().map(|((seg, doc), score)| Hit { seg, doc, score }).collect(),
+            Score::Weighted(terms) => {
+                let norm = match terms.iter().find_map(|(_, s)| s.opts().and_then(|o| o.get("norm")).cloned()).as_ref().and_then(|v| v.as_str()) {
+                    Some("none") => Norm::None,
+                    _ => Norm::MinMax,
+                };
+                let weights: Vec<f64> = terms.iter().map(|(w, _)| *w).collect();
+                fusion::weighted(&weights, &scores, norm).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect()
+            }
+            _ => unreachable!(),
+        };
+        self.sort_by_score_then_key(&mut hits, true, false);
+        self.stats.scored += cands.len() as u64;
+        self.stats.plan.push(format!("shard fusion: {} candidates from {} inputs, depth {depth}", cands.len(), inputs.len()));
+        self.parts = Some((cands, scores, ranked));
+        Ok(hits)
     }
 
     /// Exact scores of `cands` (sorted by segment, then docID) for one input.
@@ -857,6 +1043,7 @@ impl<'a> Executor<'a> {
         let mut counts: HashMap<String, u64> = HashMap::new();
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
+            self.check_deadline()?;
             let set = self.filter_set(s, &q.filter)?;
             let kw = self.keyword(s, g)?;
             let strategy = kw.choose_facet_strategy(&set);
@@ -876,10 +1063,11 @@ impl<'a> Executor<'a> {
             }
             _ => groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| if value_desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) })),
         }
+        let (skip, take) = if self.opts.shard { (0, usize::MAX) } else { (q.offset, q.limit.unwrap_or(usize::MAX)) };
         let rows = groups
             .into_iter()
-            .skip(q.offset)
-            .take(q.limit.unwrap_or(usize::MAX))
+            .skip(skip)
+            .take(take)
             .map(|(v, c)| {
                 q.projection
                     .iter()
@@ -973,6 +1161,32 @@ fn merge_top(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
     hits
 }
 
+/// The BM25 inputs of a query and of the subqueries that seed its graphs.
+fn bm25_leaves<'q>(q: &'q Select, out: &mut Vec<(usize, &'q str, &'q Opts)>) {
+    if let Some(OrderBy::Score { score, .. }) = &q.order {
+        for l in score.leaves() {
+            if let Score::Bm25 { field, text, opts } = l {
+                out.push((*field, text, opts));
+            }
+        }
+    }
+    for g in &q.graphs {
+        let seeds = match &g.kind {
+            crate::query::logical::GraphKind::Path { to, .. } => vec![&g.seeds, to],
+            _ => vec![&g.seeds],
+        };
+        for s in seeds {
+            if let Seeds::Query(sub) = s {
+                bm25_leaves(sub, out);
+            }
+        }
+    }
+}
+
+fn has_graphs(q: &Select) -> bool {
+    !q.graphs.is_empty()
+}
+
 /// The terms of a `bm25` query; `stopwords => 0` keeps query stopwords.
 fn query_terms(q: &str, opts: &Opts) -> Vec<String> {
     let drop = opts.get("stopwords").and_then(|v| v.as_f64()).map_or(true, |x| x != 0.0);
@@ -991,7 +1205,9 @@ fn group_by_seg(cands: &[(usize, DocId)]) -> Vec<(usize, std::ops::Range<usize>)
     out
 }
 
-fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+/// Orders primary keys and other values: strings and integers by value,
+/// anything else as numbers.
+pub fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),

@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use crate::error::Result;
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
 use crate::query::exec::{ExecOptions, Executor, ResultSet, SegmentReaders};
+use crate::query::stats::TermStats;
 use crate::query::{bind, Params, Select};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
@@ -81,6 +82,14 @@ impl Db {
     pub fn execute(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions) -> Result<ResultSet> {
         let readers = self.readers(snap)?;
         Executor::new(snap, &readers, opts).execute(select)
+    }
+
+    /// This database's BM25 statistics for the terms `select` scores with,
+    /// for a coordinator to sum over shards and pass back through
+    /// [`ExecOptions::stats`] ([`crate::cluster`]).
+    pub fn term_stats(&self, snap: &Snapshot, select: &Select) -> Result<TermStats> {
+        let readers = self.readers(snap)?;
+        Executor::new(snap, &readers, &self.exec).term_stats(select)
     }
 
     /// Readers for every segment of `snap`, opened on first use.
