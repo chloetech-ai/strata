@@ -3,6 +3,7 @@
 //! vacuum (DESIGN.md §3; measurements in `notes/storage.md`).
 //!
 //! * [`pager`]: file layout, meta slots, the read-only mapping.
+//! * [`dir`]: the directory layout, one file per segment.
 //! * [`freelist`]: free page runs and deferred frees.
 //! * [`manifest`]: one on-disk version (schema, segments, delete sets).
 //! * [`wal`]: the `-wal` sidecar.
@@ -12,6 +13,7 @@
 //! * [`Database`], [`WriteTxn`], [`Snapshot`]: the API.
 
 mod db;
+pub mod dir;
 pub mod freelist;
 pub mod live;
 pub mod manifest;
@@ -24,7 +26,7 @@ pub mod wal;
 
 use std::sync::{Mutex, MutexGuard};
 
-pub use db::{Database, DbOptions, DocumentSource, FileStats, SegmentStats, WriteTxn};
+pub use db::{Database, DbOptions, DocumentSource, FileStats, Layout, SegmentStats, WriteTxn};
 pub use live::LiveDocs;
 pub use merge::{MergePolicy, MergeStats, SegmentInfo};
 pub use pk::{build_pk_index, key_hash, KeyRef, PkIndex};

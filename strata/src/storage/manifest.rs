@@ -36,6 +36,13 @@ pub struct SegmentMeta {
     pub deletes_crc: u32,
     /// The commit that wrote the segment.
     pub txn: u64,
+    /// Directory layout: the segment's own file in the database directory
+    /// (`extent` then spans the whole file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Directory layout: the delete set's file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletes_file: Option<String>,
 }
 
 impl SegmentMeta {

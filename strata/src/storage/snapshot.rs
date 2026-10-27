@@ -119,7 +119,16 @@ impl Snapshot {
                 unsafe { crate::iostat::drop_mapping(m.as_ptr(), m.len())? };
             }
         }
-        crate::iostat::evict(&self.inner.path)?;
+        if self.inner.path.is_dir() {
+            for e in std::fs::read_dir(&self.inner.path)? {
+                let e = e?;
+                if e.file_name().to_string_lossy().starts_with("seg-") {
+                    crate::iostat::evict(&e.path())?;
+                }
+            }
+        } else {
+            crate::iostat::evict(&self.inner.path)?;
+        }
         Ok(())
     }
 }

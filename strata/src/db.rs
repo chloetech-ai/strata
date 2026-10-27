@@ -92,6 +92,45 @@ impl Db {
         Executor::new(snap, &readers, &self.exec).term_stats(select)
     }
 
+    /// Builds a segment image of `docs` for this schema into `dest` (a new
+    /// file), to attach to a database elsewhere ([`Db::attach_segments`]).
+    pub fn write_segment(schema: &Schema, docs: Vec<Document>, opts: &crate::segment::build::BuildOptions, dest: &Path) -> Result<()> {
+        let docs: Vec<Document> = docs
+            .into_iter()
+            .map(|mut d| {
+                schema.fill_generated(&mut d);
+                d
+            })
+            .collect();
+        let image = crate::segment::build::build_segment(schema, &docs, opts)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(dest)?;
+        std::io::Write::write_all(&mut f, &image)?;
+        f.sync_data()?;
+        Ok(())
+    }
+
+    /// Attaches segment images built elsewhere, in one commit, after
+    /// checking that every field of this table opens in each of them.
+    pub fn attach_segments(&self, images: &[std::path::PathBuf]) -> Result<Vec<u64>> {
+        let schema = self.schema().clone();
+        for p in images {
+            let file = SegmentFile::open(crate::postings::bytes::OwnedBytes::new(std::fs::read(p)?))?;
+            let r = SegmentReaders::open(&file, &schema)?;
+            for (i, f) in schema.fields.iter().enumerate() {
+                let ok = match f.ty {
+                    FieldType::Text { .. } => r.text(i).map(|_| ()),
+                    FieldType::Keyword => r.keyword(i).map(|_| ()),
+                    FieldType::Vector { .. } => r.vector(i).map(|_| ()),
+                    FieldType::Edges => r.graph(i).map(|_| ()),
+                    FieldType::Int | FieldType::Float => Ok(()),
+                };
+                ok.map_err(|e| crate::Error::Schema(format!("{}: field {}: {e}", p.display(), f.name)))?;
+            }
+            r.store()?;
+        }
+        self.storage.attach_segments(images)
+    }
+
     /// Readers for every segment of `snap`, opened on first use.
     pub fn readers(&self, snap: &Snapshot) -> Result<Vec<Arc<SegmentReaders>>> {
         {

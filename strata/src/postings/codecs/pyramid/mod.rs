@@ -1926,7 +1926,7 @@ mod tests {
                         pos += 1;
                         assert_eq!(cur.next(), l.get(pos).copied().unwrap_or(END), "next after {want}");
                     }
-                    t = cur.docid().max(t) + rng.gen_range(1..=stride);
+                    t = cur.docid().max(t).saturating_add(rng.gen_range(1..=stride));
                 }
             }
         }

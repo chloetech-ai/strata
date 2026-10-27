@@ -2,6 +2,7 @@
 //! its opened segments, the memtable, and deletes not yet flushed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::postings::bytes::OwnedBytes;
@@ -54,7 +55,26 @@ impl SegHandle {
         if !within(&meta.extent) || meta.deletes.as_ref().is_some_and(|e| !within(e)) {
             return Err(corrupt(format!("segment {} lies outside the file", meta.id)));
         }
-        let file = SegmentFile::open(map.slice(meta.extent.range()))?;
+        let deletes = meta.deletes.map(|e| map.slice(e.range()));
+        SegHandle::from_bytes(map.slice(meta.extent.range()), deletes, map.clone(), meta, random_hints)
+    }
+
+    /// Opens a segment of the directory layout from its own files.
+    pub fn open_in(dir: &Path, meta: &SegmentMeta, read_ahead: bool, random_hints: bool) -> Result<SegHandle> {
+        let name = meta.file.as_deref().ok_or_else(|| corrupt(format!("segment {} has no file", meta.id)))?;
+        let map = crate::storage::dir::map(dir, name, read_ahead)?;
+        if map.len() as u64 != meta.extent.len {
+            return Err(corrupt(format!("{name} has {} bytes, the manifest says {}", map.len(), meta.extent.len)));
+        }
+        let deletes = match &meta.deletes_file {
+            Some(d) => Some(crate::storage::dir::map(dir, d, read_ahead)?),
+            None => None,
+        };
+        SegHandle::from_bytes(map.clone(), deletes, map, meta, random_hints)
+    }
+
+    fn from_bytes(image: OwnedBytes, deletes: Option<OwnedBytes>, map: OwnedBytes, meta: &SegmentMeta, random_hints: bool) -> Result<SegHandle> {
+        let file = SegmentFile::open(image)?;
         if random_hints {
             file.advise_random_sections();
         }
@@ -62,11 +82,11 @@ impl SegHandle {
         if file.n_docs() != meta.n_docs as usize || pk.as_ref().is_some_and(|p| p.len() != file.n_docs()) {
             return Err(corrupt(format!("segment {} document count disagrees with manifest", meta.id)));
         }
-        let base = match meta.deletes {
-            Some(e) => Some(Arc::new(LiveDocs::view(map.slice(e.range()), meta.n_docs, meta.n_deleted)?)),
+        let base = match deletes {
+            Some(b) => Some(Arc::new(LiveDocs::view(b, meta.n_docs, meta.n_deleted)?)),
             None => None,
         };
-        Ok(SegHandle { meta: meta.clone(), file, pk, base, map: map.clone() })
+        Ok(SegHandle { meta: meta.clone(), file, pk, base, map })
     }
 }
 
