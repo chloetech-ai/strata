@@ -1,0 +1,9 @@
+scifact: 5183 documents, 300 queries; model static:potion-retrieval-32M (512 dimensions)
+loaded and embedded 3 fields in 1.2 s (0 documents without a title get no title vector)
+scifact (300 queries)                                            nDCG@10  recall@100
+bm25 (title + text)                                               0.6887      0.9249
+potion-retrieval-32M vector of title                              0.4869      0.7912
+potion-retrieval-32M vector of text                               0.6132      0.9276
+potion-retrieval-32M vector of title + text                       0.6331      0.9342
+rrf(bm25, potion-retrieval-32M vector of title + text)            0.6972      0.9553
+reference: Cohere embed-english-v3 vector of title + text         0.7181      0.9633
