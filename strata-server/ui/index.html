@@ -151,6 +151,7 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
           <div class="grow"><label class="lbl" for="bVecValue">&nbsp;</label><input id="bVecValue" type="text" placeholder="" disabled></div>
           <div style="width:150px"><label class="lbl" for="bVecField">vector field</label><select id="bVecField"></select></div>
         </div>
+        <div class="small muted" id="bVecNote" style="margin:-4px 0 8px"></div>
         <div class="row hidden" id="bFuseRow">
           <div><label class="lbl">Combine text and similarity</label>
             <span class="seg" id="bFuse"><button data-v="rrf" aria-pressed="true">rank fusion (RRF)</button><button data-v="weighted" aria-pressed="false">weighted sum</button></span></div>
@@ -256,7 +257,7 @@ $("theme").onclick = () => {
 };
 
 // ---- schema -------------------------------------------------------------------
-let S = null; // {table, fields:[{name, ty, stored, indexed, multi, kind, dim}], pk, embedder}
+let S = null; // {table, fields:[{name, ty, stored, indexed, multi, kind, dim}], pk, embeddings:[{field, from, model, loaded, error}]}
 const kindOf = (ty) => typeof ty === "string" ? ty.toLowerCase() : Object.keys(ty)[0].toLowerCase();
 function fieldBadge(f) {
   let t = f.kind === "vector" ? `vector ${f.dim}` : f.kind;
@@ -271,7 +272,7 @@ async function loadSchema() {
   const j = await api("/v1/schema");
   const s = j.schema;
   S = {
-    table: s.table, pk: j.primary_key, embedder: j.embedder,
+    table: s.table, pk: j.primary_key, embeddings: j.embeddings || [],
     fields: s.fields.map((f) => ({ name: f.name, kind: kindOf(f.ty), dim: f.ty.Vector ? f.ty.Vector.dim : null, stored: f.stored, indexed: f.indexed, multi: !!f.multi, generated: (f.generated_from || []).length > 0 })),
   };
   $("table").textContent = S.table;
@@ -286,7 +287,9 @@ function renderFields() {
     if (f.kind === "text" && !f.stored) badges.unshift(el("span", { class: "badge", text: "search only" }));
     if (f.kind === "text" && !f.indexed) badges.unshift(el("span", { class: "badge", text: "stored only" }));
     const vals = el("div", { class: "values hidden" });
-    const row = el("div", { class: "field", title: f.name },
+    const e = embeddingOf(f.name);
+    if (e) badges.unshift(el("span", { class: "badge", text: "← " + e.from.join(" + ") }));
+    const row = el("div", { class: "field", title: e ? `${f.name}: ${e.model}'s embedding of ${e.from.join(" + ")}` : f.name },
       el("span", { class: "name", text: f.name }), el("span", { class: "row", style: "gap:4px;flex-wrap:nowrap" }, badges));
     row.onclick = async () => {
       if (f.kind === "keyword" || (f.kind === "int" && f.multi)) {
@@ -314,6 +317,18 @@ function showTab(name) {
 for (const t of document.querySelectorAll(".tab")) t.onclick = () => showTab(t.dataset.tab);
 
 // ---- builder ------------------------------------------------------------------
+const embeddingOf = (name) => S.embeddings.find((e) => e.field === name);
+// What the chosen vector field holds, and whether typed text can be
+// searched against it (only with the model that embedded the rows).
+function vecFieldChanged() {
+  const f = $("bVecField").value, e = embeddingOf(f);
+  const text = $("bVecMode").querySelector('option[value="text"]');
+  text.disabled = !(e && e.loaded);
+  if (text.disabled && $("bVecMode").value === "text") { $("bVecMode").value = ""; $("bVecValue").disabled = true; }
+  $("bVecNote").textContent = !f ? "" : !e ? `${f} holds vectors supplied with the data; the schema does not say what they embed.`
+    : e.loaded ? `${f} is ${e.model}'s embedding of ${e.from.join(" + ")}; a description is embedded by the same model.`
+    : `${f} is ${e.model}'s embedding of ${e.from.join(" + ")}, which this server cannot run: search by a row.`;
+}
 const B = { filters: [], fuse: "rrf", cols: null };
 function opt(v, t) { return el("option", { value: v, text: t ?? v }); }
 function setupBuilder() {
@@ -322,8 +337,8 @@ function setupBuilder() {
   const gen = textFields.find((f) => f.generated); if (gen) $("bTextField").value = gen.name;
   const vecFields = S.fields.filter((f) => f.kind === "vector");
   $("bVecRow").classList.toggle("hidden", vecFields.length === 0 || !S.pk);
-  $("bVecField").replaceChildren(...vecFields.map((f) => opt(f.name)));
-  if (!S.embedder) $("bVecMode").querySelector('option[value="text"]').remove();
+  $("bVecField").replaceChildren(...vecFields.map((f) => { const e = embeddingOf(f.name); return opt(f.name, e ? `${f.name} ← ${e.from.join(" + ")}` : f.name); }));
+  $("bVecField").addEventListener("input", () => { vecFieldChanged(); updateSql(); }); vecFieldChanged();
   $("bSort").replaceChildren(opt("", "relevance / none"), ...S.fields.filter((f) => isNum(f) && !f.multi).map((f) => opt(f.name)));
   $("bBoostField").replaceChildren(opt("", "no boost"), ...S.fields.filter((f) => isNum(f) && !f.multi).map((f) => opt(f.name)));
   $("bBoostField").addEventListener("input", () => { for (const id of ["bBoostOrigin", "bBoostScale", "bBoostShape"]) $(id).disabled = !$("bBoostField").value; updateSql(); });
@@ -407,7 +422,7 @@ function builderQuery() {
   const params = {};
   const textScore = text ? `bm25(${tf}, ${sqlStr(text)})` : null;
   let vecScore = null;
-  if (vm && vv) { vecScore = `similarity(${vf}, :q)`; params.q = vm === "row" ? { vector_of: vv, field: $("bVecField").value } : { embed: vv }; }
+  if (vm && vv) { vecScore = `similarity(${vf}, :q)`; params.q = vm === "row" ? { vector_of: vv, field: $("bVecField").value } : { embed: vv, field: $("bVecField").value }; }
   let order = null;
   $("bFuseRow").classList.toggle("hidden", !(textScore && vecScore));
   // The boost: decay(field, origin, scale) multiplies a single ranking.
