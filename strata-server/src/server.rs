@@ -130,6 +130,25 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener) -> Result<(), 
         .await
 }
 
+/// Ctrl-C, or SIGTERM: how Docker and Kubernetes stop a container. As a
+/// container's first process the server would otherwise ignore SIGTERM, and
+/// be killed only when the grace period ran out (30 s in Kubernetes).
 async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
 }
