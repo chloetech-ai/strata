@@ -20,7 +20,7 @@ use crate::query::stats::{FieldStats, TermStats};
 use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
-use crate::storage::{SegmentView, Snapshot, Updates};
+use crate::storage::{KeyRef, SegmentView, Snapshot, Updates};
 use crate::text::{self, Bm25Params, CollectionStats, FilterStrategy, TextFieldReader, TopKAlgo};
 use crate::value::Value;
 use crate::vector::{self, SearchParams, VectorReader};
@@ -858,8 +858,9 @@ impl<'a> Executor<'a> {
             // order it by key themselves.
             Score::Column { field } => return self.by_column(*field, true, p, Some(depth), Some(&Tiebreak::Key { desc: key_desc })),
             Score::Decay { field, decay, .. } => return self.decay_top(*field, decay, p, depth, key_desc),
-            // Keeps every row tied with the depth-th.
+            // These keep every row tied with the depth-th.
             Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, depth)?,
+            Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, depth, true)?,
             _ => {
                 let mut want = depth + 1;
                 loop {
@@ -876,14 +877,27 @@ impl<'a> Executor<'a> {
         Ok(hits)
     }
 
-    /// Orders each run of rows with equal scores by key; rows that tie
-    /// with no other keep their place and have no key read.
+    /// Orders each run of rows with equal scores by key, as
+    /// [`cmp_values`] orders keys; rows that tie with no other keep their
+    /// place and have no key read.
     fn order_ties_by_key(&self, hits: &mut [Hit], key_desc: bool) {
         let mut i = 0;
         while i < hits.len() {
             let j = i + hits[i..].iter().take_while(|h| h.score == hits[i].score).count();
             if j - i > 1 {
-                self.sort_by_score_then_key(&mut hits[i..j], true, key_desc);
+                // Borrowed keys: a tie can hold thousands of rows.
+                let mut keyed: Vec<(Option<KeyRef<'_>>, Hit)> = hits[i..j].iter().map(|h| (self.snap.pk(h.seg).map(|p| p.key_ref(h.doc)), *h)).collect();
+                keyed.sort_by(|(a, _), (b, _)| {
+                    let c = match (a, b) {
+                        (Some(KeyRef::Str(x)), Some(KeyRef::Str(y))) => x.cmp(y),
+                        (Some(KeyRef::Int(x)), Some(KeyRef::Int(y))) => x.cmp(y),
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    if key_desc { c.reverse() } else { c }
+                });
+                for (h, (_, k)) in hits[i..j].iter_mut().zip(keyed) {
+                    *h = k;
+                }
             }
             i = j;
         }
@@ -891,7 +905,7 @@ impl<'a> Executor<'a> {
 
     fn leaf_top(&mut self, score: &Score, p: &Pred, k: usize) -> Result<Vec<Hit>> {
         match score {
-            Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, k),
+            Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, k, false),
             Score::Similarity { field, vector, opts } => self.vector_top(*field, vector, opts, p, k),
             Score::Sparse { field, terms, opts } => self.sparse_top(*field, terms, opts, p, k),
             Score::Column { field } => self.by_column(*field, true, p, Some(k), None),
@@ -982,7 +996,9 @@ impl<'a> Executor<'a> {
         (params, algo)
     }
 
-    fn bm25_top(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+    /// The top `k` rows by BM25; with `ties`, also every row tied with the
+    /// `k`-th.
+    fn bm25_top(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize, ties: bool) -> Result<Vec<Hit>> {
         let terms = query_terms(query, opts);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -1001,11 +1017,14 @@ impl<'a> Executor<'a> {
                 }
             };
             let f = ex.seg_filter_l(s, p, mode, l)?;
-            let hits = t.top_k(&terms, &stats, params, k, f.as_dyn(), algo);
+            let hits = if ties { t.top_k_ties(&terms, &stats, params, k, f.as_dyn(), algo) } else { t.top_k(&terms, &stats, params, k, f.as_dyn(), algo) };
             l.plan.push(format!("seg {}: bm25 {algo:?}, filter {mode:?}", s.ord));
             Ok(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }).collect::<Vec<_>>())
         })?;
-        Ok(merge_top(per.concat(), k))
+        let mut hits = merge_top(per.concat(), usize::MAX);
+        let keep = if ties && k > 0 && hits.len() > k { k + hits[k..].iter().take_while(|h| h.score == hits[k - 1].score).count() } else { k };
+        hits.truncate(keep);
+        Ok(hits)
     }
 
     fn search_params(&self, opts: &Opts) -> SearchParams {
