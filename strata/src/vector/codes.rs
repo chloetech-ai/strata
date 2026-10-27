@@ -61,12 +61,12 @@ impl QueryCode {
         }
     }
 
-    /// Scores of four rows (SQ8 loads each query chunk once for all four).
+    /// Scores of four rows (each query chunk is loaded once for all four).
     #[inline]
     pub fn dot4(&self, rows: [&[u8]; 4]) -> [i32; 4] {
         match self {
             QueryCode::Sq8(q) => kernels::dot_u8_i8_x4(rows, &q.q8),
-            QueryCode::Bits(q) => rows.map(|r| q.dot(r)),
+            QueryCode::Bits(q) => q.dot4(rows),
         }
     }
 

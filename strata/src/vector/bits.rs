@@ -13,8 +13,9 @@
 //! (`u_j = v_j + 128`, a byte), so a code's integer score is
 //! `Σ_{set} u_j − 128·popcount(code)`: AVX-512 loads the bytes of the set
 //! bits with the code as the load mask and sums them with `vpsadbw`, 64
-//! dimensions per step; elsewhere the eight bit planes of `u` are ANDed with
-//! the code and counted (see [`kernels::dot_bits_u8`]).
+//! dimensions per step; NEON turns the code's bits into byte masks and sums
+//! mask times `v` with `sdot`; elsewhere the eight bit planes of `u` are
+//! ANDed with the code and counted (see [`kernels::dot_bits_u8`]).
 //!
 //! A code row is `⌈dim/64⌉` little-endian u64 words: 1/32 of the float32
 //! row and 1/8 of the SQ8 one. The query keeps all its precision (8 bits per
@@ -44,6 +45,8 @@ pub struct Bits {
 pub struct BitsQuery {
     /// Offset weights `u_j = v_j + 128`, padded to 64 bytes per code word.
     pub u: Vec<u8>,
+    /// The weights `v_j` themselves, padded alike.
+    pub v: Vec<i8>,
     /// Bit plane `p` of the weights of code word `w` at `planes[8w + p]`.
     pub planes: Vec<u64>,
     pub alpha: f32,
@@ -54,7 +57,18 @@ impl BitsQuery {
     /// Integer score of a code row: `Σ_{set} v_j`.
     #[inline]
     pub fn dot(&self, code: &[u8]) -> i32 {
-        kernels::dot_bits_u8(code, &self.u, &self.planes)
+        kernels::dot_bits_u8(code, self.weights())
+    }
+
+    /// Integer scores of four code rows.
+    #[inline]
+    pub fn dot4(&self, codes: [&[u8]; 4]) -> [i32; 4] {
+        kernels::dot_bits_u8_x4(codes, self.weights())
+    }
+
+    #[inline]
+    fn weights(&self) -> kernels::BitsWeights<'_> {
+        kernels::BitsWeights { u: &self.u, v: &self.v, planes: &self.planes }
     }
 
     /// Approximate similarity from an integer score.
@@ -132,7 +146,8 @@ impl Bits {
                 planes[j / 64 * 8 + p] |= ((x >> p & 1) as u64) << (j % 64);
             }
         }
-        BitsQuery { u, planes, alpha, bias: (qt - wsum) as f32 }
+        let v = u.iter().map(|&x| (x as i32 - 128) as i8).collect();
+        BitsQuery { u, v, planes, alpha, bias: (qt - wsum) as f32 }
     }
 }
 
