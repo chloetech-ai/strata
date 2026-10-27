@@ -420,3 +420,129 @@ In `strata/`, under `caffeinate -i`, 2026-10-27 20:28 UTC, load 2.70 at the star
 
 `text_topk` includes the new `ties_kept_alike` test from 1017948. The full suites
 were not re-run here (they pass in CI on macOS).
+
+## Step 2: end-to-end benchmark (`strata-server-bench`, quora), reusing the databases again
+
+From `strata-server/` at be5083c (code identical to the merge 5eaa2be), with the
+same work directory as the first two runs:
+
+    STRATA_DATA=/Users/rkonow/code2/bench-data/beir caffeinate -i cargo run --release \
+        --bin strata-server-bench -- --collection quora --work /Users/rkonow/code2/bench-work/server-quora \
+        --reuse --out results/bench/rerun2 2> ../results/laptop/strata-server-bench-quora-rerun2.log \
+        | tee ../results/laptop/strata-server-bench-quora-rerun2.md
+
+The build finished at 20:31:12 UTC with the 1-minute load at 11.22. The driver
+waited for it to drop below 6 with no compiler or benchmark running, and started
+at 20:32:12 UTC.
+
+- **Load before:** 5.26 (5- and 15-minute 5.91 and 4.03)
+- **Load after:** 8.43 (5- and 15-minute 11.11 and 8.53); the benchmark's own 16 clients and server threads account for most of that
+- **Wall:** 629 s (re-run 627 s), exit 0, errors 0 in every row
+
+`--reuse` reopened all four databases again, so sizes and build times are the
+first run's (8-bit 2,819.6 MB, 1-bit 2,351.1 MB, shards 1,411.7 + 1,410.6 MB).
+
+Output files:
+
+- JSON: `strata-server/results/bench/rerun2/quora.json`
+- printed tables: `results/laptop/strata-server-bench-quora-rerun2.md`
+- progress lines as printed: `results/laptop/strata-server-bench-quora-rerun2.log`
+
+The comparison tables below come from the three JSON files (`strata-server/results/bench/quora.json`, `rerun/quora.json` and `rerun2/quora.json`).
+
+**HTTP queries: server-side p50 at 1 client and q/s at 16 clients**, first run / re-run / third run:
+
+| setup | kind | server p50, 1 client: first / re-run / third | third vs first | third vs re-run | q/s, 16 clients: first / re-run / third | third vs first | third vs re-run |
+|---|---|---|---:|---:|---|---:|---:|
+| one database | bm25 | 0.119 / 0.154 / 0.123 | +3% | -20% | 17,611 / 19,642 / 23,395 | +33% | +19% |
+| one database | bm25 + filter | 0.218 / 0.272 / 0.222 | +2% | -18% | 12,390 / 12,652 / 15,430 | +25% | +22% |
+| one database | vector | 0.126 / 0.122 / 0.125 | -1% | +2% | 14,102 / 18,530 / 17,197 | +22% | -7% |
+| one database | vector + filter | 0.201 / 0.203 / 0.212 | +5% | +5% | 8,510 / 12,400 / 11,436 | +34% | -8% |
+| one database | hybrid (RRF) | 0.403 / 0.528 / 0.411 | +2% | -22% | 5,519 / 6,903 / 8,429 | +53% | +22% |
+| one database | hybrid (weighted) | 0.438 / 0.568 / 0.452 | +3% | -20% | 5,311 / 6,460 / 7,641 | +44% | +18% |
+| one database | boosted (bm25 × decay) | 0.249 / 0.363 / 0.255 | +3% | -30% | 11,224 / 10,056 / 14,012 | +25% | +39% |
+| one database | facet | 0.038 / 0.044 / 0.045 | +18% | +2% | 34,130 / 46,424 / 44,743 | +31% | -4% |
+| one database | key lookup | 0.027 / 0.033 / 0.033 | +25% | +2% | 43,807 / 58,630 / 55,422 | +27% | -5% |
+| 1-bit codes | vector | 0.414 / 0.324 / 0.333 | -19% | +3% | 6,688 / 11,304 / 10,112 | +51% | -11% |
+| 1-bit codes | vector + filter | 1.069 / 0.826 / 0.881 | -18% | +7% | 2,820 / 5,523 / 4,508 | +60% | -18% |
+| 1-bit codes | hybrid (RRF) | 1.133 / 1.099 / 1.002 | -12% | -9% | 2,662 / 3,915 / 3,440 | +29% | -12% |
+| 1-bit codes | hybrid (weighted) | 1.176 / 1.133 / 1.035 | -12% | -9% | 2,491 / 3,232 / 3,351 | +35% | +4% |
+| 2 shards | bm25 | 0.331 / 0.360 / 0.331 | -0% | -8% | 3,828 / 4,094 / 3,972 | +4% | -3% |
+| 2 shards | bm25 + filter | 0.658 / 0.726 / 0.653 | -1% | -10% | 2,255 / 2,382 / 2,319 | +3% | -3% |
+| 2 shards | vector | 0.255 / 0.245 / 0.248 | -3% | +1% | 6,141 / 7,602 / 6,948 | +13% | -9% |
+| 2 shards | vector + filter | 0.384 / 0.395 / 0.394 | +3% | -0% | 2,772 / 5,238 / 4,815 | +74% | -8% |
+| 2 shards | hybrid (RRF) | 1.558 / 1.262 / 1.170 | -25% | -7% | 970 / 1,820 / 1,717 | +77% | -6% |
+| 2 shards | hybrid (weighted) | 1.602 / 1.436 / 1.367 | -15% | -5% | 888 / 1,253 / 1,306 | +47% | +4% |
+| 2 shards | boosted (bm25 × decay) | 1.184 / 1.224 / 1.036 | -12% | -15% | 1,380 / 1,414 / 1,439 | +4% | +2% |
+| 2 shards | facet | 0.181 / 0.163 / 0.171 | -5% | +5% | 9,480 / 11,345 / 10,854 | +14% | -4% |
+| 2 shards | key lookup | 0.108 / 0.094 / 0.097 | -10% | +3% | 13,861 / 17,010 / 16,320 | +18% | -4% |
+
+
+- **The BM25 slowdown is gone.** At 1 client on one database, server-side p50
+  is back within 2–3% of the first run for every BM25-ranked kind: bm25 0.119 /
+  0.154 / 0.123 ms, bm25 + filter 0.218 / 0.272 / 0.222, hybrid RRF 0.403 / 0.528
+  / 0.411, hybrid weighted 0.438 / 0.568 / 0.452, boosted 0.249 / 0.363 / 0.255.
+  The re-run's +23–46% is down to +2–3%.
+- At 16 clients the same kinds are the fastest of the three runs: bm25 23,395 q/s
+  (+19% on the re-run), bm25 + filter 15,430 (+22%), hybrid RRF 8,429 (+22%),
+  hybrid weighted 7,641 (+18%), boosted 14,012 (+39%, and now above the first
+  run's 11,224 rather than below it).
+- Over 2 shards the BM25-ranked kinds also come back to the first run's level or
+  better at 1 client (bm25 0.331 / 0.360 / 0.331 ms, boosted 1.184 / 1.224 /
+  1.036 ms), and the hybrid kinds on 1-bit codes drop 9% from the re-run.
+- Kinds 1017948 does not touch: vector, facet and key lookup are within 0 to
+  +7% of the re-run at 1 client. At 16 clients they are 4–18% below the re-run
+  (1-bit vector + filter 5,523 → 4,508 q/s) but still above the first run. The
+  8-bit exact scan below also moves 9.9 → 10.9 ms. These code paths did not
+  change, so this is most likely run-to-run variation (the 5-minute load reached
+  11 during this run). One run each, so differences of about 10% are not
+  conclusive either way.
+
+**Shard agreement** (2 shards against one database, 50 queries), first run / re-run / third run:
+
+| kind | same top 10 | same scores (ties may swap) | recall@10, one database | recall@10, shards |
+|---|---|---|---|---|
+| bm25 | 20 / 49 / 50 | 50 / 50 / 50 | exact | exact |
+| bm25 + filter | 28 / 49 / 50 | 50 / 50 / 50 | exact | exact |
+| vector | 44 / 46 / 46 | 46 / 46 / 46 | 0.990 / 0.990 / 0.990 | 0.992 / 0.992 / 0.992 |
+| vector + filter | 39 / 39 / 39 | 40 / 39 / 39 | 0.982 / 0.984 / 0.984 | 0.990 / 0.992 / 0.992 |
+| hybrid (RRF) | 20 / 42 / 42 | 20 / 42 / 42 | 0.972 / 0.972 / 0.972 | 0.942 / 0.968 / 0.968 |
+| hybrid (weighted) | 45 / 50 / 50 | 45 / 50 / 50 | 0.998 / 0.998 / 0.998 | 0.998 / 0.998 / 0.998 |
+| boosted (bm25 × decay) | 43 / 50 / 50 | 43 / 50 / 50 | exact | exact |
+| facet | 50 / 50 / 50 | 50 / 50 / 50 | exact | exact |
+| key lookup | 50 / 50 / 50 | 50 / 50 / 50 | exact | exact |
+
+
+BM25 and BM25 + filter now return the same top 10 on shards as on one database
+in 50 of 50 queries (49 in the re-run), as expected from 1017948's f64 score sums
+(a document scores the same bit for bit on a shard and on the whole database, so
+ties fall alike). Hybrid RRF stays at 42 of 50 with shard recall 0.968 (one
+database 0.972). The vector kinds are unchanged: HNSW over two half-size graphs
+finds slightly different neighbours, which is not a tie.
+
+**Writes** (one database), first run / re-run / third run:
+
+| write | clients | per s | p50 ms | p99 ms | errors (third) |
+|---|---:|---|---|---|---:|
+| in-place update (one per request) | 1 | 189 / 194 / 195 | 5.040 / 5.044 / 5.073 | 8.149 / 7.043 / 7.022 | 0 |
+| in-place update (one per request) | 4 | 198 / 411 / 406 | 5.086 / 9.915 / 9.842 | 214.941 / 11.867 / 12.370 | 0 |
+| in-place update (one per request) | 16 | 197 / 1,657 / 1,591 | 5.759 / 9.729 / 9.982 | 711.558 / 12.286 / 12.486 | 0 |
+| SQL UPDATE by key | 1 | 171 / 167 / 162 | 5.914 / 5.992 / 6.078 | 7.682 / 7.595 / 8.221 | 0 |
+| SQL UPDATE by key | 4 | 188 / 182 / 181 | 5.442 / 21.991 / 21.923 | 181.833 / 25.362 / 27.609 | 0 |
+| SQL UPDATE by key | 16 | 194 / 181 / 182 | 6.076 / 88.350 / 87.831 | 670.370 / 99.764 / 96.152 | 0 |
+| insert (100 documents per request) | 1 | 12 / 69 / 69 (6,889 docs/s) | 82.648 / 14.541 / 14.927 | 153.144 / 17.765 / 17.203 | 0 |
+
+
+Write throughput is within 4% of the re-run (1017948 does not touch writes):
+group commit still gives about 1,600 in-place updates/s at 16 clients with p99
+12.5 ms, SQL UPDATE stays near 180/s, and batched inserts run at 6,889 documents/s.
+
+**Vector search** (SQL, one thread), first run / re-run / third run:
+
+| search | recall@10 | p50 ms | p99 ms |
+|---|---|---|---|
+| 8-bit codes, HNSW ef 64 (default) | 0.990 / 0.990 / 0.990 | 0.103 / 0.100 / 0.104 | 0.149 / 0.130 / 0.161 |
+| 8-bit codes, HNSW ef 320 | 0.996 / 0.996 / 0.996 | 0.330 / 0.318 / 0.328 | 0.474 / 0.390 / 0.454 |
+| 8-bit codes, exact scan | 1.000 / 1.000 / 1.000 | 13.703 / 9.945 / 10.885 | 16.571 / 10.556 / 11.423 |
+| 1-bit codes, HNSW (breadth 320) | 0.995 / 0.995 / 0.995 | 0.389 / 0.293 / 0.305 | 2.382 / 0.447 / 0.394 |
+| 1-bit codes, exact scan | 1.000 / 1.000 / 1.000 | 22.623 / 9.160 / 9.391 | 23.450 / 9.340 / 9.618 |
