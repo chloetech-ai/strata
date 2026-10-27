@@ -1138,7 +1138,7 @@ pub fn request(dir: &Path, project: &str, req: &Json, timeout: Duration) -> Resu
 /// Starts `engram serve` in the background unless one is starting already.
 fn spawn(paths: &StorePaths, project: &str) -> Result<()> {
     crate::paths::create_private_dir(&paths.dir)?;
-    let lock = std::fs::OpenOptions::new().create(true).write(true).mode(0o600).open(&paths.spawn_lock)?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(&paths.spawn_lock)?;
     use std::os::unix::io::AsRawFd;
     // SAFETY: flock on an open descriptor.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
