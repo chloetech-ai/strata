@@ -166,6 +166,11 @@ pub struct ExecOptions {
     pub bm25_algo: TopKAlgo,
     /// Candidates per input for fusion (`rrf` uses its own `depth`).
     pub fusion_depth: usize,
+    /// Search only these segments (ordinals into the snapshot's segments),
+    /// with BM25 statistics still summed over every segment, so the top-k
+    /// lists of disjoint subsets merge by score into the whole query's. For
+    /// experiments that run a query's segments in parallel from outside.
+    pub segments: Option<Arc<[usize]>>,
 }
 
 impl Default for ExecOptions {
@@ -179,6 +184,7 @@ impl Default for ExecOptions {
             bm25: Bm25Params::default(),
             bm25_algo: TopKAlgo::MaxScore,
             fusion_depth: 100,
+            segments: None,
         }
     }
 }
@@ -273,6 +279,9 @@ pub struct Executor<'a> {
     schema: &'a Schema,
     snap: &'a Snapshot,
     segs: Vec<Seg<'a>>,
+    /// Every non-empty segment, for collection statistics; empty unless
+    /// `ExecOptions::segments` restricts `segs`.
+    stat_segs: Vec<Seg<'a>>,
     opts: &'a ExecOptions,
     stats: ExecStats,
     /// Materialised filters by segment, shared by the operators of a query.
@@ -290,7 +299,7 @@ fn err(m: impl Into<String>) -> Error {
 impl<'a> Executor<'a> {
     /// `readers[i]` must belong to `snap.segments()[i]`.
     pub fn new(snap: &'a Snapshot, readers: &[Arc<SegmentReaders>], opts: &'a ExecOptions) -> Self {
-        let segs = snap
+        let all: Vec<Seg<'a>> = snap
             .segments()
             .iter()
             .zip(readers)
@@ -298,7 +307,21 @@ impl<'a> Executor<'a> {
             .filter(|(_, (v, _))| v.file.n_docs() > 0)
             .map(|(ord, (view, r))| Seg { ord, view, r: r.clone() })
             .collect();
-        Executor { schema: snap.schema(), snap, segs, opts, stats: ExecStats::default(), sets: HashMap::new(), graphs: Vec::new(), readers_all: readers.to_vec() }
+        let (segs, stat_segs) = match &opts.segments {
+            None => (all, Vec::new()),
+            Some(only) => (all.iter().filter(|s| only.contains(&s.ord)).map(|s| Seg { ord: s.ord, view: s.view, r: s.r.clone() }).collect(), all),
+        };
+        Executor {
+            schema: snap.schema(),
+            snap,
+            segs,
+            stat_segs,
+            opts,
+            stats: ExecStats::default(),
+            sets: HashMap::new(),
+            graphs: Vec::new(),
+            readers_all: readers.to_vec(),
+        }
     }
 
     pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
@@ -607,7 +630,7 @@ impl<'a> Executor<'a> {
     /// Collection-wide BM25 statistics over every segment of the snapshot.
     fn collection_stats(&self, field: usize, terms: &[String]) -> Result<CollectionStats> {
         let mut st = CollectionStats { n_docs: 0, total_len: 0, df: HashMap::new() };
-        for s in &self.segs {
+        for s in if self.opts.segments.is_some() { &self.stat_segs } else { &self.segs } {
             let t = self.text(unsafe_extend(s), field)?;
             st.n_docs += t.n_docs() as u64;
             st.total_len += t.total_len();

@@ -1,6 +1,8 @@
 //! Turning documents into a segment.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::error::Result;
 use crate::schema::{FieldType, Schema};
@@ -27,6 +29,22 @@ impl BuildOptions {
     }
 }
 
+/// Seconds spent in each part of segment builds since the last
+/// [`take_build_times`], summed over all builds and threads.
+static BUILD_TIMES: Mutex<BTreeMap<String, f64>> = Mutex::new(BTreeMap::new());
+
+fn add_build_time(part: &str, since: Instant) {
+    let mut t = BUILD_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+    *t.entry(part.to_string()).or_insert(0.0) += since.elapsed().as_secs_f64();
+}
+
+/// Seconds spent in each part of segment builds since the last call, by
+/// part: `<field> (<type>)` for an index (`emb (vector)` includes the SQ8
+/// codes and the ANN graph), `doc store`, `keys`. Resets the counters.
+pub fn take_build_times() -> BTreeMap<String, f64> {
+    std::mem::take(&mut *BUILD_TIMES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Builds the segment image for `docs` (local docIDs follow slice order).
 pub fn build_segment(schema: &Schema, docs: &[Document], opts: &BuildOptions) -> Result<Vec<u8>> {
     for d in docs {
@@ -34,6 +52,14 @@ pub fn build_segment(schema: &Schema, docs: &[Document], opts: &BuildOptions) ->
     }
     let mut out = SegmentWriter::new(docs.len());
     let mut builders: Vec<(usize, Box<dyn FieldIndexBuilder>)> = Vec::new();
+    let kind = |ty: &FieldType| match ty {
+        FieldType::Text { .. } => "text",
+        FieldType::Keyword => "keyword",
+        FieldType::Int => "int",
+        FieldType::Float => "float",
+        FieldType::Vector { .. } => "vector",
+        FieldType::Edges => "edges",
+    };
     for (i, f) in schema.fields.iter().enumerate() {
         let b: Option<Box<dyn FieldIndexBuilder>> = match &f.ty {
             FieldType::Text { .. } if f.indexed => Some(crate::text::field_builder(f, opts)?),
@@ -54,15 +80,19 @@ pub fn build_segment(schema: &Schema, docs: &[Document], opts: &BuildOptions) ->
             builders.push((i, b));
         }
     }
-    for (d, doc) in docs.iter().enumerate() {
-        for (i, b) in builders.iter_mut() {
-            b.add(d as DocId, &doc[*i])?;
+    for (i, mut b) in builders {
+        let t = Instant::now();
+        for (d, doc) in docs.iter().enumerate() {
+            b.add(d as DocId, &doc[i])?;
         }
-    }
-    for (_, b) in builders {
         b.finish(&mut out)?;
+        add_build_time(&format!("{} ({})", schema.fields[i].name, kind(&schema.fields[i].ty)), t);
     }
+    let t = Instant::now();
     crate::forward::build_doc_store(schema, docs, opts, &mut out)?;
+    add_build_time("doc store", t);
+    let t = Instant::now();
     crate::storage::build_pk_index(schema, docs, &mut out)?;
+    add_build_time("keys", t);
     Ok(out.finish())
 }
