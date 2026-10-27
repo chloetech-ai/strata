@@ -1,0 +1,48 @@
+{
+  "data": {
+    "clusters": 1000,
+    "dim": 768,
+    "n": 500000,
+    "queries": 200,
+    "synthetic": true
+  },
+  "machine": {
+    "cores": 8,
+    "cpu": "aarch64",
+    "sq8_kernel": "neon-usdot"
+  },
+  "params": {
+    "ef": 320,
+    "nprobe": 32,
+    "threads_build": 4,
+    "threads_search": 1
+  },
+  "runs": [
+    {
+      "build_s": 140.631725875,
+      "code_bytes": 384000000,
+      "codes": "sq8",
+      "f32_bytes": 1536000000,
+      "index": "hnsw",
+      "mean_ms": 0.21540352499999993,
+      "p50_ms": 0.200167,
+      "p99_ms": 0.45849999999999996,
+      "recall_at_10": 0.9935,
+      "rerank": 40,
+      "rescored": 40.0
+    },
+    {
+      "build_s": 146.061555042,
+      "code_bytes": 48000000,
+      "codes": "binary",
+      "f32_bytes": 1536000000,
+      "index": "hnsw",
+      "mean_ms": 0.36105689000000024,
+      "p50_ms": 0.32675,
+      "p99_ms": 0.754042,
+      "recall_at_10": 0.9910000000000003,
+      "rerank": 40,
+      "rescored": 320.0
+    }
+  ]
+}
