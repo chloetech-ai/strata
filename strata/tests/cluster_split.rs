@@ -117,6 +117,45 @@ fn split_collection_answers_like_the_whole() {
 }
 
 #[test]
+fn tied_scores_cut_and_rank_alike() {
+    // 40 distinct texts over 3,000 rows: BM25 ties in runs of about 75,
+    // so the candidate cut (depth) and RRF's ranks fall inside ties. One
+    // database and the shards must cut and rank them alike (ties by key).
+    let mut docs = data::synthetic(N, DIM, 11);
+    let texts: Vec<Vec<Value>> = docs[..40].iter().map(|d| d[data::col::TITLE..=data::col::BODY].to_vec()).collect();
+    for (i, d) in docs.iter_mut().enumerate() {
+        d.splice(data::col::TITLE..=data::col::BODY, texts[i % texts.len()].iter().cloned());
+    }
+    // Loaded in descending key order, so a row's place in its segment
+    // does not follow its key.
+    docs.reverse();
+    let dir = tempfile::tempdir().unwrap();
+    let whole = open(dir.path(), "whole.strata", &docs);
+    let a = open(dir.path(), "a.strata", &docs[..N / 2]);
+    let b = open(dir.path(), "b.strata", &docs[N / 2..]);
+    let word = docs[0][data::col::TITLE].as_str().unwrap().split(' ').next().unwrap().to_string();
+    let params = Params::new().set("q", docs[7][data::col::EMB].clone()).set("t", Value::Str(word));
+    let queries = [
+        "SELECT id, score() FROM docs ORDER BY bm25(body, :t) DESC LIMIT 10",
+        "SELECT id, score() FROM docs ORDER BY bm25(body, :t) DESC LIMIT 5 OFFSET 7",
+        "SELECT id, score() FROM docs WHERE year >= 2005 ORDER BY bm25(body, :t) DESC LIMIT 10",
+        "SELECT id, score() FROM docs ORDER BY decay(year, 2020, 5) DESC LIMIT 10",
+        "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10",
+        "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q), depth => 7) DESC LIMIT 10",
+        "SELECT id, score() FROM docs ORDER BY bm25(body, :t, depth => 7) * decay(year, 2020, 5) DESC LIMIT 10",
+        "SELECT id, score() FROM docs ORDER BY 0.5 * bm25(body, :t, depth => 7) + 0.5 * similarity(emb, :q) DESC LIMIT 10",
+    ];
+    for sql in queries {
+        let want = whole.query(sql, &params).unwrap();
+        let got = sharded(&[&a, &b], sql, &params);
+        assert!(!want.rows.is_empty(), "{sql}");
+        let ids = |r: &ResultSet| r.rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&want), ids(&got), "{sql}: {:?} vs {:?}", want.rows, got.rows);
+        same(sql, &want, &got);
+    }
+}
+
+#[test]
 fn shard_mode_refuses_graph_queries() {
     let docs = data::synthetic(200, DIM, 3);
     let dir = tempfile::tempdir().unwrap();
