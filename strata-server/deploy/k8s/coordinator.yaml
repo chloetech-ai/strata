@@ -25,6 +25,14 @@ spec:
           readinessProbe:
             httpGet: {path: /v1/health, port: http}
             periodSeconds: 2
+          # Keep answering for a few seconds after the pod is told to stop,
+          # while the Service drops it: without this, moving the coordinator
+          # to another set of shards lost ~10 s of queries to connections
+          # sent to the old pod's address after it was gone.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
           resources:
             requests: {cpu: 250m, memory: 256Mi}
 ---

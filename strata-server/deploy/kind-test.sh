@@ -9,6 +9,9 @@
 #   deploy/kind-test.sh shards 2              # shards 0..1 of /data/quora.shard<i>of2.strata
 #   deploy/kind-test.sh coordinator 2         # point the coordinator at that set
 #   deploy/kind-test.sh bench NAME ARGS...    # strata-server-bench as a Job in the cluster
+#   deploy/kind-test.sh crash POD             # SIGKILL POD's server; the kubelet restarts it
+#   deploy/kind-test.sh delete POD            # stop POD gracefully; its controller replaces it
+#   deploy/kind-test.sh pause POD SECONDS     # freeze POD's node for SECONDS
 #   deploy/kind-test.sh delay POD MS          # add MS ms to every packet sent to POD (0 removes it)
 #   deploy/kind-test.sh down
 #
@@ -74,6 +77,8 @@ bench)
     shift
     args=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@")
     $K delete job "bench-$name" --ignore-not-found >/dev/null
+    # BENCH_NODE pins the client to a node (so a test can freeze another).
+    node=${BENCH_NODE:+nodeName: $BENCH_NODE}
     $K apply -f - <<EOF
 apiVersion: batch/v1
 kind: Job
@@ -84,6 +89,7 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      $node
       containers:
         - name: bench
           image: $IMAGE
@@ -105,10 +111,38 @@ EOF
     $K logs -f "job/bench-$name"
     $K wait --for=condition=complete "job/bench-$name" --timeout=60s >/dev/null
     ;;
+crash)
+    pod=${1:?crash POD}
+    # (jsonpath prints no newline, so `read` would fail under set -e.)
+    set -- $($K get pod "$pod" -o jsonpath='{.spec.nodeName} {.status.containerStatuses[0].containerID}')
+    node=$1 id=$2
+    # SIGKILL from the node, as a crash would: the kubelet restarts the
+    # container in place (same pod, same address).
+    docker exec "$node" sh -c "kill -9 \$(crictl inspect --output go-template --template '{{.info.pid}}' ${id#containerd://})"
+    echo "$pod: killed on $node"
+    ;;
+delete)
+    pod=${1:?delete POD}
+    # Stops the pod gracefully (SIGTERM); its controller starts a new one.
+    $K delete pod "$pod" --wait=false
+    ;;
+pause)
+    pod=${1:?pause POD SECONDS}
+    seconds=${2:?pause POD SECONDS}
+    node=$($K get pod "$pod" -o jsonpath='{.spec.nodeName}')
+    # Freezes the pod's whole node, as a hung machine or a partition would:
+    # its connections stay open and nothing answers.
+    docker pause "$node" >/dev/null
+    echo "$node (with $pod) paused for $seconds s"
+    sleep "$seconds"
+    docker unpause "$node" >/dev/null
+    echo "$node unpaused"
+    ;;
 delay)
     pod=${1:?delay POD MS}
     ms=${2:?delay POD MS}
-    read -r node ip < <($K get pod "$pod" -o jsonpath='{.spec.nodeName} {.status.podIP}')
+    set -- $($K get pod "$pod" -o jsonpath='{.spec.nodeName} {.status.podIP}')
+    node=$1 ip=$2
     # The pod's veth on its node: netem there delays every packet to the pod.
     dev=$(docker exec "$node" ip route get "$ip" | grep -o 'dev [^ ]*' | cut -d' ' -f2)
     if [ "$ms" = 0 ]; then
