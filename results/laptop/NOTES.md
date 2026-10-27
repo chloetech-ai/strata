@@ -248,6 +248,6 @@ First run (no 1-bit NEON kernel) against this one, p50 / p99 in ms:
 - SQ8 rows move by 0–5%, within run-to-run noise; the SQ8 kernel is unchanged.
 - HNSW recall differs between the runs for both code kinds (SQ8 0.838–0.858 →
   0.864–0.883; 1-bit at rerank 10 0.671 → 0.649, at rerank 40 0.982 → 0.991).
-  The graph is built with 4 threads, so it is not the same graph from run to
-  run; the build times (131 s and 124 s here, 136 s and 145 s before) differ too.
+  Most likely the graph differs from run to run because it is built with 4
+  threads (the tie-ordering change, 4dfb665, may also play a part); the build times (131 s and 124 s here, 136 s and 145 s before) differ too.
   Flat and IVF recall are identical to the first run.
