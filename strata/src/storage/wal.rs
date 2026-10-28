@@ -5,6 +5,10 @@
 //! record:  len: u32 | crc32(body): u32 | body = kind: u8, payload
 //!          kind 1 insert: document     kind 2 delete: key value
 //!          kind 3 commit: txn: u64, n_ops: u32
+//!          kind 4 set: key value, field: u16, value
+//!          kind 5 table: id: u32 (the operations up to the next table
+//!                 record or the commit are on this table; before any,
+//!                 on table 0)
 //! ```
 //!
 //! A transaction is its operation records followed by a commit record,
@@ -33,6 +37,7 @@ const INSERT: u8 = 1;
 const DELETE: u8 = 2;
 const COMMIT: u8 = 3;
 const SET: u8 = 4;
+const TABLE: u8 = 5;
 
 /// One logged operation.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,11 +49,12 @@ pub enum Op {
     Set { key: Value, field: u16, value: Value },
 }
 
-/// A committed transaction read back from the log.
+/// A committed transaction read back from the log: its operations, each
+/// with the id of the table it writes.
 #[derive(Debug, PartialEq)]
 pub struct WalTxn {
     pub txn: u64,
-    pub ops: Vec<Op>,
+    pub ops: Vec<(u32, Op)>,
 }
 
 /// The open log, appended to by the single writer.
@@ -92,8 +98,9 @@ impl Wal {
         Ok((wal, txns))
     }
 
-    /// Appends a committed transaction; durable on return when `sync`.
-    pub fn append(&mut self, txn: u64, ops: &[Op], sync: bool) -> Result<()> {
+    /// Appends a committed transaction (operations with the id of the table
+    /// each writes); durable on return when `sync`.
+    pub fn append(&mut self, txn: u64, ops: &[(u32, Op)], sync: bool) -> Result<()> {
         let buf = encode_txn(txn, ops);
         let res = self.file.write_all_at(&buf, self.len).and_then(|_| if sync { self.file.sync_data() } else { Ok(()) });
         if let Err(e) = res {
@@ -130,11 +137,20 @@ impl Wal {
     }
 }
 
-/// The records of one transaction.
-fn encode_txn(txn: u64, ops: &[Op]) -> Vec<u8> {
+/// The records of one transaction. A database with one table never writes
+/// a table record, so its log reads the same as before there were tables.
+fn encode_txn(txn: u64, ops: &[(u32, Op)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut body = Vec::new();
-    for op in ops {
+    let mut table = 0;
+    for (t, op) in ops {
+        if *t != table {
+            body.clear();
+            body.push(TABLE);
+            body.extend_from_slice(&t.to_le_bytes());
+            frame(&mut out, &body);
+            table = *t;
+        }
         body.clear();
         match op {
             Op::Insert(doc) => {
@@ -173,6 +189,7 @@ fn frame(out: &mut Vec<u8>, body: &[u8]) {
 fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
     let mut txns = Vec::new();
     let mut ops = Vec::new();
+    let mut table = 0u32;
     let (mut pos, mut end) = (0usize, 0usize);
     while pos + 8 <= buf.len() {
         let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
@@ -185,11 +202,15 @@ fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
         let mut r = Reader { b: &body[1..] };
         match body[0] {
             INSERT => match get_doc(&mut r) {
-                Ok(d) => ops.push(Op::Insert(Arc::new(d))),
+                Ok(d) => ops.push((table, Op::Insert(Arc::new(d)))),
                 Err(_) => break,
             },
             DELETE => match get_value(&mut r) {
-                Ok(v) => ops.push(Op::Delete(v)),
+                Ok(v) => ops.push((table, Op::Delete(v))),
+                Err(_) => break,
+            },
+            TABLE => match r.u32() {
+                Ok(t) => table = t,
                 Err(_) => break,
             },
             SET => {
@@ -197,7 +218,7 @@ fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
                 let field = r.u16();
                 let value = get_value(&mut r);
                 match (key, field, value) {
-                    (Ok(key), Ok(field), Ok(value)) => ops.push(Op::Set { key, field, value }),
+                    (Ok(key), Ok(field), Ok(value)) => ops.push((table, Op::Set { key, field, value })),
                     _ => break,
                 }
             }
@@ -207,6 +228,7 @@ fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
                     break;
                 }
                 txns.push(WalTxn { txn, ops: std::mem::take(&mut ops) });
+                table = 0;
                 end = pos;
             }
             _ => break,
@@ -340,13 +362,36 @@ mod tests {
         ])
     }
 
-    fn sample() -> Vec<(u64, Vec<Op>)> {
+    fn sample() -> Vec<(u64, Vec<(u32, Op)>)> {
         vec![
-            (3, vec![Op::Insert(doc(1)), Op::Insert(doc(2))]),
-            (4, vec![Op::Delete(Value::Str("key1".into()))]),
+            (3, vec![(0, Op::Insert(doc(1))), (0, Op::Insert(doc(2)))]),
+            (4, vec![(0, Op::Delete(Value::Str("key1".into())))]),
             (5, vec![]),
-            (7, vec![Op::Delete(Value::Int(9)), Op::Insert(doc(3)), Op::Set { key: Value::Int(3), field: 2, value: Value::Float(0.5) }]),
+            (7, vec![(0, Op::Delete(Value::Int(9))), (0, Op::Insert(doc(3))), (0, Op::Set { key: Value::Int(3), field: 2, value: Value::Float(0.5) })]),
+            // Several tables in one transaction; the next one starts on
+            // table 0 again.
+            (8, vec![(2, Op::Insert(doc(6))), (2, Op::Delete(Value::Int(1))), (0, Op::Insert(doc(7))), (5, Op::Insert(doc(8)))]),
+            (9, vec![(0, Op::Insert(doc(9)))]),
         ]
+    }
+
+    /// Operations on table 0 alone are logged exactly as before tables.
+    #[test]
+    fn one_table_writes_no_table_records() {
+        let ops = [(0, Op::Insert(doc(1))), (0, Op::Delete(Value::Int(2)))];
+        let buf = encode_txn(3, &ops);
+        let mut want = Vec::new();
+        let mut body = vec![INSERT];
+        put_doc(&mut body, &doc(1));
+        frame(&mut want, &body);
+        body = vec![DELETE];
+        put_value(&mut body, &Value::Int(2));
+        frame(&mut want, &body);
+        body = vec![COMMIT];
+        body.extend_from_slice(&3u64.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        frame(&mut want, &body);
+        assert_eq!(buf, want);
     }
 
     #[test]
@@ -400,11 +445,11 @@ mod tests {
         drop(wal);
         // Torn tail: half a record after the last commit is cut on open.
         let f = OpenOptions::new().write(true).open(&p).unwrap();
-        f.write_all_at(&encode_txn(9, &[Op::Insert(doc(4))])[..20], len).unwrap();
+        f.write_all_at(&encode_txn(9, &[(0, Op::Insert(doc(4)))])[..20], len).unwrap();
         let (mut wal, txns) = Wal::open(&p, 11, false).unwrap();
-        assert_eq!(txns.len(), 4);
+        assert_eq!(txns.len(), 6);
         assert_eq!(wal.len(), len);
-        wal.append(10, &[Op::Insert(doc(5))], false).unwrap();
+        wal.append(10, &[(0, Op::Insert(doc(5)))], false).unwrap();
         drop(wal);
         let (_, txns) = Wal::open(&p, 11, false).unwrap();
         assert_eq!(txns.last().unwrap().txn, 10);

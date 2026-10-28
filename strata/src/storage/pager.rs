@@ -26,8 +26,12 @@ pub const PAGE: u64 = 4096;
 pub const META_PAGES: u64 = 2;
 
 const MAGIC: &[u8; 8] = b"STRATADB";
-/// On-disk format version, bumped on incompatible changes.
-pub const FORMAT_VERSION: u32 = 1;
+/// On-disk format version, bumped on incompatible changes: 1 for a
+/// database holding the one table it was created with, 2 for one with
+/// several tables (see [`crate::storage::manifest`]). A file is written in
+/// the oldest format that holds it, so older versions of Strata keep opening
+/// databases with one table.
+pub const FORMAT_VERSION: u32 = 2;
 const META_LEN: usize = 84;
 
 /// A run of pages holding `len` bytes, starting at page `page`.
@@ -53,6 +57,8 @@ impl Extent {
 /// Contents of a meta slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Meta {
+    /// The format of this version ([`FORMAT_VERSION`] at most).
+    pub format: u32,
     /// Random id tying the WAL sidecar to this file.
     pub db_id: u64,
     pub txn: u64,
@@ -69,7 +75,7 @@ impl Meta {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(PAGE as usize);
         b.extend_from_slice(MAGIC);
-        b.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        b.extend_from_slice(&self.format.to_le_bytes());
         b.extend_from_slice(&(PAGE as u32).to_le_bytes());
         for v in [self.db_id, self.txn, self.manifest.page, self.manifest.len] {
             b.extend_from_slice(&v.to_le_bytes());
@@ -98,10 +104,11 @@ impl Meta {
         }
         let u32_at = |o: usize| u32::from_le_bytes(page[o..o + 4].try_into().unwrap());
         let u64_at = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
-        if u32_at(8) != FORMAT_VERSION || u32_at(12) as u64 != PAGE {
+        if !(1..=FORMAT_VERSION).contains(&u32_at(8)) || u32_at(12) as u64 != PAGE {
             return Err(corrupt(format!("unsupported format version {} / page size {}", u32_at(8), u32_at(12))));
         }
         Ok(Some(Meta {
+            format: u32_at(8),
             db_id: u64_at(16),
             txn: u64_at(24),
             manifest: Extent { page: u64_at(32), len: u64_at(40) },
@@ -189,6 +196,7 @@ mod tests {
     #[test]
     fn meta_roundtrip_and_torn_slot() {
         let m = Meta {
+            format: 1,
             db_id: 0xdead_beef,
             txn: 42,
             manifest: Extent { page: 9, len: 5000 },

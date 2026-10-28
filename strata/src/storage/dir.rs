@@ -42,6 +42,18 @@ pub struct Current {
     pub manifest: String,
     /// crc32 of the manifest file.
     pub crc: u32,
+    /// The manifest's format ([`crate::storage::pager::FORMAT_VERSION`]);
+    /// absent for format 1, as before there were several tables.
+    #[serde(default = "format_1", skip_serializing_if = "is_format_1")]
+    pub format: u32,
+}
+
+fn format_1() -> u32 {
+    1
+}
+
+fn is_format_1(f: &u32) -> bool {
+    *f == 1
 }
 
 pub fn manifest_name(txn: u64) -> String {
@@ -90,6 +102,9 @@ pub fn write_current(dir: &Path, cur: &Current, sync: bool) -> Result<()> {
 /// Reads `CURRENT` and the manifest it names.
 pub fn read_current(dir: &Path) -> Result<(Current, Manifest)> {
     let cur: Current = serde_json::from_slice(&std::fs::read(dir.join(CURRENT))?).map_err(|e| corrupt(format!("CURRENT: {e}")))?;
+    if cur.format > crate::storage::pager::FORMAT_VERSION {
+        return Err(corrupt(format!("unsupported format version {}", cur.format)));
+    }
     let bytes = std::fs::read(dir.join(&cur.manifest))?;
     if crc32fast::hash(&bytes) != cur.crc {
         return Err(corrupt(format!("{} fails its checksum", cur.manifest)));
@@ -106,7 +121,7 @@ pub fn map(dir: &Path, name: &str, read_ahead: bool) -> Result<OwnedBytes> {
 /// The files a version needs: its manifest, segments and delete sets.
 pub fn referenced(cur: &Current, manifest: &Manifest) -> HashSet<String> {
     let mut keep: HashSet<String> = [CURRENT.to_string(), LOCK.to_string(), WAL.to_string(), cur.manifest.clone()].into();
-    for s in &manifest.segments {
+    for s in manifest.segments() {
         keep.extend(s.file.iter().cloned());
         keep.extend(s.deletes_file.iter().cloned());
         keep.extend(s.updates_file.iter().cloned());
