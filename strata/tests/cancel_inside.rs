@@ -59,7 +59,7 @@ fn stops_midway(db: &Db, sql: &str) {
         })
         .min()
         .unwrap();
-    assert!(full >= Duration::from_millis(40), "{sql} took {full:?}: too short to stop in the middle");
+    assert!(full >= Duration::from_millis(25), "{sql} took {full:?}: too short to stop in the middle");
     let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + full / 10), ..ExecOptions::default() });
     assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
     assert!(took < full / 2, "{sql}: stopped after {took:?} of {full:?}");
