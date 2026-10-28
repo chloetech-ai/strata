@@ -65,6 +65,11 @@ impl Db {
         self.storage.spawn_flusher();
     }
 
+    /// Merges in the background from now on ([`Database::spawn_merger`]).
+    pub fn spawn_merger(&self, opts: crate::storage::MergerOptions) {
+        self.storage.spawn_merger(opts);
+    }
+
     /// The schema of the database's first table, which SQL and the other
     /// methods here query and write.
     pub fn schema(&self) -> &Schema {

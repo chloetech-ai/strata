@@ -738,24 +738,35 @@ impl Service {
         }
     }
 
-    /// Storage statistics (local) and query counters.
+    /// Storage statistics and what the merges are doing (local), and
+    /// query counters.
     pub async fn stats(self: &Arc<Self>) -> Json {
-        let storage = match &self.backend {
-            Backend::Local(db) => serde_json::to_value(db.storage().file_stats()).unwrap_or(Json::Null),
-            Backend::Cluster(_) => Json::Null,
+        let (storage, merges) = match &self.backend {
+            Backend::Local(db) => (
+                serde_json::to_value(db.storage().file_stats()).unwrap_or(Json::Null),
+                serde_json::to_value(db.storage().merge_status()).unwrap_or(Json::Null),
+            ),
+            Backend::Cluster(_) => (Json::Null, Json::Null),
         };
-        json!({"health": self.health().await, "storage": storage, "metrics": self.metrics.summary()})
+        json!({"health": self.health().await, "storage": storage, "merges": merges, "metrics": self.metrics.summary()})
     }
 
     pub async fn prometheus(self: &Arc<Self>) -> String {
         let h = self.health().await;
         let mut more = vec![("strata_queries_running", "gauge", self.running() as u64)];
         if let Backend::Local(db) = &self.backend {
+            let m = db.storage().merge_status();
             more.extend([
                 ("strata_snapshot_leases", "gauge", self.sweep_leases() as u64),
                 ("strata_failing", "gauge", self.failing().is_some() as u64),
                 ("strata_flush_failing", "gauge", db.storage().flush_error().is_some() as u64),
                 ("strata_writer_panics_total", "counter", self.writer_state.panics.load(Ordering::Relaxed)),
+                ("strata_merges_running", "gauge", m.running as u64),
+                ("strata_merge_memory_bytes", "gauge", m.memory),
+                ("strata_merges_total", "counter", m.merges),
+                ("strata_merges_limited_total", "counter", m.merges_limited),
+                ("strata_merges_interrupted", "gauge", m.interrupted as u64),
+                ("strata_merge_failing", "gauge", m.error.is_some() as u64),
             ]);
         }
         self.metrics.render(h["docs"].as_u64().unwrap_or(0), h["segments"].as_u64().unwrap_or(0), &more)

@@ -15,6 +15,9 @@
 //! * A flush, a bulk load and a merge each write a new on-disk version with
 //!   the shadow-paging commit ([`VersionWriter`]): new extents into free
 //!   pages, `fsync`, then the other meta slot, `fsync`.
+//! * Merges run on segments no other merge has claimed, several at once.
+//!   A merge writes its image before it takes the writer lock, into pages
+//!   (or a file) reserved for it, and holds the lock only to install it.
 //! * Readers never take the writer lock; the state lock is held only to
 //!   copy pointers, never across I/O or index builds.
 //! * With [`DbOptions::publish_snapshots`] the writer also builds each new
@@ -26,7 +29,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, TryLockError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -43,7 +46,7 @@ use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
 use crate::storage::manifest::{Manifest, SegmentMeta, TableMeta};
-use crate::storage::merge::{MergePolicy, MergeStats, SegmentInfo};
+use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
 use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
@@ -230,7 +233,13 @@ pub struct Database {
     build_lock: Mutex<()>,
     /// The snapshot readers get, with `DbOptions::publish_snapshots`.
     published: RwLock<Option<Snapshot>>,
-    merge_lock: Mutex<()>,
+    /// The merges running, with what a crash interrupted ([`Merging`]).
+    merging: Mutex<Merging>,
+    /// Where `merging.record` is kept.
+    merge_record_path: PathBuf,
+    /// Set by [`Database::spawn_merger`].
+    merger: OnceLock<Arc<Merger>>,
+    merger_threads: Mutex<Vec<JoinHandle<()>>>,
     pins: Arc<Pins>,
     mem_ids: AtomicU64,
     /// Set when a write failed in a way that leaves memory and disk out of
@@ -250,22 +259,20 @@ pub struct Database {
     /// wake the flusher instead of flushing.
     flush_signal: OnceLock<Arc<FlushSignal>>,
     flusher: Mutex<Option<JoinHandle<()>>>,
-    /// Whether a background flush waits for the writer lock
-    /// ([`BACKGROUND_WANTS`]) or holds it ([`BACKGROUND_HOLDS`]): writes
-    /// that find the lock taken wait for it ([`Database::try_writer`]).
-    background_lock: AtomicU8,
+    /// How many background flushes and merges wait for the writer lock,
+    /// and hold it (at most one): writes that find the lock taken wait for
+    /// it ([`Database::try_writer`]).
+    background_waiting: AtomicUsize,
+    background_holding: AtomicUsize,
 }
 
-const BACKGROUND_IDLE: u8 = 0;
-const BACKGROUND_WANTS: u8 = 1;
-const BACKGROUND_HOLDS: u8 = 2;
-
-/// The writer lock as a background flush holds it, to seal the memtables
-/// or to install their segments: until it is released, writes that find
-/// the lock taken wait instead of failing with `Busy`.
+/// The writer lock as a background flush or a merge holds it, briefly: to
+/// seal the memtables, to reserve space for an image, or to install
+/// segments. Until it is released, writes that find the lock taken wait
+/// instead of failing with `Busy`.
 struct BackgroundWriter<'a> {
     wal: Option<MutexGuard<'a, Wal>>,
-    state: &'a AtomicU8,
+    holding: &'a AtomicUsize,
 }
 
 impl std::ops::Deref for BackgroundWriter<'_> {
@@ -285,7 +292,137 @@ impl Drop for BackgroundWriter<'_> {
     fn drop(&mut self) {
         // Released first, so that a waiting write finds it free.
         self.wal = None;
-        self.state.store(BACKGROUND_IDLE, Ordering::Release);
+        self.holding.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The merges running: each one's inputs, which no other merge may take,
+/// and estimated memory, in `record.running`, with the merges a crash
+/// interrupted before ([`MergeRecord`]).
+#[derive(Default)]
+struct Merging {
+    record: MergeRecord,
+    /// Counters and the last error, for [`MergeStatus`].
+    merges: u64,
+    limited: u64,
+    error: Option<String>,
+}
+
+impl Merging {
+    fn claimed(&self, id: u64) -> bool {
+        self.record.running.iter().any(|m| m.segments.contains(&id))
+    }
+
+    fn memory(&self) -> u64 {
+        self.record.running.iter().map(|m| m.memory).sum()
+    }
+}
+
+/// A merge's claim on its input segments, which it releases when dropped.
+struct MergeClaim<'a> {
+    db: &'a Database,
+    table: u32,
+    snap: Snapshot,
+    /// Oldest first, so the merged segment keeps documents in age order.
+    ids: Vec<u64>,
+    /// Selected larger and cut to fit its memory budget.
+    cut: bool,
+}
+
+impl Drop for MergeClaim<'_> {
+    fn drop(&mut self) {
+        let live: HashSet<u64> = lock(&self.db.state).handles().map(|h| h.meta.id).collect();
+        let mut m = lock(&self.db.merging);
+        m.record.running.retain(|e| e.segments != self.ids);
+        m.record.retain_live(|s| live.contains(&s));
+        let _ = m.record.store(&self.db.merge_record_path);
+    }
+}
+
+/// Space reserved for a merged image while it is written without the
+/// writer lock: a segment id, and pages of the file (or the segment's file,
+/// in the directory layout) that no commit hands out meanwhile. Until the
+/// image is installed, the freelist on disk counts the pages as free (and
+/// opening removes a file no version names), so a crash leaves nothing
+/// behind.
+#[derive(Clone, Debug)]
+pub(crate) struct Reserved {
+    pub id: u64,
+    pub extent: Extent,
+    pub file: Option<String>,
+}
+
+/// The background merger's settings and wake-ups ([`Database::spawn_merger`]).
+struct Merger {
+    policy: MergePolicy,
+    budget: Option<u64>,
+    pacer: Option<Pacer>,
+    wake: Mutex<MergerWake>,
+    cv: Condvar,
+    /// The table a merger thread looks at first, in turn.
+    next_table: AtomicUsize,
+}
+
+#[derive(Default)]
+struct MergerWake {
+    /// Bumped by each version a commit publishes: segments may be due a
+    /// merge. Every merger thread looks.
+    generation: u64,
+    closed: bool,
+}
+
+impl Merger {
+    fn wake(&self) {
+        lock(&self.wake).generation += 1;
+        self.cv.notify_all();
+    }
+
+    fn close(&self) {
+        lock(&self.wake).closed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// A merger thread: merges what the policy selects whenever a version is
+/// published (new segments, deletes written) and every few seconds, while
+/// other threads take other segments. A failed merge is retried after a
+/// pause that doubles up to a minute.
+fn merger(db: Weak<Database>, m: Arc<Merger>) {
+    let mut seen = u64::MAX;
+    let mut backoff = Duration::ZERO;
+    loop {
+        {
+            let mut w = lock(&m.wake);
+            let t0 = Instant::now();
+            let wait = if backoff.is_zero() { Duration::from_secs(5) } else { backoff };
+            while !w.closed && (!backoff.is_zero() || w.generation == seen) {
+                let left = wait.saturating_sub(t0.elapsed());
+                if left.is_zero() {
+                    break;
+                }
+                w = m.cv.wait_timeout(w, left).unwrap_or_else(|e| e.into_inner()).0;
+            }
+            if w.closed {
+                return;
+            }
+            seen = w.generation;
+        }
+        let Some(db) = db.upgrade() else { return };
+        let mut failed = false;
+        while let Some(claim) = db.next_merge(&m) {
+            let mut stats = MergeStats::default();
+            let r = db.merge_claimed(&claim, m.pacer.as_ref(), &mut stats);
+            drop(claim);
+            let mut st = lock(&db.merging);
+            if let Err(e) = r {
+                st.error = Some(e.to_string());
+                failed = true;
+                break;
+            }
+            st.error = None;
+        }
+        backoff = if failed { (backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(60)) } else { Duration::ZERO };
+        drop(db);
     }
 }
 
@@ -358,9 +495,15 @@ impl Drop for Database {
         if let Some(sig) = self.flush_signal.get() {
             sig.close();
         }
-        if let Some(h) = self.flusher.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
-            // The flusher holds a reference only while it flushes; when it
-            // held the last one, the database closes on its thread.
+        if let Some(m) = self.merger.get() {
+            m.close();
+        }
+        let mut threads: Vec<JoinHandle<()>> = self.flusher.get_mut().unwrap_or_else(|e| e.into_inner()).take().into_iter().collect();
+        threads.append(self.merger_threads.get_mut().unwrap_or_else(|e| e.into_inner()));
+        for h in threads {
+            // The flusher and the mergers hold a reference only while they
+            // work; when one held the last one, the database closes on its
+            // thread.
             if h.thread().id() != std::thread::current().id() {
                 let _ = h.join();
             }
@@ -448,7 +591,7 @@ impl Database {
         let mut fl = FreeList::new(META_PAGES);
         let mbytes = manifest.encode();
         let mext = Extent { page: fl.alloc(pages_for(mbytes.len())), len: mbytes.len() as u64 };
-        let (fext, fbytes) = place_freelist(&mut fl);
+        let (fext, fbytes) = place_freelist(&mut fl, &[]);
         io::set_len(&file, fl.page_count() * PAGE)?;
         io::write_at(&file, &mbytes, mext.page * PAGE)?;
         io::write_at(&file, &fbytes, fext.page * PAGE)?;
@@ -630,6 +773,8 @@ impl Database {
             live_cache: HashMap::new(),
             updates_cache: HashMap::new(),
             cached: None,
+            reserved: Vec::new(),
+            next_segment_id: 0,
         };
         let mut flushed = false;
         for t in txns {
@@ -654,6 +799,19 @@ impl Database {
                 let _ = io::remove_file(&wal::sealed_path(&wal_path, t));
             }
         }
+        // Merges a crash interrupted; those of segments that are gone are
+        // forgotten.
+        let merge_record_path = match &dir {
+            Some(d) => d.join(dir::MERGE_RECORD),
+            None => {
+                let mut s = path.as_os_str().to_owned();
+                s.push("-merging");
+                PathBuf::from(s)
+            }
+        };
+        let mut record = MergeRecord::load(&merge_record_path);
+        record.retain_live(|id| st.handle(id).is_some());
+        record.store(&merge_record_path)?;
         let db = Database {
             path: path.to_path_buf(),
             wal_path,
@@ -665,7 +823,10 @@ impl Database {
             state: Mutex::new(st),
             build_lock: Mutex::new(()),
             published: RwLock::new(None),
-            merge_lock: Mutex::new(()),
+            merging: Mutex::new(Merging { record, ..Merging::default() }),
+            merge_record_path,
+            merger: OnceLock::new(),
+            merger_threads: Mutex::new(Vec::new()),
             pins: Arc::new(Pins::default()),
             mem_ids: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
@@ -675,7 +836,8 @@ impl Database {
             background: Mutex::new(()),
             flush_signal: OnceLock::new(),
             flusher: Mutex::new(None),
-            background_lock: AtomicU8::new(BACKGROUND_IDLE),
+            background_waiting: AtomicUsize::new(0),
+            background_holding: AtomicUsize::new(0),
         };
         db.republish();
         Ok(db)
@@ -1007,12 +1169,14 @@ impl Database {
         r
     }
 
-    /// The writer lock, for a background flush ([`BackgroundWriter`]).
+    /// The writer lock, for a background flush or a merge
+    /// ([`BackgroundWriter`]).
     fn background_writer(&self) -> BackgroundWriter<'_> {
-        self.background_lock.store(BACKGROUND_WANTS, Ordering::Release);
+        self.background_waiting.fetch_add(1, Ordering::AcqRel);
         let wal = lock(&self.writer);
-        self.background_lock.store(BACKGROUND_HOLDS, Ordering::Release);
-        BackgroundWriter { wal: Some(wal), state: &self.background_lock }
+        self.background_holding.fetch_add(1, Ordering::AcqRel);
+        self.background_waiting.fetch_sub(1, Ordering::AcqRel);
+        BackgroundWriter { wal: Some(wal), holding: &self.background_holding }
     }
 
     fn background_flush_inner(&self, between: impl FnOnce()) -> Result<()> {
@@ -1226,18 +1390,31 @@ impl Database {
 
     /// Merges each table's on-disk segments as `policy` selects until it
     /// selects nothing. Inputs are rebuilt from `DbOptions::doc_source`
-    /// without blocking writers; the commit then marks documents deleted in
-    /// the meantime as deleted in the merged segment. Must not be called by
-    /// a thread that holds a [`WriteTxn`] (the commit waits for the writer
-    /// lock).
+    /// and the merged image is written without blocking writers; the
+    /// install, under the writer lock, marks documents deleted in the
+    /// meantime as deleted in the merged segment. Merges running at once
+    /// (other calls, the threads of [`Database::spawn_merger`]) take
+    /// different segments: this one leaves those another merge holds
+    /// alone, and returns when the policy selects nothing among the rest.
+    /// Segments of a merge a crash interrupted are merged in smaller
+    /// groups ([`MergeRecord`]). Must not be called by a thread that holds
+    /// a [`WriteTxn`] (the install waits for the writer lock).
     pub fn merge(&self, policy: &MergePolicy) -> Result<MergeStats> {
-        let _m = lock(&self.merge_lock);
+        self.merge_with(policy, || true)
+    }
+
+    /// [`Database::merge`], calling `between` once each merged image is
+    /// written and before it is installed; the merge is given up when it
+    /// returns false (tests write, check and fail there).
+    #[doc(hidden)]
+    pub fn merge_with(&self, policy: &MergePolicy, mut between: impl FnMut() -> bool) -> Result<MergeStats> {
         let source = self.opts.doc_source.clone().ok_or_else(|| Error::Schema("merging needs DbOptions::doc_source".into()))?;
         // A database that cannot commit would build the merged segment
         // only to throw it away.
         self.check_poisoned()?;
         let t0 = Instant::now();
         let mut stats = MergeStats::default();
+        let pacer = self.merger.get().and_then(|m| m.pacer.as_ref());
         let tables: Vec<(u32, usize)> = lock(&self.state).tables.iter().map(|t| (t.id, t.handles.len())).collect();
         for (table, n) in tables {
             // Each merge removes a segment, except rewrites of a single
@@ -1246,21 +1423,115 @@ impl Database {
             let mut rounds = 2 * n + 1;
             while rounds > 0 {
                 rounds -= 1;
-                // The table may have been dropped meanwhile.
-                let Some(snap) = self.snapshot_inner(false).table_by_id(table) else { break };
-                let infos: Vec<SegmentInfo> =
-                    snap.segments().iter().map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live }).collect();
-                let Some(mut group) = policy.select(&infos) else { break };
-                // Oldest first, so the merged segment keeps documents in age order.
-                group.sort_by_key(|id| infos.iter().position(|s| s.id == *id));
-                self.merge_group(table, &snap, &group, source.as_ref(), &mut stats)?;
+                let Some(claim) = self.claim_merge(table, policy, None) else { break };
+                self.merge_group(&claim, source.as_ref(), pacer, &mut between, &mut stats)?;
             }
         }
         stats.seconds = t0.elapsed().as_secs_f64();
         Ok(stats)
     }
 
-    fn merge_group(&self, table: u32, snap: &Snapshot, ids: &[u64], source: &dyn DocumentSource, stats: &mut MergeStats) -> Result<()> {
+    /// Starts `opts.threads` threads that merge segments as `opts.policy`
+    /// selects, in place of calls to [`Database::merge`]: whenever a commit
+    /// publishes a version (a flush, a load, a merge, deletes written) and
+    /// every 5 s. Up to that many merges run at once, on different
+    /// segments, within `opts.memory_budget`, writing no faster than
+    /// `opts.write_bytes_per_sec` (calls to [`Database::merge`] keep to that
+    /// rate too). [`Database::merge_status`] says what they do. The threads
+    /// end with the database; calling this again does nothing.
+    pub fn spawn_merger(self: &Arc<Self>, opts: MergerOptions) {
+        let m = Arc::new(Merger {
+            policy: opts.policy,
+            budget: opts.memory_budget.or_else(|| memory_limit().map(|l| l / 4)),
+            pacer: opts.write_bytes_per_sec.map(Pacer::new),
+            wake: Mutex::new(MergerWake::default()),
+            cv: Condvar::new(),
+            next_table: AtomicUsize::new(0),
+        });
+        if self.merger.set(m.clone()).is_err() {
+            return;
+        }
+        if self.opts.doc_source.is_none() {
+            lock(&self.merging).error = Some("merging needs DbOptions::doc_source".into());
+            return;
+        }
+        let mut threads = lock(&self.merger_threads);
+        for i in 0..opts.threads.max(1) {
+            let (db, m) = (Arc::downgrade(self), m.clone());
+            threads.push(std::thread::Builder::new().name(format!("strata-merger-{i}")).spawn(move || merger(db, m)).expect("spawn a merger thread"));
+        }
+    }
+
+    /// What the merges are doing.
+    pub fn merge_status(&self) -> MergeStatus {
+        let m = lock(&self.merging);
+        MergeStatus {
+            running: m.record.running.len(),
+            segments_merging: m.record.running.iter().map(|e| e.segments.len()).sum(),
+            memory: m.memory(),
+            memory_budget: self.merger.get().and_then(|x| x.budget),
+            merges: m.merges,
+            merges_limited: m.limited,
+            interrupted: m.record.interrupted.len(),
+            error: m.error.clone(),
+        }
+    }
+
+    /// The next merge for a merger thread: of the tables in turn, the first
+    /// one with segments to merge within the budget.
+    fn next_merge(&self, m: &Merger) -> Option<MergeClaim<'_>> {
+        if self.is_poisoned() {
+            return None;
+        }
+        let tables: Vec<u32> = lock(&self.state).tables.iter().map(|t| t.id).collect();
+        let first = m.next_table.fetch_add(1, Ordering::Relaxed);
+        (0..tables.len()).find_map(|i| self.claim_merge(tables[(first + i) % tables.len()], &m.policy, m.budget))
+    }
+
+    /// Claims the next group of `table`'s segments that `policy` selects
+    /// among those no running merge holds, cut to fit what is left of
+    /// `budget` and the record of interrupted merges ([`MergeRecord`]).
+    /// The merge is recorded as running until the claim is dropped.
+    fn claim_merge(&self, table: u32, policy: &MergePolicy, budget: Option<u64>) -> Option<MergeClaim<'_>> {
+        // The snapshot is taken under the lock that claims are given up
+        // under: a merge installed (and its claim given up) after a snapshot
+        // taken before the lock would leave its inputs, gone by then, to
+        // this one.
+        let mut m = lock(&self.merging);
+        let snap = self.snapshot_inner(false).table_by_id(table)?;
+        let bytes: HashMap<u64, u64> = lock(&self.state).handles().map(|h| (h.meta.id, h.meta.extent.len)).collect();
+        let infos: Vec<SegmentInfo> = snap
+            .segments()
+            .iter()
+            .map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live, bytes: bytes.get(&v.id).copied().unwrap_or(0) })
+            .collect();
+        let cap = |g: &[u64]| match (m.record.cap(g), budget) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id), cap);
+        let mut group = group?;
+        let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>());
+        // It fits the budget alone: it waits for running merges to finish.
+        if budget.is_some_and(|b| m.memory() + memory > b) {
+            return None;
+        }
+        group.sort_by_key(|id| infos.iter().position(|s| s.id == *id));
+        m.record.running.push(MergeEntry { segments: group.clone(), memory, times: 0 });
+        m.limited += cut as u64;
+        let _ = m.record.store(&self.merge_record_path);
+        Some(MergeClaim { db: self, table, snap, ids: group, cut })
+    }
+
+    /// Runs a merge a merger thread claimed.
+    fn merge_claimed(&self, claim: &MergeClaim, pacer: Option<&Pacer>, stats: &mut MergeStats) -> Result<()> {
+        let source = self.opts.doc_source.clone().ok_or_else(|| Error::Schema("merging needs DbOptions::doc_source".into()))?;
+        self.check_poisoned()?;
+        self.merge_group(claim, source.as_ref(), pacer, &mut || true, stats)
+    }
+
+    fn merge_group(&self, claim: &MergeClaim, source: &dyn DocumentSource, pacer: Option<&Pacer>, between: &mut dyn FnMut() -> bool, stats: &mut MergeStats) -> Result<()> {
+        let (snap, ids) = (&claim.snap, &claim.ids[..]);
         let mut inputs: Vec<(u64, Vec<DocId>)> = Vec::new();
         let mut docs: Vec<Document> = Vec::new();
         for &id in ids {
@@ -1288,12 +1559,38 @@ impl Database {
         let n_new = docs.len() as u32;
         let image = if docs.is_empty() { None } else { Some(build_segment(snap.schema(), &docs, &self.opts.build)?) };
         drop(docs);
+        // Written before the writer lock is taken, into space reserved for
+        // it: commits go on meanwhile.
+        let written = match &image {
+            Some(image) => Some((self.write_reserved(image, pacer)?, crc32fast::hash(image))),
+            None => None,
+        };
+        drop(image);
+        let go = between();
+        let mut wal = self.background_writer();
+        let r = if go { self.install_merge(&mut wal, claim, written.as_ref(), &inputs, n_new, stats) } else { Ok(false) };
+        // A commit that failed before it could reach the disk leaves
+        // nothing naming the image; one that may have reached it poisons
+        // the database, and then the image stays (opening removes it if no
+        // version names it).
+        if !matches!(r, Ok(true)) && !self.is_poisoned() {
+            if let Some((res, _)) = &written {
+                self.unreserve(&wal, res);
+            }
+        }
+        r.map(|_| ())
+    }
 
-        let mut wal = lock(&self.writer);
+    /// Replaces a merge's inputs with the merged segment (`written`, of
+    /// `n_new` documents; none when every input document was deleted) in
+    /// one commit. Returns whether it did: not when the table was dropped
+    /// meanwhile.
+    fn install_merge(&self, wal: &mut Wal, claim: &MergeClaim, written: Option<&(Reserved, u32)>, inputs: &[(u64, Vec<DocId>)], n_new: u32, stats: &mut MergeStats) -> Result<bool> {
+        let (table, snap, ids) = (claim.table, &claim.snap, &claim.ids[..]);
         self.check_poisoned()?;
         if lock(&self.state).table_index(table).is_none() {
             // Dropped while the merge was building.
-            return Ok(());
+            return Ok(false);
         }
         // Documents of the inputs deleted after the snapshot, as docIDs of
         // the merged segment (inputs are concatenated in order), and values
@@ -1303,7 +1600,7 @@ impl Database {
         {
             let mut st = lock(&self.state);
             let mut base = 0u32;
-            for (id, live) in &inputs {
+            for (id, live) in inputs {
                 let h = st.handle(*id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
                 deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| base + j as u32));
                 let then = snap.segments().iter().find(|v| v.id == *id).and_then(|v| v.updates.clone());
@@ -1325,12 +1622,12 @@ impl Database {
         for &id in ids {
             vw.remove_segment(id);
         }
-        if let Some(image) = image {
+        if let Some((r, crc)) = written {
             let dels = (!deleted.is_empty()).then(|| LiveDocs::with_deleted(None, n_new, deleted.iter().copied()));
-            vw.add_segment(table, Some(pos), &image, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
+            vw.add_reserved_segment(table, Some(pos), r, *crc, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
         }
-        let c = vw.commit(&mut wal)?;
-        stats.bytes_written += c.bytes_written;
+        let c = vw.commit(wal)?;
+        stats.bytes_written += c.bytes_written + written.map_or(0, |(r, _)| r.extent.len);
         // Pending deletes of the inputs are now either dropped documents or
         // stored in the merged segment's delete set.
         self.publish(c, |st| {
@@ -1343,11 +1640,94 @@ impl Database {
                 }
                 st.updates_cache.remove(id);
             }
+            if let Some((r, _)) = written {
+                st.reserved.retain(|x| x.id != r.id);
+            }
         })?;
         stats.merges += 1;
+        stats.merges_limited += claim.cut as usize;
         stats.segments_in += ids.len();
         stats.docs_merged += (n_new as usize - deleted.len()) as u64;
-        Ok(())
+        lock(&self.merging).merges += 1;
+        Ok(true)
+    }
+
+    /// Reserves space for a merged image, writes it there and syncs it, at
+    /// the pace `pacer` allows. Takes the writer lock only to reserve.
+    fn write_reserved(&self, image: &[u8], pacer: Option<&Pacer>) -> Result<Reserved> {
+        let r = self.reserve(image.len() as u64)?;
+        if let Err(e) = self.write_image(&r, image, pacer) {
+            let wal = self.background_writer();
+            self.unreserve(&wal, &r);
+            return Err(e);
+        }
+        Ok(r)
+    }
+
+    /// A segment id and room for an image of `len` bytes ([`Reserved`]).
+    fn reserve(&self, len: u64) -> Result<Reserved> {
+        let _wal = self.background_writer();
+        self.check_poisoned()?;
+        let mut st = lock(&self.state);
+        let id = st.next_segment_id.max(st.manifest.next_segment_id);
+        let r = match &self.dir {
+            Some(_) => Reserved { id, extent: Extent { page: 0, len }, file: Some(dir::segment_name(id)) },
+            None => {
+                let pages = pages_for(len as usize);
+                let page = st.freelist.alloc(pages);
+                if st.freelist.page_count() > st.file_pages {
+                    if let Err(e) = io::set_len(&self.file, st.freelist.page_count() * PAGE) {
+                        st.freelist.free(page, pages);
+                        let floor = st.meta.page_count;
+                        st.freelist.trim_tail_to(floor);
+                        return Err(e.into());
+                    }
+                    st.file_pages = st.freelist.page_count();
+                }
+                Reserved { id, extent: Extent { page, len }, file: None }
+            }
+        };
+        st.next_segment_id = id + 1;
+        st.reserved.push(r.clone());
+        Ok(r)
+    }
+
+    fn write_image(&self, r: &Reserved, image: &[u8], pacer: Option<&Pacer>) -> Result<()> {
+        const CHUNK: usize = 1 << 20;
+        let write = |f: &File, base: u64| -> Result<()> {
+            for (i, c) in image.chunks(CHUNK).enumerate() {
+                if let Some(p) = pacer {
+                    p.pace(c.len());
+                }
+                io::write_at(f, c, base + (i * CHUNK) as u64)?;
+            }
+            io::sync(f)?;
+            Ok(())
+        };
+        match (&self.dir, &r.file) {
+            (Some(d), Some(name)) => write(&OpenOptions::new().write(true).create_new(true).open(d.join(name))?, 0),
+            _ => write(&self.file, r.extent.page * PAGE),
+        }
+    }
+
+    /// Gives back a reservation that will not be installed. The caller
+    /// holds the writer lock (`_wal`), so no version is being built from
+    /// the freelist meanwhile.
+    fn unreserve(&self, _wal: &Wal, r: &Reserved) {
+        {
+            let mut st = lock(&self.state);
+            st.reserved.retain(|x| x.id != r.id);
+            if self.dir.is_none() {
+                st.freelist.free(r.extent.page, r.extent.pages());
+                // Pages the reservation added to the end of the file are
+                // not in the version on disk.
+                let floor = st.meta.page_count;
+                st.freelist.trim_tail_to(floor);
+            }
+        }
+        if let (Some(d), Some(f)) = (&self.dir, &r.file) {
+            let _ = io::remove_file(&d.join(f));
+        }
     }
 
     /// Writes a consistent copy of the database to `dest`, which must not
@@ -1473,7 +1853,10 @@ impl Database {
                     crc: st.meta.manifest_crc,
                     format: st.meta.format,
                 };
-                dir::referenced(&cur, &st.manifest)
+                let mut keep = dir::referenced(&cur, &st.manifest);
+                // Merged images being written.
+                keep.extend(st.reserved.iter().filter_map(|r| r.file.clone()));
+                keep
             };
             let mut freed = 0;
             for (f, len) in dir::orphans(d, &keep)? {
@@ -1544,9 +1927,10 @@ impl Database {
         }
         // The writer lock keeps the version still; copy it so readers are
         // not held up while every byte is checksummed.
-        let (st_meta, st_slot, st_manifest, freelist, handles, map) = {
+        let (st_meta, st_slot, st_manifest, freelist, handles, map, reserved) = {
             let st = lock(&self.state);
-            (st.meta, st.slot, st.manifest.clone(), st.freelist.clone(), st.handles().cloned().collect::<Vec<_>>(), st.map.clone())
+            let reserved: Vec<Extent> = st.reserved.iter().map(|r| r.extent).collect();
+            (st.meta, st.slot, st.manifest.clone(), st.freelist.clone(), st.handles().cloned().collect::<Vec<_>>(), st.map.clone(), reserved)
         };
         // The open version's slot: after opening fell back from a damaged
         // newer version, the other slot names that one until a commit.
@@ -1605,6 +1989,14 @@ impl Database {
         for p in freelist.pending() {
             claim("pending free", p.page, p.pages)?;
         }
+        // Reserved for merged images being written: the version on disk
+        // counts them free, and may end before them.
+        for e in reserved {
+            let end = (e.page + e.pages()).min(meta.page_count);
+            if e.page < end {
+                claim("reserved for a merge", e.page, end - e.page)?;
+            }
+        }
         match used.iter().position(|u| !u) {
             Some(p) => Err(corrupt(format!("page {p} is neither used nor free"))),
             None => Ok(()),
@@ -1615,9 +2007,9 @@ impl Database {
     /// version, every file matches its checksum, every key is found, and no
     /// file is left over.
     fn check_dir(&self, d: &Path) -> Result<()> {
-        let (manifest, handles, meta) = {
+        let (manifest, handles, meta, reserved) = {
             let st = lock(&self.state);
-            (st.manifest.clone(), st.handles().cloned().collect::<Vec<_>>(), st.meta)
+            (st.manifest.clone(), st.handles().cloned().collect::<Vec<_>>(), st.meta, st.reserved.iter().filter_map(|r| r.file.clone()).collect::<Vec<_>>())
         };
         let (cur, on_disk) = dir::read_current(d)?;
         if on_disk.encode() != manifest.encode() || cur.txn != meta.txn {
@@ -1650,7 +2042,10 @@ impl Database {
                 }
             }
         }
-        match dir::orphans(d, &dir::referenced(&cur, &manifest))?.first() {
+        // Merged images being written are named by no version yet.
+        let mut keep = dir::referenced(&cur, &manifest);
+        keep.extend(reserved);
+        match dir::orphans(d, &keep)?.first() {
             Some((f, _)) => Err(corrupt(format!("{} is named by no version", f.display()))),
             None => Ok(()),
         }
@@ -1666,11 +2061,13 @@ impl Database {
             match self.writer.try_lock() {
                 Ok(g) => return Ok(g),
                 Err(TryLockError::Poisoned(p)) => return Ok(p.into_inner()),
-                Err(TryLockError::WouldBlock) => match self.background_lock.load(Ordering::Acquire) {
-                    BACKGROUND_HOLDS => {}
-                    BACKGROUND_WANTS if t0.elapsed() < Duration::from_millis(5) => {}
-                    _ => return Err(Error::Busy("another write is in progress".into())),
-                },
+                Err(TryLockError::WouldBlock) => {
+                    let holding = self.background_holding.load(Ordering::Acquire) > 0;
+                    let waiting = self.background_waiting.load(Ordering::Acquire) > 0;
+                    if !holding && !(waiting && t0.elapsed() < Duration::from_millis(5)) {
+                        return Err(Error::Busy("another write is in progress".into()));
+                    }
+                }
             }
             std::thread::sleep(Duration::from_micros(100));
         }
@@ -1745,6 +2142,9 @@ impl Database {
             st.changed();
         }
         self.republish();
+        if let Some(m) = self.merger.get() {
+            m.wake();
+        }
         // Directory layout: files the new version no longer names. Open
         // snapshots keep reading them through their mappings.
         if let Some(d) = &self.dir {
@@ -2193,6 +2593,8 @@ struct VersionWriter<'a> {
     /// files' checksums and lengths, by name.
     link: Option<(PathBuf, HashMap<String, (u32, u64)>)>,
     segments_linked: usize,
+    /// Ids of the reservations this version installs.
+    installs: Vec<u64>,
 }
 
 impl<'a> VersionWriter<'a> {
@@ -2203,10 +2605,13 @@ impl<'a> VersionWriter<'a> {
         // meta slot cannot reach them) and by a commit no live snapshot
         // predates.
         fl.release((st.meta.txn - 1).min(db.pins.min().unwrap_or(u64::MAX)));
+        let mut manifest = st.manifest.clone();
+        // Past the ids reserved for merges.
+        manifest.next_segment_id = manifest.next_segment_id.max(st.next_segment_id);
         VersionWriter {
             db,
             txn: st.txn + 1,
-            manifest: st.manifest.clone(),
+            manifest,
             fl,
             meta: st.meta,
             slot: st.slot,
@@ -2216,6 +2621,7 @@ impl<'a> VersionWriter<'a> {
             obsolete: Vec::new(),
             link: None,
             segments_linked: 0,
+            installs: Vec::new(),
         }
     }
 
@@ -2271,6 +2677,39 @@ impl<'a> VersionWriter<'a> {
             }
             _ => self.write_as(image, dir::segment_name(id))?,
         };
+        self.insert_segment(table, pos, id, extent, file, crc32fast::hash(image), n_docs, deleted, updates)
+    }
+
+    /// Adds a segment whose image was written into space reserved for it
+    /// ([`Reserved`]), with checksum `crc`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_reserved_segment(
+        &mut self,
+        table: u32,
+        pos: Option<usize>,
+        r: &Reserved,
+        crc: u32,
+        n_docs: u32,
+        deleted: Option<&LiveDocs>,
+        updates: Option<&Updates>,
+    ) -> Result<()> {
+        self.installs.push(r.id);
+        self.insert_segment(table, pos, r.id, r.extent, r.file.clone(), crc, n_docs, deleted, updates)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_segment(
+        &mut self,
+        table: u32,
+        pos: Option<usize>,
+        id: u64,
+        extent: Extent,
+        file: Option<String>,
+        crc: u32,
+        n_docs: u32,
+        deleted: Option<&LiveDocs>,
+        updates: Option<&Updates>,
+    ) -> Result<()> {
         let (mut deletes, mut deletes_crc, mut n_deleted, mut deletes_file) = (None, 0, 0, None);
         if let Some(l) = deleted.filter(|l| l.n_deleted() > 0) {
             let b = l.encode();
@@ -2288,7 +2727,7 @@ impl<'a> VersionWriter<'a> {
         let meta = SegmentMeta {
             id,
             extent,
-            crc: crc32fast::hash(image),
+            crc,
             n_docs,
             n_deleted,
             deletes,
@@ -2453,7 +2892,8 @@ impl<'a> VersionWriter<'a> {
         self.manifest.txn = c;
         let mbytes = self.manifest.encode();
         let manifest = self.write(&mbytes)?;
-        let (freelist, fbytes) = place_freelist(&mut self.fl);
+        let reserved: Vec<Extent> = lock(&db.state).reserved.iter().filter(|r| !self.installs.contains(&r.id)).map(|r| r.extent).collect();
+        let (freelist, fbytes) = place_freelist(&mut self.fl, &reserved);
         self.grow()?;
         io::write_at(&db.file, &fbytes, freelist.page * PAGE)?;
         self.bytes_written += fbytes.len() as u64;
@@ -2547,11 +2987,21 @@ fn check_table_name(name: &str) -> Result<()> {
 
 /// Allocates the freelist's own extent and encodes the freelist after that
 /// allocation, padded to the size measured before it (allocating never adds
-/// a run, so the encoding only shrinks).
-fn place_freelist(fl: &mut FreeList) -> (Extent, Vec<u8>) {
-    let bound = fl.encoded_len();
+/// a run, so the encoding only shrinks). Space `reserved` for merged images
+/// not installed yet is free on disk, as pages a commit freed before any
+/// other (reusable at once), so that a crash before their install leaves
+/// no page that is neither used nor free.
+fn place_freelist(fl: &mut FreeList, reserved: &[Extent]) -> (Extent, Vec<u8>) {
+    let on_disk = |fl: &FreeList| {
+        let mut d = fl.clone();
+        for &e in reserved {
+            d.defer(0, e);
+        }
+        d
+    };
+    let bound = if reserved.is_empty() { fl.encoded_len() } else { on_disk(fl).encoded_len() };
     let page = fl.alloc(pages_for(bound));
-    let mut bytes = fl.encode();
+    let mut bytes = if reserved.is_empty() { fl.encode() } else { on_disk(fl).encode() };
     bytes.resize(bound, 0);
     (Extent { page, len: bound as u64 }, bytes)
 }

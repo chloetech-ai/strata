@@ -1,9 +1,10 @@
 //! A model-based randomized test of the storage API, through [`Db`]:
 //! random transactions (insert, upsert, conditional upsert, delete, in-place
 //! set and add, rollback) on two tables, SQL writes, flushes (also in the
-//! background, with a transaction committing while one builds), merges,
-//! vacuums, bulk loads, reopens and pinned snapshots, against a model of
-//! every row.
+//! background, with a transaction committing while one builds), merges
+//! (also with a transaction, and a flush, while a merged image waits to be
+//! installed), vacuums, bulk loads, reopens and pinned snapshots, against a
+//! model of every row.
 //!
 //! After each step the rows of the database must equal the model's, field
 //! by field, and so must its lookups and a few queries (ranges, keywords,
@@ -319,8 +320,22 @@ fn run(seed: u64, steps: usize) {
             60..=63 => d.storage().flush().unwrap(),
             // A flush that builds while a transaction commits.
             64..=66 => d.storage().background_flush_with(|| transaction(d, &mut rng, &mut model, &mut side)).unwrap(),
-            67..=74 => {
+            67..=70 => {
                 d.storage().merge(&policy).unwrap();
+            }
+            // Merges whose images wait to be installed while a transaction
+            // commits, and sometimes a flush.
+            71..=74 => {
+                let flush = rng.gen_bool(0.3);
+                d.storage()
+                    .merge_with(&policy, || {
+                        transaction(d, &mut rng, &mut model, &mut side);
+                        if flush {
+                            d.storage().flush().unwrap();
+                        }
+                        true
+                    })
+                    .unwrap();
             }
             75..=77 => {
                 d.storage().vacuum().unwrap();

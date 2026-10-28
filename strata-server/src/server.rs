@@ -8,7 +8,7 @@ use strata::db::Db;
 use strata::ingest::Format;
 use strata::schema::Schema;
 use strata::segment::build::BuildOptions;
-use strata::storage::{DbOptions, Layout, MergePolicy};
+use strata::storage::{DbOptions, Layout, MergePolicy, MergerOptions};
 use tokio::net::TcpListener;
 
 use crate::auth::{self, Access};
@@ -55,6 +55,8 @@ pub struct Options {
     pub synonyms: Option<PathBuf>,
     /// Where `POST /v1/admin/checkpoint` writes checkpoints.
     pub backup_dir: Option<PathBuf>,
+    /// The background merger ([`strata::storage::Database::spawn_merger`]).
+    pub merger: MergerOptions,
 }
 
 /// Segment builds (flushes, merges, imports): vector indexes on every core.
@@ -125,8 +127,13 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
         let db = Arc::new(db);
-        // Writes go on while a full memtable becomes segments.
+        // Writes go on while a full memtable becomes segments, and while
+        // segments are merged.
         db.spawn_flusher();
+        db.spawn_merger(o.merger.clone());
+        if let Some(b) = db.storage().merge_status().memory_budget {
+            eprintln!("strata-server: up to {} merges at once, within {} MiB", o.merger.threads.max(1), b >> 20);
+        }
         let schema = db.schema().clone();
         (Backend::Local(db), schema)
     };
@@ -230,31 +237,23 @@ pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: O
     Ok(())
 }
 
-/// Merges a local database's segments in the background, as writes add
-/// them, and releases expired snapshot leases. A database that cannot
-/// write ([`Service::failing`]) is not merged: the merged segment could
-/// not be committed.
+/// Releases expired snapshot leases, and reports merges that fail (the
+/// database's merger threads merge as writes add segments; a database
+/// that cannot write, [`Service::failing`], merges nothing).
 pub fn spawn_maintenance(svc: &Arc<Service>) {
     let Some(db) = svc.local_db().cloned() else { return };
     let svc = Arc::downgrade(svc);
     tokio::spawn(async move {
-        let mut reported = false;
+        let mut reported = None;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let Some(svc) = svc.upgrade() else { return };
             svc.sweep_leases();
-            if let Some(why) = svc.failing() {
-                if !reported {
-                    eprintln!("strata-server: {why}; merges stop until then");
-                    reported = true;
-                }
-                continue;
+            let why = svc.failing().map(|w| format!("{w}; merges stop until then")).or_else(|| db.storage().merge_status().error.map(|e| format!("merge failed: {e}")));
+            if why.is_some() && why != reported {
+                eprintln!("strata-server: {}", why.as_deref().unwrap_or_default());
             }
-            let db = db.clone();
-            let r = tokio::task::spawn_blocking(move || db.storage().merge(&MergePolicy::default())).await;
-            if let Ok(Err(e)) = r {
-                eprintln!("strata-server: merge failed: {e}");
-            }
+            reported = why;
         }
     });
 }

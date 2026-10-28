@@ -14,6 +14,8 @@
 //! <dir>/wal                           the write-ahead log
 //! <dir>/wal.<txn>                     a log sealed by a background flush
 //!                                     that is not installed yet
+//! <dir>/MERGING                       the merges running, and those a
+//!                                     crash interrupted (JSON)
 //! ```
 //!
 //! A commit writes its new segment and delete-set files and its manifest,
@@ -37,6 +39,8 @@ use crate::storage::manifest::Manifest;
 pub const CURRENT: &str = "CURRENT";
 pub const LOCK: &str = "LOCK";
 pub const WAL: &str = "wal";
+/// [`crate::storage::merge::MergeRecord`]; beside a single file, `<file>-merging`.
+pub const MERGE_RECORD: &str = "MERGING";
 
 /// The contents of `CURRENT`: which manifest is the database.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
