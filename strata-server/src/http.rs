@@ -75,6 +75,8 @@ struct App {
 }
 
 pub fn router(svc: Arc<Service>, access: &Access) -> Router {
+    // Rows come in writes and imports; every other body is small.
+    let rows = DefaultBodyLimit::max(svc.max_body);
     let app = App { svc, token: access.token.clone(), hosts: access.hosts.clone().map(Into::into) };
     let api = Router::new()
         .route("/v1/stats", get(stats))
@@ -83,8 +85,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/query", post(query))
         .route("/v1/sql", post(sql))
-        .route("/v1/write", post(write))
-        .route("/v1/import", post(import))
+        .route("/v1/write", post(write).layer(rows.clone()))
+        .route("/v1/import", post(import).layer(rows))
         .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
@@ -102,7 +104,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/readyz", get(live))
         .merge(api)
         .layer(middleware::from_fn_with_state(app.clone(), browsers))
-        .layer(DefaultBodyLimit::max(256 << 20))
+        .layer(DefaultBodyLimit::max(crate::service::SMALL_BODY))
         .layer(middleware::from_fn_with_state(app.clone(), observe))
         .with_state(app)
 }
@@ -248,9 +250,9 @@ async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 
 /// The body's `ops`, applied once per idempotency key (the body's
 /// `idempotency_key` or an `Idempotency-Key` header).
-async fn write(State(app): State<App>, headers: HeaderMap, AxJson(b): AxJson<Json>) -> Res {
-    let ops = match b.get("ops") {
-        Some(Json::Array(ops)) => ops.clone(),
+async fn write(State(app): State<App>, headers: HeaderMap, AxJson(mut b): AxJson<Json>) -> Res {
+    let ops = match b.get_mut("ops").map(Json::take) {
+        Some(Json::Array(ops)) => ops,
         _ => return Err(ApiError::bad("the body needs an array \"ops\"")),
     };
     let key = match (b.get("idempotency_key"), headers.get("idempotency-key")) {

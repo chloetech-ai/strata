@@ -42,6 +42,10 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--timeout-ms N` | 5000 | default query deadline |
 | `--max-timeout-ms N` | 60000 | the longest deadline a request's `timeout_ms` may ask for |
 | `--max-concurrent N` | 64 | queries running at once; more wait for a slot until their deadline |
+| `--max-result-window N` | 10000 | the most rows a query may reach, OFFSET included ([limits](#limits)); 0: no limit |
+| `--max-groups N` | 65536 | the most groups a GROUP BY may make ([limits](#limits)); 0: no limit |
+| `--max-queued-writes N` | 1024 | write requests held at once; more are refused with 429 ([limits](#limits)); 0: no limit |
+| `--max-body-mb N` | 256 | the largest body of a write or an import, and of a gRPC message; other requests take up to 16 MiB |
 | `--model ID` | `claude-haiku-5-5` | the agent's default model |
 | `--models DIR` | `$STRATA_MODELS`, else `~/.local/share/strata/models` | where the models of [embedded vector fields](#embedded-vector-fields) are |
 | `--copy-from PATH` | | fill the new database (`--db` with `--schema`) with this database's rows, re-embedding the vector fields whose embedding changed |
@@ -115,7 +119,7 @@ curl -s -X POST 'localhost:7700/v1/import?format=csv' -H 'content-type: text/csv
 # {"written": 2, "skipped_fields": [], "took_ms": 3.1}
 ```
 
-The content type must not be `text/plain`, a form or missing (a web page on another site can send those without asking; see [security](#security)): `text/csv`, `text/tab-separated-values`, `application/x-ndjson`, `application/json` or `application/octet-stream` all work. The server reads every row before it writes any, so a bad row writes nothing, then upserts them through its writer 1,000 rows a request (a coordinator routes them to the shards). A request may be up to 256 MB. The UI's **Schema and import** tab uploads a file this way, and [Python](python.md) has `import_file` both in-process and as a client.
+The content type must not be `text/plain`, a form or missing (a web page on another site can send those without asking; see [security](#security)): `text/csv`, `text/tab-separated-values`, `application/x-ndjson`, `application/json` or `application/octet-stream` all work. The server reads every row once before it writes any, so a bad row writes nothing, then reads them again 1,000 at a time and upserts each thousand through its writer while it reads the next (a coordinator routes them to the shards), so an import holds its body and two thousand rows, not every row. A request may be up to `--max-body-mb` (256 MiB). The UI's **Schema and import** tab uploads a file this way, and [Python](python.md) has `import_file` both in-process and as a client.
 
 The server flushes the memtable into segments on a thread of its own: a write that fills it (10,000 rows and deletes not yet flushed) returns without waiting for the segments to build, and writes go on meanwhile. Once the memtable holds twice that, writes wait for the flush under way. Segments build their vector indexes on every core.
 
@@ -295,6 +299,12 @@ Every query runs under a deadline (`timeout_ms` up to `--max-timeout-ms`, or the
 
 A coordinator does not retry a query that a replica refused with 429 on that replica's sibling, which would only take on both loads: the query fails, or a partial answer leaves the shard out. Hedges (asking another replica when one has not answered after `--hedge-ms`) are budgeted at 5% of the calls to shards, with up to 10 saved for a burst, so that a slow cluster is not sent twice its load.
 
+### Limits
+
+A query may reach at most `--max-result-window` rows (10,000), as Elasticsearch's `max_result_window`: one whose LIMIT plus OFFSET is larger fails with 400, and so does one without a LIMIT that matches more rows. A ranked query without a LIMIT returns its best 100. Counts and groups are not rows, but a GROUP BY may make at most `--max-groups` groups (65,536, as Elasticsearch's `search.max_buckets`) and fails with 400 at the next one, before its LIMIT is applied. A compound query's steps may hold up to 1,000,000 rows each, as before; its answer is held to the window. A coordinator checks LIMIT and OFFSET before it asks its shards, and a shard lets a coordinator's step reach 1,000,001 rows.
+
+Write requests are held in one queue, from embedding (a server embeds on as many writes at once as it has cores) through waiting for the writer to being applied. With `--max-queued-writes` (1,024) in it, a write or a SQL `INSERT`, `UPDATE` or `DELETE` is refused with 429 before any work, and counted in `strata_write_errors_total{status="429"}`; `strata_write_queue_requests` shows how many it holds. A body larger than its route allows is refused with 413: `--max-body-mb` (256 MiB) for `/v1/write` and `/v1/import`, 16 MiB for every other route.
+
 ### Health
 
 `GET /v1/health` reports `status`:
@@ -323,7 +333,7 @@ It answers 503 for `down` and `failing`. `/livez` and `/readyz` answer 503 only 
 | `strata_writes_total`, `strata_written_docs_total` | | write requests that succeeded, and rows they wrote |
 | `strata_write_errors_total` | `status` | write requests that failed, by HTTP status |
 | `strata_write_duration_seconds` | | time from a write request to its commit, embedding and waiting for the writer included |
-| `strata_write_queue_requests`, `strata_write_batches_total` | | write requests waiting for the writer or being applied, and the groups it applied in one transaction each |
+| `strata_write_queue_requests`, `strata_write_batches_total` | | write requests held ([limits](#limits)): embedding, waiting for the writer or being applied; and the groups the writer applied in one transaction each |
 | `strata_idempotent_replays_total` | | writes answered from their idempotency key instead of being applied again |
 | `strata_slow_requests_total` | `what` | queries and writes the slow log wrote down |
 | `strata_embedded_texts_total`, `strata_embed_duration_seconds` | `for` | texts the server's models embedded for writes and for query parameters, and how long each took |

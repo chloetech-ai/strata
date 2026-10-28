@@ -45,6 +45,14 @@ pub struct Options {
     /// `timeout_ms` and 60 s).
     pub max_timeout_ms: u64,
     pub max_concurrent: usize,
+    /// The most rows a query may reach, OFFSET included (0: no limit).
+    pub max_result_window: usize,
+    /// The most groups a query may make (0: no limit).
+    pub max_groups: usize,
+    /// Write requests held at once before more are refused (0: no limit).
+    pub max_queued_writes: usize,
+    /// The largest write or import body, in MiB (0: 256).
+    pub max_body_mb: usize,
     pub model: String,
     pub api_key: Option<String>,
     pub api_base: String,
@@ -145,6 +153,12 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         svc.max_timeout = Duration::from_millis(o.max_timeout_ms).max(timeout);
     }
     svc.slow = (o.slow_ms > 0).then(|| Duration::from_millis(o.slow_ms));
+    svc.max_rows = (o.max_result_window > 0).then_some(o.max_result_window);
+    svc.max_groups = (o.max_groups > 0).then_some(o.max_groups);
+    svc.max_queued_writes = if o.max_queued_writes > 0 { o.max_queued_writes } else { usize::MAX };
+    if o.max_body_mb > 0 {
+        svc.max_body = o.max_body_mb.saturating_mul(1 << 20);
+    }
     svc.open_models(&o.models);
     for m in &svc.models {
         match &m.model {
@@ -319,7 +333,9 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access
         }
         _ => Ok(req),
     };
-    let service = pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(256 << 20).max_encoding_message_size(256 << 20);
+    // A Write message carries rows, as an HTTP write's body does.
+    let max_body = svc.max_body;
+    let service = pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(max_body).max_encoding_message_size(256 << 20);
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = &access.tls {
         builder = builder.tls_config(tonic::transport::ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(&tls.cert, &tls.key)))?;

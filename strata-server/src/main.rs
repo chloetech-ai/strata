@@ -115,6 +115,23 @@ struct Args {
     /// Queries running at once; more wait for a slot until their deadline.
     #[arg(long, default_value_t = 64)]
     max_concurrent: usize,
+    /// The most rows a query may reach, OFFSET included: a larger LIMIT
+    /// plus OFFSET, or a query without a LIMIT that matches more, fails
+    /// (0: no limit).
+    #[arg(long, default_value_t = 10_000)]
+    max_result_window: usize,
+    /// The most groups a GROUP BY may make before the query fails (0: no
+    /// limit).
+    #[arg(long, default_value_t = 65_536)]
+    max_groups: usize,
+    /// Write requests the server holds at once (embedding, waiting for the
+    /// writer, or being applied); more are refused with 429 (0: no limit).
+    #[arg(long, default_value_t = 1024)]
+    max_queued_writes: usize,
+    /// The largest body a write or an import may send, in MiB (other
+    /// requests take up to 16 MiB).
+    #[arg(long, default_value_t = 256)]
+    max_body_mb: usize,
     /// The agent's default model.
     #[arg(long, default_value = strata_server::agent::DEFAULT_MODEL)]
     model: String,
@@ -254,6 +271,10 @@ async fn main() {
         timeout_ms: a.timeout_ms,
         max_timeout_ms: a.max_timeout_ms,
         max_concurrent: a.max_concurrent,
+        max_result_window: a.max_result_window,
+        max_groups: a.max_groups,
+        max_queued_writes: a.max_queued_writes,
+        max_body_mb: a.max_body_mb,
         model: a.model,
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()),
         api_base: a.api_base,
