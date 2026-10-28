@@ -24,7 +24,6 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,6 +37,7 @@ use crate::schema::{FieldType, Schema};
 use crate::segment::build::{build_segment, BuildOptions};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::freelist::FreeList;
+use crate::storage::io;
 use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
@@ -80,7 +80,11 @@ pub struct DbOptions {
     /// Largest segment written by flushes and bulk loads.
     pub segment_max_docs: usize,
     /// `fsync` at every commit. Without it a process crash still loses
-    /// nothing, but a power failure may lose recent commits.
+    /// nothing, but a power failure may lose the transactions committed
+    /// since the last flush (a bulk load flushes first), newest first.
+    /// Flushes, merges, bulk loads and vacuums sync either way: the WAL's
+    /// unsynced appends, then the pages of the version they write, then the
+    /// meta slot that names it.
     pub sync: bool,
     /// Needed by [`Database::merge`].
     pub doc_source: Option<Arc<dyn DocumentSource>>,
@@ -216,9 +220,9 @@ impl Database {
         let mbytes = manifest.encode();
         let mext = Extent { page: fl.alloc(pages_for(mbytes.len())), len: mbytes.len() as u64 };
         let (fext, fbytes) = place_freelist(&mut fl);
-        file.set_len(fl.page_count() * PAGE)?;
-        file.write_all_at(&mbytes, mext.page * PAGE)?;
-        file.write_all_at(&fbytes, fext.page * PAGE)?;
+        io::set_len(&file, fl.page_count() * PAGE)?;
+        io::write_at(&file, &mbytes, mext.page * PAGE)?;
+        io::write_at(&file, &fbytes, fext.page * PAGE)?;
         let meta = Meta {
             format: 1,
             db_id,
@@ -230,10 +234,10 @@ impl Database {
             page_count: fl.page_count(),
         };
         pager::write_meta(&file, 0, &meta)?;
-        file.sync_all()?;
+        io::sync_all(&file)?;
         Wal::create(&wal_path(path), db_id, true)?;
         let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        File::open(dir)?.sync_all()?;
+        io::sync_dir(dir)?;
         Database::load(path, file, opts)
     }
 
@@ -264,7 +268,7 @@ impl Database {
         Wal::create(&path.join(dir::WAL), db_id, true)?;
         dir::sync_dir(path)?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        File::open(parent)?.sync_all()?;
+        io::sync_dir(parent)?;
         Database::load_dir(path, lockf, opts)
     }
 
@@ -273,7 +277,7 @@ impl Database {
         // Files a crash left behind: written for a commit that did not
         // finish, or no longer named after one that did.
         for (f, _) in dir::orphans(path, &dir::referenced(&cur, &manifest))? {
-            std::fs::remove_file(f)?;
+            io::remove_file(&f)?;
         }
         let handles = manifest
             .tables
@@ -325,12 +329,12 @@ impl Database {
             if !older {
                 return Err(corrupt("file is shorter than its page count"));
             }
-            file.set_len(meta.page_count * PAGE)?;
+            io::set_len(file, meta.page_count * PAGE)?;
         }
         if len > meta.page_count * PAGE {
             // Left by a commit that did not finish, or by the damaged
             // version skipped; nothing this version uses lives there.
-            file.set_len(meta.page_count * PAGE)?;
+            io::set_len(file, meta.page_count * PAGE)?;
         }
         let map = pager::map_file(file, opts.read_ahead)?;
         let handles = manifest
@@ -448,7 +452,7 @@ impl Database {
     /// versions of Strata before tables cannot open; dropping back to the
     /// first table alone writes format 1 again.
     pub fn create_table(&self, schema: Schema) -> Result<()> {
-        let _wal = self.try_writer()?;
+        let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         check_table_name(&schema.table)?;
         if self.table(&schema.table).is_some() {
@@ -458,7 +462,7 @@ impl Database {
         let id = vw.manifest.next_table_id;
         vw.manifest.next_table_id += 1;
         vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new() });
-        let c = vw.commit()?;
+        let c = vw.commit(&mut wal)?;
         self.publish(c, |_| {})
     }
 
@@ -483,7 +487,7 @@ impl Database {
         }
         let mut vw = VersionWriter::begin(self);
         vw.drop_table(id);
-        let c = vw.commit()?;
+        let c = vw.commit(&mut wal)?;
         self.publish(c, |st| {
             st.live_cache.clear();
             st.updates_cache.clear();
@@ -493,7 +497,7 @@ impl Database {
             // tables, and versions of Strata from before tables refuse a
             // file with such a slot even when it is the older one. Commit
             // again so that both slots hold format 1.
-            let c = VersionWriter::begin(self).commit()?;
+            let c = VersionWriter::begin(self).commit(&mut wal)?;
             self.publish(c, |_| {})?;
         }
         Ok(())
@@ -623,10 +627,6 @@ impl Database {
         };
         let mut vw = VersionWriter::begin(self);
         vw.manifest.wal_txn = txn;
-        // The WAL is reset after this commit, and it is the only other copy
-        // of what the flush writes: without `sync`, a power loss could
-        // otherwise keep the reset and lose the version.
-        vw.sync = true;
         for (table, schema, chunks, deleted, mem_updates) in mems {
             let live: Vec<Document> = chunks
                 .iter()
@@ -651,7 +651,7 @@ impl Database {
         for (&id, (_, ups)) in &pending_updates {
             vw.add_updates(id, ups)?;
         }
-        let c = vw.commit()?;
+        let c = vw.commit(wal)?;
         self.publish(c, |st| {
             for t in &mut st.tables {
                 t.clear_mem();
@@ -724,7 +724,7 @@ impl Database {
         if vw.segments_added == 0 {
             return Ok(());
         }
-        let c = vw.commit()?;
+        let c = vw.commit(&mut wal)?;
         self.publish(c, |_| {})
     }
 
@@ -742,9 +742,9 @@ impl Database {
             return Err(Error::Schema(format!("segment {id} has deleted or updated documents; merge it first")));
         }
         let image = if self.dir.is_some() { h.map.clone() } else { h.map.slice(h.meta.extent.range()) };
-        let mut f = OpenOptions::new().write(true).create_new(true).open(dest)?;
-        std::io::Write::write_all(&mut f, &image)?;
-        f.sync_data()?;
+        let f = OpenOptions::new().write(true).create_new(true).open(dest)?;
+        io::write_at(&f, &image, 0)?;
+        io::sync(&f)?;
         Ok(())
     }
 
@@ -788,7 +788,7 @@ impl Database {
         if ids.is_empty() {
             return Ok(ids);
         }
-        let c = vw.commit()?;
+        let c = vw.commit(&mut wal)?;
         self.publish(c, |_| {})?;
         Ok(ids)
     }
@@ -854,7 +854,7 @@ impl Database {
         let image = if docs.is_empty() { None } else { Some(build_segment(snap.schema(), &docs, &self.opts.build)?) };
         drop(docs);
 
-        let _wal = lock(&self.writer);
+        let mut wal = lock(&self.writer);
         self.check_poisoned()?;
         if lock(&self.state).table_index(table).is_none() {
             // Dropped while the merge was building.
@@ -894,7 +894,7 @@ impl Database {
             let dels = (!deleted.is_empty()).then(|| LiveDocs::with_deleted(None, n_new, deleted.iter().copied()));
             vw.add_segment(table, Some(pos), &image, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
         }
-        let c = vw.commit()?;
+        let c = vw.commit(&mut wal)?;
         stats.bytes_written += c.bytes_written;
         // Pending deletes of the inputs are now either dropped documents or
         // stored in the merged segment's delete set.
@@ -921,7 +921,7 @@ impl Database {
     /// reusable two commits later). Space a live snapshot can still reach
     /// stays. Returns the number of bytes the file shrank by.
     pub fn vacuum(&self) -> Result<u64> {
-        let _wal = self.try_writer()?;
+        let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         if let Some(d) = &self.dir {
             // Each segment is its own file, so there is nothing to compact:
@@ -939,7 +939,7 @@ impl Database {
             };
             let mut freed = 0;
             for (f, len) in dir::orphans(d, &keep)? {
-                std::fs::remove_file(f)?;
+                io::remove_file(&f)?;
                 freed += len;
             }
             return Ok(freed);
@@ -949,7 +949,7 @@ impl Database {
         while idle < 2 {
             let mut vw = VersionWriter::begin(self);
             let moved = vw.relocate_down()?;
-            let c = vw.commit()?;
+            let c = vw.commit(&mut wal)?;
             let shrank = c.meta.page_count < lock(&self.state).meta.page_count;
             self.publish(c, |_| {})?;
             idle = if moved > 0 || shrank { 0 } else { idle + 1 };
@@ -1193,7 +1193,7 @@ impl Database {
         // snapshots keep reading them through their mappings.
         if let Some(d) = &self.dir {
             for f in obsolete {
-                let _ = std::fs::remove_file(d.join(f));
+                let _ = io::remove_file(&d.join(f));
             }
         }
         Ok(())
@@ -1631,10 +1631,6 @@ struct VersionWriter<'a> {
     segments_added: usize,
     /// Directory layout: files the new version stops naming.
     obsolete: Vec<String>,
-    /// Make the version durable before its meta slot or `CURRENT` names
-    /// it, and that before the commit returns (`DbOptions::sync`, or a
-    /// flush, after which the WAL is reset).
-    sync: bool,
 }
 
 impl<'a> VersionWriter<'a> {
@@ -1656,7 +1652,6 @@ impl<'a> VersionWriter<'a> {
             bytes_written: 0,
             segments_added: 0,
             obsolete: Vec::new(),
-            sync: db.opts.sync,
         }
     }
 
@@ -1665,7 +1660,7 @@ impl<'a> VersionWriter<'a> {
     fn write_as(&mut self, bytes: &[u8], name: String) -> Result<(Extent, Option<String>)> {
         match &self.db.dir {
             Some(d) => {
-                dir::write_version_file(d, &name, bytes, self.sync)?;
+                dir::write_version_file(d, &name, bytes, true)?;
                 self.bytes_written += bytes.len() as u64;
                 Ok((Extent { page: 0, len: bytes.len() as u64 }, Some(name)))
             }
@@ -1678,14 +1673,14 @@ impl<'a> VersionWriter<'a> {
         debug_assert!(!bytes.is_empty());
         let page = self.fl.alloc(pages_for(bytes.len()));
         self.grow()?;
-        self.db.file.write_all_at(bytes, page * PAGE)?;
+        io::write_at(&self.db.file, bytes, page * PAGE)?;
         self.bytes_written += bytes.len() as u64;
         Ok(Extent { page, len: bytes.len() as u64 })
     }
 
     fn grow(&mut self) -> Result<()> {
         if self.fl.page_count() > self.file_pages {
-            self.db.file.set_len(self.fl.page_count() * PAGE)?;
+            io::set_len(&self.db.file, self.fl.page_count() * PAGE)?;
             self.file_pages = self.fl.page_count();
         }
         Ok(())
@@ -1805,7 +1800,7 @@ impl<'a> VersionWriter<'a> {
             // Copy out of the mapping first: on macOS, a pwrite whose source
             // is a mapping of the same file can deadlock in the kernel.
             let bytes = map[e.range()].to_vec();
-            self.db.file.write_all_at(&bytes, page * PAGE)?;
+            io::write_at(&self.db.file, &bytes, page * PAGE)?;
             self.bytes_written += e.len;
             self.fl.defer(self.txn, e);
             let to = Extent { page, len: e.len };
@@ -1862,7 +1857,12 @@ impl<'a> VersionWriter<'a> {
 
     /// Writes the manifest and freelist, syncs, then writes the other meta
     /// slot and syncs again.
-    fn commit(mut self) -> Result<Committed> {
+    fn commit(mut self, wal: &mut Wal) -> Result<Committed> {
+        // The transactions in the WAL come before this version, which may
+        // hold their effects (a merge drops the documents they deleted):
+        // without `sync` they are made durable now, before it can be.
+        wal.sync_appends()?;
+
         if let Some(d) = self.db.dir.clone() {
             return self.commit_dir(&d);
         }
@@ -1876,11 +1876,9 @@ impl<'a> VersionWriter<'a> {
         let manifest = self.write(&mbytes)?;
         let (freelist, fbytes) = place_freelist(&mut self.fl);
         self.grow()?;
-        db.file.write_all_at(&fbytes, freelist.page * PAGE)?;
+        io::write_at(&db.file, &fbytes, freelist.page * PAGE)?;
         self.bytes_written += fbytes.len() as u64;
-        if self.sync {
-            db.file.sync_data()?;
-        }
+        io::sync(&db.file)?;
         let meta = Meta {
             format: self.manifest.format(),
             db_id: self.meta.db_id,
@@ -1894,12 +1892,14 @@ impl<'a> VersionWriter<'a> {
         let slot = 1 - self.slot;
         // Past this point the on-disk version may already be the new one.
         pager::write_meta(&db.file, slot, &meta).map_err(|e| db.poison(e))?;
-        if self.sync {
-            db.file.sync_data().map_err(|e| db.poison(e.into()))?;
-        }
+        // Synced whatever `DbOptions::sync` is: the next commit overwrites
+        // the other slot and reuses the pages this version freed, so this
+        // one must be the intact version a power loss falls back to. Its
+        // pages were synced above, before the slot named them.
+        io::sync(&db.file).map_err(|e| db.poison(e.into()))?;
         // Free pages at the end are reachable from neither slot. A failed
         // truncation only leaves the file longer than needed.
-        if self.fl.page_count() < self.file_pages && db.file.set_len(self.fl.page_count() * PAGE).is_ok() {
+        if self.fl.page_count() < self.file_pages && io::set_len(&db.file, self.fl.page_count() * PAGE).is_ok() {
             self.file_pages = self.fl.page_count();
         }
         Ok(Committed { meta, slot, manifest: self.manifest, fl: self.fl, file_pages: self.file_pages, bytes_written: self.bytes_written, obsolete: Vec::new() })
@@ -1914,11 +1914,11 @@ impl<'a> VersionWriter<'a> {
         self.manifest.txn = c;
         let mbytes = self.manifest.encode();
         let name = dir::manifest_name(c);
-        dir::write_version_file(d, &name, &mbytes, self.sync)?;
+        dir::write_version_file(d, &name, &mbytes, true)?;
         self.bytes_written += mbytes.len() as u64;
         let cur = Current { db_id: self.meta.db_id, txn: c, manifest: name, crc: crc32fast::hash(&mbytes), format: self.manifest.format() };
         // Past the rename the on-disk version may already be the new one.
-        dir::write_current(d, &cur, self.sync).map_err(|e| db.poison(e))?;
+        dir::write_current(d, &cur, true).map_err(|e| db.poison(e))?;
         self.obsolete.push(previous);
         Ok(Committed {
             meta: dir_meta(&cur),

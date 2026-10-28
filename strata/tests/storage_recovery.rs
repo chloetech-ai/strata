@@ -105,6 +105,40 @@ fn a_damaged_newest_version_opens_the_one_before_it() {
     db.check().unwrap();
 }
 
+// A newest version whose pages never reached the disk can name extents
+// past the end of the file. Reading them failed with an I/O error, which
+// opening did not count as damage, so it did not fall back.
+#[test]
+fn a_newest_version_past_the_end_of_the_file_opens_the_one_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.strata");
+    let copy = dir.path().join("copy.strata");
+    let src = Arc::new(MapSource::default());
+    let db = Database::create(&path, schema(), opts(&src)).unwrap();
+    let mut cut = 0;
+    for k in 1..7u64 {
+        insert(&db, &src, (k - 1) * 100..k * 100);
+        db.flush().unwrap();
+        std::fs::copy(&path, &copy).unwrap();
+        std::fs::copy(wal_of(&path), wal_of(&copy)).unwrap();
+        let f = OpenOptions::new().read(true).write(true).open(&copy).unwrap();
+        let [(newest, _), (older, _)] = read_metas(&f).unwrap()[..] else { continue };
+        let at = newest.manifest.page.min(newest.freelist.page);
+        if at < older.page_count {
+            continue;
+        }
+        f.set_len(at * PAGE).unwrap();
+        drop(f);
+        let o = Database::open(&copy, opts(&src)).unwrap();
+        assert!(o.damaged().unwrap().contains("past the end of the file"), "{:?}", o.damaged());
+        // The flush before: the WAL was reset after the newest one.
+        assert_keys(&o.snapshot(), &keys(0..(k - 1) * 100));
+        o.check().unwrap();
+        cut += 1;
+    }
+    assert!(cut > 0);
+}
+
 // A commit cuts free pages off the end of the file, which can leave it
 // shorter than the version before it says. After every commit of a
 // workload of inserts, deletes, flushes, merges and a vacuum, a copy whose
