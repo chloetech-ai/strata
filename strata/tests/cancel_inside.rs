@@ -50,9 +50,16 @@ fn stops_midway(db: &Db, sql: &str) {
         let r = db.query_with(sql, &Params::new(), opts);
         (r.map(|r| r.rows.len()), t0.elapsed())
     };
-    let (r, full) = run(&ExecOptions::default());
-    r.unwrap();
-    assert!(full >= Duration::from_millis(100), "{sql} took {full:?}: too short to stop in the middle");
+    // The faster of two full runs (the first may still be reading pages).
+    let full = (0..2)
+        .map(|_| {
+            let (r, took) = run(&ExecOptions::default());
+            r.unwrap();
+            took
+        })
+        .min()
+        .unwrap();
+    assert!(full >= Duration::from_millis(25), "{sql} took {full:?}: too short to stop in the middle");
     let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + full / 10), ..ExecOptions::default() });
     assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
     assert!(took < full / 2, "{sql}: stopped after {took:?} of {full:?}");
@@ -71,7 +78,7 @@ fn stops_midway(db: &Db, sql: &str) {
 #[test]
 fn aggregation_and_ordering_stop_inside_a_segment() {
     let dir = tempfile::tempdir().unwrap();
-    let db = db(dir.path(), 2_000_000);
+    let db = db(dir.path(), 3_000_000);
     // Grouped document by document, 500,000 groups.
     let grouped = "SELECT a, b, COUNT(*), SUM(c) FROM t GROUP BY a, b";
     stops_midway(&db, grouped);
