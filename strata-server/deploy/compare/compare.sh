@@ -28,10 +28,11 @@ CLIENT_NODE=strata-worker3
 # and a coordinator of 0.5 CPU and 1 GiB. Loading gets the whole budget
 # too: Elasticsearch and Solr on their two data nodes, Strata one shard's
 # build job at a time.
+# SHARD_CPU and COORD_CPU may be set to split Strata's 3 CPUs otherwise.
 DATA_CPU=1500m DATA_MEM=3Gi
 BUILD_CPU=3 BUILD_MEM=6Gi
-SHARD_CPU=1250m SHARD_MEM=2560Mi
-COORD_CPU=500m COORD_MEM=1Gi
+SHARD_CPU=${SHARD_CPU:-1250m} SHARD_MEM=2560Mi
+COORD_CPU=${COORD_CPU:-500m} COORD_MEM=1Gi
 OUT=${OUT:-/data/compare}
 
 # render FILE I NODE CPU MEM [ZK]: a manifest for node I.

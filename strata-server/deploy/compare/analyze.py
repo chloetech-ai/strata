@@ -25,8 +25,18 @@ from pathlib import Path
 
 import numpy as np
 
-ENGINES = ["strata", "es", "solr"]
-NAMES = {"strata": "Strata", "es": "Elasticsearch", "solr": "Solr"}
+# Reports by label (run-<label>.json): Strata at the default split of its
+# 3 CPUs and, if present, at another (compare.sh run with SHARD_CPU and
+# COORD_CPU set, the report renamed run-strata-<split>.json and its CPU lines
+# moved to cpu-strata-<split>.jsonl).
+RUNS = [
+    ("strata", "Strata"),
+    ("strata-coord500m", "Strata, 0.5-CPU coordinator"),
+    ("es", "Elasticsearch"),
+    ("solr", "Solr"),
+]
+ENGINES = [k for k, _ in RUNS]
+NAMES = dict(RUNS)
 RANKED = ["bm25", "bm25 + filter", "vector", "vector + filter", "hybrid (RRF)", "hybrid (weighted)", "boosted (bm25 × decay)"]
 KINDS = RANKED + ["facet", "key lookup"]
 
@@ -98,6 +108,11 @@ def main():
     rep, beir = Path(sys.argv[1]), Path(sys.argv[2])
     runs = {e: load_json(rep / f"run-{e}.json") for e in ENGINES}
     runs = {e: r for e, r in runs.items() if r}
+    # Strata's answers do not depend on how its CPUs are split: score one.
+    scored = [e for e in runs if e != "strata-coord500m"]
+    if "strata-coord500m" in runs and "strata" in runs:
+        same = runs["strata-coord500m"]["answers"] == runs["strata"]["answers"]
+        print(f"Strata's answers at both CPU splits are {'identical' if same else 'DIFFERENT'}.\n")
     rel = qrels(beir)
     summary = {"engines": list(runs), "load": {}, "http": {}, "quality": {}, "unavailable": {}, "differs": {}, "cpu": {}}
 
@@ -165,7 +180,7 @@ def main():
     truth = {"vector": exact_top10(beir, vec_qids, False), "vector + filter": exact_top10(beir, vec_qids, True)}
     strata = runs.get("strata")
     quality = {}
-    for e, r in runs.items():
+    for e, r in ((e, runs[e]) for e in scored):
         quality[e] = {}
         for kind in KINDS:
             if kind not in r["answers"]:
@@ -195,16 +210,16 @@ def main():
     summary["quality"] = quality
 
     print("\n## Answers: recall@10 against an exact search, nDCG@10 against Quora's judgments\n")
-    print("| kind | " + " | ".join(f"{NAMES[e]} recall | {NAMES[e]} nDCG" for e in runs) + " |")
-    print("|---|" + "---|---|" * len(runs))
+    print("| kind | " + " | ".join(f"{NAMES[e]} recall | {NAMES[e]} nDCG" for e in scored) + " |")
+    print("|---|" + "---|---|" * len(scored))
     for kind in RANKED:
         cells = []
-        for e in runs:
+        for e in scored:
             q = quality[e].get(kind)
             cells += [fmt(q.get("recall_at_10"), 3) if q else "n/a", fmt(q.get("ndcg_at_10"), 3) if q else "n/a"]
         print(f"| {kind} | " + " | ".join(cells) + " |")
     if strata:
-        others = [e for e in runs if e != "strata"]
+        others = [e for e in scored if e != "strata"]
         print("\n## Agreement with Strata's answers\n")
         print("| kind | " + " | ".join(NAMES[e] for e in others) + " |")
         print("|---|" + "---|" * len(others))
@@ -222,6 +237,10 @@ def main():
 
     # CPU used during each run, from the containers' cgroups.
     cpu_lines = [json.loads(l) for l in open(rep / "cpu.jsonl")] if (rep / "cpu.jsonl").exists() else []
+    for e in ENGINES:
+        extra = rep / f"cpu-{e}.jsonl"
+        if e.startswith("strata-") and extra.exists():
+            cpu_lines += [dict(json.loads(l), engine=e, pod=f"{json.loads(l)['pod']} ({e[len('strata-'):]})") for l in open(extra)]
     if cpu_lines:
         print("\n## CPU used by each engine's containers (cgroup cpu.stat)\n")
         print("| engine | phase | pod | CPU seconds | wall seconds | average cores | throttled (s) |")

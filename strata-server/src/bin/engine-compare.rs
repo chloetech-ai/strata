@@ -541,6 +541,8 @@ async fn load(collection: &str, engine: Engine, urls: &[String], shards: usize, 
             report["index_bytes"] = st["_all"]["primaries"]["store"]["size_in_bytes"].clone();
             report["indexed_docs"] = st["_all"]["primaries"]["docs"]["count"].clone();
             report["segments"] = st["_all"]["primaries"]["segments"]["count"].clone();
+            let c = check(client.get(format!("{u}/quora/_count")).send().await, "count").await?;
+            report["searchable_docs"] = c["count"].clone();
             let du = check(client.post(format!("{u}/quora/_disk_usage?run_expensive_tasks=true")).send().await, "disk usage").await?;
             report["disk_usage"] = du["quora"].clone();
         }
@@ -561,7 +563,12 @@ async fn load(collection: &str, engine: Engine, urls: &[String], shards: usize, 
             report["indexed_docs"] = json!(n);
             report["segments"] = json!(segs);
             report["cores"] = json!(cores);
+            let c = check(client.get(format!("{u}/solr/quora/select?q=*:*&rows=0")).send().await, "count").await?;
+            report["searchable_docs"] = c["response"]["numFound"].clone();
         }
+    }
+    if report["searchable_docs"].as_u64() != Some(docs as u64) {
+        eprintln!("{}: WARNING: {docs} documents sent, {} searchable", engine.name(), report["searchable_docs"]);
     }
     std::fs::create_dir_all(out).map_err(s)?;
     let path = out.join(format!("load-{}.json", engine.name()));
@@ -646,6 +653,9 @@ fn request(engine: Engine, kind: &str, sql: &str, q: &data::Query, key: &str) ->
     let t = &q.text;
     // Facets need a word of the query (as strata-server-bench, they skip queries without one).
     let w = if sql.contains(":w") { match_word(t)? } else { String::new() };
+    // MATCH(body, :w) analyses the word as documents are (no query
+    // stopwords): the others look up that term as it is.
+    let term = strata::text::analyzer::analyze(&w).into_iter().next().unwrap_or_else(|| w.clone());
     let v = &q.vector;
     match engine {
         Engine::Strata => {
@@ -694,7 +704,7 @@ fn request(engine: Engine, kind: &str, sql: &str, q: &data::Query, key: &str) ->
                 }
                 "boosted (bm25 × decay)" => top(json!({"query": {"function_score": {"query": m,
                     "functions": [{"exp": {"year": {"origin": 2024, "scale": 5, "decay": 0.5}}}], "boost_mode": "multiply"}}})),
-                "facet" => json!({"size": 0, "track_total_hits": false, "query": {"match": {"body": w}},
+                "facet" => json!({"size": 0, "track_total_hits": false, "query": {"term": {"body": term}},
                     "aggs": {"c": {"terms": {"field": "category", "size": 5}}}}),
                 "key lookup" => json!({"size": 10, "track_total_hits": false, "_source": ["title", "year", "rating"], "query": {"term": {"id": key}}}),
                 _ => return None,
@@ -744,8 +754,9 @@ fn request(engine: Engine, kind: &str, sql: &str, q: &data::Query, key: &str) ->
                     json!("{!boost b=$decay v=$lexq}"),
                     json!({"decay": format!("exp(mul({DECAY_RATE},abs(sub(year,2024))))"), "lexq": lex}),
                 ),
-                "facet" => json!({"query": format!("{{!lucene df=body}}{w}"), "limit": 0,
-                    "facet": {"c": {"type": "terms", "field": "category", "limit": 5}}}),
+                // Refined: without it, a facet over shards may count wrong (it did in 37 of 300 here).
+                "facet" => json!({"query": format!("{{!term f=body}}{term}"), "limit": 0,
+                    "facet": {"c": {"type": "terms", "field": "category", "limit": 5, "refine": true}}}),
                 "key lookup" => json!({"query": format!("{{!term f=id}}{key}"), "limit": 10, "fields": "id,title,year,rating"}),
                 _ => return None,
             };
