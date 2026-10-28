@@ -13,6 +13,9 @@ csv = "1"
 sqlparser = "0.59"
 crc32fast = "1"
 libc = "0.2"
+# Log events (flush and merge failures, a database that stops writing);
+# silent unless the program installs a subscriber, as strata-server does.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 lz4_flex = "0.11"
 bitpacking = "0.9.3"
 rand = "0.8"

@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use strata_server::auth::{self, Access, Secret, Tls};
+use strata_server::obs;
 use strata_server::server::{self, Options};
 
 #[derive(Parser)]
@@ -138,6 +139,17 @@ struct Args {
     /// How fast merges may write, in MiB/s (default: no limit).
     #[arg(long)]
     merge_write_mb_per_sec: Option<u64>,
+    /// Log queries and writes that take this many milliseconds or more,
+    /// with their SQL (0: none).
+    #[arg(long, default_value_t = 1000)]
+    slow_ms: u64,
+    /// What to log: a level (error, warn, info, debug, trace), or levels
+    /// per module ("info,strata=debug"). debug logs every request.
+    #[arg(long, env = "STRATA_LOG", default_value = "info")]
+    log: String,
+    /// How to write log lines: text, or json (one object per line).
+    #[arg(long, env = "STRATA_LOG_FORMAT", default_value = "text")]
+    log_format: String,
 }
 
 #[derive(Subcommand)]
@@ -181,11 +193,19 @@ enum Command {
 #[tokio::main]
 async fn main() {
     let a = Args::parse();
+    let format = obs::LogFormat::parse(&a.log_format).unwrap_or_else(|| {
+        eprintln!("strata-server: --log-format is text or json, not {:?}", a.log_format);
+        std::process::exit(1)
+    });
+    if let Err(e) = obs::init_logs(&a.log, format) {
+        eprintln!("strata-server: {e}");
+        std::process::exit(1)
+    }
     match &a.command {
         Some(Command::FetchModel { name, models }) => {
             let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
             match server::fetch_model(name, &dir).await {
-                Ok(path) => eprintln!("strata-server: {name} is in {}", path.display()),
+                Ok(path) => tracing::info!(model = name, dir = %path.display(), "fetched the model"),
                 Err(e) => fail(&e),
             }
             return;
@@ -240,6 +260,7 @@ async fn main() {
         models: a.models.unwrap_or_else(strata::embed::models_dir),
         synonyms: a.synonyms,
         backup_dir: a.backup_dir,
+        slow_ms: a.slow_ms,
         merger: {
             let d = strata::storage::MergerOptions::default();
             strata::storage::MergerOptions {
@@ -267,23 +288,22 @@ async fn main() {
     let (http, ip) = bind(&a.listen).await;
     let access = Access { token: token.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls };
     let h = svc.health().await;
-    eprintln!("strata-server: table {} ({} rows, {} segments)", svc.schema.table, h["docs"], h["segments"]);
-    eprintln!("strata-server: SIMD kernels: {}", strata::simd::describe());
+    tracing::info!(table = %svc.schema.table, rows = %h["docs"], segments = %h["segments"], version = env!("CARGO_PKG_VERSION"), simd = %strata::simd::describe(), "serving");
     let scheme = if access.tls.is_some() { "https" } else { "http" };
     let asks = if access.token.is_some() { " (it asks for the token)" } else { "" };
-    eprintln!("strata-server: HTTP and UI on {scheme}://{}/{asks}", a.listen);
+    tracing::info!("HTTP and UI on {scheme}://{}/{asks}", a.listen);
     if svc.agent.api_key.is_none() {
-        eprintln!("strata-server: no ANTHROPIC_API_KEY; the agent asks for a key in the UI");
+        tracing::info!("no ANTHROPIC_API_KEY; the agent asks for a key in the UI");
     }
     let mut tasks = Vec::new();
     // A coordinator answers queries but is not itself a shard.
     if a.grpc != "off" && !coordinator {
         let (l, _) = bind(&a.grpc).await;
-        eprintln!("strata-server: gRPC on {}{}", a.grpc, if access.tls.is_some() { " (TLS)" } else { "" });
+        tracing::info!("gRPC on {}{}", a.grpc, if access.tls.is_some() { " (TLS)" } else { "" });
         let (svc, access) = (svc.clone(), access.clone());
         tasks.push(tokio::spawn(async move {
             if let Err(e) = server::serve_grpc(svc, l, access).await {
-                eprintln!("strata-server: gRPC stopped: {e}");
+                tracing::error!(error = %e, "gRPC stopped");
             }
         }));
     }
@@ -296,6 +316,6 @@ async fn main() {
 }
 
 fn fail(msg: &str) -> ! {
-    eprintln!("strata-server: {msg}");
+    tracing::error!("{msg}");
     std::process::exit(1)
 }

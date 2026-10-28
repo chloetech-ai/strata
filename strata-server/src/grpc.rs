@@ -1,16 +1,19 @@
 //! The service over gRPC (`proto/strata.proto`).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Instant;
 
 use strata::query::exec::ResultSet;
 use strata::query::Params;
 use strata::value::Value;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
 use crate::service::{QueryReq, Service};
-use crate::ApiError;
+use crate::{obs, ApiError};
 
 pub fn to_pb(v: &Value) -> pb::Value {
     let kind = match v {
@@ -91,46 +94,123 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
 
 pub struct Grpc(pub Arc<Service>);
 
+/// A status code's name, as the metrics label it.
+pub fn code_name(c: tonic::Code) -> &'static str {
+    use tonic::Code::*;
+    match c {
+        Ok => "Ok",
+        Cancelled => "Cancelled",
+        Unknown => "Unknown",
+        InvalidArgument => "InvalidArgument",
+        DeadlineExceeded => "DeadlineExceeded",
+        NotFound => "NotFound",
+        AlreadyExists => "AlreadyExists",
+        PermissionDenied => "PermissionDenied",
+        ResourceExhausted => "ResourceExhausted",
+        FailedPrecondition => "FailedPrecondition",
+        Aborted => "Aborted",
+        OutOfRange => "OutOfRange",
+        Unimplemented => "Unimplemented",
+        Internal => "Internal",
+        Unavailable => "Unavailable",
+        DataLoss => "DataLoss",
+        Unauthenticated => "Unauthenticated",
+    }
+}
+
+impl Grpc {
+    /// Serves one call: gives it its id (the caller's `x-request-id`, or a
+    /// new one, sent back in the answer's metadata), runs it in a span that
+    /// names it, counts it and logs it ([`crate::obs`]).
+    async fn serve<T, R, Fut>(&self, method: &'static str, req: Request<T>, f: impl FnOnce(Arc<Service>, T) -> Fut) -> Result<Response<R>, Status>
+    where
+        Fut: Future<Output = Result<R, ApiError>>,
+    {
+        let id = obs::request_id(req.metadata().get(obs::HEADER).and_then(|v| v.to_str().ok()));
+        let span = tracing::info_span!("request", id = %id, method);
+        let t0 = Instant::now();
+        let r = obs::scope(Some(id.clone()), f(self.0.clone(), req.into_inner())).instrument(span.clone()).await;
+        let secs = t0.elapsed().as_secs_f64();
+        let _in = span.enter();
+        let (code, r) = match r {
+            Ok(x) => {
+                tracing::debug!(secs, "answered");
+                ("Ok", Ok(Response::new(x)))
+            }
+            Err(e) => {
+                if e.status >= 500 {
+                    obs::server_error(e.status, &e.message);
+                }
+                let s = Status::from(e);
+                (code_name(s.code()), Err(s))
+            }
+        };
+        self.0.metrics.grpc(method, code, secs);
+        let v = id.parse::<tonic::metadata::AsciiMetadataValue>().ok();
+        match (r, v) {
+            (Ok(mut a), Some(v)) => {
+                a.metadata_mut().insert(obs::HEADER, v);
+                Ok(a)
+            }
+            (Err(mut s), Some(v)) => {
+                s.metadata_mut().insert(obs::HEADER, v);
+                Err(s)
+            }
+            (r, None) => r,
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl pb::strata_server::Strata for Grpc {
     async fn query(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::QueryResponse>, Status> {
-        let a = self.0.query(query_req(req.into_inner())?).await?;
-        Ok(Response::new(result_to_pb(&a.rs, a.took_ms)))
+        self.serve("Query", req, |svc, r| async move {
+            let a = svc.query(query_req(r)?).await?;
+            Ok(result_to_pb(&a.rs, a.took_ms))
+        })
+        .await
     }
 
     async fn term_stats(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::TermStatsResponse>, Status> {
-        let r = req.into_inner();
-        let (stats, snapshot) = self.0.term_stats(&r.sql, &params_from_pb(r.params), r.timeout_ms as u64).await?;
-        Ok(Response::new(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot }))
+        self.serve("TermStats", req, |svc, r| async move {
+            let (stats, snapshot) = svc.term_stats(&r.sql, &params_from_pb(r.params), r.timeout_ms as u64).await?;
+            Ok(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot })
+        })
+        .await
     }
 
     async fn write(&self, req: Request<pb::WriteRequest>) -> Result<Response<pb::WriteResponse>, Status> {
-        let r = req.into_inner();
-        let written = if !r.ops_json.is_empty() {
-            let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
-            let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
-            self.0.write_ops(ops, key).await?
-        } else {
-            match self.0.sql(&r.sql, &params_from_pb(r.params), 0).await? {
-                crate::service::SqlAnswer::Written { n, .. } => n,
-                crate::service::SqlAnswer::Rows(_) => return Err(Status::invalid_argument("Write takes INSERT, UPDATE or DELETE; use Query")),
-            }
-        };
-        Ok(Response::new(pb::WriteResponse { written }))
+        self.serve("Write", req, |svc, r| async move {
+            let written = if !r.ops_json.is_empty() {
+                let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
+                let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
+                svc.write_ops(ops, key).await?
+            } else {
+                match svc.sql(&r.sql, &params_from_pb(r.params), 0).await? {
+                    crate::service::SqlAnswer::Written { n, .. } => n,
+                    crate::service::SqlAnswer::Rows(_) => return Err(ApiError::bad("Write takes INSERT, UPDATE or DELETE; use Query")),
+                }
+            };
+            Ok(pb::WriteResponse { written })
+        })
+        .await
     }
 
-    async fn schema(&self, _: Request<pb::Empty>) -> Result<Response<pb::SchemaResponse>, Status> {
-        Ok(Response::new(pb::SchemaResponse { schema_json: serde_json::to_string(&self.0.schema).unwrap_or_default() }))
+    async fn schema(&self, req: Request<pb::Empty>) -> Result<Response<pb::SchemaResponse>, Status> {
+        self.serve("Schema", req, |svc, _| async move { Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&svc.schema).unwrap_or_default() }) }).await
     }
 
-    async fn health(&self, _: Request<pb::Empty>) -> Result<Response<pb::HealthResponse>, Status> {
-        let h = self.0.health().await;
-        let n = |k: &str| h[k].as_u64().unwrap_or(0);
-        Ok(Response::new(pb::HealthResponse {
-            status: h["status"].as_str().unwrap_or("unknown").to_string(),
-            docs: n("docs"),
-            segments: n("segments"),
-            txn: n("txn"),
-        }))
+    async fn health(&self, req: Request<pb::Empty>) -> Result<Response<pb::HealthResponse>, Status> {
+        self.serve("Health", req, |svc, _| async move {
+            let h = svc.health().await;
+            let n = |k: &str| h[k].as_u64().unwrap_or(0);
+            Ok(pb::HealthResponse {
+                status: h["status"].as_str().unwrap_or("unknown").to_string(),
+                docs: n("docs"),
+                segments: n("segments"),
+                txn: n("txn"),
+            })
+        })
+        .await
     }
 }

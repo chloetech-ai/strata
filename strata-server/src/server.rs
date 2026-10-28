@@ -57,6 +57,9 @@ pub struct Options {
     pub backup_dir: Option<PathBuf>,
     /// The background merger ([`strata::storage::Database::spawn_merger`]).
     pub merger: MergerOptions,
+    /// Log queries and writes that take this many milliseconds or more
+    /// (0: none).
+    pub slow_ms: u64,
 }
 
 /// Segment builds (flushes, merges, imports): vector indexes on every core.
@@ -96,7 +99,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             match Coordinator::connect_with(o.shards.clone(), o.coord.clone()).await {
                 Ok(c) => break c,
                 Err(e) if e.status != 400 => {
-                    eprintln!("strata-server: waiting for the shards: {}", e.message);
+                    tracing::warn!(error = %e.message, "waiting for the shards");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 Err(e) => return Err(e.message),
@@ -112,7 +115,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         let db = if path.exists() {
             let db = Db::open(&path, DbOptions { wal_drop_damaged: o.wal_drop_damaged, verify_checksums: o.verify_checksums, ..db_options(o.directory) }).map_err(|e| format!("open {}: {e}", path.display()))?;
             if let Some(what) = db.storage().damaged() {
-                eprintln!("strata-server: {} opened past damage: {what}", path.display());
+                tracing::warn!(db = %path.display(), damage = %what, "opened the database past damage");
             }
             db
         } else if let Some(n) = o.demo {
@@ -132,7 +135,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         db.spawn_flusher();
         db.spawn_merger(o.merger.clone());
         if let Some(b) = db.storage().merge_status().memory_budget {
-            eprintln!("strata-server: up to {} merges at once, within {} MiB", o.merger.threads.max(1), b >> 20);
+            tracing::info!(threads = o.merger.threads.max(1), memory_mib = b >> 20, "merging in the background");
         }
         let schema = db.schema().clone();
         (Backend::Local(db), schema)
@@ -141,11 +144,12 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if o.max_timeout_ms > 0 {
         svc.max_timeout = Duration::from_millis(o.max_timeout_ms).max(timeout);
     }
+    svc.slow = (o.slow_ms > 0).then(|| Duration::from_millis(o.slow_ms));
     svc.open_models(&o.models);
     for m in &svc.models {
         match &m.model {
-            Ok(e) => eprintln!("strata-server: {} is {}'s embedding of {}", m.field, e.name(), m.spec.from.join(" + ")),
-            Err(why) => eprintln!("strata-server: {} is {}'s embedding of {}, which this server cannot run ({why}): writes must supply its vectors", m.field, m.spec.model, m.spec.from.join(" + ")),
+            Ok(e) => tracing::info!(field = %m.field, model = %e.name(), from = %m.spec.from.join(" + "), "embedded field"),
+            Err(why) => tracing::warn!(field = %m.field, model = %m.spec.model, from = %m.spec.from.join(" + "), error = %why, "cannot run this embedded field's model: writes must supply its vectors"),
         }
     }
     if let (Some(fill), Backend::Local(db)) = (fill, &svc.backend) {
@@ -164,7 +168,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
                 db.load_from(&old).map_err(|e| format!("copy from {}: {e}", from.display()))?
             }
         };
-        eprintln!("strata-server: loaded {n} rows in {:.1} s", t0.elapsed().as_secs_f64());
+        tracing::info!(rows = n, secs = t0.elapsed().as_secs_f64(), "loaded the new database");
     }
     if let Some(path) = &o.synonyms {
         svc.open_synonyms(path).map_err(|e| e.message)?;
@@ -199,7 +203,7 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
         // overwritten in place.
         let tmp = out.join(format!("{file}.part"));
         std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, out.join(file))).map_err(|e| format!("{}: {e}", out.join(file).display()))?;
-        eprintln!("strata-server: {file} ({:.1} MB)", bytes.len() as f64 / 1e6);
+        tracing::info!(file, bytes = bytes.len(), "downloaded");
     }
     strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
     Ok(out)
@@ -221,19 +225,19 @@ pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: O
         Db::create(path, schema, opts).map_err(|e| format!("create {}: {e}", path.display()))?
     };
     for (field, why) in db.open_embedders(models) {
-        eprintln!("strata-server: cannot embed {field} ({why}): its vectors must be in the files");
+        tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
     }
     for file in files {
         let t0 = std::time::Instant::now();
         let r = strata::ingest::import_file(&db, file, format).map_err(|e| format!("{}: {e}", file.display()))?;
         let how = if r.bulk { "loaded" } else { "upserted" };
-        eprintln!("strata-server: {}: {} rows {how} in {:.1} s", file.display(), r.rows, t0.elapsed().as_secs_f64());
+        tracing::info!(file = %file.display(), rows = r.rows, how, secs = t0.elapsed().as_secs_f64(), "imported");
         if !r.unknown.is_empty() {
-            eprintln!("strata-server: {}: skipped fields the schema lacks: {}", file.display(), r.unknown.join(", "));
+            tracing::warn!(file = %file.display(), fields = %r.unknown.join(", "), "skipped fields the schema lacks");
         }
     }
     db.storage().merge(&MergePolicy::default()).map_err(|e| format!("merge: {e}"))?;
-    eprintln!("strata-server: {} has {} rows", path.display(), db.snapshot().n_live_docs());
+    tracing::info!(db = %path.display(), rows = db.snapshot().n_live_docs(), "imported every file");
     Ok(())
 }
 
@@ -251,7 +255,7 @@ pub fn spawn_maintenance(svc: &Arc<Service>) {
             svc.sweep_leases();
             let why = svc.failing().map(|w| format!("{w}; merges stop until then")).or_else(|| db.storage().merge_status().error.map(|e| format!("merge failed: {e}")));
             if why.is_some() && why != reported {
-                eprintln!("strata-server: {}", why.as_deref().unwrap_or_default());
+                tracing::error!(error = why.as_deref().unwrap_or_default(), "the database cannot merge");
             }
             reported = why;
         }
@@ -307,8 +311,12 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access
         s
     });
     let token = access.token.clone();
+    let counted = svc.clone();
     let check = move |req: tonic::Request<()>| match &token {
-        Some(t) if !t.admits(req.metadata().get("authorization").and_then(|v| v.to_str().ok())) => Err(tonic::Status::unauthenticated("missing or wrong token")),
+        Some(t) if !t.admits(req.metadata().get("authorization").and_then(|v| v.to_str().ok())) => {
+            counted.metrics.grpc("any", "Unauthenticated", 0.0);
+            Err(tonic::Status::unauthenticated("missing or wrong token"))
+        }
         _ => Ok(req),
     };
     let service = pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(256 << 20).max_encoding_message_size(256 << 20);
