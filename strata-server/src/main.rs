@@ -230,6 +230,7 @@ async fn main() {
     let access = Access { token: token.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls };
     let h = svc.health().await;
     eprintln!("strata-server: table {} ({} rows, {} segments)", svc.schema.table, h["docs"], h["segments"]);
+    eprintln!("strata-server: SIMD kernels: {}", strata::simd::describe());
     let scheme = if access.tls.is_some() { "https" } else { "http" };
     let asks = if access.token.is_some() { " (it asks for the token)" } else { "" };
     eprintln!("strata-server: HTTP and UI on {scheme}://{}/{asks}", a.listen);

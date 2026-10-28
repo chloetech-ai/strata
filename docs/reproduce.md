@@ -117,7 +117,7 @@ scripts/postings/run_designs.sh data/wikitext103.txt        # Pyramid, Loom and 
 python3 scripts/postings/build_report.py                    # report/postings/report.html and designs.html
 ```
 
-`.cargo/config.toml` builds with `-C target-cpu=native`. Every SIMD kernel has an AVX-512 version, a NEON version and a portable fallback; the committed timings are from the NEON build on the M2, so x86 timings are not directly comparable with them.
+`strata/.cargo/config.toml` builds with `-C target-cpu=native`. Every SIMD kernel has an AVX-512 version, a NEON version and a portable fallback; the committed timings are from the NEON build on the M2, so x86 timings are not directly comparable with them. strata-server, engram and the Python package build for a generic CPU and pick Strata's vector, column and posting-list kernels at run time (`strata::simd`; the server logs which), so their binaries run on any CPU of their architecture.
 
 ## Strata
 

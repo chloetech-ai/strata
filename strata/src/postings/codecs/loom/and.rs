@@ -46,27 +46,32 @@ const BATCH_BUF: usize = BATCH + ef::DECODE_SLACK + PAD;
 /// Number of the (sorted) `p[0..8]` below `v`.
 #[inline(always)]
 unsafe fn count_below(p: *const u32, v: u32) -> usize {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
-    {
-        use std::arch::x86_64::*;
-        let x = _mm256_loadu_si256(p.cast());
-        _mm256_cmplt_epu32_mask(x, _mm256_set1_epi32(v as i32)).count_ones() as usize
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx512() {
+        return count_below_avx512(p, v);
     }
     #[cfg(target_arch = "aarch64")]
     {
         count_below_neon(p, v)
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"), target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         count_below_scalar(p, v)
     }
 }
 
+/// [`count_below`] with one AVX-512VL compare.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline]
+unsafe fn count_below_avx512(p: *const u32, v: u32) -> usize {
+    use std::arch::x86_64::*;
+    let x = _mm256_loadu_si256(p.cast());
+    _mm256_cmplt_epu32_mask(x, _mm256_set1_epi32(v as i32)).count_ones() as usize
+}
+
 /// Portable [`count_below`].
-#[cfg_attr(
-    any(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"), target_arch = "aarch64"),
-    allow(dead_code)
-)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 unsafe fn count_below_scalar(p: *const u32, v: u32) -> usize {
     (0..8).map(|j| (*p.add(j) < v) as usize).sum()

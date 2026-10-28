@@ -270,8 +270,8 @@ impl EfCur {
     #[inline]
     pub unsafe fn decode(&mut self, count: usize, add: u32, out: *mut u32) {
         debug_assert!(count >= 1);
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-        if self.l <= 25 {
+        #[cfg(target_arch = "x86_64")]
+        if self.l <= 25 && crate::simd::avx512vbmi() {
             return self.decode_avx512(count, add, out);
         }
         #[cfg(target_arch = "aarch64")]
@@ -366,7 +366,8 @@ impl EfCur {
         }
     }
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
     #[inline(never)]
     unsafe fn decode_avx512(&mut self, count: usize, add: u32, out: *mut u32) {
         use std::arch::x86_64::*;
@@ -498,16 +499,16 @@ unsafe fn bucket_start(high: *const u64, samples: *const u16, start: usize, hb: 
 /// fallback and `pdep` give.
 #[inline(always)]
 fn select_unchecked(w: u64, k: u64) -> usize {
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    {
-        // SAFETY: guarded by the `bmi2` target feature.
-        unsafe { core::arch::x86_64::_pdep_u64(1u64.wrapping_shl(k as u32), w).trailing_zeros() as usize }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::bmi2() {
+        // SAFETY: the CPU has BMI2.
+        return unsafe { pdep_select(w, k) };
     }
     #[cfg(target_arch = "aarch64")]
     {
         crate::postings::bits::select_in_word_neon(w, k.min(64) as u32).min(64) as usize
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         if k < w.count_ones() as u64 {
             select_in_word(w, k as u32) as usize
@@ -515,6 +516,14 @@ fn select_unchecked(w: u64, k: u64) -> usize {
             64
         }
     }
+}
+
+/// [`select_unchecked`] with `pdep` (64 when `w` has `k` or fewer set bits).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[inline]
+unsafe fn pdep_select(w: u64, k: u64) -> usize {
+    core::arch::x86_64::_pdep_u64(1u64.wrapping_shl(k as u32), w).trailing_zeros() as usize
 }
 
 /// Position of zero number `r` (0-based) of the high bitvector `high` at or
@@ -529,44 +538,46 @@ fn select_unchecked(w: u64, k: u64) -> usize {
 /// The zero must exist, and 8 words from `from / 64` must be readable.
 #[inline(always)]
 unsafe fn select0_from(high: *const u64, from: usize, r: u64) -> usize {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"))]
-    {
-        use std::arch::x86_64::*;
-        let wi = from / 64;
-        let first = _mm512_mask_set1_epi64(_mm512_set1_epi64(-1), 1, (!0u64 << (from % 64)) as i64);
-        let zv = _mm512_andnot_si512(_mm512_loadu_si512(high.add(wi).cast()), first);
-        let cnt = _mm512_popcnt_epi64(zv);
-        let zero = _mm512_setzero_si512();
-        let mut pre = _mm512_add_epi64(cnt, _mm512_alignr_epi64::<7>(cnt, zero));
-        pre = _mm512_add_epi64(pre, _mm512_alignr_epi64::<6>(pre, zero));
-        pre = _mm512_add_epi64(pre, _mm512_alignr_epi64::<4>(pre, zero));
-        let m = _mm512_cmpgt_epu64_mask(pre, _mm512_set1_epi64(r as i64));
-        if m != 0 {
-            let j = _mm512_set1_epi64(m.trailing_zeros() as i64);
-            let before = _mm_cvtsi128_si64(_mm512_castsi512_si128(_mm512_permutexvar_epi64(j, _mm512_sub_epi64(pre, cnt)))) as u64;
-            let w = _mm_cvtsi128_si64(_mm512_castsi512_si128(_mm512_permutexvar_epi64(j, zv))) as u64;
-            return (wi + m.trailing_zeros() as usize) * 64 + select_in_word(w, (r - before) as u32) as usize;
-        }
-        bucket_start(high, std::ptr::null(), from, 0, r + 1) - 1
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx512vpopcntdq() {
+        return select0_from_avx512(high, from, r);
     }
     #[cfg(target_arch = "aarch64")]
     {
         select0_from_neon(high, from, r)
     }
-    #[cfg(not(any(
-        all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"),
-        target_arch = "aarch64"
-    )))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         select0_from_scalar(high, from, r)
     }
 }
 
+/// [`select0_from`] with AVX-512 VPOPCNTDQ.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq")]
+#[inline]
+unsafe fn select0_from_avx512(high: *const u64, from: usize, r: u64) -> usize {
+    use std::arch::x86_64::*;
+    let wi = from / 64;
+    let first = _mm512_mask_set1_epi64(_mm512_set1_epi64(-1), 1, (!0u64 << (from % 64)) as i64);
+    let zv = _mm512_andnot_si512(_mm512_loadu_si512(high.add(wi).cast()), first);
+    let cnt = _mm512_popcnt_epi64(zv);
+    let zero = _mm512_setzero_si512();
+    let mut pre = _mm512_add_epi64(cnt, _mm512_alignr_epi64::<7>(cnt, zero));
+    pre = _mm512_add_epi64(pre, _mm512_alignr_epi64::<6>(pre, zero));
+    pre = _mm512_add_epi64(pre, _mm512_alignr_epi64::<4>(pre, zero));
+    let m = _mm512_cmpgt_epu64_mask(pre, _mm512_set1_epi64(r as i64));
+    if m != 0 {
+        let j = _mm512_set1_epi64(m.trailing_zeros() as i64);
+        let before = _mm_cvtsi128_si64(_mm512_castsi512_si128(_mm512_permutexvar_epi64(j, _mm512_sub_epi64(pre, cnt)))) as u64;
+        let w = _mm_cvtsi128_si64(_mm512_castsi512_si128(_mm512_permutexvar_epi64(j, zv))) as u64;
+        return (wi + m.trailing_zeros() as usize) * 64 + select_in_word(w, (r - before) as u32) as usize;
+    }
+    bucket_start(high, std::ptr::null(), from, 0, r + 1) - 1
+}
+
 /// Portable [`select0_from`].
-#[cfg_attr(
-    any(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"), target_arch = "aarch64"),
-    allow(dead_code)
-)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 unsafe fn select0_from_scalar(high: *const u64, from: usize, r: u64) -> usize {
     // `bucket_start` passes r + 1 zeros from `from` (never via samples

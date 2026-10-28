@@ -32,7 +32,7 @@
 pub const SLACK: usize = 64;
 
 /// Words with at most this many set bits are extracted by the scalar loop.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[cfg(target_arch = "x86_64")]
 const SCALAR_MAX: u32 = 4;
 /// Words with at most this many set bits are extracted by the scalar loop.
 #[cfg(target_arch = "aarch64")]
@@ -49,15 +49,15 @@ const DENSE_GROUP: u32 = 12;
 /// `dst` must have room for every value plus [`SLACK`] slots.
 #[inline]
 pub unsafe fn extract(words: &[u64], base: u32, dst: *mut u32) -> *mut u32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    {
-        extract_avx512(words, base, dst)
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx512() {
+        return extract_avx512(words, base, dst);
     }
     #[cfg(target_arch = "aarch64")]
     {
         extract_neon(words, base, dst)
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         extract_scalar(words, base, dst)
     }
@@ -99,18 +99,12 @@ unsafe fn extract_word_scalar(mut w: u64, b: u32, dst: *mut u32) -> *mut u32 {
 ///
 /// # Safety
 /// `dst` must have room for the word's bits plus [`SLACK`] slots.
-#[cfg_attr(
-    not(any(
-        all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi"),
-        target_arch = "aarch64"
-    )),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_arch = "x86_64", target_arch = "aarch64")), allow(dead_code))]
 #[inline(always)]
 pub unsafe fn extract_word(w: u64, base: u32, dst: *mut u32) -> *mut u32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        if w.count_ones() <= SCALAR_MAX {
+        if w.count_ones() <= SCALAR_MAX || !crate::simd::avx512() {
             extract_word_scalar(w, base, dst)
         } else {
             extract_word_compress(w, base, dst)
@@ -124,7 +118,7 @@ pub unsafe fn extract_word(w: u64, base: u32, dst: *mut u32) -> *mut u32 {
             extract_word_neon(w, base, dst)
         }
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         extract_word_scalar(w, base, dst)
     }
@@ -134,10 +128,7 @@ pub unsafe fn extract_word(w: u64, base: u32, dst: *mut u32) -> *mut u32 {
 ///
 /// # Safety
 /// As for [`extract`].
-#[cfg_attr(
-    all(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64"), not(test)),
-    allow(dead_code)
-)]
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 #[inline]
 pub unsafe fn extract_scalar(words: &[u64], base: u32, mut dst: *mut u32) -> *mut u32 {
     for (i, &w) in words.iter().enumerate() {
@@ -149,8 +140,9 @@ pub unsafe fn extract_scalar(words: &[u64], base: u32, mut dst: *mut u32) -> *mu
 }
 
 /// Bitmask of the nonzero words among `p[..n]` (`n <= 64`).
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline]
 unsafe fn nonzero_words(p: *const u64, n: usize) -> u64 {
     use std::arch::x86_64::*;
     debug_assert!(n <= 64);
@@ -168,8 +160,9 @@ unsafe fn nonzero_words(p: *const u64, n: usize) -> u64 {
 }
 
 /// Compress-extract one word, 16 lanes per 16-bit quarter.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline]
 unsafe fn extract_word_compress(w: u64, b: u32, mut dst: *mut u32) -> *mut u32 {
     use std::arch::x86_64::*;
     let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -192,9 +185,9 @@ unsafe fn extract_word_compress(w: u64, b: u32, mut dst: *mut u32) -> *mut u32 {
 /// AVX-512 extraction (see the module documentation).
 ///
 /// # Safety
-/// As for [`extract`].
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline]
+/// As for [`extract`], on a CPU with AVX-512 ([`crate::simd::avx512`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn extract_avx512(words: &[u64], base: u32, mut dst: *mut u32) -> *mut u32 {
     let p = words.as_ptr();
     let mut g = 0;
@@ -311,43 +304,43 @@ pub unsafe fn extract_neon(words: &[u64], base: u32, mut dst: *mut u32) -> *mut 
 /// Number of set bits in `words`.
 #[inline]
 pub fn popcount(words: &[u64]) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"))]
-    {
-        // SAFETY: guarded by the target features; loads stay inside `words`.
-        unsafe {
-            use std::arch::x86_64::*;
-            let mut acc = _mm512_setzero_si512();
-            let chunks = words.chunks_exact(8);
-            let rest = chunks.remainder();
-            for c in chunks {
-                let v = _mm512_loadu_si512(c.as_ptr().cast());
-                acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(v));
-            }
-            let mut total = _mm512_reduce_add_epi64(acc) as u64;
-            for &w in rest {
-                total += w.count_ones() as u64;
-            }
-            total
-        }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx512vpopcntdq() {
+        // SAFETY: the CPU has AVX-512 VPOPCNTDQ.
+        return unsafe { popcount_avx512(words) };
     }
     #[cfg(target_arch = "aarch64")]
     {
         popcount_neon(words)
     }
-    #[cfg(not(any(
-        all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"),
-        target_arch = "aarch64"
-    )))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         popcount_scalar(words)
     }
 }
 
+/// [`popcount`] with AVX-512 VPOPCNTDQ, eight words per instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq")]
+unsafe fn popcount_avx512(words: &[u64]) -> u64 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm512_setzero_si512();
+    let chunks = words.chunks_exact(8);
+    let rest = chunks.remainder();
+    for c in chunks {
+        // Each load stays inside `words`.
+        let v = _mm512_loadu_si512(c.as_ptr().cast());
+        acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(v));
+    }
+    let mut total = _mm512_reduce_add_epi64(acc) as u64;
+    for &w in rest {
+        total += w.count_ones() as u64;
+    }
+    total
+}
+
 /// Portable [`popcount`].
-#[cfg_attr(
-    any(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vpopcntdq"), target_arch = "aarch64"),
-    allow(dead_code)
-)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
 pub fn popcount_scalar(words: &[u64]) -> u64 {
     words.iter().map(|w| w.count_ones() as u64).sum()
