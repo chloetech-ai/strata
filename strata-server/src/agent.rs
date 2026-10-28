@@ -65,6 +65,9 @@ fn field_line(svc: &Service, f: &strata::Field, i: usize) -> String {
             notes.push(format!("indexes {}", f.generated_from.join(" + ")));
         }
     }
+    if let Some(e) = &f.embed {
+        notes.push(format!("embedding of {} by {}", e.from.join(" + "), e.model));
+    }
     let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) };
     format!("- {} {ty}{notes}", f.name)
 }
@@ -72,15 +75,25 @@ fn field_line(svc: &Service, f: &strata::Field, i: usize) -> String {
 fn system_prompt(svc: &Service, docs: u64) -> String {
     let s = &svc.schema;
     let fields: Vec<String> = s.fields.iter().enumerate().map(|(i, f)| field_line(svc, f, i)).collect();
-    let vf = svc.vector_field();
-    let vector_help = match (&vf, &svc.embedder) {
-        (Some(v), Some(e)) => format!(
-            "- similarity({v}, :p) ranks by vector similarity. Bind :p in `params` as {{\"vector_of\": \"<key>\"}} (that row's vector, for \"more like this\") or {{\"embed\": \"some text\"}} (the server's embedder: {}).",
-            e.name
-        ),
-        (Some(v), None) => format!("- similarity({v}, :p) ranks by vector similarity. Bind :p in `params` as {{\"vector_of\": \"<key>\"}}, the vector of that row (\"more like this\")."),
-        (None, _) => "- The table has no VECTOR field.".to_string(),
-    };
+    let vectors: Vec<String> = s
+        .fields
+        .iter()
+        .filter(|f| matches!(f.ty, FieldType::Vector { .. }))
+        .map(|f| {
+            let v = &f.name;
+            let like = format!("{{\"vector_of\": \"<key>\", \"field\": \"{v}\"}} (that row's vector, for \"more like this\")");
+            match svc.models.iter().find(|m| &m.field == v) {
+                Some(m) if m.model.is_ok() => format!(
+                    "- similarity({v}, :p) ranks by meaning: {v} is the embedding of {} by {}. Bind :p in `params` as {like} or {{\"embed\": \"some text\", \"field\": \"{v}\"}} (the text embedded by the same model).",
+                    m.spec.from.join(" + "),
+                    m.spec.model
+                ),
+                Some(m) => format!("- similarity({v}, :p) ranks by meaning: {v} is the embedding of {} by {}, which this server cannot run. Bind :p in `params` as {like}.", m.spec.from.join(" + "), m.spec.model),
+                None => format!("- similarity({v}, :p) ranks by vector similarity. Bind :p in `params` as {like}."),
+            }
+        })
+        .collect();
+    let vector_help = if vectors.is_empty() { "- The table has no VECTOR field.".to_string() } else { vectors.join("\n") };
     let sparse_help = match s.fields.iter().find(|f| f.ty == FieldType::Sparse) {
         Some(f) => format!(
             "\n- similarity({}, :w) ranks by learned term weights (a dot product). Bind :w in `params` as an object of lower-case terms and weights, e.g. {{\"boots\": 1.0, \"hiking\": 0.7}}.",

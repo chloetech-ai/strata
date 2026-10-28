@@ -5,16 +5,20 @@
 //! strata-server --db my.strata                         # an existing database
 //! strata-server --shards http://a:7701,http://b:7701   # a coordinator over shard servers
 //! strata-server --shards 'http://a0:7701|http://a1:7701,http://b0:7701|http://b1:7701'   # two replicas each
+//! strata-server --db new.strata --schema new.json --copy-from my.strata   # re-embed into a new schema
+//! strata-server fetch-model potion-retrieval-32M       # download an embedding model
 //! ```
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use strata_server::server::{self, Options};
 
 #[derive(Parser)]
-#[command(about = "Strata over HTTP JSON and gRPC, with a query UI and an agent")]
+#[command(about = "Strata over HTTP JSON and gRPC, with a query UI and an agent", args_conflicts_with_subcommands = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// The database to serve (created if missing, with --schema or --demo).
     #[arg(long)]
     db: Option<PathBuf>,
@@ -27,6 +31,14 @@ struct Args {
     /// With --demo: keep only the products of shard I of N ("I/N").
     #[arg(long)]
     demo_shard: Option<String>,
+    /// Fill the new database (--db with --schema) with this database's rows,
+    /// field by field by name; vector fields whose embedding changed are
+    /// embedded anew.
+    #[arg(long)]
+    copy_from: Option<PathBuf>,
+    /// Where embedded fields' models are (see `fetch-model`).
+    #[arg(long, env = "STRATA_MODELS")]
+    models: Option<PathBuf>,
     /// Create a new database as a directory of segment files.
     #[arg(long)]
     directory: bool,
@@ -67,18 +79,37 @@ struct Args {
     /// The Claude API's base URL.
     #[arg(long, env = "ANTHROPIC_BASE_URL", default_value = "https://api.anthropic.com")]
     api_base: String,
-    /// Serve {"embed": "text"} parameters with hashed bag-of-words vectors.
-    #[arg(long)]
-    hash_embedder: bool,
     /// Synonyms for `synonyms => 1` searches, one rule per line in Solr's
     /// format (`laptop, notebook` or `tv => television`); the UI edits it.
     #[arg(long)]
     synonyms: Option<PathBuf>,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Download an embedding model from Hugging Face into the models directory.
+    FetchModel {
+        /// A known name (potion-retrieval-32M, potion-base-8M, bge-small-en-v1.5,
+        /// snowflake-arctic-embed-m-v1.5) or a repository, owner/name.
+        name: String,
+        /// Where to put it (default: --models, $STRATA_MODELS, or
+        /// ~/.local/share/strata/models).
+        #[arg(long, env = "STRATA_MODELS")]
+        models: Option<PathBuf>,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     let a = Args::parse();
+    if let Some(Command::FetchModel { name, models }) = &a.command {
+        let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
+        match server::fetch_model(name, &dir).await {
+            Ok(path) => eprintln!("strata-server: {name} is in {}", path.display()),
+            Err(e) => fail(&e),
+        }
+        return;
+    }
     let demo_shard = a.demo_shard.as_deref().map(|s| {
         let (i, n) = s.split_once('/').unwrap_or_else(|| fail("--demo-shard is I/N"));
         (i.parse().unwrap_or_else(|_| fail("--demo-shard is I/N")), n.parse().unwrap_or_else(|_| fail("--demo-shard is I/N")))
@@ -86,6 +117,7 @@ async fn main() {
     let o = Options {
         db: a.db,
         schema: a.schema,
+        copy_from: a.copy_from,
         demo: a.demo,
         demo_shard,
         directory: a.directory,
@@ -101,7 +133,7 @@ async fn main() {
         model: a.model,
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()),
         api_base: a.api_base,
-        hash_embedder: a.hash_embedder,
+        models: a.models.unwrap_or_else(strata::embed::models_dir),
         synonyms: a.synonyms,
     };
     let coordinator = !o.shards.is_empty();

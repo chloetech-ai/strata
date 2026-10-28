@@ -27,8 +27,14 @@ fn agent_config(base_url: &str) -> AgentConfig {
 fn create(dir: &std::path::Path, name: &str, keep: impl Fn(usize) -> bool) -> Db {
     let opts = DbOptions { segment_max_docs: 700, publish_snapshots: true, ..DbOptions::default() };
     let db = Db::create(&dir.join(name), demo::schema(N), opts).unwrap();
+    db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
     db.load((0..N).filter(|&i| keep(i)).map(|i| demo::product(i, 7))).unwrap();
     db
+}
+
+/// The demo's vector of product 42 (what `{"vector_of": "p0000042"}` binds).
+fn vector_42(db: &Db) -> Value {
+    db.query("SELECT emb FROM products WHERE id = 'p0000042'", &Params::new()).unwrap().rows[0][0].clone()
 }
 
 fn service(db: Db, base_url: &str) -> Arc<Service> {
@@ -116,7 +122,7 @@ async fn http_answers_like_the_embedded_database() {
     let db = create(dir.path(), "p.strata", |_| true);
     let mut want = Vec::new();
     for (sql, params) in queries() {
-        let p = if params["q"].is_object() { Params::new().set("q", demo::product(42, 7)[12].clone()) } else { Params::new() };
+        let p = if params["q"].is_object() { Params::new().set("q", vector_42(&db)) } else { Params::new() };
         want.push(js::result(&db.query(sql, &p).unwrap(), 0.0));
     }
     let base = http(service(db, "http://unused"), None).await;
@@ -308,7 +314,7 @@ async fn coordinator_answers_like_one_database() {
     let schema = c.schema.clone();
     let coord = Arc::new(Service::new(Backend::Cluster(Arc::new(c)), schema, agent_config("http://unused"), 16, Duration::from_secs(10)));
     for (sql, params) in queries() {
-        let p = if params["q"].is_object() { Params::new().set("q", demo::product(42, 7)[12].clone()) } else { Params::new() };
+        let p = if params["q"].is_object() { Params::new().set("q", vector_42(&whole)) } else { Params::new() };
         let want = js::result(&whole.query(sql, &p).unwrap(), 0.0);
         let params = coord.params(Some(&params)).await.unwrap();
         let got = coord.query(QueryReq { sql: sql.into(), params, ..Default::default() }).await.unwrap();
@@ -418,7 +424,7 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
     let c = Coordinator::connect_with(vec![format!("{dead}|{}", good[0][0]), format!("{hung}|{}", good[1][0])], opts.clone()).await.unwrap();
     let coord = cluster(c);
     for (sql, params) in queries() {
-        let p = if params["q"].is_object() { Params::new().set("q", demo::product(42, 7)[12].clone()) } else { Params::new() };
+        let p = if params["q"].is_object() { Params::new().set("q", vector_42(&whole)) } else { Params::new() };
         let want = js::result(&whole.query(sql, &p).unwrap(), 0.0);
         let params = coord.params(Some(&params)).await.unwrap();
         let t = std::time::Instant::now();
@@ -597,4 +603,38 @@ async fn sparse_and_binary_vector_fields_over_http() {
     assert_eq!(status, 400, "{r}");
     let metrics = c.get(format!("{base}/metrics")).send().await.unwrap().text().await.unwrap();
     assert!(metrics.contains(r#"kind="sparse",outcome="ok"} 1"#), "{metrics}");
+}
+
+/// A field declared as the embedding of others: the server embeds the rows
+/// writes send without it and the text of `{"embed": ...}` parameters with
+/// the same model, and says so in /v1/schema.
+#[tokio::test(flavor = "multi_thread")]
+async fn embedded_fields_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("e.strata"), demo::schema(500), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let schema = db.schema().clone();
+    let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
+    svc.open_models(dir.path());
+    let base = http(Arc::new(svc), None).await;
+    let c = reqwest::Client::new();
+    let r: Json = c.get(format!("{base}/v1/schema")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r["embeddings"], json!([{"field": "emb", "from": ["title", "description"], "model": "hash:64", "loaded": true, "error": null}]));
+
+    let docs: Vec<Json> = (0..500).map(|i| js::document_json(&demo::schema(500), &demo::product(i, 7))).collect();
+    let mut ops: Vec<Json> = docs.iter().map(|d| json!({"op": "insert", "doc": d})).collect();
+    ops.push(json!({"op": "insert", "doc": {"id": "zz1", "title": "Zebra striped umbrella", "description": "A zebra umbrella for rainy days."}}));
+    let (status, w) = post(&c, &format!("{base}/v1/write"), json!({"ops": ops})).await;
+    assert_eq!((status, w["written"].as_u64()), (200, Some(501)), "{w}");
+
+    let find = |text: &str| json!({"sql": "SELECT id FROM products ORDER BY similarity(emb, :q) DESC LIMIT 1", "params": {"q": {"embed": text, "field": "emb"}}});
+    let (status, r) = post(&c, &format!("{base}/v1/query"), find("zebra umbrella")).await;
+    assert_eq!((status, &r["rows"][0][0]), (200, &json!("zz1")), "{r}");
+    // A rewrite of a source re-embeds the row.
+    let (status, _) = post(&c, &format!("{base}/v1/sql"), json!({"sql": "UPDATE products SET title = 'Giraffe desk lamp', description = 'A tall giraffe lamp.' WHERE id = 'zz1'"})).await;
+    assert_eq!(status, 200);
+    let (_, r) = post(&c, &format!("{base}/v1/query"), find("giraffe lamp")).await;
+    assert_eq!(r["rows"][0][0], json!("zz1"), "{r}");
+    // Only an embedded field with a model embeds text.
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id FROM products ORDER BY similarity(emb, :q) DESC LIMIT 1", "params": {"q": {"embed": "x", "field": "title"}}})).await;
+    assert_eq!(status, 400, "{r}");
 }

@@ -11,7 +11,7 @@ use strata::storage::{DbOptions, Layout, MergePolicy};
 use tokio::net::TcpListener;
 
 use crate::coord::{CoordOptions, Coordinator};
-use crate::service::{shard_of, AgentConfig, Backend, Embedder, Service};
+use crate::service::{shard_of, AgentConfig, Backend, Service};
 use crate::{demo, grpc, http, pb};
 
 #[derive(Clone, Debug, Default)]
@@ -20,6 +20,8 @@ pub struct Options {
     pub db: Option<PathBuf>,
     /// A JSON schema (Strata's `Schema` serialization) for a new database.
     pub schema: Option<PathBuf>,
+    /// Fill a new database with the rows of this one ([`Db::load_from`]).
+    pub copy_from: Option<PathBuf>,
     /// Create the demo catalogue with this many products.
     pub demo: Option<usize>,
     /// Keep only the demo products of shard `i` of `n`.
@@ -35,8 +37,8 @@ pub struct Options {
     pub model: String,
     pub api_key: Option<String>,
     pub api_base: String,
-    /// Serve `{"embed": ...}` parameters with the demo's hashed vectors.
-    pub hash_embedder: bool,
+    /// Where embedded fields' models are ([`strata::embed::open`]).
+    pub models: PathBuf,
     /// The synonym list for `synonyms => 1` searches (Solr format), read at
     /// start if it exists and written by `PUT /v1/synonyms`.
     pub synonyms: Option<PathBuf>,
@@ -59,6 +61,12 @@ pub fn db_options(directory: bool) -> DbOptions {
 pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let agent = AgentConfig { api_key: o.api_key.clone(), model: o.model.clone(), base_url: o.api_base.clone() };
     let timeout = Duration::from_millis(o.timeout_ms.max(1));
+    // What a new database is filled with, once its models are open.
+    enum Fill {
+        Demo(usize),
+        Copy(PathBuf),
+    }
+    let mut fill = None;
     let (backend, schema) = if !o.shards.is_empty() {
         // A shard with no replica answering yet (the cluster is starting, or
         // one is down) is waited for; a wrong URL or schema is not.
@@ -76,19 +84,18 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         (Backend::Cluster(Arc::new(c)), schema)
     } else {
         let path = o.db.clone().ok_or("pass --db PATH (or --shards to coordinate shard servers)")?;
+        if o.copy_from.is_some() && (path.exists() || o.schema.is_none()) {
+            return Err("--copy-from fills a new database: pass a --db that does not exist and its --schema".into());
+        }
         let db = if path.exists() {
             Db::open(&path, db_options(o.directory)).map_err(|e| format!("open {}: {e}", path.display()))?
         } else if let Some(n) = o.demo {
-            let db = Db::create(&path, demo::schema(n), db_options(o.directory)).map_err(|e| e.to_string())?;
-            let keep = |i: usize| match o.demo_shard {
-                Some((s, of)) => shard_of(&strata::Value::Str(format!("p{i:07}")), of) == s,
-                None => true,
-            };
-            db.load((0..n).filter(|&i| keep(i)).map(|i| demo::product(i, 7))).map_err(|e| e.to_string())?;
-            db
+            fill = Some(Fill::Demo(n));
+            Db::create(&path, demo::schema(n), db_options(o.directory)).map_err(|e| e.to_string())?
         } else if let Some(s) = &o.schema {
             let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
             let schema: Schema = serde_json::from_str(&text).map_err(|e| format!("schema {}: {e}", s.display()))?;
+            fill = o.copy_from.clone().map(Fill::Copy);
             Db::create(&path, schema, db_options(o.directory)).map_err(|e| e.to_string())?
         } else {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
@@ -99,19 +106,63 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         (Backend::Local(db), schema)
     };
     let mut svc = Service::new(backend, schema, agent, o.max_concurrent.max(1), timeout);
-    if o.hash_embedder || o.demo.is_some() {
-        let dim = svc.vector_field().and_then(|f| match &svc.schema.field(&f)?.ty {
-            strata::FieldType::Vector { dim, .. } => Some(*dim),
-            _ => None,
-        });
-        if let Some(dim) = dim {
-            svc.embedder = Some(Embedder { name: "hashed bag of words (the demo's; not a learned model)".into(), dim, embed: demo::hash_embed });
+    svc.open_models(&o.models);
+    for m in &svc.models {
+        match &m.model {
+            Ok(e) => eprintln!("strata-server: {} is {}'s embedding of {}", m.field, e.name(), m.spec.from.join(" + ")),
+            Err(why) => eprintln!("strata-server: {} is {}'s embedding of {}, which this server cannot run ({why}): writes must supply its vectors", m.field, m.spec.model, m.spec.from.join(" + ")),
         }
+    }
+    if let (Some(fill), Backend::Local(db)) = (fill, &svc.backend) {
+        let t0 = std::time::Instant::now();
+        let n = match fill {
+            Fill::Demo(n) => {
+                let keep = |i: usize| match o.demo_shard {
+                    Some((s, of)) => shard_of(&strata::Value::Str(format!("p{i:07}")), of) == s,
+                    None => true,
+                };
+                db.load((0..n).filter(|&i| keep(i)).map(|i| demo::product(i, 7))).map_err(|e| e.to_string())?;
+                db.snapshot().n_live_docs()
+            }
+            Fill::Copy(from) => {
+                let old = Db::open(&from, DbOptions::default()).map_err(|e| format!("open {}: {e}", from.display()))?;
+                db.load_from(&old).map_err(|e| format!("copy from {}: {e}", from.display()))?
+            }
+        };
+        eprintln!("strata-server: loaded {n} rows in {:.1} s", t0.elapsed().as_secs_f64());
     }
     if let Some(path) = &o.synonyms {
         svc.open_synonyms(path).map_err(|e| e.message)?;
     }
     Ok(Arc::new(svc))
+}
+
+/// Downloads model `name` ([`strata::embed::KNOWN_MODELS`], or a Hugging
+/// Face repository `owner/name`) into `dir`; returns its directory.
+pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
+    let (local, repo) = match strata::embed::KNOWN_MODELS.iter().find(|m| m.0.eq_ignore_ascii_case(name)) {
+        Some(m) => (m.0.to_string(), m.1.to_string()),
+        None if name.contains('/') => (name.rsplit('/').next().unwrap_or(name).to_string(), name.to_string()),
+        None => {
+            let known: Vec<&str> = strata::embed::KNOWN_MODELS.iter().map(|m| m.0).collect();
+            return Err(format!("unknown model {name}: one of {}, or a Hugging Face repository owner/name", known.join(", ")));
+        }
+    };
+    let out = dir.join(&local);
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let client = reqwest::Client::new();
+    for file in strata::embed::MODEL_FILES {
+        let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
+        let r = client.get(&url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("{url}: {e}"))?;
+        let bytes = r.bytes().await.map_err(|e| format!("{url}: {e}"))?;
+        // Written aside and renamed, so that an open model is never
+        // overwritten in place.
+        let tmp = out.join(format!("{file}.part"));
+        std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, out.join(file))).map_err(|e| format!("{}: {e}", out.join(file).display()))?;
+        eprintln!("strata-server: {file} ({:.1} MB)", bytes.len() as f64 / 1e6);
+    }
+    strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 /// Merges segments in the background, as writes add them.

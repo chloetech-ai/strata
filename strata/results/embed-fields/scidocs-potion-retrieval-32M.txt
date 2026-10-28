@@ -1,0 +1,9 @@
+scidocs: 25657 documents, 1000 queries; model static:potion-retrieval-32M (512 dimensions)
+loaded and embedded 3 fields in 3.5 s (0 documents without a title get no title vector)
+scidocs (1000 queries)                                           nDCG@10  recall@100
+bm25 (title + text)                                               0.1569      0.3589
+potion-retrieval-32M vector of title                              0.1284      0.3056
+potion-retrieval-32M vector of text                               0.1202      0.3181
+potion-retrieval-32M vector of title + text                       0.1369      0.3421
+rrf(bm25, potion-retrieval-32M vector of title + text)            0.1594      0.3769
+reference: Cohere embed-english-v3 vector of title + text         0.2034      0.4505

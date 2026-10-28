@@ -120,6 +120,7 @@ Document lengths are quantised to one byte. Ranked queries drop English function
 - **Range postings.** Numeric fields get an equi-depth histogram of 64 buckets whose buckets are docID lists. A range is the union of the buckets it covers, plus the boundary buckets filtered through the column. The histogram doubles as the selectivity estimator.
 - **Doc store.** Rows in LZ4-compressed 16 KiB blocks with a block index; it serves projections and is the source for merges.
 - **Generated columns.** A TEXT field may be generated from other stored text fields (`body` = title + text in the evaluation table), indexed but not stored, and recomputed by merges.
+- **Embedded vector fields.** A VECTOR field may be declared as a model's embedding of other fields (`"embed": {"from": ["title"], "model": "potion-retrieval-32M"}`). The schema records it; given the model, writes that leave the vector out get it computed and rewrites of a source recompute it, while merges keep the stored vectors ([embedded vector fields](server.md#embedded-vector-fields)).
 
 ### Vectors
 

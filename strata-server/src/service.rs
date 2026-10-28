@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
 use strata::db::{Db, SqlResult};
+use strata::embed::Embedder;
 use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::stats::TermStats;
 use strata::query::{bind, compound, Params};
@@ -53,12 +54,15 @@ pub struct Answer {
     pub missing: Vec<String>,
 }
 
-/// Turns text into a vector for `{"embed": "..."}` parameters.
-pub struct Embedder {
-    /// What it is, for `/v1/schema` and the agent.
-    pub name: String,
-    pub dim: usize,
-    pub embed: fn(&str, usize) -> Vec<f32>,
+/// An embedded VECTOR field ([`strata::Embed`]) and its model, which
+/// computes the vectors writes leave out and embeds `{"embed": "text"}`
+/// parameters.
+pub struct FieldModel {
+    pub field: String,
+    pub spec: strata::Embed,
+    /// The model, or why it did not open (then writes must supply the
+    /// vectors, and text cannot be searched against the field).
+    pub model: Result<Arc<dyn Embedder>, String>,
 }
 
 /// The agent's model settings ([`crate::agent`]).
@@ -74,7 +78,8 @@ pub struct Service {
     pub schema: Schema,
     pub metrics: Metrics,
     pub agent: AgentConfig,
-    pub embedder: Option<Embedder>,
+    /// The embedded VECTOR fields' models ([`Service::open_models`]).
+    pub models: Vec<FieldModel>,
     /// Default query deadline.
     pub timeout: Duration,
     pub lease_ttl: Duration,
@@ -108,7 +113,7 @@ impl Service {
             schema,
             metrics: Metrics::default(),
             agent,
-            embedder: None,
+            models: Vec::new(),
             timeout,
             lease_ttl: Duration::from_secs(60),
             leases: Mutex::new(HashMap::new()),
@@ -120,6 +125,67 @@ impl Service {
             synonyms: RwLock::new(None),
             synonyms_file: None,
         }
+    }
+
+    /// Opens the model of each embedded VECTOR field from `dir`
+    /// ([`strata::embed::open`]); a local database computes the vectors
+    /// its writes leave out with them.
+    pub fn open_models(&mut self, dir: &std::path::Path) {
+        self.models = self
+            .schema
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let spec = f.embed.clone()?;
+                let model = strata::embed::open(&spec.model, dir).and_then(|m| match &self.backend {
+                    Backend::Local(db) => db.set_embedder(&f.name, m.clone()).map(|_| m),
+                    Backend::Cluster(_) => Ok(m),
+                });
+                Some(FieldModel { field: f.name.clone(), spec, model: model.map_err(|e| e.to_string()) })
+            })
+            .collect();
+    }
+
+    /// The model of embedded field `field`, or of the first embedded field
+    /// that has one.
+    pub fn model(&self, field: Option<&str>) -> Result<(&str, &Arc<dyn Embedder>), ApiError> {
+        let m = match field {
+            Some(f) => self.models.iter().find(|m| m.field.eq_ignore_ascii_case(f)).ok_or_else(|| ApiError::bad(format!("{f} is not an embedded VECTOR field; pass a vector")))?,
+            None => self.models.iter().find(|m| m.model.is_ok()).ok_or_else(|| ApiError::bad("this table has no field this server can embed text for; pass a vector"))?,
+        };
+        match &m.model {
+            Ok(e) => Ok((&m.field, e)),
+            Err(why) => Err(ApiError::bad(format!("{}'s model {} is not available here ({why}); pass a vector", m.field, m.spec.model))),
+        }
+    }
+
+    /// Computes the embedded vectors that the documents of `ops` leave out
+    /// before they queue for the writer, so that models run on many cores
+    /// rather than in the writer thread.
+    fn embed_ops(&self, db: &Db, ops: &mut [Json]) -> Result<(), ApiError> {
+        let wanted: Vec<usize> = self.models.iter().filter(|m| m.model.is_ok()).filter_map(|m| self.schema.field_index(&m.field)).collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let writes_doc = |op: &Json| matches!(op.get("op").and_then(|o| o.as_str()), Some("insert" | "upsert" | "upsert_if_newer"));
+        let mut at = Vec::new();
+        let mut docs = Vec::new();
+        for (i, op) in ops.iter().enumerate() {
+            if writes_doc(op) && op.get("doc").is_some_and(|d| d.is_object()) {
+                docs.push(js::document(&self.schema, &op["doc"])?);
+                at.push(i);
+            }
+        }
+        let before: Vec<Vec<bool>> = docs.iter().map(|d| wanted.iter().map(|&f| matches!(d[f], Value::Null)).collect()).collect();
+        db.embed_missing(&mut docs);
+        for ((i, d), missing) in at.into_iter().zip(&docs).zip(before) {
+            for (&f, was_missing) in wanted.iter().zip(missing) {
+                if let (true, Value::Vector(v)) = (was_missing, &d[f]) {
+                    ops[i]["doc"][self.schema.fields[f].name.as_str()] = json!(v.as_ref());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reads the synonym list at `path` if it exists; `PUT /v1/synonyms`
@@ -214,7 +280,9 @@ impl Service {
     /// Parameters from JSON. Besides plain values (see [`js::param`]), a
     /// parameter may be `{"vector_of": key, "field": "emb"}`, the vector of
     /// a stored document (field: the first VECTOR field if left out), or
-    /// `{"embed": "text"}`, the embedder's vector of the text.
+    /// `{"embed": "text", "field": "emb"}`, the vector of the text by the
+    /// model of that embedded field (the first one with a model if left
+    /// out), so that the text and the rows are embedded alike.
     pub async fn params(self: &Arc<Self>, j: Option<&Json>) -> Result<Params, ApiError> {
         let mut p = Params::new();
         let Some(j) = j.filter(|j| !j.is_null()) else { return Ok(p) };
@@ -228,10 +296,12 @@ impl Service {
                     };
                     self.vector_of(&o["vector_of"], &field).await?
                 }
-                Json::Object(o) if o.len() == 1 && o.get("embed").is_some_and(|e| e.is_string()) => {
-                    let e = self.embedder.as_ref().ok_or_else(|| ApiError::bad("this server has no embedder; pass the vector"))?;
-                    let text = o["embed"].as_str().ok_or_else(|| ApiError::bad("embed takes a string"))?;
-                    Value::Vector((e.embed)(text, e.dim).into())
+                Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string()) && o.keys().all(|k| k == "embed" || k == "field") => {
+                    let (_, e) = self.model(o.get("field").and_then(|f| f.as_str()))?;
+                    let text = o["embed"].as_str().unwrap_or_default().to_string();
+                    let e = e.clone();
+                    let v = tokio::task::spawn_blocking(move || e.embed_query(&text)).await.map_err(ApiError::internal)?;
+                    Value::Vector(v.into())
                 }
                 v => js::param(v)?,
             };
@@ -426,9 +496,16 @@ impl Service {
     /// Applies write operations (see the proto's WriteRequest) in one
     /// transaction per server, which other requests waiting at the same
     /// time may share (see [`writer`]).
-    pub async fn write_ops(self: &Arc<Self>, ops: Vec<Json>) -> Result<u64, ApiError> {
+    pub async fn write_ops(self: &Arc<Self>, mut ops: Vec<Json>) -> Result<u64, ApiError> {
         let n = match &self.backend {
-            Backend::Local(_) => self.write(WriteJob::Ops(ops), Instant::now() + self.timeout).await?,
+            Backend::Local(db) => {
+                let deadline = Instant::now() + self.timeout;
+                if self.models.iter().any(|m| m.model.is_ok()) {
+                    let (svc, db) = (self.clone(), db.clone());
+                    ops = tokio::task::spawn_blocking(move || svc.embed_ops(&db, &mut ops).map(|_| ops)).await.map_err(ApiError::internal)??;
+                }
+                self.write(WriteJob::Ops(ops), deadline).await?
+            }
             Backend::Cluster(c) => c.write_ops(ops).await?,
         };
         self.metrics.write(n);

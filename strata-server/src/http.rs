@@ -102,7 +102,12 @@ async fn schema(State(app): State<App>) -> AxJson<Json> {
     AxJson(json!({
         "schema": s,
         "primary_key": s.primary_key.map(|k| s.fields[k].name.clone()),
-        "embedder": app.svc.embedder.as_ref().map(|e| json!({"name": e.name, "dim": e.dim})),
+        // Each embedded VECTOR field: its sources, model, and whether this
+        // server can embed text for it.
+        "embeddings": app.svc.models.iter().map(|m| json!({
+            "field": m.field, "from": m.spec.from, "model": m.spec.model,
+            "loaded": m.model.is_ok(), "error": m.model.as_ref().err(),
+        })).collect::<Vec<_>>(),
     }))
 }
 

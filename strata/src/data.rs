@@ -11,7 +11,7 @@
 //! | `category` | KEYWORD | synthetic, Zipf(1) over 64 values `c00`..`c63` |
 //! | `rating` | FLOAT | synthetic, uniform [0, 5) |
 //! | `topic` | KEYWORD | k-means cluster of the embedding, `t00`..`t31` |
-//! | `emb` | VECTOR(1024) | Cohere embed-english-v3, unit length |
+//! | `emb` | VECTOR(1024) | Cohere embed-english-v3 of title + text, unit length (computed by Cohere; recorded in the schema with `embed`) |
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -56,7 +56,7 @@ pub fn beir_schema(dim: usize, index: VectorIndexKind) -> Schema {
             Field::new("category", FieldType::Keyword),
             Field::new("rating", FieldType::Float),
             Field::new("topic", FieldType::Keyword),
-            Field::new("emb", FieldType::Vector { dim, index }).not_stored(),
+            Field::new("emb", FieldType::Vector { dim, index }).not_stored().embedded("cohere/embed-english-v3.0", &["title", "text"]),
         ],
         Some("id"),
     )
