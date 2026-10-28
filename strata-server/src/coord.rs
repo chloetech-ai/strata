@@ -143,12 +143,26 @@ impl HedgeBudget {
 
     /// Earns a call's share of a hedge.
     fn earn(&self) {
-        let _ = self.0.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| (b < Self::CAP).then(|| (b + Self::SHARE).min(Self::CAP)));
+        self.update(|b| (b < Self::CAP).then(|| (b + Self::SHARE).min(Self::CAP)));
     }
 
     /// Spends a hedge, if one is saved.
     fn spend(&self) -> bool {
-        self.0.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(Self::ONE)).is_ok()
+        self.update(|b| b.checked_sub(Self::ONE))
+    }
+
+    /// Replaces the budget with `f` of it, unless `f` declines; whether it
+    /// was replaced. (`fetch_update` is deprecated on newer toolchains and
+    /// its replacement missing on older ones.)
+    fn update(&self, f: impl Fn(u64) -> Option<u64>) -> bool {
+        let mut b = self.0.load(Ordering::Relaxed);
+        while let Some(next) = f(b) {
+            match self.0.compare_exchange_weak(b, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(now) => b = now,
+            }
+        }
+        false
     }
 }
 
