@@ -14,3 +14,5 @@ scidocs potion-retrieval-32M start 2026-10-27 16:58:16 PDT load: { 24.70 40.37 3
 scidocs potion-retrieval-32M end   2026-10-27 16:58:22 PDT load: { 23.52 39.87 36.64 } exit 0 wall 6 s
 nfcorpus bge-small-en-v1.5 start 2026-10-27 16:58:24 PDT load: { 21.64 39.20 36.43 } (accelerate)
 nfcorpus bge-small-en-v1.5 end   2026-10-27 17:11:30 PDT load: { 63.20 52.01 41.55 } exit 0 wall 786 s
+scifact snowflake-arctic-embed-m-v1.5 start 2026-10-27 17:11:33 PDT load: { 63.20 52.01 41.55 } (accelerate)
+scifact snowflake-arctic-embed-m-v1.5 end   2026-10-27 17:43:47 PDT (finished; see load_and_embed_seconds in its JSON)
