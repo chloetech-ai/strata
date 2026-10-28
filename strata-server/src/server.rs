@@ -57,13 +57,20 @@ pub struct Options {
     pub backup_dir: Option<PathBuf>,
 }
 
+/// Segment builds (flushes, merges, imports): vector indexes on every core.
+fn build_options() -> BuildOptions {
+    BuildOptions::default().set("vector.threads", std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 /// How the server opens a database. Each write publishes its snapshot,
 /// rebuilding the newest in-memory chunk (up to 1,024 rows): those chunks
 /// keep their vectors flat, since a graph over so few rows costs more to
-/// build at every write than an exact scan of them costs a query.
+/// build at every write than an exact scan of them costs a query. Segments
+/// build their vector indexes on every core.
 pub fn db_options(directory: bool) -> DbOptions {
     DbOptions {
         publish_snapshots: true,
+        build: build_options(),
         mem_build: Some(BuildOptions::default().set("vector.index", "flat")),
         layout: if directory { Layout::Directory } else { Layout::SingleFile },
         ..DbOptions::default()
@@ -118,6 +125,8 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
         let db = Arc::new(db);
+        // Writes go on while a full memtable becomes segments.
+        db.spawn_flusher();
         let schema = db.schema().clone();
         (Backend::Local(db), schema)
     };
@@ -192,7 +201,7 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
 /// `strata-server import`: loads `files` into the database at `path`,
 /// created with `schema` if it does not exist, and says what each wrote.
 pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: Option<Format>, directory: bool, files: &[PathBuf]) -> Result<(), String> {
-    let opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, ..DbOptions::default() };
+    let opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, build: build_options(), ..DbOptions::default() };
     let db = if path.exists() {
         if schema.is_some() {
             return Err(format!("{} exists: --schema is only for a new database", path.display()));

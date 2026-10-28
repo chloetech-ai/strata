@@ -12,6 +12,8 @@
 //! <dir>/del-<id>-<txn>.bits           a segment's delete set
 //! <dir>/upd-<id>-<txn>.bin            a segment's in-place updates
 //! <dir>/wal                           the write-ahead log
+//! <dir>/wal.<txn>                     a log sealed by a background flush
+//!                                     that is not installed yet
 //! ```
 //!
 //! A commit writes its new segment and delete-set files and its manifest,
@@ -160,9 +162,10 @@ pub fn orphans(dir: &Path, keep: &HashSet<String>) -> Result<Vec<(PathBuf, u64)>
     Ok(out)
 }
 
-/// Total size of the directory's files (the WAL excluded).
+/// Total size of the directory's files (the WAL and sealed logs excluded).
 pub fn size(dir: &Path) -> u64 {
+    let log = |name: &str| name == WAL || name.strip_prefix("wal.").is_some_and(|t| t.len() == 20 && t.bytes().all(|b| b.is_ascii_digit()));
     std::fs::read_dir(dir)
-        .map(|it| it.filter_map(|e| e.ok()).filter(|e| e.file_name() != WAL).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
+        .map(|it| it.filter_map(|e| e.ok()).filter(|e| !log(&e.file_name().to_string_lossy())).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
         .unwrap_or(0)
 }

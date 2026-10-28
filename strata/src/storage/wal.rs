@@ -25,13 +25,23 @@
 //! flush; transactions a crash left behind in it are skipped by txn (see
 //! `Manifest::wal_txn`).
 //!
+//! A background flush seals the log instead: it is made durable and
+//! renamed to `<wal>.<txn>` ([`sealed_path`]: it holds transactions up to
+//! that txn), and commits go on in a new, empty log while the flush builds
+//! its segments. Opening replays the sealed logs a flush did not install,
+//! oldest first, before the open one, and deletes the others. A sealed log
+//! was durable before it got its name, so damage in one is damage after
+//! the fact: opening fails, or with `drop_damaged` cuts the log there and
+//! drops every later transaction, in it and in the logs after it, once
+//! each is copied aside.
+//!
 //! Values are encoded as a tag byte and a little-endian payload: integers and
 //! floats in 8 bytes, strings and vectors as a u32 length and the bytes (or
 //! f32s).
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{corrupt, Result};
@@ -180,6 +190,15 @@ impl Wal {
         Ok(())
     }
 
+    /// Starts an empty log at `path` in place of this one, which the caller
+    /// made durable ([`Wal::sync_appends`]) and renamed ([`sealed_path`]).
+    pub fn restart(&mut self, path: &Path, sync: bool) -> Result<()> {
+        let dropped = self.dropped.take();
+        *self = Wal::create(path, self.db_id, sync)?;
+        self.dropped = dropped;
+        Ok(())
+    }
+
     /// Size in bytes.
     pub fn len(&self) -> u64 {
         self.len
@@ -238,10 +257,51 @@ fn frame(out: &mut Vec<u8>, body: &[u8]) {
 }
 
 /// Where a damaged log is copied before it is cut.
-pub fn damaged_path(path: &Path) -> std::path::PathBuf {
+pub fn damaged_path(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".damaged");
     p.into()
+}
+
+/// The name the log at `path` takes when a background flush seals it at
+/// txn `txn`: `<wal>.<txn>`, in 20 digits so that names sort by txn.
+pub fn sealed_path(path: &Path, txn: u64) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(format!(".{txn:020}"));
+    p.into()
+}
+
+/// The sealed logs beside the log at `path`, oldest first, with the txn
+/// each was sealed at.
+pub fn sealed_files(path: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut found = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let file = e.file_name();
+        let Some(rest) = file.to_str().and_then(|f| f.strip_prefix(name.as_str())).and_then(|r| r.strip_prefix('.')) else { continue };
+        if rest.len() == 20 && rest.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(txn) = rest.parse() {
+                found.push((txn, e.path()));
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// The committed transactions of the sealed log at `path`, and the byte
+/// where it is damaged, if it is; `None` for a log of another database
+/// (`db_id`) or a file that is not a log.
+pub fn read_sealed(path: &Path, db_id: u64, fits: &dyn Fn(u32, &Op) -> bool) -> Result<Option<(Vec<WalTxn>, Option<u64>)>> {
+    let buf = std::fs::read(path)?;
+    if buf.len() < HEADER as usize || &buf[..8] != MAGIC || buf[8..16] != db_id.to_le_bytes() {
+        return Ok(None);
+    }
+    let (txns, end) = decode(&buf[HEADER as usize..], fits);
+    let end = HEADER + end as u64;
+    Ok(Some((txns, (end < buf.len() as u64).then_some(end))))
 }
 
 /// The txns of the intact commit records in `rest` (the log past the last
