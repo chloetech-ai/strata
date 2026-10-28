@@ -131,3 +131,112 @@ fn rare_values_use_plain_arrays() {
     assert_eq!(sizes.rare, 4 * 20_000);
     assert_eq!(col.docs("id-777").to_sorted(), vec![777]);
 }
+
+/// Values with Pyramid lists and rare values holding, together, as many
+/// documents as there are values: the writer took that for "one document
+/// per value" and left out the rare values' offsets, so a rare value
+/// matched another value's documents.
+#[test]
+fn rare_values_with_as_many_documents_as_values_keep_their_offsets() {
+    let mut rng = StdRng::seed_from_u64(3);
+    for common in 1..=3usize {
+        for n_rare in 1..=4usize {
+            let mut vals: Vec<Option<String>> = Vec::new();
+            for c in 0..common {
+                vals.extend((0..64 + 37 * c).map(|_| Some(format!("common{c}"))));
+            }
+            // One document each, plus `common` more: as many as values.
+            let mut counts = vec![1usize; n_rare];
+            for _ in 0..common {
+                counts[rng.gen_range(0..n_rare)] += 1;
+            }
+            for (r, &k) in counts.iter().enumerate() {
+                vals.extend((0..k).map(|_| Some(format!("rare{r}"))));
+            }
+            for i in (1..vals.len()).rev() {
+                vals.swap(i, rng.gen_range(0..=i));
+            }
+            let docs: Vec<Document> = vals.iter().map(|v| vec![v.clone().map_or(Value::Null, Value::Str)]).collect();
+            let seg = build(&schema(), &docs, &BuildOptions::default());
+            let col = KeywordColumn::open(&seg, "k").unwrap();
+            assert!(!col.needs_values());
+            assert!(col.is_view());
+            check(&col, &vals, &mut rng);
+        }
+    }
+}
+
+/// A database written before that fix (main at 5e2687c, with the program
+/// in `tests/fixtures/keyword_offsets/README.md`), whose keyword columns
+/// lost those offsets: a single-valued column, a multi-valued KEYWORD
+/// column and a multi-valued INT column. Opening repairs them (from the
+/// codes, and from the stored values), and a merge rewrites them.
+#[test]
+fn columns_written_without_their_offsets_are_repaired() {
+    use std::path::Path;
+    use strata::db::Db;
+    use strata::query::Params;
+    use strata::storage::{DbOptions, MergePolicy};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keyword_offsets");
+    let path = dir.path().join("t.strata");
+    for (from, to) in [("t.strata", path.clone()), ("t.strata-wal", dir.path().join("t.strata-wal"))] {
+        std::fs::copy(fixtures.join(from), to).unwrap();
+    }
+    // The documents of the fixture program.
+    let tag = |i: usize| match i {
+        0 => "one",
+        1 | 2 => "two",
+        _ => "common",
+    };
+    let tags = |i: usize| match i {
+        10 | 20 => vec!["all", "x"],
+        _ => vec!["all"],
+    };
+    let sizes = |i: usize| match i {
+        30 | 40 => vec![5, 9],
+        _ => vec![5],
+    };
+    let ids = |db: &Db, sql: &str| -> Vec<usize> {
+        let r = db.query(&format!("SELECT id FROM t WHERE {sql} LIMIT 1000"), &Params::new()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let mut out: Vec<usize> = r.rows.iter().map(|r| r[0].as_str().unwrap()[1..].parse().unwrap()).collect();
+        out.sort();
+        out
+    };
+    let check = |db: &Db, what: &str, other: bool| {
+        for v in ["one", "two", "common", "none"] {
+            assert_eq!(ids(db, &format!("tag = '{v}'")), (0..70).filter(|&i| tag(i) == v).collect::<Vec<_>>(), "{what}: tag = {v}");
+        }
+        assert_eq!(ids(db, "tag IN ('one', 'two')"), vec![0, 1, 2], "{what}");
+        for v in ["all", "x"] {
+            assert_eq!(ids(db, &format!("tags = '{v}'")), (0..70).filter(|&i| tags(i).contains(&v)).collect::<Vec<_>>(), "{what}: tags = {v}");
+        }
+        for v in [5, 9] {
+            assert_eq!(ids(db, &format!("sizes = {v}")), (0..70).filter(|&i| sizes(i).contains(&v)).collect::<Vec<_>>(), "{what}: sizes = {v}");
+        }
+        let r = db.query("SELECT tag, COUNT(*) FROM t GROUP BY tag ORDER BY tag", &Params::new()).unwrap();
+        let counts: Vec<(String, i64)> = r.rows.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap())).collect();
+        let mut want = vec![("common".to_string(), 67), ("one".to_string(), 1), ("two".to_string(), 2)];
+        if other {
+            want.insert(2, ("other".to_string(), 1));
+        }
+        assert_eq!(counts, want, "{what}");
+    };
+    let db = Db::open(&path, DbOptions::default()).unwrap();
+    assert_eq!(db.snapshot().segments().len(), 1);
+    check(&db, "as written", false);
+    db.storage().check().unwrap();
+    // A merge rebuilds the segment with offsets.
+    let mut t = db.storage().begin().unwrap();
+    t.insert(vec![Value::Str("k070".into()), Value::Str("other".into()), Value::List(vec![]), Value::List(vec![])]).unwrap();
+    t.commit().unwrap();
+    db.storage().flush().unwrap();
+    db.storage().merge(&MergePolicy { merge_factor: 2, floor_docs: 1_000, ..MergePolicy::default() }).unwrap();
+    assert_eq!(db.snapshot().segments().len(), 1);
+    assert_eq!(ids(&db, "tag = 'other'"), vec![70]);
+    check(&db, "merged", true);
+    drop(db);
+    let db = Db::open(&path, DbOptions::default()).unwrap();
+    check(&db, "reopened", true);
+}
