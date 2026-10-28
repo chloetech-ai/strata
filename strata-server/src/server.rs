@@ -35,6 +35,9 @@ pub struct Options {
     pub shards: Vec<String>,
     pub coord: CoordOptions,
     pub timeout_ms: u64,
+    /// The longest deadline a request may ask for (0: the larger of
+    /// `timeout_ms` and 60 s).
+    pub max_timeout_ms: u64,
     pub max_concurrent: usize,
     pub model: String,
     pub api_key: Option<String>,
@@ -103,11 +106,13 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
         let db = Arc::new(db);
-        spawn_maintenance(db.clone());
         let schema = db.schema().clone();
         (Backend::Local(db), schema)
     };
     let mut svc = Service::new(backend, schema, agent, o.max_concurrent.max(1), timeout);
+    if o.max_timeout_ms > 0 {
+        svc.max_timeout = Duration::from_millis(o.max_timeout_ms).max(timeout);
+    }
     svc.open_models(&o.models);
     for m in &svc.models {
         match &m.model {
@@ -136,7 +141,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if let Some(path) = &o.synonyms {
         svc.open_synonyms(path).map_err(|e| e.message)?;
     }
-    Ok(Arc::new(svc))
+    let svc = Arc::new(svc);
+    spawn_maintenance(&svc);
+    Ok(svc)
 }
 
 /// Downloads model `name` ([`strata::embed::KNOWN_MODELS`], or a Hugging
@@ -199,11 +206,26 @@ pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: O
     Ok(())
 }
 
-/// Merges segments in the background, as writes add them.
-pub fn spawn_maintenance(db: Arc<Db>) {
+/// Merges a local database's segments in the background, as writes add
+/// them, and releases expired snapshot leases. A database that cannot
+/// write ([`Service::failing`]) is not merged: the merged segment could
+/// not be committed.
+pub fn spawn_maintenance(svc: &Arc<Service>) {
+    let Some(db) = svc.local_db().cloned() else { return };
+    let svc = Arc::downgrade(svc);
     tokio::spawn(async move {
+        let mut reported = false;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
+            let Some(svc) = svc.upgrade() else { return };
+            svc.sweep_leases();
+            if let Some(why) = svc.failing() {
+                if !reported {
+                    eprintln!("strata-server: {why}; merges stop until then");
+                    reported = true;
+                }
+                continue;
+            }
             let db = db.clone();
             let r = tokio::task::spawn_blocking(move || db.storage().merge(&MergePolicy::default())).await;
             if let Ok(Err(e)) = r {

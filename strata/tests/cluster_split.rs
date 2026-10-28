@@ -183,3 +183,19 @@ fn deadline_stops_a_query() {
     let r = a.query_with("SELECT id FROM docs ORDER BY bm25(body, 'kalo') DESC LIMIT 3", &Params::new(), &opts);
     assert!(matches!(r, Err(strata::Error::Timeout(_))), "{r:?}");
 }
+
+// SCALE-2/OPS-3: a query whose caller went away kept running to the end.
+// Its cancellation flag now stops it where the deadline would.
+#[test]
+fn a_cancelled_query_stops() {
+    let docs = data::synthetic(1000, DIM, 5);
+    let dir = tempfile::tempdir().unwrap();
+    let a = open(dir.path(), "a.strata", &docs);
+    let sql = "SELECT id FROM docs ORDER BY bm25(body, 'kalo') DESC LIMIT 3";
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opts = ExecOptions { cancel: Some(flag.clone()), ..ExecOptions::default() };
+    assert!(a.query_with(sql, &Params::new(), &opts).is_ok());
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let r = a.query_with(sql, &Params::new(), &opts);
+    assert!(matches!(&r, Err(strata::Error::Timeout(m)) if m.contains("cancelled")), "{r:?}");
+}

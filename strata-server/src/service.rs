@@ -2,7 +2,7 @@
 //! coordinator, over shard servers.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -18,7 +18,11 @@ use strata::schema::Schema;
 use strata::storage::{Snapshot, WriteTxn};
 use strata::text::Synonyms;
 use strata::value::Value;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Snapshot leases held at once at most; a request for one more is
+/// refused (429) until some expire.
+pub const MAX_LEASES: usize = 10_000;
 
 use crate::coord::Coordinator;
 use crate::idem;
@@ -84,15 +88,21 @@ pub struct Service {
     pub models: Vec<FieldModel>,
     /// Default query deadline.
     pub timeout: Duration,
+    /// The longest deadline a request may ask for (`timeout_ms`).
+    pub max_timeout: Duration,
     pub lease_ttl: Duration,
     leases: Mutex<HashMap<u64, (Snapshot, Instant)>>,
     next_lease: AtomicU64,
     /// Queries allowed to run at once; the rest wait until their deadline.
-    admission: Semaphore,
+    admission: Arc<Semaphore>,
     cores: usize,
-    running: AtomicUsize,
+    /// Queries running, counted until their work ends ([`Running`]).
+    running: Arc<AtomicUsize>,
     /// The queue of a local database's writer thread ([`writer`]).
     writes: Option<mpsc::Sender<Queued>>,
+    writer_state: Arc<WriterState>,
+    /// When a failed write was last logged, and how many failed since.
+    write_log: Mutex<(Option<Instant>, u64)>,
     /// Idempotency keys of the writes it applied ([`crate::idem`]).
     idempotency: Arc<idem::Keys>,
     /// The synonym list `synonyms => 1` searches use, and its file.
@@ -104,11 +114,12 @@ impl Service {
     pub fn new(backend: Backend, schema: Schema, agent: AgentConfig, max_concurrent: usize, timeout: Duration) -> Service {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let idempotency = Arc::new(idem::Keys::default());
+        let writer_state = Arc::new(WriterState { alive: AtomicBool::new(true), panics: AtomicU64::new(0) });
         let writes = match &backend {
             Backend::Local(db) => {
                 let (tx, rx) = mpsc::channel();
-                let (db, keys) = (db.clone(), idempotency.clone());
-                std::thread::Builder::new().name("strata-writer".into()).spawn(move || writer(&db, rx, &keys)).expect("spawn the writer thread");
+                let (db, state) = (db.clone(), writer_state.clone());
+                std::thread::Builder::new().name("strata-writer".into()).spawn(move || writer(&db, rx, &state)).expect("spawn the writer thread");
                 Some(tx)
             }
             Backend::Cluster(_) => None,
@@ -120,13 +131,16 @@ impl Service {
             agent,
             models: Vec::new(),
             timeout,
+            max_timeout: timeout.max(Duration::from_secs(60)),
             lease_ttl: Duration::from_secs(60),
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
-            admission: Semaphore::new(max_concurrent.max(1)),
+            admission: Arc::new(Semaphore::new(max_concurrent.max(1))),
             cores,
-            running: AtomicUsize::new(0),
+            running: Arc::new(AtomicUsize::new(0)),
             writes,
+            writer_state,
+            write_log: Mutex::new((None, 0)),
             idempotency,
             synonyms: RwLock::new(None),
             synonyms_file: None,
@@ -244,7 +258,8 @@ impl Service {
     async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>) -> Result<u64, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
         let (reply, rx) = tokio::sync::oneshot::channel();
-        tx.send(Queued { job, deadline, reply, key }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
+        let keys = self.idempotency.clone();
+        tx.send(Queued { job, deadline, reply: Some(reply), key, keys }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
         rx.await.map_err(|_| ApiError::internal("the writer thread stopped"))?
     }
 
@@ -262,15 +277,44 @@ impl Service {
 
     /// Pins the current version for `lease_ttl`; returns the lease.
     pub fn lease(&self) -> Result<(u64, u64), ApiError> {
+        self.lease_for(self.lease_ttl)
+    }
+
+    /// Pins the current version for `ttl`; returns the lease. At most
+    /// [`MAX_LEASES`] are held at once.
+    fn lease_for(&self, ttl: Duration) -> Result<(u64, u64), ApiError> {
         let db = self.local().ok_or_else(|| ApiError::bad("a coordinator holds no snapshots"))?;
         let snap = db.snapshot();
         let txn = snap.txn();
-        let id = self.next_lease.fetch_add(1, Ordering::Relaxed);
         let mut l = self.leases.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         l.retain(|_, (_, t)| *t > now);
-        l.insert(id, (snap, now + self.lease_ttl));
+        if l.len() >= MAX_LEASES {
+            return Err(ApiError { status: 429, message: format!("{MAX_LEASES} snapshot leases are held; try again when some expire") });
+        }
+        let id = self.next_lease.fetch_add(1, Ordering::Relaxed);
+        l.insert(id, (snap, now + ttl));
         Ok((id, txn))
+    }
+
+    /// Releases expired leases, and the versions only they held; returns
+    /// how many are held still. The maintenance loop calls it, so that a
+    /// version is not kept until the next lease is made.
+    pub fn sweep_leases(&self) -> usize {
+        let mut l = self.leases.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        l.retain(|_, (_, t)| *t > now);
+        l.len()
+    }
+
+    /// A request's deadline: its `timeout_ms` up to [`Self::max_timeout`],
+    /// or the default.
+    pub fn timeout_of(&self, timeout_ms: u64) -> Duration {
+        if timeout_ms > 0 {
+            Duration::from_millis(timeout_ms).min(self.max_timeout)
+        } else {
+            self.timeout
+        }
     }
 
     fn snapshot(&self, db: &Db, lease: u64) -> Result<Snapshot, ApiError> {
@@ -340,7 +384,7 @@ impl Service {
 
     pub async fn query(self: &Arc<Self>, req: QueryReq) -> Result<Answer, ApiError> {
         let t0 = Instant::now();
-        let timeout = if req.timeout_ms > 0 { Duration::from_millis(req.timeout_ms) } else { self.timeout };
+        let timeout = self.timeout_of(req.timeout_ms);
         if compound::is_compound(&req.sql, &self.schema) {
             return self.compound(req, t0, timeout).await;
         }
@@ -352,27 +396,34 @@ impl Service {
             }
         };
         let kind = metrics::kind(&select);
-        let Ok(permit) = tokio::time::timeout(timeout, self.admission.acquire()).await else {
-            self.metrics.rejected();
-            return Err(ApiError { status: 503, message: "too many queries running; try again".into() });
+        let Some(permit) = self.admit(timeout).await else {
+            return Err(ApiError { status: 429, message: "too many queries running; try again".into() });
         };
         let res = match &self.backend {
             Backend::Local(db) => match self.snapshot(db, req.snapshot) {
                 Ok(snap) => {
-                    let running = self.running.fetch_add(1, Ordering::Relaxed) + 1;
+                    let (running, n) = Running::start(&self.running);
+                    let cancel = Cancel::default();
                     // Each running query gets its share of the cores for its
                     // segments (as engram's recall does).
                     let opts = ExecOptions {
                         stats: req.stats.map(Arc::new),
                         shard: req.shard,
-                        threads: (self.cores / running).max(1),
+                        threads: (self.cores / n).max(1),
                         deadline: Some(t0 + timeout),
+                        cancel: Some(cancel.0.clone()),
                         synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
                         ..db.exec.clone()
                     };
                     let db = db.clone();
-                    let r = tokio::task::spawn_blocking(move || db.execute(&snap, &select, &opts)).await;
-                    self.running.fetch_sub(1, Ordering::Relaxed);
+                    // The work holds the slot and the count until it ends,
+                    // and stops at its next check if this future is dropped.
+                    let r = tokio::task::spawn_blocking(move || {
+                        let _held = (permit, running);
+                        db.execute(&snap, &select, &opts)
+                    })
+                    .await;
+                    drop(cancel);
                     match r {
                         Ok(r) => r.map(|rs| (rs, Vec::new())).map_err(ApiError::from),
                         Err(e) => Err(ApiError::internal(e)),
@@ -380,9 +431,12 @@ impl Service {
                 }
                 Err(e) => Err(e),
             },
-            Backend::Cluster(c) => c.query(&req, &select, t0 + timeout).await.map(|m| (m.rs, m.missing)),
+            Backend::Cluster(c) => {
+                let r = c.query(&req, &select, t0 + timeout).await.map(|m| (m.rs, m.missing));
+                drop(permit);
+                r
+            }
         };
-        drop(permit);
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         let outcome = match &res {
             Ok((_, missing)) if !missing.is_empty() => "partial",
@@ -398,40 +452,47 @@ impl Service {
     /// snapshot here, or each through the coordinator.
     async fn compound(self: &Arc<Self>, req: QueryReq, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = "compound";
-        let Ok(permit) = tokio::time::timeout(timeout, self.admission.acquire()).await else {
-            self.metrics.rejected();
-            return Err(ApiError { status: 503, message: "too many queries running; try again".into() });
+        let Some(permit) = self.admit(timeout).await else {
+            return Err(ApiError { status: 429, message: "too many queries running; try again".into() });
         };
         let schema = self.schema.clone();
         let deadline = t0 + timeout;
+        // Each step checks it: the caller may have stopped waiting.
+        let cancel = Cancel::default();
         let r = match &self.backend {
             Backend::Local(db) => {
                 let snap = self.snapshot(db, req.snapshot)?;
-                let running = self.running.fetch_add(1, Ordering::Relaxed) + 1;
+                let (running, n) = Running::start(&self.running);
                 let opts = ExecOptions {
-                    threads: (self.cores / running).max(1),
+                    threads: (self.cores / n).max(1),
                     deadline: Some(deadline),
+                    cancel: Some(cancel.0.clone()),
                     synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
                     ..db.exec.clone()
                 };
                 let db = db.clone();
                 let r = tokio::task::spawn_blocking(move || {
+                    let _held = (permit, running);
                     compound::run(&req.sql, &schema, &req.params, &mut |text, p| {
                         let select = bind(text, snap.schema(), p)?;
                         db.execute(&snap, &select, &opts)
                     })
                 })
                 .await;
-                self.running.fetch_sub(1, Ordering::Relaxed);
                 r.map(|r| r.map(|rs| (rs, Vec::new())))
             }
             Backend::Cluster(c) => {
                 let c = c.clone();
                 let rt = tokio::runtime::Handle::current();
+                let stop = cancel.0.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _held = permit;
                     // Shards any step was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
                     let rs = compound::run(&req.sql, &schema, &req.params, &mut |text, p| {
+                        if stop.load(Ordering::Relaxed) {
+                            return Err(strata::Error::Timeout("the query was cancelled".into()));
+                        }
                         let select = bind(text, &schema, p)?;
                         let step = QueryReq { sql: text.to_string(), params: p.clone(), partial: req.partial, ..Default::default() };
                         let m = rt.block_on(c.query(&step, &select, deadline)).map_err(|e| strata::Error::Query(e.message))?;
@@ -447,7 +508,7 @@ impl Service {
                 .await
             }
         };
-        drop(permit);
+        drop(cancel);
         let res = match r {
             Ok(r) => r.map_err(ApiError::from),
             Err(e) => Err(ApiError::internal(e)),
@@ -467,20 +528,41 @@ impl Service {
         res.map(|(rs, missing)| Answer { rs, took_ms: ms, kind, missing })
     }
 
+    /// A query slot, waited for until `timeout`; `None` (counted as
+    /// rejected) if none came free.
+    async fn admit(&self, timeout: Duration) -> Option<OwnedSemaphorePermit> {
+        match tokio::time::timeout(timeout, self.admission.clone().acquire_owned()).await {
+            Ok(Ok(p)) => Some(p),
+            _ => {
+                self.metrics.rejected();
+                None
+            }
+        }
+    }
+
+    /// Queries running now, including those whose callers stopped waiting
+    /// and which have not reached a check yet.
+    pub fn running(&self) -> usize {
+        self.running.load(Ordering::Relaxed)
+    }
+
     /// The statistics `sql` scores with, and a lease on the snapshot they
-    /// came from (0 from a coordinator, which sums its shards').
-    pub async fn term_stats(self: &Arc<Self>, sql: &str, params: &Params) -> Result<(TermStats, u64), ApiError> {
+    /// came from (0 from a coordinator, which sums its shards'). The lease
+    /// lasts for the query round that follows: the request's deadline
+    /// (`timeout_ms`, or the default) and a second.
+    pub async fn term_stats(self: &Arc<Self>, sql: &str, params: &Params, timeout_ms: u64) -> Result<(TermStats, u64), ApiError> {
         let select = bind(sql, &self.schema, params)?;
         match &self.backend {
             Backend::Local(db) => {
-                let (lease, _) = self.lease()?;
+                let ttl = self.lease_ttl.min(self.timeout_of(timeout_ms) + Duration::from_secs(1));
+                let (lease, _) = self.lease_for(ttl)?;
                 let snap = self.snapshot(db, lease)?;
                 let db = db.clone();
                 let opts = ExecOptions { synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()), ..db.exec.clone() };
                 let stats = tokio::task::spawn_blocking(move || db.term_stats_with(&snap, &select, &opts)).await.map_err(ApiError::internal)??;
                 Ok((stats, lease))
             }
-            Backend::Cluster(c) => Ok((c.term_stats(sql, params, Instant::now() + self.timeout).await?.0, 0)),
+            Backend::Cluster(c) => Ok((c.term_stats(sql, params, Instant::now() + self.timeout_of(timeout_ms)).await?.0, 0)),
         }
     }
 
@@ -491,12 +573,12 @@ impl Service {
             return Ok(SqlAnswer::Rows(a));
         }
         let t0 = Instant::now();
-        let deadline = t0 + if timeout_ms > 0 { Duration::from_millis(timeout_ms) } else { self.timeout };
-        let n = match &self.backend {
-            Backend::Local(_) => self.write(WriteJob::Sql(sql.to_string(), params.clone()), deadline, None).await?,
-            Backend::Cluster(c) => c.sql(sql, params).await?,
+        let deadline = t0 + self.timeout_of(timeout_ms);
+        let r = match &self.backend {
+            Backend::Local(_) => self.write(WriteJob::Sql(sql.to_string(), params.clone()), deadline, None).await,
+            Backend::Cluster(c) => c.sql(sql, params).await,
         };
-        self.metrics.write(n);
+        let n = self.wrote(r)?;
         Ok(SqlAnswer::Written { n, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
     }
 
@@ -528,12 +610,31 @@ impl Service {
                     // Not committed (the writer reports a commit as Ok).
                     self.idempotency.finish(k, None);
                 }
-                r?
+                r
             }
-            Backend::Cluster(c) => c.write_ops(ops, key).await?,
+            Backend::Cluster(c) => c.write_ops(ops, key).await,
         };
-        self.metrics.write(n);
-        Ok(n)
+        self.wrote(n)
+    }
+
+    /// Counts a write's outcome, and logs a server-side failure (at most
+    /// one line every 10 s, with how many failed since).
+    fn wrote(&self, r: Result<u64, ApiError>) -> Result<u64, ApiError> {
+        match &r {
+            Ok(n) => self.metrics.write(*n),
+            Err(e) => {
+                self.metrics.write_error(e.status);
+                if e.status >= 500 {
+                    let mut log = self.write_log.lock().unwrap_or_else(|e| e.into_inner());
+                    log.1 += 1;
+                    if log.0.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+                        eprintln!("strata-server: a write failed ({} since the last report): {}", log.1, e.message);
+                        *log = (Some(Instant::now()), 0);
+                    }
+                }
+            }
+        }
+        r
     }
 
     /// Imports rows of `format` from `body` ([`strata::ingest`]): upserted
@@ -556,13 +657,38 @@ impl Service {
         Ok((n, unknown))
     }
 
+    /// "ok"; for a database, "failing" when it cannot write until it
+    /// restarts ([`Self::failing`]) and "degraded" while its flushes fail
+    /// (writes still commit, to the WAL, until the memtable holds twice its
+    /// limit); for a coordinator, its shards' state ([`Coordinator::health`]).
     pub async fn health(self: &Arc<Self>) -> Json {
         match &self.backend {
             Backend::Local(db) => {
                 let s = db.snapshot();
-                json!({"status": "ok", "role": "shard", "docs": s.n_live_docs(), "segments": s.segments().len(), "txn": s.txn()})
+                let mut h = json!({"status": "ok", "role": "shard", "docs": s.n_live_docs(), "segments": s.segments().len(), "txn": s.txn()});
+                if let Some(why) = self.failing() {
+                    h["status"] = json!("failing");
+                    h["error"] = json!(why);
+                } else if let Some(e) = db.storage().flush_error() {
+                    h["status"] = json!("degraded");
+                    h["error"] = json!(format!("flushes fail: {e}"));
+                }
+                h
             }
             Backend::Cluster(c) => c.health().await,
+        }
+    }
+
+    /// Why this server cannot write until it restarts, if it cannot: a
+    /// write failed partway (a full disk, an I/O error), after which the
+    /// database refuses every write until it is reopened, or the writer
+    /// thread stopped. Liveness (`/livez`) fails then, so that the server
+    /// is restarted. A coordinator is never failing; its shards may be.
+    pub fn failing(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Local(db) if db.storage().is_poisoned() => Some("a write failed partway, so the database refuses writes until it is reopened: restart the server".into()),
+            Backend::Local(_) if !self.writer_state.alive.load(Ordering::Relaxed) => Some("the writer thread stopped: restart the server".into()),
+            _ => None,
         }
     }
 
@@ -577,7 +703,16 @@ impl Service {
 
     pub async fn prometheus(self: &Arc<Self>) -> String {
         let h = self.health().await;
-        self.metrics.render(h["docs"].as_u64().unwrap_or(0), h["segments"].as_u64().unwrap_or(0))
+        let mut more = vec![("strata_queries_running", "gauge", self.running() as u64)];
+        if let Backend::Local(db) = &self.backend {
+            more.extend([
+                ("strata_snapshot_leases", "gauge", self.sweep_leases() as u64),
+                ("strata_failing", "gauge", self.failing().is_some() as u64),
+                ("strata_flush_failing", "gauge", db.storage().flush_error().is_some() as u64),
+                ("strata_writer_panics_total", "counter", self.writer_state.panics.load(Ordering::Relaxed)),
+            ]);
+        }
+        self.metrics.render(h["docs"].as_u64().unwrap_or(0), h["segments"].as_u64().unwrap_or(0), &more)
     }
 }
 
@@ -626,18 +761,82 @@ enum WriteJob {
 struct Queued {
     job: WriteJob,
     deadline: Instant,
-    reply: tokio::sync::oneshot::Sender<Result<u64, ApiError>>,
+    /// `None` once answered.
+    reply: Option<tokio::sync::oneshot::Sender<Result<u64, ApiError>>>,
     /// The request's idempotency key, whose outcome the writer records.
     key: Option<String>,
+    keys: Arc<idem::Keys>,
 }
 
 impl Queued {
     /// Records the outcome under the request's key and answers it.
-    fn answer(self, keys: &idem::Keys, r: Result<u64, ApiError>) {
+    fn answer(mut self, r: Result<u64, ApiError>) {
         if let Some(k) = &self.key {
-            keys.finish(k, r.as_ref().ok().copied());
+            self.keys.finish(k, r.as_ref().ok().copied());
         }
-        let _ = self.reply.send(r);
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(r);
+        }
+    }
+}
+
+impl Drop for Queued {
+    /// A request dropped unanswered: the writer panicked applying it.
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            if let Some(k) = &self.key {
+                self.keys.finish(k, None);
+            }
+            let _ = reply.send(Err(ApiError::internal("the writer failed applying this write (see the server's log)")));
+        }
+    }
+}
+
+/// The writer thread's state, for health checks and metrics.
+pub struct WriterState {
+    /// False once the thread has stopped.
+    pub alive: AtomicBool,
+    /// Groups of write requests whose application panicked.
+    pub panics: AtomicU64,
+}
+
+/// Marks the writer stopped when its thread ends, however it ends.
+struct Alive<'a>(&'a WriterState);
+
+impl Drop for Alive<'_> {
+    fn drop(&mut self) {
+        self.0.alive.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Counts a query among those running until dropped. The blocking work
+/// holds it, so a query whose caller stopped waiting still counts while
+/// it runs.
+struct Running(Arc<AtomicUsize>);
+
+impl Running {
+    /// Starts counting; returns the guard and how many run now.
+    fn start(n: &Arc<AtomicUsize>) -> (Running, usize) {
+        let now = n.fetch_add(1, Ordering::Relaxed) + 1;
+        (Running(n.clone()), now)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A query's cancellation flag ([`ExecOptions::cancel`]), set when this
+/// is dropped: when the query's future ends, finished or dropped by its
+/// caller (a client that went away, a hedge that lost, a shard timeout).
+#[derive(Default)]
+struct Cancel(Arc<AtomicBool>);
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -649,8 +848,10 @@ const GROUP_OPS: usize = 4096;
 /// one transaction, so one commit and one disk flush serve them all (group
 /// commit); if one of them fails, each runs again alone, so that only it
 /// fails. SQL writes find their rows by reading the database, which does
-/// not show a transaction's own changes, so they commit alone.
-fn writer(db: &Db, rx: mpsc::Receiver<Queued>, keys: &idem::Keys) {
+/// not show a transaction's own changes, so they commit alone. A group
+/// that panics is answered with errors and the writer goes on.
+fn writer(db: &Db, rx: mpsc::Receiver<Queued>, state: &WriterState) {
+    let _alive = Alive(state);
     let mut next = None;
     loop {
         let Some(first) = next.take().or_else(|| rx.recv().ok()) else { return };
@@ -671,38 +872,47 @@ fn writer(db: &Db, rx: mpsc::Receiver<Queued>, keys: &idem::Keys) {
                 }
             }
         }
-        // A request still queued at its deadline is refused unapplied.
-        let now = Instant::now();
-        let (late, group): (Vec<Queued>, Vec<Queued>) = group.into_iter().partition(|q| q.deadline <= now);
-        for q in late {
-            q.answer(keys, Err(ApiError { status: 503, message: "the deadline passed while waiting for the writer".into() }));
+        // The requests a panic leaves unanswered are answered as they drop.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply_group(db, group))).is_err() {
+            state.panics.fetch_add(1, Ordering::Relaxed);
+            eprintln!("strata-server: the writer panicked applying a group of writes; they were answered with errors");
         }
-        let Some(deadline) = group.iter().map(|q| q.deadline).max() else { continue };
-        if let [Queued { job: WriteJob::Sql(sql, params), .. }] = &group[..] {
-            let r = wait_for_writer(deadline, || match db.sql(sql, params)? {
-                SqlResult::Written(n) => Ok(n),
-                SqlResult::Rows(_) => Err(ApiError::bad("not a write statement")),
-            });
-            group.into_iter().next().expect("one").answer(keys, r);
-            continue;
+    }
+}
+
+/// Applies one group of write requests and answers each.
+fn apply_group(db: &Db, group: Vec<Queued>) {
+    // A request still queued at its deadline is refused unapplied.
+    let now = Instant::now();
+    let (late, group): (Vec<Queued>, Vec<Queued>) = group.into_iter().partition(|q| q.deadline <= now);
+    for q in late {
+        q.answer(Err(ApiError { status: 503, message: "the deadline passed while waiting for the writer".into() }));
+    }
+    let Some(deadline) = group.iter().map(|q| q.deadline).max() else { return };
+    if let [Queued { job: WriteJob::Sql(sql, params), .. }] = &group[..] {
+        let r = wait_for_writer(deadline, || match db.sql(sql, params)? {
+            SqlResult::Written(n) => Ok(n),
+            SqlResult::Rows(_) => Err(ApiError::bad("not a write statement")),
+        });
+        group.into_iter().next().expect("one").answer(r);
+        return;
+    }
+    let requests: Vec<&[Json]> = group.iter().map(|q| q.ops()).collect();
+    match wait_for_writer(deadline, || apply_requests(db, &requests)) {
+        Ok(counts) => {
+            for (q, n) in group.into_iter().zip(counts) {
+                q.answer(Ok(n));
+            }
         }
-        let requests: Vec<&[Json]> = group.iter().map(|q| q.ops()).collect();
-        match wait_for_writer(deadline, || apply_requests(db, &requests)) {
-            Ok(counts) => {
-                for (q, n) in group.into_iter().zip(counts) {
-                    q.answer(keys, Ok(n));
-                }
-            }
-            Err(e) if group.len() == 1 => {
-                group.into_iter().next().expect("one").answer(keys, Err(e));
-            }
-            // A failed commit wrote nothing (Strata reports a durable commit
-            // as Ok), so each request can run again alone.
-            Err(_) => {
-                for q in group {
-                    let r = wait_for_writer(q.deadline, || apply_ops(db, q.ops()));
-                    q.answer(keys, r);
-                }
+        Err(e) if group.len() == 1 => {
+            group.into_iter().next().expect("one").answer(Err(e));
+        }
+        // A failed commit wrote nothing (Strata reports a durable commit
+        // as Ok), so each request can run again alone.
+        Err(_) => {
+            for q in group {
+                let r = wait_for_writer(q.deadline, || apply_ops(db, q.ops()));
+                q.answer(r);
             }
         }
     }
@@ -792,3 +1002,27 @@ fn apply_into(schema: &Schema, t: &mut WriteTxn<'_>, ops: &[Json]) -> Result<u64
     Ok(n)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // OPS-6: a panic in the writer thread ended it, and every later write
+    // failed with health still "ok". The writer now catches it; the
+    // requests of the batch it was applying are answered as they drop.
+    #[test]
+    fn a_write_dropped_unanswered_gets_an_error() {
+        let keys = Arc::new(idem::Keys::default());
+        assert_eq!(keys.begin("k", 1), idem::Begin::New);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let q = Queued { job: WriteJob::Ops(Vec::new()), deadline: Instant::now(), reply: Some(tx), key: Some("k".into()), keys: keys.clone() };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = q;
+            panic!("a bug while applying a write");
+        }));
+        assert!(r.is_err());
+        assert_eq!(rx.try_recv().unwrap().unwrap_err().status, 500);
+        // It did not commit, so a retry with its key applies it.
+        assert_eq!(keys.begin("k", 1), idem::Begin::New);
+    }
+}
