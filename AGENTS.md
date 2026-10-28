@@ -93,7 +93,7 @@ editing their settings by hand.
 | `strata/fuzz/` | cargo-fuzz targets (nightly: `cargo +nightly fuzz run <target>` there) feeding Strata damaged files and arbitrary SQL; `strata/tests/corrupt_input.rs` runs the same targets on stable |
 | `strata-server/` | Strata over HTTP JSON and gRPC, a coordinator over shards, and the query UI (`ui/index.html`, compiled in with `include_str!`) |
 | `strata-py/` | Strata from Python (`import strata`): a PyO3 extension built with maturin, and an HTTP client of strata-server; tests in `strata-py/tests` |
-| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, Strata's fault-injection tests (`--features fault-injection`), a relevance gate (BM25 on three BEIR collections), the Python package's tests, and a server smoke test |
+| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, Strata's fault-injection tests (`--features fault-injection`), a relevance gate (BM25 on three BEIR collections), Miri over Strata's byte views (nightly; tests sized for it are named `miri_*`), the Python package's tests, and a server smoke test |
 | `docs/` | the documentation site (Jekyll, just-the-docs); `docs/demo/inspector.html` is a separate static copy of the inspector |
 | `install.sh` | the installer described above |
 

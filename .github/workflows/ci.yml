@@ -93,6 +93,45 @@ jobs:
         working-directory: strata
         run: STRATA_BEIR_DIR="$HOME/beir" STRATA_RELEVANCE_GATE=required cargo test --release --test relevance_gate -- --nocapture
 
+  # Miri runs the tests of Strata's zero-copy byte views (postings::bytes)
+  # and of the structures read through them, checking every access for
+  # undefined behaviour: misaligned or out-of-bounds reads, dangling
+  # pointers, aliasing. It interprets the code about a thousand times
+  # slower, and on one thread, so it runs the tests sized for it (`miri_*`)
+  # and other small ones, split in three parts of 10 to 16 minutes, on a
+  # portable build (scalar kernels; Miri has no CPUID). The nightly is
+  # pinned to the one the tests were run with.
+  miri:
+    name: miri (${{ matrix.part }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: pyramid
+            tests: "postings::codecs::pyramid::tests::miri_"
+          - part: bytes, loom, bit vectors
+            tests: "postings::bytes postings::codecs::loom::tests::miri_ postings::bits"
+          - part: columns, graph, keys, text codec
+            tests: "forward:: graph:: storage::pk::tests::collisions storage::pk::tests::section_written storage::live storage::updates::tests::round_trip text::codec --skip many_int_keys"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-27
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata
+          key: miri
+      - name: Miri
+        working-directory: strata
+        env:
+          RUSTFLAGS: ""
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test --no-default-features --lib -- ${{ matrix.tests }}
+
   server-smoke:
     name: strata-server smoke test
     runs-on: ubuntu-latest
