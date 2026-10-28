@@ -137,12 +137,17 @@ impl SegmentReaders {
     pub fn keyword(&self, field: usize) -> Result<Option<&KeywordColumn>> {
         let f = &self.schema.fields[field];
         opened(&self.keyword[field], || {
-            Ok(match f.ty {
-                FieldType::Keyword if f.indexed => Some(KeywordColumn::open(&self.seg, &f.name)?),
-                // Multi-valued INT fields are keyword columns of int_key strings.
-                FieldType::Int if f.indexed && f.multi => Some(KeywordColumn::open(&self.seg, &f.name)?),
-                _ => None,
-            })
+            // Multi-valued INT fields are keyword columns of int_key strings.
+            if !(f.indexed && (matches!(f.ty, FieldType::Keyword) || matches!(f.ty, FieldType::Int) && f.multi)) {
+                return Ok(None);
+            }
+            let mut col = KeywordColumn::open(&self.seg, &f.name)?;
+            if col.needs_values() {
+                // Multi-valued fields are stored.
+                let store = self.store()?.ok_or_else(|| crate::error::corrupt(format!("keyword column {}: no stored values to repair it from", f.name)))?;
+                col.repair(&store.field_values(field))?;
+            }
+            Ok(Some(col))
         })
     }
 

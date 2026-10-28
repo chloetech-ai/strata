@@ -299,7 +299,37 @@ impl DocStore {
         for _ in row + 1..n_rows {
             get_varint(block, &mut pos)?;
         }
-        let r = block.get(pos + start..pos + start + len)?;
+        self.decode_row(block.get(pos + start..pos + start + len)?, fields)
+    }
+
+    /// Field `field` of every document, in docID order, decompressing each
+    /// block once.
+    ///
+    /// # Panics
+    /// If a block is corrupt.
+    pub fn field_values(&self, field: usize) -> Vec<Value> {
+        let mut out = Vec::with_capacity(self.n);
+        for b in 0..self.n_blocks() {
+            let block = self.decompress(b);
+            let rows = (|| {
+                let mut pos = 0;
+                let n_rows = get_varint(&block, &mut pos)? as usize;
+                let lens = (0..n_rows).map(|_| get_varint(&block, &mut pos)).collect::<Option<Vec<u64>>>()?;
+                for l in lens {
+                    let row = block.get(pos..pos + l as usize)?;
+                    pos += l as usize;
+                    out.push(self.decode_row(row, &[field])?.pop()?);
+                }
+                Some(())
+            })();
+            rows.unwrap_or_else(|| panic!("corrupt doc store block {b}"));
+        }
+        assert_eq!(out.len(), self.n, "corrupt doc store: blocks hold {} rows for {} documents", out.len(), self.n);
+        out
+    }
+
+    /// A row, projected on `fields`.
+    fn decode_row(&self, r: &[u8], fields: &[usize]) -> Option<Vec<Value>> {
         // Slot of each stored field in the row, if requested.
         let mut out = vec![Value::Null; fields.len()];
         let mut p = self.fields.len().div_ceil(8);
