@@ -92,7 +92,7 @@ shard brings its own CPUs and memory; what carries over from these numbers
 is the coordinator's fixed cost per query and how it grows with the number
 of shards.
 
-## Failures
+## Failures, with one copy of each shard
 
 The coordinator over 2 shards, 4 clients sending every kind in turn
 (about 2,000 queries a second), with one action at t = 10 s. A 40 s run
@@ -104,10 +104,10 @@ with no action had no errors.
 | graceful delete: `kubectl delete pod`; the StatefulSet starts it again | 225 over about 3 s | after about 10 s |
 | its node frozen for 20 s (`docker pause`): connections stay open and nothing answers | only 20, but no answers at all for 19 s: each client waits the full 5 s query deadline and gets 504 | within 1 s of the node resuming |
 
-- **One missing shard fails every query.** The coordinator has no replicas
-  and does not return partial results, so a crashed or restarting shard is
-  a full outage for the seconds it is gone, and a hung one is worse: every
-  query waits out the deadline.
+- **One missing shard fails every query.** With one copy of each shard and
+  no partial answers, a crashed or restarting shard is a full outage for
+  the seconds it is gone, and a hung one is worse: every query waits out
+  the deadline. Replicas fix this (next section).
 - **A restarted shard warms up.** It answered at full speed only after about
   10 s here. Natively on the Mac, a freshly opened shard reaches full speed
   in about 2 s (190, then 2,044, then 12,000+ queries a second); in the
@@ -117,6 +117,56 @@ with no action had no errors.
   process (no handler, and the kernel drops such signals to PID 1), so
   `docker stop` took 11 s and killed it, and a pod deletion would wait out
   the 30 s grace period. It now shuts down gracefully at once.
+
+## Failures, with two replicas of each shard
+
+The coordinator now takes replicas of a shard (`--shards 'a0|a1,b0|b1'`):
+a read asks one replica of each shard, in turn, and the next one when it
+fails or has not answered after 100 ms (`--hedge-ms`); a replica that
+failed, or was outrun, is asked last for 5 s. The manifests run each shard
+as a StatefulSet of 2 pods on different nodes (`kind-test.sh shards 2 2`),
+each pod with its own copy of the shard's file. The same test as above,
+from a client on the coordinator's node, with each action on a replica of
+shard 0 on another node:
+
+| what happened | errors | slowest second after it | slowest query | coordinator |
+|---|---|---|---|---|
+| nothing (40 s) | 0 | | | |
+| crash: one replica's server killed with SIGKILL | **0** (was 2,424) | 1,937 answers | 104 ms | 4 retries, 20 hedges |
+| graceful delete of one replica's pod | **0** (was 225) | 1,680 answers | 107 ms | 22 hedges |
+| a node frozen for 20 s (holding a replica of each shard) | **0** (was no answers for 19 s) | 1,755 answers | 107 ms | 28 hedges |
+
+No query failed and none waited more than the 100 ms hedge plus an answer:
+a dead replica fails fast and the next one is asked at once (a retry), and
+one that does not answer, frozen or not yet reconnected, is outrun by the
+next one after 100 ms (a hedge) and then avoided. Writes go to every replica
+of their shard; a replica that is down when a write comes misses it and
+must be rebuilt (there is no catch-up), so this is for read availability.
+A coordinator whose shards are not answering yet now waits for them when it
+starts, instead of exiting.
+
+### Every replica of a shard gone: partial answers
+
+With `--partial` (or `"partial": true` in a query) and `--shard-timeout-ms`,
+a shard with no replica answering is left out, and the answer says so:
+`"partial": {"missing_shards": [...]}`. Shard 1 scaled to 0 replicas for
+20 s, then back to 2:
+
+| | answers a second while shard 1 was gone | median latency | errors |
+|---|---|---|---|
+| first try: each query still asked the gone shard | about 170, all partial | 22 ms | 0 |
+| now: a shard no replica answered is left out of the next second's queries without asking it | about 3,450, all partial | 1.0 ms | 0 |
+
+The first try answered every query, but slowly: each one asked both of
+the gone shard's replicas and waited for them to fail (their pods, and so
+their names, no longer existed). The coordinator now skips such a shard for a
+second at a time, so partial answers come at full speed (faster than whole
+ones, with one shard fewer to ask). Within 3 s of shard 1 coming back,
+answers were complete again; its two fresh replicas were then slow for
+about 13 s (p99 up to 250 ms) while they read their files.
+
+Without `--partial`, the same queries fail, as before, and a request a
+shard rejects as wrong (400) fails the query either way.
 
 ## Adding shards
 
@@ -173,13 +223,12 @@ Median latency in ms (p99 in brackets):
 
 ## What to do next
 
-- Replicas, or partial answers: two pods per shard, with the coordinator
-  asking a healthy one, would let it answer through the crashes, deletions
-  and frozen node above; failing that, a per-shard timeout shorter than the
-  query deadline and an answer flagged as partial would stop a hung shard
-  from costing every query the full 5 s.
+- Catch-up for replicas: a replica that misses writes while down is not
+  brought up to date; a write log the replicas replay, or rebuilding a
+  replica from another, would make replicas safe for collections that take
+  writes.
+- Warm a replica before sending it traffic: a restarted replica here is
+  slow for 10 s or more while it reads its file again, and only hedging
+  hides that.
 - Route key lookups: `WHERE id = :k` goes to every shard today, though the
   key names exactly one (as writes already use).
-- The coordinator checks every shard's schema when it starts and exits if
-  one is down (from the code; not measured here), so it cannot start while a
-  shard is missing.
