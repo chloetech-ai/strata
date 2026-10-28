@@ -411,14 +411,18 @@ fn merger(db: Weak<Database>, m: Arc<Merger>) {
         let mut failed = false;
         while let Some(claim) = db.next_merge(&m) {
             let mut stats = MergeStats::default();
+            let t0 = Instant::now();
             let r = db.merge_claimed(&claim, m.pacer.as_ref(), &mut stats);
+            let segments = claim.ids.len();
             drop(claim);
             let mut st = lock(&db.merging);
             if let Err(e) = r {
+                tracing::warn!(segments, error = %e, "a merge failed; merging pauses, then tries again");
                 st.error = Some(e.to_string());
                 failed = true;
                 break;
             }
+            tracing::debug!(segments, docs = stats.docs_merged, dropped = stats.docs_dropped, bytes = stats.bytes_written, secs = t0.elapsed().as_secs_f64(), "merged");
             st.error = None;
         }
         backoff = if failed { (backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(60)) } else { Duration::ZERO };
@@ -1164,8 +1168,19 @@ impl Database {
     #[doc(hidden)]
     pub fn background_flush_with(&self, between: impl FnOnce()) -> Result<()> {
         let _one = lock(&self.background);
+        let t0 = Instant::now();
         let r = self.background_flush_inner(between);
-        *lock(&self.flush_error) = r.as_ref().err().map(|e| e.to_string());
+        let now = r.as_ref().err().map(|e| e.to_string());
+        let mut before = lock(&self.flush_error);
+        // A failing flush is tried again every second: logged when it
+        // starts failing (or fails otherwise) and when it works again.
+        match (&now, &*before) {
+            (None, None) => tracing::debug!(secs = t0.elapsed().as_secs_f64(), "flushed the memtable"),
+            (None, Some(_)) => tracing::info!("background flushes work again"),
+            (Some(e), b) if b.as_ref() != Some(e) => tracing::warn!(error = %e, "a background flush failed; writes go on into the write-ahead log"),
+            _ => {}
+        }
+        *before = now;
         r
     }
 
@@ -2101,7 +2116,9 @@ impl Database {
     }
 
     fn poison(&self, e: Error) -> Error {
-        self.poisoned.store(true, Ordering::Release);
+        if !self.poisoned.swap(true, Ordering::AcqRel) {
+            tracing::error!(error = %e, "a write failed partway: the database refuses writes until it is reopened");
+        }
         e
     }
 

@@ -47,6 +47,9 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--copy-from PATH` | | fill the new database (`--db` with `--schema`) with this database's rows, re-embedding the vector fields whose embedding changed |
 | `--synonyms FILE` | | the synonym list for `synonyms => 1` searches ([format](query-language.md#typos-and-synonyms)): read at start if it exists, written by `PUT /v1/synonyms` |
 | `--backup-dir DIR` | | where `POST /v1/admin/checkpoint` writes checkpoints ([backups](#backups)); created if missing |
+| `--log FILTER` | `$STRATA_LOG`, else `info` | what to [log](#logs): a level (`error`, `warn`, `info`, `debug`, `trace`), or levels per module (`info,strata=debug`); `debug` logs every request |
+| `--log-format F` | `$STRATA_LOG_FORMAT`, else `text` | log lines as `text` or `json` (one object per line) |
+| `--slow-ms N` | 1000 | log queries and writes that take this many milliseconds or more, with their SQL (0: none) |
 
 `strata-server import` and `strata-server fetch-model` are subcommands: [loading rows](#loading-rows) and [embedded vector fields](#embedded-vector-fields).
 
@@ -179,7 +182,7 @@ cd strata && STRATA_DATA=~/data/beir cargo run --release --bin strata-embed-eval
 
 ## HTTP API
 
-Every request and answer is JSON. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model.
+Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model.
 
 | route | body | answer |
 |---|---|---|
@@ -303,24 +306,45 @@ A coordinator does not retry a query that a replica refused with 429 on that rep
 
 It answers 503 for `down` and `failing`. `/livez` and `/readyz` answer 503 only for `failing`, so that an orchestrator restarts the server (the [Kubernetes manifests](https://github.com/rkonow/engram/tree/main/strata-server/deploy) use them as probes). Neither asks a coordinator's shards, so one slow shard cannot take every coordinator out of service at once; `/v1/health` shows the shards. The writer thread survives a panic while applying a write: the requests in that batch get 500, the panic is counted in `strata_writer_panics_total`, and the next batch goes on.
 
-`GET /metrics` serves, in Prometheus text format:
+`GET /metrics` serves, in Prometheus text format, with `# HELP` and `# TYPE` lines for every family and durations in seconds:
 
 | metric | labels | what |
 |---|---|---|
-| `strata_queries_total` | `kind`, `outcome` | queries by kind (`bm25`, `vector`, `sparse`, `hybrid`, `boosted`, `decay`, `graph`, `column`, `facet`, `count`, `filter`) and outcome |
-| `strata_query_ms` | `kind` | latency histogram |
-| `strata_writes_total`, `strata_written_docs_total` | | write requests and rows written |
-| `strata_write_errors_total` | `status` | write requests that failed, by HTTP status (failures on the server's side are also logged, at most once every 10 s) |
-| `strata_rejected_total` | | queries refused at admission |
+| `strata_build_info` | `version`, `simd` | always 1: the server's version and the SIMD kernels it runs |
+| `process_start_time_seconds`, `process_cpu_seconds_total` | | when the process started, and the CPU time it used |
+| `process_resident_memory_bytes`, `process_open_fds` | | memory in RAM (mapped database pages included) and open file descriptors (Linux) |
+| `strata_http_requests_total`, `strata_http_request_duration_seconds` | `route`, `status` | HTTP requests by route pattern (`other` for none) and status, and their duration by route |
+| `strata_grpc_requests_total`, `strata_grpc_request_duration_seconds` | `method`, `code` | gRPC calls by method and status code, and their duration by method |
+| `strata_queries_total` | `kind`, `outcome` | queries by kind (`bm25`, `vector`, `sparse`, `hybrid`, `boosted`, `decay`, `graph`, `column`, `facet`, `aggregate`, `count`, `filter`, `compound`, `invalid`) and outcome (`ok`, `partial`, `error`, `timeout`, `rejected`) |
+| `strata_query_duration_seconds` | `kind` | time to answer a query, waiting for a slot included |
+| `strata_query_admission_wait_seconds` | | time a query waited for a slot (`--max-concurrent`) |
 | `strata_queries_running` | | queries running now |
-| `strata_agent_runs_total` | | agent runs |
-| `strata_docs`, `strata_segments` | | the database's size |
-| `strata_snapshot_leases` | | snapshot leases held (a database) |
+| `strata_rejected_total` | | queries refused because no slot came free before their deadline |
+| `strata_writes_total`, `strata_written_docs_total` | | write requests that succeeded, and rows they wrote |
+| `strata_write_errors_total` | `status` | write requests that failed, by HTTP status |
+| `strata_write_duration_seconds` | | time from a write request to its commit, embedding and waiting for the writer included |
+| `strata_write_queue_requests`, `strata_write_batches_total` | | write requests waiting for the writer or being applied, and the groups it applied in one transaction each |
+| `strata_idempotent_replays_total` | | writes answered from their idempotency key instead of being applied again |
+| `strata_slow_requests_total` | `what` | queries and writes the slow log wrote down |
+| `strata_embedded_texts_total`, `strata_embed_duration_seconds` | `for` | texts the server's models embedded for writes and for query parameters, and how long each took |
+| `strata_agent_runs_total` | | questions the agent was asked |
+| `strata_docs`, `strata_segments`, `strata_deleted_docs`, `strata_memtable_docs` | | a database's rows, segments, deleted rows merges have not dropped yet, and rows not yet flushed |
+| `strata_file_bytes`, `strata_free_bytes`, `strata_wal_bytes` | | its size on disk, the free space in its file, and its write-ahead log |
+| `strata_snapshot_leases` | | snapshot leases held |
 | `strata_failing`, `strata_flush_failing` | | 1 when the database is `failing`, or its flushes fail ([health](#health)) |
 | `strata_writer_panics_total` | | write batches whose application panicked |
 | `strata_merges_running`, `strata_merge_memory_bytes` | | merges running now and their estimated memory ([merges](#merges)) |
 | `strata_merges_total`, `strata_merges_limited_total` | | merges finished, and merges cut (or put off) to fit the memory budget or an interrupted merge's |
 | `strata_merges_interrupted`, `strata_merge_failing` | | groups of segments whose merge a crash interrupted; 1 while merges fail |
+| `strata_shard_calls_total` | `shard`, `outcome` | a coordinator's calls to each shard (replicas, retries and hedges together) by outcome: `ok`, `error`, `timeout` |
+| `strata_shard_retries_total`, `strata_shard_hedges_total` | | calls a coordinator asked of another replica after one failed, or after the first had not answered within `--hedge-ms` |
+| `strata_replicas_avoided` | | replicas a coordinator asks last for now, after they failed or were outrun |
+
+A coordinator's `/metrics` does not ask its shards: each shard serves its own, and the coordinator shows how its calls to them went. `strata_query_ms` (milliseconds) became `strata_query_duration_seconds`.
+
+### Logs
+
+The server logs to stderr, as text or, with `--log-format json`, one JSON object per line (`timestamp`, `level`, `target`, `message`, the event's fields, and `span` with the request's `id`, method and route). Every line written while serving a request names its id. At the default level, `info`, it logs what it opened and where it listens, a query or write that took `--slow-ms` or more (`slow query`, with its kind, outcome, rows and SQL, cut to 2,000 bytes; `slow write`, with the rows written and the SQL of an `INSERT`, `UPDATE` or `DELETE`; parameters are not logged), a request that failed on the server's side (status 500 and up, at most ten lines a second, with how many were held back), a merge or background flush that failed, and a database that stopped accepting writes. `debug` adds a line for every request answered (`answered`, with its status and duration), and the engine's flushes and merges. The libraries the server is built on log only warnings unless the filter names them (`--log info,h2=debug`).
 
 ### Merges
 
