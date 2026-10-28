@@ -160,6 +160,34 @@ fn tied_scores_cut_and_rank_alike() {
     }
 }
 
+// Bug 9 and SCALE-14: a fused ranking's depth is raised to LIMIT + OFFSET
+// on the shards and in the merge, and a ranked query without LIMIT answers
+// 100 rows after its OFFSET on one database as through a coordinator.
+#[test]
+fn pages_past_the_depth_split_alike() {
+    let docs = data::synthetic(N, DIM, 7);
+    let dir = tempfile::tempdir().unwrap();
+    let whole = open(dir.path(), "whole.strata", &docs);
+    let a = open(dir.path(), "a.strata", &docs[..N / 2]);
+    let b = open(dir.path(), "b.strata", &docs[N / 2..]);
+    let title = docs[42][data::col::TITLE].as_str().unwrap().to_string();
+    let text = title.split(' ').take(3).collect::<Vec<_>>().join(" ");
+    let params = Params::new().set("q", docs[42][data::col::EMB].clone()).set("t", Value::Str(text));
+    let queries = [
+        ("SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q), depth => 7) DESC LIMIT 10 OFFSET 20", 10),
+        ("SELECT id, score() FROM docs ORDER BY 0.5 * bm25(body, :t, depth => 5) + 0.5 * similarity(emb, :q) DESC LIMIT 30", 30),
+        ("SELECT id, score() FROM docs ORDER BY bm25(body, :t, depth => 7) * decay(year, 2020, 5) DESC LIMIT 10 OFFSET 15", 10),
+        ("SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC OFFSET 10", 100),
+        ("SELECT id, score() FROM docs ORDER BY bm25(body, :t) DESC OFFSET 30", 100),
+        ("SELECT id, score() FROM docs ORDER BY similarity(emb, :q) DESC OFFSET 50", 100),
+    ];
+    for (sql, n) in queries {
+        let want = whole.query(sql, &params).unwrap();
+        assert_eq!(want.rows.len(), n, "{sql}");
+        same(sql, &want, &sharded(&[&a, &b], sql, &params));
+    }
+}
+
 #[test]
 fn shard_mode_refuses_graph_queries() {
     let docs = data::synthetic(200, DIM, 3);

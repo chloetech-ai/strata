@@ -272,7 +272,7 @@ impl TextFieldReader {
     /// [`CollectionStats::add`]).
     pub fn stats(&self, terms: &[String]) -> CollectionStats {
         CollectionStats {
-            n_docs: self.n_docs() as u64,
+            n_docs: self.n_docs_with_terms() as u64,
             total_len: self.total_len(),
             df: terms.iter().map(|t| (t.clone(), self.doc_freq(t) as u64)).collect(),
         }
