@@ -129,6 +129,47 @@ documents and re-optimises the encodings for the larger lists. `vacuum`
 moves data down and shrinks the file. Large, rarely updated segments may use the
 space-optimised codecs (Entropic) instead of the speed-optimised ones.
 
+### 3.7 Tables
+
+A database holds one or more tables, each with its own schema, segments,
+primary keys, memtable and merges. They share everything that makes a
+commit: the WAL, the writer lock, the meta slots and the manifest, which
+lists the tables with their segments. So one transaction can write several
+tables and commits or rolls back as a whole, and a snapshot sees every table
+at the same version (`Snapshot::table`). Segment ids are unique across
+tables, so file names, delete sets and reader caches keyed by segment id
+need no table.
+
+* **Formats.** A manifest with only the table the database was created
+  with is written in format 1, field for field as before there were tables;
+  a database that never gets a second table is unchanged on disk, and older
+  versions of Strata open it. With more tables the manifest is format 2
+  (`{format, ..., next_table_id, tables: [{id, schema, segments}]}`) and the
+  meta slot (or, in the directory layout, `CURRENT`) says so. Older versions
+  refuse such a file: a single file with "unsupported format version 2", a
+  directory with an error about its manifest. Dropping back to the first
+  table writes format 1 again, into both meta slots (older versions check
+  both), and older versions open the file again.
+* **WAL.** Records carry no table while they write the first one; a `TABLE`
+  record switches the table for the records after it in the transaction. A
+  one-table WAL is therefore byte for byte what it was.
+* **Tables have ids** that name them in the WAL and never change. The first
+  table has id 0 and cannot be dropped, so methods that name no table
+  (`WriteTxn::insert`, `Database::bulk_load`) write it, as before.
+  `CREATE` commits a manifest with a new empty table. `DROP` flushes the
+  memtables first, so no logged write outlives its table and replays into
+  a later one with the same id, then commits a manifest without the table;
+  its pages are freed once no snapshot reads them, as after a merge.
+* **Flushes and merges.** A flush writes every table's memtable in one
+  commit. A merge works on one table's segments and commits only that
+  table's list.
+* **Later format changes.** Readers refuse a newer format number in a meta
+  slot, `CURRENT` or a manifest, but ignore keys they do not know inside a
+  schema. So a change that an older version must not ignore (stable field
+  ids, a schema id per segment, a field's analyzer, new value types) comes
+  with a new format number, written only by files that use it, as format 2
+  is written only by files with several tables.
+
 ## 4. Segments
 
 A segment is `n` documents with local docIDs `0..n`, stored as a header and a

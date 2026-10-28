@@ -60,8 +60,28 @@ impl Db {
         &self.storage
     }
 
+    /// The schema of the database's first table, which SQL and the other
+    /// methods here query and write.
     pub fn schema(&self) -> &Schema {
         self.storage.schema()
+    }
+
+    /// The schemas of the database's tables, the first one first
+    /// ([`Database::tables`]).
+    pub fn catalog(&self) -> Vec<Arc<Schema>> {
+        self.storage.tables()
+    }
+
+    /// Adds an empty table ([`Database::create_table`]). Its rows are
+    /// written with [`crate::storage::WriteTxn::table`] and read with
+    /// [`Snapshot::table`].
+    pub fn create_table(&self, schema: Schema) -> Result<()> {
+        self.storage.create_table(schema)
+    }
+
+    /// Drops a table other than the first ([`Database::drop_table`]).
+    pub fn drop_table(&self, name: &str) -> Result<()> {
+        self.storage.drop_table(name)
     }
 
     pub fn snapshot(&self) -> Snapshot {

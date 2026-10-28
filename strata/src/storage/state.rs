@@ -1,5 +1,5 @@
 //! In-memory state of an open database: the current on-disk version with
-//! its opened segments, the memtable, and deletes not yet flushed.
+//! each table's opened segments and memtable, and deletes not yet flushed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -187,6 +187,34 @@ pub(crate) enum Loc {
     Disk(u64, DocId),
 }
 
+/// One table of the open database.
+pub(crate) struct TableState {
+    /// The table's id ([`crate::storage::manifest::TableMeta::id`]).
+    pub id: u32,
+    pub schema: Arc<Schema>,
+    /// Opened segments, aligned with the table's segments in the manifest.
+    pub handles: Vec<Arc<SegHandle>>,
+    pub mem: Memtable,
+    /// Live filter of each memtable chunk, keyed by the chunk's length and
+    /// deletes (emptied by a flush).
+    pub mem_live: Vec<Option<(usize, usize, Arc<LiveDocs>)>>,
+    /// The latest segment built for each memtable chunk (emptied by a flush).
+    pub memsegs: Vec<Option<MemSeg>>,
+}
+
+impl TableState {
+    pub fn new(id: u32, schema: Arc<Schema>, handles: Vec<Arc<SegHandle>>, chunk: usize, gen: u64) -> TableState {
+        TableState { id, schema, handles, mem: Memtable::new(chunk, gen), mem_live: Vec::new(), memsegs: Vec::new() }
+    }
+
+    /// Empties the memtable (after a flush).
+    pub fn clear_mem(&mut self) {
+        self.mem.clear();
+        self.mem_live.clear();
+        self.memsegs.clear();
+    }
+}
+
 pub(crate) struct State {
     pub manifest: Manifest,
     pub meta: Meta,
@@ -197,14 +225,14 @@ pub(crate) struct State {
     /// failed commit).
     pub file_pages: u64,
     pub map: OwnedBytes,
-    /// Opened segments, aligned with `manifest.segments`.
-    pub handles: Vec<Arc<SegHandle>>,
+    /// The tables, aligned with `manifest.tables`.
+    pub tables: Vec<TableState>,
     /// Latest committed txn (WAL commits included).
     pub txn: u64,
     /// Bumped by every change; a snapshot is cached only if it is current.
     pub version: u64,
-    pub mem: Memtable,
-    /// Deletes of on-disk documents, applied to delete sets at flush.
+    /// Deletes of on-disk documents by segment id (ids are unique across
+    /// tables), applied to delete sets at flush.
     pub pending: BTreeMap<u64, BTreeSet<DocId>>,
     /// In-place updates of on-disk documents by segment id, written beside
     /// the segments at flush, each with a count of the sets applied to it.
@@ -217,22 +245,44 @@ pub(crate) struct State {
     /// Stored delete set merged with pending deletes, by segment id, keyed
     /// by the number of pending deletes it includes.
     pub live_cache: HashMap<u64, (usize, Arc<LiveDocs>)>,
-    /// Live filter of each memtable chunk, keyed by the chunk's length and
-    /// deletes (emptied by a flush).
-    pub mem_live: Vec<Option<(usize, usize, Arc<LiveDocs>)>>,
-    /// The latest segment built for each memtable chunk (emptied by a flush).
-    pub memsegs: Vec<Option<MemSeg>>,
     pub cached: Option<Arc<SnapInner>>,
 }
 
 impl State {
-    /// The live document with primary key `v`.
-    pub fn find_live(&self, v: &Value) -> Option<Loc> {
+    /// Position in `tables` of the table with this id.
+    pub fn table_index(&self, id: u32) -> Option<usize> {
+        self.tables.iter().position(|t| t.id == id)
+    }
+
+    /// The opened on-disk segment with this id, in any table.
+    pub fn handle(&self, id: u64) -> Option<&Arc<SegHandle>> {
+        self.tables.iter().flat_map(|t| &t.handles).find(|h| h.meta.id == id)
+    }
+
+    /// Every opened on-disk segment, table by table.
+    pub fn handles(&self) -> impl Iterator<Item = &Arc<SegHandle>> {
+        self.tables.iter().flat_map(|t| &t.handles)
+    }
+
+    /// Documents in the memtables, deleted ones included.
+    pub fn mem_len(&self) -> usize {
+        self.tables.iter().map(|t| t.mem.len).sum()
+    }
+
+    /// Live documents in the memtables.
+    pub fn mem_live_docs(&self) -> usize {
+        self.tables.iter().map(|t| t.mem.len - t.mem.n_deleted).sum()
+    }
+
+    /// The live document with primary key `v` in table `t` (a position in
+    /// `tables`).
+    pub fn find_live(&self, t: usize, v: &Value) -> Option<Loc> {
         let key = Key::of(v)?;
-        if let Some(&i) = self.mem.keys.get(&key) {
+        let table = &self.tables[t];
+        if let Some(&i) = table.mem.keys.get(&key) {
             return Some(Loc::Mem(i));
         }
-        for h in self.handles.iter().rev() {
+        for h in table.handles.iter().rev() {
             let Some(pk) = &h.pk else { continue };
             for d in pk.lookup_all(v) {
                 if !self.is_deleted(h, d) {
@@ -248,21 +298,24 @@ impl State {
         h.base.as_ref().is_some_and(|b| b.is_deleted(d)) || self.pending.get(&h.meta.id).is_some_and(|p| p.contains(&d))
     }
 
-    /// Applies a committed operation (at commit and on WAL replay).
-    pub fn apply(&mut self, schema: &Schema, op: Op) {
+    /// Applies a committed operation on table `t` (a position in `tables`),
+    /// at commit and on WAL replay.
+    pub fn apply(&mut self, t: usize, op: Op) {
         match op {
             Op::Insert(doc) => {
-                let key = schema.primary_key.and_then(|pk| Key::of(&doc[pk]));
+                let table = &mut self.tables[t];
+                let key = table.schema.primary_key.and_then(|pk| Key::of(&doc[pk]));
                 // The transaction owned the only reference.
-                let i = self.mem.push(Arc::try_unwrap(doc).unwrap_or_else(|d| (*d).clone()));
+                let i = table.mem.push(Arc::try_unwrap(doc).unwrap_or_else(|d| (*d).clone()));
                 if let Some(k) = key {
-                    self.mem.keys.insert(k, i);
+                    table.mem.keys.insert(k, i);
                 }
             }
-            Op::Delete(v) => match self.find_live(&v) {
+            Op::Delete(v) => match self.find_live(t, &v) {
                 Some(Loc::Mem(i)) => {
-                    self.mem.delete(i);
-                    self.mem.keys.remove(&Key::of(&v).unwrap());
+                    let mem = &mut self.tables[t].mem;
+                    mem.delete(i);
+                    mem.keys.remove(&Key::of(&v).unwrap());
                 }
                 Some(Loc::Disk(id, d)) => {
                     self.pending.entry(id).or_default().insert(d);
@@ -270,9 +323,9 @@ impl State {
                 }
                 None => {}
             },
-            Op::Set { key, field, value } => match self.find_live(&key) {
+            Op::Set { key, field, value } => match self.find_live(t, &key) {
                 Some(Loc::Mem(i)) => {
-                    self.mem.updates.set(field as usize, i, value);
+                    self.tables[t].mem.updates.set(field as usize, i, value);
                 }
                 Some(Loc::Disk(id, d)) => {
                     let (n, u) = self.pending_updates.entry(id).or_default();

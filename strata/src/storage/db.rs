@@ -1,6 +1,13 @@
 //! The database: one file plus a `-wal` sidecar (or a directory of files,
 //! [`Layout::Directory`]), one writer, any number of snapshot readers.
 //!
+//! A database holds one or more tables ([`Database::create_table`]), each
+//! with its own schema, segments and memtable. They share the WAL, the
+//! writer lock and the commit: one transaction can write several tables,
+//! and a snapshot sees every table at the same version. The table a
+//! database was created with is its first; the methods that take no table
+//! name ([`WriteTxn::insert`], [`Database::bulk_load`], ...) act on it.
+//!
 //! * Write transactions append to the WAL and `fsync` at commit; their
 //!   documents and deletes land in the memtable, visible to the next
 //!   snapshot. Deletes of on-disk documents stay *pending* (an overlay on
@@ -34,12 +41,12 @@ use crate::storage::freelist::FreeList;
 use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
-use crate::storage::manifest::{Manifest, SegmentMeta};
+use crate::storage::manifest::{Manifest, SegmentMeta, TableMeta};
 use crate::storage::merge::{MergePolicy, MergeStats, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
 use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
-use crate::storage::state::{Key, Loc, Memtable, SegHandle, State};
+use crate::storage::state::{Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::Updates;
 use crate::storage::wal::{Op, Wal};
 use crate::value::{validate, Document, Value};
@@ -146,6 +153,8 @@ pub struct FileStats {
 /// Size of one on-disk segment.
 #[derive(Clone, Debug, Serialize)]
 pub struct SegmentStats {
+    /// The table the segment belongs to.
+    pub table: String,
     pub id: u64,
     pub n_docs: u32,
     pub n_deleted: u32,
@@ -159,6 +168,7 @@ pub struct Database {
     path: PathBuf,
     wal_path: PathBuf,
     opts: DbOptions,
+    /// The first table's schema (that table cannot be dropped).
     schema: Arc<Schema>,
     /// The database file, or the directory layout's `LOCK` file.
     file: File,
@@ -189,7 +199,7 @@ impl Database {
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
         lock_exclusive(&file)?;
         let db_id: u64 = rand::random();
-        let manifest = Manifest { schema, txn: 1, wal_txn: 0, next_segment_id: 1, segments: Vec::new() };
+        let manifest = Manifest::new(schema);
         let mut fl = FreeList::new(META_PAGES);
         let mbytes = manifest.encode();
         let mext = Extent { page: fl.alloc(pages_for(mbytes.len())), len: mbytes.len() as u64 };
@@ -198,6 +208,7 @@ impl Database {
         file.write_all_at(&mbytes, mext.page * PAGE)?;
         file.write_all_at(&fbytes, fext.page * PAGE)?;
         let meta = Meta {
+            format: 1,
             db_id,
             txn: 1,
             manifest: mext,
@@ -233,11 +244,11 @@ impl Database {
         let lockf = OpenOptions::new().read(true).write(true).create_new(true).open(path.join(dir::LOCK))?;
         lock_exclusive(&lockf)?;
         let db_id: u64 = rand::random();
-        let manifest = Manifest { schema, txn: 1, wal_txn: 0, next_segment_id: 1, segments: Vec::new() };
+        let manifest = Manifest::new(schema);
         let mbytes = manifest.encode();
         let name = dir::manifest_name(1);
         dir::write_file(path, &name, &mbytes, true)?;
-        dir::write_current(path, &Current { db_id, txn: 1, manifest: name, crc: crc32fast::hash(&mbytes) }, true)?;
+        dir::write_current(path, &Current { db_id, txn: 1, manifest: name, crc: crc32fast::hash(&mbytes), format: 1 }, true)?;
         Wal::create(&path.join(dir::WAL), db_id, true)?;
         dir::sync_dir(path)?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -253,9 +264,9 @@ impl Database {
             std::fs::remove_file(f)?;
         }
         let handles = manifest
-            .segments
+            .tables
             .iter()
-            .map(|m| SegHandle::open_in(path, m, opts.read_ahead, opts.read_ahead && opts.random_hints).map(Arc::new))
+            .map(|t| t.segments.iter().map(|m| SegHandle::open_in(path, m, opts.read_ahead, opts.read_ahead && opts.random_hints).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
         let meta = dir_meta(&cur);
         Database::assemble(path, path.join(dir::WAL), Some(path.to_path_buf()), lockf, opts, manifest, meta, 0, FreeList::new(META_PAGES), OwnedBytes::empty(), handles)
@@ -274,12 +285,16 @@ impl Database {
             file.set_len(meta.page_count * PAGE)?;
         }
         let map = pager::map_file(&file, opts.read_ahead)?;
-        let handles = manifest.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints).map(Arc::new)).collect::<Result<_>>()?;
+        let handles = manifest
+            .tables
+            .iter()
+            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints).map(Arc::new)).collect())
+            .collect::<Result<_>>()?;
         Database::assemble(path, wal_path(path), None, file, opts, manifest, meta, slot, freelist, map, handles)
     }
 
-    /// The open database around an on-disk version: replays the WAL into
-    /// the memtable.
+    /// The open database around an on-disk version (`handles`: each table's
+    /// opened segments): replays the WAL into the memtables.
     #[allow(clippy::too_many_arguments)]
     fn assemble(
         path: &Path,
@@ -292,10 +307,16 @@ impl Database {
         slot: usize,
         freelist: FreeList,
         map: OwnedBytes,
-        handles: Vec<Arc<SegHandle>>,
+        handles: Vec<Vec<Arc<SegHandle>>>,
     ) -> Result<Database> {
         let (mut wal, txns) = Wal::open(&wal_path, meta.db_id, opts.sync)?;
-        let schema = Arc::new(manifest.schema.clone());
+        let tables: Vec<TableState> = manifest
+            .tables
+            .iter()
+            .zip(handles)
+            .map(|(t, h)| TableState::new(t.id, Arc::new(t.schema.clone()), h, opts.memtable_chunk_docs, 0))
+            .collect();
+        let schema = tables[0].schema.clone();
         let mut st = State {
             manifest,
             meta,
@@ -303,17 +324,14 @@ impl Database {
             freelist,
             file_pages: meta.page_count,
             map,
-            handles,
+            tables,
             txn: meta.txn,
             version: 0,
-            mem: Memtable::new(opts.memtable_chunk_docs, 0),
             pending: Default::default(),
             pending_updates: Default::default(),
             n_pending: 0,
             live_cache: HashMap::new(),
             updates_cache: HashMap::new(),
-            mem_live: Vec::new(),
-            memsegs: Vec::new(),
             cached: None,
         };
         let mut flushed = false;
@@ -323,12 +341,16 @@ impl Database {
                 flushed = true;
                 continue;
             }
-            for op in t.ops {
-                st.apply(&schema, op);
+            for (table, op) in t.ops {
+                // A dropped table's writes were flushed before the drop,
+                // so none can follow it here; skip them all the same.
+                if let Some(i) = st.table_index(table) {
+                    st.apply(i, op);
+                }
             }
             st.txn = st.txn.max(t.txn);
         }
-        if flushed && st.mem.len == 0 && st.pending.is_empty() {
+        if flushed && st.mem_len() == 0 && st.pending.is_empty() {
             wal.reset(opts.sync)?;
         }
         let db = Database {
@@ -351,8 +373,79 @@ impl Database {
         Ok(db)
     }
 
+    /// The schema of the database's first table.
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// The schemas of the database's tables, in creation order (the first
+    /// is the table the database was created with).
+    pub fn tables(&self) -> Vec<Arc<Schema>> {
+        lock(&self.state).tables.iter().map(|t| t.schema.clone()).collect()
+    }
+
+    /// The schema of the table named `name` (any case).
+    pub fn table(&self, name: &str) -> Option<Arc<Schema>> {
+        lock(&self.state).tables.iter().find(|t| t.schema.table.eq_ignore_ascii_case(name)).map(|t| t.schema.clone())
+    }
+
+    /// Adds an empty table with this schema, in one commit. Its name must
+    /// be a new one (in any case) and a plain identifier: letters, digits
+    /// and underscores, not starting with a digit.
+    ///
+    /// A database with more than one table is written in format 2, which
+    /// versions of Strata before tables cannot open; dropping back to the
+    /// first table alone writes format 1 again.
+    pub fn create_table(&self, schema: Schema) -> Result<()> {
+        let _wal = self.try_writer()?;
+        self.check_poisoned()?;
+        check_table_name(&schema.table)?;
+        if self.table(&schema.table).is_some() {
+            return Err(Error::Schema(format!("table {} already exists", schema.table)));
+        }
+        let mut vw = VersionWriter::begin(self);
+        let id = vw.manifest.next_table_id;
+        vw.manifest.next_table_id += 1;
+        vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new() });
+        let c = vw.commit()?;
+        self.publish(c, |_| {})
+    }
+
+    /// Drops the table named `name` (any case) and its rows, in one commit.
+    /// The first table (the one the database was created with) cannot be
+    /// dropped. The memtables are flushed first, so that no logged write
+    /// outlives its table. Its pages are freed once no snapshot reads them.
+    pub fn drop_table(&self, name: &str) -> Result<()> {
+        let mut wal = self.try_writer()?;
+        let id = {
+            let st = lock(&self.state);
+            st.tables.iter().find(|t| t.schema.table.eq_ignore_ascii_case(name)).map(|t| t.id)
+        };
+        let id = id.ok_or_else(|| Error::Schema(format!("no table {name}")))?;
+        if id == 0 {
+            return Err(Error::Schema(format!("{name} is the database's first table, which cannot be dropped")));
+        }
+        self.flush_locked(&mut wal)?;
+        if !wal.is_empty() {
+            // Only transactions the segments already hold can be left.
+            wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
+        }
+        let mut vw = VersionWriter::begin(self);
+        vw.drop_table(id);
+        let c = vw.commit()?;
+        self.publish(c, |st| {
+            st.live_cache.clear();
+            st.updates_cache.clear();
+        })?;
+        if self.dir.is_none() && lock(&self.state).manifest.format() == 1 {
+            // The other meta slot still names a version with several
+            // tables, and versions of Strata from before tables refuse a
+            // file with such a slot even when it is the older one. Commit
+            // again so that both slots hold format 1.
+            let c = VersionWriter::begin(self).commit()?;
+            self.publish(c, |_| {})?;
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -368,7 +461,7 @@ impl Database {
     pub fn begin(&self) -> Result<WriteTxn<'_>> {
         let wal = self.try_writer()?;
         self.check_poisoned()?;
-        Ok(WriteTxn { db: self, wal, ops: Vec::new(), touched: HashMap::new(), written: HashMap::new(), sets: HashMap::new() })
+        Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new() })
     }
 
     /// The current version. Never waits for a writer; the first snapshot
@@ -396,36 +489,39 @@ impl Database {
         let mut cap = {
             let mut st = lock(&self.state);
             if let (true, Some(s)) = (with_mem, &st.cached) {
-                return Snapshot { inner: s.clone() };
+                return Snapshot::of(s.clone());
             }
             st.capture(&self.pins, with_mem)
         };
-        if cap.mem.iter().any(|p| p.seg.is_none()) {
+        if cap.tables.iter().any(|t| t.mem.iter().any(|p| p.seg.is_none())) {
             let _b = lock(&self.build_lock);
-            for part in cap.mem.iter_mut().filter(|p| p.seg.is_none()) {
-                // Another reader may have built it while we waited.
-                let built = lock(&self.state).memseg(part.gen, part.chunk, part.len);
-                part.seg = Some(built.unwrap_or_else(|| {
-                    let id = MEM_ID | self.mem_ids.fetch_add(1, Ordering::Relaxed);
-                    let seg = build_memseg(&self.schema, self.opts.mem_build.as_ref().unwrap_or(&self.opts.build), part, id);
-                    lock(&self.state).keep_memseg(&seg);
-                    seg
-                }));
+            let opts = self.opts.mem_build.as_ref().unwrap_or(&self.opts.build);
+            for t in &mut cap.tables {
+                for part in t.mem.iter_mut().filter(|p| p.seg.is_none()) {
+                    // Another reader may have built it while we waited.
+                    let built = lock(&self.state).memseg(part.table, part.gen, part.chunk, part.len);
+                    part.seg = Some(built.unwrap_or_else(|| {
+                        let id = MEM_ID | self.mem_ids.fetch_add(1, Ordering::Relaxed);
+                        let seg = build_memseg(&t.schema, opts, part, id);
+                        lock(&self.state).keep_memseg(part.table, &seg);
+                        seg
+                    }));
+                }
             }
         }
         let version = cap.version;
-        let inner = Arc::new(cap.assemble(self.schema.clone(), self.path.clone()));
+        let inner = Arc::new(cap.assemble(self.path.clone()));
         if with_mem {
             let mut st = lock(&self.state);
             if st.version == version {
                 st.cached = Some(inner.clone());
             }
         }
-        Snapshot { inner }
+        Snapshot::of(inner)
     }
 
-    /// Writes the memtable as segments and pending deletes into delete sets,
-    /// then empties the WAL.
+    /// Writes the memtables as segments and pending deletes into delete
+    /// sets, all tables in one commit, then empties the WAL.
     pub fn flush(&self) -> Result<()> {
         let mut wal = self.try_writer()?;
         self.flush_locked(&mut wal)
@@ -433,30 +529,38 @@ impl Database {
 
     fn flush_locked(&self, wal: &mut Wal) -> Result<()> {
         self.check_poisoned()?;
-        let (chunks, deleted, pending, mem_updates, pending_updates, txn) = {
+        let (mems, pending, pending_updates, txn) = {
             let st = lock(&self.state);
-            if st.mem.len == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
+            if st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
                 return Ok(());
             }
-            (st.mem.chunks.clone(), st.mem.deleted.clone(), st.pending.clone(), st.mem.updates.clone(), st.pending_updates.clone(), st.txn)
+            let mems: Vec<_> = st
+                .tables
+                .iter()
+                .filter(|t| t.mem.len > 0)
+                .map(|t| (t.id, t.schema.clone(), t.mem.chunks.clone(), t.mem.deleted.clone(), t.mem.updates.clone()))
+                .collect();
+            (mems, st.pending.clone(), st.pending_updates.clone(), st.txn)
         };
-        let live: Vec<Document> = chunks
-            .iter()
-            .flat_map(|c| c.iter())
-            .enumerate()
-            .filter(|(i, _)| deleted[i / 64] >> (i % 64) & 1 == 0)
-            .map(|(i, d)| {
-                let mut d = d.clone();
-                mem_updates.apply(i as DocId, &mut d);
-                d
-            })
-            .collect();
-        drop(chunks);
         let mut vw = VersionWriter::begin(self);
         vw.manifest.wal_txn = txn;
-        for chunk in live.chunks(self.opts.segment_max_docs.max(1)) {
-            let image = build_segment(&self.schema, chunk, &self.opts.build)?;
-            vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
+        for (table, schema, chunks, deleted, mem_updates) in mems {
+            let live: Vec<Document> = chunks
+                .iter()
+                .flat_map(|c| c.iter())
+                .enumerate()
+                .filter(|(i, _)| deleted[i / 64] >> (i % 64) & 1 == 0)
+                .map(|(i, d)| {
+                    let mut d = d.clone();
+                    mem_updates.apply(i as DocId, &mut d);
+                    d
+                })
+                .collect();
+            drop(chunks);
+            for chunk in live.chunks(self.opts.segment_max_docs.max(1)) {
+                let image = build_segment(&schema, chunk, &self.opts.build)?;
+                vw.add_segment(table, None, &image, chunk.len() as u32, None, None)?;
+            }
         }
         for (&id, docs) in &pending {
             vw.add_deletes(id, docs)?;
@@ -466,9 +570,9 @@ impl Database {
         }
         let c = vw.commit()?;
         self.publish(c, |st| {
-            st.mem.clear();
-            st.mem_live.clear();
-            st.memsegs.clear();
+            for t in &mut st.tables {
+                t.clear_mem();
+            }
             st.pending.clear();
             st.pending_updates.clear();
             st.updates_cache.clear();
@@ -477,8 +581,9 @@ impl Database {
         wal.reset(self.opts.sync).map_err(|e| self.poison(e))
     }
 
-    /// Loads documents straight into segments of `segment_max_docs`, in one
-    /// commit and without the WAL. Keys must be new (as with `insert`).
+    /// Loads documents into the first table straight into segments of
+    /// `segment_max_docs`, in one commit and without the WAL. Keys must be
+    /// new (as with `insert`).
     pub fn bulk_load(&self, docs: impl IntoIterator<Item = Document>) -> Result<()> {
         self.try_bulk_load(docs.into_iter().map(Ok))
     }
@@ -486,36 +591,52 @@ impl Database {
     /// [`Database::bulk_load`] of documents that may fail to arrive: the
     /// first error ends the load, and nothing is committed.
     pub fn try_bulk_load(&self, docs: impl IntoIterator<Item = Result<Document>>) -> Result<()> {
+        self.bulk_load_table(None, docs)
+    }
+
+    /// [`Database::bulk_load`] into the table named `table`.
+    pub fn bulk_load_into(&self, table: &str, docs: impl IntoIterator<Item = Document>) -> Result<()> {
+        self.bulk_load_table(Some(table), docs.into_iter().map(Ok))
+    }
+
+    /// [`Database::try_bulk_load`] into the table named `table`.
+    pub fn try_bulk_load_into(&self, table: &str, docs: impl IntoIterator<Item = Result<Document>>) -> Result<()> {
+        self.bulk_load_table(Some(table), docs)
+    }
+
+    fn bulk_load_table(&self, table: Option<&str>, docs: impl IntoIterator<Item = Result<Document>>) -> Result<()> {
         let mut wal = self.try_writer()?;
+        let t = self.table_ref(table)?;
         // WAL deletes are replayed against the on-disk version; segments
         // written behind the WAL's back must not hold keys it touches.
         self.flush_locked(&mut wal)?;
         let mut vw = VersionWriter::begin(self);
-        let pk = self.schema.primary_key;
-        let check_existing = !lock(&self.state).handles.is_empty();
+        let schema = &t.schema;
+        let pk = schema.primary_key;
+        let check_existing = !lock(&self.state).tables[t.pos].handles.is_empty();
         let mut seen = HashSet::new();
         let mut chunk = Vec::new();
         let max = self.opts.segment_max_docs.max(1);
         for doc in docs {
             let doc = doc?;
-            validate(&self.schema, &doc)?;
+            validate(schema, &doc)?;
             if let Some(pk) = pk {
                 let dup = !seen.insert(Key::of(&doc[pk]).expect("validated key"))
-                    || (check_existing && lock(&self.state).find_live(&doc[pk]).is_some());
+                    || (check_existing && lock(&self.state).find_live(t.pos, &doc[pk]).is_some());
                 if dup {
                     return Err(Error::Schema(format!("duplicate primary key {:?}", doc[pk])));
                 }
             }
             chunk.push(doc);
             if chunk.len() == max {
-                let image = build_segment(&self.schema, &chunk, &self.opts.build)?;
-                vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
+                let image = build_segment(schema, &chunk, &self.opts.build)?;
+                vw.add_segment(t.id, None, &image, chunk.len() as u32, None, None)?;
                 chunk.clear();
             }
         }
         if !chunk.is_empty() {
-            let image = build_segment(&self.schema, &chunk, &self.opts.build)?;
-            vw.add_segment(None, &image, chunk.len() as u32, None, None)?;
+            let image = build_segment(schema, &chunk, &self.opts.build)?;
+            vw.add_segment(t.id, None, &image, chunk.len() as u32, None, None)?;
         }
         if vw.segments_added == 0 {
             return Ok(());
@@ -531,7 +652,7 @@ impl Database {
     pub fn export_segment(&self, id: u64, dest: &Path) -> Result<()> {
         let (h, pending) = {
             let st = lock(&self.state);
-            let h = st.handles.iter().find(|h| h.meta.id == id).cloned().ok_or_else(|| Error::Schema(format!("no segment {id}")))?;
+            let h = st.handle(id).cloned().ok_or_else(|| Error::Schema(format!("no segment {id}")))?;
             (h, st.pending.get(&id).map_or(0, |p| p.len()) + st.pending_updates.get(&id).map_or(0, |p| p.1.len()))
         };
         if h.meta.n_deleted > 0 || h.updates.is_some() || pending > 0 {
@@ -545,9 +666,10 @@ impl Database {
     }
 
     /// Adds segment images built elsewhere (by [`Database::export_segment`]
-    /// or [`crate::segment::build::build_segment`] with this schema) in one
-    /// commit, after flushing the memtable. Their primary keys must be new.
-    /// Returns the new segments' ids.
+    /// or [`crate::segment::build::build_segment`] with the first table's
+    /// schema) to the first table in one commit, after flushing the
+    /// memtables. Their primary keys must be new. Returns the new segments'
+    /// ids.
     pub fn attach_segments(&self, images: &[PathBuf]) -> Result<Vec<u64>> {
         let mut wal = self.try_writer()?;
         // As for bulk loads: WAL deletes are replayed against the on-disk
@@ -567,7 +689,7 @@ impl Database {
                 let st = lock(&self.state);
                 for d in 0..file.n_docs() as DocId {
                     let k = keys.key(d);
-                    if !seen.insert(Key::of(&k).ok_or_else(|| corrupt("bad key"))?) || st.find_live(&k).is_some() {
+                    if !seen.insert(Key::of(&k).ok_or_else(|| corrupt("bad key"))?) || st.find_live(0, &k).is_some() {
                         return Err(Error::Schema(format!("{}: duplicate primary key {k:?}", path.display())));
                     }
                 }
@@ -577,7 +699,7 @@ impl Database {
         let mut vw = VersionWriter::begin(self);
         let first = vw.manifest.next_segment_id;
         for (bytes, n) in &loaded {
-            vw.add_segment(None, bytes, *n, None, None)?;
+            vw.add_segment(0, None, bytes, *n, None, None)?;
         }
         let ids: Vec<u64> = (first..vw.manifest.next_segment_id).collect();
         if ids.is_empty() {
@@ -588,42 +710,47 @@ impl Database {
         Ok(ids)
     }
 
-    /// Merges on-disk segments as `policy` selects until it selects nothing.
-    /// Inputs are rebuilt from `DbOptions::doc_source` without blocking
-    /// writers; the commit then marks documents deleted in the meantime as
-    /// deleted in the merged segment. Must not be called by a thread that
-    /// holds a [`WriteTxn`] (the commit waits for the writer lock).
+    /// Merges each table's on-disk segments as `policy` selects until it
+    /// selects nothing. Inputs are rebuilt from `DbOptions::doc_source`
+    /// without blocking writers; the commit then marks documents deleted in
+    /// the meantime as deleted in the merged segment. Must not be called by
+    /// a thread that holds a [`WriteTxn`] (the commit waits for the writer
+    /// lock).
     pub fn merge(&self, policy: &MergePolicy) -> Result<MergeStats> {
         let _m = lock(&self.merge_lock);
         let source = self.opts.doc_source.clone().ok_or_else(|| Error::Schema("merging needs DbOptions::doc_source".into()))?;
         let t0 = Instant::now();
         let mut stats = MergeStats::default();
-        // Each merge removes a segment, except rewrites of a single segment
-        // to drop deletes; the bound stops those from repeating forever
-        // under a concurrent stream of deletes.
-        let mut rounds = 2 * lock(&self.state).handles.len() + 1;
-        while rounds > 0 {
-            rounds -= 1;
-            let snap = self.snapshot_inner(false);
-            let infos: Vec<SegmentInfo> =
-                snap.segments().iter().map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live }).collect();
-            let Some(mut group) = policy.select(&infos) else { break };
-            // Oldest first, so the merged segment keeps documents in age order.
-            group.sort_by_key(|id| infos.iter().position(|s| s.id == *id));
-            self.merge_group(&snap, &group, source.as_ref(), &mut stats)?;
+        let tables: Vec<(u32, usize)> = lock(&self.state).tables.iter().map(|t| (t.id, t.handles.len())).collect();
+        for (table, n) in tables {
+            // Each merge removes a segment, except rewrites of a single
+            // segment to drop deletes; the bound stops those from repeating
+            // forever under a concurrent stream of deletes.
+            let mut rounds = 2 * n + 1;
+            while rounds > 0 {
+                rounds -= 1;
+                // The table may have been dropped meanwhile.
+                let Some(snap) = self.snapshot_inner(false).table_by_id(table) else { break };
+                let infos: Vec<SegmentInfo> =
+                    snap.segments().iter().map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live }).collect();
+                let Some(mut group) = policy.select(&infos) else { break };
+                // Oldest first, so the merged segment keeps documents in age order.
+                group.sort_by_key(|id| infos.iter().position(|s| s.id == *id));
+                self.merge_group(table, &snap, &group, source.as_ref(), &mut stats)?;
+            }
         }
         stats.seconds = t0.elapsed().as_secs_f64();
         Ok(stats)
     }
 
-    fn merge_group(&self, snap: &Snapshot, ids: &[u64], source: &dyn DocumentSource, stats: &mut MergeStats) -> Result<()> {
+    fn merge_group(&self, table: u32, snap: &Snapshot, ids: &[u64], source: &dyn DocumentSource, stats: &mut MergeStats) -> Result<()> {
         let mut inputs: Vec<(u64, Vec<DocId>)> = Vec::new();
         let mut docs: Vec<Document> = Vec::new();
         for &id in ids {
             let v = snap.segments().iter().find(|v| v.id == id).expect("selected from this snapshot");
             let n = v.file.n_docs() as DocId;
             let live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
-            let mut got = source.documents(&self.schema, &v.file, &live)?;
+            let mut got = source.documents(snap.schema(), &v.file, &live)?;
             if got.len() != live.len() {
                 return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
             }
@@ -638,11 +765,15 @@ impl Database {
             inputs.push((id, live));
         }
         let n_new = docs.len() as u32;
-        let image = if docs.is_empty() { None } else { Some(build_segment(&self.schema, &docs, &self.opts.build)?) };
+        let image = if docs.is_empty() { None } else { Some(build_segment(snap.schema(), &docs, &self.opts.build)?) };
         drop(docs);
 
         let _wal = lock(&self.writer);
         self.check_poisoned()?;
+        if lock(&self.state).table_index(table).is_none() {
+            // Dropped while the merge was building.
+            return Ok(());
+        }
         // Documents of the inputs deleted after the snapshot, as docIDs of
         // the merged segment (inputs are concatenated in order), and values
         // written in place after it.
@@ -652,7 +783,7 @@ impl Database {
             let mut st = lock(&self.state);
             let mut base = 0u32;
             for (id, live) in &inputs {
-                let h = st.handles.iter().find(|h| h.meta.id == *id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
+                let h = st.handle(*id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
                 deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| base + j as u32));
                 let then = snap.segments().iter().find(|v| v.id == *id).and_then(|v| v.updates.clone());
                 if let Some(now) = st.updates_of(&h) {
@@ -669,13 +800,13 @@ impl Database {
         }
         let mut vw = VersionWriter::begin(self);
         // The merged segment takes the place of the oldest input.
-        let pos = vw.manifest.segments.iter().position(|s| ids.contains(&s.id)).expect("inputs present");
+        let pos = vw.table_mut(table).segments.iter().position(|s| ids.contains(&s.id)).expect("inputs present");
         for &id in ids {
             vw.remove_segment(id);
         }
         if let Some(image) = image {
             let dels = (!deleted.is_empty()).then(|| LiveDocs::with_deleted(None, n_new, deleted.iter().copied()));
-            vw.add_segment(Some(pos), &image, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
+            vw.add_segment(table, Some(pos), &image, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
         }
         let c = vw.commit()?;
         stats.bytes_written += c.bytes_written;
@@ -711,7 +842,14 @@ impl Database {
             // only files a crash or a failed unlink left behind.
             let keep = {
                 let st = lock(&self.state);
-                dir::referenced(&Current { db_id: st.meta.db_id, txn: st.meta.txn, manifest: dir::manifest_name(st.manifest.txn), crc: st.meta.manifest_crc }, &st.manifest)
+                let cur = Current {
+                    db_id: st.meta.db_id,
+                    txn: st.meta.txn,
+                    manifest: dir::manifest_name(st.manifest.txn),
+                    crc: st.meta.manifest_crc,
+                    format: st.meta.format,
+                };
+                dir::referenced(&cur, &st.manifest)
             };
             let mut freed = 0;
             for (f, len) in dir::orphans(d, &keep)? {
@@ -743,30 +881,14 @@ impl Database {
                 free_pages: 0,
                 pending_pages: 0,
                 wal_bytes: std::fs::metadata(&self.wal_path).map_or(0, |m| m.len()),
-                memtable_docs: st.mem.len - st.mem.n_deleted,
+                memtable_docs: st.mem_live_docs(),
                 pending_deletes: st.n_pending,
-                segments: st
-                    .manifest
-                    .segments
-                    .iter()
-                    .map(|s| SegmentStats { id: s.id, n_docs: s.n_docs, n_deleted: s.n_deleted, bytes: s.extent.len, delete_set_bytes: s.deletes.map_or(0, |e| e.len) })
-                    .collect(),
+                segments: segment_stats(&st.manifest),
             };
         }
-        let segments: Vec<SegmentStats> = st
-            .manifest
-            .segments
-            .iter()
-            .map(|s| SegmentStats {
-                id: s.id,
-                n_docs: s.n_docs,
-                n_deleted: s.n_deleted,
-                bytes: s.extent.len,
-                delete_set_bytes: s.deletes.map_or(0, |e| e.len),
-            })
-            .collect();
+        let segments = segment_stats(&st.manifest);
         let seg_pages: u64 =
-            st.manifest.segments.iter().map(|s| s.extent.pages() + s.deletes.map_or(0, |e| e.pages()) + s.updates.map_or(0, |e| e.pages())).sum();
+            st.manifest.segments().map(|s| s.extent.pages() + s.deletes.map_or(0, |e| e.pages()) + s.updates.map_or(0, |e| e.pages())).sum();
         FileStats {
             file_bytes: self.file.metadata().map_or(st.file_pages * PAGE, |m| m.len()),
             page_count: st.meta.page_count,
@@ -774,7 +896,7 @@ impl Database {
             free_pages: st.freelist.free_pages(),
             pending_pages: st.freelist.pending_pages(),
             wal_bytes: std::fs::metadata(&self.wal_path).map_or(0, |m| m.len()),
-            memtable_docs: st.mem.len - st.mem.n_deleted,
+            memtable_docs: st.mem_live_docs(),
             pending_deletes: st.n_pending,
             segments,
         }
@@ -794,11 +916,13 @@ impl Database {
         // not held up while every byte is checksummed.
         let (st_meta, st_manifest, freelist, handles, map) = {
             let st = lock(&self.state);
-            (st.meta, st.manifest.clone(), st.freelist.clone(), st.handles.clone(), st.map.clone())
+            (st.meta, st.manifest.clone(), st.freelist.clone(), st.handles().cloned().collect::<Vec<_>>(), st.map.clone())
         };
         let (meta, _) = pager::read_meta(&self.file)?;
         let manifest = Manifest::decode(&pager::read_extent(&self.file, meta.manifest, meta.manifest_crc)?)?;
-        if meta != st_meta || manifest != st_manifest {
+        // Compared as written: a format-1 manifest does not hold the next
+        // table id, which the open one keeps counting.
+        if meta != st_meta || manifest.encode() != st_manifest.encode() {
             return Err(corrupt("on-disk version differs from the open one"));
         }
         let mut used = vec![false; meta.page_count as usize];
@@ -814,7 +938,7 @@ impl Database {
         claim("meta", 0, META_PAGES)?;
         claim("manifest", meta.manifest.page, meta.manifest.pages())?;
         claim("freelist", meta.freelist.page, meta.freelist.pages())?;
-        for (s, h) in manifest.segments.iter().zip(&handles) {
+        for (s, h) in manifest.segments().zip(&handles) {
             claim("segment", s.extent.page, s.extent.pages())?;
             if crc32fast::hash(&map[s.extent.range()]) != s.crc {
                 return Err(corrupt(format!("segment {} fails its checksum", s.id)));
@@ -861,13 +985,13 @@ impl Database {
     fn check_dir(&self, d: &Path) -> Result<()> {
         let (manifest, handles, meta) = {
             let st = lock(&self.state);
-            (st.manifest.clone(), st.handles.clone(), st.meta)
+            (st.manifest.clone(), st.handles().cloned().collect::<Vec<_>>(), st.meta)
         };
         let (cur, on_disk) = dir::read_current(d)?;
-        if on_disk != manifest || cur.txn != meta.txn {
+        if on_disk.encode() != manifest.encode() || cur.txn != meta.txn {
             return Err(corrupt("on-disk version differs from the open one"));
         }
-        for (s, h) in manifest.segments.iter().zip(&handles) {
+        for (s, h) in manifest.segments().zip(&handles) {
             let name = s.file.as_deref().ok_or_else(|| corrupt(format!("segment {} has no file", s.id)))?;
             if crc32fast::hash(&std::fs::read(d.join(name))?) != s.crc {
                 return Err(corrupt(format!("{name} fails its checksum")));
@@ -924,25 +1048,47 @@ impl Database {
     fn publish(&self, c: Committed, update: impl FnOnce(&mut State)) -> Result<()> {
         let (old, map) = {
             let st = lock(&self.state);
-            (st.handles.clone(), st.map.clone())
+            (st.handles().cloned().collect::<Vec<_>>(), st.map.clone())
         };
         let grown = self.dir.is_none() && c.meta.page_count * PAGE > map.len() as u64;
         let map = if grown { pager::map_file(&self.file, self.opts.read_ahead).map_err(|e| self.poison(e))? } else { map };
         let hints = self.opts.read_ahead && self.opts.random_hints;
         let handles = c
             .manifest
-            .segments
+            .tables
             .iter()
-            .map(|m| match (old.iter().find(|h| h.meta == *m), &self.dir) {
-                (Some(h), _) => Ok(h.clone()),
-                (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints).map(Arc::new),
-                (None, None) => SegHandle::open(&map, m, hints).map(Arc::new),
+            .map(|t| {
+                t.segments
+                    .iter()
+                    .map(|m| match (old.iter().find(|h| h.meta == *m), &self.dir) {
+                        (Some(h), _) => Ok(h.clone()),
+                        (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints).map(Arc::new),
+                        (None, None) => SegHandle::open(&map, m, hints).map(Arc::new),
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()
             .map_err(|e| self.poison(e))?;
         let obsolete = c.obsolete;
         {
             let mut st = lock(&self.state);
+            // Tables keep their memtables; created ones start empty and
+            // dropped ones go.
+            let mut old_tables = std::mem::take(&mut st.tables);
+            st.tables = c
+                .manifest
+                .tables
+                .iter()
+                .zip(handles)
+                .map(|(t, h)| match old_tables.iter().position(|o| o.id == t.id) {
+                    Some(i) => {
+                        let mut o = old_tables.swap_remove(i);
+                        o.handles = h;
+                        o
+                    }
+                    None => TableState::new(t.id, Arc::new(t.schema.clone()), h, self.opts.memtable_chunk_docs, 0),
+                })
+                .collect();
             st.txn = c.meta.txn;
             st.manifest = c.manifest;
             st.meta = c.meta;
@@ -950,7 +1096,6 @@ impl Database {
             st.freelist = c.fl;
             st.file_pages = c.file_pages;
             st.map = map;
-            st.handles = handles;
             st.live_cache.clear();
             update(&mut st);
             st.changed();
@@ -966,47 +1111,50 @@ impl Database {
         Ok(())
     }
 
-    fn primary_key(&self) -> Result<usize> {
-        self.schema.primary_key.ok_or_else(|| Error::Schema("table has no primary key".into()))
+    /// The table named `name` (the first table for `None`). Callers hold
+    /// the writer lock, so it stays where it is until they release it.
+    fn table_ref(&self, name: Option<&str>) -> Result<TableRef> {
+        let Some(n) = name else { return Ok(self.first_table()) };
+        let st = lock(&self.state);
+        let pos = st.tables.iter().position(|t| t.schema.table.eq_ignore_ascii_case(n)).ok_or_else(|| Error::Schema(format!("no table {n}")))?;
+        let t = &st.tables[pos];
+        Ok(TableRef { id: t.id, pos, schema: t.schema.clone() })
     }
 
-    /// INT field `f` of the live document with primary key `key`: the
-    /// value written in place if any, else the document's.
-    fn live_int(&self, key: &Value, f: usize) -> Result<Option<i64>> {
+    /// The first table: id 0, always first since it cannot be dropped.
+    fn first_table(&self) -> TableRef {
+        TableRef { id: 0, pos: 0, schema: self.schema.clone() }
+    }
+
+    /// INT field `f` of the live document of table `t` with primary key
+    /// `key`: the value written in place if any, else the document's.
+    fn live_int(&self, t: &TableRef, key: &Value, f: usize) -> Result<Option<i64>> {
         let st = lock(&self.state);
-        let (h, d) = match st.find_live(key) {
+        let (h, d) = match st.find_live(t.pos, key) {
             None => return Ok(None),
             Some(Loc::Mem(i)) => {
-                return Ok(match st.mem.updates.get(f, i) {
+                let mem = &st.tables[t.pos].mem;
+                return Ok(match mem.updates.get(f, i) {
                     Some(v) => v.as_i64(),
-                    None => st.mem.chunks[i as usize / st.mem.chunk][i as usize % st.mem.chunk][f].as_i64(),
-                })
+                    None => mem.chunks[i as usize / mem.chunk][i as usize % mem.chunk][f].as_i64(),
+                });
             }
-            Some(Loc::Disk(id, d)) => (st.handles.iter().find(|h| h.meta.id == id).cloned().expect("segment of a live key"), d),
+            Some(Loc::Disk(id, d)) => (st.handle(id).cloned().expect("segment of a live key"), d),
         };
         let written = st.pending_updates.get(&h.meta.id).and_then(|(_, u)| u.get(f, d)).or_else(|| h.updates.as_ref().and_then(|u| u.get(f, d)));
         if let Some(v) = written {
             return Ok(v.as_i64());
         }
         drop(st);
-        let field = &self.schema.fields[f];
+        let field = &t.schema.fields[f];
         Ok(if field.indexed {
             crate::forward::NumericColumn::open(&h.file, &field.name)?.get(d).as_i64()
         } else {
-            crate::forward::DocStore::open(&h.file, &self.schema)?.get_fields(d, &[f]).pop().and_then(|v| v.as_i64())
+            crate::forward::DocStore::open(&h.file, &t.schema)?.get_fields(d, &[f]).pop().and_then(|v| v.as_i64())
         })
     }
 
-    /// Checks that `key` has the primary key's type.
-    fn key_of(&self, key: &Value) -> Result<Key> {
-        let pk = self.primary_key()?;
-        match (&self.schema.fields[pk].ty, key) {
-            (FieldType::Keyword, Value::Str(_)) | (FieldType::Int, Value::Int(_)) => Ok(Key::of(key).unwrap()),
-            _ => Err(Error::Schema(format!("{key:?} is not a value of primary key {}", self.schema.fields[pk].name))),
-        }
-    }
-
-    fn commit_ops(&self, wal: &mut Wal, ops: Vec<Op>) -> Result<()> {
+    fn commit_ops(&self, wal: &mut Wal, ops: Vec<(u32, Op)>) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
@@ -1018,11 +1166,13 @@ impl Database {
         wal.append(txn, &ops, self.opts.sync).map_err(|e| self.poison(e))?;
         let full = {
             let mut st = lock(&self.state);
-            for op in ops {
-                st.apply(&self.schema, op);
+            for (table, op) in ops {
+                // The writer lock kept every table of the transaction.
+                let t = st.table_index(table).expect("table of a logged write");
+                st.apply(t, op);
             }
             st.txn = txn;
-            st.mem.len + st.n_pending > self.opts.memtable_max_docs
+            st.mem_len() + st.n_pending > self.opts.memtable_max_docs
         };
         if full {
             // The flush publishes its version; if it fails, the transaction
@@ -1039,11 +1189,20 @@ impl Database {
 }
 
 /// The single write transaction. Operations are buffered and logged at
-/// commit; dropping the transaction rolls it back.
+/// commit; dropping the transaction rolls it back. Its methods write the
+/// first table; [`WriteTxn::table`] writes another, in the same
+/// transaction.
 pub struct WriteTxn<'a> {
     db: &'a Database,
     wal: MutexGuard<'a, Wal>,
-    ops: Vec<Op>,
+    ops: Vec<(u32, Op)>,
+    /// What the transaction did to each table it wrote, by table id.
+    keys: Vec<(u32, TxnKeys)>,
+}
+
+/// What a transaction did to one table's keys.
+#[derive(Default)]
+struct TxnKeys {
     /// Keys this transaction made live (true) or deleted (false).
     touched: HashMap<Key, bool>,
     /// Documents this transaction wrote, by key, as they now stand.
@@ -1052,36 +1211,85 @@ pub struct WriteTxn<'a> {
     sets: HashMap<(Key, usize), Value>,
 }
 
-impl WriteTxn<'_> {
+/// A table resolved under the writer lock, which keeps it from being
+/// dropped or moved until the lock is released.
+#[derive(Clone)]
+struct TableRef {
+    id: u32,
+    /// Its position in `State::tables`.
+    pos: usize,
+    schema: Arc<Schema>,
+}
+
+impl TableRef {
+    fn primary_key(&self) -> Result<usize> {
+        self.schema.primary_key.ok_or_else(|| Error::Schema(format!("table {} has no primary key", self.schema.table)))
+    }
+
+    /// Checks that `key` has the primary key's type.
+    fn key_of(&self, key: &Value) -> Result<Key> {
+        let pk = self.primary_key()?;
+        match (&self.schema.fields[pk].ty, key) {
+            (FieldType::Keyword, Value::Str(_)) | (FieldType::Int, Value::Int(_)) => Ok(Key::of(key).unwrap()),
+            _ => Err(Error::Schema(format!("{key:?} is not a value of primary key {}", self.schema.fields[pk].name))),
+        }
+    }
+}
+
+/// Writes to one table of a [`WriteTxn`], from [`WriteTxn::table`].
+pub struct TableTxn<'t, 'a> {
+    txn: &'t mut WriteTxn<'a>,
+    t: TableRef,
+}
+
+impl TableTxn<'_, '_> {
+    /// [`WriteTxn::insert`] into this table.
+    pub fn insert(&mut self, doc: Document) -> Result<()> {
+        self.txn.insert_in(&self.t, doc)
+    }
+
+    /// [`WriteTxn::upsert`] into this table.
+    pub fn upsert(&mut self, doc: Document) -> Result<()> {
+        self.txn.upsert_in(&self.t, doc)
+    }
+
+    /// [`WriteTxn::upsert_if_newer`] into this table.
+    pub fn upsert_if_newer(&mut self, doc: Document, version: &str) -> Result<bool> {
+        self.txn.upsert_if_newer_in(&self.t, doc, version)
+    }
+
+    /// [`WriteTxn::delete`] from this table.
+    pub fn delete(&mut self, key: &Value) -> Result<bool> {
+        self.txn.delete_in(&self.t, key)
+    }
+
+    /// [`WriteTxn::set`] in this table.
+    pub fn set(&mut self, key: &Value, field: &str, value: Value) -> Result<bool> {
+        self.txn.set_in(&self.t, key, field, value)
+    }
+
+    pub fn schema(&self) -> &Schema {
+        &self.t.schema
+    }
+}
+
+impl<'a> WriteTxn<'a> {
+    /// Writes to the table named `name` (any case) in this transaction.
+    pub fn table(&mut self, name: &str) -> Result<TableTxn<'_, 'a>> {
+        let t = self.db.table_ref(Some(name))?;
+        Ok(TableTxn { txn: self, t })
+    }
+
     /// Inserts a document; its primary key must not be live.
     pub fn insert(&mut self, doc: Document) -> Result<()> {
-        validate(&self.db.schema, &doc)?;
-        if let Some(pk) = self.db.schema.primary_key {
-            let key = Key::of(&doc[pk]).expect("validated key");
-            if self.is_live(&key, &doc[pk]) {
-                return Err(Error::Schema(format!("duplicate primary key {:?}", doc[pk])));
-            }
-            self.touched.insert(key.clone(), true);
-            let doc = Arc::new(doc);
-            self.written.insert(key, doc.clone());
-            self.ops.push(Op::Insert(doc));
-            return Ok(());
-        }
-        self.ops.push(Op::Insert(Arc::new(doc)));
-        Ok(())
+        let t = self.db.first_table();
+        self.insert_in(&t, doc)
     }
 
     /// Inserts a document, replacing the live one with the same key.
     pub fn upsert(&mut self, doc: Document) -> Result<()> {
-        validate(&self.db.schema, &doc)?;
-        let pk = self.db.primary_key()?;
-        self.delete(&doc[pk].clone())?;
-        let key = Key::of(&doc[pk]).expect("validated key");
-        self.touched.insert(key.clone(), true);
-        let doc = Arc::new(doc);
-        self.written.insert(key, doc.clone());
-        self.ops.push(Op::Insert(doc));
-        Ok(())
+        let t = self.db.first_table();
+        self.upsert_in(&t, doc)
     }
 
     /// Upserts `doc` only if its INT field `version` is greater than the
@@ -1089,39 +1297,14 @@ impl WriteTxn<'_> {
     /// that writers whose updates arrive out of order keep the newest.
     /// Returns whether it was written.
     pub fn upsert_if_newer(&mut self, doc: Document, version: &str) -> Result<bool> {
-        validate(&self.db.schema, &doc)?;
-        let pk = self.db.primary_key()?;
-        let vf = self.db.schema.fields.iter().position(|f| f.name == version).ok_or_else(|| Error::Schema(format!("no field {version}")))?;
-        if self.db.schema.fields[vf].ty != FieldType::Int || self.db.schema.fields[vf].multi {
-            return Err(Error::Schema(format!("version field {version} must be a single-valued INT")));
-        }
-        let new = doc[vf].as_i64().ok_or_else(|| Error::Schema(format!("document has no {version}")))?;
-        let key = Key::of(&doc[pk]).expect("validated key");
-        let old = match (self.touched.get(&key), self.written.get(&key)) {
-            (Some(true), Some(d)) => d[vf].as_i64(),
-            (Some(false), _) => None,
-            _ => match self.sets.get(&(key.clone(), vf)) {
-                Some(v) => v.as_i64(),
-                None => self.db.live_int(&doc[pk], vf)?,
-            },
-        };
-        if old.is_some_and(|o| o >= new) {
-            return Ok(false);
-        }
-        self.upsert(doc)?;
-        Ok(true)
+        let t = self.db.first_table();
+        self.upsert_if_newer_in(&t, doc, version)
     }
 
     /// Deletes the live document with this primary key; false if none.
     pub fn delete(&mut self, key: &Value) -> Result<bool> {
-        let k = self.db.key_of(key)?;
-        if !self.is_live(&k, key) {
-            return Ok(false);
-        }
-        self.touched.insert(k.clone(), false);
-        self.written.remove(&k);
-        self.ops.push(Op::Delete(key.clone()));
-        Ok(true)
+        let t = self.db.first_table();
+        self.delete_in(&t, key)
     }
 
     /// Sets a numeric field of the live document with this primary key in
@@ -1129,11 +1312,84 @@ impl WriteTxn<'_> {
     /// they are. The field must be a single-valued INT or FLOAT. False if no
     /// document has the key.
     pub fn set(&mut self, key: &Value, field: &str, value: Value) -> Result<bool> {
-        let k = self.db.key_of(key)?;
-        let i = self.db.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
-        let f = &self.db.schema.fields[i];
+        let t = self.db.first_table();
+        self.set_in(&t, key, field, value)
+    }
+
+    fn insert_in(&mut self, t: &TableRef, doc: Document) -> Result<()> {
+        validate(&t.schema, &doc)?;
+        if let Some(pk) = t.schema.primary_key {
+            let key = Key::of(&doc[pk]).expect("validated key");
+            if self.is_live(t, &key, &doc[pk]) {
+                return Err(Error::Schema(format!("duplicate primary key {:?}", doc[pk])));
+            }
+            let doc = Arc::new(doc);
+            let k = self.keys(t.id);
+            k.touched.insert(key.clone(), true);
+            k.written.insert(key, doc.clone());
+            self.ops.push((t.id, Op::Insert(doc)));
+            return Ok(());
+        }
+        self.ops.push((t.id, Op::Insert(Arc::new(doc))));
+        Ok(())
+    }
+
+    fn upsert_in(&mut self, t: &TableRef, doc: Document) -> Result<()> {
+        validate(&t.schema, &doc)?;
+        let pk = t.primary_key()?;
+        self.delete_in(t, &doc[pk].clone())?;
+        let key = Key::of(&doc[pk]).expect("validated key");
+        let doc = Arc::new(doc);
+        let k = self.keys(t.id);
+        k.touched.insert(key.clone(), true);
+        k.written.insert(key, doc.clone());
+        self.ops.push((t.id, Op::Insert(doc)));
+        Ok(())
+    }
+
+    fn upsert_if_newer_in(&mut self, t: &TableRef, doc: Document, version: &str) -> Result<bool> {
+        validate(&t.schema, &doc)?;
+        let pk = t.primary_key()?;
+        let vf = t.schema.fields.iter().position(|f| f.name == version).ok_or_else(|| Error::Schema(format!("no field {version}")))?;
+        if t.schema.fields[vf].ty != FieldType::Int || t.schema.fields[vf].multi {
+            return Err(Error::Schema(format!("version field {version} must be a single-valued INT")));
+        }
+        let new = doc[vf].as_i64().ok_or_else(|| Error::Schema(format!("document has no {version}")))?;
+        let key = Key::of(&doc[pk]).expect("validated key");
+        let k = self.keys(t.id);
+        let old = match (k.touched.get(&key), k.written.get(&key)) {
+            (Some(true), Some(d)) => d[vf].as_i64(),
+            (Some(false), _) => None,
+            _ => match k.sets.get(&(key.clone(), vf)) {
+                Some(v) => v.as_i64(),
+                None => self.db.live_int(t, &doc[pk], vf)?,
+            },
+        };
+        if old.is_some_and(|o| o >= new) {
+            return Ok(false);
+        }
+        self.upsert_in(t, doc)?;
+        Ok(true)
+    }
+
+    fn delete_in(&mut self, t: &TableRef, key: &Value) -> Result<bool> {
+        let k = t.key_of(key)?;
+        if !self.is_live(t, &k, key) {
+            return Ok(false);
+        }
+        let keys = self.keys(t.id);
+        keys.touched.insert(k.clone(), false);
+        keys.written.remove(&k);
+        self.ops.push((t.id, Op::Delete(key.clone())));
+        Ok(true)
+    }
+
+    fn set_in(&mut self, t: &TableRef, key: &Value, field: &str, value: Value) -> Result<bool> {
+        let k = t.key_of(key)?;
+        let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let f = &t.schema.fields[i];
         let value = match (&f.ty, value) {
-            _ if f.multi || Some(i) == self.db.schema.primary_key => {
+            _ if f.multi || Some(i) == t.schema.primary_key => {
                 return Err(Error::Schema(format!("{field} cannot be set in place: it is multi-valued or the key")))
             }
             (FieldType::Int, v @ (Value::Int(_) | Value::Null)) => v,
@@ -1142,16 +1398,17 @@ impl WriteTxn<'_> {
             (FieldType::Int | FieldType::Float, v) => return Err(Error::Schema(format!("bad value for {field}: {v:?}"))),
             _ => return Err(Error::Schema(format!("{field} is not a numeric field; only INT and FLOAT are set in place"))),
         };
-        if !self.is_live(&k, key) {
+        if !self.is_live(t, &k, key) {
             return Ok(false);
         }
-        match self.written.get_mut(&k) {
+        let keys = self.keys(t.id);
+        match keys.written.get_mut(&k) {
             Some(d) => Arc::make_mut(d)[i] = value.clone(),
             None => {
-                self.sets.insert((k, i), value.clone());
+                keys.sets.insert((k, i), value.clone());
             }
         }
-        self.ops.push(Op::Set { key: key.clone(), field: i as u16, value });
+        self.ops.push((t.id, Op::Set { key: key.clone(), field: i as u16, value }));
         Ok(true)
     }
 
@@ -1165,8 +1422,8 @@ impl WriteTxn<'_> {
     }
 
     /// Logs the transaction (durable on return when `DbOptions::sync`) and
-    /// applies it. If the memtable is then full it is flushed; an error from
-    /// that flush leaves the transaction committed.
+    /// applies it. If the memtables are then full they are flushed; an
+    /// error from that flush leaves the transaction committed.
     pub fn commit(self) -> Result<()> {
         let WriteTxn { db, mut wal, ops, .. } = self;
         db.commit_ops(&mut wal, ops)
@@ -1174,10 +1431,21 @@ impl WriteTxn<'_> {
 
     pub fn rollback(self) {}
 
-    fn is_live(&self, k: &Key, v: &Value) -> bool {
-        match self.touched.get(k) {
+    fn keys(&mut self, table: u32) -> &mut TxnKeys {
+        let i = match self.keys.iter().position(|(id, _)| *id == table) {
+            Some(i) => i,
+            None => {
+                self.keys.push((table, TxnKeys::default()));
+                self.keys.len() - 1
+            }
+        };
+        &mut self.keys[i].1
+    }
+
+    fn is_live(&self, t: &TableRef, k: &Key, v: &Value) -> bool {
+        match self.keys.iter().find(|(id, _)| *id == t.id).and_then(|(_, keys)| keys.touched.get(k)) {
             Some(&live) => live,
-            None => lock(&self.db.state).find_live(v).is_some(),
+            None => lock(&self.db.state).find_live(t.pos, v).is_some(),
         }
     }
 }
@@ -1265,8 +1533,17 @@ impl<'a> VersionWriter<'a> {
         Ok(())
     }
 
-    /// Adds a segment at position `pos` (default: last).
-    fn add_segment(&mut self, pos: Option<usize>, image: &[u8], n_docs: u32, deleted: Option<&LiveDocs>, updates: Option<&Updates>) -> Result<()> {
+    /// Adds a segment to table `table` at position `pos` (default: last).
+    #[allow(clippy::too_many_arguments)]
+    fn add_segment(
+        &mut self,
+        table: u32,
+        pos: Option<usize>,
+        image: &[u8],
+        n_docs: u32,
+        deleted: Option<&LiveDocs>,
+        updates: Option<&Updates>,
+    ) -> Result<()> {
         let id = self.manifest.next_segment_id;
         self.manifest.next_segment_id += 1;
         let (extent, file) = self.write_as(image, dir::segment_name(id))?;
@@ -1299,19 +1576,23 @@ impl<'a> VersionWriter<'a> {
             updates_file,
             updates_crc,
         };
-        let segs = &mut self.manifest.segments;
+        let segs = &mut self.table_mut(table).segments;
         segs.insert(pos.unwrap_or(segs.len()), meta);
         self.segments_added += 1;
         Ok(())
     }
 
+    fn table_mut(&mut self, id: u32) -> &mut TableMeta {
+        self.manifest.table_mut(id).expect("table in manifest")
+    }
+
     /// Replaces a segment's delete set with its current one plus `docs`.
     fn add_deletes(&mut self, id: u64, docs: &BTreeSet<DocId>) -> Result<()> {
-        let h = lock(&self.db.state).handles.iter().find(|h| h.meta.id == id).cloned().expect("segment of a pending delete");
+        let h = lock(&self.db.state).handle(id).cloned().expect("segment of a pending delete");
         let live = LiveDocs::with_deleted(h.base.as_deref(), h.meta.n_docs, docs.iter().copied());
         let b = live.encode();
         let (e, file) = self.write_as(&b, dir::deletes_name(id, self.txn))?;
-        let s = self.manifest.segments.iter_mut().find(|s| s.id == id).expect("segment in manifest");
+        let s = self.manifest.segment_mut(id).expect("segment in manifest");
         match (s.deletes, s.deletes_file.take()) {
             (_, Some(old)) => self.obsolete.push(old),
             (Some(old), None) => self.fl.defer(self.txn, old),
@@ -1327,10 +1608,10 @@ impl<'a> VersionWriter<'a> {
     /// Replaces a segment's in-place updates with its current ones plus
     /// `newer`.
     fn add_updates(&mut self, id: u64, newer: &Updates) -> Result<()> {
-        let h = lock(&self.db.state).handles.iter().find(|h| h.meta.id == id).cloned().expect("segment of a pending update");
+        let h = lock(&self.db.state).handle(id).cloned().expect("segment of a pending update");
         let b = Updates::merged(h.updates.as_deref(), newer).encode();
         let (e, file) = self.write_as(&b, dir::updates_name(id, self.txn))?;
-        let s = self.manifest.segments.iter_mut().find(|s| s.id == id).expect("segment in manifest");
+        let s = self.manifest.segment_mut(id).expect("segment in manifest");
         match (s.updates, s.updates_file.take()) {
             (_, Some(old)) => self.obsolete.push(old),
             (Some(old), None) => self.fl.defer(self.txn, old),
@@ -1349,16 +1630,19 @@ impl<'a> VersionWriter<'a> {
             return Ok(0);
         }
         let map = lock(&self.db.state).map.clone();
-        // (extent, segment, what): 0 the image, 1 the delete set, 2 updates.
-        let mut extents: Vec<(Extent, usize, u8)> = Vec::new();
-        for (i, s) in self.manifest.segments.iter().enumerate() {
-            extents.push((s.extent, i, 0));
-            extents.extend(s.deletes.map(|e| (e, i, 1)));
-            extents.extend(s.updates.map(|e| (e, i, 2)));
+        // (extent, (table, segment), what): 0 the image, 1 the delete set,
+        // 2 updates.
+        let mut extents: Vec<(Extent, (usize, usize), u8)> = Vec::new();
+        for (t, table) in self.manifest.tables.iter().enumerate() {
+            for (i, s) in table.segments.iter().enumerate() {
+                extents.push((s.extent, (t, i), 0));
+                extents.extend(s.deletes.map(|e| (e, (t, i), 1)));
+                extents.extend(s.updates.map(|e| (e, (t, i), 2)));
+            }
         }
         extents.sort_by_key(|&(e, _, _)| std::cmp::Reverse(e.page));
         let mut moved = 0;
-        for (e, i, what) in extents {
+        for (e, (t, i), what) in extents {
             let Some(page) = self.fl.alloc_below(e.pages(), e.page) else { continue };
             // Copy out of the mapping first: on macOS, a pwrite whose source
             // is a mapping of the same file can deadlock in the kernel.
@@ -1367,7 +1651,7 @@ impl<'a> VersionWriter<'a> {
             self.bytes_written += e.len;
             self.fl.defer(self.txn, e);
             let to = Extent { page, len: e.len };
-            let s = &mut self.manifest.segments[i];
+            let s = &mut self.manifest.tables[t].segments[i];
             if what == 2 {
                 s.updates = Some(to);
             } else if what == 1 {
@@ -1381,8 +1665,28 @@ impl<'a> VersionWriter<'a> {
     }
 
     fn remove_segment(&mut self, id: u64) {
-        let i = self.manifest.segments.iter().position(|s| s.id == id).expect("segment in manifest");
-        let s = self.manifest.segments.remove(i);
+        let (t, i) = self
+            .manifest
+            .tables
+            .iter()
+            .enumerate()
+            .find_map(|(t, table)| Some((t, table.segments.iter().position(|s| s.id == id)?)))
+            .expect("segment in manifest");
+        let s = self.manifest.tables[t].segments.remove(i);
+        self.free_segment(s);
+    }
+
+    /// Drops table `id` and frees its segments.
+    fn drop_table(&mut self, id: u32) {
+        let i = self.manifest.tables.iter().position(|t| t.id == id).expect("table in manifest");
+        for s in self.manifest.tables.remove(i).segments {
+            self.free_segment(s);
+        }
+    }
+
+    /// Frees the pages (or names the files) of a segment the new version
+    /// no longer holds.
+    fn free_segment(&mut self, s: SegmentMeta) {
         if self.db.dir.is_some() {
             self.obsolete.extend(s.file);
             self.obsolete.extend(s.deletes_file);
@@ -1420,6 +1724,7 @@ impl<'a> VersionWriter<'a> {
             db.file.sync_data()?;
         }
         let meta = Meta {
+            format: self.manifest.format(),
             db_id: self.meta.db_id,
             txn: c,
             manifest,
@@ -1453,7 +1758,7 @@ impl<'a> VersionWriter<'a> {
         let name = dir::manifest_name(c);
         dir::write_file(d, &name, &mbytes, db.opts.sync)?;
         self.bytes_written += mbytes.len() as u64;
-        let cur = Current { db_id: self.meta.db_id, txn: c, manifest: name, crc: crc32fast::hash(&mbytes) };
+        let cur = Current { db_id: self.meta.db_id, txn: c, manifest: name, crc: crc32fast::hash(&mbytes), format: self.manifest.format() };
         // Past the rename the on-disk version may already be the new one.
         dir::write_current(d, &cur, db.opts.sync).map_err(|e| db.poison(e))?;
         self.obsolete.push(previous);
@@ -1472,7 +1777,35 @@ impl<'a> VersionWriter<'a> {
 /// The meta of a directory-layout version (it has no pages).
 fn dir_meta(cur: &Current) -> Meta {
     let none = Extent { page: 0, len: 0 };
-    Meta { db_id: cur.db_id, txn: cur.txn, manifest: none, manifest_crc: cur.crc, freelist: none, freelist_crc: 0, page_count: 0 }
+    Meta { format: cur.format, db_id: cur.db_id, txn: cur.txn, manifest: none, manifest_crc: cur.crc, freelist: none, freelist_crc: 0, page_count: 0 }
+}
+
+/// Every segment's size, by table.
+fn segment_stats(m: &Manifest) -> Vec<SegmentStats> {
+    m.tables
+        .iter()
+        .flat_map(|t| {
+            t.segments.iter().map(|s| SegmentStats {
+                table: t.schema.table.clone(),
+                id: s.id,
+                n_docs: s.n_docs,
+                n_deleted: s.n_deleted,
+                bytes: s.extent.len,
+                delete_set_bytes: s.deletes.map_or(0, |e| e.len),
+            })
+        })
+        .collect()
+}
+
+/// Table names are plain identifiers, so SQL can name them unquoted.
+fn check_table_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Schema(format!("bad table name {name:?}: use letters, digits and underscores, not starting with a digit")))
+    }
 }
 
 /// Allocates the freelist's own extent and encodes the freelist after that
