@@ -8,7 +8,7 @@ use strata::db::{Db, SqlResult};
 use strata::embed::{Embedder, HashEmbedder};
 use strata::query::Params;
 use strata::schema::{Field, FieldType, Schema};
-use strata::storage::{DbOptions, Layout};
+use strata::storage::{CheckpointOptions, DbOptions, Layout};
 use strata::value::Value;
 
 fn papers() -> Schema {
@@ -193,6 +193,15 @@ fn references_are_recorded_and_kept_consistent() {
     assert_eq!(refs(&db), [None, None, Some("papers".to_string()), Some("wrote".to_string())]);
 
     written(&db, "CREATE TABLE notes (id INT PRIMARY KEY, about INT REFERENCES wrote)");
+    // A checkpoint creates the tables again in their order, in which a
+    // table comes after those it references, and keeps the references.
+    let copy = dir.path().join("copy.strata");
+    db.storage().checkpoint(&copy, &CheckpointOptions::default()).unwrap();
+    let c = Db::open(&copy, DbOptions::default()).unwrap();
+    assert_eq!(names(&c), names(&db));
+    assert_eq!(refs(&c), refs(&db));
+    assert_eq!(c.storage().table("notes").unwrap().fields[1].references.as_deref(), Some("wrote"));
+    drop(c);
     assert!(fails(&db, "DROP TABLE wrote").contains("notes.about references wrote"));
     // Dropped together, and a table's references to itself do not hold it.
     assert_eq!(written(&db, "DROP TABLE wrote, notes"), 0);
