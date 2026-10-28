@@ -120,6 +120,7 @@ Document lengths are quantised to one byte. Ranked queries drop English function
 - **Range postings.** Numeric fields get an equi-depth histogram of 64 buckets whose buckets are docID lists. A range is the union of the buckets it covers, plus the boundary buckets filtered through the column. The histogram doubles as the selectivity estimator.
 - **Doc store.** Rows in LZ4-compressed 16 KiB blocks with a block index; it serves projections and is the source for merges.
 - **Generated columns.** A TEXT field may be generated from other stored text fields (`body` = title + text in the evaluation table), indexed but not stored, and recomputed by merges.
+- **Loading files.** `strata::ingest` reads rows from JSON Lines, JSON and CSV or TSV files against the schema, and `ingest::import` bulk-loads them into an empty table in one commit (a bad row writes nothing) or upserts them in batches; `strata-server import`, the server's `POST /v1/import` and Python's `import_file` use it ([loading rows](server.md#loading-rows)). `Schema::from_json` reads a schema in a short form, types by name and only the options that differ from the defaults ([schemas](server.md#schemas)).
 - **Embedded vector fields.** A VECTOR field may be declared as a model's embedding of other fields (`"embed": {"from": ["title"], "model": "potion-retrieval-32M"}`). The schema records it; given the model, writes that leave the vector out get it computed and rewrites of a source recompute it, while merges keep the stored vectors ([embedded vector fields](server.md#embedded-vector-fields)).
 
 ### Vectors
@@ -182,7 +183,7 @@ The plan the planner chose is visible: the `strata` shell's `--plan` flag prints
 
 Strata is built for embedded retrieval: local search over documents with metadata and embeddings, such as retrieval for a model on a laptop, a desktop app's search box or an edge device, with SQL and one file to copy, back up or ship. It suits read-mostly corpora with steady writes: commits are visible at once, and batching amortises their sync, but merges rebuild every index of the segments they combine, and HNSW builds dominate load time (IVF builds 2.1–2.5× faster for write-heavy vector workloads). It is not meant for relational workloads with joins, high write concurrency, or corpora larger than one machine.
 
-**Current limits.** SQL covers one table, without joins; `INSERT`, `UPDATE` and `DELETE` run through `Db::sql`, and the Rust transaction API (`Database::begin`, `WriteTxn::insert`, `set`, `delete`, `commit`) groups several writes. The multi-process writer lock is designed but not built. A query searches a snapshot's segments on `ExecOptions::threads` threads (one by default). [strata-server](server.md) serves a database, or a set of shards, over the network.
+**Current limits.** SQL covers one table, without joins; `INSERT`, `UPDATE` and `DELETE` run through `Db::sql`, and the Rust transaction API (`Database::begin`, `WriteTxn::insert`, `set`, `delete`, `commit`) groups several writes. The multi-process writer lock is designed but not built. A query searches a snapshot's segments on `ExecOptions::threads` threads (one by default). [strata-server](server.md) serves a database, or a set of shards, over the network, and the [Python package](python.md) runs one in-process or talks to a server.
 
 ## Code layout
 

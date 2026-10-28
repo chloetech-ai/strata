@@ -1,0 +1,179 @@
+"""Strata from Python.
+
+`Database` runs the database in this process (a file, or a directory of
+segment files); `Client` talks to a running `strata-server` over HTTP. Both
+answer queries with the same `Result` and write rows the same way, so code
+can move from one to the other::
+
+    import strata
+
+    db = strata.open("books.strata", schema={
+        "table": "books", "key": "id",
+        "fields": [
+            {"name": "id", "type": "keyword"},
+            {"name": "title", "type": "text"},
+            {"name": "year", "type": "int"},
+        ],
+    })
+    db.upsert([{"id": "b1", "title": "The river and the dragon", "year": 1999}])
+    for row in db.search("dragon"):
+        print(row["id"], row["title"])
+    db.query("SELECT year, COUNT(*) FROM books GROUP BY year").rows
+
+Rows are dicts of field name to value: str, int, float, None, a list for a
+list field, a list of floats (or a numpy array) for a vector, a dict of term
+weights for a sparse field. Query parameters (``:name`` in the SQL) are
+passed as a dict or as keyword arguments; ``{"embed": "some text"}`` binds
+the text's vector by an embedded field's model, ``{"vector_of": key}`` a
+stored row's vector.
+"""
+
+from __future__ import annotations
+
+import builtins
+import json
+import os
+from typing import Any, Iterable, Mapping
+
+from . import _strata
+from ._search import Search, ordered_schema, params as _params
+from ._strata import StrataError
+from .client import Client
+from .result import Result
+
+__all__ = ["Database", "Client", "Result", "StrataError", "open", "connect"]
+
+
+def _schema_json(schema: Any) -> str:
+    """A schema given as a dict, JSON text or the path of a JSON file."""
+    if isinstance(schema, Mapping):
+        return json.dumps(schema)
+    if isinstance(schema, (str, os.PathLike)):
+        text = os.fspath(schema)
+        if text.lstrip().startswith("{"):
+            return text
+        with builtins.open(text, encoding="utf-8") as f:
+            return f.read()
+    raise TypeError("a schema is a dict, JSON text or the path of a JSON file")
+
+
+class Database(Search):
+    """A Strata database opened in this process.
+
+    Create one with `Database.create` (or `strata.open` with a schema), open
+    an existing one with `Database.open`. Only one process may have a
+    database open: to share one, serve it with `strata-server` and use
+    `Client`. Calls release the GIL, so threads can query at once.
+    """
+
+    def __init__(self, inner: Any):
+        self._db = inner
+
+    @classmethod
+    def create(cls, path: str | os.PathLike, schema: Any, *, directory: bool = False, models: str | os.PathLike | None = None) -> "Database":
+        """Creates a database at `path` with `schema` (a dict, JSON text, or
+        the path of a JSON file; the short form or the long one).
+        `directory` keeps it as a directory of segment files instead of one
+        file. `models` is where embedded fields' models are (default
+        $STRATA_MODELS or ~/.local/share/strata/models; see `strata-server
+        fetch-model`)."""
+        return cls(_strata.Database.create(os.fspath(path), _schema_json(schema), directory, None if models is None else os.fspath(models)))
+
+    @classmethod
+    def open(cls, path: str | os.PathLike, *, models: str | os.PathLike | None = None) -> "Database":
+        """Opens the database at `path`."""
+        return cls(_strata.Database.open(os.fspath(path), None if models is None else os.fspath(models)))
+
+    @property
+    def schema(self) -> dict:
+        """The schema in its short form: {table, key, fields}."""
+        return ordered_schema(json.loads(self._db.schema_json()))
+
+    @property
+    def embed_errors(self) -> dict[str, str]:
+        """Embedded fields whose model did not open, with the reason: rows
+        written here must bring those fields' vectors."""
+        return dict(self._db.embed_errors)
+
+    def _embedded(self) -> list[str]:
+        broken = self.embed_errors
+        return [f["name"] for f in self.schema["fields"] if f.get("embed") and f["name"] not in broken]
+
+    def __len__(self) -> int:
+        return self._db.count()
+
+    def query(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> Result:
+        """Runs a SELECT."""
+        return Result._of(self._db.query(sql, _params(params, kw)))
+
+    def sql(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> Result | int:
+        """Runs any statement: a SELECT's `Result`, or the number of rows an
+        INSERT, UPDATE or DELETE wrote."""
+        r = self._db.sql(sql, _params(params, kw))
+        return r if isinstance(r, int) else Result._of(r)
+
+    def insert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]]) -> int:
+        """Inserts a row or rows, whose keys must be new; all or none are
+        written. Returns how many."""
+        return self._db.insert(rows)
+
+    def upsert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]]) -> int:
+        """Inserts a row or rows, replacing the rows that have their keys,
+        in transactions of 10,000 rows. Returns how many."""
+        return self._db.upsert(rows)
+
+    def delete(self, keys: Any) -> int:
+        """Deletes the rows with this key or these keys; returns how many
+        there were."""
+        return self._db.delete(keys)
+
+    def import_file(self, path: str | os.PathLike, format: str | None = None) -> dict:
+        """Loads a JSON Lines, JSON (an array), CSV or TSV file, in `format`
+        or the one its extension names. Into an empty table the rows are
+        bulk-loaded in one commit; otherwise they are upserted. Returns
+        {rows, bulk, skipped_fields}: the columns the schema lacks."""
+        rows, bulk, skipped = self._db.import_file(os.fspath(path), format)
+        return {"rows": rows, "bulk": bulk, "skipped_fields": skipped}
+
+    def embed(self, text: str, field: str | None = None) -> list[float]:
+        """The query vector of `text` by an embedded field's model."""
+        return self._db.embed(text, field)
+
+    def optimize(self) -> None:
+        """Merges small segments (many small writes leave many)."""
+        self._db.optimize()
+
+    def close(self) -> None:
+        """Merges small segments and closes the database."""
+        self._db.close()
+
+    @property
+    def closed(self) -> bool:
+        return self._db.closed()
+
+    def __enter__(self) -> "Database":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        if self.closed:
+            return "<strata.Database (closed)>"
+        return f"<strata.Database {self.schema['table']}: {len(self)} rows>"
+
+
+def open(path: str | os.PathLike, schema: Any = None, *, directory: bool = False, models: str | os.PathLike | None = None) -> Database:
+    """Opens the database at `path`, creating it with `schema` if it does
+    not exist."""
+    if os.path.exists(path):
+        return Database.open(path, models=models)
+    if schema is None:
+        raise StrataError(f"{os.fspath(path)} does not exist: pass a schema to create it")
+    return Database.create(path, schema, directory=directory, models=models)
+
+
+def connect(url: str = "http://127.0.0.1:7700", *, token: str | None = None, timeout: float = 30.0) -> Client:
+    """A `Client` of the strata-server at `url`."""
+    return Client(url, token=token, timeout=timeout)
+
