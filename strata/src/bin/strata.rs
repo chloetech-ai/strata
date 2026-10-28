@@ -6,16 +6,20 @@
 //!   --plan                               print the planner's choices
 //!   --repeat N                           run each statement N times and report the median time
 //!   .schema / .segments                  print the schema / the snapshot's segments
+//!   .check                               check every byte against its checksums
+//!   .vacuum                              return free space to the file system
+//!   .checkpoint DEST [file|dir] [EARLIER] write a consistent copy (a backup) to DEST,
+//!                                        hard-linking segments an EARLIER dir checkpoint holds
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
 use strata::db::Db;
 use strata::query::sql::Params;
-use strata::storage::DbOptions;
+use strata::storage::{CheckpointOptions, DbOptions, Layout};
 use strata::Value;
 
 #[derive(Parser)]
@@ -76,6 +80,36 @@ fn run(db: &Db, sql: &str, params: &Params, args: &Args, out: &mut impl Write) -
     }
     match trimmed {
         ".schema" => return writeln!(out, "{}", serde_json::to_string_pretty(db.schema()).unwrap_or_default()),
+        ".check" => {
+            return match db.storage().check() {
+                Ok(()) => writeln!(out, "ok"),
+                Err(e) => writeln!(out, "error: {e}"),
+            }
+        }
+        ".vacuum" => {
+            return match db.storage().vacuum() {
+                Ok(n) => writeln!(out, "{n} bytes returned"),
+                Err(e) => writeln!(out, "error: {e}"),
+            }
+        }
+        _ if trimmed.starts_with(".checkpoint") => {
+            let words: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+            let layout = match words.get(1).copied() {
+                None | Some("file") => Layout::SingleFile,
+                Some("dir") => Layout::Directory,
+                Some(other) => return writeln!(out, "error: the layout is file or dir, not {other}"),
+            };
+            let Some(dest) = words.first() else { return writeln!(out, "usage: .checkpoint DEST [file|dir] [EARLIER]") };
+            let opts = CheckpointOptions { layout, link_from: words.get(2).map(PathBuf::from) };
+            return match db.storage().checkpoint(Path::new(dest), &opts) {
+                Ok(s) => writeln!(
+                    out,
+                    "{dest}: txn {}, {} tables, {} segments ({} linked), {} rows, {} bytes written in {:.2} s",
+                    s.txn, s.tables, s.segments, s.segments_linked, s.live_docs, s.bytes_written, s.seconds
+                ),
+                Err(e) => writeln!(out, "error: {e}"),
+            };
+        }
         ".segments" => {
             let snap = db.snapshot();
             for s in snap.segments() {

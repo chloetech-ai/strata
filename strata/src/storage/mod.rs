@@ -31,7 +31,7 @@ pub mod wal;
 
 use std::sync::{Mutex, MutexGuard};
 
-pub use db::{Database, DbOptions, DocumentSource, DropOptions, FileStats, Layout, SegmentStats, TableTxn, WriteTxn, LOCK_WAIT};
+pub use db::{CheckpointOptions, CheckpointStats, Database, DbOptions, DocumentSource, DropOptions, FileStats, Layout, SegmentStats, TableTxn, WriteTxn, LOCK_WAIT};
 pub use live::LiveDocs;
 pub use merge::{MergePolicy, MergeStats, SegmentInfo};
 pub use pk::{build_pk_index, key_hash, KeyRef, PkIndex};

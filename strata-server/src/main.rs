@@ -124,6 +124,10 @@ struct Args {
     /// format (`laptop, notebook` or `tv => television`); the UI edits it.
     #[arg(long)]
     synonyms: Option<PathBuf>,
+    /// A directory for checkpoints (consistent copies of the database,
+    /// taken while it serves) written by `POST /v1/admin/checkpoint`.
+    #[arg(long)]
+    backup_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -225,6 +229,7 @@ async fn main() {
         api_base: a.api_base,
         models: a.models.unwrap_or_else(strata::embed::models_dir),
         synonyms: a.synonyms,
+        backup_dir: a.backup_dir,
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
