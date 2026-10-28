@@ -38,7 +38,7 @@ use serde::Serialize;
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};
-use crate::segment::build::{build_segment, BuildOptions};
+use crate::segment::build::{build_segment, build_threads, BuildOptions};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::freelist::FreeList;
 use crate::storage::io;
@@ -1509,9 +1509,10 @@ impl Database {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id), cap);
+        let threads = build_threads(&self.opts.build).unwrap_or(1);
+        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id), cap, threads);
         let mut group = group?;
-        let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>());
+        let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>(), threads);
         // It fits the budget alone: it waits for running merges to finish.
         if budget.is_some_and(|b| m.memory() + memory > b) {
             return None;
