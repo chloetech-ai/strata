@@ -144,34 +144,30 @@ def main():
         summary["unavailable"][e] = r.get("unavailable", {})
         summary["differs"][e] = r.get("differs", {})
         summary["http"][e] = r["http"]
-    print("\n## One client: median latency in ms (p99)\n")
-    print("| kind | " + " | ".join(NAMES[e] for e in runs) + " |")
-    print("|---|" + "---|" * len(runs))
-    for kind in KINDS:
-        cells = []
-        for e in runs:
-            h = http(e, kind, 1)
-            cells.append(f"{h['p50_ms']:.2f} ({h['p99_ms']:.1f})" if h else ("n/a" if kind in runs[e].get("unavailable", {}) else "–"))
-        print(f"| {kind} | " + " | ".join(cells) + " |")
     concs = sorted({h["concurrency"] for r in runs.values() for h in r["http"]})
-    print("\n## Queries per second (" + " / ".join(f"{c} clients" for c in concs) + ")\n")
-    print("| kind | " + " | ".join(NAMES[e] for e in runs) + " |")
-    print("|---|" + "---|" * len(runs))
-    for kind in KINDS:
-        cells = []
-        for e in runs:
-            hs = [http(e, kind, c) for c in concs]
-            cells.append(" / ".join(fmt(h["qps"], 0) if h else "–" for h in hs) if any(hs) else "n/a")
-        print(f"| {kind} | " + " | ".join(cells) + " |")
-    print(f"\n## {concs[-1]} clients: median latency in ms (p99)\n")
-    print("| kind | " + " | ".join(NAMES[e] for e in runs) + " |")
-    print("|---|" + "---|" * len(runs))
-    for kind in KINDS:
-        cells = []
-        for e in runs:
-            h = http(e, kind, concs[-1])
-            cells.append(f"{h['p50_ms']:.2f} ({h['p99_ms']:.1f})" if h else "n/a")
-        print(f"| {kind} | " + " | ".join(cells) + " |")
+
+    def pct(h):
+        # p90 is in reports from runs after it was added.
+        return " / ".join(f"{h[k]:.2f}" if k in h else "–" for k in ["p50_ms", "p90_ms", "p99_ms"])
+
+    for c in concs:
+        print(f"\n## {c} client{'s' if c > 1 else ''}: queries per second, and latency in ms (p50 / p90 / p99)\n")
+        print("| kind | " + " | ".join(f"{NAMES[e]} q/s | {NAMES[e]} ms" for e in runs) + " |")
+        print("|---|" + "---|---|" * len(runs))
+        for kind in KINDS:
+            cells = []
+            for e in runs:
+                h = http(e, kind, c)
+                cells += [fmt(h["qps"], 0), pct(h)] if h else ["n/a", "n/a"]
+            print(f"| {kind} | " + " | ".join(cells) + " |")
+    # Every percentile, for the appendix.
+    with open(rep / "latency-full.md", "w") as f:
+        f.write("| engine | kind | clients | q/s | p50 | p90 | p95 | p99 | p99.9 | max | mean | errors |\n")
+        f.write("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+        for e, r in runs.items():
+            for h in r["http"]:
+                ms = " | ".join(f"{h[k]:.2f}" if k in h else "–" for k in ["p50_ms", "p90_ms", "p95_ms", "p99_ms", "p999_ms", "max_ms", "mean_ms"])
+                f.write(f"| {NAMES[e]} | {h['kind']} | {h['concurrency']} | {h['qps']:,.0f} | {ms} | {h['errors']} |\n")
     errors = {e: sum(h["errors"] for h in r["http"]) for e, r in runs.items()}
     print("\nErrors during the timed runs: " + ", ".join(f"{NAMES[e]} {n}" for e, n in errors.items()))
 

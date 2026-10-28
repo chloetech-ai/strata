@@ -906,9 +906,10 @@ async fn run(collection: &str, engine: Engine, urls: &[String], n_queries: usize
         for &c in concurrency {
             let t = drive(&client, reqs.clone(), c, seconds).await;
             eprintln!(
-                "{label:<8} {kind:<24} c={c:<3} {:>8.0} q/s  p50 {:>7.3} ms  p99 {:>7.3} ms  errors {}",
+                "{label:<8} {kind:<24} c={c:<3} {:>8.0} q/s  p50 {:>7.3} ms  p90 {:>7.3} ms  p99 {:>7.3} ms  errors {}",
                 t.ms.len() as f64 / t.seconds,
                 percentile(&t.ms, 50.0),
+                percentile(&t.ms, 90.0),
                 percentile(&t.ms, 99.0),
                 t.errors
             );
@@ -917,7 +918,8 @@ async fn run(collection: &str, engine: Engine, urls: &[String], n_queries: usize
             }
             http.push(json!({
                 "kind": kind, "concurrency": c, "requests": t.ms.len(), "qps": t.ms.len() as f64 / t.seconds.max(1e-9),
-                "p50_ms": percentile(&t.ms, 50.0), "p95_ms": percentile(&t.ms, 95.0), "p99_ms": percentile(&t.ms, 99.0),
+                "p50_ms": percentile(&t.ms, 50.0), "p90_ms": percentile(&t.ms, 90.0), "p95_ms": percentile(&t.ms, 95.0),
+                "p99_ms": percentile(&t.ms, 99.0), "p999_ms": percentile(&t.ms, 99.9), "max_ms": t.ms.iter().cloned().fold(0.0, f64::max),
                 "mean_ms": mean(&t.ms), "errors": t.errors, "first_error": t.first_error,
             }));
         }
