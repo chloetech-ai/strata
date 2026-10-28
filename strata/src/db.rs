@@ -71,27 +71,44 @@ impl Db {
     /// Bulk-loads documents (generated columns are filled in, and embedded
     /// vectors the documents leave out are computed).
     pub fn load(&self, docs: impl IntoIterator<Item = Document>) -> Result<()> {
+        self.try_load(docs.into_iter().map(Ok))
+    }
+
+    /// [`Db::load`] of documents that may fail to arrive (rows read from a
+    /// file): the first error ends the load, and nothing is committed.
+    pub fn try_load(&self, docs: impl IntoIterator<Item = Result<Document>>) -> Result<()> {
         let schema = self.schema().clone();
         let mut docs = docs.into_iter();
         if !self.embeds() {
-            return self.storage.bulk_load(docs.map(move |mut d| {
-                schema.fill_generated(&mut d);
-                d
+            return self.storage.try_bulk_load(docs.map(move |d| {
+                d.map(|mut d| {
+                    schema.fill_generated(&mut d);
+                    d
+                })
             }));
         }
         // Embedded in batches, so that a model sees many texts at once.
-        let mut ready = Vec::new().into_iter();
-        self.storage.bulk_load(std::iter::from_fn(|| loop {
+        let mut ready: std::vec::IntoIter<Result<Document>> = Vec::new().into_iter();
+        self.storage.try_bulk_load(std::iter::from_fn(|| loop {
             if let Some(d) = ready.next() {
                 return Some(d);
             }
-            let mut batch: Vec<Document> = docs.by_ref().take(EMBED_BATCH).collect();
+            let mut batch = Vec::new();
+            for d in docs.by_ref().take(EMBED_BATCH) {
+                match d {
+                    Ok(d) => batch.push(d),
+                    Err(e) => {
+                        // The rows before the error are not loaded either.
+                        return Some(Err(e));
+                    }
+                }
+            }
             if batch.is_empty() {
                 return None;
             }
             batch.iter_mut().for_each(|d| schema.fill_generated(d));
             self.embed_missing(&mut batch);
-            ready = batch.into_iter();
+            ready = batch.into_iter().map(Ok).collect::<Vec<_>>().into_iter();
         }))
     }
 

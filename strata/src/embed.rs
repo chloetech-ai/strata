@@ -59,6 +59,16 @@ pub const KNOWN_MODELS: &[(&str, &str, &str)] = &[
     ("snowflake-arctic-embed-m-v1.5", "Snowflake/snowflake-arctic-embed-m-v1.5", "BERT, 768 dimensions (feature bert)"),
 ];
 
+/// The dimensions of a model [`open`] knows by name (`hash:N` included),
+/// without opening it.
+pub fn known_dim(model: &str) -> Option<usize> {
+    if let Some(n) = model.strip_prefix("hash:") {
+        return n.parse().ok();
+    }
+    let dims = [("potion-retrieval-32M", 512), ("potion-base-8M", 256), ("bge-small-en-v1.5", 384), ("snowflake-arctic-embed-m-v1.5", 768), ("cohere/embed-english-v3.0", 1024)];
+    dims.iter().find(|(m, _)| m.eq_ignore_ascii_case(model)).map(|&(_, d)| d)
+}
+
 /// The files a model directory needs.
 pub const MODEL_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
 

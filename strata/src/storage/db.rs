@@ -480,6 +480,12 @@ impl Database {
     /// Loads documents straight into segments of `segment_max_docs`, in one
     /// commit and without the WAL. Keys must be new (as with `insert`).
     pub fn bulk_load(&self, docs: impl IntoIterator<Item = Document>) -> Result<()> {
+        self.try_bulk_load(docs.into_iter().map(Ok))
+    }
+
+    /// [`Database::bulk_load`] of documents that may fail to arrive: the
+    /// first error ends the load, and nothing is committed.
+    pub fn try_bulk_load(&self, docs: impl IntoIterator<Item = Result<Document>>) -> Result<()> {
         let mut wal = self.try_writer()?;
         // WAL deletes are replayed against the on-disk version; segments
         // written behind the WAL's back must not hold keys it touches.
@@ -491,6 +497,7 @@ impl Database {
         let mut chunk = Vec::new();
         let max = self.opts.segment_max_docs.max(1);
         for doc in docs {
+            let doc = doc?;
             validate(&self.schema, &doc)?;
             if let Some(pk) = pk {
                 let dup = !seen.insert(Key::of(&doc[pk]).expect("validated key"))
