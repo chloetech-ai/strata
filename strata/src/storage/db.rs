@@ -187,6 +187,8 @@ pub struct Database {
     /// Set when a write failed in a way that leaves memory and disk out of
     /// step; every later write fails until the database is reopened.
     poisoned: AtomicBool,
+    /// Why the last flush failed, until one succeeds.
+    flush_error: Mutex<Option<String>>,
 }
 
 impl Database {
@@ -368,6 +370,7 @@ impl Database {
             pins: Arc::new(Pins::default()),
             mem_ids: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
+            flush_error: Mutex::new(None),
         };
         db.republish();
         Ok(db)
@@ -527,7 +530,20 @@ impl Database {
         self.flush_locked(&mut wal)
     }
 
+    /// Why the last flush failed, if no flush has succeeded since. Writes
+    /// still commit meanwhile (the WAL holds them) until the memtable
+    /// reaches twice its limit.
+    pub fn flush_error(&self) -> Option<String> {
+        lock(&self.flush_error).clone()
+    }
+
     fn flush_locked(&self, wal: &mut Wal) -> Result<()> {
+        let r = self.flush_inner(wal);
+        *lock(&self.flush_error) = r.as_ref().err().map(|e| e.to_string());
+        r
+    }
+
+    fn flush_inner(&self, wal: &mut Wal) -> Result<()> {
         self.check_poisoned()?;
         let (mems, pending, pending_updates, txn) = {
             let st = lock(&self.state);
@@ -719,6 +735,9 @@ impl Database {
     pub fn merge(&self, policy: &MergePolicy) -> Result<MergeStats> {
         let _m = lock(&self.merge_lock);
         let source = self.opts.doc_source.clone().ok_or_else(|| Error::Schema("merging needs DbOptions::doc_source".into()))?;
+        // A database that cannot commit would build the merged segment
+        // only to throw it away.
+        self.check_poisoned()?;
         let t0 = Instant::now();
         let mut stats = MergeStats::default();
         let tables: Vec<(u32, usize)> = lock(&self.state).tables.iter().map(|t| (t.id, t.handles.len())).collect();
@@ -1129,28 +1148,35 @@ impl Database {
     /// INT field `f` of the live document of table `t` with primary key
     /// `key`: the value written in place if any, else the document's.
     fn live_int(&self, t: &TableRef, key: &Value, f: usize) -> Result<Option<i64>> {
+        Ok(self.live_value(t, key, f)?.as_i64())
+    }
+
+    /// Numeric field `f` of the live document of table `t` with primary
+    /// key `key` (NULL without one): the value written in place if any,
+    /// else the document's.
+    fn live_value(&self, t: &TableRef, key: &Value, f: usize) -> Result<Value> {
         let st = lock(&self.state);
         let (h, d) = match st.find_live(t.pos, key) {
-            None => return Ok(None),
+            None => return Ok(Value::Null),
             Some(Loc::Mem(i)) => {
                 let mem = &st.tables[t.pos].mem;
                 return Ok(match mem.updates.get(f, i) {
-                    Some(v) => v.as_i64(),
-                    None => mem.chunks[i as usize / mem.chunk][i as usize % mem.chunk][f].as_i64(),
+                    Some(v) => v.clone(),
+                    None => mem.chunks[i as usize / mem.chunk][i as usize % mem.chunk][f].clone(),
                 });
             }
             Some(Loc::Disk(id, d)) => (st.handle(id).cloned().expect("segment of a live key"), d),
         };
         let written = st.pending_updates.get(&h.meta.id).and_then(|(_, u)| u.get(f, d)).or_else(|| h.updates.as_ref().and_then(|u| u.get(f, d)));
         if let Some(v) = written {
-            return Ok(v.as_i64());
+            return Ok(v.clone());
         }
         drop(st);
         let field = &t.schema.fields[f];
         Ok(if field.indexed {
-            crate::forward::NumericColumn::open(&h.file, &field.name)?.get(d).as_i64()
+            crate::forward::NumericColumn::open(&h.file, &field.name)?.get(d)
         } else {
-            crate::forward::DocStore::open(&h.file, &t.schema)?.get_fields(d, &[f]).pop().and_then(|v| v.as_i64())
+            crate::forward::DocStore::open(&h.file, &t.schema)?.get_fields(d, &[f]).pop().unwrap_or(Value::Null)
         })
     }
 
@@ -1159,6 +1185,15 @@ impl Database {
             return Ok(());
         }
         self.check_poisoned()?;
+        // While flushes fail, the memtable grows; past twice its limit,
+        // writes wait for a flush to succeed, refused before they are logged.
+        let over = {
+            let st = lock(&self.state);
+            st.mem_len() + st.n_pending > 2 * self.opts.memtable_max_docs.max(1)
+        };
+        if over && self.flush_error().is_some() {
+            self.flush_locked(wal).map_err(|e| Error::Io(std::io::Error::other(format!("writes wait for a flush to succeed: {e}"))))?;
+        }
         let txn = lock(&self.state).txn + 1;
         // A failed append is cut off the log, so the transaction is not
         // committed; but the page cache may be in doubt after a failed
@@ -1174,14 +1209,13 @@ impl Database {
             st.txn = txn;
             st.mem_len() + st.n_pending > self.opts.memtable_max_docs
         };
-        if full {
-            // The flush publishes its version; if it fails, the transaction
-            // is committed all the same and must be visible.
-            let r = self.flush_locked(wal);
-            if r.is_err() {
-                self.republish();
-            }
-            return r;
+        // From here the transaction is durable, and its result is Ok: an
+        // error would make callers retry a write that already happened (an
+        // `add` applied twice). A failed flush is kept in `flush_error`
+        // and tried again by the next commit.
+        if full && self.flush_locked(wal).is_ok() {
+            // The flush published its version.
+            return Ok(());
         }
         self.republish();
         Ok(())
@@ -1268,6 +1302,11 @@ impl TableTxn<'_, '_> {
         self.txn.set_in(&self.t, key, field, value)
     }
 
+    /// [`WriteTxn::add`] in this table.
+    pub fn add(&mut self, key: &Value, field: &str, delta: &Value) -> Result<bool> {
+        self.txn.add_in(&self.t, key, field, delta)
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.t.schema
     }
@@ -1314,6 +1353,17 @@ impl<'a> WriteTxn<'a> {
     pub fn set(&mut self, key: &Value, field: &str, value: Value) -> Result<bool> {
         let t = self.db.first_table();
         self.set_in(&t, key, field, value)
+    }
+
+    /// Adds `delta` to a numeric field of the live document with this
+    /// primary key, in place as [`WriteTxn::set`] does. The base is the
+    /// value as this transaction sees it, its own writes included (NULL
+    /// counts as 0). An INT field takes an integer and refuses a sum that
+    /// overflows; a FLOAT sum must be finite. False if no document has the
+    /// key.
+    pub fn add(&mut self, key: &Value, field: &str, delta: &Value) -> Result<bool> {
+        let t = self.db.first_table();
+        self.add_in(&t, key, field, delta)
     }
 
     fn insert_in(&mut self, t: &TableRef, doc: Document) -> Result<()> {
@@ -1413,6 +1463,37 @@ impl<'a> WriteTxn<'a> {
         Ok(true)
     }
 
+    fn add_in(&mut self, t: &TableRef, key: &Value, field: &str, delta: &Value) -> Result<bool> {
+        let k = t.key_of(key)?;
+        let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        if !self.is_live(t, &k, key) {
+            return Ok(false);
+        }
+        let keys = self.keys(t.id);
+        let base = match (keys.touched.get(&k), keys.written.get(&k)) {
+            (Some(true), Some(d)) => d[i].clone(),
+            _ => match keys.sets.get(&(k.clone(), i)) {
+                Some(v) => v.clone(),
+                None => self.db.live_value(t, key, i)?,
+            },
+        };
+        let overflow = || Error::Schema(format!("{field} + {delta:?} overflows"));
+        let sum = match (&t.schema.fields[i].ty, delta) {
+            (FieldType::Int, Value::Int(x)) => Value::Int(base.as_i64().unwrap_or(0).checked_add(*x).ok_or_else(overflow)?),
+            (FieldType::Int, _) => return Err(Error::Schema(format!("{field} is INT: add an integer"))),
+            (FieldType::Float, d @ (Value::Int(_) | Value::Float(_))) => {
+                let y = base.as_f64().unwrap_or(0.0) + d.as_f64().unwrap_or(0.0);
+                if !y.is_finite() {
+                    return Err(overflow());
+                }
+                Value::Float(y)
+            }
+            (FieldType::Float, d) => return Err(Error::Schema(format!("cannot add {d:?} to {field}"))),
+            _ => return Err(Error::Schema(format!("{field} is not a numeric field"))),
+        };
+        self.set_in(t, key, field, sum)
+    }
+
     /// Operations buffered so far.
     pub fn len(&self) -> usize {
         self.ops.len()
@@ -1423,8 +1504,10 @@ impl<'a> WriteTxn<'a> {
     }
 
     /// Logs the transaction (durable on return when `DbOptions::sync`) and
-    /// applies it. If the memtables are then full they are flushed; an
-    /// error from that flush leaves the transaction committed.
+    /// applies it. `Ok` means it committed and `Err` that it did not, so a
+    /// failed commit can be retried. If the memtables are then full they
+    /// are flushed; a failed flush does not fail the commit, and shows in
+    /// [`Database::flush_error`].
     pub fn commit(self) -> Result<()> {
         let WriteTxn { db, mut wal, ops, .. } = self;
         db.commit_ops(&mut wal, ops)

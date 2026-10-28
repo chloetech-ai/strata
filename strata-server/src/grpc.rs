@@ -108,7 +108,8 @@ impl pb::strata_server::Strata for Grpc {
         let r = req.into_inner();
         let written = if !r.ops_json.is_empty() {
             let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
-            self.0.write_ops(ops).await?
+            let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
+            self.0.write_ops(ops, key).await?
         } else {
             match self.0.sql(&r.sql, &params_from_pb(r.params), 0).await? {
                 crate::service::SqlAnswer::Written { n, .. } => n,

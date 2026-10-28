@@ -14,6 +14,7 @@ pub mod coord;
 pub mod demo;
 pub mod grpc;
 pub mod http;
+pub mod idem;
 pub mod json;
 pub mod metrics;
 pub mod server;

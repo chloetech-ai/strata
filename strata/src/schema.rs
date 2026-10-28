@@ -185,6 +185,12 @@ impl Schema {
                 }
             }
         }
+        if let Some(f) = s.unrebuildable() {
+            return Err(Error::Schema(format!(
+                "{} must be stored (or generated from stored fields): merges rebuild a TEXT or SPARSE index from the stored values",
+                f.name
+            )));
+        }
         for (i, f) in s.fields.iter().enumerate() {
             if f.multi && (!matches!(f.ty, FieldType::Keyword | FieldType::Int) || !f.stored || s.primary_key == Some(i)) {
                 return Err(Error::Schema(format!("multi-valued field {} must be a stored KEYWORD or INT, not the primary key", f.name)));
@@ -220,6 +226,14 @@ impl Schema {
             return Err(Error::Schema("duplicate field name".into()));
         }
         Ok(s)
+    }
+
+    /// An indexed TEXT or SPARSE field that is neither stored nor
+    /// generated: nothing can rebuild its index when segments merge.
+    /// [`Schema::new`] refuses them; databases created before it did can
+    /// still hold one.
+    pub fn unrebuildable(&self) -> Option<&Field> {
+        self.fields.iter().find(|f| f.indexed && !f.stored && f.generated_from.is_empty() && matches!(f.ty, FieldType::Text { .. } | FieldType::Sparse))
     }
 
     pub fn field_index(&self, name: &str) -> Option<usize> {

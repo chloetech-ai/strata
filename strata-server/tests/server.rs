@@ -279,6 +279,63 @@ async fn grouped_writes_fail_alone() {
     assert_eq!(sold(&post(&c, &format!("{base}/v1/query"), count).await.1), sold0 + 56);
 }
 
+/// A retried write with an idempotency key is applied once (DB-2), and an
+/// `add` after an upsert of the same key in one request reads the upserted
+/// value (bug 13).
+#[tokio::test(flavor = "multi_thread")]
+async fn retries_apply_once_and_adds_read_earlier_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = http(service(create(dir.path(), "i.strata", |i| i < 100), "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let url = format!("{base}/v1/write");
+    let sold = |id: &'static str| {
+        let (c, base) = (c.clone(), base.clone());
+        async move { post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT sold FROM products WHERE id = :k", "params": {"k": id}})).await.1["rows"][0][0].clone() }
+    };
+
+    let ops = json!([
+        {"op": "upsert", "doc": {"id": "p0000005", "title": "Five", "sold": 1}},
+        {"op": "add", "key": "p0000005", "field": "sold", "value": 5},
+    ]);
+    let (status, r) = post(&c, &url, json!({"ops": ops})).await;
+    assert_eq!((status, r["written"].clone()), (200, json!(2)), "{r}");
+    assert_eq!(sold("p0000005").await, json!(6));
+
+    // The same request three times, with a key: applied once, answered alike.
+    let add = json!([{"op": "add", "key": "p0000005", "field": "sold", "value": 10}, {"op": "insert", "doc": {"id": "n9", "title": "New"}}]);
+    for _ in 0..3 {
+        let (status, r) = post(&c, &url, json!({"ops": add, "idempotency_key": "req-1"})).await;
+        assert_eq!((status, r["written"].clone()), (200, json!(2)), "{r}");
+    }
+    assert_eq!(sold("p0000005").await, json!(16));
+    // The key in a header works the same.
+    for _ in 0..2 {
+        let r = c.post(&url).header("Idempotency-Key", "req-2").json(&json!({"ops": [{"op": "add", "key": "p0000005", "field": "sold", "value": 1}]})).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    assert_eq!(sold("p0000005").await, json!(17));
+    // A key reused for other operations is refused.
+    let (status, _) = post(&c, &url, json!({"ops": [{"op": "delete", "key": "n9"}], "idempotency_key": "req-1"})).await;
+    assert_eq!(status, 422);
+    // A request that failed is not remembered, so its retry runs.
+    let bad = json!([{"op": "insert", "doc": {"id": "n9", "title": "again"}}]);
+    assert_eq!(post(&c, &url, json!({"ops": bad, "idempotency_key": "req-3"})).await.0, 400);
+    let (status, _) = post(&c, &url, json!({"ops": [{"op": "delete", "key": "n9"}], "idempotency_key": "req-4"})).await;
+    assert_eq!(status, 200);
+    let (status, r) = post(&c, &url, json!({"ops": bad, "idempotency_key": "req-3"})).await;
+    assert_eq!((status, r["written"].clone()), (200, json!(1)), "{r}");
+
+    // Integers stay exact past 2^53; an INT takes integer increments only.
+    let big = 9007199254740993i64;
+    let set = json!([{"op": "set", "key": "p0000005", "field": "sold", "value": big - 1}, {"op": "add", "key": "p0000005", "field": "sold", "value": 1}]);
+    assert_eq!(post(&c, &url, json!({"ops": set})).await.0, 200);
+    assert_eq!(sold("p0000005").await, json!(big));
+    let (status, _) = post(&c, &url, json!({"ops": [{"op": "add", "key": "p0000005", "field": "sold", "value": 1.5}]})).await;
+    assert_eq!(status, 400);
+    let (status, _) = post(&c, &url, json!({"ops": [{"op": "add", "key": "p0000005", "field": "sold", "value": 1}], "idempotency_key": ""})).await;
+    assert_eq!(status, 400);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_token_guards_the_api() {
     let dir = tempfile::tempdir().unwrap();

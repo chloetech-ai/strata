@@ -21,6 +21,7 @@ use strata::value::Value;
 use tokio::sync::Semaphore;
 
 use crate::coord::Coordinator;
+use crate::idem;
 use crate::metrics::{self, Metrics};
 use crate::{json as js, ApiError};
 
@@ -92,6 +93,8 @@ pub struct Service {
     running: AtomicUsize,
     /// The queue of a local database's writer thread ([`writer`]).
     writes: Option<mpsc::Sender<Queued>>,
+    /// Idempotency keys of the writes it applied ([`crate::idem`]).
+    idempotency: Arc<idem::Keys>,
     /// The synonym list `synonyms => 1` searches use, and its file.
     synonyms: RwLock<Option<Arc<Synonyms>>>,
     synonyms_file: Option<PathBuf>,
@@ -100,11 +103,12 @@ pub struct Service {
 impl Service {
     pub fn new(backend: Backend, schema: Schema, agent: AgentConfig, max_concurrent: usize, timeout: Duration) -> Service {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let idempotency = Arc::new(idem::Keys::default());
         let writes = match &backend {
             Backend::Local(db) => {
                 let (tx, rx) = mpsc::channel();
-                let db = db.clone();
-                std::thread::Builder::new().name("strata-writer".into()).spawn(move || writer(&db, rx)).expect("spawn the writer thread");
+                let (db, keys) = (db.clone(), idempotency.clone());
+                std::thread::Builder::new().name("strata-writer".into()).spawn(move || writer(&db, rx, &keys)).expect("spawn the writer thread");
                 Some(tx)
             }
             Backend::Cluster(_) => None,
@@ -123,6 +127,7 @@ impl Service {
             cores,
             running: AtomicUsize::new(0),
             writes,
+            idempotency,
             synonyms: RwLock::new(None),
             synonyms_file: None,
         }
@@ -234,11 +239,12 @@ impl Service {
         self.synonyms_file.as_deref()
     }
 
-    /// Hands a write to the writer thread and waits for its commit.
-    async fn write(&self, job: WriteJob, deadline: Instant) -> Result<u64, ApiError> {
+    /// Hands a write to the writer thread and waits for its commit. The
+    /// writer records `key`'s outcome, even if this future is dropped.
+    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>) -> Result<u64, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
         let (reply, rx) = tokio::sync::oneshot::channel();
-        tx.send(Queued { job, deadline, reply }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
+        tx.send(Queued { job, deadline, reply, key }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
         rx.await.map_err(|_| ApiError::internal("the writer thread stopped"))?
     }
 
@@ -487,7 +493,7 @@ impl Service {
         let t0 = Instant::now();
         let deadline = t0 + if timeout_ms > 0 { Duration::from_millis(timeout_ms) } else { self.timeout };
         let n = match &self.backend {
-            Backend::Local(_) => self.write(WriteJob::Sql(sql.to_string(), params.clone()), deadline).await?,
+            Backend::Local(_) => self.write(WriteJob::Sql(sql.to_string(), params.clone()), deadline, None).await?,
             Backend::Cluster(c) => c.sql(sql, params).await?,
         };
         self.metrics.write(n);
@@ -496,18 +502,35 @@ impl Service {
 
     /// Applies write operations (see the proto's WriteRequest) in one
     /// transaction per server, which other requests waiting at the same
-    /// time may share (see [`writer`]).
-    pub async fn write_ops(self: &Arc<Self>, mut ops: Vec<Json>) -> Result<u64, ApiError> {
+    /// time may share (see [`writer`]). With an idempotency `key`, a retry
+    /// of a request that committed returns its answer unapplied.
+    pub async fn write_ops(self: &Arc<Self>, mut ops: Vec<Json>, key: Option<String>) -> Result<u64, ApiError> {
         let n = match &self.backend {
             Backend::Local(db) => {
-                if self.models.iter().any(|m| m.model.is_ok()) {
-                    let (svc, db) = (self.clone(), db.clone());
-                    ops = tokio::task::spawn_blocking(move || svc.embed_ops(&db, &mut ops).map(|_| ops)).await.map_err(ApiError::internal)??;
+                if let Some(k) = &key {
+                    match self.idempotency.begin(k, idem::hash_ops(&ops)) {
+                        idem::Begin::New => {}
+                        idem::Begin::Done(n) => return Ok(n),
+                        idem::Begin::Busy => return Err(ApiError { status: 409, message: "a write with this idempotency key is still running".into() }),
+                        idem::Begin::Mismatch => return Err(ApiError { status: 422, message: "this idempotency key was used for different operations".into() }),
+                    }
                 }
-                // The deadline bounds the wait for the writer, not the embedding.
-                self.write(WriteJob::Ops(ops), Instant::now() + self.timeout).await?
+                let r = async {
+                    if self.models.iter().any(|m| m.model.is_ok()) {
+                        let (svc, db) = (self.clone(), db.clone());
+                        ops = tokio::task::spawn_blocking(move || svc.embed_ops(&db, &mut ops).map(|_| ops)).await.map_err(ApiError::internal)??;
+                    }
+                    // The deadline bounds the wait for the writer, not the embedding.
+                    self.write(WriteJob::Ops(ops), Instant::now() + self.timeout, key.clone()).await
+                }
+                .await;
+                if let (Err(_), Some(k)) = (&r, &key) {
+                    // Not committed (the writer reports a commit as Ok).
+                    self.idempotency.finish(k, None);
+                }
+                r?
             }
-            Backend::Cluster(c) => c.write_ops(ops).await?,
+            Backend::Cluster(c) => c.write_ops(ops, key).await?,
         };
         self.metrics.write(n);
         Ok(n)
@@ -528,7 +551,7 @@ impl Service {
         .map_err(ApiError::internal)??;
         let mut n = 0;
         for chunk in ops.chunks(IMPORT_OPS) {
-            n += self.write_ops(chunk.to_vec()).await?;
+            n += self.write_ops(chunk.to_vec(), None).await?;
         }
         Ok((n, unknown))
     }
@@ -604,6 +627,18 @@ struct Queued {
     job: WriteJob,
     deadline: Instant,
     reply: tokio::sync::oneshot::Sender<Result<u64, ApiError>>,
+    /// The request's idempotency key, whose outcome the writer records.
+    key: Option<String>,
+}
+
+impl Queued {
+    /// Records the outcome under the request's key and answers it.
+    fn answer(self, keys: &idem::Keys, r: Result<u64, ApiError>) {
+        if let Some(k) = &self.key {
+            keys.finish(k, r.as_ref().ok().copied());
+        }
+        let _ = self.reply.send(r);
+    }
 }
 
 /// Operations one shared transaction takes at most.
@@ -615,7 +650,7 @@ const GROUP_OPS: usize = 4096;
 /// commit); if one of them fails, each runs again alone, so that only it
 /// fails. SQL writes find their rows by reading the database, which does
 /// not show a transaction's own changes, so they commit alone.
-fn writer(db: &Db, rx: mpsc::Receiver<Queued>) {
+fn writer(db: &Db, rx: mpsc::Receiver<Queued>, keys: &idem::Keys) {
     let mut next = None;
     loop {
         let Some(first) = next.take().or_else(|| rx.recv().ok()) else { return };
@@ -640,7 +675,7 @@ fn writer(db: &Db, rx: mpsc::Receiver<Queued>) {
         let now = Instant::now();
         let (late, group): (Vec<Queued>, Vec<Queued>) = group.into_iter().partition(|q| q.deadline <= now);
         for q in late {
-            let _ = q.reply.send(Err(ApiError { status: 503, message: "the deadline passed while waiting for the writer".into() }));
+            q.answer(keys, Err(ApiError { status: 503, message: "the deadline passed while waiting for the writer".into() }));
         }
         let Some(deadline) = group.iter().map(|q| q.deadline).max() else { continue };
         if let [Queued { job: WriteJob::Sql(sql, params), .. }] = &group[..] {
@@ -648,23 +683,25 @@ fn writer(db: &Db, rx: mpsc::Receiver<Queued>) {
                 SqlResult::Written(n) => Ok(n),
                 SqlResult::Rows(_) => Err(ApiError::bad("not a write statement")),
             });
-            let _ = group.into_iter().next().expect("one").reply.send(r);
+            group.into_iter().next().expect("one").answer(keys, r);
             continue;
         }
         let requests: Vec<&[Json]> = group.iter().map(|q| q.ops()).collect();
         match wait_for_writer(deadline, || apply_requests(db, &requests)) {
             Ok(counts) => {
                 for (q, n) in group.into_iter().zip(counts) {
-                    let _ = q.reply.send(Ok(n));
+                    q.answer(keys, Ok(n));
                 }
             }
             Err(e) if group.len() == 1 => {
-                let _ = group.into_iter().next().expect("one").reply.send(Err(e));
+                group.into_iter().next().expect("one").answer(keys, Err(e));
             }
+            // A failed commit wrote nothing (Strata reports a durable commit
+            // as Ok), so each request can run again alone.
             Err(_) => {
                 for q in group {
                     let r = wait_for_writer(q.deadline, || apply_ops(db, q.ops()));
-                    let _ = q.reply.send(r);
+                    q.answer(keys, r);
                 }
             }
         }
@@ -702,17 +739,15 @@ pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<u64, ApiError> {
 fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<Vec<u64>, ApiError> {
     let schema = db.schema().clone();
     let mut t = db.storage().begin()?;
-    // Values this transaction set, for `add` to build on.
-    let mut seen: HashMap<(String, String), f64> = HashMap::new();
     let mut counts = Vec::with_capacity(requests.len());
     for ops in requests {
-        counts.push(apply_into(db, &schema, &mut t, &mut seen, ops)?);
+        counts.push(apply_into(&schema, &mut t, ops)?);
     }
     t.commit()?;
     Ok(counts)
 }
 
-fn apply_into(db: &Db, schema: &Schema, t: &mut WriteTxn<'_>, seen: &mut HashMap<(String, String), f64>, ops: &[Json]) -> Result<u64, ApiError> {
+fn apply_into(schema: &Schema, t: &mut WriteTxn<'_>, ops: &[Json]) -> Result<u64, ApiError> {
     let mut n = 0u64;
     for op in ops {
         let kind = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
@@ -732,31 +767,23 @@ fn apply_into(db: &Db, schema: &Schema, t: &mut WriteTxn<'_>, seen: &mut HashMap
                 t.upsert_if_newer(doc()?, v)?
             }
             "delete" => t.delete(&op_key(&schema, op)?)?,
-            "set" | "add" => {
-                let key = op_key(&schema, op)?;
+            "set" => {
+                let key = op_key(schema, op)?;
                 let f = field()?;
                 let fi = schema.field_index(f).ok_or_else(|| ApiError::bad(format!("no field {f}")))?;
+                t.set(&key, f, js::field_value(schema, fi, op.get("value").unwrap_or(&Json::Null))?)?
+            }
+            // The transaction's own writes count, other requests' in the
+            // same group commit included.
+            "add" => {
+                let key = op_key(schema, op)?;
                 let raw = op.get("value").unwrap_or(&Json::Null);
-                let value = if kind == "add" {
-                    let x = raw.as_f64().ok_or_else(|| ApiError::bad("add needs a numeric value"))?;
-                    let slot = (format!("{key:?}"), f.to_string());
-                    let base = match seen.get(&slot) {
-                        Some(b) => *b,
-                        None => current(db, &schema, &key, fi)?,
-                    };
-                    seen.insert(slot, base + x);
-                    match schema.fields[fi].ty {
-                        strata::FieldType::Int => Value::Int((base + x) as i64),
-                        _ => Value::Float(base + x),
-                    }
-                } else {
-                    let v = js::field_value(&schema, fi, raw)?;
-                    if let Some(x) = v.as_f64() {
-                        seen.insert((format!("{key:?}"), f.to_string()), x);
-                    }
-                    v
+                let delta = match (raw.as_i64(), raw.as_f64()) {
+                    (Some(x), _) => Value::Int(x),
+                    (None, Some(x)) => Value::Float(x),
+                    _ => return Err(ApiError::bad("add needs a numeric value")),
                 };
-                t.set(&key, f, value)?
+                t.add(&key, field()?, &delta)?
             }
             other => return Err(ApiError::bad(format!("unknown write op {other:?}"))),
         };
@@ -765,10 +792,3 @@ fn apply_into(db: &Db, schema: &Schema, t: &mut WriteTxn<'_>, seen: &mut HashMap
     Ok(n)
 }
 
-/// Numeric field `f` of the live document `key` (0 if it has none).
-fn current(db: &Db, schema: &Schema, key: &Value, f: usize) -> Result<f64, ApiError> {
-    let pk = schema.primary_key.expect("checked by op_key");
-    let sql = format!("SELECT {} FROM {} WHERE {} = :k", schema.fields[f].name, schema.table, schema.fields[pk].name);
-    let r = db.query(&sql, &Params::new().set("k", key.clone()))?;
-    Ok(r.rows.first().and_then(|r| r[0].as_f64()).unwrap_or(0.0))
-}

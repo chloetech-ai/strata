@@ -177,6 +177,9 @@ impl Db {
     /// loaded.
     pub fn load_from(&self, other: &Db) -> Result<u64> {
         let (old, new) = (other.schema(), self.schema());
+        if let Some(f) = old.unrebuildable() {
+            return Err(crate::Error::Schema(format!("{} is not stored, so its values cannot be copied", f.name)));
+        }
         let map: Vec<Option<usize>> = new
             .fields
             .iter()
@@ -534,11 +537,16 @@ fn with_source(mut opts: DbOptions) -> DbOptions {
 
 /// Rebuilds documents for merges: stored fields from the doc store, vectors
 /// and unstored structured fields from their indexes, generated text from
-/// its sources.
+/// its sources. Unstored TEXT or SPARSE has none, so a merge of a schema
+/// with one (from before [`Schema::new`] refused them) fails instead of
+/// emptying its index.
 pub struct StoredSource;
 
 impl DocumentSource for StoredSource {
     fn documents(&self, schema: &Schema, seg: &SegmentFile, docs: &[DocId]) -> Result<Vec<Document>> {
+        if let Some(f) = schema.unrebuildable() {
+            return Err(crate::Error::Schema(format!("cannot merge: {} is neither stored nor generated, so a merge would erase its index", f.name)));
+        }
         let store = if schema.fields.iter().any(|f| f.stored) { Some(DocStore::open(seg, schema)?) } else { None };
         let mut vectors = Vec::new();
         let mut numeric = Vec::new();

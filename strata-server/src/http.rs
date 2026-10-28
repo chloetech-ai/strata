@@ -165,13 +165,24 @@ async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     }
 }
 
-async fn write(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+/// The body's `ops`, applied once per idempotency key (the body's
+/// `idempotency_key` or an `Idempotency-Key` header).
+async fn write(State(app): State<App>, headers: HeaderMap, AxJson(b): AxJson<Json>) -> Res {
     let ops = match b.get("ops") {
         Some(Json::Array(ops)) => ops.clone(),
         _ => return Err(ApiError::bad("the body needs an array \"ops\"")),
     };
+    let key = match (b.get("idempotency_key"), headers.get("idempotency-key")) {
+        (Some(Json::String(k)), _) => Some(k.clone()),
+        (Some(_), _) => return Err(ApiError::bad("idempotency_key is a string")),
+        (None, Some(h)) => Some(h.to_str().map_err(|_| ApiError::bad("the Idempotency-Key header is not text"))?.to_string()),
+        (None, None) => None,
+    };
+    if key.as_ref().is_some_and(|k| k.is_empty() || k.len() > 256) {
+        return Err(ApiError::bad("an idempotency key has 1 to 256 characters"));
+    }
     let t0 = std::time::Instant::now();
-    let n = app.svc.write_ops(ops).await?;
+    let n = app.svc.write_ops(ops, key).await?;
     Ok(AxJson(json!({"written": n, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
 }
 
