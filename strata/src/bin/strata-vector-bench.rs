@@ -297,7 +297,7 @@ fn kernels_study(ds: &Dataset, r: &VectorReader, gt: &[Vec<Hit>], nq: usize) -> 
     let scalar_ns = time_ns(200_000, |i| {
         std::hint::black_box(kernels::dot_u8_i8_scalar(cs[i % 64], &qc.q8));
     });
-    let isa = kernels::SQ8_KERNEL;
+    let isa = kernels::sq8_kernel();
     // Ranking quality of SQ8 alone (no re-ranking): top-10 by each scoring.
     let n = ds.n as u32;
     let nq = nq.min(ds.queries.len());

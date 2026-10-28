@@ -41,6 +41,7 @@ pub mod postings;
 pub mod query;
 pub mod schema;
 pub mod segment;
+pub mod simd;
 pub mod storage;
 pub mod text;
 pub mod value;

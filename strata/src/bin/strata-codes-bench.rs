@@ -138,7 +138,7 @@ fn main() {
     let report = json!({
         "data": {"n": a.n, "dim": a.dim, "clusters": a.clusters, "queries": a.queries, "synthetic": true},
         "params": {"nprobe": a.nprobe, "ef": a.ef, "threads_build": a.threads, "threads_search": 1},
-        "machine": {"cpu": machine, "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), "sq8_kernel": kernels::SQ8_KERNEL},
+        "machine": {"cpu": machine, "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), "sq8_kernel": kernels::sq8_kernel()},
         "runs": runs,
     });
     std::fs::create_dir_all(&a.out).unwrap();

@@ -15,23 +15,30 @@ pub fn bit_width(x: u64) -> u32 {
 #[inline]
 pub fn select_in_word(w: u64, k: u32) -> u32 {
     debug_assert!(k < w.count_ones());
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    {
-        // SAFETY: guarded by the `bmi2` target feature.
-        unsafe { core::arch::x86_64::_pdep_u64(1u64 << k, w).trailing_zeros() }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::bmi2() {
+        // SAFETY: the CPU has BMI2.
+        return unsafe { select_in_word_bmi2(w, k) };
     }
     #[cfg(target_arch = "aarch64")]
     {
         select_in_word_neon(w, k)
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         select_in_word_scalar(w, k)
     }
 }
 
+/// [`select_in_word`] with `pdep`: deposit bit `k` into the set bits of `w`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn select_in_word_bmi2(w: u64, k: u32) -> u32 {
+    core::arch::x86_64::_pdep_u64(1u64 << k, w).trailing_zeros()
+}
+
 /// Portable [`select_in_word`]: clear the `k` lowest set bits.
-#[cfg_attr(all(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64"), not(test)), allow(dead_code))]
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 #[inline]
 pub fn select_in_word_scalar(w: u64, k: u32) -> u32 {
     let mut w = w;

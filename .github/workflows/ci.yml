@@ -28,8 +28,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Builds use -C target-cpu=native (.cargo/config.toml), so a cache
-      # must not be restored on a runner with another CPU model.
+      # The strata crate builds with -C target-cpu=native
+      # (strata/.cargo/config.toml), so a cache must not be restored on a
+      # runner with another CPU model.
       - name: CPU model
         id: cpu
         shell: bash
@@ -41,6 +42,18 @@ jobs:
       - name: Tests
         working-directory: ${{ matrix.crate }}
         run: cargo test --release
+      # strata-server, engram and the Python package build for a generic
+      # CPU, where Strata chooses its SIMD kernels at run time: test the
+      # kernels in such a build, then with every SIMD path turned off.
+      - name: Kernels on a generic build
+        if: matrix.crate == 'strata' && runner.os == 'Linux'
+        working-directory: strata
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64
+          CARGO_TARGET_DIR: target-generic
+        run: |
+          cargo test --release --lib -- vector:: postings:: forward:: simd
+          STRATA_SIMD=portable cargo test --release --lib -- vector:: postings:: forward::
       # Compiler warnings and clippy's correctness and suspicious lints fail
       # the build; style, complexity and performance lints are advice.
       - name: Clippy
@@ -54,16 +67,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Builds use -C target-cpu=native (.cargo/config.toml), so a cache
-      # must not be restored on a runner with another CPU model.
-      - name: CPU model
-        id: cpu
-        shell: bash
-        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: strata-server
-          key: strata-server-${{ steps.cpu.outputs.model }}
+          key: strata-server-smoke
       - name: Build
         working-directory: strata-server
         run: cargo build --release
