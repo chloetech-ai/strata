@@ -119,6 +119,8 @@ $$
 
 *N* and avgdl count the documents with at least one term in the field, as Lucene's `docCount` does, so rows without a value do not shrink the average length. Document lengths are quantised to one byte. Ranked queries drop English function words, and a term written twice weighs twice.
 
+A relevance gate in CI holds the ranking still: BM25 through SQL on the test splits of SciFact, NFCorpus and ArguAna (plain, and with `fuzzy => 'auto'` on the first two) must keep nDCG@10, recall@100 and recall@1000 within 0.002 of the numbers in `strata/tests/fixtures/relevance_gate.json`. A change that moves them fails until the pull request that makes it commits the new numbers, which the test writes (`STRATA_RELEVANCE_GATE=update`); the failure gives a paired randomization p-value over the queries. Settings are tuned on the dev or train splits (`strata-bm25-eval --split dev`), and the hybrid study picks its fusion weight on half of the queries and reports the other half.
+
 ### Structured fields
 
 - **Columns.** Integers and floats in 128-document blocks, frame-of-reference bit-packed, with min/max zone maps per block. Keywords are dictionary encoded with bit-packed codes. A column answers "value of document *d*" in O(1) and scans at memory bandwidth.

@@ -27,6 +27,7 @@
 
 #[cfg(feature = "baselines")]
 pub mod baselines;
+pub mod beir;
 pub mod cluster;
 pub mod data;
 pub mod db;

@@ -1,5 +1,5 @@
 //! nDCG@10 of BM25 ranked through SQL, on BEIR collections in their
-//! published layout (`corpus.jsonl`, `queries.jsonl`, `qrels/test.tsv`):
+//! published layout ([`strata::beir`]):
 //! the whole query path (query analysis, expansions, statistics, top-k), for
 //! comparing ranking changes before and after.
 //!
@@ -10,16 +10,16 @@
 //!
 //! Each variant is a `bm25` call's options: `plain` (none), `fuzzy`
 //! (`fuzzy => 'auto'`). Writes `<out>/bm25_<tag>.json` (default
-//! `results/text/`).
+//! `results/text/`). Tune on `--split dev` (or `train` where a collection
+//! has no dev split) and report `test`; `tests/relevance_gate.rs` holds the
+//! test numbers.
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
 use serde_json::{json, Value as Json};
+use strata::beir;
 use strata::db::Db;
 use strata::metrics::{mean, ndcg_at_k};
 use strata::query::Params;
@@ -37,6 +37,9 @@ struct Args {
     collections: Vec<String>,
     #[arg(long, value_delimiter = ',', default_value = "plain,fuzzy")]
     variants: Vec<String>,
+    /// The judgements to evaluate: `test`, or `dev` / `train` for tuning.
+    #[arg(long, default_value = "test")]
+    split: String,
     /// Names the output file (`bm25_<tag>.json`).
     #[arg(long)]
     tag: String,
@@ -46,47 +49,6 @@ struct Args {
     /// after its collection.
     #[arg(long)]
     tmp: Option<PathBuf>,
-}
-
-struct Coll {
-    docs: Vec<(String, String)>,
-    /// Queries with judgements, in file order.
-    queries: Vec<(String, String)>,
-    qrels: HashMap<String, HashMap<String, u32>>,
-}
-
-fn lines(path: &Path) -> impl Iterator<Item = String> {
-    let f = File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    BufReader::new(f).lines().map(|l| l.expect("readable line"))
-}
-
-fn str_of<'a>(j: &'a Json, key: &str) -> &'a str {
-    j.get(key).and_then(Json::as_str).unwrap_or("")
-}
-
-fn load(dir: &Path) -> Coll {
-    let mut docs = Vec::new();
-    for line in lines(&dir.join("corpus.jsonl")) {
-        let j: Json = serde_json::from_str(&line).expect("corpus line is JSON");
-        let (title, text) = (str_of(&j, "title"), str_of(&j, "text"));
-        let body = if title.is_empty() { text.to_string() } else { format!("{title}\n{text}") };
-        docs.push((str_of(&j, "_id").to_string(), body));
-    }
-    let mut qrels: HashMap<String, HashMap<String, u32>> = HashMap::new();
-    for line in lines(&dir.join("qrels/test.tsv")).skip(1) {
-        let mut cols = line.split('\t');
-        let (Some(q), Some(d), Some(g)) = (cols.next(), cols.next(), cols.next()) else { continue };
-        qrels.entry(q.to_string()).or_default().insert(d.to_string(), g.trim().parse().unwrap_or(0));
-    }
-    let mut queries = Vec::new();
-    for line in lines(&dir.join("queries.jsonl")) {
-        let j: Json = serde_json::from_str(&line).expect("query line is JSON");
-        let id = str_of(&j, "_id");
-        if qrels.contains_key(id) {
-            queries.push((id.to_string(), str_of(&j, "text").to_string()));
-        }
-    }
-    Coll { docs, queries, qrels }
 }
 
 fn options(variant: &str) -> &'static str {
@@ -117,7 +79,7 @@ fn main() {
     let mut report = serde_json::Map::new();
     for name in &args.collections {
         let t0 = Instant::now();
-        let coll = load(&args.dir.join(name));
+        let coll = beir::load(&args.dir.join(name), &args.split).unwrap_or_else(|e| panic!("{name}: {e}"));
         let path = tmp.join(format!("strata-bm25-eval-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
@@ -150,7 +112,7 @@ fn main() {
         drop(db);
         let _ = std::fs::remove_dir_all(&path);
         // Written after each collection, so a stopped run keeps what it measured.
-        let out = json!({ "tag": args.tag, "machine": machine(), "collections": report });
+        let out = json!({ "tag": args.tag, "split": args.split, "machine": machine(), "collections": report });
         std::fs::write(&file, serde_json::to_string_pretty(&out).unwrap() + "\n").unwrap();
     }
     eprintln!("wrote {}", file.display());
