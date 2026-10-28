@@ -1,0 +1,9 @@
+scidocs: 25657 documents, 1000 queries; model bert:bge-small-en-v1.5 (384 dimensions)
+loaded and embedded 3 fields in 2848.4 s (0 documents without a title get no title vector)
+scidocs (1000 queries)                                           nDCG@10  recall@100
+bm25 (title + text)                                               0.1569      0.3589
+bge-small-en-v1.5 vector of title                                 0.1946      0.4442
+bge-small-en-v1.5 vector of text                                  0.1982      0.4597
+bge-small-en-v1.5 vector of title + text                          0.2052      0.4594
+rrf(bm25, bge-small-en-v1.5 vector of title + text)               0.1945      0.4420
+reference: Cohere embed-english-v3 vector of title + text         0.2034      0.4505
