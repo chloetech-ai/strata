@@ -1,0 +1,48 @@
+# Strata: shard __I__ of 2, serving the database `engine-compare build`
+# wrote on this node's own disk (hostPath /var/local/compare, so the pod
+# must run on the node that built it). With the coordinator below, the
+# shards and the coordinator together have the same CPU and memory as the
+# other engines' two data pods (strata-coordinator.yaml). compare.sh
+# writes strata-0 and strata-1 from this file.
+apiVersion: v1
+kind: Service
+metadata:
+  name: strata
+  namespace: compare
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: strata-shard}
+  ports:
+    - {name: http, port: 7700}
+    - {name: grpc, port: 7701}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: strata-__I__
+  namespace: compare
+  labels: {app: strata-shard, engine: strata}
+spec:
+  hostname: strata-__I__
+  subdomain: strata
+  nodeName: __NODE__
+  containers:
+    - name: strata
+      image: strata-server:compare
+      imagePullPolicy: IfNotPresent
+      args: [--db, /local/quora.shard__I__of2.strata, --listen, "0.0.0.0:7700", --grpc, "0.0.0.0:7701"]
+      ports:
+        - {name: http, containerPort: 7700}
+        - {name: grpc, containerPort: 7701}
+      readinessProbe:
+        httpGet: {path: /v1/health, port: http}
+        periodSeconds: 2
+      resources:
+        requests: {cpu: __CPU__, memory: __MEM__}
+        limits: {cpu: __CPU__, memory: __MEM__}
+      volumeMounts:
+        - {name: local, mountPath: /local}
+  volumes:
+    - name: local
+      hostPath: {path: /var/local/compare, type: Directory}

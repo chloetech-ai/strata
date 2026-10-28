@@ -1,0 +1,36 @@
+# Strata's coordinator over strata-0 and strata-1: it takes the CPU and
+# memory the shards leave of the engine's budget.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: strata-coordinator
+  namespace: compare
+  labels: {app: strata-coordinator, engine: strata}
+spec:
+  nodeName: __NODE__
+  containers:
+    - name: strata
+      image: strata-server:compare
+      imagePullPolicy: IfNotPresent
+      args:
+        - --listen=0.0.0.0:7700
+        - --grpc=off
+        - --shards=http://strata-0.strata:7701,http://strata-1.strata:7701
+      ports:
+        - {name: http, containerPort: 7700}
+      readinessProbe:
+        httpGet: {path: /v1/health, port: http}
+        periodSeconds: 2
+      resources:
+        requests: {cpu: __CPU__, memory: __MEM__}
+        limits: {cpu: __CPU__, memory: __MEM__}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: strata-coordinator
+  namespace: compare
+spec:
+  selector: {app: strata-coordinator}
+  ports:
+    - {name: http, port: 7700}
