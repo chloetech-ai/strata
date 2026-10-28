@@ -128,6 +128,16 @@ struct Args {
     /// taken while it serves) written by `POST /v1/admin/checkpoint`.
     #[arg(long)]
     backup_dir: Option<PathBuf>,
+    /// Merges that may run at once (default: half the cores, 1 to 4).
+    #[arg(long)]
+    merge_threads: Option<usize>,
+    /// Memory the running merges may use together, in MiB (default: a
+    /// quarter of the cgroup memory limit, or of RAM).
+    #[arg(long)]
+    merge_memory_mb: Option<u64>,
+    /// How fast merges may write, in MiB/s (default: no limit).
+    #[arg(long)]
+    merge_write_mb_per_sec: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -230,6 +240,15 @@ async fn main() {
         models: a.models.unwrap_or_else(strata::embed::models_dir),
         synonyms: a.synonyms,
         backup_dir: a.backup_dir,
+        merger: {
+            let d = strata::storage::MergerOptions::default();
+            strata::storage::MergerOptions {
+                threads: a.merge_threads.unwrap_or(d.threads),
+                memory_budget: a.merge_memory_mb.map(|m| m << 20),
+                write_bytes_per_sec: a.merge_write_mb_per_sec.map(|m| m << 20),
+                ..d
+            }
+        },
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));

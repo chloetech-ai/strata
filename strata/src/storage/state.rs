@@ -10,6 +10,7 @@ use crate::postings::bytes::OwnedBytes;
 use crate::error::{corrupt, Result};
 use crate::schema::Schema;
 use crate::segment::{DocId, SegmentFile};
+use crate::storage::db::Reserved;
 use crate::storage::freelist::FreeList;
 use crate::storage::live::{words_for, LiveDocs};
 use crate::storage::manifest::{Manifest, SegmentMeta};
@@ -327,6 +328,12 @@ pub(crate) struct State {
     /// by the number of pending deletes it includes.
     pub live_cache: HashMap<u64, (usize, Arc<LiveDocs>)>,
     pub cached: Option<Arc<SnapInner>>,
+    /// Space reserved for merged images being written, which no commit may
+    /// hand out until they are installed or given back.
+    pub reserved: Vec<Reserved>,
+    /// Segment ids below this are taken (by reservations), even when the
+    /// manifest's `next_segment_id` is lower.
+    pub next_segment_id: u64,
 }
 
 impl State {

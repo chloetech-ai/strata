@@ -12,7 +12,9 @@
 //! * [`live`]: delete sets as live-document filters.
 //! * [`updates`]: in-place updates of numeric fields.
 //! * [`pk`]: the primary-key index section.
-//! * [`merge`]: the tiered merge policy.
+//! * [`merge`]: the tiered merge policy, and what the background merger
+//!   needs (memory estimates and limits, a write throttle, the record of
+//!   interrupted merges).
 //! * [`Database`], [`WriteTxn`], [`Snapshot`]: the API.
 
 mod db;
@@ -33,7 +35,7 @@ use std::sync::{Mutex, MutexGuard};
 
 pub use db::{CheckpointOptions, CheckpointStats, Database, DbOptions, DocumentSource, FileStats, Layout, SegmentStats, TableTxn, WriteTxn, LOCK_WAIT};
 pub use live::LiveDocs;
-pub use merge::{MergePolicy, MergeStats, SegmentInfo};
+pub use merge::{memory_limit, merge_memory, MergePolicy, MergeStats, MergeStatus, MergerOptions, SegmentInfo};
 pub use pk::{build_pk_index, key_hash, KeyRef, PkIndex};
 pub use snapshot::{SegmentView, Snapshot};
 pub use updates::Updates;

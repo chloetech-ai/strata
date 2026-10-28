@@ -1,7 +1,8 @@
 //! Power losses, full disks and failing syncs, simulated by `storage::io`
 //! (feature `fault-injection`): a workload of transactions, flushes (also
 //! in the background, with a transaction committing while one builds),
-//! merges, vacuums and bulk loads runs with the `n`-th change to its files
+//! merges (also with a transaction committing while a merged image waits
+//! to be installed), vacuums and bulk loads runs with the `n`-th change to its files
 //! failing, for every `n`, and the database is reopened from what the
 //! failure left.
 //!
@@ -113,7 +114,34 @@ fn workload(path: &Path, src: &Arc<MapSource>, sync: bool, seed: u64, ops: usize
                 next = live.clone();
                 (res, Some(0))
             }
-            80..=87 => (db.merge(&policy).map(|_| ()), None),
+            80..=83 => (db.merge(&policy).map(|_| ()), None),
+            84..=87 => {
+                // A transaction while the first merged image waits to be
+                // installed; as with the background flush, it stands on its
+                // own.
+                let (mut inner, mut with) = (None, live.clone());
+                let res = db.merge_with(&policy, || {
+                    if inner.is_none() {
+                        inner = Some(transaction(&db, &mut rng, src, &mut with, n));
+                    }
+                    true
+                });
+                match inner {
+                    Some(Ok(())) => {
+                        live = with;
+                        run.states.push(live.clone());
+                    }
+                    Some(Err(_)) => {
+                        run.failed.push((run.states.len() - 1, with, db.is_poisoned()));
+                        if stop {
+                            break;
+                        }
+                    }
+                    None => {}
+                }
+                next = live.clone();
+                (res.map(|_| ()), None)
+            }
             88..=91 => (db.vacuum().map(|_| ()), None),
             _ => {
                 let ids: Vec<u64> = (fresh..fresh + rng.gen_range(1..40)).collect();
