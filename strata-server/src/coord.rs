@@ -37,7 +37,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value as Json};
 use strata::query::exec::ResultSet;
 use strata::query::stats::TermStats;
-use strata::query::{bind_write, Params, Select, Write};
+use strata::query::{bind_write, Conflict, Params, Select, Write};
 use strata::schema::Schema;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -498,13 +498,25 @@ impl Coordinator {
     }
 
     /// An INSERT goes to the shards of its documents' keys; UPDATE and
-    /// DELETE go to every shard.
+    /// DELETE go to every shard, so they take no LIMIT here.
     pub async fn sql(&self, sql: &str, params: &Params) -> Result<u64, ApiError> {
         match bind_write(sql, &self.schema, params)? {
-            Some(Write::Insert { docs, replace }) => {
-                let op = if replace { "upsert" } else { "insert" };
+            Some(Write::Insert { docs, conflict }) => {
+                let op = match conflict {
+                    Conflict::Fail => "insert",
+                    Conflict::Replace => "upsert",
+                    // The shards' write operations have no insert-if-absent
+                    // or update-on-conflict.
+                    Conflict::Skip | Conflict::Update(_) => {
+                        return Err(ApiError::bad("INSERT ... ON CONFLICT DO NOTHING and DO UPDATE are not supported through a coordinator yet (INSERT OR REPLACE is)"))
+                    }
+                };
                 let ops = docs.iter().map(|d| json!({"op": op, "doc": js::document_json(&self.schema, d)})).collect();
                 self.write_ops(ops, None).await
+            }
+            // Each shard would take its own LIMIT rows.
+            Some(Write::Update { select, .. } | Write::Delete { select }) if select.limit.is_some() => {
+                Err(ApiError::bad("UPDATE ... LIMIT and DELETE ... LIMIT are not supported through a coordinator yet"))
             }
             Some(_) => {
                 let r = pb::WriteRequest { sql: sql.into(), params: params_to_pb(params), ..Default::default() };

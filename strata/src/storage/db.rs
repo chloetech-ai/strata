@@ -218,6 +218,10 @@ impl Database {
     /// Creates a new database (the path must not exist) in the layout
     /// `opts.layout` names, and its WAL.
     pub fn create(path: &Path, schema: Schema, opts: DbOptions) -> Result<Database> {
+        if let Some(f) = schema.fields.iter().find(|f| f.references.as_ref().is_some_and(|r| !r.eq_ignore_ascii_case(&schema.table))) {
+            let r = f.references.as_deref().unwrap_or_default();
+            return Err(Error::Schema(format!("field {}: references {r}, and a new database has no table but {}", f.name, schema.table)));
+        }
         if opts.layout == Layout::Directory {
             return Database::create_dir(path, schema, opts);
         }
@@ -461,12 +465,36 @@ impl Database {
     /// A database with more than one table is written in format 2, which
     /// versions of Strata before tables cannot open; dropping back to the
     /// first table alone writes format 1 again.
-    pub fn create_table(&self, schema: Schema) -> Result<()> {
+    ///
+    /// A field that references another table ([`crate::schema::Field::references`])
+    /// must name a table of this database whose primary key has the field's
+    /// type; the reference is spelled as that table's name.
+    pub fn create_table(&self, mut schema: Schema) -> Result<()> {
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         check_table_name(&schema.table)?;
         if self.table(&schema.table).is_some() {
             return Err(Error::Schema(format!("table {} already exists", schema.table)));
+        }
+        let tables = self.tables();
+        for f in schema.fields.iter_mut() {
+            let Some(r) = &f.references else { continue };
+            if r.eq_ignore_ascii_case(&schema.table) {
+                continue;
+            }
+            let t = tables.iter().find(|t| t.table.eq_ignore_ascii_case(r)).ok_or_else(|| Error::Schema(format!("field {}: references {r}, which is not a table", f.name)))?;
+            let pk = t.primary_key.map(|k| &t.fields[k]).ok_or_else(|| Error::Schema(format!("field {}: references {}, which has no primary key", f.name, t.table)))?;
+            if pk.ty != f.ty {
+                return Err(Error::Schema(format!(
+                    "field {}: references {}, whose primary key {} is {}, not {}",
+                    f.name,
+                    t.table,
+                    pk.name,
+                    crate::schema::type_name(&pk.ty),
+                    crate::schema::type_name(&f.ty)
+                )));
+            }
+            f.references = Some(t.table.clone());
         }
         let mut vw = VersionWriter::begin(self);
         let id = vw.manifest.next_table_id;
@@ -478,17 +506,50 @@ impl Database {
 
     /// Drops the table named `name` (any case) and its rows, in one commit.
     /// The first table (the one the database was created with) cannot be
-    /// dropped. The memtables are flushed first, so that no logged write
-    /// outlives its table. Its pages are freed once no snapshot reads them.
+    /// dropped, nor a table that another one references
+    /// ([`Database::drop_tables`] can). The memtables are flushed first, so
+    /// that no logged write outlives its table. Its pages are freed once no
+    /// snapshot reads them.
     pub fn drop_table(&self, name: &str) -> Result<()> {
+        self.drop_tables(&[name], DropOptions::default())
+    }
+
+    /// Drops the tables named in `names` (any case) and their rows, in one
+    /// commit, as [`Database::drop_table`] drops one. A table that a table
+    /// left standing references ([`crate::schema::Field::references`]) is
+    /// dropped only with `opts.cascade`, which removes those references in
+    /// the same commit; a name that is not a table is an error unless
+    /// `opts.if_exists`.
+    pub fn drop_tables(&self, names: &[&str], opts: DropOptions) -> Result<()> {
         let mut wal = self.try_writer()?;
-        let id = {
+        let (ids, dropped) = {
             let st = lock(&self.state);
-            st.tables.iter().find(|t| t.schema.table.eq_ignore_ascii_case(name)).map(|t| t.id)
+            let mut ids = Vec::new();
+            let mut dropped: Vec<String> = Vec::new();
+            for name in names {
+                match st.tables.iter().find(|t| t.schema.table.eq_ignore_ascii_case(name)) {
+                    None if opts.if_exists => {}
+                    None => return Err(Error::Schema(format!("no table {name}"))),
+                    Some(t) if t.id == 0 => return Err(Error::Schema(format!("{} is the database's first table, which cannot be dropped", t.schema.table))),
+                    Some(t) if ids.contains(&t.id) => {}
+                    Some(t) => {
+                        ids.push(t.id);
+                        dropped.push(t.schema.table.clone());
+                    }
+                }
+            }
+            if !opts.cascade {
+                for t in st.tables.iter().filter(|t| !ids.contains(&t.id)) {
+                    if let Some((f, r)) = dropped.iter().find_map(|d| t.schema.referencing(d).next().map(|f| (f, d))) {
+                        let (t, f) = (&t.schema.table, &t.schema.fields[f].name);
+                        return Err(Error::Schema(format!("{t}.{f} references {r}: drop {t} as well, or drop with CASCADE, which removes the reference")));
+                    }
+                }
+            }
+            (ids, dropped)
         };
-        let id = id.ok_or_else(|| Error::Schema(format!("no table {name}")))?;
-        if id == 0 {
-            return Err(Error::Schema(format!("{name} is the database's first table, which cannot be dropped")));
+        if ids.is_empty() {
+            return Ok(());
         }
         self.flush_locked(&mut wal)?;
         if !wal.is_empty() {
@@ -496,7 +557,16 @@ impl Database {
             wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
         }
         let mut vw = VersionWriter::begin(self);
-        vw.drop_table(id);
+        for &id in &ids {
+            vw.drop_table(id);
+        }
+        for t in vw.manifest.tables.iter_mut() {
+            for f in t.schema.fields.iter_mut() {
+                if f.references.as_ref().is_some_and(|r| dropped.iter().any(|d| d.eq_ignore_ascii_case(r))) {
+                    f.references = None;
+                }
+            }
+        }
         let c = vw.commit(&mut wal)?;
         self.publish(c, |st| {
             st.live_cache.clear();
@@ -1186,6 +1256,13 @@ impl Database {
                     Some(i) => {
                         let mut o = old_tables.swap_remove(i);
                         o.handles = h;
+                        // A drop with CASCADE removes references; nothing
+                        // else changes a table's schema, and never the
+                        // first table's (whose references are its own).
+                        if *o.schema != t.schema {
+                            debug_assert!(t.id != 0, "the first table's schema changed");
+                            o.schema = Arc::new(t.schema.clone());
+                        }
                         o
                     }
                     None => TableState::new(t.id, Arc::new(t.schema.clone()), h, self.opts.memtable_chunk_docs, 0),
@@ -1967,6 +2044,16 @@ fn segment_stats(m: &Manifest) -> Vec<SegmentStats> {
             })
         })
         .collect()
+}
+
+/// What [`Database::drop_tables`] does about references and missing tables.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DropOptions {
+    /// Remove the references that tables left standing hold to the dropped
+    /// ones (SQL `CASCADE`), instead of refusing to drop.
+    pub cascade: bool,
+    /// Skip names that are not tables (SQL `IF EXISTS`), instead of failing.
+    pub if_exists: bool,
 }
 
 /// Table names are plain identifiers, so SQL can name them unquoted.
