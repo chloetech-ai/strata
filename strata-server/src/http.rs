@@ -17,7 +17,9 @@
 //! | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the steps taken |
 //!
 //! With a token set, every route but `/` and `/v1/health` needs
-//! `Authorization: Bearer <token>`.
+//! `Authorization: Bearer <token>`. Every route checks the `Host` header
+//! and, on a request that can change something, the `Origin` header
+//! ([`crate::auth`]).
 
 use std::sync::Arc;
 
@@ -32,6 +34,7 @@ use serde_json::{json, Value as Json};
 
 use strata::ingest::Format;
 
+use crate::auth::{self, Access, Secret};
 use crate::service::{QueryReq, Service, SqlAnswer};
 use crate::{agent, json as js, ApiError};
 
@@ -49,11 +52,12 @@ type Res = Result<AxJson<Json>, ApiError>;
 #[derive(Clone)]
 struct App {
     svc: Arc<Service>,
-    token: Option<Arc<str>>,
+    token: Option<Secret>,
+    hosts: Option<Arc<[String]>>,
 }
 
-pub fn router(svc: Arc<Service>, token: Option<String>) -> Router {
-    let app = App { svc, token: token.map(Into::into) };
+pub fn router(svc: Arc<Service>, access: &Access) -> Router {
+    let app = App { svc, token: access.token.clone(), hosts: access.hosts.clone().map(Into::into) };
     let api = Router::new()
         .route("/v1/stats", get(stats))
         .route("/v1/schema", get(schema))
@@ -74,16 +78,33 @@ pub fn router(svc: Arc<Service>, token: Option<String>) -> Router {
         .route("/", get(|| async { Html(UI) }))
         .route("/v1/health", get(health))
         .merge(api)
+        .layer(middleware::from_fn_with_state(app.clone(), browsers))
         .layer(DefaultBodyLimit::max(256 << 20))
         .with_state(app)
 }
 
+fn header_str<'a>(headers: &'a HeaderMap, name: header::HeaderName) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
 async fn auth(State(app): State<App>, headers: HeaderMap, req: Request, next: Next) -> Response {
     if let Some(token) = &app.token {
-        let given = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-        if given != Some(&**token) {
+        if !token.admits(header_str(&headers, header::AUTHORIZATION)) {
             return ApiError { status: 401, message: "missing or wrong token".into() }.into_response();
         }
+    }
+    next.run(req).await
+}
+
+/// Keeps out pages on other sites: one that reached this server through
+/// DNS rebinding (a `Host` it does not answer to), and one that posts to
+/// it (an `Origin` other than its own), which a browser lets any page do
+/// without a token.
+async fn browsers(State(app): State<App>, headers: HeaderMap, req: Request, next: Next) -> Response {
+    let safe = req.method().is_safe();
+    let host = header_str(&headers, header::HOST).map(str::to_string).or_else(|| req.uri().authority().map(|a| a.to_string()));
+    if let Some(why) = auth::browser_check(app.hosts.as_deref(), host.as_deref(), header_str(&headers, header::ORIGIN), safe) {
+        return ApiError { status: 403, message: why }.into_response();
     }
     next.run(req).await
 }
@@ -186,8 +207,16 @@ async fn write(State(app): State<App>, headers: HeaderMap, AxJson(b): AxJson<Jso
     Ok(AxJson(json!({"written": n, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
 }
 
-/// Rows in the body, in the format `?format=` names or the content type implies.
+/// Rows in the body, in the format `?format=` names or the content type
+/// implies. The content type must not be one a page on another site may
+/// send without asking first (text/plain, a form, or none).
 async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>, headers: HeaderMap, body: Bytes) -> Res {
+    if auth::simple_content_type(header_str(&headers, header::CONTENT_TYPE)) {
+        return Err(ApiError {
+            status: 415,
+            message: "send the rows with their content type (text/csv, text/tab-separated-values, application/x-ndjson, application/json or application/octet-stream), not text/plain or a form".into(),
+        });
+    }
     let format = match q.get("format") {
         Some(f) => Some(Format::parse(f).ok_or_else(|| ApiError::bad(format!("unknown format {f:?}: jsonl, json, csv or tsv")))?),
         None => {

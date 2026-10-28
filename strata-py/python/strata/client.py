@@ -19,6 +19,8 @@ from .result import Result
 WRITE_BATCH = 1000
 
 FORMATS = {".jsonl": "jsonl", ".ndjson": "jsonl", ".json": "json", ".csv": "csv", ".tsv": "tsv", ".tab": "tsv"}
+# The content type an import is sent with: a server refuses text/plain.
+CONTENT_TYPES = {"jsonl": "application/x-ndjson", "json": "application/json", "csv": "text/csv", "tsv": "text/tab-separated-values"}
 
 
 def _default(o: Any) -> Any:
@@ -144,7 +146,8 @@ class Client(Search):
             raise ValueError(f"name the format of {path}: jsonl, json, csv or tsv")
         with open(path, "rb") as f:
             size = os.fstat(f.fileno()).st_size
-            r = self._call("POST", "/v1/import?" + urllib.parse.urlencode({"format": format}), data=f, headers={"content-length": str(size)})
+            ct = CONTENT_TYPES.get(format, "application/octet-stream")
+            r = self._call("POST", "/v1/import?" + urllib.parse.urlencode({"format": format}), data=f, headers={"content-length": str(size), "content-type": ct})
         return {"rows": r["written"], "bulk": False, "skipped_fields": r.get("skipped_fields", [])}
 
     def ask(self, question: str, *, model: str | None = None, effort: str | None = None, api_key: str | None = None, max_steps: int | None = None) -> dict:

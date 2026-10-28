@@ -400,6 +400,8 @@ const store = {
 // ---- connection -------------------------------------------------------------
 let token = new URLSearchParams(location.search).get("token") || (() => { try { return sessionStorage.getItem("strata.token"); } catch { return null; } })();
 if (token) { try { sessionStorage.setItem("strata.token", token); } catch {} }
+// A token in the address would stay in the history and in shared links.
+if (new URLSearchParams(location.search).has("token")) { try { history.replaceState(null, "", location.pathname + location.hash); } catch {} }
 async function api(path, body, method) {
   const opts = { method: method || (body === undefined ? "GET" : "POST"), headers: {} };
   if (body !== undefined) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
@@ -1469,6 +1471,8 @@ function importRows(body, format, label) {
   const finish = (kids) => { out.replaceChildren(...kids); $("dImport").disabled = !$("dFile").files.length; $("dPasteImport").disabled = false; };
   const x = new XMLHttpRequest();
   x.open("POST", "/v1/import?format=" + format);
+  // The server refuses text/plain, which pages on other sites can send.
+  x.setRequestHeader("content-type", { csv: "text/csv", tsv: "text/tab-separated-values", json: "application/json" }[format] || "application/x-ndjson");
   if (token) x.setRequestHeader("authorization", "Bearer " + token);
   x.upload.onprogress = (e) => { if (e.lengthComputable) { bar.max = e.total; bar.value = e.loaded; } };
   x.upload.onload = () => { what.textContent = `Writing ${label}…`; bar.removeAttribute("value"); };

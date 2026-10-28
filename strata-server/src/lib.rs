@@ -10,6 +10,7 @@
 //!   query the table.
 
 pub mod agent;
+pub mod auth;
 pub mod coord;
 pub mod demo;
 pub mod grpc;

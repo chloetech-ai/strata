@@ -35,9 +35,11 @@ use strata::query::exec::ResultSet;
 use strata::query::stats::TermStats;
 use strata::query::{bind_write, Params, Select, Write};
 use strata::schema::Schema;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::Code;
 
+use crate::auth::Secret;
 use crate::grpc::{params_to_pb, result_from_pb};
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{op_key, shard_of, QueryReq};
@@ -55,18 +57,38 @@ pub struct CoordOptions {
     /// Answer without shards that have no replica answering, and say so,
     /// instead of failing the query.
     pub partial: bool,
+    /// The shards' token, sent with every call.
+    pub token: Option<Secret>,
+    /// A CA certificate (PEM) that `https://` shards' certificates are
+    /// checked against, besides the public roots.
+    pub ca: Option<Vec<u8>>,
 }
 
 impl Default for CoordOptions {
     fn default() -> CoordOptions {
-        CoordOptions { hedge: Duration::from_millis(100), cool_off: Duration::from_secs(5), shard_timeout: None, partial: false }
+        CoordOptions { hedge: Duration::from_millis(100), cool_off: Duration::from_secs(5), shard_timeout: None, partial: false, token: None, ca: None }
     }
 }
+
+/// Adds the shards' token to every call.
+#[derive(Clone)]
+pub struct Credentials(Option<tonic::metadata::AsciiMetadataValue>);
+
+impl tonic::service::Interceptor for Credentials {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(v) = &self.0 {
+            req.metadata_mut().insert("authorization", v.clone());
+        }
+        Ok(req)
+    }
+}
+
+type Client = StrataClient<InterceptedService<Channel, Credentials>>;
 
 /// One server holding a copy of a shard.
 struct Replica {
     url: String,
-    client: StrataClient<Channel>,
+    client: Client,
     /// Asked last until this time (ms after [`Coordinator::epoch`]).
     avoid_until: AtomicU64,
 }
@@ -120,16 +142,25 @@ impl Coordinator {
         if shards.is_empty() {
             return Err(ApiError::bad("a coordinator needs at least one shard"));
         }
+        let credentials = match &opts.token {
+            Some(t) => Some(format!("Bearer {}", t.0).parse().map_err(|_| ApiError::bad("the shards' token must be printable ASCII"))?),
+            None => None,
+        };
+        let mut tls = tonic::transport::ClientTlsConfig::new().with_webpki_roots();
+        if let Some(ca) = &opts.ca {
+            tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(ca));
+        }
         let mut replicas = Vec::new();
         for group in &shards {
             let mut rs = Vec::new();
             for url in group.split('|').map(str::trim).filter(|u| !u.is_empty()) {
-                let ch = Channel::from_shared(url.to_string())
-                    .map_err(|e| ApiError::bad(format!("bad shard URL {url}: {e}")))?
-                    .connect_timeout(Duration::from_secs(5))
-                    .tcp_nodelay(true)
-                    .connect_lazy();
-                rs.push(Replica { url: url.to_string(), client: StrataClient::new(ch).max_decoding_message_size(256 << 20), avoid_until: AtomicU64::new(0) });
+                let mut ep = Channel::from_shared(url.to_string()).map_err(|e| ApiError::bad(format!("bad shard URL {url}: {e}")))?;
+                if url.starts_with("https://") {
+                    ep = ep.tls_config(tls.clone()).map_err(|e| ApiError::bad(format!("TLS to {url}: {e}")))?;
+                }
+                let ch = ep.connect_timeout(Duration::from_secs(5)).tcp_nodelay(true).connect_lazy();
+                let client = StrataClient::with_interceptor(ch, Credentials(credentials.clone())).max_decoding_message_size(256 << 20);
+                rs.push(Replica { url: url.to_string(), client, avoid_until: AtomicU64::new(0) });
             }
             if rs.is_empty() {
                 return Err(ApiError::bad(format!("shard {group:?} has no URL")));
@@ -200,7 +231,7 @@ impl Coordinator {
     /// delay. Returns the replica that answered and its answer.
     async fn call<T, F, Fut>(&self, i: usize, start: usize, first: Option<usize>, deadline: Instant, f: F) -> Result<(usize, T), ApiError>
     where
-        F: Fn(usize, StrataClient<Channel>) -> Fut,
+        F: Fn(usize, Client) -> Fut,
         Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
         let order = self.order(i, start, first);

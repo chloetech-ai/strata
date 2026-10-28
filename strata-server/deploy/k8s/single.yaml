@@ -20,7 +20,8 @@ spec:
         - name: strata
           image: strata-server:dev
           imagePullPolicy: IfNotPresent
-          args: ["--db", "/data/quora.sq8.strata", "--listen", "0.0.0.0:7700", "--grpc", "off"]
+          # A test cluster, served open (see README.md, Security).
+          args: ["--db", "/data/quora.sq8.strata", "--listen", "0.0.0.0:7700", "--grpc", "off", "--no-token"]
           ports:
             - {name: http, containerPort: 7700}
           readinessProbe:

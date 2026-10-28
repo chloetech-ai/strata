@@ -31,7 +31,12 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--shards URL,URL,…` | | run as a coordinator over these shard servers' gRPC addresses |
 | `--listen ADDR` | `127.0.0.1:7700` | HTTP: the API, `/metrics` and the UI |
 | `--grpc ADDR` | `127.0.0.1:7701` | gRPC (`off` to disable) |
-| `--token T` | `$STRATA_TOKEN` | require `Authorization: Bearer T` on the API |
+| `--token T` | `$STRATA_TOKEN` | require `Authorization: Bearer T` on the API and on gRPC; needed to listen beyond loopback ([security](#security)) |
+| `--no-token` | off | listen beyond loopback without a token anyway |
+| `--allow-host NAME` | | also answer HTTP requests for this host name (repeatable) |
+| `--tls-cert FILE`, `--tls-key FILE` | | serve HTTP and gRPC over TLS with this PEM certificate chain and key |
+| `--shard-token T` | `$STRATA_SHARD_TOKEN`, else `--token` | a coordinator's token for its shards |
+| `--shard-ca FILE` | | a CA certificate (PEM) a coordinator trusts for `https://` shards, besides the public roots |
 | `--timeout-ms N` | 5000 | default query deadline |
 | `--max-concurrent N` | 64 | queries running at once; more wait for a slot until their deadline |
 | `--model ID` | `claude-haiku-5-5` | the agent's default model |
@@ -99,11 +104,11 @@ Into an empty table the rows are bulk-loaded straight into segments, in one comm
 To a running server, `POST /v1/import` with the rows as the body and the format as `?format=` (or the content type):
 
 ```sh
-curl -s -X POST 'localhost:7700/v1/import?format=csv' --data-binary @more.csv
+curl -s -X POST 'localhost:7700/v1/import?format=csv' -H 'content-type: text/csv' --data-binary @more.csv
 # {"written": 2, "skipped_fields": [], "took_ms": 3.1}
 ```
 
-The server reads every row before it writes any, so a bad row writes nothing, then upserts them through its writer 1,000 rows a request (a coordinator routes them to the shards). A request may be up to 256 MB. The UI's **Schema and import** tab uploads a file this way, and [Python](python.md) has `import_file` both in-process and as a client.
+The content type must not be `text/plain`, a form or missing (a web page on another site can send those without asking; see [security](#security)): `text/csv`, `text/tab-separated-values`, `application/x-ndjson`, `application/json` or `application/octet-stream` all work. The server reads every row before it writes any, so a bad row writes nothing, then upserts them through its writer 1,000 rows a request (a coordinator routes them to the shards). A request may be up to 256 MB. The UI's **Schema and import** tab uploads a file this way, and [Python](python.md) has `import_file` both in-process and as a client.
 
 ## Embedded vector fields
 
@@ -215,6 +220,13 @@ An answer of 200 means the batch is durable, and an error that nothing of it was
 
 With `--token`, every route except `/` and `/v1/health` needs `Authorization: Bearer <token>`; the UI asks for the token.
 
+## Security
+
+- **A token, or loopback only.** `--token` (or `$STRATA_TOKEN`) guards the HTTP API and every gRPC call, compared in constant time. Without one the server listens only on loopback addresses: an address reachable from elsewhere (`0.0.0.0`, a LAN address) is refused at start unless `--no-token` says to serve it open. The token is not printed in the log; open the UI and give it there (or once as `/?token=…`, which the page then drops from its address).
+- **Browsers on other sites.** A server on your laptop is reachable by every web page you visit, through your browser. It answers only to the host names `localhost`, `127.0.0.1` and `::1` when it listens on loopback (add names with `--allow-host`), so a page that points its own name at 127.0.0.1 (DNS rebinding) gets 403. A request that can change something and carries an `Origin` other than the server's own gets 403, and `/v1/import` refuses the content types a page may send without asking first (`text/plain`, forms, none). The UI and the clients here send their own origin or no origin, and proper content types.
+- **TLS.** `--tls-cert FILE --tls-key FILE` (PEM) serve both HTTP and gRPC over TLS. A coordinator reaches `https://` shards over TLS, trusting the public roots and `--shard-ca FILE`, and sends `--shard-token` (by default its own `--token`) with every call.
+- **What is not there yet**: scoped keys (read, write, admin), mutual TLS, and an audit log.
+
 ## gRPC
 
 `proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `Schema` and `Health`, mirroring the HTTP routes. Values are typed (`int`, `float`, `str`, `vector`, `list`); statistics, plans and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
@@ -226,6 +238,8 @@ strata-server --demo 20000 --demo-shard 0/2 --db a.strata --listen 127.0.0.1:771
 strata-server --demo 20000 --demo-shard 1/2 --db b.strata --listen 127.0.0.1:7720 --grpc 127.0.0.1:7721
 strata-server --shards http://127.0.0.1:7711,http://127.0.0.1:7721 --listen 127.0.0.1:7700 --grpc off
 ```
+
+With a token, give it to the shards and the coordinator alike (`STRATA_TOKEN=…` for all three), or give the coordinator its shards' token with `--shard-token`. On other machines, serve the shards with `--tls-cert` and `--tls-key` and list them as `https://`.
 
 A coordinator holds no data. For a query, it
 
