@@ -30,11 +30,13 @@ jobs:
           components: clippy
       # The strata crate builds with -C target-cpu=native
       # (strata/.cargo/config.toml), so a cache must not be restored on a
-      # runner with another CPU model.
+      # runner with another CPU: the key hashes the model and its
+      # instruction sets (runners with the same model name differ in them,
+      # and a cached proc macro then dies of SIGILL).
       - name: CPU model
         id: cpu
         shell: bash
-        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ matrix.crate }}
@@ -78,7 +80,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: CPU model
         id: cpu
-        run: echo "model=$(grep -m1 'model name' /proc/cpuinfo | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: strata
@@ -191,7 +193,7 @@ jobs:
       - name: CPU model
         id: cpu
         shell: bash
-        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
