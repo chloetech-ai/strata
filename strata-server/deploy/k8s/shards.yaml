@@ -1,0 +1,80 @@
+# A set of N shards, each served by R replicas: replica r of shard i is pod
+# strata-shards-<N>-s<i>-<r> and serves /data/<collection>.shard<i>of<N>.strata
+# (as strata-server-bench --build-only splits it; replica r > 0 its own copy,
+# ...shard<i>of<N>.r<r>.strata, since a database file is open in one process
+# at a time). Replicas of one shard run on different nodes.
+#
+# This file holds the set's Service and shard 0 of 2 with 2 replicas;
+# `deploy/kind-test.sh shards N R` writes one StatefulSet per shard from it,
+# and the set's name carries N, so a set of another size can start beside it
+# before the coordinator moves over.
+apiVersion: v1
+kind: Service
+metadata:
+  name: strata-shards-2
+  namespace: strata
+spec:
+  clusterIP: None
+  selector: {app: strata-shard, shards: "2"}
+  ports:
+    - {name: grpc, port: 7701}
+    - {name: http, port: 7700}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: strata-shards-2-s0
+  namespace: strata
+spec:
+  serviceName: strata-shards-2
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: strata-shard, shards: "2", shard: "0"}
+  template:
+    metadata:
+      labels: {app: strata-shard, shards: "2", shard: "0"}
+    spec:
+      affinity:
+        # Never two replicas of a shard on one node.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: strata-shard, shards: "2", shard: "0"}
+      # And the set's shards spread over the nodes.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: strata-shard, shards: "2"}
+      containers:
+        - name: strata
+          image: strata-server:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: COLLECTION, value: quora}
+            - {name: SHARDS, value: "2"}
+            - {name: SHARD, value: "0"}
+          # The pod's ordinal is its replica number, which picks its file.
+          command: ["sh", "-c"]
+          args:
+            - |
+              r=${HOSTNAME##*-}
+              f=/data/${COLLECTION}.shard${SHARD}of${SHARDS}.strata
+              [ "$r" = 0 ] || f=/data/${COLLECTION}.shard${SHARD}of${SHARDS}.r$r.strata
+              exec strata-server --db "$f" --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701
+          ports:
+            - {name: http, containerPort: 7700}
+            - {name: grpc, containerPort: 7701}
+          readinessProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 250m, memory: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          hostPath: {path: /data, type: Directory}

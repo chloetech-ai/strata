@@ -37,6 +37,12 @@
 //!
 //! Writes `--out/<collection>.json` (default `results/bench/`) naming the
 //! machine, and prints the tables in Markdown.
+//!
+//! On a cluster (see `deploy/README.md`), `--build-only` builds the shard
+//! databases and stops, and the client then runs against servers already
+//! running: `--single URL --coordinator URL` times both and compares their
+//! answers (steps 3 and 5), and `--coordinator URL --watch SECONDS` prints
+//! each second's answers and errors while a shard is killed or moved.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -67,8 +73,8 @@ struct Args {
     #[arg(long, default_value = "quora")]
     collection: String,
     /// Where the databases are built (several GB for Quora).
-    #[arg(long)]
-    work: PathBuf,
+    #[arg(long, required_unless_present_any = ["single", "coordinator"])]
+    work: Option<PathBuf>,
     #[arg(long, default_value = "results/bench")]
     out: PathBuf,
     /// Keep only the first N documents (for a quick check).
@@ -92,6 +98,26 @@ struct Args {
     /// Reopen databases a previous run built in --work.
     #[arg(long)]
     reuse: bool,
+    /// Build the databases in --work and stop.
+    #[arg(long)]
+    build_only: bool,
+    /// Instead of building and serving databases, query one database
+    /// already serving at this HTTP URL.
+    #[arg(long)]
+    single: Option<String>,
+    /// A coordinator already serving at this HTTP URL; with --single, also
+    /// how often their answers agree.
+    #[arg(long)]
+    coordinator: Option<String>,
+    /// With --coordinator (or --single): send every kind in turn from the
+    /// first --concurrency clients for this many seconds, printing each
+    /// second's answers, errors and latency.
+    #[arg(long)]
+    watch: Option<f64>,
+    /// Names the coordinator's setup in the tables, and the report
+    /// (`--out/<collection>-<label>.json`).
+    #[arg(long)]
+    label: Option<String>,
 }
 
 fn wal_path(p: &Path) -> PathBuf {
@@ -361,6 +387,214 @@ async fn read_mix(args: &Args, client: &reqwest::Client, base: &str, setup: &str
     }
 }
 
+/// How often the coordinator at `coord` answers as the one database at
+/// `one` does, over up to 50 requests of each kind.
+async fn agree(client: &reqwest::Client, one: &str, coord: &str, kinds: &[(&'static str, Vec<Json>)]) -> Result<Vec<Json>, String> {
+    let mut agreement = Vec::new();
+    for (kind, reqs) in kinds {
+        let (mut same_keys, mut same_scores, mut total) = (0, 0, 0);
+        // Vector searches are approximate, on one database and on each
+        // shard alike: score both against an exact scan instead.
+        let approximate = kind.starts_with("vector") || kind.starts_with("hybrid");
+        let (mut found_one, mut found_shards, mut wanted) = (0, 0, 0);
+        for body in reqs.iter().take(50) {
+            let a: Json = client.post(format!("{one}/v1/query")).json(body).send().await.map_err(|x| x.to_string())?.json().await.map_err(|x| x.to_string())?;
+            let b: Json = client.post(format!("{coord}/v1/query")).json(body).send().await.map_err(|x| x.to_string())?.json().await.map_err(|x| x.to_string())?;
+            total += 1;
+            // Facets compare their counts; ranked kinds their keys in
+            // order, and their scores (rows tied on score may swap).
+            let field = if *kind == "facet" { "rows" } else { "keys" };
+            let keys_equal = a.get("error").is_none() && a[field] == b[field];
+            same_keys += keys_equal as usize;
+            let scores = |j: &Json| j["scores"].as_array().cloned().unwrap_or_default().iter().map(|s| s.as_f64().unwrap_or(f64::NAN)).collect::<Vec<_>>();
+            let (sa, sb) = (scores(&a), scores(&b));
+            let scores_equal = sa.len() == sb.len() && sa.iter().zip(&sb).all(|(x, y)| (x - y).abs() <= 1e-5 * x.abs().max(1.0));
+            same_scores += (keys_equal || scores_equal) as usize;
+            if approximate {
+                let mut exact = body.clone();
+                exact["sql"] = json!(body["sql"].as_str().unwrap().replace("similarity(emb, :v)", "similarity(emb, :v, strategy => 'flat')"));
+                let e: Json = client.post(format!("{one}/v1/query")).json(&exact).send().await.map_err(|x| x.to_string())?.json().await.map_err(|x| x.to_string())?;
+                let keys = |j: &Json| j["keys"].as_array().cloned().unwrap_or_default();
+                let truth = keys(&e);
+                wanted += truth.len();
+                found_one += keys(&a).iter().filter(|k| truth.contains(k)).count();
+                found_shards += keys(&b).iter().filter(|k| truth.contains(k)).count();
+            }
+        }
+        let mut row = json!({"kind": kind, "same_keys": same_keys, "same_scores": same_scores, "of": total});
+        if approximate && wanted > 0 {
+            row["recall_one"] = json!(found_one as f64 / wanted as f64);
+            row["recall_shards"] = json!(found_shards as f64 / wanted as f64);
+        }
+        agreement.push(row);
+    }
+    Ok(agreement)
+}
+
+/// Steps 3 and 5 against servers already running (`--single`,
+/// `--coordinator`), or with `--watch`, one of them over time.
+async fn remote(args: &Args) -> Result<(), String> {
+    // A client needs only the queries, and some keys for the lookups.
+    let coll = data::load(&args.collection, Some(args.limit.unwrap_or(20_000))).map_err(|e| e.to_string())?;
+    let queries: Vec<data::Query> = coll.queries.iter().filter(|q| !q.text.trim().is_empty()).take(args.queries).cloned().collect();
+    let keys: Vec<String> = coll.docs.iter().map(|d| d[col::ID].as_str().unwrap_or("").to_string()).collect();
+    let kinds = bodies(&queries, &keys);
+    let client = reqwest::Client::builder().pool_max_idle_per_host(1024).build().map_err(|x| x.to_string())?;
+    let label = args.label.clone().unwrap_or_else(|| "coordinator".into());
+    let mut report = json!({
+        "machine": machine(), "collection": args.collection, "queries": queries.len(),
+        "single": args.single, "coordinator": args.coordinator, "label": label,
+    });
+    if let Some(seconds) = args.watch {
+        let base = args.coordinator.as_ref().or(args.single.as_ref()).unwrap();
+        report["watch"] = json!(watch(&client, base, &kinds, args.concurrency[0], seconds).await);
+    } else {
+        let mut http = Vec::new();
+        if let Some(one) = &args.single {
+            read_mix(args, &client, one, "one database", &kinds, &mut http).await;
+        }
+        if let Some(c) = &args.coordinator {
+            read_mix(args, &client, c, &label, &kinds, &mut http).await;
+        }
+        let agreement = match (&args.single, &args.coordinator) {
+            (Some(one), Some(c)) => agree(&client, one, c, &kinds).await?,
+            _ => Vec::new(),
+        };
+        print_http(http.iter());
+        print_agreement(&agreement);
+        report["http"] = json!(http);
+        report["shard_agreement"] = json!(agreement);
+    }
+    std::fs::create_dir_all(&args.out).map_err(|x| x.to_string())?;
+    let path = args.out.join(format!("{}-{}.json", args.collection, label.replace(' ', "-")));
+    std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).map_err(|x| x.to_string())?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
+/// Sends every kind in turn from `concurrency` clients for `seconds`, and
+/// prints each second's answers (by when they arrived), how many of them a
+/// coordinator gave without some shards, errors and latency.
+async fn watch(client: &reqwest::Client, base: &str, kinds: &[(&'static str, Vec<Json>)], concurrency: usize, seconds: f64) -> Vec<Json> {
+    let longest = kinds.iter().map(|(_, r)| r.len()).max().unwrap_or(0);
+    let mixed: Vec<Json> = (0..longest).flat_map(|i| kinds.iter().filter_map(move |(_, r)| r.get(i).cloned())).collect();
+    let bodies = encode(&mixed);
+    let url = format!("{base}/v1/query");
+    let t0 = Instant::now();
+    let next = Arc::new(AtomicUsize::new(0));
+    // (second, ms, partial, error)
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, f64, bool, Option<String>)>();
+    for _ in 0..concurrency {
+        let (client, url, bodies, next, tx) = (client.clone(), url.clone(), bodies.clone(), next.clone(), tx.clone());
+        tokio::spawn(async move {
+            while t0.elapsed().as_secs_f64() < seconds {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let start = Instant::now();
+                let r = client.post(&url).header("content-type", "application/json").body(bodies[i % bodies.len()].clone()).timeout(Duration::from_secs(10)).send().await;
+                let (partial, error) = match r {
+                    Ok(r) if r.status().is_success() => match r.json::<Json>().await {
+                        Ok(j) => (j.get("partial").is_some(), None),
+                        Err(e) => (false, Some(e.to_string())),
+                    },
+                    Ok(r) => (false, Some(format!("{}: {}", r.status(), r.text().await.unwrap_or_default()))),
+                    Err(e) => (false, Some(e.to_string())),
+                };
+                let _ = tx.send((t0.elapsed().as_secs() as usize, start.elapsed().as_secs_f64() * 1e3, partial, error));
+            }
+        });
+    }
+    drop(tx);
+    // Per second: latencies of the answers, partial answers, errors, and
+    // the first error.
+    type Second = (Vec<f64>, usize, usize, Option<String>);
+    let mut secs: Vec<Second> = Vec::new();
+    let show = |s: usize, (ms, partial, errors, first): &Second| {
+        let first = first.as_deref().map(|e| format!("  first error: {}", e.chars().take(160).collect::<String>())).unwrap_or_default();
+        eprintln!(
+            "t={s:<4} ok {:>6}  partial {partial:>5}  errors {errors:>5}  p50 {:>8.3} ms  p99 {:>8.3} ms{first}",
+            ms.len(),
+            percentile(ms, 50.0),
+            percentile(ms, 99.0)
+        );
+    };
+    let mut shown = 0;
+    while let Some((s, ms, partial, error)) = rx.recv().await {
+        if secs.len() <= s {
+            secs.resize(s + 1, Default::default());
+        }
+        match error {
+            None => {
+                secs[s].0.push(ms);
+                secs[s].1 += partial as usize;
+            }
+            Some(e) => {
+                secs[s].2 += 1;
+                secs[s].3.get_or_insert(e);
+            }
+        }
+        while shown < s {
+            show(shown, &secs[shown]);
+            shown += 1;
+        }
+    }
+    while shown < secs.len() {
+        show(shown, &secs[shown]);
+        shown += 1;
+    }
+    secs.iter()
+        .enumerate()
+        .map(|(s, (ms, partial, errors, first))| {
+            json!({
+                "second": s, "ok": ms.len(), "partial": partial, "errors": errors,
+                "p50_ms": percentile(ms, 50.0), "p99_ms": percentile(ms, 99.0), "max_ms": ms.iter().cloned().fold(0.0, f64::max),
+                "first_error": first,
+            })
+        })
+        .collect()
+}
+
+fn print_http<'a>(rows: impl Iterator<Item = &'a Json>) {
+    let rows: Vec<Vec<String>> = rows
+        .map(|h| {
+            let f = |k: &str| h[k].as_f64().unwrap_or(f64::NAN);
+            vec![
+                h["setup"].as_str().unwrap_or("").to_string(),
+                h["kind"].as_str().unwrap_or("").to_string(),
+                h["concurrency"].to_string(),
+                format!("{:.0}", f("qps")),
+                format!("{:.3}", f("p50_ms")),
+                format!("{:.3}", f("p99_ms")),
+                format!("{:.3}", f("server_p50_ms")),
+                h["errors"].to_string(),
+            ]
+        })
+        .collect();
+    println!("{}", md_table(&["setup", "kind", "clients", "per s", "p50 ms", "p99 ms", "server p50 ms", "errors"], &rows));
+}
+
+fn print_agreement(agreement: &[Json]) {
+    if !agreement.is_empty() {
+        let rows: Vec<Vec<String>> =
+            agreement
+                .iter()
+                .map(|a| {
+                    let recall = |k: &str| a.get(k).and_then(|r| r.as_f64()).map(|r| format!("{r:.3}")).unwrap_or_else(|| "exact".into());
+                    vec![
+                        a["kind"].as_str().unwrap().to_string(),
+                        format!("{} of {}", a["same_keys"], a["of"]),
+                        format!("{} of {}", a["same_scores"], a["of"]),
+                        recall("recall_one"),
+                        recall("recall_shards"),
+                    ]
+                })
+                .collect();
+        println!(
+            "{}",
+            md_table(&["kind", "same top 10 as one database", "same scores (ties may swap)", "recall@10, one database", "recall@10, shards"], &rows)
+        );
+    }
+}
+
 fn md_table(head: &[&str], rows: &[Vec<String>]) -> String {
     let mut s = format!("| {} |\n|{}|\n", head.join(" | "), head.iter().map(|_| "---").collect::<Vec<_>>().join("|"));
     for r in rows {
@@ -379,8 +613,12 @@ async fn main() {
 }
 
 async fn run(args: Args) -> Result<(), String> {
+    if args.single.is_some() || args.coordinator.is_some() {
+        return remote(&args).await;
+    }
     let e = |x: strata::Error| x.to_string();
-    std::fs::create_dir_all(&args.work).map_err(|x| x.to_string())?;
+    let work = args.work.clone().ok_or("pass --work")?;
+    std::fs::create_dir_all(&work).map_err(|x| x.to_string())?;
     let t = Instant::now();
     let coll = data::load(&args.collection, args.limit).map_err(e)?;
     let n = coll.docs.len();
@@ -391,7 +629,7 @@ async fn run(args: Args) -> Result<(), String> {
     let keys: Vec<String> = coll.docs.iter().map(|d| d[col::ID].as_str().unwrap_or("").to_string()).collect();
 
     // 1. Builds.
-    let base = args.work.join(&args.collection);
+    let base = work.join(&args.collection);
     let sq8 = build(&args, "8-bit codes", &PathBuf::from(format!("{}.sq8.strata", base.display())), VectorCodes::Sq8, coll.dim, coll.docs.clone()).map_err(e)?;
     let bin = build(&args, "1-bit codes", &PathBuf::from(format!("{}.binary.strata", base.display())), VectorCodes::Binary, coll.dim, coll.docs.clone()).map_err(e)?;
     let mut shards = Vec::new();
@@ -399,6 +637,9 @@ async fn run(args: Args) -> Result<(), String> {
         let docs: Vec<Document> = coll.docs.iter().filter(|d| shard_of(&d[col::ID], args.shards) == s).cloned().collect();
         let path = PathBuf::from(format!("{}.shard{s}of{}.strata", base.display(), args.shards));
         shards.push(build(&args, &format!("shard {s} of {}", args.shards), &path, VectorCodes::Sq8, coll.dim, docs).map_err(e)?);
+    }
+    if args.build_only {
+        return Ok(());
     }
 
     // 2. Vector recall and latency through SQL, one thread.
@@ -501,8 +742,9 @@ async fn run(args: Args) -> Result<(), String> {
     drive(&client, &write_url, encode(&deletes), 1, 0.0, true).await;
 
     // 5. A coordinator over the shards.
-    let mut agreement = Vec::new();
-    if !shards.is_empty() {
+    let agreement = if shards.is_empty() {
+        Vec::new()
+    } else {
         let mut urls = Vec::new();
         for s in &shards {
             urls.push(serve_grpc(service(Backend::Local(s.db.clone()), s.db.schema().clone())).await);
@@ -512,44 +754,8 @@ async fn run(args: Args) -> Result<(), String> {
         let coord = serve_http(service(Backend::Cluster(Arc::new(c)), schema)).await;
         let setup = format!("{} shards", shards.len());
         read_mix(&args, &client, &coord, &setup, &kinds, &mut http).await;
-        for (kind, reqs) in &kinds {
-            let (mut same_keys, mut same_scores, mut total) = (0, 0, 0);
-            // Vector searches are approximate, on one database and on each
-            // shard alike: score both against an exact scan instead.
-            let approximate = kind.starts_with("vector") || kind.starts_with("hybrid");
-            let (mut found_one, mut found_shards, mut wanted) = (0, 0, 0);
-            for body in reqs.iter().take(50) {
-                let a: Json = client.post(format!("{one}/v1/query")).json(body).send().await.map_err(|x| x.to_string())?.json().await.map_err(|x| x.to_string())?;
-                let b: Json = client.post(format!("{coord}/v1/query")).json(body).send().await.map_err(|x| x.to_string())?.json().await.map_err(|x| x.to_string())?;
-                total += 1;
-                // Facets compare their counts; ranked kinds their keys in
-                // order, and their scores (rows tied on score may swap).
-                let field = if *kind == "facet" { "rows" } else { "keys" };
-                let keys_equal = a.get("error").is_none() && a[field] == b[field];
-                same_keys += keys_equal as usize;
-                let scores = |j: &Json| j["scores"].as_array().cloned().unwrap_or_default().iter().map(|s| s.as_f64().unwrap_or(f64::NAN)).collect::<Vec<_>>();
-                let (sa, sb) = (scores(&a), scores(&b));
-                let scores_equal = sa.len() == sb.len() && sa.iter().zip(&sb).all(|(x, y)| (x - y).abs() <= 1e-5 * x.abs().max(1.0));
-                same_scores += (keys_equal || scores_equal) as usize;
-                if approximate {
-                    let mut exact = body.clone();
-                    exact["sql"] = json!(body["sql"].as_str().unwrap().replace("similarity(emb, :v)", "similarity(emb, :v, strategy => 'flat')"));
-                    let e: Json = client.post(format!("{one}/v1/query")).json(&exact).send().await.map_err(|x| x.to_string())?.json().await.map_err(|x| x.to_string())?;
-                    let keys = |j: &Json| j["keys"].as_array().cloned().unwrap_or_default();
-                    let truth = keys(&e);
-                    wanted += truth.len();
-                    found_one += keys(&a).iter().filter(|k| truth.contains(k)).count();
-                    found_shards += keys(&b).iter().filter(|k| truth.contains(k)).count();
-                }
-            }
-            let mut row = json!({"kind": kind, "same_keys": same_keys, "same_scores": same_scores, "of": total});
-            if approximate && wanted > 0 {
-                row["recall_one"] = json!(found_one as f64 / wanted as f64);
-                row["recall_shards"] = json!(found_shards as f64 / wanted as f64);
-            }
-            agreement.push(row);
-        }
-    }
+        agree(&client, &one, &coord, &kinds).await?
+    };
 
     // Report.
     let builds: Vec<Json> = [&sq8, &bin]
@@ -589,43 +795,7 @@ async fn run(args: Args) -> Result<(), String> {
         .map(|v| vec![v["config"].as_str().unwrap().to_string(), format!("{:.3}", v["recall_at_10"].as_f64().unwrap()), format!("{:.3}", v["p50_ms"].as_f64().unwrap()), format!("{:.3}", v["p99_ms"].as_f64().unwrap())])
         .collect();
     println!("{}", md_table(&["vector search (SQL, one thread)", "recall@10", "p50 ms", "p99 ms"], &rows));
-    let rows: Vec<Vec<String>> = http
-        .iter()
-        .chain(writes.iter())
-        .map(|h| {
-            let f = |k: &str| h[k].as_f64().unwrap_or(f64::NAN);
-            vec![
-                h["setup"].as_str().unwrap_or("").to_string(),
-                h["kind"].as_str().unwrap_or("").to_string(),
-                h["concurrency"].to_string(),
-                format!("{:.0}", f("qps")),
-                format!("{:.3}", f("p50_ms")),
-                format!("{:.3}", f("p99_ms")),
-                format!("{:.3}", f("server_p50_ms")),
-                h["errors"].to_string(),
-            ]
-        })
-        .collect();
-    println!("{}", md_table(&["setup", "kind", "clients", "per s", "p50 ms", "p99 ms", "server p50 ms", "errors"], &rows));
-    if !agreement.is_empty() {
-        let rows: Vec<Vec<String>> =
-            agreement
-                .iter()
-                .map(|a| {
-                    let recall = |k: &str| a.get(k).and_then(|r| r.as_f64()).map(|r| format!("{r:.3}")).unwrap_or_else(|| "exact".into());
-                    vec![
-                        a["kind"].as_str().unwrap().to_string(),
-                        format!("{} of {}", a["same_keys"], a["of"]),
-                        format!("{} of {}", a["same_scores"], a["of"]),
-                        recall("recall_one"),
-                        recall("recall_shards"),
-                    ]
-                })
-                .collect();
-        println!(
-            "{}",
-            md_table(&["kind", "same top 10 as one database", "same scores (ties may swap)", "recall@10, one database", "recall@10, shards"], &rows)
-        );
-    }
+    print_http(http.iter().chain(writes.iter()));
+    print_agreement(&agreement);
     Ok(())
 }

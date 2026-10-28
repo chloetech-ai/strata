@@ -1,0 +1,475 @@
+{
+  "collection": "quora",
+  "coordinator": "http://strata-coordinator:7700",
+  "label": "watch reshard-3to4",
+  "machine": {
+    "arch": "aarch64",
+    "cores": 4,
+    "cpu": null,
+    "memory_gb": 9.4,
+    "os": "Linux 5.15.49-linuxkit-pr"
+  },
+  "queries": 300,
+  "single": null,
+  "watch": [
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 72.979708,
+      "ok": 387,
+      "p50_ms": 3.8670419999999996,
+      "p99_ms": 61.387792,
+      "second": 0
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 72.92800000000001,
+      "ok": 253,
+      "p50_ms": 1.8402500000000002,
+      "p99_ms": 67.246333,
+      "second": 1
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 43.603167,
+      "ok": 1237,
+      "p50_ms": 2.400417,
+      "p99_ms": 24.10775,
+      "second": 2
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.167709,
+      "ok": 1655,
+      "p50_ms": 2.24425,
+      "p99_ms": 5.520333,
+      "second": 3
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.691208,
+      "ok": 1705,
+      "p50_ms": 2.145917,
+      "p99_ms": 5.369416999999999,
+      "second": 4
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.305375,
+      "ok": 1643,
+      "p50_ms": 2.231583,
+      "p99_ms": 5.912417,
+      "second": 5
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.534834,
+      "ok": 1696,
+      "p50_ms": 2.142,
+      "p99_ms": 5.068,
+      "second": 6
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.002875,
+      "ok": 1660,
+      "p50_ms": 2.2725000000000004,
+      "p99_ms": 5.360333,
+      "second": 7
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.836124999999999,
+      "ok": 1632,
+      "p50_ms": 2.24625,
+      "p99_ms": 5.529916999999999,
+      "second": 8
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.535333,
+      "ok": 1590,
+      "p50_ms": 2.289292,
+      "p99_ms": 5.543625,
+      "second": 9
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 16.284125,
+      "ok": 1406,
+      "p50_ms": 2.5005,
+      "p99_ms": 8.673292,
+      "second": 10
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 17.104041,
+      "ok": 1350,
+      "p50_ms": 2.6896250000000004,
+      "p99_ms": 7.241833,
+      "second": 11
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 23.761999999999997,
+      "ok": 1406,
+      "p50_ms": 2.54575,
+      "p99_ms": 8.866083,
+      "second": 12
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.741292,
+      "ok": 1383,
+      "p50_ms": 2.650833,
+      "p99_ms": 6.901125,
+      "second": 13
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 15.77125,
+      "ok": 1354,
+      "p50_ms": 2.694458,
+      "p99_ms": 6.668042,
+      "second": 14
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.130875,
+      "ok": 1367,
+      "p50_ms": 2.688167,
+      "p99_ms": 6.441792,
+      "second": 15
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.225917,
+      "ok": 1347,
+      "p50_ms": 2.746875,
+      "p99_ms": 6.375249999999999,
+      "second": 16
+    },
+    {
+      "errors": 1,
+      "first_error": "error sending request for url (http://strata-coordinator:7700/v1/query)",
+      "max_ms": 25.001084,
+      "ok": 886,
+      "p50_ms": 3.79875,
+      "p99_ms": 17.268708,
+      "second": 17
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.274333,
+      "ok": 1109,
+      "p50_ms": 3.2506660000000003,
+      "p99_ms": 8.261083000000001,
+      "second": 18
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.898541,
+      "ok": 1088,
+      "p50_ms": 3.318417,
+      "p99_ms": 8.414166000000002,
+      "second": 19
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 14.5925,
+      "ok": 1153,
+      "p50_ms": 3.136708,
+      "p99_ms": 7.309209,
+      "second": 20
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 22.661875000000002,
+      "ok": 1137,
+      "p50_ms": 3.200167,
+      "p99_ms": 7.947666000000001,
+      "second": 21
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 15.265416,
+      "ok": 1087,
+      "p50_ms": 3.297375,
+      "p99_ms": 8.392,
+      "second": 22
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 12.078625,
+      "ok": 1100,
+      "p50_ms": 3.3915830000000002,
+      "p99_ms": 7.972040999999999,
+      "second": 23
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 13.170542000000001,
+      "ok": 1073,
+      "p50_ms": 3.444875,
+      "p99_ms": 8.580499999999999,
+      "second": 24
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 12.014958,
+      "ok": 1072,
+      "p50_ms": 3.377083,
+      "p99_ms": 8.866375,
+      "second": 25
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 20.426042,
+      "ok": 959,
+      "p50_ms": 3.774458,
+      "p99_ms": 11.513625,
+      "second": 26
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.756125,
+      "ok": 1063,
+      "p50_ms": 3.427291,
+      "p99_ms": 8.007166,
+      "second": 27
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.236292,
+      "ok": 1051,
+      "p50_ms": 3.4624159999999997,
+      "p99_ms": 8.716375,
+      "second": 28
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 12.791458,
+      "ok": 1041,
+      "p50_ms": 3.522917,
+      "p99_ms": 8.400708999999999,
+      "second": 29
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.727959,
+      "ok": 1039,
+      "p50_ms": 3.584875,
+      "p99_ms": 8.125625,
+      "second": 30
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.172875,
+      "ok": 1035,
+      "p50_ms": 3.4815419999999997,
+      "p99_ms": 8.186625,
+      "second": 31
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 17.497291,
+      "ok": 999,
+      "p50_ms": 3.619542,
+      "p99_ms": 9.043624999999999,
+      "second": 32
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.418083000000001,
+      "ok": 1036,
+      "p50_ms": 3.530958,
+      "p99_ms": 8.732125,
+      "second": 33
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 16.755166,
+      "ok": 976,
+      "p50_ms": 3.7668749999999998,
+      "p99_ms": 9.663583,
+      "second": 34
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.68725,
+      "ok": 1012,
+      "p50_ms": 3.606291,
+      "p99_ms": 8.303084,
+      "second": 35
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 16.551583,
+      "ok": 1007,
+      "p50_ms": 3.6435,
+      "p99_ms": 8.584334,
+      "second": 36
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.708082999999998,
+      "ok": 1010,
+      "p50_ms": 3.5489580000000003,
+      "p99_ms": 8.708166,
+      "second": 37
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.615625,
+      "ok": 1035,
+      "p50_ms": 3.5409159999999997,
+      "p99_ms": 8.093667,
+      "second": 38
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 13.932833,
+      "ok": 955,
+      "p50_ms": 3.834209,
+      "p99_ms": 9.149375,
+      "second": 39
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.978458999999999,
+      "ok": 1009,
+      "p50_ms": 3.645375,
+      "p99_ms": 8.371333,
+      "second": 40
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 13.000458,
+      "ok": 1014,
+      "p50_ms": 3.554958,
+      "p99_ms": 8.815542,
+      "second": 41
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 17.325542,
+      "ok": 923,
+      "p50_ms": 3.889333,
+      "p99_ms": 12.296958,
+      "second": 42
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 13.139542,
+      "ok": 985,
+      "p50_ms": 3.6814999999999998,
+      "p99_ms": 9.008541,
+      "second": 43
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 15.599542,
+      "ok": 931,
+      "p50_ms": 3.9682500000000003,
+      "p99_ms": 9.879083,
+      "second": 44
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.827957999999999,
+      "ok": 948,
+      "p50_ms": 3.845542,
+      "p99_ms": 9.329542,
+      "second": 45
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.403666999999999,
+      "ok": 952,
+      "p50_ms": 3.754125,
+      "p99_ms": 9.0375,
+      "second": 46
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.910082999999998,
+      "ok": 985,
+      "p50_ms": 3.7520000000000002,
+      "p99_ms": 8.830375,
+      "second": 47
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.176,
+      "ok": 967,
+      "p50_ms": 3.8565,
+      "p99_ms": 8.3135,
+      "second": 48
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.627334,
+      "ok": 977,
+      "p50_ms": 3.7052919999999996,
+      "p99_ms": 8.868457999999999,
+      "second": 49
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.980083,
+      "ok": 4,
+      "p50_ms": 5.96925,
+      "p99_ms": 6.980083,
+      "second": 50
+    }
+  ]
+}
