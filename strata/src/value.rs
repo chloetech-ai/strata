@@ -95,8 +95,11 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
             (_, Value::Null) => schema.primary_key.map_or(true, |pk| schema.fields[pk].name != f.name),
             (FieldType::Text { .. } | FieldType::Keyword, Value::Str(_)) => true,
             (FieldType::Int, Value::Int(_)) => true,
-            (FieldType::Float, Value::Float(_) | Value::Int(_)) => true,
-            (FieldType::Vector { dim, .. }, Value::Vector(x)) => x.len() == *dim,
+            // NaN and infinities have no place in an order or a sum (as in
+            // Elasticsearch and Lucene, which refuse them too).
+            (FieldType::Float, Value::Float(x)) => x.is_finite(),
+            (FieldType::Float, Value::Int(_)) => true,
+            (FieldType::Vector { dim, .. }, Value::Vector(x)) => x.len() == *dim && x.iter().all(|c| c.is_finite()),
             (FieldType::Edges, Value::Str(_)) => {
                 crate::graph::parse_edges(v, crate::graph::int_keys(schema))?;
                 true
@@ -116,9 +119,8 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
 
 fn short(v: &Value) -> String {
     let s = format!("{v:?}");
-    if s.len() > 60 {
-        format!("{}...", &s[..60])
-    } else {
-        s
+    match s.char_indices().nth(60) {
+        Some((i, _)) => format!("{}...", &s[..i]),
+        None => s,
     }
 }

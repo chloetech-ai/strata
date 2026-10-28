@@ -11,7 +11,11 @@ use strata::{Document, FieldType, Schema};
 /// postings, doc store), so the tests do not depend on other components.
 pub fn build(schema: &Schema, docs: &[Document], opts: &BuildOptions) -> SegmentFile {
     for d in docs {
-        strata::value::validate(schema, d).unwrap();
+        // Columns encode NaN and infinities (databases written before
+        // writes refused them can hold some), so those skip validation.
+        if !d.iter().any(|v| matches!(v, strata::Value::Float(x) if !x.is_finite())) {
+            strata::value::validate(schema, d).unwrap();
+        }
     }
     let mut out = SegmentWriter::new(docs.len());
     for (i, f) in schema.fields.iter().enumerate() {

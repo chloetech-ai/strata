@@ -29,7 +29,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -1394,6 +1394,7 @@ impl<'a> WriteTxn<'a> {
             }
             (FieldType::Int, v @ (Value::Int(_) | Value::Null)) => v,
             (FieldType::Float, Value::Int(x)) => Value::Float(x as f64),
+            (FieldType::Float, Value::Float(x)) if !x.is_finite() => return Err(Error::Schema(format!("bad value for {field}: {x} (FLOAT values are finite)"))),
             (FieldType::Float, v @ (Value::Float(_) | Value::Null)) => v,
             (FieldType::Int | FieldType::Float, v) => return Err(Error::Schema(format!("bad value for {field}: {v:?}"))),
             _ => return Err(Error::Schema(format!("{field} is not a numeric field; only INT and FLOAT are set in place"))),
@@ -1829,16 +1830,29 @@ fn wal_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// How long an open waits for a lock that is held.
+pub const LOCK_WAIT: Duration = Duration::from_millis(500);
+
 /// One open `Database` per file: an exclusive `flock`, released when the
-/// file is closed (also by a crash).
+/// file is closed (also by a crash). A child process holds a copy of every
+/// descriptor of its parent from its fork until its exec closes them, so a
+/// database that a process closes and opens again while it starts a child
+/// can find its own lock still held for a moment: a held lock is retried
+/// for [`LOCK_WAIT`] before the open fails.
 fn lock_exclusive(file: &File) -> Result<()> {
-    // SAFETY: flock on a valid descriptor.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        // SAFETY: flock on a valid descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(e.into());
+        }
+        if Instant::now() >= deadline {
             return Err(Error::Busy("the database is open elsewhere".into()));
         }
-        return Err(e.into());
+        std::thread::sleep(Duration::from_millis(2));
     }
-    Ok(())
 }

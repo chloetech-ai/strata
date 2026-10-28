@@ -126,6 +126,10 @@ pub fn drive_cost(algo: TopKAlgo) -> f64 {
 /// different orders) never prunes a document that would qualify.
 const BOUND_SLACK: f32 = 1.0 + 1e-5;
 
+/// Entries a top-k heap reserves up front; it grows past this only with
+/// what it holds, so a huge `k` costs nothing until rows arrive.
+const HEAP_RESERVE: usize = 4096;
+
 // A document's score is the sum of its terms' scores, added in f64: exact
 // for terms of any plausible spread, so a score does not depend on the
 // order in which a traversal met the terms (one segment and two shards,
@@ -204,7 +208,7 @@ impl PartialOrd for Entry {
 
 impl TopK {
     fn new(k: usize) -> Self {
-        TopK { k, heap: BinaryHeap::with_capacity(k + 1), ties: None }
+        TopK { k, heap: BinaryHeap::with_capacity(k.saturating_add(1).min(HEAP_RESERVE)), ties: None }
     }
 
     fn with_ties(k: usize) -> Self {
