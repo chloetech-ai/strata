@@ -163,6 +163,12 @@ need no table.
 * **Flushes and merges.** A flush writes every table's memtable in one
   commit. A merge works on one table's segments and commits only that
   table's list.
+* **Later format changes.** Readers refuse a newer format number in a meta
+  slot, `CURRENT` or a manifest, but ignore keys they do not know inside a
+  schema. So a change that an older version must not ignore (stable field
+  ids, a schema id per segment, a field's analyzer, new value types) comes
+  with a new format number, written only by files that use it, as format 2
+  is written only by files with several tables.
 
 ## 4. Segments
 
