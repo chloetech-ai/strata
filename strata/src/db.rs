@@ -31,7 +31,7 @@ pub enum SqlResult {
 }
 
 pub struct Db {
-    storage: Database,
+    storage: Arc<Database>,
     /// Readers by segment id, with the address of the image they read.
     /// On-disk segments keep their id for life (deletes travel with the
     /// snapshot, not the readers), but a vacuum can move their bytes;
@@ -53,11 +53,16 @@ impl Db {
 
     fn wrap(storage: Database) -> Db {
         let n = storage.schema().fields.len();
-        Db { storage, readers: RwLock::new(HashMap::new()), exec: ExecOptions::default(), embedders: RwLock::new(vec![None; n]) }
+        Db { storage: Arc::new(storage), readers: RwLock::new(HashMap::new()), exec: ExecOptions::default(), embedders: RwLock::new(vec![None; n]) }
     }
 
     pub fn storage(&self) -> &Database {
         &self.storage
+    }
+
+    /// Flushes in the background from now on ([`Database::spawn_flusher`]).
+    pub fn spawn_flusher(&self) {
+        self.storage.spawn_flusher();
     }
 
     /// The schema of the database's first table, which SQL and the other

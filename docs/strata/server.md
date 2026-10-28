@@ -114,6 +114,8 @@ curl -s -X POST 'localhost:7700/v1/import?format=csv' -H 'content-type: text/csv
 
 The content type must not be `text/plain`, a form or missing (a web page on another site can send those without asking; see [security](#security)): `text/csv`, `text/tab-separated-values`, `application/x-ndjson`, `application/json` or `application/octet-stream` all work. The server reads every row before it writes any, so a bad row writes nothing, then upserts them through its writer 1,000 rows a request (a coordinator routes them to the shards). A request may be up to 256 MB. The UI's **Schema and import** tab uploads a file this way, and [Python](python.md) has `import_file` both in-process and as a client.
 
+The server flushes the memtable into segments on a thread of its own: a write that fills it (10,000 rows and deletes not yet flushed) returns without waiting for the segments to build, and writes go on meanwhile. Once the memtable holds twice that, writes wait for the flush under way. Segments build their vector indexes on every core.
+
 ## Embedded vector fields
 
 A `VECTOR` field can say what its vectors are: a model's embedding of other fields.

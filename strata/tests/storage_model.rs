@@ -1,7 +1,9 @@
 //! A model-based randomized test of the storage API, through [`Db`]:
 //! random transactions (insert, upsert, conditional upsert, delete, in-place
-//! set and add, rollback) on two tables, SQL writes, flushes, merges, vacuums, bulk
-//! loads, reopens and pinned snapshots, against a model of every row.
+//! set and add, rollback) on two tables, SQL writes, flushes (also in the
+//! background, with a transaction committing while one builds), merges,
+//! vacuums, bulk loads, reopens and pinned snapshots, against a model of
+//! every row.
 //!
 //! After each step the rows of the database must equal the model's, field
 //! by field, and so must its lookups and a few queries (ranges, keywords,
@@ -314,7 +316,9 @@ fn run(seed: u64, steps: usize) {
         match op {
             0..=49 => transaction(d, &mut rng, &mut model, &mut side),
             50..=59 => sql_write(d, &mut rng, &mut model),
-            60..=66 => d.storage().flush().unwrap(),
+            60..=63 => d.storage().flush().unwrap(),
+            // A flush that builds while a transaction commits.
+            64..=66 => d.storage().background_flush_with(|| transaction(d, &mut rng, &mut model, &mut side)).unwrap(),
             67..=74 => {
                 d.storage().merge(&policy).unwrap();
             }

@@ -26,8 +26,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, TryLockError, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -48,7 +49,7 @@ use crate::postings::bytes::OwnedBytes;
 use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
 use crate::storage::state::{Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::Updates;
-use crate::storage::wal::{Op, Wal};
+use crate::storage::wal::{self, Op, Wal, WalTxn};
 use crate::value::{validate, Document, Value};
 
 /// Ids of in-memory segments have this bit set.
@@ -240,6 +241,197 @@ pub struct Database {
     /// What opening found damaged and skipped: the newest version on disk
     /// (the one before it was opened), commits at the end of the WAL.
     damaged: Option<String>,
+    /// The txns of the sealed WAL files a background flush has not
+    /// installed yet ([`wal::sealed_path`]), oldest first.
+    sealed_wals: Mutex<Vec<u64>>,
+    /// One background flush at a time.
+    background: Mutex<()>,
+    /// Set by [`Database::spawn_flusher`]: commits that fill the memtable
+    /// wake the flusher instead of flushing.
+    flush_signal: OnceLock<Arc<FlushSignal>>,
+    flusher: Mutex<Option<JoinHandle<()>>>,
+    /// Whether a background flush waits for the writer lock
+    /// ([`BACKGROUND_WANTS`]) or holds it ([`BACKGROUND_HOLDS`]): writes
+    /// that find the lock taken wait for it ([`Database::try_writer`]).
+    background_lock: AtomicU8,
+}
+
+const BACKGROUND_IDLE: u8 = 0;
+const BACKGROUND_WANTS: u8 = 1;
+const BACKGROUND_HOLDS: u8 = 2;
+
+/// The writer lock as a background flush holds it, to seal the memtables
+/// or to install their segments: until it is released, writes that find
+/// the lock taken wait instead of failing with `Busy`.
+struct BackgroundWriter<'a> {
+    wal: Option<MutexGuard<'a, Wal>>,
+    state: &'a AtomicU8,
+}
+
+impl std::ops::Deref for BackgroundWriter<'_> {
+    type Target = Wal;
+    fn deref(&self) -> &Wal {
+        self.wal.as_ref().expect("held until dropped")
+    }
+}
+
+impl std::ops::DerefMut for BackgroundWriter<'_> {
+    fn deref_mut(&mut self) -> &mut Wal {
+        self.wal.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for BackgroundWriter<'_> {
+    fn drop(&mut self) {
+        // Released first, so that a waiting write finds it free.
+        self.wal = None;
+        self.state.store(BACKGROUND_IDLE, Ordering::Release);
+    }
+}
+
+/// Wakes the flusher thread.
+#[derive(Default)]
+struct FlushSignal {
+    state: Mutex<FlushWake>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct FlushWake {
+    /// A commit filled the memtable since the flusher last looked.
+    due: bool,
+    /// The flusher is flushing.
+    running: bool,
+    /// The database is closing.
+    closed: bool,
+}
+
+impl FlushSignal {
+    fn wake(&self) {
+        lock(&self.state).due = true;
+        self.cv.notify_all();
+    }
+
+    fn set_running(&self, running: bool) {
+        lock(&self.state).running = running;
+        self.cv.notify_all();
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// The flusher thread: a background flush each time a commit fills the
+/// memtable, until the database closes. A flush that failed is retried
+/// after a pause rather than at every commit.
+fn flusher(db: Weak<Database>, sig: Arc<FlushSignal>) {
+    loop {
+        {
+            let mut w = lock(&sig.state);
+            while !w.due && !w.closed {
+                w = sig.cv.wait(w).unwrap_or_else(|e| e.into_inner());
+            }
+            if w.closed {
+                return;
+            }
+            w.due = false;
+        }
+        let Some(db) = db.upgrade() else { return };
+        let mut failed = false;
+        if db.flush_due() {
+            sig.set_running(true);
+            failed = db.background_flush().is_err();
+            sig.set_running(false);
+        }
+        drop(db);
+        if failed {
+            let w = lock(&sig.state);
+            let _ = sig.cv.wait_timeout_while(w, Duration::from_secs(1), |w| !w.closed);
+        }
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(sig) = self.flush_signal.get() {
+            sig.close();
+        }
+        if let Some(h) = self.flusher.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            // The flusher holds a reference only while it flushes; when it
+            // held the last one, the database closes on its thread.
+            if h.thread().id() != std::thread::current().id() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+/// What a background flush took from a table's memtable when it sealed
+/// it: its `len` documents, with the deletes and values written in place
+/// up to then.
+struct SealedMem {
+    table: u32,
+    schema: Arc<Schema>,
+    gen: u64,
+    len: usize,
+    chunks: Vec<Arc<Vec<Document>>>,
+    deleted: Vec<u64>,
+    updates: Updates,
+}
+
+/// A sealed position that was deleted when the memtable was sealed.
+const GONE: u32 = u32::MAX;
+
+impl SealedMem {
+    /// Seals the whole memtable: the version the flush installs holds every
+    /// transaction up to the seal (the WAL from there on is all the
+    /// memtable keeps).
+    fn of(t: &TableState) -> SealedMem {
+        let m = &t.mem;
+        SealedMem { table: t.id, schema: t.schema.clone(), gen: m.gen, len: m.len, chunks: m.chunks.clone(), deleted: m.deleted.clone(), updates: m.updates.clone() }
+    }
+
+    fn was_deleted(&self, p: usize) -> bool {
+        self.deleted[p / 64] >> (p % 64) & 1 == 1
+    }
+
+    /// The live documents, with their values written in place, and each
+    /// position's docID among them (`GONE` for deleted ones).
+    fn live(&self) -> (Vec<Document>, Vec<u32>) {
+        let mut docids = vec![GONE; self.len];
+        let mut live = Vec::new();
+        for (p, d) in self.chunks.iter().flat_map(|c| c.iter()).take(self.len).enumerate() {
+            if !self.was_deleted(p) {
+                docids[p] = live.len() as u32;
+                let mut d = d.clone();
+                self.updates.apply(p as DocId, &mut d);
+                live.push(d);
+            }
+        }
+        (live, docids)
+    }
+
+    /// The deletes and values written in place since the seal on sealed
+    /// documents, as docIDs of the segments built from them (`max`
+    /// documents each, `n_segs` of them), or `None` when the table is gone.
+    fn since(&self, st: &State, docids: &[u32], n_segs: usize, max: usize) -> Option<Vec<(Vec<DocId>, Updates)>> {
+        let mem = &st.tables[st.table_index(self.table)?].mem;
+        let mut out = vec![(Vec::new(), Updates::default()); n_segs];
+        for (p, &d) in docids.iter().enumerate() {
+            if d != GONE && mem.deleted[p / 64] >> (p % 64) & 1 == 1 {
+                out[d as usize / max].0.push(d % max as u32);
+            }
+        }
+        for (f, p, v) in mem.updates.iter() {
+            let Some(&d) = docids.get(p as usize).filter(|&&d| d != GONE) else { continue };
+            if self.updates.get(f, p) != Some(v) {
+                out[d as usize / max].1.set(f, d % max as u32, v.clone());
+            }
+        }
+        Some(out)
+    }
 }
 
 impl Database {
@@ -399,8 +591,22 @@ impl Database {
         handles: Vec<Vec<Arc<SegHandle>>>,
     ) -> Result<Database> {
         let fits = |table: u32, op: &Op| manifest.table(table).is_none_or(|t| op_fits(&t.schema, op));
-        let (mut wal, txns) = Wal::open(&wal_path, meta.db_id, opts.sync, opts.wal_drop_damaged, &fits)?;
-        let wal_dropped = wal.dropped().map(str::to_string);
+        let (sealed, mut txns, cut) = read_sealed_wals(&wal_path, &manifest, meta.db_id, opts.wal_drop_damaged, &fits)?;
+        let (mut wal, wal_dropped) = match cut {
+            None => {
+                let (wal, active) = Wal::open(&wal_path, meta.db_id, opts.sync, opts.wal_drop_damaged, &fits)?;
+                txns.extend(active);
+                let dropped = wal.dropped().map(str::to_string);
+                (wal, dropped)
+            }
+            Some(what) => {
+                // Every transaction after the damage goes, the open log's too.
+                if std::fs::metadata(&wal_path).is_ok_and(|m| m.len() > 0) {
+                    std::fs::copy(&wal_path, wal::damaged_path(&wal_path))?;
+                }
+                (Wal::create(&wal_path, meta.db_id, opts.sync)?, Some(what))
+            }
+        };
         let tables: Vec<TableState> = manifest
             .tables
             .iter()
@@ -441,8 +647,12 @@ impl Database {
             }
             st.txn = st.txn.max(t.txn);
         }
-        if flushed && st.mem_len() == 0 && st.pending.is_empty() {
+        let mut sealed = sealed;
+        if flushed && st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
             wal.reset(opts.sync)?;
+            for t in sealed.drain(..) {
+                let _ = io::remove_file(&wal::sealed_path(&wal_path, t));
+            }
         }
         let db = Database {
             path: path.to_path_buf(),
@@ -461,6 +671,11 @@ impl Database {
             poisoned: AtomicBool::new(false),
             flush_error: Mutex::new(None),
             damaged: wal_dropped,
+            sealed_wals: Mutex::new(sealed),
+            background: Mutex::new(()),
+            flush_signal: OnceLock::new(),
+            flusher: Mutex::new(None),
+            background_lock: AtomicU8::new(BACKGROUND_IDLE),
         };
         db.republish();
         Ok(db)
@@ -552,6 +767,7 @@ impl Database {
     /// Starts the write transaction; `Error::Busy` while another one (or a
     /// flush, bulk load or merge commit) is in progress.
     pub fn begin(&self) -> Result<WriteTxn<'_>> {
+        self.wait_for_flusher();
         let wal = self.try_writer()?;
         self.check_poisoned()?;
         Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new() })
@@ -699,7 +915,184 @@ impl Database {
             st.updates_cache.clear();
             st.n_pending = 0;
         })?;
-        wal.reset(self.opts.sync).map_err(|e| self.poison(e))
+        wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
+        self.remove_sealed(txn);
+        Ok(())
+    }
+
+    /// Deletes the sealed WAL files the on-disk version holds (sealed at or
+    /// before `txn`). One that stays is deleted when the database opens.
+    fn remove_sealed(&self, txn: u64) {
+        lock(&self.sealed_wals).retain(|&t| {
+            let flushed = t <= txn;
+            if flushed {
+                let _ = io::remove_file(&wal::sealed_path(&self.wal_path, t));
+            }
+            !flushed
+        });
+    }
+
+    /// Whether the memtables and pending deletes are past
+    /// `memtable_max_docs`.
+    fn flush_due(&self) -> bool {
+        let st = lock(&self.state);
+        st.mem_len() + st.n_pending > self.opts.memtable_max_docs
+    }
+
+    /// Whether the memtables and pending deletes are past twice
+    /// `memtable_max_docs`, where commits stop leaving flushes to the
+    /// flusher.
+    fn over_twice(&self) -> bool {
+        let st = lock(&self.state);
+        st.mem_len() + st.n_pending > 2 * self.opts.memtable_max_docs.max(1)
+    }
+
+    /// Past twice `memtable_max_docs` while the flusher flushes (or is about
+    /// to), waits for it, without the writer lock: writes then go at the
+    /// pace of flushes, rather than a commit flushing the whole memtable
+    /// itself. A flusher whose flushes fail is not waited for (commits
+    /// flush, or are refused).
+    fn wait_for_flusher(&self) {
+        let Some(sig) = self.flush_signal.get() else { return };
+        let mut w = lock(&sig.state);
+        while (w.running || w.due) && !w.closed && self.over_twice() {
+            w = sig.cv.wait_timeout(w, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    /// Starts a thread that flushes in the background
+    /// ([`Database::background_flush`]) when a commit fills the memtable,
+    /// in place of that commit flushing before it returns. Past twice
+    /// `memtable_max_docs` (the flusher fell behind), new writes wait for
+    /// its flush; if its flushes fail, commits flush the memtable whole or
+    /// are refused, as without a flusher. The thread ends with the
+    /// database; calling this again does nothing.
+    pub fn spawn_flusher(self: &Arc<Self>) {
+        let sig = Arc::new(FlushSignal::default());
+        if self.flush_signal.set(sig.clone()).is_err() {
+            return;
+        }
+        let db = Arc::downgrade(self);
+        let h = std::thread::Builder::new().name("strata-flusher".into()).spawn(move || flusher(db, sig)).expect("spawn the flusher thread");
+        *lock(&self.flusher) = Some(h);
+        if self.flush_due() {
+            if let Some(sig) = self.flush_signal.get() {
+                sig.wake();
+            }
+        }
+    }
+
+    /// Flushes as [`Database::flush`] does, but holds the writer lock only
+    /// to seal the memtables and to install the segments built from them,
+    /// so that commits go on while they build: into a new WAL file (the
+    /// sealed one, `<wal>.<txn>`, is deleted once the flush is installed)
+    /// and into the memtable, which keeps them. A sealed document deleted
+    /// or written in place meanwhile is so in its new segment. A flush of
+    /// everything meanwhile ([`Database::flush`], a bulk load, dropping a
+    /// table) makes this one a no-op. Writes that start while it holds the
+    /// lock wait for it rather than fail with `Busy`. It waits for the
+    /// writer lock, so it must not be called from a thread that holds a
+    /// [`WriteTxn`].
+    pub fn background_flush(&self) -> Result<()> {
+        self.background_flush_with(|| {})
+    }
+
+    /// [`Database::background_flush`], running `between` after the seal and
+    /// before the install (tests write there).
+    #[doc(hidden)]
+    pub fn background_flush_with(&self, between: impl FnOnce()) -> Result<()> {
+        let _one = lock(&self.background);
+        let r = self.background_flush_inner(between);
+        *lock(&self.flush_error) = r.as_ref().err().map(|e| e.to_string());
+        r
+    }
+
+    /// The writer lock, for a background flush ([`BackgroundWriter`]).
+    fn background_writer(&self) -> BackgroundWriter<'_> {
+        self.background_lock.store(BACKGROUND_WANTS, Ordering::Release);
+        let wal = lock(&self.writer);
+        self.background_lock.store(BACKGROUND_HOLDS, Ordering::Release);
+        BackgroundWriter { wal: Some(wal), state: &self.background_lock }
+    }
+
+    fn background_flush_inner(&self, between: impl FnOnce()) -> Result<()> {
+        let (sealed, txn) = {
+            let mut wal = self.background_writer();
+            self.check_poisoned()?;
+            let st = lock(&self.state);
+            if st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
+                return Ok(());
+            }
+            let sealed: Vec<SealedMem> = st.tables.iter().filter(|t| t.mem.len > 0).map(SealedMem::of).collect();
+            let txn = st.txn;
+            drop(st);
+            // A log with no commits since the last seal stays as it is.
+            if !wal.is_empty() {
+                wal.sync_appends()?;
+                let to = wal::sealed_path(&self.wal_path, txn);
+                io::rename(&self.wal_path, &to)?;
+                lock(&self.sealed_wals).push(txn);
+                // Commits must not go on in the sealed file: the install
+                // deletes it.
+                wal.restart(&self.wal_path, self.opts.sync).and_then(|_| Ok(io::sync_dir(self.wal_dir())?)).map_err(|e| self.poison(e))?;
+            }
+            (sealed, txn)
+        };
+        between();
+        let max = self.opts.segment_max_docs.max(1);
+        let mut built = Vec::with_capacity(sealed.len());
+        for s in &sealed {
+            let (live, docids) = s.live();
+            let images = live.chunks(max).map(|c| Ok((build_segment(&s.schema, c, &self.opts.build)?, c.len() as u32))).collect::<Result<Vec<_>>>()?;
+            built.push((images, docids));
+        }
+
+        let mut wal = self.background_writer();
+        self.check_poisoned()?;
+        let (carried, pending, pending_updates) = {
+            let st = lock(&self.state);
+            // A flush of everything since the seal holds what this one built.
+            if st.manifest.wal_txn >= txn || sealed.iter().any(|s| st.table_index(s.table).is_some_and(|i| st.tables[i].mem.gen != s.gen)) {
+                return Ok(());
+            }
+            let carried: Vec<_> = sealed.iter().zip(&built).map(|(s, (images, docids))| s.since(&st, docids, images.len(), max)).collect();
+            (carried, st.pending.clone(), st.pending_updates.clone())
+        };
+        let mut vw = VersionWriter::begin(self);
+        vw.manifest.wal_txn = txn;
+        for ((s, (images, _)), carried) in sealed.iter().zip(&built).zip(carried) {
+            let Some(carried) = carried else { continue };
+            for ((image, n), (deleted, updated)) in images.iter().zip(carried) {
+                let dels = (!deleted.is_empty()).then(|| LiveDocs::with_deleted(None, *n, deleted.iter().copied()));
+                vw.add_segment(s.table, None, image, *n, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
+            }
+        }
+        for (&id, docs) in &pending {
+            vw.add_deletes(id, docs)?;
+        }
+        for (&id, (_, ups)) in &pending_updates {
+            vw.add_updates(id, ups)?;
+        }
+        let c = vw.commit(&mut wal)?;
+        self.publish(c, |st| {
+            for s in &sealed {
+                if let Some(i) = st.table_index(s.table) {
+                    st.tables[i].split_mem(s.len);
+                }
+            }
+            st.pending.clear();
+            st.pending_updates.clear();
+            st.updates_cache.clear();
+            st.n_pending = 0;
+        })?;
+        drop(wal);
+        self.remove_sealed(txn);
+        Ok(())
+    }
+
+    /// The directory that holds the WAL.
+    fn wal_dir(&self) -> &Path {
+        self.wal_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
     }
 
     /// Loads documents into the first table straight into segments of
@@ -1102,6 +1495,12 @@ impl Database {
         Ok(before.saturating_sub(lock(&self.state).meta.page_count) * PAGE)
     }
 
+    /// The size of the WAL, sealed files included.
+    fn wal_bytes(&self) -> u64 {
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        size(&self.wal_path) + lock(&self.sealed_wals).iter().map(|&t| size(&wal::sealed_path(&self.wal_path, t))).sum::<u64>()
+    }
+
     pub fn file_stats(&self) -> FileStats {
         let st = lock(&self.state);
         if let Some(d) = &self.dir {
@@ -1111,7 +1510,7 @@ impl Database {
                 live_pages: 0,
                 free_pages: 0,
                 pending_pages: 0,
-                wal_bytes: std::fs::metadata(&self.wal_path).map_or(0, |m| m.len()),
+                wal_bytes: self.wal_bytes(),
                 memtable_docs: st.mem_live_docs(),
                 pending_deletes: st.n_pending,
                 segments: segment_stats(&st.manifest),
@@ -1126,7 +1525,7 @@ impl Database {
             live_pages: META_PAGES + st.meta.manifest.pages() + st.meta.freelist.pages() + seg_pages,
             free_pages: st.freelist.free_pages(),
             pending_pages: st.freelist.pending_pages(),
-            wal_bytes: std::fs::metadata(&self.wal_path).map_or(0, |m| m.len()),
+            wal_bytes: self.wal_bytes(),
             memtable_docs: st.mem_live_docs(),
             pending_deletes: st.n_pending,
             segments,
@@ -1257,11 +1656,23 @@ impl Database {
         }
     }
 
+    /// The writer lock, or `Busy` when another write holds it. A background
+    /// flush holds it only to seal or install, briefly: that is waited for.
+    /// While one waits for the lock, so does this, for a few milliseconds,
+    /// in case the lock is being handed to the flush.
     fn try_writer(&self) -> Result<MutexGuard<'_, Wal>> {
-        match self.writer.try_lock() {
-            Ok(g) => Ok(g),
-            Err(TryLockError::Poisoned(p)) => Ok(p.into_inner()),
-            Err(TryLockError::WouldBlock) => Err(Error::Busy("another write is in progress".into())),
+        let t0 = Instant::now();
+        loop {
+            match self.writer.try_lock() {
+                Ok(g) => return Ok(g),
+                Err(TryLockError::Poisoned(p)) => return Ok(p.into_inner()),
+                Err(TryLockError::WouldBlock) => match self.background_lock.load(Ordering::Acquire) {
+                    BACKGROUND_HOLDS => {}
+                    BACKGROUND_WANTS if t0.elapsed() < Duration::from_millis(5) => {}
+                    _ => return Err(Error::Busy("another write is in progress".into())),
+                },
+            }
+            std::thread::sleep(Duration::from_micros(100));
         }
     }
 
@@ -1399,13 +1810,11 @@ impl Database {
             return Ok(());
         }
         self.check_poisoned()?;
-        // While flushes fail, the memtable grows; past twice its limit,
-        // writes wait for a flush to succeed, refused before they are logged.
-        let over = {
-            let st = lock(&self.state);
-            st.mem_len() + st.n_pending > 2 * self.opts.memtable_max_docs.max(1)
-        };
-        if over && self.flush_error().is_some() {
+        // While flushes fail or the flusher falls behind, the memtable
+        // grows; past twice its limit, writes wait for a flush to succeed,
+        // refused before they are logged.
+        let flusher = self.flush_signal.get();
+        if self.over_twice() && (flusher.is_some() || self.flush_error().is_some()) {
             self.flush_locked(wal).map_err(|e| Error::Io(std::io::Error::other(format!("writes wait for a flush to succeed: {e}"))))?;
         }
         let txn = lock(&self.state).txn + 1;
@@ -1427,9 +1836,13 @@ impl Database {
         // error would make callers retry a write that already happened (an
         // `add` applied twice). A failed flush is kept in `flush_error`
         // and tried again by the next commit.
-        if full && self.flush_locked(wal).is_ok() {
-            // The flush published its version.
-            return Ok(());
+        if full {
+            match flusher {
+                Some(sig) => sig.wake(),
+                // The flush published its version.
+                None if self.flush_locked(wal).is_ok() => return Ok(()),
+                None => {}
+            }
         }
         self.republish();
         Ok(())
@@ -2172,6 +2585,55 @@ fn op_fits(schema: &Schema, op: &Op) -> bool {
                 })
         }
     }
+}
+
+/// The sealed WAL files ([`wal::sealed_path`]) a background flush did not
+/// install, oldest first: their txns, their committed transactions, and,
+/// when one is damaged and `drop_damaged` says to drop what follows, what
+/// was dropped (opening then drops the open log's transactions too). The
+/// ones a flush installed (sealed at or before `manifest.wal_txn`) and
+/// other databases' are deleted.
+#[allow(clippy::type_complexity)]
+fn read_sealed_wals(
+    wal_path: &Path,
+    manifest: &Manifest,
+    db_id: u64,
+    drop_damaged: bool,
+    fits: &dyn Fn(u32, &Op) -> bool,
+) -> Result<(Vec<u64>, Vec<WalTxn>, Option<String>)> {
+    let (mut kept, mut txns, mut cut) = (Vec::new(), Vec::new(), None::<String>);
+    for (t, p) in wal::sealed_files(wal_path)? {
+        if t <= manifest.wal_txn {
+            let _ = io::remove_file(&p);
+            continue;
+        }
+        if cut.is_some() {
+            std::fs::copy(&p, wal::damaged_path(&p))?;
+            io::remove_file(&p)?;
+            continue;
+        }
+        let Some((got, damage)) = wal::read_sealed(&p, db_id, fits)? else {
+            let _ = io::remove_file(&p);
+            continue;
+        };
+        txns.extend(got);
+        kept.push(t);
+        if let Some(at) = damage {
+            // It was durable before it was sealed: this is no torn append.
+            let what = format!("{} is damaged at byte {at}", p.display());
+            if !drop_damaged {
+                return Err(corrupt(format!(
+                    "{what}; open with DbOptions::wal_drop_damaged to drop the transactions from there on, in it and in the logs after it (each is copied to <log>.damaged first)"
+                )));
+            }
+            std::fs::copy(&p, wal::damaged_path(&p))?;
+            let f = OpenOptions::new().write(true).open(&p)?;
+            io::set_len(&f, at)?;
+            io::sync(&f)?;
+            cut = Some(format!("{what}: dropped the transactions from there on, in it and in the logs after it, each copied to <log>.damaged"));
+        }
+    }
+    Ok((kept, txns, cut))
 }
 
 fn wal_path(path: &Path) -> PathBuf {
