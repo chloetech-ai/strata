@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::{err, unsafe_extend, Executor, Hit, ProbeNode};
+use super::{err, Executor, Hit, ProbeNode, Seg};
 use crate::error::Result;
 use crate::graph::traverse::{self, node, split, Adjacency, Node, NodeMap};
 use crate::graph::GraphReader;
@@ -195,7 +195,8 @@ impl<'a> Executor<'a> {
             GraphKind::Path { to, .. } => self.resolve_seeds(to)?.into_iter().map(|s| s.0).collect(),
             _ => Vec::new(),
         };
-        let mut adj = self.adjacency(g)?;
+        let from = self.segs.clone();
+        let mut adj = self.adjacency(g, &from)?;
         let mut nodes: NodeMap<(u32, f64)> = traverse::node_map();
         let (what, edges, extra) = match &g.kind {
             GraphKind::Reach { min_hops, max_hops } => {
@@ -265,12 +266,13 @@ impl<'a> Executor<'a> {
         })
     }
 
-    fn adjacency(&self, g: &GraphQuery) -> Result<GraphAdj<'a>> {
+    /// The traversal's view of `from`, the executor's segments (a copy of
+    /// [`Executor::segs`] the caller keeps while it traverses).
+    fn adjacency<'s>(&self, g: &GraphQuery, from: &'s [Seg<'a>]) -> Result<GraphAdj<'s>> {
         let field = &self.schema.fields[g.field];
         let vector = matches!(field.ty, FieldType::Vector { .. });
-        let mut segs: Vec<Option<SegRef<'a>>> = (0..self.snap.segments().len()).map(|_| None).collect();
-        for s in &self.segs {
-            let s: &'a super::Seg<'a> = unsafe_extend(s);
+        let mut segs: Vec<Option<SegRef<'s>>> = (0..self.snap.segments().len()).map(|_| None).collect();
+        for s in from {
             let graph = if vector { None } else { s.r.graph(g.field)? };
             let vectors = if vector { s.r.vector(g.field)? } else { None };
             let labels = match (graph, g.labels.is_empty()) {
@@ -314,8 +316,8 @@ impl<'a> Executor<'a> {
                 by_seg.entry(s).or_default().push((d, value(x)));
             }
         }
-        let segs: Vec<&'a super::Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
+        let segs = self.segs.clone();
+        for s in segs.iter() {
             let Some(cands) = by_seg.remove(&s.ord) else { continue };
             let probeable = {
                 let est = super::SegEst { ex: self, s, params: None, local_sel: None };

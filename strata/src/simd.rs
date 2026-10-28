@@ -62,6 +62,10 @@ fn detect() -> u32 {
 #[cfg(target_arch = "x86_64")]
 fn fast_pdep() -> bool {
     use std::arch::x86_64::__cpuid;
+    if cfg!(miri) {
+        // Miri has no CPUID; it runs the `pdep` the build enables.
+        return true;
+    }
     #[allow(unused_unsafe)]
     // SAFETY: CPUID exists on every x86_64 CPU.
     let (v, l1) = unsafe { (__cpuid(0), __cpuid(1)) };

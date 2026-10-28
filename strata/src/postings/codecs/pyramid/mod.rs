@@ -2142,6 +2142,84 @@ mod tests {
         assert!(loaded[0].clone().is_view());
     }
 
+    /// Small lists with Small, Tiered (sparse and dense blocks) and Flat
+    /// chunks, read back from bytes and used: sized for Miri (`cargo miri
+    /// test --lib miri_`), which checks the views' alignment and pointer
+    /// arithmetic, and the bounds of the unsafe probes, on every access.
+    #[test]
+    fn miri_views_of_every_chunk_kind() {
+        let mut rng = StdRng::seed_from_u64(29);
+        let universe = 2 << 16;
+        let chunk = |rng: &mut StdRng, key: u32, kind: u32| -> Vec<u32> {
+            let base = key << 16;
+            match kind {
+                0 => (0..20).map(|_| base + rng.gen_range(0..65_536)).collect(),
+                1 => (0..300).map(|_| base + rng.gen_range(0..65_536)).collect(),
+                // Every eighth block dense, the others empty.
+                2 => (0..256u32).filter(|b| b % 8 == 0).flat_map(|b| (0..40).map(move |i| base + (b << 8) + i * 5)).collect(),
+                _ => (0..256u32).flat_map(|b| (0..30).map(move |i| base + (b << 8) + i * 7)).collect(),
+            }
+        };
+        // Chunks of kinds 0 and 2, 1 and 3, 2 and 0, 3 and 1.
+        let mut lists: Vec<Vec<u32>> = (0..4u32)
+            .map(|l| {
+                let mut docs = BTreeSet::new();
+                for key in 0..2 {
+                    docs.extend(chunk(&mut rng, key, (l + 2 * key) % 4));
+                }
+                docs.into_iter().collect()
+            })
+            .collect();
+        lists.extend([vec![], vec![universe - 1]]);
+        let built: Vec<Pyramid> = lists.iter().map(|l| Pyramid::build(l, universe)).collect();
+        let kinds = built.iter().fold([0; 3], |t, p| {
+            let c = p.chunk_counts();
+            [t[0] + c[0], t[1] + c[1], t[2] + c[2]]
+        });
+        let blocks = built.iter().fold([0; 2], |t, p| [t[0] + p.block_counts()[0], t[1] + p.block_counts()[1]]);
+        assert!(kinds.iter().all(|&n| n > 0) && blocks.iter().all(|&n| n > 0), "chunks {kinds:?}, blocks {blocks:?}");
+        let mut w = ByteWriter::new();
+        for p in &built {
+            p.write_to(&mut w);
+        }
+        let mut r = ByteReader::new(OwnedBytes::new(w.finish()));
+        let views: Vec<Pyramid> = built.iter().map(|_| Pyramid::read_from(&mut r).unwrap()).collect();
+        for (l, q) in lists.iter().zip(&views) {
+            assert!(q.is_view());
+            let mut out = Vec::new();
+            q.decode_into(&mut out);
+            assert!(&out == l);
+            for _ in 0..50 {
+                let x = if rng.gen_bool(0.5) && !l.is_empty() { l[rng.gen_range(0..l.len())] } else { rng.gen_range(0..universe) };
+                assert_eq!(q.contains(x), l.binary_search(&x).is_ok(), "contains({x})");
+            }
+            let mut cur = q.cursor();
+            let mut t = 0u32;
+            while t < universe {
+                let want = l.get(l.partition_point(|&x| x < t)).copied().unwrap_or(END);
+                assert_eq!(cur.next_geq(t), want, "next_geq({t})");
+                if want == END {
+                    break;
+                }
+                t = want + rng.gen_range(1..=2000);
+            }
+        }
+        // Each list with the next: every chunk kind meets every other.
+        for i in 0..lists.len() {
+            for j in [i, (i + 1) % lists.len()] {
+                let refs = [&lists[i], &lists[j]];
+                let mut got = Vec::new();
+                Pyramid::intersect(&[&views[i], &built[j]], &mut got);
+                assert!(got == reference_and(&refs), "AND of lists {i} and {j}");
+                assert_eq!(Pyramid::and_count(&[&views[i], &views[j]]), got.len() as u64);
+                got.clear();
+                Pyramid::union(&[&built[i], &views[j]], &mut got);
+                assert!(got == reference_or(&refs), "OR of lists {i} and {j}");
+                assert_eq!(Pyramid::or_count(&[&views[i], &views[j]]), got.len() as u64);
+            }
+        }
+    }
+
     #[test]
     fn corrupt_bytes_are_rejected() {
         let mut rng = StdRng::seed_from_u64(19);

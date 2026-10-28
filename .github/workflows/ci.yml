@@ -30,11 +30,13 @@ jobs:
           components: clippy
       # The strata crate builds with -C target-cpu=native
       # (strata/.cargo/config.toml), so a cache must not be restored on a
-      # runner with another CPU model.
+      # runner with another CPU: the key hashes the model and its
+      # instruction sets (runners with the same model name differ in them,
+      # and a cached proc macro then dies of SIGILL).
       - name: CPU model
         id: cpu
         shell: bash
-        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ matrix.crate }}
@@ -78,7 +80,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: CPU model
         id: cpu
-        run: echo "model=$(grep -m1 'model name' /proc/cpuinfo | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: strata
@@ -92,6 +94,45 @@ jobs:
       - name: Gate
         working-directory: strata
         run: STRATA_BEIR_DIR="$HOME/beir" STRATA_RELEVANCE_GATE=required cargo test --release --test relevance_gate -- --nocapture
+
+  # Miri runs the tests of Strata's zero-copy byte views (postings::bytes)
+  # and of the structures read through them, checking every access for
+  # undefined behaviour: misaligned or out-of-bounds reads, dangling
+  # pointers, aliasing. It interprets the code about a thousand times
+  # slower, and on one thread, so it runs the tests sized for it (`miri_*`)
+  # and other small ones, split in three parts of 10 to 16 minutes, on a
+  # portable build (scalar kernels; Miri has no CPUID). The nightly is
+  # pinned to the one the tests were run with.
+  miri:
+    name: miri (${{ matrix.part }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: pyramid
+            tests: "postings::codecs::pyramid::tests::miri_"
+          - part: bytes, loom, bit vectors
+            tests: "postings::bytes postings::codecs::loom::tests::miri_ postings::bits"
+          - part: columns, graph, keys, text codec
+            tests: "forward:: graph:: storage::pk::tests::collisions storage::pk::tests::section_written storage::live storage::updates::tests::round_trip text::codec --skip many_int_keys"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-27
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata
+          key: miri
+      - name: Miri
+        working-directory: strata
+        env:
+          RUSTFLAGS: ""
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test --no-default-features --lib -- ${{ matrix.tests }}
 
   server-smoke:
     name: strata-server smoke test
@@ -152,7 +193,7 @@ jobs:
       - name: CPU model
         id: cpu
         shell: bash
-        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
