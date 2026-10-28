@@ -416,17 +416,26 @@ impl Service {
                 })
                 .await;
                 self.running.fetch_sub(1, Ordering::Relaxed);
-                r
+                r.map(|r| r.map(|rs| (rs, Vec::new())))
             }
             Backend::Cluster(c) => {
                 let c = c.clone();
                 let rt = tokio::runtime::Handle::current();
                 tokio::task::spawn_blocking(move || {
-                    compound::run(&req.sql, &schema, &req.params, &mut |text, p| {
+                    // Shards any step was answered without (partial answers).
+                    let mut missing: Vec<String> = Vec::new();
+                    let rs = compound::run(&req.sql, &schema, &req.params, &mut |text, p| {
                         let select = bind(text, &schema, p)?;
-                        let step = QueryReq { sql: text.to_string(), params: p.clone(), ..Default::default() };
-                        rt.block_on(c.query(&step, &select, deadline)).map_err(|e| strata::Error::Query(e.message))
-                    })
+                        let step = QueryReq { sql: text.to_string(), params: p.clone(), partial: req.partial, ..Default::default() };
+                        let m = rt.block_on(c.query(&step, &select, deadline)).map_err(|e| strata::Error::Query(e.message))?;
+                        for s in m.missing {
+                            if !missing.contains(&s) {
+                                missing.push(s);
+                            }
+                        }
+                        Ok(m.rs)
+                    });
+                    rs.map(|rs| (rs, missing))
                 })
                 .await
             }
@@ -441,8 +450,14 @@ impl Service {
             Err(_) if Instant::now() > deadline => Err(ApiError { status: 504, message: format!("the query ran past its {} ms deadline", timeout.as_millis()) }),
             r => r,
         };
-        self.metrics.query(kind, if res.is_ok() { "ok" } else if res.as_ref().is_err_and(|e| e.status == 504) { "timeout" } else { "error" }, ms);
-        res.map(|rs| Answer { rs, took_ms: ms, kind })
+        let outcome = match &res {
+            Ok((_, missing)) if !missing.is_empty() => "partial",
+            Ok(_) => "ok",
+            Err(e) if e.status == 504 => "timeout",
+            Err(_) => "error",
+        };
+        self.metrics.query(kind, outcome, ms);
+        res.map(|(rs, missing)| Answer { rs, took_ms: ms, kind, missing })
     }
 
     /// The statistics `sql` scores with, and a lease on the snapshot they
