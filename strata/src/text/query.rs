@@ -126,12 +126,19 @@ fn lex(q: &str) -> Result<Vec<Tok>> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Parentheses and NOTs open around the current position.
+    depth: usize,
 }
+
+/// How deeply a `MATCH` query may nest parentheses and `NOT`s. Parsing
+/// and evaluation recurse once per level, so without a bound one query
+/// could overflow the thread's stack and abort the process.
+pub const MAX_DEPTH: usize = 100;
 
 /// Parses a `MATCH` query (see the module documentation). A query whose
 /// words are all stopwords matches nothing (`Or([])`).
 pub fn parse_match(q: &str) -> Result<BoolQuery> {
-    let mut p = Parser { toks: lex(q)?, pos: 0 };
+    let mut p = Parser { toks: lex(q)?, pos: 0, depth: 0 };
     let e = p.or()?;
     if p.pos < p.toks.len() {
         return Err(Error::Query(format!("unexpected {:?} in MATCH query {q:?}", p.toks[p.pos])));
@@ -170,9 +177,20 @@ impl Parser {
     fn unary(&mut self) -> Result<Option<BoolQuery>> {
         if self.peek() == Some(&Tok::Not) {
             self.pos += 1;
-            return Ok(self.unary()?.map(|q| BoolQuery::Not(Box::new(q))));
+            self.enter()?;
+            let q = self.unary()?.map(|q| BoolQuery::Not(Box::new(q)));
+            self.depth -= 1;
+            return Ok(q);
         }
         self.primary()
+    }
+
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(Error::Query(format!("MATCH query nests more than {MAX_DEPTH} levels of parentheses and NOT")));
+        }
+        Ok(())
     }
 
     fn primary(&mut self) -> Result<Option<BoolQuery>> {
@@ -184,7 +202,9 @@ impl Parser {
                     self.pos += 1;
                     return Ok(None);
                 }
+                self.enter()?;
                 let e = self.or()?;
+                self.depth -= 1;
                 if self.peek() != Some(&Tok::RParen) {
                     return Err(Error::Query("unbalanced parentheses in MATCH query".into()));
                 }

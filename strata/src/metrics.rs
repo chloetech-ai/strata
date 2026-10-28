@@ -44,7 +44,7 @@ pub fn percentile(xs: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     let mut v = xs.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(|a, b| a.total_cmp(b));
     let i = ((p / 100.0) * (v.len() - 1) as f64).round() as usize;
     v[i.min(v.len() - 1)]
 }

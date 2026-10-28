@@ -407,6 +407,17 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Rows live in the snapshot: an upper bound of any result, to which
+    /// LIMIT and fusion depths are cut before they size anything.
+    fn n_live(&self) -> usize {
+        self.stat_segs().iter().map(|s| s.view.n_live as usize).sum()
+    }
+
+    /// A fusion depth or other requested row count, cut to the live rows.
+    fn rows_at_most(&self, n: usize) -> usize {
+        n.min(self.n_live())
+    }
+
     /// Every segment of the snapshot, for collection statistics and term
     /// expansions, even when `ExecOptions::segments` searches only some.
     fn stat_segs(&self) -> &[Seg<'a>] {
@@ -488,7 +499,9 @@ impl<'a> Executor<'a> {
     }
 
     fn ordered_hits(&mut self, q: &Select) -> Result<Vec<Hit>> {
-        let want = q.limit.map(|l| l + q.offset);
+        // No query returns more rows than are live, so a larger LIMIT asks
+        // for nothing more (and sizes nothing by itself).
+        let want = q.limit.map(|l| l.saturating_add(q.offset).min(self.n_live()));
         Ok(match &q.order {
             None => self.unordered(&q.filter, want)?,
             Some(OrderBy::Score { score: Score::Column { field }, desc }) => self.by_column(*field, *desc, &q.filter, want, q.tiebreak.as_ref())?,
@@ -692,7 +705,7 @@ impl<'a> Executor<'a> {
                 let est = SegEst { ex: self, s, params: None, local_sel: None };
                 let planner = self.planner(&est);
                 let mut ests: Vec<(f64, &Pred)> = cs.iter().map(|c| (planner.estimate(c).card, c)).collect();
-                ests.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                ests.sort_by(|a, b| a.0.total_cmp(&b.0));
                 let mut acc: Option<DocSet> = None;
                 for (_, c) in ests {
                     acc = Some(match acc {
@@ -762,7 +775,7 @@ impl<'a> Executor<'a> {
                 let est = SegEst { ex: self, s, params: None, local_sel: None };
                 let planner = self.planner(&est);
                 let mut ordered: Vec<(f64, &Pred)> = cs.iter().map(|c| (planner.estimate(c).card, c)).collect();
-                ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
                 ProbeNode::And(ordered.into_iter().map(|(_, c)| self.compile_probe(s, c)).collect::<Result<_>>()?)
             }
         })
@@ -823,7 +836,7 @@ impl<'a> Executor<'a> {
             }
         }
         self.stats.scored += cands.len() as u64;
-        let better = |a: &Hit, b: &Hit| if desc { b.score.partial_cmp(&a.score).unwrap() } else { a.score.partial_cmp(&b.score).unwrap() };
+        let better = |a: &Hit, b: &Hit| if desc { b.score.total_cmp(&a.score) } else { a.score.total_cmp(&b.score) };
         if let Some(k) = want.filter(|&k| k > 0 && k < cands.len()) {
             cands.select_nth_unstable_by(k - 1, better);
             let cut = cands[k - 1].score;
@@ -856,7 +869,7 @@ impl<'a> Executor<'a> {
         self.stats.scored += cands.len() as u64;
         self.stats.plan.push(format!("decay {:?} of {} around {}, scale {}", f.shape, self.schema.fields[field].name, f.origin, f.scale));
         if k > 0 && k < cands.len() {
-            cands.select_nth_unstable_by(k - 1, |a, b| b.score.partial_cmp(&a.score).unwrap());
+            cands.select_nth_unstable_by(k - 1, |a, b| b.score.total_cmp(&a.score));
             let cut = cands[k - 1].score;
             cands.retain(|h| h.score >= cut);
         }
@@ -873,6 +886,7 @@ impl<'a> Executor<'a> {
         }
         let mut hits = match score {
             Score::Rrf { inputs, k: rk, depth } => {
+                let depth = &self.rows_at_most(*depth);
                 let mut lists = Vec::new();
                 for s in inputs {
                     lists.push(self.input_top(s, p, *depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>());
@@ -1382,7 +1396,7 @@ impl<'a> Executor<'a> {
     fn weighted(&mut self, terms: &[(f64, Score)], p: &Pred, k: usize) -> Result<Vec<Hit>> {
         let opt = |key: &str| terms.iter().find_map(|(_, s)| s.opts().and_then(|o| o.get(key)).cloned());
         let exact = opt("exact").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
-        let depth = opt("depth").and_then(|v| v.as_f64()).map(|d| d as usize).unwrap_or(self.opts.fusion_depth);
+        let depth = self.rows_at_most(opt("depth").and_then(|v| v.as_f64()).map(|d| d as usize).unwrap_or(self.opts.fusion_depth));
         let norm = match opt("norm").as_ref().and_then(|v| v.as_str()) {
             Some("none") => Norm::None,
             _ => Norm::MinMax,
@@ -1419,7 +1433,7 @@ impl<'a> Executor<'a> {
     /// `a * b * ...`: the top `depth` rows of each relevance factor (of
     /// every factor if none is), scored exactly by every factor.
     fn product(&mut self, factors: &[Score], p: &Pred, k: usize) -> Result<Vec<Hit>> {
-        let depth = factors.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(self.opts.fusion_depth, |d| d as usize);
+        let depth = self.rows_at_most(factors.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(self.opts.fusion_depth, |d| d as usize));
         let any_relevance = factors.iter().any(Score::is_relevance);
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         for f in factors.iter().filter(|f| f.is_relevance() || !any_relevance) {
@@ -1459,6 +1473,7 @@ impl<'a> Executor<'a> {
             }
             _ => unreachable!("fused scores only"),
         };
+        let depth = self.rows_at_most(depth);
         // A product's candidates come from its relevance factors only.
         let generates = |s: &Score| match score {
             Score::Product(factors) => s.is_relevance() || !factors.iter().any(Score::is_relevance),
@@ -1622,7 +1637,7 @@ impl<'a> Executor<'a> {
     fn sort_by_score_then_key(&self, hits: &mut [Hit], score_desc: bool, key_desc: bool) {
         let mut keyed: Vec<(Hit, Value)> = hits.iter().map(|h| (*h, self.key(h))).collect();
         keyed.sort_by(|(a, ka), (b, kb)| {
-            let s = if score_desc { b.score.partial_cmp(&a.score).unwrap() } else { a.score.partial_cmp(&b.score).unwrap() };
+            let s = if score_desc { b.score.total_cmp(&a.score) } else { a.score.total_cmp(&b.score) };
             s.then_with(|| {
                 let c = cmp_values(ka, kb);
                 if key_desc { c.reverse() } else { c }
@@ -1698,7 +1713,7 @@ fn unsafe_extend<'a, T>(x: &T) -> &'a T {
 }
 
 fn merge_top(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then((a.seg, a.doc).cmp(&(b.seg, b.doc))));
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then((a.seg, a.doc).cmp(&(b.seg, b.doc))));
     hits.truncate(k);
     hits
 }
@@ -1753,7 +1768,10 @@ pub fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        _ => a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(std::cmp::Ordering::Equal),
+        _ => match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            (x, y) => x.is_some().cmp(&y.is_some()),
+        },
     }
 }
 

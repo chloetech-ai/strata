@@ -29,8 +29,6 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, TableFactor, UnaryOperator};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
 use crate::query::agg::{self, Acc, Part};
@@ -61,7 +59,7 @@ fn fname(f: &sql::Function) -> String {
 }
 
 fn parse(sql_text: &str) -> Result<Box<sql::Query>> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql_text).map_err(|e| err(e.to_string()))?;
+    let stmts = super::parse::parse(sql_text)?;
     match stmts.into_iter().collect::<Vec<_>>().as_mut_slice() {
         [sql::Statement::Query(q)] => Ok(q.clone()),
         _ => Err(err("expected one SELECT")),
@@ -70,7 +68,7 @@ fn parse(sql_text: &str) -> Result<Box<sql::Query>> {
 
 /// Whether `sql` needs this layer; anything else binds as one SELECT.
 pub fn is_compound(sql_text: &str, schema: &Schema) -> bool {
-    match Parser::parse_sql(&GenericDialect {}, sql_text) {
+    match super::parse::parse(sql_text) {
         Ok(stmts) => matches!(stmts.as_slice(), [sql::Statement::Query(q)] if needs(q, schema)),
         Err(_) => false,
     }
@@ -689,9 +687,9 @@ impl<'a, 'r> Ctx<'a, 'r> {
             let (e, desc) = mem_order[0].clone();
             scan_order[0] = Some((e, desc));
         }
-        let want = limit.map(|l| l + offset);
+        let want = limit.map(|l| l.saturating_add(offset));
         let mut lim = match (driver_order, want) {
-            (true, Some(w)) => Some((w * 2).max(32)),
+            (true, Some(w)) => Some(w.saturating_mul(2).clamp(32, MAX_ROWS)),
             _ => None,
         };
         let needed = sides.needed(&s, &order, &srcs)?;
@@ -1346,14 +1344,30 @@ fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>
     })
 }
 
-/// SQL LIKE: `%` any run, `_` one character.
+/// SQL LIKE: `%` any run, `_` one character. Greedy matching that backs
+/// up only to the last `%`: linear in the text for each pattern piece, and
+/// without recursion, so a long pattern cannot overflow the stack.
 fn like(s: &[char], p: &[char]) -> bool {
-    match p.first() {
-        None => s.is_empty(),
-        Some('%') => (0..=s.len()).any(|i| like(&s[i..], &p[1..])),
-        Some('_') => !s.is_empty() && like(&s[1..], &p[1..]),
-        Some(c) => s.first() == Some(c) && like(&s[1..], &p[1..]),
+    let (mut i, mut j) = (0, 0);
+    // The last `%` seen, and where in `s` its run currently ends.
+    let mut star: Option<(usize, usize)> = None;
+    while i < s.len() {
+        if j < p.len() && (p[j] == '_' || (p[j] != '%' && p[j] == s[i])) {
+            i += 1;
+            j += 1;
+        } else if j < p.len() && p[j] == '%' {
+            star = Some((j, i));
+            j += 1;
+        } else if let Some((sj, si)) = star {
+            // Let the last `%` swallow one more character and retry.
+            j = sj + 1;
+            i = si + 1;
+            star = Some((sj, si + 1));
+        } else {
+            return false;
+        }
     }
+    p[j..].iter().all(|&c| c == '%')
 }
 
 /// An aggregate call: its text (how other expressions name it), function and argument.
@@ -1605,5 +1619,16 @@ mod tests {
         assert!(l("graph", "gr_ph"));
         assert!(!l("graph", "gr_h"));
         assert!(l("", "%"));
+        assert!(l("abcabd", "%ab_"));
+        assert!(l("mississippi", "m%ss%pi"));
+        assert!(!l("mississippi", "m%ss%px"));
+        assert!(l("a%b", "a%%b"));
+        assert!(!l("ab", "a"));
+        assert!(!l("", "_"));
+        // A long pattern used to recurse once per character (and `%` runs
+        // to backtrack exponentially).
+        let s = "a".repeat(50_000);
+        assert!(!l(&s, &format!("{}b", "%a".repeat(25_000))));
+        assert!(l(&s, &"_".repeat(50_000)));
     }
 }

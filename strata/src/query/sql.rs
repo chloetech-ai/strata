@@ -24,8 +24,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
@@ -75,7 +73,7 @@ pub enum Assign {
 
 /// Parses and binds one INSERT, UPDATE or DELETE; `None` for a SELECT.
 pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Option<Write>> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql_text).map_err(|e| err(e.to_string()))?;
+    let stmts = super::parse::parse(sql_text)?;
     let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
     let b = Binder::new(schema, params);
     let table = |name: &str| {
@@ -159,7 +157,7 @@ pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Op
 
 /// Parses and binds one SELECT statement.
 pub fn bind(sql_text: &str, schema: &Schema, params: &Params) -> Result<Select> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql_text).map_err(|e| err(e.to_string()))?;
+    let stmts = super::parse::parse(sql_text)?;
     let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
     let sql::Statement::Query(q) = stmt else { return Err(err("only SELECT is supported")) };
     Binder::new(schema, params).query(q)
@@ -996,14 +994,18 @@ impl<'a> Binder<'a> {
     }
 
     fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {
-        match self.literal(e)? {
-            Value::Vector(v) => Ok(v),
+        let v: Arc<[f32]> = match self.literal(e)? {
+            Value::Vector(v) => v,
             Value::Str(s) => {
                 let v: Vec<f32> = serde_json::from_str(&s).map_err(|_| err("vector literal must be a JSON array"))?;
-                Ok(v.into())
+                v.into()
             }
-            v => Err(err(format!("expected a vector, got {v:?}"))),
+            v => return Err(err(format!("expected a vector, got {v:?}"))),
+        };
+        if v.iter().any(|x| !x.is_finite()) {
+            return Err(err("a vector's components must be finite numbers"));
         }
+        Ok(v)
     }
 }
 

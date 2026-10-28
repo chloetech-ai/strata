@@ -25,7 +25,7 @@ fn unpack(key: i64) -> (i32, DocId) {
 
 impl TopK {
     pub fn new(k: usize) -> Self {
-        TopK { k, heap: BinaryHeap::with_capacity(k + 1) }
+        TopK { k, heap: BinaryHeap::with_capacity(k.saturating_add(1).min(4096)) }
     }
 
     pub fn is_full(&self) -> bool {

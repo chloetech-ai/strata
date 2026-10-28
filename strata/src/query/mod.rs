@@ -10,6 +10,7 @@ pub mod compound;
 pub mod exec;
 pub mod fusion;
 pub mod logical;
+pub mod parse;
 pub mod plan;
 pub mod sql;
 pub mod stats;

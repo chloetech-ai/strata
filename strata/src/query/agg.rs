@@ -174,7 +174,7 @@ pub fn cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         _ => match (a.as_f64(), b.as_f64()) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            (Some(x), Some(y)) => x.total_cmp(&y),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => format!("{a:?}").cmp(&format!("{b:?}")),

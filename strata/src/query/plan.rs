@@ -160,7 +160,7 @@ impl<E: Estimator> Planner<'_, E> {
             }
             Pred::And(ps) => {
                 let mut es: Vec<PredEstimate> = ps.iter().map(|q| self.estimate(q)).collect();
-                es.sort_by(|a, b| a.card.partial_cmp(&b.card).unwrap());
+                es.sort_by(|a, b| a.card.total_cmp(&b.card));
                 let card = es.iter().fold(n, |acc, e| acc * e.card / n);
                 // Probing short-circuits: child i runs on the survivors of 0..i.
                 let mut pass = 1.0;
@@ -245,7 +245,7 @@ impl<E: Estimator> Planner<'_, E> {
                 options.push((s, mode, search + filt));
             }
         }
-        options.into_iter().min_by(|a, b| a.2.partial_cmp(&b.2).unwrap()).unwrap()
+        options.into_iter().min_by(|a, b| a.2.total_cmp(&b.2)).unwrap()
     }
 }
 

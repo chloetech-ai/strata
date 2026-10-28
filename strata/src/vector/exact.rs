@@ -65,7 +65,7 @@ pub fn exact_top_k(rows: &[&[f32]], queries: &[&[f32]], k: usize, filter: Option
         for (qs, res) in queries.chunks(per).zip(out.chunks_mut(per)) {
             let (ids, docs) = (&ids, &docs);
             s.spawn(move || {
-                let mut heaps: Vec<BinaryHeap<Reverse<Entry>>> = vec![BinaryHeap::with_capacity(k + 1); qs.len()];
+                let mut heaps: Vec<BinaryHeap<Reverse<Entry>>> = vec![BinaryHeap::with_capacity(k.saturating_add(1).min(4096)); qs.len()];
                 let mut floor = vec![f32::NEG_INFINITY; qs.len()];
                 // A 256-query tile (1 MiB at 1024 dimensions) fits in L2.
                 block_dots(qs, docs, 256, |i, j, d| {

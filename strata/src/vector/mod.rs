@@ -455,6 +455,16 @@ impl VectorReader {
     /// The top-`k` documents by similarity to `query`, best first.
     pub fn search(&self, query: &[f32], k: usize, params: &SearchParams, filter: Option<&dyn DocFilter>) -> SearchOutput {
         assert_eq!(query.len(), self.info.dim, "query dimension");
+        // No search returns more rows than the segment holds, and every
+        // size derived from k (heaps, rerank pools) stays within it.
+        let k = k.min(self.shape.n);
+        let clamped;
+        let params = if params.rerank > self.shape.n || params.ef > self.shape.n {
+            clamped = SearchParams { rerank: params.rerank.min(self.shape.n), ef: params.ef.min(self.shape.n.max(1)), ..params.clone() };
+            &clamped
+        } else {
+            params
+        };
         let card = filter.map(|f| f.cardinality());
         let strategy = self.plan(k, card, params);
         let mut stats = SearchStats { strategy, estimated_us: self.cost.estimate(&self.shape, strategy, k, card, params), ..Default::default() };

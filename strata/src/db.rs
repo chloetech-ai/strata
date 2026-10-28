@@ -360,22 +360,33 @@ impl Db {
                 };
                 let mut rewrites = Vec::new();
                 for row in self.execute(&self.snapshot(), &select, &self.exec)?.rows {
-                    let new = |f: usize, a: &Assign| match a {
-                        Assign::Value(v) => v.clone(),
-                        // NULL counts as zero.
-                        Assign::Add(x) => match schema.fields[f].ty {
-                            FieldType::Int => Value::Int(row[f].as_i64().unwrap_or(0) + *x as i64),
-                            _ => Value::Float(row[f].as_f64().unwrap_or(0.0) + x),
-                        },
+                    let new = |f: usize, a: &Assign| -> Result<Value> {
+                        Ok(match a {
+                            Assign::Value(v) => v.clone(),
+                            // NULL counts as zero; a sum that overflows is an
+                            // error, as in Postgres.
+                            Assign::Add(x) => match schema.fields[f].ty {
+                                FieldType::Int => Value::Int(
+                                    row[f].as_i64().unwrap_or(0).checked_add(*x as i64).ok_or_else(|| crate::Error::Query(format!("{} + {x} overflows", schema.fields[f].name)))?,
+                                ),
+                                _ => {
+                                    let y = row[f].as_f64().unwrap_or(0.0) + x;
+                                    if !y.is_finite() {
+                                        return Err(crate::Error::Query(format!("{} + {x} overflows", schema.fields[f].name)));
+                                    }
+                                    Value::Float(y)
+                                }
+                            },
+                        })
                     };
                     if sets.iter().all(|(f, _)| in_place(*f)) {
                         for (f, a) in &sets {
-                            t.set(&row[pk], &schema.fields[*f].name, new(*f, a))?;
+                            t.set(&row[pk], &schema.fields[*f].name, new(*f, a)?)?;
                         }
                     } else {
                         let mut doc = row.clone();
                         for (f, a) in &sets {
-                            doc[*f] = new(*f, a);
+                            doc[*f] = new(*f, a)?;
                         }
                         for &f in &stale {
                             doc[f] = Value::Null;

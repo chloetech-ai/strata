@@ -22,7 +22,7 @@ pub fn rrf<K: Copy + Eq + Hash>(rankings: &[Vec<K>], k: f64) -> Vec<(K, f64)> {
         }
     }
     let mut out: Vec<(K, f64, usize)> = score.into_iter().map(|(d, (s, o))| (d, s, o)).collect();
-    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.2.cmp(&b.2)));
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.2.cmp(&b.2)));
     out.into_iter().map(|(d, s, _)| (d, s)).collect()
 }
 
@@ -40,32 +40,54 @@ pub enum Norm {
 
 /// Weighted fusion of exact scores: `scores[i][j]` is input `i`'s score of
 /// candidate `j`. Returns `(candidate index, fused score)`, best first.
+///
+/// A score that is not finite (a missing column value arrives as −∞) is
+/// missing, and a missing value is the input's worst: in a sum it counts as
+/// the lowest score of the input over the candidates when its weight is
+/// positive and as the highest when it is negative (after min-max, 0 or 1),
+/// so a row without a value never gains from it; in a product it counts as
+/// 0. Product factors below 0 count as 0 too, so that two negative factors
+/// cannot multiply into a high score. Every fused score is finite.
 pub fn weighted(weights: &[f64], scores: &[Vec<f32>], norm: Norm) -> Vec<(usize, f64)> {
     assert_eq!(weights.len(), scores.len());
     let n = scores.first().map_or(0, |s| s.len());
     let mut fused = vec![if norm == Norm::Product { 1.0 } else { 0.0f64 }; n];
-    for (w, s) in weights.iter().zip(scores) {
+    for (&w, s) in weights.iter().zip(scores) {
         assert_eq!(s.len(), n);
-        let (lo, hi) = s.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| (lo.min(x as f64), hi.max(x as f64)));
+        let (lo, hi) = s.iter().filter(|x| x.is_finite()).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| (lo.min(x as f64), hi.max(x as f64)));
+        // The worst value of this input, which missing values take.
+        let worst = match norm {
+            _ if lo > hi => 0.0,
+            Norm::None if w < 0.0 => hi,
+            Norm::None => lo,
+            Norm::MinMax if w < 0.0 && hi > lo => 1.0,
+            Norm::MinMax => 0.0,
+            Norm::Product => 0.0,
+        };
         for (f, &x) in fused.iter_mut().zip(s) {
+            let x = x as f64;
             let v = match norm {
-                Norm::None | Norm::Product => x as f64,
-                Norm::MinMax if hi > lo => (x as f64 - lo) / (hi - lo),
+                _ if !x.is_finite() => worst,
+                Norm::None => x,
+                Norm::Product => x.max(0.0),
+                Norm::MinMax if hi > lo => (x - lo) / (hi - lo),
                 Norm::MinMax => 1.0,
             };
             if norm == Norm::Product {
-                *f *= if *w == 1.0 { v } else { v.powf(*w) };
-                // A missing value (−∞) times 0.
-                if f.is_nan() {
-                    *f = f64::NEG_INFINITY;
-                }
+                *f *= if w == 1.0 { v } else { v.powf(w) };
             } else {
                 *f += w * v;
             }
         }
     }
+    for f in &mut fused {
+        // An overflow or 0^-w; the row ranks last.
+        if !f.is_finite() {
+            *f = f64::MIN;
+        }
+    }
     let mut out: Vec<(usize, f64)> = fused.into_iter().enumerate().collect();
-    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     out
 }
 
@@ -93,5 +115,29 @@ mod tests {
         let mm = weighted(&[0.5, 0.5], &[s0, s1], Norm::MinMax);
         assert_eq!(mm[0].0, 2, "after min-max, the candidate good on both wins");
         assert!((mm[0].1 - (0.5 * 0.5 + 0.5 * 0.75)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn missing_values_are_the_worst_of_their_input() {
+        let ninf = f32::NEG_INFINITY;
+        // Candidate 1 has no value of input 1 (a NULL column).
+        let s0 = vec![1.0, 3.0, 2.0];
+        let s1 = vec![10.0, ninf, 20.0];
+        let mm = weighted(&[0.7, 0.3], &[s0.clone(), s1.clone()], Norm::MinMax);
+        assert!(mm.iter().all(|(_, s)| s.is_finite()), "{mm:?}");
+        // 0.7·1 + 0.3·0 for the row without a value; 0.7·0.5 + 0.3·1 for row 2.
+        assert_eq!(mm.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 2, 0]);
+        assert!((mm[0].1 - 0.7).abs() < 1e-9);
+        // A negative weight: missing counts as the highest value, so the
+        // row gains nothing over rows that have one.
+        let neg = weighted(&[1.0, -0.1], &[s0.clone(), s1.clone()], Norm::None);
+        let row1 = neg.iter().find(|x| x.0 == 1).unwrap().1;
+        assert!((row1 - (3.0 - 0.1 * 20.0)).abs() < 1e-9, "{neg:?}");
+        // Products: a missing factor is 0, negatives are 0, and nothing is NaN.
+        let p = weighted(&[1.0, 1.0], &[vec![2.0, 3.0, -1.0], vec![ninf, 1.0, -5.0]], Norm::Product);
+        assert_eq!(p, vec![(1, 3.0), (0, 0.0), (2, 0.0)]);
+        // An input with no value at all.
+        let none = weighted(&[0.5, 0.5], &[vec![1.0, 2.0], vec![ninf, ninf]], Norm::MinMax);
+        assert_eq!(none.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 0]);
     }
 }

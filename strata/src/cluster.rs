@@ -90,7 +90,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     if matches!(&q.order, Some(OrderBy::Score { score: Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_), .. })) {
         rows.sort_by(|a, b| by_score(a.score, b.score, true).then_with(|| by_key(&a.key, &b.key, key_desc)));
     }
-    let end = want.map_or(rows.len(), |w| (w + q.offset).min(rows.len()));
+    let end = want.map_or(rows.len(), |w| w.saturating_add(q.offset).min(rows.len()));
     let rows: Vec<Row> = rows.into_iter().take(end).skip(q.offset).collect();
     let score_cols: Vec<usize> = q.projection.iter().enumerate().filter(|(_, (_, p))| *p == Projection::Score).map(|(i, _)| i).collect();
     let mut out = empty(Vec::with_capacity(rows.len()), stats);
@@ -117,7 +117,7 @@ struct Row {
 }
 
 fn by_score(a: f64, b: f64, desc: bool) -> Ordering {
-    let o = a.partial_cmp(&b).unwrap_or(Ordering::Equal);
+    let o = a.total_cmp(&b);
     if desc {
         o.reverse()
     } else {

@@ -1394,6 +1394,7 @@ impl<'a> WriteTxn<'a> {
             }
             (FieldType::Int, v @ (Value::Int(_) | Value::Null)) => v,
             (FieldType::Float, Value::Int(x)) => Value::Float(x as f64),
+            (FieldType::Float, Value::Float(x)) if !x.is_finite() => return Err(Error::Schema(format!("bad value for {field}: {x} (FLOAT values are finite)"))),
             (FieldType::Float, v @ (Value::Float(_) | Value::Null)) => v,
             (FieldType::Int | FieldType::Float, v) => return Err(Error::Schema(format!("bad value for {field}: {v:?}"))),
             _ => return Err(Error::Schema(format!("{field} is not a numeric field; only INT and FLOAT are set in place"))),
