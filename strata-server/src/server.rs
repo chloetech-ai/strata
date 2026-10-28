@@ -1,10 +1,11 @@
 //! Opening the database, and serving HTTP and gRPC.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use strata::db::Db;
+use strata::ingest::Format;
 use strata::schema::Schema;
 use strata::segment::build::BuildOptions;
 use strata::storage::{DbOptions, Layout, MergePolicy};
@@ -18,7 +19,7 @@ use crate::{demo, grpc, http, pb};
 pub struct Options {
     /// The database to serve; created if missing (with `schema` or `demo`).
     pub db: Option<PathBuf>,
-    /// A JSON schema (Strata's `Schema` serialization) for a new database.
+    /// A JSON schema for a new database, in either form ([`Schema::from_json`]).
     pub schema: Option<PathBuf>,
     /// Fill a new database with the rows of this one ([`Db::load_from`]).
     pub copy_from: Option<PathBuf>,
@@ -94,7 +95,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             Db::create(&path, demo::schema(n), db_options(o.directory)).map_err(|e| e.to_string())?
         } else if let Some(s) = &o.schema {
             let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
-            let schema: Schema = serde_json::from_str(&text).map_err(|e| format!("schema {}: {e}", s.display()))?;
+            let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
             fill = o.copy_from.clone().map(Fill::Copy);
             Db::create(&path, schema, db_options(o.directory)).map_err(|e| e.to_string())?
         } else {
@@ -163,6 +164,38 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     }
     strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/// `strata-server import`: loads `files` into the database at `path`,
+/// created with `schema` if it does not exist, and says what each wrote.
+pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: Option<Format>, directory: bool, files: &[PathBuf]) -> Result<(), String> {
+    let opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, ..DbOptions::default() };
+    let db = if path.exists() {
+        if schema.is_some() {
+            return Err(format!("{} exists: --schema is only for a new database", path.display()));
+        }
+        Db::open(path, opts).map_err(|e| format!("open {}: {e}", path.display()))?
+    } else {
+        let s = schema.ok_or_else(|| format!("{} does not exist: pass --schema FILE to create it", path.display()))?;
+        let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
+        let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
+        Db::create(path, schema, opts).map_err(|e| format!("create {}: {e}", path.display()))?
+    };
+    for (field, why) in db.open_embedders(models) {
+        eprintln!("strata-server: cannot embed {field} ({why}): its vectors must be in the files");
+    }
+    for file in files {
+        let t0 = std::time::Instant::now();
+        let r = strata::ingest::import_file(&db, file, format).map_err(|e| format!("{}: {e}", file.display()))?;
+        let how = if r.bulk { "loaded" } else { "upserted" };
+        eprintln!("strata-server: {}: {} rows {how} in {:.1} s", file.display(), r.rows, t0.elapsed().as_secs_f64());
+        if !r.unknown.is_empty() {
+            eprintln!("strata-server: {}: skipped fields the schema lacks: {}", file.display(), r.unknown.join(", "));
+        }
+    }
+    db.storage().merge(&MergePolicy::default()).map_err(|e| format!("merge: {e}"))?;
+    eprintln!("strata-server: {} has {} rows", path.display(), db.snapshot().n_live_docs());
+    Ok(())
 }
 
 /// Merges segments in the background, as writes add them.

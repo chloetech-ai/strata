@@ -8,6 +8,8 @@
 //! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?}` | rows |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows, or `{written}` |
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`) | `{written}` |
+//! | `POST /v1/import?format=jsonl` | rows as JSON Lines, JSON, CSV or TSV | `{written, skipped_fields}` |
+//! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?}` | the bound query and its plan |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?}` | `{stats, snapshot}` |
@@ -19,13 +21,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json as AxJson, Router};
 use serde_json::{json, Value as Json};
+
+use strata::ingest::Format;
 
 use crate::service::{QueryReq, Service, SqlAnswer};
 use crate::{agent, json as js, ApiError};
@@ -57,6 +62,8 @@ pub fn router(svc: Arc<Service>, token: Option<String>) -> Router {
         .route("/v1/query", post(query))
         .route("/v1/sql", post(sql))
         .route("/v1/write", post(write))
+        .route("/v1/import", post(import))
+        .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
@@ -101,6 +108,7 @@ async fn schema(State(app): State<App>) -> AxJson<Json> {
     let s = &app.svc.schema;
     AxJson(json!({
         "schema": s,
+        "short": s.to_short_json(),
         "primary_key": s.primary_key.map(|k| s.fields[k].name.clone()),
         // Each embedded VECTOR field: its sources, model, and whether this
         // server can embed text for it.
@@ -165,6 +173,34 @@ async fn write(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let t0 = std::time::Instant::now();
     let n = app.svc.write_ops(ops).await?;
     Ok(AxJson(json!({"written": n, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
+}
+
+/// Rows in the body, in the format `?format=` names or the content type implies.
+async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>, headers: HeaderMap, body: Bytes) -> Res {
+    let format = match q.get("format") {
+        Some(f) => Some(Format::parse(f).ok_or_else(|| ApiError::bad(format!("unknown format {f:?}: jsonl, json, csv or tsv")))?),
+        None => {
+            let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+            let ct = ct.split(';').next().unwrap_or("").trim();
+            match ct {
+                "text/csv" => Some(Format::Csv),
+                "text/tab-separated-values" => Some(Format::Tsv),
+                "application/x-ndjson" | "application/jsonl" | "application/x-jsonlines" => Some(Format::Jsonl),
+                "application/json" => Some(Format::Json),
+                _ => None,
+            }
+        }
+    };
+    let format = format.ok_or_else(|| ApiError::bad("name the rows' format: ?format=jsonl, json, csv or tsv"))?;
+    let t0 = std::time::Instant::now();
+    let (n, skipped) = app.svc.import(body, format).await?;
+    Ok(AxJson(json!({"written": n, "skipped_fields": skipped, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
+}
+
+/// A schema validated, in both JSON forms.
+async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
+    let s = strata::schema::Schema::from_json_value(&b)?;
+    Ok(AxJson(json!({"schema": s, "short": s.to_short_json()})))
 }
 
 async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {

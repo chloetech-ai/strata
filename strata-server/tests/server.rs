@@ -638,3 +638,80 @@ async fn embedded_fields_over_http() {
     let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id FROM products ORDER BY similarity(emb, :q) DESC LIMIT 1", "params": {"q": {"embed": "x", "field": "title"}}})).await;
     assert_eq!(status, 400, "{r}");
 }
+
+const ITEMS: &str = r#"{"table": "items", "key": "id", "fields": [
+    {"name": "id", "type": "keyword"},
+    {"name": "title", "type": "text"},
+    {"name": "tags", "type": "keyword", "multi": true},
+    {"name": "price", "type": "float"},
+    {"name": "emb", "type": "vector", "embed": {"from": "title", "model": "hash:16"}}
+]}"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn imports_files_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = strata::Schema::from_json(ITEMS).unwrap();
+    let db = Db::create(&dir.path().join("i.strata"), schema.clone(), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
+    svc.open_models(dir.path());
+    let base = http(Arc::new(svc), None).await;
+    let c = reqwest::Client::new();
+
+    let jsonl = (0..2500).map(|i| json!({"id": format!("i{i}"), "title": format!("item number {i}"), "tags": ["a", "b"], "price": i, "colour": "red"}).to_string()).collect::<Vec<_>>().join("\n");
+    let r = c.post(format!("{base}/v1/import?format=jsonl")).body(jsonl).send().await.unwrap();
+    let (status, r): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
+    assert_eq!((status, &r["written"], &r["skipped_fields"]), (200, &json!(2500), &json!(["colour"])), "{r}");
+
+    // CSV by its content type, replacing a row and adding one; the model
+    // embeds the new titles.
+    let csv = "id,title,tags,price\ni7,\"zebra striped, umbrella\",x|y,7.5\nnew,giraffe desk lamp,,1\n";
+    let r = c.post(format!("{base}/v1/import")).header("content-type", "text/csv").body(csv).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT COUNT(*) FROM items"})).await;
+    assert_eq!(r["rows"][0][0], json!(2501), "{r}");
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT title, tags, price FROM items WHERE id = 'i7'"})).await;
+    assert_eq!(r["rows"][0], json!(["zebra striped, umbrella", ["x", "y"], 7.5]), "{r}");
+    let find = |text: &str| json!({"sql": "SELECT id FROM items ORDER BY similarity(emb, :q) DESC LIMIT 1", "params": {"q": {"embed": text, "field": "emb"}}});
+    let (_, r) = post(&c, &format!("{base}/v1/query"), find("giraffe desk lamp")).await;
+    assert_eq!(r["rows"][0][0], json!("new"), "{r}");
+
+    // A bad row names its line; no format is an error.
+    let r = c.post(format!("{base}/v1/import?format=jsonl")).body("{\"id\": \"ok\"}\n{\"id\": \"bad\", \"price\": \"cheap\"}\n").send().await.unwrap();
+    let (status, r): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
+    assert_eq!(status, 400);
+    assert!(r["error"].as_str().unwrap().contains("line 2"), "{r}");
+    let r = c.post(format!("{base}/v1/import")).body("id\nx\n").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+
+    // The schema in its short form, and a schema checked.
+    let r: Json = c.get(format!("{base}/v1/schema")).send().await.unwrap().json().await.unwrap();
+    let mut short: Json = serde_json::from_str(ITEMS).unwrap();
+    short["fields"][4]["embed"]["from"] = json!(["title"]);
+    assert_eq!(r["short"], short, "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/schema/check"), json!({"table": "t", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "v", "type": "vector"}]})).await;
+    assert_eq!(status, 400);
+    assert!(r["error"].as_str().unwrap().contains("dim"), "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/schema/check"), json!({"table": "t", "key": "id", "fields": [{"name": "id", "type": "keyword"}]})).await;
+    assert_eq!((status, &r["short"]["key"]), (200, &json!("id")), "{r}");
+    assert_eq!(r["schema"]["primary_key"], json!(0), "{r}");
+}
+
+#[test]
+fn imports_files_from_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let (schema, rows, more) = (dir.path().join("items.json"), dir.path().join("rows.jsonl"), dir.path().join("more.tsv"));
+    std::fs::write(&schema, ITEMS).unwrap();
+    std::fs::write(&rows, "{\"id\": \"a\", \"title\": \"first\"}\n{\"id\": \"b\", \"title\": \"second\", \"price\": 2}\n").unwrap();
+    std::fs::write(&more, "id\ttitle\tprice\nb\tsecond again\t3\nc\tthird\t\n").unwrap();
+    let db = dir.path().join("items.strata");
+    server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows.clone(), more]).unwrap();
+    let opened = Db::open(&db, DbOptions::default()).unwrap();
+    let r = opened.query("SELECT id, title, price FROM items", &Params::new()).unwrap();
+    let mut got: Vec<String> = r.rows.iter().map(|r| format!("{:?}", r)).collect();
+    got.sort();
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert!(got[1].contains("second again") && got[1].contains("3.0"), "{got:?}");
+    drop(opened);
+    // An existing database takes no schema.
+    assert!(server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows]).unwrap_err().contains("exists"));
+}

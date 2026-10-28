@@ -340,7 +340,10 @@ impl Schema {
                     FieldType::Int => ("int", true),
                     FieldType::Float => ("float", true),
                     FieldType::Vector { dim, index } => {
-                        m.insert("dim".into(), json!(dim));
+                        // A known model's vectors have its dimension.
+                        if f.embed.as_ref().and_then(|e| crate::embed::known_dim(&e.model)) != Some(*dim) {
+                            m.insert("dim".into(), json!(dim));
+                        }
                         if *index != DEFAULT_HNSW {
                             m.insert(
                                 "index".into(),
