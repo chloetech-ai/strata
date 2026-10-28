@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{corrupt, Result};
+use crate::error::{corrupt, Error, Result};
 use crate::postings::bytes::OwnedBytes;
 use crate::storage::manifest::Manifest;
 
@@ -80,6 +80,21 @@ pub fn write_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<()
         f.sync_data()?;
     }
     Ok(())
+}
+
+/// Writes a file a version being committed names: a segment, delete set,
+/// update set or manifest file named after an id or txn no committed
+/// version has used yet. A file already there under that name was left by
+/// a commit that failed before it finished (nothing references it), so it
+/// is replaced, and the commit can be tried again.
+pub fn write_version_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<()> {
+    match write_file(dir, name, bytes, sync) {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(dir.join(name))?;
+            write_file(dir, name, bytes, sync)
+        }
+        r => r,
+    }
 }
 
 pub fn sync_dir(dir: &Path) -> Result<()> {

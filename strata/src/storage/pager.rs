@@ -123,18 +123,22 @@ impl Meta {
 /// Reads both meta slots; returns the valid one with the larger txn and its
 /// slot number.
 pub fn read_meta(file: &File) -> Result<(Meta, usize)> {
-    let mut best: Option<(Meta, usize)> = None;
+    read_metas(file)?.into_iter().next().ok_or_else(|| corrupt("no valid meta slot"))
+}
+
+/// The valid meta slots with their slot numbers, newest first.
+pub fn read_metas(file: &File) -> Result<Vec<(Meta, usize)>> {
+    let mut metas = Vec::new();
     for slot in 0..2 {
         let mut page = vec![0u8; PAGE as usize];
         // A short file (crash during creation) reads as an invalid slot.
         let n = read_up_to(file, &mut page, slot as u64 * PAGE)?;
         if let Some(m) = Meta::decode(&page[..n])? {
-            if best.is_none_or(|(b, _)| m.txn > b.txn) {
-                best = Some((m, slot));
-            }
+            metas.push((m, slot));
         }
     }
-    best.ok_or_else(|| corrupt("no valid meta slot"))
+    metas.sort_by_key(|(m, _)| std::cmp::Reverse(m.txn));
+    Ok(metas)
 }
 
 /// Writes `meta` into `slot`.
