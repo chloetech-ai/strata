@@ -73,6 +73,9 @@ message WriteRequest {
   //  {"op": "delete", "key": ...},
   //  {"op": "set" | "add", "key": ..., "field": "...", "value": ...}].
   bytes ops_json = 3;
+  // With ops_json: a retry of a request with the same key (and the same
+  // operations) returns the first answer instead of writing again.
+  string idempotency_key = 4;
 }
 
 message WriteResponse { uint64 written = 1; }

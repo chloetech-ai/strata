@@ -174,7 +174,7 @@ Every request and answer is JSON. Parameters bind `:name` placeholders: a number
 |---|---|---|
 | `POST /v1/query` | `{sql, params?, timeout_ms?}` | `{columns, rows, keys, scores, stats, took_ms}` |
 | `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows for a `SELECT`; `{written}` for `INSERT`, `UPDATE`, `DELETE` |
-| `POST /v1/write` | `{ops: [...]}` | `{written}` |
+| `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written}` |
 | `POST /v1/import?format=F` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?}` | the bound query and its plan lines |
@@ -209,7 +209,9 @@ curl -s localhost:7700/v1/query -H 'content-type: application/json' -d '{
 
 A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as several single-table queries on one snapshot; on a coordinator, each step goes to the shards. Its plan lists the steps. A coordinator has no synonym list of its own: start each shard with `--synonyms FILE`.
 
-`set` and `add` change a numeric field in place, without rewriting the row; `upsert_if_newer` writes the row only if its version field is higher than the stored row's, so a feed replayed out of order keeps the newest.
+`set` and `add` change a numeric field in place, without rewriting the row; `upsert_if_newer` writes the row only if its version field is higher than the stored row's, so a feed replayed out of order keeps the newest. Operations see the ones before them in the batch: an `add` after an `upsert` of the same key adds to the upserted value. An `add` to an `INT` field takes an integer and fails on overflow (exact over the whole 64-bit range); one to a `FLOAT` field must stay finite; a missing value counts as 0.
+
+An answer of 200 means the batch is durable, and an error that nothing of it was written, so a client can retry on an error. When an answer is lost (a timeout, a dropped connection, a coordinator whose other replica failed), send the retry with the same `idempotency_key` (or an `Idempotency-Key` header), 1 to 256 characters: a server that already applied that batch answers with its first `written` instead of applying it again, so an `add` counts once and an `insert` does not fail as a duplicate of itself. The same key with other operations is refused (422), and while the first attempt still runs a retry gets 409. A server remembers keys for an hour, the latest 100,000, in memory, so a restart forgets them. A coordinator passes the key to each shard as `key/shard`. Over gRPC, `WriteRequest.idempotency_key` does the same.
 
 With `--token`, every route except `/` and `/v1/health` needs `Authorization: Bearer <token>`; the UI asks for the token.
 

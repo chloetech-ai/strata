@@ -406,10 +406,10 @@ impl Coordinator {
             Some(Write::Insert { docs, replace }) => {
                 let op = if replace { "upsert" } else { "insert" };
                 let ops = docs.iter().map(|d| json!({"op": op, "doc": js::document_json(&self.schema, d)})).collect();
-                self.write_ops(ops).await
+                self.write_ops(ops, None).await
             }
             Some(_) => {
-                let r = pb::WriteRequest { sql: sql.into(), params: params_to_pb(params), ops_json: Vec::new() };
+                let r = pb::WriteRequest { sql: sql.into(), params: params_to_pb(params), ..Default::default() };
                 let calls = (0..self.replicas.len()).map(|i| self.write(i, r.clone()));
                 Ok(join_all(calls).await.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().sum())
             }
@@ -417,15 +417,18 @@ impl Coordinator {
         }
     }
 
-    /// Write operations, grouped by the shard of their key.
-    pub async fn write_ops(&self, ops: Vec<Json>) -> Result<u64, ApiError> {
+    /// Write operations, grouped by the shard of their key. An idempotency
+    /// key goes to each shard as `key/shard`, so a retry after a replica
+    /// failed is not applied twice by the replicas that took it.
+    pub async fn write_ops(&self, ops: Vec<Json>, key: Option<String>) -> Result<u64, ApiError> {
         let mut by_shard: BTreeMap<usize, Vec<Json>> = BTreeMap::new();
         for op in ops {
             let s = shard_of(&op_key(&self.schema, &op)?, self.replicas.len());
             by_shard.entry(s).or_default().push(op);
         }
         let calls = by_shard.into_iter().map(|(i, ops)| {
-            let r = pb::WriteRequest { ops_json: serde_json::to_vec(&ops).unwrap_or_default(), ..Default::default() };
+            let idempotency_key = key.as_ref().map(|k| format!("{k}/{i}")).unwrap_or_default();
+            let r = pb::WriteRequest { ops_json: serde_json::to_vec(&ops).unwrap_or_default(), idempotency_key, ..Default::default() };
             self.write(i, r)
         });
         Ok(join_all(calls).await.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().sum())
