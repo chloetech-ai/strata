@@ -29,7 +29,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -1830,16 +1830,29 @@ fn wal_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// How long an open waits for a lock that is held.
+pub const LOCK_WAIT: Duration = Duration::from_millis(500);
+
 /// One open `Database` per file: an exclusive `flock`, released when the
-/// file is closed (also by a crash).
+/// file is closed (also by a crash). A child process holds a copy of every
+/// descriptor of its parent from its fork until its exec closes them, so a
+/// database that a process closes and opens again while it starts a child
+/// can find its own lock still held for a moment: a held lock is retried
+/// for [`LOCK_WAIT`] before the open fails.
 fn lock_exclusive(file: &File) -> Result<()> {
-    // SAFETY: flock on a valid descriptor.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        // SAFETY: flock on a valid descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(e.into());
+        }
+        if Instant::now() >= deadline {
             return Err(Error::Busy("the database is open elsewhere".into()));
         }
-        return Err(e.into());
+        std::thread::sleep(Duration::from_millis(2));
     }
-    Ok(())
 }
