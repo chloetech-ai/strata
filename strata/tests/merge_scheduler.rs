@@ -17,6 +17,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use storage_util::*;
 use strata::db::Db;
+use strata::segment::build::build_threads;
 use strata::storage::merge::{merge_memory, MergeEntry, MergeRecord, SegmentInfo};
 use strata::storage::{DbOptions, Layout, MergePolicy, MergerOptions};
 use strata::Value;
@@ -270,6 +271,11 @@ fn infos(db: &Db, ids: &[u64]) -> Vec<SegmentInfo> {
         .collect()
 }
 
+/// The merge memory the database estimates for segments `ids`.
+fn estimate(db: &Db, ids: &[u64]) -> u64 {
+    merge_memory(&infos(db, ids), build_threads(&options(Layout::SingleFile).build).unwrap())
+}
+
 #[test]
 fn segments_of_an_interrupted_merge_merge_in_smaller_groups() {
     let policy = MergePolicy { merge_factor: 4, ..ALL_TIER_0 };
@@ -277,7 +283,7 @@ fn segments_of_an_interrupted_merge_merge_in_smaller_groups() {
     let path = path_for(dir.path(), Layout::SingleFile);
     let (db, model) = segments(&path, Layout::SingleFile, 4, 50);
     let ids = segment_ids(&db);
-    let memory = merge_memory(&infos(&db, &ids));
+    let memory = estimate(&db, &ids);
     drop(db);
     // The process died merging all four: the next merges of them are
     // estimated at under half that, so two at a time.
@@ -296,7 +302,7 @@ fn segments_of_an_interrupted_merge_merge_in_smaller_groups() {
     let path = path_for(dir.path(), Layout::SingleFile);
     let (db, model) = segments(&path, Layout::SingleFile, 4, 50);
     let ids = segment_ids(&db);
-    let memory = merge_memory(&infos(&db, &ids));
+    let memory = estimate(&db, &ids);
     drop(db);
     MergeRecord { running: vec![MergeEntry { segments: ids.clone(), memory, times: 0 }], interrupted: vec![] }.store(&record_path(&path)).unwrap();
     let db = Db::open(&path, options(Layout::SingleFile)).unwrap();
@@ -349,7 +355,7 @@ fn the_merger_cuts_merges_to_its_memory_budget() {
     let path = path_for(dir.path(), Layout::SingleFile);
     let (db, model) = segments(&path, Layout::SingleFile, 8, 50);
     let ids = segment_ids(&db);
-    let three = merge_memory(&infos(&db, &ids[..3]));
+    let three = estimate(&db, &ids[..3]);
     let db = Arc::new(db);
     let policy = MergePolicy { merge_factor: 8, ..ALL_TIER_0 };
     db.spawn_merger(MergerOptions { policy, threads: 1, memory_budget: Some(three + three / 10), write_bytes_per_sec: None });

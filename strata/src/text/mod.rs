@@ -53,9 +53,15 @@ use crate::segment::FieldIndexBuilder;
 
 /// Builder for an indexed TEXT field.
 pub fn field_builder(field: &Field, opts: &BuildOptions) -> Result<Box<dyn FieldIndexBuilder>> {
+    Ok(Box::new(text_builder(field, opts)?))
+}
+
+/// [`field_builder`] as its concrete type, for builds that analyse runs of
+/// documents on several threads and join them ([`TextFieldBuilder::append`]).
+pub fn text_builder(field: &Field, opts: &BuildOptions) -> Result<TextFieldBuilder> {
     let FieldType::Text { positions } = field.ty else {
         return Err(Error::Schema(format!("field {} is not TEXT", field.name)));
     };
     let (format, loom_min_df) = builder::options(opts)?;
-    Ok(Box::new(TextFieldBuilder::new(&field.name, positions, format, loom_min_df)))
+    Ok(TextFieldBuilder::new(&field.name, positions, format, loom_min_df))
 }

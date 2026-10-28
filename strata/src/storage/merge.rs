@@ -113,19 +113,25 @@ pub struct MergeStatus {
     pub error: Option<String>,
 }
 
-/// The estimated peak memory of merging segments: their live documents
-/// decoded, the structures the segment builder keeps for them, and the
-/// merged image, which together come to at most about
-/// `MEMORY_PER_IMAGE_BYTE` times the inputs' image bytes that hold live
-/// documents.
-pub fn merge_memory(segs: &[SegmentInfo]) -> u64 {
-    segs.iter().map(|s| (s.bytes as f64 * s.n_live as f64 / s.n_docs.max(1) as f64 * MEMORY_PER_IMAGE_BYTE) as u64).sum()
+/// The estimated peak memory of merging segments with a build on
+/// `threads` threads: their live documents decoded, the structures the
+/// segment builder keeps for them, and the merged image, which together
+/// come to at most about [`memory_per_image_byte`] times the inputs' image
+/// bytes that hold live documents.
+pub fn merge_memory(segs: &[SegmentInfo], threads: usize) -> u64 {
+    let per_byte = memory_per_image_byte(threads);
+    segs.iter().map(|s| (s.bytes as f64 * s.n_live as f64 / s.n_docs.max(1) as f64 * per_byte) as u64).sum()
 }
 
-/// A merge's peak memory per byte of input image: 2.7 to 5.2 measured
+/// A merge's peak memory per byte of input image, when its build uses
+/// `threads` threads, with a margin over what was measured
 /// (`examples/merge_memory.rs`, inputs of 12 to 186 MB of short text, long
-/// text, and text with 64- and 384-dim vectors), with a margin.
-pub const MEMORY_PER_IMAGE_BYTE: f64 = 6.0;
+/// text, and text with 64- and 384-dim vectors): 2.7 to 4.5 on one thread,
+/// 3.1 to 6.7 on four and 2.9 to 8.5 on eight, short texts taking the most
+/// (each thread analyses its own run of documents).
+pub fn memory_per_image_byte(threads: usize) -> f64 {
+    5.5 + 0.5 * threads.max(1) as f64
+}
 
 /// The memory this process may use: the tightest cgroup limit that
 /// applies to it (v2 `memory.max`, v1 `memory.limit_in_bytes`), else the
@@ -309,16 +315,17 @@ impl MergePolicy {
 
     /// [`select`](Self::select) among the segments `skip` does not name,
     /// with the selected group cut to its smallest inputs until
-    /// [`merge_memory`] estimates it at most `cap(group)`. A group that
+    /// [`merge_memory`] (with a build on `threads` threads) estimates it at
+    /// most `cap(group)`. A group that
     /// cannot be cut that far (one input, or two that do not fit) is left
     /// alone and the policy selects again without it. Returns the group and
     /// whether it was cut, or whether any group was left alone.
-    pub fn select_within(&self, segs: &[SegmentInfo], skip: impl Fn(u64) -> bool, cap: impl Fn(&[u64]) -> Option<u64>) -> (Option<Vec<u64>>, bool) {
+    pub fn select_within(&self, segs: &[SegmentInfo], skip: impl Fn(u64) -> bool, cap: impl Fn(&[u64]) -> Option<u64>, threads: usize) -> (Option<Vec<u64>>, bool) {
         let mut left: Vec<SegmentInfo> = segs.iter().copied().filter(|s| !skip(s.id)).collect();
         let mut limited = false;
         while let Some(mut group) = self.select(&left) {
             let info = |id: &u64| *left.iter().find(|s| s.id == *id).expect("selected from these");
-            let fits = |g: &[u64]| cap(g).is_none_or(|c| merge_memory(&g.iter().map(info).collect::<Vec<_>>()) <= c);
+            let fits = |g: &[u64]| cap(g).is_none_or(|c| merge_memory(&g.iter().map(info).collect::<Vec<_>>(), threads) <= c);
             // Smallest inputs first: they are cheapest to keep.
             group.sort_by_key(|id| (info(id).n_live, *id));
             let whole = group.len();
@@ -366,25 +373,25 @@ mod tests {
     fn selections_fit_their_memory_cap() {
         let p = MergePolicy { merge_factor: 4, floor_docs: 100, max_merged_docs: 10_000, max_deleted_ratio: 0.5 };
         let segs: Vec<SegmentInfo> = (1..=6).map(|i| seg(i, 50 + i as u32, 50 + i as u32)).collect();
-        let one = merge_memory(&segs[..1]);
+        let one = merge_memory(&segs[..1], 1);
         let none = |_: u64| false;
         // No cap: the policy's group.
-        assert_eq!(p.select_within(&segs, none, |_| None), (Some(vec![1, 2, 3, 4]), false));
+        assert_eq!(p.select_within(&segs, none, |_| None, 1), (Some(vec![1, 2, 3, 4]), false));
         // Cut to its smallest inputs.
-        assert_eq!(p.select_within(&segs, none, |_| Some(3 * one)), (Some(vec![1, 2]), true));
+        assert_eq!(p.select_within(&segs, none, |_| Some(3 * one), 1), (Some(vec![1, 2]), true));
         // Claimed segments are left to their merge.
-        assert_eq!(p.select_within(&segs, |id| id <= 2, |_| None), (Some(vec![3, 4, 5, 6]), false));
+        assert_eq!(p.select_within(&segs, |id| id <= 2, |_| None, 1), (Some(vec![3, 4, 5, 6]), false));
         // A group that cannot be cut to fit is left alone; the rest are
         // too few for another.
-        assert_eq!(p.select_within(&segs, none, |_| Some(one)), (None, true));
+        assert_eq!(p.select_within(&segs, none, |_| Some(one), 1), (None, true));
         // A cap on some segments only (an interrupted merge's): the
         // smallest two are left alone, the next four fit.
         let cap = |g: &[u64]| g.contains(&1).then_some(one);
-        assert_eq!(p.select_within(&segs, none, cap), (Some(vec![3, 4, 5, 6]), true));
+        assert_eq!(p.select_within(&segs, none, cap, 1), (Some(vec![3, 4, 5, 6]), true));
         // A single-segment rewrite that does not fit is left alone too.
         let gone = [seg(7, 1000, 100)];
-        assert_eq!(p.select_within(&gone, none, |_| Some(1)), (None, true));
-        assert_eq!(p.select_within(&gone, none, |_| None), (Some(vec![7]), false));
+        assert_eq!(p.select_within(&gone, none, |_| Some(1), 1), (None, true));
+        assert_eq!(p.select_within(&gone, none, |_| None, 1), (Some(vec![7]), false));
     }
 
     #[test]
