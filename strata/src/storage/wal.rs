@@ -13,8 +13,10 @@
 //!
 //! A transaction is its operation records followed by a commit record,
 //! written with one `write` and made durable with one `fdatasync`. Replay
-//! stops at the first record that is short or fails its checksum and drops
-//! operations not followed by a commit, and the log is cut there. If
+//! stops at the first record that is short, fails its checksum or holds an
+//! operation its table's schema could not have committed (damage the
+//! checksum missed), drops operations not followed by a commit, and the
+//! log is cut there. If
 //! commit records follow the damage, the log is first copied aside
 //! (`<wal>.damaged`), and with `sync` more than one of them means the log
 //! was damaged after it was durable, not torn by a crash during the last
@@ -92,7 +94,9 @@ impl Wal {
     /// log was damaged after it was made durable, and opening fails unless
     /// `drop_damaged`. (Without `sync` a power loss can tear any appends
     /// not yet written back.)
-    pub fn open(path: &Path, db_id: u64, sync: bool, drop_damaged: bool) -> Result<(Wal, Vec<WalTxn>)> {
+    /// `fits(table, op)` says whether an operation could have been
+    /// committed; one that could not counts as damage.
+    pub fn open(path: &Path, db_id: u64, sync: bool, drop_damaged: bool, fits: &dyn Fn(u32, &Op) -> bool) -> Result<(Wal, Vec<WalTxn>)> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         let size = file.metadata()?.len();
         let mut buf = vec![0u8; size as usize];
@@ -103,7 +107,7 @@ impl Wal {
             wal.reset(sync)?;
             return Ok((wal, Vec::new()));
         }
-        let (txns, end) = decode(&buf[HEADER as usize..]);
+        let (txns, end) = decode(&buf[HEADER as usize..], fits);
         let end = HEADER + end as u64;
         if end < size {
             let later = commits_after(&buf[end as usize..], txns.last().map_or(0, |t| t.txn));
@@ -263,8 +267,9 @@ fn commits_after(rest: &[u8], last: u64) -> Vec<u64> {
 }
 
 /// Committed transactions in `buf` (the log after its header) and the
-/// length of the prefix they occupy.
-fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
+/// length of the prefix they occupy, up to the first operation that does
+/// not `fit`.
+fn decode(buf: &[u8], fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<WalTxn>, usize) {
     let mut txns = Vec::new();
     let mut ops = Vec::new();
     let mut table = 0u32;
@@ -278,17 +283,14 @@ fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
         }
         pos += 8 + len;
         let mut r = Reader { b: &body[1..] };
-        match body[0] {
-            INSERT => match get_doc(&mut r) {
-                Ok(d) => ops.push((table, Op::Insert(Arc::new(d)))),
-                Err(_) => break,
-            },
-            DELETE => match get_value(&mut r) {
-                Ok(v) => ops.push((table, Op::Delete(v))),
-                Err(_) => break,
-            },
+        let op = match body[0] {
+            INSERT => get_doc(&mut r).map(|d| Op::Insert(Arc::new(d))),
+            DELETE => get_value(&mut r).map(Op::Delete),
             TABLE => match r.u32() {
-                Ok(t) => table = t,
+                Ok(t) => {
+                    table = t;
+                    continue;
+                }
                 Err(_) => break,
             },
             SET => {
@@ -296,7 +298,7 @@ fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
                 let field = r.u16();
                 let value = get_value(&mut r);
                 match (key, field, value) {
-                    (Ok(key), Ok(field), Ok(value)) => ops.push((table, Op::Set { key, field, value })),
+                    (Ok(key), Ok(field), Ok(value)) => Ok(Op::Set { key, field, value }),
                     _ => break,
                 }
             }
@@ -308,7 +310,12 @@ fn decode(buf: &[u8]) -> (Vec<WalTxn>, usize) {
                 txns.push(WalTxn { txn, ops: std::mem::take(&mut ops) });
                 table = 0;
                 end = pos;
+                continue;
             }
+            _ => break,
+        };
+        match op {
+            Ok(op) if fits(table, &op) => ops.push((table, op)),
             _ => break,
         }
     }
@@ -430,6 +437,10 @@ fn get_doc(r: &mut Reader) -> Result<Document> {
 mod tests {
     use super::*;
 
+    fn any(_: u32, _: &Op) -> bool {
+        true
+    }
+
     fn doc(i: i64) -> Arc<Document> {
         Arc::new(vec![
             Value::Str(format!("key{i}")),
@@ -478,7 +489,7 @@ mod tests {
         for (t, ops) in sample() {
             buf.extend(encode_txn(t, &ops));
         }
-        let (txns, end) = decode(&buf);
+        let (txns, end) = decode(&buf, &any);
         assert_eq!(end, buf.len());
         let want: Vec<WalTxn> = sample().into_iter().map(|(txn, ops)| WalTxn { txn, ops }).collect();
         assert_eq!(txns, want);
@@ -500,7 +511,7 @@ mod tests {
                 let mut b = buf[..cut].to_vec();
                 b.extend_from_slice(tail);
                 let committed = ends.iter().filter(|&&e| b.starts_with(&buf[..e])).count();
-                let (txns, end) = decode(&b);
+                let (txns, end) = decode(&b, &any);
                 assert_eq!(txns.len(), committed, "cut at {cut}");
                 assert_eq!(end, if committed == 0 { 0 } else { ends[committed - 1] });
             }
@@ -508,7 +519,7 @@ mod tests {
         // A flipped bit inside the second transaction loses it and the rest.
         let mut b = buf.clone();
         b[ends[0] + 12] ^= 4;
-        assert_eq!(decode(&b).0.len(), 1);
+        assert_eq!(decode(&b, &any).0.len(), 1);
     }
 
     #[test]
@@ -524,14 +535,46 @@ mod tests {
         // Torn tail: half a record after the last commit is cut on open.
         let f = OpenOptions::new().write(true).open(&p).unwrap();
         f.write_all_at(&encode_txn(9, &[(0, Op::Insert(doc(4)))])[..20], len).unwrap();
-        let (mut wal, txns) = Wal::open(&p, 11, false, false).unwrap();
+        let (mut wal, txns) = Wal::open(&p, 11, false, false, &any).unwrap();
         assert_eq!(txns.len(), 6);
         assert_eq!(wal.len(), len);
         wal.append(10, &[(0, Op::Insert(doc(5)))], false).unwrap();
         drop(wal);
-        let (_, txns) = Wal::open(&p, 11, false, false).unwrap();
+        let (_, txns) = Wal::open(&p, 11, false, false, &any).unwrap();
         assert_eq!(txns.last().unwrap().txn, 10);
-        let (wal, txns) = Wal::open(&p, 12, false, false).unwrap();
+        let (wal, txns) = Wal::open(&p, 12, false, false, &any).unwrap();
         assert!(txns.is_empty() && wal.is_empty());
+    }
+
+    /// An operation that does not fit (intact records the schema could
+    /// not have committed) ends replay before its transaction, like a
+    /// failed checksum.
+    #[test]
+    fn an_operation_that_does_not_fit_is_damage() {
+        let mut buf = Vec::new();
+        let mut ends = Vec::new();
+        for (t, ops) in sample() {
+            buf.extend(encode_txn(t, &ops));
+            ends.push(buf.len());
+        }
+        let no_set = |_: u32, op: &Op| !matches!(op, Op::Set { .. });
+        assert_eq!(decode(&buf, &no_set), (decode(&buf[..ends[2]], &any).0, ends[2]));
+        let no_table_5 = |t: u32, _: &Op| t != 5;
+        assert_eq!(decode(&buf, &no_table_5).1, ends[3]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db-wal");
+        let mut wal = Wal::create(&p, 11, false).unwrap();
+        for (t, ops) in sample() {
+            wal.append(t, &ops, true).unwrap();
+        }
+        drop(wal);
+        // With sync, three commits after the damage: refused unless asked.
+        let err = Wal::open(&p, 11, true, false, &no_set).err().unwrap();
+        assert!(err.to_string().contains("3 committed transactions follow the damage"), "{err}");
+        let (wal, txns) = Wal::open(&p, 11, true, true, &no_set).unwrap();
+        assert_eq!(txns.len(), 3);
+        assert_eq!(wal.len(), HEADER + ends[2] as u64);
+        assert!(wal.dropped().is_some());
     }
 }

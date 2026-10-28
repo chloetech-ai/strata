@@ -261,9 +261,10 @@ impl Loom {
 
     /// Views a list written by [`Loom::write_to`] without copying: every
     /// array is a [`Slice::Shared`] into `bytes`, which must be 8-byte
-    /// aligned. Checks the structure (array lengths, padding) but trusts the
-    /// partition descriptors, as the codec trusts its own build; data from
-    /// untrusted storage must be checksummed by the caller.
+    /// aligned. Checks the structure: array lengths, padding and every
+    /// partition descriptor, so that loading a partition stays inside the
+    /// arrays (O(partitions)). The payload bits are trusted; a list from
+    /// untrusted bytes must pass [`Loom::validate`] before it is used.
     pub fn from_bytes(bytes: OwnedBytes) -> Result<Self, String> {
         Self::read_from(&mut ByteReader::new(bytes))
     }
@@ -280,14 +281,80 @@ impl Loom {
         if desc.len() != p || ranks.len() != p || words.len() < PAD_WORDS || (n == 0) != (p == 0) || n > u32::MAX as usize {
             return Err(format!("inconsistent Loom list: {n} postings, {p} partitions, {} words", words.len()));
         }
-        if p > 0 {
-            let d = desc[p - 1];
-            let last_n = ((d >> N_SHIFT) & 0x1fff) as usize + 1;
-            if ranks[p - 1] as usize + last_n != n || (d & OFF_MASK) as usize >= words.len() {
-                return Err("Loom list ranks or offsets out of range".into());
+        let list = Loom { n, ends, desc, ranks, words, size_bits };
+        list.check_descriptors()?;
+        Ok(list)
+    }
+
+    /// The descriptor checks of [`Loom::read_from`]: partitions are ordered
+    /// and below [`END`], ranks add up, counts fit their spans and encodings,
+    /// and every payload ends before the padding.
+    fn check_descriptors(&self) -> Result<(), String> {
+        let bad = |p: usize, what: &str| Err(format!("Loom partition {p}: {what}"));
+        let payload = self.words.len() - PAD_WORDS;
+        let mut rank = 0u64;
+        for p in 0..self.ends.len() {
+            if (p > 0 && self.ends[p - 1] >= self.ends[p]) || self.ends[p] == END {
+                return bad(p, "docIDs out of order");
+            }
+            let (base, last, d) = (self.base(p) as u64, self.ends[p] as u64, self.desc[p]);
+            let (kind, m, l) = ((d >> KIND_SHIFT) & 3, ((d >> N_SHIFT) & 0x1fff) + 1, (d >> L_SHIFT) as u32 & 63);
+            let span = last - base + 1;
+            if m > MAX_PART as u64 || m > span || self.ranks[p] as u64 != rank || d >> (L_SHIFT + 6) != 0 || d >> 47 & 1 != 0 {
+                return bad(p, "bad descriptor");
+            }
+            rank += m;
+            let words = match kind as u32 {
+                RUN if m == span && l == 0 => 0,
+                BV if l == 0 => ((last - (base & !63)) / 64 + 1) as usize,
+                EF if l == ef::lower_bits(span, m) => ef::Layout::new(span, m).words(),
+                _ => return bad(p, "bad encoding"),
+            };
+            if (d & OFF_MASK) as usize + words > payload {
+                return bad(p, "payload out of bounds");
             }
         }
-        Ok(Loom { n, ends, desc, ranks, words, size_bits })
+        if rank != self.n as u64 {
+            return Err(format!("Loom list: partitions hold {rank} postings, the header says {}", self.n));
+        }
+        Ok(())
+    }
+
+    /// Checks the payload of every partition against its descriptor, in
+    /// O(postings): a bitvector has exactly its postings set, the first at
+    /// or after its base and the last at its last docID; an EF partition
+    /// decodes to strictly increasing values ending at its last docID, and
+    /// its select samples are the encoder's ([`ef::check`]). Cursors and
+    /// set operations rely on this of a list the builder wrote (their scans
+    /// stop at the partition's last posting), so a list read from bytes
+    /// that may be corrupt is safe to use once it passes.
+    pub fn validate(&self) -> Result<(), String> {
+        let bad = |p: usize, what: &str| Err(format!("Loom partition {p}: {what}"));
+        let mut scratch = Vec::new();
+        for p in 0..self.ends.len() {
+            let (base, last, d) = (self.base(p), self.ends[p], self.desc[p]);
+            let (kind, m) = ((d >> KIND_SHIFT) as u32 & 3, ((d >> N_SHIFT) & 0x1fff) as usize + 1);
+            let off = (d & OFF_MASK) as usize;
+            let span = (last - base) as u64 + 1;
+            match kind {
+                RUN => {}
+                BV => {
+                    let ws = &self.words[off..off + ((last - (base & !63)) / 64 + 1) as usize];
+                    let below = (1u64 << (base % 64)) - 1;
+                    let ones: u64 = ws.iter().map(|w| w.count_ones() as u64).sum();
+                    if ws[0] & below != 0 || ws[ws.len() - 1] >> (last % 64) != 1 || ones != m as u64 {
+                        return bad(p, "bitvector does not match its postings");
+                    }
+                }
+                _ => {
+                    let lay = ef::Layout::new(span, m as u64);
+                    if !ef::check(&self.words[off..off + lay.words()], &lay, m, span, &mut scratch) {
+                        return bad(p, "EF payload does not match its postings");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether every array is a zero-copy view (as after [`Loom::from_bytes`]).
@@ -302,6 +369,11 @@ impl Loom {
     /// that keep cursors beyond the scope of a borrowed list.
     pub fn into_cursor(self) -> LoomCursor<Loom> {
         LoomCursor::new(self)
+    }
+
+    /// The largest docID, if any.
+    pub fn last_doc(&self) -> Option<u32> {
+        self.ends.last().copied()
     }
 
     /// Number of partitions.

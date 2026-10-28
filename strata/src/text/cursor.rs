@@ -7,10 +7,11 @@
 //! postings before it in its block, using their frequencies.
 
 use crate::postings::bytes::OwnedBytes;
+use crate::postings::codecs::loom::Loom;
 use crate::postings::codecs::PostingList;
 
 use super::codec::{get_varint, put_varint};
-use super::postings::{open_loom, read_frontier, BpCursor, Impact, LoomListCursor, BLOCK};
+use super::postings::{read_frontier, BpCursor, Impact, LoomListCursor, BLOCK};
 use crate::segment::DocId;
 
 pub use super::postings::END;
@@ -111,9 +112,9 @@ impl<'a> PostingCursor<'a> {
         PostingCursor { inner, df, frontier, positions: positions.map(|p| PosReader::new(p, df)) }
     }
 
-    /// The Loom list at `start..end` of the postings section.
-    pub(crate) fn loom(section: &'a OwnedBytes, start: usize, end: usize, df: u32, positions: Option<&'a [u8]>) -> Self {
-        let (list, mut pos) = open_loom(section, start, end);
+    /// The Loom list `list` at `start` of the postings section, opened by
+    /// [`super::postings::open_loom`] (which returned `pos`).
+    pub(crate) fn loom(section: &'a OwnedBytes, start: usize, list: Loom, mut pos: usize, df: u32, positions: Option<&'a [u8]>) -> Self {
         debug_assert_eq!(list.len(), df as usize);
         let data = &section[start..];
         let frontier = read_frontier(data, &mut pos);

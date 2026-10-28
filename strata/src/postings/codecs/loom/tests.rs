@@ -439,3 +439,94 @@ fn rank_matches_index() {
         }
     }
 }
+
+/// Every list the builder writes passes [`Loom::validate`], as a built
+/// list and read back from its bytes.
+#[test]
+fn built_lists_validate() {
+    use crate::postings::bytes::OwnedBytes;
+    let mut rng = StdRng::seed_from_u64(17);
+    let mut lists: Vec<Vec<u32>> = conformance::sample_lists().into_iter().map(|(d, _)| d).collect();
+    lists.push((0..400_000u32).filter(|_| rng.gen_bool(0.3)).collect());
+    lists.push(clustered(&mut rng, 50_000, 1 << 24));
+    lists.push(random_sorted(&mut rng, 100_000, u32::MAX - 1));
+    for params in [Params::DEFAULT, Params { chunk: 8, lambda: (2, 1) }, Params { chunk: 32, lambda: (1, 1) }] {
+        for docs in &lists {
+            let l = Loom::build_with(docs, params);
+            l.validate().unwrap();
+            Loom::from_bytes(OwnedBytes::new(l.to_bytes())).unwrap().validate().unwrap();
+        }
+    }
+}
+
+/// Damaged bytes either fail [`Loom::from_bytes`] or [`Loom::validate`],
+/// or form a list that decodes, seeks and combines like the docIDs it
+/// decodes to: random bit flips, overwritten words and truncations of
+/// lists with run, bitvector and EF partitions.
+#[test]
+fn damaged_lists_fail_or_behave() {
+    use crate::postings::bytes::OwnedBytes;
+    let mut rng = StdRng::seed_from_u64(23);
+    let mut lists = vec![
+        (0..3000u32).chain((10_000..60_000).filter(|x| x % 3 == 0)).chain((1 << 20..(1 << 20) + 5000).map(|x| x * 7)).collect::<Vec<u32>>(),
+        random_sorted(&mut rng, 20_000, 1 << 22),
+        clustered(&mut rng, 20_000, 1 << 22),
+    ];
+    let k = kinds(&Loom::build(&lists[0], 0));
+    assert!(k.iter().all(|&c| c > 0), "{k:?}");
+    let other = random_sorted(&mut rng, 30_000, 1 << 22);
+    let other_l = Loom::build(&other, 0);
+    let (mut rejected, mut by_validate, mut usable) = (0, 0, 0);
+    for docs in lists.drain(..) {
+        let good = Loom::build(&docs, 0).to_bytes();
+        for trial in 0..3000 {
+            let mut b = good.clone();
+            match trial % 3 {
+                0 => {
+                    for _ in 0..rng.gen_range(1..=3) {
+                        let i = rng.gen_range(0..b.len());
+                        b[i] ^= 1 << rng.gen_range(0..8);
+                    }
+                }
+                1 => {
+                    let i = rng.gen_range(0..b.len() / 8) * 8;
+                    b[i..i + 8].copy_from_slice(&rng.gen::<u64>().to_le_bytes());
+                }
+                _ => b.truncate(rng.gen_range(0..b.len()) / 8 * 8),
+            }
+            let Ok(list) = Loom::from_bytes(OwnedBytes::new(b)) else {
+                rejected += 1;
+                continue;
+            };
+            if list.validate().is_err() {
+                by_validate += 1;
+                continue;
+            }
+            usable += 1;
+            let mut got = Vec::new();
+            list.decode_into(&mut got);
+            assert_eq!(got.len(), list.len());
+            assert!(got.windows(2).all(|w| w[0] < w[1]), "a validated list decodes in order");
+            let mut c = list.cursor();
+            for (i, &d) in got.iter().enumerate() {
+                assert_eq!((c.docid(), c.rank()), (d, i));
+                c.next();
+            }
+            assert_eq!(c.docid(), END);
+            let mut c = list.cursor();
+            for &t in got.iter().step_by(97) {
+                let t = t.saturating_sub(rng.gen_range(0..3));
+                assert_eq!(c.next_geq(t), got[got.partition_point(|&x| x < t)]);
+            }
+            let refs = [&got, &other];
+            let mut out = Vec::new();
+            Loom::intersect(&[&list, &other_l], &mut out);
+            assert!(out == reference_and(&refs));
+            out.clear();
+            Loom::union(&[&list, &other_l], &mut out);
+            assert!(out == reference_or(&refs));
+        }
+    }
+    eprintln!("{rejected} rejected when read, {by_validate} by validate, {usable} usable");
+    assert!(by_validate > 100 && rejected > usable, "{rejected} rejected when read, {by_validate} by validate, {usable} usable");
+}

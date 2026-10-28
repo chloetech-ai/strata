@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use storage_util::*;
 use strata::error::Error;
-use strata::storage::pager::{read_metas, PAGE};
+use strata::storage::manifest::Manifest;
+use strata::storage::pager::{read_extent, read_metas, Extent, PAGE};
 use strata::storage::{Database, DbOptions, Layout, MergePolicy};
 use strata::Value;
 
@@ -302,6 +303,39 @@ fn without_sync_a_damaged_wal_drops_the_commits_after_it() {
     assert!(damaged_copy_of(&wal).exists());
 }
 
+// A record with an intact checksum but a value its field cannot hold (an
+// INT stored as a FLOAT here) was replayed into the memtable, and a later
+// snapshot panicked building it. Now it counts as damage like a failed
+// checksum.
+#[test]
+fn a_wal_record_that_does_not_fit_the_schema_is_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.strata");
+    let src = Arc::new(MapSource::default());
+    let lens = wal_with_ten_commits(&path, &src);
+    let wal = wal_of(&path);
+    // The third transaction's insert: the tag of `n` (after the key) goes
+    // from INT to FLOAT, and the record's checksum is fixed.
+    let mut b = std::fs::read(&wal).unwrap();
+    let rec = lens[1] as usize;
+    let tag = rec + b[rec..].windows(7).position(|w| w == key(2).as_bytes()).unwrap() + 7;
+    assert_eq!(b[tag], 1);
+    b[tag] = 2;
+    let len = u32::from_le_bytes(b[rec..rec + 4].try_into().unwrap()) as usize;
+    let crc = crc32fast::hash(&b[rec + 8..rec + 8 + len]);
+    b[rec + 4..rec + 8].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&wal, &b).unwrap();
+
+    let sync = DbOptions { sync: true, ..opts(&src) };
+    match Database::open(&path, sync.clone()) {
+        Err(Error::Corrupt(m)) => assert!(m.contains("8 committed transactions follow the damage"), "{m}"),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("replayed a document that does not fit the schema"),
+    }
+    let db = Database::open(&path, DbOptions { wal_drop_damaged: true, ..sync }).unwrap();
+    assert_keys(&db.snapshot(), &keys(0..2));
+}
+
 // A crash during the last append tears the tail: cut off quietly, or, when
 // the commit record of that last (unacknowledged) transaction survived the
 // tear, cut off after a copy is kept.
@@ -333,4 +367,126 @@ fn a_torn_wal_tail_opens() {
     assert!(db.damaged().unwrap().contains("1 committed transactions"));
     assert_keys(&db.snapshot(), &keys(0..9));
     assert!(damaged_copy_of(&wal).exists());
+}
+
+/// Where each segment of the newest version lies: `(file, offset, len)` of
+/// its image and of its delete set, if any, for either layout.
+#[allow(clippy::type_complexity)]
+fn segment_bytes(path: &Path) -> Vec<((PathBuf, u64, u64), Option<(PathBuf, u64, u64)>)> {
+    let manifest = if path.is_dir() {
+        strata::storage::dir::read_current(path).unwrap().1
+    } else {
+        let f = std::fs::File::open(path).unwrap();
+        let (meta, _) = read_metas(&f).unwrap()[0];
+        Manifest::decode(&read_extent(&f, meta.manifest, meta.manifest_crc).unwrap()).unwrap()
+    };
+    let at = |e: Option<Extent>, file: &Option<String>| match (e, file) {
+        (_, Some(f)) => Some((path.join(f), 0, std::fs::metadata(path.join(f)).unwrap().len())),
+        (Some(e), None) => Some((path.to_path_buf(), e.page * PAGE, e.len)),
+        _ => None,
+    };
+    manifest.segments().map(|s| (at(Some(s.extent), &s.file).unwrap(), at(s.deletes, &s.deletes_file))).collect()
+}
+
+// A merge rebuilds its inputs from their documents and gives the merged
+// segment a fresh checksum, so a segment damaged on disk became a valid
+// one and `check` stopped seeing the damage. A merge now checks its
+// inputs first.
+#[test]
+fn a_merge_refuses_a_damaged_segment() {
+    for name in ["db.strata", "db.dir"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        let src = Arc::new(MapSource::default());
+        {
+            let db = open_or_create(&path, opts(&src));
+            insert(&db, &src, 0..300);
+            db.flush().unwrap();
+            insert(&db, &src, 300..600);
+            db.flush().unwrap();
+        }
+        let (file, off, len) = segment_bytes(&path)[0].0.clone();
+        corrupt_byte(&file, off + len / 2);
+        let db = Database::open(&path, opts(&src)).unwrap();
+        let policy = MergePolicy { merge_factor: 2, ..MergePolicy::default() };
+        match db.merge(&policy) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("fails its checksum"), "{name}: {m}"),
+            other => panic!("{name}: merged a damaged segment: {other:?}"),
+        }
+        assert!(db.check().is_err(), "{name}: the damage is still there to see");
+        assert_eq!(db.snapshot().segments().len(), 2, "{name}");
+    }
+}
+
+// A delete set was read without its checksum, so damage to it brought
+// deleted rows back, or deleted others, and the next delete wrote it out
+// again under a fresh checksum. Opening now checks it (it is small).
+#[test]
+fn a_damaged_delete_set_fails_to_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.strata");
+    let src = Arc::new(MapSource::default());
+    {
+        let db = Database::create(&path, schema(), opts(&src)).unwrap();
+        insert(&db, &src, 0..300);
+        db.flush().unwrap();
+        delete(&db, 0..100);
+        db.flush().unwrap();
+        // A second version naming the same delete set, so that both meta
+        // slots do.
+        insert(&db, &src, 1000..1001);
+        db.flush().unwrap();
+    }
+    let (file, off, _) = segment_bytes(&path).into_iter().find_map(|(_, d)| d).expect("a delete set");
+    corrupt_byte(&file, off);
+    match Database::open(&path, opts(&src)) {
+        Err(Error::Corrupt(m)) => assert!(m.contains("delete set") && m.contains("fails its checksum"), "{m}"),
+        Err(e) => panic!("{e}"),
+        Ok(db) => panic!("opened with keys {:?}", live_keys(&db.snapshot()).len()),
+    }
+}
+
+// With `verify_checksums`, opening reads every segment against its
+// checksum: a version naming a damaged one is damaged, and opening falls
+// back to the one before it. Without it, opening trusts the segment (its
+// text lists are checked when first used).
+#[test]
+fn verify_checksums_skips_a_version_with_a_damaged_segment() {
+    for name in ["db.strata", "db.dir"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        let src = Arc::new(MapSource::default());
+        {
+            let db = open_or_create(&path, opts(&src));
+            insert(&db, &src, 0..300);
+            db.flush().unwrap();
+            insert(&db, &src, 300..600);
+            db.flush().unwrap();
+        }
+        let segs = segment_bytes(&path);
+        let (file, off, len) = segs[1].0.clone();
+        corrupt_byte(&file, off + len / 2);
+        // Opening without the option trusts the segment.
+        assert!(Database::open(&path, opts(&src)).unwrap().damaged().is_none(), "{name}");
+        let verify = verify_opts(&src);
+        if name.ends_with(".dir") {
+            // One version on disk: nothing to fall back to.
+            match Database::open(&path, verify) {
+                Err(Error::Corrupt(m)) => assert!(m.contains("fails its checksum"), "{m}"),
+                other => panic!("{name}: {:?}", other.map(|_| ())),
+            }
+        } else {
+            let db = Database::open(&path, verify).unwrap();
+            let why = db.damaged().expect("says what was skipped");
+            assert!(why.contains("fails its checksum"), "{why}");
+            assert_keys(&db.snapshot(), &keys(0..300));
+        }
+        // Damage that every version shares fails to open.
+        corrupt_byte(&segs[0].0 .0, segs[0].0 .1 + segs[0].0 .2 / 2);
+        assert!(matches!(Database::open(&path, verify_opts(&src)), Err(Error::Corrupt(_))), "{name}");
+    }
+}
+
+fn verify_opts(src: &Arc<MapSource>) -> DbOptions {
+    DbOptions { verify_checksums: true, ..opts(src) }
 }
