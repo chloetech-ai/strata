@@ -493,6 +493,9 @@ mod tests {
     #[test]
     fn rank_select_match_naive() {
         for (n, density, seed) in [(1, 0.5, 1), (63, 0.3, 2), (64, 0.5, 3), (5000, 0.01, 4), (100_000, 0.5, 5), (70_000, 0.97, 6)] {
+            // Under Miri a tenth of the long ones: still hundreds of rank
+            // blocks and select samples.
+            let n = if cfg!(miri) && n > 5000 { n / 10 } else { n };
             let (bv, v) = random_bits(n, density, seed);
             let rs = RankSelect::new(bv, true, true);
             let mut ones = Vec::new();
@@ -522,8 +525,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(8);
         let mut words: Vec<u64> = vec![1, 1 << 63, !0, 0xff, 0xff << 56, 0x8000_0000_0000_0001, 0x5555_5555_5555_5555];
         words.extend((0..64).flat_map(|b| [1u64 << b, !(1u64 << b)]));
-        words.extend((0..2000).map(|_| rng.gen::<u64>() & rng.gen::<u64>()));
-        words.extend((0..2000).map(|_| rng.gen::<u64>() | rng.gen::<u64>()));
+        let random = if cfg!(miri) { 200 } else { 2000 };
+        words.extend((0..random).map(|_| rng.gen::<u64>() & rng.gen::<u64>()));
+        words.extend((0..random).map(|_| rng.gen::<u64>() | rng.gen::<u64>()));
         for &w in &words {
             let ones: Vec<u32> = (0..64).filter(|&b| w >> b & 1 == 1).collect();
             for (k, &p) in ones.iter().enumerate() {
