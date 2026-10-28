@@ -291,6 +291,7 @@ engram remember decision "Prices are integer cents"
 engram ingest-transcript ~/.claude/projects/<project>/<session>.jsonl   # back-fill old sessions
 engram distill                                                          # distill turns stored before distillation existed
 engram consolidate                                                      # merge overlapping notes now
+engram backup ~/backups/engram-2026-10-28                               # a consistent copy of this project's store
 engram stats | briefing | stop
 ```
 

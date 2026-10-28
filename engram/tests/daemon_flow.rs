@@ -152,3 +152,43 @@ fn distilled_knowledge_reaches_later_sessions() {
     let ctx = hook(&d, "UserPromptSubmit", json!({"session_id": "s3", "prompt": "Is the CSV export of the ledger planned?"}));
     assert!(!ctx.contains("[planned]"), "{ctx}");
 }
+
+/// `engram backup`: a copy of the store taken while the daemon serves,
+/// which a daemon opens with the same records, briefing and state.
+#[test]
+fn a_backup_opens_with_the_same_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    std::fs::create_dir(&store).unwrap();
+    let d = daemon(&store);
+    hook(&d, "SessionStart", json!({"session_id": "s1", "source": "startup"}));
+    hook(&d, "UserPromptSubmit", json!({"session_id": "s1", "prompt": "Never log customer emails."}));
+    hook(&d, "Stop", json!({"session_id": "s1", "last_assistant_message": "Logging now drops the email field."}));
+    let r = call(&d, json!({"op": "remember", "kind": "decision", "text": "Backups go to the NAS nightly."}));
+    assert!(r.get("error").is_none(), "{r}");
+    let before = call(&d, json!({"op": "stats"}));
+
+    let dest = dir.path().join("backup");
+    let r = call(&d, json!({"op": "backup", "dest": dest}));
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(r["records"], before["records"], "{r}");
+    for f in ["memory.strata", "config.json", "state.json", "events.log"] {
+        assert!(dest.join(f).exists(), "{f}");
+    }
+    let log = std::fs::read_to_string(dest.join("events.log")).unwrap();
+    assert!(log.ends_with('\n'));
+    // The daemon goes on recording.
+    hook(&d, "UserPromptSubmit", json!({"session_id": "s1", "prompt": "Rotate the API keys monthly."}));
+
+    let restored = daemon(&dest);
+    let after = call(&restored, json!({"op": "stats"}));
+    assert_eq!(after["records"], before["records"]);
+    assert_eq!(after["by_kind"], before["by_kind"]);
+    let q = json!({"op": "sql", "sql": "SELECT kind, text FROM memory WHERE MATCH(body, 'NAS') LIMIT 5"});
+    let s = call(&restored, q);
+    assert!(s["text"].as_str().unwrap().contains("Backups go to the NAS nightly"), "{s}");
+
+    // An existing or relative destination is refused.
+    assert!(call(&d, json!({"op": "backup", "dest": dest})).get("error").is_some());
+    assert!(call(&d, json!({"op": "backup", "dest": "relative/path"})).get("error").is_some());
+}

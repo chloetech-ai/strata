@@ -154,6 +154,34 @@ impl Default for DbOptions {
     }
 }
 
+/// How [`Database::checkpoint`] writes its copy.
+#[derive(Clone, Debug, Default)]
+pub struct CheckpointOptions {
+    /// The copy's layout, whatever the database's (default: one file).
+    pub layout: Layout,
+    /// Directory layout: an earlier checkpoint of the same database, whose
+    /// segment files the copy hard-links instead of writing again when the
+    /// segment is unchanged (same id and checksum). Segments are immutable
+    /// and keep their ids in a checkpoint, so successive checkpoints share
+    /// every segment no merge has replaced since.
+    pub link_from: Option<PathBuf>,
+}
+
+/// What [`Database::checkpoint`] copied.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CheckpointStats {
+    /// The commit of the database that the copy holds.
+    pub txn: u64,
+    pub tables: usize,
+    pub segments: usize,
+    /// Of `segments`, those hard-linked from `link_from`.
+    pub segments_linked: usize,
+    pub live_docs: u64,
+    /// Bytes written (linked segments not counted).
+    pub bytes_written: u64,
+    pub seconds: f64,
+}
+
 /// Space use of the file and the WAL.
 #[derive(Clone, Debug, Serialize)]
 pub struct FileStats {
@@ -929,6 +957,109 @@ impl Database {
         Ok(())
     }
 
+    /// Writes a consistent copy of the database to `dest`, which must not
+    /// exist: a backup that is itself a database, opened like any other.
+    ///
+    /// Under the writer lock the memtables are flushed, so that the version
+    /// on disk holds every committed transaction, and that version is
+    /// pinned; then the lock is released and the pinned segments, delete
+    /// sets and in-place updates are copied while writes and merges go on.
+    /// Copying a database's files instead is not safe while it is open: a
+    /// commit reuses pages an older version freed, and the directory layout
+    /// unlinks files a version stops naming.
+    ///
+    /// The copy holds only live data (no free pages, no WAL), keeps every
+    /// table and segment id and the commit number, and is written under a
+    /// temporary name, checked against its checksums ([`Database::check`])
+    /// and only then renamed to `dest`, so a failed checkpoint leaves no
+    /// `dest` behind.
+    pub fn checkpoint(&self, dest: &Path, opts: &CheckpointOptions) -> Result<CheckpointStats> {
+        let t0 = Instant::now();
+        if dest.exists() {
+            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} exists", dest.display()))));
+        }
+        let link = match &opts.link_from {
+            Some(prev) if opts.layout == Layout::Directory => {
+                let (_, m) = dir::read_current(prev)?;
+                let segs: HashMap<String, (u32, u64)> = m.tables.iter().flat_map(|t| &t.segments).map(|s| (dir::segment_name(s.id), (s.crc, s.extent.len))).collect();
+                Some((prev.clone(), segs))
+            }
+            Some(_) => return Err(Error::Schema("link_from needs a checkpoint in the directory layout".into())),
+            None => None,
+        };
+        let (_snap, manifest, handles) = {
+            let mut wal = lock(&self.writer);
+            self.check_poisoned()?;
+            self.flush_locked(&mut wal)?;
+            // Pins the version: no later commit reuses its pages.
+            let snap = self.snapshot_inner(false);
+            let st = lock(&self.state);
+            if !st.pending.is_empty() || !st.pending_updates.is_empty() {
+                return Err(Error::Busy("deletes or updates are pending after a flush".into()));
+            }
+            (snap, st.manifest.clone(), st.handles().cloned().collect::<Vec<_>>())
+        };
+        let name = dest.file_name().ok_or_else(|| Error::Schema(format!("{} names no file", dest.display())))?.to_string_lossy();
+        let tmp = dest.with_file_name(format!(".{name}.checkpoint-{:016x}", rand::random::<u64>()));
+        let r = self.write_checkpoint(&tmp, opts.layout, &manifest, &handles, link);
+        let mut stats = match r {
+            Ok(stats) => stats,
+            Err(e) => {
+                let _ = if tmp.is_dir() { std::fs::remove_dir_all(&tmp) } else { std::fs::remove_file(&tmp) };
+                let _ = std::fs::remove_file(wal_path(&tmp));
+                return Err(e);
+            }
+        };
+        if opts.layout == Layout::SingleFile {
+            // Empty; opening creates it.
+            io::remove_file(&wal_path(&tmp))?;
+        }
+        std::fs::rename(&tmp, dest)?;
+        let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        io::sync_dir(parent)?;
+        stats.txn = manifest.txn;
+        stats.seconds = t0.elapsed().as_secs_f64();
+        Ok(stats)
+    }
+
+    fn write_checkpoint(&self, tmp: &Path, layout: Layout, manifest: &Manifest, handles: &[Arc<SegHandle>], link: Option<(PathBuf, HashMap<String, (u32, u64)>)>) -> Result<CheckpointStats> {
+        let o = DbOptions { layout, sync: true, publish_snapshots: false, doc_source: None, ..DbOptions::default() };
+        let out = Database::create(tmp, manifest.tables[0].schema.clone(), o)?;
+        for t in &manifest.tables[1..] {
+            out.create_table(t.schema.clone())?;
+        }
+        let mut stats = CheckpointStats { tables: manifest.tables.len(), ..CheckpointStats::default() };
+        {
+            let mut wal = lock(&out.writer);
+            let mut vw = VersionWriter::begin(&out);
+            vw.link = link;
+            // The copy's version takes the source's commit number, which
+            // names its manifest and delete sets in the directory layout:
+            // two checkpoints' files then share a name only if they hold
+            // the same bytes, and can be synced into one place.
+            vw.txn = vw.txn.max(manifest.txn);
+            // The copy's tables were created in the same order; their ids
+            // may differ (dropped tables leave gaps in the source's).
+            let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).collect();
+            for (t, &to) in manifest.tables.iter().zip(&ids) {
+                for m in &t.segments {
+                    let h = handles.iter().find(|h| h.meta.id == m.id).ok_or_else(|| corrupt(format!("segment {} is in the manifest but not open", m.id)))?;
+                    vw.manifest.next_segment_id = m.id;
+                    vw.add_segment(to, None, h.file.image(), m.n_docs, h.base.as_deref(), h.updates.as_deref())?;
+                    stats.segments += 1;
+                    stats.live_docs += (m.n_docs - m.n_deleted) as u64;
+                }
+            }
+            vw.manifest.next_segment_id = manifest.next_segment_id;
+            stats.segments_linked = vw.segments_linked;
+            let c = vw.commit(&mut wal)?;
+            stats.bytes_written = c.bytes_written;
+            out.publish(c, |_| {})?;
+        }
+        out.check()?;
+        Ok(stats)
+    }
+
     /// Returns space to the file system: moves segments and delete sets from
     /// the end of the file into free runs below them and truncates the free
     /// tail, committing until nothing moves (pages freed by a commit become
@@ -1645,6 +1776,10 @@ struct VersionWriter<'a> {
     segments_added: usize,
     /// Directory layout: files the new version stops naming.
     obsolete: Vec<String>,
+    /// A checkpoint's earlier checkpoint: its directory and its segment
+    /// files' checksums and lengths, by name.
+    link: Option<(PathBuf, HashMap<String, (u32, u64)>)>,
+    segments_linked: usize,
 }
 
 impl<'a> VersionWriter<'a> {
@@ -1666,6 +1801,8 @@ impl<'a> VersionWriter<'a> {
             bytes_written: 0,
             segments_added: 0,
             obsolete: Vec::new(),
+            link: None,
+            segments_linked: 0,
         }
     }
 
@@ -1713,7 +1850,14 @@ impl<'a> VersionWriter<'a> {
     ) -> Result<()> {
         let id = self.manifest.next_segment_id;
         self.manifest.next_segment_id += 1;
-        let (extent, file) = self.write_as(image, dir::segment_name(id))?;
+        let (extent, file) = match (&self.db.dir, self.linkable(id, image)) {
+            (Some(d), Some(from)) => {
+                std::fs::hard_link(&from, d.join(dir::segment_name(id)))?;
+                self.segments_linked += 1;
+                (Extent { page: 0, len: image.len() as u64 }, Some(dir::segment_name(id)))
+            }
+            _ => self.write_as(image, dir::segment_name(id))?,
+        };
         let (mut deletes, mut deletes_crc, mut n_deleted, mut deletes_file) = (None, 0, 0, None);
         if let Some(l) = deleted.filter(|l| l.n_deleted() > 0) {
             let b = l.encode();
@@ -1747,6 +1891,14 @@ impl<'a> VersionWriter<'a> {
         segs.insert(pos.unwrap_or(segs.len()), meta);
         self.segments_added += 1;
         Ok(())
+    }
+
+    /// The earlier checkpoint's file of segment `id`, if it holds `image`.
+    fn linkable(&self, id: u64, image: &[u8]) -> Option<PathBuf> {
+        let (prev, segs) = self.link.as_ref()?;
+        let name = dir::segment_name(id);
+        let &(crc, len) = segs.get(&name)?;
+        (len == image.len() as u64 && crc == crc32fast::hash(image)).then(|| prev.join(name))
     }
 
     fn table_mut(&mut self, id: u32) -> &mut TableMeta {

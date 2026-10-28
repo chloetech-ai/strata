@@ -53,6 +53,8 @@ pub struct Options {
     /// The synonym list for `synonyms => 1` searches (Solr format), read at
     /// start if it exists and written by `PUT /v1/synonyms`.
     pub synonyms: Option<PathBuf>,
+    /// Where `POST /v1/admin/checkpoint` writes checkpoints.
+    pub backup_dir: Option<PathBuf>,
 }
 
 /// How the server opens a database. Each write publishes its snapshot,
@@ -150,6 +152,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     if let Some(path) = &o.synonyms {
         svc.open_synonyms(path).map_err(|e| e.message)?;
+    }
+    if let Some(dir) = &o.backup_dir {
+        svc.set_backup_dir(dir).map_err(|e| e.message)?;
     }
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
