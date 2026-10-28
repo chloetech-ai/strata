@@ -66,6 +66,33 @@ jobs:
         working-directory: strata
         run: cargo test --release --features fault-injection --test storage_faults
 
+  # BM25 through SQL on three BEIR collections against the committed
+  # baseline (strata/tests/relevance_gate.rs): a ranking change must come
+  # with its new numbers.
+  relevance-gate:
+    name: relevance gate (BEIR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: CPU model
+        id: cpu
+        run: echo "model=$(grep -m1 'model name' /proc/cpuinfo | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata
+          key: relevance-${{ steps.cpu.outputs.model }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/beir
+          key: beir-${{ hashFiles('strata/tests/fixtures/beir/fetch.sh') }}
+      - name: Collections
+        run: strata/tests/fixtures/beir/fetch.sh "$HOME/beir"
+      - name: Gate
+        working-directory: strata
+        run: STRATA_BEIR_DIR="$HOME/beir" STRATA_RELEVANCE_GATE=required cargo test --release --test relevance_gate -- --nocapture
+
   server-smoke:
     name: strata-server smoke test
     runs-on: ubuntu-latest

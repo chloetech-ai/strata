@@ -8,7 +8,10 @@
 //! * `hybrid`: retrieval quality (nDCG@10) and latency of BM25, approximate
 //!   and exact vector search, RRF and weighted fusion over a weight sweep;
 //!   recall of candidate-based weighted fusion against exact weighted
-//!   ranking (`results/strata/hybrid_<tag>.json`).
+//!   ranking (`results/strata/hybrid_<tag>.json`). The fusion weight is
+//!   chosen on half of the judged queries (dev) and every method is
+//!   reported on the other half (test), with a paired randomization
+//!   p-value against BM25.
 //! * `planner`: every filtered query re-run under each forced plan; the
 //!   planner's choice against the best plan in hindsight
 //!   (`results/strata/planner_<tag>.json`).
@@ -25,7 +28,7 @@ use strata::db::Db;
 use strata::error::{Error, Result};
 use strata::forward::RangeStrategy;
 use strata::iostat;
-use strata::metrics::{mean, ndcg_at_k, percentile, recall};
+use strata::metrics::{mean, ndcg_at_k, paired_randomization, percentile, recall};
 use strata::query::exec::ExecOptions;
 use strata::query::plan::{FilterMode, VectorStrategy};
 use strata::query::Params;
@@ -343,7 +346,9 @@ fn timed(reps: usize, mut f: impl FnMut() -> Result<Vec<String>>) -> Result<(f64
 }
 
 /// nDCG@10 and latency of each ranking method; recall of candidate-based
-/// weighted fusion against exact weighted ranking.
+/// weighted fusion against exact weighted ranking. The judged queries
+/// alternate between a dev half, on which the fusion weight is chosen, and
+/// a test half, on which every method is reported.
 fn hybrid_study(args: &Args, sys: &StrataSys, coll: &Collection) -> Result<Json> {
     let db = sys.db();
     let judged: Vec<usize> = (0..coll.queries.len()).filter(|&i| coll.qrels.contains_key(&coll.queries[i].id)).collect();
@@ -374,19 +379,23 @@ fn hybrid_study(args: &Args, sys: &StrataSys, coll: &Collection) -> Result<Json>
             outs.entry(m.clone()).or_default().push(got);
         }
     }
-    // Exact weighted ranking at the best weight, as the recall reference.
+    let half = |v: &[f64], r: usize| v.iter().skip(r).step_by(2).copied().collect::<Vec<f64>>();
+    let (dev, test) = (|m: &str| half(&ndcg[m], 0), |m: &str| half(&ndcg[m], 1));
+    // The weight that does best on dev; exact weighted ranking at it is the
+    // recall reference.
     let best = methods
         .iter()
         .filter(|(m, _)| m.starts_with("weighted_"))
-        .max_by(|a, b| mean(&ndcg[&a.0]).partial_cmp(&mean(&ndcg[&b.0])).unwrap())
+        .max_by(|a, b| mean(&dev(&a.0)).total_cmp(&mean(&dev(&b.0))))
         .map(|(m, o)| (m.clone(), o.clone()));
+    let chosen = best.as_ref().map(|(m, _)| m.clone());
     let mut exact = Json::Null;
     if let (Some((m, order)), true) = (best, exact_ok) {
         let exact_order = order.replace("similarity(emb, :q)", "similarity(emb, :q, exact => 1)");
         let mut rec = Vec::new();
         let mut ms_all = Vec::new();
         let mut nd = Vec::new();
-        for (j, &qi) in picked.iter().enumerate().take(100) {
+        for (j, &qi) in picked.iter().enumerate().skip(1).step_by(2).take(100) {
             let q = &coll.queries[qi];
             let params = Params::new().set("q", Value::Vector(q.vector.clone()));
             let sql = format!("SELECT id FROM docs {} LIMIT 10", exact_order.replace("{t}", &sql_text(&q.text)));
@@ -400,11 +409,26 @@ fn hybrid_study(args: &Args, sys: &StrataSys, coll: &Collection) -> Result<Json>
     let summary: BTreeMap<String, Json> = methods
         .iter()
         .map(|(m, _)| {
-            (m.clone(), json!({"ndcg10": mean(&ndcg[m]), "ms_mean": mean(&lat[m]), "ms_p50": percentile(&lat[m], 50.0), "ms_p99": percentile(&lat[m], 99.0)}))
+            let p = paired_randomization(&test(m), &test("bm25"), 10_000, 1);
+            let row = json!({
+                "ndcg10": mean(&test(m)),
+                "ndcg10_dev": mean(&dev(m)),
+                "p_vs_bm25": p,
+                "ms_mean": mean(&lat[m]),
+                "ms_p50": percentile(&lat[m], 50.0),
+                "ms_p99": percentile(&lat[m], 99.0)
+            });
+            (m.clone(), row)
         })
         .collect();
-    eprintln!("   hybrid: {}", methods.iter().map(|(m, _)| format!("{m} {:.3}", mean(&ndcg[m]))).collect::<Vec<_>>().join(", "));
-    Ok(json!({"collection": coll.name, "queries": picked.len(), "methods": summary, "weighted_exact": exact}))
+    eprintln!("   hybrid (test half): {}", methods.iter().map(|(m, _)| format!("{m} {:.3}", mean(&test(m)))).collect::<Vec<_>>().join(", "));
+    Ok(json!({
+        "collection": coll.name,
+        "queries": {"dev": picked.len().div_ceil(2), "test": picked.len() / 2},
+        "weight_chosen_on_dev": chosen,
+        "methods": summary,
+        "weighted_exact": exact
+    }))
 }
 
 struct Plan {
