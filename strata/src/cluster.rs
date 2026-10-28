@@ -78,7 +78,10 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     let key_desc = matches!(q.tiebreak, Some(Tiebreak::Key { desc: true }));
     let (mut rows, want) = match &q.order {
         None => (rows, q.limit),
-        Some(OrderBy::Score { score: score @ (Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_)), .. }) => (fuse(score, rows)?, Some(q.limit.unwrap_or(DEFAULT_K))),
+        Some(OrderBy::Score { score: score @ (Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_)), .. }) => {
+            let want = q.limit.unwrap_or(DEFAULT_K);
+            (fuse(score, rows, want.saturating_add(q.offset))?, Some(want))
+        }
         Some(OrderBy::Score { score, desc, .. }) => {
             let desc = *desc || !matches!(score, Score::Column { .. });
             rows.sort_by(|a, b| by_score(a.score, b.score, desc).then_with(|| by_key(&a.key, &b.key, key_desc)));
@@ -141,8 +144,9 @@ fn fused_opt<'a>(terms: &'a [(f64, Score)], key: &str) -> Option<&'a Value> {
 }
 
 /// Fuses the candidates of every shard: each input's top `depth` over all
-/// shards, then RRF or the weighted sum over the union.
-fn fuse(score: &Score, rows: Vec<Row>) -> Result<Vec<Row>> {
+/// shards (at least the `k` rows the page needs, as each shard took), then
+/// RRF or the weighted sum over the union.
+fn fuse(score: &Score, rows: Vec<Row>, k: usize) -> Result<Vec<Row>> {
     let n_inputs = match score {
         Score::Rrf { inputs, .. } | Score::Product(inputs) => inputs.len(),
         Score::Weighted(t) => t.len(),
@@ -163,6 +167,7 @@ fn fuse(score: &Score, rows: Vec<Row>) -> Result<Vec<Row>> {
         ),
         _ => unreachable!(),
     };
+    let depth = depth.max(k);
     // Input j's ranking over all shards: its own top `depth` of each shard,
     // by its score, ties by key (as one database orders them).
     let lists: Vec<Vec<usize>> = (0..n_inputs)

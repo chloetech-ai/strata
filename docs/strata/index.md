@@ -113,7 +113,7 @@ $$
 \mathrm{idf}(t) = \ln\Bigl(1 + \frac{N - \mathrm{df}_t + 0.5}{\mathrm{df}_t + 0.5}\Bigr)
 $$
 
-Document lengths are quantised to one byte. Ranked queries drop English function words and count each term once.
+*N* and avgdl count the documents with at least one term in the field, as Lucene's `docCount` does, so rows without a value do not shrink the average length. Document lengths are quantised to one byte. Ranked queries drop English function words, and a term written twice weighs twice.
 
 ### Structured fields
 

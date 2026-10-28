@@ -512,7 +512,12 @@ impl<'a> Executor<'a> {
             Some(OrderBy::Score { score: Score::Column { field }, desc, nulls_first }) => {
                 self.by_column(*field, *desc, Some(*nulls_first), &q.filter, want, q.tiebreak.as_ref())?
             }
-            Some(OrderBy::Score { score, desc: true, .. }) => self.ranked(score, &q.filter, want.unwrap_or(DEFAULT_K), q.tiebreak.as_ref())?,
+            // Without a LIMIT, DEFAULT_K rows after the OFFSET, as a
+            // coordinator cuts them.
+            Some(OrderBy::Score { score, desc: true, .. }) => {
+                let k = want.unwrap_or_else(|| DEFAULT_K.saturating_add(q.offset).min(self.n_live()));
+                self.ranked(score, &q.filter, k, q.tiebreak.as_ref())?
+            }
             Some(OrderBy::Score { .. }) => return Err(err("relevance scores can only be ordered DESC")),
             Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
         })
@@ -944,13 +949,15 @@ impl<'a> Executor<'a> {
 
     // ---- ranked ----------------------------------------------------------
 
+    /// The top `k` rows by `score`. A fused score takes at least `k` rows
+    /// of each input (its depth is raised to the page asked for).
     fn ranked(&mut self, score: &Score, p: &Pred, k: usize, tb: Option<&Tiebreak>) -> Result<Vec<Hit>> {
         if self.opts.shard && matches!(score, Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_)) {
-            return self.fusion_candidates(score, p);
+            return self.fusion_candidates(score, p, k);
         }
         let mut hits = match score {
             Score::Rrf { inputs, k: rk, depth } => {
-                let depth = &self.rows_at_most(*depth);
+                let depth = &self.rows_at_most((*depth).max(k));
                 let mut lists = Vec::new();
                 for s in inputs {
                     lists.push(self.input_top(s, p, *depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>());
@@ -1049,7 +1056,7 @@ impl<'a> Executor<'a> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let (_, algo) = self.bm25_params(opts);
+        let (_, algo) = self.bm25_params(opts)?;
         let per = self.per_segment(|ex, s, l| {
             let t = ex.text(s, field)?;
             let candidates = terms.iter().map(|(w, _)| t.doc_freq(w) as f64).sum::<f64>() * 0.3;
@@ -1073,7 +1080,7 @@ impl<'a> Executor<'a> {
         let mut st = CollectionStats { n_docs: 0, total_len: 0, df: HashMap::new() };
         for s in self.stat_segs() {
             let t = self.text(unsafe_extend(s), field)?;
-            st.n_docs += t.n_docs() as u64;
+            st.n_docs += t.n_docs_with_terms() as u64;
             st.total_len += t.total_len();
             for w in terms {
                 *st.df.entry(w.clone()).or_insert(0) += t.doc_freq(w) as u64;
@@ -1153,43 +1160,83 @@ impl<'a> Executor<'a> {
         Ok(q)
     }
 
-    /// The weighted terms of `bm25(field, text, ...)`: the query's own
-    /// (weight 1), then its synonyms' (1) and its typo-tolerant words'
-    /// nearest indexed terms (`1 − edits / length`).
+    /// The weighted terms of `bm25(field, text, ...)`: the query's own,
+    /// each weighing as often as it occurs, then its synonyms' (1) and its
+    /// typo-tolerant words' nearest indexed terms (`1 − edits / length`).
     fn bm25_terms(&self, field: usize, text: &str, opts: &Opts) -> Result<Vec<(String, f32)>> {
-        let base = query_terms(text, opts);
+        Ok(self.bm25_query(field, text, opts)?.terms)
+    }
+
+    /// [`Self::bm25_terms`], and the groups of terms that stand for one
+    /// query term: it, its typo neighbours and its one-word synonyms. A
+    /// group shares its statistics ([`blend_groups`]), as Lucene's synonym
+    /// and fuzzy queries do, so that a rare misspelling does not outrank
+    /// the word it misspells.
+    fn bm25_query(&self, field: usize, text: &str, opts: &Opts) -> Result<Bm25Query> {
+        let seq = query_term_seq(text, opts);
         let expand = Expand::from_opts(opts).map_err(err)?;
-        let mut out: Vec<(String, f32)> = base.iter().map(|t| (t.clone(), 1.0)).collect();
-        let add = |t: &str, w: f32, out: &mut Vec<(String, f32)>| {
-            if !out.iter().any(|(x, _)| x == t) {
-                out.push((t.to_string(), w));
+        let mut out = Bm25Query::default();
+        for t in &seq {
+            match out.terms.iter_mut().find(|(x, _)| x == t) {
+                Some((_, w)) => *w += 1.0,
+                None => {
+                    out.groups.push(vec![out.terms.len()]);
+                    out.terms.push((t.clone(), 1.0));
+                }
+            }
+        }
+        let n_base = out.terms.len();
+        // Adds `t` unless the query has it; to base term `g`'s group if given.
+        let add = |t: &str, w: f32, g: Option<usize>, out: &mut Bm25Query| {
+            if !out.terms.iter().any(|(x, _)| x == t) {
+                if let Some(g) = g {
+                    out.groups[g].push(out.terms.len());
+                }
+                out.terms.push((t.to_string(), w));
             }
         };
+        let base_of = |t: &str, out: &Bm25Query| out.terms[..n_base].iter().position(|(x, _)| x == t);
         if expand.synonyms {
             let syn = self.synonyms()?;
-            for i in 0..base.len() {
-                for len in 1..=syn.max_len().min(base.len() - i) {
-                    for alt in syn.get(&base[i..i + len]) {
+            for i in 0..seq.len() {
+                for len in 1..=syn.max_len().min(seq.len() - i) {
+                    for alt in syn.get(&seq[i..i + len]) {
+                        // A one-word synonym of one word stands for it; the
+                        // words of longer ones score on their own.
+                        let g = if len == 1 && alt.len() == 1 { base_of(&seq[i], &out) } else { None };
                         for t in alt {
-                            add(t, 1.0, &mut out);
+                            add(t, 1.0, g, &mut out);
                         }
                     }
                 }
             }
         }
         if let Some(fz) = expand.fuzzy {
-            for t in &base {
+            for b in 0..n_base {
+                let t = out.terms[b].0.clone();
                 let len = t.chars().count();
                 let e = fz.edits(len);
                 if e == 0 {
                     continue;
                 }
-                for (near, _, d) in self.near_terms(field, t, e)?.iter().filter(|x| x.2 > 0).take(MAX_FUZZY_TERMS) {
-                    add(near, text::fuzzy::weight(*d, len), &mut out);
+                for (near, _, d) in self.near_terms(field, &t, e)?.iter().filter(|x| x.2 > 0).take(MAX_FUZZY_TERMS) {
+                    add(near, text::fuzzy::weight(*d, len), Some(b), &mut out);
                 }
             }
         }
+        out.n_base = n_base;
         Ok(out)
+    }
+
+    /// The terms of a `bm25` query and the collection statistics it scores
+    /// with, each group's terms sharing the largest document frequency
+    /// among them.
+    fn bm25_scoring(&self, field: usize, text: &str, opts: &Opts) -> Result<(Bm25Query, CollectionStats)> {
+        let q = self.bm25_query(field, text, opts)?;
+        let names: Vec<String> = q.terms.iter().map(|(t, _)| t.clone()).collect();
+        let mut stats = self.collection_stats(field, &names)?;
+        blend_groups(&q, &mut stats);
+        Ok((q, stats))
     }
 
     /// Whether facets can count `field`'s values (a keyword column).
@@ -1299,12 +1346,21 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn bm25_params(&self, opts: &Opts) -> (Bm25Params, TopKAlgo) {
+    /// BM25's `k1` and `b` (`k1 >= 0` and `0 <= b <= 1`, under which a
+    /// score grows with a term's frequency, as the precomputed bounds of
+    /// MaxScore and Block-Max WAND assume) and the top-k algorithm.
+    fn bm25_params(&self, opts: &Opts) -> Result<(Bm25Params, TopKAlgo)> {
         let mut params = self.opts.bm25;
         if let Some(v) = opts.get("k1").and_then(|v| v.as_f64()) {
+            if !(v >= 0.0 && v.is_finite()) {
+                return Err(err(format!("bm25's k1 must be 0 or more, not {v}")));
+            }
             params.k1 = v as f32;
         }
         if let Some(v) = opts.get("b").and_then(|v| v.as_f64()) {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(err(format!("bm25's b must be between 0 and 1, not {v}")));
+            }
             params.b = v as f32;
         }
         let algo = match opts.get("algo").and_then(|v| v.as_str()) {
@@ -1313,24 +1369,23 @@ impl<'a> Executor<'a> {
             Some("bmw") | Some("wand") => TopKAlgo::BlockMaxWand,
             _ => self.opts.bm25_algo,
         };
-        (params, algo)
+        Ok((params, algo))
     }
 
     /// The top `k` rows by BM25; with `ties`, also every row tied with the
     /// `k`-th.
     fn bm25_top(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize, ties: bool) -> Result<Vec<Hit>> {
-        let terms = self.bm25_terms(field, query, opts)?;
+        let (q, stats) = self.bm25_scoring(field, query, opts)?;
+        let terms = &q.terms;
         if terms.is_empty() {
             return Ok(Vec::new());
         }
         let names: Vec<String> = terms.iter().map(|(t, _)| t.clone()).collect();
-        let n_base = query_terms(query, opts).len();
-        if terms.len() > n_base {
-            let added: Vec<&str> = names[n_base..].iter().map(|t| t.as_str()).collect();
+        if terms.len() > q.n_base {
+            let added: Vec<&str> = names[q.n_base..].iter().map(|t| t.as_str()).collect();
             self.stats.plan.push(format!("bm25 expanded with {} terms: {}", added.len(), added.join(", ")));
         }
-        let stats = self.collection_stats(field, &names)?;
-        let (params, algo) = self.bm25_params(opts);
+        let (params, algo) = self.bm25_params(opts)?;
         let per = self.per_segment(|ex, s, l| {
             let t = ex.text(s, field)?;
             // Block-Max WAND fully scores a fraction of the postings it meets.
@@ -1343,7 +1398,7 @@ impl<'a> Executor<'a> {
                 }
             };
             let f = ex.seg_filter_l(s, p, mode, l)?;
-            let hits = t.top_k_weighted(&terms, &stats, params, k, f.as_dyn(), algo, ties);
+            let hits = t.top_k_weighted(terms, &stats, params, k, f.as_dyn(), algo, ties);
             l.plan.push(format!("seg {}: bm25 {algo:?}, filter {mode:?}", s.ord));
             Ok(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }).collect::<Vec<_>>())
         })?;
@@ -1464,7 +1519,7 @@ impl<'a> Executor<'a> {
     fn weighted(&mut self, terms: &[(f64, Score)], p: &Pred, k: usize) -> Result<Vec<Hit>> {
         let opt = |key: &str| terms.iter().find_map(|(_, s)| s.opts().and_then(|o| o.get(key)).cloned());
         let exact = opt("exact").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
-        let depth = self.rows_at_most(opt("depth").and_then(|v| v.as_f64()).map(|d| d as usize).unwrap_or(self.opts.fusion_depth));
+        let depth = self.rows_at_most(opt("depth").and_then(|v| v.as_f64()).map(|d| d as usize).unwrap_or(self.opts.fusion_depth).max(k));
         let norm = match opt("norm").as_ref().and_then(|v| v.as_str()) {
             Some("none") => Norm::None,
             _ => Norm::MinMax,
@@ -1501,7 +1556,7 @@ impl<'a> Executor<'a> {
     /// `a * b * ...`: the top `depth` rows of each relevance factor (of
     /// every factor if none is), scored exactly by every factor.
     fn product(&mut self, factors: &[Score], p: &Pred, k: usize) -> Result<Vec<Hit>> {
-        let depth = self.rows_at_most(factors.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(self.opts.fusion_depth, |d| d as usize));
+        let depth = self.rows_at_most(factors.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(self.opts.fusion_depth, |d| d as usize).max(k));
         let any_relevance = factors.iter().any(Score::is_relevance);
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         for f in factors.iter().filter(|f| f.is_relevance() || !any_relevance) {
@@ -1526,7 +1581,7 @@ impl<'a> Executor<'a> {
     /// score, ordered by the fused score over this shard's candidates. The
     /// coordinator takes each input's top `depth` over all shards and fuses
     /// those, which is what one database holding every shard would do.
-    fn fusion_candidates(&mut self, score: &Score, p: &Pred) -> Result<Vec<Hit>> {
+    fn fusion_candidates(&mut self, score: &Score, p: &Pred, k: usize) -> Result<Vec<Hit>> {
         let (inputs, depth, exact): (Vec<&Score>, usize, bool) = match score {
             Score::Rrf { inputs, depth, .. } => (inputs.iter().collect(), *depth, false),
             Score::Weighted(terms) => {
@@ -1541,7 +1596,7 @@ impl<'a> Executor<'a> {
             }
             _ => unreachable!("fused scores only"),
         };
-        let depth = self.rows_at_most(depth);
+        let depth = self.rows_at_most(depth.max(k));
         // A product's candidates come from its relevance factors only.
         let generates = |s: &Score| match score {
             Score::Product(factors) => s.is_relevance() || !factors.iter().any(Score::is_relevance),
@@ -1604,10 +1659,9 @@ impl<'a> Executor<'a> {
         let by_seg = group_by_seg(cands);
         match score {
             Score::Bm25 { field, text: q, opts } => {
-                let terms = self.bm25_terms(*field, q, opts)?;
-                let names: Vec<String> = terms.iter().map(|(t, _)| t.clone()).collect();
-                let stats = self.collection_stats(*field, &names)?;
-                let (params, _) = self.bm25_params(opts);
+                let (q, stats) = self.bm25_scoring(*field, q, opts)?;
+                let terms = q.terms;
+                let (params, _) = self.bm25_params(opts)?;
                 for (seg, range) in by_seg {
                     let s = self.seg_by_ord(seg);
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
@@ -1814,10 +1868,33 @@ fn has_graphs(q: &Select) -> bool {
     !q.graphs.is_empty()
 }
 
-/// The terms of a `bm25` query; `stopwords => 0` keeps query stopwords.
-fn query_terms(q: &str, opts: &Opts) -> Vec<String> {
+/// The terms of a `bm25` query in order, repeats included; `stopwords =>
+/// 0` keeps query stopwords.
+fn query_term_seq(q: &str, opts: &Opts) -> Vec<String> {
     let drop = opts.get("stopwords").and_then(|v| v.as_f64()).map_or(true, |x| x != 0.0);
-    text::analyze_query_with(q, drop)
+    text::query_term_seq(q, drop)
+}
+
+/// The weighted terms of a `bm25` query ([`Executor::bm25_query`]).
+#[derive(Default)]
+struct Bm25Query {
+    terms: Vec<(String, f32)>,
+    /// Indices into `terms` that stand for one query term.
+    groups: Vec<Vec<usize>>,
+    /// The query's own terms, before its expansions.
+    n_base: usize,
+}
+
+/// Gives each group's terms the largest document frequency among them, so
+/// that a group scores like the term it stands for rather than like its
+/// rarest variant.
+fn blend_groups(q: &Bm25Query, stats: &mut CollectionStats) {
+    for g in q.groups.iter().filter(|g| g.len() > 1) {
+        let df = g.iter().map(|&i| stats.df.get(&q.terms[i].0).copied().unwrap_or(0)).max().unwrap_or(0);
+        for &i in g {
+            stats.df.insert(q.terms[i].0.clone(), df);
+        }
+    }
 }
 
 fn group_by_seg(cands: &[(usize, DocId)]) -> Vec<(usize, std::ops::Range<usize>)> {

@@ -34,6 +34,8 @@ pub struct TextFieldReader {
     pub(crate) post: OwnedBytes,
     pub(crate) pos: Option<OwnedBytes>,
     pub(crate) norms: Slice<u8>,
+    /// [`Self::n_docs_with_terms`], counted when first asked for.
+    with_terms: std::sync::OnceLock<u32>,
 }
 
 /// Bytes of a field's sections by part.
@@ -64,12 +66,20 @@ impl TextFieldReader {
         if norms.len() != meta.n_docs as usize || dict.n_terms() != meta.n_terms || meta.n_docs as usize != seg.n_docs() {
             return Err(corrupt(format!("text field {field}: inconsistent document or term counts")));
         }
-        Ok(TextFieldReader { meta, dict, post, pos, norms })
+        Ok(TextFieldReader { meta, dict, post, pos, norms, with_terms: std::sync::OnceLock::new() })
     }
 
     /// Documents in the segment.
     pub fn n_docs(&self) -> u32 {
         self.meta.n_docs
+    }
+
+    /// Documents with at least one indexed term in the field: BM25's
+    /// document count, as Lucene's `docCount`, so that rows without a value
+    /// do not shrink the average length. A one-byte norm keeps a length of 0
+    /// exact, so this counts the norms above 0.
+    pub fn n_docs_with_terms(&self) -> u32 {
+        *self.with_terms.get_or_init(|| self.norms.iter().filter(|&&n| n != 0).count() as u32)
     }
 
     /// Sum of document lengths.

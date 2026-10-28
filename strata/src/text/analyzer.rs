@@ -40,6 +40,17 @@ pub const QUERY_STOPWORDS: [&str; 153] = [
     "with", "won", "wouldn", "y", "you", "your", "yours", "yourself", "yourselves",
 ];
 
+/// Letters of [`QUERY_STOPWORDS`] that are words of their own in a query
+/// ("vitamin d", "T cell", "type O"): dropped only as the end of a
+/// contraction ("don't", "it's", "I'm", "she'd").
+const LETTER_STOPWORDS: [&str; 6] = ["d", "m", "o", "s", "t", "y"];
+
+/// Whether a ranked query drops `word`; `contraction`: it follows an
+/// apostrophe that follows a word.
+fn is_query_stopword(word: &str, contraction: bool) -> bool {
+    QUERY_STOPWORDS.binary_search(&word).is_ok() && (contraction || !LETTER_STOPWORDS.contains(&word))
+}
+
 /// The terms of a ranked (`bm25`) query: analysed like documents, minus
 /// [`QUERY_STOPWORDS`], each distinct term once.
 pub fn analyze_query(text: &str) -> Vec<String> {
@@ -50,14 +61,24 @@ pub fn analyze_query(text: &str) -> Vec<String> {
 /// own stopwords are never indexed, so those are dropped either way).
 pub fn analyze_query_with(text: &str, drop_stopwords: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for_each_word(text, |w| {
-        if drop_stopwords && QUERY_STOPWORDS.binary_search(&w).is_ok() {
+    for t in query_term_seq(text, drop_stopwords) {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// The terms of a ranked query in order, repeats included (a repeated
+/// term weighs more), as [`analyze_query_with`] analyses them.
+pub fn query_term_seq(text: &str, drop_stopwords: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_word_in(text, |w, contraction| {
+        if drop_stopwords && is_query_stopword(w, contraction) {
             return;
         }
         if let Some(t) = term_of(w) {
-            if !out.iter().any(|x| *x == t) {
-                out.push(t.into_owned());
-            }
+            out.push(t.into_owned());
         }
     });
     out
@@ -105,17 +126,30 @@ pub fn normalize_word(word: &str) -> String {
 
 /// Calls `f` with every word of `text`, lowercased and folded, in order.
 pub fn for_each_word(text: &str, mut f: impl FnMut(&str)) {
+    for_each_word_in(text, |w, _| f(w));
+}
+
+/// [`for_each_word`], also telling whether the word ends a contraction: it
+/// follows an apostrophe (`'` or `’`) that follows a word, as `t` in
+/// "don't".
+fn for_each_word_in(text: &str, mut f: impl FnMut(&str, bool)) {
     let mut buf = String::new();
     let mut start: Option<usize> = None;
+    let contraction = |s: usize| {
+        let mut before = text[..s].chars().rev();
+        matches!(before.next(), Some('\'' | '\u{2019}')) && before.next().is_some_and(is_word_char)
+    };
     for (i, c) in text.char_indices() {
         if is_word_char(c) {
             start.get_or_insert(i);
         } else if let Some(s) = start.take() {
-            emit(&text[s..i], &mut buf, &mut f);
+            let after = contraction(s);
+            emit(&text[s..i], &mut buf, &mut |w| f(w, after));
         }
     }
     if let Some(s) = start {
-        emit(&text[s..], &mut buf, &mut f);
+        let after = contraction(s);
+        emit(&text[s..], &mut buf, &mut |w| f(w, after));
     }
 }
 
@@ -197,6 +231,19 @@ mod tests {
         assert!(QUERY_STOPWORDS.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(analyze_query("What is the origin of the COVID-19 origin?"), ["origin", "covid", "19"]);
         assert_eq!(analyze_query_with("How can I learn?", false), ["how", "can", "i", "learn"]);
+    }
+
+    // IR-4: "vitamin d deficiency" ranked on [vitamin, defici] and "T cell
+    // exhaustion" on [cell, exhaust]. A letter is a query word unless it
+    // ends a contraction; a repeated term is kept for its weight.
+    #[test]
+    fn query_letters_and_repeats() {
+        assert_eq!(analyze_query("vitamin D deficiency"), ["vitamin", "d", "defici"]);
+        assert_eq!(analyze_query("T cell exhaustion"), ["t", "cell", "exhaust"]);
+        assert_eq!(analyze_query("Why don't cats purr? It\u{2019}s late, I'd say"), ["cat", "purr", "late", "say"]);
+        assert_eq!(analyze_query("the letter \u{2018}d\u{2019} and 's'"), ["letter", "d", "s"]);
+        assert_eq!(query_term_seq("cat dog cats", true), ["cat", "dog", "cat"]);
+        assert_eq!(analyze_query("cat dog cats"), ["cat", "dog"]);
     }
 
     #[test]

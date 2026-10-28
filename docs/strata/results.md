@@ -89,6 +89,19 @@ Strata's BM25 is within 0.018 nDCG@10 of both baselines on every collection, and
 
 All three systems drop NLTK's 153 English function words from BM25 queries, so the rankings are comparable. Keeping them (`stopwords => 0`) costs TREC-COVID 0.055 nDCG@10, whose queries are full questions, and gains Quora the same 0.055 (0.811 against 0.756): its questions are short, and "how", "why" or "can" carry much of their meaning.
 
+### Ranking fixes
+
+The engineering review's ranking fixes (query letters such as "d" and "t" kept, repeated query words weighted, BM25's document count and average length taken over the documents that have the field, and a word's typos and one-word synonyms sharing its document frequency) were measured on seven BEIR collections with `strata-bm25-eval`, BM25 through SQL with stopwords dropped, plain and with typo tolerance (`fuzzy => 1`). Before is the code just before the fixes; both ran at the same time in the cloud container (Intel Xeon @ 2.80 GHz, 4 cores, Linux), so their query times are not compared. Results: `strata/results/text/bm25_before.json` and `bm25_after.json`.
+
+| nDCG@10 | SciFact | NFCorpus | ArguAna | FiQA | SCIDOCS | TREC-COVID | Quora |
+|---|---|---|---|---|---|---|---|
+| BM25, before | 0.689 | 0.327 | 0.310 | 0.252 | 0.157 | 0.658 | 0.756 |
+| BM25, after | 0.691 | 0.329 | 0.362 | 0.253 | 0.156 | 0.664 | 0.756 |
+| typo-tolerant, before | 0.626 | 0.270 | 0.212 | 0.148 | 0.119 | 0.151 | 0.689 |
+| typo-tolerant, after | 0.673 | 0.294 | 0.331 | 0.207 | 0.139 | 0.565 | 0.724 |
+
+Plain BM25 moves little except on ArguAna (+0.052), whose queries are whole arguments; every one of its 8,674 documents has text, so the gain comes from the query-side fixes (repeated words, kept letters), which this run does not separate. Typo tolerance gains on every collection, most on TREC-COVID (+0.414): before, a query word's rare typo neighbours scored with their own, higher IDF and could outrank the word itself.
+
 ## Hybrid ranking
 
 ![Weighted hybrid ranking: nDCG@10 by BM25 weight on four collections, with RRF of the same two rankings as dashed lines](../assets/img/chart-strata-fusion.png)
