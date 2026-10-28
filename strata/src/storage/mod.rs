@@ -4,6 +4,8 @@
 //!
 //! * [`pager`]: file layout, meta slots, the read-only mapping.
 //! * [`dir`]: the directory layout, one file per segment.
+//! * [`io`]: every change to the files, and (feature `fault-injection`)
+//!   power losses and failing disks for tests.
 //! * [`freelist`]: free page runs and deferred frees.
 //! * [`manifest`]: one on-disk version (schema, segments, delete sets).
 //! * [`wal`]: the `-wal` sidecar.
@@ -16,6 +18,7 @@
 mod db;
 pub mod dir;
 pub mod freelist;
+pub mod io;
 pub mod live;
 pub mod manifest;
 pub mod merge;

@@ -19,6 +19,7 @@ use crate::postings::bytes::OwnedBytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{corrupt, Result};
+use crate::storage::io;
 
 /// Page size in bytes.
 pub const PAGE: u64 = 4096;
@@ -143,14 +144,19 @@ pub fn read_metas(file: &File) -> Result<Vec<(Meta, usize)>> {
 
 /// Writes `meta` into `slot`.
 pub fn write_meta(file: &File, slot: usize, meta: &Meta) -> Result<()> {
-    file.write_all_at(&meta.encode(), slot as u64 * PAGE)?;
+    io::write_at(file, &meta.encode(), slot as u64 * PAGE)?;
     Ok(())
 }
 
 /// Reads an extent with a positioned read and checks its crc32.
 pub fn read_extent(file: &File, e: Extent, crc: u32) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; e.len as usize];
-    file.read_exact_at(&mut buf, e.page * PAGE)?;
+    match file.read_exact_at(&mut buf, e.page * PAGE) {
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(corrupt(format!("extent at page {} runs past the end of the file", e.page)));
+        }
+        r => r?,
+    }
     if crc32fast::hash(&buf) != crc {
         return Err(corrupt(format!("checksum mismatch in extent at page {}", e.page)));
     }

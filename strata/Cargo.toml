@@ -39,6 +39,8 @@ bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 accelerate = ["bert", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 # SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
 baselines = ["dep:rusqlite", "dep:tantivy"]
+# Power losses, full disks and failing syncs for tests (`storage::io`).
+fault-injection = []
 
 [[bin]]
 name = "strata-baselines"

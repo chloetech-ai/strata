@@ -92,7 +92,7 @@ editing their settings by hand.
 | `strata/` | the database (Rust crate), including the posting-list study in `src/postings/` |
 | `strata-server/` | Strata over HTTP JSON and gRPC, a coordinator over shards, and the query UI (`ui/index.html`, compiled in with `include_str!`) |
 | `strata-py/` | Strata from Python (`import strata`): a PyO3 extension built with maturin, and an HTTP client of strata-server; tests in `strata-py/tests` |
-| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, the Python package's tests, and a server smoke test |
+| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, Strata's fault-injection tests (`--features fault-injection`), the Python package's tests, and a server smoke test |
 | `docs/` | the documentation site (Jekyll, just-the-docs); `docs/demo/inspector.html` is a separate static copy of the inspector |
 | `install.sh` | the installer described above |
 

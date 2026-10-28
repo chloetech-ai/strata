@@ -21,13 +21,13 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{corrupt, Error, Result};
 use crate::postings::bytes::OwnedBytes;
+use crate::storage::io;
 use crate::storage::manifest::Manifest;
 
 pub const CURRENT: &str = "CURRENT";
@@ -74,10 +74,10 @@ pub fn updates_name(id: u64, txn: u64) -> String {
 
 /// Writes a new file (it must not exist) and syncs it when `sync`.
 pub fn write_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<()> {
-    let mut f = OpenOptions::new().write(true).create_new(true).open(dir.join(name))?;
-    f.write_all(bytes)?;
+    let f = OpenOptions::new().write(true).create_new(true).open(dir.join(name))?;
+    io::write_at(&f, bytes, 0)?;
     if sync {
-        f.sync_data()?;
+        io::sync(&f)?;
     }
     Ok(())
 }
@@ -90,7 +90,7 @@ pub fn write_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<()
 pub fn write_version_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<()> {
     match write_file(dir, name, bytes, sync) {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(dir.join(name))?;
+            io::remove_file(&dir.join(name))?;
             write_file(dir, name, bytes, sync)
         }
         r => r,
@@ -98,16 +98,16 @@ pub fn write_version_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> R
 }
 
 pub fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)?.sync_all()?;
+    io::sync_dir(dir)?;
     Ok(())
 }
 
 /// Replaces `CURRENT` atomically (write a temporary file, rename it over).
 pub fn write_current(dir: &Path, cur: &Current, sync: bool) -> Result<()> {
     let tmp = dir.join("CURRENT.tmp");
-    let _ = std::fs::remove_file(&tmp);
+    let _ = io::remove_file(&tmp);
     write_file(dir, "CURRENT.tmp", &serde_json::to_vec(cur).expect("current serialises"), sync)?;
-    std::fs::rename(&tmp, dir.join(CURRENT))?;
+    io::rename(&tmp, &dir.join(CURRENT))?;
     if sync {
         sync_dir(dir)?;
     }

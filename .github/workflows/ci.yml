@@ -59,6 +59,12 @@ jobs:
       - name: Clippy
         working-directory: ${{ matrix.crate }}
         run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+      # Power losses, full disks and failing syncs at every write of a
+      # storage workload (storage::io, tests/storage_faults.rs).
+      - name: Fault injection
+        if: matrix.crate == 'strata'
+        working-directory: strata
+        run: cargo test --release --features fault-injection --test storage_faults
 
   server-smoke:
     name: strata-server smoke test

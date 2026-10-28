@@ -33,6 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{corrupt, Result};
+use crate::storage::io;
 use crate::value::{Document, Value};
 
 const MAGIC: &[u8; 8] = b"STRWAL01";
@@ -69,13 +70,15 @@ pub struct Wal {
     len: u64,
     /// What opening cut off past damage that committed transactions follow.
     dropped: Option<String>,
+    /// Changed since its last sync (appends without `sync`).
+    unsynced: bool,
 }
 
 impl Wal {
     /// Creates (or truncates) the log.
     pub fn create(path: &Path, db_id: u64, sync: bool) -> Result<Wal> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
-        let mut wal = Wal { file, db_id, len: 0, dropped: None };
+        let mut wal = Wal { file, db_id, len: 0, dropped: None, unsynced: true };
         wal.reset(sync)?;
         Ok(wal)
     }
@@ -94,7 +97,8 @@ impl Wal {
         let size = file.metadata()?.len();
         let mut buf = vec![0u8; size as usize];
         file.read_exact_at(&mut buf, 0)?;
-        let mut wal = Wal { file, db_id, len: size, dropped: None };
+        // What an earlier process appended may not be durable yet.
+        let mut wal = Wal { file, db_id, len: size, dropped: None, unsynced: true };
         if size < HEADER || &buf[..8] != MAGIC || buf[8..16] != db_id.to_le_bytes() {
             wal.reset(sync)?;
             return Ok((wal, Vec::new()));
@@ -117,9 +121,9 @@ impl Wal {
                 std::fs::write(&saved, &buf)?;
                 wal.dropped = Some(format!("{what}: dropped them, the whole log is copied to {}", saved.display()));
             }
-            wal.file.set_len(end)?;
+            io::set_len(&wal.file, end)?;
             if sync {
-                wal.file.sync_data()?;
+                io::sync(&wal.file)?;
             }
             wal.len = end;
         }
@@ -136,27 +140,38 @@ impl Wal {
     /// each writes); durable on return when `sync`.
     pub fn append(&mut self, txn: u64, ops: &[(u32, Op)], sync: bool) -> Result<()> {
         let buf = encode_txn(txn, ops);
-        let res = self.file.write_all_at(&buf, self.len).and_then(|_| if sync { self.file.sync_data() } else { Ok(()) });
+        let res = io::write_at(&self.file, &buf, self.len).and_then(|_| if sync { io::sync(&self.file) } else { Ok(()) });
         if let Err(e) = res {
             // Cut off whatever part landed, so that later commits stay
             // reachable by replay; if even that fails the caller poisons
             // the database.
-            self.file.set_len(self.len)?;
+            io::set_len(&self.file, self.len)?;
             return Err(e.into());
         }
         self.len += buf.len() as u64;
+        self.unsynced |= !sync;
+        Ok(())
+    }
+
+    /// Makes appends made without `sync` durable.
+    pub fn sync_appends(&mut self) -> Result<()> {
+        if self.unsynced {
+            io::sync(&self.file)?;
+            self.unsynced = false;
+        }
         Ok(())
     }
 
     /// Empties the log (after a flush made its contents durable elsewhere).
     pub fn reset(&mut self, sync: bool) -> Result<()> {
-        self.file.set_len(0)?;
+        io::set_len(&self.file, 0)?;
         let mut h = MAGIC.to_vec();
         h.extend_from_slice(&self.db_id.to_le_bytes());
-        self.file.write_all_at(&h, 0)?;
+        io::write_at(&self.file, &h, 0)?;
         if sync {
-            self.file.sync_data()?;
+            io::sync(&self.file)?;
         }
+        self.unsynced = !sync;
         self.len = HEADER;
         Ok(())
     }
