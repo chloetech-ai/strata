@@ -26,9 +26,10 @@ of shards and the same CPU and memory, and asks each the query kinds of
 - **CPU and memory**: 3 CPUs and 6 GiB per engine, as Kubernetes limits:
   Elasticsearch and Solr have two data nodes of 1.5 CPUs and 3 GiB (heap
   1.5 GB for Elasticsearch, as Elastic recommends; 1 GB for Solr, whose
-  full-precision vectors need the page cache); Strata has two shards of 1.25
-  CPUs and 2.5 GiB and a coordinator of 0.5 CPU and 1 GiB, since its
-  shards do not also coordinate. Loading has the same budget: Elasticsearch
+  full-precision vectors need the page cache); Strata has two shards of 1
+  CPU and 2.5 GiB and a coordinator of 1 CPU and 1 GiB, since its shards do
+  not also coordinate (`SHARD_CPU` and `COORD_CPU` split it otherwise; the
+  results compare 1.25 + 1.25 + 0.5 too). Loading has the same budget: Elasticsearch
   and Solr take bulk requests on their two data nodes (from a loader pod on
   the third node, outside the budget), and Strata builds its shards one
   after the other in a job of 3 CPUs and 6 GiB on the shard's node (a
@@ -83,6 +84,8 @@ $C build;        $C up strata; $C run strata; $C down strata
 $C up es;        $C load es;   $C run es;     $C down es
 $C up solr;      $C load solr; $C run solr;   $C down solr
 python3 strata-server/deploy/compare/analyze.py $STRATA_WORK/compare $STRATA_DATA/quora
+# Strata at another split of its 3 CPUs, kept beside the default run:
+SHARD_CPU=1250m COORD_CPU=500m $C up strata; $C run strata --label strata-coord500m; $C down strata
 ```
 
 The Docker VM must allow `vm.max_map_count` of at least 262144 for

@@ -24,15 +24,15 @@ K="kubectl --context kind-$CLUSTER -n $NS"
 NODES=(strata-worker strata-worker2)
 CLIENT_NODE=strata-worker3
 # Every engine: 3 CPUs and 6 GiB in all. Elasticsearch and Solr: two data
-# nodes of 1.5 CPUs and 3 GiB. Strata: two shards of 1.25 CPUs and 2.5 GiB
-# and a coordinator of 0.5 CPU and 1 GiB. Loading gets the whole budget
+# nodes of 1.5 CPUs and 3 GiB. Strata: two shards of 1 CPU and 2.5 GiB and a
+# coordinator of 1 CPU and 1 GiB. Loading gets the whole budget
 # too: Elasticsearch and Solr on their two data nodes, Strata one shard's
 # build job at a time.
 # SHARD_CPU and COORD_CPU may be set to split Strata's 3 CPUs otherwise.
 DATA_CPU=1500m DATA_MEM=3Gi
 BUILD_CPU=3 BUILD_MEM=6Gi
-SHARD_CPU=${SHARD_CPU:-1250m} SHARD_MEM=2560Mi
-COORD_CPU=${COORD_CPU:-500m} COORD_MEM=1Gi
+SHARD_CPU=${SHARD_CPU:-1} SHARD_MEM=2560Mi
+COORD_CPU=${COORD_CPU:-1} COORD_MEM=1Gi
 OUT=${OUT:-/data/compare}
 
 # render FILE I NODE CPU MEM [ZK]: a manifest for node I.

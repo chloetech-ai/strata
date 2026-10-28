@@ -18,6 +18,7 @@ quality of each engine's answers:
 Writes REPORTS_DIR/summary.json with the same numbers. Needs numpy.
 """
 
+import gzip
 import json
 import math
 import sys
@@ -42,7 +43,11 @@ KINDS = RANKED + ["facet", "key lookup"]
 
 
 def load_json(p):
-    return json.loads(Path(p).read_text()) if Path(p).exists() else None
+    p = Path(p)
+    if p.exists():
+        return json.loads(p.read_text())
+    gz = p.with_name(p.name + ".gz")
+    return json.loads(gzip.decompress(gz.read_bytes())) if gz.exists() else None
 
 
 def exact_top10(beir, qids, filtered):
@@ -122,11 +127,12 @@ def main():
     print("|---|---|---|---|---|---|---|")
     builds = [load_json(rep / f"build-strata-s{i}.json") for i in (0, 1)]
     if all(builds):
-        total = max(b["total_s"] for b in builds)
+        # compare.sh builds the shards one after the other.
+        total = sum(b["total_s"] for b in builds)
         size = sum(b["file_bytes"] for b in builds)
         docs = sum(b["docs"] for b in builds)
         summary["load"]["strata"] = {"total_s": total, "index_bytes": size, "docs": docs, "shards": builds}
-        print(f"| Strata | {total:.0f} | read {max(b['read_s'] for b in builds):.0f} + build {max(b['build_s'] for b in builds):.0f} | (built) | (built as one) | {size / 1e9:.2f} | {docs:,} |")
+        print(f"| Strata | {total:.0f} | read {sum(b['read_s'] for b in builds):.0f} + build {sum(b['build_s'] for b in builds):.0f} | (built) | (built as one) | {size / 1e9:.2f} | {docs:,} |")
     for e in ["es", "solr"]:
         l = load_json(rep / f"load-{e}.json")
         if l:
