@@ -1,0 +1,9 @@
+nfcorpus: 3633 documents, 323 queries; model static:potion-retrieval-32M (512 dimensions)
+loaded and embedded 3 fields in 0.6 s (0 documents without a title get no title vector)
+nfcorpus (323 queries)                                           nDCG@10  recall@100
+bm25 (title + text)                                               0.3274      0.2489
+potion-retrieval-32M vector of title                              0.2827      0.2712
+potion-retrieval-32M vector of text                               0.2949      0.2830
+potion-retrieval-32M vector of title + text                       0.3080      0.2873
+rrf(bm25, potion-retrieval-32M vector of title + text)            0.3397      0.3087
+reference: Cohere embed-english-v3 vector of title + text         0.3874      0.3511

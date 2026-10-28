@@ -1,0 +1,9 @@
+scifact: 5183 documents, 300 queries; model bert:bge-small-en-v1.5 (384 dimensions)
+loaded and embedded 3 fields in 1893.4 s (0 documents without a title get no title vector)
+scifact (300 queries)                                            nDCG@10  recall@100
+bm25 (title + text)                                               0.6887      0.9249
+bge-small-en-v1.5 vector of title                                 0.5980      0.8760
+bge-small-en-v1.5 vector of text                                  0.6968      0.9483
+bge-small-en-v1.5 vector of title + text                          0.7127      0.9450
+rrf(bm25, bge-small-en-v1.5 vector of title + text)               0.7239      0.9650
+reference: Cohere embed-english-v3 vector of title + text         0.7181      0.9633

@@ -1,0 +1,9 @@
+nfcorpus: 3633 documents, 323 queries; model bert:bge-small-en-v1.5 (384 dimensions)
+loaded and embedded 3 fields in 773.5 s (0 documents without a title get no title vector)
+nfcorpus (323 queries)                                           nDCG@10  recall@100
+bm25 (title + text)                                               0.3274      0.2489
+bge-small-en-v1.5 vector of title                                 0.3175      0.2898
+bge-small-en-v1.5 vector of text                                  0.3487      0.3131
+bge-small-en-v1.5 vector of title + text                          0.3438      0.3115
+rrf(bm25, bge-small-en-v1.5 vector of title + text)               0.3646      0.3141
+reference: Cohere embed-english-v3 vector of title + text         0.3874      0.3511
