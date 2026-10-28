@@ -9,7 +9,8 @@ service Strata {
   // Runs a SELECT. With `shard`, returns results a coordinator can merge.
   rpc Query(QueryRequest) returns (QueryResponse);
   // The BM25 statistics a SELECT scores with, and a snapshot lease for the
-  // query round that follows.
+  // query round that follows, which lasts for `timeout_ms` (or the server's
+  // default deadline) and a second.
   rpc TermStats(QueryRequest) returns (TermStatsResponse);
   // Runs an INSERT, UPDATE or DELETE, or a batch of write operations.
   rpc Write(WriteRequest) returns (WriteResponse);

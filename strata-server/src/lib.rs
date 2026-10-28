@@ -66,7 +66,8 @@ impl From<tonic::Status> for ApiError {
         let status = match s.code() {
             Code::InvalidArgument => 400,
             Code::DeadlineExceeded => 504,
-            Code::Unavailable | Code::ResourceExhausted => 503,
+            Code::ResourceExhausted => 429,
+            Code::Unavailable => 503,
             _ => 502,
         };
         ApiError { status, message: s.message().to_string() }
@@ -78,6 +79,9 @@ impl From<ApiError> for tonic::Status {
         use tonic::Code;
         let code = match e.status {
             400 => Code::InvalidArgument,
+            // Too many queries running: another replica would only be
+            // loaded more ([`crate::coord`] does not retry it elsewhere).
+            429 => Code::ResourceExhausted,
             503 => Code::Unavailable,
             504 => Code::DeadlineExceeded,
             _ => Code::Internal,

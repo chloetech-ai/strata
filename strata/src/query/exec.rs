@@ -5,6 +5,7 @@
 mod graph;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -192,6 +193,9 @@ pub struct ExecOptions {
     /// Fail with `Error::Timeout` once this has passed (checked between
     /// segments).
     pub deadline: Option<Instant>,
+    /// Fail with `Error::Timeout` once this is set, checked where the
+    /// deadline is: the caller stopped waiting for the answer.
+    pub cancel: Option<Arc<AtomicBool>>,
     /// The synonym list `synonyms => 1` expands searches with.
     pub synonyms: Option<Arc<Synonyms>>,
     /// Search only these segments (ordinals into the snapshot's segments),
@@ -216,6 +220,7 @@ impl Default for ExecOptions {
             shard: false,
             threads: 1,
             deadline: None,
+            cancel: None,
             synonyms: None,
             segments: None,
         }
@@ -1282,8 +1287,12 @@ impl<'a> Executor<'a> {
         Ok(groups)
     }
 
-    /// `Error::Timeout` once [`ExecOptions::deadline`] has passed.
+    /// `Error::Timeout` once [`ExecOptions::deadline`] has passed or the
+    /// query was cancelled.
     fn check_deadline(&self) -> Result<()> {
+        if self.opts.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Error::Timeout("the query was cancelled".into()));
+        }
         match self.opts.deadline {
             Some(d) if Instant::now() >= d => Err(Error::Timeout("the query ran past its deadline".into())),
             _ => Ok(()),

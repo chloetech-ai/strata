@@ -537,6 +537,12 @@ impl Database {
         lock(&self.flush_error).clone()
     }
 
+    /// Whether a write failed partway (a WAL append, a meta page), after
+    /// which every write and merge fails until the database is reopened.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
     fn flush_locked(&self, wal: &mut Wal) -> Result<()> {
         let r = self.flush_inner(wal);
         *lock(&self.flush_error) = r.as_ref().err().map(|e| e.to_string());

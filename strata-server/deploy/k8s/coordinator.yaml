@@ -29,8 +29,10 @@ spec:
             - --shards=http://strata-shards-2-s0-0.strata-shards-2:7701|http://strata-shards-2-s0-1.strata-shards-2:7701,http://strata-shards-2-s1-0.strata-shards-2:7701|http://strata-shards-2-s1-1.strata-shards-2:7701
           ports:
             - {name: http, containerPort: 7700}
+          # Ready once it listens: it does not ask its shards, so one slow
+          # shard cannot take every coordinator out of service together.
           readinessProbe:
-            httpGet: {path: /v1/health, port: http}
+            httpGet: {path: /readyz, port: http}
             periodSeconds: 2
           # Keep answering for a few seconds after the pod is told to stop,
           # while the Service drops it: without this, moving the coordinator

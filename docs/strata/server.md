@@ -38,6 +38,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--shard-token T` | `$STRATA_SHARD_TOKEN`, else `--token` | a coordinator's token for its shards |
 | `--shard-ca FILE` | | a CA certificate (PEM) a coordinator trusts for `https://` shards, besides the public roots |
 | `--timeout-ms N` | 5000 | default query deadline |
+| `--max-timeout-ms N` | 60000 | the longest deadline a request's `timeout_ms` may ask for |
 | `--max-concurrent N` | 64 | queries running at once; more wait for a slot until their deadline |
 | `--model ID` | `claude-haiku-5-5` | the agent's default model |
 | `--models DIR` | `$STRATA_MODELS`, else `~/.local/share/strata/models` | where the models of [embedded vector fields](#embedded-vector-fields) are |
@@ -183,12 +184,14 @@ Every request and answer is JSON. Parameters bind `:name` placeholders: a number
 | `POST /v1/import?format=F` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?}` | the bound query and its plan lines |
-| `POST /v1/term_stats` | `{sql, params?}` | BM25 statistics and a snapshot lease, for a coordinator |
-| `POST /v1/snapshot` | | a snapshot lease: `{snapshot, txn, ttl_s}` |
+| `POST /v1/term_stats` | `{sql, params?, timeout_ms?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
+| `POST /v1/snapshot` | | a snapshot lease for 60 s: `{snapshot, txn, ttl_s}` (at most 10,000 are held at once; more get 429) |
 | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the queries it ran |
 | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` for `PUT` | the synonym list: `{text, rules, file}` |
 | `GET /v1/schema` | | `{schema, short, primary_key, embeddings}` |
-| `GET /v1/health`, `/v1/stats`, `/v1/config` | | JSON |
+| `GET /v1/health` | | `{status, docs, segments, ...}`, with 503 when the status is `down` or `failing` ([health](#health)) |
+| `GET /livez`, `/readyz` | | `{status}`, with 503 when the server must be restarted ([health](#health)) |
+| `GET /v1/stats`, `/v1/config` | | JSON |
 | `GET /metrics` | | Prometheus text |
 | `GET /` | | the UI |
 
@@ -218,7 +221,7 @@ A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as several
 
 An answer of 200 means the batch is durable, and an error that nothing of it was written, so a client can retry on an error. When an answer is lost (a timeout, a dropped connection, a coordinator whose other replica failed), send the retry with the same `idempotency_key` (or an `Idempotency-Key` header), 1 to 256 characters: a server that already applied that batch answers with its first `written` instead of applying it again, so an `add` counts once and an `insert` does not fail as a duplicate of itself. The same key with other operations is refused (422), and while the first attempt still runs a retry gets 409. A server remembers keys for an hour, the latest 100,000, in memory, so a restart forgets them. A coordinator passes the key to each shard as `key/shard`. Over gRPC, `WriteRequest.idempotency_key` does the same.
 
-With `--token`, every route except `/` and `/v1/health` needs `Authorization: Bearer <token>`; the UI asks for the token.
+With `--token`, every route except `/`, `/v1/health`, `/livez` and `/readyz` needs `Authorization: Bearer <token>`; the UI asks for the token.
 
 ## Security
 
@@ -243,7 +246,7 @@ With a token, give it to the shards and the coordinator alike (`STRATA_TOKEN=…
 
 A coordinator holds no data. For a query, it
 
-1. asks every shard for the BM25 statistics of the query's terms and a snapshot lease (skipped when nothing in the query needs collection statistics: vectors, sparse fields, columns),
+1. asks every shard for the BM25 statistics of the query's terms and a snapshot lease, which lasts until the query's deadline and a second (skipped when nothing in the query needs collection statistics: vectors, sparse fields, columns),
 2. sends every shard the query with the summed statistics and its lease, in shard mode, so that each shard scores exactly as the whole collection would and returns what a merge needs (for fusions and products, each input's raw scores over its candidates),
 3. merges the answers with `strata::cluster::merge`: top *k*, fusion, products and facet counts.
 
@@ -251,7 +254,20 @@ A sharded collection therefore ranks like one database: the tests run every quer
 
 ## Deadlines, admission and metrics
 
-Every query runs under a deadline (`timeout_ms`, or the server's default) and gets its share of the cores: a query arriving when *r* are running searches its segments on about *cores / r* threads. At most `--max-concurrent` run at once; the rest wait for a slot, and one still waiting at its deadline is refused with 503 and counted in `strata_rejected_total`. A query still running at its deadline stops at the next segment and returns an error.
+Every query runs under a deadline (`timeout_ms` up to `--max-timeout-ms`, or the server's default) and gets its share of the cores: a query arriving when *r* are running searches its segments on about *cores / r* threads. At most `--max-concurrent` run at once; the rest wait for a slot, and one still waiting at its deadline is refused with 429 (`ResourceExhausted` over gRPC) and counted in `strata_rejected_total`. A query still running at its deadline stops at the next segment and returns an error. So does a query whose caller stopped waiting (a client that hung up, a coordinator's hedge that lost), and it holds its slot and counts as running until it has stopped.
+
+A coordinator does not retry a query that a replica refused with 429 on that replica's sibling, which would only take on both loads: the query fails, or a partial answer leaves the shard out. Hedges (asking another replica when one has not answered after `--hedge-ms`) are budgeted at 5% of the calls to shards, with up to 10 saved for a burst, so that a slow cluster is not sent twice its load.
+
+### Health
+
+`GET /v1/health` reports `status`:
+
+- `ok`.
+- `degraded`: on a database, its flushes fail (a full disk), and `error` says why. Writes still commit, to the write-ahead log, until the memtable holds twice its limit; then they are refused until a flush succeeds. On a coordinator, a replica does not answer, or is not `ok`, but every shard has one that answers.
+- `failing`: the database cannot write until the server restarts. A write failed partway (a full disk, an I/O error) and the database refuses writes until it is reopened, or the writer thread stopped. Reads still work; merges stop.
+- `down`: a coordinator has a shard with no replica answering.
+
+It answers 503 for `down` and `failing`. `/livez` and `/readyz` answer 503 only for `failing`, so that an orchestrator restarts the server (the [Kubernetes manifests](https://github.com/rkonow/engram/tree/main/strata-server/deploy) use them as probes). Neither asks a coordinator's shards, so one slow shard cannot take every coordinator out of service at once; `/v1/health` shows the shards. The writer thread survives a panic while applying a write: the requests in that batch get 500, the panic is counted in `strata_writer_panics_total`, and the next batch goes on.
 
 `GET /metrics` serves, in Prometheus text format:
 
@@ -260,9 +276,14 @@ Every query runs under a deadline (`timeout_ms`, or the server's default) and ge
 | `strata_queries_total` | `kind`, `outcome` | queries by kind (`bm25`, `vector`, `sparse`, `hybrid`, `boosted`, `decay`, `graph`, `column`, `facet`, `count`, `filter`) and outcome |
 | `strata_query_ms` | `kind` | latency histogram |
 | `strata_writes_total`, `strata_written_docs_total` | | write requests and rows written |
+| `strata_write_errors_total` | `status` | write requests that failed, by HTTP status (failures on the server's side are also logged, at most once every 10 s) |
 | `strata_rejected_total` | | queries refused at admission |
+| `strata_queries_running` | | queries running now |
 | `strata_agent_runs_total` | | agent runs |
 | `strata_docs`, `strata_segments` | | the database's size |
+| `strata_snapshot_leases` | | snapshot leases held (a database) |
+| `strata_failing`, `strata_flush_failing` | | 1 when the database is `failing`, or its flushes fail ([health](#health)) |
+| `strata_writer_panics_total` | | write batches whose application panicked |
 
 ## The UI
 

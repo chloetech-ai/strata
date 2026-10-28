@@ -11,10 +11,10 @@ use std::time::Duration;
 use serde_json::{json, Value as Json};
 use strata::db::Db;
 use strata::query::Params;
-use strata::storage::DbOptions;
+use strata::storage::{DbOptions, Layout};
 use strata::value::Value;
 use strata_server::auth::{self, Access, Secret, Tls};
-use strata_server::service::{shard_of, AgentConfig, Backend, QueryReq, Service};
+use strata_server::service::{shard_of, AgentConfig, Backend, QueryReq, Service, MAX_LEASES};
 use strata_server::coord::{CoordOptions, Coordinator};
 use strata_server::{demo, json as js, pb, server};
 use tokio::net::TcpListener;
@@ -557,6 +557,28 @@ impl pb::strata_server::Strata for Stuck {
     }
 }
 
+/// A shard server that refuses every query because too many are running.
+struct Overloaded(String);
+
+#[tonic::async_trait]
+impl pb::strata_server::Strata for Overloaded {
+    async fn query(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
+        Err(tonic::Status::resource_exhausted("too many queries running; try again"))
+    }
+    async fn term_stats(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::TermStatsResponse>, tonic::Status> {
+        Err(tonic::Status::resource_exhausted("too many queries running; try again"))
+    }
+    async fn write(&self, _: tonic::Request<pb::WriteRequest>) -> Result<tonic::Response<pb::WriteResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("read only"))
+    }
+    async fn schema(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::SchemaResponse>, tonic::Status> {
+        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone() }))
+    }
+    async fn health(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
+        Ok(tonic::Response::new(pb::HealthResponse { status: "ok".into(), ..Default::default() }))
+    }
+}
+
 async fn stuck(schema: &strata::Schema) -> String {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -892,3 +914,140 @@ fn imports_files_from_the_command_line() {
     // An existing database takes no schema.
     assert!(server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows]).unwrap_err().contains("exists"));
 }
+
+// OPS-3: a replica that refused a query because too many were running was
+// retried on its sibling, which then carried both loads. The refusal (429,
+// ResourceExhausted over gRPC) now fails the query instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overloaded_replica_is_not_relieved_by_its_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(dir.path(), "db.strata", |_| true);
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let over = format!("http://{}", l.local_addr().unwrap());
+    let fake = pb::strata_server::StrataServer::new(Overloaded(serde_json::to_string(db.schema()).unwrap()));
+    tokio::spawn(tonic::transport::Server::builder().add_service(fake).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
+    let good = grpc(service(db, "http://unused")).await;
+    let coord = cluster(Coordinator::connect(vec![format!("{over}|{good}")]).await.unwrap());
+    // Reads take the replicas in turn: one of two asks the overloaded one first.
+    let mut statuses = Vec::new();
+    for _ in 0..2 {
+        let r = coord.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await;
+        statuses.push(r.map_or_else(|e| e.status, |_| 200));
+    }
+    statuses.sort();
+    assert_eq!(statuses, vec![200, 429]);
+    assert_eq!(coord.health().await["retries"], 0);
+}
+
+// SCALE-2/OPS-3: a query whose caller went away (a client that hung up, a
+// hedge that lost, a shard timeout) never took itself off the running
+// count, so every later query searched its segments on fewer threads until
+// a restart; and it gave its slot back while its work went on. The work now
+// holds both, and stops at its next check.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_queries_leave_the_running_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = service(create(dir.path(), "db.strata", |_| true), "http://unused");
+    let sql = "SELECT id, score() FROM products ORDER BY bm25(body, 'waterproof hiking boots') DESC LIMIT 100";
+    for i in 0..60u64 {
+        let s = svc.clone();
+        let t = tokio::spawn(async move { s.query(QueryReq { sql: sql.into(), ..Default::default() }).await });
+        tokio::time::sleep(Duration::from_micros(50 * (i % 20))).await;
+        t.abort();
+    }
+    let t0 = std::time::Instant::now();
+    while svc.running() > 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "{} queries still count as running", svc.running());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    svc.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap();
+    assert_eq!(svc.running(), 0);
+}
+
+// SCALE-5: each BM25 query through a coordinator pinned a version on every
+// shard for 60 s, released only when a later lease was made, and a client
+// could make leases without limit. A statistics round's lease now lasts for
+// its query's deadline and a second, expired ones are swept, and at most
+// MAX_LEASES are held. A request's deadline is capped too.
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_leases_end_with_their_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = service(create(dir.path(), "db.strata", |_| true), "http://unused");
+    let sql = "SELECT id FROM products ORDER BY bm25(body, 'waterproof hiking boots') DESC LIMIT 5";
+    let (_, lease) = svc.term_stats(sql, &Params::new(), 200).await.unwrap();
+    let q = |snapshot| QueryReq { sql: sql.into(), snapshot, ..Default::default() };
+    svc.query(q(lease)).await.unwrap();
+    assert_eq!(svc.sweep_leases(), 1);
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert_eq!(svc.sweep_leases(), 0);
+    let e = svc.query(q(lease)).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("expired"), "{}", e.message);
+
+    for _ in 0..MAX_LEASES {
+        svc.lease().unwrap();
+    }
+    assert_eq!(svc.lease().err().unwrap().status, 429);
+    assert_eq!(svc.timeout_of(u64::MAX), svc.max_timeout);
+}
+
+// OPS-5/OPS-6: a database that could not write (a full disk) still said
+// "ok", failed every write with a 500 nobody counted or logged, and went on
+// merging every 5 s for nothing. Health now says "degraded" while flushes
+// fail (writes still commit to the WAL) and "failing" once no write can
+// succeed until a restart; /livez and /readyz, open without the token, then
+// answer 503 so that the server is restarted. Failed writes are counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_reports_a_database_that_cannot_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("d.strata");
+    let opts = DbOptions { layout: Layout::Directory, publish_snapshots: true, ..DbOptions::default() };
+    let db = Db::create(&path, demo::schema(10), opts).unwrap();
+    db.load((0..10).map(|i| demo::product(i, 7))).unwrap();
+    let svc = service(db, "http://unused");
+    let db = svc.local_db().unwrap().clone();
+    let url = http(svc.clone(), Some("tok")).await;
+    let c = reqwest::Client::new();
+    let get = |route: &str| {
+        let r = c.get(format!("{url}{route}")).bearer_auth("tok").send();
+        async move {
+            let r = r.await.unwrap();
+            (r.status().as_u16(), r.text().await.unwrap())
+        }
+    };
+    let open = |route: &str| {
+        let r = c.get(format!("{url}{route}")).send();
+        async move { r.await.unwrap().status().as_u16() }
+    };
+    let write = |i: usize| svc.write_ops(vec![json!({"op": "upsert", "doc": js::document_json(&svc.schema, &demo::product(i, 7))})], None);
+    let status = |h: &str| serde_json::from_str::<Json>(h).unwrap()["status"].clone();
+    assert_eq!((open("/livez").await, open("/readyz").await), (200, 200));
+    let (code, h) = get("/v1/health").await;
+    assert_eq!((code, status(&h)), (200, json!("ok")), "{h}");
+
+    // Flushes fail (directories where the segment files go): degraded.
+    let blockers: Vec<_> = (0..64).map(|id| path.join(format!("seg-{id:010}.strata"))).filter(|p| !p.exists()).collect();
+    for b in &blockers {
+        std::fs::create_dir(b).unwrap();
+    }
+    write(20).await.unwrap();
+    assert!(db.storage().flush().is_err());
+    let (code, h) = get("/v1/health").await;
+    assert_eq!((code, status(&h)), (200, json!("degraded")), "{h}");
+    assert_eq!(open("/livez").await, 200);
+    for b in &blockers {
+        std::fs::remove_dir(b).unwrap();
+    }
+
+    // A commit that fails partway (here pointing CURRENT at the new
+    // manifest) leaves the database refusing writes until it is reopened.
+    std::fs::create_dir(path.join("CURRENT.tmp")).unwrap();
+    assert!(db.storage().flush().is_err());
+    assert!(db.storage().is_poisoned());
+    let (code, h) = get("/v1/health").await;
+    assert_eq!((code, status(&h)), (503, json!("failing")), "{h}");
+    assert_eq!((open("/livez").await, open("/readyz").await), (503, 503));
+    assert_eq!(write(21).await.err().unwrap().status, 500);
+    let (_, m) = get("/metrics").await;
+    assert!(m.contains("strata_write_errors_total{status=\"500\"} 1") && m.contains("strata_failing 1"), "{m}");
+}
+

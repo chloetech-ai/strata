@@ -60,11 +60,13 @@ class Client(Search):
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
-                msg = json.loads(raw).get("error") or raw.decode(errors="replace")
+                answer = json.loads(raw)
+                msg = answer.get("error") or raw.decode(errors="replace")
             except (ValueError, AttributeError):
-                msg = raw.decode(errors="replace") or str(e)
+                answer, msg = None, raw.decode(errors="replace") or str(e)
             err = StrataError(f"{msg} (HTTP {e.code})")
             err.status = e.code
+            err.answer = answer
             raise err from None
 
     def _schema_answer(self) -> dict:
@@ -81,8 +83,14 @@ class Client(Search):
         return [e["field"] for e in self._schema_answer().get("embeddings", []) if e.get("loaded")]
 
     def health(self) -> dict:
-        """{status, docs, segments, role, ...}."""
-        return self._call("GET", "/v1/health")
+        """{status, docs, segments, role, ...}, also when the status is "down"
+        or "failing" (which the server answers with 503)."""
+        try:
+            return self._call("GET", "/v1/health")
+        except StrataError as e:
+            if e.status == 503 and isinstance(e.answer, dict) and "status" in e.answer:
+                return e.answer
+            raise
 
     def stats(self) -> dict:
         return self._call("GET", "/v1/stats")

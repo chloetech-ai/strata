@@ -24,6 +24,8 @@ struct Inner {
     latency: BTreeMap<&'static str, Histogram>,
     writes: u64,
     written_docs: u64,
+    /// HTTP status → failed writes.
+    write_errors: BTreeMap<u16, u64>,
     rejected: u64,
     agent_runs: u64,
 }
@@ -82,6 +84,10 @@ impl Metrics {
         m.written_docs += docs;
     }
 
+    pub fn write_error(&self, status: u16) {
+        *self.inner().write_errors.entry(status).or_default() += 1;
+    }
+
     pub fn rejected(&self) {
         self.inner().rejected += 1;
     }
@@ -98,10 +104,12 @@ impl Metrics {
             let e = by_kind.entry(k).or_insert_with(|| serde_json::json!({}));
             e[o] = serde_json::json!(n);
         }
-        serde_json::json!({ "queries": by_kind, "writes": m.writes, "written_docs": m.written_docs, "rejected": m.rejected, "agent_runs": m.agent_runs })
+        let write_errors: u64 = m.write_errors.values().sum();
+        serde_json::json!({ "queries": by_kind, "writes": m.writes, "written_docs": m.written_docs, "write_errors": write_errors, "rejected": m.rejected, "agent_runs": m.agent_runs })
     }
 
-    pub fn render(&self, docs: u64, segments: u64) -> String {
+    /// The text format, with `more` series as (name, type, value).
+    pub fn render(&self, docs: u64, segments: u64, more: &[(&str, &str, u64)]) -> String {
         let m = self.inner();
         let mut out = String::new();
         let _ = writeln!(out, "# TYPE strata_queries_total counter");
@@ -127,8 +135,15 @@ impl Metrics {
         ] {
             let _ = writeln!(out, "# TYPE {name} counter\n{name} {v}");
         }
+        let _ = writeln!(out, "# TYPE strata_write_errors_total counter");
+        for (status, n) in &m.write_errors {
+            let _ = writeln!(out, "strata_write_errors_total{{status=\"{status}\"}} {n}");
+        }
         let _ = writeln!(out, "# TYPE strata_docs gauge\nstrata_docs {docs}");
         let _ = writeln!(out, "# TYPE strata_segments gauge\nstrata_segments {segments}");
+        for (name, ty, v) in more {
+            let _ = writeln!(out, "# TYPE {name} {ty}\n{name} {v}");
+        }
         out
     }
 }

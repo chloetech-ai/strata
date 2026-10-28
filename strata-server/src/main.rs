@@ -96,6 +96,9 @@ struct Args {
     /// Default query deadline.
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
+    /// The longest deadline a request's `timeout_ms` may ask for.
+    #[arg(long, default_value_t = 60000)]
+    max_timeout_ms: u64,
     /// Queries running at once; more wait for a slot until their deadline.
     #[arg(long, default_value_t = 64)]
     max_concurrent: usize,
@@ -201,6 +204,7 @@ async fn main() {
             ..Default::default()
         },
         timeout_ms: a.timeout_ms,
+        max_timeout_ms: a.max_timeout_ms,
         max_concurrent: a.max_concurrent,
         model: a.model,
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()),

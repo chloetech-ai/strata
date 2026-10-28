@@ -12,8 +12,12 @@
 //! documents (`--shards a0|a1,b0|b1`). A read goes to one replica of each
 //! shard, in turn; when a replica fails, the next one is asked, and when
 //! one has not answered after [`CoordOptions::hedge`], the next one is
-//! asked too and the first answer wins. A replica that failed, or was
-//! outrun, is asked last for [`CoordOptions::cool_off`]. With
+//! asked too and the first answer wins, while hedges stay within
+//! [`HEDGE_SHARE`] of calls. A replica that refuses a query because too
+//! many are running is not relieved by asking its sibling, which would
+//! only be loaded more: the query fails (or leaves the shard out of a
+//! partial answer). A replica that failed, or was outrun, is asked last
+//! for [`CoordOptions::cool_off`]. With
 //! [`CoordOptions::partial`], a query whose shard has no replica answering
 //! is answered from the other shards and says which are missing, and the
 //! queries of the next second leave that shard out without asking it.
@@ -108,6 +112,7 @@ pub struct Coordinator {
     /// Replicas asked again after another failed, and hedged requests.
     retries: AtomicU64,
     hedges: AtomicU64,
+    hedge_budget: HedgeBudget,
 }
 
 /// A query's merged answer, and the shards it lacks (with
@@ -117,16 +122,55 @@ pub struct Merged {
     pub missing: Vec<String>,
 }
 
+/// The share of calls that may be hedged: each call earns this much of a
+/// hedge, up to [`HEDGE_BURST`] saved, so that a slow cluster is not sent
+/// twice its load.
+pub const HEDGE_SHARE: f64 = 0.05;
+/// Hedges that may be saved up for a burst.
+pub const HEDGE_BURST: f64 = 10.0;
+
+/// The hedges a coordinator may send now, in thousandths of one.
+struct HedgeBudget(AtomicU64);
+
+impl HedgeBudget {
+    const ONE: u64 = 1000;
+    const SHARE: u64 = (HEDGE_SHARE * 1000.0) as u64;
+    const CAP: u64 = (HEDGE_BURST * 1000.0) as u64;
+
+    fn new() -> HedgeBudget {
+        HedgeBudget(AtomicU64::new(Self::CAP))
+    }
+
+    /// Earns a call's share of a hedge.
+    fn earn(&self) {
+        let _ = self.0.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| (b < Self::CAP).then(|| (b + Self::SHARE).min(Self::CAP)));
+    }
+
+    /// Spends a hedge, if one is saved.
+    fn spend(&self) -> bool {
+        self.0.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(Self::ONE)).is_ok()
+    }
+}
+
 fn ms_left(deadline: Instant) -> u32 {
     deadline.saturating_duration_since(Instant::now()).as_millis().clamp(1, u32::MAX as u128) as u32
 }
 
 /// Whether another replica may answer where this one failed: not when the
-/// request itself is wrong.
+/// request itself is wrong, nor when the replica is overloaded
+/// (`ResourceExhausted`), which would only load the next one more.
 fn try_elsewhere(s: &tonic::Status) -> bool {
     !matches!(
         s.code(),
-        Code::InvalidArgument | Code::NotFound | Code::AlreadyExists | Code::PermissionDenied | Code::Unauthenticated | Code::FailedPrecondition | Code::OutOfRange | Code::Unimplemented
+        Code::InvalidArgument
+            | Code::NotFound
+            | Code::AlreadyExists
+            | Code::PermissionDenied
+            | Code::Unauthenticated
+            | Code::FailedPrecondition
+            | Code::OutOfRange
+            | Code::Unimplemented
+            | Code::ResourceExhausted
     )
 }
 
@@ -204,6 +248,7 @@ impl Coordinator {
             skip_until,
             retries: AtomicU64::new(0),
             hedges: AtomicU64::new(0),
+            hedge_budget: HedgeBudget::new(),
         })
     }
 
@@ -228,7 +273,8 @@ impl Coordinator {
     /// Calls shard `i` with `f(replica, client)`, asking its replicas in
     /// [`Self::order`]: the next one when one fails with an error another
     /// may not have, and also when one has not answered after the hedge
-    /// delay. Returns the replica that answered and its answer.
+    /// delay and the hedge budget allows. Returns the replica that
+    /// answered and its answer.
     async fn call<T, F, Fut>(&self, i: usize, start: usize, first: Option<usize>, deadline: Instant, f: F) -> Result<(usize, T), ApiError>
     where
         F: Fn(usize, Client) -> Fut,
@@ -244,7 +290,10 @@ impl Coordinator {
         };
         pending.push(launch(order[0]));
         asked.push(order[0]);
+        self.hedge_budget.earn();
         let mut hedge_at = Instant::now() + self.opts.hedge;
+        // Off once a hedge was due and the budget had none.
+        let mut hedging = true;
         loop {
             let more = asked.len() < order.len();
             tokio::select! {
@@ -275,7 +324,11 @@ impl Coordinator {
                     }
                     Err(s) => return Err(self.named(&self.replicas[i][r].url, s)),
                 },
-                _ = tokio::time::sleep_until(hedge_at.into()), if more => {
+                _ = tokio::time::sleep_until(hedge_at.into()), if more && hedging => {
+                    if !self.hedge_budget.spend() {
+                        hedging = false;
+                        continue;
+                    }
                     self.hedges.fetch_add(1, Ordering::Relaxed);
                     let next = order[asked.len()];
                     pending.push(launch(next));
@@ -300,9 +353,9 @@ impl Coordinator {
     }
 
     /// The statistics of shards `which`, and the replica and lease each
-    /// came from.
+    /// came from. A lease lasts until `deadline` and a second.
     async fn shard_stats(&self, sql: &str, params: &Params, which: Vec<usize>, start: usize, deadline: Instant) -> Vec<(usize, Result<(TermStats, usize, u64), ApiError>)> {
-        let req = pb::QueryRequest { sql: sql.into(), params: params_to_pb(params), ..Default::default() };
+        let req = pb::QueryRequest { sql: sql.into(), params: params_to_pb(params), timeout_ms: ms_left(deadline), ..Default::default() };
         let calls = which.into_iter().map(|i| {
             let req = req.clone();
             async move {
@@ -480,7 +533,9 @@ impl Coordinator {
         let (mut docs, mut segments, mut all_up, mut every_shard) = (0, 0, true, true);
         for (i, answers) in join_all(calls).await.into_iter().enumerate() {
             let mut replicas = Vec::new();
-            let mut counted = None;
+            // Counted from a replica that is "ok", else from any answering:
+            // one that cannot write ("failing") still answers queries.
+            let (mut counted, mut answering) = (None, None);
             for (r, a) in self.replicas[i].iter().zip(answers) {
                 let mut j = match a {
                     Ok(Ok(h)) => {
@@ -488,6 +543,7 @@ impl Coordinator {
                         if h.status == "ok" {
                             counted.get_or_insert((h.docs, h.segments));
                         }
+                        answering.get_or_insert((h.docs, h.segments));
                         json!({"url": r.url, "status": h.status, "docs": h.docs, "segments": h.segments, "txn": h.txn})
                     }
                     Ok(Err(e)) => json!({"url": r.url, "status": "down", "error": e.message()}),
@@ -499,6 +555,7 @@ impl Coordinator {
                 }
                 replicas.push(j);
             }
+            let counted = counted.or(answering);
             every_shard &= counted.is_some();
             let (d, s) = counted.unwrap_or((0, 0));
             docs += d;
@@ -520,5 +577,35 @@ impl Coordinator {
             "status": status, "role": "coordinator", "docs": docs, "segments": segments, "txn": 0, "shards": shards,
             "retries": self.retries.load(Ordering::Relaxed), "hedges": self.hedges.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hedges_stay_within_their_share() {
+        let b = HedgeBudget::new();
+        let mut hedged = 0;
+        for _ in 0..1000 {
+            b.earn();
+            hedged += b.spend() as usize;
+        }
+        // The saved burst, then one call in twenty.
+        assert!((1000 / 20..=HEDGE_BURST as usize + 1000 / 20).contains(&hedged), "{hedged}");
+        assert!(!b.spend());
+    }
+
+    #[test]
+    fn an_overloaded_replica_is_not_retried_elsewhere() {
+        assert!(!try_elsewhere(&tonic::Status::resource_exhausted("too many queries running")));
+        assert!(try_elsewhere(&tonic::Status::unavailable("connection refused")));
+        assert!(!try_elsewhere(&tonic::Status::invalid_argument("bad SQL")));
+        // The server answers too many queries with 429, which crosses gRPC
+        // as ResourceExhausted and back.
+        let s = tonic::Status::from(ApiError { status: 429, message: "too many queries running".into() });
+        assert_eq!(s.code(), Code::ResourceExhausted);
+        assert_eq!(ApiError::from(s).status, 429);
     }
 }

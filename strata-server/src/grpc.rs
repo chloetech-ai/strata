@@ -100,7 +100,7 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn term_stats(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::TermStatsResponse>, Status> {
         let r = req.into_inner();
-        let (stats, snapshot) = self.0.term_stats(&r.sql, &params_from_pb(r.params)).await?;
+        let (stats, snapshot) = self.0.term_stats(&r.sql, &params_from_pb(r.params), r.timeout_ms as u64).await?;
         Ok(Response::new(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot }))
     }
 

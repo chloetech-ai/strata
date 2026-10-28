@@ -3,7 +3,8 @@
 //! | route | body | answer |
 //! |---|---|---|
 //! | `GET /` | | the UI |
-//! | `GET /v1/health`, `/v1/stats`, `/v1/schema`, `/v1/config` | | JSON |
+//! | `GET /livez`, `/readyz` | | `{status}`: 503 when a restart is needed |
+//! | `GET /v1/health`, `/v1/stats`, `/v1/schema`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
 //! | `GET /metrics` | | Prometheus text |
 //! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?}` | rows |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows, or `{written}` |
@@ -12,11 +13,12 @@
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?}` | the bound query and its plan |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
-//! | `POST /v1/term_stats` | `{sql, params?}` | `{stats, snapshot}` |
+//! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
 //! | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the steps taken |
 //!
-//! With a token set, every route but `/` and `/v1/health` needs
+//! With a token set, every route but `/`, `/livez`, `/readyz` and
+//! `/v1/health` needs
 //! `Authorization: Bearer <token>`. Every route checks the `Host` header
 //! and, on a request that can change something, the `Origin` header
 //! ([`crate::auth`]).
@@ -77,6 +79,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
     Router::new()
         .route("/", get(|| async { Html(UI) }))
         .route("/v1/health", get(health))
+        .route("/livez", get(live))
+        .route("/readyz", get(live))
         .merge(api)
         .layer(middleware::from_fn_with_state(app.clone(), browsers))
         .layer(DefaultBodyLimit::max(256 << 20))
@@ -117,8 +121,21 @@ fn body_u64(b: &Json, k: &str) -> u64 {
     b.get(k).and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
-async fn health(State(app): State<App>) -> AxJson<Json> {
-    AxJson(app.svc.health().await)
+async fn health(State(app): State<App>) -> Response {
+    let h = app.svc.health().await;
+    let code = if matches!(h["status"].as_str(), Some("down" | "failing")) { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
+    (code, AxJson(h)).into_response()
+}
+
+/// Liveness and readiness: 503 when the server cannot write until it is
+/// restarted ([`Service::failing`]). Neither asks a coordinator's shards,
+/// so a slow shard cannot take every coordinator out of service at once;
+/// `/v1/health` shows them.
+async fn live(State(app): State<App>) -> Response {
+    match app.svc.failing() {
+        Some(why) => (StatusCode::SERVICE_UNAVAILABLE, AxJson(json!({"status": "failing", "error": why}))).into_response(),
+        None => AxJson(json!({"status": "ok"})).into_response(),
+    }
 }
 
 async fn stats(State(app): State<App>) -> AxJson<Json> {
@@ -279,7 +296,7 @@ async fn put_synonyms(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 
 async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
-    let (stats, snapshot) = app.svc.term_stats(body_str(&b, "sql")?, &params).await?;
+    let (stats, snapshot) = app.svc.term_stats(body_str(&b, "sql")?, &params, body_u64(&b, "timeout_ms")).await?;
     Ok(AxJson(json!({"stats": stats, "snapshot": snapshot})))
 }
 
