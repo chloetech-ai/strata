@@ -116,7 +116,12 @@ impl RangeIndex {
 
     /// The buckets `[lo, hi]` covers and cuts (`None` for an empty range).
     pub fn plan(&self, lo: f64, hi: f64) -> Option<RangePlan> {
-        let range = self.col.key_range(lo, hi)?;
+        self.plan_keys(self.col.key_range(lo, hi))
+    }
+
+    /// The buckets the keys in `range` cover and cut.
+    pub fn plan_keys(&self, range: Option<KeyRange>) -> Option<RangePlan> {
+        let range = range?;
         let h = self.col.histogram();
         let mut p = RangePlan { range, covered: Vec::new(), boundary: Vec::new(), covered_docs: 0, boundary_docs: 0 };
         for i in h.overlapping(range) {
@@ -135,8 +140,13 @@ impl RangeIndex {
     /// Documents with a value in `[lo, hi]` (inclusive; `+-inf` for open
     /// ends).
     pub fn eval(&self, lo: f64, hi: f64) -> DocSet {
+        self.eval_keys(self.col.key_range(lo, hi))
+    }
+
+    /// Documents with a key in `r`.
+    pub fn eval_keys(&self, r: Option<KeyRange>) -> DocSet {
         let n = self.col.len();
-        let Some(p) = self.plan(lo, hi) else { return DocSet::empty(n as u32) };
+        let Some(p) = self.plan_keys(r) else { return DocSet::empty(n as u32) };
         let blocks = self.col.blocks();
         let mut buf = Vec::new();
         if (p.covered_docs + p.boundary_docs) as usize > n / 32 {
@@ -173,7 +183,12 @@ impl RangeIndex {
     /// Number of documents with a value in `[lo, hi]`: covered buckets
     /// count by their stored cardinality, cut ones by checking members.
     pub fn count(&self, lo: f64, hi: f64) -> usize {
-        let Some(p) = self.plan(lo, hi) else { return 0 };
+        self.count_keys(self.col.key_range(lo, hi))
+    }
+
+    /// Number of documents with a key in `r`.
+    pub fn count_keys(&self, r: Option<KeyRange>) -> usize {
+        let Some(p) = self.plan_keys(r) else { return 0 };
         let blocks = self.col.blocks();
         let mut buf = Vec::new();
         let mut c = p.covered_docs as usize;
@@ -208,7 +223,12 @@ mod cost {
 /// Estimated costs (ns) of a scan and of the postings for `[lo, hi]`
 /// (`None` without an index or for an empty range).
 pub fn range_costs(col: &NumericColumn, idx: Option<&RangeIndex>, lo: f64, hi: f64, count_only: bool) -> Option<(f64, f64)> {
-    let p = idx?.plan(lo, hi)?;
+    range_costs_keys(col, idx, col.key_range(lo, hi), count_only)
+}
+
+/// [`range_costs`] of the keys in `r`.
+pub fn range_costs_keys(col: &NumericColumn, idx: Option<&RangeIndex>, r: Option<KeyRange>, count_only: bool) -> Option<(f64, f64)> {
+    let p = idx?.plan_keys(r)?;
     let n = col.len() as f64;
     let blocks = col.len().div_ceil(super::BLOCK) as f64;
     let bitset = if count_only { 0.0 } else { n * cost::BITSET };
@@ -224,7 +244,11 @@ pub fn range_costs(col: &NumericColumn, idx: Option<&RangeIndex>, lo: f64, hi: f
 /// Picks the cheaper strategy for `[lo, hi]` (`count_only`: whether only
 /// the number of matches is needed, which makes covered buckets free).
 pub fn choose_range_strategy(col: &NumericColumn, idx: Option<&RangeIndex>, lo: f64, hi: f64, count_only: bool) -> RangeStrategy {
-    match range_costs(col, idx, lo, hi, count_only) {
+    choose_keys_strategy(col, idx, col.key_range(lo, hi), count_only)
+}
+
+fn choose_keys_strategy(col: &NumericColumn, idx: Option<&RangeIndex>, r: Option<KeyRange>, count_only: bool) -> RangeStrategy {
+    match range_costs_keys(col, idx, r, count_only) {
         Some((scan, postings)) if postings < scan => RangeStrategy::Postings,
         // An empty range costs nothing either way.
         None if idx.is_some() => RangeStrategy::Postings,
@@ -235,24 +259,34 @@ pub fn choose_range_strategy(col: &NumericColumn, idx: Option<&RangeIndex>, lo: 
 /// Documents of `col` with a value in `[lo, hi]` (inclusive; `+-inf` for
 /// open ends), by `strategy` (`Postings` without an index scans).
 pub fn eval_range(col: &NumericColumn, idx: Option<&RangeIndex>, lo: f64, hi: f64, strategy: RangeStrategy) -> DocSet {
+    eval_keys(col, idx, col.key_range(lo, hi), strategy)
+}
+
+/// Documents of `col` with a key in `r`, by `strategy`.
+pub fn eval_keys(col: &NumericColumn, idx: Option<&RangeIndex>, r: Option<KeyRange>, strategy: RangeStrategy) -> DocSet {
     let strategy = match strategy {
-        RangeStrategy::Auto => choose_range_strategy(col, idx, lo, hi, false),
+        RangeStrategy::Auto => choose_keys_strategy(col, idx, r, false),
         s => s,
     };
     match (strategy, idx) {
-        (RangeStrategy::Postings, Some(idx)) => idx.eval(lo, hi),
-        _ => col.scan(lo, hi),
+        (RangeStrategy::Postings, Some(idx)) => idx.eval_keys(r),
+        _ => col.scan_keys(r),
     }
 }
 
 /// Number of documents of `col` with a value in `[lo, hi]`, by `strategy`.
 pub fn count_range(col: &NumericColumn, idx: Option<&RangeIndex>, lo: f64, hi: f64, strategy: RangeStrategy) -> usize {
+    count_keys(col, idx, col.key_range(lo, hi), strategy)
+}
+
+/// Number of documents of `col` with a key in `r`, by `strategy`.
+pub fn count_keys(col: &NumericColumn, idx: Option<&RangeIndex>, r: Option<KeyRange>, strategy: RangeStrategy) -> usize {
     let strategy = match strategy {
-        RangeStrategy::Auto => choose_range_strategy(col, idx, lo, hi, true),
+        RangeStrategy::Auto => choose_keys_strategy(col, idx, r, true),
         s => s,
     };
     match (strategy, idx) {
-        (RangeStrategy::Postings, Some(idx)) => idx.count(lo, hi),
-        _ => col.scan_count(lo, hi),
+        (RangeStrategy::Postings, Some(idx)) => idx.count_keys(r),
+        _ => col.scan_count_keys(r),
     }
 }

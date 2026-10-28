@@ -54,7 +54,7 @@ SELECT [DISTINCT] <columns | * | score() | hops() | aggregates>
 FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [WHERE <predicate>]
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
-[ORDER BY <score, column or aggregate> [ASC | DESC] [, <tie-break> [ASC | DESC]]]
+[ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]]]
 [LIMIT n [OFFSET m]]
 ```
 
@@ -69,14 +69,18 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 
 | type | indexed as | filters |
 |---|---|---|
-| `INT`, `FLOAT` (finite: no NaN or infinity) | frame-of-reference column with zone maps, range histogram | `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN` |
-| `KEYWORD` | dictionary codes and one docID list per value | `=`, `!=`, `IN`, `NOT IN`; `GROUP BY` |
+| `INT`, `FLOAT` (finite: no NaN or infinity) | frame-of-reference column with zone maps, range histogram | `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL` |
+| `KEYWORD` | dictionary codes and one docID list per value | `=`, `!=`, `IN`, `NOT IN`, `IS [NOT] NULL`; `GROUP BY` |
 | `TEXT` | inverted index (optionally with positions); may be generated from other text fields | `MATCH` |
 | `VECTOR(d)` | float32 rows plus 8-bit codes (or 1-bit codes, `"codes": "binary"`), with HNSW, IVF or flat search; may be declared as a model's embedding of other fields ([embedded vector fields](server.md#embedded-vector-fields)) | ordering by `similarity` / `distance`; a similarity graph |
 | `SPARSE` | inverted index of learned term weights (SPLADE and similar) | ordering by `similarity` |
 | `EDGES` | out-edge CSR and reverse index per segment | `REACHABLE`, `PATH`, `ppr` |
 
 Predicates combine with `AND`, `OR`, `NOT` and parentheses, across all of these.
+
+`INT` values are 64-bit integers and compare exactly: `id = 9007199254740993` finds that row and not 9007199254740992, which a double cannot tell apart. A fraction bounds integers by rounding inward (`n > 2.5` is `n >= 3`, `n = 2.5` matches nothing).
+
+`NULL` follows SQL's three-valued logic. A comparison with a missing value is neither true nor false, and so is its negation: `rating != 2` and `NOT rating > 2` leave out the rows without a rating. Ask for them with `rating IS NULL` (`IS NOT NULL` for the others). `MATCH` and graph predicates are always true or false, so `NOT MATCH(body, 'x')` includes rows without a body. A filter on a multi-valued field holds when some value matches, and its negation when none does, so `tags != 'red'` includes rows without tags (`tags IS NULL` finds those). `rating = NULL` is an error that points to `IS NULL`.
 
 `KEYWORD` and `INT` fields may be multi-valued (`"multi": true` in the schema): a row holds a list, such as `ARRAY['red', 'blue']`, and a filter matches a row if any of its values matches. A facet counts each distinct value once per row.
 
@@ -195,7 +199,7 @@ A product's factors are scores (`bm25`, `similarity`, `ppr`, `decay`) and numeri
 
 ### A column
 
-`ORDER BY year DESC` orders by a numeric column. With no `ORDER BY`, rows come in storage order.
+`ORDER BY year DESC` orders by a numeric column. Rows without a value come last in either direction (as in Elasticsearch); `ORDER BY year DESC NULLS FIRST` puts them first. Their `score()` is `NULL`. With no `ORDER BY`, rows come in storage order.
 
 ## Typos and synonyms
 

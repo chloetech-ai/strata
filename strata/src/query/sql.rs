@@ -67,8 +67,8 @@ pub enum Write {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Assign {
     Value(Value),
-    /// `field = field + x` (or `- x`).
-    Add(f64),
+    /// `field = field + x` (or `- x`): an INT or a FLOAT, integers exact.
+    Add(Value),
 }
 
 /// Parses and binds one INSERT, UPDATE or DELETE; `None` for a SELECT.
@@ -133,8 +133,11 @@ pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Op
                 }
                 let assign = match &a.value {
                     Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if b.field_of(left).ok() == Some(f) => {
-                        let x = b.num_lit(right)?;
-                        Assign::Add(if *op == BinaryOperator::Minus { -x } else { x })
+                        Assign::Add(match (b.num_literal(right)?, op) {
+                            (x, BinaryOperator::Plus) => x,
+                            (Value::Int(x), _) => x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int),
+                            (x, _) => Value::Float(-x.as_f64().unwrap_or(0.0)),
+                        })
                     }
                     e => Assign::Value(b.write_value(f, e)?),
                 };
@@ -187,7 +190,7 @@ impl<'a> Binder<'a> {
             }
         }
         let filter = match &s.selection {
-            Some(e) => self.pred(e)?.simplify(),
+            Some(e) => self.pred(e)?.three_valued(&|f| self.schema.fields[f].multi).simplify(),
             None => Pred::True,
         };
         let group_by: Vec<usize> = match &s.group_by {
@@ -234,11 +237,19 @@ impl<'a> Binder<'a> {
             Some(ob) => match &ob.kind {
                 sql::OrderByKind::Expressions(es) if (1..=2).contains(&es.len()) => {
                     let desc = es[0].options.asc == Some(false);
-                    let order = if aggregated {
+                    let mut order = if aggregated {
                         self.group_order(&es[0].expr, desc, &projection, &group_by)?
                     } else {
                         self.order(&es[0].expr, desc, &projection)?
                     };
+                    // Rows without the column's value come last, either way
+                    // (as in Elasticsearch); `NULLS FIRST` puts them first.
+                    if es[0].options.nulls_first == Some(true) {
+                        match &mut order {
+                            OrderBy::Score { score: Score::Column { .. }, nulls_first, .. } => *nulls_first = true,
+                            _ => return Err(err("NULLS FIRST applies to ORDER BY a column")),
+                        }
+                    }
                     let tiebreak = match es.get(1) {
                         None => None,
                         Some(e) => Some(self.tiebreak(&e.expr, e.options.asc == Some(false), &projection, &group_by)?),
@@ -296,7 +307,7 @@ impl<'a> Binder<'a> {
         let mut through = None;
         for (k, e) in named {
             if k == "through" {
-                let p = self.pred(e)?.simplify();
+                let p = self.pred(e)?.three_valued(&|f| self.schema.fields[f].multi).simplify();
                 if contains_graph(&p) {
                     return Err(err("a through predicate cannot hold a graph predicate"));
                 }
@@ -593,25 +604,25 @@ impl<'a> Binder<'a> {
         if let Some(n) = literal_usize(e) {
             let (_, p) = proj.get(n.wrapping_sub(1)).ok_or_else(|| err(format!("ORDER BY {n}: no such column")))?;
             return match p {
-                Projection::Field(f) => Ok(OrderBy::Score { score: Score::Column { field: *f }, desc }),
+                Projection::Field(f) => Ok(OrderBy::Score { score: Score::Column { field: *f }, desc, nulls_first: false }),
                 Projection::Score => Err(err("ORDER BY score(): order by the score expression itself")),
-                Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true }),
+                Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true, nulls_first: false }),
                 Projection::Count | Projection::Agg { .. } => Err(err("ORDER BY an aggregate needs GROUP BY")),
             };
         }
         // `ORDER BY hops()` is nearest first; ranking is always best first.
         if let Expr::Function(f) = e {
             if fname(f) == "hops" {
-                return Ok(OrderBy::Score { score: Score::Hops { graph: self.hops_graph()?, far_first: desc }, desc: true });
+                return Ok(OrderBy::Score { score: Score::Hops { graph: self.hops_graph()?, far_first: desc }, desc: true, nulls_first: false });
             }
         }
         // `ORDER BY distance(..) ASC` ranks like `similarity DESC`.
         if let Expr::Function(f) = e {
             if fname(f) == "distance" {
-                return Ok(OrderBy::Score { score: self.score(e)?, desc: !desc });
+                return Ok(OrderBy::Score { score: self.score(e)?, desc: !desc, nulls_first: false });
             }
         }
-        Ok(OrderBy::Score { score: self.score(e)?, desc })
+        Ok(OrderBy::Score { score: self.score(e)?, desc, nulls_first: false })
     }
 
     fn score(&self, e: &Expr) -> Result<Score> {
@@ -770,9 +781,21 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op, right } => self.comparison(left, op, right)?,
             Expr::Between { expr, negated, low, high } => {
                 let f = self.numeric_field(expr)?;
-                let (lo, hi) = (self.num_lit(low)?, self.num_lit(high)?);
-                let p = Pred::Range { field: f, lo, hi };
+                let p = if self.schema.fields[f].ty == FieldType::Int {
+                    int_range(f, ceil(&self.num_literal(low)?), floor(&self.num_literal(high)?))
+                } else {
+                    Pred::Range { field: f, lo: self.num_lit(low)?, hi: self.num_lit(high)? }
+                };
                 if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
+            Expr::IsNull(x) | Expr::IsNotNull(x) => {
+                let f = self.field_of(x)?;
+                let field = &self.schema.fields[f];
+                if !matches!(field.ty, FieldType::Int | FieldType::Float | FieldType::Keyword) || !field.indexed {
+                    return Err(err(format!("IS NULL works on indexed INT, FLOAT and KEYWORD fields, not {}", field.name)));
+                }
+                let p = Pred::Present { field: f };
+                if matches!(e, Expr::IsNull(_)) { Pred::Not(Box::new(p)) } else { p }
             }
             Expr::InList { expr, list, negated } => {
                 let f = self.field_of(expr)?;
@@ -834,6 +857,9 @@ impl<'a> Binder<'a> {
         };
         let f = self.field_of(field_e)?;
         let ty = &self.schema.fields[f].ty;
+        if matches!(self.literal(lit_e), Ok(Value::Null)) {
+            return Err(err(format!("{e} compares with NULL, which is never true: use IS NULL or IS NOT NULL", e = Expr::BinaryOp { left: Box::new(left.clone()), op: op.clone(), right: Box::new(right.clone()) })));
+        }
         if matches!(ty, FieldType::Keyword) {
             let v = self.field_value(f, lit_e)?;
             return match op {
@@ -842,22 +868,34 @@ impl<'a> Binder<'a> {
                 _ => Err(err("keyword fields support =, != and IN")),
             };
         }
-        if !matches!(ty, FieldType::Int | FieldType::Float) {
+        if matches!(ty, FieldType::Int) {
+            // Integers compare exactly, in 128 bits so that the bounds of
+            // `> i64::MAX` or `< 1e30` need no special cases.
+            let v = self.num_literal(lit_e)?;
+            let (min, max) = (i64::MIN as i128, i64::MAX as i128);
+            return Ok(match op {
+                Eq => int_range(f, ceil(&v), floor(&v)),
+                NotEq => Pred::Not(Box::new(int_range(f, ceil(&v), floor(&v)))),
+                Gt => int_range(f, floor(&v) + 1, max),
+                GtEq => int_range(f, ceil(&v), max),
+                Lt => int_range(f, min, ceil(&v) - 1),
+                LtEq => int_range(f, min, floor(&v)),
+                o => return Err(err(format!("unsupported operator {o}"))),
+            });
+        }
+        if !matches!(ty, FieldType::Float) {
             return Err(err(format!("cannot compare field {}", self.schema.fields[f].name)));
         }
         let x = self.num_lit(lit_e)?;
-        let int = matches!(ty, FieldType::Int);
-        let above = |x: f64| if int { x.floor() + 1.0 } else { next_up(x) };
-        let below = |x: f64| if int { x.ceil() - 1.0 } else { next_down(x) };
         let (inf, ninf) = (f64::INFINITY, f64::NEG_INFINITY);
         let range = |lo, hi| Pred::Range { field: f, lo, hi };
         Ok(match op {
             Eq => range(x, x),
             NotEq => Pred::Not(Box::new(range(x, x))),
-            Gt => range(above(x), inf),
-            GtEq => range(if int { x.ceil() } else { x }, inf),
-            Lt => range(ninf, below(x)),
-            LtEq => range(ninf, if int { x.floor() } else { x }),
+            Gt => range(next_up(x), inf),
+            GtEq => range(x, inf),
+            Lt => range(ninf, next_down(x)),
+            LtEq => range(ninf, x),
             o => return Err(err(format!("unsupported operator {o}"))),
         })
     }
@@ -920,7 +958,8 @@ impl<'a> Binder<'a> {
                 other => Err(err(format!("unsupported literal {other}"))),
             },
             Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => match self.literal(expr)? {
-                Value::Int(x) => Ok(Value::Int(-x)),
+                // -i64::MIN is the one integer without a negation.
+                Value::Int(x) => Ok(x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int)),
                 Value::Float(x) => Ok(Value::Float(-x)),
                 _ => Err(err("cannot negate a non-number")),
             },
@@ -938,6 +977,18 @@ impl<'a> Binder<'a> {
 
     fn num_lit(&self, e: &Expr) -> Result<f64> {
         self.number(e).ok_or_else(|| err(format!("expected a number, got {e}")))
+    }
+
+    /// A finite numeric literal or parameter, an integer kept exact.
+    fn num_literal(&self, e: &Expr) -> Result<Value> {
+        if self.field_of(e).is_err() {
+            match self.literal(e) {
+                Ok(v @ Value::Int(_)) => return Ok(v),
+                Ok(Value::Float(x)) if x.is_finite() => return Ok(Value::Float(x)),
+                _ => {}
+            }
+        }
+        Err(err(format!("expected a number, got {e}")))
     }
 
     fn usize_lit(&self, e: &Expr) -> Result<usize> {
@@ -1000,6 +1051,10 @@ impl<'a> Binder<'a> {
                 let v: Vec<f32> = serde_json::from_str(&s).map_err(|_| err("vector literal must be a JSON array"))?;
                 v.into()
             }
+            // Clients send a list of whole numbers as a list of integers.
+            Value::List(xs) if !xs.is_empty() && xs.iter().all(|x| matches!(x, Value::Int(_) | Value::Float(_))) => {
+                xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect::<Vec<_>>().into()
+            }
             v => return Err(err(format!("expected a vector, got {v:?}"))),
         };
         if v.iter().any(|x| !x.is_finite()) {
@@ -1030,6 +1085,32 @@ fn literal_usize(e: &Expr) -> Option<usize> {
         },
         _ => None,
     }
+}
+
+/// The smallest integer at least `v` (a number), in 128 bits so that
+/// doubles beyond the 64-bit range stay beyond it.
+fn ceil(v: &Value) -> i128 {
+    match v {
+        Value::Int(x) => *x as i128,
+        v => v.as_f64().unwrap_or(0.0).ceil().clamp(-1e20, 1e20) as i128,
+    }
+}
+
+/// The largest integer at most `v` (a number).
+fn floor(v: &Value) -> i128 {
+    match v {
+        Value::Int(x) => *x as i128,
+        v => v.as_f64().unwrap_or(0.0).floor().clamp(-1e20, 1e20) as i128,
+    }
+}
+
+/// INT field `f` within `[lo, hi]`, cut to the 64-bit range.
+fn int_range(f: usize, lo: i128, hi: i128) -> Pred {
+    let (lo, hi) = (lo.max(i64::MIN as i128), hi.min(i64::MAX as i128));
+    if lo > hi {
+        return Pred::False;
+    }
+    Pred::IntRange { field: f, lo: lo as i64, hi: hi as i64 }
 }
 
 fn next_up(x: f64) -> f64 {
@@ -1086,22 +1167,22 @@ mod tests {
         let Pred::And(ps) = &s.filter else { panic!("{:?}", s.filter) };
         assert_eq!(ps.len(), 4);
         assert!(matches!(&ps[0], Pred::Match { field: 3, query, .. } if query == "vaccine -animal"));
-        assert_eq!(ps[1], Pred::Range { field: 4, lo: 2019.0, hi: 2021.0 });
+        assert_eq!(ps[1], Pred::IntRange { field: 4, lo: 2019, hi: 2021 });
         assert!(matches!(&ps[2], Pred::In { field: 5, values } if values.len() == 2));
         assert!(matches!(ps[3], Pred::Range { field: 6, lo, hi } if lo > 4.0 && lo < 4.0001 && hi.is_infinite()));
-        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Bm25 { field: 3, text, .. }, desc: true }) if text == "mrna vaccine"));
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Bm25 { field: 3, text, .. }, desc: true, .. }) if text == "mrna vaccine"));
     }
 
     #[test]
     fn binds_vector_and_hybrid_scores() {
         let s = bind("SELECT id FROM docs WHERE year > 2019 ORDER BY similarity(emb, :q, nprobe => 32) DESC LIMIT 5", &schema(), &q())
             .unwrap();
-        assert_eq!(s.filter, Pred::Range { field: 4, lo: 2020.0, hi: f64::INFINITY });
-        let Some(OrderBy::Score { score: Score::Similarity { opts, .. }, desc: true }) = &s.order else { panic!() };
+        assert_eq!(s.filter, Pred::IntRange { field: 4, lo: 2020, hi: i64::MAX });
+        let Some(OrderBy::Score { score: Score::Similarity { opts, .. }, desc: true, .. }) = &s.order else { panic!() };
         assert_eq!(opts.get("nprobe"), Some(&Value::Int(32)));
 
         let s = bind("SELECT id FROM docs ORDER BY distance(emb, :q) LIMIT 5", &schema(), &q()).unwrap();
-        assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Similarity { .. }, desc: true })));
+        assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Similarity { .. }, desc: true, .. })));
 
         let s = bind("SELECT id FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q), k => 20) DESC LIMIT 5", &schema(), &q())
             .unwrap();
@@ -1125,10 +1206,10 @@ mod tests {
         assert_eq!(s.tiebreak, Some(Tiebreak::GroupValue { desc: false }));
         let s = bind("SELECT id FROM docs WHERE rating BETWEEN 2.0 AND 2.0 ORDER BY rating DESC, id LIMIT 10", &schema(), &q()).unwrap();
         assert_eq!(s.tiebreak, Some(Tiebreak::Key { desc: false }));
-        assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Column { field: 6 }, desc: true })));
+        assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Column { field: 6 }, desc: true, .. })));
         // A product of scores (a boost), not a weighted sum.
         let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
-        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true }) if f.len() == 2), "{:?}", s.order);
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true, .. }) if f.len() == 2), "{:?}", s.order);
 
         for bad in [
             "SELECT id FROM other",
@@ -1151,6 +1232,7 @@ mod tests {
         assert_eq!((s.limit, s.offset), (Some(3), 1));
         let Pred::Or(ps) = &s.filter else { panic!() };
         assert!(matches!(ps[0], Pred::Range { lo, hi, .. } if lo.is_infinite() && hi < 2.5 && hi > 2.4999));
-        assert!(matches!(&ps[1], Pred::Not(_)));
+        // A negated comparison also needs the value (NULL != 'c00' is not true).
+        assert!(matches!(&ps[1], Pred::And(qs) if matches!(qs[..], [Pred::Present { field: 5 }, Pred::Not(_)])), "{:?}", ps[1]);
     }
 }

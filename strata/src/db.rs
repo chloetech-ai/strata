@@ -365,18 +365,23 @@ impl Db {
                             Assign::Value(v) => v.clone(),
                             // NULL counts as zero; a sum that overflows is an
                             // error, as in Postgres.
-                            Assign::Add(x) => match schema.fields[f].ty {
-                                FieldType::Int => Value::Int(
-                                    row[f].as_i64().unwrap_or(0).checked_add(*x as i64).ok_or_else(|| crate::Error::Query(format!("{} + {x} overflows", schema.fields[f].name)))?,
-                                ),
-                                _ => {
-                                    let y = row[f].as_f64().unwrap_or(0.0) + x;
-                                    if !y.is_finite() {
-                                        return Err(crate::Error::Query(format!("{} + {x} overflows", schema.fields[f].name)));
+                            Assign::Add(x) => {
+                                let overflow = || crate::Error::Query(format!("{} + {x:?} overflows", schema.fields[f].name));
+                                match (&schema.fields[f].ty, x) {
+                                    (FieldType::Int, Value::Int(x)) => Value::Int(row[f].as_i64().unwrap_or(0).checked_add(*x).ok_or_else(overflow)?),
+                                    (FieldType::Int, Value::Float(y)) if y.fract() == 0.0 && y.abs() < 9.2e18 => {
+                                        Value::Int(row[f].as_i64().unwrap_or(0).checked_add(*y as i64).ok_or_else(overflow)?)
                                     }
-                                    Value::Float(y)
+                                    (FieldType::Int, _) => return Err(crate::Error::Query(format!("{} is INT: add an integer", schema.fields[f].name))),
+                                    _ => {
+                                        let y = row[f].as_f64().unwrap_or(0.0) + x.as_f64().unwrap_or(0.0);
+                                        if !y.is_finite() {
+                                            return Err(overflow());
+                                        }
+                                        Value::Float(y)
+                                    }
                                 }
-                            },
+                            }
                         })
                     };
                     if sets.iter().all(|(f, _)| in_place(*f)) {

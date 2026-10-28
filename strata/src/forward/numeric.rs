@@ -451,11 +451,25 @@ impl NumericColumn {
         self.kind.key_range(lo, hi)
     }
 
+    /// The keys of the integers in `[lo, hi]`: exact for INT columns, whose
+    /// keys are their values (a double cannot tell 2^53 from 2^53 + 1).
+    pub fn int_key_range(&self, lo: i64, hi: i64) -> Option<KeyRange> {
+        match self.kind {
+            NumericKind::Int => (lo <= hi).then_some(KeyRange { lo, hi }),
+            k => k.key_range(lo as f64, hi as f64),
+        }
+    }
+
     /// Documents with a value in `[lo, hi]`: a scan of the packed blocks,
     /// skipping blocks by their zone maps.
     pub fn scan(&self, lo: f64, hi: f64) -> DocSet {
+        self.scan_keys(self.key_range(lo, hi))
+    }
+
+    /// Documents with a key in `r` (none for `None`).
+    pub fn scan_keys(&self, r: Option<KeyRange>) -> DocSet {
         let n = self.len() as u32;
-        match self.key_range(lo, hi) {
+        match r {
             Some(r) => DocSet::from_bits(self.blocks.scan_bits(r), n),
             None => DocSet::empty(n),
         }
@@ -464,7 +478,12 @@ impl NumericColumn {
     /// Number of documents with a value in `[lo, hi]` (a scan that only
     /// counts).
     pub fn scan_count(&self, lo: f64, hi: f64) -> usize {
-        self.key_range(lo, hi).map_or(0, |r| self.blocks.scan_count(r))
+        self.scan_count_keys(self.key_range(lo, hi))
+    }
+
+    /// Number of documents with a key in `r`.
+    pub fn scan_count_keys(&self, r: Option<KeyRange>) -> usize {
+        r.map_or(0, |r| self.blocks.scan_count(r))
     }
 
     /// Whether document `d` has a value in `[lo, hi]`. Converts the bounds
@@ -475,7 +494,12 @@ impl NumericColumn {
 
     /// A per-document check of `[lo, hi]` against the column.
     pub fn filter(&self, lo: f64, hi: f64) -> ColumnRangeFilter {
-        ColumnRangeFilter { blocks: self.blocks.clone(), range: self.key_range(lo, hi), estimate: self.estimate(lo, hi).round() as usize }
+        self.filter_keys(self.key_range(lo, hi))
+    }
+
+    /// A per-document check of the keys in `r` against the column.
+    pub fn filter_keys(&self, r: Option<KeyRange>) -> ColumnRangeFilter {
+        ColumnRangeFilter { blocks: self.blocks.clone(), range: r, estimate: self.estimate_keys(r).round() as usize }
     }
 
     /// Estimated number of documents with a value in `[lo, hi]`, from the
@@ -483,7 +507,13 @@ impl NumericColumn {
     /// the covered fraction of their value range. Without a histogram,
     /// values are assumed uniform between the minimum and maximum.
     pub fn estimate(&self, lo: f64, hi: f64) -> f64 {
-        let Some(r) = self.key_range(lo, hi) else { return 0.0 };
+        self.estimate_keys(self.key_range(lo, hi))
+    }
+
+    /// Estimated number of documents with a key in `r` (as
+    /// [`NumericColumn::estimate`]).
+    pub fn estimate_keys(&self, r: Option<KeyRange>) -> f64 {
+        let Some(r) = r else { return 0.0 };
         let Some((gmin, gmax)) = self.blocks.key_bounds() else { return 0.0 };
         if self.hist.is_empty() {
             return self.n_present() as f64 * self.fraction(r, gmin, gmax);

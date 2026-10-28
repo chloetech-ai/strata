@@ -302,12 +302,25 @@ impl KeywordColumn {
 
     /// Codes of the INT values in `lo..=hi` of a multi-valued INT field.
     pub fn int_codes(&self, lo: f64, hi: f64) -> std::ops::Range<u32> {
+        const TWO63: f64 = 9_223_372_036_854_775_808.0;
         let (lo, hi) = (lo.ceil(), hi.floor());
-        if lo > hi || lo >= i64::MAX as f64 || hi < i64::MIN as f64 {
+        if !(lo <= hi) || lo >= TWO63 || hi < -TWO63 {
             return 0..0;
         }
-        let a = self.lower_bound(&int_key(lo.max(i64::MIN as f64) as i64));
-        let b = if hi >= i64::MAX as f64 { self.n_values() as u32 } else { self.lower_bound(&int_key(hi as i64 + 1)) };
+        // `as` saturates at the i64 limits.
+        self.int_codes_exact(lo as i64, if hi >= TWO63 { i64::MAX } else { hi as i64 })
+    }
+
+    /// Codes of the INT values in `lo..=hi` (exact bounds).
+    pub fn int_codes_exact(&self, lo: i64, hi: i64) -> std::ops::Range<u32> {
+        if lo > hi {
+            return 0..0;
+        }
+        let a = self.lower_bound(&int_key(lo));
+        let b = match hi.checked_add(1) {
+            Some(h) => self.lower_bound(&int_key(h)),
+            None => self.n_values() as u32,
+        };
         a..b.max(a)
     }
 
@@ -419,6 +432,16 @@ impl KeywordColumn {
                 DocSet::from_sorted(out, n)
             }
         }
+    }
+
+    /// Documents with a value (multi-valued: at least one).
+    pub fn present(&self) -> DocSet {
+        DocSet::from_bits(self.codes.scan_bits(super::KeyRange { lo: i64::MIN, hi: i64::MAX }), self.n as u32)
+    }
+
+    /// Number of documents with a value.
+    pub fn n_present(&self) -> usize {
+        self.codes.n_present()
     }
 
     /// Documents with `value` (`= value`).

@@ -79,7 +79,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     let (mut rows, want) = match &q.order {
         None => (rows, q.limit),
         Some(OrderBy::Score { score: score @ (Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_)), .. }) => (fuse(score, rows)?, Some(q.limit.unwrap_or(DEFAULT_K))),
-        Some(OrderBy::Score { score, desc }) => {
+        Some(OrderBy::Score { score, desc, .. }) => {
             let desc = *desc || !matches!(score, Score::Column { .. });
             rows.sort_by(|a, b| by_score(a.score, b.score, desc).then_with(|| by_key(&a.key, &b.key, key_desc)));
             let want = if matches!(score, Score::Column { .. }) { q.limit } else { Some(q.limit.unwrap_or(DEFAULT_K)) };
@@ -96,7 +96,8 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     let mut out = empty(Vec::with_capacity(rows.len()), stats);
     for mut r in rows {
         for &c in &score_cols {
-            r.values[c] = Value::Float(r.score);
+            // Rows without the ordering column's value score ±inf.
+            r.values[c] = if r.score.is_finite() { Value::Float(r.score) } else { Value::Null };
         }
         out.keys.push(r.key);
         out.scores.push(r.score);

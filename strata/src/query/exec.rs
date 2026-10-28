@@ -11,7 +11,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::forward::{self, DocStore, KeywordColumn, NumericColumn, RangeIndex, RangeStrategy};
+use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, RangeIndex, RangeStrategy};
 use crate::graph::GraphReader;
 use crate::query::fusion::{self, Norm};
 use crate::query::agg;
@@ -504,8 +504,10 @@ impl<'a> Executor<'a> {
         let want = q.limit.map(|l| l.saturating_add(q.offset).min(self.n_live()));
         Ok(match &q.order {
             None => self.unordered(&q.filter, want)?,
-            Some(OrderBy::Score { score: Score::Column { field }, desc }) => self.by_column(*field, *desc, &q.filter, want, q.tiebreak.as_ref())?,
-            Some(OrderBy::Score { score, desc: true }) => self.ranked(score, &q.filter, want.unwrap_or(DEFAULT_K), q.tiebreak.as_ref())?,
+            Some(OrderBy::Score { score: Score::Column { field }, desc, nulls_first }) => {
+                self.by_column(*field, *desc, Some(*nulls_first), &q.filter, want, q.tiebreak.as_ref())?
+            }
+            Some(OrderBy::Score { score, desc: true, .. }) => self.ranked(score, &q.filter, want.unwrap_or(DEFAULT_K), q.tiebreak.as_ref())?,
             Some(OrderBy::Score { .. }) => return Err(err("relevance scores can only be ordered DESC")),
             Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
         })
@@ -537,14 +539,22 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Document `d`'s value of INT `field`, exactly.
+    fn int_value(&self, s: &'a Seg, field: usize, col: &NumericColumn, d: DocId) -> Option<i64> {
+        match self.updates(s, field).and_then(|u| u.get(field, d)) {
+            Some(v) => v.as_i64(),
+            None => col.get_i64(d),
+        }
+    }
+
     /// `set`, the documents whose column value of `field` passes `keep`,
     /// corrected for the values written in place.
-    fn patch(&self, s: &'a Seg, field: usize, set: DocSet, keep: impl Fn(f64) -> bool) -> DocSet {
+    fn patch(&self, s: &'a Seg, field: usize, set: DocSet, keep: impl Fn(&Value) -> bool) -> DocSet {
         let Some(u) = self.updates(s, field) else { return set };
         let n = s.r.n_docs;
         let (mut add, mut drop) = (Vec::new(), Vec::new());
         for (d, v) in u.field(field) {
-            if v.as_f64().is_some_and(&keep) {
+            if keep(v) {
                 add.push(d);
             } else {
                 drop.push(d);
@@ -687,8 +697,24 @@ impl<'a> Executor<'a> {
             Pred::Range { field, lo, hi } => {
                 let num = self.numeric(s, *field)?;
                 let set = forward::eval_range(num.col(), num.index(), *lo, *hi, self.opts.range);
-                self.patch(s, *field, set, |x| *lo <= x && x <= *hi)
+                self.patch(s, *field, set, |v| v.as_f64().is_some_and(|x| *lo <= x && x <= *hi))
             }
+            Pred::IntRange { field, lo, hi } if self.schema.fields[*field].multi => {
+                let kw = self.keyword(s, *field)?;
+                kw.docs_codes(&kw.int_codes_exact(*lo, *hi).collect::<Vec<u32>>())
+            }
+            Pred::IntRange { field, lo, hi } => {
+                let num = self.numeric(s, *field)?;
+                let set = forward::eval_keys(num.col(), num.index(), num.col().int_key_range(*lo, *hi), self.opts.range);
+                self.patch(s, *field, set, |v| int_in(v, *lo, *hi))
+            }
+            Pred::Present { field } => match self.schema.fields[*field].ty {
+                FieldType::Int | FieldType::Float if !self.schema.fields[*field].multi => {
+                    let set = self.numeric(s, *field)?.col().scan_keys(Some(KeyRange { lo: i64::MIN, hi: i64::MAX }));
+                    self.patch(s, *field, set, |v| !matches!(v, Value::Null))
+                }
+                _ => self.keyword(s, *field)?.present(),
+            },
             Pred::In { field, values } => self.materialize_in(s, *field, values)?,
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
             Pred::Not(c) => self.materialize(s, c)?.complement(),
@@ -738,11 +764,10 @@ impl<'a> Executor<'a> {
             _ => {
                 let num = self.numeric(s, field)?;
                 let mut acc = DocSet::empty(s.r.n_docs);
-                let xs: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
-                for &v in &xs {
-                    acc = acc.union(&forward::eval_range(num.col(), num.index(), v, v, self.opts.range));
+                for v in values {
+                    acc = acc.union(&forward::eval_keys(num.col(), num.index(), value_keys(num.col(), v), self.opts.range));
                 }
-                Ok(self.patch(s, field, acc, |x| xs.contains(&x)))
+                Ok(self.patch(s, field, acc, |v| values.iter().any(|x| num_eq(v, x))))
             }
         }
     }
@@ -754,10 +779,17 @@ impl<'a> Executor<'a> {
             Pred::Match { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
             // Multi-valued fields are probed through their postings, fields
             // with values written in place through the corrected set.
-            Pred::Range { field, .. } | Pred::In { field, .. } if self.schema.fields[*field].multi || self.updates(s, *field).is_some() => {
+            Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. }
+                if self.schema.fields[*field].multi || self.updates(s, *field).is_some() =>
+            {
                 ProbeNode::Leaf(Box::new(self.materialize(s, p)?))
             }
+            Pred::Present { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
             Pred::Range { field, lo, hi } => ProbeNode::Leaf(Box::new(self.numeric(s, *field)?.col().filter(*lo, *hi))),
+            Pred::IntRange { field, lo, hi } => {
+                let col = self.numeric(s, *field)?.col();
+                ProbeNode::Leaf(Box::new(col.filter_keys(col.int_key_range(*lo, *hi))))
+            }
             Pred::In { field, values } => match self.schema.fields[*field].ty {
                 FieldType::Keyword => {
                     let vs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
@@ -765,7 +797,7 @@ impl<'a> Executor<'a> {
                 }
                 _ => {
                     let col = self.numeric(s, *field)?.col();
-                    ProbeNode::Or(values.iter().filter_map(|v| v.as_f64()).map(|v| ProbeNode::Leaf(Box::new(col.filter(v, v)))).collect())
+                    ProbeNode::Or(values.iter().map(|v| ProbeNode::Leaf(Box::new(col.filter_keys(value_keys(col, v))))).collect())
                 }
             },
             Pred::Graph { id } => ProbeNode::Leaf(Box::new(self.graph_set(*id, s.ord, s.r.n_docs))),
@@ -795,6 +827,11 @@ impl<'a> Executor<'a> {
                     self.stats.plan.push(format!("seg {}: count from the range index", s.ord));
                     forward::count_range(num.col(), num.index(), *lo, *hi, self.opts.range) as u64
                 }
+                (Pred::IntRange { field, lo, hi }, None) if !self.schema.fields[*field].multi && self.updates(s, *field).is_none() => {
+                    let num = self.numeric(s, *field)?;
+                    self.stats.plan.push(format!("seg {}: count from the range index", s.ord));
+                    forward::count_keys(num.col(), num.index(), num.col().int_key_range(*lo, *hi), self.opts.range) as u64
+                }
                 _ => self.filter_set(s, p)?.len() as u64,
             };
         }
@@ -821,35 +858,57 @@ impl<'a> Executor<'a> {
     }
 
     /// Top rows by a numeric column; all rows tied with the last one are
-    /// kept until the tie-break orders them.
-    fn by_column(&mut self, field: usize, desc: bool, p: &Pred, want: Option<usize>, tb: Option<&Tiebreak>) -> Result<Vec<Hit>> {
-        let mut cands = Vec::new();
+    /// kept until the tie-break orders them. Rows without a value are left
+    /// out (`nulls: None`, a fusion input) or score `∓inf` so that they
+    /// sort last, or first with `nulls: Some(true)` (`NULLS FIRST`).
+    fn by_column(&mut self, field: usize, desc: bool, nulls: Option<bool>, p: &Pred, want: Option<usize>, tb: Option<&Tiebreak>) -> Result<Vec<Hit>> {
+        let null_score = nulls.map(|first| if first == desc { f64::INFINITY } else { f64::NEG_INFINITY });
+        // Each row with its exact INT value: a double cannot order
+        // integers beyond 2^53 (0 for FLOAT columns and missing values).
+        let int = self.schema.fields[field].ty == FieldType::Int;
+        let mut cands: Vec<(Hit, i64)> = Vec::new();
         let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
         for s in segs {
             self.check_deadline()?;
             let col = self.numeric(s, field)?.col();
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
-                if let Some(v) = self.num_value(s, field, col, d) {
-                    cands.push(Hit { seg: s.ord, doc: d, score: v });
+                if let Some(v) = self.num_value(s, field, col, d).or(null_score) {
+                    let exact = if int { self.int_value(s, field, col, d).unwrap_or(0) } else { 0 };
+                    cands.push((Hit { seg: s.ord, doc: d, score: v }, exact));
                 }
             }
         }
         self.stats.scored += cands.len() as u64;
-        let better = |a: &Hit, b: &Hit| if desc { b.score.total_cmp(&a.score) } else { a.score.total_cmp(&b.score) };
+        let better = |a: &(Hit, i64), b: &(Hit, i64)| {
+            let o = a.0.score.total_cmp(&b.0.score).then(a.1.cmp(&b.1));
+            if desc { o.reverse() } else { o }
+        };
         if let Some(k) = want.filter(|&k| k > 0 && k < cands.len()) {
             cands.select_nth_unstable_by(k - 1, better);
-            let cut = cands[k - 1].score;
-            cands.retain(|h| if desc { h.score >= cut } else { h.score <= cut });
+            let cut = cands[k - 1];
+            cands.retain(|c| better(c, &cut) != std::cmp::Ordering::Greater);
         }
-        cands.sort_by(|a, b| better(a, b).then((a.seg, a.doc).cmp(&(b.seg, b.doc))));
-        if let Some(Tiebreak::Key { desc: kd }) = tb {
-            self.sort_by_score_then_key(&mut cands, desc, *kd);
-        }
+        // Rows tied on the value go by key (`ORDER BY rating DESC, id`), or
+        // in index order.
+        let key_desc = match tb {
+            Some(Tiebreak::Key { desc }) => Some(*desc),
+            _ => None,
+        };
+        let mut keyed: Vec<(Hit, i64, Value)> = cands.into_iter().map(|(h, x)| (h, x, if key_desc.is_some() { self.key(&h) } else { Value::Null })).collect();
+        keyed.sort_by(|a, b| {
+            better(&(a.0, a.1), &(b.0, b.1)).then_with(|| match key_desc {
+                Some(kd) => {
+                    let c = cmp_values(&a.2, &b.2);
+                    if kd { c.reverse() } else { c }
+                }
+                None => (a.0.seg, a.0.doc).cmp(&(b.0.seg, b.0.doc)),
+            })
+        });
         if let Some(k) = want {
-            cands.truncate(k);
+            keyed.truncate(k);
         }
-        Ok(cands)
+        Ok(keyed.into_iter().map(|(h, _, _)| h).collect())
     }
 
     /// The `k` rows of the filter with the largest decay of `field` (rows
@@ -919,7 +978,7 @@ impl<'a> Executor<'a> {
         let mut hits = match score {
             // Scans of every row: they keep the whole tie at the cut and
             // order it by key themselves.
-            Score::Column { field } => return self.by_column(*field, true, p, Some(depth), Some(&Tiebreak::Key { desc: key_desc })),
+            Score::Column { field } => return self.by_column(*field, true, None, p, Some(depth), Some(&Tiebreak::Key { desc: key_desc })),
             Score::Decay { field, decay, .. } => return self.decay_top(*field, decay, p, depth, key_desc),
             // These keep every row tied with the depth-th.
             Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, depth)?,
@@ -971,7 +1030,7 @@ impl<'a> Executor<'a> {
             Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, k, false),
             Score::Similarity { field, vector, opts } => self.vector_top(*field, vector, opts, p, k),
             Score::Sparse { field, terms, opts } => self.sparse_top(*field, terms, opts, p, k),
-            Score::Column { field } => self.by_column(*field, true, p, Some(k), None),
+            Score::Column { field } => self.by_column(*field, true, None, p, Some(k), None),
             Score::Decay { field, decay, .. } => self.decay_top(*field, decay, p, k, false),
             Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, k),
             _ => Err(err("fusion inputs must be bm25, similarity, ppr, hops, decay or a column")),
@@ -1674,7 +1733,9 @@ impl<'a> Executor<'a> {
             let mut row = Vec::with_capacity(q.projection.len());
             for (_, p) in &q.projection {
                 row.push(match p {
-                    Projection::Score => Value::Float(h.score),
+                    // A row without the ordering column's value scores ±inf.
+                    Projection::Score if h.score.is_finite() => Value::Float(h.score),
+                    Projection::Score => Value::Null,
                     Projection::Count | Projection::Agg { .. } => Value::Null,
                     Projection::Hops(g) => self.hops_of(*g, h.seg, h.doc).map_or(Value::Null, |x| Value::Int(x as i64)),
                     Projection::Field(i) if Some(*i) == self.schema.primary_key => self.key(h),
@@ -1825,6 +1886,12 @@ impl Estimator for SegEst<'_, '_> {
         let n = self.s.r.numeric(field).ok().flatten()?;
         forward::range_costs(n.col(), n.index(), lo, hi, false).map(|(scan, post)| scan.min(post))
     }
+    fn present_count(&self, field: usize) -> f64 {
+        if let Some(kw) = self.s.r.keyword(field).ok().flatten() {
+            return kw.n_present() as f64;
+        }
+        self.s.r.numeric(field).ok().flatten().map_or(self.n_docs(), |n| n.col().n_present() as f64)
+    }
     fn in_count(&self, field: usize, values: &[Value]) -> f64 {
         if let Some(kw) = self.s.r.keyword(field).ok().flatten() {
             return values.iter().filter_map(forward::key_of).map(|v| kw.count(&v) as f64).sum();
@@ -1848,5 +1915,30 @@ impl Estimator for SegEst<'_, '_> {
             _ => card,
         };
         vr.estimate_cost(st, k, card.map(|c| c.max(0.0) as usize), &params)
+    }
+}
+
+/// Whether `v` is an integer in `[lo, hi]` (a FLOAT in a column written
+/// before it became INT counts by its value).
+fn int_in(v: &Value, lo: i64, hi: i64) -> bool {
+    match v {
+        Value::Int(x) => lo <= *x && *x <= hi,
+        v => v.as_f64().is_some_and(|x| lo as f64 <= x && x <= hi as f64),
+    }
+}
+
+/// Whether two numbers are equal, integers exactly.
+fn num_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        _ => a.as_f64().zip(b.as_f64()).is_some_and(|(x, y)| x == y),
+    }
+}
+
+/// The keys of column `col` equal to the number `v`.
+fn value_keys(col: &NumericColumn, v: &Value) -> Option<KeyRange> {
+    match v {
+        Value::Int(x) => col.int_key_range(*x, *x),
+        v => v.as_f64().and_then(|x| col.key_range(x, x)),
     }
 }
