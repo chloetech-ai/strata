@@ -253,3 +253,228 @@ impl Schema {
         parts.join("\n")
     }
 }
+
+// ------------------------------------------------------------- JSON forms
+
+/// The HNSW parameters a vector field gets when its JSON names `"hnsw"`
+/// without them.
+pub const DEFAULT_HNSW: VectorIndexKind = VectorIndexKind::Hnsw { m: 16, ef_construction: 200 };
+
+impl Schema {
+    /// A schema from JSON, in either form, validated as [`Schema::new`] does.
+    ///
+    /// The short form names types and the key, and leaves defaults out:
+    ///
+    /// ```json
+    /// {"table": "products", "key": "id", "fields": [
+    ///   {"name": "id", "type": "keyword"},
+    ///   {"name": "title", "type": "text"},
+    ///   {"name": "tags", "type": "keyword", "multi": true},
+    ///   {"name": "price", "type": "float"},
+    ///   {"name": "body", "type": "text", "from": ["title", "description"]},
+    ///   {"name": "emb", "type": "vector", "dim": 512,
+    ///    "embed": {"from": ["title"], "model": "potion-retrieval-32M"}}
+    /// ]}
+    /// ```
+    ///
+    /// Types are `text`, `keyword`, `int`, `float`, `vector`, `sparse` and
+    /// `edges`. A vector `embed`ded by a model Strata knows may leave out
+    /// `dim`. Every field is stored and indexed unless it says otherwise
+    /// (`"stored": false`, `"indexed": false`), except that vectors and
+    /// generated text (`from`) are not stored. Text keeps positions (for
+    /// phrases) unless `"positions": false`. A vector's `index` is
+    /// `"hnsw"` (the default, m 16 and ef_construction 200), `"flat"`,
+    /// `{"hnsw": {"m": .., "ef_construction": ..}}` or
+    /// `{"ivf": {"nlist": ..}}`, and its `codes` `"sq8"` (default) or
+    /// `"binary"`.
+    ///
+    /// The long form is this type's own serialization (what
+    /// `GET /v1/schema` returns), with `primary_key` the key field's
+    /// position or name.
+    pub fn from_json(text: &str) -> Result<Schema> {
+        let j: serde_json::Value = serde_json::from_str(text).map_err(|e| Error::Schema(format!("schema JSON: {e}")))?;
+        Schema::from_json_value(&j)
+    }
+
+    pub fn from_json_value(j: &serde_json::Value) -> Result<Schema> {
+        use serde_json::Value as J;
+        let bad = |m: String| Error::Schema(m);
+        let obj = j.as_object().ok_or_else(|| bad("a schema is a JSON object".into()))?;
+        let table = obj.get("table").and_then(J::as_str).ok_or_else(|| bad("a schema needs a \"table\" name".into()))?;
+        let fields = obj.get("fields").and_then(J::as_array).ok_or_else(|| bad("a schema needs a \"fields\" array".into()))?;
+        let long = fields.iter().any(|f| f.get("ty").is_some());
+        let fields: Vec<Field> = if long {
+            fields.iter().map(|f| serde_json::from_value(f.clone()).map_err(|e| bad(format!("field {}: {e}", f.get("name").unwrap_or(&J::Null))))).collect::<Result<_>>()?
+        } else {
+            fields.iter().map(short_field).collect::<Result<_>>()?
+        };
+        let key = match obj.get("key").or_else(|| obj.get("primary_key")) {
+            None | Some(J::Null) => None,
+            Some(J::String(s)) => Some(s.clone()),
+            Some(J::Number(n)) => {
+                let i = n.as_u64().map(|i| i as usize).filter(|&i| i < fields.len()).ok_or_else(|| bad(format!("primary_key {n} is not a field's position")))?;
+                Some(fields[i].name.clone())
+            }
+            Some(other) => return Err(bad(format!("the key is a field name, not {other}"))),
+        };
+        Schema::new(table, fields, key.as_deref())
+    }
+
+    /// The short JSON form ([`Schema::from_json`]), defaults left out.
+    pub fn to_short_json(&self) -> serde_json::Value {
+        use serde_json::{json, Map, Value as J};
+        let fields: Vec<J> = self
+            .fields
+            .iter()
+            .map(|f| {
+                let mut m = Map::new();
+                m.insert("name".into(), json!(f.name));
+                let (ty, stored_default) = match &f.ty {
+                    FieldType::Text { positions } => {
+                        if !positions {
+                            m.insert("positions".into(), json!(false));
+                        }
+                        ("text", f.generated_from.is_empty())
+                    }
+                    FieldType::Keyword => ("keyword", true),
+                    FieldType::Int => ("int", true),
+                    FieldType::Float => ("float", true),
+                    FieldType::Vector { dim, index } => {
+                        // A known model's vectors have its dimension.
+                        if f.embed.as_ref().and_then(|e| crate::embed::known_dim(&e.model)) != Some(*dim) {
+                            m.insert("dim".into(), json!(dim));
+                        }
+                        if *index != DEFAULT_HNSW {
+                            m.insert(
+                                "index".into(),
+                                match index {
+                                    VectorIndexKind::Flat => json!("flat"),
+                                    VectorIndexKind::Hnsw { m, ef_construction } => json!({"hnsw": {"m": m, "ef_construction": ef_construction}}),
+                                    VectorIndexKind::Ivf { nlist } => json!({"ivf": {"nlist": nlist}}),
+                                },
+                            );
+                        }
+                        if !f.codes.is_sq8() {
+                            m.insert("codes".into(), json!(f.codes.as_str()));
+                        }
+                        if let Some(e) = &f.embed {
+                            m.insert("embed".into(), json!({"from": e.from, "model": e.model}));
+                        }
+                        ("vector", false)
+                    }
+                    FieldType::Sparse => ("sparse", true),
+                    FieldType::Edges => ("edges", true),
+                };
+                m.insert("type".into(), json!(ty));
+                if f.multi {
+                    m.insert("multi".into(), json!(true));
+                }
+                if !f.generated_from.is_empty() {
+                    m.insert("from".into(), json!(f.generated_from));
+                }
+                if f.stored != stored_default {
+                    m.insert("stored".into(), json!(f.stored));
+                }
+                if !f.indexed {
+                    m.insert("indexed".into(), json!(false));
+                }
+                // "name" and "type" first, for people reading it.
+                let mut out = Map::new();
+                for k in ["name", "type"] {
+                    out.insert(k.into(), m.remove(k).unwrap());
+                }
+                out.extend(m);
+                J::Object(out)
+            })
+            .collect();
+        let mut out = Map::new();
+        out.insert("table".into(), json!(self.table));
+        if let Some(k) = self.primary_key {
+            out.insert("key".into(), json!(self.fields[k].name));
+        }
+        out.insert("fields".into(), J::Array(fields));
+        J::Object(out)
+    }
+}
+
+/// One field of the short JSON form.
+fn short_field(j: &serde_json::Value) -> Result<Field> {
+    use serde_json::Value as J;
+    let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
+    let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed"];
+    if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
+        return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
+    }
+    let flag = |k: &str| -> Result<Option<bool>> {
+        match j.get(k) {
+            None | Some(J::Null) => Ok(None),
+            Some(J::Bool(b)) => Ok(Some(*b)),
+            Some(_) => Err(bad(&format!("{k} is true or false"))),
+        }
+    };
+    let names = |k: &str| -> Result<Vec<String>> {
+        match j.get(k) {
+            None | Some(J::Null) => Ok(Vec::new()),
+            Some(J::String(s)) => Ok(vec![s.clone()]),
+            Some(J::Array(xs)) => xs.iter().map(|x| x.as_str().map(String::from).ok_or_else(|| bad(&format!("{k} lists field names")))).collect(),
+            Some(_) => Err(bad(&format!("{k} lists field names"))),
+        }
+    };
+    let ty_name = j.get("type").and_then(J::as_str).ok_or_else(|| bad("needs a \"type\" (text, keyword, int, float, vector, sparse or edges)"))?;
+    let from = names("from")?;
+    let ty = match ty_name.to_ascii_lowercase().as_str() {
+        "text" => FieldType::Text { positions: flag("positions")?.unwrap_or(true) },
+        "keyword" => FieldType::Keyword,
+        "int" | "integer" => FieldType::Int,
+        "float" | "double" | "real" => FieldType::Float,
+        "sparse" => FieldType::Sparse,
+        "edges" => FieldType::Edges,
+        "vector" => {
+            let model_dim = j.get("embed").and_then(|e| e.get("model")).and_then(J::as_str).and_then(crate::embed::known_dim);
+            let dim = match j.get("dim") {
+                None | Some(J::Null) => model_dim.ok_or_else(|| bad("a vector needs \"dim\", its number of dimensions"))?,
+                Some(d) => d.as_u64().filter(|&d| d > 0).ok_or_else(|| bad("dim is a positive number"))? as usize,
+            };
+            let index = match j.get("index") {
+                None | Some(J::Null) => DEFAULT_HNSW,
+                Some(J::String(s)) if s.eq_ignore_ascii_case("flat") => VectorIndexKind::Flat,
+                Some(J::String(s)) if s.eq_ignore_ascii_case("hnsw") => DEFAULT_HNSW,
+                Some(J::Object(o)) if o.contains_key("hnsw") => {
+                    let p = &o["hnsw"];
+                    let get = |k: &str, d: usize| p.get(k).and_then(J::as_u64).map_or(d, |v| v as usize);
+                    VectorIndexKind::Hnsw { m: get("m", 16), ef_construction: get("ef_construction", 200) }
+                }
+                Some(J::Object(o)) if o.contains_key("ivf") => {
+                    let nlist = o["ivf"].get("nlist").and_then(J::as_u64).ok_or_else(|| bad("ivf needs nlist"))? as usize;
+                    VectorIndexKind::Ivf { nlist }
+                }
+                Some(other) => return Err(bad(&format!("index is \"hnsw\", \"flat\", {{\"hnsw\": {{..}}}} or {{\"ivf\": {{\"nlist\": n}}}}, not {other}"))),
+            };
+            FieldType::Vector { dim, index }
+        }
+        other => return Err(bad(&format!("unknown type {other:?} (text, keyword, int, float, vector, sparse or edges)"))),
+    };
+    let is_vector = matches!(ty, FieldType::Vector { .. });
+    let mut f = Field::new(name, ty);
+    f.generated_from = from;
+    f.stored = flag("stored")?.unwrap_or(!is_vector && f.generated_from.is_empty());
+    f.indexed = flag("indexed")?.unwrap_or(true);
+    f.multi = flag("multi")?.unwrap_or(false);
+    if let Some(c) = j.get("codes").filter(|c| !c.is_null()) {
+        f.codes = c.as_str().and_then(VectorCodes::parse).ok_or_else(|| bad("codes is \"sq8\" or \"binary\""))?;
+    }
+    match j.get("embed") {
+        None | Some(J::Null) => {}
+        Some(e) => {
+            let from = match e.get("from") {
+                Some(J::String(s)) => vec![s.clone()],
+                Some(J::Array(xs)) => xs.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                _ => return Err(bad("embed needs \"from\", the fields it embeds")),
+            };
+            let model = e.get("model").and_then(J::as_str).ok_or_else(|| bad("embed needs a \"model\""))?;
+            f.embed = Some(Embed { from, model: model.to_string() });
+        }
+    }
+    Ok(f)
+}

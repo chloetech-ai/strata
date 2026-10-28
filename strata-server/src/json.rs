@@ -10,7 +10,7 @@
 use serde_json::{json, Map, Value as Json};
 use strata::query::exec::ResultSet;
 use strata::query::Params;
-use strata::schema::{FieldType, Schema};
+use strata::schema::Schema;
 use strata::value::{Document, Value};
 
 use crate::ApiError;
@@ -60,55 +60,14 @@ pub fn params(j: Option<&Json>) -> Result<Params, ApiError> {
     Ok(p)
 }
 
-/// The value of field `f` of `schema` from JSON.
+/// The value of field `f` of `schema` from JSON ([`strata::ingest::value`]).
 pub fn field_value(schema: &Schema, f: usize, j: &Json) -> Result<Value, ApiError> {
-    let field = &schema.fields[f];
-    let bad = || ApiError::bad(format!("bad value for {}: {j}", field.name));
-    if j.is_null() {
-        return Ok(Value::Null);
-    }
-    if field.multi {
-        let items = match j {
-            Json::Array(xs) => xs.clone(),
-            x => vec![x.clone()],
-        };
-        let one = |x: &Json| match (&field.ty, x) {
-            (FieldType::Keyword, Json::String(s)) => Ok(Value::Str(s.clone())),
-            (FieldType::Int, Json::Number(n)) => n.as_i64().map(Value::Int).ok_or_else(bad),
-            _ => Err(bad()),
-        };
-        return Ok(Value::List(items.iter().map(one).collect::<Result<_, _>>()?));
-    }
-    Ok(match (&field.ty, j) {
-        (FieldType::Vector { .. }, Json::Array(xs)) => {
-            Value::Vector(xs.iter().map(|x| x.as_f64().map(|v| v as f32).ok_or_else(bad)).collect::<Result<Vec<_>, _>>()?.into())
-        }
-        (FieldType::Int, Json::Number(n)) => Value::Int(n.as_i64().ok_or_else(bad)?),
-        (FieldType::Float, Json::Number(n)) => Value::Float(n.as_f64().ok_or_else(bad)?),
-        (FieldType::Keyword, Json::Number(n)) if schema.primary_key == Some(f) => Value::Str(n.to_string()),
-        (FieldType::Text { .. } | FieldType::Keyword | FieldType::Edges, Json::String(s)) => Value::Str(s.clone()),
-        (FieldType::Sparse, Json::Object(_) | Json::String(_)) => {
-            let v = match j {
-                Json::String(s) => Value::Str(s.clone()),
-                o => Value::Str(o.to_string()),
-            };
-            strata::text::sparse::parse(&v).map_err(|e| ApiError::bad(format!("bad value for {}: {e}", field.name)))?;
-            v
-        }
-        _ => return Err(bad()),
-    })
+    Ok(strata::ingest::value(schema, f, j)?)
 }
 
 /// A document from a JSON object of field values (missing fields null).
 pub fn document(schema: &Schema, j: &Json) -> Result<Document, ApiError> {
-    let Json::Object(m) = j else { return Err(ApiError::bad("a document is a JSON object")) };
-    let mut doc = vec![Value::Null; schema.fields.len()];
-    for (k, v) in m {
-        let f = schema.field_index(k).ok_or_else(|| ApiError::bad(format!("no field {k}")))?;
-        doc[f] = field_value(schema, f, v)?;
-    }
-    schema.fill_generated(&mut doc);
-    Ok(doc)
+    Ok(strata::ingest::document(schema, j)?)
 }
 
 /// A document as a JSON object.

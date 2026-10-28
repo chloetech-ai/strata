@@ -43,8 +43,8 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 .badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--chip); color: var(--muted); white-space: nowrap; }
 .badge.pk { background: var(--accent-soft); color: var(--accent); }
 .values { margin: 2px 0 6px 8px; display: flex; flex-wrap: wrap; gap: 4px; }
-.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
-.tab { padding: 8px 14px; border: 0; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: var(--muted); font-weight: 500; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 14px; overflow-x: auto; scrollbar-width: none; }
+.tab { padding: 8px 14px; border: 0; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: var(--muted); font-weight: 500; white-space: nowrap; }
 .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; box-shadow: var(--shadow); margin-bottom: 14px; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -141,7 +141,16 @@ svg.graph text.ringlabel { fill: var(--muted); font-size: 10px; }
 .node-info { margin-top: 10px; }
 .node-info table { font-size: 12.5px; }
 .node-info td:first-child { font-family: var(--mono); color: var(--muted); white-space: nowrap; width: 1%; }
+.sf-row { display: grid; grid-template-columns: minmax(0, 1fr) 120px minmax(0, 2.4fr) auto; gap: 6px; align-items: start; padding: 6px 0; border-top: 1px solid var(--line); }
+.sf-row:first-child { border-top: 0; }
+.sf-opts { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; font-size: 12.5px; }
+.sf-opts label { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+.sf-opts select, .sf-opts input[type=number], .sf-opts input[type=text] { width: auto; padding: 3px 6px; font-size: 12.5px; }
+.ok-msg { background: var(--accent-soft); color: var(--accent); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+progress { width: 100%; accent-color: var(--accent); }
 @media (max-width: 760px) {
+  .sf-row { grid-template-columns: minmax(0, 1fr) 110px auto; }
+  .sf-opts { grid-column: 1 / -1; grid-row: 2; }
   .layout { grid-template-columns: 1fr; }
   aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 40vh; }
   main { padding: 12px 16px; }
@@ -175,6 +184,7 @@ svg.graph text.ringlabel { fill: var(--muted); font-size: 10px; }
       <button class="tab hidden" role="tab" data-tab="graph" aria-selected="false" id="graphTab">Graph</button>
       <button class="tab" role="tab" data-tab="sql" aria-selected="false">SQL</button>
       <button class="tab" role="tab" data-tab="ask" aria-selected="false">Ask an agent</button>
+      <button class="tab" role="tab" data-tab="data" aria-selected="false">Schema and import</button>
       <button class="tab" role="tab" data-tab="help" aria-selected="false">Query language</button>
     </div>
 
@@ -320,6 +330,43 @@ svg.graph text.ringlabel { fill: var(--muted); font-size: 10px; }
       <div id="askOut"></div>
     </section>
 
+    <section id="tab-data" class="hidden">
+      <div class="card">
+        <div class="row" style="justify-content:space-between"><h2 style="margin:0">Import rows</h2><span class="hint" id="dInto"></span></div>
+        <p class="small muted" style="margin:6px 0 10px">JSON Lines (an object per line), a JSON array of objects, or CSV or TSV with a header row. Columns go to the fields of the same name, and columns the schema lacks are skipped and listed. A row whose key is already here replaces that row. In CSV an empty cell is empty, a list is <code>a|b|c</code> or a JSON array, and a vector is a JSON array. Embedded vector fields are computed from their source fields by the server's model. Up to 256 MB a file; for more, use <code>strata-server import</code> while the server is stopped.</p>
+        <div class="row">
+          <div class="grow"><label class="lbl" for="dFile">File</label><input id="dFile" type="file" accept=".jsonl,.ndjson,.json,.csv,.tsv,.tab"></div>
+          <div style="width:160px"><label class="lbl" for="dFormat">format</label><select id="dFormat"><option value="">from the file name</option><option value="jsonl">JSON Lines</option><option value="json">JSON array</option><option value="csv">CSV</option><option value="tsv">TSV</option></select></div>
+          <div><label class="lbl">&nbsp;</label><button class="btn primary" id="dImport" disabled>Import</button></div>
+        </div>
+        <details class="sec"><summary>Or paste rows</summary>
+          <textarea id="dPaste" rows="5" spellcheck="false"></textarea>
+          <div class="row" style="margin-top:6px"><button class="btn" id="dPasteImport">Import pasted rows</button><span class="hint">as JSON Lines, a JSON array, or CSV with a header row</span></div>
+        </details>
+        <div id="dOut" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:6px"><h2 style="margin:0">This table's schema</h2><button class="btn small" id="dCopySchema">Copy</button></div>
+        <p class="small muted" style="margin:0 0 8px">In the short form that <code>--schema</code> takes. A database's schema is set when it is created. To change it, design a new one below and copy this database's rows into it with <code>--copy-from</code>, which also embeds again the vectors whose model or source fields changed.</p>
+        <pre class="sql" id="dSchema"></pre>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between"><h2 style="margin:0">Design a schema</h2>
+          <span class="row"><button class="btn small" id="sFromCurrent">Start from this table</button><button class="btn small" id="sInferBtn">Guess from a file…</button><input type="file" id="sInferFile" class="hidden" accept=".jsonl,.ndjson,.json,.csv,.tsv,.tab"><button class="btn small" id="sClear">Start empty</button></span></div>
+        <p class="small muted" style="margin:6px 0 10px">Text is searched by words (BM25), keywords match exactly and can be counted, numbers filter, sort and sum, a vector finds similar rows, edges link rows to other rows by key. A vector field can embed text fields itself: on the collections measured, one vector of title + description together scored best, and searching it together with the text did better still in 8 of 9 runs (<a href="https://github.com/rkonow/engram/tree/main/strata/results/embed-fields" target="_blank" rel="noopener">the measurements</a>).</p>
+        <div class="row">
+          <div style="width:200px"><label class="lbl" for="sTable">Table name</label><input id="sTable" type="text" spellcheck="false"></div>
+          <div style="width:200px"><label class="lbl" for="sKey">Key <span class="muted">(unique per row)</span></label><select id="sKey"></select></div>
+        </div>
+        <div id="sFields" style="margin-top:10px"></div>
+        <div class="row" style="margin-top:6px"><button class="btn small" id="sAddField">+ field</button><button class="btn small" id="sAddVector">+ vector embedding the text fields</button></div>
+        <div class="row" style="margin-top:12px"><div class="grow"><label class="lbl" for="sJson">Schema JSON <span class="muted">(edit it here or above; the long form is accepted too)</span></label>
+          <textarea id="sJson" rows="10" spellcheck="false"></textarea></div></div>
+        <div class="row" style="margin-top:6px"><button class="btn primary" id="sCheck">Check</button><button class="btn" id="sDownload">Download schema.json</button><span id="sStatus" class="small"></span></div>
+        <div id="sCmds" style="margin-top:10px"></div>
+      </div>
+    </section>
+
     <section id="tab-help" class="hidden">
       <div class="card">
         <p style="margin:0 0 8px">Strata's SQL goes well past filters. Each example below uses this table's own fields; <b>Try it</b> opens it in the SQL tab and runs it.</p>
@@ -382,6 +429,7 @@ function fieldBadge(f) {
   return t;
 }
 const isNum = (f) => f.kind === "int" || f.kind === "float";
+const plural = (n, w) => `${Number(n).toLocaleString()} ${w}${n == 1 ? "" : "s"}`;
 const sqlStr = (s) => "'" + String(s).replace(/'/g, "''") + "'";
 const ident = (n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) ? n : '"' + n.replace(/"/g, '""') + '"';
 
@@ -389,7 +437,7 @@ async function loadSchema() {
   const j = await api("/v1/schema");
   const s = j.schema;
   S = {
-    table: s.table, pk: j.primary_key, embeddings: j.embeddings || [],
+    table: s.table, pk: j.primary_key, embeddings: j.embeddings || [], short: j.short,
     fields: s.fields.map((f) => ({ name: f.name, kind: kindOf(f.ty), dim: f.ty.Vector ? f.ty.Vector.dim : null, stored: f.stored, indexed: f.indexed, multi: !!f.multi, generated: (f.generated_from || []).length > 0 })),
   };
   $("table").textContent = S.table;
@@ -428,9 +476,10 @@ function renderFields() {
 // ---- tabs ---------------------------------------------------------------------
 function showTab(name) {
   for (const t of document.querySelectorAll(".tab")) t.setAttribute("aria-selected", String(t.dataset.tab === name));
-  for (const n of ["build", "graph", "sql", "ask", "help"]) $("tab-" + n).classList.toggle("hidden", n !== name);
-  $("results").classList.toggle("hidden", name === "ask" || name === "help");
+  for (const n of ["build", "graph", "sql", "ask", "data", "help"]) $("tab-" + n).classList.toggle("hidden", n !== name);
+  $("results").classList.toggle("hidden", name === "ask" || name === "help" || name === "data");
   if (name === "help") renderHelp();
+  if (name === "data") renderData();
   store.set("tab", name);
 }
 // "More" links open the guide at a section.
@@ -1393,10 +1442,305 @@ async function refreshHealth() {
   try {
     const h = await api("/v1/health");
     $("dot").className = "dot " + (h.status === "ok" ? "ok" : "bad");
-    const plural = (n, w) => `${Number(n).toLocaleString()} ${w}${n == 1 ? "" : "s"}`;
     $("counts").textContent = `${plural(h.docs, "row")} · ${plural(h.segments, "segment")}${h.role === "coordinator" ? ` · ${plural(h.shards.length, "shard")}` : ""}`;
   } catch (e) { $("dot").className = "dot bad"; $("counts").textContent = e.message; }
 }
+// ---- schema and import ----------------------------------------------------------
+const TYPES = ["text", "keyword", "int", "float", "vector", "sparse", "edges"];
+const MODELS = { "potion-retrieval-32M": 512, "potion-base-8M": 256, "bge-small-en-v1.5": 384, "snowflake-arctic-embed-m-v1.5": 768 };
+const modelDim = (m) => !m ? null : m.startsWith("hash:") ? Number(m.slice(5)) || null : (MODELS[m] || null);
+const FORMATS = { jsonl: "jsonl", ndjson: "jsonl", json: "json", csv: "csv", tsv: "tsv", tab: "tsv" };
+const formatOf = (name) => FORMATS[(name.split(".").pop() || "").toLowerCase()] || "";
+
+// The short form in reading order: table, key, fields; each field's name and type first.
+const shortOrdered = (s) => ({ table: s.table, ...(s.key != null ? { key: s.key } : {}), fields: s.fields.map((f) => ({ name: f.name, type: f.type, ...f })) });
+function renderData() {
+  $("dInto").replaceChildren("into ", el("b", { text: S.table }), S.pk ? el("span", {}, ", by ", el("code", { text: S.pk })) : "");
+  $("dSchema").textContent = JSON.stringify(shortOrdered(S.short), null, 2);
+  if (!D) designFrom(S.short);
+}
+$("dCopySchema").onclick = () => { try { navigator.clipboard.writeText(JSON.stringify(shortOrdered(S.short), null, 2)); } catch {} };
+
+// Sends rows to /v1/import, showing the upload's progress.
+function importRows(body, format, label) {
+  const out = $("dOut"), bar = el("progress", { max: 1, value: 0 }), what = el("div", { class: "small muted", text: `Sending ${label}…` });
+  out.replaceChildren(what, bar);
+  $("dImport").disabled = $("dPasteImport").disabled = true;
+  const finish = (kids) => { out.replaceChildren(...kids); $("dImport").disabled = !$("dFile").files.length; $("dPasteImport").disabled = false; };
+  const x = new XMLHttpRequest();
+  x.open("POST", "/v1/import?format=" + format);
+  if (token) x.setRequestHeader("authorization", "Bearer " + token);
+  x.upload.onprogress = (e) => { if (e.lengthComputable) { bar.max = e.total; bar.value = e.loaded; } };
+  x.upload.onload = () => { what.textContent = `Writing ${label}…`; bar.removeAttribute("value"); };
+  x.onload = () => {
+    let j = {}; try { j = JSON.parse(x.responseText); } catch {}
+    if (x.status === 401) $("tokenBox").classList.remove("hidden");
+    if (x.status < 200 || x.status >= 300) {
+      const why = j.error || (x.status === 413 ? "The file is over the server's 256 MB limit: load it with strata-server import." : `HTTP ${x.status}`);
+      return finish([el("div", { class: "error", text: why })]);
+    }
+    const kids = [el("div", { class: "ok-msg", text: `${label}: ${plural(j.written, "row")} written in ${(j.took_ms / 1000).toFixed(1)} s.` })];
+    if (j.skipped_fields && j.skipped_fields.length) kids.push(el("div", { class: "note", style: "margin-top:6px", text: "Skipped columns the schema lacks: " + j.skipped_fields.join(", ") }));
+    finish(kids);
+    refreshHealth();
+  };
+  x.onerror = () => finish([el("div", { class: "error", text: "The upload failed: the connection closed." })]);
+  x.send(body);
+}
+$("dFile").onchange = () => { $("dImport").disabled = !$("dFile").files.length; };
+$("dImport").onclick = () => {
+  const f = $("dFile").files[0]; if (!f) return;
+  const format = $("dFormat").value || formatOf(f.name);
+  if (!format) { $("dOut").replaceChildren(el("div", { class: "error", text: `Choose the format of ${f.name}.` })); return; }
+  importRows(f, format, f.name);
+};
+$("dPasteImport").onclick = () => {
+  const t = $("dPaste").value.trim(); if (!t) return;
+  const format = t.startsWith("[") ? "json" : t.startsWith("{") ? "jsonl" : t.split("\n")[0].includes("\t") ? "tsv" : "csv";
+  importRows(t, format, "The pasted rows");
+};
+
+// The schema being designed, in the short form: {table, key, fields: [{name, type, ...options}]}.
+let D = null;
+function designFrom(short) {
+  D = JSON.parse(JSON.stringify(shortOrdered(short || { table: "items", fields: [] })));
+  D.fields = Array.isArray(D.fields) ? D.fields : [];
+  for (const f of D.fields) {
+    if (f.embed && typeof f.embed.from === "string") f.embed.from = [f.embed.from];
+    if (typeof f.from === "string") f.from = [f.from];
+  }
+  renderDesign();
+}
+// The design as JSON, leaving out what the defaults already say.
+function designJson() {
+  const fields = D.fields.map((f) => {
+    const o = { name: f.name, type: f.type }, vec = f.type === "vector", gen = !!(f.from && f.from.length);
+    if (f.type === "text" && f.positions === false) o.positions = false;
+    if (gen) o.from = f.from;
+    if (f.multi) o.multi = true;
+    if (f.stored != null && f.stored !== (!vec && !gen)) o.stored = f.stored;
+    if (f.indexed === false) o.indexed = false;
+    if (vec) {
+      if (f.embed && f.embed.model) o.embed = { from: f.embed.from || [], model: f.embed.model };
+      if (f.dim && !(o.embed && modelDim(o.embed.model) === Number(f.dim))) o.dim = Number(f.dim);
+      if (f.index && f.index !== "hnsw") o.index = f.index;
+      if (f.codes && f.codes !== "sq8") o.codes = f.codes;
+    }
+    return o;
+  });
+  return D.key ? { table: D.table, key: D.key, fields } : { table: D.table, fields };
+}
+function designChanged(rerender) {
+  if (rerender) return renderDesign();
+  $("sJson").value = JSON.stringify(designJson(), null, 2);
+  renderCmds();
+}
+function renderDesign(keepJson) {
+  $("sTable").value = D.table || "";
+  const keyable = D.fields.filter((f) => (f.type === "keyword" || f.type === "int") && !f.multi && f.name);
+  $("sKey").replaceChildren(el("option", { value: "", text: "none" }), ...keyable.map((f) => el("option", { value: f.name, text: f.name })));
+  $("sKey").value = keyable.some((f) => f.name === D.key) ? D.key : "";
+  $("sFields").replaceChildren(...D.fields.map(fieldRow));
+  if (!keepJson) $("sJson").value = JSON.stringify(designJson(), null, 2);
+  renderCmds();
+}
+function fieldRow(f) {
+  const check = (label, on, set, title) => {
+    const c = el("input", { type: "checkbox", checked: on });
+    c.onchange = () => { set(c.checked); designChanged(true); };
+    return el("label", { title }, c, label);
+  };
+  const name = el("input", { type: "text", value: f.name || "", spellcheck: "false", placeholder: "name" });
+  name.oninput = () => {
+    const old = f.name; f.name = name.value.trim();
+    if (D.key === old) D.key = f.name;
+    for (const g of D.fields) {
+      if (g.embed && g.embed.from) g.embed.from = g.embed.from.map((n) => n === old ? f.name : n);
+      if (g.from) g.from = g.from.map((n) => n === old ? f.name : n);
+    }
+    designChanged(false);
+  };
+  name.onchange = () => renderDesign();
+  const type = el("select", {}, ...TYPES.map((t) => el("option", { value: t, text: t })));
+  type.value = f.type;
+  type.onchange = () => {
+    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored"]) delete f[k];
+    f.type = type.value;
+    if (f.type === "vector") { const from = textFields(); f.embed = from.length ? { from, model: "potion-retrieval-32M" } : undefined; if (!f.embed) f.dim = 384; }
+    designChanged(true);
+  };
+  const vec = f.type === "vector", gen = !!(f.from && f.from.length);
+  const opts = el("div", { class: "sf-opts" });
+  if (gen) opts.append(el("span", { class: "muted", text: "generated from " + f.from.join(" + ") }));
+  if (vec) {
+    const m = f.embed && f.embed.model;
+    const names = Object.keys(MODELS);
+    const model = el("select", {}, el("option", { value: "", text: "vectors come with the rows" }),
+      ...names.map((n) => el("option", { value: n, text: `${n} (${MODELS[n]})` })),
+      el("option", { value: m && m.startsWith("hash:") ? m : "hash:64", text: (m && m.startsWith("hash:") ? m : "hash:64") + " (a test model)" }),
+      m && !names.includes(m) && !m.startsWith("hash:") ? el("option", { value: m, text: m }) : null);
+    model.value = m || "";
+    model.onchange = () => {
+      if (!model.value) { delete f.embed; f.dim = f.dim || 384; }
+      else { f.embed = { from: f.embed && f.embed.from.length ? f.embed.from : textFields(), model: model.value }; if (modelDim(model.value)) delete f.dim; }
+      designChanged(true);
+    };
+    opts.append(el("label", { title: "The model that embeds this field's source fields when rows are written" }, "embedding by", model));
+    if (f.embed) {
+      const order = D.fields.map((g) => g.name);
+      opts.append(el("span", { class: "muted", text: "of" }), ...D.fields.filter((g) => g !== f && (g.type === "text" || g.type === "keyword")).map((g) =>
+        check(g.name, f.embed.from.includes(g.name), (on) => { const s = new Set(f.embed.from); on ? s.add(g.name) : s.delete(g.name); f.embed.from = order.filter((n) => s.has(n)); })));
+    }
+    if (!f.embed || !modelDim(f.embed.model)) {
+      const dim = el("input", { type: "number", min: 1, value: f.dim || "", style: "width:80px" });
+      dim.oninput = () => { f.dim = Number(dim.value) || undefined; designChanged(false); };
+      opts.append(el("label", {}, "dimensions", dim));
+    } else opts.append(el("span", { class: "muted", text: `${modelDim(f.embed.model)} dimensions` }));
+    const index = el("select", {}, el("option", { value: "hnsw", text: "graph (HNSW)" }), el("option", { value: "flat", text: "exact scan" }));
+    index.value = typeof f.index === "string" ? f.index : "hnsw";
+    index.disabled = typeof f.index === "object" && f.index !== null;
+    index.onchange = () => { f.index = index.value; designChanged(false); };
+    const codes = el("select", {}, el("option", { value: "sq8", text: "a byte a dimension" }), el("option", { value: "binary", text: "a bit a dimension" }));
+    codes.value = f.codes || "sq8";
+    codes.onchange = () => { f.codes = codes.value; designChanged(false); };
+    opts.append(el("label", { title: "How nearest rows are found" }, "index", index), el("label", { title: "How the vectors are compressed for search; the full vectors rescore the best" }, "codes", codes));
+  }
+  if (f.type === "keyword" || f.type === "int") opts.append(check("list", !!f.multi, (on) => { f.multi = on || undefined; if (on) delete f.stored; }, "Each row holds several values"));
+  if (f.type === "text") opts.append(check("phrases", f.positions !== false, (on) => { f.positions = on ? undefined : false; }, "Keep word positions, for \"exact phrase\" searches"));
+  const storedDefault = !vec && !gen;
+  opts.append(check("indexed", f.indexed !== false, (on) => { f.indexed = on ? undefined : false; }, "Searchable and filterable"),
+    check("stored", f.stored == null ? storedDefault : f.stored, (on) => { f.stored = on === storedDefault ? undefined : on; }, vec ? "Keep the full vectors to return them (search needs only the index)" : "Returned in results"));
+  const del = el("button", { class: "btn small", title: "Remove this field", text: "×" });
+  del.onclick = () => {
+    D.fields = D.fields.filter((g) => g !== f);
+    if (D.key === f.name) D.key = undefined;
+    for (const g of D.fields) if (g.embed && g.embed.from) g.embed.from = g.embed.from.filter((n) => n !== f.name);
+    renderDesign();
+  };
+  return el("div", { class: "sf-row" }, name, type, opts, del);
+}
+const textFields = () => D.fields.filter((g) => g.type === "text" && !(g.from && g.from.length) && g.name).map((g) => g.name);
+const freshName = (base) => { let n = base, i = 2; while (D.fields.some((f) => f.name === n)) n = base + i++; return n; };
+$("sTable").oninput = () => { D.table = $("sTable").value.trim(); designChanged(false); };
+$("sKey").onchange = () => { D.key = $("sKey").value || undefined; designChanged(false); };
+$("sAddField").onclick = () => { D.fields.push({ name: freshName("field"), type: "text" }); renderDesign(); };
+$("sAddVector").onclick = () => { D.fields.push({ name: freshName("embedding"), type: "vector", embed: { from: textFields(), model: "potion-retrieval-32M" } }); renderDesign(); };
+$("sFromCurrent").onclick = () => { designFrom(S.short); $("sStatus").replaceChildren(); };
+$("sClear").onclick = () => { designFrom({ table: "items", key: "id", fields: [{ name: "id", type: "keyword" }, { name: "title", type: "text" }] }); $("sStatus").replaceChildren(); };
+$("sJson").oninput = () => {
+  let j;
+  try { j = JSON.parse($("sJson").value); } catch (e) { $("sStatus").replaceChildren(el("span", { class: "muted", text: "Not JSON yet: " + e.message })); return; }
+  $("sStatus").replaceChildren();
+  // The short form updates the fields above as it is typed; Check converts the long form.
+  if (j && Array.isArray(j.fields) && j.fields.every((f) => f && typeof f.type === "string")) {
+    D = JSON.parse(JSON.stringify(j));
+    for (const f of D.fields) if (f.embed && typeof f.embed.from === "string") f.embed.from = [f.embed.from];
+    renderDesign(true);
+  } else $("sStatus").replaceChildren(el("span", { class: "muted", text: "Check reads the long form into the fields above." }));
+};
+$("sCheck").onclick = async () => {
+  let j;
+  try { j = JSON.parse($("sJson").value); } catch (e) { $("sStatus").replaceChildren(el("span", { class: "error", text: "Not JSON: " + e.message })); return; }
+  try {
+    const r = await api("/v1/schema/check", j);
+    designFrom(r.short);
+    $("sStatus").replaceChildren(el("span", { class: "ok-msg", text: "The schema is valid." }));
+  } catch (e) { $("sStatus").replaceChildren(el("span", { class: "error", text: e.message })); }
+};
+$("sDownload").onclick = () => {
+  const a = el("a", { href: URL.createObjectURL(new Blob([$("sJson").value + "\n"], { type: "application/json" })), download: (D.table || "schema") + ".json" });
+  document.body.append(a); a.click(); a.remove();
+};
+function renderCmds() {
+  const file = (D.table || "schema") + ".json", db = (D.table || "new") + ".strata";
+  const models = [...new Set(D.fields.map((f) => f.embed && f.embed.model).filter((m) => m && MODELS[m]))];
+  const lines = [];
+  if (models.length) lines.push("# the embedding models, once", ...models.map((m) => `strata-server fetch-model ${m}`));
+  lines.push("# a new database filled from files (JSON Lines, JSON, CSV or TSV)", `strata-server import --db ${db} --schema ${file} rows.jsonl`,
+    "# or filled with an existing database's rows (not open in a running server)", `strata-server --db ${db} --schema ${file} --copy-from old.strata`,
+    "# then serve it", `strata-server --db ${db}`);
+  $("sCmds").replaceChildren(el("label", { class: "lbl", text: "With the schema downloaded, in a terminal:" }), el("pre", { class: "sql", text: lines.join("\n") }));
+}
+
+// Guessing a schema from the first rows of a file.
+$("sInferBtn").onclick = () => $("sInferFile").click();
+$("sInferFile").onchange = async () => {
+  const f = $("sInferFile").files[0]; if (!f) return;
+  try {
+    const rows = await sampleRows(f);
+    if (!rows.length) throw new Error(`${f.name} has no rows`);
+    designFrom(guessSchema(rows, f.name));
+    $("sStatus").replaceChildren(el("span", { class: "muted", text: `Guessed from the first ${plural(rows.length, "row")} of ${f.name}. Check the types, then press Check.` }));
+  } catch (e) { $("sStatus").replaceChildren(el("span", { class: "error", text: e.message })); }
+  $("sInferFile").value = "";
+};
+async function sampleRows(file) {
+  const fmt = formatOf(file.name) || "jsonl", head = 2 << 20, whole = file.size <= head;
+  if (fmt === "json") {
+    const a = JSON.parse(await file.text());
+    if (!Array.isArray(a)) throw new Error("A .json file holds an array of objects; use .jsonl for an object per line.");
+    return a.slice(0, 2000);
+  }
+  const lines = (await file.slice(0, head).text()).split(/\r?\n/);
+  if (!whole) lines.pop(); // cut short
+  if (fmt === "jsonl") return lines.filter((l) => l.trim()).slice(0, 2000).map((l, i) => { try { return JSON.parse(l); } catch { throw new Error(`Line ${i + 1} of ${file.name} is not JSON.`); } });
+  return parseDelimited(lines.join("\n"), fmt === "tsv" ? "\t" : ",").slice(0, 2000);
+}
+function parseDelimited(text, sep) {
+  const rows = []; let row = [], cell = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; }
+    else if (c === '"' && cell === "") q = true;
+    else if (c === sep) { row.push(cell); cell = ""; }
+    else if (c === "\n" || c === "\r") { if (c === "\r" && text[i + 1] === "\n") i++; row.push(cell); rows.push(row); row = []; cell = ""; }
+    else cell += c;
+  }
+  if (!q && (cell !== "" || row.length)) { row.push(cell); rows.push(row); }
+  const [head, ...body] = rows;
+  if (!head) return [];
+  return body.filter((r) => r.length > 1 || r[0] !== "").map((r) => Object.fromEntries(head.map((h, i) => [h.trim(), r[i] ?? ""])));
+}
+function guessSchema(rows, fileName) {
+  const delimited = /\.(csv|tsv|tab)$/i.test(fileName);
+  const names = [];
+  for (const r of rows) for (const k of Object.keys(r)) if (!names.includes(k)) names.push(k);
+  const fields = names.map((n) => guessField(n, rows.map((r) => r[n]), delimited));
+  const unique = (n) => { const vs = rows.map((r) => r[n]); return vs.every((v) => v != null && v !== "") && new Set(vs.map(String)).size === vs.length; };
+  const keyable = fields.filter((f) => (f.type === "keyword" || f.type === "int") && !f.multi && unique(f.name));
+  const key = keyable.find((f) => /^(_?id|key|uuid|doc_?id|sku|slug)$/i.test(f.name)) || keyable[0];
+  let table = fileName.replace(/\.[^.]*$/, "").replace(/[^A-Za-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase() || "rows";
+  if (!/^[a-z_]/.test(table)) table = "t_" + table;
+  return { table, key: key && key.name, fields };
+}
+function guessField(name, values, delimited) {
+  let vs = values.filter((v) => v != null && v !== "");
+  if (delimited) vs = vs.map((v) => {
+    const t = String(v).trim();
+    if (/^[[{]/.test(t)) { try { return JSON.parse(t); } catch {} }
+    return /^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t) ? Number(t) : v;
+  });
+  if (!vs.length) return { name, type: "text" };
+  if (vs.every((v) => typeof v === "number" || typeof v === "boolean")) return { name, type: vs.every((v) => typeof v === "boolean" || Number.isInteger(v)) ? "int" : "float" };
+  if (vs.every(Array.isArray)) {
+    const flat = vs.flat();
+    if (flat.length && flat.every((x) => typeof x === "number")) {
+      if (new Set(vs.map((v) => v.length)).size === 1 && vs[0].length >= 8 && !flat.every(Number.isInteger)) return { name, type: "vector", dim: vs[0].length };
+      if (flat.every(Number.isInteger)) return { name, type: "int", multi: true };
+    }
+    if (flat.every((x) => typeof x === "string")) return { name, type: "keyword", multi: true };
+    if (flat.every((x) => x && typeof x === "object" && "to" in x)) return { name, type: "edges" };
+    return { name, type: "text" };
+  }
+  if (vs.every((v) => v && typeof v === "object" && Object.values(v).every((x) => typeof x === "number"))) return { name, type: "sparse" };
+  const ss = vs.map(String);
+  // In CSV, short values joined by | are a list.
+  if (delimited && ss.some((s) => s.includes("|")) && ss.every((s) => s.split("|").every((p) => p.trim().split(/\s+/).length <= 3))) return { name, type: "keyword", multi: true };
+  // Short values of a word or two are keywords; the rest is text.
+  const words = ss.reduce((n, s) => n + s.trim().split(/\s+/).length, 0) / ss.length;
+  return { name, type: words <= 2 && ss.every((s) => s.length <= 64) ? "keyword" : "text" };
+}
+
 async function init() {
   try {
     await refreshHealth();

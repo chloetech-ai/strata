@@ -132,6 +132,7 @@ target/release/strata-server --demo 20000 --db products.strata   # http://127.0.
 | [`engram/`](engram/) | the memory system: hooks client, daemon, MCP server, recall and gate, distiller, live inspector (`demo/`), evaluation harnesses and results |
 | [`strata/`](strata/) | the database: storage engine, segments, text / structured / vector / graph indexes, SQL binder, planner and executor, baselines and benchmarks; [`src/postings/`](strata/src/postings/) holds the compressed posting lists and set algorithms, the Pyramid, Loom and Entropic designs, and their testbed (`strata-posting-bench`) |
 | [`strata-server/`](strata-server/) | Strata over HTTP JSON and gRPC: a coordinator over shards, deadlines, Prometheus metrics, a query-builder UI and an agent that answers questions with SQL ([docs](docs/strata/server.md)) |
+| [`strata-py/`](strata-py/) | Strata from Python: the database in-process (a Rust extension) or a client of strata-server, with the same methods ([docs](docs/strata/python.md)) |
 | [`docs/`](docs/) | this documentation, as Markdown and as a GitHub Pages site |
 | [`install.sh`](install.sh) | builds Engram, installs it to `~/.local/bin` and wires it into Claude Code |
 | [`AGENTS.md`](AGENTS.md) | instructions for a coding agent setting Engram up or working on this repository (`CLAUDE.md` imports it) |
@@ -142,7 +143,7 @@ Each crate also carries its own design document ([Strata](strata/DESIGN.md), [En
 
 - [Overview](docs/index.md)
 - **Engram:** [install on your machine](docs/engram/setup.md) · [how it works](docs/engram/index.md) · [live inspector](docs/engram/inspector.md) · [results](docs/engram/results.md)
-- **Strata:** [design](docs/strata/index.md) · [query language](docs/strata/query-language.md) · [graphs](docs/strata/graphs.md) · [server](docs/strata/server.md) · [results](docs/strata/results.md)
+- **Strata:** [design](docs/strata/index.md) · [query language](docs/strata/query-language.md) · [graphs](docs/strata/graphs.md) · [server](docs/strata/server.md) · [Python](docs/strata/python.md) · [results](docs/strata/results.md)
 - [Posting lists](docs/posting-lists.md)
 - [Reproducing the results](docs/reproduce.md)
 

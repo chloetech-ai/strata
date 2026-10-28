@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value as Json};
 use strata::db::{Db, SqlResult};
 use strata::embed::Embedder;
+use strata::ingest::{Format, Rows};
 use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::stats::TermStats;
 use strata::query::{bind, compound, Params};
@@ -499,17 +500,37 @@ impl Service {
     pub async fn write_ops(self: &Arc<Self>, mut ops: Vec<Json>) -> Result<u64, ApiError> {
         let n = match &self.backend {
             Backend::Local(db) => {
-                let deadline = Instant::now() + self.timeout;
                 if self.models.iter().any(|m| m.model.is_ok()) {
                     let (svc, db) = (self.clone(), db.clone());
                     ops = tokio::task::spawn_blocking(move || svc.embed_ops(&db, &mut ops).map(|_| ops)).await.map_err(ApiError::internal)??;
                 }
-                self.write(WriteJob::Ops(ops), deadline).await?
+                // The deadline bounds the wait for the writer, not the embedding.
+                self.write(WriteJob::Ops(ops), Instant::now() + self.timeout).await?
             }
             Backend::Cluster(c) => c.write_ops(ops).await?,
         };
         self.metrics.write(n);
         Ok(n)
+    }
+
+    /// Imports rows of `format` from `body` ([`strata::ingest`]): upserted
+    /// through the writer (or routed to the shards) [`IMPORT_OPS`] rows a
+    /// request, so the rows before a failed request stay written. Returns
+    /// the rows written and the fields the schema lacks (skipped).
+    pub async fn import(self: &Arc<Self>, body: axum::body::Bytes, format: Format) -> Result<(u64, Vec<String>), ApiError> {
+        let schema = self.schema.clone();
+        let (ops, unknown) = tokio::task::spawn_blocking(move || -> strata::Result<_> {
+            let mut rows = Rows::new(&schema, std::io::Cursor::new(body), format)?;
+            let ops: Vec<Json> = rows.by_ref().map(|d| d.map(|d| json!({"op": "upsert", "doc": js::document_json(&schema, &d)}))).collect::<strata::Result<_>>()?;
+            Ok((ops, rows.unknown.into_iter().collect::<Vec<_>>()))
+        })
+        .await
+        .map_err(ApiError::internal)??;
+        let mut n = 0;
+        for chunk in ops.chunks(IMPORT_OPS) {
+            n += self.write_ops(chunk.to_vec()).await?;
+        }
+        Ok((n, unknown))
     }
 
     pub async fn health(self: &Arc<Self>) -> Json {
@@ -544,6 +565,9 @@ pub enum SqlAnswer {
 
 /// The shard of `key` among `n`: FNV-1a of its text (an integer key as
 /// decimal digits), modulo `n`. Loaders must split documents the same way.
+/// Rows one write request of an import carries.
+pub const IMPORT_OPS: usize = 1000;
+
 pub fn shard_of(key: &Value, n: usize) -> usize {
     let text = match key {
         Value::Str(s) => s.clone(),

@@ -9,6 +9,7 @@ publish = false
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+csv = "1"
 sqlparser = "0.59"
 crc32fast = "1"
 libc = "0.2"

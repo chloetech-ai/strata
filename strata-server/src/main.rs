@@ -7,6 +7,7 @@
 //! strata-server --shards 'http://a0:7701|http://a1:7701,http://b0:7701|http://b1:7701'   # two replicas each
 //! strata-server --db new.strata --schema new.json --copy-from my.strata   # re-embed into a new schema
 //! strata-server fetch-model potion-retrieval-32M       # download an embedding model
+//! strata-server import --db my.strata --schema my.json rows.jsonl more.csv   # load files
 //! ```
 
 use std::path::PathBuf;
@@ -97,18 +98,53 @@ enum Command {
         #[arg(long, env = "STRATA_MODELS")]
         models: Option<PathBuf>,
     },
+    /// Load rows from JSON Lines, JSON, CSV or TSV files into a database,
+    /// created with --schema if it does not exist. A server must not have
+    /// the database open (import through `POST /v1/import` instead).
+    Import {
+        /// The database.
+        #[arg(long)]
+        db: PathBuf,
+        /// Schema of a new database, as JSON.
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        /// The files' format: jsonl, json, csv or tsv (default: from each
+        /// file's extension).
+        #[arg(long)]
+        format: Option<String>,
+        /// Where embedded fields' models are (see `fetch-model`).
+        #[arg(long, env = "STRATA_MODELS")]
+        models: Option<PathBuf>,
+        /// Create a new database as a directory of segment files.
+        #[arg(long)]
+        directory: bool,
+        /// The files, loaded in order.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
 }
 
 #[tokio::main]
 async fn main() {
     let a = Args::parse();
-    if let Some(Command::FetchModel { name, models }) = &a.command {
-        let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
-        match server::fetch_model(name, &dir).await {
-            Ok(path) => eprintln!("strata-server: {name} is in {}", path.display()),
-            Err(e) => fail(&e),
+    match &a.command {
+        Some(Command::FetchModel { name, models }) => {
+            let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
+            match server::fetch_model(name, &dir).await {
+                Ok(path) => eprintln!("strata-server: {name} is in {}", path.display()),
+                Err(e) => fail(&e),
+            }
+            return;
         }
-        return;
+        Some(Command::Import { db, schema, format, models, directory, files }) => {
+            let format = format.as_deref().map(|f| strata::ingest::Format::parse(f).unwrap_or_else(|| fail(&format!("unknown --format {f}: jsonl, json, csv or tsv"))));
+            let models = models.clone().unwrap_or_else(strata::embed::models_dir);
+            if let Err(e) = server::import_files(db, schema.as_deref(), &models, format, *directory, files) {
+                fail(&e);
+            }
+            return;
+        }
+        None => {}
     }
     let demo_shard = a.demo_shard.as_deref().map(|s| {
         let (i, n) = s.split_once('/').unwrap_or_else(|| fail("--demo-shard is I/N"));

@@ -39,34 +39,79 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--copy-from PATH` | | fill the new database (`--db` with `--schema`) with this database's rows, re-embedding the vector fields whose embedding changed |
 | `--synonyms FILE` | | the synonym list for `synonyms => 1` searches ([format](query-language.md#typos-and-synonyms)): read at start if it exists, written by `PUT /v1/synonyms` |
 
-A schema file is Strata's schema as JSON. `GET /v1/schema` returns it in the same form:
+`strata-server import` and `strata-server fetch-model` are subcommands: [loading rows](#loading-rows) and [embedded vector fields](#embedded-vector-fields).
+
+## Schemas
+
+A database holds one table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the UI's schema designer, or `strata.Database.create` in [Python](python.md)). A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
 
 ```json
 {
   "table": "docs",
-  "primary_key": 0,
+  "key": "id",
   "fields": [
-    {"name": "id", "ty": "Keyword", "stored": true, "indexed": true},
-    {"name": "body", "ty": {"Text": {"positions": true}}, "stored": true, "indexed": true},
-    {"name": "tags", "ty": "Keyword", "multi": true, "stored": true, "indexed": true},
-    {"name": "published", "ty": "Int", "stored": true, "indexed": true},
-    {"name": "emb", "ty": {"Vector": {"dim": 768, "index": {"Hnsw": {"m": 16, "ef_construction": 200}}}}, "codes": "binary", "stored": false, "indexed": true},
-    {"name": "splade", "ty": "Sparse", "stored": true, "indexed": true}
+    {"name": "id", "type": "keyword"},
+    {"name": "title", "type": "text"},
+    {"name": "body", "type": "text"},
+    {"name": "tags", "type": "keyword", "multi": true},
+    {"name": "published", "type": "int"},
+    {"name": "emb", "type": "vector", "embed": {"from": ["title", "body"], "model": "potion-retrieval-32M"}},
+    {"name": "splade", "type": "sparse"}
   ]
 }
 ```
 
-The [query language](query-language.md#columns-and-types) page describes the types.
+| type | holds | used by |
+|---|---|---|
+| `text` | words, searched by relevance | `MATCH`, `bm25()` |
+| `keyword` | exact values: ids, categories, tags | `=`, `IN`, `GROUP BY` (facets) |
+| `int`, `float` | numbers (an `int` also holds dates as Unix seconds) | ranges, sorting, sums, boosts |
+| `vector` | a fixed number of floats | `similarity()`, `distance()` |
+| `sparse` | learned term weights (SPLADE, BGE-M3), `{"term": weight}` | `similarity()` |
+| `edges` | links to other rows by key, a JSON array | [graph queries](graphs.md) |
+
+| option | types | default | what it does |
+|---|---|---|---|
+| `stored` | all | true; false for vectors and generated text | the value is kept and returned in results |
+| `indexed` | all | true | the value can be searched and filtered on |
+| `multi` | `keyword`, `int` | false | a list of values per row (stored, not the key) |
+| `positions` | `text` | true | keep word positions, for phrase searches |
+| `from` | `text` | | generated: the named fields' text joined, such as a `body` of title and description to search at once |
+| `dim` | `vector` | the model's, for a known `embed` model | the number of dimensions |
+| `index` | `vector` | `"hnsw"` (m 16, ef_construction 200) | `"flat"` (an exact scan), `{"hnsw": {"m": 32, "ef_construction": 400}}` or `{"ivf": {"nlist": 1024}}` |
+| `codes` | `vector` | `"sq8"` (a byte a dimension) | `"binary"`: a bit a dimension, 1/32 of the vectors, rescored |
+| `embed` | `vector` | | `{"from": [fields], "model": name}`: the vectors are that model's embedding of those fields ([below](#embedded-vector-fields)) |
+
+`key` names the primary key, a `keyword` or `int` field; rows are upserted and deleted by it, and a table without one only takes inserts. An option a type does not know is an error, so a typo does not pass silently. `GET /v1/schema` returns the schema in this form as `short` (and in the long form Strata stores, as `schema`); `POST /v1/schema/check` validates one and returns both. The long form is accepted wherever a schema is read. The [query language](query-language.md#columns-and-types) page describes the types further.
+
+## Loading rows
+
+Rows come as JSON Lines (an object per line), a JSON array of objects, or CSV or TSV with a header row. Each column goes to the field of its name; columns the schema has no field for are skipped and reported. A row's values are what a write takes: a list for a `multi` field, an array of numbers for a vector, an object of weights for a `sparse` field. In CSV and TSV an empty cell is empty (null), a list is `a|b|c` or a JSON array, and vectors, sparse weights and edges are JSON. Vectors of [embedded fields](#embedded-vector-fields) that a row leaves out are computed from its other fields.
+
+From the command line, into a database no server has open (an open database is locked):
+
+```sh
+strata-server import --db books.strata --schema books.json books.jsonl more.csv   # --schema only creates
+```
+
+Into an empty table the rows are bulk-loaded straight into segments, in one commit: a bad row is reported with its line or row number, and nothing is written. Into a table that has rows they are upserted, 10,000 rows a transaction. The format comes from each file's extension (`.jsonl`, `.ndjson`, `.json`, `.csv`, `.tsv`) or `--format`.
+
+To a running server, `POST /v1/import` with the rows as the body and the format as `?format=` (or the content type):
+
+```sh
+curl -s -X POST 'localhost:7700/v1/import?format=csv' --data-binary @more.csv
+# {"written": 2, "skipped_fields": [], "took_ms": 3.1}
+```
+
+The server reads every row before it writes any, so a bad row writes nothing, then upserts them through its writer 1,000 rows a request (a coordinator routes them to the shards). A request may be up to 256 MB. The UI's **Schema and import** tab uploads a file this way, and [Python](python.md) has `import_file` both in-process and as a client.
 
 ## Embedded vector fields
 
 A `VECTOR` field can say what its vectors are: a model's embedding of other fields.
 
 ```json
-{"name": "emb_title", "ty": {"Vector": {"dim": 512, "index": "Flat"}}, "stored": false, "indexed": true,
- "embed": {"from": ["title"], "model": "potion-retrieval-32M"}},
-{"name": "emb_both", "ty": {"Vector": {"dim": 512, "index": "Flat"}}, "stored": false, "indexed": true,
- "embed": {"from": ["title", "description"], "model": "potion-retrieval-32M"}}
+{"name": "emb_title", "type": "vector", "embed": {"from": ["title"], "model": "potion-retrieval-32M"}},
+{"name": "emb_both", "type": "vector", "embed": {"from": ["title", "description"], "model": "potion-retrieval-32M"}}
 ```
 
 The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text embedded is their non-empty values joined by newlines, as for a generated field. The declaration is kept in the database, returned by `/v1/schema` and shown by the UI ("emb_title ← title") and the agent. When the server starts it opens each field's model from `--models` and logs what each field is. With the model open:
@@ -110,9 +155,10 @@ Rows are copied field by field by name; a vector field is copied when the old on
 | NFCorpus | BGE-small v1.5 | 0.318 | **0.349** | 0.344 | 0.365 |
 | NFCorpus | Arctic Embed M v1.5 | 0.321 | 0.361 | **0.363** | 0.370 |
 | SciDocs | Model2Vec potion-retrieval-32M | 0.128 | 0.120 | **0.137** | 0.159 |
+| SciDocs | BGE-small v1.5 | 0.195 | 0.198 | **0.205** | 0.195 |
 | TREC-COVID | Model2Vec potion-retrieval-32M | **0.504** | 0.482 | 0.446 | 0.654 |
 
-Title + text is the best single vector, or within 0.005 of it, everywhere but TREC-COVID with Model2Vec, where short COVID questions match its on-topic titles better than a static model's average over long abstracts. Fusing the vector with BM25 (`rrf(bm25(body, :t), similarity(emb, :q))`) beats the best single vector in every run. So start with one vector of title + description searched together with BM25, and when titles are informative and descriptions long, above all with a static model, add a title-only field and compare the two on your own queries. On the M2's CPU, Model2Vec loaded and embedded 12,000 to 22,000 texts a second and the BERT models 8 to 15 (build with `--features accelerate` on a Mac).
+Title + text is the best single vector, or within 0.005 of it, everywhere but TREC-COVID with Model2Vec, where short COVID questions match its on-topic titles better than a static model's average over long abstracts. Fusing the vector with BM25 (`rrf(bm25(body, :t), similarity(emb, :q))`) beats the best single vector in 8 of the 9 runs; the exception is SciDocs with BGE-small, where BM25 (0.157) is far behind the vector and fusion pulls it from 0.205 to 0.195. So start with one vector of title + description searched together with BM25, check the fusion against the vector alone on your own queries, and when titles are informative and descriptions long, above all with a static model, add a title-only field and compare the two. On the M2's CPU, Model2Vec loaded and embedded 12,000 to 22,000 texts a second and the BERT models 8 to 27 (build with `--features accelerate` on a Mac).
 
 `strata-embed-eval` (in `strata/`) runs this comparison: it loads a BEIR collection into fields embedding its titles, its texts and both, by one model, and reports nDCG@10 and recall@100 for each, with BM25, hybrid and the collection's Cohere vectors as references.
 
@@ -129,12 +175,15 @@ Every request and answer is JSON. Parameters bind `:name` placeholders: a number
 | `POST /v1/query` | `{sql, params?, timeout_ms?}` | `{columns, rows, keys, scores, stats, took_ms}` |
 | `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows for a `SELECT`; `{written}` for `INSERT`, `UPDATE`, `DELETE` |
 | `POST /v1/write` | `{ops: [...]}` | `{written}` |
+| `POST /v1/import?format=F` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
+| `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?}` | the bound query and its plan lines |
 | `POST /v1/term_stats` | `{sql, params?}` | BM25 statistics and a snapshot lease, for a coordinator |
 | `POST /v1/snapshot` | | a snapshot lease: `{snapshot, txn, ttl_s}` |
 | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the queries it ran |
 | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` for `PUT` | the synonym list: `{text, rules, file}` |
-| `GET /v1/health`, `/v1/stats`, `/v1/schema`, `/v1/config` | | JSON |
+| `GET /v1/schema` | | `{schema, short, primary_key, embeddings}` |
+| `GET /v1/health`, `/v1/stats`, `/v1/config` | | JSON |
 | `GET /metrics` | | Prometheus text |
 | `GET /` | | the UI |
 
@@ -201,7 +250,7 @@ Every query runs under a deadline (`timeout_ms`, or the server's default) and ge
 
 ## The UI
 
-`GET /` serves a single page with five tabs.
+`GET /` serves a single page with six tabs.
 
 ![The query builder: search text, similar to a description, weighted fusion, a filter, the SQL it writes, and the results](../assets/img/strata-server-builder.png)
 
@@ -209,6 +258,7 @@ Every query runs under a deadline (`timeout_ms`, or the server's default) and ge
 - **Graph** (for a table with an `EDGES` or `VECTOR` field) starts from keys, the top rows of a search or the rows matching a condition, follows links (out, in or both ways, optionally one label) or similarity (each row's *k* nearest), and finds the rows within some hops, the shortest path to other rows, or the rows ranked by personalized PageRank, with conditions on the rows found. The answer is a table and a picture: rings by hop distance, a path left to right, or PageRank as node size. Clicking a node shows its row, expands its links or starts a new walk from it.
 - **SQL** is an editor with parameters, results and the plan the executor recorded, segment by segment, with example queries one click away.
 - **Ask an agent** takes a question in plain language.
+- **Schema and import** uploads a JSON Lines, JSON, CSV or TSV file (or pasted rows) into the table, showing the upload's progress and the columns it skipped. It shows the table's schema in the short form, and designs new ones: fields by type with their options, vector fields embedding chosen text fields by a named model, a first draft guessed from a file's first rows (numbers, lists, vectors, short values as keywords and longer ones as text, a unique `id`-like column as the key), JSON that edits both ways, a check against the server, a download, and the commands that create and fill a database with it.
 - **Query language** is a guide to the SQL with examples written against the table's own fields and words from its rows: boolean, phrase, prefix, typo and synonym searches, conditions, aggregates and `HAVING`, subqueries and `WITH`, joins, graph queries, hybrid ranking and boosts, and what is not supported. "Try it" runs an example in the SQL tab. It also edits the server's synonym list.
 
 ![The SQL editor with a plan](../assets/img/strata-server-sql.png)

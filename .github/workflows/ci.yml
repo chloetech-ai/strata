@@ -84,3 +84,53 @@ jobs:
             | grep -q '"rows"'
           curl -sf http://127.0.0.1:7700/metrics | grep -q strata_queries_total
           curl -sf http://127.0.0.1:7700/ | grep -qi '<html'
+          # Rows into a new database from the command line, then over HTTP.
+          printf '{"table": "t", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "title", "type": "text"}]}' > "$RUNNER_TEMP/t.json"
+          printf '{"id": "a", "title": "first row"}\n{"id": "b", "title": "second row", "extra": 1}\n' > "$RUNNER_TEMP/t.jsonl"
+          ./target/release/strata-server import --db "$RUNNER_TEMP/t.strata" --schema "$RUNNER_TEMP/t.json" "$RUNNER_TEMP/t.jsonl"
+          ./target/release/strata-server --db "$RUNNER_TEMP/t.strata" --listen 127.0.0.1:7702 --grpc off &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:7702/v1/health && break; sleep 1; done
+          printf 'id,title\nc,third row\n' | curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=csv' --data-binary @- | grep -q '"written":1'
+          curl -sf http://127.0.0.1:7702/v1/health | grep -q '"docs":3'
+
+  python:
+    name: Python package on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: CPU model
+        id: cpu
+        shell: bash
+        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            strata-py
+            strata-server
+          key: python-${{ steps.cpu.outputs.model }}
+      # The client tests run against a real server.
+      - name: Build strata-server
+        working-directory: strata-server
+        run: cargo build --release
+      - name: Build and test
+        working-directory: strata-py
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest numpy
+          maturin develop --release
+          pytest tests -v
+      - name: Clippy
+        working-directory: strata-py
+        run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
