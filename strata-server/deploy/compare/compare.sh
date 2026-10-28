@@ -4,7 +4,7 @@
 # same CPU and memory in all. See README.md.
 #
 #   compare.sh image                  # build the image and load it and the engines' images into the nodes
-#   compare.sh build                  # Strata: build both shards, each on its node (timed)
+#   compare.sh build                  # Strata: build both shards, one after the other, each on its node (timed)
 #   compare.sh up strata|es|solr      # start an engine
 #   compare.sh load es|solr           # load the collection into it (timed)
 #   compare.sh run strata|es|solr     # time the query kinds and record answers; CPU use around it
@@ -26,8 +26,10 @@ CLIENT_NODE=strata-worker3
 # Every engine: 3 CPUs and 6 GiB in all. Elasticsearch and Solr: two data
 # nodes of 1.5 CPUs and 3 GiB. Strata: two shards of 1.25 CPUs and 2.5 GiB
 # and a coordinator of 0.5 CPU and 1 GiB. Loading gets the whole budget
-# on the two data nodes (Strata's build jobs: 1.5 CPUs and 3 GiB each).
+# too: Elasticsearch and Solr on their two data nodes, Strata one shard's
+# build job at a time.
 DATA_CPU=1500m DATA_MEM=3Gi
+BUILD_CPU=3 BUILD_MEM=6Gi
 SHARD_CPU=1250m SHARD_MEM=2560Mi
 COORD_CPU=500m COORD_MEM=1Gi
 OUT=${OUT:-/data/compare}
@@ -112,14 +114,12 @@ image)
     kubectl --context "kind-$CLUSTER" create namespace "$NS" --dry-run=client -o yaml | kubectl --context "kind-$CLUSTER" apply -f -
     ;;
 build)
-    # Both shards at once, each on the node that will serve it.
+    # One shard after the other, each on the node that will serve it, with
+    # the engine's whole budget: a shard's build holds its documents in
+    # memory, and two at once in 3 GiB each were killed for lack of memory.
     for i in 0 1; do
-        job "build-s$i" "${NODES[$i]}" "$DATA_CPU" "$DATA_MEM" build --shard "$i" --of 2 --out "/local/quora.shard${i}of2.strata" --threads 2 >"${STRATA_WORK:?}/compare/build-s$i.log" 2>&1 &
-    done
-    wait
-    cat "$STRATA_WORK"/compare/build-s*.log
-    for i in 0 1; do
-        docker exec "${NODES[$i]}" cat "/var/local/compare/quora.shard${i}of2.strata.build.json" >"$STRATA_WORK/compare/build-strata-s$i.json"
+        job "build-s$i" "${NODES[$i]}" "$BUILD_CPU" "$BUILD_MEM" build --shard "$i" --of 2 --out "/local/quora.shard${i}of2.strata" --threads 3
+        docker exec "${NODES[$i]}" cat "/var/local/compare/quora.shard${i}of2.strata.build.json" >"${STRATA_WORK:?}/${OUT#/data/}/build-strata-s$i.json"
     done
     ;;
 up)

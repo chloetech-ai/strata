@@ -28,7 +28,12 @@ of shards and the same CPU and memory, and asks each the query kinds of
   1.5 GB for Elasticsearch, as Elastic recommends; 1 GB for Solr, whose
   full-precision vectors need the page cache); Strata has two shards of 1.25
   CPUs and 2.5 GiB and a coordinator of 0.5 CPU and 1 GiB, since its
-  shards do not also coordinate.
+  shards do not also coordinate. Loading has the same budget: Elasticsearch
+  and Solr take bulk requests on their two data nodes (from a loader pod on
+  the third node, outside the budget), and Strata builds its shards one
+  after the other in a job of 3 CPUs and 6 GiB on the shard's node (a
+  shard's build holds its documents in memory; two at once in 3 GiB each
+  ran out of memory).
 - **Text analysis**: Strata's, rebuilt in the other two: words are runs of
   letters and digits, lowercased and folded to ASCII, minus Lucene's classic
   English stopwords, stemmed with Snowball English (Porter 2); ranked
