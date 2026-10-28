@@ -102,6 +102,12 @@ pub struct DbOptions {
     /// How a database created with these options is laid out on disk (an
     /// existing one opens in the layout it has).
     pub layout: Layout,
+    /// Open a database whose WAL was damaged after it was made durable
+    /// (more than one commit follows the damage) by dropping the
+    /// transactions from the damage on; the log is copied to
+    /// `<wal>.damaged` first. Without it, opening such a database with
+    /// `sync` fails. ([`Database::damaged`] says what was dropped.)
+    pub wal_drop_damaged: bool,
 }
 
 /// How a database is laid out on disk.
@@ -130,6 +136,7 @@ impl Default for DbOptions {
             random_hints: true,
             publish_snapshots: false,
             layout: Layout::SingleFile,
+            wal_drop_damaged: false,
         }
     }
 }
@@ -189,6 +196,9 @@ pub struct Database {
     poisoned: AtomicBool,
     /// Why the last flush failed, until one succeeds.
     flush_error: Mutex<Option<String>>,
+    /// What opening found damaged and skipped: the newest version on disk
+    /// (the one before it was opened), commits at the end of the WAL.
+    damaged: Option<String>,
 }
 
 impl Database {
@@ -274,25 +284,61 @@ impl Database {
         Database::assemble(path, path.join(dir::WAL), Some(path.to_path_buf()), lockf, opts, manifest, meta, 0, FreeList::new(META_PAGES), OwnedBytes::empty(), handles)
     }
 
+    /// Opens the newest version named by a valid meta slot, or, when that
+    /// version is damaged (its manifest or free list fails its checksum,
+    /// or a segment it names does not open), the version in the other
+    /// slot: the one before it, which the newer commit left intact
+    /// ([`crate::storage::freelist`]). With `sync` off, a power loss can
+    /// leave the newest slot naming pages that never reached the disk;
+    /// that loses the newest commits, not the database.
     fn load(path: &Path, file: File, opts: DbOptions) -> Result<Database> {
-        let (meta, slot) = pager::read_meta(&file)?;
-        let manifest = Manifest::decode(&pager::read_extent(&file, meta.manifest, meta.manifest_crc)?)?;
-        let freelist = FreeList::decode(&pager::read_extent(&file, meta.freelist, meta.freelist_crc)?, meta.page_count)?;
+        let metas = pager::read_metas(&file)?;
+        let mut damaged = None;
+        for (i, &(meta, slot)) in metas.iter().enumerate() {
+            match Database::load_version(&file, &opts, meta, i > 0) {
+                Ok((manifest, freelist, map, handles)) => {
+                    let mut db = Database::assemble(path, wal_path(path), None, file, opts, manifest, meta, slot, freelist, map, handles)?;
+                    db.damaged = match (damaged, db.damaged.take()) {
+                        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+                        (a, b) => a.or(b),
+                    };
+                    return Ok(db);
+                }
+                Err(Error::Corrupt(m)) if i + 1 < metas.len() => damaged = Some(format!("version {} skipped: {m}", meta.txn)),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(corrupt("no valid meta slot"))
+    }
+
+    /// Reads and checks the version `meta` names. A commit cuts free pages
+    /// off the end of the file, which can leave it shorter than the
+    /// version before it says (`older`); those pages are none that version
+    /// references (every page it does is either still in use or a pending
+    /// free of the newer commit), so the file is extended back.
+    #[allow(clippy::type_complexity)]
+    fn load_version(file: &File, opts: &DbOptions, meta: Meta, older: bool) -> Result<(Manifest, FreeList, OwnedBytes, Vec<Vec<Arc<SegHandle>>>)> {
+        let manifest = Manifest::decode(&pager::read_extent(file, meta.manifest, meta.manifest_crc)?)?;
+        let freelist = FreeList::decode(&pager::read_extent(file, meta.freelist, meta.freelist_crc)?, meta.page_count)?;
         let len = file.metadata()?.len();
         if len < meta.page_count * PAGE {
-            return Err(corrupt("file is shorter than its page count"));
-        }
-        if len > meta.page_count * PAGE {
-            // Left by a commit that did not finish; nothing valid lives there.
+            if !older {
+                return Err(corrupt("file is shorter than its page count"));
+            }
             file.set_len(meta.page_count * PAGE)?;
         }
-        let map = pager::map_file(&file, opts.read_ahead)?;
+        if len > meta.page_count * PAGE {
+            // Left by a commit that did not finish, or by the damaged
+            // version skipped; nothing this version uses lives there.
+            file.set_len(meta.page_count * PAGE)?;
+        }
+        let map = pager::map_file(file, opts.read_ahead)?;
         let handles = manifest
             .tables
             .iter()
             .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
-        Database::assemble(path, wal_path(path), None, file, opts, manifest, meta, slot, freelist, map, handles)
+        Ok((manifest, freelist, map, handles))
     }
 
     /// The open database around an on-disk version (`handles`: each table's
@@ -311,7 +357,8 @@ impl Database {
         map: OwnedBytes,
         handles: Vec<Vec<Arc<SegHandle>>>,
     ) -> Result<Database> {
-        let (mut wal, txns) = Wal::open(&wal_path, meta.db_id, opts.sync)?;
+        let (mut wal, txns) = Wal::open(&wal_path, meta.db_id, opts.sync, opts.wal_drop_damaged)?;
+        let wal_dropped = wal.dropped().map(str::to_string);
         let tables: Vec<TableState> = manifest
             .tables
             .iter()
@@ -371,6 +418,7 @@ impl Database {
             mem_ids: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             flush_error: Mutex::new(None),
+            damaged: wal_dropped,
         };
         db.republish();
         Ok(db)
@@ -537,6 +585,15 @@ impl Database {
         lock(&self.flush_error).clone()
     }
 
+    /// Set when opening skipped something damaged: the newest version on
+    /// disk, when it failed a check and the one before it was opened (the
+    /// next commit overwrites its meta slot), or committed transactions
+    /// after damage in the WAL, which were dropped after the log was copied
+    /// aside. Says what, why and where the copy is.
+    pub fn damaged(&self) -> Option<&str> {
+        self.damaged.as_deref()
+    }
+
     /// Whether a write failed partway (a WAL append, a meta page), after
     /// which every write and merge fails until the database is reopened.
     pub fn is_poisoned(&self) -> bool {
@@ -566,6 +623,10 @@ impl Database {
         };
         let mut vw = VersionWriter::begin(self);
         vw.manifest.wal_txn = txn;
+        // The WAL is reset after this commit, and it is the only other copy
+        // of what the flush writes: without `sync`, a power loss could
+        // otherwise keep the reset and lose the version.
+        vw.sync = true;
         for (table, schema, chunks, deleted, mem_updates) in mems {
             let live: Vec<Document> = chunks
                 .iter()
@@ -939,11 +1000,13 @@ impl Database {
         }
         // The writer lock keeps the version still; copy it so readers are
         // not held up while every byte is checksummed.
-        let (st_meta, st_manifest, freelist, handles, map) = {
+        let (st_meta, st_slot, st_manifest, freelist, handles, map) = {
             let st = lock(&self.state);
-            (st.meta, st.manifest.clone(), st.freelist.clone(), st.handles().cloned().collect::<Vec<_>>(), st.map.clone())
+            (st.meta, st.slot, st.manifest.clone(), st.freelist.clone(), st.handles().cloned().collect::<Vec<_>>(), st.map.clone())
         };
-        let (meta, _) = pager::read_meta(&self.file)?;
+        // The open version's slot: after opening fell back from a damaged
+        // newer version, the other slot names that one until a commit.
+        let meta = pager::read_metas(&self.file)?.into_iter().find(|&(_, s)| s == st_slot).ok_or_else(|| corrupt("the open version's meta slot is not valid"))?.0;
         let manifest = Manifest::decode(&pager::read_extent(&self.file, meta.manifest, meta.manifest_crc)?)?;
         // Compared as written: a format-1 manifest does not hold the next
         // table id, which the open one keeps counting.
@@ -1568,6 +1631,10 @@ struct VersionWriter<'a> {
     segments_added: usize,
     /// Directory layout: files the new version stops naming.
     obsolete: Vec<String>,
+    /// Make the version durable before its meta slot or `CURRENT` names
+    /// it, and that before the commit returns (`DbOptions::sync`, or a
+    /// flush, after which the WAL is reset).
+    sync: bool,
 }
 
 impl<'a> VersionWriter<'a> {
@@ -1589,6 +1656,7 @@ impl<'a> VersionWriter<'a> {
             bytes_written: 0,
             segments_added: 0,
             obsolete: Vec::new(),
+            sync: db.opts.sync,
         }
     }
 
@@ -1597,7 +1665,7 @@ impl<'a> VersionWriter<'a> {
     fn write_as(&mut self, bytes: &[u8], name: String) -> Result<(Extent, Option<String>)> {
         match &self.db.dir {
             Some(d) => {
-                dir::write_file(d, &name, bytes, self.db.opts.sync)?;
+                dir::write_version_file(d, &name, bytes, self.sync)?;
                 self.bytes_written += bytes.len() as u64;
                 Ok((Extent { page: 0, len: bytes.len() as u64 }, Some(name)))
             }
@@ -1810,7 +1878,7 @@ impl<'a> VersionWriter<'a> {
         self.grow()?;
         db.file.write_all_at(&fbytes, freelist.page * PAGE)?;
         self.bytes_written += fbytes.len() as u64;
-        if db.opts.sync {
+        if self.sync {
             db.file.sync_data()?;
         }
         let meta = Meta {
@@ -1826,7 +1894,7 @@ impl<'a> VersionWriter<'a> {
         let slot = 1 - self.slot;
         // Past this point the on-disk version may already be the new one.
         pager::write_meta(&db.file, slot, &meta).map_err(|e| db.poison(e))?;
-        if db.opts.sync {
+        if self.sync {
             db.file.sync_data().map_err(|e| db.poison(e.into()))?;
         }
         // Free pages at the end are reachable from neither slot. A failed
@@ -1846,11 +1914,11 @@ impl<'a> VersionWriter<'a> {
         self.manifest.txn = c;
         let mbytes = self.manifest.encode();
         let name = dir::manifest_name(c);
-        dir::write_file(d, &name, &mbytes, db.opts.sync)?;
+        dir::write_version_file(d, &name, &mbytes, self.sync)?;
         self.bytes_written += mbytes.len() as u64;
         let cur = Current { db_id: self.meta.db_id, txn: c, manifest: name, crc: crc32fast::hash(&mbytes), format: self.manifest.format() };
         // Past the rename the on-disk version may already be the new one.
-        dir::write_current(d, &cur, db.opts.sync).map_err(|e| db.poison(e))?;
+        dir::write_current(d, &cur, self.sync).map_err(|e| db.poison(e))?;
         self.obsolete.push(previous);
         Ok(Committed {
             meta: dir_meta(&cur),

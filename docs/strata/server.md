@@ -28,6 +28,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--db PATH` | | the database to serve; created if missing, with `--schema` or `--demo` |
 | `--schema FILE` | | the schema of a new database, as JSON (below) |
 | `--directory` | off | create the new database as a directory of segment files instead of one file |
+| `--wal-drop-damaged` | off | open a database whose write-ahead log was damaged after it was durable, dropping the transactions from the damage on (the log is copied to `<log>.damaged` first); without it the server refuses to start on one |
 | `--shards URL,URL,…` | | run as a coordinator over these shard servers' gRPC addresses |
 | `--listen ADDR` | `127.0.0.1:7700` | HTTP: the API, `/metrics` and the UI |
 | `--grpc ADDR` | `127.0.0.1:7701` | gRPC (`off` to disable) |

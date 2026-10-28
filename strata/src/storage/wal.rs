@@ -13,10 +13,15 @@
 //!
 //! A transaction is its operation records followed by a commit record,
 //! written with one `write` and made durable with one `fdatasync`. Replay
-//! stops at the first record that is short or fails its checksum (a torn
-//! tail) and drops operations not followed by a commit. The WAL is truncated
-//! after each flush; transactions a crash left behind in it are skipped by
-//! txn (see `Manifest::wal_txn`).
+//! stops at the first record that is short or fails its checksum and drops
+//! operations not followed by a commit, and the log is cut there. If
+//! commit records follow the damage, the log is first copied aside
+//! (`<wal>.damaged`), and with `sync` more than one of them means the log
+//! was damaged after it was durable, not torn by a crash during the last
+//! append: opening then fails rather than drop them, unless the caller asks
+//! to ([`Wal::open`]'s `drop_damaged`). The WAL is truncated after each
+//! flush; transactions a crash left behind in it are skipped by txn (see
+//! `Manifest::wal_txn`).
 //!
 //! Values are encoded as a tag byte and a little-endian payload: integers and
 //! floats in 8 bytes, strings and vectors as a u32 length and the bytes (or
@@ -62,13 +67,15 @@ pub struct Wal {
     file: File,
     db_id: u64,
     len: u64,
+    /// What opening cut off past damage that committed transactions follow.
+    dropped: Option<String>,
 }
 
 impl Wal {
     /// Creates (or truncates) the log.
     pub fn create(path: &Path, db_id: u64, sync: bool) -> Result<Wal> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
-        let mut wal = Wal { file, db_id, len: 0 };
+        let mut wal = Wal { file, db_id, len: 0, dropped: None };
         wal.reset(sync)?;
         Ok(wal)
     }
@@ -76,12 +83,18 @@ impl Wal {
     /// Opens the log and returns its committed transactions. A missing log,
     /// or one left by another database (different id), counts as empty. A
     /// torn tail is cut off so that later appends follow the last commit.
-    pub fn open(path: &Path, db_id: u64, sync: bool) -> Result<(Wal, Vec<WalTxn>)> {
+    /// Committed transactions after the damage are dropped too, once the
+    /// whole log is copied aside ([`damaged_path`]). With `sync` that is
+    /// one at most, the last append, which had not returned; more mean the
+    /// log was damaged after it was made durable, and opening fails unless
+    /// `drop_damaged`. (Without `sync` a power loss can tear any appends
+    /// not yet written back.)
+    pub fn open(path: &Path, db_id: u64, sync: bool, drop_damaged: bool) -> Result<(Wal, Vec<WalTxn>)> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         let size = file.metadata()?.len();
         let mut buf = vec![0u8; size as usize];
         file.read_exact_at(&mut buf, 0)?;
-        let mut wal = Wal { file, db_id, len: size };
+        let mut wal = Wal { file, db_id, len: size, dropped: None };
         if size < HEADER || &buf[..8] != MAGIC || buf[8..16] != db_id.to_le_bytes() {
             wal.reset(sync)?;
             return Ok((wal, Vec::new()));
@@ -89,6 +102,21 @@ impl Wal {
         let (txns, end) = decode(&buf[HEADER as usize..]);
         let end = HEADER + end as u64;
         if end < size {
+            let later = commits_after(&buf[end as usize..], txns.last().map_or(0, |t| t.txn));
+            let saved = damaged_path(path);
+            if !later.is_empty() {
+                let what = format!(
+                    "{} is damaged at byte {end}, and {} committed transactions follow the damage (up to txn {})",
+                    path.display(),
+                    later.len(),
+                    later.iter().max().unwrap()
+                );
+                if sync && later.len() > 1 && !drop_damaged {
+                    return Err(corrupt(format!("{what}; open with DbOptions::wal_drop_damaged to drop them (the log is copied to {} first)", saved.display())));
+                }
+                std::fs::write(&saved, &buf)?;
+                wal.dropped = Some(format!("{what}: dropped them, the whole log is copied to {}", saved.display()));
+            }
             wal.file.set_len(end)?;
             if sync {
                 wal.file.sync_data()?;
@@ -96,6 +124,12 @@ impl Wal {
             wal.len = end;
         }
         Ok((wal, txns))
+    }
+
+    /// Set when opening dropped committed transactions after damage: where
+    /// the log was damaged, what was dropped, where the copy is.
+    pub fn dropped(&self) -> Option<&str> {
+        self.dropped.as_deref()
     }
 
     /// Appends a committed transaction (operations with the id of the table
@@ -182,6 +216,35 @@ fn frame(out: &mut Vec<u8>, body: &[u8]) {
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
     out.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
     out.extend_from_slice(body);
+}
+
+/// Where a damaged log is copied before it is cut.
+pub fn damaged_path(path: &Path) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".damaged");
+    p.into()
+}
+
+/// The txns of the intact commit records in `rest` (the log past the last
+/// transaction replay reached) that come after txn `last`. A commit record
+/// is 21 bytes (length 13, checksum, kind, txn, op count), so finding one
+/// in damaged bytes by chance takes a checksum collision.
+fn commits_after(rest: &[u8], last: u64) -> Vec<u64> {
+    const BODY: usize = 13;
+    let mut found = Vec::new();
+    for p in 0..rest.len().saturating_sub(8 + BODY - 1) {
+        if u32::from_le_bytes(rest[p..p + 4].try_into().unwrap()) as usize != BODY {
+            continue;
+        }
+        let body = &rest[p + 8..p + 8 + BODY];
+        if body[0] == COMMIT && crc32fast::hash(body) == u32::from_le_bytes(rest[p + 4..p + 8].try_into().unwrap()) {
+            let txn = u64::from_le_bytes(body[1..9].try_into().unwrap());
+            if txn > last {
+                found.push(txn);
+            }
+        }
+    }
+    found
 }
 
 /// Committed transactions in `buf` (the log after its header) and the
@@ -446,14 +509,14 @@ mod tests {
         // Torn tail: half a record after the last commit is cut on open.
         let f = OpenOptions::new().write(true).open(&p).unwrap();
         f.write_all_at(&encode_txn(9, &[(0, Op::Insert(doc(4)))])[..20], len).unwrap();
-        let (mut wal, txns) = Wal::open(&p, 11, false).unwrap();
+        let (mut wal, txns) = Wal::open(&p, 11, false, false).unwrap();
         assert_eq!(txns.len(), 6);
         assert_eq!(wal.len(), len);
         wal.append(10, &[(0, Op::Insert(doc(5)))], false).unwrap();
         drop(wal);
-        let (_, txns) = Wal::open(&p, 11, false).unwrap();
+        let (_, txns) = Wal::open(&p, 11, false, false).unwrap();
         assert_eq!(txns.last().unwrap().txn, 10);
-        let (wal, txns) = Wal::open(&p, 12, false).unwrap();
+        let (wal, txns) = Wal::open(&p, 12, false, false).unwrap();
         assert!(txns.is_empty() && wal.is_empty());
     }
 }
