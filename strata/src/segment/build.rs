@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
-use crate::segment::{DocId, FieldIndexBuilder, SegmentWriter};
+use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
 use crate::text::TextFieldBuilder;
 use crate::value::Document;
 
@@ -93,6 +93,24 @@ fn kind(ty: &FieldType) -> &'static str {
 /// Builds the segment image for `docs` (local docIDs follow slice order) on
 /// [`build_threads`] threads.
 pub fn build_segment(schema: &Schema, docs: &[Document], opts: &BuildOptions) -> Result<Vec<u8>> {
+    build_segment_from(schema, docs, opts, &[])
+}
+
+/// A vector field's HNSW graph to start a build from: `segment`'s graph of
+/// the field, whose documents are the build's from docID `base` on, all of
+/// them, with the same vectors. A merge starts from its largest input that
+/// lost no documents.
+#[derive(Clone)]
+pub struct GraphStart {
+    pub field: usize,
+    pub segment: SegmentFile,
+    pub base: u32,
+}
+
+/// [`build_segment`], with the vector graphs `starts` names started from
+/// those segments' graphs (ignored where the field's graph does not fit:
+/// another `M`, no graph, other documents).
+pub fn build_segment_from(schema: &Schema, docs: &[Document], opts: &BuildOptions, starts: &[GraphStart]) -> Result<Vec<u8>> {
     for d in docs {
         crate::value::validate(schema, d)?;
     }
@@ -118,7 +136,10 @@ pub fn build_segment(schema: &Schema, docs: &[Document], opts: &BuildOptions) ->
             }
             FieldType::Keyword | FieldType::Int | FieldType::Float => None,
             // Vector fields always store their vectors; `indexed` adds the ANN index.
-            FieldType::Vector { .. } => Some(crate::vector::field_builder(f, opts)?),
+            FieldType::Vector { .. } => Some(match starts.iter().find(|g| g.field == i) {
+                Some(g) => crate::vector::field_builder_from(f, opts, g.segment.clone(), g.base)?,
+                None => crate::vector::field_builder(f, opts)?,
+            }),
             FieldType::Edges if f.indexed => {
                 let keys = schema.primary_key.map_or_else(Vec::new, |pk| docs.iter().map(|d| d[pk].clone()).collect());
                 Some(crate::graph::field_builder(f, schema, keys)?)
