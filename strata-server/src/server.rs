@@ -39,6 +39,9 @@ pub struct Options {
     pub api_base: String,
     /// Where embedded fields' models are ([`strata::embed::open`]).
     pub models: PathBuf,
+    /// The synonym list for `synonyms => 1` searches (Solr format), read at
+    /// start if it exists and written by `PUT /v1/synonyms`.
+    pub synonyms: Option<PathBuf>,
 }
 
 /// How the server opens a database. Each write publishes its snapshot,
@@ -127,6 +130,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             }
         };
         eprintln!("strata-server: loaded {n} rows in {:.1} s", t0.elapsed().as_secs_f64());
+    }
+    if let Some(path) = &o.synonyms {
+        svc.open_synonyms(path).map_err(|e| e.message)?;
     }
     Ok(Arc::new(svc))
 }

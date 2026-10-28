@@ -96,6 +96,11 @@ fn split_collection_answers_like_the_whole() {
         "SELECT category, COUNT(*) FROM docs WHERE year >= 2000 GROUP BY category ORDER BY COUNT(*) DESC LIMIT 8".into(),
         "SELECT topic, COUNT(*) FROM docs GROUP BY topic ORDER BY topic LIMIT 5 OFFSET 2".into(),
         "SELECT COUNT(*) FROM docs WHERE MATCH(body, :t) AND rating < 4".into(),
+        "SELECT category, COUNT(*), AVG(rating), MIN(year), MAX(year), COUNT(DISTINCT topic) FROM docs GROUP BY category ORDER BY AVG(rating) DESC LIMIT 6".into(),
+        "SELECT category, topic, COUNT(*) FROM docs WHERE year >= 2000 GROUP BY category, topic HAVING COUNT(*) > 3 ORDER BY 3 DESC, 1 LIMIT 10".into(),
+        "SELECT year, SUM(rating) FROM docs GROUP BY year ORDER BY year DESC LIMIT 4 OFFSET 1".into(),
+        "SELECT COUNT(*), SUM(year), MIN(rating), COUNT(DISTINCT category) FROM docs WHERE rating > 2".into(),
+        "SELECT topic FROM docs GROUP BY topic LIMIT 5".into(),
         format!("SELECT COUNT(*) FROM docs WHERE MATCH(body, '{}')", words[0]),
     ];
     for sql in &queries {

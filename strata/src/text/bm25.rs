@@ -275,24 +275,34 @@ impl TextFieldReader {
     }
 
     fn query<'a>(&'a self, terms: &[String], stats: &CollectionStats, params: Bm25Params) -> Query<'a> {
+        let w: Vec<(&str, f32)> = terms.iter().map(|t| (t.as_str(), 1.0)).collect();
+        self.query_weighted(&w, stats, params)
+    }
+
+    /// BM25 with a weight per term (repeated terms add up): a term scores
+    /// `weight · idf · (k1 + 1) · tf / (tf + k)`.
+    fn query_weighted<'a>(&'a self, terms: &[(&str, f32)], stats: &CollectionStats, params: Bm25Params) -> Query<'a> {
         let avgdl = stats.avgdl();
         let mut k = [0f32; 256];
         for (i, k) in k.iter_mut().enumerate() {
             *k = params.k1 * (1.0 - params.b + params.b * NORM_LENGTHS[i] as f32 / avgdl);
         }
-        // Distinct terms in first-occurrence order, with multiplicities.
-        let mut uniq: Vec<(&str, u32)> = Vec::new();
-        for t in terms {
-            match uniq.iter_mut().find(|(u, _)| *u == t.as_str()) {
-                Some(e) => e.1 += 1,
-                None => uniq.push((t, 1)),
+        // Distinct terms in first-occurrence order, with summed weights.
+        let mut uniq: Vec<(&str, f32)> = Vec::new();
+        for &(t, w) in terms {
+            match uniq.iter_mut().find(|(u, _)| *u == t) {
+                Some(e) => e.1 += w,
+                None => uniq.push((t, w)),
             }
         }
         let mut scorers = Vec::new();
         for (t, m) in uniq {
+            if m <= 0.0 {
+                continue;
+            }
             let Some(info) = self.term_info(t) else { continue };
             let df = stats.df.get(t).copied().unwrap_or(info.df as u64);
-            let weight = m as f32 * stats.idf(df) * (params.k1 + 1.0);
+            let weight = m * stats.idf(df) * (params.k1 + 1.0);
             let cur = self.cursor(&info);
             let max = cur.frontier().iter().map(|&(tf, n)| weight * tf as f32 / (tf as f32 + k[n as usize])).fold(0.0, f32::max)
                 * BOUND_SLACK;
@@ -369,6 +379,30 @@ impl TextFieldReader {
         algo: TopKAlgo,
     ) -> Vec<(DocId, f32)> {
         self.run(self.query(terms, stats, params), TopK::with_ties(k), filter, algo, FilterStrategy::Auto)
+    }
+
+    /// Top-`k` (with `ties`, plus every document tied with the `k`-th) by
+    /// BM25 with a weight per term ([`top_k`](Self::top_k) weighs each 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn top_k_weighted(
+        &self,
+        terms: &[(String, f32)],
+        stats: &CollectionStats,
+        params: Bm25Params,
+        k: usize,
+        filter: Option<&dyn DocFilter>,
+        algo: TopKAlgo,
+        ties: bool,
+    ) -> Vec<(DocId, f32)> {
+        let w: Vec<(&str, f32)> = terms.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        let top = if ties { TopK::with_ties(k) } else { TopK::new(k) };
+        self.run(self.query_weighted(&w, stats, params), top, filter, algo, FilterStrategy::Auto)
+    }
+
+    /// Exact weighted BM25 of `docs` (see [`top_k_weighted`](Self::top_k_weighted)).
+    pub fn score_weighted(&self, terms: &[(String, f32)], stats: &CollectionStats, params: Bm25Params, docs: &[DocId]) -> Vec<f32> {
+        let w: Vec<(&str, f32)> = terms.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        self.score_with(self.query_weighted(&w, stats, params), docs)
     }
 
     /// Top-`k` of a sparse field by the dot product of each document's

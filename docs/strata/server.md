@@ -37,6 +37,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--model ID` | `claude-haiku-5-5` | the agent's default model |
 | `--models DIR` | `$STRATA_MODELS`, else `~/.local/share/strata/models` | where the models of [embedded vector fields](#embedded-vector-fields) are |
 | `--copy-from PATH` | | fill the new database (`--db` with `--schema`) with this database's rows, re-embedding the vector fields whose embedding changed |
+| `--synonyms FILE` | | the synonym list for `synonyms => 1` searches ([format](query-language.md#typos-and-synonyms)): read at start if it exists, written by `PUT /v1/synonyms` |
 
 A schema file is Strata's schema as JSON. `GET /v1/schema` returns it in the same form:
 
@@ -132,6 +133,7 @@ Every request and answer is JSON. Parameters bind `:name` placeholders: a number
 | `POST /v1/term_stats` | `{sql, params?}` | BM25 statistics and a snapshot lease, for a coordinator |
 | `POST /v1/snapshot` | | a snapshot lease: `{snapshot, txn, ttl_s}` |
 | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the queries it ran |
+| `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` for `PUT` | the synonym list: `{text, rules, file}` |
 | `GET /v1/health`, `/v1/stats`, `/v1/schema`, `/v1/config` | | JSON |
 | `GET /metrics` | | Prometheus text |
 | `GET /` | | the UI |
@@ -155,6 +157,8 @@ curl -s localhost:7700/v1/query -H 'content-type: application/json' -d '{
   {"op": "delete", "key": "p9"}
 ]}
 ```
+
+A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as several single-table queries on one snapshot; on a coordinator, each step goes to the shards. Its plan lists the steps. A coordinator has no synonym list of its own: start each shard with `--synonyms FILE`.
 
 `set` and `add` change a numeric field in place, without rewriting the row; `upsert_if_newer` writes the row only if its version field is higher than the stored row's, so a feed replayed out of order keeps the newest.
 
@@ -197,13 +201,15 @@ Every query runs under a deadline (`timeout_ms`, or the server's default) and ge
 
 ## The UI
 
-`GET /` serves a single page with three tabs.
+`GET /` serves a single page with five tabs.
 
 ![The query builder: search text, similar to a description, weighted fusion, a filter, the SQL it writes, and the results](../assets/img/strata-server-builder.png)
 
-- **Build** writes SQL from a form: search text (any word, or every word), "similar to" a stored row or a description, rank fusion or a weighted sum with a slider, filters, a boost by closeness (`decay`), a facet, the columns and the row count. The SQL updates as you type; "Edit as SQL" takes it to the editor. Clicking a keyword field in the sidebar shows its most common values, and clicking a value filters on it. Each result row has a "similar" link that searches for rows like it.
-- **SQL** is an editor with parameters, results and the plan the executor recorded, segment by segment.
+- **Build** writes SQL from a form: search text (ranked, or only matching rows, with typo tolerance and synonyms), "similar to" a stored row or a description, rank fusion or a weighted sum with a slider, conditions, a boost by closeness (`decay`), a facet, the columns and the row count. Conditions nest in groups of *all of* (`AND`), *any of* (`OR`) and *none of* (`NOT`), and a condition can be "is among the *field* of the rows where …", an `IN (SELECT ...)` subquery. **Join related rows** pairs each row with the rows it links to, the rows linking to it (for each `EDGES` field) or the rows sharing a value, with conditions and columns for the related rows; **Summarize** groups by any fields of either side and computes counts, distinct counts, sums, averages, minimums and maximums, with `HAVING` and an order. The SQL updates as you type; "Edit as SQL" takes it to the editor. Clicking a keyword field in the sidebar shows its most common values, and clicking a value adds a condition. Each result row has a "similar" link that searches for rows like it, and a "links" link that opens its neighbourhood in the Graph tab. A search that finds nothing offers to search again allowing typos, or with synonyms.
+- **Graph** (for a table with an `EDGES` or `VECTOR` field) starts from keys, the top rows of a search or the rows matching a condition, follows links (out, in or both ways, optionally one label) or similarity (each row's *k* nearest), and finds the rows within some hops, the shortest path to other rows, or the rows ranked by personalized PageRank, with conditions on the rows found. The answer is a table and a picture: rings by hop distance, a path left to right, or PageRank as node size. Clicking a node shows its row, expands its links or starts a new walk from it.
+- **SQL** is an editor with parameters, results and the plan the executor recorded, segment by segment, with example queries one click away.
 - **Ask an agent** takes a question in plain language.
+- **Query language** is a guide to the SQL with examples written against the table's own fields and words from its rows: boolean, phrase, prefix, typo and synonym searches, conditions, aggregates and `HAVING`, subqueries and `WITH`, joins, graph queries, hybrid ranking and boosts, and what is not supported. "Try it" runs an example in the SQL tab. It also edits the server's synonym list.
 
 ![The SQL editor with a plan](../assets/img/strata-server-sql.png)
 

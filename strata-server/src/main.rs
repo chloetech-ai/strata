@@ -79,6 +79,10 @@ struct Args {
     /// The Claude API's base URL.
     #[arg(long, env = "ANTHROPIC_BASE_URL", default_value = "https://api.anthropic.com")]
     api_base: String,
+    /// Synonyms for `synonyms => 1` searches, one rule per line in Solr's
+    /// format (`laptop, notebook` or `tv => television`); the UI edits it.
+    #[arg(long)]
+    synonyms: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -130,6 +134,7 @@ async fn main() {
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()),
         api_base: a.api_base,
         models: a.models.unwrap_or_else(strata::embed::models_dir),
+        synonyms: a.synonyms,
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));

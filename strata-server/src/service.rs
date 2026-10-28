@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
@@ -11,9 +12,10 @@ use strata::db::{Db, SqlResult};
 use strata::embed::Embedder;
 use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::stats::TermStats;
-use strata::query::{bind, Params};
+use strata::query::{bind, compound, Params};
 use strata::schema::Schema;
 use strata::storage::{Snapshot, WriteTxn};
+use strata::text::Synonyms;
 use strata::value::Value;
 use tokio::sync::Semaphore;
 
@@ -89,6 +91,9 @@ pub struct Service {
     running: AtomicUsize,
     /// The queue of a local database's writer thread ([`writer`]).
     writes: Option<mpsc::Sender<Queued>>,
+    /// The synonym list `synonyms => 1` searches use, and its file.
+    synonyms: RwLock<Option<Arc<Synonyms>>>,
+    synonyms_file: Option<PathBuf>,
 }
 
 impl Service {
@@ -117,6 +122,8 @@ impl Service {
             cores,
             running: AtomicUsize::new(0),
             writes,
+            synonyms: RwLock::new(None),
+            synonyms_file: None,
         }
     }
 
@@ -181,12 +188,62 @@ impl Service {
         Ok(())
     }
 
+    /// Reads the synonym list at `path` if it exists; `PUT /v1/synonyms`
+    /// writes it there.
+    pub fn open_synonyms(&mut self, path: &Path) -> Result<(), ApiError> {
+        if let Backend::Cluster(_) = self.backend {
+            return Err(ApiError::bad("--synonyms goes to each shard server, which expands its own searches"));
+        }
+        self.synonyms_file = Some(path.to_path_buf());
+        match std::fs::read_to_string(path) {
+            Ok(text) => self.set_synonyms_text(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ApiError::bad(format!("read {}: {e}", path.display()))),
+        }
+    }
+
+    /// The synonym list, if one is loaded.
+    pub fn synonyms(&self) -> Option<Arc<Synonyms>> {
+        self.synonyms.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_synonyms_text(&self, text: &str) -> Result<(), ApiError> {
+        let s = Synonyms::parse(text)?;
+        *self.synonyms.write().unwrap_or_else(|e| e.into_inner()) = (!s.is_empty() || !text.trim().is_empty()).then(|| Arc::new(s));
+        Ok(())
+    }
+
+    /// Replaces the synonym list (and its file, if the server has one).
+    pub fn put_synonyms(&self, text: &str) -> Result<usize, ApiError> {
+        if let Backend::Cluster(_) = self.backend {
+            return Err(ApiError::bad("a coordinator has no synonym list: each shard server takes --synonyms FILE"));
+        }
+        let parsed = Synonyms::parse(text)?;
+        if let Some(path) = &self.synonyms_file {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+        }
+        let rules = parsed.rules();
+        *self.synonyms.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(parsed));
+        Ok(rules)
+    }
+
+    /// Where the synonym list is saved, if anywhere.
+    pub fn synonyms_file(&self) -> Option<&Path> {
+        self.synonyms_file.as_deref()
+    }
+
     /// Hands a write to the writer thread and waits for its commit.
     async fn write(&self, job: WriteJob, deadline: Instant) -> Result<u64, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         tx.send(Queued { job, deadline, reply }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
         rx.await.map_err(|_| ApiError::internal("the writer thread stopped"))?
+    }
+
+    /// The database, unless this is a coordinator.
+    pub fn local_db(&self) -> Option<&Arc<Db>> {
+        self.local()
     }
 
     fn local(&self) -> Option<&Arc<Db>> {
@@ -277,6 +334,9 @@ impl Service {
     pub async fn query(self: &Arc<Self>, req: QueryReq) -> Result<Answer, ApiError> {
         let t0 = Instant::now();
         let timeout = if req.timeout_ms > 0 { Duration::from_millis(req.timeout_ms) } else { self.timeout };
+        if compound::is_compound(&req.sql, &self.schema) {
+            return self.compound(req, t0, timeout).await;
+        }
         let select = match bind(&req.sql, &self.schema, &req.params) {
             Ok(s) => s,
             Err(e) => {
@@ -300,6 +360,7 @@ impl Service {
                         shard: req.shard,
                         threads: (self.cores / running).max(1),
                         deadline: Some(t0 + timeout),
+                        synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
                         ..db.exec.clone()
                     };
                     let db = db.clone();
@@ -326,6 +387,64 @@ impl Service {
         res.map(|(rs, missing)| Answer { rs, took_ms: ms, kind, missing })
     }
 
+    /// A compound query ([`compound`]): its single-table steps run on one
+    /// snapshot here, or each through the coordinator.
+    async fn compound(self: &Arc<Self>, req: QueryReq, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
+        let kind = "compound";
+        let Ok(permit) = tokio::time::timeout(timeout, self.admission.acquire()).await else {
+            self.metrics.rejected();
+            return Err(ApiError { status: 503, message: "too many queries running; try again".into() });
+        };
+        let schema = self.schema.clone();
+        let deadline = t0 + timeout;
+        let r = match &self.backend {
+            Backend::Local(db) => {
+                let snap = self.snapshot(db, req.snapshot)?;
+                let running = self.running.fetch_add(1, Ordering::Relaxed) + 1;
+                let opts = ExecOptions {
+                    threads: (self.cores / running).max(1),
+                    deadline: Some(deadline),
+                    synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
+                    ..db.exec.clone()
+                };
+                let db = db.clone();
+                let r = tokio::task::spawn_blocking(move || {
+                    compound::run(&req.sql, &schema, &req.params, &mut |text, p| {
+                        let select = bind(text, snap.schema(), p)?;
+                        db.execute(&snap, &select, &opts)
+                    })
+                })
+                .await;
+                self.running.fetch_sub(1, Ordering::Relaxed);
+                r
+            }
+            Backend::Cluster(c) => {
+                let c = c.clone();
+                let rt = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    compound::run(&req.sql, &schema, &req.params, &mut |text, p| {
+                        let select = bind(text, &schema, p)?;
+                        let step = QueryReq { sql: text.to_string(), params: p.clone(), ..Default::default() };
+                        rt.block_on(c.query(&step, &select, deadline)).map_err(|e| strata::Error::Query(e.message))
+                    })
+                })
+                .await
+            }
+        };
+        drop(permit);
+        let res = match r {
+            Ok(r) => r.map_err(ApiError::from),
+            Err(e) => Err(ApiError::internal(e)),
+        };
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let res = match res {
+            Err(_) if Instant::now() > deadline => Err(ApiError { status: 504, message: format!("the query ran past its {} ms deadline", timeout.as_millis()) }),
+            r => r,
+        };
+        self.metrics.query(kind, if res.is_ok() { "ok" } else if res.as_ref().is_err_and(|e| e.status == 504) { "timeout" } else { "error" }, ms);
+        res.map(|rs| Answer { rs, took_ms: ms, kind })
+    }
+
     /// The statistics `sql` scores with, and a lease on the snapshot they
     /// came from (0 from a coordinator, which sums its shards').
     pub async fn term_stats(self: &Arc<Self>, sql: &str, params: &Params) -> Result<(TermStats, u64), ApiError> {
@@ -335,7 +454,8 @@ impl Service {
                 let (lease, _) = self.lease()?;
                 let snap = self.snapshot(db, lease)?;
                 let db = db.clone();
-                let stats = tokio::task::spawn_blocking(move || db.term_stats(&snap, &select)).await.map_err(ApiError::internal)??;
+                let opts = ExecOptions { synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()), ..db.exec.clone() };
+                let stats = tokio::task::spawn_blocking(move || db.term_stats_with(&snap, &select, &opts)).await.map_err(ApiError::internal)??;
                 Ok((stats, lease))
             }
             Backend::Cluster(c) => Ok((c.term_stats(sql, params, Instant::now() + self.timeout).await?.0, 0)),

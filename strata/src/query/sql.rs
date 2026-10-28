@@ -28,7 +28,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
-use crate::query::logical::{Decay, DecayShape, Direction, GraphKind, GraphQuery, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
 
@@ -192,17 +192,9 @@ impl<'a> Binder<'a> {
             Some(e) => self.pred(e)?.simplify(),
             None => Pred::True,
         };
-        let group_by = match &s.group_by {
-            sql::GroupByExpr::Expressions(es, _) if es.is_empty() => None,
-            sql::GroupByExpr::Expressions(es, _) if es.len() == 1 => {
-                let f = self.field_of(&es[0])?;
-                let fld = &self.schema.fields[f];
-                if fld.ty != FieldType::Keyword && !(fld.ty == FieldType::Int && fld.multi) {
-                    return Err(err("GROUP BY needs a KEYWORD field or a multi-valued INT field"));
-                }
-                Some(f)
-            }
-            _ => return Err(err("GROUP BY supports one keyword field")),
+        let group_by: Vec<usize> = match &s.group_by {
+            sql::GroupByExpr::Expressions(es, _) => es.iter().map(|e| self.group_field(e, &s.projection)).collect::<Result<_>>()?,
+            _ => return Err(err("GROUP BY ALL is not supported")),
         };
         let mut projection = Vec::new();
         for item in &s.projection {
@@ -220,22 +212,38 @@ impl<'a> Binder<'a> {
                 _ => return Err(err("unsupported select item")),
             };
             let p = self.projection(e)?;
-            if let (Some(g), Projection::Field(f)) = (group_by, &p) {
-                if *f != g {
-                    return Err(err("with GROUP BY, select the group field and COUNT(*)"));
-                }
-            }
             projection.push((alias.unwrap_or_else(|| e.to_string()), p));
         }
+        let aggregated = !group_by.is_empty() || projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
+        if aggregated {
+            for (name, p) in &projection {
+                match p {
+                    Projection::Field(f) if !group_by.contains(f) => {
+                        return Err(err(format!("{name} must be in GROUP BY or inside an aggregate (COUNT, SUM, AVG, MIN, MAX)")))
+                    }
+                    Projection::Score | Projection::Hops(_) => return Err(err("score() and hops() cannot be aggregated")),
+                    _ => {}
+                }
+            }
+        }
+        let having = match &s.having {
+            None => None,
+            Some(_) if !aggregated => return Err(err("HAVING needs GROUP BY or aggregates")),
+            Some(h) => Some(self.having(h, &projection, &group_by)?),
+        };
         let (order, tiebreak) = match &q.order_by {
             None => (None, None),
             Some(ob) => match &ob.kind {
                 sql::OrderByKind::Expressions(es) if (1..=2).contains(&es.len()) => {
                     let desc = es[0].options.asc == Some(false);
-                    let order = self.order(&es[0].expr, desc, &projection, group_by)?;
+                    let order = if aggregated {
+                        self.group_order(&es[0].expr, desc, &projection, &group_by)?
+                    } else {
+                        self.order(&es[0].expr, desc, &projection)?
+                    };
                     let tiebreak = match es.get(1) {
                         None => None,
-                        Some(e) => Some(self.tiebreak(&e.expr, e.options.asc == Some(false), &projection, group_by)?),
+                        Some(e) => Some(self.tiebreak(&e.expr, e.options.asc == Some(false), &projection, &group_by)?),
                     };
                     (Some(order), tiebreak)
                 }
@@ -253,7 +261,7 @@ impl<'a> Binder<'a> {
             }
         };
         let graphs = self.graphs.take();
-        Ok(Select { projection, filter, order, group_by, tiebreak, limit, offset, graphs })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs })
     }
 
     /// The graph predicate `hops()` refers to: the first REACHABLE or PATH.
@@ -378,7 +386,14 @@ impl<'a> Binder<'a> {
             Expr::Nested(inner) => self.seeds(inner),
             Expr::Tuple(items) => Ok(Seeds::Keys(items.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
             Expr::Array(a) => Ok(Seeds::Keys(a.elem.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
-            _ => Ok(Seeds::Keys(vec![self.key_value(e)?])),
+            // A list-valued parameter is a list of keys.
+            _ => match self.literal(e).map(as_list) {
+                Ok(Ok(xs)) => {
+                    let pk = self.schema.primary_key.ok_or_else(|| err("graph queries need a primary key"))?;
+                    Ok(Seeds::Keys(xs.into_iter().map(|x| self.coerce(pk, x)).collect::<Result<_>>()?))
+                }
+                _ => Ok(Seeds::Keys(vec![self.key_value(e)?])),
+            },
         }
     }
 
@@ -388,8 +403,8 @@ impl<'a> Binder<'a> {
         self.field_value(pk, e)
     }
 
-    /// The second ORDER BY key: the primary key, or the group value of a facet.
-    fn tiebreak(&self, e: &Expr, desc: bool, proj: &[(String, Projection)], group: Option<usize>) -> Result<Tiebreak> {
+    /// The second ORDER BY key: the primary key, or the (first) group value.
+    fn tiebreak(&self, e: &Expr, desc: bool, proj: &[(String, Projection)], group: &[usize]) -> Result<Tiebreak> {
         let field = match literal_usize(e) {
             Some(n) => match proj.get(n.wrapping_sub(1)) {
                 Some((_, Projection::Field(f))) => *f,
@@ -397,13 +412,51 @@ impl<'a> Binder<'a> {
             },
             None => self.field_of(e)?,
         };
-        if Some(field) == group {
+        if group.first() == Some(&field) {
             Ok(Tiebreak::GroupValue { desc })
-        } else if Some(field) == self.schema.primary_key {
+        } else if Some(field) == self.schema.primary_key && group.is_empty() {
             Ok(Tiebreak::Key { desc })
         } else {
-            Err(err("the second ORDER BY key must be the primary key or the group field"))
+            Err(err("the second ORDER BY key must be the primary key or the first group field"))
         }
+    }
+
+    /// A GROUP BY item: a field, or the position of a selected field.
+    fn group_field(&self, e: &Expr, items: &[sql::SelectItem]) -> Result<usize> {
+        let f = match literal_usize(e) {
+            Some(n) => match items.get(n.wrapping_sub(1)) {
+                Some(sql::SelectItem::UnnamedExpr(e)) | Some(sql::SelectItem::ExprWithAlias { expr: e, .. }) => self.field_of(e)?,
+                _ => return Err(err(format!("GROUP BY {n}: not a selected column"))),
+            },
+            None => match self.field_of(e) {
+                Ok(f) => f,
+                // An alias of a selected field.
+                Err(e2) => {
+                    let alias = match e {
+                        Expr::Identifier(id) => &id.value,
+                        _ => return Err(e2),
+                    };
+                    let found = items.iter().find_map(|i| match i {
+                        sql::SelectItem::ExprWithAlias { expr, alias: a } if a.value.eq_ignore_ascii_case(alias) => Some(expr),
+                        _ => None,
+                    });
+                    self.field_of(found.ok_or(e2)?)?
+                }
+            },
+        };
+        let fld = &self.schema.fields[f];
+        let ok = match fld.ty {
+            FieldType::Keyword | FieldType::Int => true,
+            FieldType::Float => !fld.multi,
+            _ => false,
+        };
+        if !ok {
+            return Err(err(format!("GROUP BY {}: group by KEYWORD, INT or FLOAT fields", fld.name)));
+        }
+        if !fld.indexed {
+            return Err(err(format!("GROUP BY {}: the field is not indexed", fld.name)));
+        }
+        Ok(f)
     }
 
     fn projection(&self, e: &Expr) -> Result<Projection> {
@@ -411,24 +464,141 @@ impl<'a> Binder<'a> {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(Projection::Field(self.field_of(e)?)),
             Expr::Function(f) => match fname(f).as_str() {
                 "score" => Ok(Projection::Score),
-                "count" => Ok(Projection::Count),
                 "hops" => Ok(Projection::Hops(self.hops_graph()?)),
+                "count" | "sum" | "avg" | "min" | "max" => self.aggregate(f),
                 n => Err(err(format!("unsupported function in SELECT: {n}"))),
             },
             _ => Err(err(format!("unsupported select expression: {e}"))),
         }
     }
 
-    fn order(&self, e: &Expr, desc: bool, proj: &[(String, Projection)], group: Option<usize>) -> Result<OrderBy> {
-        // Positional `ORDER BY 2`, `COUNT(*)` and the group field address facet output.
+    /// `COUNT(*)`, `COUNT([DISTINCT] f)`, `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`.
+    fn aggregate(&self, f: &sql::Function) -> Result<Projection> {
+        let name = fname(f);
+        let distinct = matches!(&f.args, FunctionArguments::List(l) if l.duplicate_treatment == Some(sql::DuplicateTreatment::Distinct));
+        let (args, _) = self.args_raw(f)?;
+        let star = args.is_empty() || (name == "count" && args.len() == 1 && literal_usize(args[0]).is_some());
+        if star {
+            return if name == "count" && !distinct { Ok(Projection::Count) } else { Err(err(format!("{}(field)", name.to_uppercase()))) };
+        }
+        let [arg] = args.as_slice() else { return Err(err(format!("{} takes one field", name.to_uppercase()))) };
+        let field = self.field_of(arg)?;
+        let fld = &self.schema.fields[field];
+        let numeric = matches!(fld.ty, FieldType::Int | FieldType::Float);
+        let func = match name.as_str() {
+            "count" if distinct => AggFn::CountDistinct,
+            "count" => AggFn::Count,
+            "sum" => AggFn::Sum,
+            "avg" => AggFn::Avg,
+            "min" => AggFn::Min,
+            _ => AggFn::Max,
+        };
+        match func {
+            AggFn::Sum | AggFn::Avg if !numeric => return Err(err(format!("{}({}): not a numeric field", name.to_uppercase(), fld.name))),
+            AggFn::Min | AggFn::Max | AggFn::CountDistinct if !(numeric || fld.ty == FieldType::Keyword) => {
+                return Err(err(format!("{}({}): needs a KEYWORD, INT or FLOAT field", name.to_uppercase(), fld.name)))
+            }
+            AggFn::Count if !(numeric || fld.ty == FieldType::Keyword) => return Err(err(format!("COUNT({}): count a KEYWORD, INT or FLOAT field, or COUNT(*)", fld.name))),
+            _ => {}
+        }
+        if distinct && func != AggFn::CountDistinct {
+            return Err(err("DISTINCT works in COUNT only"));
+        }
+        if !fld.indexed {
+            return Err(err(format!("{}: aggregates read the field's column, and it is not indexed", fld.name)));
+        }
+        Ok(Projection::Agg { func, field })
+    }
+
+    /// An aggregate or group value named in HAVING or ORDER BY: a function
+    /// call, a selected column's alias or position, or a group field.
+    fn group_value(&self, e: &Expr, proj: &[(String, Projection)], group: &[usize]) -> Result<Projection> {
+        if let Some(n) = literal_usize(e) {
+            return proj.get(n.wrapping_sub(1)).map(|(_, p)| p.clone()).ok_or_else(|| err(format!("{n}: no such column")));
+        }
+        match e {
+            Expr::Nested(inner) => self.group_value(inner, proj, group),
+            Expr::Function(f) if matches!(fname(f).as_str(), "count" | "sum" | "avg" | "min" | "max") => self.aggregate(f),
+            Expr::Identifier(id) if proj.iter().any(|(n, p)| n.eq_ignore_ascii_case(&id.value) && !matches!(p, Projection::Field(_))) => {
+                Ok(proj.iter().find(|(n, _)| n.eq_ignore_ascii_case(&id.value)).unwrap().1.clone())
+            }
+            _ => {
+                let f = self.field_of(e)?;
+                if group.contains(&f) {
+                    Ok(Projection::Field(f))
+                } else {
+                    Err(err(format!("{e}: use a group field or an aggregate")))
+                }
+            }
+        }
+    }
+
+    fn group_order(&self, e: &Expr, desc: bool, proj: &[(String, Projection)], group: &[usize]) -> Result<OrderBy> {
+        Ok(match self.group_value(e, proj, group)? {
+            Projection::Count => OrderBy::Count { desc },
+            Projection::Field(f) if group.first() == Some(&f) => OrderBy::GroupValue { desc },
+            what => OrderBy::Agg { what, desc },
+        })
+    }
+
+    fn having(&self, e: &Expr, proj: &[(String, Projection)], group: &[usize]) -> Result<Having> {
+        use BinaryOperator::*;
+        Ok(match e {
+            Expr::Nested(inner) => self.having(inner, proj, group)?,
+            Expr::BinaryOp { left, op: And, right } => Having::And(vec![self.having(left, proj, group)?, self.having(right, proj, group)?]),
+            Expr::BinaryOp { left, op: Or, right } => Having::Or(vec![self.having(left, proj, group)?, self.having(right, proj, group)?]),
+            Expr::UnaryOp { op: sql::UnaryOperator::Not, expr } => Having::Not(Box::new(self.having(expr, proj, group)?)),
+            Expr::Between { expr, negated, low, high } => {
+                let h = Having::Range { what: self.group_value(expr, proj, group)?, lo: self.num_lit(low)?, hi: self.num_lit(high)? };
+                if *negated { Having::Not(Box::new(h)) } else { h }
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let (what, lit, op) = match self.group_value(left, proj, group) {
+                    Ok(w) => (w, right, op.clone()),
+                    Err(_) => {
+                        let flipped = match op {
+                            Lt => Gt,
+                            LtEq => GtEq,
+                            Gt => Lt,
+                            GtEq => LtEq,
+                            o => o.clone(),
+                        };
+                        (self.group_value(right, proj, group)?, left, flipped)
+                    }
+                };
+                let v = self.literal(lit)?;
+                let Some(x) = v.as_f64() else {
+                    return match op {
+                        Eq => Ok(Having::Eq { what, value: v }),
+                        NotEq => Ok(Having::Not(Box::new(Having::Eq { what, value: v }))),
+                        _ => Err(err("HAVING compares strings with = and != only")),
+                    };
+                };
+                let (inf, ninf) = (f64::INFINITY, f64::NEG_INFINITY);
+                let range = |lo, hi| Having::Range { what: what.clone(), lo, hi };
+                match op {
+                    Eq => range(x, x),
+                    NotEq => Having::Not(Box::new(range(x, x))),
+                    Gt => range(next_up(x), inf),
+                    GtEq => range(x, inf),
+                    Lt => range(ninf, next_down(x)),
+                    LtEq => range(ninf, x),
+                    o => return Err(err(format!("unsupported operator {o} in HAVING"))),
+                }
+            }
+            _ => return Err(err(format!("unsupported HAVING condition: {e}"))),
+        })
+    }
+
+    fn order(&self, e: &Expr, desc: bool, proj: &[(String, Projection)]) -> Result<OrderBy> {
+        // Positional `ORDER BY 2` addresses a selected column.
         if let Some(n) = literal_usize(e) {
             let (_, p) = proj.get(n.wrapping_sub(1)).ok_or_else(|| err(format!("ORDER BY {n}: no such column")))?;
             return match p {
-                Projection::Count => Ok(OrderBy::Count { desc }),
-                Projection::Field(f) if Some(*f) == group => Ok(OrderBy::GroupValue { desc }),
                 Projection::Field(f) => Ok(OrderBy::Score { score: Score::Column { field: *f }, desc }),
                 Projection::Score => Err(err("ORDER BY score(): order by the score expression itself")),
                 Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true }),
+                Projection::Count | Projection::Agg { .. } => Err(err("ORDER BY an aggregate needs GROUP BY")),
             };
         }
         // `ORDER BY hops()` is nearest first; ranking is always best first.
@@ -436,15 +606,6 @@ impl<'a> Binder<'a> {
             if fname(f) == "hops" {
                 return Ok(OrderBy::Score { score: Score::Hops { graph: self.hops_graph()?, far_first: desc }, desc: true });
             }
-        }
-        if let Expr::Function(f) = e {
-            if fname(f) == "count" {
-                return Ok(OrderBy::Count { desc });
-            }
-        }
-        if group.is_some() {
-            let f = self.field_of(e)?;
-            return if Some(f) == group { Ok(OrderBy::GroupValue { desc }) } else { Err(err("facet queries order by count or value")) };
         }
         // `ORDER BY distance(..) ASC` ranks like `similarity DESC`.
         if let Expr::Function(f) = e {
@@ -488,6 +649,7 @@ impl<'a> Binder<'a> {
                         let [field, text] = args.as_slice() else { return Err(err("bm25(field, text)")) };
                         let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
+                        Expand::from_opts(&opts).map_err(err)?;
                         Ok(Score::Bm25 { field, text, opts })
                     }
                     "similarity" | "distance" => {
@@ -616,19 +778,38 @@ impl<'a> Binder<'a> {
             }
             Expr::InList { expr, list, negated } => {
                 let f = self.field_of(expr)?;
-                let values = list.iter().map(|v| self.field_value(f, v)).collect::<Result<Vec<_>>>()?;
-                let p = Pred::In { field: f, values };
+                if self.schema.fields[f].ty == FieldType::Edges {
+                    return Err(err(format!("{} is an EDGES field: use REACHABLE({}, keys) for rows linked to keys", self.schema.fields[f].name, self.schema.fields[f].name)));
+                }
+                // A list-valued parameter stands for its values (`IN (:ids)`).
+                let mut values = Vec::with_capacity(list.len());
+                for v in list {
+                    match as_list(self.literal(v)?) {
+                        Ok(xs) => {
+                            for x in xs {
+                                values.push(self.coerce(f, x)?);
+                            }
+                        }
+                        Err(x) => values.push(self.coerce(f, x)?),
+                    }
+                }
+                let p = if values.is_empty() { Pred::False } else { Pred::In { field: f, values } };
                 if *negated { Pred::Not(Box::new(p)) } else { p }
             }
             Expr::Function(func) if fname(func) == "match" => {
-                let (args, _) = self.args(func)?;
-                let [field, q] = args.as_slice() else { return Err(err("MATCH(field, query)")) };
+                let (args, opts) = self.args(func)?;
+                let [field, q] = args.as_slice() else { return Err(err("MATCH(field, query, synonyms => 0 | 1, fuzzy => 0 | 1 | 2 | 'auto')")) };
                 let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                 if !self.schema.fields[field].indexed {
                     return Err(err(format!("{} is not indexed", self.schema.fields[field].name)));
                 }
+                if let Some(k) = opts.keys().find(|k| !matches!(k.as_str(), "synonyms" | "fuzzy")) {
+                    return Err(err(format!("unknown option {k} for MATCH: synonyms, fuzzy")));
+                }
+                let expand = Expand::from_opts(&opts).map_err(err)?;
                 let query = self.literal(q)?.as_str().ok_or_else(|| err("MATCH query must be a string"))?.to_string();
-                Pred::Match { field, query }
+                crate::text::parse_match(&query)?;
+                Pred::Match { field, query, expand }
             }
             Expr::Function(func) if matches!(fname(func).as_str(), "reachable" | "path") => Pred::Graph { id: self.graph(func, &fname(func))? },
             Expr::Value(v) if matches!(v.value, sql::Value::Boolean(_)) => {
@@ -771,7 +952,11 @@ impl<'a> Binder<'a> {
 
     /// A literal coerced to field `f`'s type.
     fn field_value(&self, f: usize, e: &Expr) -> Result<Value> {
-        let v = self.literal(e)?;
+        self.coerce(f, self.literal(e)?)
+    }
+
+    /// A value coerced to field `f`'s type.
+    fn coerce(&self, f: usize, v: Value) -> Result<Value> {
         match (&self.schema.fields[f].ty, v) {
             (FieldType::Keyword, Value::Str(s)) => Ok(Value::Str(s)),
             (FieldType::Keyword, Value::Int(x)) => Ok(Value::Str(x.to_string())),
@@ -860,6 +1045,17 @@ fn next_down(x: f64) -> f64 {
     -next_up(-x)
 }
 
+/// The values of a list-valued parameter. A JSON list of numbers arrives as
+/// a vector of f32, so a vector of whole numbers that f32 holds exactly
+/// counts as a list of integers.
+fn as_list(v: Value) -> std::result::Result<Vec<Value>, Value> {
+    match v {
+        Value::List(xs) => Ok(xs),
+        Value::Vector(xs) if xs.iter().all(|x| x.fract() == 0.0 && x.abs() < 16_777_216.0) => Ok(xs.iter().map(|&x| Value::Int(x as i64)).collect()),
+        v => Err(v),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,7 +1083,7 @@ mod tests {
         assert_eq!(s.projection.len(), 3);
         let Pred::And(ps) = &s.filter else { panic!("{:?}", s.filter) };
         assert_eq!(ps.len(), 4);
-        assert!(matches!(&ps[0], Pred::Match { field: 3, query } if query == "vaccine -animal"));
+        assert!(matches!(&ps[0], Pred::Match { field: 3, query, .. } if query == "vaccine -animal"));
         assert_eq!(ps[1], Pred::Range { field: 4, lo: 2019.0, hi: 2021.0 });
         assert!(matches!(&ps[2], Pred::In { field: 5, values } if values.len() == 2));
         assert!(matches!(ps[3], Pred::Range { field: 6, lo, hi } if lo > 4.0 && lo < 4.0001 && hi.is_infinite()));
@@ -920,7 +1116,7 @@ mod tests {
     fn binds_facets_and_rejects_errors() {
         let s = bind("SELECT category, COUNT(*) FROM docs WHERE MATCH(body, 'x') GROUP BY category ORDER BY 2 DESC LIMIT 5", &schema(), &q())
             .unwrap();
-        assert_eq!(s.group_by, Some(5));
+        assert_eq!(s.group_by, vec![5]);
         assert_eq!(s.order, Some(OrderBy::Count { desc: true }));
         assert_eq!(s.projection[1].1, Projection::Count);
         let s = bind("SELECT category, COUNT(*) FROM docs GROUP BY category ORDER BY 2 DESC, 1 LIMIT 5", &schema(), &q()).unwrap();

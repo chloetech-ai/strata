@@ -105,13 +105,51 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
 .history { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
 .history button { text-align: left; font: 12px/1.4 var(--mono); border: 0; background: none; color: var(--muted); cursor: pointer; padding: 3px 4px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .history button:hover { background: var(--panel-2); color: var(--text); }
+code { font-family: var(--mono); font-size: 12px; background: var(--code-bg); padding: 0 4px; border-radius: 4px; }
+.hint { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+.group { border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; padding: 8px 8px 2px; margin-bottom: 8px; background: var(--panel); }
+.group .group { background: var(--panel-2); }
+.group-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.group-head .seg button { padding: 3px 9px; font-size: 12px; }
+.sub-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; padding: 6px; border: 1px dashed var(--line); border-radius: 7px; }
+.sub-row select { width: auto; max-width: 180px; }
+.sub-row .cond { flex: 1 1 260px; }
+.sub-row .lim { width: 80px; }
+details.sec { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 10px; }
+details.sec > summary { cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+details.sec > summary .hint { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: 6px; }
+details.sec[open] > summary { margin-bottom: 8px; }
+.metric-row { display: grid; grid-template-columns: 170px minmax(0, 1fr) auto; gap: 6px; margin-bottom: 6px; }
+.help-nav { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+.help-sec h3 { font-size: 15px; margin: 0 0 2px; }
+.help-sec > p { margin: 0 0 8px; }
+.ex { border-top: 1px solid var(--line); padding: 10px 0; }
+.ex .head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-bottom: 6px; }
+.ex .head span { min-width: 0; }
+svg.graph { width: 100%; height: 480px; display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; color: var(--muted); }
+svg.graph .edge { stroke: currentColor; stroke-opacity: .5; fill: none; }
+svg.graph .ring { stroke: var(--line); fill: none; stroke-dasharray: 3 4; }
+svg.graph .node circle { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; cursor: pointer; }
+svg.graph .node.seed circle { fill: var(--accent); }
+svg.graph .node.sel circle { stroke: var(--warn); stroke-width: 3; }
+svg.graph text { fill: var(--text); font-size: 11px; pointer-events: none; }
+svg.graph text.ringlabel { fill: var(--muted); font-size: 10px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 6px 0; align-items: center; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--accent); background: var(--accent-soft); margin-right: 4px; vertical-align: -1px; }
+.legend i.seed { background: var(--accent); }
+.node-info { margin-top: 10px; }
+.node-info table { font-size: 12.5px; }
+.node-info td:first-child { font-family: var(--mono); color: var(--muted); white-space: nowrap; width: 1%; }
 @media (max-width: 760px) {
   .layout { grid-template-columns: 1fr; }
   aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 40vh; }
   main { padding: 12px 16px; }
   .filter-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .filter-row button { justify-self: start; }
+  .metric-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   header { flex-wrap: wrap; }
+  svg.graph { height: 360px; }
 }
 </style>
 </head>
@@ -134,8 +172,10 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
   <main>
     <div class="tabs" role="tablist">
       <button class="tab" role="tab" data-tab="build" aria-selected="true">Build</button>
+      <button class="tab hidden" role="tab" data-tab="graph" aria-selected="false" id="graphTab">Graph</button>
       <button class="tab" role="tab" data-tab="sql" aria-selected="false">SQL</button>
       <button class="tab" role="tab" data-tab="ask" aria-selected="false">Ask an agent</button>
+      <button class="tab" role="tab" data-tab="help" aria-selected="false">Query language</button>
     </div>
 
     <section id="tab-build">
@@ -143,7 +183,13 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
         <div class="row">
           <div class="grow"><label class="lbl" for="bText">Search text</label><input id="bText" type="text" placeholder="e.g. waterproof hiking boots"></div>
           <div style="width:170px"><label class="lbl" for="bTextField">in</label><select id="bTextField"></select></div>
-          <div><label class="lbl">&nbsp;</label><label class="small"><input type="checkbox" id="bMatchAll"> every word must appear</label></div>
+          <div><label class="lbl">&nbsp;</label><label class="small"><input type="checkbox" id="bMatchAll"> only rows that match it</label></div>
+        </div>
+        <div class="row small" id="bTextOpts" style="margin-top:6px">
+          <label title="Also find words a letter or two away: 'nueral' finds 'neural'"><input type="checkbox" id="bFuzzy"> allow typos</label>
+          <label id="bSynBox" title="Also find the words a synonym list says are the same"><input type="checkbox" id="bSyn"> use synonyms</label>
+          <button class="btn link small hidden" id="bSynSetup">set up synonyms</button>
+          <span class="hint" id="bTextHint">Matching understands <code>AND</code>, <code>OR</code>, <code>-word</code>, <code>"a phrase"</code>, <code>prefix*</code> and <code>typo~</code>. <button class="btn link small" data-help="text">More</button></span>
         </div>
         <div class="row" id="bVecRow">
           <div style="width:170px"><label class="lbl" for="bVecMode">Similar to</label>
@@ -164,7 +210,7 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
           <div style="width:130px"><label class="lbl" for="bBoostShape">falling</label><select id="bBoostShape" disabled><option value="exp">exponentially</option><option value="gauss">like a bell</option><option value="linear">linearly</option></select></div>
           <div class="grow small muted" id="bBoostNote" style="align-self:flex-end;padding-bottom:8px"></div>
         </div>
-        <div class="row" style="margin-top:14px"><h2 style="margin:0">Filters</h2><button class="btn small" id="bAddFilter">+ filter</button></div>
+        <div class="row" style="margin-top:14px"><h2 style="margin:0">Conditions</h2><span class="hint">Mix all of (AND), any of (OR) and none of (NOT) in groups; a condition can also look at another query's results. <button class="btn link small" data-help="filters">More</button></span></div>
         <div id="bFilters" style="margin-top:8px"></div>
         <div class="row">
           <div style="width:200px"><label class="lbl" for="bSort">Sort by (without search)</label><select id="bSort"></select></div>
@@ -173,6 +219,27 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
           <div style="width:90px"><label class="lbl" for="bLimit">Rows</label><input id="bLimit" type="number" value="20" min="1" max="1000"></div>
         </div>
         <div class="row"><div class="grow"><label class="lbl">Columns</label><div class="cols" id="bCols"></div></div></div>
+        <details class="sec" id="bJoinBox">
+          <summary>Join related rows <span class="hint">pair each row with rows it links to, that link to it, or that share a value</span></summary>
+          <div class="row">
+            <div style="width:300px"><label class="lbl" for="bJoinHow">Pair each row with the rows</label><select id="bJoinHow"></select></div>
+            <div><label class="lbl">&nbsp;</label><label class="small" title="LEFT JOIN: rows without a related row stay, with empty related columns"><input type="checkbox" id="bJoinLeft"> keep rows that have none</label></div>
+          </div>
+          <div class="row"><div class="grow"><label class="lbl" for="bJoinWhere">The related rows must <span class="muted">(SQL over their columns, e.g. year &gt;= 2015 AND MATCH(title, 'graph'))</span></label>
+            <input id="bJoinWhere" type="text" spellcheck="false" style="font-family:var(--mono);font-size:13px" placeholder="any condition, or leave empty"></div></div>
+          <div class="row"><div class="grow"><label class="lbl">Related columns</label><div class="cols" id="bJoinCols"></div></div></div>
+        </details>
+        <details class="sec" id="bAggBox">
+          <summary>Summarize <span class="hint">group rows and compute counts, sums, averages, minimums and maximums</span></summary>
+          <div class="row"><div class="grow"><label class="lbl">Group by</label><div class="cols" id="bGroupBy"></div></div></div>
+          <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0">Compute</label><button class="btn small" id="bAddMetric">+ value</button></div>
+          <div id="bMetrics" style="margin-top:6px"></div>
+          <div class="row">
+            <div class="grow"><label class="lbl" for="bHaving">Keep groups where <span class="muted">(HAVING, e.g. COUNT(*) &gt; 10)</span></label><input id="bHaving" type="text" spellcheck="false" style="font-family:var(--mono);font-size:13px"></div>
+            <div style="width:240px"><label class="lbl" for="bAggOrder">Order groups by</label><select id="bAggOrder"></select></div>
+          </div>
+          <p class="hint" id="bAggNote" style="margin:6px 0 0"></p>
+        </details>
       </div>
       <div class="card">
         <div class="row" style="justify-content:space-between;margin-bottom:8px"><h2 style="margin:0">SQL</h2>
@@ -182,10 +249,52 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
       </div>
     </section>
 
+    <section id="tab-graph" class="hidden">
+      <div class="card">
+        <p class="small muted" style="margin:0 0 10px" id="gIntro"></p>
+        <div class="row">
+          <div style="width:230px"><label class="lbl" for="gSeedMode">Start from</label>
+            <select id="gSeedMode"><option value="keys">rows with these keys</option><option value="search">the top rows of a search</option><option value="where">rows matching a condition</option></select></div>
+          <div class="grow" id="gSeedKeysBox"><label class="lbl" for="gSeedKeys">keys <span class="muted">(comma-separated)</span></label><input id="gSeedKeys" type="text" spellcheck="false"></div>
+          <div class="grow hidden" id="gSeedTextBox"><label class="lbl" for="gSeedText">search text</label><input id="gSeedText" type="text"></div>
+          <div style="width:150px" class="hidden" id="gSeedFieldBox"><label class="lbl" for="gSeedField">in</label><select id="gSeedField"></select></div>
+          <div style="width:80px" class="hidden" id="gSeedNBox"><label class="lbl" for="gSeedN">top</label><input id="gSeedN" type="number" value="5" min="1" max="1000"></div>
+          <div class="grow hidden" id="gSeedWhereBox"><label class="lbl" for="gSeedWhere">condition <span class="muted">(SQL)</span></label><input id="gSeedWhere" type="text" spellcheck="false" style="font-family:var(--mono);font-size:13px"></div>
+        </div>
+        <div class="row">
+          <div style="width:260px"><label class="lbl" for="gVia">Follow</label><select id="gVia"></select></div>
+          <div style="width:230px" id="gDirBox"><label class="lbl" for="gDir">direction</label>
+            <select id="gDir"><option value="out">to the rows they link to</option><option value="in">to the rows linking to them</option><option value="both">both ways</option></select></div>
+          <div style="width:150px" id="gLabelBox"><label class="lbl" for="gLabel">only links labelled</label><input id="gLabel" type="text" placeholder="any label"></div>
+          <div style="width:120px" class="hidden" id="gKBox"><label class="lbl" for="gK">nearest rows (k)</label><input id="gK" type="number" value="10" min="1" max="200"></div>
+          <div style="width:130px" class="hidden" id="gMinSimBox"><label class="lbl" for="gMinSim">min similarity</label><input id="gMinSim" type="text" placeholder="e.g. 0.5"></div>
+        </div>
+        <div class="row">
+          <div style="width:300px"><label class="lbl" for="gFind">Find</label>
+            <select id="gFind"><option value="reach">the rows within some hops (neighbourhood)</option><option value="path">the shortest path to other rows</option><option value="ppr">the most connected rows (personalized PageRank)</option></select></div>
+          <div style="width:100px" id="gHopsBox"><label class="lbl" for="gHops" id="gHopsLbl">hops</label><input id="gHops" type="number" value="2" min="1" max="8"></div>
+          <div class="grow hidden" id="gToBox"><label class="lbl" for="gTo">to the rows with keys</label><input id="gTo" type="text" spellcheck="false"></div>
+          <div id="gStartBox"><label class="lbl">&nbsp;</label><label class="small"><input type="checkbox" id="gWithStart" checked> include the starting rows</label></div>
+        </div>
+        <div class="row">
+          <div class="grow"><label class="lbl" for="gWhere">The rows found must also <span class="muted">(SQL, e.g. year &gt;= 2015)</span></label><input id="gWhere" type="text" spellcheck="false" style="font-family:var(--mono);font-size:13px"></div>
+          <div style="width:90px"><label class="lbl" for="gLimit">Rows</label><input id="gLimit" type="number" value="60" min="1" max="1000"></div>
+        </div>
+        <div class="row"><div class="grow"><label class="lbl">Columns</label><div class="cols" id="gCols"></div></div></div>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px"><h2 style="margin:0">SQL</h2>
+          <span class="row"><button class="btn small" id="gToEditor">Edit as SQL</button><button class="btn primary" id="gRun">Run</button></span></div>
+        <pre class="sql" id="gSql"></pre>
+        <div class="small muted" id="gParams" style="margin-top:6px"></div>
+      </div>
+    </section>
+
     <section id="tab-sql" class="hidden">
       <div class="card">
         <label class="lbl" for="sqlText">SQL <span class="muted">(Ctrl+Enter or ⌘+Enter runs; INSERT, UPDATE and DELETE write)</span></label>
         <textarea id="sqlText" rows="6" spellcheck="false"></textarea>
+        <div class="row small" id="sqlHints" style="margin-top:6px"></div>
         <div class="row" style="margin-top:8px">
           <div class="grow"><label class="lbl" for="sqlParams">Parameters (JSON), e.g. {"q": {"vector_of": "p0000042"}}</label>
             <input id="sqlParams" type="text" placeholder="{}" spellcheck="false" style="font-family:var(--mono);font-size:13px"></div>
@@ -209,6 +318,14 @@ details.plan pre { font: 12px/1.5 var(--mono); background: var(--code-bg); borde
         <p class="small muted" id="askNote" style="margin:8px 0 0">The agent reads the schema, writes read-only SQL, runs it here and answers from the rows it saw. Every query it ran is listed with its answer.</p>
       </div>
       <div id="askOut"></div>
+    </section>
+
+    <section id="tab-help" class="hidden">
+      <div class="card">
+        <p style="margin:0 0 8px">Strata's SQL goes well past filters. Each example below uses this table's own fields; <b>Try it</b> opens it in the SQL tab and runs it.</p>
+        <div class="help-nav" id="helpNav"></div>
+      </div>
+      <div id="helpBody"></div>
     </section>
 
     <div id="results"></div>
@@ -236,8 +353,8 @@ const store = {
 // ---- connection -------------------------------------------------------------
 let token = new URLSearchParams(location.search).get("token") || (() => { try { return sessionStorage.getItem("strata.token"); } catch { return null; } })();
 if (token) { try { sessionStorage.setItem("strata.token", token); } catch {} }
-async function api(path, body) {
-  const opts = { method: body === undefined ? "GET" : "POST", headers: {} };
+async function api(path, body, method) {
+  const opts = { method: method || (body === undefined ? "GET" : "POST"), headers: {} };
   if (body !== undefined) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
   if (token) opts.headers.authorization = "Bearer " + token;
   const r = await fetch(path, opts);
@@ -278,6 +395,7 @@ async function loadSchema() {
   $("table").textContent = S.table;
   renderFields();
   setupBuilder();
+  setupGraph();
 }
 
 function renderFields() {
@@ -310,10 +428,16 @@ function renderFields() {
 // ---- tabs ---------------------------------------------------------------------
 function showTab(name) {
   for (const t of document.querySelectorAll(".tab")) t.setAttribute("aria-selected", String(t.dataset.tab === name));
-  for (const n of ["build", "sql", "ask"]) $("tab-" + n).classList.toggle("hidden", n !== name);
-  $("results").classList.toggle("hidden", name === "ask");
+  for (const n of ["build", "graph", "sql", "ask", "help"]) $("tab-" + n).classList.toggle("hidden", n !== name);
+  $("results").classList.toggle("hidden", name === "ask" || name === "help");
+  if (name === "help") renderHelp();
   store.set("tab", name);
 }
+// "More" links open the guide at a section.
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-help]"); if (!b) return;
+  e.preventDefault(); showTab("help"); helpGoTo(b.dataset.help);
+});
 for (const t of document.querySelectorAll(".tab")) t.onclick = () => showTab(t.dataset.tab);
 
 // ---- builder ------------------------------------------------------------------
@@ -329,7 +453,9 @@ function vecFieldChanged() {
     : e.loaded ? `${f} is ${e.model}'s embedding of ${e.from.join(" + ")}; a description is embedded by the same model.`
     : `${f} is ${e.model}'s embedding of ${e.from.join(" + ")}, which this server cannot run: search by a row.`;
 }
-const B = { filters: [], fuse: "rrf", cols: null };
+// Conditions are a tree of groups: all of (AND), any of (OR), none of (NOT).
+const newGroup = (op = "AND") => ({ group: true, op, items: [] });
+const B = { where: newGroup("AND"), fuse: "rrf", cols: null, joinCols: null, groupBy: [], metrics: [] };
 function opt(v, t) { return el("option", { value: v, text: t ?? v }); }
 function setupBuilder() {
   const textFields = S.fields.filter((f) => f.kind === "text" && f.indexed);
@@ -352,6 +478,7 @@ function setupBuilder() {
     return el("label", {}, cb, f.name);
   }));
   for (const id of ["bText", "bTextField", "bMatchAll", "bVecValue", "bVecField", "bSort", "bDir", "bFacet", "bLimit"]) $(id).addEventListener("input", updateSql);
+  for (const id of ["bFuzzy", "bSyn", "bJoinLeft", "bJoinWhere", "bHaving", "bAggOrder"]) $(id).addEventListener("input", updateSql);
   $("bVecMode").addEventListener("input", () => {
     const m = $("bVecMode").value; $("bVecValue").disabled = !m;
     $("bVecValue").placeholder = m === "row" ? `a ${S.pk}, e.g. one from the results` : m === "text" ? "describe what you want" : "";
@@ -362,48 +489,190 @@ function setupBuilder() {
     $("bWeightBox").classList.toggle("hidden", B.fuse !== "weighted"); updateSql();
   };
   $("bWeight").addEventListener("input", updateSql);
-  renderFilters(); updateSql();
+  setupJoin(); renderSummary(); renderFilters(); updateSql();
 }
 function opsFor(f) {
   if (!f) return ["="];
-  if (f.kind === "text") return ["matches"];
+  if (f.kind === "text") return ["matches", "matches, allowing typos", "matches, with synonyms"];
   if (isNum(f) && !f.multi) return ["=", "!=", "<", "<=", ">", ">=", "between", "in"];
   if (f.multi) return ["has", "has any of", "has none of"];
   return ["=", "!=", "in", "not in"];
 }
-function addFilter(field, op, value) {
+function addFilter(field, op, value, into) {
   const f = S.fields.find((x) => x.name === field) || filterable()[0];
-  B.filters.push({ field: f.name, op: op && opsFor(f).includes(op) ? op : (f.multi ? "has" : opsFor(f)[0]), value: value ?? "" });
+  (into || B.where).items.push({ field: f.name, op: op && opsFor(f).includes(op) ? op : (f.multi ? "has" : opsFor(f)[0]), value: value ?? "" });
   renderFilters(); updateSql();
 }
 const filterable = () => S.fields.filter((f) => f.kind !== "vector" && f.kind !== "edges" && f.indexed);
-function renderFilters() {
-  const box = $("bFilters"); box.replaceChildren();
-  B.filters.forEach((flt, i) => {
-    const fsel = el("select", {}, ...filterable().map((f) => opt(f.name)));
-    fsel.value = flt.field;
-    const f = S.fields.find((x) => x.name === flt.field);
-    const osel = el("select", {}, ...opsFor(f).map((o) => opt(o)));
-    osel.value = flt.op;
-    const val = el("input", { type: "text", value: flt.value, placeholder: flt.op === "between" ? "low, high" : /in|any|none/.test(flt.op) ? "a, b, c" : "value" });
-    fsel.oninput = () => { flt.field = fsel.value; const nf = S.fields.find((x) => x.name === flt.field); flt.op = opsFor(nf)[0]; renderFilters(); updateSql(); };
-    osel.oninput = () => { flt.op = osel.value; renderFilters(); updateSql(); };
-    val.oninput = () => { flt.value = val.value; updateSql(); };
-    box.append(el("div", { class: "filter-row" }, fsel, osel, val, el("button", { class: "btn small", title: "Remove", onclick: () => { B.filters.splice(i, 1); renderFilters(); updateSql(); } }, "✕")));
+const changed = () => { renderFilters(); updateSql(); };
+function renderFilters() { $("bFilters").replaceChildren(renderGroup(B.where, null)); }
+function renderGroup(g, parent) {
+  const seg = el("span", { class: "seg" }, [["AND", "all of", "every condition holds (AND)"], ["OR", "any of", "at least one holds (OR)"], ["NOT", "none of", "no condition holds (NOT)"]].map(([v, t, title]) =>
+    el("button", { "aria-pressed": String(g.op === v), title, onclick: () => { g.op = v; changed(); } }, t)));
+  const head = el("div", { class: "group-head" },
+    el("span", { class: "small muted", text: parent ? "a group: rows matching" : "Rows matching" }), seg, el("span", { class: "spacer" }),
+    el("button", { class: "btn small", onclick: () => addFilter(filterable()[0].name, null, null, g) }, "+ condition"),
+    el("button", { class: "btn small", title: "A nested group, e.g. (a OR b) inside all of", onclick: () => { g.items.push(newGroup(g.op === "OR" ? "AND" : "OR")); changed(); } }, "+ group"),
+    el("button", { class: "btn small", title: "Keep rows whose value is among another query's results (IN (SELECT ...))", onclick: () => { g.items.push(newSub()); changed(); } }, "+ in another query's results"),
+    parent ? el("button", { class: "btn small", title: "Remove this group", onclick: () => { parent.items.splice(parent.items.indexOf(g), 1); changed(); } }, "✕") : null);
+  const box = el("div", { class: "group" }, head);
+  if (!g.items.length) box.append(el("p", { class: "small muted", style: "margin:0 0 6px", text: parent ? "Empty: add conditions to this group." : "No conditions yet: every row passes. Click a value under Fields, or add one here." }));
+  for (const it of g.items) box.append(it.group ? renderGroup(it, g) : it.sub ? renderSub(it, g) : renderCond(it, g));
+  return box;
+}
+function renderCond(flt, g) {
+  const fsel = el("select", {}, ...filterable().map((f) => opt(f.name)));
+  fsel.value = flt.field;
+  const f = S.fields.find((x) => x.name === flt.field);
+  const osel = el("select", {}, ...opsFor(f).map((o) => opt(o)));
+  osel.value = flt.op;
+  const val = el("input", { type: "text", value: flt.value, placeholder: flt.op === "between" ? "low, high" : /in|any|none/.test(flt.op) ? "a, b, c" : /matches/.test(flt.op) ? 'words, "a phrase", a OR b, -not' : "value" });
+  fsel.oninput = () => { flt.field = fsel.value; const nf = S.fields.find((x) => x.name === flt.field); flt.op = opsFor(nf)[0]; changed(); };
+  osel.oninput = () => { flt.op = osel.value; changed(); };
+  val.oninput = () => { flt.value = val.value; updateSql(); };
+  return el("div", { class: "filter-row" }, fsel, osel, val, el("button", { class: "btn small", title: "Remove", onclick: () => { g.items.splice(g.items.indexOf(flt), 1); changed(); } }, "✕"));
+}
+// A subquery condition: field [NOT] IN (SELECT subField FROM table WHERE cond LIMIT n).
+const subFields = () => filterable().filter((f) => f.kind !== "text");
+function newSub() {
+  const f = subFields().find((x) => x.name !== S.pk && x.kind === "keyword") || subFields()[0];
+  return { sub: true, field: f.name, neg: false, subField: f.name, cond: "", limit: "" };
+}
+function renderSub(it, g) {
+  const fields = subFields();
+  const fsel = el("select", { title: "This row's field" }, ...fields.map((f) => opt(f.name))); fsel.value = it.field;
+  const nsel = el("select", {}, opt("in", "is among"), opt("not", "is not among")); nsel.value = it.neg ? "not" : "in";
+  const ssel = el("select", { title: "The field the other query returns" }, ...fields.map((f) => opt(f.name))); ssel.value = it.subField;
+  const cond = el("input", { type: "text", class: "cond", value: it.cond, spellcheck: "false", style: "font-family:var(--mono);font-size:13px", placeholder: "condition on those rows, e.g. year = 2020 AND MATCH(title, 'graph')" });
+  const lim = el("input", { type: "text", class: "lim", value: it.limit, placeholder: "all rows", title: "Read at most this many rows of the other query" });
+  fsel.oninput = () => { it.field = fsel.value; if (!it.cond) it.subField = fsel.value; changed(); };
+  nsel.oninput = () => { it.neg = nsel.value === "not"; updateSql(); };
+  ssel.oninput = () => { it.subField = ssel.value; updateSql(); };
+  cond.oninput = () => { it.cond = cond.value; updateSql(); };
+  lim.oninput = () => { it.limit = lim.value; updateSql(); };
+  return el("div", { class: "sub-row" }, fsel, nsel, el("span", { class: "small muted", text: "the" }), ssel, el("span", { class: "small muted", text: "of the rows where" }), cond,
+    el("span", { class: "small muted", text: "limit" }), lim, el("button", { class: "btn small", title: "Remove", onclick: () => { g.items.splice(g.items.indexOf(it), 1); changed(); } }, "✕"));
+}
+function subSql(it, q) {
+  const cond = it.cond.trim(), lim = it.limit.trim();
+  const inner = `SELECT ${ident(it.subField)} FROM ${ident(S.table)}${cond ? ` WHERE ${cond}` : ""}${/^\d+$/.test(lim) ? ` LIMIT ${lim}` : ""}`;
+  return `${q}${ident(it.field)} ${it.neg ? "NOT IN" : "IN"} (${inner})`;
+}
+const itemSql = (it, q) => it.group ? groupSql(it, q) : it.sub ? subSql(it, q) : filterSql(it, q);
+function groupSql(g, q) {
+  const parts = g.items.map((it) => itemSql(it, q)).filter(Boolean);
+  if (!parts.length) return null;
+  if (g.op === "NOT") return `NOT (${parts.join(" OR ")})`;
+  return parts.length === 1 ? parts[0] : `(${parts.join(g.op === "OR" ? " OR " : " AND ")})`;
+}
+// The top group's conditions, each its own line when they are ANDed.
+function whereParts(q) {
+  const g = B.where, parts = g.items.map((it) => itemSql(it, q)).filter(Boolean);
+  if (!parts.length) return [];
+  if (g.op === "AND") return parts;
+  if (g.op === "OR") return [parts.length > 1 ? `(${parts.join("\n    OR ")})` : parts[0]];
+  return [`NOT (${parts.join(" OR ")})`];
+}
+// Prefixes this table's column names in a condition with `alias.`.
+function qualify(sql, alias) {
+  const names = new Set(S.fields.map((f) => f.name.toLowerCase()));
+  return sql.replace(/('(?:[^']|'')*')|("(?:[^"]|"")*")|([A-Za-z_][A-Za-z0-9_]*)(\s*\(|\.)?/g, (m, sq, dq, w, after, off, all) => {
+    if (sq || dq || !w || after || all[off - 1] === "." || !names.has(w.toLowerCase())) return m;
+    return `${alias}.${w}`;
   });
 }
-$("bAddFilter").onclick = () => addFilter(filterable()[0].name);
+
+// ---- joins of the table with itself ------------------------------------------------
+function setupJoin() {
+  const edges = S.fields.filter((f) => f.kind === "edges");
+  const same = S.fields.filter((f) => (f.kind === "keyword" || (isNum(f) && !f.multi)) && f.indexed && f.name !== S.pk);
+  $("bJoinHow").replaceChildren(opt("", "no join"),
+    ...edges.flatMap((f) => [opt("out:" + f.name, `it links to through ${f.name}`), opt("in:" + f.name, `that link to it through ${f.name}`)]),
+    ...same.map((f) => opt("same:" + f.name, `with the same ${f.name}`)));
+  $("bJoinBox").classList.toggle("hidden", !S.pk || (!edges.length && !same.length));
+  const selectable = S.fields.filter((f) => f.kind !== "vector" && (f.stored || f.name === S.pk));
+  if (!B.joinCols) B.joinCols = new Set(selectable.filter((f) => f.kind !== "edges").slice(0, 3).map((f) => f.name));
+  $("bJoinCols").replaceChildren(...selectable.map((f) => {
+    const cb = el("input", { type: "checkbox" }); cb.checked = B.joinCols.has(f.name);
+    cb.onchange = () => { cb.checked ? B.joinCols.add(f.name) : B.joinCols.delete(f.name); updateSql(); };
+    return el("label", {}, cb, f.name);
+  }));
+  $("bJoinHow").addEventListener("input", () => { renderSummary(); updateSql(); });
+}
+function joinSpec() {
+  const how = $("bJoinHow").value; if (!how || !S.pk) return null;
+  const i = how.indexOf(":"), kind = how.slice(0, i), F = ident(how.slice(i + 1)), K = ident(S.pk);
+  let on = kind === "out" ? `a.${F} = b.${K}` : kind === "in" ? `b.${F} = a.${K}` : `a.${F} = b.${F} AND b.${K} != a.${K}`;
+  const w = $("bJoinWhere").value.trim();
+  if (w) on += ` AND (${qualify(w, "b")})`;
+  return { on, left: $("bJoinLeft").checked, cols: S.fields.filter((f) => B.joinCols.has(f.name)).map((f) => "b." + ident(f.name)) };
+}
+
+// ---- summaries: GROUP BY and aggregates ---------------------------------------------
+const METRICS = [["COUNT", "count rows"], ["COUNT DISTINCT", "count different"], ["SUM", "sum of"], ["AVG", "average of"], ["MIN", "minimum of"], ["MAX", "maximum of"]];
+function metricFields(fn) {
+  const ok = (f) => f.indexed && (fn === "SUM" || fn === "AVG" ? isNum(f) : (f.kind === "keyword" || isNum(f)));
+  const mine = S.fields.filter(ok).map((f) => f.name);
+  return $("bJoinHow").value ? [...mine, ...mine.map((n) => "b." + n)] : mine;
+}
+function renderSummary() {
+  const joined = !!$("bJoinHow").value;
+  const groupable = S.fields.filter((f) => f.indexed && (f.kind === "keyword" || isNum(f))).map((f) => f.name);
+  const names = joined ? [...groupable, ...groupable.map((n) => "b." + n)] : groupable;
+  B.groupBy = B.groupBy.filter((n) => names.includes(n));
+  $("bGroupBy").replaceChildren(...names.map((n) => {
+    const cb = el("input", { type: "checkbox" }); cb.checked = B.groupBy.includes(n);
+    cb.onchange = () => { B.groupBy = cb.checked ? [...B.groupBy, n] : B.groupBy.filter((x) => x !== n); renderSummary(); updateSql(); };
+    return el("label", { title: n.startsWith("b.") ? "a column of the related row" : "" }, cb, n.startsWith("b.") ? "related " + n.slice(2) : n);
+  }));
+  $("bMetrics").replaceChildren(...B.metrics.map((m, i) => {
+    const fsel = el("select", {}, ...METRICS.map(([v, t]) => opt(v, t))); fsel.value = m.fn;
+    const fields = metricFields(m.fn);
+    if (m.fn !== "COUNT" && !fields.includes(m.field)) m.field = fields[0] || "";
+    const csel = el("select", { disabled: m.fn === "COUNT" }, ...(m.fn === "COUNT" ? [opt("", "(every row)")] : fields.map((n) => opt(n, n.startsWith("b.") ? "related " + n.slice(2) : n))));
+    csel.value = m.field;
+    fsel.oninput = () => { m.fn = fsel.value; renderSummary(); updateSql(); };
+    csel.oninput = () => { m.field = csel.value; renderSummary(); updateSql(); };
+    return el("div", { class: "metric-row" }, fsel, csel, el("button", { class: "btn small", title: "Remove", onclick: () => { B.metrics.splice(i, 1); renderSummary(); updateSql(); } }, "✕"));
+  }));
+  if (!B.metrics.length) $("bMetrics").append(el("p", { class: "small muted", style: "margin:0 0 6px", text: B.groupBy.length ? "Each group shows its row count; add values to compute more." : "Pick fields to group by, or add values to compute over all rows." }));
+  const prev = $("bAggOrder").value;
+  const spec = summarySpec(joined);
+  const opts = [opt("", "largest groups first")];
+  if (spec) {
+    spec.metrics.forEach((m, i) => opts.push(opt(`m${i} DESC`, `${m} high first`), opt(`m${i} ASC`, `${m} low first`)));
+    spec.groups.forEach((g, i) => opts.push(opt(`g${i} ASC`, `${g} ascending`), opt(`g${i} DESC`, `${g} descending`)));
+  }
+  $("bAggOrder").replaceChildren(...opts);
+  $("bAggOrder").value = [...$("bAggOrder").options].some((o) => o.value === prev) ? prev : "";
+}
+$("bAddMetric").onclick = () => { B.metrics.push({ fn: B.metrics.length ? "AVG" : "COUNT", field: "" }); renderSummary(); updateSql(); $("bAggBox").open = true; };
+function summarySpec(joined) {
+  const col = (n) => n.startsWith("b.") ? (joined ? "b." + ident(n.slice(2)) : null) : (joined ? "a." : "") + ident(n);
+  const groups = B.groupBy.map(col).filter(Boolean);
+  const metrics = B.metrics.map((m) => {
+    if (m.fn === "COUNT") return "COUNT(*)";
+    const c = m.field ? col(m.field) : null; if (!c) return null;
+    return m.fn === "COUNT DISTINCT" ? `COUNT(DISTINCT ${c})` : `${m.fn}(${c})`;
+  }).filter(Boolean);
+  if (!groups.length && !metrics.length) return null;
+  return { groups, metrics: metrics.length ? metrics : ["COUNT(*)"] };
+}
+const textOpts = () => ($("bFuzzy").checked ? ", fuzzy => 'auto'" : "") + ($("bSyn").checked && !$("bSyn").disabled ? ", synonyms => 1" : "");
 
 function literal(f, v) {
   v = v.trim();
   if (isNum(f) || (f.multi && f.kind === "int")) return /^-?\d+(\.\d+)?([eE]-?\d+)?$/.test(v) ? v : null;
   return sqlStr(v);
 }
-function filterSql(flt) {
+function filterSql(flt, q = "") {
   const f = S.fields.find((x) => x.name === flt.field); if (!f) return null;
-  const n = ident(f.name);
+  const n = q + ident(f.name);
   const list = () => flt.value.split(",").map((v) => literal(f, v)).filter((x) => x != null && x !== "''");
-  if (flt.op === "matches") return flt.value.trim() ? `MATCH(${n}, ${sqlStr(flt.value.trim())})` : null;
+  if (flt.op.startsWith("matches")) {
+    const o = flt.op.endsWith("typos") ? ", fuzzy => 'auto'" : flt.op.endsWith("synonyms") ? ", synonyms => 1" : "";
+    return flt.value.trim() ? `MATCH(${n}, ${sqlStr(flt.value.trim())}${o})` : null;
+  }
   if (flt.op === "between") { const [a, b] = flt.value.split(",").map((v) => literal(f, v || "")); return a && b ? `${n} BETWEEN ${a} AND ${b}` : null; }
   if (["in", "not in", "has any of", "has none of"].includes(flt.op)) {
     const l = list(); if (!l.length) return null;
@@ -414,15 +683,22 @@ function filterSql(flt) {
 }
 function builderQuery() {
   const T = ident(S.table);
-  const text = $("bText").value.trim(), tf = ident($("bTextField").value || "");
+  // A join names this table's side `a` and the related rows `b`.
+  const J = joinSpec(), A = J ? "a." : "";
+  const agg = summarySpec(!!J), to = textOpts();
+  const text = $("bText").value.trim(), tf = A + ident($("bTextField").value || "");
   const vm = $("bVecMode").value, vv = $("bVecValue").value.trim(), vf = ident($("bVecField").value || "");
   const where = [];
-  if (text && $("bMatchAll").checked) where.push(`MATCH(${tf}, ${sqlStr(text)})`);
-  for (const flt of B.filters) { const s = filterSql(flt); if (s) where.push(s); }
+  // A summary has no ranking, so the search text filters.
+  if (text && ($("bMatchAll").checked || agg)) where.push(`MATCH(${tf}, ${sqlStr(text)}${to})`);
+  where.push(...whereParts(A));
   const params = {};
-  const textScore = text ? `bm25(${tf}, ${sqlStr(text)})` : null;
+  const textScore = text && !agg ? `bm25(${tf}, ${sqlStr(text)}${to})` : null;
   let vecScore = null;
   if (vm && vv) { vecScore = `similarity(${vf}, :q)`; params.q = vm === "row" ? { vector_of: vv, field: $("bVecField").value } : { embed: vv, field: $("bVecField").value }; }
+  if (vecScore && J) vecScore = vecScore.replace(/^similarity\(/, "similarity(a.");
+  if (vecScore && agg) { vecScore = null; delete params.q; }
+  $("bAggNote").textContent = agg ? [text ? "The search text filters the rows here: a summary has no ranking." : "", vm && vv ? "Similarity ranks rows, so a summary leaves it out." : ""].join(" ").trim() : "";
   let order = null;
   $("bFuseRow").classList.toggle("hidden", !(textScore && vecScore));
   // The boost: decay(field, origin, scale) multiplies a single ranking.
@@ -433,7 +709,7 @@ function builderQuery() {
     const origin = bo.toLowerCase() === "now" ? "now()" : num(bo) ? bo : null;
     if (!origin || !num(bs) || Number(bs) <= 0) $("bBoostNote").textContent = "Give a number (or now) and a scale above 0.";
     else if (textScore && vecScore) $("bBoostNote").textContent = "A boost multiplies one ranking: clear the text or the similarity.";
-    else boost = `decay(${ident(bf)}, ${origin}, ${bs}${$("bBoostShape").value !== "exp" ? `, shape => '${$("bBoostShape").value}'` : ""})`;
+    else if (!agg) boost = `decay(${A}${ident(bf)}, ${origin}, ${bs}${$("bBoostShape").value !== "exp" ? `, shape => '${$("bBoostShape").value}'` : ""})`;
   }
   if (boost && !(textScore && vecScore)) {
     order = `${textScore || vecScore ? (textScore || vecScore) + " * " : ""}${boost} DESC`;
@@ -441,17 +717,27 @@ function builderQuery() {
     if (B.fuse === "rrf") order = `rrf(${textScore}, ${vecScore}) DESC`;
     else { const w = $("bWeight").value / 100; $("bWeightVal").textContent = `${(1 - w).toFixed(2)} / ${w.toFixed(2)}`; order = `${(1 - w).toFixed(2)} * ${textScore} + ${w.toFixed(2)} * ${vecScore} DESC`; }
   } else if (textScore || vecScore) order = `${textScore || vecScore} DESC`;
-  else if ($("bSort").value) order = `${ident($("bSort").value)} ${$("bDir").value}`;
-  const cols = S.fields.filter((f) => B.cols.has(f.name)).map((f) => ident(f.name));
+  else if ($("bSort").value) order = `${A}${ident($("bSort").value)} ${$("bDir").value}`;
+  const cols = S.fields.filter((f) => B.cols.has(f.name)).map((f) => A + ident(f.name));
+  if (J) cols.push(...J.cols);
   if (order && (textScore || vecScore || boost)) cols.push("score()");
   const limit = Math.max(1, Math.min(1000, parseInt($("bLimit").value, 10) || 20));
+  const from = J ? `${T} a\n${J.left ? "LEFT JOIN" : "JOIN"} ${T} b ON ${J.on}` : T;
   const w = where.length ? `\nWHERE ${where.join("\n  AND ")}` : "";
-  const sql = `SELECT ${cols.length ? cols.join(", ") : "*"}\nFROM ${T}${w}${order ? `\nORDER BY ${order}` : ""}\nLIMIT ${limit}`;
-  const facet = $("bFacet").value ? `SELECT ${ident($("bFacet").value)}, COUNT(*) FROM ${T}${w.replace(/\n/g, " ")} GROUP BY ${ident($("bFacet").value)} ORDER BY 2 DESC LIMIT 15` : null;
+  let sql;
+  if (agg) {
+    const having = $("bHaving").value.trim();
+    const ob = $("bAggOrder").value.match(/^([mg])(\d+) (ASC|DESC)$/);
+    const by = ob ? `${(ob[1] === "m" ? agg.metrics : agg.groups)[+ob[2]]} ${ob[3]}` : "";
+    sql = `SELECT ${[...agg.groups, ...agg.metrics].join(", ")}\nFROM ${from}${w}` +
+      (agg.groups.length ? `\nGROUP BY ${agg.groups.join(", ")}` : "") + (having ? `\nHAVING ${having}` : "") +
+      (agg.groups.length && by ? `\nORDER BY ${by}` : "") + (agg.groups.length ? `\nLIMIT ${limit}` : "");
+  } else sql = `SELECT ${cols.length ? cols.join(", ") : "*"}\nFROM ${from}${w}${order ? `\nORDER BY ${order}` : ""}\nLIMIT ${limit}`;
+  const facet = $("bFacet").value && !J && !agg ? `SELECT ${ident($("bFacet").value)}, COUNT(*) FROM ${T}${w.replace(/\n/g, " ")} GROUP BY ${ident($("bFacet").value)} ORDER BY 2 DESC LIMIT 15` : null;
   return { sql, params, facet };
 }
 function highlight(sql) {
-  const out = []; const re = /('(?:[^']|'')*')|\b(SELECT|FROM|WHERE|AND|OR|NOT|IN|BETWEEN|ORDER BY|GROUP BY|LIMIT|OFFSET|DESC|ASC|MATCH|COUNT|INSERT|INTO|VALUES|UPDATE|SET|DELETE)\b/g;
+  const out = []; const re = /('(?:[^']|'')*')|\b(SELECT|DISTINCT|FROM|WHERE|AND|OR|NOT|IN|IS|NULL|EXISTS|BETWEEN|ORDER BY|GROUP BY|HAVING|WITH|AS|JOIN|LEFT JOIN|ON|LIMIT|OFFSET|DESC|ASC|MATCH|REACHABLE|PATH|COUNT|SUM|AVG|MIN|MAX|INSERT|INTO|VALUES|UPDATE|SET|DELETE)\b/g;
   let last = 0, m;
   while ((m = re.exec(sql))) {
     if (m.index > last) out.push(document.createTextNode(sql.slice(last, m.index)));
@@ -465,7 +751,7 @@ function updateSql() {
   $("bSql").replaceChildren(...highlight(q.sql));
   $("bParams").textContent = Object.keys(q.params).length ? "parameters: " + JSON.stringify(q.params) : "";
 }
-$("bRun").onclick = () => { const q = builderQuery(); runQuery(q.sql, q.params, q.facet); };
+$("bRun").onclick = () => { const q = builderQuery(); runQuery(q.sql, q.params, q.facet, false, { builder: true }); };
 $("bToEditor").onclick = () => { const q = builderQuery(); $("sqlText").value = q.sql; $("sqlParams").value = Object.keys(q.params).length ? JSON.stringify(q.params) : ""; showTab("sql"); $("sqlText").focus(); };
 $("bText").addEventListener("keydown", (e) => { if (e.key === "Enter") $("bRun").click(); });
 $("bVecValue").addEventListener("keydown", (e) => { if (e.key === "Enter") $("bRun").click(); });
@@ -495,7 +781,10 @@ $("sqlText").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ct
 
 // ---- running and showing results -------------------------------------------------
 const fmtMs = (ms) => ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : ms < 100 ? `${ms.toFixed(1)} ms` : `${Math.round(ms)} ms`;
-function showError(msg) { $("results").replaceChildren(el("div", { class: "error", text: msg })); }
+function showError(msg, withHelp) {
+  $("results").replaceChildren(el("div", { class: "error", text: msg }),
+    withHelp ? el("p", { class: "hint" }, "What the query language takes, with examples: ", el("button", { class: "btn link small", "data-help": "" }, "Query language")) : null);
+}
 function remember(sql, params) {
   const h = store.get("history", []).filter((x) => x.sql !== sql);
   h.unshift({ sql, params }); store.set("history", h.slice(0, 15)); renderHistory();
@@ -504,7 +793,7 @@ function renderHistory() {
   const h = store.get("history", []);
   $("history").replaceChildren(...(h.length ? h.map((x) => el("button", { title: x.sql, onclick: () => { $("sqlText").value = x.sql; $("sqlParams").value = x.params && Object.keys(x.params).length ? JSON.stringify(x.params) : ""; showTab("sql"); } }, x.sql.replace(/\s+/g, " "))) : [el("span", { class: "small muted", text: "Queries you run appear here." })]));
 }
-async function runQuery(sql, params, facetSql, anyStatement) {
+async function runQuery(sql, params, facetSql, anyStatement, ctx = {}) {
   const out = $("results");
   out.replaceChildren(el("p", { class: "muted", text: "running…" }));
   try {
@@ -517,8 +806,8 @@ async function runQuery(sql, params, facetSql, anyStatement) {
       out.replaceChildren(el("div", { class: "card" }, el("div", { class: "status" }, el("span", {}, el("b", { text: j.written }), " rows written"), el("span", {}, el("b", { text: fmtMs(j.took_ms) })))));
       refreshHealth(); return;
     }
-    renderResult(j, facet);
-  } catch (e) { showError(e.message); }
+    renderResult(j, facet, { ...ctx, sql });
+  } catch (e) { showError(e.message, true); }
 }
 function cell(v, f) {
   if (v === null || v === undefined) return el("td", {}, el("span", { class: "null", text: "null" }));
@@ -528,6 +817,7 @@ function cell(v, f) {
   if (f && f.name === S.pk) {
     const td = el("td", { class: "key" }, s);
     if (S.fields.some((x) => x.kind === "vector")) td.append(" ", el("button", { class: "btn link small", title: "Find rows like this one", onclick: () => moreLike(s) }, "similar"));
+    if (S.fields.some((x) => x.kind === "edges")) td.append(" ", el("button", { class: "btn link small", title: "Show this row's links as a graph", onclick: () => graphFrom(s) }, "links"));
     return td;
   }
   const c = el("div", { class: "clip", text: s, title: "Click to expand" });
@@ -538,7 +828,20 @@ function moreLike(key) {
   $("bVecMode").value = "row"; $("bVecValue").disabled = false; $("bVecValue").value = key; $("bText").value = "";
   showTab("build"); updateSql(); $("bRun").click();
 }
-function renderResult(j, facet) {
+// When a search finds nothing: offer typo tolerance and synonyms.
+function noRowHints(ctx) {
+  const sql = ctx.sql || "", searched = /\b(MATCH|bm25)\s*\(/i.test(sql);
+  if (!searched) return [];
+  if (ctx.builder) {
+    const out = [];
+    if (!$("bFuzzy").checked) out.push(el("button", { class: "btn small", onclick: () => { $("bFuzzy").checked = true; updateSql(); $("bRun").click(); } }, "Search again allowing typos"));
+    if (!$("bSyn").checked && !$("bSyn").disabled) out.push(el("button", { class: "btn small", onclick: () => { $("bSyn").checked = true; updateSql(); $("bRun").click(); } }, "Search again with synonyms"));
+    return out.length ? [el("div", { class: "row" }, el("span", { class: "hint", text: "Misspelled, or worded differently?" }), out)] : [];
+  }
+  if (/fuzzy\s*=>|~/.test(sql)) return [];
+  return [el("p", { class: "hint" }, "Misspelled? Add ", el("code", { text: "fuzzy => 'auto'" }), " to MATCH or bm25, write a word as ", el("code", { text: "word~" }), ", or use ", el("code", { text: "synonyms => 1" }), ". ", el("button", { class: "btn link small", "data-help": "text" }, "Examples"))];
+}
+function renderResult(j, facet, ctx = {}) {
   const out = $("results");
   const status = el("div", { class: "status" },
     el("span", {}, el("b", { text: j.rows.length }), " rows"),
@@ -546,19 +849,469 @@ function renderResult(j, facet) {
     j.stats && j.stats.filter_docs ? el("span", {}, el("b", { text: j.stats.filter_docs.toLocaleString() }), " passed the filter") : null,
     j.stats && j.stats.scored ? el("span", {}, el("b", { text: j.stats.scored.toLocaleString() }), " scored") : null);
   const parts = [status];
+  if (ctx.picture) parts.push(ctx.picture);
   if (facet) {
     if (facet.error) parts.push(el("div", { class: "note", text: "Facet: " + facet.error }));
     else parts.push(el("div", { class: "facets" }, el("span", { class: "small muted", style: "align-self:center", text: facet.columns[0] + ":" }),
       facet.rows.map(([v, n]) => el("span", { class: "chip", title: "Filter on this value", onclick: () => { addFilter(facet.columns[0], "=", String(v)); $("bRun").click(); } }, String(v), el("span", { class: "n", text: n.toLocaleString() })))));
   }
   if (j.rows.length) {
-    const fields = j.columns.map((c) => S.fields.find((f) => f.name === c));
+    const fields = j.columns.map((c) => S.fields.find((f) => f.name === c.replace(/^[ab]\./, "")));
     const head = el("tr", {}, j.columns.map((c) => el("th", { text: c })));
     const body = j.rows.map((r) => el("tr", {}, r.map((v, i) => cell(v, fields[i]))));
     parts.push(el("div", { class: "table-wrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
-  } else parts.push(el("p", { class: "muted", text: "No rows." }));
+  } else parts.push(el("p", { class: "muted", text: "No rows." }), ...noRowHints(ctx));
   if (j.stats && j.stats.plan && j.stats.plan.length) parts.push(el("details", { class: "plan", style: "margin-top:10px" }, el("summary", { text: "How it ran (plan)" }), el("pre", { text: j.stats.plan.join("\n") })));
   out.replaceChildren(...parts);
+}
+
+// ---- graph queries ------------------------------------------------------------------
+// Seeds (keys, a search's top rows, or a condition), followed through an
+// EDGES field or a VECTOR field's nearest rows, as a neighbourhood
+// (REACHABLE), a path (PATH) or a ranking (ppr); the answer is drawn.
+const G = { cols: null, nodes: new Map(), sel: null, mode: "reach", via: null };
+const keyValue = (v) => S.fields.find((f) => f.name === S.pk)?.kind === "int" && /^-?\d+$/.test(v) ? Number(v) : v;
+const parseKeys = (t) => t.split(/[,\n]/).map((x) => x.trim()).filter(Boolean).map(keyValue);
+// Keys as SQL: one key, or a tuple of them.
+const keysSql = (ks) => ks.length === 1 ? lit(ks[0]) : `(${ks.map(lit).join(", ")})`;
+function setupGraph() {
+  const edges = S.fields.filter((f) => f.kind === "edges"), vecs = S.fields.filter((f) => f.kind === "vector");
+  const on = !!S.pk && (edges.length || vecs.length);
+  $("graphTab").classList.toggle("hidden", !on);
+  if (!on) return;
+  $("gIntro").textContent = edges.length
+    ? `Graph queries follow the links in ${edges.map((f) => f.name).join(", ")} from the rows you start at${vecs.length ? `, or similarity: each row linked to its nearest rows by ${vecs[0].name}` : ""}. The answer is a table and a picture; click a node to see it, expand it or start from it.`
+    : `Graph queries here follow similarity: each row is linked to its nearest rows by ${vecs[0].name}. The answer is a table and a picture.`;
+  $("gVia").replaceChildren(...edges.map((f) => opt("edges:" + f.name, `links in ${f.name}`)), ...vecs.map((f) => opt("vector:" + f.name, `similarity of ${f.name} (nearest rows)`)));
+  const textFields = S.fields.filter((f) => f.kind === "text" && f.indexed);
+  $("gSeedField").replaceChildren(...textFields.map((f) => opt(f.name)));
+  const gen = textFields.find((f) => f.generated); if (gen) $("gSeedField").value = gen.name;
+  const selectable = S.fields.filter((f) => f.kind !== "vector" && f.kind !== "edges" && (f.stored || f.name === S.pk));
+  if (!G.cols) G.cols = new Set(selectable.slice(0, 4).map((f) => f.name));
+  $("gCols").replaceChildren(...selectable.map((f) => {
+    const cb = el("input", { type: "checkbox" }); cb.checked = G.cols.has(f.name);
+    cb.onchange = () => { cb.checked ? G.cols.add(f.name) : G.cols.delete(f.name); updateGraphSql(); };
+    return el("label", {}, cb, f.name);
+  }));
+  $("gSeedKeys").placeholder = `e.g. two ${S.pk}s from the results, comma-separated`;
+  for (const id of ["gSeedMode", "gSeedKeys", "gSeedText", "gSeedField", "gSeedN", "gSeedWhere", "gVia", "gDir", "gLabel", "gK", "gMinSim", "gFind", "gHops", "gTo", "gWithStart", "gWhere", "gLimit"]) $(id).addEventListener("input", updateGraphSql);
+  for (const id of ["gSeedKeys", "gSeedText", "gSeedWhere", "gTo", "gWhere"]) $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("gRun").click(); });
+  updateGraphSql();
+}
+function graphQuery() {
+  const T = ident(S.table), K = ident(S.pk), params = {};
+  const [kind, fname] = [$("gVia").value.split(":")[0], $("gVia").value.split(":").slice(1).join(":")];
+  const F = ident(fname), vec = kind === "vector", mode = $("gSeedMode").value, find = $("gFind").value;
+  // Show only the inputs this query uses.
+  const show = (id, on) => $(id).classList.toggle("hidden", !on);
+  show("gSeedKeysBox", mode === "keys"); show("gSeedTextBox", mode === "search"); show("gSeedFieldBox", mode === "search"); show("gSeedNBox", mode === "search"); show("gSeedWhereBox", mode === "where");
+  show("gDirBox", !vec); show("gLabelBox", !vec); show("gKBox", vec); show("gMinSimBox", vec);
+  show("gToBox", find === "path"); show("gHopsBox", find !== "ppr"); show("gStartBox", find === "reach");
+  $("gHopsLbl").textContent = find === "path" ? "at most hops" : "hops";
+  const ppr = $("gFind").querySelector('option[value="ppr"]'); ppr.disabled = vec;
+  if (vec && find === "ppr") { $("gFind").value = "reach"; return graphQuery(); }
+  let seeds = null, problem = null; G.seedKeys = [];
+  if (mode === "keys") {
+    const ks = parseKeys($("gSeedKeys").value);
+    if (ks.length) seeds = keysSql(ks); else problem = `Give one or more ${S.pk}s to start from.`;
+    G.seedKeys = ks;
+  } else if (mode === "search") {
+    const t = $("gSeedText").value.trim(), n = Math.max(1, Math.min(1000, parseInt($("gSeedN").value, 10) || 5));
+    if (t) seeds = `(SELECT ${K} FROM ${T} ORDER BY bm25(${ident($("gSeedField").value)}, ${sqlStr(t)}) DESC LIMIT ${n})`; else problem = "Give the search whose top rows to start from.";
+  } else {
+    const c = $("gSeedWhere").value.trim();
+    if (c) seeds = `(SELECT ${K} FROM ${T} WHERE ${c} LIMIT 1000)`; else problem = "Give the condition the starting rows meet.";
+  }
+  const opts = [];
+  if (vec) {
+    opts.push(`k => ${Math.max(1, parseInt($("gK").value, 10) || 10)}`);
+    if (/^0?\.\d+$|^1(\.0+)?$/.test($("gMinSim").value.trim())) opts.push(`min_sim => ${$("gMinSim").value.trim()}`);
+  } else {
+    if ($("gDir").value !== "out") opts.push(`dir => '${$("gDir").value}'`);
+    if ($("gLabel").value.trim()) opts.push(`label => ${sqlStr($("gLabel").value.trim())}`);
+  }
+  const hops = Math.max(1, Math.min(8, parseInt($("gHops").value, 10) || 2));
+  const where = [], cols = S.fields.filter((f) => G.cols.has(f.name)).map((f) => ident(f.name));
+  if (!cols.includes(K)) cols.unshift(K);
+  // The picture needs each row's links.
+  if (!vec) cols.push(F);
+  let order;
+  const o = (xs) => xs.length ? ", " + xs.join(", ") : "";
+  if (find === "reach") {
+    const h = [`hops => ${hops}`]; if ($("gWithStart").checked) h.push("min_hops => 0");
+    where.push(`REACHABLE(${F}, ${seeds}${o([...h, ...opts])})`); cols.push("hops()"); order = "hops()";
+  } else if (find === "path") {
+    const to = parseKeys($("gTo").value);
+    if (!to.length) problem = problem || `Give the ${S.pk}s the path goes to.`;
+    where.push(`PATH(${F}, ${seeds}, ${to.length ? keysSql(to) : "?"}${o([`max_hops => ${hops}`, ...opts])})`); cols.push("hops()"); order = "hops()";
+  } else {
+    order = `ppr(${F}, ${seeds}${o(opts)}) DESC`; cols.push("score()");
+  }
+  const extra = $("gWhere").value.trim(); if (extra) where.push(extra);
+  const limit = Math.max(1, Math.min(1000, parseInt($("gLimit").value, 10) || 60));
+  const sql = `SELECT ${cols.join(", ")}\nFROM ${T}${where.length ? `\nWHERE ${where.join("\n  AND ")}` : ""}\nORDER BY ${order}\nLIMIT ${limit}`;
+  return { sql, params, problem, field: fname, vec, find, seedKeys: G.seedKeys };
+}
+function updateGraphSql() {
+  const q = graphQuery();
+  $("gSql").replaceChildren(...highlight(q.sql));
+  $("gParams").textContent = q.problem ? q.problem : Object.keys(q.params).length ? "parameters: " + JSON.stringify(q.params) : "";
+}
+$("gRun").onclick = () => runGraph(graphQuery());
+$("gToEditor").onclick = () => { const q = graphQuery(); $("sqlText").value = q.sql; $("sqlParams").value = Object.keys(q.params).length ? JSON.stringify(q.params) : ""; showTab("sql"); $("sqlText").focus(); };
+function graphFrom(key) {
+  $("gSeedMode").value = "keys"; $("gSeedKeys").value = String(key); $("gFind").value = "reach"; $("gHops").value = 1; $("gDir").value = "both";
+  const e = S.fields.find((f) => f.kind === "edges"); if (e) $("gVia").value = "edges:" + e.name;
+  showTab("graph"); updateGraphSql(); $("gRun").click();
+}
+async function runGraph(q) {
+  if (q.problem) return showError(q.problem);
+  const out = $("results"); out.replaceChildren(el("p", { class: "muted", text: "running…" }));
+  try {
+    const j = await api("/v1/query", { sql: q.sql, params: q.params });
+    remember(q.sql, q.params);
+    G.q = q; G.nodes = new Map(); G.sel = null;
+    addGraphRows(j, null);
+    renderResult(j, null, { sql: q.sql, picture: graphCard() });
+  } catch (e) { showError(e.message, true); }
+}
+// Rows of a result as nodes: their key, hops, score, label and links.
+function addGraphRows(j, from) {
+  const ci = (n) => j.columns.indexOf(n);
+  const k = ci(S.pk), h = ci("hops()"), sc = ci("score()"), lk = G.q.vec ? -1 : ci(G.q.field);
+  const labelCol = j.columns.findIndex((c) => c !== S.pk && S.fields.some((f) => f.name === c && (f.kind === "text" || f.kind === "keyword") && f.stored));
+  for (const r of j.rows) {
+    const key = String(r[k]);
+    let links = [];
+    if (lk >= 0 && r[lk]) { try { links = JSON.parse(r[lk]).map((e) => Array.isArray(e) ? { to: String(e[1]), label: e[0] } : { to: String(e) }); } catch {} }
+    const old = G.nodes.get(key);
+    G.nodes.set(key, {
+      key, row: Object.fromEntries(j.columns.map((c, i) => [c, r[i]])), links,
+      hops: old ? old.hops : h >= 0 && r[h] != null ? r[h] : from ? from.hops + 1 : null,
+      score: sc >= 0 ? r[sc] : old?.score, label: labelCol >= 0 && r[labelCol] != null ? String(r[labelCol]) : key,
+      seed: old?.seed || (h >= 0 && r[h] === 0) || G.q.seedKeys.map(String).includes(key),
+    });
+  }
+}
+function graphEdges() {
+  const out = [];
+  for (const n of G.nodes.values()) for (const l of n.links) if (G.nodes.has(l.to) && l.to !== n.key) out.push({ from: n.key, to: l.to, label: l.label });
+  return out;
+}
+const W = 900, H = 480;
+function layout(nodes, edges) {
+  const nb = new Map(nodes.map((n) => [n.key, []]));
+  for (const e of edges) { nb.get(e.from).push(e.to); nb.get(e.to).push(e.from); }
+  const pos = new Map();
+  if (G.q.find === "path") {
+    const path = [...nodes].sort((a, b) => (a.hops ?? 0) - (b.hops ?? 0));
+    path.forEach((n, i) => pos.set(n.key, { x: 60 + (path.length > 1 ? i * (W - 120) / (path.length - 1) : (W - 120) / 2), y: H / 2 + (i % 2 ? 40 : -40) }));
+    return pos;
+  }
+  if (G.q.find === "reach" && nodes.every((n) => n.hops != null)) {
+    // Rings by hop distance; each ring ordered by where its neighbours in the ring inside sit.
+    const rings = [];
+    for (const n of nodes) (rings[n.hops] ||= []).push(n);
+    const step = Math.min(W, H) / 2 / Math.max(1, rings.length - (rings[0] && rings[0].length === 1 ? 1 : 0) + 0.3);
+    let r0 = 0;
+    rings.forEach((ring, d) => {
+      if (!ring) return;
+      const radius = d === 0 ? (ring.length === 1 ? 0 : step * 0.45) : (rings[0] && rings[0].length === 1 ? d : d + 0.45) * step;
+      const ang = (n) => { const a = nb.get(n.key).map((k) => pos.get(k)).filter(Boolean); return a.length ? Math.atan2(a.reduce((s, p) => s + p.y - H / 2, 0), a.reduce((s, p) => s + p.x - W / 2, 0)) : 0; };
+      if (d > 0) ring.sort((a, b) => ang(a) - ang(b));
+      ring.forEach((n, i) => { const t = 2 * Math.PI * i / ring.length + r0; pos.set(n.key, { x: W / 2 + radius * Math.cos(t) * 1.6, y: H / 2 + radius * Math.sin(t), ring: radius }); });
+      r0 += 0.4;
+    });
+    return pos;
+  }
+  // Force-directed for rankings.
+  const n = nodes.length, kk = Math.sqrt(W * H / Math.max(1, n)) * 0.6;
+  nodes.forEach((x, i) => pos.set(x.key, { x: W / 2 + 200 * Math.cos(2 * Math.PI * i / n), y: H / 2 + 150 * Math.sin(2 * Math.PI * i / n) }));
+  let temp = 60;
+  for (let it = 0; it < 250; it++, temp *= 0.985) {
+    const d = new Map(nodes.map((x) => [x.key, { x: 0, y: 0 }]));
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      const a = pos.get(nodes[i].key), b = pos.get(nodes[j].key); let dx = a.x - b.x, dy = a.y - b.y; const dist = Math.max(1, Math.hypot(dx, dy));
+      const f = kk * kk / dist; dx /= dist; dy /= dist;
+      d.get(nodes[i].key).x += dx * f; d.get(nodes[i].key).y += dy * f; d.get(nodes[j].key).x -= dx * f; d.get(nodes[j].key).y -= dy * f;
+    }
+    for (const e of edges) {
+      const a = pos.get(e.from), b = pos.get(e.to); let dx = a.x - b.x, dy = a.y - b.y; const dist = Math.max(1, Math.hypot(dx, dy));
+      const f = dist * dist / kk; dx /= dist; dy /= dist;
+      d.get(e.from).x -= dx * f; d.get(e.from).y -= dy * f; d.get(e.to).x += dx * f; d.get(e.to).y += dy * f;
+    }
+    for (const x of nodes) {
+      const p = pos.get(x.key), v = d.get(x.key); v.x += (W / 2 - p.x) * 0.05 * kk / 50; v.y += (H / 2 - p.y) * 0.08 * kk / 50;
+      const m = Math.max(1, Math.hypot(v.x, v.y));
+      p.x = Math.min(W - 20, Math.max(20, p.x + v.x / m * Math.min(m, temp))); p.y = Math.min(H - 20, Math.max(20, p.y + v.y / m * Math.min(m, temp)));
+    }
+  }
+  return pos;
+}
+const NS = "http://www.w3.org/2000/svg";
+const sv = (tag, attrs = {}, ...kids) => { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); for (const k of kids) e.append(k); return e; };
+function graphCard() {
+  const box = el("div", { class: "card", id: "gPicture" });
+  drawGraph(box);
+  return box;
+}
+function drawGraph(box) {
+  const nodes = [...G.nodes.values()], edges = graphEdges();
+  if (!nodes.length) { box.replaceChildren(el("p", { class: "muted", text: "Nothing to draw." })); return; }
+  const pos = layout(nodes, edges);
+  const svg = sv("svg", { class: "graph", viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${nodes.length} rows and ${edges.length} links` });
+  svg.append(sv("defs", {}, sv("marker", { id: "arrow", viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" }, sv("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "currentColor", "fill-opacity": ".6" }))));
+  const rings = [...new Set([...pos.values()].map((p) => p.ring).filter((r) => r > 0))];
+  for (const r of rings) svg.append(sv("ellipse", { class: "ring", cx: W / 2, cy: H / 2, rx: r * 1.6, ry: r }));
+  const maxScore = Math.max(...nodes.map((n) => n.score || 0), 1e-9);
+  const rad = (n) => G.q.find === "ppr" && n.score != null ? 5 + 9 * Math.sqrt(n.score / maxScore) : n.seed ? 9 : 6;
+  for (const e of edges) {
+    const a = pos.get(e.from), b = pos.get(e.to), rb = rad(G.nodes.get(e.to)) + 2;
+    const dx = b.x - a.x, dy = b.y - a.y, d = Math.max(1, Math.hypot(dx, dy));
+    const line = sv("line", { class: "edge", x1: a.x, y1: a.y, x2: b.x - dx / d * rb, y2: b.y - dy / d * rb, "marker-end": "url(#arrow)" });
+    if (e.label) line.append(sv("title", {}, e.label));
+    svg.append(line);
+  }
+  // Labels for every node only while they fit; otherwise the start, the first ring and the selected node.
+  const all = nodes.length <= 24, top = G.q.find === "ppr" ? new Set(nodes.filter((n) => !n.seed).sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8).map((n) => n.key)) : null;
+  const labelled = (n) => all || n.seed || G.sel === n.key || (top ? top.has(n.key) : G.q.find === "path" || (n.hops != null && n.hops <= 1 && nodes.length <= 60));
+  for (const n of nodes) {
+    const p = pos.get(n.key);
+    const g = sv("g", { class: "node" + (n.seed ? " seed" : "") + (G.sel === n.key ? " sel" : ""), transform: `translate(${p.x},${p.y})`, tabindex: "0" });
+    g.append(sv("circle", { r: rad(n) }), sv("title", {}, `${n.key}${n.label !== n.key ? ": " + n.label : ""}`));
+    // Nodes near the right edge put their label on the left so it is not cut off.
+    const left = p.x > W - 180;
+    if (labelled(n)) g.append(sv("text", { x: left ? -rad(n) - 3 : rad(n) + 3, y: 4, "text-anchor": left ? "end" : "start" }, n.label.length > 28 ? n.label.slice(0, 27) + "…" : n.label));
+    const pick = () => { G.sel = n.key; drawGraph(box); };
+    g.addEventListener("click", pick); g.addEventListener("keydown", (e) => { if (e.key === "Enter") pick(); });
+    svg.append(g);
+  }
+  const legend = el("div", { class: "legend" },
+    el("span", {}, el("i", { class: "seed" }), "where it started"), el("span", {}, el("i"), "found"),
+    el("span", { text: `${nodes.length} rows · ${edges.length} links drawn` + (all ? "" : " · hover or click a dot for its name") }),
+    G.q.vec ? el("span", { text: "similarity links aren't stored, so rings show the hop distance only" }) : G.q.find === "ppr" ? el("span", { text: "bigger: higher PageRank" }) : G.q.find === "reach" ? el("span", { text: "rings: hops from the start" }) : null);
+  const parts = [el("h2", { text: "Graph" }), legend, svg];
+  const sel = G.sel && G.nodes.get(G.sel);
+  if (sel) {
+    const rows = Object.entries(sel.row).filter(([c]) => c !== G.q.field);
+    parts.push(el("div", { class: "node-info" },
+      el("div", { class: "row" }, el("b", { text: sel.key }),
+        el("button", { class: "btn small", onclick: () => expandNode(sel, box) }, "Expand its links"),
+        el("button", { class: "btn small", onclick: () => graphFrom(sel.key) }, "Start from it"),
+        S.fields.some((f) => f.kind === "vector") ? el("button", { class: "btn small", onclick: () => moreLike(sel.key) }, "Similar rows") : null),
+      el("table", { style: "margin-top:6px" }, el("tbody", {}, rows.map(([c, v]) => el("tr", {}, el("td", { text: c }), el("td", { text: v == null ? "null" : Array.isArray(v) ? v.join(", ") : String(v) })))))));
+  } else parts.push(el("p", { class: "hint", style: "margin:6px 0 0", text: "Click a node to see its row, expand its links or start from it." }));
+  box.replaceChildren(...parts);
+}
+async function expandNode(n, box) {
+  const T = ident(S.table), F = ident(G.q.field);
+  const cols = [...new Set([ident(S.pk), ...[...G.cols].map(ident), ...(G.q.vec ? [] : [F])])];
+  const how = G.q.vec ? `k => ${Math.max(1, parseInt($("gK").value, 10) || 10)}` : "dir => 'both'";
+  try {
+    const j = await api("/v1/query", { sql: `SELECT ${cols.join(", ")} FROM ${T} WHERE REACHABLE(${F}, :k, ${how}) LIMIT 40`, params: { k: keyValue(n.key) } });
+    addGraphRows(j, n); drawGraph(box);
+  } catch (e) { box.append(el("div", { class: "error", text: e.message })); }
+}
+
+// ---- the query language guide -------------------------------------------------------
+// Examples are written against this table's fields and words from its rows,
+// so "Try it" finds something.
+let SAMPLE = null, HELP = null;
+// English words of five letters or more that searches drop.
+const STOP = new Set("about above after again against because before being below between could doing during further having other ought their theirs there these those through under until where which while would should yours yourself yourselves ourselves themselves herself himself itself what".split(" "));
+async function loadSamples() {
+  if (SAMPLE) return SAMPLE;
+  const T = ident(S.table), K = S.pk ? ident(S.pk) : null;
+  const kw = S.fields.find((f) => f.kind === "keyword" && f.indexed && f.name !== S.pk && !f.multi);
+  const num = S.fields.find((f) => isNum(f) && !f.multi && f.indexed);
+  const edges = S.fields.find((f) => f.kind === "edges");
+  const stored = S.fields.filter((f) => f.kind === "text" && f.stored);
+  const q = (sql, params) => api("/v1/query", { sql, params }).catch(() => null);
+  const cols = [K, ...stored.map((f) => ident(f.name))].filter(Boolean);
+  const [rows, kv, nv, er] = await Promise.all([
+    cols.length ? q(`SELECT ${cols.join(", ")} FROM ${T} LIMIT 30`) : null,
+    kw ? q(`SELECT ${ident(kw.name)}, COUNT(*) FROM ${T} GROUP BY ${ident(kw.name)} LIMIT 3`) : null,
+    num ? q(`SELECT AVG(${ident(num.name)}), MIN(${ident(num.name)}), MAX(${ident(num.name)}) FROM ${T}`) : null,
+    edges && K ? q(`SELECT ${K}, ${ident(edges.name)} FROM ${T} LIMIT 200`) : null,
+  ]);
+  // Words in several sample rows, but not in most, are likely to find rows.
+  const counts = new Map(), docs = []; let phrase = null;
+  for (const r of rows ? rows.rows : []) {
+    const ws = r.slice(K ? 1 : 0).flatMap((v) => String(v ?? "").toLowerCase().match(/[a-z]+/g) || []);
+    docs.push(new Set(ws));
+    ws.forEach((w, i) => { if (!phrase && w.length >= 4 && !STOP.has(w) && ws[i + 1] && ws[i + 1].length >= 4 && !STOP.has(ws[i + 1])) phrase = `${w} ${ws[i + 1]}`; });
+    for (const w of new Set(ws)) if (w.length >= 5 && !STOP.has(w)) counts.set(w, (counts.get(w) || 0) + 1);
+  }
+  const most = Math.max(2, docs.length * 0.6);
+  let words = [...counts.entries()].filter(([, n]) => n >= 2 && n <= most).sort((a, b) => b[1] - a[1]).map(([w]) => w);
+  if (words.length < 3) words = [...words, ...[...counts.keys()].filter((w) => !words.includes(w))];
+  while (words.length < 3) words.push(["data", "model", "search"][words.length]);
+  // The word to leave out: one some row with the first two words lacks.
+  const without = words.slice(2).find((w) => docs.some((d) => (d.has(words[0]) || d.has(words[1])) && !d.has(w)));
+  if (without) words = [words[0], words[1], without, ...words.slice(2).filter((w) => w !== without)];
+  const keys = rows && K ? rows.rows.map((r) => r[0]) : [];
+  // A row with links, and a row two hops from it, for the path example.
+  let linked = null, far = null;
+  if (er) {
+    const nLinks = (v) => { try { return JSON.parse(v).length; } catch { return 0; } };
+    const r = [...er.rows].sort((a, b) => nLinks(b[1]) - nLinks(a[1]))[0];
+    if (r && nLinks(r[1]) > 0) {
+      linked = r[0];
+      const f = await q(`SELECT ${K} FROM ${T} WHERE REACHABLE(${ident(edges.name)}, :k, hops => 3, min_hops => 3, dir => 'both') LIMIT 1`, { k: linked });
+      far = f && f.rows.length ? f.rows[0][0] : null;
+    }
+  }
+  const round = (x) => x == null ? 0 : Math.abs(x) >= 10 ? Math.round(x) : Math.round(x * 100) / 100;
+  // A typo (two letters swapped) in a longer word that word~ still finds.
+  let typo = null;
+  const tf = S.fields.find((f) => f.kind === "text" && f.indexed && f.generated) || S.fields.find((f) => f.kind === "text" && f.indexed);
+  for (const w of [...words].sort((a, b) => b.length - a.length).filter((w) => w.length >= 6).slice(0, 3)) {
+    const t = w.slice(0, 2) + w[3] + w[2] + w.slice(4);
+    const c = tf ? await q(`SELECT COUNT(*) FROM ${T} WHERE MATCH(${ident(tf.name)}, :t)`, { t: t + "~" }) : null;
+    if (c && c.rows[0][0] > 0) { typo = t; break; }
+  }
+  typo = typo || (words[0].length > 5 ? words[0].slice(0, 2) + words[0][3] + words[0][2] + words[0].slice(4) : words[0] + "s");
+  SAMPLE = {
+    words, phrase: phrase || `${words[0]} ${words[1]}`, typo, keys, linked: linked ?? keys[0], far,
+    values: kv ? kv.rows.map((r) => r[0]) : [], avg: nv ? round(nv.rows[0][0]) : 0, min: nv ? round(nv.rows[0][1]) : 0, max: nv ? round(nv.rows[0][2]) : 0,
+  };
+  return SAMPLE;
+}
+const lit = (v) => typeof v === "number" ? String(v) : sqlStr(v);
+function helpSections(x) {
+  const T = ident(S.table), K = S.pk ? ident(S.pk) : null;
+  const pick = (p) => S.fields.find(p);
+  const textF = pick((f) => f.kind === "text" && f.indexed && f.generated) || pick((f) => f.kind === "text" && f.indexed);
+  const tf = textF ? ident(textF.name) : null;
+  const kwF = pick((f) => f.kind === "keyword" && f.indexed && f.name !== S.pk && !f.multi), kw = kwF ? ident(kwF.name) : null;
+  const numF = pick((f) => isNum(f) && !f.multi && f.indexed), num = numF ? ident(numF.name) : null;
+  const intF = pick((f) => f.kind === "int" && !f.multi && f.indexed && f !== numF) || (numF && numF.kind === "int" ? numF : null);
+  const eF = pick((f) => f.kind === "edges"), E = eF ? ident(eF.name) : null;
+  const vF = pick((f) => f.kind === "vector"), V = vF ? ident(vF.name) : null;
+  const labelF = pick((f) => f.name !== S.pk && f.stored && (f.kind === "text" || f.kind === "keyword")), L = labelF ? ident(labelF.name) : null;
+  const show = [K, L].filter(Boolean).join(", ") || "*";
+  const [w1, w2, w3] = x.words, [v1, v2] = [x.values[0] ?? "a", x.values[1] ?? x.values[0] ?? "b"];
+  const k0 = x.keys[0], k1 = x.keys[1] ?? x.keys[0], kL = x.linked;
+  const sec = [];
+  if (tf) sec.push({ id: "text", title: "Text search", intro: `MATCH(field, '...') keeps the rows that match; bm25(field, '...') ranks them. Both take typo and synonym options.`, ex: [
+    { t: "Boolean search", d: `Words are ANDed. Uppercase OR, AND and NOT (or a leading -) combine them, with parentheses.`, sql: `SELECT ${show} FROM ${T}\nWHERE MATCH(${tf}, '(${w1} OR ${w2}) -${w3}')\nLIMIT 20` },
+    { t: "Phrases and prefixes", d: `"Quoted words" must appear together; pre* matches every word that starts with pre.`, sql: `SELECT ${show} FROM ${T}\nWHERE MATCH(${tf}, '"${x.phrase}" OR ${w2.slice(0, 4)}*')\nLIMIT 20` },
+    { t: "Typos", d: `word~ also matches words an edit or two away (word~1, word~2 to choose). fuzzy => 'auto' does it for every word, in MATCH and bm25: 1 edit for words of 3 to 5 letters, 2 for longer ones.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${x.typo}', fuzzy => 'auto') DESC\nLIMIT 10` },
+    { t: "Synonyms", d: `synonyms => 1 also searches what the synonym list (below) says is the same: "laptop, notebook" or "tv => television".`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1}', synonyms => 1) DESC\nLIMIT 10`, needs: "synonyms" },
+    { t: "Ranked search with filters", d: `bm25 ranks; score() shows the score. Filters decide which rows compete.`, sql: `SELECT ${show}${num ? ", " + num : ""}, score() FROM ${T}${num ? `\nWHERE ${num} >= ${x.avg}` : ""}\nORDER BY bm25(${tf}, '${w1} ${w2}') DESC\nLIMIT 10` },
+  ] });
+  const fl = [];
+  if (kw) fl.push({ t: "AND, OR and NOT", d: `Parentheses group conditions; NOT negates one or a group.`, sql: `SELECT ${show}${num ? ", " + num : ""} FROM ${T}\nWHERE (${kw} = ${lit(v1)} OR ${kw} = ${lit(v2)})${num ? `\n  AND NOT ${num} < ${x.avg}` : ""}\nLIMIT 20` });
+  if (kw && num) fl.push({ t: "IN and BETWEEN", d: `A list of values, a range, and either negated.`, sql: `SELECT ${show}, ${kw}, ${num} FROM ${T}\nWHERE ${kw} IN (${lit(v1)}, ${lit(v2)}) AND ${num} NOT BETWEEN ${x.min} AND ${x.avg}\nLIMIT 20` });
+  if (tf && kw) fl.push({ t: "Text OR a filter", d: `A text match is a condition like any other.`, sql: `SELECT ${show} FROM ${T}\nWHERE MATCH(${tf}, '${w1}') OR ${kw} = ${lit(v1)}\nLIMIT 20` });
+  if (fl.length) sec.push({ id: "filters", title: "Conditions", intro: "WHERE takes =, !=, <, <=, >, >=, IN, BETWEEN, MATCH and the graph predicates, combined with AND, OR, NOT and parentheses.", ex: fl });
+  const ag = [];
+  if (kw) ag.push({ t: "Count, average, minimum, maximum", d: `GROUP BY KEYWORD, INT or FLOAT fields; COUNT(*), COUNT(f), COUNT(DISTINCT f), SUM, AVG, MIN and MAX per group.`, sql: `SELECT ${kw}, COUNT(*)${num ? `, AVG(${num}), MIN(${num}), MAX(${num})` : ""} FROM ${T}\nGROUP BY ${kw}\nORDER BY COUNT(*) DESC\nLIMIT 10` });
+  if (kw && num) ag.push({ t: "HAVING", d: `Keep groups by their aggregates, named by alias or written out, and order by any of them.`, sql: `SELECT ${kw}, COUNT(*) AS n, AVG(${num}) AS avg_${numF.name} FROM ${T}\nGROUP BY ${kw}\nHAVING n >= 5\nORDER BY avg_${numF.name} DESC\nLIMIT 10` });
+  if (tf) ag.push({ t: "Over a search", d: `Without GROUP BY, aggregates summarize every row that passes.`, sql: `SELECT COUNT(*)${kw ? `, COUNT(DISTINCT ${kw})` : ""}${num ? `, AVG(${num})` : ""} FROM ${T}\nWHERE MATCH(${tf}, '${w1}')` });
+  if (kw && intF) ag.push({ t: "Several group fields", d: `One group per combination of values.`, sql: `SELECT ${kw}, ${ident(intF.name)}, COUNT(*) FROM ${T}\nGROUP BY ${kw}, ${ident(intF.name)}\nORDER BY 3 DESC\nLIMIT 20` });
+  if (ag.length) sec.push({ id: "aggregates", title: "Aggregates", intro: "GROUP BY, aggregates and HAVING run inside the database, across shards too.", ex: ag });
+  const sq = [];
+  if (kw && tf) sq.push({ t: "IN (SELECT ...)", d: `The subquery runs first; its values filter the outer query. NOT IN excludes them.`, sql: `SELECT ${show}, ${kw} FROM ${T}\nWHERE ${kw} IN (SELECT ${kw} FROM ${T} WHERE MATCH(${tf}, '${w1}'))\nLIMIT 20` });
+  if (num) sq.push({ t: "A value from a subquery", d: `A subquery in place of a value returns one row and one column.`, sql: `SELECT ${show}, ${num} FROM ${T}\nWHERE ${num} > (SELECT AVG(${num}) FROM ${T})\nORDER BY ${num} DESC\nLIMIT 10` });
+  if (K && tf && kw) sq.push({ t: "WITH", d: `Name a query and read it like the table. Here: the ${kwF.name}s of the 50 best matches.`, sql: `WITH top AS (\n  SELECT ${K} FROM ${T} ORDER BY bm25(${tf}, '${w1} ${w2}') DESC LIMIT 50\n)\nSELECT ${kw}, COUNT(*) FROM top\nGROUP BY ${kw}` });
+  if (kw) sq.push({ t: "FROM (SELECT ...) and DISTINCT", d: `Query a query's result. SELECT DISTINCT drops repeated rows.`, sql: `SELECT ${kw}, n FROM (\n  SELECT ${kw}, COUNT(*) AS n FROM ${T} GROUP BY ${kw}\n) AS t\nWHERE n >= 10\nORDER BY n DESC` });
+  if (sq.length) sec.push({ id: "subqueries", title: "Subqueries and WITH", intro: "These run as several queries on one snapshot, each using the indexes.", ex: sq });
+  const jn = [];
+  if (E && K) {
+    jn.push({ t: `Join along ${eF.name}`, d: `a.${eF.name} = b.${S.pk} pairs each row with each row it links to; b.${eF.name} = a.${S.pk} with the rows linking to it.`, sql: `SELECT a.${K}${L ? `, a.${L}` : ""}, b.${K} AS linked${L ? `, b.${L} AS linked_${labelF.name}` : ""}\nFROM ${T} a JOIN ${T} b ON a.${E} = b.${K}\n${tf ? `WHERE MATCH(a.${tf}, '${w1}')\n` : ""}LIMIT 30` });
+    jn.push({ t: "LEFT JOIN", d: `Rows without a match stay, with NULL in the joined columns.`, sql: `SELECT a.${K}, b.${K} AS linked_from\nFROM ${T} a LEFT JOIN ${T} b ON b.${E} = a.${K}\nWHERE a.${K} IN (${lit(k0)}, ${lit(k1)})` });
+    jn.push({ t: "Aggregates over a join", d: `The rows linked to most often by the rows that mention ${w1}.`, sql: `SELECT b.${K}${L ? `, b.${L}` : ""}, COUNT(*) AS links\nFROM ${T} a JOIN ${T} b ON a.${E} = b.${K}\n${tf ? `WHERE MATCH(a.${tf}, '${w1}')\n` : ""}GROUP BY b.${K}${L ? `, b.${L}` : ""}\nORDER BY links DESC\nLIMIT 10` });
+  }
+  if (kw && K) jn.push({ t: "Rows sharing a value", d: `Join on a field: the other rows with the same ${kwF.name} as ${k0}.`, sql: `SELECT a.${K}, b.${K}, b.${kw}\nFROM ${T} a JOIN ${T} b ON a.${kw} = b.${kw} AND b.${K} != a.${K}\nWHERE a.${K} = ${lit(k0)}\nLIMIT 20` });
+  if (jn.length) sec.push({ id: "joins", title: "Joins", intro: `A database holds one table: join it with itself (name each side, a and b) or with a WITH result. ON needs an equality; comparing an EDGES field with the key follows its links. Text and score functions name one side, e.g. MATCH(a.${tf || "body"}, ...).`, ex: jn });
+  const gr = [];
+  if (E && kL != null) {
+    gr.push({ t: "Neighbourhood", d: `Rows within 2 links of ${kL}, either way; hops() is the distance. dir => 'out' (default) follows links, 'in' goes against them.`, sql: `SELECT ${show}, hops() FROM ${T}\nWHERE REACHABLE(${E}, ${lit(kL)}, hops => 2, dir => 'both')\nORDER BY hops()\nLIMIT 50` });
+    if (tf) gr.push({ t: "Start from a search", d: `Seeds can be a subquery: here, the rows linking to the 5 best matches for ${w1}.`, sql: `SELECT ${show} FROM ${T}\nWHERE REACHABLE(${E}, (SELECT ${K} FROM ${T} ORDER BY bm25(${tf}, '${w1}') DESC LIMIT 5), dir => 'in')\nLIMIT 30` });
+    if (x.far != null) gr.push({ t: "Shortest path", d: `The rows on the shortest path between two rows, in order.`, sql: `SELECT ${show}, hops() FROM ${T}\nWHERE PATH(${E}, ${lit(kL)}, ${lit(x.far)}, dir => 'both')\nORDER BY hops()` });
+    gr.push({ t: "Personalized PageRank", d: `Rank every row by how strongly it connects to the seeds.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY ppr(${E}, ${lit(kL)}) DESC\nLIMIT 20` });
+    if (tf) gr.push({ t: "Text and graph together", d: `rrf() fuses rankings: rows that match the text and sit near ${kL}.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY rrf(bm25(${tf}, '${w1} ${w2}'), ppr(${E}, ${lit(kL)})) DESC\nLIMIT 20` });
+    if (num) gr.push({ t: "Walk only through some rows", d: `through => keeps the walk on rows that pass a condition.`, sql: `SELECT ${show}, ${num}, hops() FROM ${T}\nWHERE REACHABLE(${E}, ${lit(kL)}, hops => 3, dir => 'both', through => ${num} >= ${x.avg})\nORDER BY hops()\nLIMIT 50` });
+  }
+  if (V && k0 != null) gr.push({ t: "Similarity as a graph", d: `A VECTOR field is a graph too: each row linked to its k nearest rows.`, sql: `SELECT ${show}, hops() FROM ${T}\nWHERE REACHABLE(${V}, ${lit(k0)}, k => 10, hops => 2)\nORDER BY hops()\nLIMIT 40` });
+  if (gr.length) sec.push({ id: "graph", title: "Graph queries", intro: "REACHABLE(field, seeds, ...) keeps the rows a walk reaches, PATH(field, from, to) the rows on a shortest path, ppr(field, seeds) ranks by PageRank. Seeds are a key, a list parameter or a subquery. The Graph tab builds these and draws the answer.", ex: gr });
+  const vx = [];
+  if (V && k0 != null) {
+    vx.push({ t: "Rows like a row", d: `{"vector_of": key} is that row's vector.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY similarity(${V}, :q) DESC\nLIMIT 10`, params: { q: { vector_of: k0 } } });
+    if (tf) vx.push({ t: "Hybrid: text and vectors", d: `rrf() fuses the two rankings; 0.5 * a + 0.5 * b weighs them instead.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY rrf(bm25(${tf}, '${w1} ${w2}'), similarity(${V}, :q)) DESC\nLIMIT 10`, params: { q: embeddingOf(vF.name)?.loaded ? { embed: `${w1} ${w2}`, field: vF.name } : { vector_of: k0 } } });
+  }
+  if (tf && num) vx.push({ t: "Boost by a number", d: `decay(field, origin, scale) is 1 at the origin and 0.5 a scale away; multiply a score by it.`, sql: `SELECT ${show}, ${num}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1}') * decay(${num}, ${x.max}, ${Math.max(1, round2((x.max - x.min) / 4))}) DESC\nLIMIT 10` });
+  if (vx.length) sec.push({ id: "ranking", title: "Similarity, hybrid and boosts", intro: "", ex: vx });
+  return sec;
+}
+const round2 = (v) => Math.abs(v) >= 10 ? Math.round(v) : Math.round(v * 100) / 100;
+let synInfo = { rules: 0, editable: false };
+async function renderHelp() {
+  if (HELP) return;
+  HELP = true;
+  $("helpBody").replaceChildren(el("p", { class: "muted", text: "Writing examples for this table…" }));
+  let x, secs;
+  try { x = await loadSamples(); secs = helpSections(x); }
+  catch (e) { HELP = null; $("helpBody").replaceChildren(el("div", { class: "error", text: e.message })); return; }
+  $("helpNav").replaceChildren(...secs.map((s) => el("button", { class: "chip", onclick: () => helpGoTo(s.id) }, s.title)), el("button", { class: "chip", onclick: () => helpGoTo("synonyms") }, "Synonym list"), el("button", { class: "chip", onclick: () => helpGoTo("limits") }, "Not supported"));
+  const body = secs.map((s) => el("div", { class: "card help-sec", id: "help-" + s.id },
+    el("h3", { text: s.title }), s.intro ? el("p", { class: "small muted", text: s.intro }) : null,
+    s.ex.map((e) => el("div", { class: "ex" },
+      el("div", { class: "head" }, el("span", {}, el("b", { text: e.t }), " ", el("span", { class: "small muted", text: e.d })),
+        el("span", { class: "row", style: "flex-wrap:nowrap" },
+          el("button", { class: "btn small", title: "Put it in the SQL editor", onclick: () => { $("sqlText").value = e.sql; $("sqlParams").value = e.params ? JSON.stringify(e.params) : ""; showTab("sql"); $("sqlText").focus(); } }, "Edit"),
+          el("button", { class: "btn small primary", onclick: () => openInEditor(e.sql, e.params) }, "Try it"))),
+      el("pre", { class: "sql" }, ...highlight(e.sql)),
+      e.params ? el("div", { class: "small muted", style: "margin-top:4px", text: "parameters: " + JSON.stringify(e.params) }) : null,
+      e.needs === "synonyms" && !synInfo.rules ? el("div", { class: "note", style: "margin-top:6px", text: "There is no synonym list yet, so this query reports an error: add rules in the synonym list below." }) : null))));
+  body.push(synonymCard());
+  body.push(el("div", { class: "card help-sec", id: "help-limits" }, el("h3", { text: "Not supported" }),
+    el("ul", { class: "small", style: "margin:4px 0 0;padding-left:20px" },
+      ["UNION, INTERSECT and EXCEPT.", "WITH RECURSIVE: REACHABLE and PATH walk links instead.", "RIGHT, FULL and CROSS joins, and joins without an equality in ON.", "Joins of different tables: a database holds one table, so join it with itself or with a WITH result.", "Window functions (OVER ...).", "Each step of a join, subquery or WITH reads at most 1,000,000 rows."].map((t) => el("li", { text: t })))));
+  $("helpBody").replaceChildren(...body);
+  renderSqlHints(secs);
+}
+function helpGoTo(id) {
+  const go = () => { const t = id ? $("help-" + id) : $("tab-help"); if (t) t.scrollIntoView({ behavior: "smooth", block: "start" }); };
+  if ($("helpBody").childElementCount > 1) go(); else setTimeout(go, 400);
+}
+function synonymCard() {
+  const ta = el("textarea", { rows: 6, spellcheck: "false", placeholder: "laptop, notebook, portable computer\ntv => television" });
+  const status = el("span", { class: "small muted" });
+  const save = el("button", { class: "btn primary", disabled: !synInfo.editable }, "Save");
+  const load = async () => {
+    try { const j = await api("/v1/synonyms"); ta.value = j.text; status.textContent = `${j.rules} rules` + (j.file ? `, saved in ${j.file}` : ", kept in memory until the server restarts (start it with --synonyms FILE to keep them)"); }
+    catch (e) { status.textContent = e.message; }
+  };
+  save.onclick = async () => {
+    try {
+      const j = await api("/v1/synonyms", { text: ta.value }, "PUT");
+      synInfo.rules = j.rules; syncSynonyms(); status.textContent = `Saved: ${j.rules} rules` + (j.file ? ` in ${j.file}` : " (in memory)");
+    } catch (e) { status.textContent = e.message; }
+  };
+  if (synInfo.editable) load(); else status.textContent = "A coordinator has no synonym list: start each shard server with --synonyms FILE.";
+  return el("div", { class: "card help-sec", id: "help-synonyms" }, el("h3", { text: "Synonym list" }),
+    el("p", { class: "small muted", text: "One rule per line. \"a, b, c\": each word also finds the others. \"a => b\": a search for a also finds b, not the reverse. Words are matched after stemming, so plurals count. Searches use the list with synonyms => 1 (or the \"use synonyms\" box in Build)." }),
+    ta, el("div", { class: "row", style: "margin-top:8px" }, save, status));
+}
+function syncSynonyms() {
+  const has = synInfo.rules > 0;
+  $("bSyn").disabled = !has; if (!has) $("bSyn").checked = false;
+  $("bSynBox").title = has ? `Also find the words the synonym list (${synInfo.rules} rules) says are the same` : "No synonym list yet";
+  $("bSynBox").classList.toggle("muted", !has);
+  $("bSynSetup").classList.toggle("hidden", has || !synInfo.editable);
+}
+$("bSynSetup").onclick = () => { showTab("help"); helpGoTo("synonyms"); };
+// Example chips under the SQL editor.
+function renderSqlHints(secs) {
+  const want = [["text", "Boolean search", 0], ["text", "Typos", 2], ["aggregates", "Aggregates", 0], ["subqueries", "Subquery", 0], ["subqueries", "WITH", 2], ["joins", "Join", 0], ["graph", "Graph", 0]];
+  const chips = [];
+  for (const [id, label, i] of want) {
+    const s = secs.find((x) => x.id === id), e = s && s.ex[i];
+    if (e) chips.push(el("button", { class: "chip", title: e.d, onclick: () => { $("sqlText").value = e.sql; $("sqlParams").value = e.params ? JSON.stringify(e.params) : ""; $("sqlText").focus(); } }, label));
+  }
+  $("sqlHints").replaceChildren(el("span", { class: "hint", text: "Examples:" }), ...chips, el("button", { class: "btn link small", "data-help": "" }, "all of the query language"));
 }
 
 // ---- agent ----------------------------------------------------------------------
@@ -572,6 +1325,8 @@ async function loadConfig() {
   if (!models.includes($("askModel").value)) $("askModel").value = c.agent.model;
   $("askKeyBox").classList.toggle("hidden", serverKey);
   const k = store.get("apiKey", ""); if (k) { $("askKey").value = k; $("askRemember").checked = true; }
+  synInfo = c.synonyms || { rules: 0, editable: false };
+  syncSynonyms();
 }
 function renderMarkdown(text) {
   // Paragraphs, lists, `code` and ```sql blocks; everything as text nodes.
@@ -649,7 +1404,9 @@ async function init() {
     await loadConfig();
     renderHistory();
     if (!$("sqlText").value) $("sqlText").value = `SELECT * FROM ${ident(S.table)} LIMIT 10`;
-    showTab(store.get("tab", "build"));
+    const tab = store.get("tab", "build");
+    showTab($("graphTab").classList.contains("hidden") && tab === "graph" ? "build" : tab);
+    if (tab !== "help") loadSamples().then(() => renderSqlHints(helpSections(SAMPLE))).catch(() => {});
     $("results").replaceChildren(el("p", { class: "muted", text: "Build a query above, or press Run to see some rows." }));
   } catch (e) { $("table").textContent = "not connected"; showError(e.message); }
 }

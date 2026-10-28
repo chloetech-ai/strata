@@ -4,7 +4,7 @@
 //! query   := and ("OR" and)*
 //! and     := unary (["AND"] unary)*        juxtaposition is AND
 //! unary   := ("NOT" | "-") unary | primary  "a NOT b" is "a AND NOT b"
-//! primary := "(" query ")" | "\"phrase\"" | word | word*
+//! primary := "(" query ")" | "\"phrase\"" | word | word* | word~ | word~N
 //! ```
 //!
 //! Operators are uppercase (`AND`, `OR`, `NOT`), as in SQLite FTS5;
@@ -13,7 +13,9 @@
 //! that analyses to several terms (`e-mail`) is a phrase, one that analyses
 //! to none (a stopword) is dropped. A prefix (`vacc*`) is lowercased and
 //! folded but not stemmed, and matches the indexed (stemmed) terms that
-//! start with it.
+//! start with it. A typo-tolerant word (`nueral~`, `nueral~1`) also matches
+//! the indexed terms within N edits of its term (`~` alone: 1 edit for terms
+//! of 3 to 5 letters, 2 for longer ones; see [`super::fuzzy`]).
 
 use super::analyzer::{analyze, for_each_word};
 use crate::error::{Error, Result};
@@ -26,6 +28,8 @@ pub enum BoolQuery {
     Phrase(Vec<String>),
     /// Every indexed term with this prefix.
     Prefix(String),
+    /// Every indexed term within `edits` edits of `term` (itself included).
+    Fuzzy { term: String, edits: u8 },
     /// All of (an empty `And` matches every document).
     And(Vec<BoolQuery>),
     /// Any of (an empty `Or` matches nothing).
@@ -46,7 +50,7 @@ impl BoolQuery {
         match self {
             BoolQuery::Term(t) => out.push(t),
             BoolQuery::Phrase(ts) => out.extend(ts.iter().map(|t| t.as_str())),
-            BoolQuery::Prefix(_) => {}
+            BoolQuery::Prefix(_) | BoolQuery::Fuzzy { .. } => {}
             BoolQuery::And(cs) | BoolQuery::Or(cs) => cs.iter().for_each(|c| c.collect_terms(out)),
             BoolQuery::Not(c) => c.collect_terms(out),
         }
@@ -188,9 +192,10 @@ impl Parser {
                 e
             }
             Tok::Phrase(s) => terms_query(analyze(&s)),
-            Tok::Word(w) => match w.strip_suffix('*') {
-                Some(stem) => prefix_query(stem),
-                None => terms_query(analyze(&w)),
+            Tok::Word(w) => match (w.strip_suffix('*'), fuzzy_suffix(&w)) {
+                (Some(stem), _) => prefix_query(stem),
+                (None, Some((word, edits))) => fuzzy_query(word, edits)?,
+                _ => terms_query(analyze(&w)),
             },
             t => return Err(Error::Query(format!("unexpected {t:?} in MATCH query"))),
         })
@@ -212,6 +217,97 @@ fn terms_query(mut terms: Vec<String>) -> Option<BoolQuery> {
         0 => None,
         1 => terms.pop().map(BoolQuery::Term),
         _ => Some(BoolQuery::Phrase(terms)),
+    }
+}
+
+/// `word~` (`None` edits: by length) or `word~N`.
+fn fuzzy_suffix(w: &str) -> Option<(&str, Option<u8>)> {
+    let (word, n) = w.rsplit_once('~')?;
+    if word.is_empty() {
+        return None;
+    }
+    match n {
+        "" => Some((word, None)),
+        "0" | "1" | "2" => Some((word, Some(n.parse().unwrap()))),
+        _ => None,
+    }
+}
+
+fn fuzzy_query(word: &str, edits: Option<u8>) -> Result<Option<BoolQuery>> {
+    let terms = analyze(word);
+    let parts = terms
+        .into_iter()
+        .map(|t| {
+            let e = edits.unwrap_or_else(|| auto_edits(t.chars().count()));
+            Some(if e == 0 { BoolQuery::Term(t) } else { BoolQuery::Fuzzy { term: t, edits: e } })
+        })
+        .collect();
+    Ok(combine(parts, BoolQuery::And))
+}
+
+/// Edits a word of `len` letters may have: 0 up to 2 letters, 1 up to 5, else 2.
+pub fn auto_edits(len: usize) -> u8 {
+    match len {
+        0..=2 => 0,
+        3..=5 => 1,
+        _ => 2,
+    }
+}
+
+/// Widens every word of `q`: with its synonyms (`synonyms`), and with the
+/// indexed terms near it (`edits(term)` edits; 0 for none). Phrases with
+/// synonyms get them too.
+pub fn expand(q: BoolQuery, synonyms: Option<&super::synonyms::Synonyms>, edits: &dyn Fn(&str) -> u8) -> BoolQuery {
+    let with = |base: BoolQuery, key: &[String]| -> BoolQuery {
+        let mut alts = vec![base];
+        if let Some(s) = synonyms {
+            for p in s.get(key) {
+                alts.extend(terms_query(p.clone()));
+            }
+        }
+        if let [t] = key {
+            let e = edits(t);
+            if e > 0 {
+                alts.push(BoolQuery::Fuzzy { term: t.clone(), edits: e });
+            }
+        }
+        if alts.len() == 1 { alts.pop().unwrap() } else { BoolQuery::Or(alts) }
+    };
+    match q {
+        BoolQuery::Term(t) => {
+            let key = [t.clone()];
+            with(BoolQuery::Term(t), &key)
+        }
+        BoolQuery::Phrase(ts) => {
+            let key = ts.clone();
+            let p = BoolQuery::Phrase(ts);
+            match synonyms {
+                Some(s) if !s.get(&key).is_empty() => with(p, &key),
+                _ => p,
+            }
+        }
+        BoolQuery::And(cs) => BoolQuery::And(cs.into_iter().map(|c| expand(c, synonyms, edits)).collect()),
+        BoolQuery::Or(cs) => BoolQuery::Or(cs.into_iter().map(|c| expand(c, synonyms, edits)).collect()),
+        // Excluded words stay exact.
+        q => q,
+    }
+}
+
+/// Replaces every `Fuzzy` node by the terms `near(term, edits)` lists (an
+/// `Or` of them, the term itself included).
+pub fn resolve_fuzzy(q: BoolQuery, near: &mut dyn FnMut(&str, u8) -> Vec<String>) -> BoolQuery {
+    match q {
+        BoolQuery::Fuzzy { term, edits } => {
+            let mut ts = near(&term, edits);
+            if !ts.contains(&term) {
+                ts.insert(0, term);
+            }
+            if ts.len() == 1 { BoolQuery::Term(ts.pop().unwrap()) } else { BoolQuery::Or(ts.into_iter().map(BoolQuery::Term).collect()) }
+        }
+        BoolQuery::And(cs) => BoolQuery::And(cs.into_iter().map(|c| resolve_fuzzy(c, near)).collect()),
+        BoolQuery::Or(cs) => BoolQuery::Or(cs.into_iter().map(|c| resolve_fuzzy(c, near)).collect()),
+        BoolQuery::Not(c) => BoolQuery::Not(Box::new(resolve_fuzzy(*c, near))),
+        q => q,
     }
 }
 
@@ -259,6 +355,11 @@ mod tests {
         assert_eq!(parse_match("()").unwrap(), Or(vec![]));
         // Lowercase operators are words.
         assert_eq!(parse_match("cats or dogs").unwrap(), And(vec![t("cat"), t("dog")]));
+        // Typo tolerance.
+        assert_eq!(parse_match("nueral~").unwrap(), Fuzzy { term: "nueral".into(), edits: 2 });
+        assert_eq!(parse_match("grpah~1 OR cat~").unwrap(), Or(vec![Fuzzy { term: "grpah".into(), edits: 1 }, Fuzzy { term: "cat".into(), edits: 1 }]));
+        assert_eq!(parse_match("ox~").unwrap(), t("ox"));
+        assert_eq!(parse_match("cat~dog").unwrap(), Phrase(vec!["cat".into(), "dog".into()]));
         for bad in ["(cat", "cat)", "\"cat", "cat OR", "AND cat", "NOT"] {
             assert!(parse_match(bad).is_err(), "{bad}");
         }

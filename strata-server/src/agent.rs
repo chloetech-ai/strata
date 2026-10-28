@@ -101,6 +101,14 @@ fn system_prompt(svc: &Service, docs: u64) -> String {
         ),
         None => String::new(),
     };
+    let graph_help = match s.fields.iter().find(|f| f.ty == FieldType::Edges) {
+        Some(f) => format!(
+            "\n- {e} holds links to other rows. REACHABLE({e}, 'key', hops => 2, dir => 'out' | 'in' | 'both') keeps the rows that many links away and hops() is their distance (ORDER BY hops()); PATH({e}, 'a', 'b') is the rows of a shortest path; ORDER BY ppr({e}, 'key') DESC ranks by personalized PageRank. Seeds may be ('a', 'b') or a subquery (SELECT {k} FROM ... LIMIT 5). JOIN ... ON a.{e} = b.{k} pairs a row with each row it links to.",
+            e = f.name,
+            k = s.primary_key.map_or("id", |p| s.fields[p].name.as_str())
+        ),
+        None => String::new(),
+    };
     format!(
         r#"You answer questions about the data in one Strata table by querying it with SQL through the run_sql tool. Strata is a search database: a single table queried with SELECT plus search functions.
 
@@ -108,16 +116,20 @@ Table `{table}`, {docs} rows. Fields:
 {fields}
 
 Strata SQL (read-only here):
-SELECT <fields | * | score() | COUNT(*)> FROM {table} [WHERE <predicate>] [GROUP BY <field>] [ORDER BY <one score or numeric field> [ASC|DESC]] [LIMIT n [OFFSET m]]
-- MATCH(text_field, 'query') is a boolean full-text filter: terms, "phrases", AND, OR, NOT, -term, prefix*, parentheses; words side by side mean AND.
+SELECT <fields | * | score() | aggregates> FROM {table} [WHERE <predicate>] [GROUP BY <fields> [HAVING ...]] [ORDER BY <one score, numeric field or aggregate> [ASC|DESC]] [LIMIT n [OFFSET m]]
+- MATCH(text_field, 'query') is a boolean full-text filter: terms, "phrases", AND, OR, NOT, -term, prefix*, word~ (allows a typo), parentheses; words side by side mean AND.
+- MATCH and bm25 take fuzzy => 'auto' (tolerate typos in every word){synonym_help}.
 - bm25(text_field, 'words') ranks by text relevance (a row scores if it has any of the words). Put the user's key words here.
 - Comparisons (=, <, <=, >, >=, !=), BETWEEN, IN (...), AND, OR, NOT on KEYWORD, INT and FLOAT fields.
-{vector_help}{sparse_help}
+{vector_help}{sparse_help}{graph_help}
 - rrf(score1, score2) fuses two rankings by rank; 0.7 * bm25(...) + 0.3 * similarity(...) is a weighted sum of normalised scores.
 - decay(numeric_field, origin, scale) is 1 at the origin and 0.5 at origin ± scale (options: offset => d, decay => 0.5, shape => 'exp' | 'gauss' | 'linear'; origin may be now() for Unix-second timestamps). Multiply to boost relevance: ORDER BY bm25(body, 'boots') * decay(year, 2026, 2) DESC.
 - ORDER BY a numeric field sorts by it (ORDER BY price ASC). score() returns the ranking score.
 - Facets: SELECT f, COUNT(*) FROM {table} WHERE ... GROUP BY f ORDER BY 2 DESC LIMIT 10, where f is a KEYWORD field (or a multi-valued INT field). COUNT(*) alone counts rows.
-- Not supported: JOIN, other aggregates (SUM, AVG, MIN, MAX), expressions in SELECT, ORDER BY two scores. For a minimum or maximum, ORDER BY the field and LIMIT 1. For an average, fetch the rows and compute it yourself only if there are few.
+- Aggregates: COUNT(*), COUNT(f), COUNT(DISTINCT f), SUM, AVG, MIN, MAX, grouped by one or more KEYWORD, INT or FLOAT fields or over all rows, with HAVING (SELECT f, COUNT(*) AS n, AVG(x) FROM {table} GROUP BY f HAVING n > 5 ORDER BY AVG(x) DESC).
+- Subqueries and WITH: f IN (SELECT f FROM {table} WHERE ...), x > (SELECT AVG(x) FROM {table}), WITH top AS (SELECT ... LIMIT 50) SELECT ... FROM top.
+- Joins of the table with itself (name the sides a and b): JOIN or LEFT JOIN ... ON a.f = b.f; text and score functions name one side, MATCH(a.body, '...').
+- Not supported: UNION, window functions, joins with other tables, ORDER BY two scores.
 
 How to work:
 - Query before you answer, and base every claim on rows you saw. Never invent rows or values.
@@ -126,6 +138,7 @@ How to work:
 - If a query fails, read the error and fix the SQL.
 - Stop querying as soon as you can answer.
 - Answer in a few plain sentences or a short list. Name the keys of the rows you rely on. End with the one query that best supports the answer, in a ```sql block."#,
+        synonym_help = if svc.synonyms().is_some_and(|s| !s.is_empty()) { ", and synonyms => 1 (also find synonyms from the server's list)" } else { "" },
         table = s.table,
         fields = fields.join("\n"),
     )
