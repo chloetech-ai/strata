@@ -1,11 +1,12 @@
 //! HNSW: hierarchical navigable small-world graph (Malkov & Yashunin).
 //!
-//! **Construction** inserts documents in docID order with exact float32
-//! similarities, the neighbour-selection heuristic, `M` links per node on the
-//! upper layers and `2M` on layer 0. Several threads insert at once; each
-//! node's link list has its own lock, as in hnswlib. Levels come from a
-//! seeded hash of the docID, so the layer structure does not depend on the
-//! thread count (the links do, slightly, through insertion races).
+//! **Construction** inserts documents in docID order (in a seeded random
+//! order with several threads) with exact float32 similarities, the
+//! neighbour-selection heuristic, `M` links per node on the upper layers and
+//! `2M` on layer 0. Several threads insert at once; each node's link list has
+//! its own lock, as in hnswlib. Levels come from a seeded hash of the docID,
+//! so the layer structure does not depend on the thread count (the links do,
+//! slightly, through insertion races).
 //!
 //! **Layout** (sections `vec.<field>.hnsw` and `vec.<field>.hnsw_upper`):
 //! layer 0 is `n × 2M` u32 neighbour ids, padded with `u32::MAX`, so a node's
@@ -303,19 +304,28 @@ pub(crate) fn build(rows: &Rows, present: &(dyn Fn(u32) -> bool + Sync), cfg: &H
         grow: Mutex::new(()),
     };
     *b.entry.lock().unwrap() = (first, b.levels[first as usize] as usize);
-    let next = AtomicUsize::new(first as usize + 1);
+    // Concurrent inserts cannot see each other. In docID order, threads
+    // insert neighbouring docIDs together, and where docIDs follow the
+    // source (consecutive passages of one document are each other's nearest
+    // neighbours) those pairs end up unlinked: 4 threads cut recall@10 at ef
+    // 64 from 0.86 to 0.77 on MS MARCO passages (notes/scale.md). A seeded
+    // permutation makes concurrent inserts unrelated.
+    let mut order: Vec<u32> = (first + 1..n as u32).filter(|&i| present(i)).collect();
+    if cfg.threads > 1 {
+        use rand::{seq::SliceRandom, SeedableRng};
+        order.shuffle(&mut rand::rngs::StdRng::seed_from_u64(cfg.seed));
+    }
+    let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..cfg.threads.max(1) {
             s.spawn(|| {
                 let mut sc = Scratch::new(n);
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
+                    let j = next.fetch_add(1, Ordering::Relaxed);
+                    if j >= order.len() {
                         break;
                     }
-                    if present(i as u32) {
-                        b.insert(i as u32, &mut sc);
-                    }
+                    b.insert(order[j], &mut sc);
                 }
             });
         }

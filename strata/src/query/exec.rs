@@ -194,6 +194,11 @@ pub struct ExecOptions {
     pub deadline: Option<Instant>,
     /// The synonym list `synonyms => 1` expands searches with.
     pub synonyms: Option<Arc<Synonyms>>,
+    /// Search only these segments (ordinals into the snapshot's segments),
+    /// with BM25 statistics still summed over every segment, so the top-k
+    /// lists of disjoint subsets merge by score into the whole query's. For
+    /// experiments that run a query's segments in parallel from outside.
+    pub segments: Option<Arc<[usize]>>,
 }
 
 impl Default for ExecOptions {
@@ -212,6 +217,7 @@ impl Default for ExecOptions {
             threads: 1,
             deadline: None,
             synonyms: None,
+            segments: None,
         }
     }
 }
@@ -339,6 +345,9 @@ pub struct Executor<'a> {
     schema: &'a Schema,
     snap: &'a Snapshot,
     segs: Vec<Seg<'a>>,
+    /// Every non-empty segment, for collection statistics; empty unless
+    /// `ExecOptions::segments` restricts `segs`.
+    stat_segs: Vec<Seg<'a>>,
     opts: &'a ExecOptions,
     stats: ExecStats,
     /// Materialised filters by segment, shared by the operators of a query.
@@ -371,7 +380,7 @@ fn err(m: impl Into<String>) -> Error {
 impl<'a> Executor<'a> {
     /// `readers[i]` must belong to `snap.segments()[i]`.
     pub fn new(snap: &'a Snapshot, readers: &[Arc<SegmentReaders>], opts: &'a ExecOptions) -> Self {
-        let segs = snap
+        let all: Vec<Seg<'a>> = snap
             .segments()
             .iter()
             .zip(readers)
@@ -379,10 +388,15 @@ impl<'a> Executor<'a> {
             .filter(|(_, (v, _))| v.file.n_docs() > 0)
             .map(|(ord, (view, r))| Seg { ord, view, r: r.clone() })
             .collect();
+        let (segs, stat_segs) = match &opts.segments {
+            None => (all, Vec::new()),
+            Some(only) => (all.iter().filter(|s| only.contains(&s.ord)).map(|s| Seg { ord: s.ord, view: s.view, r: s.r.clone() }).collect(), all),
+        };
         Executor {
             schema: snap.schema(),
             snap,
             segs,
+            stat_segs,
             opts,
             stats: ExecStats::default(),
             sets: HashMap::new(),
@@ -390,6 +404,16 @@ impl<'a> Executor<'a> {
             readers_all: readers.to_vec(),
             parts: None,
             expanded: Mutex::new(Expanded::default()),
+        }
+    }
+
+    /// Every segment of the snapshot, for collection statistics and term
+    /// expansions, even when `ExecOptions::segments` searches only some.
+    fn stat_segs(&self) -> &[Seg<'a>] {
+        if self.opts.segments.is_some() {
+            &self.stat_segs
+        } else {
+            &self.segs
         }
     }
 
@@ -969,7 +993,7 @@ impl<'a> Executor<'a> {
     /// BM25 statistics over every segment of the snapshot.
     fn local_stats(&self, field: usize, terms: &[String]) -> Result<CollectionStats> {
         let mut st = CollectionStats { n_docs: 0, total_len: 0, df: HashMap::new() };
-        for s in &self.segs {
+        for s in self.stat_segs() {
             let t = self.text(unsafe_extend(s), field)?;
             st.n_docs += t.n_docs() as u64;
             st.total_len += t.total_len();
@@ -1010,7 +1034,7 @@ impl<'a> Executor<'a> {
             return Ok(v.clone());
         }
         let mut found: HashMap<String, (u64, u8)> = HashMap::new();
-        for s in &self.segs {
+        for s in self.stat_segs() {
             for (t, info, d) in self.text(unsafe_extend(s), field)?.fuzzy_terms(term, edits) {
                 found.entry(t).or_insert((0, d)).0 += info.df as u64;
             }
