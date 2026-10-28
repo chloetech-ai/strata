@@ -1051,3 +1051,58 @@ async fn health_reports_a_database_that_cannot_write() {
     assert!(m.contains("strata_write_errors_total{status=\"500\"} 1") && m.contains("strata_failing 1"), "{m}");
 }
 
+
+/// Checkpoints into `--backup-dir` (a write still in the memtable included,
+/// a directory checkpoint linked to the one before), names that would leave
+/// the directory refused, and the check and vacuum routes.
+#[tokio::test]
+async fn admin_routes_checkpoint_check_and_vacuum() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(dir.path(), "db.strata", |_| true);
+    let schema = db.schema().clone();
+    let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://127.0.0.1:9"), 16, Duration::from_secs(10));
+    let backups = dir.path().join("backups");
+    svc.set_backup_dir(&backups).unwrap();
+    let base = http(Arc::new(svc), None).await;
+    let c = reqwest::Client::new();
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({"ops": [{"op": "delete", "key": "p0000001"}]})).await;
+    assert_eq!(status, 200, "{r}");
+
+    let (status, r) = post(&c, &format!("{base}/v1/admin/checkpoint"), json!({"name": "first"})).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["checkpoint"]["live_docs"], json!(N - 1));
+    let copy = Db::open(&backups.join("first"), DbOptions::default()).unwrap();
+    assert_eq!(copy.snapshot().n_live_docs(), (N - 1) as u64);
+    assert!(copy.query("SELECT id FROM products WHERE id = 'p0000001'", &Params::new()).unwrap().rows.is_empty());
+    drop(copy);
+
+    let (status, r) = post(&c, &format!("{base}/v1/admin/checkpoint"), json!({"name": "d1", "layout": "dir"})).await;
+    assert_eq!(status, 200, "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/admin/checkpoint"), json!({"name": "d2", "layout": "dir", "link_from": "d1"})).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["checkpoint"]["segments_linked"], r["checkpoint"]["segments"], "{r}");
+
+    for body in [json!({"name": "../out"}), json!({"name": ".hidden"}), json!({"name": "a/b"}), json!({"name": "x", "layout": "zip"}), json!({}), json!({"name": "y", "layout": "dir", "link_from": "../d1"})] {
+        let (status, r) = post(&c, &format!("{base}/v1/admin/checkpoint"), body.clone()).await;
+        assert_eq!(status, 400, "{body}: {r}");
+    }
+    let (status, _) = post(&c, &format!("{base}/v1/admin/checkpoint"), json!({"name": "first"})).await;
+    assert_eq!(status, 500, "an existing name is not overwritten");
+    // (`first-wal` is the log opening `first` above created.)
+    let mut names: Vec<String> = std::fs::read_dir(&backups).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n != "first-wal").collect();
+    names.sort();
+    assert_eq!(names, ["d1", "d2", "first"]);
+    assert!(!dir.path().join("out").exists());
+
+    let (status, r) = post(&c, &format!("{base}/v1/admin/check"), json!({})).await;
+    assert_eq!((status, &r), (200, &json!({"ok": true})));
+    let (status, r) = post(&c, &format!("{base}/v1/admin/vacuum"), json!({})).await;
+    assert_eq!(status, 200, "{r}");
+    assert!(r["bytes_freed"].is_u64(), "{r}");
+
+    // Without --backup-dir there is nowhere to write.
+    let db = create(dir.path(), "other.strata", |i| i < 10);
+    let base = http(service(db, "http://127.0.0.1:9"), None).await;
+    let (status, r) = post(&c, &format!("{base}/v1/admin/checkpoint"), json!({"name": "x"})).await;
+    assert_eq!(status, 400, "{r}");
+}
