@@ -15,7 +15,7 @@ use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::stats::TermStats;
 use strata::query::{bind, compound, Params};
 use strata::schema::Schema;
-use strata::storage::{Snapshot, WriteTxn};
+use strata::storage::{CheckpointOptions, CheckpointStats, Layout, Snapshot, WriteTxn};
 use strata::text::Synonyms;
 use strata::value::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -108,6 +108,8 @@ pub struct Service {
     /// The synonym list `synonyms => 1` searches use, and its file.
     synonyms: RwLock<Option<Arc<Synonyms>>>,
     synonyms_file: Option<PathBuf>,
+    /// Where `POST /v1/admin/checkpoint` writes checkpoints.
+    backup_dir: Option<PathBuf>,
 }
 
 impl Service {
@@ -144,6 +146,7 @@ impl Service {
             idempotency,
             synonyms: RwLock::new(None),
             synonyms_file: None,
+            backup_dir: None,
         }
     }
 
@@ -251,6 +254,49 @@ impl Service {
     /// Where the synonym list is saved, if anywhere.
     pub fn synonyms_file(&self) -> Option<&Path> {
         self.synonyms_file.as_deref()
+    }
+
+    /// Sets where `POST /v1/admin/checkpoint` writes checkpoints, creating
+    /// the directory if need be.
+    pub fn set_backup_dir(&mut self, dir: &Path) -> Result<(), ApiError> {
+        if let Backend::Cluster(_) = self.backend {
+            return Err(ApiError::bad("--backup-dir goes to each shard server, which checkpoints its own database"));
+        }
+        std::fs::create_dir_all(dir).map_err(|e| ApiError::bad(format!("create {}: {e}", dir.display())))?;
+        self.backup_dir = Some(dir.to_path_buf());
+        Ok(())
+    }
+
+    /// Writes a checkpoint of the database ([`strata::storage::Database::checkpoint`])
+    /// named `name` in the backup directory, hard-linking the segments an
+    /// earlier checkpoint there (`link_from`) already holds.
+    pub async fn checkpoint(&self, name: &str, layout: Layout, link_from: Option<&str>) -> Result<CheckpointStats, ApiError> {
+        let dir = self.backup_dir.as_ref().ok_or_else(|| ApiError::bad("checkpoints need the server started with --backup-dir"))?;
+        let db = self.admin_db()?;
+        let dest = dir.join(checkpoint_name(name)?);
+        let link_from = link_from.map(|n| checkpoint_name(n).map(|n| dir.join(n))).transpose()?;
+        let opts = CheckpointOptions { layout, link_from };
+        tokio::task::spawn_blocking(move || db.storage().checkpoint(&dest, &opts)).await.map_err(ApiError::internal)?.map_err(Into::into)
+    }
+
+    /// Checks every byte of the database against its checksums
+    /// ([`strata::storage::Database::check`]). Writes wait meanwhile.
+    pub async fn check(&self) -> Result<(), ApiError> {
+        let db = self.admin_db()?;
+        let deadline = Instant::now() + self.max_timeout;
+        tokio::task::spawn_blocking(move || wait_for_writer(deadline, || Ok(db.storage().check()?))).await.map_err(ApiError::internal)?
+    }
+
+    /// Returns free space to the file system ([`strata::storage::Database::vacuum`]);
+    /// the bytes the file shrank by.
+    pub async fn vacuum(&self) -> Result<u64, ApiError> {
+        let db = self.admin_db()?;
+        let deadline = Instant::now() + self.max_timeout;
+        tokio::task::spawn_blocking(move || wait_for_writer(deadline, || Ok(db.storage().vacuum()?))).await.map_err(ApiError::internal)?
+    }
+
+    fn admin_db(&self) -> Result<Arc<Db>, ApiError> {
+        self.local_db().cloned().ok_or_else(|| ApiError::bad("a coordinator has no database of its own: ask each shard server"))
     }
 
     /// Hands a write to the writer thread and waits for its commit. The
@@ -925,6 +971,13 @@ impl Queued {
             WriteJob::Sql(..) => &[],
         }
     }
+}
+
+/// A checkpoint's name in the backup directory: letters, digits, '.', '_'
+/// and '-', not starting with '.', so that it stays in the directory.
+fn checkpoint_name(name: &str) -> Result<&str, ApiError> {
+    let ok = !name.is_empty() && name.len() <= 200 && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    ok.then_some(name).ok_or_else(|| ApiError::bad(format!("bad checkpoint name {name:?}: use letters, digits, '.', '_' and '-', not starting with '.'")))
 }
 
 /// Runs `write` until it gets the writer or `deadline` passes: Strata

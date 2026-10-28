@@ -35,6 +35,7 @@ use axum::{Json as AxJson, Router};
 use serde_json::{json, Value as Json};
 
 use strata::ingest::Format;
+use strata::storage::Layout;
 
 use crate::auth::{self, Access, Secret};
 use crate::service::{QueryReq, Service, SqlAnswer};
@@ -74,6 +75,9 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
         .route("/v1/snapshot", post(snapshot))
+        .route("/v1/admin/checkpoint", post(admin_checkpoint))
+        .route("/v1/admin/check", post(admin_check))
+        .route("/v1/admin/vacuum", post(admin_vacuum))
         .route("/v1/agent", post(agent_run))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -303,6 +307,27 @@ async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 async fn snapshot(State(app): State<App>) -> Res {
     let (id, txn) = app.svc.lease()?;
     Ok(AxJson(json!({"snapshot": id, "txn": txn, "ttl_s": app.svc.lease_ttl.as_secs()})))
+}
+
+/// `{"name": ..., "layout": "file" | "dir", "link_from": ...}`: writes a
+/// checkpoint into the server's `--backup-dir`.
+async fn admin_checkpoint(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let layout = match b.get("layout").and_then(|v| v.as_str()).unwrap_or("file") {
+        "file" => Layout::SingleFile,
+        "dir" | "directory" => Layout::Directory,
+        other => return Err(ApiError::bad(format!("layout is \"file\" or \"dir\", not {other:?}"))),
+    };
+    let stats = app.svc.checkpoint(body_str(&b, "name")?, layout, b.get("link_from").and_then(|v| v.as_str())).await?;
+    Ok(AxJson(json!({"checkpoint": stats})))
+}
+
+async fn admin_check(State(app): State<App>) -> Res {
+    app.svc.check().await?;
+    Ok(AxJson(json!({"ok": true})))
+}
+
+async fn admin_vacuum(State(app): State<App>) -> Res {
+    Ok(AxJson(json!({"bytes_freed": app.svc.vacuum().await?})))
 }
 
 async fn agent_run(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {

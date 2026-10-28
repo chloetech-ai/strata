@@ -94,6 +94,10 @@ enum Cmd {
     Remember { kind: String, text: String },
     /// Counts and sizes.
     Stats,
+    /// Copy the project's store to a new directory while Engram runs: a
+    /// consistent copy of the database, the session state and the event
+    /// log. To restore, run `engram stop` and copy the files back.
+    Backup { dest: PathBuf },
     /// Print the session-start briefing.
     Briefing,
     /// Write down the decisions, rules, requirements and facts of every
@@ -203,6 +207,11 @@ fn main() {
         Cmd::Sql { sql } => text(&send(&project, json!({"op": "sql", "sql": sql}), 30)),
         Cmd::Remember { kind, text: t } => text(&send(&project, json!({"op": "remember", "kind": kind, "text": t}), 30)),
         Cmd::Stats => println!("{}", serde_json::to_string_pretty(&send(&project, json!({"op": "stats"}), 30)).unwrap()),
+        Cmd::Backup { dest } => {
+            let dest = std::path::absolute(&dest).unwrap_or(dest);
+            let r = send(&project, json!({"op": "backup", "dest": dest}), 3600);
+            println!("{}: {} records, {} bytes, in {:.1} s", dest.display(), r["records"], r["bytes"], r["seconds"].as_f64().unwrap_or(0.0));
+        }
         Cmd::Briefing => text(&send(&project, json!({"op": "briefing", "session": ""}), 30)),
         Cmd::Distill => println!("{}", send(&project, json!({"op": "distill_backfill"}), 6 * 3600)),
         Cmd::Consolidate => println!("{}", send(&project, json!({"op": "consolidate"}), 3600)["report"]),

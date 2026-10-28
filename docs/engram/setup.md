@@ -133,6 +133,8 @@ It is also the quickest way to debug an install. A `DISTILL` event with an error
 
 Store directories are created readable by their owner only. Engram redacts common credential formats (cloud and API keys, tokens, private keys, `password = …`) before storing anything, but a store is still a transcript of your sessions: treat it like your shell history.
 
+To back a store up, run `engram backup DEST` in the project directory. It copies the store while sessions go on: a consistent checkpoint of `memory.strata` (copying the file itself while the daemon writes can catch it half way through a commit), `state.json`, the config and `events.log`, into a new directory `DEST`. To restore, run `engram stop` and copy those files back into the store's directory. A backup is as private as the store.
+
 | variable | effect |
 |---|---|
 | `ENGRAM_DISABLE=1` | the hooks do nothing in this session |

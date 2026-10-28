@@ -1,6 +1,8 @@
 //! The directory layout: a database as a directory of files instead of one
 //! file, so that segments can be built on one machine and shipped to
-//! another, stored on object storage, or copied with ordinary tools.
+//! another, stored on object storage, or copied with ordinary tools once it
+//! is closed. While it is open, a commit can unlink files a copy is still
+//! reading: [`crate::storage::Database::checkpoint`] copies it consistently.
 //!
 //! ```text
 //! <dir>/LOCK                          held with flock by the open database

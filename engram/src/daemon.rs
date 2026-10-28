@@ -211,6 +211,7 @@ impl Daemon {
             "forget" => self.op_forget(req).map(|r| (r, None)),
             "append" => self.op_append(req).map(|r| (r, None)),
             "stats" => self.op_stats().map(|r| (r, None)),
+            "backup" => self.op_backup(req).map(|r| (r, None)),
             // Read-only views for the demo inspector (demo/server.py).
             "inspect_query" => crate::inspect::query(&self.store, req).map(|r| (r, None)),
             "inspect_layout" => crate::inspect::layout(&self.store).map(|r| (r, None)),
@@ -1023,6 +1024,32 @@ impl Daemon {
         let drafts: Vec<Draft> = serde_json::from_value(req.get("drafts").cloned().unwrap_or(json!([])))?;
         let recs = self.store.append(sid, turn, ts, drafts)?;
         Ok(json!({"stored": recs.len(), "last_seq": self.store.last_seq()}))
+    }
+
+    /// Copies the store to the new directory `dest` while it serves: the
+    /// database as a checkpoint (a consistent copy, which copying
+    /// `memory.strata` while the daemon writes is not), the session state
+    /// and config as they are, and the event log up to its last whole line.
+    /// Restoring is putting these files back with the daemon stopped.
+    fn op_backup(&self, req: &Json) -> Result<Json> {
+        let dest = PathBuf::from(req.get("dest").and_then(|v| v.as_str()).ok_or_else(|| err("backup needs a dest"))?);
+        if !dest.is_absolute() {
+            return Err(err(format!("{} is not an absolute path", dest.display())));
+        }
+        std::fs::create_dir(&dest).map_err(|e| err(format!("create {}: {e}", dest.display())))?;
+        let stats = self.store.db.storage().checkpoint(&dest.join("memory.strata"), &strata::storage::CheckpointOptions::default())?;
+        self.persist();
+        for name in ["state.json", "config.json"] {
+            match std::fs::copy(self.paths.dir.join(name), dest.join(name)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(err(format!("copy {name}: {e}"))),
+                _ => {}
+            }
+        }
+        if let Ok(log) = std::fs::read(self.paths.dir.join("events.log")) {
+            let whole = log.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            std::fs::write(dest.join("events.log"), &log[..whole]).map_err(|e| err(format!("write events.log: {e}")))?;
+        }
+        Ok(json!({"dest": dest, "records": stats.live_docs, "bytes": stats.bytes_written, "txn": stats.txn, "seconds": stats.seconds}))
     }
 
     fn op_stats(&self) -> Result<Json> {
