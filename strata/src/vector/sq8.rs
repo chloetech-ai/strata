@@ -25,7 +25,7 @@ pub struct Sq8 {
 
 /// A query prepared for SQ8 scoring.
 #[derive(Clone, Debug)]
-pub struct QueryCode {
+pub struct Sq8Query {
     /// Quantised weights, zero-padded to the code row stride.
     pub q8: Vec<i8>,
     /// Float32 weights `q_j·scale_j` (for the asymmetric kernel), padded.
@@ -34,7 +34,7 @@ pub struct QueryCode {
     pub bias: f32,
 }
 
-impl QueryCode {
+impl Sq8Query {
     /// Approximate similarity from an integer code dot product.
     #[inline]
     pub fn score(&self, dot: i32) -> f32 {
@@ -92,7 +92,7 @@ impl Sq8 {
     }
 
     /// Prepares `q` for scoring code rows of `stride` bytes.
-    pub fn prepare(&self, q: &[f32], stride: usize) -> QueryCode {
+    pub fn prepare(&self, q: &[f32], stride: usize) -> Sq8Query {
         let dim = self.dim();
         let mut w = vec![0f32; stride];
         let mut bias = 0f64;
@@ -103,7 +103,7 @@ impl Sq8 {
         let max = w.iter().fold(0f32, |m, &x| m.max(x.abs()));
         let alpha = max / 127.0;
         let q8 = w.iter().map(|&x| if alpha > 0.0 { (x / alpha).round().clamp(-127.0, 127.0) as i8 } else { 0 }).collect();
-        QueryCode { q8, w, alpha, bias: bias as f32 }
+        Sq8Query { q8, w, alpha, bias: bias as f32 }
     }
 }
 

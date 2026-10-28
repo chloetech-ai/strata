@@ -1,0 +1,47 @@
+{
+  "dataset": "scidocs",
+  "dimensions": 512,
+  "documents": 25657,
+  "documents_without_title": 0,
+  "load_and_embed_seconds": 3.462694625,
+  "model": "potion-retrieval-32M",
+  "queries": 1000,
+  "rankings": [
+    {
+      "ndcg_at_10": 0.15687203668963715,
+      "order_by": "bm25(body, :t)",
+      "ranking": "bm25 (title + text)",
+      "recall_at_100": 0.35889999999999866
+    },
+    {
+      "ndcg_at_10": 0.1283586010772467,
+      "order_by": "similarity(emb_title, :q)",
+      "ranking": "potion-retrieval-32M vector of title",
+      "recall_at_100": 0.3056333333333325
+    },
+    {
+      "ndcg_at_10": 0.12024594548726207,
+      "order_by": "similarity(emb_text, :q)",
+      "ranking": "potion-retrieval-32M vector of text",
+      "recall_at_100": 0.31813333333333216
+    },
+    {
+      "ndcg_at_10": 0.13692857875408906,
+      "order_by": "similarity(emb_both, :q)",
+      "ranking": "potion-retrieval-32M vector of title + text",
+      "recall_at_100": 0.3420833333333321
+    },
+    {
+      "ndcg_at_10": 0.15942198616109457,
+      "order_by": "rrf(bm25(body, :t), similarity(emb_both, :q))",
+      "ranking": "rrf(bm25, potion-retrieval-32M vector of title + text)",
+      "recall_at_100": 0.3769333333333322
+    },
+    {
+      "ndcg_at_10": 0.2034199683182811,
+      "order_by": "similarity(cohere, :q)",
+      "ranking": "reference: Cohere embed-english-v3 vector of title + text",
+      "recall_at_100": 0.4504833333333324
+    }
+  ]
+}

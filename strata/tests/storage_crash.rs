@@ -158,8 +158,17 @@ fn candidates(start: &BTreeSet<u64>, log: &str) -> Vec<BTreeSet<u64>> {
 
 #[test]
 fn killed_writer_recovers_a_committed_prefix() {
+    killed_writer_recovers("db.strata");
+}
+
+#[test]
+fn killed_writer_recovers_a_committed_prefix_in_directory_layout() {
+    killed_writer_recovers("db.dir");
+}
+
+fn killed_writer_recovers(name: &str) {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("db.strata");
+    let db_path = dir.path().join(name);
     let exe = std::env::current_exe().unwrap();
     let mut rng = rand::rngs::StdRng::seed_from_u64(99);
     let mut state: BTreeSet<u64> = BTreeSet::new();

@@ -65,6 +65,7 @@ fn show(v: &Value) -> String {
             }
         }
         Value::Vector(v) => format!("vector({})", v.len()),
+        Value::List(xs) => format!("[{}]", xs.iter().map(show).collect::<Vec<_>>().join(", ")),
     }
 }
 

@@ -15,16 +15,16 @@
 //!
 //! [`DocSet`]: crate::segment::DocSet
 
-use crate::query::logical::Pred;
+use crate::query::logical::{Expand, Pred};
 use crate::value::Value;
 
 /// Per-segment statistics, answered from index metadata without scanning.
 pub trait Estimator {
     fn n_docs(&self) -> f64;
     /// Documents matching `MATCH(field, query)` (exact for single terms).
-    fn match_count(&self, field: usize, query: &str) -> f64;
+    fn match_count(&self, field: usize, query: &str, expand: &Expand) -> f64;
     /// Total postings read to materialise `MATCH(field, query)`.
-    fn match_postings(&self, field: usize, query: &str) -> f64;
+    fn match_postings(&self, field: usize, query: &str, expand: &Expand) -> f64;
     /// Documents with `lo <= field <= hi` (histogram estimate).
     fn range_count(&self, field: usize, lo: f64, hi: f64) -> f64;
     /// Documents whose keyword field equals one of `values` (exact).
@@ -129,10 +129,10 @@ impl<E: Estimator> Planner<'_, E> {
         match p {
             Pred::True => PredEstimate { card: n, mat_cost: n * c.emit / 64.0, probe_cost: 0.0, probeable: true },
             Pred::False => PredEstimate { card: 0.0, mat_cost: 0.0, probe_cost: 0.0, probeable: true },
-            Pred::Match { field, query } => {
-                let card = self.est.match_count(*field, query).min(n);
-                let postings = self.est.match_postings(*field, query);
-                let simple = !query.contains('"') && !query.contains('*');
+            Pred::Match { field, query, expand } => {
+                let card = self.est.match_count(*field, query, expand).min(n);
+                let postings = self.est.match_postings(*field, query, expand);
+                let simple = !query.contains('"') && !query.contains('*') && !query.contains('~') && expand.is_none();
                 PredEstimate { card, mat_cost: c.leaf + postings * c.posting + card * c.emit, probe_cost: c.probe_match, probeable: simple }
             }
             Pred::Range { field, lo, hi } => {
@@ -259,11 +259,11 @@ mod tests {
         fn n_docs(&self) -> f64 {
             1e6
         }
-        fn match_count(&self, _: usize, q: &str) -> f64 {
+        fn match_count(&self, _: usize, q: &str, _: &Expand) -> f64 {
             if q == "rare" { 100.0 } else { 300_000.0 }
         }
-        fn match_postings(&self, f: usize, q: &str) -> f64 {
-            self.match_count(f, q)
+        fn match_postings(&self, f: usize, q: &str, e: &Expand) -> f64 {
+            self.match_count(f, q, e)
         }
         fn range_count(&self, _: usize, lo: f64, hi: f64) -> f64 {
             ((hi.min(1000.0) - lo.max(0.0)).max(0.0) / 1000.0) * 1e6
@@ -313,7 +313,7 @@ mod tests {
         let f = Pred::Range { field: 1, lo: 0.0, hi: 499.0 };
         assert_eq!(p.filter_mode(&f, 100.0), FilterMode::Probe);
         assert_eq!(p.filter_mode(&f, 1e6), FilterMode::Materialize);
-        assert_eq!(p.filter_mode(&Pred::Match { field: 0, query: "\"a b\"".into() }, 10.0), FilterMode::Materialize);
+        assert_eq!(p.filter_mode(&Pred::Match { field: 0, query: "\"a b\"".into(), expand: Default::default() }, 10.0), FilterMode::Materialize);
     }
 
     #[test]

@@ -11,6 +11,11 @@
 //! Upper bounds: a list's from its impact frontier (exact), a block's from
 //! its impact (largest tf, smallest norm). Both hold for any parameters.
 //!
+//! The same machinery ranks learned sparse fields ([`crate::text::sparse`])
+//! by the dot product `Σ_t q_t · w_t`: there a posting's frequency is the
+//! document's quantised weight for the term, and a term scores linearly
+//! (`weight · tf`) instead of saturating.
+//!
 //! All three algorithms visit documents in docID order and keep the first of
 //! equal-scored documents, so they return the same top-k up to float
 //! rounding (sums are taken in different orders).
@@ -121,10 +126,18 @@ pub fn drive_cost(algo: TopKAlgo) -> f64 {
 /// different orders) never prunes a document that would qualify.
 const BOUND_SLACK: f32 = 1.0 + 1e-5;
 
+// A document's score is the sum of its terms' scores, added in f64: exact
+// for terms of any plausible spread, so a score does not depend on the
+// order in which a traversal met the terms (one segment and two shards,
+// or two algorithms, give a document the same f32 score, and tie alike).
+
 /// One query term: its cursor, weight `m · idf · (k1 + 1)` and list bound.
+/// A posting scores `weight · tf / (sat · tf + k[norm])`: BM25 with `sat`
+/// 1, a linear `weight · tf` with `sat` 0 and every `k` 1 (sparse fields).
 struct TermScorer<'a> {
     cur: PostingCursor<'a>,
     weight: f32,
+    sat: f32,
     max: f32,
     /// The block bound last computed, valid for targets below `block_end`
     /// (one past the block's last docID; 0 before the first call).
@@ -136,7 +149,7 @@ impl TermScorer<'_> {
     #[inline]
     fn score(&mut self, k: &[f32; 256], norm: u8) -> f32 {
         let tf = self.cur.freq() as f32;
-        self.weight * tf / (tf + k[norm as usize])
+        self.weight * tf / (self.sat * tf + k[norm as usize])
     }
 
     #[inline]
@@ -145,7 +158,7 @@ impl TermScorer<'_> {
             return self.max;
         }
         let tf = (imp >> 8) as f32;
-        self.weight * tf / (tf + k[(imp & 0xff) as usize]) * BOUND_SLACK
+        self.weight * tf / (self.sat * tf + k[(imp & 0xff) as usize]) * BOUND_SLACK
     }
 
     /// Bound of the block holding the first posting `>= target` (targets
@@ -161,10 +174,13 @@ impl TermScorer<'_> {
     }
 }
 
-/// The best `k` (score, doc) pairs; ties keep the earlier document.
+/// The best `k` (score, doc) pairs; ties keep the earlier document, or,
+/// with `ties`, every document tied with the `k`-th stays as well.
 struct TopK {
     k: usize,
     heap: BinaryHeap<Entry>,
+    /// Pairs left out of the heap with the score of its worst, when kept.
+    ties: Option<Vec<Entry>>,
 }
 
 /// Heap order: the greatest entry is the worst (lowest score, then highest
@@ -188,31 +204,54 @@ impl PartialOrd for Entry {
 
 impl TopK {
     fn new(k: usize) -> Self {
-        TopK { k, heap: BinaryHeap::with_capacity(k + 1) }
+        TopK { k, heap: BinaryHeap::with_capacity(k + 1), ties: None }
     }
 
-    /// Scores must exceed this to enter.
+    fn with_ties(k: usize) -> Self {
+        TopK { ties: Some(Vec::new()), ..TopK::new(k) }
+    }
+
+    /// Scores must exceed this to enter (to be kept, with ties).
     #[inline]
     fn threshold(&self) -> f32 {
         if self.heap.len() < self.k {
-            f32::NEG_INFINITY
-        } else {
-            self.heap.peek().map_or(f32::NEG_INFINITY, |e| e.0)
+            return f32::NEG_INFINITY;
         }
+        let worst = self.heap.peek().map_or(f32::NEG_INFINITY, |e| e.0);
+        // A score equal to the worst is kept with ties, so only lower
+        // bounds may be skipped.
+        if self.ties.is_some() { worst.next_down() } else { worst }
     }
 
     #[inline]
     fn insert(&mut self, doc: DocId, score: f32) {
         if self.heap.len() < self.k {
             self.heap.push(Entry(score, doc));
-        } else if score > self.threshold() {
-            self.heap.pop();
+            return;
+        }
+        let Some(worst) = self.heap.peek().map(|e| e.0) else { return };
+        if score > worst {
+            let out = self.heap.pop().expect("a full heap");
             self.heap.push(Entry(score, doc));
+            if let Some(ties) = &mut self.ties {
+                if self.heap.peek().is_some_and(|e| e.0 == out.0) {
+                    ties.push(out);
+                } else {
+                    ties.clear();
+                }
+            }
+        } else if score == worst {
+            if let Some(ties) = &mut self.ties {
+                ties.push(Entry(score, doc));
+            }
         }
     }
 
+    /// By decreasing score, the kept ties last.
     fn into_sorted(self) -> Vec<(DocId, f32)> {
-        self.heap.into_sorted_vec().into_iter().map(|e| (e.1, e.0)).collect()
+        let mut v = self.heap.into_sorted_vec();
+        v.extend(self.ties.unwrap_or_default());
+        v.into_iter().map(|e| (e.1, e.0)).collect()
     }
 }
 
@@ -236,30 +275,64 @@ impl TextFieldReader {
     }
 
     fn query<'a>(&'a self, terms: &[String], stats: &CollectionStats, params: Bm25Params) -> Query<'a> {
+        let w: Vec<(&str, f32)> = terms.iter().map(|t| (t.as_str(), 1.0)).collect();
+        self.query_weighted(&w, stats, params)
+    }
+
+    /// BM25 with a weight per term (repeated terms add up): a term scores
+    /// `weight · idf · (k1 + 1) · tf / (tf + k)`.
+    fn query_weighted<'a>(&'a self, terms: &[(&str, f32)], stats: &CollectionStats, params: Bm25Params) -> Query<'a> {
         let avgdl = stats.avgdl();
         let mut k = [0f32; 256];
         for (i, k) in k.iter_mut().enumerate() {
             *k = params.k1 * (1.0 - params.b + params.b * NORM_LENGTHS[i] as f32 / avgdl);
         }
-        // Distinct terms in first-occurrence order, with multiplicities.
-        let mut uniq: Vec<(&str, u32)> = Vec::new();
-        for t in terms {
-            match uniq.iter_mut().find(|(u, _)| *u == t.as_str()) {
-                Some(e) => e.1 += 1,
-                None => uniq.push((t, 1)),
+        // Distinct terms in first-occurrence order, with summed weights.
+        let mut uniq: Vec<(&str, f32)> = Vec::new();
+        for &(t, w) in terms {
+            match uniq.iter_mut().find(|(u, _)| *u == t) {
+                Some(e) => e.1 += w,
+                None => uniq.push((t, w)),
             }
         }
         let mut scorers = Vec::new();
         for (t, m) in uniq {
+            if m <= 0.0 {
+                continue;
+            }
             let Some(info) = self.term_info(t) else { continue };
             let df = stats.df.get(t).copied().unwrap_or(info.df as u64);
-            let weight = m as f32 * stats.idf(df) * (params.k1 + 1.0);
+            let weight = m * stats.idf(df) * (params.k1 + 1.0);
             let cur = self.cursor(&info);
             let max = cur.frontier().iter().map(|&(tf, n)| weight * tf as f32 / (tf as f32 + k[n as usize])).fold(0.0, f32::max)
                 * BOUND_SLACK;
-            scorers.push(TermScorer { cur, weight, max, block_end: 0, block_max: 0.0 });
+            scorers.push(TermScorer { cur, weight, sat: 1.0, max, block_end: 0, block_max: 0.0 });
         }
         Query { scorers, k, norms: &self.norms }
+    }
+
+    /// The linear query of a sparse field: `terms` with their query
+    /// weights (repeated terms add up; weights at or below 0 are dropped).
+    fn query_dot<'a>(&'a self, terms: &[(String, f32)]) -> Query<'a> {
+        let mut uniq: Vec<(&str, f32)> = Vec::new();
+        for (t, w) in terms {
+            match uniq.iter_mut().find(|(u, _)| *u == t.as_str()) {
+                Some(e) => e.1 += w,
+                None => uniq.push((t, *w)),
+            }
+        }
+        let mut scorers = Vec::new();
+        for (t, w) in uniq {
+            if w <= 0.0 {
+                continue;
+            }
+            let Some(info) = self.term_info(t) else { continue };
+            let weight = w / super::sparse::SCALE;
+            let cur = self.cursor(&info);
+            let max = cur.frontier().iter().map(|&(tf, _)| weight * tf as f32).fold(0.0, f32::max) * BOUND_SLACK;
+            scorers.push(TermScorer { cur, weight, sat: 0.0, max, block_end: 0, block_max: 0.0 });
+        }
+        Query { scorers, k: [1.0; 256], norms: &self.norms }
     }
 
     /// Disjunctive BM25 top-`k` of the analysed `terms` (repeated terms
@@ -290,9 +363,62 @@ impl TextFieldReader {
         algo: TopKAlgo,
         strategy: FilterStrategy,
     ) -> Vec<(DocId, f32)> {
-        let mut q = self.query(terms, stats, params);
-        let mut top = TopK::new(k);
-        if k == 0 || q.scorers.is_empty() {
+        self.run(self.query(terms, stats, params), TopK::new(k), filter, algo, strategy)
+    }
+
+    /// [`top_k`](Self::top_k), plus every document whose score equals the
+    /// `k`-th's, in no particular order after the others: all candidates
+    /// for a cut at `k` that breaks ties by something else (a key).
+    pub fn top_k_ties(
+        &self,
+        terms: &[String],
+        stats: &CollectionStats,
+        params: Bm25Params,
+        k: usize,
+        filter: Option<&dyn DocFilter>,
+        algo: TopKAlgo,
+    ) -> Vec<(DocId, f32)> {
+        self.run(self.query(terms, stats, params), TopK::with_ties(k), filter, algo, FilterStrategy::Auto)
+    }
+
+    /// Top-`k` (with `ties`, plus every document tied with the `k`-th) by
+    /// BM25 with a weight per term ([`top_k`](Self::top_k) weighs each 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn top_k_weighted(
+        &self,
+        terms: &[(String, f32)],
+        stats: &CollectionStats,
+        params: Bm25Params,
+        k: usize,
+        filter: Option<&dyn DocFilter>,
+        algo: TopKAlgo,
+        ties: bool,
+    ) -> Vec<(DocId, f32)> {
+        let w: Vec<(&str, f32)> = terms.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        let top = if ties { TopK::with_ties(k) } else { TopK::new(k) };
+        self.run(self.query_weighted(&w, stats, params), top, filter, algo, FilterStrategy::Auto)
+    }
+
+    /// Exact weighted BM25 of `docs` (see [`top_k_weighted`](Self::top_k_weighted)).
+    pub fn score_weighted(&self, terms: &[(String, f32)], stats: &CollectionStats, params: Bm25Params, docs: &[DocId]) -> Vec<f32> {
+        let w: Vec<(&str, f32)> = terms.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        self.score_with(self.query_weighted(&w, stats, params), docs)
+    }
+
+    /// Top-`k` of a sparse field by the dot product of each document's
+    /// term weights with `terms`' (see [`crate::text::sparse`]); filters as
+    /// in [`top_k_with`](Self::top_k_with).
+    pub fn top_k_dot(&self, terms: &[(String, f32)], k: usize, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
+        self.run(self.query_dot(terms), TopK::new(k), filter, algo, strategy)
+    }
+
+    /// Exact dot product of a sparse field's documents `docs` with `terms`.
+    pub fn score_dot(&self, terms: &[(String, f32)], docs: &[DocId]) -> Vec<f32> {
+        self.score_with(self.query_dot(terms), docs)
+    }
+
+    fn run(&self, mut q: Query<'_>, mut top: TopK, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
+        if top.k == 0 || q.scorers.is_empty() {
             return Vec::new();
         }
         if let Some(f) = filter {
@@ -322,10 +448,13 @@ impl TextFieldReader {
     /// Exact BM25 of each of `docs` (0 for documents without the terms), in
     /// the order given; sorted input reads each list once.
     pub fn score(&self, terms: &[String], stats: &CollectionStats, params: Bm25Params, docs: &[DocId]) -> Vec<f32> {
+        self.score_with(self.query(terms, stats, params), docs)
+    }
+
+    fn score_with(&self, mut q: Query<'_>, docs: &[DocId]) -> Vec<f32> {
         let mut out = vec![0f32; docs.len()];
         let mut idx: Vec<usize> = (0..docs.len()).collect();
         idx.sort_by_key(|&i| docs[i]);
-        let mut q = self.query(terms, stats, params);
         for i in idx {
             let d = docs[i];
             if (d as usize) < q.norms.len() {
@@ -343,16 +472,16 @@ impl Query<'_> {
     #[inline]
     fn score_doc(&mut self, d: DocId) -> (f32, bool, bool) {
         let norm = self.norms[d as usize];
-        let (mut s, mut any, mut live) = (0.0, false, false);
+        let (mut s, mut any, mut live) = (0.0f64, false, false);
         for sc in &mut self.scorers {
             let x = sc.cur.seek(d);
             if x == d {
-                s += sc.score(&self.k, norm);
+                s += sc.score(&self.k, norm) as f64;
                 any = true;
             }
             live |= x != END;
         }
-        (s, any, live)
+        (s as f32, any, live)
     }
 
     fn drive(&mut self, members: impl Iterator<Item = DocId>, top: &mut TopK) {
@@ -379,14 +508,14 @@ impl Query<'_> {
             }
             if filter.is_none_or(|f| f.contains(d)) {
                 let norm = self.norms[d as usize];
-                let mut s = 0.0;
+                let mut s = 0.0f64;
                 for (i, x) in docs.iter_mut().enumerate() {
                     if *x == d {
-                        s += sc[i].score(&self.k, norm);
+                        s += sc[i].score(&self.k, norm) as f64;
                         *x = sc[i].cur.next();
                     }
                 }
-                top.insert(d, s);
+                top.insert(d, s as f32);
             } else {
                 for (i, x) in docs.iter_mut().enumerate() {
                     if *x == d {
@@ -433,16 +562,16 @@ impl Query<'_> {
                 continue;
             }
             let norm = self.norms[d as usize];
-            let mut s = 0.0;
+            let mut s = 0.0f64;
             for i in ne..n {
                 if docs[i] == d {
-                    s += sc[i].score(&self.k, norm);
+                    s += sc[i].score(&self.k, norm) as f64;
                     docs[i] = sc[i].cur.next();
                 }
             }
             let mut alive = true;
             for i in (0..ne).rev() {
-                if s + ub[i] <= theta {
+                if s as f32 + ub[i] <= theta {
                     alive = false;
                     break;
                 }
@@ -450,11 +579,11 @@ impl Query<'_> {
                     docs[i] = sc[i].cur.seek(d);
                 }
                 if docs[i] == d {
-                    s += sc[i].score(&self.k, norm);
+                    s += sc[i].score(&self.k, norm) as f64;
                 }
             }
             if alive {
-                top.insert(d, s);
+                top.insert(d, s as f32);
             }
         }
     }
@@ -498,16 +627,16 @@ impl Query<'_> {
                     // replacing block bounds by scores while it can qualify.
                     if filter.is_none_or(|f| f.contains(pivot_doc)) {
                         let norm = self.norms[pivot_doc as usize];
-                        let (mut s, mut bound) = (0.0, block_upper);
+                        let (mut s, mut bound) = (0.0f64, block_upper);
                         for &i in &order[..=pivot] {
                             let x = sc[i].score(&self.k, norm);
-                            s += x;
+                            s += x as f64;
                             bound -= sc[i].block_max - x;
                             if bound <= theta {
                                 break;
                             }
                         }
-                        top.insert(pivot_doc, s);
+                        top.insert(pivot_doc, s as f32);
                     }
                     for &i in &order[..=pivot] {
                         docs[i] = sc[i].cur.next();

@@ -1,0 +1,9 @@
+trec-covid: 171332 documents, 50 queries; model static:potion-retrieval-32M (512 dimensions)
+loaded and embedded 3 fields in 25.5 s (7 documents without a title get no title vector)
+trec-covid (50 queries)                                          nDCG@10  recall@100
+bm25 (title + text)                                               0.6577      0.1266
+potion-retrieval-32M vector of title                              0.5040      0.0701
+potion-retrieval-32M vector of text                               0.4823      0.0725
+potion-retrieval-32M vector of title + text                       0.4463      0.0747
+rrf(bm25, potion-retrieval-32M vector of title + text)            0.6539      0.1099
+reference: Cohere embed-english-v3 vector of title + text         0.8178      0.1594

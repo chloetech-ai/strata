@@ -280,7 +280,7 @@ fn kernels_study(ds: &Dataset, r: &VectorReader, gt: &[Vec<Hit>], nq: usize) -> 
     let vs: Vec<&[f32]> = (0..64).map(|d| ds.doc(d)).collect();
     let cs: Vec<&[u8]> = (0..64).map(|d| r.codes(d)).collect();
     let q = &ds.queries[0];
-    let qc = r.sq8().prepare(q, stride);
+    let qc = r.sq8().expect("SQ8 codes").prepare(q, stride);
     let f32_ns = time_ns(2_000_000, |i| {
         std::hint::black_box(kernels::dot_f32(vs[i % 64], q));
     });
@@ -303,7 +303,7 @@ fn kernels_study(ds: &Dataset, r: &VectorReader, gt: &[Vec<Hit>], nq: usize) -> 
     let nq = nq.min(ds.queries.len());
     let (mut rv, mut ra) = (Vec::new(), Vec::new());
     for (qi, q) in ds.queries.iter().take(nq).enumerate() {
-        let qc = r.sq8().prepare(q, stride);
+        let qc = r.sq8().expect("SQ8 codes").prepare(q, stride);
         let mut a: Vec<(i32, u32)> = (0..n).map(|d| (qc.dot(r.codes(d)), d)).collect();
         a.sort_unstable_by(|x, y| y.cmp(x));
         let mut b: Vec<(f32, u32)> = (0..n).map(|d| (kernels::dot_u8_f32(r.codes(d), &qc.w), d)).collect();

@@ -164,6 +164,15 @@ reader (sections to a zero-copy view). Global docIDs are
 * **Scoring.** BM25 with `k1 = 1.2, b = 0.75` and collection-wide statistics
   summed over the snapshot's segments, so a document scores the same in any
   segment.
+* **Learned sparse fields.** A `SPARSE` field holds a weight per term, as
+  SPLADE, BGE-M3's sparse head or OpenSearch's neural sparse models produce
+  (a JSON object, `{"tok": 1.25, "##en": 0.4}`). It is stored as the same
+  inverted index, with each weight quantised to steps of 1/1024 in the
+  frequency slot (`text/sparse.rs`), and ranked by the dot product with the
+  query's weights: the term scorer runs in a linear mode (`w · tf` instead of
+  BM25's saturation), so MaxScore, Block-Max WAND, the block impacts and the
+  filter strategies all apply unchanged. Its scores need no collection
+  statistics, so shards and segments agree without the stats round.
 
 ### 5.2 Structured fields: forward columns and filter postings
 
@@ -191,6 +200,13 @@ reader (sections to a zero-copy view). Global docIDs are
   for scanning: 4× less I/O, and with the query quantised too, integer dot
   products with AVX-512 VNNI on x86-64 or NEON `usdot` on aarch64, at
   10–14 ns per 1,024-dimension vector on the M2.
+* **Binary codes.** A field declared with binary codes keeps one bit per
+  dimension (the sign around the segment's per-dimension mean) instead of
+  SQ8: 1/32 of the float32 vectors, so a 100M-vector index keeps its codes
+  in memory and leaves the float32 rows on disk, read only for the
+  candidates. The query keeps 8-bit weights; AVX-512 sums the weights of
+  the set bits with masked loads and `vpsadbw`. Searches rescore 8 × `rerank`
+  candidates (`notes/vector.md`).
 * **Flat.** Exact scan of SQ8 codes plus float32 re-ranking. The right answer
   for small segments and very selective filters.
 * **IVF.** k-means centroids; each cluster's members are stored contiguously
@@ -301,12 +317,28 @@ GROUP BY category ORDER BY 2 DESC LIMIT 5;
   Quora, -0.055 on TREC-COVID).
 * `similarity(field, vector)` (dot product, cosine for unit vectors) and
   `distance(field, vector)`. Vectors are bound parameters or JSON arrays.
+  On a `SPARSE` field, `similarity(field, :q)` is the dot product with a
+  JSON object of query term weights (`algo => ..` as for `bm25`).
 * `rrf(s1, s2, ...)`: reciprocal rank fusion, `Σ 1/(60 + rank_i)`, where each
   ranking is over the rows passing `WHERE` (`k => ..`, `depth => ..`).
   Arithmetic on scores gives weighted fusion: candidates are the union of
   each input's top 100, re-scored exactly by every input and min-max
   normalised (`norm => 'none'` keeps raw scores, `exact => 1` scores every
   row passing `WHERE`).
+* `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`:
+  a numeric column's closeness to `origin`, as Elasticsearch's decay
+  functions: `d = max(0, |x − origin| − offset)` maps to 1 at `d = 0` and
+  to `decay` at `d = scale`, falling exponentially, as a Gaussian
+  (`'gauss'`) or linearly (`'linear'`, reaching 0 at `scale / (1 −
+  decay)`). Rows without a value score 0. `now()` as the origin is the
+  current Unix time in seconds. Usable alone, in sums and in `rrf`.
+* Products of scores boost relevance by a row's own values:
+  `ORDER BY bm25(body, :t) * decay(published, now(), 2592000)` (half the boost at 30 days) or
+  `similarity(emb, :q) * rating`. Candidates are the top `depth` (100)
+  rows of each relevance factor (BM25, similarity, graph scores; of every
+  factor when there is none), scored exactly by every factor; shards
+  return each factor's raw scores and the coordinator multiplies them over
+  the same candidates, so a split collection ranks as the whole one.
 * Options as named arguments, e.g. `similarity(emb, :q, nprobe => 32)`,
   `bm25(body, :t, k1 => 0.9, stopwords => 0)`.
 

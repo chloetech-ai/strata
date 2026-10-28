@@ -23,6 +23,7 @@ pub fn value_json(v: &Value, max_dims: Option<usize>) -> Json {
             let n = max_dims.unwrap_or(v.len()).min(v.len());
             json!({"dim": v.len(), "values": v[..n].to_vec()})
         }
+        Value::List(xs) => Json::Array(xs.iter().map(|x| value_json(x, max_dims)).collect()),
     }
 }
 

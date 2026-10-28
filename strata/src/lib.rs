@@ -6,6 +6,7 @@
 //! functions, planned by a cost-based optimizer. See `DESIGN.md`.
 //!
 //! * [`schema`], [`value`]: tables, field types, documents.
+//! * [`embed`]: the models that fill VECTOR fields declared with `embed`.
 //! * [`segment`]: the immutable unit of storage, a directory of aligned,
 //!   named sections, and the builder that turns documents into one.
 //! * [`storage`]: the single-file pager, commit protocol, WAL, snapshots.
@@ -16,6 +17,7 @@
 //!   compared with), their set-operation algorithms, and the testbed of the
 //!   `strata-posting-bench` binary.
 //! * [`query`]: SQL front end, planner and executor.
+//! * [`cluster`]: merging the answers of shards of one collection.
 //! * [`data`], [`metrics`]: BEIR loaders and retrieval metrics for the
 //!   evaluation.
 //! * [`workload`]: the query workloads shared with the baselines, and the
@@ -24,8 +26,10 @@
 
 #[cfg(feature = "baselines")]
 pub mod baselines;
+pub mod cluster;
 pub mod data;
 pub mod db;
+pub mod embed;
 pub mod error;
 pub mod forward;
 pub mod graph;
@@ -42,6 +46,6 @@ pub mod vector;
 pub mod workload;
 
 pub use error::{Error, Result};
-pub use schema::{Field, FieldType, Schema, VectorIndexKind};
+pub use schema::{Embed, Field, FieldType, Schema, VectorCodes, VectorIndexKind};
 pub use segment::DocId;
 pub use value::{Document, Value};

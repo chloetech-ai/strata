@@ -18,7 +18,7 @@ Strata is to search what SQLite is to relational data: a library that keeps a wh
 
 - **Embedded and single-file.** One `.strata` file plus a `-wal` sidecar, like SQLite in WAL mode. Opening a database maps the file and loads nothing eagerly, so databases larger than RAM work and a cold open costs the same whatever the size.
 - **ACID with snapshot isolation.** One writer, any number of readers. Readers never block and always see a consistent snapshot; a crash at any point leaves the last committed state.
-- **SQL with search extensions.** `SELECT … WHERE … ORDER BY … LIMIT`, `GROUP BY` for facets, plus `MATCH` (boolean full text), `bm25()`, `similarity()` and `distance()` (vectors), `rrf()` (rank fusion) and graph traversal. The [query language](query-language.md) page is the reference.
+- **SQL with search extensions.** `SELECT … WHERE … ORDER BY … LIMIT`, `GROUP BY` for facets, plus `MATCH` (boolean full text), `bm25()`, `similarity()` and `distance()` (vectors and learned sparse weights), `rrf()`, weighted sums and products (fusion and boosts), `decay()` (closeness to a value or a time) and graph traversal, and `INSERT`, `UPDATE` and `DELETE`. The [query language](query-language.md) page is the reference.
 - **Three index families, freely combined.** Full text (BM25, boolean and phrase queries), structured fields (equality, `IN`, ranges, facets) and vectors (approximate and exact nearest neighbours), in any combination: filtered vector search, filtered BM25, hybrid ranking, facets over any result.
 - **Graphs over the same rows.** A row can hold typed, weighted edges to other rows. Traversals, shortest paths and personalized PageRank run in the same statement as everything else ([Graphs](graphs.md)).
 - **Disk-aware.** Every structure is read in place through `mmap`, with no deserialisation, and laid out so that a query's I/O is proportional to its work.
@@ -101,6 +101,7 @@ A segment is *n* documents with local docIDs `0..n`, stored as a header and a di
 - **Postings.** DocIDs, term frequencies and per-block maximum scores, so that top-k can skip blocks. DocIDs of terms in at least 512 documents are [Loom](../posting-lists.md#loom) lists; rarer terms use BP128 blocks. Frequencies are bit-packed in 128-posting blocks addressed by posting rank. Against BP128 for every list, Loom is 2–4% smaller with 7.6–11× faster conjunctions.
 - **Top-k.** MaxScore by default; on the BEIR queries it beats Block-Max WAND by 1.9–2.6×. A filter either drives scoring (its members are scored directly) or is probed per candidate, by a fitted crossover.
 - **Positions** (optional per field) live in a separate stream, read only by phrase queries.
+- **Learned sparse fields.** A `SPARSE` field holds a weight per term, as SPLADE or BGE-M3's sparse head produce, in the same kind of inverted index with the weights quantised into the frequency slot. `similarity(field, :q)` ranks by the dot product with the query's weights through the same MaxScore and Block-Max WAND, block bounds and filter strategies as BM25.
 
 Scores are BM25 with *k*<sub>1</sub> = 1.2, *b* = 0.75 and Lucene's idf, over statistics summed across the snapshot's segments, so a document scores the same in any segment:
 
@@ -119,10 +120,11 @@ Document lengths are quantised to one byte. Ranked queries drop English function
 - **Range postings.** Numeric fields get an equi-depth histogram of 64 buckets whose buckets are docID lists. A range is the union of the buckets it covers, plus the boundary buckets filtered through the column. The histogram doubles as the selectivity estimator.
 - **Doc store.** Rows in LZ4-compressed 16 KiB blocks with a block index; it serves projections and is the source for merges.
 - **Generated columns.** A TEXT field may be generated from other stored text fields (`body` = title + text in the evaluation table), indexed but not stored, and recomputed by merges.
+- **Embedded vector fields.** A VECTOR field may be declared as a model's embedding of other fields (`"embed": {"from": ["title"], "model": "potion-retrieval-32M"}`). The schema records it; given the model, writes that leave the vector out get it computed and rewrites of a source recompute it, while merges keep the stored vectors ([embedded vector fields](server.md#embedded-vector-fields)).
 
 ### Vectors
 
-- **Forward vectors.** Every vector field stores float32 vectors for exact re-ranking and 8-bit scalar-quantised codes (SQ8, per-dimension min/max) for scanning: 4× less I/O, and with the query quantised too, integer dot products at about 14 ns per 1,024-dimension vector with NEON `usdot` on the M2 (AVX-512 VNNI on x86-64).
+- **Forward vectors.** Every vector field stores float32 vectors for exact re-ranking and 8-bit scalar-quantised codes (SQ8, per-dimension min/max) for scanning: 4× less I/O, and with the query quantised too, integer dot products at about 14 ns per 1,024-dimension vector with NEON `usdot` on the M2 (AVX-512 VNNI on x86-64). A field can keep 1-bit codes instead (`"codes": "binary"`), an eighth of the memory, with 8 times as many candidates re-ranked ([results](results.md#compressed-vectors)).
 - **Flat.** An exact scan of the codes plus float32 re-ranking: the right answer for small segments and very selective filters.
 - **IVF.** k-means centroids; each cluster's members are stored contiguously as a docID list followed by their codes. Probing a cluster is one sequential read, and a filter is applied by intersecting the cluster's list with the filter's, the same operation as a text conjunction.
 - **HNSW.** A navigable small-world graph with fixed-degree adjacency lists in the segment. Fastest in memory; random I/O on disk.
@@ -180,7 +182,7 @@ The plan the planner chose is visible: the `strata` shell's `--plan` flag prints
 
 Strata is built for embedded retrieval: local search over documents with metadata and embeddings, such as retrieval for a model on a laptop, a desktop app's search box or an edge device, with SQL and one file to copy, back up or ship. It suits read-mostly corpora with steady writes: commits are visible at once, and batching amortises their sync, but merges rebuild every index of the segments they combine, and HNSW builds dominate load time (IVF builds 2.1–2.5× faster for write-heavy vector workloads). It is not meant for relational workloads with joins, high write concurrency, or corpora larger than one machine.
 
-**Current limits.** SQL covers single-table `SELECT`; writes go through the Rust API (`Database::begin`, `WriteTxn::insert`, `delete`, `commit`). The multi-process writer lock is designed but not built. Queries are single-threaded.
+**Current limits.** SQL covers one table, without joins; `INSERT`, `UPDATE` and `DELETE` run through `Db::sql`, and the Rust transaction API (`Database::begin`, `WriteTxn::insert`, `set`, `delete`, `commit`) groups several writes. The multi-process writer lock is designed but not built. A query searches a snapshot's segments on `ExecOptions::threads` threads (one by default). [strata-server](server.md) serves a database, or a set of shards, over the network.
 
 ## Code layout
 
@@ -190,7 +192,7 @@ Strata is built for embedded retrieval: local search over documents with metadat
 | `strata/src/segment/` | immutable segments of named, aligned sections, read zero-copy through `mmap` |
 | `strata/src/text/` | analyser, Loom and BP128 postings, positions, BM25 with MaxScore and Block-Max WAND |
 | `strata/src/forward/` | columns with zone maps, keyword dictionaries and Pyramid lists, range histograms, facets, doc store |
-| `strata/src/vector/` | float32 and SQ8 vectors, flat, IVF and HNSW, filtered search |
+| `strata/src/vector/` | float32 vectors with SQ8 or binary codes, flat, IVF and HNSW, filtered search |
 | `strata/src/graph/` | EDGES fields: out-edge CSR and reverse index per segment; BFS, shortest paths, personalized PageRank |
 | `strata/src/query/` | SQL binder, logical plan, cost-based planner, executor, fusion, graph predicates and scores |
 | `strata/src/baselines/` | SQLite + FTS5 and Tantivy baselines (feature `baselines`) |

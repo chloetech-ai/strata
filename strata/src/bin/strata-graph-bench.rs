@@ -370,6 +370,7 @@ fn traversal_study(db: &Db, table: &str, field: &str, ids: &[i64], edges: &[(i64
             r.dist.values().filter(|&&d| d >= 1).count() as i64
         });
         assert_eq!(counts, ccounts, "Strata and the CSR disagree on {dir} {hops}");
+        #[cfg_attr(not(feature = "baselines"), allow(unused_mut))]
         let mut row = json!({"strata_ms": stats_ms(&ms), "csr_ms": stats_ms(&cms), "rows": mean(&counts.iter().map(|&c| c as f64).collect::<Vec<_>>())});
         #[cfg(feature = "baselines")]
         if let Some(l) = &lite {

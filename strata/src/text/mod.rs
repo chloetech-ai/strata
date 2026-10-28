@@ -20,6 +20,9 @@
 //! array is a view into the segment. Queries: [`parse_match`] /
 //! [`BoolQuery`] for boolean retrieval ([`TextFieldReader::eval`]), and
 //! [`TextFieldReader::top_k`] for BM25 ranking.
+//!
+//! SPARSE fields (learned term weights) are stored the same way, with the
+//! weights as posting frequencies ([`sparse`]).
 
 pub mod analyzer;
 pub mod bm25;
@@ -27,9 +30,12 @@ pub mod builder;
 pub mod codec;
 pub mod cursor;
 pub mod dict;
+pub mod fuzzy;
 pub mod postings;
 pub mod query;
 pub mod reader;
+pub mod sparse;
+pub mod synonyms;
 
 pub use analyzer::{analyze, analyze_query, analyze_query_with, analyze_with_positions, QUERY_STOPWORDS};
 pub use bm25::{Bm25Params, CollectionStats, FilterStrategy, TopKAlgo};
@@ -38,6 +44,7 @@ pub use cursor::{PostingCursor, END};
 pub use postings::PostingsFormat;
 pub use query::{parse_match, BoolQuery};
 pub use reader::{TextFieldReader, TextSizes};
+pub use synonyms::Synonyms;
 
 use crate::error::{Error, Result};
 use crate::schema::{Field, FieldType};

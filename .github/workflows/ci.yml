@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: ${{ matrix.crate }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        crate: [strata, engram, strata-server]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Builds use -C target-cpu=native (.cargo/config.toml), so a cache
+      # must not be restored on a runner with another CPU model.
+      - name: CPU model
+        id: cpu
+        shell: bash
+        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+          key: ${{ matrix.crate }}-${{ steps.cpu.outputs.model }}
+      - name: Tests
+        working-directory: ${{ matrix.crate }}
+        run: cargo test --release
+      # Compiler warnings and clippy's correctness and suspicious lints fail
+      # the build; style, complexity and performance lints are advice.
+      - name: Clippy
+        working-directory: ${{ matrix.crate }}
+        run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+
+  server-smoke:
+    name: strata-server smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Builds use -C target-cpu=native (.cargo/config.toml), so a cache
+      # must not be restored on a runner with another CPU model.
+      - name: CPU model
+        id: cpu
+        shell: bash
+        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata-server
+          key: strata-server-${{ steps.cpu.outputs.model }}
+      - name: Build
+        working-directory: strata-server
+        run: cargo build --release
+      - name: Serve a demo catalogue and query it
+        working-directory: strata-server
+        run: |
+          ./target/release/strata-server --demo 5000 --db "$RUNNER_TEMP/demo.strata" --listen 127.0.0.1:7700 --grpc off &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:7700/v1/health && break; sleep 1; done
+          curl -sf http://127.0.0.1:7700/v1/health | grep -q '"ok"'
+          curl -sf -X POST http://127.0.0.1:7700/v1/query -H 'content-type: application/json' \
+            -d '{"sql": "SELECT id, title, score() FROM products ORDER BY bm25(body, :q) DESC LIMIT 5", "params": {"q": "waterproof jacket"}}' \
+            | grep -q '"rows"'
+          curl -sf -X POST http://127.0.0.1:7700/v1/query -H 'content-type: application/json' \
+            -d '{"sql": "SELECT category, COUNT(*) FROM products GROUP BY category ORDER BY 2 DESC LIMIT 5"}' \
+            | grep -q '"rows"'
+          curl -sf -X POST http://127.0.0.1:7700/v1/query -H 'content-type: application/json' \
+            -d '{"sql": "WITH top AS (SELECT id FROM products ORDER BY bm25(body, '"'"'jaket'"'"', fuzzy => 1) DESC LIMIT 50) SELECT category, COUNT(*), AVG(price) FROM top GROUP BY category"}' \
+            | grep -q '"rows"'
+          curl -sf http://127.0.0.1:7700/metrics | grep -q strata_queries_total
+          curl -sf http://127.0.0.1:7700/ | grep -qi '<html'

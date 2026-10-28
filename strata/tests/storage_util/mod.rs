@@ -98,10 +98,13 @@ pub fn assert_keys(s: &Snapshot, want: &std::collections::BTreeSet<String>) {
 }
 
 /// Opens or creates `path` with `opts`.
+/// Opens the database at `path`, or creates it: in the directory layout
+/// when the path ends in `.dir`.
 pub fn open_or_create(path: &std::path::Path, opts: DbOptions) -> Database {
     if path.exists() {
         Database::open(path, opts).unwrap()
     } else {
-        Database::create(path, schema(), opts).unwrap()
+        let layout = if path.extension().is_some_and(|e| e == "dir") { strata::storage::Layout::Directory } else { strata::storage::Layout::SingleFile };
+        Database::create(path, schema(), DbOptions { layout, ..opts }).unwrap()
     }
 }

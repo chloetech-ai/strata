@@ -134,6 +134,7 @@ without a filter is the plain index search.
 | key | default | |
 |---|---|---|
 | `vector.index` | schema's `VectorIndexKind` | `flat`, `ivf`, `hnsw` |
+| `vector.codes` | schema's `Field::codes` (`sq8`) | `sq8` or `binary` |
 | `vector.ivf.nlist` | schema's `nlist` if > 0, else ≈ 4·√n | |
 | `vector.ivf.iters` | 10 | k-means iterations |
 | `vector.ivf.sample` | 64 | training points per list |
@@ -153,6 +154,7 @@ A field that is not `indexed` stores the forward vectors only (flat).
 | `vec.<f>.present` | bitset of documents with a vector, only if some are NULL |
 | `vec.<f>.f32` | `n × stride` f32, rows padded to 16 floats (one 4 KiB page per vector at 1024 d) |
 | `vec.<f>.sq8` | `n × code_stride` u8, rows padded to 64 bytes (1 KiB at 1024 d) |
+| `vec.<f>.bin`, `vec.<f>.binp` | instead of `sq8`/`sq8p` for a field with binary codes: `n × ⌈d/64⌉` u64 sign bits (128 B at 1024 d), and the per-dimension threshold and spread |
 | `vec.<f>.ivf_centroids` | SQ8 ranges of the centroids, then one code row per centroid |
 | `vec.<f>.ivf_dir` | per cluster: byte offset (u64) and size (u32) |
 | `vec.<f>.ivf` | clusters back to back, 64-byte aligned: docIDs (u32, ascending), pad, code rows |
@@ -227,6 +229,62 @@ on TREC-COVID's 669 MiB and Quora's 2 GiB).
 Per-dimension min/max ranges (no clipping) are used: the round-trip error is
 bounded by half a step per dimension (tested), and the SQ8-only recall above
 leaves little to gain from percentile clipping.
+
+### Binary codes
+
+A field declared with `codes: "binary"` (or built with `vector.codes =
+binary`) keeps one bit per dimension instead of SQ8's byte: whether the
+value is above the segment's per-dimension mean. Centring matters: learned
+embeddings share a common direction, and signs taken around zero would put
+most of each code's bits in agreement. A code stands for `t + a∘s`
+(threshold `t`, per-dimension mean absolute deviation `a`, signs `s`), so a
+document ranks by `Σ_{bits set} q_j·a_j`, the query's weights quantised to
+int8 (the query keeps 8 bits per dimension; only documents are reduced).
+
+Kernel: on AVX-512BW the code word is the load mask for the 64 weight bytes
+(`vmovdqu8` with a zeroing mask) and `vpsadbw` sums them, 64 dimensions per
+step; a `popcnt` of the word removes the +128 offset. Elsewhere the weights
+are split into 8 bit planes and each plane is ANDed with the code and
+counted (9 popcounts per 64 dimensions); both give the same integer, tested
+against a one-bit-at-a-time reference.
+
+Binary codes order candidates more loosely, so a search rescores
+`BINARY_RERANK = 8` times `rerank` candidates with float32 (320 by
+default), and a post-filter search keeps 8 times as many members.
+Everything else (flat scan, IVF lists, HNSW walk, every filter strategy)
+runs unchanged over the binary rows, because all of them score through
+`QueryCode`.
+
+500,000 synthetic 768-d unit vectors (1,000 centres sharing a common
+direction, noise 1.5 per dimension), 200 queries, cloud container (Intel
+Xeon 2.80 GHz, 4 cores, AVX-512 VNNI and BW, no VPOPCNTDQ), one search
+thread, builds on four (`strata-codes-bench`,
+results/vector/codes-500000x768.json and, for the breadth-320 HNSW rows,
+codes-500000x768-hnsw-ef320.json):
+
+| codes | index | rescored | codes in memory | recall@10 | p50 ms |
+|---|---|---|---|---|---|
+| SQ8 | flat | 40 | 384 MB | 1.000 | 60.0 |
+| binary | flat | 160 | 48 MB | 0.917 | 14.2 |
+| binary | flat | 320 | 48 MB | 0.994 | 17.2 |
+| SQ8 | IVF (nprobe 32) | 40 | 384 MB | 1.000 | 1.80 |
+| binary | IVF (nprobe 32) | 160 | 48 MB | 0.917 | 0.66 |
+| binary | IVF (nprobe 32) | 320 | 48 MB | 0.994 | 0.89 |
+| SQ8 | HNSW (ef 64) | 40 | 384 MB | 0.868 | 0.54 |
+| SQ8 | HNSW (ef 320) | 40 | 384 MB | 0.993 | 0.86 |
+| binary | HNSW (breadth 320) | 320 | 48 MB | 0.991, 0.985 | 0.95, 0.87 |
+
+The float32 rows (1,536 MB) are read only for the rescored candidates.
+HNSW searches with breadth `max(ef, rescored)`, so binary codes at the
+default rerank of 40 walk the graph 320 wide: compare them with SQ8 at
+ef 320, not ef 64. The two binary HNSW figures are two builds (threaded
+builds differ). So, with 320 candidates rescored, binary codes make the
+flat scan 3.5× faster and IVF 2.0× faster than SQ8 at recall 0.994
+against 1.000, and HNSW level with SQ8 at equal breadth (0.985–0.991
+against 0.993), each holding an eighth of the code memory.
+Synthetic clusters are easy for IVF; real embeddings lose more to binary
+codes, and how much depends on the model, so measure recall on the
+collection before choosing them.
 
 ### Flat scan
 

@@ -58,12 +58,15 @@ pub fn build_segment(schema: &Schema, docs: &[Document], opts: &BuildOptions) ->
         FieldType::Int => "int",
         FieldType::Float => "float",
         FieldType::Vector { .. } => "vector",
+        FieldType::Sparse => "sparse",
         FieldType::Edges => "edges",
     };
     for (i, f) in schema.fields.iter().enumerate() {
         let b: Option<Box<dyn FieldIndexBuilder>> = match &f.ty {
             FieldType::Text { .. } if f.indexed => Some(crate::text::field_builder(f, opts)?),
             FieldType::Text { .. } => None,
+            FieldType::Sparse if f.indexed => Some(crate::text::sparse::field_builder(f, opts)?),
+            FieldType::Sparse => None,
             FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => {
                 Some(crate::forward::field_builder(f, opts)?)
             }

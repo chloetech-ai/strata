@@ -5,8 +5,14 @@
 //! [WHERE <pred>] [GROUP BY <keyword>] [ORDER BY <score> [ASC|DESC]]
 //! [LIMIT n [OFFSET m]]`, where predicates combine `MATCH(field, q)`,
 //! comparisons, `BETWEEN`, `IN` with AND/OR/NOT, and scores are `bm25`,
-//! `similarity`, `distance`, `rrf`, weighted sums of those, or a column.
+//! `similarity` (on a VECTOR or a SPARSE field), `distance`, `decay`, `rrf`,
+//! weighted sums and products of those, or a column.
 //! Parameters (`:name`) are bound from [`Params`].
+//!
+//! Writes ([`bind_write`]): `INSERT INTO t (cols) VALUES (...), ...`,
+//! `INSERT OR REPLACE` (an upsert), `UPDATE t SET f = v, g = g + 1 [WHERE
+//! ...]` and `DELETE FROM t [WHERE ...]`. Lists are `ARRAY[...]`; vectors are
+//! parameters, `ARRAY[...]` or a JSON array string.
 //!
 //! Graph queries over EDGES fields (DESIGN.md §6.1): the predicates
 //! `REACHABLE(field, seeds, ...)` and `PATH(field, from, to, ...)`, the score
@@ -22,7 +28,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
-use crate::query::logical::{Direction, GraphKind, GraphQuery, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
 
@@ -46,6 +52,109 @@ impl Params {
 
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
+}
+
+/// A bound INSERT, UPDATE or DELETE.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Write {
+    /// Documents in schema order (unnamed columns NULL); `replace` upserts.
+    Insert { docs: Vec<Vec<Value>>, replace: bool },
+    /// The documents `select` returns (their primary keys) get `sets`.
+    Update { select: Select, sets: Vec<(usize, Assign)> },
+    /// The documents `select` returns are deleted.
+    Delete { select: Select },
+}
+
+/// The right-hand side of `SET field = ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Assign {
+    Value(Value),
+    /// `field = field + x` (or `- x`).
+    Add(f64),
+}
+
+/// Parses and binds one INSERT, UPDATE or DELETE; `None` for a SELECT.
+pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Option<Write>> {
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql_text).map_err(|e| err(e.to_string()))?;
+    let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
+    let b = Binder::new(schema, params);
+    let table = |name: &str| {
+        if name.eq_ignore_ascii_case(&schema.table) {
+            Ok(())
+        } else {
+            Err(err(format!("no such table: {name}")))
+        }
+    };
+    // The documents a WHERE clause selects, as a query for their keys and
+    // every field (an UPDATE may rewrite them).
+    let selecting = |selection: &Option<Expr>| -> Result<Select> {
+        let cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        let text = match selection {
+            Some(e) => format!("SELECT {} FROM {} WHERE {e}", cols.join(", "), schema.table),
+            None => format!("SELECT {} FROM {}", cols.join(", "), schema.table),
+        };
+        bind(&text, schema, params)
+    };
+    Ok(Some(match stmt {
+        sql::Statement::Query(_) => return Ok(None),
+        sql::Statement::Insert(ins) => {
+            match &ins.table {
+                sql::TableObject::TableName(n) => table(&n.to_string())?,
+                _ => return Err(err("INSERT needs a table name")),
+            }
+            let replace = ins.replace_into || matches!(ins.or, Some(sql::SqliteOnConflict::Replace)) || ins.on.is_some();
+            let cols: Vec<usize> = if ins.columns.is_empty() {
+                (0..schema.fields.len()).collect()
+            } else {
+                ins.columns.iter().map(|c| schema.field_index(&c.value).ok_or_else(|| err(format!("no such column: {}", c.value)))).collect::<Result<_>>()?
+            };
+            let Some(sql::SetExpr::Values(values)) = ins.source.as_ref().map(|q| q.body.as_ref()) else {
+                return Err(err("INSERT needs VALUES"));
+            };
+            let mut docs = Vec::with_capacity(values.rows.len());
+            for row in &values.rows {
+                if row.len() != cols.len() {
+                    return Err(err(format!("{} values for {} columns", row.len(), cols.len())));
+                }
+                let mut doc = vec![Value::Null; schema.fields.len()];
+                for (&f, e) in cols.iter().zip(row) {
+                    doc[f] = b.write_value(f, e)?;
+                }
+                docs.push(doc);
+            }
+            Write::Insert { docs, replace }
+        }
+        sql::Statement::Update { table: t, assignments, selection, .. } => {
+            table(&t.relation.to_string())?;
+            let mut sets = Vec::new();
+            for a in assignments {
+                let sql::AssignmentTarget::ColumnName(name) = &a.target else { return Err(err("SET one column at a time")) };
+                let f = schema.field_index(&name.to_string()).ok_or_else(|| err(format!("no such column: {name}")))?;
+                if Some(f) == schema.primary_key {
+                    return Err(err("the primary key cannot be updated; delete and insert instead"));
+                }
+                let assign = match &a.value {
+                    Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if b.field_of(left).ok() == Some(f) => {
+                        let x = b.num_lit(right)?;
+                        Assign::Add(if *op == BinaryOperator::Minus { -x } else { x })
+                    }
+                    e => Assign::Value(b.write_value(f, e)?),
+                };
+                if matches!(assign, Assign::Add(_)) && !matches!(schema.fields[f].ty, FieldType::Int | FieldType::Float) {
+                    return Err(err(format!("{name} is not numeric")));
+                }
+                sets.push((f, assign));
+            }
+            Write::Update { select: selecting(selection)?, sets }
+        }
+        sql::Statement::Delete(d) => {
+            let (sql::FromTable::WithFromKeyword(from) | sql::FromTable::WithoutKeyword(from)) = &d.from;
+            let [t] = from.as_slice() else { return Err(err("DELETE from exactly one table")) };
+            table(&t.relation.to_string())?;
+            Write::Delete { select: selecting(&d.selection)? }
+        }
+        _ => return Err(err("only SELECT, INSERT, UPDATE and DELETE are supported")),
+    }))
 }
 
 /// Parses and binds one SELECT statement.
@@ -83,16 +192,9 @@ impl<'a> Binder<'a> {
             Some(e) => self.pred(e)?.simplify(),
             None => Pred::True,
         };
-        let group_by = match &s.group_by {
-            sql::GroupByExpr::Expressions(es, _) if es.is_empty() => None,
-            sql::GroupByExpr::Expressions(es, _) if es.len() == 1 => {
-                let f = self.field_of(&es[0])?;
-                if self.schema.fields[f].ty != FieldType::Keyword {
-                    return Err(err("GROUP BY needs a KEYWORD field"));
-                }
-                Some(f)
-            }
-            _ => return Err(err("GROUP BY supports one keyword field")),
+        let group_by: Vec<usize> = match &s.group_by {
+            sql::GroupByExpr::Expressions(es, _) => es.iter().map(|e| self.group_field(e, &s.projection)).collect::<Result<_>>()?,
+            _ => return Err(err("GROUP BY ALL is not supported")),
         };
         let mut projection = Vec::new();
         for item in &s.projection {
@@ -110,22 +212,38 @@ impl<'a> Binder<'a> {
                 _ => return Err(err("unsupported select item")),
             };
             let p = self.projection(e)?;
-            if let (Some(g), Projection::Field(f)) = (group_by, &p) {
-                if *f != g {
-                    return Err(err("with GROUP BY, select the group field and COUNT(*)"));
-                }
-            }
             projection.push((alias.unwrap_or_else(|| e.to_string()), p));
         }
+        let aggregated = !group_by.is_empty() || projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
+        if aggregated {
+            for (name, p) in &projection {
+                match p {
+                    Projection::Field(f) if !group_by.contains(f) => {
+                        return Err(err(format!("{name} must be in GROUP BY or inside an aggregate (COUNT, SUM, AVG, MIN, MAX)")))
+                    }
+                    Projection::Score | Projection::Hops(_) => return Err(err("score() and hops() cannot be aggregated")),
+                    _ => {}
+                }
+            }
+        }
+        let having = match &s.having {
+            None => None,
+            Some(_) if !aggregated => return Err(err("HAVING needs GROUP BY or aggregates")),
+            Some(h) => Some(self.having(h, &projection, &group_by)?),
+        };
         let (order, tiebreak) = match &q.order_by {
             None => (None, None),
             Some(ob) => match &ob.kind {
                 sql::OrderByKind::Expressions(es) if (1..=2).contains(&es.len()) => {
                     let desc = es[0].options.asc == Some(false);
-                    let order = self.order(&es[0].expr, desc, &projection, group_by)?;
+                    let order = if aggregated {
+                        self.group_order(&es[0].expr, desc, &projection, &group_by)?
+                    } else {
+                        self.order(&es[0].expr, desc, &projection)?
+                    };
                     let tiebreak = match es.get(1) {
                         None => None,
-                        Some(e) => Some(self.tiebreak(&e.expr, e.options.asc == Some(false), &projection, group_by)?),
+                        Some(e) => Some(self.tiebreak(&e.expr, e.options.asc == Some(false), &projection, &group_by)?),
                     };
                     (Some(order), tiebreak)
                 }
@@ -143,7 +261,7 @@ impl<'a> Binder<'a> {
             }
         };
         let graphs = self.graphs.take();
-        Ok(Select { projection, filter, order, group_by, tiebreak, limit, offset, graphs })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs })
     }
 
     /// The graph predicate `hops()` refers to: the first REACHABLE or PATH.
@@ -268,7 +386,14 @@ impl<'a> Binder<'a> {
             Expr::Nested(inner) => self.seeds(inner),
             Expr::Tuple(items) => Ok(Seeds::Keys(items.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
             Expr::Array(a) => Ok(Seeds::Keys(a.elem.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
-            _ => Ok(Seeds::Keys(vec![self.key_value(e)?])),
+            // A list-valued parameter is a list of keys.
+            _ => match self.literal(e).map(as_list) {
+                Ok(Ok(xs)) => {
+                    let pk = self.schema.primary_key.ok_or_else(|| err("graph queries need a primary key"))?;
+                    Ok(Seeds::Keys(xs.into_iter().map(|x| self.coerce(pk, x)).collect::<Result<_>>()?))
+                }
+                _ => Ok(Seeds::Keys(vec![self.key_value(e)?])),
+            },
         }
     }
 
@@ -278,8 +403,8 @@ impl<'a> Binder<'a> {
         self.field_value(pk, e)
     }
 
-    /// The second ORDER BY key: the primary key, or the group value of a facet.
-    fn tiebreak(&self, e: &Expr, desc: bool, proj: &[(String, Projection)], group: Option<usize>) -> Result<Tiebreak> {
+    /// The second ORDER BY key: the primary key, or the (first) group value.
+    fn tiebreak(&self, e: &Expr, desc: bool, proj: &[(String, Projection)], group: &[usize]) -> Result<Tiebreak> {
         let field = match literal_usize(e) {
             Some(n) => match proj.get(n.wrapping_sub(1)) {
                 Some((_, Projection::Field(f))) => *f,
@@ -287,13 +412,51 @@ impl<'a> Binder<'a> {
             },
             None => self.field_of(e)?,
         };
-        if Some(field) == group {
+        if group.first() == Some(&field) {
             Ok(Tiebreak::GroupValue { desc })
-        } else if Some(field) == self.schema.primary_key {
+        } else if Some(field) == self.schema.primary_key && group.is_empty() {
             Ok(Tiebreak::Key { desc })
         } else {
-            Err(err("the second ORDER BY key must be the primary key or the group field"))
+            Err(err("the second ORDER BY key must be the primary key or the first group field"))
         }
+    }
+
+    /// A GROUP BY item: a field, or the position of a selected field.
+    fn group_field(&self, e: &Expr, items: &[sql::SelectItem]) -> Result<usize> {
+        let f = match literal_usize(e) {
+            Some(n) => match items.get(n.wrapping_sub(1)) {
+                Some(sql::SelectItem::UnnamedExpr(e)) | Some(sql::SelectItem::ExprWithAlias { expr: e, .. }) => self.field_of(e)?,
+                _ => return Err(err(format!("GROUP BY {n}: not a selected column"))),
+            },
+            None => match self.field_of(e) {
+                Ok(f) => f,
+                // An alias of a selected field.
+                Err(e2) => {
+                    let alias = match e {
+                        Expr::Identifier(id) => &id.value,
+                        _ => return Err(e2),
+                    };
+                    let found = items.iter().find_map(|i| match i {
+                        sql::SelectItem::ExprWithAlias { expr, alias: a } if a.value.eq_ignore_ascii_case(alias) => Some(expr),
+                        _ => None,
+                    });
+                    self.field_of(found.ok_or(e2)?)?
+                }
+            },
+        };
+        let fld = &self.schema.fields[f];
+        let ok = match fld.ty {
+            FieldType::Keyword | FieldType::Int => true,
+            FieldType::Float => !fld.multi,
+            _ => false,
+        };
+        if !ok {
+            return Err(err(format!("GROUP BY {}: group by KEYWORD, INT or FLOAT fields", fld.name)));
+        }
+        if !fld.indexed {
+            return Err(err(format!("GROUP BY {}: the field is not indexed", fld.name)));
+        }
+        Ok(f)
     }
 
     fn projection(&self, e: &Expr) -> Result<Projection> {
@@ -301,24 +464,141 @@ impl<'a> Binder<'a> {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(Projection::Field(self.field_of(e)?)),
             Expr::Function(f) => match fname(f).as_str() {
                 "score" => Ok(Projection::Score),
-                "count" => Ok(Projection::Count),
                 "hops" => Ok(Projection::Hops(self.hops_graph()?)),
+                "count" | "sum" | "avg" | "min" | "max" => self.aggregate(f),
                 n => Err(err(format!("unsupported function in SELECT: {n}"))),
             },
             _ => Err(err(format!("unsupported select expression: {e}"))),
         }
     }
 
-    fn order(&self, e: &Expr, desc: bool, proj: &[(String, Projection)], group: Option<usize>) -> Result<OrderBy> {
-        // Positional `ORDER BY 2`, `COUNT(*)` and the group field address facet output.
+    /// `COUNT(*)`, `COUNT([DISTINCT] f)`, `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`.
+    fn aggregate(&self, f: &sql::Function) -> Result<Projection> {
+        let name = fname(f);
+        let distinct = matches!(&f.args, FunctionArguments::List(l) if l.duplicate_treatment == Some(sql::DuplicateTreatment::Distinct));
+        let (args, _) = self.args_raw(f)?;
+        let star = args.is_empty() || (name == "count" && args.len() == 1 && literal_usize(args[0]).is_some());
+        if star {
+            return if name == "count" && !distinct { Ok(Projection::Count) } else { Err(err(format!("{}(field)", name.to_uppercase()))) };
+        }
+        let [arg] = args.as_slice() else { return Err(err(format!("{} takes one field", name.to_uppercase()))) };
+        let field = self.field_of(arg)?;
+        let fld = &self.schema.fields[field];
+        let numeric = matches!(fld.ty, FieldType::Int | FieldType::Float);
+        let func = match name.as_str() {
+            "count" if distinct => AggFn::CountDistinct,
+            "count" => AggFn::Count,
+            "sum" => AggFn::Sum,
+            "avg" => AggFn::Avg,
+            "min" => AggFn::Min,
+            _ => AggFn::Max,
+        };
+        match func {
+            AggFn::Sum | AggFn::Avg if !numeric => return Err(err(format!("{}({}): not a numeric field", name.to_uppercase(), fld.name))),
+            AggFn::Min | AggFn::Max | AggFn::CountDistinct if !(numeric || fld.ty == FieldType::Keyword) => {
+                return Err(err(format!("{}({}): needs a KEYWORD, INT or FLOAT field", name.to_uppercase(), fld.name)))
+            }
+            AggFn::Count if !(numeric || fld.ty == FieldType::Keyword) => return Err(err(format!("COUNT({}): count a KEYWORD, INT or FLOAT field, or COUNT(*)", fld.name))),
+            _ => {}
+        }
+        if distinct && func != AggFn::CountDistinct {
+            return Err(err("DISTINCT works in COUNT only"));
+        }
+        if !fld.indexed {
+            return Err(err(format!("{}: aggregates read the field's column, and it is not indexed", fld.name)));
+        }
+        Ok(Projection::Agg { func, field })
+    }
+
+    /// An aggregate or group value named in HAVING or ORDER BY: a function
+    /// call, a selected column's alias or position, or a group field.
+    fn group_value(&self, e: &Expr, proj: &[(String, Projection)], group: &[usize]) -> Result<Projection> {
+        if let Some(n) = literal_usize(e) {
+            return proj.get(n.wrapping_sub(1)).map(|(_, p)| p.clone()).ok_or_else(|| err(format!("{n}: no such column")));
+        }
+        match e {
+            Expr::Nested(inner) => self.group_value(inner, proj, group),
+            Expr::Function(f) if matches!(fname(f).as_str(), "count" | "sum" | "avg" | "min" | "max") => self.aggregate(f),
+            Expr::Identifier(id) if proj.iter().any(|(n, p)| n.eq_ignore_ascii_case(&id.value) && !matches!(p, Projection::Field(_))) => {
+                Ok(proj.iter().find(|(n, _)| n.eq_ignore_ascii_case(&id.value)).unwrap().1.clone())
+            }
+            _ => {
+                let f = self.field_of(e)?;
+                if group.contains(&f) {
+                    Ok(Projection::Field(f))
+                } else {
+                    Err(err(format!("{e}: use a group field or an aggregate")))
+                }
+            }
+        }
+    }
+
+    fn group_order(&self, e: &Expr, desc: bool, proj: &[(String, Projection)], group: &[usize]) -> Result<OrderBy> {
+        Ok(match self.group_value(e, proj, group)? {
+            Projection::Count => OrderBy::Count { desc },
+            Projection::Field(f) if group.first() == Some(&f) => OrderBy::GroupValue { desc },
+            what => OrderBy::Agg { what, desc },
+        })
+    }
+
+    fn having(&self, e: &Expr, proj: &[(String, Projection)], group: &[usize]) -> Result<Having> {
+        use BinaryOperator::*;
+        Ok(match e {
+            Expr::Nested(inner) => self.having(inner, proj, group)?,
+            Expr::BinaryOp { left, op: And, right } => Having::And(vec![self.having(left, proj, group)?, self.having(right, proj, group)?]),
+            Expr::BinaryOp { left, op: Or, right } => Having::Or(vec![self.having(left, proj, group)?, self.having(right, proj, group)?]),
+            Expr::UnaryOp { op: sql::UnaryOperator::Not, expr } => Having::Not(Box::new(self.having(expr, proj, group)?)),
+            Expr::Between { expr, negated, low, high } => {
+                let h = Having::Range { what: self.group_value(expr, proj, group)?, lo: self.num_lit(low)?, hi: self.num_lit(high)? };
+                if *negated { Having::Not(Box::new(h)) } else { h }
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let (what, lit, op) = match self.group_value(left, proj, group) {
+                    Ok(w) => (w, right, op.clone()),
+                    Err(_) => {
+                        let flipped = match op {
+                            Lt => Gt,
+                            LtEq => GtEq,
+                            Gt => Lt,
+                            GtEq => LtEq,
+                            o => o.clone(),
+                        };
+                        (self.group_value(right, proj, group)?, left, flipped)
+                    }
+                };
+                let v = self.literal(lit)?;
+                let Some(x) = v.as_f64() else {
+                    return match op {
+                        Eq => Ok(Having::Eq { what, value: v }),
+                        NotEq => Ok(Having::Not(Box::new(Having::Eq { what, value: v }))),
+                        _ => Err(err("HAVING compares strings with = and != only")),
+                    };
+                };
+                let (inf, ninf) = (f64::INFINITY, f64::NEG_INFINITY);
+                let range = |lo, hi| Having::Range { what: what.clone(), lo, hi };
+                match op {
+                    Eq => range(x, x),
+                    NotEq => Having::Not(Box::new(range(x, x))),
+                    Gt => range(next_up(x), inf),
+                    GtEq => range(x, inf),
+                    Lt => range(ninf, next_down(x)),
+                    LtEq => range(ninf, x),
+                    o => return Err(err(format!("unsupported operator {o} in HAVING"))),
+                }
+            }
+            _ => return Err(err(format!("unsupported HAVING condition: {e}"))),
+        })
+    }
+
+    fn order(&self, e: &Expr, desc: bool, proj: &[(String, Projection)]) -> Result<OrderBy> {
+        // Positional `ORDER BY 2` addresses a selected column.
         if let Some(n) = literal_usize(e) {
             let (_, p) = proj.get(n.wrapping_sub(1)).ok_or_else(|| err(format!("ORDER BY {n}: no such column")))?;
             return match p {
-                Projection::Count => Ok(OrderBy::Count { desc }),
-                Projection::Field(f) if Some(*f) == group => Ok(OrderBy::GroupValue { desc }),
                 Projection::Field(f) => Ok(OrderBy::Score { score: Score::Column { field: *f }, desc }),
                 Projection::Score => Err(err("ORDER BY score(): order by the score expression itself")),
                 Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true }),
+                Projection::Count | Projection::Agg { .. } => Err(err("ORDER BY an aggregate needs GROUP BY")),
             };
         }
         // `ORDER BY hops()` is nearest first; ranking is always best first.
@@ -326,15 +606,6 @@ impl<'a> Binder<'a> {
             if fname(f) == "hops" {
                 return Ok(OrderBy::Score { score: Score::Hops { graph: self.hops_graph()?, far_first: desc }, desc: true });
             }
-        }
-        if let Expr::Function(f) = e {
-            if fname(f) == "count" {
-                return Ok(OrderBy::Count { desc });
-            }
-        }
-        if group.is_some() {
-            let f = self.field_of(e)?;
-            return if Some(f) == group { Ok(OrderBy::GroupValue { desc }) } else { Err(err("facet queries order by count or value")) };
         }
         // `ORDER BY distance(..) ASC` ranks like `similarity DESC`.
         if let Expr::Function(f) = e {
@@ -350,6 +621,9 @@ impl<'a> Binder<'a> {
             Expr::Nested(inner) => self.score(inner),
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 let f = self.field_of(e)?;
+                if self.schema.fields[f].multi {
+                    return Err(err(format!("cannot order by multi-valued field {}", self.schema.fields[f].name)));
+                }
                 match self.schema.fields[f].ty {
                     FieldType::Int | FieldType::Float => Ok(Score::Column { field: f }),
                     _ => Err(err("ORDER BY a column needs a numeric field")),
@@ -361,7 +635,13 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: BinaryOperator::Minus, right } => {
                 Ok(Score::Weighted([self.weighted(left, 1.0)?, self.weighted(right, -1.0)?].concat()))
             }
-            Expr::BinaryOp { op: BinaryOperator::Multiply, .. } => Ok(Score::Weighted(self.weighted(e, 1.0)?)),
+            Expr::BinaryOp { op: BinaryOperator::Multiply, .. } => {
+                let mut terms = self.weighted(e, 1.0)?;
+                match terms.as_slice() {
+                    [(w, Score::Product(_))] if *w == 1.0 => Ok(terms.pop().unwrap().1),
+                    _ => Ok(Score::Weighted(terms)),
+                }
+            }
             Expr::Function(f) => {
                 let (args, opts) = self.args(f)?;
                 match fname(f).as_str() {
@@ -369,11 +649,19 @@ impl<'a> Binder<'a> {
                         let [field, text] = args.as_slice() else { return Err(err("bm25(field, text)")) };
                         let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
+                        Expand::from_opts(&opts).map_err(err)?;
                         Ok(Score::Bm25 { field, text, opts })
                     }
                     "similarity" | "distance" => {
                         let [field, v] = args.as_slice() else { return Err(err("similarity(field, vector)")) };
-                        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. }), "VECTOR")?;
+                        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. } | FieldType::Sparse), "VECTOR or SPARSE")?;
+                        if self.schema.fields[field].ty == FieldType::Sparse {
+                            if fname(f) == "distance" {
+                                return Err(err("a SPARSE field takes similarity(...), not distance(...)"));
+                            }
+                            let terms = crate::text::sparse::parse(&self.literal(v)?).map_err(|e| err(format!("similarity({}, ..): {e}", self.schema.fields[field].name)))?;
+                            return Ok(Score::Sparse { field, terms, opts });
+                        }
                         let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
                         let vector = self.vector(v)?;
                         if vector.len() != dim {
@@ -390,6 +678,7 @@ impl<'a> Binder<'a> {
                         Ok(Score::Rrf { inputs, k: num("k", 60.0), depth: num("depth", 100.0) as usize })
                     }
                     "ppr" => Ok(Score::Ppr { graph: self.graph(f, "ppr")? }),
+                    "decay" => self.decay(f),
                     n => Err(err(format!("unknown score function {n}"))),
                 }
             }
@@ -413,11 +702,65 @@ impl<'a> Binder<'a> {
                 } else if let Some(c) = self.number(right) {
                     self.weighted(left, w * c)
                 } else {
-                    Err(err("weights must be numeric constants"))
+                    Ok(vec![(w, Score::Product(self.factors(e)?))])
                 }
             }
             _ => Ok(vec![(w, self.score(e)?)]),
         }
+    }
+
+    /// The factors of a product of scores, `a * b * ...`.
+    fn factors(&self, e: &Expr) -> Result<Vec<Score>> {
+        match e {
+            Expr::Nested(inner) => self.factors(inner),
+            Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } => {
+                if self.number(left).is_some() || self.number(right).is_some() {
+                    return Err(err("a product of scores takes no constant factors (they do not change the order)"));
+                }
+                Ok([self.factors(left)?, self.factors(right)?].concat())
+            }
+            _ => {
+                let s = self.score(e)?;
+                match s {
+                    Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Column { .. } | Score::Decay { .. } | Score::Ppr { .. } | Score::Hops { .. } => Ok(vec![s]),
+                    _ => Err(err("a product multiplies bm25, similarity, ppr, a column or decay, not sums or fusions")),
+                }
+            }
+        }
+    }
+
+    /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
+    /// 'exp' | 'gauss' | 'linear')`; the origin may be `now()` (seconds
+    /// since the Unix epoch).
+    fn decay(&self, f: &sql::Function) -> Result<Score> {
+        let (args, opts) = self.args(f)?;
+        let usage = "decay(field, origin, scale, offset => .., decay => .., shape => 'exp' | 'gauss' | 'linear')";
+        let [field, origin, scale] = args.as_slice() else { return Err(err(usage)) };
+        let field = self.numeric_field(field)?;
+        if self.schema.fields[field].multi {
+            return Err(err(format!("cannot decay multi-valued field {}", self.schema.fields[field].name)));
+        }
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let origin = match origin {
+            Expr::Function(g) if fname(g) == "now" => now(),
+            e => match self.literal(e)? {
+                Value::Str(s) if s.eq_ignore_ascii_case("now") => now(),
+                v => v.as_f64().ok_or_else(|| err("decay origin must be a number or now()"))?,
+            },
+        };
+        let scale = self.num_lit(scale)?;
+        let num = |k: &str, d: f64| opts.get(k).map_or(Ok(d), |v| v.as_f64().ok_or_else(|| err(format!("decay {k} must be a number"))));
+        let (offset, decay) = (num("offset", 0.0)?, num("decay", 0.5)?);
+        if scale <= 0.0 || offset < 0.0 || !(decay > 0.0 && decay < 1.0) {
+            return Err(err("decay needs scale > 0, offset >= 0 and 0 < decay < 1"));
+        }
+        let shape = match opts.get("shape").map(|v| v.as_str().unwrap_or("").to_ascii_lowercase()).as_deref() {
+            None | Some("exp") => DecayShape::Exp,
+            Some("gauss") => DecayShape::Gauss,
+            Some("linear") => DecayShape::Linear,
+            Some(s) => return Err(err(format!("unknown decay shape {s:?}: exp, gauss or linear"))),
+        };
+        Ok(Score::Decay { field, decay: Decay { origin, scale, offset, decay, shape }, opts })
     }
 
     fn pred(&self, e: &Expr) -> Result<Pred> {
@@ -435,19 +778,38 @@ impl<'a> Binder<'a> {
             }
             Expr::InList { expr, list, negated } => {
                 let f = self.field_of(expr)?;
-                let values = list.iter().map(|v| self.field_value(f, v)).collect::<Result<Vec<_>>>()?;
-                let p = Pred::In { field: f, values };
+                if self.schema.fields[f].ty == FieldType::Edges {
+                    return Err(err(format!("{} is an EDGES field: use REACHABLE({}, keys) for rows linked to keys", self.schema.fields[f].name, self.schema.fields[f].name)));
+                }
+                // A list-valued parameter stands for its values (`IN (:ids)`).
+                let mut values = Vec::with_capacity(list.len());
+                for v in list {
+                    match as_list(self.literal(v)?) {
+                        Ok(xs) => {
+                            for x in xs {
+                                values.push(self.coerce(f, x)?);
+                            }
+                        }
+                        Err(x) => values.push(self.coerce(f, x)?),
+                    }
+                }
+                let p = if values.is_empty() { Pred::False } else { Pred::In { field: f, values } };
                 if *negated { Pred::Not(Box::new(p)) } else { p }
             }
             Expr::Function(func) if fname(func) == "match" => {
-                let (args, _) = self.args(func)?;
-                let [field, q] = args.as_slice() else { return Err(err("MATCH(field, query)")) };
+                let (args, opts) = self.args(func)?;
+                let [field, q] = args.as_slice() else { return Err(err("MATCH(field, query, synonyms => 0 | 1, fuzzy => 0 | 1 | 2 | 'auto')")) };
                 let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                 if !self.schema.fields[field].indexed {
                     return Err(err(format!("{} is not indexed", self.schema.fields[field].name)));
                 }
+                if let Some(k) = opts.keys().find(|k| !matches!(k.as_str(), "synonyms" | "fuzzy")) {
+                    return Err(err(format!("unknown option {k} for MATCH: synonyms, fuzzy")));
+                }
+                let expand = Expand::from_opts(&opts).map_err(err)?;
                 let query = self.literal(q)?.as_str().ok_or_else(|| err("MATCH query must be a string"))?.to_string();
-                Pred::Match { field, query }
+                crate::text::parse_match(&query)?;
+                Pred::Match { field, query, expand }
             }
             Expr::Function(func) if matches!(fname(func).as_str(), "reachable" | "path") => Pred::Graph { id: self.graph(func, &fname(func))? },
             Expr::Value(v) if matches!(v.value, sql::Value::Boolean(_)) => {
@@ -590,7 +952,11 @@ impl<'a> Binder<'a> {
 
     /// A literal coerced to field `f`'s type.
     fn field_value(&self, f: usize, e: &Expr) -> Result<Value> {
-        let v = self.literal(e)?;
+        self.coerce(f, self.literal(e)?)
+    }
+
+    /// A value coerced to field `f`'s type.
+    fn coerce(&self, f: usize, v: Value) -> Result<Value> {
         match (&self.schema.fields[f].ty, v) {
             (FieldType::Keyword, Value::Str(s)) => Ok(Value::Str(s)),
             (FieldType::Keyword, Value::Int(x)) => Ok(Value::Str(x.to_string())),
@@ -598,6 +964,35 @@ impl<'a> Binder<'a> {
             (FieldType::Float, v @ (Value::Int(_) | Value::Float(_))) => Ok(Value::Float(v.as_f64().unwrap())),
             (t, v) => Err(err(format!("value {v:?} does not fit a {t:?} field"))),
         }
+    }
+
+    /// A value written to field `f`: a literal or parameter of its type,
+    /// `ARRAY[...]` for lists and vectors.
+    fn write_value(&self, f: usize, e: &Expr) -> Result<Value> {
+        let field = &self.schema.fields[f];
+        if let Expr::Array(a) = e {
+            return match &field.ty {
+                FieldType::Vector { .. } => {
+                    let xs: Vec<f32> = a.elem.iter().map(|x| self.num_lit(x).map(|v| v as f32)).collect::<Result<_>>()?;
+                    Ok(Value::Vector(xs.into()))
+                }
+                _ if field.multi => Ok(Value::List(a.elem.iter().map(|x| self.field_value(f, x)).collect::<Result<_>>()?)),
+                _ => Err(err(format!("{} does not take a list", field.name))),
+            };
+        }
+        let v = self.literal(e)?;
+        Ok(match (&field.ty, v) {
+            (_, Value::Null) => Value::Null,
+            (FieldType::Vector { .. }, _) => Value::Vector(self.vector(e)?),
+            (_, v @ Value::List(_)) if field.multi => v,
+            (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
+            (FieldType::Sparse, v @ Value::Str(_)) => {
+                crate::text::sparse::parse(&v)?;
+                v
+            }
+            (FieldType::Keyword | FieldType::Int | FieldType::Float, _) if field.multi => Value::List(vec![self.field_value(f, e)?]),
+            _ => self.field_value(f, e)?,
+        })
     }
 
     fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {
@@ -650,6 +1045,17 @@ fn next_down(x: f64) -> f64 {
     -next_up(-x)
 }
 
+/// The values of a list-valued parameter. A JSON list of numbers arrives as
+/// a vector of f32, so a vector of whole numbers that f32 holds exactly
+/// counts as a list of integers.
+fn as_list(v: Value) -> std::result::Result<Vec<Value>, Value> {
+    match v {
+        Value::List(xs) => Ok(xs),
+        Value::Vector(xs) if xs.iter().all(|x| x.fract() == 0.0 && x.abs() < 16_777_216.0) => Ok(xs.iter().map(|&x| Value::Int(x as i64)).collect()),
+        v => Err(v),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,7 +1083,7 @@ mod tests {
         assert_eq!(s.projection.len(), 3);
         let Pred::And(ps) = &s.filter else { panic!("{:?}", s.filter) };
         assert_eq!(ps.len(), 4);
-        assert!(matches!(&ps[0], Pred::Match { field: 3, query } if query == "vaccine -animal"));
+        assert!(matches!(&ps[0], Pred::Match { field: 3, query, .. } if query == "vaccine -animal"));
         assert_eq!(ps[1], Pred::Range { field: 4, lo: 2019.0, hi: 2021.0 });
         assert!(matches!(&ps[2], Pred::In { field: 5, values } if values.len() == 2));
         assert!(matches!(ps[3], Pred::Range { field: 6, lo, hi } if lo > 4.0 && lo < 4.0001 && hi.is_infinite()));
@@ -710,7 +1116,7 @@ mod tests {
     fn binds_facets_and_rejects_errors() {
         let s = bind("SELECT category, COUNT(*) FROM docs WHERE MATCH(body, 'x') GROUP BY category ORDER BY 2 DESC LIMIT 5", &schema(), &q())
             .unwrap();
-        assert_eq!(s.group_by, Some(5));
+        assert_eq!(s.group_by, vec![5]);
         assert_eq!(s.order, Some(OrderBy::Count { desc: true }));
         assert_eq!(s.projection[1].1, Projection::Count);
         let s = bind("SELECT category, COUNT(*) FROM docs GROUP BY category ORDER BY 2 DESC, 1 LIMIT 5", &schema(), &q()).unwrap();
@@ -718,13 +1124,16 @@ mod tests {
         let s = bind("SELECT id FROM docs WHERE rating BETWEEN 2.0 AND 2.0 ORDER BY rating DESC, id LIMIT 10", &schema(), &q()).unwrap();
         assert_eq!(s.tiebreak, Some(Tiebreak::Key { desc: false }));
         assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Column { field: 6 }, desc: true })));
+        // A product of scores (a boost), not a weighted sum.
+        let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true }) if f.len() == 2), "{:?}", s.order);
 
         for bad in [
             "SELECT id FROM other",
             "SELECT id FROM docs WHERE MATCH(year, 'x')",
             "SELECT id FROM docs WHERE category > 'c01'",
             "SELECT id FROM docs ORDER BY similarity(emb, :missing)",
-            "SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q)",
+            "SELECT id FROM docs ORDER BY bm25(body, :t) * 2 * similarity(emb, :q)",
             "SELECT id FROM docs ORDER BY year, rating",
             "DELETE FROM docs",
         ] {

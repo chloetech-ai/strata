@@ -23,8 +23,19 @@ rust-stemmers = "1.2"
 # Baselines (feature `baselines`): SQLite with FTS5, and Tantivy.
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
 tantivy = { version = "0.26", optional = true }
+# Embedding models for VECTOR fields declared with `embed` (`embed`):
+# Model2Vec by default, BERT encoders through candle with `bert`.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
 
 [features]
+default = ["embed"]
+embed = ["dep:tokenizers"]
+bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+# `bert` with matrix products in Apple's Accelerate framework (macOS only).
+accelerate = ["bert", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 # SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
 baselines = ["dep:rusqlite", "dep:tantivy"]
 

@@ -1,0 +1,31 @@
+[package]
+name = "strata-server"
+version = "0.1.0"
+edition = "2021"
+description = "Strata over the network: HTTP JSON and gRPC, a coordinator over shards, and a query UI"
+
+[dependencies]
+strata = { path = "../strata" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+axum = "0.7"
+tonic = "0.12"
+prost = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[features]
+# BERT embedding models (bge-small-en-v1.5, snowflake-arctic-embed-m-v1.5) through candle.
+bert = ["strata/bert"]
+# `bert` with matrix products in Apple's Accelerate framework (macOS only).
+accelerate = ["strata/accelerate"]
+
+[build-dependencies]
+tonic-build = "0.12"
+protox = "0.7"
+
+[dev-dependencies]
+tempfile = "3"

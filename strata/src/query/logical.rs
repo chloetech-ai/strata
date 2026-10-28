@@ -11,8 +11,9 @@ use crate::value::Value;
 pub enum Pred {
     True,
     False,
-    /// `MATCH(field, 'boolean query')` on a TEXT field (grammar: text module).
-    Match { field: usize, query: String },
+    /// `MATCH(field, 'boolean query')` on a TEXT field (grammar: text
+    /// module), with its words expanded by synonyms or typos as asked.
+    Match { field: usize, query: String, expand: Expand },
     /// Numeric range with inclusive bounds (`±inf` for open ends). Strict
     /// comparisons are normalised to inclusive ones at bind time.
     Range { field: usize, lo: f64, hi: f64 },
@@ -24,6 +25,61 @@ pub enum Pred {
     /// Membership in the result of `Select::graphs[id]` (`REACHABLE`,
     /// `PATH`), computed before the rest of the query.
     Graph { id: usize },
+}
+
+/// How a full-text search widens its words (`MATCH(.., synonyms => 1,
+/// fuzzy => 'auto')`, the same options on `bm25`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Expand {
+    /// Each word also matches its synonyms from the synonym list
+    /// ([`crate::text::synonyms`]).
+    pub synonyms: bool,
+    /// Each word also matches indexed terms within this many edits.
+    pub fuzzy: Option<Fuzzy>,
+}
+
+/// Edits a typo-tolerant word may be away from an indexed term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fuzzy {
+    /// By the word's length: none up to 2 letters, 1 up to 5, else 2.
+    Auto,
+    Edits(u8),
+}
+
+impl Fuzzy {
+    pub fn edits(self, len: usize) -> u8 {
+        match self {
+            Fuzzy::Edits(n) => n,
+            Fuzzy::Auto if len <= 2 => 0,
+            Fuzzy::Auto if len <= 5 => 1,
+            Fuzzy::Auto => 2,
+        }
+    }
+}
+
+impl Expand {
+    /// The expansion options of a search function: `synonyms => 0 | 1`,
+    /// `fuzzy => 0 | 1 | 2 | 'auto'`.
+    pub fn from_opts(opts: &Opts) -> std::result::Result<Expand, String> {
+        let synonyms = match opts.get("synonyms") {
+            None => false,
+            Some(v) => v.as_f64().ok_or("synonyms => 0 or 1")? != 0.0,
+        };
+        let fuzzy = match opts.get("fuzzy") {
+            None => None,
+            Some(Value::Str(s)) if s.eq_ignore_ascii_case("auto") => Some(Fuzzy::Auto),
+            Some(v) => match v.as_f64() {
+                Some(x) if x == 0.0 => None,
+                Some(x) if x == 1.0 || x == 2.0 => Some(Fuzzy::Edits(x as u8)),
+                _ => return Err("fuzzy => 0, 1, 2 or 'auto'".into()),
+            },
+        };
+        Ok(Expand { synonyms, fuzzy })
+    }
+
+    pub fn is_none(&self) -> bool {
+        !self.synonyms && self.fuzzy.is_none()
+    }
 }
 
 /// Which way edges are followed.
@@ -134,6 +190,9 @@ pub enum Score {
     /// Dot product with `vector` (cosine for unit vectors). `distance(...)`
     /// binds to this with the sort direction flipped.
     Similarity { field: usize, vector: Arc<[f32]>, opts: Opts },
+    /// Dot product of a SPARSE field's term weights with `terms`' (also
+    /// `similarity(...)` in SQL).
+    Sparse { field: usize, terms: Vec<(String, f32)>, opts: Opts },
     /// Reciprocal rank fusion: `Σ 1 / (k + rank_i)` over the inputs' rankings
     /// of their top `depth` rows.
     Rrf { inputs: Vec<Score>, k: f64, depth: usize },
@@ -146,13 +205,20 @@ pub enum Score {
     /// Hop distance in `Select::graphs[graph]`, nearest first (as
     /// `-hops`) or farthest first.
     Hops { graph: usize, far_first: bool },
+    /// A numeric column's closeness to an origin, from 1 at the origin down
+    /// towards 0 ([`Decay`]); 0 for rows without a value.
+    Decay { field: usize, decay: Decay, opts: Opts },
+    /// The product of scores (`bm25(..) * decay(..)`): candidates are the
+    /// top `depth` rows of each relevance factor (BM25, similarity, graph;
+    /// of every factor when there is none), scored exactly by every factor.
+    Product(Vec<Score>),
 }
 
 impl Score {
     /// Every leaf (BM25, similarity or column) of the expression.
     pub fn leaves(&self) -> Vec<&Score> {
         match self {
-            Score::Rrf { inputs, .. } => inputs.iter().flat_map(|s| s.leaves()).collect(),
+            Score::Rrf { inputs, .. } | Score::Product(inputs) => inputs.iter().flat_map(|s| s.leaves()).collect(),
             Score::Weighted(ts) => ts.iter().flat_map(|(_, s)| s.leaves()).collect(),
             s => vec![s],
         }
@@ -160,8 +226,55 @@ impl Score {
 
     pub fn opts(&self) -> Option<&Opts> {
         match self {
-            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } => Some(opts),
+            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } | Score::Sparse { opts, .. } | Score::Decay { opts, .. } => Some(opts),
             _ => None,
+        }
+    }
+
+    /// Whether the score ranks by relevance to the query (BM25,
+    /// similarity, sparse, graph), as opposed to a row's own values (a column, a
+    /// decay), which only boost rows found by relevance.
+    pub fn is_relevance(&self) -> bool {
+        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Ppr { .. } | Score::Hops { .. })
+    }
+}
+
+/// How a decay function falls off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecayShape {
+    /// `exp(λ·d)`: halves (by default) every `scale`.
+    Exp,
+    /// A Gaussian of the distance: flat near the origin, then steep.
+    Gauss,
+    /// Straight down to 0 at `scale / (1 − decay)`.
+    Linear,
+}
+
+/// `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`,
+/// as Elasticsearch's decay functions: the distance `d = max(0, |x −
+/// origin| − offset)` maps to 1 at `d = 0` and to `decay` at `d = scale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Decay {
+    pub origin: f64,
+    pub scale: f64,
+    pub offset: f64,
+    pub decay: f64,
+    pub shape: DecayShape,
+}
+
+impl Decay {
+    pub fn eval(&self, x: f64) -> f64 {
+        let d = ((x - self.origin).abs() - self.offset).max(0.0);
+        match self.shape {
+            DecayShape::Exp => (self.decay.ln() / self.scale * d).exp(),
+            DecayShape::Gauss => {
+                let var = -self.scale * self.scale / (2.0 * self.decay.ln());
+                (-d * d / (2.0 * var)).exp()
+            }
+            DecayShape::Linear => {
+                let s = self.scale / (1.0 - self.decay);
+                ((s - d) / s).max(0.0)
+            }
         }
     }
 }
@@ -172,8 +285,33 @@ pub enum OrderBy {
     Score { score: Score, desc: bool },
     /// Facet queries: order groups by their count.
     Count { desc: bool },
-    /// Facet queries: order groups by their value.
+    /// Facet queries: order groups by their value (the first group field's).
     GroupValue { desc: bool },
+    /// Aggregate queries: order groups by an aggregate or a group field.
+    Agg { what: Projection, desc: bool },
+}
+
+/// An aggregate function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggFn {
+    /// `COUNT(f)`: rows with a value.
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    CountDistinct,
+}
+
+/// A `HAVING` condition on a group's aggregates or group values.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Having {
+    /// An inclusive numeric range.
+    Range { what: Projection, lo: f64, hi: f64 },
+    Eq { what: Projection, value: Value },
+    And(Vec<Having>),
+    Or(Vec<Having>),
+    Not(Box<Having>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -185,6 +323,9 @@ pub enum Projection {
     Count,
     /// `hops()`: the row's hop distance in `Select::graphs[id]`.
     Hops(usize),
+    /// `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`, `COUNT(f)`, `COUNT(DISTINCT
+    /// f)`: of the whole result, or per group.
+    Agg { func: AggFn, field: usize },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -193,8 +334,11 @@ pub struct Select {
     pub projection: Vec<(String, Projection)>,
     pub filter: Pred,
     pub order: Option<OrderBy>,
-    /// A KEYWORD field to group by (facets), with `COUNT(*)` per group.
-    pub group_by: Option<usize>,
+    /// Fields to group by (KEYWORD, INT or FLOAT, multi-valued ones
+    /// counting a row once per value), with aggregates per group.
+    pub group_by: Vec<usize>,
+    /// Which groups to keep.
+    pub having: Option<Having>,
     /// Secondary order for rows that tie on the primary one.
     pub tiebreak: Option<Tiebreak>,
     pub limit: Option<usize>,
