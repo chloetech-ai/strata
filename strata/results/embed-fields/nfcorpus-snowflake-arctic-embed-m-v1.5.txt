@@ -1,0 +1,9 @@
+nfcorpus: 3633 documents, 323 queries; model bert:snowflake-arctic-embed-m-v1.5 (768 dimensions)
+loaded and embedded 3 fields in 1437.1 s (0 documents without a title get no title vector)
+nfcorpus (323 queries)                                           nDCG@10  recall@100
+bm25 (title + text)                                               0.3274      0.2489
+snowflake-arctic-embed-m-v1.5 vector of title                     0.3215      0.2888
+snowflake-arctic-embed-m-v1.5 vector of text                      0.3615      0.3240
+snowflake-arctic-embed-m-v1.5 vector of title + text              0.3631      0.3247
+rrf(bm25, snowflake-arctic-embed-m-v1.5 vector of title + text)    0.3699      0.3258
+reference: Cohere embed-english-v3 vector of title + text         0.3874      0.3511
