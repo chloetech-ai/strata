@@ -424,7 +424,7 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
     let c = Coordinator::connect_with(vec![format!("{dead}|{}", good[0][0]), format!("{hung}|{}", good[1][0])], opts.clone()).await.unwrap();
     let coord = cluster(c);
     for (sql, params) in queries() {
-        let p = if params["q"].is_object() { Params::new().set("q", demo::product(42, 7)[12].clone()) } else { Params::new() };
+        let p = if params["q"].is_object() { Params::new().set("q", vector_42(&whole)) } else { Params::new() };
         let want = js::result(&whole.query(sql, &p).unwrap(), 0.0);
         let params = coord.params(Some(&params)).await.unwrap();
         let t = std::time::Instant::now();
