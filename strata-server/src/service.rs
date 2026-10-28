@@ -12,6 +12,7 @@ use strata::db::{Db, SqlResult};
 use strata::embed::Embedder;
 use strata::ingest::{Format, Rows};
 use strata::query::exec::{ExecOptions, ResultSet};
+use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::{bind, compound, Params};
 use strata::schema::Schema;
@@ -98,6 +99,9 @@ pub struct Service {
     pub max_rows: Option<usize>,
     /// The most groups a query may make ([`ExecOptions::max_groups`]).
     pub max_groups: Option<usize>,
+    /// The memory queries may hold at once ([`ExecOptions::memory`];
+    /// `None`: not counted).
+    pub query_memory: Option<Arc<MemoryBudget>>,
     /// The most write requests in the write path at once (embedding,
     /// waiting for the writer or being applied); more are refused with 429.
     pub max_queued_writes: usize,
@@ -151,6 +155,7 @@ impl Service {
             slow: None,
             max_rows: None,
             max_groups: None,
+            query_memory: None,
             max_queued_writes: usize::MAX,
             max_body: 256 << 20,
             lease_ttl: Duration::from_secs(60),
@@ -506,6 +511,7 @@ impl Service {
                         // as many rows as a compound step may hold.
                         max_rows: if req.shard { self.max_rows.map(|m| m.max(compound::MAX_ROWS + 1)) } else { self.max_rows },
                         max_groups: self.max_groups,
+                        memory: self.query_memory.clone(),
                         ..db.exec.clone()
                     };
                     let db = db.clone();
@@ -551,6 +557,8 @@ impl Service {
             Ok((_, missing)) if !missing.is_empty() => "partial",
             Ok(_) => "ok",
             Err(e) if e.status == 504 => "timeout",
+            // Out of query memory, or a shard was.
+            Err(e) if e.status == 429 => "rejected",
             Err(_) => "error",
         };
         self.metrics.query(kind, outcome, secs);
@@ -587,6 +595,7 @@ impl Service {
                     cancel: Some(cancel.0.clone()),
                     synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
                     max_groups: self.max_groups,
+                    memory: self.query_memory.clone(),
                     ..db.exec.clone()
                 };
                 let db = db.clone();
@@ -600,7 +609,7 @@ impl Service {
                             let select = bind(text, snap.schema(), p)?;
                             db.execute(&snap, &select, &opts)
                         },
-                        &|| opts.check(),
+                        &opts,
                     )
                 })
                 .await;
@@ -610,16 +619,16 @@ impl Service {
                 let c = c.clone();
                 let rt = tokio::runtime::Handle::current();
                 let stop = cancel.0.clone();
+                let memory = self.query_memory.clone();
                 // The steps' calls to the shards carry the request's id.
                 let id = obs::current();
                 tokio::task::spawn_blocking(move || {
                     let _held = permit;
                     // Shards any step was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
-                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), ..ExecOptions::default() };
-                    let check = || checks.check();
+                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, ..ExecOptions::default() };
                     let rs = compound::run_checked(&req.sql, &schema, &req.params, &mut |text, p| {
-                        check()?;
+                        checks.check()?;
                         let select = bind(text, &schema, p)?;
                         let step = QueryReq { sql: text.to_string(), params: p.clone(), partial: req.partial, ..Default::default() };
                         let m = rt.block_on(obs::scope(id.clone(), c.query(&step, &select, deadline))).map_err(|e| strata::Error::Query(e.message))?;
@@ -629,7 +638,7 @@ impl Service {
                             }
                         }
                         Ok(m.rs)
-                    }, &check);
+                    }, &checks);
                     rs.map(|rs| (rs, missing))
                 })
                 .await
@@ -867,6 +876,13 @@ impl Service {
     pub async fn prometheus(self: &Arc<Self>) -> String {
         let one = Family::one;
         let mut more = vec![one("strata_queries_running", "gauge", "Queries running now, those whose callers stopped waiting included.", self.running() as f64)];
+        if let Some(b) = &self.query_memory {
+            more.extend([
+                one("strata_query_memory_bytes", "gauge", "Memory the running queries hold, as counted against their budget.", b.used() as f64),
+                one("strata_query_memory_limit_bytes", "gauge", "Memory the running queries may hold together (--query-memory-mb).", b.limit() as f64),
+                one("strata_query_memory_trips_total", "counter", "Queries refused because the running queries' memory budget was spent.", b.trips() as f64),
+            ]);
+        }
         match &self.backend {
             Backend::Local(db) => {
                 let s = db.snapshot();

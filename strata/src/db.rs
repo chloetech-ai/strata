@@ -317,7 +317,7 @@ impl Db {
                     let select = bind(text, snap.schema(), p)?;
                     self.execute(snap, &select, &steps)
                 },
-                &|| opts.check(),
+                opts,
             )?;
             if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
                 return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
