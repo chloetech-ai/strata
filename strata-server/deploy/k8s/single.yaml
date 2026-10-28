@@ -1,0 +1,45 @@
+# One database holding the whole collection: the reference that the
+# coordinator's answers are compared with. It reads /data on its node.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: strata-single
+  namespace: strata
+spec:
+  replicas: 1
+  # The database file is locked by the process that has it open.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: strata-single}
+  template:
+    metadata:
+      labels: {app: strata-single}
+    spec:
+      containers:
+        - name: strata
+          image: strata-server:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--db", "/data/quora.sq8.strata", "--listen", "0.0.0.0:7700", "--grpc", "off"]
+          ports:
+            - {name: http, containerPort: 7700}
+          readinessProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 250m, memory: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          hostPath: {path: /data, type: Directory}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: strata-single
+  namespace: strata
+spec:
+  selector: {app: strata-single}
+  ports:
+    - {name: http, port: 7700}
