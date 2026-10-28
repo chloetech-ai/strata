@@ -210,7 +210,8 @@ fn huge_limits_and_depths_answer_with_what_there_is() {
     for (sql, rows) in [
         ("SELECT id FROM t ORDER BY bm25(body, 'apple') DESC LIMIT 1000000000000", 3),
         ("SELECT id FROM t ORDER BY bm25(body, 'apple') DESC LIMIT 18446744073709551615 OFFSET 1", 2),
-        ("SELECT id FROM t ORDER BY rating DESC LIMIT 18446744073709551615 OFFSET 1", 2),
+        // Row 1 has no rating and comes last.
+        ("SELECT id FROM t ORDER BY rating DESC LIMIT 18446744073709551615 OFFSET 1", 3),
         ("SELECT id FROM t LIMIT 18446744073709551615 OFFSET 3", 1),
         ("SELECT id FROM t ORDER BY similarity(emb, :q) DESC LIMIT 1000000000000", 4),
         ("SELECT id FROM t ORDER BY similarity(emb, :q, ef => 1e15, rerank => 1e15) DESC LIMIT 2", 2),

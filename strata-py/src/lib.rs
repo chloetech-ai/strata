@@ -111,6 +111,9 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
             None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
         },
         Json::String(s) => Value::Str(s.clone()),
+        // Whole numbers stay exact integers (`IN (:ids)` with 64-bit ids);
+        // where a vector is expected, a list of numbers is one.
+        Json::Array(xs) if !xs.is_empty() && xs.iter().all(|x| x.is_i64()) => Value::List(xs.iter().map(|x| Value::Int(x.as_i64().unwrap_or(0))).collect()),
         Json::Array(xs) if !xs.is_empty() && xs.iter().all(|x| x.is_number()) => Value::Vector(xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect::<Vec<_>>().into()),
         Json::Array(xs) => Value::List(xs.iter().map(|x| param(db, x)).collect::<strata::Result<_>>()?),
         Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string()) && o.keys().all(|k| k == "embed" || k == "field") => {

@@ -14,13 +14,22 @@ pub enum Pred {
     /// `MATCH(field, 'boolean query')` on a TEXT field (grammar: text
     /// module), with its words expanded by synonyms or typos as asked.
     Match { field: usize, query: String, expand: Expand },
-    /// Numeric range with inclusive bounds (`±inf` for open ends). Strict
+    /// FLOAT range with inclusive bounds (`±inf` for open ends). Strict
     /// comparisons are normalised to inclusive ones at bind time.
     Range { field: usize, lo: f64, hi: f64 },
+    /// INT range with inclusive bounds, exact (`i64::MIN` and `i64::MAX`
+    /// for open ends): a double cannot tell 2^53 from 2^53 + 1.
+    IntRange { field: usize, lo: i64, hi: i64 },
     /// Keyword (or numeric) equality with any of `values`.
     In { field: usize, values: Vec<Value> },
+    /// Rows with a value of the field (`IS NOT NULL`; a multi-valued field
+    /// needs at least one).
+    Present { field: usize },
     And(Vec<Pred>),
     Or(Vec<Pred>),
+    /// The rows the inner predicate does not hold: a plain complement.
+    /// The binder hands the executor predicates in which NULL is already
+    /// accounted for ([`Pred::three_valued`]).
     Not(Box<Pred>),
     /// Membership in the result of `Select::graphs[id]` (`REACHABLE`,
     /// `PATH`), computed before the rest of the query.
@@ -133,6 +142,41 @@ pub struct GraphQuery {
 }
 
 impl Pred {
+    /// The rows for which `self`, read with SQL's three-valued logic, is
+    /// TRUE, as a predicate of plain sets. A comparison with NULL is
+    /// UNKNOWN, and so is its negation, so `rating != 2` and `NOT rating >
+    /// 2` leave out rows without a rating. NOTs are pushed down to the
+    /// leaves (De Morgan's laws hold for three values too), and a negated
+    /// comparison also asks for its field's value. MATCH, graph membership
+    /// and `IS NULL` are never UNKNOWN, and neither is a comparison on a
+    /// multi-valued field (`multi`), which holds when some value matches:
+    /// its negation holds when none does, also for an empty list, as
+    /// `NOT (x = ANY(list))` does. Apply it once, to a predicate as written.
+    pub fn three_valued(self, multi: &dyn Fn(usize) -> bool) -> Pred {
+        self.nnf(false, multi)
+    }
+
+    fn nnf(self, negated: bool, multi: &dyn Fn(usize) -> bool) -> Pred {
+        match self {
+            Pred::Not(p) => p.nnf(!negated, multi),
+            Pred::And(ps) => {
+                let ps = ps.into_iter().map(|p| p.nnf(negated, multi)).collect();
+                if negated { Pred::Or(ps) } else { Pred::And(ps) }
+            }
+            Pred::Or(ps) => {
+                let ps = ps.into_iter().map(|p| p.nnf(negated, multi)).collect();
+                if negated { Pred::And(ps) } else { Pred::Or(ps) }
+            }
+            p if !negated => p,
+            Pred::True => Pred::False,
+            Pred::False => Pred::True,
+            p @ (Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. }) if !multi(field) => {
+                Pred::And(vec![Pred::Present { field }, Pred::Not(Box::new(p))])
+            }
+            p => Pred::Not(Box::new(p)),
+        }
+    }
+
     /// Flattens nested AND/OR and folds constants.
     pub fn simplify(self) -> Pred {
         match self {
@@ -281,8 +325,10 @@ impl Decay {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OrderBy {
-    /// Rank by a score, best first (`desc = true`) or worst first.
-    Score { score: Score, desc: bool },
+    /// Rank by a score, best first (`desc = true`) or worst first. Rows
+    /// without a value of a column come last unless `nulls_first`
+    /// (`NULLS FIRST`).
+    Score { score: Score, desc: bool, nulls_first: bool },
     /// Facet queries: order groups by their count.
     Count { desc: bool },
     /// Facet queries: order groups by their value (the first group field's).
@@ -355,4 +401,26 @@ pub enum Tiebreak {
     Key { desc: bool },
     /// The group value of a facet query.
     GroupValue { desc: bool },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negations_reach_the_leaves() {
+        let r = |f| Pred::IntRange { field: f, lo: 1, hi: 2 };
+        let not = |p| Pred::Not(Box::new(p));
+        let present_not = |f| Pred::And(vec![Pred::Present { field: f }, not(r(f))]);
+        assert_eq!(not(r(0)).three_valued(&|_| false), present_not(0));
+        assert_eq!(not(not(r(0))).three_valued(&|_| false), r(0));
+        assert_eq!(not(Pred::Or(vec![r(0), r(1)])).three_valued(&|_| false), Pred::And(vec![present_not(0), present_not(1)]));
+        assert_eq!(not(Pred::And(vec![r(0), not(r(1))])).three_valued(&|_| false), Pred::Or(vec![present_not(0), r(1)]));
+        // IS NULL and MATCH are two-valued: a plain complement.
+        assert_eq!(not(Pred::Present { field: 3 }).three_valued(&|_| false), not(Pred::Present { field: 3 }));
+        assert_eq!(not(not(Pred::Present { field: 3 })).three_valued(&|_| false), Pred::Present { field: 3 });
+        assert_eq!(not(Pred::True).three_valued(&|_| false), Pred::False);
+        // A multi-valued field: NOT holds when no value matches, for none too.
+        assert_eq!(not(r(0)).three_valued(&|f| f == 0), not(r(0)));
+    }
 }

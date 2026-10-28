@@ -51,8 +51,10 @@ impl Part {
 pub enum Acc {
     /// `COUNT(*)` (rows) or `COUNT(f)` (rows with a value).
     Count(i64),
-    /// The sum, whether every value was an integer, and whether any was seen.
-    Sum { sum: f64, int: bool, any: bool },
+    /// The sum of the FLOAT values, of the INT values (exactly: an i128
+    /// cannot overflow), whether every value was an integer, and whether
+    /// any was seen.
+    Sum { sum: f64, isum: i128, int: bool, any: bool },
     Avg { sum: f64, n: i64 },
     Min(Option<Value>),
     Max(Option<Value>),
@@ -64,7 +66,7 @@ impl Acc {
         match p {
             Projection::Agg { func, .. } => match func {
                 AggFn::Count => Acc::Count(0),
-                AggFn::Sum => Acc::Sum { sum: 0.0, int: true, any: false },
+                AggFn::Sum => Acc::Sum { sum: 0.0, isum: 0, int: true, any: false },
                 AggFn::Avg => Acc::Avg { sum: 0.0, n: 0 },
                 AggFn::Min => Acc::Min(None),
                 AggFn::Max => Acc::Max(None),
@@ -88,13 +90,19 @@ impl Acc {
         }
         match self {
             Acc::Count(n) => *n += 1,
-            Acc::Sum { sum, int, any } => {
-                if let Some(x) = v.as_f64() {
-                    *sum += x;
-                    *int &= matches!(v, Value::Int(_));
+            Acc::Sum { sum, isum, int, any } => match v {
+                Value::Int(x) => {
+                    *isum += *x as i128;
                     *any = true;
                 }
-            }
+                v => {
+                    if let Some(x) = v.as_f64() {
+                        *sum += x;
+                        *int = false;
+                        *any = true;
+                    }
+                }
+            },
             Acc::Avg { sum, n } => {
                 if let Some(x) = v.as_f64() {
                     *sum += x;
@@ -122,8 +130,10 @@ impl Acc {
         match self {
             Acc::Count(n) => Value::Int(*n),
             Acc::Sum { any: false, .. } => Value::Null,
-            Acc::Sum { sum, int: true, .. } => Value::Int(*sum as i64),
-            Acc::Sum { sum, .. } => Value::Float(*sum),
+            // A sum of integers beyond the 64-bit range is a FLOAT rather
+            // than a wrapped integer.
+            Acc::Sum { isum, int: true, .. } => i64::try_from(*isum).map_or(Value::Float(*isum as f64), Value::Int),
+            Acc::Sum { sum, isum, .. } => Value::Float(sum + *isum as f64),
             Acc::Avg { n: 0, .. } => Value::Null,
             Acc::Avg { sum, n } => Value::Float(sum / *n as f64),
             Acc::Min(m) | Acc::Max(m) => m.clone().unwrap_or(Value::Null),
@@ -133,10 +143,10 @@ impl Acc {
 
     /// The state as one value, for a shard's answer: an average is
     /// `[sum, n]`, a distinct count the list of values, a sum `[sum, int,
-    /// any]`.
+    /// any, integer sum]` (the last as decimal text: it can exceed 64 bits).
     pub fn partial(&self) -> Value {
         match self {
-            Acc::Sum { sum, int, any } => Value::List(vec![Value::Float(*sum), Value::Int(*int as i64), Value::Int(*any as i64)]),
+            Acc::Sum { sum, isum, int, any } => Value::List(vec![Value::Float(*sum), Value::Int(*int as i64), Value::Int(*any as i64), Value::Str(isum.to_string())]),
             Acc::Avg { sum, n } => Value::List(vec![Value::Float(*sum), Value::Int(*n)]),
             Acc::Distinct(s) => Value::List(s.iter().map(Part::value).collect()),
             a => a.value(),
@@ -148,10 +158,11 @@ impl Acc {
         let bad = || err("a shard's partial aggregate does not match the query");
         match (self, p) {
             (Acc::Count(n), v) => *n += v.as_i64().ok_or_else(bad)?,
-            (Acc::Sum { sum, int, any }, Value::List(xs)) if xs.len() == 3 => {
+            (Acc::Sum { sum, isum, int, any }, Value::List(xs)) if xs.len() == 4 => {
                 *sum += xs[0].as_f64().ok_or_else(bad)?;
                 *int &= xs[1].as_i64() == Some(1);
                 *any |= xs[2].as_i64() == Some(1);
+                *isum += xs[3].as_str().and_then(|s| s.parse::<i128>().ok()).ok_or_else(bad)?;
             }
             (Acc::Avg { sum, n }, Value::List(xs)) if xs.len() == 2 => {
                 *sum += xs[0].as_f64().ok_or_else(bad)?;
@@ -173,12 +184,31 @@ pub fn cmp(a: &Value, b: &Value) -> Ordering {
         (_, Value::Null) => Ordering::Greater,
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(x), Value::Float(y)) => cmp_int_float(*x, *y),
+        (Value::Float(x), Value::Int(y)) => cmp_int_float(*y, *x).reverse(),
         _ => match (a.as_f64(), b.as_f64()) {
             (Some(x), Some(y)) => x.total_cmp(&y),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => format!("{a:?}").cmp(&format!("{b:?}")),
         },
+    }
+}
+
+/// The exact order of an integer and a double (converting the integer
+/// would round 2^53 + 1 to 2^53). NaN sorts last, as in `total_cmp`.
+fn cmp_int_float(x: i64, y: f64) -> Ordering {
+    const TWO63: f64 = 9_223_372_036_854_775_808.0;
+    if y.is_nan() || y >= TWO63 {
+        return Ordering::Less;
+    }
+    if y < -TWO63 {
+        return Ordering::Greater;
+    }
+    let f = y.floor();
+    match x.cmp(&(f as i64)) {
+        Ordering::Equal if y > f => Ordering::Less,
+        o => o,
     }
 }
 

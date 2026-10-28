@@ -1137,6 +1137,14 @@ fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Optio
 
 // ---- evaluation in memory ------------------------------------------------
 
+/// A condition's truth value: `None` for NULL (UNKNOWN).
+fn logic(v: &Value) -> Option<bool> {
+    match v {
+        Value::Null => None,
+        v => Some(truthy(v)),
+    }
+}
+
 fn truthy(v: &Value) -> bool {
     match v {
         Value::Int(x) => *x != 0,
@@ -1209,9 +1217,15 @@ fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>
             sql::Value::Placeholder(p) => params.0.get(p.trim_start_matches([':', '$', '@', '?'])).cloned().ok_or_else(|| err(format!("unbound parameter {p}")))?,
             v => return Err(err(format!("unsupported literal {v}"))),
         },
-        Expr::UnaryOp { op: UnaryOperator::Not, expr } => Value::Int(!truthy(&ev(expr)?) as i64),
+        // Conditions follow SQL's three-valued logic: a comparison with
+        // NULL is NULL (UNKNOWN), NOT NULL is NULL, and a WHERE keeps only
+        // rows whose condition is true.
+        Expr::UnaryOp { op: UnaryOperator::Not, expr } => match ev(expr)? {
+            Value::Null => Value::Null,
+            v => Value::Int(!truthy(&v) as i64),
+        },
         Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match ev(expr)? {
-            Value::Int(x) => Value::Int(-x),
+            Value::Int(x) => x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int),
             Value::Float(x) => Value::Float(-x),
             Value::Null => Value::Null,
             v => return Err(err(format!("cannot negate {v:?}"))),
@@ -1222,12 +1236,27 @@ fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>
         Expr::BinaryOp { left, op, right } => {
             use BinaryOperator::*;
             match op {
-                And => Value::Int((truthy(&ev(left)?) && truthy(&ev(right)?)) as i64),
-                Or => Value::Int((truthy(&ev(left)?) || truthy(&ev(right)?)) as i64),
+                And | Or => {
+                    let (a, b) = (logic(&ev(left)?), logic(&ev(right)?));
+                    let v = if matches!(op, And) {
+                        match (a, b) {
+                            (Some(false), _) | (_, Some(false)) => Some(false),
+                            (Some(true), Some(true)) => Some(true),
+                            _ => None,
+                        }
+                    } else {
+                        match (a, b) {
+                            (Some(true), _) | (_, Some(true)) => Some(true),
+                            (Some(false), Some(false)) => Some(false),
+                            _ => None,
+                        }
+                    };
+                    v.map_or(Value::Null, |t| Value::Int(t as i64))
+                }
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
                     let (a, b) = (ev(left)?, ev(right)?);
                     if matches!(a, Value::Null) || matches!(b, Value::Null) {
-                        return Ok(Value::Int(0));
+                        return Ok(Value::Null);
                     }
                     let c = agg::cmp(&a, &b);
                     Value::Int(match op {
@@ -1252,12 +1281,16 @@ fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>
                 Plus | Minus | Multiply | Divide | Modulo => {
                     let (a, b) = (ev(left)?, ev(right)?);
                     if let (Value::Int(x), Value::Int(y), false) = (&a, &b, matches!(op, Divide)) {
+                        // An integer result that overflows becomes a FLOAT,
+                        // as in SQLite.
+                        let (fx, fy) = (*x as f64, *y as f64);
                         return Ok(match op {
-                            Plus => Value::Int(x.wrapping_add(*y)),
-                            Minus => Value::Int(x.wrapping_sub(*y)),
-                            Multiply => Value::Int(x.wrapping_mul(*y)),
+                            Plus => x.checked_add(*y).map_or(Value::Float(fx + fy), Value::Int),
+                            Minus => x.checked_sub(*y).map_or(Value::Float(fx - fy), Value::Int),
+                            Multiply => x.checked_mul(*y).map_or(Value::Float(fx * fy), Value::Int),
                             _ if *y == 0 => Value::Null,
-                            _ => Value::Int(x % y),
+                            // i64::MIN % -1 overflows; the remainder is 0.
+                            _ => Value::Int(x.checked_rem(*y).unwrap_or(0)),
                         });
                     }
                     match (num(&a), num(&b)) {
@@ -1277,26 +1310,37 @@ fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>
         }
         Expr::Between { expr, negated, low, high } => {
             let (v, lo, hi) = (ev(expr)?, ev(low)?, ev(high)?);
-            if matches!(v, Value::Null) {
-                return Ok(Value::Int(0));
+            if [&v, &lo, &hi].iter().any(|x| matches!(x, Value::Null)) {
+                return Ok(Value::Null);
             }
             let inside = agg::cmp(&v, &lo) != Ordering::Less && agg::cmp(&v, &hi) != Ordering::Greater;
             Value::Int((inside != *negated) as i64)
         }
         Expr::InList { expr, list, negated } => {
             let v = ev(expr)?;
-            let mut found = false;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            // `x IN (1, NULL)` is NULL, not false, when x is not 1.
+            let (mut found, mut null) = (false, false);
             for x in list {
-                match ev(x)? {
-                    Value::List(xs) => found |= xs.iter().any(|y| agg::cmp(&v, y) == Ordering::Equal),
-                    y => found |= agg::cmp(&v, &y) == Ordering::Equal,
+                let xs = match ev(x)? {
+                    Value::List(xs) => xs,
+                    y => vec![y],
+                };
+                for y in &xs {
+                    null |= matches!(y, Value::Null);
+                    found |= !matches!(y, Value::Null) && agg::cmp(&v, y) == Ordering::Equal;
                 }
             }
-            Value::Int((found != *negated && !matches!(v, Value::Null)) as i64)
+            if !found && null {
+                return Ok(Value::Null);
+            }
+            Value::Int((found != *negated) as i64)
         }
         Expr::Like { negated, expr, pattern, .. } | Expr::ILike { negated, expr, pattern, .. } => {
             let ci = matches!(e, Expr::ILike { .. });
-            let (Value::Str(s), Value::Str(p)) = (ev(expr)?, ev(pattern)?) else { return Ok(Value::Int(0)) };
+            let (Value::Str(s), Value::Str(p)) = (ev(expr)?, ev(pattern)?) else { return Ok(Value::Null) };
             let (s, p) = if ci { (s.to_lowercase(), p.to_lowercase()) } else { (s, p) };
             Value::Int((like(&s.chars().collect::<Vec<_>>(), &p.chars().collect::<Vec<_>>()) != *negated) as i64)
         }
@@ -1322,7 +1366,7 @@ fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>
                 "upper" => one().as_str().map_or(Value::Null, |s| Value::Str(s.to_uppercase())),
                 "length" => one().as_str().map_or(Value::Null, |s| Value::Int(s.chars().count() as i64)),
                 "abs" => match one() {
-                    Value::Int(x) => Value::Int(x.abs()),
+                    Value::Int(x) => x.checked_abs().map_or(Value::Float((x as f64).abs()), Value::Int),
                     v => num(&v).map_or(Value::Null, |x| Value::Float(x.abs())),
                 },
                 "round" => {
@@ -1611,6 +1655,39 @@ fn having_with_aliases(h: &Expr, items: &[(String, Expr)]) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditions_are_three_valued_and_integers_exact() {
+        let params = Params::new().set("min", Value::Int(i64::MIN)).set("n", Value::Null);
+        let ev = |src: &str| {
+            let e = sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {}).try_with_sql(src).unwrap().parse_expr().unwrap();
+            eval(&e, &params, &|_| None).unwrap()
+        };
+        for (src, want) in [
+            ("NULL = 1", Value::Null),
+            ("NOT (:n = 1)", Value::Null),
+            ("NOT (:n = 1) OR 1 = 1", Value::Int(1)),
+            ("NULL AND 1 = 0", Value::Int(0)),
+            ("NULL AND 1 = 1", Value::Null),
+            ("NULL OR 1 = 0", Value::Null),
+            ("2 IN (1, NULL)", Value::Null),
+            ("2 NOT IN (1, NULL)", Value::Null),
+            ("1 IN (1, NULL)", Value::Int(1)),
+            ("NULL BETWEEN 1 AND 2", Value::Null),
+            ("9007199254740993 > 9007199254740992.0", Value::Int(1)),
+            ("9007199254740992.0 < 9007199254740993", Value::Int(1)),
+            ("9007199254740993 = 9007199254740992.0", Value::Int(0)),
+            // Overflowing integer arithmetic gives a FLOAT, never a panic
+            // or a wrapped value.
+            ("9223372036854775807 + 1", Value::Float(9_223_372_036_854_775_808.0)),
+            ("-:min", Value::Float(9_223_372_036_854_775_808.0)),
+            ("abs(:min)", Value::Float(9_223_372_036_854_775_808.0)),
+            (":min % -1", Value::Int(0)),
+            (":min * 2", Value::Float(-18_446_744_073_709_551_616.0)),
+        ] {
+            assert_eq!(ev(src), want, "{src}");
+        }
+    }
 
     #[test]
     fn like_patterns() {

@@ -29,6 +29,10 @@ pub trait Estimator {
     fn range_count(&self, field: usize, lo: f64, hi: f64) -> f64;
     /// Documents whose keyword field equals one of `values` (exact).
     fn in_count(&self, field: usize, values: &[Value]) -> f64;
+    /// Documents with a value of `field`.
+    fn present_count(&self, _field: usize) -> f64 {
+        self.n_docs()
+    }
     /// Nanoseconds to materialise a range, if the index can estimate it
     /// (otherwise the planner's own scan-vs-postings formula is used).
     fn range_cost(&self, _field: usize, _lo: f64, _hi: f64) -> Option<f64> {
@@ -139,6 +143,12 @@ impl<E: Estimator> Planner<'_, E> {
                 let card = self.est.range_count(*field, *lo, *hi).min(n);
                 let cost = self.est.range_cost(*field, *lo, *hi).unwrap_or_else(|| self.range_strategy(n, card).1);
                 PredEstimate { card, mat_cost: c.leaf + cost, probe_cost: c.probe_column, probeable: true }
+            }
+            // An estimate: the bounds as doubles are close enough.
+            Pred::IntRange { field, lo, hi } => self.estimate(&Pred::Range { field: *field, lo: *lo as f64, hi: *hi as f64 }),
+            Pred::Present { field } => {
+                let card = self.est.present_count(*field).min(n);
+                PredEstimate { card, mat_cost: c.leaf + n * c.emit / 64.0 + card * c.emit, probe_cost: c.probe_column, probeable: true }
             }
             Pred::In { field, values } => {
                 let card = self.est.in_count(*field, values).min(n);
