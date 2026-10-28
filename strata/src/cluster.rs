@@ -25,10 +25,10 @@
 //! [`TermStats::sum`]: crate::query::stats::TermStats::sum
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::query::exec::{cmp_values, ExecStats, ResultSet, DEFAULT_K};
+use crate::query::agg;
 use crate::query::fusion::{self, Norm};
 use crate::query::logical::{OrderBy, Projection, Score, Select, Tiebreak};
 use crate::value::Value;
@@ -48,8 +48,15 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         stats.plan.extend(s.stats.plan.iter().map(|l| format!("shard {i}: {l}")));
     }
     let empty = |rows, stats| ResultSet { columns: columns.clone(), rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
-    if q.group_by.is_some() {
-        return Ok(empty(merge_groups(q, &shards)?, stats));
+    // Groups and aggregates: each shard returns its groups with partial
+    // aggregates.
+    if !q.group_by.is_empty() || agg::is_general(q, |_| false) {
+        let needed = agg::needed(q);
+        let mut groups = agg::Groups::default();
+        for s in &shards {
+            groups.merge_rows(&s.rows, q.group_by.len(), &needed)?;
+        }
+        return Ok(empty(agg::finish(q, groups, &needed), stats));
     }
     if q.projection.iter().any(|(_, p)| *p == Projection::Count) {
         let n: i64 = shards.iter().filter_map(|s| s.rows.first().and_then(|r| r.first()).and_then(|v| v.as_i64())).sum();
@@ -205,33 +212,5 @@ fn fuse(score: &Score, rows: Vec<Row>) -> Result<Vec<Row>> {
             r.score = s;
             r
         })
-        .collect())
-}
-
-/// Sums facet groups over shards, then orders and cuts them as
-/// [`crate::query::exec`] does for one database.
-fn merge_groups(q: &Select, shards: &[ResultSet]) -> Result<Vec<Vec<Value>>> {
-    let value_col = q.projection.iter().position(|(_, p)| *p != Projection::Count).ok_or_else(|| err("a sharded GROUP BY must select the group field"))?;
-    let count_col = q.projection.iter().position(|(_, p)| *p == Projection::Count);
-    let mut counts: HashMap<String, u64> = HashMap::new();
-    for s in shards {
-        for r in &s.rows {
-            let v = r[value_col].as_str().unwrap_or_default().to_string();
-            let c = count_col.and_then(|c| r[c].as_i64()).unwrap_or(0) as u64;
-            *counts.entry(v).or_insert(0) += c;
-        }
-    }
-    let mut groups: Vec<(String, u64)> = counts.into_iter().collect();
-    let value_desc = matches!(q.tiebreak, Some(Tiebreak::GroupValue { desc: true }));
-    match q.order {
-        Some(OrderBy::GroupValue { desc }) => groups.sort_by(|a, b| if desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) }),
-        Some(OrderBy::Count { desc: false }) => groups.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| if value_desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) })),
-        _ => groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| if value_desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) })),
-    }
-    Ok(groups
-        .into_iter()
-        .skip(q.offset)
-        .take(q.limit.unwrap_or(usize::MAX))
-        .map(|(v, c)| q.projection.iter().map(|(_, p)| if *p == Projection::Count { Value::Int(c as i64) } else { Value::Str(v.clone()) }).collect())
         .collect())
 }

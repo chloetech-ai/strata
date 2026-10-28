@@ -9,6 +9,7 @@
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows, or `{written}` |
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`) | `{written}` |
 //! | `POST /v1/explain` | `{sql, params?}` | the bound query and its plan |
+//! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
 //! | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the steps taken |
@@ -22,7 +23,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json as AxJson, Router};
 use serde_json::{json, Value as Json};
 
@@ -57,6 +58,7 @@ pub fn router(svc: Arc<Service>, token: Option<String>) -> Router {
         .route("/v1/sql", post(sql))
         .route("/v1/write", post(write))
         .route("/v1/explain", post(explain))
+        .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
         .route("/v1/snapshot", post(snapshot))
         .route("/v1/agent", post(agent_run))
@@ -106,7 +108,8 @@ async fn schema(State(app): State<App>) -> AxJson<Json> {
 
 async fn config(State(app): State<App>) -> AxJson<Json> {
     let a = &app.svc.agent;
-    AxJson(json!({"agent": {"model": a.model, "server_key": a.api_key.is_some(), "models": agent::MODELS}}))
+    let rules = app.svc.synonyms().map_or(0, |s| s.rules());
+    AxJson(json!({"agent": {"model": a.model, "server_key": a.api_key.is_some(), "models": agent::MODELS}, "synonyms": {"rules": rules, "editable": app.svc.local_db().is_some()}}))
 }
 
 async fn metrics(State(app): State<App>) -> impl IntoResponse {
@@ -162,17 +165,35 @@ async fn write(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let sql = body_str(&b, "sql")?;
     let params = app.svc.params(b.get("params")).await?;
-    let select = strata::query::bind(sql, &app.svc.schema, &params)?;
+    // A compound query's plan lists the queries it ran.
+    let logical = match strata::query::compound::is_compound(sql, &app.svc.schema) {
+        true => "a compound query: its steps and their plans are in \"plan\"".to_string(),
+        false => format!("{:#?}", strata::query::bind(sql, &app.svc.schema, &params)?),
+    };
     let a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await?;
     Ok(AxJson(json!({
         "kind": a.kind,
-        "logical": format!("{select:#?}"),
+        "logical": logical,
         "plan": a.rs.stats.plan,
         "filter_docs": a.rs.stats.filter_docs,
         "scored": a.rs.stats.scored,
         "rows": a.rs.rows.len(),
         "took_ms": a.took_ms,
     })))
+}
+
+async fn synonyms(State(app): State<App>) -> AxJson<Json> {
+    let s = app.svc.synonyms();
+    AxJson(json!({
+        "text": s.as_ref().map_or("", |s| s.text()),
+        "rules": s.as_ref().map_or(0, |s| s.rules()),
+        "file": app.svc.synonyms_file().map(|p| p.display().to_string()),
+    }))
+}
+
+async fn put_synonyms(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let rules = app.svc.put_synonyms(body_str(&b, "text")?)?;
+    Ok(AxJson(json!({"rules": rules, "file": app.svc.synonyms_file().map(|p| p.display().to_string())})))
 }
 
 async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {

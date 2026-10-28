@@ -11,8 +11,9 @@ use crate::value::Value;
 pub enum Pred {
     True,
     False,
-    /// `MATCH(field, 'boolean query')` on a TEXT field (grammar: text module).
-    Match { field: usize, query: String },
+    /// `MATCH(field, 'boolean query')` on a TEXT field (grammar: text
+    /// module), with its words expanded by synonyms or typos as asked.
+    Match { field: usize, query: String, expand: Expand },
     /// Numeric range with inclusive bounds (`±inf` for open ends). Strict
     /// comparisons are normalised to inclusive ones at bind time.
     Range { field: usize, lo: f64, hi: f64 },
@@ -24,6 +25,61 @@ pub enum Pred {
     /// Membership in the result of `Select::graphs[id]` (`REACHABLE`,
     /// `PATH`), computed before the rest of the query.
     Graph { id: usize },
+}
+
+/// How a full-text search widens its words (`MATCH(.., synonyms => 1,
+/// fuzzy => 'auto')`, the same options on `bm25`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Expand {
+    /// Each word also matches its synonyms from the synonym list
+    /// ([`crate::text::synonyms`]).
+    pub synonyms: bool,
+    /// Each word also matches indexed terms within this many edits.
+    pub fuzzy: Option<Fuzzy>,
+}
+
+/// Edits a typo-tolerant word may be away from an indexed term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fuzzy {
+    /// By the word's length: none up to 2 letters, 1 up to 5, else 2.
+    Auto,
+    Edits(u8),
+}
+
+impl Fuzzy {
+    pub fn edits(self, len: usize) -> u8 {
+        match self {
+            Fuzzy::Edits(n) => n,
+            Fuzzy::Auto if len <= 2 => 0,
+            Fuzzy::Auto if len <= 5 => 1,
+            Fuzzy::Auto => 2,
+        }
+    }
+}
+
+impl Expand {
+    /// The expansion options of a search function: `synonyms => 0 | 1`,
+    /// `fuzzy => 0 | 1 | 2 | 'auto'`.
+    pub fn from_opts(opts: &Opts) -> std::result::Result<Expand, String> {
+        let synonyms = match opts.get("synonyms") {
+            None => false,
+            Some(v) => v.as_f64().ok_or("synonyms => 0 or 1")? != 0.0,
+        };
+        let fuzzy = match opts.get("fuzzy") {
+            None => None,
+            Some(Value::Str(s)) if s.eq_ignore_ascii_case("auto") => Some(Fuzzy::Auto),
+            Some(v) => match v.as_f64() {
+                Some(x) if x == 0.0 => None,
+                Some(x) if x == 1.0 || x == 2.0 => Some(Fuzzy::Edits(x as u8)),
+                _ => return Err("fuzzy => 0, 1, 2 or 'auto'".into()),
+            },
+        };
+        Ok(Expand { synonyms, fuzzy })
+    }
+
+    pub fn is_none(&self) -> bool {
+        !self.synonyms && self.fuzzy.is_none()
+    }
 }
 
 /// Which way edges are followed.
@@ -229,8 +285,33 @@ pub enum OrderBy {
     Score { score: Score, desc: bool },
     /// Facet queries: order groups by their count.
     Count { desc: bool },
-    /// Facet queries: order groups by their value.
+    /// Facet queries: order groups by their value (the first group field's).
     GroupValue { desc: bool },
+    /// Aggregate queries: order groups by an aggregate or a group field.
+    Agg { what: Projection, desc: bool },
+}
+
+/// An aggregate function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggFn {
+    /// `COUNT(f)`: rows with a value.
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    CountDistinct,
+}
+
+/// A `HAVING` condition on a group's aggregates or group values.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Having {
+    /// An inclusive numeric range.
+    Range { what: Projection, lo: f64, hi: f64 },
+    Eq { what: Projection, value: Value },
+    And(Vec<Having>),
+    Or(Vec<Having>),
+    Not(Box<Having>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -242,6 +323,9 @@ pub enum Projection {
     Count,
     /// `hops()`: the row's hop distance in `Select::graphs[id]`.
     Hops(usize),
+    /// `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`, `COUNT(f)`, `COUNT(DISTINCT
+    /// f)`: of the whole result, or per group.
+    Agg { func: AggFn, field: usize },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -250,8 +334,11 @@ pub struct Select {
     pub projection: Vec<(String, Projection)>,
     pub filter: Pred,
     pub order: Option<OrderBy>,
-    /// A KEYWORD field to group by (facets), with `COUNT(*)` per group.
-    pub group_by: Option<usize>,
+    /// Fields to group by (KEYWORD, INT or FLOAT, multi-valued ones
+    /// counting a row once per value), with aggregates per group.
+    pub group_by: Vec<usize>,
+    /// Which groups to keep.
+    pub having: Option<Having>,
     /// Secondary order for rows that tie on the primary one.
     pub tiebreak: Option<Tiebreak>,
     pub limit: Option<usize>,

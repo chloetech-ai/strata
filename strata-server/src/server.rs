@@ -37,6 +37,9 @@ pub struct Options {
     pub api_base: String,
     /// Serve `{"embed": ...}` parameters with the demo's hashed vectors.
     pub hash_embedder: bool,
+    /// The synonym list for `synonyms => 1` searches (Solr format), read at
+    /// start if it exists and written by `PUT /v1/synonyms`.
+    pub synonyms: Option<PathBuf>,
 }
 
 /// How the server opens a database. Each write publishes its snapshot,
@@ -104,6 +107,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         if let Some(dim) = dim {
             svc.embedder = Some(Embedder { name: "hashed bag of words (the demo's; not a learned model)".into(), dim, embed: demo::hash_embed });
         }
+    }
+    if let Some(path) = &o.synonyms {
+        svc.open_synonyms(path).map_err(|e| e.message)?;
     }
     Ok(Arc::new(svc))
 }

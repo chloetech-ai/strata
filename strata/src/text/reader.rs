@@ -133,6 +133,29 @@ impl TextFieldReader {
         out
     }
 
+    /// The indexed terms within `edits` edits of `term` (itself included),
+    /// with their entries and distances, in dictionary order.
+    pub fn fuzzy_terms(&self, term: &str, edits: u8) -> Vec<(String, TermInfo, u8)> {
+        let q: Vec<char> = term.chars().collect();
+        let (lo, hi) = (q.len().saturating_sub(edits as usize), q.len() + edits as usize);
+        let mut out = Vec::new();
+        self.dict.for_each(|t, info| {
+            // Bytes bound letters from above, and from below by a factor of 4.
+            if t.len() < lo || t.len() > 4 * hi {
+                return;
+            }
+            let Ok(t) = std::str::from_utf8(t) else { return };
+            if let Some(d) = super::fuzzy::within(&q, t, edits) {
+                out.push((t.to_string(), info, d));
+            }
+        });
+        out
+    }
+
+    fn fuzzy_infos(&self, term: &str, edits: u8) -> Vec<TermInfo> {
+        self.fuzzy_terms(term, edits).into_iter().map(|(_, i, _)| i).collect()
+    }
+
     /// A cursor over an (analysed) term's postings.
     pub fn postings(&self, term: &str) -> Option<PostingCursor<'_>> {
         self.dict.get(term).map(|i| self.cursor(&i))
@@ -235,6 +258,7 @@ impl TextFieldReader {
             BoolQuery::Term(t) => self.doc_freq(t) as f64,
             BoolQuery::Phrase(ts) => ts.len() as f64 * ts.iter().map(|t| self.doc_freq(t) as f64).fold(f64::INFINITY, f64::min),
             BoolQuery::Prefix(p) => self.prefix_infos(p).iter().map(|i| i.df as f64).sum(),
+            BoolQuery::Fuzzy { term, edits } => self.fuzzy_infos(term, *edits).iter().map(|i| i.df as f64).sum(),
             BoolQuery::Or(cs) => cs.iter().map(|c| self.eval_cost(c)).sum(),
             BoolQuery::And(cs) => {
                 let (neg, pos): (Vec<&BoolQuery>, Vec<&BoolQuery>) = cs.iter().partition(|c| matches!(c, BoolQuery::Not(_)));
@@ -258,6 +282,7 @@ impl TextFieldReader {
                 let infos = self.prefix_infos(p);
                 self.union_terms(&infos)
             }
+            BoolQuery::Fuzzy { term, edits } => self.union_terms(&self.fuzzy_infos(term, *edits)),
             BoolQuery::And(cs) => {
                 let mut acc: Option<DocSet> = None;
                 let terms: Vec<&str> = cs.iter().filter_map(|c| if let BoolQuery::Term(t) = c { Some(t.as_str()) } else { None }).collect();
@@ -390,6 +415,9 @@ impl TextFieldReader {
             BoolQuery::Prefix(p) => {
                 n * (1.0 - self.prefix_infos(p).iter().map(|i| 1.0 - i.df as f64 / n).product::<f64>())
             }
+            BoolQuery::Fuzzy { term, edits } => {
+                n * (1.0 - self.fuzzy_infos(term, *edits).iter().map(|i| 1.0 - i.df as f64 / n).product::<f64>())
+            }
             BoolQuery::And(cs) => {
                 n * cs
                     .iter()
@@ -419,8 +447,12 @@ impl TextFieldReader {
                     None => Matcher::Never,
                 }
             }
-            BoolQuery::Prefix(p) => {
-                let infos = self.prefix_infos(p);
+            BoolQuery::Prefix(_) | BoolQuery::Fuzzy { .. } => {
+                let infos = match q {
+                    BoolQuery::Prefix(p) => self.prefix_infos(p),
+                    BoolQuery::Fuzzy { term, edits } => self.fuzzy_infos(term, *edits),
+                    _ => unreachable!(),
+                };
                 if infos.len() > MATCHER_MAX_EXPANSIONS {
                     Matcher::Set(self.union_terms(&infos))
                 } else {
