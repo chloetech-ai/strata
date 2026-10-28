@@ -40,12 +40,17 @@ pub struct QueryReq {
     pub stats: Option<TermStats>,
     /// A snapshot lease; 0 for the latest version.
     pub snapshot: u64,
+    /// From a coordinator: answer without shards that cannot answer
+    /// (`None`: its default, [`crate::coord::CoordOptions::partial`]).
+    pub partial: Option<bool>,
 }
 
 pub struct Answer {
     pub rs: ResultSet,
     pub took_ms: f64,
     pub kind: &'static str,
+    /// Shards a coordinator answered without (see [`QueryReq::partial`]).
+    pub missing: Vec<String>,
 }
 
 /// Turns text into a vector for `{"embed": "..."}` parameters.
@@ -292,23 +297,24 @@ impl Service {
                     let r = tokio::task::spawn_blocking(move || db.execute(&snap, &select, &opts)).await;
                     self.running.fetch_sub(1, Ordering::Relaxed);
                     match r {
-                        Ok(r) => r.map_err(ApiError::from),
+                        Ok(r) => r.map(|rs| (rs, Vec::new())).map_err(ApiError::from),
                         Err(e) => Err(ApiError::internal(e)),
                     }
                 }
                 Err(e) => Err(e),
             },
-            Backend::Cluster(c) => c.query(&req, &select, t0 + timeout).await,
+            Backend::Cluster(c) => c.query(&req, &select, t0 + timeout).await.map(|m| (m.rs, m.missing)),
         };
         drop(permit);
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         let outcome = match &res {
+            Ok((_, missing)) if !missing.is_empty() => "partial",
             Ok(_) => "ok",
             Err(e) if e.status == 504 => "timeout",
             Err(_) => "error",
         };
         self.metrics.query(kind, outcome, ms);
-        res.map(|rs| Answer { rs, took_ms: ms, kind })
+        res.map(|(rs, missing)| Answer { rs, took_ms: ms, kind, missing })
     }
 
     /// A compound query ([`compound`]): its single-table steps run on one

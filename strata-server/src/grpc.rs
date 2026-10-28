@@ -85,6 +85,7 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         shard: r.shard,
         stats: if r.stats_json.is_empty() { None } else { Some(from_json(&r.stats_json, "statistics")?) },
         snapshot: r.snapshot,
+        partial: None,
     })
 }
 

@@ -1,0 +1,475 @@
+{
+  "collection": "quora",
+  "coordinator": "http://strata-coordinator:7700",
+  "label": "watch pause",
+  "machine": {
+    "arch": "aarch64",
+    "cores": 4,
+    "cpu": null,
+    "memory_gb": 9.4,
+    "os": "Linux 5.15.49-linuxkit-pr"
+  },
+  "queries": 300,
+  "single": null,
+  "watch": [
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.27525,
+      "ok": 1800,
+      "p50_ms": 2.0345,
+      "p99_ms": 5.5215000000000005,
+      "second": 0
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.718792,
+      "ok": 1982,
+      "p50_ms": 1.856625,
+      "p99_ms": 4.823333,
+      "second": 1
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.513666000000001,
+      "ok": 2006,
+      "p50_ms": 1.813458,
+      "p99_ms": 4.757292,
+      "second": 2
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.840166,
+      "ok": 2045,
+      "p50_ms": 1.813291,
+      "p99_ms": 4.696209,
+      "second": 3
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.7805,
+      "ok": 2052,
+      "p50_ms": 1.795791,
+      "p99_ms": 4.641083,
+      "second": 4
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.915416,
+      "ok": 1922,
+      "p50_ms": 1.8840000000000001,
+      "p99_ms": 5.345459,
+      "second": 5
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.078666,
+      "ok": 1895,
+      "p50_ms": 1.9358330000000001,
+      "p99_ms": 4.961708,
+      "second": 6
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.253042,
+      "ok": 1874,
+      "p50_ms": 1.9630839999999998,
+      "p99_ms": 4.91925,
+      "second": 7
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.227915999999999,
+      "ok": 1682,
+      "p50_ms": 2.17375,
+      "p99_ms": 6.0218750000000005,
+      "second": 8
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.685709,
+      "ok": 1846,
+      "p50_ms": 2.013709,
+      "p99_ms": 4.936208,
+      "second": 9
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 14.3605,
+      "ok": 1195,
+      "p50_ms": 2.4177920000000004,
+      "p99_ms": 6.857208,
+      "second": 10
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 11
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 12
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 13
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 14
+    },
+    {
+      "errors": 4,
+      "first_error": "504 Gateway Timeout: {\"error\":\"the query ran past its deadline\"}",
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 15
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 16
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 17
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 18
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 19
+    },
+    {
+      "errors": 4,
+      "first_error": "504 Gateway Timeout: {\"error\":\"the query ran past its deadline\"}",
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 20
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 21
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 22
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 23
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 24
+    },
+    {
+      "errors": 4,
+      "first_error": "504 Gateway Timeout: {\"error\":\"the query ran past its deadline\"}",
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 25
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 26
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 27
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 28
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 0.0,
+      "ok": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "second": 29
+    },
+    {
+      "errors": 8,
+      "first_error": "504 Gateway Timeout: {\"error\":\"the query ran past its deadline\"}",
+      "max_ms": 50.838458,
+      "ok": 47,
+      "p50_ms": 5.136,
+      "p99_ms": 50.838458,
+      "second": 30
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.518917,
+      "ok": 1988,
+      "p50_ms": 1.8689170000000002,
+      "p99_ms": 4.875,
+      "second": 31
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.358083,
+      "ok": 2113,
+      "p50_ms": 1.754,
+      "p99_ms": 4.432708,
+      "second": 32
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 5.878,
+      "ok": 2056,
+      "p50_ms": 1.780292,
+      "p99_ms": 4.814541999999999,
+      "second": 33
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.876375000000001,
+      "ok": 2017,
+      "p50_ms": 1.8487079999999998,
+      "p99_ms": 4.673084,
+      "second": 34
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.709667000000001,
+      "ok": 1960,
+      "p50_ms": 1.8565829999999999,
+      "p99_ms": 5.014208,
+      "second": 35
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.103,
+      "ok": 2111,
+      "p50_ms": 1.74625,
+      "p99_ms": 4.5433330000000005,
+      "second": 36
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.65925,
+      "ok": 2099,
+      "p50_ms": 1.76925,
+      "p99_ms": 4.318875,
+      "second": 37
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 11.957,
+      "ok": 1898,
+      "p50_ms": 1.919375,
+      "p99_ms": 5.46075,
+      "second": 38
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 5.846583,
+      "ok": 2101,
+      "p50_ms": 1.7703339999999999,
+      "p99_ms": 4.443458,
+      "second": 39
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.459708,
+      "ok": 2066,
+      "p50_ms": 1.7849579999999998,
+      "p99_ms": 4.278874999999999,
+      "second": 40
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 7.45275,
+      "ok": 2024,
+      "p50_ms": 1.8103749999999998,
+      "p99_ms": 4.8665,
+      "second": 41
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 6.398292,
+      "ok": 1853,
+      "p50_ms": 2.027583,
+      "p99_ms": 4.848208,
+      "second": 42
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.805959,
+      "ok": 1747,
+      "p50_ms": 2.125875,
+      "p99_ms": 5.5,
+      "second": 43
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.79725,
+      "ok": 1774,
+      "p50_ms": 2.081958,
+      "p99_ms": 5.736834,
+      "second": 44
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 9.504375000000001,
+      "ok": 1562,
+      "p50_ms": 2.33075,
+      "p99_ms": 6.8294999999999995,
+      "second": 45
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.123875,
+      "ok": 1680,
+      "p50_ms": 2.2415,
+      "p99_ms": 5.470292,
+      "second": 46
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 10.418458000000001,
+      "ok": 1606,
+      "p50_ms": 2.273042,
+      "p99_ms": 5.994208,
+      "second": 47
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.5595,
+      "ok": 1556,
+      "p50_ms": 2.3905,
+      "p99_ms": 6.173459,
+      "second": 48
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 8.610208,
+      "ok": 1569,
+      "p50_ms": 2.387958,
+      "p99_ms": 6.143292,
+      "second": 49
+    },
+    {
+      "errors": 0,
+      "first_error": null,
+      "max_ms": 4.436125,
+      "ok": 4,
+      "p50_ms": 3.9991669999999995,
+      "p99_ms": 4.436125,
+      "second": 50
+    }
+  ]
+}

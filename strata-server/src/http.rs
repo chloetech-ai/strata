@@ -128,15 +128,26 @@ async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         shard: b.get("shard").and_then(|v| v.as_bool()).unwrap_or(false),
         stats,
         snapshot: body_u64(&b, "snapshot"),
+        partial: b.get("partial").and_then(|v| v.as_bool()),
     };
     let a = app.svc.query(req).await?;
-    Ok(AxJson(js::result(&a.rs, a.took_ms)))
+    Ok(AxJson(answer(&a)))
+}
+
+/// A query's answer; one a coordinator gave without some shards says
+/// which (`"partial": {"missing_shards": [...]}`).
+fn answer(a: &crate::service::Answer) -> Json {
+    let mut j = js::result(&a.rs, a.took_ms);
+    if !a.missing.is_empty() {
+        j["partial"] = json!({"missing_shards": a.missing});
+    }
+    j
 }
 
 async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
     match app.svc.sql(body_str(&b, "sql")?, &params, body_u64(&b, "timeout_ms")).await? {
-        SqlAnswer::Rows(a) => Ok(AxJson(js::result(&a.rs, a.took_ms))),
+        SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
         SqlAnswer::Written { n, took_ms } => Ok(AxJson(json!({"written": n, "took_ms": took_ms}))),
     }
 }

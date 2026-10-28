@@ -10,7 +10,7 @@ use strata::segment::build::BuildOptions;
 use strata::storage::{DbOptions, Layout, MergePolicy};
 use tokio::net::TcpListener;
 
-use crate::coord::Coordinator;
+use crate::coord::{CoordOptions, Coordinator};
 use crate::service::{shard_of, AgentConfig, Backend, Embedder, Service};
 use crate::{demo, grpc, http, pb};
 
@@ -26,8 +26,10 @@ pub struct Options {
     pub demo_shard: Option<(usize, usize)>,
     /// A new database as a directory of segment files.
     pub directory: bool,
-    /// Coordinate these shard servers (gRPC URLs) instead of serving a database.
+    /// Coordinate these shard servers (gRPC URLs; replicas of a shard
+    /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
+    pub coord: CoordOptions,
     pub timeout_ms: u64,
     pub max_concurrent: usize,
     pub model: String,
@@ -58,7 +60,18 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let agent = AgentConfig { api_key: o.api_key.clone(), model: o.model.clone(), base_url: o.api_base.clone() };
     let timeout = Duration::from_millis(o.timeout_ms.max(1));
     let (backend, schema) = if !o.shards.is_empty() {
-        let c = Coordinator::connect(o.shards.clone()).await.map_err(|e| e.message)?;
+        // A shard with no replica answering yet (the cluster is starting, or
+        // one is down) is waited for; a wrong URL or schema is not.
+        let c = loop {
+            match Coordinator::connect_with(o.shards.clone(), o.coord.clone()).await {
+                Ok(c) => break c,
+                Err(e) if e.status != 400 => {
+                    eprintln!("strata-server: waiting for the shards: {}", e.message);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(e) => return Err(e.message),
+            }
+        };
         let schema = c.schema.clone();
         (Backend::Cluster(Arc::new(c)), schema)
     } else {
@@ -136,6 +149,25 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener) -> Result<(), 
         .await
 }
 
+/// Ctrl-C, or SIGTERM: how Docker and Kubernetes stop a container. As a
+/// container's first process the server would otherwise ignore SIGTERM, and
+/// be killed only when the grace period ran out (30 s in Kubernetes).
 async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
 }
