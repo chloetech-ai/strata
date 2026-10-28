@@ -50,21 +50,36 @@ pub(crate) struct SegHandle {
     pub map: OwnedBytes,
 }
 
+/// Checks a segment's image and, if any, its delete set and updates
+/// against the checksums of its manifest entry.
+fn verify_segment(meta: &SegmentMeta, image: Option<&[u8]>, deletes: Option<&[u8]>, updates: Option<&[u8]>) -> Result<()> {
+    for (what, bytes, crc) in [("image", image, meta.crc), ("delete set", deletes, meta.deletes_crc), ("updates", updates, meta.updates_crc)] {
+        if bytes.is_some_and(|b| crc32fast::hash(b) != crc) {
+            return Err(corrupt(format!("the {what} of segment {} fails its checksum", meta.id)));
+        }
+    }
+    Ok(())
+}
+
 impl SegHandle {
     /// `random_hints`: advise the segment's random-access sections
-    /// `MADV_RANDOM` ([`SegmentFile::advise_random_sections`]).
-    pub fn open(map: &OwnedBytes, meta: &SegmentMeta, random_hints: bool) -> Result<SegHandle> {
+    /// `MADV_RANDOM` ([`SegmentFile::advise_random_sections`]). The delete
+    /// set and updates are checked against their checksums (they are small
+    /// and read whole); the image only with `verify`, since that reads
+    /// every byte of the segment.
+    pub fn open(map: &OwnedBytes, meta: &SegmentMeta, random_hints: bool, verify: bool) -> Result<SegHandle> {
         let within = |e: &Extent| e.range().end <= map.len();
         if !within(&meta.extent) || [meta.deletes, meta.updates].iter().flatten().any(|e| !within(e)) {
             return Err(corrupt(format!("segment {} lies outside the file", meta.id)));
         }
         let deletes = meta.deletes.map(|e| map.slice(e.range()));
         let updates = meta.updates.map(|e| map.slice(e.range()));
-        SegHandle::from_bytes(map.slice(meta.extent.range()), deletes, updates, map.clone(), meta, random_hints)
+        SegHandle::from_bytes(map.slice(meta.extent.range()), deletes, updates, map.clone(), meta, random_hints, verify)
     }
 
-    /// Opens a segment of the directory layout from its own files.
-    pub fn open_in(dir: &Path, meta: &SegmentMeta, read_ahead: bool, random_hints: bool) -> Result<SegHandle> {
+    /// Opens a segment of the directory layout from its own files (see
+    /// [`SegHandle::open`]).
+    pub fn open_in(dir: &Path, meta: &SegmentMeta, read_ahead: bool, random_hints: bool, verify: bool) -> Result<SegHandle> {
         let name = meta.file.as_deref().ok_or_else(|| corrupt(format!("segment {} has no file", meta.id)))?;
         let map = crate::storage::dir::map(dir, name, read_ahead)?;
         if map.len() as u64 != meta.extent.len {
@@ -78,9 +93,10 @@ impl SegHandle {
             Some(u) => Some(OwnedBytes::new(std::fs::read(dir.join(u))?)),
             None => None,
         };
-        SegHandle::from_bytes(map.clone(), deletes, updates, map, meta, random_hints)
+        SegHandle::from_bytes(map.clone(), deletes, updates, map, meta, random_hints, verify)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_bytes(
         image: OwnedBytes,
         deletes: Option<OwnedBytes>,
@@ -88,7 +104,9 @@ impl SegHandle {
         map: OwnedBytes,
         meta: &SegmentMeta,
         random_hints: bool,
+        verify: bool,
     ) -> Result<SegHandle> {
+        verify_segment(meta, verify.then_some(&image[..]), deletes.as_deref(), updates.as_deref())?;
         let file = SegmentFile::open(image)?;
         if random_hints {
             file.advise_random_sections();
@@ -106,6 +124,23 @@ impl SegHandle {
             None => None,
         };
         Ok(SegHandle { meta: meta.clone(), file, pk, base, updates, map })
+    }
+
+    /// Checks the segment's image, delete set and updates against their
+    /// checksums; `dir` is the directory of the directory layout.
+    pub fn verify(&self, dir: Option<&Path>) -> Result<()> {
+        let m = &self.meta;
+        match dir {
+            None => {
+                let at = |e: Option<Extent>| e.map(|e| &self.map[e.range()]);
+                verify_segment(m, Some(&self.map[m.extent.range()]), at(m.deletes), at(m.updates))
+            }
+            Some(d) => {
+                let read = |f: &Option<String>| f.as_ref().map(|f| std::fs::read(d.join(f))).transpose();
+                let (deletes, updates) = (read(&m.deletes_file)?, read(&m.updates_file)?);
+                verify_segment(m, Some(&self.map), deletes.as_deref(), updates.as_deref())
+            }
+        }
     }
 }
 

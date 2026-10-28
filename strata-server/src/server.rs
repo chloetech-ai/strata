@@ -33,6 +33,9 @@ pub struct Options {
     /// Open a database whose WAL was damaged after it was durable
     /// ([`DbOptions::wal_drop_damaged`]).
     pub wal_drop_damaged: bool,
+    /// Check every segment's checksum on opening
+    /// ([`DbOptions::verify_checksums`]).
+    pub verify_checksums: bool,
     /// Coordinate these shard servers (gRPC URLs; replicas of a shard
     /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
@@ -96,7 +99,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             return Err("--copy-from fills a new database: pass a --db that does not exist and its --schema".into());
         }
         let db = if path.exists() {
-            let db = Db::open(&path, DbOptions { wal_drop_damaged: o.wal_drop_damaged, ..db_options(o.directory) }).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let db = Db::open(&path, DbOptions { wal_drop_damaged: o.wal_drop_damaged, verify_checksums: o.verify_checksums, ..db_options(o.directory) }).map_err(|e| format!("open {}: {e}", path.display()))?;
             if let Some(what) = db.storage().damaged() {
                 eprintln!("strata-server: {} opened past damage: {what}", path.display());
             }

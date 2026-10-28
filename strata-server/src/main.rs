@@ -51,6 +51,12 @@ struct Args {
     /// start on such a database.
     #[arg(long)]
     wal_drop_damaged: bool,
+    /// Check every segment of the database against its checksum before
+    /// serving (reads the whole database once). A damaged newest version
+    /// is then skipped for the one before it, as when its manifest is
+    /// damaged.
+    #[arg(long)]
+    verify_checksums: bool,
     /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
     /// of one shard joined by '|').
     #[arg(long, value_delimiter = ',')]
@@ -201,6 +207,7 @@ async fn main() {
         demo_shard,
         directory: a.directory,
         wal_drop_damaged: a.wal_drop_damaged,
+        verify_checksums: a.verify_checksums,
         shards: a.shards,
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),

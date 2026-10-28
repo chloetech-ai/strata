@@ -112,6 +112,14 @@ pub struct DbOptions {
     /// `<wal>.damaged` first. Without it, opening such a database with
     /// `sync` fails. ([`Database::damaged`] says what was dropped.)
     pub wal_drop_damaged: bool,
+    /// Check every segment against its checksum when the database opens,
+    /// which reads every byte of it; a version whose segment fails is
+    /// damaged and opening falls back to the one before it. Without it a
+    /// segment is trusted as far as its structure checks go (a text list,
+    /// for one, is checked in full when first used) until
+    /// [`Database::check`] runs. Delete sets and updates are checked
+    /// either way, and merges check the segments they read.
+    pub verify_checksums: bool,
 }
 
 /// How a database is laid out on disk.
@@ -141,6 +149,7 @@ impl Default for DbOptions {
             publish_snapshots: false,
             layout: Layout::SingleFile,
             wal_drop_damaged: false,
+            verify_checksums: false,
         }
     }
 }
@@ -282,7 +291,7 @@ impl Database {
         let handles = manifest
             .tables
             .iter()
-            .map(|t| t.segments.iter().map(|m| SegHandle::open_in(path, m, opts.read_ahead, opts.read_ahead && opts.random_hints).map(Arc::new)).collect())
+            .map(|t| t.segments.iter().map(|m| SegHandle::open_in(path, m, opts.read_ahead, opts.read_ahead && opts.random_hints, opts.verify_checksums).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
         let meta = dir_meta(&cur);
         Database::assemble(path, path.join(dir::WAL), Some(path.to_path_buf()), lockf, opts, manifest, meta, 0, FreeList::new(META_PAGES), OwnedBytes::empty(), handles)
@@ -340,7 +349,7 @@ impl Database {
         let handles = manifest
             .tables
             .iter()
-            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints).map(Arc::new)).collect())
+            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints, opts.verify_checksums).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
         Ok((manifest, freelist, map, handles))
     }
@@ -361,7 +370,8 @@ impl Database {
         map: OwnedBytes,
         handles: Vec<Vec<Arc<SegHandle>>>,
     ) -> Result<Database> {
-        let (mut wal, txns) = Wal::open(&wal_path, meta.db_id, opts.sync, opts.wal_drop_damaged)?;
+        let fits = |table: u32, op: &Op| manifest.table(table).is_none_or(|t| op_fits(&t.schema, op));
+        let (mut wal, txns) = Wal::open(&wal_path, meta.db_id, opts.sync, opts.wal_drop_damaged, &fits)?;
         let wal_dropped = wal.dropped().map(str::to_string);
         let tables: Vec<TableState> = manifest
             .tables
@@ -834,6 +844,10 @@ impl Database {
         let mut docs: Vec<Document> = Vec::new();
         for &id in ids {
             let v = snap.segments().iter().find(|v| v.id == id).expect("selected from this snapshot");
+            // The merged segment gets a checksum of its own, so a damaged
+            // input must fail here rather than become a valid segment.
+            let h = lock(&self.state).handle(id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
+            h.verify(self.dir.as_deref())?;
             let n = v.file.n_docs() as DocId;
             let live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
             let mut got = source.documents(snap.schema(), &v.file, &live)?;
@@ -1150,8 +1164,8 @@ impl Database {
                     .iter()
                     .map(|m| match (old.iter().find(|h| h.meta == *m), &self.dir) {
                         (Some(h), _) => Ok(h.clone()),
-                        (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints).map(Arc::new),
-                        (None, None) => SegHandle::open(&map, m, hints).map(Arc::new),
+                        (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints, false).map(Arc::new),
+                        (None, None) => SegHandle::open(&map, m, hints, false).map(Arc::new),
                     })
                     .collect::<Result<Vec<_>>>()
             })
@@ -1979,6 +1993,33 @@ fn place_freelist(fl: &mut FreeList) -> (Extent, Vec<u8>) {
 
 fn pages_for(bytes: usize) -> u64 {
     (bytes as u64).div_ceil(PAGE).max(1)
+}
+
+/// Whether a logged operation is one a transaction on a table of `schema`
+/// could have committed (see [`WriteTxn`]'s checks). Replay takes one that
+/// is not, behind an intact checksum, as damage: applied, it would break
+/// what readers rely on.
+fn op_fits(schema: &Schema, op: &Op) -> bool {
+    let is_key = |k: &Value| {
+        schema.primary_key.is_some_and(|pk| matches!((&schema.fields[pk].ty, k), (FieldType::Keyword, Value::Str(_)) | (FieldType::Int, Value::Int(_))))
+    };
+    match op {
+        Op::Insert(doc) => validate(schema, doc).is_ok(),
+        Op::Delete(k) => is_key(k),
+        Op::Set { key, field, value } => {
+            let i = *field as usize;
+            is_key(key)
+                && Some(i) != schema.primary_key
+                && schema.fields.get(i).is_some_and(|f| {
+                    !f.multi
+                        && match (&f.ty, value) {
+                            (FieldType::Int, Value::Int(_)) | (FieldType::Int | FieldType::Float, Value::Null) => true,
+                            (FieldType::Float, Value::Float(x)) => x.is_finite(),
+                            _ => false,
+                        }
+                })
+        }
+    }
 }
 
 fn wal_path(path: &Path) -> PathBuf {

@@ -104,7 +104,14 @@ pub fn encode(values: &[u32], base: u32, span: u64, words: &mut Vec<u64>) -> u64
         let h = (x >> l) as usize + i;
         high[h / 64] |= 1u64 << (h % 64);
     }
-    // Sample s (1-based) is the position of zero number s * SAMPLE.
+    write_samples(high, &lay, samples);
+    n * l as u64 + lay.high_bits as u64 + 16 * lay.samples as u64
+}
+
+/// Writes the select samples of the high words `high` of layout `lay` into
+/// the zeroed `samples`: sample s (1-based) is the position of zero number
+/// s * SAMPLE.
+fn write_samples(high: &[u64], lay: &Layout, samples: &mut [u64]) {
     let mut zeros = 0u64;
     let mut s = 0usize;
     'outer: for (wi, &w) in high.iter().enumerate() {
@@ -133,7 +140,51 @@ pub fn encode(values: &[u32], base: u32, span: u64, words: &mut Vec<u64>) -> u64
         }
     }
     debug_assert_eq!(s, lay.samples);
-    n * l as u64 + lay.high_bits as u64 + 16 * lay.samples as u64
+}
+
+/// Checks an untrusted partition of `m` values spanning `span` (its
+/// `lay.words()` words, [`super::Loom::validate`]), reading only inside
+/// them: the high words hold exactly `m` one bits, the values they decode
+/// to rise strictly to `span - 1`, and the samples are the encoder's. The
+/// high words and samples are then exactly what [`encode`] writes for those
+/// values, and the low fields of the `m` values are theirs, which is all
+/// the cursors and decoders read. `scratch` is a reusable buffer.
+pub fn check(words: &[u64], lay: &Layout, m: usize, span: u64, scratch: &mut Vec<u64>) -> bool {
+    let (low, rest) = words.split_at(lay.low_words);
+    let (high, samples) = rest.split_at(lay.high_words);
+    let (l, mask) = (lay.l as usize, (1u64 << lay.l) - 1);
+    let (mut i, mut prev) = (0usize, 0u64);
+    for (wi, &w) in high.iter().enumerate() {
+        let mut w = w;
+        while w != 0 {
+            if i == m {
+                return false;
+            }
+            let pos = wi * 64 + w.trailing_zeros() as usize;
+            w &= w - 1;
+            let mut lo = 0;
+            if l > 0 {
+                let (q, r) = (i * l / 64, i * l % 64);
+                lo = low[q] >> r;
+                if r + l > 64 {
+                    lo |= low[q + 1] << (64 - r);
+                }
+            }
+            let v = (((pos - i) as u64) << l) | (lo & mask);
+            if i > 0 && v <= prev {
+                return false;
+            }
+            prev = v;
+            i += 1;
+        }
+    }
+    if i != m || prev != span - 1 {
+        return false;
+    }
+    scratch.clear();
+    scratch.resize(samples.len(), 0);
+    write_samples(high, lay, scratch);
+    scratch[..] == *samples
 }
 
 /// Read the `l`-bit low field starting at bit `bit` of the bytes at `low`
