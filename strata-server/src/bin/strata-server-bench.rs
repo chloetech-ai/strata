@@ -348,14 +348,14 @@ fn service(backend: Backend, schema: strata::Schema) -> Arc<Service> {
 async fn serve_http(svc: Arc<Service>) -> String {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    tokio::spawn(server::serve_http(svc, l, None));
+    tokio::spawn(server::serve_http(svc, l, Default::default()));
     format!("http://{addr}")
 }
 
 async fn serve_grpc(svc: Arc<Service>) -> String {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    tokio::spawn(server::serve_grpc(svc, l));
+    tokio::spawn(server::serve_grpc(svc, l, Default::default()));
     format!("http://{addr}")
 }
 

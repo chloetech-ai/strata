@@ -13,6 +13,7 @@ use strata::db::Db;
 use strata::query::Params;
 use strata::storage::DbOptions;
 use strata::value::Value;
+use strata_server::auth::{self, Access, Secret, Tls};
 use strata_server::service::{shard_of, AgentConfig, Backend, QueryReq, Service};
 use strata_server::coord::{CoordOptions, Coordinator};
 use strata_server::{demo, json as js, pb, server};
@@ -43,18 +44,35 @@ fn service(db: Db, base_url: &str) -> Arc<Service> {
 }
 
 async fn http(svc: Arc<Service>, token: Option<&str>) -> String {
+    http_with(svc, Access { token: token.map(Secret::new), ..Default::default() }).await
+}
+
+/// The server's URL, `https://localhost:port` with TLS.
+async fn http_with(svc: Arc<Service>, access: Access) -> String {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    let token = token.map(String::from);
-    tokio::spawn(server::serve_http(svc, l, token));
-    format!("http://{addr}")
+    let port = l.local_addr().unwrap().port();
+    let url = if access.tls.is_some() { format!("https://localhost:{port}") } else { format!("http://127.0.0.1:{port}") };
+    tokio::spawn(server::serve_http(svc, l, access));
+    url
 }
 
 async fn grpc(svc: Arc<Service>) -> String {
+    grpc_with(svc, Access::default()).await
+}
+
+async fn grpc_with(svc: Arc<Service>, access: Access) -> String {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(server::serve_grpc(svc, l));
-    format!("http://{addr}")
+    let port = l.local_addr().unwrap().port();
+    let url = if access.tls.is_some() { format!("https://localhost:{port}") } else { format!("http://127.0.0.1:{port}") };
+    tokio::spawn(server::serve_grpc(svc, l, access));
+    url
+}
+
+/// The test certificate for localhost and the CA that signed it.
+fn test_tls() -> (Tls, Vec<u8>) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tls");
+    let read = |f: &str| std::fs::read(dir.join(f)).unwrap();
+    (Tls { cert: read("cert.pem"), key: read("key.pem") }, read("ca.pem"))
 }
 
 async fn post(c: &reqwest::Client, url: &str, body: Json) -> (u16, Json) {
@@ -350,6 +368,104 @@ async fn a_token_guards_the_api() {
     // The UI page and health stay open, so the page can ask for the token.
     assert_eq!(c.get(format!("{base}/")).send().await.unwrap().status(), 200);
     assert_eq!(c.get(format!("{base}/v1/health")).send().await.unwrap().status(), 200);
+}
+
+/// OPS-1: the gRPC port took writes from anyone, a token on HTTP or not.
+/// Every gRPC call now needs the token, and a coordinator sends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_guards_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = Some(Secret::new("sh4rd"));
+    let url = grpc_with(service(create(dir.path(), "g.strata", |i| i < 100), "http://unused"), Access { token: token.clone(), ..Default::default() }).await;
+    let mut c = pb::strata_client::StrataClient::connect(url.clone()).await.unwrap();
+    let delete = pb::WriteRequest { sql: "DELETE FROM products".into(), ..Default::default() };
+    let e = c.write(delete.clone()).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unauthenticated);
+    let mut req = tonic::Request::new(delete);
+    req.metadata_mut().insert("authorization", "Bearer wrong".parse().unwrap());
+    assert_eq!(c.write(req).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+    assert!(c.health(pb::Empty {}).await.is_err());
+
+    let err = Coordinator::connect(vec![url.clone()]).await.err().unwrap();
+    assert!(err.message.contains("token"), "{}", err.message);
+    let coord = Coordinator::connect_with(vec![url], CoordOptions { token, ..Default::default() }).await.unwrap();
+    let svc = Arc::new(Service::new(Backend::Cluster(Arc::new(coord)), demo::schema(N), agent_config("http://unused"), 16, Duration::from_secs(10)));
+    let rs = svc.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.unwrap().rs;
+    assert_eq!(rs.rows[0][0], Value::Int(100));
+}
+
+/// Bug 14 and OPS-2: with no token, any web page could write through the
+/// visitor's browser: a text/plain POST to /v1/import needs no preflight,
+/// and a page that rebinds its own name to 127.0.0.1 reads answers too.
+#[tokio::test(flavor = "multi_thread")]
+async fn pages_on_other_sites_are_kept_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let hosts = auth::allowed_hosts("127.0.0.1".parse().unwrap(), &["db.internal".into()]);
+    let base = http_with(service(create(dir.path(), "b.strata", |i| i < 100), "http://unused"), Access { hosts, ..Default::default() }).await;
+    let host = base.trim_start_matches("http://").to_string();
+    let c = reqwest::Client::new();
+    let csv = "id,title\nx1,from a page\n";
+    let import = format!("{base}/v1/import?format=csv");
+
+    // The attack as the review sent it: refused for its origin, and for its
+    // content type even without one.
+    let r = c.post(&import).header("content-type", "text/plain").header("origin", "https://evil.example").body(csv).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    let r = c.post(&import).header("content-type", "text/plain").body(csv).send().await.unwrap();
+    assert_eq!(r.status(), 415);
+    let r = c.post(&import).body(csv).send().await.unwrap();
+    assert_eq!(r.status(), 415);
+    let count = json!({"sql": "SELECT COUNT(*) FROM products"});
+    assert_eq!(post(&c, &format!("{base}/v1/query"), count.clone()).await.1["rows"][0][0], 100);
+    // A JSON write from another origin, too.
+    let w = json!({"ops": [{"op": "delete", "key": "p0000001"}]});
+    let r = c.post(format!("{base}/v1/write")).header("origin", "https://evil.example").json(&w).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+
+    // The UI's own requests, and clients that say what they send, pass.
+    let r = c.post(&import).header("content-type", "text/csv").header("origin", format!("http://{host}")).body(csv).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = c.post(format!("{base}/v1/write")).header("origin", format!("http://{host}")).json(&w).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(post(&c, &format!("{base}/v1/query"), count).await.1["rows"][0][0], 100);
+
+    // DNS rebinding: the page's own host name, on every route.
+    let port = host.rsplit(':').next().unwrap();
+    for path in ["/", "/v1/health", "/v1/schema"] {
+        let r = c.get(format!("{base}{path}")).header("host", format!("evil.example:{port}")).send().await.unwrap();
+        assert_eq!(r.status(), 403, "{path}");
+    }
+    for name in ["localhost", "db.internal", "DB.internal."] {
+        let r = c.get(format!("{base}/v1/health")).header("host", format!("{name}:{port}")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{name}");
+    }
+}
+
+/// OPS-1: TLS on both listeners, and a coordinator that checks its shards'
+/// certificates against a CA.
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_on_both_listeners() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tls, ca) = test_tls();
+    let svc = service(create(dir.path(), "s.strata", |i| i < 100), "http://unused");
+    let access = Access { token: Some(Secret::new("t")), tls: Some(tls), ..Default::default() };
+    let base = http_with(svc.clone(), access.clone()).await;
+    let shard = grpc_with(svc, access).await;
+    assert!(base.starts_with("https://") && shard.starts_with("https://"));
+
+    let c = reqwest::Client::builder().add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap()).build().unwrap();
+    let r = c.post(format!("{base}/v1/query")).bearer_auth("t").json(&json!({"sql": "SELECT COUNT(*) FROM products"})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<Json>().await.unwrap()["rows"][0][0], 100);
+    // Plain HTTP to the TLS port gets nothing, and a client without the CA
+    // does not trust the certificate.
+    assert!(reqwest::get(base.replace("https://", "http://") + "/v1/health").await.is_err());
+    assert!(reqwest::get(format!("{base}/v1/health")).await.is_err());
+
+    let opts = |ca| CoordOptions { token: Some(Secret::new("t")), ca, ..Default::default() };
+    assert!(Coordinator::connect_with(vec![shard.clone()], opts(None)).await.is_err());
+    let coord = Coordinator::connect_with(vec![shard], opts(Some(ca))).await.unwrap();
+    assert_eq!(coord.schema.table, "products");
 }
 
 /// A coordinator over three shard servers answers like one database
@@ -715,7 +831,8 @@ async fn imports_files_over_http() {
     let c = reqwest::Client::new();
 
     let jsonl = (0..2500).map(|i| json!({"id": format!("i{i}"), "title": format!("item number {i}"), "tags": ["a", "b"], "price": i, "colour": "red"}).to_string()).collect::<Vec<_>>().join("\n");
-    let r = c.post(format!("{base}/v1/import?format=jsonl")).body(jsonl).send().await.unwrap();
+    let ndjson = "application/x-ndjson";
+    let r = c.post(format!("{base}/v1/import?format=jsonl")).header("content-type", ndjson).body(jsonl).send().await.unwrap();
     let (status, r): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
     assert_eq!((status, &r["written"], &r["skipped_fields"]), (200, &json!(2500), &json!(["colour"])), "{r}");
 
@@ -733,12 +850,15 @@ async fn imports_files_over_http() {
     assert_eq!(r["rows"][0][0], json!("new"), "{r}");
 
     // A bad row names its line; no format is an error.
-    let r = c.post(format!("{base}/v1/import?format=jsonl")).body("{\"id\": \"ok\"}\n{\"id\": \"bad\", \"price\": \"cheap\"}\n").send().await.unwrap();
+    let r = c.post(format!("{base}/v1/import?format=jsonl")).header("content-type", ndjson).body("{\"id\": \"ok\"}\n{\"id\": \"bad\", \"price\": \"cheap\"}\n").send().await.unwrap();
     let (status, r): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
     assert_eq!(status, 400);
     assert!(r["error"].as_str().unwrap().contains("line 2"), "{r}");
-    let r = c.post(format!("{base}/v1/import")).body("id\nx\n").send().await.unwrap();
+    let r = c.post(format!("{base}/v1/import")).header("content-type", "application/octet-stream").body("id\nx\n").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 400);
+    // No content type at all is what a page's Blob upload sends.
+    let r = c.post(format!("{base}/v1/import?format=csv")).body("id\nx\n").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 415);
 
     // The schema in its short form, and a schema checked.
     let r: Json = c.get(format!("{base}/v1/schema")).send().await.unwrap().json().await.unwrap();

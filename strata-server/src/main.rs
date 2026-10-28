@@ -3,6 +3,7 @@
 //! ```text
 //! strata-server --demo 20000 --db products.strata      # a demo catalogue, UI at http://127.0.0.1:7700
 //! strata-server --db my.strata                         # an existing database
+//! STRATA_TOKEN=... strata-server --db my.strata --listen 0.0.0.0:7700   # beyond loopback: a token
 //! strata-server --shards http://a:7701,http://b:7701   # a coordinator over shard servers
 //! strata-server --shards 'http://a0:7701|http://a1:7701,http://b0:7701|http://b1:7701'   # two replicas each
 //! strata-server --db new.strata --schema new.json --copy-from my.strata   # re-embed into a new schema
@@ -13,6 +14,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use strata_server::auth::{self, Access, Secret, Tls};
 use strata_server::server::{self, Options};
 
 #[derive(Parser)]
@@ -65,9 +67,32 @@ struct Args {
     /// gRPC address ("off" to disable).
     #[arg(long, default_value = "127.0.0.1:7701")]
     grpc: String,
-    /// Require "Authorization: Bearer TOKEN" on the API (the UI asks for it).
-    #[arg(long, env = "STRATA_TOKEN")]
+    /// Require "Authorization: Bearer TOKEN" on the API and on gRPC (the
+    /// UI asks for it). Needed to listen beyond loopback.
+    #[arg(long, env = "STRATA_TOKEN", hide_env_values = true)]
     token: Option<String>,
+    /// Listen beyond loopback without --token: anyone who can reach the
+    /// ports can read and write.
+    #[arg(long)]
+    no_token: bool,
+    /// Also answer HTTP requests for this host name (repeatable). On
+    /// loopback the server answers only to localhost, 127.0.0.1 and ::1, so
+    /// that a web page cannot reach it by DNS rebinding.
+    #[arg(long)]
+    allow_host: Vec<String>,
+    /// Serve HTTP and gRPC over TLS with this certificate chain (PEM).
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// The private key of --tls-cert (PEM).
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// With --shards: the token the shards require (default: --token).
+    #[arg(long, env = "STRATA_SHARD_TOKEN", hide_env_values = true)]
+    shard_token: Option<String>,
+    /// With --shards: a CA certificate (PEM) for https:// shards, besides
+    /// the public roots.
+    #[arg(long)]
+    shard_ca: Option<PathBuf>,
     /// Default query deadline.
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
@@ -150,6 +175,15 @@ async fn main() {
         let (i, n) = s.split_once('/').unwrap_or_else(|| fail("--demo-shard is I/N"));
         (i.parse().unwrap_or_else(|_| fail("--demo-shard is I/N")), n.parse().unwrap_or_else(|_| fail("--demo-shard is I/N")))
     });
+    let read = |p: &PathBuf| std::fs::read(p).unwrap_or_else(|e| fail(&format!("read {}: {e}", p.display())));
+    let tls = match (&a.tls_cert, &a.tls_key) {
+        (Some(c), Some(k)) => Some(Tls { cert: read(c), key: read(k) }),
+        _ => None,
+    };
+    if let Some(t) = &tls {
+        auth::server_config(t).unwrap_or_else(|e| fail(&e));
+    }
+    let token = a.token.clone().filter(|t| !t.is_empty()).map(Secret::new);
     let o = Options {
         db: a.db,
         schema: a.schema,
@@ -162,6 +196,8 @@ async fn main() {
             hedge: std::time::Duration::from_millis(a.hedge_ms),
             shard_timeout: (a.shard_timeout_ms > 0).then(|| std::time::Duration::from_millis(a.shard_timeout_ms)),
             partial: a.partial,
+            token: a.shard_token.clone().filter(|t| !t.is_empty()).map(Secret::new).or_else(|| token.clone()),
+            ca: a.shard_ca.as_ref().map(read),
             ..Default::default()
         },
         timeout_ms: a.timeout_ms,
@@ -174,30 +210,41 @@ async fn main() {
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
-    let http = tokio::net::TcpListener::bind(&a.listen).await.unwrap_or_else(|e| fail(&format!("listen on {}: {e}", a.listen)));
+    let bind = |addr: &str| {
+        let addr = addr.to_string();
+        let open = token.is_none() && !a.no_token;
+        async move {
+            let l = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}")));
+            let ip = l.local_addr().unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}"))).ip();
+            if open && !ip.is_loopback() {
+                fail(&format!("{addr} is reachable beyond this machine: set --token (or $STRATA_TOKEN), or pass --no-token to serve it open"));
+            }
+            (l, ip)
+        }
+    };
+    let (http, ip) = bind(&a.listen).await;
+    let access = Access { token: token.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls };
     let h = svc.health().await;
     eprintln!("strata-server: table {} ({} rows, {} segments)", svc.schema.table, h["docs"], h["segments"]);
-    let ui = match &a.token {
-        Some(t) => format!("http://{}/?token={t}", a.listen),
-        None => format!("http://{}/", a.listen),
-    };
-    eprintln!("strata-server: HTTP and UI on {ui}");
+    let scheme = if access.tls.is_some() { "https" } else { "http" };
+    let asks = if access.token.is_some() { " (it asks for the token)" } else { "" };
+    eprintln!("strata-server: HTTP and UI on {scheme}://{}/{asks}", a.listen);
     if svc.agent.api_key.is_none() {
         eprintln!("strata-server: no ANTHROPIC_API_KEY; the agent asks for a key in the UI");
     }
     let mut tasks = Vec::new();
     // A coordinator answers queries but is not itself a shard.
     if a.grpc != "off" && !coordinator {
-        let l = tokio::net::TcpListener::bind(&a.grpc).await.unwrap_or_else(|e| fail(&format!("listen on {}: {e}", a.grpc)));
-        eprintln!("strata-server: gRPC on {}", a.grpc);
-        let svc = svc.clone();
+        let (l, _) = bind(&a.grpc).await;
+        eprintln!("strata-server: gRPC on {}{}", a.grpc, if access.tls.is_some() { " (TLS)" } else { "" });
+        let (svc, access) = (svc.clone(), access.clone());
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = server::serve_grpc(svc, l).await {
+            if let Err(e) = server::serve_grpc(svc, l, access).await {
                 eprintln!("strata-server: gRPC stopped: {e}");
             }
         }));
     }
-    if let Err(e) = server::serve_http(svc, http, a.token).await {
+    if let Err(e) = server::serve_http(svc, http, access).await {
         fail(&format!("HTTP server: {e}"));
     }
     for t in tasks {

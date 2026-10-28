@@ -64,7 +64,8 @@ spec:
               r=${HOSTNAME##*-}
               f=/data/${COLLECTION}.shard${SHARD}of${SHARDS}.strata
               [ "$r" = 0 ] || f=/data/${COLLECTION}.shard${SHARD}of${SHARDS}.r$r.strata
-              exec strata-server --db "$f" --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701
+              # A test cluster, served open (see README.md, Security).
+              exec strata-server --db "$f" --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701 --no-token
           ports:
             - {name: http, containerPort: 7700}
             - {name: grpc, containerPort: 7701}

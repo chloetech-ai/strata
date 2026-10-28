@@ -90,7 +90,7 @@ jobs:
           ./target/release/strata-server import --db "$RUNNER_TEMP/t.strata" --schema "$RUNNER_TEMP/t.json" "$RUNNER_TEMP/t.jsonl"
           ./target/release/strata-server --db "$RUNNER_TEMP/t.strata" --listen 127.0.0.1:7702 --grpc off &
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:7702/v1/health && break; sleep 1; done
-          printf 'id,title\nc,third row\n' | curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=csv' --data-binary @- | grep -q '"written":1'
+          printf 'id,title\nc,third row\n' | curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=csv' -H 'content-type: text/csv' --data-binary @- | grep -q '"written":1'
           curl -sf http://127.0.0.1:7702/v1/health | grep -q '"docs":3'
 
   python:

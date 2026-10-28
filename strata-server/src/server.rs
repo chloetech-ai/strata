@@ -11,6 +11,7 @@ use strata::segment::build::BuildOptions;
 use strata::storage::{DbOptions, Layout, MergePolicy};
 use tokio::net::TcpListener;
 
+use crate::auth::{self, Access};
 use crate::coord::{CoordOptions, Coordinator};
 use crate::service::{shard_of, AgentConfig, Backend, Service};
 use crate::{demo, grpc, http, pb};
@@ -212,11 +213,44 @@ pub fn spawn_maintenance(db: Arc<Db>) {
     });
 }
 
-pub async fn serve_http(svc: Arc<Service>, listener: TcpListener, token: Option<String>) -> std::io::Result<()> {
-    axum::serve(listener, http::router(svc, token)).with_graceful_shutdown(shutdown()).await
+/// Serves the HTTP API and UI, over TLS with `access.tls`.
+pub async fn serve_http(svc: Arc<Service>, listener: TcpListener, access: Access) -> std::io::Result<()> {
+    let router = http::router(svc, &access);
+    let Some(tls) = &access.tls else {
+        return axum::serve(listener, router).with_graceful_shutdown(shutdown()).await;
+    };
+    let config = auth::server_config(tls).map_err(std::io::Error::other)?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    let service = hyper_util::service::TowerToHyperService::new(router);
+    let stop = shutdown();
+    tokio::pin!(stop);
+    loop {
+        let (tcp, _) = tokio::select! {
+            r = listener.accept() => match r {
+                Ok(c) => c,
+                // Out of descriptors, say: wait rather than spin.
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = &mut stop => return Ok(()),
+        };
+        let _ = tcp.set_nodelay(true);
+        let (acceptor, service) = (acceptor.clone(), service.clone());
+        tokio::spawn(async move {
+            // A client that never finishes its handshake holds a task, not
+            // the accept loop.
+            let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await else { return };
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new()).serve_connection_with_upgrades(io, service).await;
+        });
+    }
 }
 
-pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener) -> Result<(), tonic::transport::Error> {
+/// Serves gRPC: every call needs `access.token`, over TLS with
+/// `access.tls`.
+pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access) -> Result<(), tonic::transport::Error> {
     use tokio_stream::StreamExt;
     // A gRPC answer is several small writes (headers, data, trailers); with
     // Nagle's algorithm on, the last waits for the client's delayed ACK and
@@ -227,8 +261,18 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener) -> Result<(), 
         }
         s
     });
-    tonic::transport::Server::builder()
-        .add_service(pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(256 << 20).max_encoding_message_size(256 << 20))
+    let token = access.token.clone();
+    let check = move |req: tonic::Request<()>| match &token {
+        Some(t) if !t.admits(req.metadata().get("authorization").and_then(|v| v.to_str().ok())) => Err(tonic::Status::unauthenticated("missing or wrong token")),
+        _ => Ok(req),
+    };
+    let service = pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(256 << 20).max_encoding_message_size(256 << 20);
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = &access.tls {
+        builder = builder.tls_config(tonic::transport::ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(&tls.cert, &tls.key)))?;
+    }
+    builder
+        .add_service(tonic::service::interceptor::InterceptedService::new(service, check))
         .serve_with_incoming_shutdown(incoming, shutdown())
         .await
 }
