@@ -1,8 +1,13 @@
-# A set of N shards: pod i serves /data/<collection>.shard<i>of<N>.strata
-# (as strata-server-bench --build-only splits it) over gRPC, to the
-# coordinator. The set's name carries N, so a set of another size can start
-# beside it before the coordinator moves over; `deploy/kind-test.sh shards N`
-# writes this file for another N.
+# A set of N shards, each served by R replicas: replica r of shard i is pod
+# strata-shards-<N>-s<i>-<r> and serves /data/<collection>.shard<i>of<N>.strata
+# (as strata-server-bench --build-only splits it; replica r > 0 its own copy,
+# ...shard<i>of<N>.r<r>.strata, since a database file is open in one process
+# at a time). Replicas of one shard run on different nodes.
+#
+# This file holds the set's Service and shard 0 of 2 with 2 replicas;
+# `deploy/kind-test.sh shards N R` writes one StatefulSet per shard from it,
+# and the set's name carries N, so a set of another size can start beside it
+# before the coordinator moves over.
 apiVersion: v1
 kind: Service
 metadata:
@@ -18,19 +23,26 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: strata-shards-2
+  name: strata-shards-2-s0
   namespace: strata
 spec:
   serviceName: strata-shards-2
   replicas: 2
   podManagementPolicy: Parallel
   selector:
-    matchLabels: {app: strata-shard, shards: "2"}
+    matchLabels: {app: strata-shard, shards: "2", shard: "0"}
   template:
     metadata:
-      labels: {app: strata-shard, shards: "2"}
+      labels: {app: strata-shard, shards: "2", shard: "0"}
     spec:
-      # One shard per node where there are enough nodes.
+      affinity:
+        # Never two replicas of a shard on one node.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: strata-shard, shards: "2", shard: "0"}
+      # And the set's shards spread over the nodes.
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
@@ -44,10 +56,15 @@ spec:
           env:
             - {name: COLLECTION, value: quora}
             - {name: SHARDS, value: "2"}
-          # The pod's ordinal (strata-shards-2-<i>) picks its file.
+            - {name: SHARD, value: "0"}
+          # The pod's ordinal is its replica number, which picks its file.
           command: ["sh", "-c"]
           args:
-            - exec strata-server --db /data/${COLLECTION}.shard${HOSTNAME##*-}of${SHARDS}.strata --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701
+            - |
+              r=${HOSTNAME##*-}
+              f=/data/${COLLECTION}.shard${SHARD}of${SHARDS}.strata
+              [ "$r" = 0 ] || f=/data/${COLLECTION}.shard${SHARD}of${SHARDS}.r$r.strata
+              exec strata-server --db "$f" --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701
           ports:
             - {name: http, containerPort: 7700}
             - {name: grpc, containerPort: 7701}

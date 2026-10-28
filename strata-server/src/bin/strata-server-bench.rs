@@ -473,7 +473,8 @@ async fn remote(args: &Args) -> Result<(), String> {
 }
 
 /// Sends every kind in turn from `concurrency` clients for `seconds`, and
-/// prints each second's answers (by when they arrived), errors and latency.
+/// prints each second's answers (by when they arrived), how many of them a
+/// coordinator gave without some shards, errors and latency.
 async fn watch(client: &reqwest::Client, base: &str, kinds: &[(&'static str, Vec<Json>)], concurrency: usize, seconds: f64) -> Vec<Json> {
     let longest = kinds.iter().map(|(_, r)| r.len()).max().unwrap_or(0);
     let mixed: Vec<Json> = (0..longest).flat_map(|i| kinds.iter().filter_map(move |(_, r)| r.get(i).cloned())).collect();
@@ -481,7 +482,8 @@ async fn watch(client: &reqwest::Client, base: &str, kinds: &[(&'static str, Vec
     let url = format!("{base}/v1/query");
     let t0 = Instant::now();
     let next = Arc::new(AtomicUsize::new(0));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, f64, Option<String>)>();
+    // (second, ms, partial, error)
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, f64, bool, Option<String>)>();
     for _ in 0..concurrency {
         let (client, url, bodies, next, tx) = (client.clone(), url.clone(), bodies.clone(), next.clone(), tx.clone());
         tokio::spawn(async move {
@@ -489,32 +491,45 @@ async fn watch(client: &reqwest::Client, base: &str, kinds: &[(&'static str, Vec
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let start = Instant::now();
                 let r = client.post(&url).header("content-type", "application/json").body(bodies[i % bodies.len()].clone()).timeout(Duration::from_secs(10)).send().await;
-                let error = match r {
-                    Ok(r) if r.status().is_success() => r.bytes().await.err().map(|e| e.to_string()),
-                    Ok(r) => Some(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())),
-                    Err(e) => Some(e.to_string()),
+                let (partial, error) = match r {
+                    Ok(r) if r.status().is_success() => match r.json::<Json>().await {
+                        Ok(j) => (j.get("partial").is_some(), None),
+                        Err(e) => (false, Some(e.to_string())),
+                    },
+                    Ok(r) => (false, Some(format!("{}: {}", r.status(), r.text().await.unwrap_or_default()))),
+                    Err(e) => (false, Some(e.to_string())),
                 };
-                let _ = tx.send((t0.elapsed().as_secs() as usize, start.elapsed().as_secs_f64() * 1e3, error));
+                let _ = tx.send((t0.elapsed().as_secs() as usize, start.elapsed().as_secs_f64() * 1e3, partial, error));
             }
         });
     }
     drop(tx);
-    // Per second: latencies of the answers, errors, and the first error.
-    let mut secs: Vec<(Vec<f64>, usize, Option<String>)> = Vec::new();
-    let show = |s: usize, (ms, errors, first): &(Vec<f64>, usize, Option<String>)| {
+    // Per second: latencies of the answers, partial answers, errors, and
+    // the first error.
+    type Second = (Vec<f64>, usize, usize, Option<String>);
+    let mut secs: Vec<Second> = Vec::new();
+    let show = |s: usize, (ms, partial, errors, first): &Second| {
         let first = first.as_deref().map(|e| format!("  first error: {}", e.chars().take(160).collect::<String>())).unwrap_or_default();
-        eprintln!("t={s:<4} ok {:>6}  errors {errors:>5}  p50 {:>8.3} ms  p99 {:>8.3} ms{first}", ms.len(), percentile(ms, 50.0), percentile(ms, 99.0));
+        eprintln!(
+            "t={s:<4} ok {:>6}  partial {partial:>5}  errors {errors:>5}  p50 {:>8.3} ms  p99 {:>8.3} ms{first}",
+            ms.len(),
+            percentile(ms, 50.0),
+            percentile(ms, 99.0)
+        );
     };
     let mut shown = 0;
-    while let Some((s, ms, error)) = rx.recv().await {
+    while let Some((s, ms, partial, error)) = rx.recv().await {
         if secs.len() <= s {
             secs.resize(s + 1, Default::default());
         }
         match error {
-            None => secs[s].0.push(ms),
+            None => {
+                secs[s].0.push(ms);
+                secs[s].1 += partial as usize;
+            }
             Some(e) => {
-                secs[s].1 += 1;
-                secs[s].2.get_or_insert(e);
+                secs[s].2 += 1;
+                secs[s].3.get_or_insert(e);
             }
         }
         while shown < s {
@@ -528,9 +543,9 @@ async fn watch(client: &reqwest::Client, base: &str, kinds: &[(&'static str, Vec
     }
     secs.iter()
         .enumerate()
-        .map(|(s, (ms, errors, first))| {
+        .map(|(s, (ms, partial, errors, first))| {
             json!({
-                "second": s, "ok": ms.len(), "errors": errors,
+                "second": s, "ok": ms.len(), "partial": partial, "errors": errors,
                 "p50_ms": percentile(ms, 50.0), "p99_ms": percentile(ms, 99.0), "max_ms": ms.iter().cloned().fold(0.0, f64::max),
                 "first_error": first,
             })

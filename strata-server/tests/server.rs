@@ -14,7 +14,8 @@ use strata::query::Params;
 use strata::storage::DbOptions;
 use strata::value::Value;
 use strata_server::service::{shard_of, AgentConfig, Backend, QueryReq, Service};
-use strata_server::{coord::Coordinator, demo, json as js, server};
+use strata_server::coord::{CoordOptions, Coordinator};
+use strata_server::{demo, json as js, pb, server};
 use tokio::net::TcpListener;
 
 const N: usize = 3000;
@@ -352,6 +353,122 @@ async fn coordinator_answers_like_one_database() {
     drop(dead);
     let err = Coordinator::connect(vec![urls[0].clone(), "http://127.0.0.1:1".into()]).await.err().unwrap();
     assert!(err.message.contains("127.0.0.1:1"), "{}", err.message);
+}
+
+/// A shard server that answers `Schema` and never anything else, like one
+/// whose machine froze after the coordinator started.
+struct Stuck(String);
+
+#[tonic::async_trait]
+impl pb::strata_server::Strata for Stuck {
+    async fn query(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn term_stats(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::TermStatsResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn write(&self, _: tonic::Request<pb::WriteRequest>) -> Result<tonic::Response<pb::WriteResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn schema(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::SchemaResponse>, tonic::Status> {
+        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone() }))
+    }
+    async fn health(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+}
+
+async fn stuck(schema: &strata::Schema) -> String {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let svc = pb::strata_server::StrataServer::new(Stuck(serde_json::to_string(schema).unwrap()));
+    tokio::spawn(tonic::transport::Server::builder().add_service(svc).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
+    format!("http://{addr}")
+}
+
+fn cluster(c: Coordinator) -> Arc<Service> {
+    let schema = c.schema.clone();
+    Arc::new(Service::new(Backend::Cluster(Arc::new(c)), schema, agent_config("http://unused"), 16, Duration::from_secs(10)))
+}
+
+/// With two replicas, a shard whose first replica is down or hangs still
+/// answers, as one database would, and quickly. A shard with no replica
+/// answering fails the query, or, with partial answers allowed, is left
+/// out and named. Writes reach every replica.
+#[tokio::test(flavor = "multi_thread")]
+async fn replicas_cover_for_a_shard_down_or_hung() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = create(dir.path(), "whole.strata", |_| true);
+    let key = |i: usize| Value::Str(format!("p{i:07}"));
+    let mut good = Vec::new();
+    for s in 0..2 {
+        let mut replicas = Vec::new();
+        for r in 0..2 {
+            let db = create(dir.path(), &format!("s{s}r{r}.strata"), |i| shard_of(&key(i), 2) == s);
+            replicas.push(grpc(service(db, "http://unused")).await);
+        }
+        good.push(replicas);
+    }
+    let dead = "http://127.0.0.1:1".to_string();
+    let hung = stuck(whole.schema()).await;
+
+    // Shard 0's first replica refuses connections; shard 1's never answers.
+    let opts = CoordOptions { hedge: Duration::from_millis(50), ..Default::default() };
+    let c = Coordinator::connect_with(vec![format!("{dead}|{}", good[0][0]), format!("{hung}|{}", good[1][0])], opts.clone()).await.unwrap();
+    let coord = cluster(c);
+    for (sql, params) in queries() {
+        let p = if params["q"].is_object() { Params::new().set("q", demo::product(42, 7)[12].clone()) } else { Params::new() };
+        let want = js::result(&whole.query(sql, &p).unwrap(), 0.0);
+        let params = coord.params(Some(&params)).await.unwrap();
+        let t = std::time::Instant::now();
+        let got = coord.query(QueryReq { sql: sql.into(), params, ..Default::default() }).await.unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2), "{sql}: {:?}", t.elapsed());
+        assert!(got.missing.is_empty());
+        same(sql, &want, &js::result(&got.rs, 0.0));
+    }
+    let h = coord.health().await;
+    assert_eq!(h["status"], "degraded", "{h}");
+    assert_eq!(h["docs"].as_u64(), Some(N as u64), "{h}");
+    assert!(h["retries"].as_u64().unwrap() >= 1 && h["hedges"].as_u64().unwrap() >= 1, "{h}");
+
+    // Shard 1 with no replica answering, given up after 200 ms.
+    let sql = "SELECT id, score() FROM products ORDER BY bm25(body, 'waterproof hiking boots') DESC LIMIT 10";
+    let opts = CoordOptions { shard_timeout: Some(Duration::from_millis(200)), ..opts };
+    let c = Coordinator::connect_with(vec![good[0][1].clone(), hung.clone()], opts.clone()).await.unwrap();
+    let strict = cluster(c);
+    let t = std::time::Instant::now();
+    let err = strict.query(QueryReq { sql: sql.into(), ..Default::default() }).await.err().unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(err.status, 504, "{}", err.message);
+    assert!(err.message.contains(&hung), "{}", err.message);
+    let a = strict.query(QueryReq { sql: sql.into(), partial: Some(true), ..Default::default() }).await.unwrap();
+    assert_eq!(a.missing, vec![hung.clone()]);
+    assert!(!a.rs.rows.is_empty());
+    for row in &a.rs.rows {
+        assert_eq!(shard_of(&row[0], 2), 0, "{row:?}");
+    }
+    // Scored over the shard that answered, as a database of its documents would.
+    let only0 = create(dir.path(), "only0.strata", |i| shard_of(&key(i), 2) == 0);
+    same(sql, &js::result(&only0.query(sql, &Params::new()).unwrap(), 0.0), &js::result(&a.rs, 0.0));
+    let c = Coordinator::connect_with(vec![good[0][1].clone(), hung.clone()], CoordOptions { partial: true, ..opts }).await.unwrap();
+    let lenient = cluster(c);
+    assert_eq!(lenient.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap().missing, vec![hung.clone()]);
+    assert!(lenient.query(QueryReq { sql: sql.into(), partial: Some(false), ..Default::default() }).await.is_err());
+
+    // Writes go to every replica of their shard.
+    let c = Coordinator::connect(vec![good[0].join("|"), good[1].join("|")]).await.unwrap();
+    let both = cluster(c);
+    let ids: Vec<String> = (0..20).map(|i| format!("rep{i}")).collect();
+    let values: Vec<String> = ids.iter().map(|id| format!("('{id}', 'Tent {id}', 'outdoor', 10.0, 0)")).collect();
+    both.sql(&format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), 0).await.unwrap();
+    let h = both.health().await;
+    assert_eq!(h["status"], "ok", "{h}");
+    for (s, shard) in h["shards"].as_array().unwrap().iter().enumerate() {
+        let want = (0..N).filter(|&i| shard_of(&key(i), 2) == s).count() + ids.iter().filter(|id| shard_of(&Value::Str(id.to_string()), 2) == s).count();
+        for r in shard["replicas"].as_array().unwrap() {
+            assert_eq!(r["docs"].as_u64(), Some(want as u64), "shard {s}: {r}");
+        }
+    }
 }
 
 /// The agent's tool loop, against a stand-in for the Messages API that

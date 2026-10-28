@@ -6,8 +6,8 @@
 #   STRATA_WORK=/path/to/dbs STRATA_DATA=/path/to/beir deploy/kind-test.sh up
 #   deploy/kind-test.sh image                 # build the image and load it into the nodes
 #   deploy/kind-test.sh single                # the unsplit database
-#   deploy/kind-test.sh shards 2              # shards 0..1 of /data/quora.shard<i>of2.strata
-#   deploy/kind-test.sh coordinator 2         # point the coordinator at that set
+#   deploy/kind-test.sh shards 2 [R]          # shards 0..1 of /data/quora.shard<i>of2.strata, R replicas each
+#   deploy/kind-test.sh coordinator 2 [R] [ARGS...]   # point the coordinator at that set
 #   deploy/kind-test.sh bench NAME ARGS...    # strata-server-bench as a Job in the cluster
 #   deploy/kind-test.sh crash POD             # SIGKILL POD's server; the kubelet restarts it
 #   deploy/kind-test.sh delete POD            # stop POD gracefully; its controller replaces it
@@ -61,15 +61,42 @@ single)
     $K rollout status deploy/strata-single --timeout=300s
     ;;
 shards)
-    n=${1:?shards N}
-    sed -e "s/strata-shards-2/strata-shards-$n/g" -e "s/shards: \"2\"/shards: \"$n\"/g" \
-        -e "s/replicas: 2/replicas: $n/" -e "s/value: \"2\"/value: \"$n\"/" "$HERE/k8s/shards.yaml" | $K apply -f -
-    $K rollout status "statefulset/strata-shards-$n" --timeout=300s
+    n=${1:?shards N [R]}
+    r=${2:-1}
+    # Replica k > 0 of a shard serves its own copy of the shard's file
+    # (a clone on APFS, so instant and sharing the disk blocks).
+    for i in $(seq 0 $((n - 1))); do
+        for k in $(seq 1 $((r - 1))); do
+            base="${STRATA_WORK:?set STRATA_WORK for replica copies}/quora.shard${i}of${n}"
+            [ -e "$base.r$k.strata" ] || cp -c "$base.strata" "$base.r$k.strata" 2>/dev/null || cp "$base.strata" "$base.r$k.strata"
+        done
+    done
+    # The set's Service, then one StatefulSet per shard.
+    awk '/^---$/ {exit} {print}' "$HERE/k8s/shards.yaml" | sed -e "s/strata-shards-2/strata-shards-$n/g" -e "s/shards: \"2\"/shards: \"$n\"/g" | $K apply -f -
+    for i in $(seq 0 $((n - 1))); do
+        awk 'f {print} /^---$/ {f = 1}' "$HERE/k8s/shards.yaml" | sed -e "s/strata-shards-2/strata-shards-$n/g" -e "s/shards: \"2\"/shards: \"$n\"/g" \
+            -e "s/strata-shards-$n-s0/strata-shards-$n-s$i/" -e "s/shard: \"0\"/shard: \"$i\"/g" \
+            -e "s/replicas: 2/replicas: $r/" -e "s/name: SHARDS, value: \"2\"/name: SHARDS, value: \"$n\"/" -e "s/name: SHARD, value: \"0\"/name: SHARD, value: \"$i\"/" | $K apply -f -
+    done
+    for i in $(seq 0 $((n - 1))); do
+        $K rollout status "statefulset/strata-shards-$n-s$i" --timeout=300s
+    done
     ;;
 coordinator)
-    n=${1:?coordinator N}
-    urls=$(for i in $(seq 0 $((n - 1))); do printf 'http://strata-shards-%s-%s.strata-shards-%s:7701,' "$n" "$i" "$n"; done)
-    sed -e "s|--shards=.*|--shards=${urls%,}|" "$HERE/k8s/coordinator.yaml" | $K apply -f -
+    n=${1:?coordinator N [R] [ARGS...]}
+    r=${2:-1}
+    shift $(($# < 2 ? $# : 2))
+    urls=""
+    for i in $(seq 0 $((n - 1))); do
+        group=""
+        for k in $(seq 0 $((r - 1))); do
+            group="$group|http://strata-shards-$n-s$i-$k.strata-shards-$n:7701"
+        done
+        urls="$urls,${group#|}"
+    done
+    extra=$(for a in "$@"; do printf '            - %s\n' "$a"; done)
+    URLS=${urls#,} EXTRA=$extra awk '/- --shards=/ { sub(/--shards=.*/, "--shards=" ENVIRON["URLS"]); print; if (ENVIRON["EXTRA"] != "") print ENVIRON["EXTRA"]; next } { print }' \
+        "$HERE/k8s/coordinator.yaml" | $K apply -f -
     $K rollout status deploy/strata-coordinator --timeout=300s
     ;;
 bench)

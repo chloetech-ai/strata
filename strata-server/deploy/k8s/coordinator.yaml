@@ -1,5 +1,10 @@
 # The coordinator: answers queries over HTTP by asking every shard of a set
 # over gRPC and merging. It holds no data, so it can run several replicas.
+# --shards lists the shards, comma-separated, and each shard's replicas
+# joined by '|': one replica of each shard answers a query, another when it
+# fails or has not answered after --hedge-ms (default 100). `kind-test.sh
+# coordinator N R [ARGS...]` points it at the set of N shards × R replicas,
+# adding ARGS (such as --partial --shard-timeout-ms=500).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,7 +24,7 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --listen=0.0.0.0:7700
-            - --shards=http://strata-shards-2-0.strata-shards-2:7701,http://strata-shards-2-1.strata-shards-2:7701
+            - --shards=http://strata-shards-2-s0-0.strata-shards-2:7701|http://strata-shards-2-s0-1.strata-shards-2:7701,http://strata-shards-2-s1-0.strata-shards-2:7701|http://strata-shards-2-s1-1.strata-shards-2:7701
           ports:
             - {name: http, containerPort: 7700}
           readinessProbe:

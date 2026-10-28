@@ -4,6 +4,7 @@
 //! strata-server --demo 20000 --db products.strata      # a demo catalogue, UI at http://127.0.0.1:7700
 //! strata-server --db my.strata                         # an existing database
 //! strata-server --shards http://a:7701,http://b:7701   # a coordinator over shard servers
+//! strata-server --shards 'http://a0:7701|http://a1:7701,http://b0:7701|http://b1:7701'   # two replicas each
 //! ```
 
 use std::path::PathBuf;
@@ -29,9 +30,22 @@ struct Args {
     /// Create a new database as a directory of segment files.
     #[arg(long)]
     directory: bool,
-    /// Coordinate these shard servers (comma-separated gRPC URLs).
+    /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
+    /// of one shard joined by '|').
     #[arg(long, value_delimiter = ',')]
     shards: Vec<String>,
+    /// With --shards: ask another replica of a shard when one has not
+    /// answered after this many milliseconds.
+    #[arg(long, default_value_t = 100)]
+    hedge_ms: u64,
+    /// With --shards: give up on a shard after this many milliseconds (0:
+    /// at the query's deadline).
+    #[arg(long, default_value_t = 0)]
+    shard_timeout_ms: u64,
+    /// With --shards: answer without shards that have no replica answering,
+    /// flagged "partial" (a request's "partial" overrides it).
+    #[arg(long)]
+    partial: bool,
     /// HTTP address (API, metrics, UI).
     #[arg(long, default_value = "127.0.0.1:7700")]
     listen: String,
@@ -72,6 +86,12 @@ async fn main() {
         demo_shard,
         directory: a.directory,
         shards: a.shards,
+        coord: strata_server::coord::CoordOptions {
+            hedge: std::time::Duration::from_millis(a.hedge_ms),
+            shard_timeout: (a.shard_timeout_ms > 0).then(|| std::time::Duration::from_millis(a.shard_timeout_ms)),
+            partial: a.partial,
+            ..Default::default()
+        },
         timeout_ms: a.timeout_ms,
         max_concurrent: a.max_concurrent,
         model: a.model,
