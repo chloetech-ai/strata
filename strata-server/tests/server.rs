@@ -394,7 +394,8 @@ fn cluster(c: Coordinator) -> Arc<Service> {
 /// With two replicas, a shard whose first replica is down or hangs still
 /// answers, as one database would, and quickly. A shard with no replica
 /// answering fails the query, or, with partial answers allowed, is left
-/// out and named. Writes reach every replica.
+/// out and named (and not waited for again for a second). Writes reach
+/// every replica.
 #[tokio::test(flavor = "multi_thread")]
 async fn replicas_cover_for_a_shard_down_or_hung() {
     let dir = tempfile::tempdir().unwrap();
@@ -443,6 +444,11 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
     assert!(err.message.contains(&hung), "{}", err.message);
     let a = strict.query(QueryReq { sql: sql.into(), partial: Some(true), ..Default::default() }).await.unwrap();
     assert_eq!(a.missing, vec![hung.clone()]);
+    // For the next second, partial answers leave the shard out without waiting for it.
+    let t = std::time::Instant::now();
+    let again = strict.query(QueryReq { sql: sql.into(), partial: Some(true), ..Default::default() }).await.unwrap();
+    assert!(t.elapsed() < Duration::from_millis(150), "{:?}", t.elapsed());
+    assert_eq!(again.missing, vec![hung.clone()]);
     assert!(!a.rs.rows.is_empty());
     for row in &a.rs.rows {
         assert_eq!(shard_of(&row[0], 2), 0, "{row:?}");

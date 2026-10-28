@@ -15,7 +15,8 @@
 //! asked too and the first answer wins. A replica that failed, or was
 //! outrun, is asked last for [`CoordOptions::cool_off`]. With
 //! [`CoordOptions::partial`], a query whose shard has no replica answering
-//! is answered from the other shards and says which are missing.
+//! is answered from the other shards and says which are missing, and the
+//! queries of the next second leave that shard out without asking it.
 //!
 //! Writes go to the shard of their key ([`shard_of`]), on every replica;
 //! UPDATE and DELETE statements go to every shard. A write that spans
@@ -79,6 +80,9 @@ pub struct Coordinator {
     epoch: Instant,
     /// Where each read starts among a shard's replicas, to spread the load.
     turn: AtomicUsize,
+    /// Per shard: until when partial answers leave it out (ms after
+    /// `epoch`), after no replica of it answered.
+    skip_until: Vec<AtomicU64>,
     /// Replicas asked again after another failed, and hedged requests.
     retries: AtomicU64,
     hedges: AtomicU64,
@@ -158,7 +162,18 @@ impl Coordinator {
         if schema.primary_key.is_none() {
             return Err(ApiError::bad("a sharded table needs a primary key to route writes"));
         }
-        Ok(Coordinator { shards, replicas, schema, opts, epoch: Instant::now(), turn: AtomicUsize::new(0), retries: AtomicU64::new(0), hedges: AtomicU64::new(0) })
+        let skip_until = replicas.iter().map(|_| AtomicU64::new(0)).collect();
+        Ok(Coordinator {
+            shards,
+            replicas,
+            schema,
+            opts,
+            epoch: Instant::now(),
+            turn: AtomicUsize::new(0),
+            skip_until,
+            retries: AtomicU64::new(0),
+            hedges: AtomicU64::new(0),
+        })
     }
 
     fn now_ms(&self) -> u64 {
@@ -253,20 +268,24 @@ impl Coordinator {
         e
     }
 
-    /// Each shard's statistics and the replica and lease they came from.
-    async fn shard_stats(&self, sql: &str, params: &Params, start: usize, deadline: Instant) -> Vec<Result<(TermStats, usize, u64), ApiError>> {
+    /// The statistics of shards `which`, and the replica and lease each
+    /// came from.
+    async fn shard_stats(&self, sql: &str, params: &Params, which: Vec<usize>, start: usize, deadline: Instant) -> Vec<(usize, Result<(TermStats, usize, u64), ApiError>)> {
         let req = pb::QueryRequest { sql: sql.into(), params: params_to_pb(params), ..Default::default() };
-        let calls = (0..self.replicas.len()).map(|i| {
+        let calls = which.into_iter().map(|i| {
             let req = req.clone();
             async move {
-                let (r, a) = self
+                let a = self
                     .call(i, start, None, deadline, |_, mut c| {
                         let req = req.clone();
                         async move { c.term_stats(req).await }
                     })
-                    .await?;
-                let s: TermStats = serde_json::from_slice(&a.stats_json).map_err(ApiError::internal)?;
-                Ok((s, r, a.snapshot))
+                    .await;
+                let a = a.and_then(|(r, a)| {
+                    let s: TermStats = serde_json::from_slice(&a.stats_json).map_err(ApiError::internal)?;
+                    Ok((s, r, a.snapshot))
+                });
+                (i, a)
             }
         });
         join_all(calls).await
@@ -277,7 +296,7 @@ impl Coordinator {
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let mut sum = TermStats::default();
         let mut leases = Vec::new();
-        for a in self.shard_stats(sql, params, start, deadline).await {
+        for (_, a) in self.shard_stats(sql, params, (0..self.replicas.len()).collect(), start, deadline).await {
             let (s, _, lease) = a?;
             sum.add(&s);
             leases.push(lease);
@@ -293,18 +312,36 @@ impl Coordinator {
         // Per shard: the replica holding a lease for this query, and the lease.
         let mut leased: Vec<Option<(usize, u64)>> = vec![None; n];
         let mut failed: Vec<Option<ApiError>> = (0..n).map(|_| None).collect();
+        if partial {
+            let now = self.now_ms();
+            for (i, f) in failed.iter_mut().enumerate() {
+                if self.skip_until[i].load(Ordering::Relaxed) > now {
+                    *f = Some(ApiError { status: 503, message: format!("shard {}: no replica answered in the last second", self.shards[i]) });
+                }
+            }
+        }
+        // A shard that cannot answer is left out of a partial answer (and of
+        // the next second's), but a request it rejects fails the query.
+        let missing = |i: usize, e: ApiError, failed: &mut Vec<Option<ApiError>>| {
+            if !partial || e.status == 400 {
+                return Err(e);
+            }
+            self.skip_until[i].store(self.now_ms() + 1000, Ordering::Relaxed);
+            failed[i] = Some(e);
+            Ok(())
+        };
         let stats = match &req.stats {
             Some(s) => Some(s.clone()),
             None if ranked_text && n > 1 => {
                 let mut sum = TermStats::default();
-                for (i, a) in self.shard_stats(&req.sql, &req.params, start, deadline).await.into_iter().enumerate() {
+                let which = (0..n).filter(|&i| failed[i].is_none()).collect();
+                for (i, a) in self.shard_stats(&req.sql, &req.params, which, start, deadline).await {
                     match a {
                         Ok((s, r, lease)) => {
                             sum.add(&s);
                             leased[i] = Some((r, lease));
                         }
-                        Err(e) if partial => failed[i] = Some(e),
-                        Err(e) => return Err(e),
+                        Err(e) => missing(i, e, &mut failed)?,
                     }
                 }
                 Some(sum)
@@ -337,8 +374,7 @@ impl Coordinator {
         for (i, a) in join_all(calls).await {
             match a {
                 Ok((_, a)) => shards.push(result_from_pb(a)?),
-                Err(e) if partial => failed[i] = Some(e),
-                Err(e) => return Err(e),
+                Err(e) => missing(i, e, &mut failed)?,
             }
         }
         if shards.is_empty() {
