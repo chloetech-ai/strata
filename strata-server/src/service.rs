@@ -890,7 +890,10 @@ impl Service {
                 let m = db.storage().merge_status();
                 let w = &self.writer_state;
                 let deleted: u64 = f.segments.iter().map(|s| s.n_deleted as u64).sum::<u64>() + f.pending_deletes as u64;
+                let pool = strata::query::pool::Pool::global();
                 more.extend([
+                    one("strata_query_pool_threads", "gauge", "Threads in the pool queries borrow from to search segments in parallel.", pool.threads() as f64),
+                    one("strata_query_pool_queued", "gauge", "Threads queries asked the pool for that none was free to give yet.", pool.queued() as f64),
                     one("strata_docs", "gauge", "Rows in the database.", s.n_live_docs() as f64),
                     one("strata_segments", "gauge", "Segments on disk.", s.segments().len() as f64),
                     one("strata_deleted_docs", "gauge", "Deleted rows that merges have not dropped yet.", deleted as f64),
