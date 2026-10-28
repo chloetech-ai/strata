@@ -1493,6 +1493,11 @@ impl Database {
     /// `budget` and the record of interrupted merges ([`MergeRecord`]).
     /// The merge is recorded as running until the claim is dropped.
     fn claim_merge(&self, table: u32, policy: &MergePolicy, budget: Option<u64>) -> Option<MergeClaim<'_>> {
+        // The snapshot is taken under the lock that claims are given up
+        // under: a merge installed (and its claim given up) after a snapshot
+        // taken before the lock would leave its inputs, gone by then, to
+        // this one.
+        let mut m = lock(&self.merging);
         let snap = self.snapshot_inner(false).table_by_id(table)?;
         let bytes: HashMap<u64, u64> = lock(&self.state).handles().map(|h| (h.meta.id, h.meta.extent.len)).collect();
         let infos: Vec<SegmentInfo> = snap
@@ -1500,7 +1505,6 @@ impl Database {
             .iter()
             .map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live, bytes: bytes.get(&v.id).copied().unwrap_or(0) })
             .collect();
-        let mut m = lock(&self.merging);
         let cap = |g: &[u64]| match (m.record.cap(g), budget) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),

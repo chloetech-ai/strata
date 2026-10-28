@@ -167,6 +167,26 @@ fn merges_on_several_threads_run_at_once_on_different_segments() {
 }
 
 #[test]
+fn merges_racing_on_many_threads_take_only_segments_still_there() {
+    // A merge that installs its segment and gives up its claim between
+    // another one's snapshot and its claim must not leave that one its
+    // inputs, gone by then ("merge input vanished").
+    for round in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_for(dir.path(), Layout::SingleFile);
+        let (db, model) = segments(&path, Layout::SingleFile, 32, 10);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| db.storage().merge(&ALL_TIER_0).unwrap());
+            }
+        });
+        db.storage().merge(&ALL_TIER_0).unwrap();
+        assert_eq!(segment_ids(&db).len(), 1, "round {round}");
+        assert_eq!(rows(&db), model);
+    }
+}
+
+#[test]
 fn writes_go_on_while_a_merged_image_is_written() {
     for (seed, layout) in [(1, Layout::SingleFile), (2, Layout::Directory)] {
         let dir = tempfile::tempdir().unwrap();
