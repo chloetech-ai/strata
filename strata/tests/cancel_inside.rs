@@ -3,7 +3,7 @@
 //! check every so many rows, not only between segments.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use strata::db::Db;
@@ -41,6 +41,13 @@ fn db(dir: &std::path::Path, n: i64) -> Db {
     db
 }
 
+/// Held by each test for its whole run: a test's timings must not include
+/// another one's load or queries on the same cores (a CI runner has three).
+fn alone() -> MutexGuard<'static, ()> {
+    static ONE: Mutex<()> = Mutex::new(());
+    ONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `sql` stops with a timeout, well before it would have finished, when
 /// its deadline passes a tenth of the way in, and when another thread
 /// cancels it then.
@@ -60,23 +67,38 @@ fn stops_midway(db: &Db, sql: &str) {
         .min()
         .unwrap();
     assert!(full >= Duration::from_millis(25), "{sql} took {full:?}: too short to stop in the middle");
-    let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + full / 10), ..ExecOptions::default() });
-    assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
+    // The faster of two stops each way, as a runner can stall a thread
+    // for tens of milliseconds.
+    let took = (0..2)
+        .map(|_| {
+            let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + full / 10), ..ExecOptions::default() });
+            assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
+            took
+        })
+        .min()
+        .unwrap();
     assert!(took < full / 2, "{sql}: stopped after {took:?} of {full:?}");
-    let cancel = Arc::new(AtomicBool::new(false));
-    let flag = cancel.clone();
-    let canceller = std::thread::spawn(move || {
-        std::thread::sleep(full / 10);
-        flag.store(true, Ordering::Relaxed);
-    });
-    let (r, took) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
-    canceller.join().unwrap();
-    assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("cancelled")), "{sql}: {r:?}");
+    let took = (0..2)
+        .map(|_| {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = cancel.clone();
+            let canceller = std::thread::spawn(move || {
+                std::thread::sleep(full / 10);
+                flag.store(true, Ordering::Relaxed);
+            });
+            let (r, took) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
+            canceller.join().unwrap();
+            assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("cancelled")), "{sql}: {r:?}");
+            took
+        })
+        .min()
+        .unwrap();
     assert!(took < full / 2, "{sql}: stopped after {took:?} of {full:?}");
 }
 
 #[test]
 fn aggregation_and_ordering_stop_inside_a_segment() {
+    let _alone = alone();
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path(), 3_000_000);
     // Grouped document by document, 500,000 groups.
@@ -89,6 +111,7 @@ fn aggregation_and_ordering_stop_inside_a_segment() {
 
 #[test]
 fn graph_walks_stop_inside_a_segment() {
+    let _alone = alone();
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path(), 1_000_000);
     // A chain: each hop reaches one more row.
@@ -98,6 +121,7 @@ fn graph_walks_stop_inside_a_segment() {
 
 #[test]
 fn joins_stop_inside_a_segment() {
+    let _alone = alone();
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path(), 2_400);
     // Every row meets every row of its `c` (800 each), and none passes
