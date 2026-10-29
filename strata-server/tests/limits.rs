@@ -115,6 +115,32 @@ async fn a_coordinator_and_its_shards_refuse_them_too() {
     check_caps(&base).await;
 }
 
+/// Whether a request failed because the server closed the connection.
+fn reset(e: &reqwest::Error) -> bool {
+    let mut at: Option<&dyn std::error::Error> = Some(e);
+    while let Some(x) = at {
+        if x.downcast_ref::<std::io::Error>().is_some_and(|io| matches!(io.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe)) {
+            return true;
+        }
+        at = x.source();
+    }
+    false
+}
+
+/// [`reset`] knows a connection the server closed before reading the body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_connection_is_seen_as_one() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        std::io::Read::read(&mut conn, &mut [0u8; 1024]).unwrap();
+        // Closed with unread bytes: the client gets a reset.
+    });
+    let e = reqwest::Client::new().post(format!("http://{addr}/v1/query")).body("x".repeat(32 << 20)).send().await.unwrap_err();
+    assert!(reset(&e), "{e:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bodies_are_capped_by_route() {
     let dir = tempfile::tempdir().unwrap();
@@ -123,17 +149,21 @@ async fn bodies_are_capped_by_route() {
     let base = http(Arc::new(svc)).await;
     let client = reqwest::Client::new();
     let post = |path: &str, body: String| client.post(format!("{base}{path}")).header("content-type", "application/json").body(body).send();
+    // A body over the cap gets 413, or, when the server answers before the
+    // client has sent all of it, a closed connection (seen on macOS).
+    let refused = |r: reqwest::Result<reqwest::Response>| match r {
+        Ok(r) => assert_eq!(r.status(), 413),
+        Err(e) => assert!(reset(&e), "{e:?}"),
+    };
     // Queries take 16 MiB.
     let pad = "x".repeat(17 << 20);
-    let r = post("/v1/query", json!({"sql": "SELECT id FROM products LIMIT 1", "pad": pad}).to_string()).await.unwrap();
-    assert_eq!(r.status(), 413);
+    refused(post("/v1/query", json!({"sql": "SELECT id FROM products LIMIT 1", "pad": pad}).to_string()).await);
     let pad = "x".repeat(2 << 20);
     let r = post("/v1/query", json!({"sql": "SELECT id FROM products LIMIT 1", "pad": pad}).to_string()).await.unwrap();
     assert_eq!(r.status(), 200);
     // Writes take --max-body-mb: here 1 MiB.
     let doc = |i: usize, len: usize| json!({"op": "upsert", "doc": {"id": format!("big{i}"), "title": "y".repeat(len)}});
-    let r = post("/v1/write", json!({"ops": [doc(0, 1100 << 10)]}).to_string()).await.unwrap();
-    assert_eq!(r.status(), 413);
+    refused(post("/v1/write", json!({"ops": [doc(0, 1100 << 10)]}).to_string()).await);
     let r = post("/v1/write", json!({"ops": [doc(1, 900 << 10)]}).to_string()).await.unwrap();
     assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
 }
