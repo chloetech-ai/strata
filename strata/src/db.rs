@@ -418,10 +418,7 @@ impl Db {
                 &q,
                 view.schema(),
                 params,
-                &mut |text, p| {
-                    let plan = Plan::bind(text, view.schema(), p)?;
-                    self.execute(&view, &plan.to_select(view.schema())?, &steps)
-                },
+                &mut |step| self.execute(&view, &step.plan.to_select(view.schema())?, &steps),
                 opts,
             )?;
             if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {

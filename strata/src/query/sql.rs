@@ -483,6 +483,16 @@ pub(crate) fn assigned(field: &Field, v: Value) -> Result<Value> {
     })
 }
 
+/// The name of a column of the answer without an alias: a column's own
+/// name, quoted or not (`"order"` is `order`), else the expression's text.
+pub(crate) fn name_of(e: &Expr) -> String {
+    match e {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(ids) => ids.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."),
+        e => e.to_string(),
+    }
+}
+
 /// A name as SQL spells it: quoted unless it is a plain identifier.
 pub fn ident(n: &str) -> String {
     if n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -568,7 +578,7 @@ impl<'a> Binder<'a> {
                 _ => return Err(err("unsupported select item")),
             };
             let p = self.projection(e)?;
-            projection.push((alias.unwrap_or_else(|| e.to_string()), p));
+            projection.push((alias.unwrap_or_else(|| name_of(e)), p));
         }
         let aggregated = !group_by.is_empty() || projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
         if aggregated {
@@ -1339,6 +1349,7 @@ impl<'a> Binder<'a> {
 
     fn literal(&self, e: &Expr) -> Result<Value> {
         match e {
+            Expr::Nested(x) => self.literal(x),
             Expr::Value(v) => match &v.value {
                 sql::Value::Number(s, _) => {
                     Ok(s.parse::<i64>().map(Value::Int).or_else(|_| s.parse::<f64>().map(Value::Float)).map_err(|_| err("bad number"))?)

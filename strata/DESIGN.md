@@ -564,14 +564,21 @@ handing a query to its shards) are to make instead of writing SQL text.
   query it builds, where each used to print SQL text and parse it again:
   printed, `- -1` is the comment `--1`, and a column named `order` stopped
   `SELECT id, order, ...` from parsing.
+* **Compound steps bind their own syntax trees.** Each step of a compound
+  query (a side of a join, a subquery, a `WITH`) is built as a syntax
+  tree and bound, where it used to be printed as SQL and parsed again,
+  with the same two failures. A coordinator still sends its shards a
+  step as SQL, printed so that it parses back to the step's plan (a
+  column named like a keyword quoted, the operand of a sign that starts
+  with a sign in parentheses), and a test checks that it does.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next, in order: operators in place of the compound-query code (which
-still prints SQL for each step, so a join's `- -1` is still a comment),
-the Python builder, joins across tables, and plans as the shard protocol.
+Next, in order: a compound query as one plan, its joins, `WITH` and
+subqueries as operators in place of the compound-query code, then the
+Python builder, joins across tables, and plans as the shard protocol.
 
 ## 7. Planning and execution
 

@@ -3,7 +3,9 @@
 //! the table with itself or with a `WITH` result.
 //!
 //! They run as a sequence of the single-table queries the executor answers
-//! ([`is_compound`] tells them apart). A subquery runs first and its result
+//! ([`is_compound`] tells them apart), each bound from a syntax tree built
+//! here, so no step is printed as SQL and parsed again ([`Step`]). A
+//! subquery runs first and its result
 //! reaches the outer query as a list parameter (`IN (:_s0)`), so every
 //! index still serves the outer filter. A join scans each side with the
 //! conditions that name only that side, the right side restricted to the
@@ -44,8 +46,19 @@ use crate::value::Value;
 /// subquery, a `WITH` result).
 pub const MAX_ROWS: usize = 1_000_000;
 
-/// Runs one single-table SELECT (the executor, or a coordinator).
-pub type Runner<'r> = dyn FnMut(&str, &Params) -> Result<ResultSet> + 'r;
+/// Runs one step (the executor, or a coordinator).
+pub type Runner<'r> = dyn FnMut(&Step) -> Result<ResultSet> + 'r;
+
+/// One single-table step of a compound query.
+pub struct Step<'s> {
+    /// The step's plan, bound from its syntax tree.
+    pub plan: &'s ir::Plan,
+    /// The step as SQL that parses back to the same plan, with `params`:
+    /// what a coordinator sends its shards, which take SQL until they take
+    /// plans, and what the step's line of the query's plan shows.
+    pub sql: &'s str,
+    pub params: &'s Params,
+}
 
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
@@ -350,11 +363,15 @@ impl<'a, 'r> Ctx<'a, 'r> {
         Ok(self.schema.fields[pk].name.clone())
     }
 
-    fn run_sql(&mut self, text: &str, what: &str) -> Result<Rel> {
-        let rs = (self.runner)(text, &self.params).map_err(|e| match e {
+    /// Binds a step's syntax tree and runs it.
+    fn run_step(&mut self, q: &sql::Query, what: &str) -> Result<Rel> {
+        let text = printable(q);
+        let at = |e: Error| match e {
             Error::Query(m) => err(format!("{m} (in {what}: {text})")),
             e => e,
-        })?;
+        };
+        let plan = ir::Plan::of_select(self.schema, &super::sql::bind_query(q, self.schema, &self.params).map_err(&at)?);
+        let rs = (self.runner)(&Step { plan: &plan, sql: &text, params: &self.params }).map_err(at)?;
         self.plan.push(format!("{what}: {} rows: {text}", rs.rows.len()));
         for l in &rs.stats.plan {
             self.plan.push(format!("  {l}"));
@@ -431,8 +448,7 @@ impl<'a, 'r> Ctx<'a, 'r> {
             distinct_to_group(&mut s)?;
         }
         q.body = Box::new(sql::SetExpr::Select(Box::new(s)));
-        let text = q.to_string();
-        self.run_sql(&text, "query")
+        self.run_step(&q, "query")
     }
 
     /// A SELECT over the rows of the table that a `WITH` result holds:
@@ -792,7 +808,7 @@ impl<'a, 'r> Ctx<'a, 'r> {
                 Rel { columns: needed[i].clone(), ..Rel::default() }
             } else {
                 let restrict: Vec<(String, Vec<Value>)> = keys[i].iter().map(|(_, c)| c.clone()).zip(lefts).collect();
-                self.scan(&srcs[i], &needed[i], &pushed[i], &restrict, &scan_order[i], None, &format!("join {}", srcs[i].alias))?
+                self.scan(&srcs[i], &needed[i], &pushed[i], &restrict, &scan_order[i], None, "join")?
             };
             // Hash the right side on its key columns.
             let rcols: Vec<(String, String)> = needed[i].iter().map(|c| (srcs[i].alias.to_ascii_lowercase(), c.clone())).collect();
@@ -909,41 +925,45 @@ impl<'a, 'r> Ctx<'a, 'r> {
             return Ok(Rel { columns: columns.to_vec(), rows, keys: None, scores: Vec::new() });
         }
         let alias = src.alias.to_ascii_lowercase();
-        let mut where_: Vec<String> = conds.iter().map(|c| unqualify(c, &alias).to_string()).collect();
+        let column = |c: &str| Expr::Identifier(sql::Ident::new(c));
+        let mut where_: Vec<Expr> = conds.iter().map(|c| unqualify(c, &alias)).collect();
         if let SrcKind::TableRows(keys) = &src.kind {
             let p = self.param(Value::List(keys.clone()));
-            where_.push(format!("{} IN ({p})", self.pk_name()?));
+            where_.push(Expr::InList { expr: Box::new(column(&self.pk_name()?)), list: vec![p], negated: false });
         }
         for (col, vals) in restrict {
             let p = self.param(Value::List(vals.clone()));
             if self.is_edges(col) {
-                // Rows whose links point at the values.
-                // `min_hops => 0`: a value's own row may link to another value.
-                where_.push(format!("REACHABLE({}, {p}, dir => 'in', min_hops => 0, max_nodes => {})", ident(col), MAX_ROWS + 1));
+                where_.push(linking_to(column(col), p)?);
             } else {
                 let f = self.schema.field(col).ok_or_else(|| err(format!("no such column: {col}")))?;
                 if !matches!(f.ty, FieldType::Keyword | FieldType::Int | FieldType::Float) {
                     return Err(err(format!("joins compare KEYWORD, INT or FLOAT fields, the key or EDGES links, not {col}")));
                 }
-                where_.push(format!("{} IN ({p})", ident(col)));
+                where_.push(Expr::InList { expr: Box::new(column(col)), list: vec![p], negated: false });
             }
         }
-        let cols: Vec<String> = columns.iter().map(|c| if c == "__score" { "score() AS __score".to_string() } else { ident(c) }).collect();
-        let mut text = format!("SELECT {} FROM {}", cols.join(", "), ident(&self.schema.table));
-        if !where_.is_empty() {
-            text += &format!(" WHERE {}", where_.iter().map(|w| format!("({w})")).collect::<Vec<_>>().join(" AND "));
+        let mut q = super::sql::parse_query("SELECT score() AS __score FROM t")?;
+        let sql::SetExpr::Select(s) = q.body.as_mut() else { unreachable!("a SELECT") };
+        let score = s.projection.pop().expect("score() AS __score");
+        s.projection = columns.iter().map(|c| if c == "__score" { score.clone() } else { SelectItem::UnnamedExpr(column(c)) }).collect();
+        if let TableFactor::Table { name, .. } = &mut s.from[0].relation {
+            *name = sql::ObjectName::from(vec![sql::Ident::new(self.schema.table.clone())]);
         }
+        s.selection = where_.into_iter().map(|w| Expr::Nested(Box::new(w))).reduce(|a, b| Expr::BinaryOp { left: Box::new(a), op: BinaryOperator::And, right: Box::new(b) });
         let ranked = order.as_ref().is_some_and(|(e, _)| is_score(e));
         if let Some((e, desc)) = order {
-            text += &format!(" ORDER BY {}{}", unqualify(e, &alias), if *desc { " DESC" } else { "" });
+            let options = sql::OrderByOptions { asc: desc.then_some(false), nulls_first: None };
+            q.order_by = Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(vec![sql::OrderByExpr { expr: unqualify(e, &alias), options, with_fill: None }]), interpolate: None });
         }
-        match lim {
-            Some(l) => text += &format!(" LIMIT {l}"),
+        let limit = match lim {
+            Some(l) => Some(l),
             // A ranked scan without a LIMIT would stop at the executor's default.
-            None if ranked => text += &format!(" LIMIT {}", MAX_ROWS + 1),
-            None => {}
-        }
-        let rel = self.run_sql(&text, &format!("{what} {}", src.alias))?;
+            None if ranked => Some(MAX_ROWS + 1),
+            None => None,
+        };
+        q.limit_clause = limit.map(|l| sql::LimitClause::LimitOffset { limit: Some(Expr::value(sql::Value::Number(l.to_string(), false))), offset: None, limit_by: Vec::new() });
+        let rel = self.run_step(&q, &format!("{what} {}", src.alias))?;
         if rel.rows.len() > MAX_ROWS {
             return Err(err(format!("{} would read more than {MAX_ROWS} rows; add conditions on it", src.alias)));
         }
@@ -1114,15 +1134,120 @@ fn unqualify(e: &Expr, alias: &str) -> Expr {
     e
 }
 
+/// Rows whose links (EDGES field `col`) point at `keys`.
+fn linking_to(col: Expr, keys: Expr) -> Result<Expr> {
+    // `min_hops => 0`: a value's own row may link to another value.
+    let q = super::sql::parse_query(&format!("SELECT f FROM t WHERE REACHABLE(f, k, dir => 'in', min_hops => 0, max_nodes => {})", MAX_ROWS + 1))?;
+    let sql::SetExpr::Select(s) = *q.body else { unreachable!("a SELECT") };
+    let mut r = s.selection.expect("a WHERE");
+    if let Expr::Function(f) = &mut r {
+        let mut args = func_args_mut(f);
+        *args[0] = col;
+        *args[1] = keys;
+    }
+    Ok(r)
+}
+
 fn qualified(alias: &str, column: &str) -> Expr {
     Expr::CompoundIdentifier(vec![sql::Ident::new(alias), sql::Ident::new(column)])
 }
 
-fn ident(n: &str) -> String {
-    if n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        n.to_string()
-    } else {
-        format!("\"{}\"", n.replace('"', "\"\""))
+/// `q` as SQL that parses back to it: a column named like a keyword, or
+/// other than a plain identifier, quoted (`"order"`, `"doc id"`), and the
+/// operand of a sign in parentheses when it starts with a sign itself
+/// (`- -1` would print as `--1`, which starts a comment).
+fn printable(q: &sql::Query) -> String {
+    let mut q = q.clone();
+    query_mut(&mut q, &mut |e| match e {
+        Expr::Identifier(id) => quote(id),
+        Expr::CompoundIdentifier(ids) => ids.iter_mut().for_each(quote),
+        Expr::UnaryOp { expr, .. } if expr.to_string().starts_with(['-', '+']) => {
+            let x = std::mem::replace(expr.as_mut(), Expr::value(sql::Value::Null));
+            **expr = Expr::Nested(Box::new(x));
+        }
+        _ => {}
+    });
+    q.to_string()
+}
+
+fn quote(id: &mut sql::Ident) {
+    let plain = id.value.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && id.value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if id.quote_style.is_none() && (!plain || sqlparser::keywords::ALL_KEYWORDS.contains(&id.value.to_ascii_uppercase().as_str())) {
+        id.quote_style = Some('"');
+    }
+}
+
+/// Calls `f` on every expression of `q`'s SELECT, its subqueries' too,
+/// each before its subexpressions.
+fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
+    if let Some(w) = &mut q.with {
+        for cte in &mut w.cte_tables {
+            query_mut(&mut cte.query, f);
+        }
+    }
+    if let sql::SetExpr::Select(s) = q.body.as_mut() {
+        for item in &mut s.projection {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+                walk_mut(e, f);
+            }
+        }
+        for t in &mut s.from {
+            if let TableFactor::Derived { subquery, .. } = &mut t.relation {
+                query_mut(subquery, f);
+            }
+        }
+        s.selection.iter_mut().for_each(|e| walk_mut(e, f));
+        s.having.iter_mut().for_each(|e| walk_mut(e, f));
+        if let sql::GroupByExpr::Expressions(es, _) = &mut s.group_by {
+            es.iter_mut().for_each(|e| walk_mut(e, f));
+        }
+    }
+    if let Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) = &mut q.order_by {
+        es.iter_mut().for_each(|o| walk_mut(&mut o.expr, f));
+    }
+}
+
+/// [`walk`], changing the expressions, and into subqueries.
+fn walk_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    f(e);
+    match e {
+        Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::Cast { expr: x, .. } => walk_mut(x, f),
+        Expr::BinaryOp { left, right, .. } => {
+            walk_mut(left, f);
+            walk_mut(right, f);
+        }
+        Expr::Between { expr, low, high, .. } => {
+            walk_mut(expr, f);
+            walk_mut(low, f);
+            walk_mut(high, f);
+        }
+        Expr::InList { expr, list, .. } => {
+            walk_mut(expr, f);
+            list.iter_mut().for_each(|x| walk_mut(x, f));
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            walk_mut(expr, f);
+            query_mut(subquery, f);
+        }
+        Expr::Exists { subquery: q, .. } | Expr::Subquery(q) => query_mut(q, f),
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            walk_mut(expr, f);
+            walk_mut(pattern, f);
+        }
+        Expr::Function(func) => {
+            for a in func_args_mut(func) {
+                walk_mut(a, f);
+            }
+        }
+        Expr::Case { operand, conditions, else_result, .. } => {
+            operand.iter_mut().for_each(|x| walk_mut(x, f));
+            for c in conditions {
+                walk_mut(&mut c.condition, f);
+                walk_mut(&mut c.result, f);
+            }
+            else_result.iter_mut().for_each(|x| walk_mut(x, f));
+        }
+        _ => {}
     }
 }
 
@@ -1414,7 +1539,7 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
     let mut items: Vec<(String, Expr)> = Vec::new();
     for item in &s.projection {
         match item {
-            SelectItem::UnnamedExpr(e) => items.push((e.to_string(), e.clone())),
+            SelectItem::UnnamedExpr(e) => items.push((super::sql::name_of(e), e.clone())),
             SelectItem::ExprWithAlias { expr, alias } => items.push((alias.value.clone(), expr.clone())),
             SelectItem::Wildcard(_) => {
                 for (a, c) in j.cols.iter().filter(|(_, c)| c != "__score") {

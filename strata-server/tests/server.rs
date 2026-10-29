@@ -495,6 +495,18 @@ async fn coordinator_answers_like_one_database() {
         let got = coord.query(QueryReq { sql: sql.into(), params, ..Default::default() }).await.unwrap();
         same(sql, &want, &js::result(&got.rs, 0.0));
     }
+    // A compound query's steps reach the shards as SQL that parses back to
+    // each step's plan, `- -1` and a column named like a keyword (`year`)
+    // included.
+    for sql in [
+        "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE a.year >= - -2022 AND b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
+        "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > - -100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
+    ] {
+        let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
+        assert!(!want["rows"].as_array().unwrap().is_empty(), "{sql}");
+        let got = coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+        same(sql, &want, &js::result(&got.rs, 0.0));
+    }
     let h = coord.health().await;
     assert_eq!((h["status"].as_str(), h["docs"].as_u64()), (Some("ok"), Some(N as u64)), "{h}");
     // A coordinator takes SQL, not plans, until its shards take plans.
