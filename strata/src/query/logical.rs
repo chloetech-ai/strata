@@ -387,6 +387,10 @@ pub enum Projection {
     Count,
     /// `hops()`: the row's hop distance in `Select::graphs[id]`.
     Hops(usize),
+    /// `seq_no()`: the sequence number of the write that last changed the
+    /// row, in a database that numbers its writes
+    /// ([`crate::storage::Database::seq_of`]).
+    SeqNo,
     /// `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`, `COUNT(f)`, `COUNT(DISTINCT
     /// f)`: of the whole result, or per group.
     Agg { func: AggFn, field: usize },

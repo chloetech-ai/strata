@@ -616,6 +616,13 @@ impl Db {
     /// texts did not change. It can run again after an error (a busy
     /// writer).
     pub fn write_prepared(&self, p: &PreparedWrite) -> Result<u64> {
+        Ok(self.write_prepared_seq(p)?.0)
+    }
+
+    /// [`Db::write_prepared`], also returning the transaction's sequence
+    /// number in a database that numbers its writes (none if it wrote
+    /// nothing).
+    pub fn write_prepared_seq(&self, p: &PreparedWrite) -> Result<(u64, Option<u64>)> {
         let schema = &*p.schema;
         let mut t = self.storage.begin()?;
         let mut tt = t.table(&schema.table)?;
@@ -678,8 +685,8 @@ impl Db {
             }
         }
         drop(tt);
-        t.commit()?;
-        Ok(n)
+        let seq = t.commit_seq()?;
+        Ok((n, seq))
     }
 
     /// The live rows of the documents an INSERT proposed (`live`), every

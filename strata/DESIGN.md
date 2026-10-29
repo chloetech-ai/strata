@@ -677,16 +677,27 @@ handing a query to its shards) are to make instead of writing SQL text.
   own (§3.4): a numbered database gives each write transaction a term and
   a sequence number, logged in its commit record and kept across flushes,
   crashes, checkpoints and reopening, and each row the number of the
-  write that last changed it. Nothing ships the log yet, and SQL and the
-  server do not read the numbers yet.
+  write that last changed it. Nothing ships the log yet.
+* **Conditional writes.** `seq_no()` is a column of a query on one table
+  (plan feature `seq_no`, so an older shard refuses the plan by name), read
+  from the row's segment, its updates or the memtable. strata-server's
+  `--seq-no` numbers its database, a write's answer carries its number,
+  and a write operation with `if_seq_no` applies only while its row's
+  number is that, checked under the writer lock (`WriteTxn::seq_of`): a
+  mismatch, a missing row or a row the request already wrote refuses the
+  request with 409. Several requests share a group commit, so a conflict
+  fails the group and each request is then applied alone, which leaves
+  exactly one of the racing writers applied. A coordinator passes both on
+  only while each shard has one replica, since replicas number their writes
+  independently until the log is shipped.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication on top of the shard protocol (conditional
-writes through SQL and the server, WAL shipping, catch-up, read-your-writes,
-promotion), and a coordinator and strata-server over every table.
+Next: the rest of replication on top of the shard protocol (WAL shipping,
+catch-up, read-your-writes, promotion), and a coordinator and strata-server
+over every table.
 
 ## 7. Planning and execution
 

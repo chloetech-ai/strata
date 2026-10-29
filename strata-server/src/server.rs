@@ -36,6 +36,10 @@ pub struct Options {
     /// Check every segment's checksum on opening
     /// ([`DbOptions::verify_checksums`]).
     pub verify_checksums: bool,
+    /// Number the database's writes ([`strata::storage::Database::start_seq_no`]),
+    /// for `seq_no()` and conditional writes (`if_seq_no`); once started,
+    /// for good.
+    pub seq_no: bool,
     /// Coordinate these shard servers (gRPC URLs; replicas of a shard
     /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
@@ -104,6 +108,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     let mut fill = None;
     let mut slots_file = None;
+    if o.seq_no && !o.shards.is_empty() {
+        return Err("--seq-no numbers a database's writes: start each shard server with it, not the coordinator".into());
+    }
     let (backend, schema) = if !o.shards.is_empty() {
         // A shard with no replica answering yet (the cluster is starting, or
         // one is down) is waited for; a wrong URL or schema is not.
@@ -144,6 +151,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         } else {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
+        if o.seq_no {
+            db.storage().start_seq_no().map_err(|e| format!("--seq-no on {}: {e}", path.display()))?;
+        }
         let db = Arc::new(db);
         // Writes go on while a full memtable becomes segments, and while
         // segments are merged.

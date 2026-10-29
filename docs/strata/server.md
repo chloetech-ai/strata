@@ -29,6 +29,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--schema FILE` | | the schema of a new database, as JSON (below) |
 | `--directory` | off | create the new database as a directory of segment files instead of one file |
 | `--wal-drop-damaged` | off | open a database whose write-ahead log was damaged after it was durable, dropping the transactions from the damage on (the log is copied to `<log>.damaged` first); without it the server refuses to start on one |
+| `--seq-no` | off | number the database's writes, for [conditional writes](#conditional-writes) and `seq_no()`; it cannot be undone, and versions of Strata from before it refuse the database |
 | `--verify-checksums` | off | check every segment against its checksum before serving (reads the whole database once); a damaged newest version is skipped for the one before it |
 | `--shards URL,URL,…` | | run as a coordinator over these shard servers' gRPC addresses |
 | `--slot-map FILE` | equal runs, epoch 1 | with `--shards`: the [slot map](#slots) to route writes by, which the shards are given |
@@ -198,8 +199,8 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | route | body | answer |
 |---|---|---|
 | `POST /v1/query` | `{sql, params?, timeout_ms?}` | `{columns, rows, keys, scores, stats, took_ms}` |
-| `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows for a `SELECT`; `{written}` for `INSERT`, `UPDATE`, `DELETE` |
-| `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written}` |
+| `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows for a `SELECT`; `{written, seq_no?}` for `INSERT`, `UPDATE`, `DELETE` |
+| `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written, seq_no?}` ([conditional writes](#conditional-writes)) |
 | `POST /v1/plan` | `{plan, timeout_ms?}`: a [plan](query-language.md#explain) in JSON, as `/v1/explain` gives it in `ir` | rows for a read, a compound query's plan included, `{written}` for a write; a coordinator runs reads, and refuses a write plan (400) until its shards take write plans |
 | `POST /v1/import?format=F` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
@@ -246,6 +247,18 @@ A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as its pla
 An answer of 200 means the batch is durable, and an error that nothing of it was written, so a client can retry on an error. When an answer is lost (a timeout, a dropped connection, a coordinator whose other replica failed), send the retry with the same `idempotency_key` (or an `Idempotency-Key` header), 1 to 256 characters: a server that already applied that batch answers with its first `written` instead of applying it again, so an `add` counts once and an `insert` does not fail as a duplicate of itself. The same key with other operations is refused (422), and while the first attempt still runs a retry gets 409. A server remembers keys for an hour, the latest 100,000, in memory, so a restart forgets them. A coordinator passes the key to each shard as `key/shard`. Over gRPC, `WriteRequest.idempotency_key` does the same.
 
 With `--token`, every route except `/`, `/v1/health`, `/livez` and `/readyz` needs `Authorization: Bearer <token>`; the UI asks for the token.
+
+### Conditional writes
+
+A server started with `--seq-no` numbers its database's writes (`Database::start_seq_no`): every write transaction gets the next sequence number, and each row keeps the number of the write that last changed it. It cannot be undone, and versions of Strata from before it refuse to open the database rather than lose the numbers. The answer to a write that changed something carries its number, `{"written": 1, "seq_no": 42}` (`WriteResponse.seq_no` over gRPC); requests the writer commits together share one, and a retry with an idempotency key gets the first attempt's. `SELECT id, seq_no() FROM t` reads each row's number. Rows written before numbering started, and rows loaded in bulk (`--demo`, an import into an empty table), have 0.
+
+An operation with `"if_seq_no": n` applies only while its row's number is n, so a client that read a row can write it back without losing a write made in between:
+
+```json
+{"ops": [{"op": "set", "key": "p1", "field": "price", "value": 10.5, "if_seq_no": 42}]}
+```
+
+Every operation but `insert`, which fails if the row exists, takes it. When the row has another number, has no row, or was written by an earlier operation of the same request, the request writes nothing and gets 409 (`FailedPrecondition` over gRPC), naming the key and its number. Of several requests writing a row with the same `if_seq_no`, exactly one applies. Without `--seq-no`, `if_seq_no` and `seq_no()` are refused.
 
 ### Backups
 
@@ -306,7 +319,7 @@ Query then fetch (from protocol 3): for a page of rows with stored columns, when
 
 A coordinator asks each replica the protocol versions it speaks (`Hello`) when it connects, again every minute and after the replica fails (it may have restarted on another version), and speaks the oldest any replica speaks, so shards can be upgraded one at a time: while one runs a server from before `Hello`, every shard gets SQL and JSON plans; once all speak protocol 2 they get typed plans, and once all speak 3, pages are fetched. `/v1/health` shows the protocol spoken (`protocol`).
 
-A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key, to the shard holding its [slot](#slots); `UPDATE` and `DELETE` go to every shard. A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
+A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key, to the shard holding its [slot](#slots); `UPDATE` and `DELETE` go to every shard. Start each shard with `--seq-no` for [conditional writes](#conditional-writes): a coordinator passes `if_seq_no` and `seq_no()` on while every shard has one replica (replicas number the writes they take in their own order until replication ships the primary's log), and its write answers carry no `seq_no`, since a batch can span shards. A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
 
 ### Slots
 

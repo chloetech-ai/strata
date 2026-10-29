@@ -21,6 +21,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use storage_util::*;
 use strata::db::Db;
+use strata::query::ir::{self, Plan};
+use strata::query::Params;
 use strata::storage::pager::{Meta, PAGE};
 use strata::storage::{wal, CheckpointOptions, DbOptions, Layout, MergePolicy, SeqNo};
 use strata::Value;
@@ -321,13 +323,21 @@ fn churn(db: &Db, rng: &mut StdRng, rows: &mut Rows, seqs: &mut Seqs, n: usize, 
     }
 }
 
-/// The rows and every key's number are as the model has them.
+/// Each row's `seq_no()`, by key.
+fn select_seqs(db: &Db) -> Seqs {
+    let r = db.query("SELECT id, seq_no() FROM t LIMIT 100000", &Params::new()).unwrap();
+    r.rows.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap() as u64)).collect()
+}
+
+/// The rows and every key's number are as the model has them, by
+/// `seq_of` and by `seq_no()` in a SELECT.
 fn check_seqs(db: &Db, want: &Rows, seqs: &Seqs, keys: u64, what: &str) {
     assert_eq!(&rows(db), want, "{what}");
     for i in 0..keys {
         let k = key(i);
         assert_eq!(db.storage().seq_of(Some("t"), &Value::Str(k.clone())).unwrap(), seqs.get(&k).copied(), "{what}: {k}");
     }
+    assert_eq!(&select_seqs(db), seqs, "{what}: seq_no()");
 }
 
 /// Rows keep the number of the write that last changed them, through the
@@ -339,7 +349,9 @@ fn rows_keep_the_number_of_their_last_write() {
     for (seed, layout) in [(1, Layout::SingleFile), (2, Layout::Directory), (3, Layout::SingleFile), (4, Layout::Directory)] {
         let dir = tempfile::tempdir().unwrap();
         let path = path_for(dir.path(), "db", layout);
-        let opts = DbOptions { segment_max_docs: 40, ..options(layout) };
+        // Small memtable chunks: a query builds segments of the full ones
+        // once, and of the last one again after each write.
+        let opts = DbOptions { segment_max_docs: 40, memtable_chunk_docs: 8, ..options(layout) };
         let mut rng = StdRng::seed_from_u64(seed);
         let (mut rows, mut seqs, keys) = (Rows::new(), Seqs::new(), 300);
         let mut db = Db::create(&path, schema(), opts.clone()).unwrap();
@@ -430,5 +442,46 @@ fn attached_rows_have_number_0() {
         let attached: Vec<_> = db.snapshot().segments().iter().filter(|s| ids.contains(&s.id)).map(|s| s.file.has("seq")).collect();
         assert_eq!(attached, [false]);
         db.storage().check().unwrap();
+    }
+}
+
+/// `seq_no()` is a column of a SELECT on one table of a numbered database:
+/// its plan needs feature `seq_no`, and it cannot be aggregated, ordered
+/// by, or used in a compound query.
+#[test]
+fn seq_no_is_a_column_of_numbered_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&path_for(dir.path(), "db", Layout::SingleFile), schema(), options(Layout::SingleFile)).unwrap();
+    let mut model = Rows::new();
+    upsert(&db, &mut model, 1, 1);
+    let sql = "SELECT id, seq_no() FROM t WHERE n >= 0 LIMIT 10";
+    let e = db.query(sql, &Params::new()).unwrap_err().to_string();
+    assert!(e.contains("the database does not number its writes"), "{e}");
+
+    db.storage().start_seq_no().unwrap();
+    for i in 2..5 {
+        upsert(&db, &mut model, i, i as i64);
+    }
+    let r = db.query(sql, &Params::new()).unwrap();
+    assert_eq!(r.columns, ["id", "seq_no()"]);
+    let got: Vec<(String, i64)> = r.rows.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap())).collect();
+    assert_eq!(got, [(key(1), 0), (key(2), 1), (key(3), 2), (key(4), 3)]);
+
+    // The plan needs the feature, and runs the same from JSON.
+    let plan = db.explain(sql, &Params::new()).unwrap();
+    assert_eq!(plan.features, [ir::SEQ_NO]);
+    assert!(db.explain("SELECT id FROM t LIMIT 10", &Params::new()).unwrap().features.is_empty());
+    let read = Plan::from_json(&plan.to_json().unwrap()).unwrap();
+    assert_eq!(read, plan);
+    assert_eq!(db.run_at(&db.snapshot(), &read, &Default::default()).unwrap().rows, r.rows);
+    assert!(ir::FEATURES.contains(&"seq_no"));
+
+    for (sql, says) in [
+        ("SELECT COUNT(*), seq_no() FROM t", "cannot be aggregated"),
+        ("SELECT id, seq_no() FROM t ORDER BY 2", "ORDER BY seq_no()"),
+        ("SELECT id, seq_no() FROM t WHERE id IN (SELECT id FROM t WHERE n > 1)", "not of a compound query"),
+    ] {
+        let e = db.query(sql, &Params::new()).unwrap_err().to_string();
+        assert!(e.contains(says), "{sql}: {e}");
     }
 }

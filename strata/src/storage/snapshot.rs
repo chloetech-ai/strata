@@ -22,11 +22,12 @@ use crate::postings::bytes::OwnedBytes;
 
 use crate::error::Result;
 use crate::schema::Schema;
-use crate::segment::build::{build_segment, BuildOptions};
+use crate::segment::build::BuildOptions;
 use crate::segment::{DocFilter, DocId, SegmentFile};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
 use crate::storage::pk::PkIndex;
+use crate::storage::rowseq;
 use crate::storage::state::{SegHandle, State};
 use crate::storage::updates::Updates;
 use crate::value::{Document, Value};
@@ -57,6 +58,8 @@ pub struct Snapshot {
 
 pub(crate) struct SnapInner {
     txn: u64,
+    /// Whether the database numbers its writes (`seq_no()`).
+    numbered: bool,
     tables: Vec<TableView>,
     /// Mappings the on-disk segments point into.
     maps: Vec<OwnedBytes>,
@@ -76,6 +79,12 @@ struct TableView {
 impl Snapshot {
     pub(crate) fn of(inner: Arc<SnapInner>) -> Snapshot {
         Snapshot { inner, table: 0 }
+    }
+
+    /// Whether the database numbers its writes, so that each row has a
+    /// sequence number (`seq_no()`).
+    pub fn numbers_writes(&self) -> bool {
+        self.inner.numbered
     }
 
     fn view(&self) -> &TableView {
@@ -242,6 +251,9 @@ pub(crate) struct MemPart {
     /// Already built, if the cache held this prefix.
     pub seg: Option<MemSeg>,
     pub updates: Option<Arc<Updates>>,
+    /// The documents' insert numbers, when the database numbers its
+    /// writes and the segment is still to build.
+    pub seqs: Option<Vec<u64>>,
 }
 
 /// What a snapshot needs of one table.
@@ -256,6 +268,7 @@ pub(crate) struct TableCapture {
 pub(crate) struct Capture {
     pub version: u64,
     txn: u64,
+    numbered: bool,
     pin: Pin,
     pub tables: Vec<TableCapture>,
 }
@@ -265,13 +278,14 @@ impl State {
     /// memtables unless `with_mem`).
     pub(crate) fn capture(&mut self, pins: &Arc<Pins>, with_mem: bool) -> Capture {
         let mut tables = Vec::with_capacity(self.tables.len());
+        let numbered = self.manifest.seq_no.is_some();
         for t in 0..self.tables.len() {
-            tables.push(self.capture_table(t, with_mem));
+            tables.push(self.capture_table(t, with_mem, numbered));
         }
-        Capture { version: self.version, txn: self.txn, pin: pins.pin(self.txn), tables }
+        Capture { version: self.version, txn: self.txn, numbered, pin: pins.pin(self.txn), tables }
     }
 
-    fn capture_table(&mut self, t: usize, with_mem: bool) -> TableCapture {
+    fn capture_table(&mut self, t: usize, with_mem: bool, numbered: bool) -> TableCapture {
         let handles = self.tables[t].handles.clone();
         let mut disk = Vec::with_capacity(handles.len());
         for h in &handles {
@@ -314,8 +328,10 @@ impl State {
             }
             let seg = table.memsegs.get(k).and_then(|s| s.as_ref()).filter(|s| (s.gen, s.len) == (gen, len)).cloned();
             let docs = table.mem.chunks[k].clone();
-            let updates = Some(table.mem.updates.slice((k * table.mem.chunk) as DocId, len as u32)).filter(|u| !u.is_empty()).map(Arc::new);
-            mem.push(MemPart { table: table.id, gen, chunk: k, len, docs, live, n_live: (len - n_deleted) as u32, seg, updates });
+            let first = k * table.mem.chunk;
+            let updates = Some(table.mem.updates.slice(first as DocId, len as u32)).filter(|u| !u.is_empty()).map(Arc::new);
+            let seqs = (numbered && seg.is_none()).then(|| (first..first + len).map(|p| table.mem.seqs.get(p).copied().unwrap_or(0)).collect());
+            mem.push(MemPart { table: table.id, gen, chunk: k, len, docs, live, n_live: (len - n_deleted) as u32, seg, updates, seqs });
         }
         TableCapture { id: table.id, schema: table.schema.clone(), disk, mem }
     }
@@ -349,7 +365,7 @@ impl State {
 pub(crate) fn build_memseg(schema: &Schema, opts: &BuildOptions, part: &MemPart, id: u64) -> MemSeg {
     // The documents were validated when they were written, so a failure
     // here is a bug in an index builder.
-    let image = build_segment(schema, &part.docs[..part.len], opts).expect("building a memtable segment");
+    let image = rowseq::build(schema, &part.docs[..part.len], part.seqs.as_deref(), opts).expect("building a memtable segment");
     let file = SegmentFile::open(OwnedBytes::new(PageAligned::new(&image))).expect("memtable segment opens");
     let pk = PkIndex::open(&file).expect("memtable pk index");
     MemSeg { gen: part.gen, chunk: part.chunk, len: part.len, id, file, pk }
@@ -391,7 +407,7 @@ impl Capture {
             let n_live = segments.iter().map(|s| s.n_live as u64).sum();
             tables.push(TableView { id: t.id, schema: t.schema, segments, pks, n_live });
         }
-        SnapInner { txn: self.txn, tables, maps, path, _pin: self.pin }
+        SnapInner { txn: self.txn, numbered: self.numbered, tables, maps, path, _pin: self.pin }
     }
 }
 

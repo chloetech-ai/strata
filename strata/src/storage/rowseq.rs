@@ -17,7 +17,12 @@
 
 use crate::error::{corrupt, Result};
 use crate::postings::bytes::OwnedBytes;
+use crate::schema::Schema;
+use crate::segment::build::{build_segment, BuildOptions, SegmentBuild};
 use crate::segment::{DocId, SegmentFile, SegmentWriter};
+use crate::storage::snapshot::SegmentView;
+use crate::storage::updates::SEQ;
+use crate::value::Document;
 
 /// The section of a segment's numbers.
 pub const SECTION: &str = "seq";
@@ -76,6 +81,24 @@ impl Seqs {
 /// Document `d`'s number in `seg`, as built.
 pub fn of(seg: &SegmentFile, d: DocId) -> Result<u64> {
     Ok(Seqs::of(seg)?.map_or(0, |s| s.get(d)))
+}
+
+/// Document `d`'s number as a snapshot's segment `v` has it: of its last
+/// value written in place, else as built.
+pub fn of_view(v: &SegmentView, d: DocId) -> Result<u64> {
+    match v.updates.as_ref().and_then(|u| u.get(SEQ, d)) {
+        Some(x) => Ok(x.as_i64().unwrap_or(0) as u64),
+        None => of(&v.file, d),
+    }
+}
+
+/// The image of a segment of `docs`, with their numbers when the
+/// database numbers its writes (`seqs`, one per document).
+pub fn build(schema: &Schema, docs: &[Document], seqs: Option<&[u64]>, opts: &BuildOptions) -> Result<Vec<u8>> {
+    let Some(seqs) = seqs else { return build_segment(schema, docs, opts) };
+    let mut w = SegmentBuild::new(schema, opts, docs.len())?.finish(docs)?;
+    w.put(SECTION, encode(seqs));
+    Ok(w.finish())
 }
 
 /// `seg`'s image without its numbers, or `None` when it has none: a

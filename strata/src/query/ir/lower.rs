@@ -65,6 +65,7 @@ impl Outputs {
             Projection::Field(f) => return self.keys.iter().position(|k| k == f).map_or(Expr::Field(*f as u32), |i| Expr::Output(i as u32)),
             Projection::Score => return Expr::Score,
             Projection::Hops(_) => return Expr::Hops,
+            Projection::SeqNo => return Expr::SeqNo,
             Projection::Count => Agg { func: logical::AggFn::Count, arg: None },
             Projection::Agg { func, field } => Agg { func: *func, arg: Some(Expr::Field(*field as u32)) },
         };
@@ -150,6 +151,7 @@ impl Lower<'_> {
                     expr: match p {
                         Projection::Field(f) => Expr::Field(*f as u32),
                         Projection::Hops(_) => Expr::Hops,
+                        Projection::SeqNo => Expr::SeqNo,
                         _ => Expr::Score,
                     },
                 })
