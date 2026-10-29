@@ -59,6 +59,13 @@ struct Args {
     /// damaged.
     #[arg(long)]
     verify_checksums: bool,
+    /// Number the database's writes, for good: each row then has the
+    /// sequence number of its last write (`seq_no()` in a SELECT), and a
+    /// write operation can apply only while a row's number is the one it
+    /// read (`if_seq_no`). The database then needs this version of
+    /// Strata or a later one.
+    #[arg(long)]
+    seq_no: bool,
     /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
     /// of one shard joined by '|').
     #[arg(long, value_delimiter = ',')]
@@ -272,6 +279,7 @@ async fn main() {
         directory: a.directory,
         wal_drop_damaged: a.wal_drop_damaged,
         verify_checksums: a.verify_checksums,
+        seq_no: a.seq_no,
         shards: a.shards,
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),

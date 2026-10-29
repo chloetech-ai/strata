@@ -643,7 +643,7 @@ impl<'a> Binder<'a> {
                     Projection::Field(f) if !group_by.contains(f) => {
                         return Err(err(format!("{name} must be in GROUP BY or inside an aggregate (COUNT, SUM, AVG, MIN, MAX)")))
                     }
-                    Projection::Score | Projection::Hops(_) => return Err(err("score() and hops() cannot be aggregated")),
+                    Projection::Score | Projection::Hops(_) | Projection::SeqNo => return Err(err("score(), hops() and seq_no() cannot be aggregated")),
                     _ => {}
                 }
             }
@@ -901,6 +901,7 @@ impl<'a> Binder<'a> {
             Expr::Function(f) => match fname(f).as_str() {
                 "score" => Ok(Projection::Score),
                 "hops" => Ok(Projection::Hops(self.hops_graph()?)),
+                "seq_no" => Ok(Projection::SeqNo),
                 "count" | "sum" | "avg" | "min" | "max" => self.aggregate(f),
                 n => Err(err(format!("unsupported function in SELECT: {n}"))),
             },
@@ -1053,6 +1054,7 @@ impl<'a> Binder<'a> {
             return match p {
                 Projection::Field(f) => Ok(OrderBy::Score { score: Score::Column { field: *f }, desc, nulls_first: false }),
                 Projection::Score => Err(err("ORDER BY score(): order by the score expression itself")),
+                Projection::SeqNo => Err(err("ORDER BY seq_no(): a query cannot order by it")),
                 Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true, nulls_first: false }),
                 Projection::Count | Projection::Agg { .. } => Err(err("ORDER BY an aggregate needs GROUP BY")),
             };

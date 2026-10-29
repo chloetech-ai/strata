@@ -328,6 +328,8 @@ message Expr {
     Node keys = 32;
     Node exists = 33;
     Node scalar = 34;
+    // A row's sequence number (seq_no()); plan feature "seq_no".
+    Empty seq_no = 35;
   }
 }
 
@@ -542,6 +544,8 @@ message WriteRequest {
   //  {"op": "upsert_if_newer", "doc": {...}, "version": "field"},
   //  {"op": "delete", "key": ...},
   //  {"op": "set" | "add", "key": ..., "field": "...", "value": ...}].
+  // Any but insert may carry "if_seq_no": n, and then applies only while
+  // the row's sequence number is n (FailedPrecondition otherwise).
   bytes ops_json = 3;
   // With ops_json: a retry of a request with the same key (and the same
   // operations) returns the first answer instead of writing again.
@@ -550,7 +554,12 @@ message WriteRequest {
   uint64 epoch = 5;
 }
 
-message WriteResponse { uint64 written = 1; }
+message WriteResponse {
+  uint64 written = 1;
+  // The transaction's sequence number, from a server that numbers its
+  // writes (--seq-no) when the request wrote.
+  optional uint64 seq_no = 2;
+}
 
 message SchemaResponse { string schema_json = 1; }
 

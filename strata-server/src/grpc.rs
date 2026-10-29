@@ -236,17 +236,18 @@ impl pb::strata_server::Strata for Grpc {
     async fn write(&self, req: Request<pb::WriteRequest>) -> Result<Response<pb::WriteResponse>, Status> {
         self.serve("Write", req, |svc, r| async move {
             svc.check_epoch(r.epoch)?;
-            let written = if !r.ops_json.is_empty() {
+            let (written, seq_no) = if !r.ops_json.is_empty() {
                 let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
                 let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
-                svc.write_ops(ops, key).await?
+                let w = svc.write_ops(ops, key).await?;
+                (w.rows, w.seq_no)
             } else {
                 match svc.sql(&r.sql, &params_from_pb(r.params), 0).await? {
-                    crate::service::SqlAnswer::Written { n, .. } => n,
+                    crate::service::SqlAnswer::Written { n, seq_no, .. } => (n, seq_no),
                     crate::service::SqlAnswer::Rows(_) => return Err(ApiError::bad("Write takes INSERT, UPDATE or DELETE; use Query")),
                 }
             };
-            Ok(pb::WriteResponse { written })
+            Ok(pb::WriteResponse { written, seq_no })
         })
         .await
     }

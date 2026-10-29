@@ -23,7 +23,7 @@ use crate::query::stats::{FieldStats, TermStats};
 use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
-use crate::storage::{KeyRef, SegmentView, Snapshot, Updates};
+use crate::storage::{rowseq, KeyRef, SegmentView, Snapshot, Updates};
 use crate::text::{self, Bm25Params, BoolQuery, CollectionStats, FilterStrategy, Synonyms, TextFieldReader, TopKAlgo};
 use crate::value::Value;
 use crate::vector::{self, SearchParams, VectorReader};
@@ -1923,6 +1923,9 @@ impl<'a> Executor<'a> {
     }
 
     fn project(&self, q: &Select, hits: &[Hit]) -> Result<Vec<Vec<Value>>> {
+        if q.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && !self.snap.numbers_writes() {
+            return Err(Error::Query("seq_no(): the database does not number its writes (Database::start_seq_no)".into()));
+        }
         let stored: Vec<usize> = q
             .projection
             .iter()
@@ -1953,6 +1956,7 @@ impl<'a> Executor<'a> {
                     Projection::Score => Value::Null,
                     Projection::Count | Projection::Agg { .. } => Value::Null,
                     Projection::Hops(g) => self.hops_of(*g, h.seg, h.doc).map_or(Value::Null, |x| Value::Int(x as i64)),
+                    Projection::SeqNo => Value::Int(rowseq::of_view(s.view, h.doc)? as i64),
                     Projection::Field(i) if Some(*i) == self.schema.primary_key => self.key(h),
                     Projection::Field(i) if self.updates(s, *i).is_some_and(|u| u.get(*i, h.doc).is_some()) => {
                         self.updates(s, *i).and_then(|u| u.get(*i, h.doc)).cloned().unwrap_or(Value::Null)

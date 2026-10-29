@@ -474,7 +474,7 @@ impl Service {
 
     /// Hands a write to the writer thread and waits for its commit. The
     /// writer records `key`'s outcome, even if this future is dropped.
-    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue) -> Result<u64, ApiError> {
+    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue) -> Result<Written, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
         match &job {
             WriteJob::Ops(ops) => self.check_keys(&ops.iter().map(|op| op_key(&self.schema, op)).collect::<Result<Vec<_>, _>>()?)?,
@@ -679,9 +679,9 @@ impl Service {
             let Backend::Local(db) = &self.backend else {
                 return Err(ApiError::bad("a coordinator takes writes as SQL; its shards do not take write plans yet"));
             };
-            let n = self.write_local(db, move |db| db.prepare_plan(&plan).map(Some), timeout_ms).await;
-            let n = self.wrote(n, t0, Some(&text))?;
-            return Ok(SqlAnswer::Written { n, took_ms: t0.elapsed().as_secs_f64() * 1e3 });
+            let w = self.write_local(db, move |db| db.prepare_plan(&plan).map(Some), timeout_ms).await;
+            let w = self.wrote(w, t0, Some(&text))?;
+            return Ok(SqlAnswer::Written { n: w.rows, seq_no: w.seq_no, took_ms: t0.elapsed().as_secs_f64() * 1e3 });
         }
         let req = QueryReq { sql: text, timeout_ms, plan: Some(Arc::new(plan)), ..Default::default() };
         self.query(req).await.map(SqlAnswer::Rows)
@@ -918,16 +918,16 @@ impl Service {
                 let (text, p) = (sql.to_string(), params.clone());
                 self.write_local(db, move |db| db.prepare_write(&text, &p), timeout_ms).await
             }
-            Backend::Cluster(c) => c.sql(sql, params).await,
+            Backend::Cluster(c) => c.sql(sql, params).await.map(Written::rows),
         };
-        let n = self.wrote(r, t0, Some(sql))?;
-        Ok(SqlAnswer::Written { n, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
+        let w = self.wrote(r, t0, Some(sql))?;
+        Ok(SqlAnswer::Written { n: w.rows, seq_no: w.seq_no, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
     }
 
     /// A write `prepare` binds (`None`: not a write), queued for the writer
     /// thread. It is bound, and its vectors computed, before it queues:
     /// models run on a core of their own, not in the writer thread.
-    async fn write_local<F>(self: &Arc<Self>, db: &Arc<Db>, prepare: F, timeout_ms: u64) -> Result<u64, ApiError>
+    async fn write_local<F>(self: &Arc<Self>, db: &Arc<Db>, prepare: F, timeout_ms: u64) -> Result<Written, ApiError>
     where
         F: FnOnce(&Db) -> strata::Result<Option<PreparedWrite>> + Send + 'static,
     {
@@ -953,7 +953,7 @@ impl Service {
     /// transaction per server, which other requests waiting at the same
     /// time may share (see [`writer`]). With an idempotency `key`, a retry
     /// of a request that committed returns its answer unapplied.
-    pub async fn write_ops(self: &Arc<Self>, mut ops: Vec<Json>, key: Option<String>) -> Result<u64, ApiError> {
+    pub async fn write_ops(self: &Arc<Self>, mut ops: Vec<Json>, key: Option<String>) -> Result<Written, ApiError> {
         let t0 = Instant::now();
         let n = match &self.backend {
             Backend::Local(db) => {
@@ -995,22 +995,22 @@ impl Service {
                 }
                 r
             }
-            Backend::Cluster(c) => c.write_ops(ops, key).await,
+            Backend::Cluster(c) => c.write_ops(ops, key).await.map(Written::rows),
         };
         self.wrote(n, t0, None)
     }
 
     /// Counts a write's outcome (the request logs a failure on the
     /// server's side), and logs it if it was slow.
-    fn wrote(&self, r: Result<u64, ApiError>, t0: Instant, sql: Option<&str>) -> Result<u64, ApiError> {
+    fn wrote(&self, r: Result<Written, ApiError>, t0: Instant, sql: Option<&str>) -> Result<Written, ApiError> {
         let secs = t0.elapsed().as_secs_f64();
         match &r {
-            Ok(n) => self.metrics.write(*n, secs),
+            Ok(w) => self.metrics.write(w.rows, secs),
             Err(e) => self.metrics.write_error(e.status),
         }
         if self.slow.is_some_and(|s| t0.elapsed() >= s) {
             self.metrics.slow("write");
-            let (rows, status) = (r.as_ref().map_or(0, |n| *n), r.as_ref().map_or_else(|e| e.status, |_| 200));
+            let (rows, status) = (r.as_ref().map_or(0, |w| w.rows), r.as_ref().map_or_else(|e| e.status, |_| 200));
             match sql {
                 Some(sql) => tracing::warn!(secs, rows, status, sql = %obs::truncate(sql, 2000), "slow write"),
                 None => tracing::warn!(secs, rows, status, "slow write"),
@@ -1048,7 +1048,7 @@ impl Service {
         while let Some(chunk) = rx.recv().await {
             let ops = chunk?;
             if !ops.is_empty() {
-                n += self.write_ops(ops, None).await?;
+                n += self.write_ops(ops, None).await?.rows;
             }
         }
         let unknown = reader.await.map_err(ApiError::internal)??;
@@ -1158,7 +1158,23 @@ impl Service {
 
 pub enum SqlAnswer {
     Rows(Answer),
-    Written { n: u64, took_ms: f64 },
+    /// `seq_no` as in [`Written`].
+    Written { n: u64, seq_no: Option<u64>, took_ms: f64 },
+}
+
+/// What a write did: the rows it wrote and, in a database that numbers
+/// its writes (`--seq-no`), its transaction's sequence number (none
+/// through a coordinator, whose shards number their own writes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Written {
+    pub rows: u64,
+    pub seq_no: Option<u64>,
+}
+
+impl Written {
+    fn rows(rows: u64) -> Written {
+        Written { rows, seq_no: None }
+    }
 }
 
 /// Rows one write request of an import carries.
@@ -1237,7 +1253,7 @@ struct Queued {
     job: WriteJob,
     deadline: Instant,
     /// `None` once answered.
-    reply: Option<tokio::sync::oneshot::Sender<Result<u64, ApiError>>>,
+    reply: Option<tokio::sync::oneshot::Sender<Result<Written, ApiError>>>,
     /// The request's idempotency key, whose outcome the writer records.
     key: Option<String>,
     keys: Arc<idem::Keys>,
@@ -1247,7 +1263,7 @@ struct Queued {
 
 impl Queued {
     /// Records the outcome under the request's key and answers it.
-    fn answer(mut self, r: Result<u64, ApiError>) {
+    fn answer(mut self, r: Result<Written, ApiError>) {
         if let Some(k) = &self.key {
             self.keys.finish(k, r.as_ref().ok().copied());
         }
@@ -1399,15 +1415,15 @@ fn apply_group(db: &Db, group: Vec<Queued>) {
     }
     let Some(deadline) = group.iter().map(|q| q.deadline).max() else { return };
     if let [Queued { job: WriteJob::Sql(p), .. }] = &group[..] {
-        let r = wait_for_writer(deadline, || Ok(db.write_prepared(p)?));
+        let r = wait_for_writer(deadline, || db.write_prepared_seq(p).map(|(rows, seq_no)| Written { rows, seq_no }).map_err(ApiError::from));
         group.into_iter().next().expect("one").answer(r);
         return;
     }
     let requests: Vec<&[Json]> = group.iter().map(|q| q.ops()).collect();
     match wait_for_writer(deadline, || apply_requests(db, &requests)) {
-        Ok(counts) => {
-            for (q, n) in group.into_iter().zip(counts) {
-                q.answer(Ok(n));
+        Ok((counts, seq_no)) => {
+            for (q, rows) in group.into_iter().zip(counts) {
+                q.answer(Ok(Written { rows, seq_no }));
             }
         }
         Err(e) if group.len() == 1 => {
@@ -1452,22 +1468,55 @@ fn wait_for_writer<T>(deadline: Instant, mut write: impl FnMut() -> Result<T, Ap
     }
 }
 
-/// Applies `ops` to `db` in one transaction; returns how many wrote.
-pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<u64, ApiError> {
-    Ok(apply_requests(db, &[ops])?[0])
+/// Applies `ops` to `db` in one transaction.
+pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<Written, ApiError> {
+    let (counts, seq_no) = apply_requests(db, &[ops])?;
+    Ok(Written { rows: counts[0], seq_no })
 }
 
 /// Applies several requests' operations in one transaction; returns the
-/// rows each wrote.
-fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<Vec<u64>, ApiError> {
+/// rows each wrote, and the transaction's sequence number in a database
+/// that numbers its writes.
+fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<(Vec<u64>, Option<u64>), ApiError> {
     let schema = db.schema().clone();
     let mut t = db.storage().begin()?;
     let mut counts = Vec::with_capacity(requests.len());
     for ops in requests {
         counts.push(apply_into(&schema, &mut t, ops)?);
     }
-    t.commit()?;
-    Ok(counts)
+    let seq_no = t.commit_seq()?;
+    Ok((counts, seq_no))
+}
+
+/// Refuses an operation with `if_seq_no` unless the row with `key` is
+/// live with that sequence number, as this transaction finds it (a row an
+/// earlier operation of the transaction wrote has none yet). Checked
+/// under the writer lock, so no other write comes between it and the
+/// operation.
+fn check_seq_no(t: &WriteTxn<'_>, op: &Json, key: &Value) -> Result<(), ApiError> {
+    let want = match op.get("if_seq_no") {
+        None | Some(Json::Null) => return Ok(()),
+        Some(v) => v.as_u64().ok_or_else(|| ApiError::bad("if_seq_no is a sequence number: a whole number from 0"))?,
+    };
+    let now = t.seq_of(key).map_err(|e| match e {
+        strata::Error::Schema(_) => ApiError::bad("if_seq_no needs a database that numbers its writes: start the server with --seq-no"),
+        e => e.into(),
+    })?;
+    if now == Some(want) {
+        return Ok(());
+    }
+    let found = match now {
+        Some(n) => format!("its sequence number is {n}"),
+        None => "no row has the key, or an earlier operation of this request wrote it".to_string(),
+    };
+    Err(ApiError { status: 409, message: format!("if_seq_no {want} does not hold for key {}: {found}", key_text(key)) })
+}
+
+fn key_text(key: &Value) -> String {
+    match key {
+        Value::Str(s) => format!("{s:?}"),
+        v => format!("{v:?}"),
+    }
 }
 
 /// Applies one request's `ops`; a TIMESTAMP defaulting to `"now"` takes
@@ -1479,6 +1528,14 @@ fn apply_into(schema: &Schema, t: &mut WriteTxn<'_>, ops: &[Json]) -> Result<u64
         let kind = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
         let doc = || js::document(schema, op.get("doc").unwrap_or(&Json::Null), now);
         let field = || op.get("field").and_then(|f| f.as_str()).ok_or_else(|| ApiError::bad(format!("{kind} needs a field")));
+        let checked = |t: &WriteTxn<'_>| -> Result<(), ApiError> {
+            match op.get("if_seq_no") {
+                None => Ok(()),
+                Some(_) if kind == "insert" => Err(ApiError::bad("insert takes no if_seq_no: it fails if the row exists")),
+                Some(_) => check_seq_no(t, op, &op_key(schema, op)?),
+            }
+        };
+        checked(t)?;
         let wrote = match kind {
             "insert" => {
                 t.insert(doc()?)?;
@@ -1492,7 +1549,7 @@ fn apply_into(schema: &Schema, t: &mut WriteTxn<'_>, ops: &[Json]) -> Result<u64
                 let v = op.get("version").and_then(|v| v.as_str()).ok_or_else(|| ApiError::bad("upsert_if_newer needs a version field"))?;
                 t.upsert_if_newer(doc()?, v)?
             }
-            "delete" => t.delete(&op_key(&schema, op)?)?,
+            "delete" => t.delete(&op_key(schema, op)?)?,
             "set" => {
                 let key = op_key(schema, op)?;
                 let f = field()?;

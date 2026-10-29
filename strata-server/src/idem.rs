@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value as Json;
 
+use crate::service::Written;
+
 /// How long a key is remembered.
 pub const TTL: Duration = Duration::from_secs(3600);
 /// How many keys are remembered at most.
@@ -26,8 +28,8 @@ pub const CAPACITY: usize = 100_000;
 pub enum Begin {
     /// Unseen: apply the request.
     New,
-    /// Already committed, writing this many rows.
-    Done(u64),
+    /// Already committed, with this answer.
+    Done(Written),
     /// A request with this key is being applied now.
     Busy,
     /// The key was used for different operations.
@@ -43,7 +45,7 @@ pub struct Keys {
 struct Inner {
     /// The hash of the key's operations, and what they wrote once
     /// committed (`None` while running).
-    keys: HashMap<String, (u64, Option<u64>)>,
+    keys: HashMap<String, (u64, Option<Written>)>,
     /// Keys in the order they arrived, to forget the oldest.
     order: VecDeque<(Instant, String)>,
 }
@@ -70,10 +72,10 @@ impl Keys {
         }
     }
 
-    /// Records the outcome of the request that claimed `key`: the rows it
+    /// Records the outcome of the request that claimed `key`: what it
     /// wrote, or `None` if it did not commit (the key is then forgotten,
     /// so a retry applies it).
-    pub fn finish(&self, key: &str, written: Option<u64>) {
+    pub fn finish(&self, key: &str, written: Option<Written>) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match written {
             Some(n) => {
@@ -108,14 +110,16 @@ mod tests {
         assert_eq!(k.begin("a", 1), Begin::New);
         assert_eq!(k.begin("a", 1), Begin::Busy);
         assert_eq!(k.begin("a", 2), Begin::Mismatch);
-        k.finish("a", Some(3));
-        assert_eq!(k.begin("a", 1), Begin::Done(3));
+        // The answer comes back whole, with its sequence number.
+        let w = Written { rows: 3, seq_no: Some(7) };
+        k.finish("a", Some(w));
+        assert_eq!(k.begin("a", 1), Begin::Done(w));
         // A request that did not commit can be retried.
         assert_eq!(k.begin("b", 1), Begin::New);
         k.finish("b", None);
         assert_eq!(k.begin("b", 1), Begin::New);
         // A late failure report does not forget a committed key.
         k.finish("a", None);
-        assert_eq!(k.begin("a", 1), Begin::Done(3));
+        assert_eq!(k.begin("a", 1), Begin::Done(w));
     }
 }

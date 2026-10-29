@@ -61,7 +61,7 @@ use strata::query::agg::Part;
 use strata::query::exec::ResultSet;
 use strata::query::ir::Plan;
 use strata::query::stats::TermStats;
-use strata::query::{bind_write, Conflict, Params, Select, Write};
+use strata::query::{bind_write, Conflict, Params, Projection, Select, Write};
 use strata::schema::Schema;
 use strata::value::Value;
 use tonic::service::interceptor::InterceptedService;
@@ -157,6 +157,11 @@ pub const FETCH_FROM: usize = 8;
 /// How long a replica's answer to `Hello` is trusted before it is asked
 /// again, so that the coordinator follows a rolling upgrade or a rollback.
 const HELLO_EVERY_MS: u64 = 60_000;
+
+/// Why `seq_no()` and `if_seq_no` need one replica per shard: each
+/// replica numbers the writes it takes in its own order until replication
+/// ships the primary's log.
+const ONE_REPLICA: &str = "seq_no() and if_seq_no need one replica per shard: each replica numbers its own writes until replication ships the primary's log";
 
 /// The protocol to speak with a server that answered `Hello`: the newest
 /// both speak.
@@ -653,6 +658,9 @@ impl Coordinator {
     }
 
     pub async fn query(&self, req: &QueryReq, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
+        if select.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && self.replicas.iter().any(|r| r.len() > 1) {
+            return Err(ApiError::bad(ONE_REPLICA));
+        }
         let partial = req.partial.unwrap_or(self.opts.partial);
         let protocol = self.protocol();
         let n = self.replicas.len();
@@ -896,6 +904,9 @@ impl Coordinator {
         let mut by_shard: BTreeMap<usize, Vec<Json>> = BTreeMap::new();
         for op in ops {
             let s = self.shard_of(&op_key(&self.schema, &op)?);
+            if op.get("if_seq_no").is_some() && self.replicas[s].len() > 1 {
+                return Err(ApiError::bad(ONE_REPLICA));
+            }
             by_shard.entry(s).or_default().push(op);
         }
         let calls = by_shard.into_iter().map(|(i, ops)| {

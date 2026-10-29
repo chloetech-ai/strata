@@ -60,12 +60,16 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 1] = [OPERATORS];
+pub const FEATURES: [&str; 2] = [OPERATORS, SEQ_NO];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
 /// Search's ([module docs](self)).
 pub const OPERATORS: &str = "operators";
+
+/// The feature of a plan with a column of rows' sequence numbers
+/// ([`Expr::SeqNo`]).
+pub const SEQ_NO: &str = "seq_no";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -302,6 +306,10 @@ pub enum Expr {
     /// The row's hops from the seeds of the Search's first `REACHABLE` or
     /// `PATH` (`hops()`).
     Hops,
+    /// The sequence number of the write that last changed the row
+    /// (`seq_no()`), a column of a Search in a database that numbers its
+    /// writes. Feature [`SEQ_NO`].
+    SeqNo,
     /// Column `n` of the input's rows: an Aggregate's keys, then its
     /// aggregates; a Project's columns; a Join's left columns, then its
     /// right ones; a [`Node::Ref`]'s.
@@ -683,7 +691,17 @@ fn err(m: impl Into<String>) -> Error {
 impl Plan {
     /// A plan of the current version, with the features it uses.
     pub fn new(root: Node) -> Plan {
-        let features = if root.is_write() || !root.uses_operators() { Vec::new() } else { vec![OPERATORS.to_string()] };
+        let mut features = Vec::new();
+        if !root.is_write() && root.uses_operators() {
+            features.push(OPERATORS.to_string());
+        }
+        let mut seq_no = false;
+        if root.is_leaf() {
+            root.leaf_exprs(&mut |e| e.visit(&mut |x| seq_no |= *x == Expr::SeqNo));
+        }
+        if seq_no {
+            features.push(SEQ_NO.to_string());
+        }
         Plan { version: VERSION, features, root }
     }
 

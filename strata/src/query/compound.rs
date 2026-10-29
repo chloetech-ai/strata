@@ -398,6 +398,9 @@ impl<'a> Planner<'a> {
         };
         let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind, Some(schema));
         let select = super::sql::bind_query_with(q, schema, self.params, &subs as &Subs).map_err(at)?;
+        if select.projection.iter().any(|(_, p)| *p == Projection::SeqNo) {
+            return Err(at(err("seq_no() is a column of a SELECT on one table, not of a compound query")));
+        }
         let aggregated = !select.group_by.is_empty() || select.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
         let keyed = !aggregated
             && select.projection.iter().all(|(name, p)| match p {

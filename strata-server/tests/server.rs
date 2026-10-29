@@ -1910,3 +1910,170 @@ async fn explain_gives_the_plan_ir() {
     assert!(!want["rows"].as_array().unwrap().is_empty(), "{want}");
     same(compound, &want, &got);
 }
+
+/// Conditional writes: with `--seq-no` each row has the sequence number of
+/// its last write (`seq_no()`), a write answers its own, and an operation
+/// with `if_seq_no` applies only while the row still has that number,
+/// else answers 409 and writes nothing. Of requests racing on one number,
+/// exactly one applies, also when they share a commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn conditional_writes_apply_while_the_row_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(dir.path(), "q.strata", |i| i < 200);
+    db.storage().start_seq_no().unwrap();
+    let svc = service(db, "http://unused");
+    let base = http(svc.clone(), None).await;
+    let c = reqwest::Client::new();
+    let url = format!("{base}/v1/write");
+    let row = |id: &'static str| {
+        let (c, base) = (c.clone(), base.clone());
+        async move {
+            let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT seq_no(), sold FROM products WHERE id = :k", "params": {"k": id}})).await;
+            r["rows"].get(0).map(|r| (r[0].as_u64().unwrap(), r[1].as_i64().unwrap()))
+        }
+    };
+    let write = |ops: Json| {
+        let (c, url) = (c.clone(), url.clone());
+        async move { post(&c, &url, json!({"ops": ops})).await }
+    };
+
+    // Loaded rows have number 0; a write answers its number.
+    assert_eq!(row("p0000003").await.unwrap().0, 0);
+    let (status, r) = write(json!([{"op": "set", "key": "p0000003", "field": "sold", "value": 10, "if_seq_no": 0}])).await;
+    assert_eq!((status, r["written"].clone(), r["seq_no"].clone()), (200, json!(1), json!(1)), "{r}");
+    assert_eq!(row("p0000003").await, Some((1, 10)));
+    // A stale number is refused, naming the row's.
+    let (status, r) = write(json!([{"op": "add", "key": "p0000003", "field": "sold", "value": 1, "if_seq_no": 0}])).await;
+    assert_eq!(status, 409, "{r}");
+    assert!(r["error"].as_str().unwrap().contains("its sequence number is 1"), "{r}");
+    let (status, r) = write(json!([{"op": "add", "key": "p0000003", "field": "sold", "value": 1, "if_seq_no": 1}])).await;
+    assert_eq!((status, r["seq_no"].clone()), (200, json!(2)), "{r}");
+    assert_eq!(row("p0000003").await, Some((2, 11)));
+
+    // A refused operation takes the request's others with it.
+    let (status, _) = write(json!([
+        {"op": "set", "key": "p0000004", "field": "sold", "value": 99},
+        {"op": "delete", "key": "p0000003", "if_seq_no": 1},
+    ]))
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(row("p0000004").await.unwrap().0, 0);
+    // An operation after another on its row in the same request finds no
+    // number to match.
+    let (status, r) = write(json!([
+        {"op": "set", "key": "p0000004", "field": "sold", "value": 99},
+        {"op": "set", "key": "p0000004", "field": "sold", "value": 98, "if_seq_no": 0},
+    ]))
+    .await;
+    assert_eq!(status, 409, "{r}");
+    assert!(r["error"].as_str().unwrap().contains("an earlier operation of this request"), "{r}");
+    // Upserts and deletes take a condition too; a missing row matches none.
+    let (status, r) = write(json!([{"op": "upsert", "doc": {"id": "p0000004", "title": "Four", "sold": 4}, "if_seq_no": 0}])).await;
+    assert_eq!((status, r["seq_no"].clone()), (200, json!(3)), "{r}");
+    let (status, _) = write(json!([{"op": "delete", "key": "p0000004", "if_seq_no": 2}])).await;
+    assert_eq!(status, 409);
+    let (status, _) = write(json!([{"op": "delete", "key": "p0000004", "if_seq_no": 3}])).await;
+    assert_eq!(status, 200);
+    let (status, r) = write(json!([{"op": "set", "key": "p0000004", "field": "sold", "value": 1, "if_seq_no": 4}])).await;
+    assert_eq!(status, 409);
+    assert!(r["error"].as_str().unwrap().contains("no row has the key"), "{r}");
+    // Refused as malformed: on an insert, or not a number.
+    assert_eq!(write(json!([{"op": "insert", "doc": {"id": "n1", "title": "New"}, "if_seq_no": 0}])).await.0, 400);
+    assert_eq!(write(json!([{"op": "add", "key": "p0000005", "field": "sold", "value": 1, "if_seq_no": "0"}])).await.0, 400);
+
+    // SQL writes answer their number too; a retry with an idempotency key
+    // answers the first one's.
+    let (status, r) = post(&c, &format!("{base}/v1/sql"), json!({"sql": "UPDATE products SET sold = 0 WHERE id = 'p0000006'"})).await;
+    assert_eq!((status, r["seq_no"].clone()), (200, json!(5)), "{r}");
+    for _ in 0..2 {
+        let (status, r) = post(&c, &url, json!({"ops": [{"op": "add", "key": "p0000006", "field": "sold", "value": 1}], "idempotency_key": "k1"})).await;
+        assert_eq!((status, r["seq_no"].clone()), (200, json!(6)), "{r}");
+    }
+
+    // Requests racing on one number: exactly one applies. While the
+    // writer waits on a write of another row, they queue for one commit.
+    let (seq, sold) = row("p0000007").await.unwrap();
+    let held = svc.local_db().unwrap().storage().begin().unwrap();
+    let first = tokio::spawn(write(json!([{"op": "add", "key": "p0000009", "field": "sold", "value": 1}])));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let racing: Vec<_> = (0..32).map(|_| tokio::spawn(write(json!([{"op": "add", "key": "p0000007", "field": "sold", "value": 1, "if_seq_no": seq}])))).collect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(held);
+    assert_eq!(first.await.unwrap().0, 200);
+    let mut statuses = Vec::new();
+    for r in racing {
+        statuses.push(r.await.unwrap().0);
+    }
+    assert_eq!((statuses.iter().filter(|&&s| s == 200).count(), statuses.iter().filter(|&&s| s == 409).count()), (1, 31), "{statuses:?}");
+    assert_eq!(row("p0000007").await.unwrap().1, sold + 1);
+
+    // gRPC answers the number as well.
+    let mut g = pb::strata_client::StrataClient::connect(grpc(svc.clone()).await).await.unwrap();
+    let ops = |n: u64| serde_json::to_vec(&json!([{"op": "add", "key": "p0000008", "field": "sold", "value": 1, "if_seq_no": n}])).unwrap();
+    let w = g.write(pb::WriteRequest { ops_json: ops(0), ..Default::default() }).await.unwrap().into_inner();
+    // 7 was the write of another row, 8 the one racer that applied: the
+    // commits that failed took no number.
+    assert_eq!((w.written, w.seq_no), (1, Some(9)));
+    let e = g.write(pb::WriteRequest { ops_json: ops(0), ..Default::default() }).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
+
+    // A database that does not number its writes refuses both, by name,
+    // and answers no number.
+    let plain = http(service(create(dir.path(), "p.strata", |i| i < 50), "http://unused"), None).await;
+    let (status, r) = post(&c, &format!("{plain}/v1/write"), json!({"ops": [{"op": "add", "key": "p0000003", "field": "sold", "value": 1, "if_seq_no": 0}]})).await;
+    assert_eq!(status, 400);
+    assert!(r["error"].as_str().unwrap().contains("--seq-no"), "{r}");
+    let (status, r) = post(&c, &format!("{plain}/v1/query"), json!({"sql": "SELECT id, seq_no() FROM products LIMIT 1"})).await;
+    assert_eq!(status, 400);
+    assert!(r["error"].as_str().unwrap().contains("does not number its writes"), "{r}");
+    let (status, r) = post(&c, &format!("{plain}/v1/write"), json!({"ops": [{"op": "add", "key": "p0000003", "field": "sold", "value": 1}]})).await;
+    assert_eq!(status, 200);
+    assert!(r.get("seq_no").is_none(), "{r}");
+}
+
+/// Through a coordinator, `seq_no()` reads each shard's numbers and
+/// `if_seq_no` reaches the row's shard, a conflict answering 409; with
+/// more than one replica of a shard, whose numbers differ, both are
+/// refused. `--seq-no` starts numbering on a server's database, and a
+/// coordinator refuses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn conditional_writes_through_a_coordinator() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = |i: usize| Value::Str(format!("p{i:07}"));
+    let mut urls = Vec::new();
+    for s in 0..2 {
+        let db = create(dir.path(), &format!("s{s}.strata"), |i| i < 300 && shard_of(&key(i), 2) == s);
+        db.storage().start_seq_no().unwrap();
+        urls.push(grpc(service(db, "http://unused")).await);
+    }
+    let coord = cluster(Coordinator::connect(urls.clone()).await.unwrap());
+    let seq_of = |id: &'static str| {
+        let coord = coord.clone();
+        async move {
+            let q = QueryReq { sql: format!("SELECT seq_no() FROM products WHERE id = '{id}'"), ..Default::default() };
+            coord.query(q).await.unwrap().rs.rows[0][0].as_i64().unwrap()
+        }
+    };
+    let set = |id: &str, n: u64| vec![json!({"op": "set", "key": id, "field": "sold", "value": 5, "if_seq_no": n})];
+    assert_eq!(seq_of("p0000003").await, 0);
+    let w = coord.write_ops(set("p0000003", 0), None).await.unwrap();
+    assert_eq!((w.rows, w.seq_no), (1, None), "a coordinator answers no number: each shard numbers its own");
+    assert_eq!(seq_of("p0000003").await, 1);
+    let e = coord.write_ops(set("p0000003", 0), None).await.unwrap_err();
+    assert_eq!(e.status, 409, "{}", e.message);
+
+    let replicated = cluster(Coordinator::connect(urls.iter().map(|u| format!("{u}|{u}")).collect()).await.unwrap());
+    let e = replicated.write_ops(set("p0000003", 1), None).await.unwrap_err();
+    assert!(e.status == 400 && e.message.contains("one replica per shard"), "{}", e.message);
+    let e = replicated.query(QueryReq { sql: "SELECT id, seq_no() FROM products LIMIT 3".into(), ..Default::default() }).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("one replica per shard"), "{}", e.message);
+
+    // --seq-no.
+    let numbered = |name: &str, seq_no: bool| server::Options { db: Some(dir.path().join(name)), demo: Some(20), seq_no, ..Default::default() };
+    let svc = server::service(&numbered("on.strata", true)).await.unwrap();
+    assert!(svc.local_db().unwrap().storage().seq_no().is_some());
+    let svc = server::service(&numbered("off.strata", false)).await.unwrap();
+    assert!(svc.local_db().unwrap().storage().seq_no().is_none());
+    let e = server::service(&server::Options { shards: urls, seq_no: true, ..Default::default() }).await.err().unwrap();
+    assert!(e.contains("start each shard server with it"), "{e}");
+}

@@ -223,6 +223,7 @@ impl<'a> Text<'a> {
             Expr::Field(f) => field(names, *f),
             Expr::Score => "score()".into(),
             Expr::Hops => "hops()".into(),
+            Expr::SeqNo => "seq_no()".into(),
             Expr::Output(i) => names.outputs.get(*i as usize).cloned().unwrap_or_else(|| format!("#{i}")),
             Expr::Excluded(f) => format!("excluded.{}", field(names, *f)),
             Expr::Lit(v) => lit(v),

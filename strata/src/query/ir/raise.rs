@@ -172,7 +172,8 @@ impl<'a> Raise<'a> {
                                 Expr::Field(f) => Projection::Field(self.field(*f)?),
                                 Expr::Score => Projection::Score,
                                 Expr::Hops => Projection::Hops(self.hops_graph()?),
-                                e => return Err(err(format!("a column of a Search is a field, score() or hops(), not {e:?}"))),
+                                Expr::SeqNo => Projection::SeqNo,
+                                e => return Err(err(format!("a column of a Search is a field, score(), hops() or seq_no(), not {e:?}"))),
                             },
                         ))
                     })

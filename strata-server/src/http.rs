@@ -46,7 +46,7 @@ use strata::ingest::Format;
 use strata::storage::Layout;
 
 use crate::auth::{self, Access, Secret};
-use crate::service::{QueryReq, Service, SqlAnswer};
+use crate::service::{QueryReq, Service, SqlAnswer, Written};
 use crate::{agent, json as js, obs, ApiError};
 
 const UI: &str = include_str!("../ui/index.html");
@@ -249,8 +249,18 @@ async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
     match app.svc.sql(body_str(&b, "sql")?, &params, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
-        SqlAnswer::Written { n, took_ms } => Ok(AxJson(json!({"written": n, "took_ms": took_ms}))),
+        SqlAnswer::Written { n, seq_no, took_ms } => Ok(AxJson(written(Written { rows: n, seq_no }, took_ms))),
     }
+}
+
+/// A write's answer: the rows written, and the transaction's sequence
+/// number in a database that numbers its writes.
+fn written(w: Written, took_ms: f64) -> Json {
+    let mut j = json!({"written": w.rows, "took_ms": took_ms});
+    if let Some(s) = w.seq_no {
+        j["seq_no"] = json!(s);
+    }
+    j
 }
 
 /// Runs a plan ([`strata::query::ir`]) as `/v1/sql` runs a statement.
@@ -258,7 +268,7 @@ async fn run_plan(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let plan = strata::query::ir::Plan::from_json(b.get("plan").ok_or_else(|| ApiError::bad("the body needs a \"plan\""))?)?;
     match app.svc.run_plan(plan, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
-        SqlAnswer::Written { n, took_ms } => Ok(AxJson(json!({"written": n, "took_ms": took_ms}))),
+        SqlAnswer::Written { n, seq_no, took_ms } => Ok(AxJson(written(Written { rows: n, seq_no }, took_ms))),
     }
 }
 
@@ -279,8 +289,8 @@ async fn write(State(app): State<App>, headers: HeaderMap, AxJson(mut b): AxJson
         return Err(ApiError::bad("an idempotency key has 1 to 256 characters"));
     }
     let t0 = std::time::Instant::now();
-    let n = app.svc.write_ops(ops, key).await?;
-    Ok(AxJson(json!({"written": n, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
+    let w = app.svc.write_ops(ops, key).await?;
+    Ok(AxJson(written(w, t0.elapsed().as_secs_f64() * 1e3)))
 }
 
 /// Rows in the body, in the format `?format=` names or the content type

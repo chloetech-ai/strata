@@ -35,6 +35,7 @@ pub enum Ref {
     Excluded(u32),
     Score,
     Hops,
+    SeqNo,
 }
 
 /// A row's values, as an expression reads them.
@@ -60,6 +61,7 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
         Expr::Excluded(f) => row(Ref::Excluded(*f))?,
         Expr::Score => row(Ref::Score)?,
         Expr::Hops => row(Ref::Hops)?,
+        Expr::SeqNo => row(Ref::SeqNo)?,
         Expr::Lit(v) => v.clone(),
         Expr::Not(x) => known(cond(x)?.map(|b| !b)),
         Expr::And(xs) => {

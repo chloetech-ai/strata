@@ -596,14 +596,6 @@ struct SealedMem {
     numbered: bool,
 }
 
-/// The image of a segment of `docs`, with their sequence numbers
-/// ([`rowseq`]) when the database numbers its writes.
-fn build_numbered(schema: &Schema, docs: &[Document], seqs: Option<&[u64]>, opts: &BuildOptions) -> Result<Vec<u8>> {
-    let Some(seqs) = seqs else { return build_segment(schema, docs, opts) };
-    let mut w = SegmentBuild::new(schema, opts, docs.len())?.finish(docs)?;
-    w.put(rowseq::SECTION, rowseq::encode(seqs));
-    Ok(w.finish())
-}
 
 /// A sealed position that was deleted when the memtable was sealed.
 const GONE: u32 = u32::MAX;
@@ -1322,7 +1314,7 @@ impl Database {
             drop(chunks);
             let max = self.opts.segment_max_docs.max(1);
             for (chunk, seqs) in live.chunks(max).zip(seqs.chunks(max)) {
-                let image = build_numbered(&schema, chunk, numbered.then_some(seqs), &self.opts.build)?;
+                let image = rowseq::build(&schema, chunk, numbered.then_some(seqs), &self.opts.build)?;
                 vw.add_segment(table, None, &image, chunk.len() as u32, None, None)?;
             }
         }
@@ -1487,7 +1479,7 @@ impl Database {
             let images = live
                 .chunks(max)
                 .zip(seqs.chunks(max))
-                .map(|(c, seqs)| Ok((build_numbered(&s.schema, c, s.numbered.then_some(seqs), &self.opts.build)?, c.len() as u32)))
+                .map(|(c, seqs)| Ok((rowseq::build(&s.schema, c, s.numbered.then_some(seqs), &self.opts.build)?, c.len() as u32)))
                 .collect::<Result<Vec<_>>>()?;
             built.push((images, docids));
         }
