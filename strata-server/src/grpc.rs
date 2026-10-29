@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
-use crate::service::{QueryReq, Service};
+use crate::service::{After, QueryReq, Service};
 use crate::{obs, plan_pb, ApiError};
 
 pub fn to_pb(v: &Value) -> pb::Value {
@@ -88,9 +88,10 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 
 /// The protocol versions this server speaks (`proto/strata.proto`): 1
 /// takes SQL or a JSON plan, 2 a typed plan, 3 holds a query's snapshot
-/// for the fetch that follows, and 4 places keys in slots.
+/// for the fetch that follows, 4 places keys in slots, and 5 reads the
+/// writes a read must see (`min_seq_no`), which a replica waits for.
 pub const MIN_PROTOCOL: u32 = 1;
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 /// What [`pb::strata_server::Strata::hello`] answers, but what is the
 /// server's own: its slot map's epoch, role, term and last number.
@@ -118,6 +119,7 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         plan: plan.map(Arc::new),
         hold: r.hold,
         release: r.release,
+        after: After::of(r.min_seq_no, r.min_seq_nos)?,
     })
 }
 
@@ -227,7 +229,8 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("TermStats", req, |svc, r| async move {
             svc.check_epoch(r.epoch)?;
             let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
-            let (stats, snapshot) = svc.term_stats(&r.sql, plan.as_ref(), &params_from_pb(r.params), r.timeout_ms as u64).await?;
+            let after = After::of(r.min_seq_no, r.min_seq_nos)?;
+            let (stats, snapshot) = svc.term_stats(&r.sql, plan.as_ref(), &params_from_pb(r.params), &after, r.timeout_ms as u64).await?;
             Ok(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot })
         })
         .await
@@ -236,18 +239,17 @@ impl pb::strata_server::Strata for Grpc {
     async fn write(&self, req: Request<pb::WriteRequest>) -> Result<Response<pb::WriteResponse>, Status> {
         self.serve("Write", req, |svc, r| async move {
             svc.check_epoch(r.epoch)?;
-            let (written, seq_no) = if !r.ops_json.is_empty() {
+            let w = if !r.ops_json.is_empty() {
                 let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
                 let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
-                let w = svc.write_ops(ops, key).await?;
-                (w.rows, w.seq_no)
+                svc.write_ops(ops, key).await?
             } else {
-                match svc.sql(&r.sql, &params_from_pb(r.params), 0).await? {
-                    crate::service::SqlAnswer::Written { n, seq_no, .. } => (n, seq_no),
+                match svc.sql(&r.sql, &params_from_pb(r.params), After::Any, 0).await? {
+                    crate::service::SqlAnswer::Written { w, .. } => w,
                     crate::service::SqlAnswer::Rows(_) => return Err(ApiError::bad("Write takes INSERT, UPDATE or DELETE; use Query")),
                 }
             };
-            Ok(pb::WriteResponse { written, seq_no })
+            Ok(pb::WriteResponse { written: w.rows, seq_no: w.seq_no, seq_nos: w.seq_nos })
         })
         .await
     }

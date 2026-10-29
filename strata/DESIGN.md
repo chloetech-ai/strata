@@ -737,6 +737,19 @@ handing a query to its shards) are to make instead of writing SQL text.
   primary of that term, and answers a primary of an older term with its
   own, which fences that primary. A coordinator learns each copy's role
   from `Hello` and writes to a shard's primary.
+* **Reads that see a write.** A snapshot says the last transaction it
+  holds (`Snapshot::seq_no`). A read may name a write's number
+  (`min_seq_no`; through a coordinator `min_seq_nos`, one per shard, as
+  its writes answer `seq_nos`): a replica waits up to a second, woken by
+  its commit hook, for a version that holds it and then refuses the read
+  (503), and a primary refuses a number past its last (409), as a lease
+  from before the write does. The wait comes before admission, so it
+  holds no query slot. A replica serves reads only while its primary's
+  last call found it caught up (each call says whether the replica is
+  behind), not after a mismatch, a failed batch or a copy. A coordinator
+  asks a shard's primary first after a copy fails a read, and passes over
+  a replica of a protocol before 5, which would not wait, without
+  counting it as failed (protocol 5).
 * **Conditional writes.** `seq_no()` is a column of a query on one table
   (plan feature `seq_no`, so an older shard refuses the plan by name), read
   from the row's segment, its updates or the memtable. strata-server's
@@ -754,7 +767,7 @@ handing a query to its shards) are to make instead of writing SQL text.
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication (read-your-writes and digests, promotion),
+Next: the rest of replication (digests, promotion),
 and a coordinator and
 strata-server over every table.
 
