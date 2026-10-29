@@ -86,7 +86,8 @@ impl FieldIndexBuilder for SparseBuilder {
         Ok(())
     }
 
-    fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
+    fn finish(mut self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
+        self.text.seal();
         self.text.write(out)
     }
 }

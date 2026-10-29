@@ -72,6 +72,13 @@ pub fn field_builder(field: &Field, opts: &BuildOptions) -> Result<Box<dyn Field
     Ok(Box::new(build::VectorBuilder::new(field, opts)?))
 }
 
+/// [`field_builder`] whose HNSW graph, if it builds one, starts from
+/// `seg`'s: `seg`'s documents are this build's from docID `base` on, all of
+/// them, with the same vectors (a merge's input that lost none).
+pub fn field_builder_from(field: &Field, opts: &BuildOptions, seg: SegmentFile, base: u32) -> Result<Box<dyn FieldIndexBuilder>> {
+    Ok(Box::new(build::VectorBuilder::new(field, opts)?.start_from(seg, base)))
+}
+
 /// Name of section `part` of vector field `field`.
 pub fn section(field: &str, part: &str) -> String {
     format!("vec.{field}.{part}")
