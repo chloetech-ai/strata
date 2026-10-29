@@ -83,7 +83,7 @@ const SELECTS: &[&str] = &[
 
 /// Writes of each kind.
 const WRITES: &[&str] = &[
-    "INSERT INTO papers (id, title, year, done, published, tags, emb, terms, cites) VALUES ('p9', 'a', 1, TRUE, '2026-10-01', ARRAY['x', 'y'], ARRAY[0.1, 0.2, 0.3, 0.4], '{\"a\": 1}', 'p1'), ('p10', 'b', NULL, FALSE, NULL, ARRAY['z'], NULL, NULL, NULL)",
+    "INSERT INTO papers (id, title, year, done, published, tags, emb, terms, cites) VALUES ('n1', 'a', 1, TRUE, '2026-10-01', ARRAY['x', 'y'], ARRAY[0.1, 0.2, 0.3, 0.4], '{\"a\": 1}', '[\"p1\"]'), ('n2', 'b', NULL, FALSE, NULL, ARRAY['z'], NULL, NULL, NULL)",
     "INSERT OR REPLACE INTO papers (id, year) VALUES ('p1', 2)",
     "INSERT INTO papers (id, year) VALUES ('p1', 2) ON CONFLICT (id) DO NOTHING",
     "INSERT INTO papers (id, year, rating) VALUES ('p1', 2, 0.5) ON CONFLICT (id) DO UPDATE SET year = excluded.year, rating = rating + 1",
@@ -209,6 +209,69 @@ fn plans_from_elsewhere_run_as_their_sql() {
     let other = serde_json::json!({"version": 1, "root": {"node": "project", "columns": [], "input": {"node": "search", "table": "seed"}}});
     let e = Plan::from_json(&other).unwrap().to_select(&schema).err().unwrap().to_string();
     assert!(e.contains("table seed"), "{e}");
+}
+
+/// The rows of a few papers, the same in every database here.
+fn fill(db: &Db) {
+    for i in 0..12 {
+        let year = if i % 4 == 3 { "NULL".to_string() } else { (2015 + i).to_string() };
+        let done = ["TRUE", "FALSE", "NULL"][i % 3];
+        let cites = if i > 0 { format!("'[\"p{}\"]'", i - 1) } else { "NULL".into() };
+        run(db, &format!(
+            "INSERT INTO papers (id, body, year, rating, category, tags, done, published, emb, cites) VALUES ('p{i}', 'graph {i}', {year}, {}, '{}', ARRAY['t{}'], {done}, '2026-10-{:02}', ARRAY[0.{i}, 0.2, 0.3, 0.4], {cites})",
+            i as f64 / 4.0,
+            ["ml", "db"][i % 2],
+            i % 3,
+            i + 1
+        ));
+    }
+}
+
+fn rows(r: SqlResult) -> Vec<Vec<Value>> {
+    let SqlResult::Rows(r) = r else { panic!("rows") };
+    r.rows
+}
+
+/// Db::run runs a plan as Db::sql runs its statement: every SELECT gives
+/// the same rows, and every write leaves the same table, from a plan that
+/// went through JSON.
+#[test]
+fn db_runs_plans() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (db(&dir.path().join("a.strata")), db(&dir.path().join("b.strata")));
+    fill(&a);
+    fill(&b);
+    // The same rows, or the same error (a synonym list the database lacks).
+    let mut answered = 0;
+    for sql in SELECTS.iter().filter(|s| !s.contains("now()")) {
+        let plan = through_json(&a.explain(sql, &params()).unwrap());
+        let want = a.sql(sql, &params()).map(rows).map_err(|e| e.to_string());
+        answered += want.is_ok() as usize;
+        assert_eq!(a.run(&plan).map(rows).map_err(|e| e.to_string()), want, "{sql}");
+    }
+    assert!(answered + 2 >= SELECTS.len(), "{answered}");
+    let all = |db: &Db| {
+        let mut r = rows(run(db, "SELECT * FROM papers"));
+        r.sort_by_key(|r| r[0].as_str().unwrap().to_string());
+        r
+    };
+    let mut written = 0;
+    for sql in WRITES {
+        let plan = through_json(&b.explain(sql, &params()).unwrap());
+        let (SqlResult::Written(x), SqlResult::Written(y)) = (run(&a, sql), b.run(&plan).unwrap_or_else(|e| panic!("{sql}: {e}"))) else { panic!("{sql}") };
+        assert_eq!(x, y, "{sql}");
+        assert_eq!(all(&a), all(&b), "{sql}");
+        written += x;
+    }
+    assert!(written >= 20, "{written}");
+    // A plan names its table, which must exist; a read is not prepared as
+    // a write.
+    let mut j = b.explain("DELETE FROM papers", &Params::new()).unwrap().to_json().unwrap();
+    j["root"]["table"] = "nowhere".into();
+    let e = b.run(&Plan::from_json(&j).unwrap()).err().unwrap().to_string();
+    assert!(e.contains("nowhere"), "{e}");
+    let read = b.explain("SELECT id FROM papers", &Params::new()).unwrap();
+    assert!(b.prepare_plan(&read).err().unwrap().to_string().contains("reads"));
 }
 
 fn lines(db: &Db, sql: &str) -> Vec<String> {

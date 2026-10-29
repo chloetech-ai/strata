@@ -1,4 +1,5 @@
-//! Plans of bound statements: [`Plan::of_select`] and [`Plan::of_write`].
+//! Plans of bound statements: [`Plan::bind`], [`Plan::of_select`] and
+//! [`Plan::of_write`].
 
 use super::{Agg, Column, Expr, Graph, GraphKind, Node, OnConflict, Plan, Search, Set, SortKey};
 use crate::query::logical::{self, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
@@ -7,6 +8,12 @@ use crate::schema::Schema;
 use crate::value::Value;
 
 impl Plan {
+    /// Binds one SELECT of `schema`'s table ([`crate::query::bind`]) into
+    /// its plan.
+    pub fn bind(sql_text: &str, schema: &Schema, params: &crate::query::Params) -> crate::error::Result<Plan> {
+        Ok(Plan::of_select(schema, &crate::query::bind(sql_text, schema, params)?))
+    }
+
     /// The plan of a SELECT bound to `schema`'s table: `Project [Limit]
     /// Search`, or with aggregates `Project [Limit] [Sort] [Filter]
     /// Aggregate Search`.

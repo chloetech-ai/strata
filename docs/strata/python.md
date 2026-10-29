@@ -115,9 +115,16 @@ db.search("dragon", where="year >= :y", params={"y": 1990}, columns=["id", "titl
 
 `embed(text, field=None)` returns the query vector of a text, and `len(db)` the number of rows.
 
+`plan(sql, params)` returns a statement's [plan](query-language.md#explain) as a dict without running it, and `run(plan)` runs a plan: a read's `Result`, or the number of rows a write wrote.
+
+```python
+p = db.plan("SELECT id FROM books WHERE year >= :y LIMIT 3", y=2000)
+db.run(p)
+```
+
 ## A server from Python
 
-`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
+`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `run(plan)` (a plan from `explain(...)["ir"]`, run by [`/v1/plan`](server.md#http-api)), `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
 
 ```python
 client = strata.connect("http://127.0.0.1:7700")   # token= or $STRATA_TOKEN for a server with --token

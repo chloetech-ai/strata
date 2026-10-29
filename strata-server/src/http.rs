@@ -9,6 +9,7 @@
 //! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?}` | rows |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows, or `{written}` |
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`) | `{written}` |
+//! | `POST /v1/plan` | `{plan, timeout_ms?}` (a plan as `/v1/explain` gives it) | rows, or `{written}` |
 //! | `POST /v1/import?format=jsonl` | rows as JSON Lines, JSON, CSV or TSV | `{written, skipped_fields}` |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?}` | the bound query, its plan IR and the executor's plan |
@@ -86,6 +87,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/query", post(query))
         .route("/v1/sql", post(sql))
         .route("/v1/write", post(write).layer(rows.clone()))
+        .route("/v1/plan", post(run_plan).layer(rows.clone()))
         .route("/v1/import", post(import).layer(rows))
         .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
@@ -243,6 +245,15 @@ fn answer(a: &crate::service::Answer) -> Json {
 async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
     match app.svc.sql(body_str(&b, "sql")?, &params, body_u64(&b, "timeout_ms")).await? {
+        SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
+        SqlAnswer::Written { n, took_ms } => Ok(AxJson(json!({"written": n, "took_ms": took_ms}))),
+    }
+}
+
+/// Runs a plan ([`strata::query::ir`]) as `/v1/sql` runs a statement.
+async fn run_plan(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let plan = strata::query::ir::Plan::from_json(b.get("plan").ok_or_else(|| ApiError::bad("the body needs a \"plan\""))?)?;
+    match app.svc.run_plan(plan, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
         SqlAnswer::Written { n, took_ms } => Ok(AxJson(json!({"written": n, "took_ms": took_ms}))),
     }

@@ -418,8 +418,8 @@ impl Db {
                 view.schema(),
                 params,
                 &mut |text, p| {
-                    let select = bind(text, view.schema(), p)?;
-                    self.execute(&view, &select, &steps)
+                    let plan = Plan::bind(text, view.schema(), p)?;
+                    self.execute(&view, &plan.to_select(view.schema())?, &steps)
                 },
                 opts,
             )?;
@@ -428,8 +428,37 @@ impl Db {
             }
             return Ok(rs);
         }
-        let select = qsql::bind_query(&q, view.schema(), params)?;
-        self.execute(&view, &select, opts)
+        let plan = Plan::of_select(view.schema(), &qsql::bind_query(&q, view.schema(), params)?);
+        self.execute(&view, &plan.to_select(view.schema())?, opts)
+    }
+
+    /// Runs a plan ([`crate::query::ir`]) on the table it names: a read
+    /// returns its rows, a write the number of rows it wrote, in one
+    /// transaction. SQL runs the same way: [`Db::query`] and [`Db::sql`]
+    /// bind a statement into a plan, and the executor answers its Search.
+    /// A plan made elsewhere is checked against the table's schema as the
+    /// binder checks SQL.
+    pub fn run(&self, plan: &Plan) -> Result<SqlResult> {
+        match plan.is_write() {
+            true => self.write_prepared(&self.prepare_plan(plan)?).map(SqlResult::Written),
+            false => self.run_at(&self.snapshot(), plan, &self.exec).map(SqlResult::Rows),
+        }
+    }
+
+    /// [`Db::run`] of a plan that reads, against a given snapshot.
+    pub fn run_at(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
+        let view = snap.table(plan.table()).ok_or_else(|| Error::Query(format!("no such table: {}", plan.table())))?;
+        self.execute(&view, &plan.to_select(view.schema())?, opts)
+    }
+
+    /// [`Db::prepare_write`] of a plan that writes.
+    pub fn prepare_plan(&self, plan: &Plan) -> Result<PreparedWrite> {
+        if !plan.is_write() {
+            return Err(Error::Query("the plan reads; run it with Db::run".into()));
+        }
+        let schema = self.table(plan.table())?;
+        let write = plan.to_write(&schema)?;
+        Ok(self.prepare(schema, write))
     }
 
     /// Runs any statement, on any table: a SELECT returns its rows; an
@@ -469,6 +498,7 @@ impl Db {
             }
             Command::Write { table, write } => {
                 let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
+                let write = Plan::of_write(schema, &write).to_write(schema)?;
                 self.write_prepared(&self.prepare(schema.clone(), write)).map(SqlResult::Written)
             }
         }
@@ -514,6 +544,7 @@ impl Db {
         let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
         let Command::Write { table, write } = bind_command(sql, &tables, params)? else { return Ok(None) };
         let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
+        let write = Plan::of_write(schema, &write).to_write(schema)?;
         Ok(Some(self.prepare(schema.clone(), write)))
     }
 

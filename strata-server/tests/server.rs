@@ -497,6 +497,10 @@ async fn coordinator_answers_like_one_database() {
     }
     let h = coord.health().await;
     assert_eq!((h["status"].as_str(), h["docs"].as_u64()), (Some("ok"), Some(N as u64)), "{h}");
+    // A coordinator takes SQL, not plans, until its shards take plans.
+    let plan = strata::query::ir::Plan::bind("SELECT id FROM products LIMIT 3", &coord.schema, &Params::new()).unwrap();
+    let e = coord.run_plan(plan, 0).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("coordinator"), "{}", e.message);
 
     // Writes: inserts go to their key's shard, UPDATE and DELETE to all.
     let sql = |s: String| {
@@ -1305,10 +1309,11 @@ async fn a_simple_analyzer_over_http() {
 
 /// `/v1/explain` gives the plan IR of a query, as JSON that reads back to
 /// the query it was bound from, and as lines of text; a compound query has
-/// none yet.
+/// none yet. `/v1/plan` runs a plan.
 #[tokio::test(flavor = "multi_thread")]
 async fn explain_gives_the_plan_ir() {
     use strata::query::ir::Plan;
+    use strata::query::{bind_command, Command};
     let dir = tempfile::tempdir().unwrap();
     let db = create(dir.path(), "e.strata", |i| i < 300);
     let schema = db.schema().clone();
@@ -1332,6 +1337,26 @@ async fn explain_gives_the_plan_ir() {
         "{r}"
     );
     assert!(r["plan"].as_array().is_some_and(|p| !p.is_empty()), "{r}");
+    // POST /v1/plan runs that plan as /v1/query runs the SQL, and a write
+    // plan as /v1/sql runs the statement.
+    let (status, want) = post(&c, &format!("{base}/v1/query"), json!({ "sql": sql })).await;
+    assert_eq!(status, 200, "{want}");
+    let (status, got) = post(&c, &format!("{base}/v1/plan"), json!({ "plan": r["ir"] })).await;
+    assert_eq!(status, 200, "{got}");
+    same(sql, &want, &got);
+    let Command::Write { write, .. } = bind_command("DELETE FROM products WHERE category = 'kitchen'", &[&schema], &Params::new()).unwrap() else { panic!() };
+    let kitchen = "SELECT COUNT(*) FROM products WHERE category = 'kitchen'";
+    let (_, before) = post(&c, &format!("{base}/v1/query"), json!({ "sql": kitchen })).await;
+    let (status, w) = post(&c, &format!("{base}/v1/plan"), json!({ "plan": Plan::of_write(&schema, &write).to_json().unwrap() })).await;
+    assert_eq!(status, 200, "{w}");
+    assert!(w["written"].as_u64().unwrap() > 0 && w["written"] == before["rows"][0][0], "{w} {before}");
+    let (_, after) = post(&c, &format!("{base}/v1/query"), json!({ "sql": kitchen })).await;
+    assert_eq!(after["rows"][0][0], 0, "{after}");
+    // A plan this version cannot read is refused by name.
+    let mut newer = r["ir"].clone();
+    newer["features"] = json!(["hash_join"]);
+    let (status, e) = post(&c, &format!("{base}/v1/plan"), json!({ "plan": newer })).await;
+    assert!(status == 400 && e["error"].as_str().unwrap().contains("hash_join"), "{e}");
     let compound = "SELECT id FROM products WHERE id IN (SELECT id FROM products WHERE price < 10)";
     let (status, r) = post(&c, &format!("{base}/v1/explain"), json!({ "sql": compound })).await;
     assert_eq!(status, 200, "{r}");

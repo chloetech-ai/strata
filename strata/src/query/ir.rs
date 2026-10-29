@@ -30,7 +30,8 @@
 //! statement the executor runs, for the shapes it runs:
 //! `Project [Limit] Search` and `Project [Limit] [Sort] [Filter] Aggregate
 //! Search`. Plans travel as JSON and read as a tree in `EXPLAIN`
-//! ([`Plan::explain`]).
+//! ([`Plan::explain`]). Every SQL statement runs as its plan, and
+//! [`crate::db::Db::run`] runs a plan made elsewhere.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -329,6 +330,24 @@ impl Plan {
     /// A plan of the current version, without features.
     pub fn new(root: Node) -> Plan {
         Plan { version: VERSION, features: Vec::new(), root }
+    }
+
+    /// The table the plan reads or writes: its Search's, or its write's.
+    pub fn table(&self) -> &str {
+        fn of(n: &Node) -> &str {
+            match n {
+                Node::Search(s) => &s.table,
+                Node::Insert { table, .. } | Node::Update { table, .. } | Node::Delete { table, .. } => table,
+                Node::Aggregate { input, .. } | Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Project { input, .. } => of(input),
+            }
+        }
+        of(&self.root)
+    }
+
+    /// Whether the plan writes (an Insert, Update or Delete) rather than
+    /// reads.
+    pub fn is_write(&self) -> bool {
+        matches!(self.root, Node::Insert { .. } | Node::Update { .. } | Node::Delete { .. })
     }
 
     pub fn to_json(&self) -> Result<serde_json::Value> {
