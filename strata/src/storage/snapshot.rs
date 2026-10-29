@@ -109,6 +109,11 @@ impl Snapshot {
         self.inner.tables.iter().map(|t| &*t.schema)
     }
 
+    /// The segments of every table at this version.
+    pub(crate) fn all_segments(&self) -> impl Iterator<Item = &SegmentView> {
+        self.inner.tables.iter().flat_map(|t| &t.segments)
+    }
+
     /// On-disk segments (oldest first), then the memtable's in-memory
     /// segments (one per chunk of `DbOptions::memtable_chunk_docs`).
     pub fn segments(&self) -> &[SegmentView] {

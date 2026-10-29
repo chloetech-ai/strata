@@ -60,7 +60,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 
 ## Schemas
 
-A database holds one table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the UI's schema designer, or `strata.Database.create` in [Python](python.md)). A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
+The server serves a database's first table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the UI's schema designer, or `strata.Database.create` in [Python](python.md)). A database can hold more tables, which [`CREATE TABLE`](query-language.md#tables) adds in-process (`Db::sql` in Rust, `Database.sql` in Python); the server, its APIs and the coordinator do not serve those yet. A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
 
 ```json
 {
@@ -99,7 +99,7 @@ A database holds one table, whose schema is set when the database is created (`-
 | `codes` | `vector` | `"sq8"` (a byte a dimension) | `"binary"`: a bit a dimension, 1/32 of the vectors, rescored |
 | `embed` | `vector` | | `{"from": [fields], "model": name}`: the vectors are that model's embedding of those fields ([below](#embedded-vector-fields)) |
 
-`key` names the primary key, a `keyword` or `int` field; rows are upserted and deleted by it, and a table without one only takes inserts. An option a type does not know is an error, so a typo does not pass silently. `GET /v1/schema` returns the schema in this form as `short` (and in the long form Strata stores, as `schema`); `POST /v1/schema/check` validates one and returns both. The long form is accepted wherever a schema is read. The [query language](query-language.md#columns-and-types) page describes the types further.
+`key` names the primary key, a `keyword` or `int` field; rows are upserted and deleted by it, and a table without one only takes inserts. `"references": "authors"` on a `keyword` or `int` field records that it holds keys of that table ([references](query-language.md#tables)); a new database's first table can reference only itself. An option a type does not know is an error, so a typo does not pass silently. `GET /v1/schema` returns the schema in this form as `short` (and in the long form Strata stores, as `schema`); `POST /v1/schema/check` validates one and returns both. The long form is accepted wherever a schema is read. The [query language](query-language.md#columns-and-types) page describes the types further.
 
 ## Loading rows
 
@@ -292,7 +292,7 @@ A coordinator holds no data. For a query, it
 2. sends every shard the query with the summed statistics and its lease, in shard mode, so that each shard scores exactly as the whole collection would and returns what a merge needs (for fusions and products, each input's raw scores over its candidates),
 3. merges the answers with `strata::cluster::merge`: top *k*, fusion, products and facet counts.
 
-A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key (a hash of the key picks the shard); `UPDATE` and `DELETE` go to every shard. Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
+A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key (a hash of the key picks the shard); `UPDATE` and `DELETE` go to every shard. A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
 
 ## Deadlines, admission and metrics
 

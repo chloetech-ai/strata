@@ -15,7 +15,7 @@ Rows can link to other rows. A traversal, a shortest path or personalized PageRa
 
 ## Rows are nodes
 
-Graph databases keep nodes and edges in stores of their own. Strata keeps its one table: a row is a node, and an `EDGES` field holds the row's outgoing edges as a JSON array of targets, each a primary key of the same table, optionally with a label and a positive weight.
+Graph databases keep nodes and edges in stores of their own. Strata keeps them in a table: a row is a node, and an `EDGES` field holds the row's outgoing edges as a JSON array of targets, each a primary key of the same table, optionally with a label and a positive weight.
 
 ```sql
 -- id KEYWORD PRIMARY KEY, title TEXT, body TEXT, year INT, emb VECTOR(512), cites EDGES

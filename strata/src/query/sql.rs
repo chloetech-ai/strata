@@ -9,10 +9,14 @@
 //! weighted sums and products of those, or a column.
 //! Parameters (`:name`) are bound from [`Params`].
 //!
-//! Writes ([`bind_write`]): `INSERT INTO t (cols) VALUES (...), ...`,
-//! `INSERT OR REPLACE` (an upsert), `UPDATE t SET f = v, g = g + 1 [WHERE
-//! ...]` and `DELETE FROM t [WHERE ...]`. Lists are `ARRAY[...]`; vectors are
-//! parameters, `ARRAY[...]` or a JSON array string.
+//! Writes ([`bind_command`], [`bind_write`]): `INSERT INTO t (cols) VALUES
+//! (...), ...` with `OR REPLACE`, `OR IGNORE` or `ON CONFLICT (key) DO
+//! NOTHING | DO UPDATE SET ...`, `UPDATE t SET f = v, g = g + 1 [WHERE ...]
+//! [LIMIT n]` and `DELETE FROM t [WHERE ...] [ORDER BY ...] [LIMIT n]`, of
+//! any table of the database. Lists are `ARRAY[...]`; vectors are
+//! parameters, `ARRAY[...]` or a JSON array string. `CREATE TABLE` and
+//! `DROP TABLE` are bound in [`crate::query::ddl`]. A clause the binder does
+//! not handle is an error, never ignored.
 //!
 //! Graph queries over EDGES fields (DESIGN.md §6.1): the predicates
 //! `REACHABLE(field, seeds, ...)` and `PATH(field, from, to, ...)`, the score
@@ -26,8 +30,10 @@ use std::sync::Arc;
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::error::{Error, Result};
+use crate::query::ddl;
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
 use crate::schema::{FieldType, Schema};
+use crate::storage::DropOptions;
 use crate::value::Value;
 
 /// Values for `:name` placeholders.
@@ -55,12 +61,30 @@ fn err(m: impl Into<String>) -> Error {
 /// A bound INSERT, UPDATE or DELETE.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Write {
-    /// Documents in schema order (unnamed columns NULL); `replace` upserts.
-    Insert { docs: Vec<Vec<Value>>, replace: bool },
+    /// Documents in schema order (unnamed columns NULL), and what to do
+    /// with one whose primary key is live.
+    Insert { docs: Vec<Vec<Value>>, conflict: Conflict },
     /// The documents `select` returns (their primary keys) get `sets`.
     Update { select: Select, sets: Vec<(usize, Assign)> },
     /// The documents `select` returns are deleted.
     Delete { select: Select },
+}
+
+/// What an INSERT does with a document whose primary key is already live
+/// (or written earlier by the same statement).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Conflict {
+    /// The statement fails: `INSERT`.
+    Fail,
+    /// The new document replaces the live one: `INSERT OR REPLACE`,
+    /// `REPLACE INTO`.
+    Replace,
+    /// The live document stays and the new one is skipped: `INSERT OR
+    /// IGNORE`, `ON CONFLICT DO NOTHING`.
+    Skip,
+    /// The live document gets these fields set, as by an UPDATE: `ON
+    /// CONFLICT (key) DO UPDATE SET ...`.
+    Update(Vec<(usize, Assign)>),
 }
 
 /// The right-hand side of `SET field = ...`.
@@ -69,100 +93,286 @@ pub enum Assign {
     Value(Value),
     /// `field = field + x` (or `- x`): an INT or a FLOAT, integers exact.
     Add(Value),
+    /// `field = excluded.g`, in `ON CONFLICT DO UPDATE`: field `g` of the
+    /// document the INSERT proposed.
+    Excluded(usize),
 }
 
-/// Parses and binds one INSERT, UPDATE or DELETE; `None` for a SELECT.
+/// A bound statement ([`bind_command`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    /// A SELECT, bound when it runs ([`crate::db::Db::query`]).
+    Query,
+    /// An INSERT, UPDATE or DELETE of the table named `table`.
+    Write { table: String, write: Write },
+    /// `CREATE TABLE [IF NOT EXISTS] ...`.
+    CreateTable { schema: Schema, if_not_exists: bool },
+    /// `DROP TABLE [IF EXISTS] a, b [CASCADE | RESTRICT]`.
+    DropTable { tables: Vec<String>, opts: DropOptions },
+}
+
+/// Parses one statement.
+pub(crate) fn parse_one(sql_text: &str) -> Result<sql::Statement> {
+    let mut stmts = super::parse::parse(sql_text)?;
+    if stmts.len() != 1 {
+        return Err(err("expected exactly one statement"));
+    }
+    Ok(stmts.pop().unwrap())
+}
+
+/// Parses one SELECT statement.
+pub(crate) fn parse_query(sql_text: &str) -> Result<Box<sql::Query>> {
+    match parse_one(sql_text)? {
+        sql::Statement::Query(q) => Ok(q),
+        _ => Err(err("only SELECT is supported")),
+    }
+}
+
+/// Parses and binds one INSERT, UPDATE or DELETE of `schema`'s table;
+/// `None` for a SELECT.
 pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Option<Write>> {
-    let stmts = super::parse::parse(sql_text)?;
-    let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
-    let b = Binder::new(schema, params);
-    let table = |name: &str| {
-        if name.eq_ignore_ascii_case(&schema.table) {
-            Ok(())
-        } else {
-            Err(err(format!("no such table: {name}")))
-        }
+    match bind_command(sql_text, &[schema], params)? {
+        Command::Query => Ok(None),
+        Command::Write { write, .. } => Ok(Some(write)),
+        _ => Err(err("only SELECT, INSERT, UPDATE and DELETE are supported")),
+    }
+}
+
+/// Parses and binds one statement of a database whose tables are `tables`:
+/// a SELECT (bound when it runs), an INSERT, UPDATE or DELETE of one of
+/// them, `CREATE TABLE` or `DROP TABLE`.
+pub fn bind_command(sql_text: &str, tables: &[&Schema], params: &Params) -> Result<Command> {
+    let table = |name: &sql::ObjectName| -> Result<&Schema> {
+        let n = name.to_string();
+        tables.iter().copied().find(|t| t.table.eq_ignore_ascii_case(&n)).ok_or_else(|| err(format!("no such table: {n}")))
     };
-    // The documents a WHERE clause selects, as a query for their keys and
-    // every field (an UPDATE may rewrite them).
-    let selecting = |selection: &Option<Expr>| -> Result<Select> {
-        let cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
-        let text = match selection {
-            Some(e) => format!("SELECT {} FROM {} WHERE {e}", cols.join(", "), schema.table),
-            None => format!("SELECT {} FROM {}", cols.join(", "), schema.table),
-        };
-        bind(&text, schema, params)
-    };
-    Ok(Some(match stmt {
-        sql::Statement::Query(_) => return Ok(None),
+    let write = |schema: &Schema, write: Write| Command::Write { table: schema.table.clone(), write };
+    Ok(match &parse_one(sql_text)? {
+        sql::Statement::Query(_) => Command::Query,
         sql::Statement::Insert(ins) => {
-            match &ins.table {
-                sql::TableObject::TableName(n) => table(&n.to_string())?,
-                _ => return Err(err("INSERT needs a table name")),
-            }
-            let replace = ins.replace_into || matches!(ins.or, Some(sql::SqliteOnConflict::Replace)) || ins.on.is_some();
-            let cols: Vec<usize> = if ins.columns.is_empty() {
-                (0..schema.fields.len()).collect()
-            } else {
-                ins.columns.iter().map(|c| schema.field_index(&c.value).ok_or_else(|| err(format!("no such column: {}", c.value)))).collect::<Result<_>>()?
-            };
-            let Some(sql::SetExpr::Values(values)) = ins.source.as_ref().map(|q| q.body.as_ref()) else {
-                return Err(err("INSERT needs VALUES"));
-            };
-            let mut docs = Vec::with_capacity(values.rows.len());
-            for row in &values.rows {
-                if row.len() != cols.len() {
-                    return Err(err(format!("{} values for {} columns", row.len(), cols.len())));
-                }
-                let mut doc = vec![Value::Null; schema.fields.len()];
-                for (&f, e) in cols.iter().zip(row) {
-                    doc[f] = b.write_value(f, e)?;
-                }
-                docs.push(doc);
-            }
-            Write::Insert { docs, replace }
+            let sql::TableObject::TableName(n) = &ins.table else { return Err(err("INSERT needs a table name")) };
+            let schema = table(n)?;
+            write(schema, insert(ins, schema, params)?)
         }
-        sql::Statement::Update { table: t, assignments, selection, .. } => {
-            table(&t.relation.to_string())?;
-            let mut sets = Vec::new();
-            for a in assignments {
-                let sql::AssignmentTarget::ColumnName(name) = &a.target else { return Err(err("SET one column at a time")) };
-                let f = schema.field_index(&name.to_string()).ok_or_else(|| err(format!("no such column: {name}")))?;
-                if Some(f) == schema.primary_key {
-                    return Err(err("the primary key cannot be updated; delete and insert instead"));
-                }
-                let assign = match &a.value {
-                    Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if b.field_of(left).ok() == Some(f) => {
-                        Assign::Add(match (b.num_literal(right)?, op) {
-                            (x, BinaryOperator::Plus) => x,
-                            (Value::Int(x), _) => x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int),
-                            (x, _) => Value::Float(-x.as_f64().unwrap_or(0.0)),
-                        })
-                    }
-                    e => Assign::Value(b.write_value(f, e)?),
-                };
-                if matches!(assign, Assign::Add(_)) && !matches!(schema.fields[f].ty, FieldType::Int | FieldType::Float) {
-                    return Err(err(format!("{name} is not numeric")));
-                }
-                sets.push((f, assign));
+        sql::Statement::Update { table: t, assignments, from, selection, returning, or, limit } => {
+            if !t.joins.is_empty() || from.is_some() {
+                return Err(err("UPDATE ... FROM and joins are not supported: UPDATE one table, with a WHERE over its own columns"));
             }
-            Write::Update { select: selecting(selection)?, sets }
+            if returning.is_some() {
+                return Err(err("UPDATE ... RETURNING is not supported"));
+            }
+            if let Some(o) = or {
+                return Err(err(format!("UPDATE {o} is not supported")));
+            }
+            let schema = table(plain_table(&t.relation, "UPDATE")?)?;
+            let sets = Binder::new(schema, params).assignments(assignments, false)?;
+            write(schema, Write::Update { select: selecting(schema, params, selection, &[], limit)?, sets })
         }
         sql::Statement::Delete(d) => {
-            let (sql::FromTable::WithFromKeyword(from) | sql::FromTable::WithoutKeyword(from)) = &d.from;
+            let sql::Delete { tables: named, from, using, selection, returning, order_by, limit } = d;
+            if !named.is_empty() || using.is_some() {
+                return Err(err("DELETE ... USING and multi-table DELETE are not supported: DELETE FROM one table, with a WHERE over its own columns"));
+            }
+            if returning.is_some() {
+                return Err(err("DELETE ... RETURNING is not supported"));
+            }
+            let (sql::FromTable::WithFromKeyword(from) | sql::FromTable::WithoutKeyword(from)) = from;
             let [t] = from.as_slice() else { return Err(err("DELETE from exactly one table")) };
-            table(&t.relation.to_string())?;
-            Write::Delete { select: selecting(&d.selection)? }
+            if !t.joins.is_empty() {
+                return Err(err("DELETE from exactly one table"));
+            }
+            let schema = table(plain_table(&t.relation, "DELETE")?)?;
+            write(schema, Write::Delete { select: selecting(schema, params, selection, order_by, limit)? })
         }
-        _ => return Err(err("only SELECT, INSERT, UPDATE and DELETE are supported")),
-    }))
+        sql::Statement::CreateTable(ct) => {
+            let (schema, if_not_exists) = ddl::create_table(ct, tables)?;
+            Command::CreateTable { schema, if_not_exists }
+        }
+        stmt @ sql::Statement::Drop { .. } => {
+            let (tables, opts) = ddl::drop_table(stmt)?;
+            Command::DropTable { tables, opts }
+        }
+        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE and DROP TABLE are supported")),
+    })
+}
+
+/// The name of a plain table in FROM (an alias allowed), for `what`.
+fn plain_table<'t>(t: &'t sql::TableFactor, what: &str) -> Result<&'t sql::ObjectName> {
+    match t {
+        sql::TableFactor::Table { name, alias: _, args: None, with_hints, version: None, with_ordinality: false, partitions, json_path: None, sample: None, index_hints }
+            if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty() =>
+        {
+            Ok(name)
+        }
+        _ => Err(err(format!("{what} needs a table name, not {t}"))),
+    }
+}
+
+/// Binds an INSERT into `schema`'s table.
+fn insert(ins: &sql::Insert, schema: &Schema, params: &Params) -> Result<Write> {
+    let sql::Insert {
+        or,
+        ignore,
+        into: _,
+        table: _,
+        table_alias,
+        columns,
+        overwrite,
+        source,
+        assignments,
+        partitioned,
+        after_columns,
+        has_table_keyword,
+        on,
+        returning,
+        replace_into,
+        priority,
+        insert_alias,
+        settings,
+        format_clause,
+    } = ins;
+    if returning.is_some() {
+        return Err(err("INSERT ... RETURNING is not supported"));
+    }
+    if !assignments.is_empty() {
+        return Err(err("INSERT ... SET is not supported: INSERT INTO t (columns) VALUES (...)"));
+    }
+    if table_alias.is_some() || *overwrite || partitioned.is_some() || !after_columns.is_empty() || *has_table_keyword || priority.is_some() || insert_alias.is_some() || settings.is_some() || format_clause.is_some() {
+        return Err(err(format!("this form of INSERT is not supported: {ins}")));
+    }
+    let b = Binder::new(schema, params);
+    let mut conflict = match (or, *replace_into, *ignore) {
+        (Some(sql::SqliteOnConflict::Replace), ..) | (None, true, false) => Conflict::Replace,
+        (Some(sql::SqliteOnConflict::Ignore), ..) | (None, false, true) => Conflict::Skip,
+        (None, false, false) => Conflict::Fail,
+        (Some(o), ..) => return Err(err(format!("INSERT {o} is not supported: INSERT fails on a key that is taken, OR REPLACE replaces that row and OR IGNORE keeps it"))),
+        (None, true, true) => return Err(err("REPLACE IGNORE is not supported")),
+    };
+    match on {
+        None => {}
+        Some(_) if conflict != Conflict::Fail => return Err(err("INSERT OR ... and ON CONFLICT cannot be combined")),
+        Some(sql::OnInsert::DuplicateKeyUpdate(_)) => return Err(err("ON DUPLICATE KEY UPDATE is not supported: use ON CONFLICT (key) DO UPDATE SET ...")),
+        Some(sql::OnInsert::OnConflict(oc)) => {
+            let pk = schema.primary_key.ok_or_else(|| err(format!("ON CONFLICT needs a primary key, and {} has none", schema.table)))?;
+            match &oc.conflict_target {
+                None => {}
+                Some(sql::ConflictTarget::Columns(cols)) if cols.len() == 1 && schema.field_index(&cols[0].value) == Some(pk) => {}
+                Some(_) => return Err(err(format!("ON CONFLICT names the primary key: ON CONFLICT ({})", schema.fields[pk].name))),
+            }
+            conflict = match &oc.action {
+                sql::OnConflictAction::DoNothing => Conflict::Skip,
+                sql::OnConflictAction::DoUpdate(u) => {
+                    if u.selection.is_some() {
+                        return Err(err("ON CONFLICT ... DO UPDATE ... WHERE is not supported"));
+                    }
+                    Conflict::Update(b.assignments(&u.assignments, true)?)
+                }
+            };
+        }
+        Some(o) => return Err(err(format!("INSERT ...{o} is not supported"))),
+    }
+    let cols: Vec<usize> = if columns.is_empty() {
+        (0..schema.fields.len()).collect()
+    } else {
+        columns.iter().map(|c| schema.field_index(&c.value).ok_or_else(|| err(format!("no such column: {}", c.value)))).collect::<Result<_>>()?
+    };
+    let values = match source.as_deref() {
+        Some(q) if no_clauses(q).is_none() => match q.body.as_ref() {
+            sql::SetExpr::Values(v) => v,
+            _ => return Err(err("INSERT needs VALUES")),
+        },
+        Some(q) => return Err(err(format!("INSERT ... VALUES takes no {}", no_clauses(q).unwrap_or_default()))),
+        None => return Err(err("INSERT needs VALUES")),
+    };
+    let mut docs = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        if row.len() != cols.len() {
+            return Err(err(format!("{} values for {} columns", row.len(), cols.len())));
+        }
+        let mut doc = vec![Value::Null; schema.fields.len()];
+        for (&f, e) in cols.iter().zip(row) {
+            doc[f] = b.write_value(f, e)?;
+        }
+        docs.push(doc);
+    }
+    Ok(Write::Insert { docs, conflict })
+}
+
+/// The first clause of `q` other than its body: `WITH`, `ORDER BY`,
+/// `LIMIT` and the clauses no statement here takes.
+fn no_clauses(q: &sql::Query) -> Option<String> {
+    let sql::Query { with, body: _, order_by, limit_clause, fetch, locks, for_clause, settings, format_clause, pipe_operators } = q;
+    if with.is_some() {
+        Some("WITH".into())
+    } else if order_by.is_some() {
+        Some("ORDER BY".into())
+    } else if limit_clause.is_some() {
+        Some("LIMIT".into())
+    } else {
+        unsupported_query_clause(fetch, locks, for_clause, settings, format_clause, pipe_operators)
+    }
+}
+
+/// The clauses of a query that no statement here takes, by name.
+fn unsupported_query_clause(
+    fetch: &Option<sql::Fetch>,
+    locks: &[sql::LockClause],
+    for_clause: &Option<sql::ForClause>,
+    settings: &Option<Vec<sql::Setting>>,
+    format_clause: &Option<sql::FormatClause>,
+    pipe_operators: &[sql::PipeOperator],
+) -> Option<String> {
+    if fetch.is_some() {
+        Some("FETCH (use LIMIT)".into())
+    } else if !locks.is_empty() {
+        Some("FOR UPDATE or FOR SHARE (reads never lock: they see a snapshot)".into())
+    } else if let Some(f) = for_clause {
+        Some(f.to_string())
+    } else if settings.is_some() {
+        Some("SETTINGS".into())
+    } else if let Some(f) = format_clause {
+        Some(f.to_string())
+    } else if !pipe_operators.is_empty() {
+        Some("pipe operators".into())
+    } else {
+        None
+    }
+}
+
+/// The rows a WHERE clause selects, as a query of every field (an UPDATE
+/// may rewrite them; a DELETE needs their keys), cut by `ORDER BY` and
+/// `LIMIT` as a SELECT's rows are.
+fn selecting(schema: &Schema, params: &Params, selection: &Option<Expr>, order_by: &[sql::OrderByExpr], limit: &Option<Expr>) -> Result<Select> {
+    let cols: Vec<String> = schema.fields.iter().map(|f| ident(&f.name)).collect();
+    let mut text = format!("SELECT {} FROM {}", cols.join(", "), ident(&schema.table));
+    if let Some(e) = selection {
+        text += &format!(" WHERE {e}");
+    }
+    if !order_by.is_empty() {
+        text += &format!(" ORDER BY {}", order_by.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(", "));
+    }
+    if let Some(l) = limit {
+        text += &format!(" LIMIT {l}");
+    }
+    bind(&text, schema, params)
+}
+
+/// A name as SQL spells it: quoted unless it is a plain identifier.
+pub(crate) fn ident(n: &str) -> String {
+    if n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        n.to_string()
+    } else {
+        format!("\"{}\"", n.replace('"', "\"\""))
+    }
 }
 
 /// Parses and binds one SELECT statement.
 pub fn bind(sql_text: &str, schema: &Schema, params: &Params) -> Result<Select> {
-    let stmts = super::parse::parse(sql_text)?;
-    let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
-    let sql::Statement::Query(q) = stmt else { return Err(err("only SELECT is supported")) };
+    bind_query(&*parse_query(sql_text)?, schema, params)
+}
+
+/// [`bind`] of a parsed query.
+pub(crate) fn bind_query(q: &sql::Query, schema: &Schema, params: &Params) -> Result<Select> {
     Binder::new(schema, params).query(q)
 }
 
@@ -179,14 +389,30 @@ impl<'a> Binder<'a> {
     }
 
     fn query(&self, q: &sql::Query) -> Result<Select> {
-        let sql::SetExpr::Select(s) = q.body.as_ref() else { return Err(err("only simple SELECT is supported")) };
+        let sql::Query { with, body, order_by: _, limit_clause, fetch, locks, for_clause, settings, format_clause, pipe_operators } = q;
+        if with.is_some() {
+            return Err(err("WITH runs as a compound query (Db::query), not as one SELECT"));
+        }
+        if let Some(c) = unsupported_query_clause(fetch, locks, for_clause, settings, format_clause, pipe_operators) {
+            return Err(err(format!("{c} is not supported")));
+        }
+        let sql::SetExpr::Select(s) = body.as_ref() else { return Err(err("only simple SELECT is supported")) };
+        check_select(s)?;
         if s.from.len() != 1 || !s.from[0].joins.is_empty() {
             return Err(err("exactly one table, no joins"));
         }
-        if let sql::TableFactor::Table { name, .. } = &s.from[0].relation {
-            let t = name.to_string();
-            if !t.eq_ignore_ascii_case(&self.schema.table) {
-                return Err(err(format!("no such table: {t}")));
+        let t = plain_table(&s.from[0].relation, "SELECT")?.to_string();
+        if !t.eq_ignore_ascii_case(&self.schema.table) {
+            return Err(err(format!("no such table: {t}")));
+        }
+        if let Some(sql::LimitClause::LimitOffset { limit_by, .. }) = limit_clause {
+            if !limit_by.is_empty() {
+                return Err(err("LIMIT ... BY is not supported"));
+            }
+        }
+        if let Some(ob) = &q.order_by {
+            if ob.interpolate.is_some() || matches!(&ob.kind, sql::OrderByKind::Expressions(es) if es.iter().any(|e| e.with_fill.is_some())) {
+                return Err(err("ORDER BY ... WITH FILL and INTERPOLATE are not supported"));
             }
         }
         let filter = match &s.selection {
@@ -963,7 +1189,13 @@ impl<'a> Binder<'a> {
                 Value::Float(x) => Ok(Value::Float(-x)),
                 _ => Err(err("cannot negate a non-number")),
             },
-            Expr::Identifier(id) if !id.value.is_empty() => Ok(Value::Str(id.value.clone())),
+            // "x" reads as a string, as in SQLite and MySQL; an unquoted
+            // name is a column, which is no value.
+            Expr::Identifier(id) if id.quote_style == Some('"') => Ok(Value::Str(id.value.clone())),
+            Expr::Identifier(id) if self.schema.field_index(&id.value).is_some() => {
+                Err(err(format!("{} is a column, and a value is expected here (a string is quoted: '{}')", id.value, id.value)))
+            }
+            Expr::Identifier(id) => Err(err(format!("no such column: {} (a string is quoted: '{}')", id.value, id.value))),
             _ => Err(err(format!("expected a literal or parameter, got {e}"))),
         }
     }
@@ -1044,6 +1276,49 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// `SET f = value, g = g + 1, ...`; with `excluded`, as in `ON CONFLICT
+    /// DO UPDATE`, also `h = excluded.h` (the value the INSERT proposed).
+    fn assignments(&self, assignments: &[sql::Assignment], excluded: bool) -> Result<Vec<(usize, Assign)>> {
+        let mut sets: Vec<(usize, Assign)> = Vec::new();
+        for a in assignments {
+            let sql::AssignmentTarget::ColumnName(name) = &a.target else { return Err(err("SET one column at a time")) };
+            let f = self.schema.field_index(&name.to_string()).ok_or_else(|| err(format!("no such column: {name}")))?;
+            let fld = &self.schema.fields[f];
+            if Some(f) == self.schema.primary_key {
+                return Err(err("the primary key cannot be updated; delete and insert instead"));
+            }
+            if sets.iter().any(|(g, _)| *g == f) {
+                return Err(err(format!("{} is set twice", fld.name)));
+            }
+            let assign = match &a.value {
+                Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if self.field_of(left).ok() == Some(f) => {
+                    if !matches!(fld.ty, FieldType::Int | FieldType::Float) {
+                        return Err(err(format!("{} is not numeric", fld.name)));
+                    }
+                    if fld.multi {
+                        return Err(err(format!("{} holds a list: SET it to a list", fld.name)));
+                    }
+                    Assign::Add(match (self.num_literal(right)?, op) {
+                        (x, BinaryOperator::Plus) => x,
+                        (Value::Int(x), _) => x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int),
+                        (x, _) => Value::Float(-x.as_f64().unwrap_or(0.0)),
+                    })
+                }
+                Expr::CompoundIdentifier(ids) if excluded && ids.len() == 2 && ids[0].value.eq_ignore_ascii_case("excluded") => {
+                    let g = self.schema.field_index(&ids[1].value).ok_or_else(|| err(format!("no such column: {}", ids[1].value)))?;
+                    let src = &self.schema.fields[g];
+                    if src.ty != fld.ty || src.multi != fld.multi {
+                        return Err(err(format!("{} = excluded.{}: the columns have different types", fld.name, src.name)));
+                    }
+                    Assign::Excluded(g)
+                }
+                e => Assign::Value(self.write_value(f, e)?),
+            };
+            sets.push((f, assign));
+        }
+        Ok(sets)
+    }
+
     fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {
         let v: Arc<[f32]> = match self.literal(e)? {
             Value::Vector(v) => v,
@@ -1062,6 +1337,52 @@ impl<'a> Binder<'a> {
         }
         Ok(v)
     }
+}
+
+/// Refuses the clauses of a SELECT that the binder does not handle, so that
+/// none is silently ignored.
+fn check_select(s: &sql::Select) -> Result<()> {
+    let sql::Select {
+        select_token: _,
+        distinct,
+        top,
+        top_before_distinct: _,
+        projection: _,
+        exclude,
+        into,
+        from: _,
+        lateral_views,
+        prewhere,
+        selection: _,
+        group_by,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having: _,
+        named_window,
+        qualify,
+        window_before_qualify: _,
+        value_table_mode,
+        connect_by,
+        flavor,
+    } = s;
+    let modifiers = matches!(group_by, sql::GroupByExpr::Expressions(_, m) if !m.is_empty());
+    let clause = if distinct.is_some() {
+        "SELECT DISTINCT (it runs as a compound query, through Db::query)"
+    } else if top.is_some() {
+        "TOP (use LIMIT)"
+    } else if into.is_some() {
+        "SELECT INTO"
+    } else if named_window.is_empty() && qualify.is_none() && !modifiers && exclude.is_none() && lateral_views.is_empty() && prewhere.is_none() && cluster_by.is_empty() && distribute_by.is_empty() && sort_by.is_empty() && value_table_mode.is_none() && connect_by.is_none() && *flavor == sql::SelectFlavor::Standard {
+        return Ok(());
+    } else if !named_window.is_empty() || qualify.is_some() {
+        "WINDOW or QUALIFY"
+    } else if modifiers {
+        "GROUP BY ... WITH ROLLUP, CUBE or TOTALS"
+    } else {
+        return Err(err(format!("this form of SELECT is not supported: {s}")));
+    };
+    Err(err(format!("{clause} is not supported")))
 }
 
 fn contains_graph(p: &Pred) -> bool {
