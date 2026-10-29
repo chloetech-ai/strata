@@ -58,8 +58,9 @@ socket.
 - **Reads in parallel, one writer.** Each client connection gets a thread,
   and reads run on it against a snapshot, any number at once. Every write
   goes to one writer thread, which commits whatever is queued as one
-  transaction (one WAL sync), numbers new records in commit order, and
-  flushes and merges between transactions. Callers embed on their own
+  transaction (one WAL sync) and numbers new records in commit order. A
+  full memtable becomes a segment, and segments merge, on Strata's flusher
+  and merger threads while writes go on. Callers embed on their own
   threads and return once their write is visible, so a session reads its
   own writes. The writer also builds each new version before the write
   returns (Strata's `publish_snapshots`), including the last memtable
@@ -288,7 +289,7 @@ differ.
 | `PostToolUse`, `Stop` client | < 10 ms (queued, embedded and committed in the background) |
 | `UserPromptSubmit` | < 100 ms p99 at 1M records (measured on an Apple M2: 24.9 ms p50, 38.6 ms p99 as a hook process, with 1% knowledge records; the knowledge query runs beside the main search; about 10 ms of it is process start) |
 | `SessionStart` | < 150 ms (daemon already up), < 1 s with daemon spawn |
-| background | the writer thread commits queued writes together and builds the new in-memory segment (at most 256 records, no graph) before they return, so no query does |
+| background | the writer thread commits queued writes together and builds the new in-memory segment (at most 256 records, no graph) before they return, so no query does; flushes and merges run on threads of their own, so no write waits for them |
 | ingest | > 1,000 records per second with the static embedder |
 
 The default embedder is static (Model2Vec potion-retrieval-32M: token
