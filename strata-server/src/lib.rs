@@ -5,7 +5,7 @@
 //! * [`http`]: the JSON API (`/v1/...`), Prometheus metrics (`/metrics`)
 //!   and the query UI (`/`).
 //! * [`grpc`]: the same operations over gRPC (`proto/strata.proto`), which
-//!   a coordinator uses to reach its shards.
+//!   a coordinator uses to reach its shards; [`plan_pb`]: plans as protobuf.
 //! * [`agent`]: answers a question in words by letting a Claude model
 //!   query the table.
 //! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves.
@@ -20,6 +20,7 @@ pub mod idem;
 pub mod json;
 pub mod metrics;
 pub mod obs;
+pub mod plan_pb;
 pub mod server;
 pub mod service;
 

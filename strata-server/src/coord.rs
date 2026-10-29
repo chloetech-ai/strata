@@ -26,10 +26,17 @@
 //! UPDATE and DELETE statements go to every shard. A write that spans
 //! shards is one transaction per replica, not one across them, and a
 //! replica that misses a write (it was down) is not caught up: rebuild it.
+//!
+//! The coordinator asks each replica the protocol versions it speaks
+//! (`Hello`, [`crate::grpc::PROTOCOL`]) when it connects, again every
+//! minute and after the replica fails, as it may have restarted on another
+//! version, and speaks the oldest any replica speaks. From protocol 2 a
+//! read reaches the shards as a typed plan ([`crate::plan_pb`]); a server
+//! from before `Hello` takes SQL, or a JSON plan, as it did.
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
@@ -45,11 +52,11 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::auth::Secret;
-use crate::grpc::{params_to_pb, result_from_pb};
+use crate::grpc::{params_to_pb, result_from_pb, MIN_PROTOCOL, PROTOCOL};
 use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{op_key, shard_of, QueryReq};
-use crate::{json as js, ApiError};
+use crate::{json as js, plan_pb, ApiError};
 
 /// How the coordinator uses replicas and handles shards that do not answer.
 #[derive(Clone, Debug)]
@@ -102,6 +109,72 @@ struct Replica {
     client: Client,
     /// Asked last until this time (ms after [`Coordinator::epoch`]).
     avoid_until: AtomicU64,
+    /// The protocol it speaks with the coordinator (0: not known), and
+    /// when it said so (ms after [`Coordinator::epoch`]).
+    protocol: AtomicU32,
+    hello_at: AtomicU64,
+}
+
+impl Replica {
+    fn new(url: &str, client: Client) -> Replica {
+        Replica { url: url.to_string(), client, avoid_until: AtomicU64::new(0), protocol: AtomicU32::new(0), hello_at: AtomicU64::new(0) }
+    }
+}
+
+/// How long a replica's answer to `Hello` is trusted before it is asked
+/// again, so that the coordinator follows a rolling upgrade or a rollback.
+const HELLO_EVERY_MS: u64 = 60_000;
+
+/// The protocol to speak with a server that answered `Hello`: the newest
+/// both speak.
+fn agree(h: &pb::HelloResponse) -> Result<u32, String> {
+    let p = h.max_protocol.min(PROTOCOL);
+    if p < h.min_protocol.max(MIN_PROTOCOL) {
+        return Err(format!("{} speaks protocols {} to {}, and this coordinator {MIN_PROTOCOL} to {PROTOCOL}", h.server, h.min_protocol, h.max_protocol));
+    }
+    Ok(p)
+}
+
+/// Asks a server the protocol to speak with it ([`agree`]). One from
+/// before `Hello` (it answers Unimplemented) speaks protocol 1.
+async fn hello(c: &mut Client) -> Result<u32, tonic::Status> {
+    match c.hello(pb::HelloRequest { min_protocol: MIN_PROTOCOL, max_protocol: PROTOCOL }).await {
+        Ok(h) => agree(&h.into_inner()).map_err(tonic::Status::failed_precondition),
+        Err(s) if s.code() == Code::Unimplemented => Ok(1),
+        Err(s) => Err(s),
+    }
+}
+
+/// A read in the forms the shards take: SQL and its parameters, or a JSON
+/// plan, in protocol 1; a typed plan from protocol 2, when the read is to
+/// speak it.
+struct Read {
+    sql: String,
+    params: std::collections::HashMap<String, pb::Value>,
+    plan_json: Vec<u8>,
+    plan: Option<pb::Plan>,
+}
+
+impl Read {
+    /// `sql` with `params`, or `given` (a compound query's leaf, which
+    /// `sql` then only names), and `typed()`, the plan protocol 2 sends,
+    /// made only when `protocol` is 2 or newer.
+    fn new(sql: &str, params: &Params, given: Option<&Plan>, protocol: u32, typed: impl FnOnce() -> strata::Result<Plan>) -> Result<Read, ApiError> {
+        let plan = match (protocol >= 2, given) {
+            (false, _) => None,
+            (true, Some(p)) => Some(plan_pb::to_pb_plan(p)),
+            (true, None) => Some(plan_pb::to_pb_plan(&typed()?)),
+        };
+        Ok(Read { sql: sql.to_string(), params: params_to_pb(params), plan_json: plan_json(given)?, plan })
+    }
+
+    /// The request in `protocol`.
+    fn request(&self, protocol: u32) -> pb::QueryRequest {
+        match (&self.plan, protocol >= 2) {
+            (Some(plan), true) => pb::QueryRequest { sql: self.sql.clone(), protocol, plan: Some(plan.clone()), ..Default::default() },
+            _ => pb::QueryRequest { sql: self.sql.clone(), params: self.params.clone(), plan_json: self.plan_json.clone(), protocol: 1, ..Default::default() },
+        }
+    }
 }
 
 pub struct Coordinator {
@@ -235,7 +308,7 @@ impl Coordinator {
                 }
                 let ch = ep.connect_timeout(Duration::from_secs(5)).tcp_nodelay(true).connect_lazy();
                 let client = StrataClient::with_interceptor(ch, Credentials(credentials.clone())).max_decoding_message_size(256 << 20);
-                rs.push(Replica { url: url.to_string(), client, avoid_until: AtomicU64::new(0) });
+                rs.push(Replica::new(url, client));
             }
             if rs.is_empty() {
                 return Err(ApiError::bad(format!("shard {group:?} has no URL")));
@@ -246,13 +319,20 @@ impl Coordinator {
         for (i, rs) in replicas.iter().enumerate() {
             let answers = join_all(rs.iter().map(|r| {
                 let mut c = r.client.clone();
-                async move { tokio::time::timeout(Duration::from_secs(5), c.schema(pb::Empty {})).await }
+                let ask = async move {
+                    let s = c.schema(pb::Empty {}).await?.into_inner().schema_json;
+                    Ok::<_, tonic::Status>((s, hello(&mut c).await?))
+                };
+                tokio::time::timeout(Duration::from_secs(5), ask)
             }))
             .await;
             let mut errors = Vec::new();
             for (r, a) in rs.iter().zip(answers) {
                 match a {
-                    Ok(Ok(s)) => schemas.push(s.into_inner().schema_json),
+                    Ok(Ok((s, p))) => {
+                        schemas.push(s);
+                        r.protocol.store(p, Ordering::Relaxed);
+                    }
                     Ok(Err(e)) => errors.push(format!("{}: {}", r.url, e.message())),
                     Err(_) => errors.push(format!("{}: no answer within 5 s", r.url)),
                 }
@@ -297,11 +377,32 @@ impl Coordinator {
             Family::one("strata_shard_retries_total", "counter", "Calls asked of another replica after one failed.", self.retries.load(Ordering::Relaxed) as f64),
             Family::one("strata_shard_hedges_total", "counter", "Calls asked of another replica too after the first had not answered within --hedge-ms.", self.hedges.load(Ordering::Relaxed) as f64),
             Family::one("strata_replicas_avoided", "gauge", "Replicas asked last for now, after they failed or were outrun.", avoided as f64),
+            Family::one("strata_shard_protocol", "gauge", "The protocol reads speak to the shards: the oldest a replica speaks.", self.protocol() as f64),
         ]
     }
 
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// The protocol reads speak to the shards: the oldest a replica
+    /// speaks, of those that said (the newest while none has).
+    pub fn protocol(&self) -> u32 {
+        self.replicas.iter().flatten().map(|r| r.protocol.load(Ordering::Relaxed)).filter(|&p| p != 0).min().unwrap_or(PROTOCOL)
+    }
+
+    /// The protocol to speak with replica `r` of shard `i`, `max` at most:
+    /// asked of it first when not known, or not asked for a minute.
+    async fn speak(&self, i: usize, r: usize, c: &mut Client, max: u32) -> Result<u32, tonic::Status> {
+        let rep = &self.replicas[i][r];
+        let p = rep.protocol.load(Ordering::Relaxed);
+        if p != 0 && self.now_ms() < rep.hello_at.load(Ordering::Relaxed) + HELLO_EVERY_MS {
+            return Ok(p.min(max));
+        }
+        let p = hello(c).await?;
+        rep.protocol.store(p, Ordering::Relaxed);
+        rep.hello_at.store(self.now_ms(), Ordering::Relaxed);
+        Ok(p.min(max))
     }
 
     fn avoid(&self, i: usize, r: usize) {
@@ -357,6 +458,8 @@ impl Coordinator {
                     }
                     Err(s) if try_elsewhere(&s) => {
                         self.avoid(i, r);
+                        // It may come back on another version: asked again.
+                        self.replicas[i][r].protocol.store(0, Ordering::Relaxed);
                         if more {
                             self.retries.fetch_add(1, Ordering::Relaxed);
                             let next = order[asked.len()];
@@ -408,15 +511,13 @@ impl Coordinator {
 
     /// The statistics of shards `which`, and the replica and lease each
     /// came from. A lease lasts until `deadline` and a second.
-    async fn shard_stats(&self, sql: &str, plan_json: &[u8], params: &Params, which: Vec<usize>, start: usize, deadline: Instant) -> Vec<(usize, Result<(TermStats, usize, u64), ApiError>)> {
-        let req = pb::QueryRequest { sql: sql.into(), params: params_to_pb(params), timeout_ms: ms_left(deadline), plan_json: plan_json.to_vec(), ..Default::default() };
+    async fn shard_stats(&self, read: &Read, protocol: u32, which: Vec<usize>, start: usize, deadline: Instant) -> Vec<(usize, Result<(TermStats, usize, u64), ApiError>)> {
         let calls = which.into_iter().map(|i| {
-            let req = req.clone();
             async move {
                 let a = self
-                    .call(i, start, None, deadline, |_, mut c| {
-                        let req = req.clone();
-                        async move { c.term_stats(req).await }
+                    .call(i, start, None, deadline, |r, mut c| async move {
+                        let p = self.speak(i, r, &mut c, protocol).await?;
+                        c.term_stats(pb::QueryRequest { timeout_ms: ms_left(deadline), ..read.request(p) }).await
                     })
                     .await;
                 let a = a.and_then(|(r, a)| {
@@ -434,8 +535,9 @@ impl Coordinator {
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let mut sum = TermStats::default();
         let mut leases = Vec::new();
-        let plan_json = plan_json(plan)?;
-        for (_, a) in self.shard_stats(sql, &plan_json, params, (0..self.replicas.len()).collect(), start, deadline).await {
+        let protocol = self.protocol();
+        let read = Read::new(sql, params, plan, protocol, || Plan::bind(sql, &self.schema, params))?;
+        for (_, a) in self.shard_stats(&read, protocol, (0..self.replicas.len()).collect(), start, deadline).await {
             let (s, _, lease) = a?;
             sum.add(&s);
             leases.push(lease);
@@ -445,7 +547,8 @@ impl Coordinator {
 
     pub async fn query(&self, req: &QueryReq, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
         let partial = req.partial.unwrap_or(self.opts.partial);
-        let plan_json = &plan_json(req.plan.as_deref())?;
+        let protocol = self.protocol();
+        let read = &Read::new(&req.sql, &req.params, req.plan.as_deref(), protocol, || Ok(Plan::of_select(&self.schema, select)))?;
         let n = self.replicas.len();
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let ranked_text = matches!(crate::metrics::kind(select), "bm25" | "hybrid" | "boosted");
@@ -475,7 +578,7 @@ impl Coordinator {
             None if ranked_text && n > 1 => {
                 let mut sum = TermStats::default();
                 let which = (0..n).filter(|&i| failed[i].is_none()).collect();
-                for (i, a) in self.shard_stats(&req.sql, plan_json, &req.params, which, start, deadline).await {
+                for (i, a) in self.shard_stats(read, protocol, which, start, deadline).await {
                     match a {
                         Ok((s, r, lease)) => {
                             sum.add(&s);
@@ -495,18 +598,14 @@ impl Coordinator {
             let first = leased[i].map(|(r, _)| r);
             async move {
                 let rs = self.call(i, start, first, deadline, |r, mut c| {
-                    let q = pb::QueryRequest {
-                        sql: req.sql.clone(),
-                        params: params_to_pb(&req.params),
-                        timeout_ms: ms_left(deadline),
-                        shard: true,
-                        stats_json: stats_json.clone(),
-                        // The lease holds on the replica that granted it; another
-                        // replica scores from its latest version.
-                        snapshot: leased[i].filter(|(lr, _)| *lr == r).map_or(0, |(_, l)| l),
-                        plan_json: plan_json.clone(),
-                    };
-                    async move { c.query(q).await }
+                    let stats_json = stats_json.clone();
+                    // The lease holds on the replica that granted it; another
+                    // replica scores from its latest version.
+                    let snapshot = leased[i].filter(|(lr, _)| *lr == r).map_or(0, |(_, l)| l);
+                    async move {
+                        let p = self.speak(i, r, &mut c, protocol).await?;
+                        c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, ..read.request(p) }).await
+                    }
                 });
                 (i, rs.await)
             }
@@ -644,7 +743,7 @@ impl Coordinator {
         let status = if all_up { "ok" } else if every_shard { "degraded" } else { "down" };
         json!({
             "status": status, "role": "coordinator", "docs": docs, "segments": segments, "txn": 0, "shards": shards,
-            "retries": self.retries.load(Ordering::Relaxed), "hedges": self.hedges.load(Ordering::Relaxed),
+            "retries": self.retries.load(Ordering::Relaxed), "hedges": self.hedges.load(Ordering::Relaxed), "protocol": self.protocol(),
         })
     }
 }

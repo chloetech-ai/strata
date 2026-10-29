@@ -238,7 +238,7 @@ curl -s localhost:7700/v1/query -H 'content-type: application/json' -d '{
 ]}
 ```
 
-A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as its plan: operators over single-table queries, all on one snapshot. On a coordinator the operators run there, and each single-table query goes to the shards as its plan, in JSON (`QueryRequest.plan_json` over gRPC, provisional until the shard protocol takes typed plans). Its plan lines list the single-table queries that ran. A coordinator has no synonym list of its own: start each shard with `--synonyms FILE`.
+A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as its plan: operators over single-table queries, all on one snapshot. On a coordinator the operators run there, and each single-table query goes to the shards as its plan (typed from protocol 2, JSON before; see [gRPC](#grpc)). Its plan lines list the single-table queries that ran. A coordinator has no synonym list of its own: start each shard with `--synonyms FILE`.
 
 `set` and `add` change a numeric field in place, without rewriting the row; `upsert_if_newer` writes the row only if its version field is higher than the stored row's, so a feed replayed out of order keeps the newest. Operations see the ones before them in the batch: an `add` after an `upsert` of the same key adds to the upserted value. An `add` to an `INT` field takes an integer and fails on overflow (exact over the whole 64-bit range); one to a `FLOAT` field must stay finite; a missing value counts as 0.
 
@@ -281,7 +281,9 @@ Not yet: point-in-time recovery between checkpoints, which needs the write-ahead
 
 ## gRPC
 
-`proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `Schema` and `Health`, mirroring the HTTP routes. Values are typed (`int`, `float`, `str`, `vector`, `list`); statistics, plans and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
+`proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `Schema` and `Health`, mirroring the HTTP routes, and `Hello`. Values are typed (`int`, `float`, `str`, `vector`, `list`, `boolean`, `timestamp`); statistics and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
+
+A query travels as SQL with its parameters or, from protocol 2, as a typed plan (`QueryRequest.plan`, with `protocol = 2`): the tree of operators [`EXPLAIN`](query-language.md#explain) shows, its fields named by position in the schema and its values typed, with no SQL to parse. `sql` then only names the query in the shard's logs. `Hello` answers the protocol versions a server speaks (1 to 2), the plan version it reads and the plan features it has. A server refuses a protocol newer than its own, and a plan of a newer version or one that needs a feature it lacks, by name (`InvalidArgument`). Protocol 1, the servers before `Hello`, takes SQL, or a JSON plan (`plan_json`) for a compound query's leaf.
 
 ## Sharding: one coordinator, many shards
 
@@ -298,6 +300,8 @@ A coordinator holds no data. For a query, it
 1. asks every shard for the BM25 statistics of the query's terms and a snapshot lease, which lasts until the query's deadline and a second (skipped when nothing in the query needs collection statistics: vectors, sparse fields, columns),
 2. sends every shard the query with the summed statistics and its lease, in shard mode, so that each shard scores exactly as the whole collection would and returns what a merge needs (for fusions and products, each input's raw scores over its candidates),
 3. merges the answers with `strata::cluster::merge`: top *k*, fusion, products and facet counts.
+
+A coordinator asks each replica the protocol versions it speaks (`Hello`) when it connects, again every minute and after the replica fails (it may have restarted on another version), and speaks the oldest any replica speaks, so shards can be upgraded one at a time: while one runs a server from before `Hello`, every shard gets SQL and JSON plans, and once all speak protocol 2 they get typed plans. `/v1/health` shows the protocol spoken (`protocol`).
 
 A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key (a hash of the key picks the shard); `UPDATE` and `DELETE` go to every shard. A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
 
@@ -361,6 +365,7 @@ It answers 503 for `down` and `failing`. `/livez` and `/readyz` answer 503 only 
 | `strata_merges_interrupted`, `strata_merge_failing` | | groups of segments whose merge a crash interrupted; 1 while merges fail |
 | `strata_shard_calls_total` | `shard`, `outcome` | a coordinator's calls to each shard (replicas, retries and hedges together) by outcome: `ok`, `error`, `timeout` |
 | `strata_shard_retries_total`, `strata_shard_hedges_total` | | calls a coordinator asked of another replica after one failed, or after the first had not answered within `--hedge-ms` |
+| `strata_shard_protocol` | | the protocol a coordinator speaks to its shards: the oldest a replica speaks |
 | `strata_replicas_avoided` | | replicas a coordinator asks last for now, after they failed or were outrun |
 
 A coordinator's `/metrics` does not ask its shards: each shard serves its own, and the coordinator shows how its calls to them went. `strata_query_ms` (milliseconds) became `strata_query_duration_seconds`.

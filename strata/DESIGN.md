@@ -595,16 +595,27 @@ handing a query to its shards) are to make instead of writing SQL text.
   sort. A `SELECT DISTINCT` over rows of a `WITH` result kept every
   distinct value and dropped its `LIMIT`; it keeps the `LIMIT` now. A
   coordinator runs the operators and sends each leaf to its shards as its
-  plan (`QueryRequest.plan_json`, JSON until the shard protocol takes
-  typed plans), where it sent SQL text printed to parse back to the
-  leaf.
+  plan, where it sent SQL text printed to parse back to the leaf.
+* **The shard protocol.** From protocol 2 a coordinator sends every read
+  to its shards as a typed plan in protobuf (`QueryRequest.plan`, the same
+  tree as the JSON form, with typed values and no SQL), where protocol 1
+  sent SQL with parameters, or a leaf as a JSON plan. `Hello` answers a
+  server's protocol versions, plan version and plan features. The
+  coordinator asks each replica when it connects, every minute and after
+  the replica fails, and speaks the oldest version any replica speaks, so
+  a cluster upgrades one server at a time. A server refuses a protocol
+  newer than its own, and reads a protobuf plan with the checks JSON's
+  reading makes: version and features by name, every node and expression
+  present, every number finite.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: typed plans as the shard protocol, then a coordinator and
-strata-server over every table.
+Next: the rest of replication on top of the shard protocol (query then
+fetch with partial aggregates, slots and epochs, sequence numbers in the
+WAL, WAL shipping, catch-up, read-your-writes, promotion), and a
+coordinator and strata-server over every table.
 
 ## 7. Planning and execution
 
