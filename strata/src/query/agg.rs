@@ -9,6 +9,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 
 use crate::error::{Error, Result};
+use crate::query::ir::eval::{self, Ref};
+use crate::query::ir::{lower, Expr};
 use crate::query::memory::Charge;
 use crate::query::logical::{AggFn, Having, OrderBy, Projection, Select, Tiebreak};
 use crate::value::Value;
@@ -222,7 +224,7 @@ pub fn cmp(a: &Value, b: &Value) -> Ordering {
 
 /// The exact order of an integer and a double (converting the integer
 /// would round 2^53 + 1 to 2^53). NaN sorts last, as in `total_cmp`.
-fn cmp_int_float(x: i64, y: f64) -> Ordering {
+pub(crate) fn cmp_int_float(x: i64, y: f64) -> Ordering {
     const TWO63: f64 = 9_223_372_036_854_775_808.0;
     if y.is_nan() || y >= TWO63 {
         return Ordering::Less;
@@ -334,7 +336,10 @@ impl Groups {
 
 /// Applies `HAVING`, the order, `OFFSET` and `LIMIT`, and projects each
 /// group. A query without `GROUP BY` has one group, even over no rows.
-pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Vec<Vec<Value>> {
+/// `HAVING` keeps the groups for which it is TRUE, in the one evaluator of
+/// plan expressions ([`crate::query::ir::eval`]): an aggregate of no
+/// values is NULL, and a comparison with it is neither true nor false.
+pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Result<Vec<Vec<Value>>> {
     if q.group_by.is_empty() && groups.map.is_empty() {
         groups.map.insert(Vec::new(), needed.iter().map(Acc::new).collect());
     }
@@ -344,8 +349,30 @@ pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Vec<Vec<
             _ => needed.iter().position(|n| n == p).map_or(Value::Null, |i| accs[i].value()),
         }
     };
-    let mut rows: Vec<(Vec<Part>, Vec<Acc>)> =
-        groups.map.into_iter().filter(|(k, a)| q.having.as_ref().is_none_or(|h| h.eval(&|p| value_of(k, a, p)))).collect();
+    // The values HAVING names, as columns of the group's row.
+    let mut columns: Vec<Projection> = Vec::new();
+    let having = q.having.as_ref().map(|h| {
+        lower::having(h, &mut |p| {
+            let i = columns.iter().position(|c| c == p).unwrap_or_else(|| {
+                columns.push(p.clone());
+                columns.len() - 1
+            });
+            Expr::Output(i as u32)
+        })
+    });
+    let mut rows: Vec<(Vec<Part>, Vec<Acc>)> = Vec::with_capacity(groups.map.len());
+    for (k, a) in groups.map {
+        let keep = match &having {
+            None => true,
+            Some(h) => eval::holds(h, &|r| match r {
+                Ref::Output(i) => Ok(value_of(&k, &a, &columns[i as usize])),
+                r => Err(err(format!("HAVING reads {r:?}, which a group does not have"))),
+            })?,
+        };
+        if keep {
+            rows.push((k, a));
+        }
+    }
     let value_desc = matches!(q.tiebreak, Some(Tiebreak::GroupValue { desc: true }));
     let by_key = |a: &[Part], b: &[Part]| if value_desc { b.cmp(a) } else { a.cmp(b) };
     let primary: Option<(Projection, bool)> = match &q.order {
@@ -366,11 +393,12 @@ pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Vec<Vec<
         };
         o.then_with(|| by_key(ka, kb))
     });
-    rows.into_iter()
+    Ok(rows
+        .into_iter()
         .skip(q.offset)
         .take(q.limit.unwrap_or(usize::MAX))
         .map(|(k, a)| q.projection.iter().map(|(_, p)| value_of(&k, &a, p)).collect())
-        .collect()
+        .collect())
 }
 
 impl Having {
@@ -379,16 +407,6 @@ impl Having {
             Having::Range { what, .. } | Having::Eq { what, .. } => f(what),
             Having::And(hs) | Having::Or(hs) => hs.iter().for_each(|h| h.visit(f)),
             Having::Not(h) => h.visit(f),
-        }
-    }
-
-    pub fn eval(&self, value: &dyn Fn(&Projection) -> Value) -> bool {
-        match self {
-            Having::Range { what, lo, hi } => value(what).as_f64().is_some_and(|x| *lo <= x && x <= *hi),
-            Having::Eq { what, value: v } => cmp(&value(what), v) == Ordering::Equal,
-            Having::And(hs) => hs.iter().all(|h| h.eval(value)),
-            Having::Or(hs) => hs.iter().any(|h| h.eval(value)),
-            Having::Not(h) => !h.eval(value),
         }
     }
 }

@@ -59,7 +59,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         for s in &shards {
             groups.merge_rows(&s.rows, q.group_by.len(), &needed)?;
         }
-        let mut rows = agg::finish(q, groups, &needed);
+        let mut rows = agg::finish(q, groups, &needed)?;
         q.typed(&mut rows);
         return Ok(empty(rows, stats));
     }

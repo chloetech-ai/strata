@@ -42,8 +42,9 @@ use crate::error::{Error, Result};
 use crate::query::logical::{AggFn, Decay, Direction, Expand, Opts};
 use crate::value::Value;
 
+pub mod eval;
 mod explain;
-mod lower;
+pub(crate) mod lower;
 mod raise;
 
 /// The plan version this version of Strata writes and reads.
@@ -186,6 +187,33 @@ pub enum CmpOp {
 pub enum ArithOp {
     Add,
     Sub,
+    Mul,
+    /// Always a FLOAT; NULL for a zero divisor.
+    Div,
+    /// The remainder; NULL for a zero divisor.
+    Mod,
+}
+
+/// A scalar function of values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Func {
+    Lower,
+    Upper,
+    /// Characters of a text.
+    Length,
+    Abs,
+    /// To the nearest integer, or to `args[1]` decimals.
+    Round,
+    /// The first argument that is not NULL.
+    Coalesce,
+}
+
+/// A branch of [`Expr::Case`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct When {
+    pub when: Expr,
+    pub then: Expr,
 }
 
 /// An expression over a row. Conditions follow SQL's three-valued logic:
@@ -225,8 +253,33 @@ pub enum Expr {
     /// `expr` equals one of `list` (a multi-valued field: one of its
     /// values does).
     In { expr: Box<Expr>, list: Vec<Expr> },
-    /// `left + right` or `left - right`; integers exact.
+    /// `left + right`, `-`, `*`, `/` or `%`: integers exact, and a FLOAT
+    /// where an integer result would overflow.
     Arith { op: ArithOp, left: Box<Expr>, right: Box<Expr> },
+    /// `-expr`.
+    Neg(Box<Expr>),
+    /// The values as text, one after another (`||`); NULL adds nothing.
+    Concat(Vec<Expr>),
+    /// `expr LIKE pattern` (`%` any run of characters, `_` one), or
+    /// `ILIKE` ignoring case; NULL unless both are text.
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_insensitive: bool,
+    },
+    /// `CASE [operand] WHEN .. THEN .. [ELSE ..] END`: the first branch
+    /// whose `when` is TRUE (or equals the operand), else `otherwise`, else
+    /// NULL.
+    Case {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operand: Option<Box<Expr>>,
+        whens: Vec<When>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        otherwise: Option<Box<Expr>>,
+    },
+    /// A scalar function.
+    Call { func: Func, args: Vec<Expr> },
     /// `MATCH(field, query)`: a TEXT field's full-text query.
     Match {
         field: u32,

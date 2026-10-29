@@ -352,3 +352,38 @@ fn explain_shows_the_plan() {
         assert!(e.contains(why), "{bad}: {e}");
     }
 }
+
+/// LIKE, CASE, arithmetic and functions are plan expressions: they go
+/// through JSON and `EXPLAIN` shows them in SQL's words. The joins and
+/// `WITH` results that evaluate them run over rows in memory; a Search
+/// filters with what its indexes answer and says so.
+#[test]
+fn row_expressions_explain() {
+    use strata::query::ir::{ArithOp, CmpOp, Expr, Func, When};
+    let dir = tempfile::tempdir().unwrap();
+    let db = db(&dir.path().join("d.strata"));
+    let schema = db.storage().table("papers").unwrap();
+    let f = |name: &str| Box::new(Expr::Field(schema.field_index(name).unwrap() as u32));
+    let lit = |v: Value| Box::new(Expr::Lit(v));
+    let text = |s: &str| lit(Value::Str(s.into()));
+    let year2 = Expr::Arith { op: ArithOp::Mul, left: Box::new(Expr::Arith { op: ArithOp::Add, left: f("year"), right: lit(Value::Int(1)) }), right: lit(Value::Int(2)) };
+    let filter = Expr::And(vec![
+        Expr::Like { expr: Box::new(Expr::Call { func: Func::Lower, args: vec![*f("title")] }), pattern: text("g%"), case_insensitive: false },
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left: Box::new(Expr::Case { operand: None, whens: vec![When { when: Expr::Cmp { op: CmpOp::Gt, left: f("year"), right: lit(Value::Int(2020)) }, then: *text("new") }], otherwise: Some(text("old")) }),
+            right: text("new"),
+        },
+        Expr::Cmp { op: CmpOp::Gt, left: Box::new(year2), right: Box::new(Expr::Neg(lit(Value::Int(4)))) },
+        Expr::Not(Box::new(Expr::Like { expr: Box::new(Expr::Concat(vec![*f("category"), *text("!")])), pattern: text("%db%"), case_insensitive: true })),
+    ]);
+    let mut j = serde_json::json!({"version": 1, "root": {"node": "project", "input": {"node": "search", "table": "papers"}, "columns": []}});
+    j["root"]["input"]["filter"] = serde_json::to_value(&filter).unwrap();
+    let plan = Plan::from_json(&j).unwrap();
+    assert_eq!(Plan::from_json(&plan.to_json().unwrap()).unwrap(), plan);
+    let lines = plan.explain(&[&schema]);
+    let line = lines.iter().find(|l| l.contains("filter:")).unwrap_or_else(|| panic!("{lines:?}"));
+    assert_eq!(line.trim(), "filter: (lower(title) LIKE 'g%') AND CASE WHEN year > 2020 THEN 'new' ELSE 'old' END = 'new' AND ((year + 1) * 2) > -4 AND NOT ((category || '!') ILIKE '%db%')");
+    let e = db.run(&plan).err().expect("a Search does not evaluate rows").to_string();
+    assert!(e.contains("cannot filter by"), "{e}");
+}

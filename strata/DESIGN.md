@@ -507,7 +507,9 @@ handing a query to its shards) are to make instead of writing SQL text.
   which never changes, since there is no `ALTER`), typed literals
   (`{"int": 5}`, `{"float": 5.0}`, `{"text": "5"}`, `{"timestamp": ...}`),
   `NOT`, `AND`, `OR`, `IS NULL`, comparisons, `BETWEEN` with open ends,
-  `IN`, arithmetic, `MATCH`, the graph predicates, every score (BM25,
+  `IN`, arithmetic (`+ - * / %`, negation), `||`, `LIKE` and `ILIKE`,
+  `CASE`, the functions `lower`, `upper`, `length`, `abs`, `round` and
+  `coalesce`, `MATCH`, the graph predicates, every score (BM25,
   similarity, sparse, decay, RRF, weighted sums, products, PageRank), and
   a subquery. A filter is in three-valued logic as the binder makes it: a
   negation over a field that can be null carries `x IS NOT NULL`.
@@ -532,13 +534,28 @@ handing a query to its shards) are to make instead of writing SQL text.
   0.4 to 1.3 µs to a query whose binding takes 9 to 22 µs (cloud
   container, 2026-10-29). A coordinator still takes SQL: its shards take
   plans with the shard protocol.
+* **One evaluator.** `ir::eval` gives an expression's value over a row,
+  in SQL's three-valued logic: NULL is UNKNOWN, `AND` and `OR` are
+  Kleene's, `NOT` of UNKNOWN is UNKNOWN, and a row or group is kept only
+  when its condition is TRUE. A comparison with a multi-valued field
+  holds when one of its values does and is never UNKNOWN (a field with no
+  values is an empty list), as the indexes answer it. Integers are exact,
+  a result too big for one is a FLOAT, `/` gives a FLOAT and a zero
+  divisor NULL. `HAVING` runs in it, and so do the conditions and values
+  over joined and derived rows (`WITH`, `FROM (SELECT ...)`, joins),
+  compiled into plan expressions once per query instead of walking the
+  SQL for each row. Tests check that the evaluator and the indexes keep
+  the same rows for 1,500 random conditions over rows with NULLs and
+  lists, that a join keeps them too, and that `NOT` over an aggregate of
+  no values keeps no group (`HAVING` was two-valued before, and joins
+  compared a list with a value by its text, so `b.tags = 'x'` never
+  held, and read a field with no values as NULL).
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next, in order: one three-valued evaluator for every filter; writes run
-as plans; then operators in place of the compound-query code, the Python
+Next, in order: writes run as plans; then operators in place of the compound-query code, the Python
 builder, joins across tables, and plans as the shard protocol.
 
 ## 7. Planning and execution

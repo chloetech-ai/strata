@@ -32,6 +32,8 @@ use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArg
 
 use crate::error::{Error, Result};
 use crate::query::agg::{self, Acc, Part};
+use crate::query::ir::eval::{self, Ref};
+use crate::query::ir::{self, ArithOp, CmpOp, Func, When};
 use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
 use crate::query::memory::Charge;
 use crate::query::{AggFn, Params, Projection};
@@ -313,9 +315,11 @@ enum JoinKind {
     Left,
 }
 
-/// Rows of several tables side by side: `cols[i]` is (alias, column).
+/// Rows of several tables side by side: `cols[i]` is (alias, column), and
+/// `multi[i]` whether that is a multi-valued field of the table.
 struct Joined {
     cols: Vec<(String, String)>,
+    multi: Vec<bool>,
     rows: Vec<Vec<Value>>,
     /// The first table's key and score of each row.
     keys: Vec<Value>,
@@ -759,20 +763,23 @@ impl<'a, 'r> Ctx<'a, 'r> {
     ) -> Result<(Joined, usize)> {
         let first = self.scan(&srcs[0], &needed[0], &pushed[0], &[], &scan_order[0], lim, "scan")?;
         let driver_rows = first.rows.len();
+        let multi = |i: usize| -> Vec<bool> { needed[i].iter().map(|c| !matches!(srcs[i].kind, SrcKind::Rows(_)) && self.schema.field(c).is_some_and(|f| f.multi)).collect() };
         let mut joined = Joined {
             cols: needed[0].iter().map(|c| (srcs[0].alias.to_ascii_lowercase(), c.clone())).collect(),
+            multi: multi(0),
             keys: first.keys.clone().unwrap_or_else(|| vec![Value::Null; first.rows.len()]),
             scores: if first.scores.len() == first.rows.len() { first.scores.clone() } else { vec![0.0; first.rows.len()] },
             rows: first.rows,
         };
         for i in 1..srcs.len() {
             // The join values the rows so far hold, for each key.
+            let lefts_at: Vec<ir::Expr> = keys[i].iter().map(|(le, _)| compile_row(le, &joined.cols, &joined.multi, &self.params)).collect::<Result<_>>()?;
             let mut lefts: Vec<Vec<Value>> = Vec::new();
-            for (le, _) in &keys[i] {
+            for ((le, _), at) in keys[i].iter().zip(&lefts_at) {
                 let mut seen = HashSet::new();
                 let mut vals = Vec::new();
                 for r in &joined.rows {
-                    for v in self.join_values(&eval_row(le, &joined.cols, r, &self.params)?, &joined.cols, le)? {
+                    for v in self.join_values(&value(at, r)?, &joined.cols, le)? {
                         if seen.insert(Part::of(&v)) {
                             vals.push(v);
                         }
@@ -806,12 +813,14 @@ impl<'a, 'r> Ctx<'a, 'r> {
             let mut cols = joined.cols.clone();
             cols.extend(rcols);
             let width = needed[i].len();
-            let mut out = Joined { cols, rows: Vec::new(), keys: Vec::new(), scores: Vec::new() };
+            let both = [joined.multi.clone(), multi(i)].concat();
+            let on = compile_all(&on_rest[i], &cols, &both, &self.params)?;
+            let mut out = Joined { cols, multi: both, rows: Vec::new(), keys: Vec::new(), scores: Vec::new() };
             for (li, l) in joined.rows.iter().enumerate() {
                 self.tick()?;
                 let mut combos: Vec<Vec<Part>> = vec![Vec::new()];
-                for (le, _) in &keys[i] {
-                    let v = eval_row(le, &joined.cols, l, &self.params)?;
+                for ((le, _), at) in keys[i].iter().zip(&lefts_at) {
+                    let v = value(at, l)?;
                     let vals: Vec<Part> = self.join_values(&v, &joined.cols, le)?.iter().map(Part::of).collect();
                     combos = combos.into_iter().flat_map(|c| vals.iter().map(move |v| [c.clone(), vec![v.clone()]].concat())).collect();
                 }
@@ -822,7 +831,7 @@ impl<'a, 'r> Ctx<'a, 'r> {
                 for ri in matched {
                     self.tick()?;
                     let row: Vec<Value> = l.iter().chain(&right.rows[ri]).cloned().collect();
-                    if pass_all(&on_rest[i], &out.cols, &row, &self.params)? {
+                    if pass_all(&on, &row)? {
                         self.charge.row(&row)?;
                         out.rows.push(row);
                         out.keys.push(joined.keys[li].clone());
@@ -1164,7 +1173,7 @@ fn distinct_to_group(s: &mut sql::Select) -> Result<()> {
 
 fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Option<usize>)> {
     let n = |e: &Expr| -> Result<usize> {
-        match eval_row(e, &[], &[], params)? {
+        match value(&compile(e, params, &|_| None, &[])?, &[])? {
             Value::Int(x) if x >= 0 => Ok(x as usize),
             v => Err(err(format!("LIMIT and OFFSET take non-negative integers, not {v:?}"))),
         }
@@ -1177,29 +1186,54 @@ fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Optio
 }
 
 // ---- evaluation in memory ------------------------------------------------
+//
+// Expressions over rows in memory compile, once per query, into the plan
+// IR's expressions, each column (grouped: each aggregate and group value)
+// a slot of the row, and run on its one three-valued evaluator, as HAVING
+// and the single-table queries' conditions do.
 
-/// A condition's truth value: `None` for NULL (UNKNOWN).
-fn logic(v: &Value) -> Option<bool> {
-    match v {
-        Value::Null => None,
-        v => Some(truthy(v)),
+/// The slot of a column in rows of joined tables; `None` when `e` is not a
+/// column.
+fn slot(e: &Expr, cols: &[(String, String)]) -> Option<Result<u32>> {
+    let (alias, name) = match e {
+        Expr::CompoundIdentifier(ids) if ids.len() >= 2 => (Some(ids[ids.len() - 2].value.to_ascii_lowercase()), &ids.last().unwrap().value),
+        Expr::Identifier(id) => (None, &id.value),
+        _ => return None,
+    };
+    let hits: Vec<usize> = (0..cols.len()).filter(|&i| cols[i].1.eq_ignore_ascii_case(name) && alias.as_ref().is_none_or(|a| *a == cols[i].0)).collect();
+    Some(match hits.as_slice() {
+        [i] => Ok(*i as u32),
+        [] => Err(err(format!("no such column: {e}"))),
+        _ => Err(err(format!("column {e} is in several tables: qualify it"))),
+    })
+}
+
+/// `e` over rows of joined tables ([`Joined`]'s `cols` and `multi`).
+fn compile_row(e: &Expr, cols: &[(String, String)], multi: &[bool], params: &Params) -> Result<ir::Expr> {
+    compile(e, params, &|x| slot(x, cols), multi)
+}
+
+fn compile_all(es: &[Expr], cols: &[(String, String)], multi: &[bool], params: &Params) -> Result<Vec<ir::Expr>> {
+    es.iter().map(|e| compile_row(e, cols, multi, params)).collect()
+}
+
+/// A row in memory, as the evaluator reads it.
+fn reader(row: &[Value]) -> impl Fn(Ref) -> Result<Value> + '_ {
+    |r| match r {
+        Ref::Output(i) => Ok(row[i as usize].clone()),
+        r => Err(err(format!("{r:?} is not a column of rows in memory"))),
     }
 }
 
-fn truthy(v: &Value) -> bool {
-    match v {
-        Value::Int(x) => *x != 0,
-        Value::Bool(b) => *b,
-        Value::Timestamp(_) => true,
-        Value::Float(x) => *x != 0.0,
-        Value::Str(s) => !s.is_empty(),
-        _ => false,
-    }
+fn value(e: &ir::Expr, row: &[Value]) -> Result<Value> {
+    eval::eval(e, &reader(row))
 }
 
-fn pass_all(conds: &[Expr], cols: &[(String, String)], row: &[Value], params: &Params) -> Result<bool> {
+/// Whether `row` passes every condition: UNKNOWN fails it, as FALSE does.
+fn pass_all(conds: &[ir::Expr], row: &[Value]) -> Result<bool> {
+    let read = reader(row);
     for c in conds {
-        if !truthy(&eval_row(c, cols, row, params)?) {
+        if !eval::holds(c, &read)? {
             return Ok(false);
         }
     }
@@ -1210,9 +1244,10 @@ fn filter_rows(mut j: Joined, conds: &[Expr], params: &Params) -> Result<Joined>
     if conds.is_empty() {
         return Ok(j);
     }
+    let conds = compile_all(conds, &j.cols, &j.multi, params)?;
     let mut keep = Vec::with_capacity(j.rows.len());
     for r in &j.rows {
-        keep.push(pass_all(conds, &j.cols, r, params)?);
+        keep.push(pass_all(&conds, r)?);
     }
     let mut it = keep.iter();
     j.rows.retain(|_| *it.next().unwrap());
@@ -1223,240 +1258,104 @@ fn filter_rows(mut j: Joined, conds: &[Expr], params: &Params) -> Result<Joined>
     Ok(j)
 }
 
-/// Looks a column up in a row of joined tables.
-fn lookup(e: &Expr, cols: &[(String, String)], row: &[Value]) -> Option<Result<Value>> {
-    let (alias, name) = match e {
-        Expr::CompoundIdentifier(ids) if ids.len() >= 2 => (Some(ids[ids.len() - 2].value.to_ascii_lowercase()), &ids.last().unwrap().value),
-        Expr::Identifier(id) => (None, &id.value),
-        _ => return None,
-    };
-    let hits: Vec<usize> = (0..cols.len()).filter(|&i| cols[i].1.eq_ignore_ascii_case(name) && alias.as_ref().is_none_or(|a| *a == cols[i].0)).collect();
-    Some(match hits.as_slice() {
-        [i] => Ok(row[*i].clone()),
-        [] => Err(err(format!("no such column: {e}"))),
-        _ => Err(err(format!("column {e} is in several tables: qualify it"))),
+fn literal(v: &sql::Value, params: &Params) -> Result<Value> {
+    Ok(match v {
+        sql::Value::Number(s, _) => s.parse::<i64>().map(Value::Int).or_else(|_| s.parse::<f64>().map(Value::Float)).map_err(|_| err(format!("bad number {s}")))?,
+        sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => Value::Str(s.clone()),
+        sql::Value::Boolean(b) => Value::Bool(*b),
+        sql::Value::Null => Value::Null,
+        sql::Value::Placeholder(p) => params.0.get(p.trim_start_matches([':', '$', '@', '?'])).cloned().ok_or_else(|| err(format!("unbound parameter {p}")))?,
+        v => return Err(err(format!("unsupported literal {v}"))),
     })
 }
 
-fn eval_row(e: &Expr, cols: &[(String, String)], row: &[Value], params: &Params) -> Result<Value> {
-    eval(e, params, &|x| lookup(x, cols, row))
-}
-
-/// Evaluates an expression; `look` answers column references (and, in a
-/// grouped query, group values and aggregates) first.
-fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>) -> Result<Value> {
-    if let Some(v) = look(e) {
-        return v;
+/// Compiles `e` into the plan IR's expression: `slot` places columns (and,
+/// grouped, aggregates and group values) in the row, and parameters become
+/// literals. A multi-valued field (`multi[slot]`) with no values compares
+/// as an empty list, as the executor compares it: `tags = 'a'` is FALSE
+/// there and `NOT (tags = 'a')` TRUE, not UNKNOWN.
+fn compile(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result<u32>>, multi: &[bool]) -> Result<ir::Expr> {
+    if let Some(i) = slot(e) {
+        return Ok(ir::Expr::Output(i?));
     }
-    let ev = |x: &Expr| eval(x, params, look);
-    let num = |v: &Value| v.as_f64();
+    let go = |x: &Expr| compile(x, params, slot, multi);
+    let bx = |x: &Expr| go(x).map(Box::new);
+    // An operand of a comparison.
+    let listy = |x: &Expr| -> Result<Box<ir::Expr>> {
+        Ok(Box::new(match go(x)? {
+            ir::Expr::Output(i) if multi.get(i as usize) == Some(&true) => ir::Expr::Call { func: Func::Coalesce, args: vec![ir::Expr::Output(i), ir::Expr::Lit(Value::List(Vec::new()))] },
+            x => x,
+        }))
+    };
+    let not_if = |negated: bool, x: ir::Expr| if negated { ir::Expr::Not(Box::new(x)) } else { x };
     Ok(match e {
-        Expr::Nested(x) => ev(x)?,
-        Expr::Value(v) => match &v.value {
-            sql::Value::Number(s, _) => s.parse::<i64>().map(Value::Int).or_else(|_| s.parse::<f64>().map(Value::Float)).map_err(|_| err(format!("bad number {s}")))?,
-            sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => Value::Str(s.clone()),
-            sql::Value::Boolean(b) => Value::Bool(*b),
-            sql::Value::Null => Value::Null,
-            sql::Value::Placeholder(p) => params.0.get(p.trim_start_matches([':', '$', '@', '?'])).cloned().ok_or_else(|| err(format!("unbound parameter {p}")))?,
-            v => return Err(err(format!("unsupported literal {v}"))),
-        },
-        // Conditions follow SQL's three-valued logic: a comparison with
-        // NULL is NULL (UNKNOWN), NOT NULL is NULL, and a WHERE keeps only
-        // rows whose condition is true.
-        Expr::UnaryOp { op: UnaryOperator::Not, expr } => match ev(expr)? {
-            Value::Null => Value::Null,
-            v => Value::Int(!truthy(&v) as i64),
-        },
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match ev(expr)? {
-            Value::Int(x) => x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int),
-            Value::Float(x) => Value::Float(-x),
-            Value::Null => Value::Null,
-            v => return Err(err(format!("cannot negate {v:?}"))),
-        },
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => ev(expr)?,
-        Expr::IsNull(x) => Value::Int(matches!(ev(x)?, Value::Null) as i64),
-        Expr::IsNotNull(x) => Value::Int(!matches!(ev(x)?, Value::Null) as i64),
+        Expr::Nested(x) | Expr::UnaryOp { op: UnaryOperator::Plus, expr: x } => go(x)?,
+        Expr::Value(v) => ir::Expr::Lit(literal(&v.value, params)?),
+        Expr::UnaryOp { op: UnaryOperator::Not, expr } => ir::Expr::Not(bx(expr)?),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => ir::Expr::Neg(bx(expr)?),
+        Expr::IsNull(x) => ir::Expr::IsNull(bx(x)?),
+        Expr::IsNotNull(x) => ir::Expr::Not(Box::new(ir::Expr::IsNull(bx(x)?))),
         Expr::BinaryOp { left, op, right } => {
-            use BinaryOperator::*;
-            match op {
-                And | Or => {
-                    let (a, b) = (logic(&ev(left)?), logic(&ev(right)?));
-                    let v = if matches!(op, And) {
-                        match (a, b) {
-                            (Some(false), _) | (_, Some(false)) => Some(false),
-                            (Some(true), Some(true)) => Some(true),
-                            _ => None,
-                        }
-                    } else {
-                        match (a, b) {
-                            (Some(true), _) | (_, Some(true)) => Some(true),
-                            (Some(false), Some(false)) => Some(false),
-                            _ => None,
-                        }
-                    };
-                    v.map_or(Value::Null, |t| Value::Int(t as i64))
-                }
-                Eq | NotEq | Lt | LtEq | Gt | GtEq => {
-                    let (a, b) = (ev(left)?, ev(right)?);
-                    if matches!(a, Value::Null) || matches!(b, Value::Null) {
-                        return Ok(Value::Null);
-                    }
-                    let c = agg::cmp(&a, &b);
-                    Value::Int(match op {
-                        Eq => c == Ordering::Equal,
-                        NotEq => c != Ordering::Equal,
-                        Lt => c == Ordering::Less,
-                        LtEq => c != Ordering::Greater,
-                        Gt => c == Ordering::Greater,
-                        _ => c != Ordering::Less,
-                    } as i64)
-                }
-                StringConcat => {
-                    let s = |v: Value| match v {
-                        Value::Str(s) => s,
-                        Value::Null => String::new(),
-                        Value::Int(x) => x.to_string(),
-                        Value::Float(x) => x.to_string(),
-                        Value::Bool(b) => b.to_string(),
-                        Value::Timestamp(t) => crate::timestamp::format(t),
-                        v => format!("{v:?}"),
-                    };
-                    Value::Str(s(ev(left)?) + &s(ev(right)?))
-                }
-                Plus | Minus | Multiply | Divide | Modulo => {
-                    let (a, b) = (ev(left)?, ev(right)?);
-                    if let (Value::Int(x), Value::Int(y), false) = (&a, &b, matches!(op, Divide)) {
-                        // An integer result that overflows becomes a FLOAT,
-                        // as in SQLite.
-                        let (fx, fy) = (*x as f64, *y as f64);
-                        return Ok(match op {
-                            Plus => x.checked_add(*y).map_or(Value::Float(fx + fy), Value::Int),
-                            Minus => x.checked_sub(*y).map_or(Value::Float(fx - fy), Value::Int),
-                            Multiply => x.checked_mul(*y).map_or(Value::Float(fx * fy), Value::Int),
-                            _ if *y == 0 => Value::Null,
-                            // i64::MIN % -1 overflows; the remainder is 0.
-                            _ => Value::Int(x.checked_rem(*y).unwrap_or(0)),
-                        });
-                    }
-                    match (num(&a), num(&b)) {
-                        (Some(x), Some(y)) => Value::Float(match op {
-                            Plus => x + y,
-                            Minus => x - y,
-                            Multiply => x * y,
-                            Divide if y == 0.0 => return Ok(Value::Null),
-                            Divide => x / y,
-                            _ => x % y,
-                        }),
-                        _ => Value::Null,
-                    }
-                }
-                o => return Err(err(format!("unsupported operator {o}"))),
+            use BinaryOperator as B;
+            let cmp = match op {
+                B::Eq => Some(CmpOp::Eq),
+                B::NotEq => Some(CmpOp::Ne),
+                B::Lt => Some(CmpOp::Lt),
+                B::LtEq => Some(CmpOp::Le),
+                B::Gt => Some(CmpOp::Gt),
+                B::GtEq => Some(CmpOp::Ge),
+                _ => None,
+            };
+            if let Some(op) = cmp {
+                return Ok(ir::Expr::Cmp { op, left: listy(left)?, right: listy(right)? });
+            }
+            let arith = match op {
+                B::Plus => Some(ArithOp::Add),
+                B::Minus => Some(ArithOp::Sub),
+                B::Multiply => Some(ArithOp::Mul),
+                B::Divide => Some(ArithOp::Div),
+                B::Modulo => Some(ArithOp::Mod),
+                _ => None,
+            };
+            let (l, r) = (go(left)?, go(right)?);
+            match (op, arith) {
+                (_, Some(op)) => ir::Expr::Arith { op, left: Box::new(l), right: Box::new(r) },
+                (B::And, _) => ir::Expr::And(vec![l, r]),
+                (B::Or, _) => ir::Expr::Or(vec![l, r]),
+                (B::StringConcat, _) => ir::Expr::Concat(vec![l, r]),
+                (o, _) => return Err(err(format!("unsupported operator {o}"))),
             }
         }
-        Expr::Between { expr, negated, low, high } => {
-            let (v, lo, hi) = (ev(expr)?, ev(low)?, ev(high)?);
-            if [&v, &lo, &hi].iter().any(|x| matches!(x, Value::Null)) {
-                return Ok(Value::Null);
+        Expr::Between { expr, negated, low, high } => not_if(*negated, ir::Expr::Between { expr: listy(expr)?, lo: Some(bx(low)?), hi: Some(bx(high)?) }),
+        Expr::InList { expr, list, negated } => not_if(*negated, ir::Expr::In { expr: listy(expr)?, list: list.iter().map(go).collect::<Result<_>>()? }),
+        Expr::Like { negated, any, expr, pattern, escape_char } | Expr::ILike { negated, any, expr, pattern, escape_char } => {
+            if *any || escape_char.is_some() {
+                return Err(err(format!("unsupported expression: {e}")));
             }
-            let inside = agg::cmp(&v, &lo) != Ordering::Less && agg::cmp(&v, &hi) != Ordering::Greater;
-            Value::Int((inside != *negated) as i64)
+            not_if(*negated, ir::Expr::Like { expr: bx(expr)?, pattern: bx(pattern)?, case_insensitive: matches!(e, Expr::ILike { .. }) })
         }
-        Expr::InList { expr, list, negated } => {
-            let v = ev(expr)?;
-            if matches!(v, Value::Null) {
-                return Ok(Value::Null);
-            }
-            // `x IN (1, NULL)` is NULL, not false, when x is not 1.
-            let (mut found, mut null) = (false, false);
-            for x in list {
-                let xs = match ev(x)? {
-                    Value::List(xs) => xs,
-                    y => vec![y],
-                };
-                for y in &xs {
-                    null |= matches!(y, Value::Null);
-                    found |= !matches!(y, Value::Null) && agg::cmp(&v, y) == Ordering::Equal;
-                }
-            }
-            if !found && null {
-                return Ok(Value::Null);
-            }
-            Value::Int((found != *negated) as i64)
-        }
-        Expr::Like { negated, expr, pattern, .. } | Expr::ILike { negated, expr, pattern, .. } => {
-            let ci = matches!(e, Expr::ILike { .. });
-            let (Value::Str(s), Value::Str(p)) = (ev(expr)?, ev(pattern)?) else { return Ok(Value::Null) };
-            let (s, p) = if ci { (s.to_lowercase(), p.to_lowercase()) } else { (s, p) };
-            Value::Int((like(&s.chars().collect::<Vec<_>>(), &p.chars().collect::<Vec<_>>()) != *negated) as i64)
-        }
-        Expr::Case { operand, conditions, else_result, .. } => {
-            let base = operand.as_ref().map(|o| ev(o)).transpose()?;
-            for c in conditions {
-                let hit = match &base {
-                    Some(b) => agg::cmp(b, &ev(&c.condition)?) == Ordering::Equal,
-                    None => truthy(&ev(&c.condition)?),
-                };
-                if hit {
-                    return ev(&c.result);
-                }
-            }
-            else_result.as_ref().map(|x| ev(x)).transpose()?.unwrap_or(Value::Null)
-        }
+        Expr::Case { operand, conditions, else_result, .. } => ir::Expr::Case {
+            operand: operand.as_deref().map(bx).transpose()?,
+            whens: conditions.iter().map(|c| Ok(When { when: go(&c.condition)?, then: go(&c.result)? })).collect::<Result<_>>()?,
+            otherwise: else_result.as_deref().map(bx).transpose()?,
+        },
         Expr::Function(f) => {
-            let name = fname(f);
-            let args: Vec<Value> = func_args(f).into_iter().map(ev).collect::<Result<_>>()?;
-            let one = || args.first().cloned().unwrap_or(Value::Null);
-            match name.as_str() {
-                "lower" => one().as_str().map_or(Value::Null, |s| Value::Str(s.to_lowercase())),
-                "upper" => one().as_str().map_or(Value::Null, |s| Value::Str(s.to_uppercase())),
-                "length" => one().as_str().map_or(Value::Null, |s| Value::Int(s.chars().count() as i64)),
-                "abs" => match one() {
-                    Value::Int(x) => x.checked_abs().map_or(Value::Float((x as f64).abs()), Value::Int),
-                    v => num(&v).map_or(Value::Null, |x| Value::Float(x.abs())),
-                },
-                "round" => {
-                    let d = args.get(1).and_then(num).unwrap_or(0.0) as i32;
-                    num(&one()).map_or(Value::Null, |x| {
-                        let m = 10f64.powi(d);
-                        let r = (x * m).round() / m;
-                        if d <= 0 { Value::Int(r as i64) } else { Value::Float(r) }
-                    })
-                }
-                "coalesce" => args.into_iter().find(|v| !matches!(v, Value::Null)).unwrap_or(Value::Null),
+            let func = match fname(f).as_str() {
+                "lower" => Func::Lower,
+                "upper" => Func::Upper,
+                "length" => Func::Length,
+                "abs" => Func::Abs,
+                "round" => Func::Round,
+                "coalesce" => Func::Coalesce,
                 n if NATIVE.contains(&n) => return Err(err(format!("{}(...) works on one table's scan: give it that table's column (a.body) and use it in WHERE or ORDER BY, not across tables", n.to_uppercase()))),
                 n if AGGREGATES.contains(&n) => return Err(err(format!("{}(...) needs GROUP BY or a SELECT of aggregates", n.to_uppercase()))),
                 n => return Err(err(format!("unknown function {n}"))),
-            }
+            };
+            ir::Expr::Call { func, args: func_args(f).into_iter().map(go).collect::<Result<_>>()? }
         }
         e @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => return Err(err(format!("no such column: {e}"))),
         e => return Err(err(format!("unsupported expression: {e}"))),
     })
-}
-
-/// SQL LIKE: `%` any run, `_` one character. Greedy matching that backs
-/// up only to the last `%`: linear in the text for each pattern piece, and
-/// without recursion, so a long pattern cannot overflow the stack.
-fn like(s: &[char], p: &[char]) -> bool {
-    let (mut i, mut j) = (0, 0);
-    // The last `%` seen, and where in `s` its run currently ends.
-    let mut star: Option<(usize, usize)> = None;
-    while i < s.len() {
-        if j < p.len() && (p[j] == '_' || (p[j] != '%' && p[j] == s[i])) {
-            i += 1;
-            j += 1;
-        } else if j < p.len() && p[j] == '%' {
-            star = Some((j, i));
-            j += 1;
-        } else if let Some((sj, si)) = star {
-            // Let the last `%` swallow one more character and retry.
-            j = sj + 1;
-            i = si + 1;
-            star = Some((sj, si + 1));
-        } else {
-            return false;
-        }
-    }
-    p[j..].iter().all(|&c| c == '%')
 }
 
 /// An aggregate call: its text (how other expressions name it), function and argument.
@@ -1538,7 +1437,7 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
                     let n: usize = e.to_string().parse().unwrap_or(0);
                     items.get(n.wrapping_sub(1)).map(|i| i.1.clone()).ok_or_else(|| err(format!("GROUP BY {n}: no such column")))
                 }
-                Expr::Identifier(id) if lookup(e, &j.cols, &vec![Value::Null; j.cols.len()]).is_none_or(|r| r.is_err()) => {
+                Expr::Identifier(id) if slot(e, &j.cols).is_none_or(|r| r.is_err()) => {
                     items.iter().find(|(n, _)| n.eq_ignore_ascii_case(&id.value)).map(|i| i.1.clone()).ok_or_else(|| err(format!("no such column: {e}")))
                 }
                 e => Ok(e.clone()),
@@ -1552,29 +1451,39 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
     let calls = agg_calls(&item_exprs)?;
     let grouped = !group_exprs.is_empty() || !calls.is_empty();
     let mut out: Vec<(Vec<Value>, Vec<Value>, Value, f64)> = Vec::new(); // row, sort keys, key, score
-    let by_alias = |e: &Expr, row: &[Value]| -> Option<Value> {
+    // ORDER BY an output column's name or number, or an expression over
+    // the input row.
+    let by_alias = |e: &Expr| -> Option<usize> {
         match e {
-            Expr::Identifier(id) => items.iter().position(|(n, _)| n.eq_ignore_ascii_case(&id.value)).map(|i| row[i].clone()),
-            Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => e.to_string().parse::<usize>().ok().and_then(|n| row.get(n.wrapping_sub(1)).cloned()),
+            Expr::Identifier(id) => items.iter().position(|(n, _)| n.eq_ignore_ascii_case(&id.value)),
+            Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => e.to_string().parse::<usize>().ok().filter(|n| (1..=items.len()).contains(n)).map(|n| n - 1),
             _ => None,
         }
+    };
+    let sort_keys = |slot: &dyn Fn(&Expr) -> Option<Result<u32>>, multi: &[bool]| -> Result<Vec<SortKey>> {
+        order.iter().map(|(e, _)| Ok(match by_alias(e) { Some(i) => SortKey::Item(i), None => SortKey::Expr(compile(e, params, slot, multi)?) })).collect()
+    };
+    let sort = |keys: &[SortKey], row: &[Value], input: &[Value]| -> Result<Vec<Value>> {
+        keys.iter().map(|k| match k { SortKey::Item(i) => Ok(row[*i].clone()), SortKey::Expr(e) => value(e, input) }).collect()
     };
     if grouped {
         let mut groups: HashMap<Vec<Part>, (Vec<Value>, Vec<Acc>, usize)> = HashMap::new();
         let mut order_seen: Vec<Vec<Part>> = Vec::new();
         let projections: Vec<Projection> = calls.iter().map(|c| Projection::Agg { func: c.func.unwrap_or(AggFn::Count), field: 0 }).collect();
+        let group_at = compile_all(&group_exprs, &j.cols, &j.multi, params)?;
+        let args_at: Vec<Option<ir::Expr>> = calls.iter().map(|c| c.arg.as_ref().map(|a| compile_row(a, &j.cols, &j.multi, params)).transpose()).collect::<Result<_>>()?;
         for r in &j.rows {
-            let vals: Vec<Value> = group_exprs.iter().map(|g| eval_row(g, &j.cols, r, params)).collect::<Result<_>>()?;
+            let vals: Vec<Value> = group_at.iter().map(|g| value(g, r)).collect::<Result<_>>()?;
             let key: Vec<Part> = vals.iter().map(|v| if let Value::List(_) = v { Part::Str(format!("{v:?}")) } else { Part::of(v) }).collect();
             let entry = groups.entry(key.clone()).or_insert_with(|| {
                 order_seen.push(key);
                 (vals, projections.iter().map(Acc::new).collect(), 0)
             });
             entry.2 += 1;
-            for (acc, c) in entry.1.iter_mut().zip(&calls) {
-                match &c.arg {
+            for (acc, arg) in entry.1.iter_mut().zip(&args_at) {
+                match arg {
                     None => acc.add_row(),
-                    Some(a) => match eval_row(a, &j.cols, r, params)? {
+                    Some(a) => match value(a, r)? {
                         Value::List(xs) => xs.iter().for_each(|x| {
                             acc.add(x);
                         }),
@@ -1590,35 +1499,41 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
             order_seen.push(k.clone());
             groups.insert(k, (Vec::new(), projections.iter().map(Acc::new).collect(), 0));
         }
+        // A group's row: its aggregates, then its group values.
+        let group_slot = |e: &Expr| -> Option<Result<u32>> {
+            if let Some(i) = calls.iter().position(|c| c.text == e.to_string()) {
+                return Some(Ok(i as u32));
+            }
+            if let Some(i) = group_exprs.iter().position(|g| g.to_string() == e.to_string() || same_column(g, e, &j.cols)) {
+                return Some(Ok((calls.len() + i) as u32));
+            }
+            match e {
+                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(Err(err(format!("{e} must be in GROUP BY or inside an aggregate")))),
+                _ => None,
+            }
+        };
+        let having = s.having.as_ref().map(|h| compile(&having_with_aliases(h, &items), params, &group_slot, &[])).transpose()?;
+        let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile(e, params, &group_slot, &[])).collect::<Result<_>>()?;
+        let keys = sort_keys(&group_slot, &[])?;
         for key in order_seen {
             let (vals, accs, rows) = &groups[&key];
-            let look = |e: &Expr| -> Option<Result<Value>> {
-                if let Some(i) = calls.iter().position(|c| c.text == e.to_string()) {
-                    return Some(Ok(accs[i].value()));
-                }
-                if let Some(i) = group_exprs.iter().position(|g| g.to_string() == e.to_string() || same_column(g, e, &j.cols)) {
-                    return Some(Ok(vals[i].clone()));
-                }
-                match e {
-                    Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(Err(err(format!("{e} must be in GROUP BY or inside an aggregate")))),
-                    _ => None,
-                }
-            };
-            if let Some(h) = &s.having {
-                let h = having_with_aliases(h, &items);
-                if !truthy(&eval(&h, params, &look)?) {
+            let input: Vec<Value> = accs.iter().map(Acc::value).chain(vals.iter().cloned()).collect();
+            if let Some(h) = &having {
+                if !eval::holds(h, &reader(&input))? {
                     continue;
                 }
             }
-            let row: Vec<Value> = items.iter().map(|(_, e)| eval(e, params, &look)).collect::<Result<_>>()?;
-            let sort: Vec<Value> = order.iter().map(|(e, _)| by_alias(e, &row).map_or_else(|| eval(e, params, &look), Ok)).collect::<Result<_>>()?;
+            let row: Vec<Value> = items_at.iter().map(|e| value(e, &input)).collect::<Result<_>>()?;
+            let sort = sort(&keys, &row, &input)?;
             // The group's rows stand in the score until the order is set.
             out.push((row, sort, Value::Null, *rows as f64));
         }
     } else {
+        let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_row(e, &j.cols, &j.multi, params)).collect::<Result<_>>()?;
+        let keys = sort_keys(&|e| slot(e, &j.cols), &j.multi)?;
         for (i, r) in j.rows.iter().enumerate() {
-            let row: Vec<Value> = items.iter().map(|(_, e)| eval_row(e, &j.cols, r, params)).collect::<Result<_>>()?;
-            let sort: Vec<Value> = order.iter().map(|(e, _)| by_alias(e, &row).map_or_else(|| eval_row(e, &j.cols, r, params), Ok)).collect::<Result<_>>()?;
+            let row: Vec<Value> = items_at.iter().map(|e| value(e, r)).collect::<Result<_>>()?;
+            let sort = sort(&keys, &row, r)?;
             out.push((row, sort, j.keys[i].clone(), j.scores[i]));
         }
     }
@@ -1658,6 +1573,12 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
         rel.keys = Some(keys);
     }
     Ok(rel)
+}
+
+/// An ORDER BY key: an output column, or an expression over the input row.
+enum SortKey {
+    Item(usize),
+    Expr(ir::Expr),
 }
 
 /// Whether `a` and `b` name the same column.
@@ -1710,22 +1631,22 @@ mod tests {
         let params = Params::new().set("min", Value::Int(i64::MIN)).set("n", Value::Null);
         let ev = |src: &str| {
             let e = sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {}).try_with_sql(src).unwrap().parse_expr().unwrap();
-            eval(&e, &params, &|_| None).unwrap()
+            value(&compile(&e, &params, &|_| None, &[]).unwrap(), &[]).unwrap()
         };
         for (src, want) in [
             ("NULL = 1", Value::Null),
             ("NOT (:n = 1)", Value::Null),
-            ("NOT (:n = 1) OR 1 = 1", Value::Int(1)),
-            ("NULL AND 1 = 0", Value::Int(0)),
+            ("NOT (:n = 1) OR 1 = 1", Value::Bool(true)),
+            ("NULL AND 1 = 0", Value::Bool(false)),
             ("NULL AND 1 = 1", Value::Null),
             ("NULL OR 1 = 0", Value::Null),
             ("2 IN (1, NULL)", Value::Null),
             ("2 NOT IN (1, NULL)", Value::Null),
-            ("1 IN (1, NULL)", Value::Int(1)),
+            ("1 IN (1, NULL)", Value::Bool(true)),
             ("NULL BETWEEN 1 AND 2", Value::Null),
-            ("9007199254740993 > 9007199254740992.0", Value::Int(1)),
-            ("9007199254740992.0 < 9007199254740993", Value::Int(1)),
-            ("9007199254740993 = 9007199254740992.0", Value::Int(0)),
+            ("9007199254740993 > 9007199254740992.0", Value::Bool(true)),
+            ("9007199254740992.0 < 9007199254740993", Value::Bool(true)),
+            ("9007199254740993 = 9007199254740992.0", Value::Bool(false)),
             // Overflowing integer arithmetic gives a FLOAT, never a panic
             // or a wrapped value.
             ("9223372036854775807 + 1", Value::Float(9_223_372_036_854_775_808.0)),
@@ -1736,25 +1657,5 @@ mod tests {
         ] {
             assert_eq!(ev(src), want, "{src}");
         }
-    }
-
-    #[test]
-    fn like_patterns() {
-        let l = |s: &str, p: &str| like(&s.chars().collect::<Vec<_>>(), &p.chars().collect::<Vec<_>>());
-        assert!(l("graph neural", "graph%"));
-        assert!(l("graph", "gr_ph"));
-        assert!(!l("graph", "gr_h"));
-        assert!(l("", "%"));
-        assert!(l("abcabd", "%ab_"));
-        assert!(l("mississippi", "m%ss%pi"));
-        assert!(!l("mississippi", "m%ss%px"));
-        assert!(l("a%b", "a%%b"));
-        assert!(!l("ab", "a"));
-        assert!(!l("", "_"));
-        // A long pattern used to recurse once per character (and `%` runs
-        // to backtrack exponentially).
-        let s = "a".repeat(50_000);
-        assert!(!l(&s, &format!("{}b", "%a".repeat(25_000))));
-        assert!(l(&s, &"_".repeat(50_000)));
     }
 }
