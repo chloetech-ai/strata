@@ -372,6 +372,41 @@ fn explain_shows_the_plan() {
         assert_eq!(json.len(), 1);
         assert_eq!(Plan::from_json(&serde_json::from_str(&json[0]).unwrap()).unwrap(), db.explain(sql, &Params::new()).unwrap(), "{explain}");
     }
+    // A compound query's plan is operators over single-table queries.
+    assert_eq!(lines(&db, "EXPLAIN SELECT DISTINCT category FROM papers"), ["Project: category", "  Aggregate by category", "    Search papers"]);
+    assert_eq!(
+        lines(&db, "EXPLAIN SELECT a.id, b.title FROM papers a JOIN papers b ON a.cites = b.id WHERE a.year >= 2019 ORDER BY a.year DESC LIMIT 5"),
+        [
+            "Project: id AS \"a.id\", title AS \"b.title\"",
+            "  Limit: 5",
+            "    Join on targets(cites) = id",
+            "      Project: id, year, cites",
+            "        Search papers",
+            "          filter: year >= 2019",
+            "          order: year DESC",
+            "      Project: title, id",
+            "        Search papers",
+        ]
+    );
+    assert_eq!(
+        lines(&db, "EXPLAIN WITH top AS (SELECT id FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 20) SELECT category, COUNT(*) AS n FROM papers WHERE id IN (SELECT id FROM top) GROUP BY category"),
+        [
+            "With",
+            "  top AS",
+            "    Project: id",
+            "      Limit: 20",
+            "        Search papers",
+            "          order: bm25(body, 'graph') DESC",
+            "  Project: category, COUNT(*) AS n",
+            "    Aggregate by category: COUNT(*)",
+            "      Search papers",
+            "        filter: id IN values of (Key order of top; Project: id; Search papers; filter: id IN keys of (Ref top))",
+        ]
+    );
+    assert_eq!(
+        lines(&db, "EXPLAIN SELECT id FROM papers WHERE year > (SELECT AVG(year) FROM papers) AND EXISTS (SELECT id FROM papers WHERE done)")[2],
+        "    filter: year > (Project: AVG(year); Aggregate: AVG(year); Search papers) AND EXISTS (Project: id; Search papers; filter: done = TRUE)"
+    );
     // EXPLAIN does not run the statement.
     run(&db, "EXPLAIN DELETE FROM papers");
     run(&db, "INSERT INTO papers (id) VALUES ('kept')");
@@ -381,7 +416,6 @@ fn explain_shows_the_plan() {
     for (bad, why) in [
         ("EXPLAIN ANALYZE SELECT id FROM papers", "ANALYZE"),
         ("EXPLAIN FORMAT GRAPHVIZ SELECT id FROM papers", "GRAPHVIZ"),
-        ("EXPLAIN SELECT DISTINCT category FROM papers", "compound"),
         ("EXPLAIN CREATE TABLE x (id INT PRIMARY KEY)", "SELECT, INSERT, UPDATE or DELETE"),
         ("EXPLAIN SELECT id FROM nowhere", "no such table"),
     ] {

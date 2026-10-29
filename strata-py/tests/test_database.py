@@ -63,6 +63,11 @@ def test_queries_and_results(db):
     assert db.run(db.plan("UPDATE books SET rating = 1 WHERE id = 'b0002'")) == 1
     with pytest.raises(strata.StrataError, match="newer"):
         db.run({**plan, "version": 2})
+    # A compound query's plan has operators over single-table queries.
+    sql = "SELECT id FROM books WHERE year > (SELECT AVG(year) FROM books) ORDER BY year DESC LIMIT 5"
+    plan = db.plan(sql)
+    assert plan["features"] == ["operators"]
+    assert len(db.run(plan).keys) == 5 and db.run(plan).keys == db.query(sql).keys
     assert db.sql("UPDATE books SET rating = rating + 1 WHERE id = :k", k="b0001") == 1
     assert db.query("SELECT genres FROM books WHERE id = 'b0001'").scalar() == ["fantasy", "new"]
     # A vector, the text's embedding, and a stored row's vector.

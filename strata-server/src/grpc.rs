@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use strata::query::exec::ResultSet;
+use strata::query::ir::Plan;
 use strata::query::Params;
 use strata::value::Value;
 use tonic::{Request, Response, Status};
@@ -93,7 +94,17 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         stats: if r.stats_json.is_empty() { None } else { Some(from_json(&r.stats_json, "statistics")?) },
         snapshot: r.snapshot,
         partial: None,
+        plan: plan_of(&r.plan_json)?.map(Arc::new),
     })
+}
+
+/// A request's plan (`plan_json`), if it has one.
+pub fn plan_of(json: &[u8]) -> Result<Option<Plan>, ApiError> {
+    if json.is_empty() {
+        return Ok(None);
+    }
+    let j: serde_json::Value = from_json(json, "plan")?;
+    Ok(Some(Plan::from_json(&j)?))
 }
 
 pub struct Grpc(pub Arc<Service>);
@@ -177,7 +188,8 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn term_stats(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::TermStatsResponse>, Status> {
         self.serve("TermStats", req, |svc, r| async move {
-            let (stats, snapshot) = svc.term_stats(&r.sql, &params_from_pb(r.params), r.timeout_ms as u64).await?;
+            let plan = plan_of(&r.plan_json)?;
+            let (stats, snapshot) = svc.term_stats(&r.sql, plan.as_ref(), &params_from_pb(r.params), r.timeout_ms as u64).await?;
             Ok(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot })
         })
         .await

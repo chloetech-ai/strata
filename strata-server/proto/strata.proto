@@ -50,6 +50,10 @@ message QueryRequest {
   bytes stats_json = 5;
   // A snapshot lease from TermStats or /v1/snapshot; 0 for the latest.
   uint64 snapshot = 6;
+  // A plan (strata::query::ir, as JSON) to run instead of sql: a leaf of a
+  // coordinator's compound query. Provisional, until shards take typed
+  // plans.
+  bytes plan_json = 7;
 }
 
 message QueryResponse {

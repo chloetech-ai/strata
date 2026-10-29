@@ -32,6 +32,15 @@
 //! Search`. Plans travel as JSON and read as a tree in `EXPLAIN`
 //! ([`Plan::explain`]). Every SQL statement runs as its plan, and
 //! [`crate::db::Db::run`] runs a plan made elsewhere.
+//!
+//! A compound query (joins, `WITH`, subqueries, `SELECT DISTINCT`) is a
+//! plan of operators over those shapes, its leaves ([`crate::query::compound`]
+//! makes it): [`Node::Join`], [`Node::With`] and [`Node::Ref`],
+//! [`Node::Distinct`], [`Node::KeyOrder`], the nodes above over rows in
+//! memory, and subqueries as expressions ([`Expr::Values`], [`Expr::Keys`],
+//! [`Expr::Exists`], [`Expr::Scalar`]). [`crate::query::ops`] runs it: each
+//! leaf on the executor, the rest in memory. Such a plan needs the feature
+//! [`OPERATORS`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -50,9 +59,13 @@ mod raise;
 /// The plan version this version of Strata writes and reads.
 pub const VERSION: u32 = 1;
 
-/// The plan features this version of Strata reads: none yet, as every node
-/// and expression here is version 1's.
-pub const FEATURES: [&str; 0] = [];
+/// The plan features this version of Strata reads.
+pub const FEATURES: [&str; 1] = [OPERATORS];
+
+/// The feature of a plan with operators over rows in memory: a join,
+/// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
+/// Search's ([module docs](self)).
+pub const OPERATORS: &str = "operators";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -102,6 +115,66 @@ pub enum Node {
     Update { table: String, input: Box<Node>, sets: Vec<Set> },
     /// The rows of `input` (a Search of `table`) are deleted.
     Delete { table: String, input: Box<Node> },
+    /// Each row of `left` beside each row of `right` whose `keys` match it
+    /// and for which `on` holds: the left's columns, then the right's. A
+    /// left join keeps a left row that matches none, with NULLs on the
+    /// right. Rows keep the left's order.
+    Join {
+        left: Box<Node>,
+        right: Box<Node>,
+        #[serde(default, skip_serializing_if = "JoinKind::is_inner")]
+        kind: JoinKind,
+        keys: Vec<JoinKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on: Option<Expr>,
+    },
+    /// `input`, which reads the rows of named plans with [`Node::Ref`]:
+    /// each runs once, in order, and may read those before it.
+    With { ctes: Vec<Cte>, input: Box<Node> },
+    /// The rows of a plan a [`Node::With`] names.
+    Ref { name: String },
+    /// The input's rows, each once.
+    Distinct { input: Box<Node> },
+    /// The input's rows (rows of one table) in the order of the rows of
+    /// `by` with the same primary key.
+    KeyOrder { input: Box<Node>, by: Box<Node> },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinKind {
+    #[default]
+    Inner,
+    Left,
+}
+
+impl JoinKind {
+    fn is_inner(&self) -> bool {
+        *self == JoinKind::Inner
+    }
+}
+
+/// A key of a [`Node::Join`]: a value of the left row equals a value of
+/// the right row. Numbers equal by value whatever their type; a list
+/// matches by any of its values, and an EDGES field (`links`) by the
+/// targets of its links.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JoinKey {
+    /// Over the left rows.
+    pub left: Expr,
+    /// A column of the right rows ([`Expr::Output`]).
+    pub right: Expr,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub left_links: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub right_links: bool,
+}
+
+/// A named plan of a [`Node::With`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cte {
+    pub name: String,
+    pub input: Node,
 }
 
 /// The rows of one table that `filter` holds for, ordered by `order`.
@@ -229,8 +302,9 @@ pub enum Expr {
     /// The row's hops from the seeds of the Search's first `REACHABLE` or
     /// `PATH` (`hops()`).
     Hops,
-    /// Column `n` of the rows of the Aggregate below: its keys, then its
-    /// aggregates.
+    /// Column `n` of the input's rows: an Aggregate's keys, then its
+    /// aggregates; a Project's columns; a Join's left columns, then its
+    /// right ones; a [`Node::Ref`]'s.
     Output(u32),
     /// A field of the row an insert proposed, in [`OnConflict::Update`]
     /// (`excluded.f`).
@@ -325,8 +399,19 @@ pub enum Expr {
     Product(Vec<Expr>),
     /// Personalized PageRank from a traversal's seeds.
     Ppr(Box<Graph>),
-    /// The rows of a plan (graph seeds from a query).
+    /// The rows of a plan (graph seeds from a query of the table, which
+    /// the executor runs).
     Subquery(Box<Node>),
+    /// The values of the one column of a plan's rows, each value of a list
+    /// and NULL none, in an [`Expr::In`] list or as graph seeds.
+    Values(Box<Node>),
+    /// The primary keys of a plan's rows (rows of one table), in an
+    /// [`Expr::In`] list or as graph seeds.
+    Keys(Box<Node>),
+    /// Whether a plan has a row.
+    Exists(Box<Node>),
+    /// The value of a plan's one row and one column; NULL without a row.
+    Scalar(Box<Node>),
 }
 
 /// A traversal over an EDGES field, or over a VECTOR field whose `k` most
@@ -367,6 +452,213 @@ impl Expr {
     }
 }
 
+impl Node {
+    fn is_write(&self) -> bool {
+        matches!(self, Node::Insert { .. } | Node::Update { .. } | Node::Delete { .. })
+    }
+
+    /// Whether the node has the shape the executor runs: `Project [Limit]
+    /// [Sort] [Filter] [Aggregate] Search` ([`Plan::to_select`] says
+    /// whether it is one it takes). Its subqueries ([`Expr::Values`] and
+    /// the like) run first.
+    pub fn is_leaf(&self) -> bool {
+        let Node::Project { input, .. } = self else { return false };
+        let mut n: &Node = input;
+        loop {
+            match n {
+                Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } => n = input,
+                Node::Search(_) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether running the node takes operators: it is not a leaf
+    /// ([`Node::is_leaf`]), or holds a subquery that runs first.
+    pub fn uses_operators(&self) -> bool {
+        if !self.is_leaf() {
+            return true;
+        }
+        let mut found = false;
+        self.leaf_exprs(&mut |e| found |= e.has_operators());
+        found
+    }
+
+    /// Calls `f` on each expression of a leaf's nodes.
+    pub(crate) fn leaf_exprs(&self, f: &mut dyn FnMut(&Expr)) {
+        match self {
+            Node::Project { input, columns } => {
+                columns.iter().for_each(|c| f(&c.expr));
+                input.leaf_exprs(f);
+            }
+            Node::Limit { input, .. } => input.leaf_exprs(f),
+            Node::Sort { input, keys } => {
+                keys.iter().for_each(|k| f(&k.expr));
+                input.leaf_exprs(f);
+            }
+            Node::Filter { input, cond } => {
+                f(cond);
+                input.leaf_exprs(f);
+            }
+            Node::Aggregate { input, keys, aggs } => {
+                keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut *f);
+                input.leaf_exprs(f);
+            }
+            Node::Search(s) => {
+                f(&s.filter);
+                s.order.iter().for_each(|k| f(&k.expr));
+            }
+            _ => {}
+        }
+    }
+
+    /// [`Node::leaf_exprs`], changing them.
+    pub(crate) fn leaf_exprs_mut(&mut self, f: &mut dyn FnMut(&mut Expr) -> Result<()>) -> Result<()> {
+        match self {
+            Node::Project { input, columns } => {
+                for c in columns {
+                    f(&mut c.expr)?;
+                }
+                input.leaf_exprs_mut(f)
+            }
+            Node::Limit { input, .. } => input.leaf_exprs_mut(f),
+            Node::Sort { input, keys } => {
+                for k in keys {
+                    f(&mut k.expr)?;
+                }
+                input.leaf_exprs_mut(f)
+            }
+            Node::Filter { input, cond } => {
+                f(cond)?;
+                input.leaf_exprs_mut(f)
+            }
+            Node::Aggregate { input, keys, aggs } => {
+                for k in keys.iter_mut().chain(aggs.iter_mut().filter_map(|a| a.arg.as_mut())) {
+                    f(k)?;
+                }
+                input.leaf_exprs_mut(f)
+            }
+            Node::Search(s) => {
+                f(&mut s.filter)?;
+                for k in &mut s.order {
+                    f(&mut k.expr)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The Search of a leaf.
+    pub(crate) fn search_mut(&mut self) -> Option<&mut Search> {
+        match self {
+            Node::Search(s) => Some(s),
+            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } => input.search_mut(),
+            _ => None,
+        }
+    }
+}
+
+impl Expr {
+    /// Whether the expression holds a subquery that operators run
+    /// ([`Expr::Values`], [`Expr::Keys`], [`Expr::Exists`],
+    /// [`Expr::Scalar`]).
+    pub fn has_operators(&self) -> bool {
+        let mut found = false;
+        self.visit(&mut |e| found |= matches!(e, Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_)));
+        found
+    }
+
+    /// Calls `f` on this expression and each within it, not inside the
+    /// plans of subqueries.
+    pub fn visit(&self, f: &mut dyn FnMut(&Expr)) {
+        f(self);
+        let graph = |g: &Graph, f: &mut dyn FnMut(&Expr)| {
+            g.seeds.visit(f);
+            if let GraphKind::Path { to, .. } = &g.kind {
+                to.visit(f);
+            }
+            if let Some(t) = &g.through {
+                t.visit(f);
+            }
+        };
+        match self {
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => x.visit(f),
+            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) => xs.iter().for_each(|x| x.visit(f)),
+            Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => {
+                left.visit(f);
+                right.visit(f);
+            }
+            Expr::Between { expr, lo, hi } => {
+                expr.visit(f);
+                lo.iter().chain(hi.iter()).for_each(|x| x.visit(f));
+            }
+            Expr::In { expr, list } => {
+                expr.visit(f);
+                list.iter().for_each(|x| x.visit(f));
+            }
+            Expr::Like { expr, pattern, .. } => {
+                expr.visit(f);
+                pattern.visit(f);
+            }
+            Expr::Case { operand, whens, otherwise } => {
+                operand.iter().for_each(|x| x.visit(f));
+                for w in whens {
+                    w.when.visit(f);
+                    w.then.visit(f);
+                }
+                otherwise.iter().for_each(|x| x.visit(f));
+            }
+            Expr::Call { args, .. } => args.iter().for_each(|x| x.visit(f)),
+            Expr::Rrf { inputs, .. } => inputs.iter().for_each(|x| x.visit(f)),
+            Expr::Weighted(ts) => ts.iter().for_each(|(_, x)| x.visit(f)),
+            Expr::Graph(g) | Expr::Ppr(g) => graph(g, f),
+            _ => {}
+        }
+    }
+
+    /// [`Expr::visit`], changing the expressions: `f` sees each before
+    /// those within it.
+    pub fn visit_mut(&mut self, f: &mut dyn FnMut(&mut Expr) -> Result<()>) -> Result<()> {
+        f(self)?;
+        let mut within: Vec<&mut Expr> = Vec::new();
+        match self {
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => within.push(x),
+            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
+            Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => within.extend([&mut **left, &mut **right]),
+            Expr::Between { expr, lo, hi } => {
+                within.push(expr);
+                within.extend(lo.iter_mut().chain(hi.iter_mut()).map(|x| &mut **x));
+            }
+            Expr::In { expr, list } => {
+                within.push(expr);
+                within.extend(list.iter_mut());
+            }
+            Expr::Case { operand, whens, otherwise } => {
+                within.extend(operand.iter_mut().map(|x| &mut **x));
+                for w in whens {
+                    within.extend([&mut w.when, &mut w.then]);
+                }
+                within.extend(otherwise.iter_mut().map(|x| &mut **x));
+            }
+            Expr::Weighted(ts) => within.extend(ts.iter_mut().map(|(_, x)| x)),
+            Expr::Graph(g) | Expr::Ppr(g) => {
+                let Graph { seeds, kind, through, .. } = &mut **g;
+                within.push(seeds);
+                if let GraphKind::Path { to, .. } = kind {
+                    within.push(to);
+                }
+                within.extend(through.iter_mut());
+            }
+            _ => {}
+        }
+        for x in within {
+            x.visit_mut(f)?;
+        }
+        Ok(())
+    }
+}
+
 fn is_zero(x: &u64) -> bool {
     *x == 0
 }
@@ -380,27 +672,38 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 impl Plan {
-    /// A plan of the current version, without features.
+    /// A plan of the current version, with the features it uses.
     pub fn new(root: Node) -> Plan {
-        Plan { version: VERSION, features: Vec::new(), root }
+        let features = if root.is_write() || !root.uses_operators() { Vec::new() } else { vec![OPERATORS.to_string()] };
+        Plan { version: VERSION, features, root }
     }
 
-    /// The table the plan reads or writes: its Search's, or its write's.
+    /// The table the plan reads or writes: its (first) Search's, or its
+    /// write's.
     pub fn table(&self) -> &str {
-        fn of(n: &Node) -> &str {
+        fn of(n: &Node) -> Option<&str> {
             match n {
-                Node::Search(s) => &s.table,
-                Node::Insert { table, .. } | Node::Update { table, .. } | Node::Delete { table, .. } => table,
-                Node::Aggregate { input, .. } | Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Project { input, .. } => of(input),
+                Node::Search(s) => Some(&s.table),
+                Node::Insert { table, .. } | Node::Update { table, .. } | Node::Delete { table, .. } => Some(table),
+                Node::Aggregate { input, .. }
+                | Node::Filter { input, .. }
+                | Node::Sort { input, .. }
+                | Node::Limit { input, .. }
+                | Node::Project { input, .. }
+                | Node::Distinct { input }
+                | Node::KeyOrder { input, .. } => of(input),
+                Node::Join { left, right, .. } => of(left).or_else(|| of(right)),
+                Node::With { ctes, input } => of(input).or_else(|| ctes.iter().find_map(|c| of(&c.input))),
+                Node::Ref { .. } => None,
             }
         }
-        of(&self.root)
+        of(&self.root).unwrap_or("")
     }
 
     /// Whether the plan writes (an Insert, Update or Delete) rather than
     /// reads.
     pub fn is_write(&self) -> bool {
-        matches!(self.root, Node::Insert { .. } | Node::Update { .. } | Node::Delete { .. })
+        self.root.is_write()
     }
 
     pub fn to_json(&self) -> Result<serde_json::Value> {

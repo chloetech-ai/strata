@@ -194,6 +194,7 @@ impl Lower<'_> {
             Pred::And(ps) => Expr::And(ps.iter().map(|p| self.pred(p)).collect()),
             Pred::Or(ps) => Expr::Or(ps.iter().map(|p| self.pred(p)).collect()),
             Pred::Graph { id } => Expr::Graph(Box::new(self.graph(&self.graphs[*id]))),
+            Pred::Sub(e) => (**e).clone(),
         }
     }
 
@@ -219,6 +220,7 @@ impl Lower<'_> {
         match s {
             Seeds::Keys(keys) => Expr::Lit(Value::List(keys.clone())),
             Seeds::Query(q) => Expr::Subquery(Box::new(Lower { schema: self.schema, graphs: &q.graphs }.select(q))),
+            Seeds::Plan(e) => (**e).clone(),
         }
     }
 

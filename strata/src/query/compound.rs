@@ -2,16 +2,16 @@
 //! scalar subqueries, `FROM (SELECT ...)`, `SELECT DISTINCT`, and joins of
 //! the table with itself or with a `WITH` result.
 //!
-//! They run as a sequence of the single-table queries the executor answers
-//! ([`is_compound`] tells them apart), each bound from a syntax tree built
-//! here, so no step is printed as SQL and parsed again ([`Step`]). A
-//! subquery runs first and its result
-//! reaches the outer query as a list parameter (`IN (:_s0)`), so every
-//! index still serves the outer filter. A join scans each side with the
-//! conditions that name only that side, the right side restricted to the
-//! join values the left side holds (`b.id IN (...)`, or for an EDGES field
-//! the rows linking to them), and joins, filters, groups, orders and cuts
-//! the rows in memory.
+//! A compound query ([`is_compound`]) plans into one plan tree ([`plan`]):
+//! the single-table queries the executor answers are its leaves, each bound
+//! from a syntax tree built here, and joins, `WITH`, subqueries and
+//! `DISTINCT` are operators over them ([`crate::query::ir`]), which
+//! [`crate::query::ops`] runs. A subquery runs first and its result reaches
+//! the outer query as a list of values (`IN (...)`), so every index still
+//! serves the outer filter. A join scans each side with the conditions that
+//! name only that side, the right side restricted to the join values the
+//! left side holds (`b.id IN (...)`, or for an EDGES field the rows linking
+//! to them), and joins, filters, groups, orders and cuts the rows in memory.
 //!
 //! ```sql
 //! -- each recent graph paper with the papers it cites
@@ -27,38 +27,24 @@
 //! EDGES field with a key follows the edges (`a.cites = b.id`: b is a row
 //! a links to). Text searches, scores and graph predicates name one side.
 
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashSet;
 
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, TableFactor, UnaryOperator};
 
 use crate::error::{Error, Result};
-use crate::query::agg::{self, Acc, Part};
-use crate::query::ir::eval::{self, Ref};
+use crate::query::exec::{ExecOptions, ResultSet};
+use crate::query::ir::eval;
 use crate::query::ir::{self, ArithOp, CmpOp, Func, When};
-use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
-use crate::query::memory::Charge;
+use crate::query::ops;
+use crate::query::sql::{Sub, Subs};
 use crate::query::{AggFn, Params, Projection};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
 
-/// Rows one step of a compound query reads at most (a side of a join, a
+/// Rows one part of a compound query reads at most (a side of a join, a
 /// subquery, a `WITH` result).
 pub const MAX_ROWS: usize = 1_000_000;
-
-/// Runs one step (the executor, or a coordinator).
-pub type Runner<'r> = dyn FnMut(&Step) -> Result<ResultSet> + 'r;
-
-/// One single-table step of a compound query.
-pub struct Step<'s> {
-    /// The step's plan, bound from its syntax tree.
-    pub plan: &'s ir::Plan,
-    /// The step as SQL that parses back to the same plan, with `params`:
-    /// what a coordinator sends its shards, which take SQL until they take
-    /// plans, and what the step's line of the query's plan shows.
-    pub sql: &'s str,
-    pub params: &'s Params,
-}
 
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
@@ -216,93 +202,54 @@ fn is_star(f: &sql::Function) -> bool {
     matches!(&f.args, FunctionArguments::List(l) if l.args.iter().any(|a| matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Wildcard)))) || func_args(f).is_empty()
 }
 
-/// Runs a compound SELECT; `runner` runs each single-table step.
-pub fn run(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner) -> Result<ResultSet> {
+/// The plan of a compound SELECT ([`is_compound`]): its single-table
+/// queries are leaves, and its joins, `WITH`, subqueries and `DISTINCT`
+/// operators over them.
+pub fn plan(sql_text: &str, schema: &Schema, params: &Params) -> Result<ir::Plan> {
+    plan_query(&*parse(sql_text)?, schema, params)
+}
+
+/// [`plan`] of a parsed query.
+pub(crate) fn plan_query(q: &sql::Query, schema: &Schema, params: &Params) -> Result<ir::Plan> {
+    let p = Planner { schema, params, ctes: RefCell::new(Vec::new()) };
+    Ok(ir::Plan::new(p.query(q)?.node))
+}
+
+/// Runs a compound SELECT: its [`plan`], each leaf run by `runner`.
+pub fn run(sql_text: &str, schema: &Schema, params: &Params, runner: &mut ops::Runner) -> Result<ResultSet> {
     run_checked(sql_text, schema, params, runner, &ExecOptions::default())
 }
 
-/// [`run`] under `opts`' deadline and cancel flag, checked every 1,024 rows
-/// it joins, and its memory budget, which the steps' rows, the joins' hash
-/// tables and the joined rows are counted against while the query runs.
-/// The steps themselves run under whatever options `runner` gives them.
-pub fn run_checked(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    run_query(&*parse(sql_text)?, schema, params, runner, opts)
+/// [`run`] under `opts`' deadline, cancel flag and memory budget
+/// ([`ops::run`]). The leaves run under whatever options `runner` gives
+/// them.
+pub fn run_checked(sql_text: &str, schema: &Schema, params: &Params, runner: &mut ops::Runner, opts: &ExecOptions) -> Result<ResultSet> {
+    ops::run(&plan(sql_text, schema, params)?, schema, runner, opts)
 }
 
-/// [`run_checked`] of a parsed query.
-pub(crate) fn run_query(q: &sql::Query, schema: &Schema, params: &Params, runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let charge = Charge::new(opts.memory.clone());
-    let mut cx = Ctx { schema, params: params.clone(), ctes: HashMap::new(), runner, next: 0, plan: Vec::new(), opts, steps: 0, charge };
-    let rel = cx.query(q)?;
-    let n = rel.rows.len();
-    Ok(ResultSet {
-        columns: rel.columns,
-        rows: rel.rows,
-        keys: rel.keys.unwrap_or_default(),
-        scores: if rel.scores.len() == n { rel.scores } else { Vec::new() },
-        parts: None,
-        stats: ExecStats { plan: cx.plan, filter_docs: 0, scored: 0 },
-    })
-}
-
-/// Rows a step produced.
-#[derive(Clone, Debug, Default)]
-struct Rel {
+/// A query's plan, its columns, and whether its rows are rows of the
+/// table (with their keys), which a `WITH` of them keeps: a SELECT of the
+/// table's fields, not of aggregates.
+#[derive(Clone, Debug)]
+struct Planned {
+    node: ir::Node,
     columns: Vec<String>,
-    rows: Vec<Vec<Value>>,
-    /// Each row's primary key, when the rows are rows of the table.
-    keys: Option<Vec<Value>>,
-    scores: Vec<f64>,
+    keyed: bool,
 }
 
-impl Rel {
-    fn of(rs: ResultSet) -> Rel {
-        let rows_of_table = rs.keys.len() == rs.rows.len() && !rs.rows.is_empty() && rs.keys.iter().all(|k| !matches!(k, Value::Null));
-        let empty_rows = rs.rows.is_empty() && !rs.columns.is_empty();
-        Rel {
-            columns: rs.columns,
-            rows: rs.rows,
-            keys: if rows_of_table || empty_rows { Some(rs.keys) } else { None },
-            scores: rs.scores,
-        }
-    }
-
-    /// The values of the first column.
-    fn first_column(&self) -> Result<Vec<Value>> {
-        if self.columns.len() != 1 {
-            return Err(err(format!("a subquery in IN returns one column, not {}", self.columns.len())));
-        }
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for r in &self.rows {
-            let vals: Vec<Value> = match &r[0] {
-                Value::List(xs) => xs.clone(),
-                Value::Null => Vec::new(),
-                v => vec![v.clone()],
-            };
-            for v in vals {
-                if seen.insert(Part::of(&v)) {
-                    out.push(v);
-                }
-            }
-        }
-        Ok(out)
-    }
+/// A `WITH` result in scope.
+#[derive(Clone, Debug)]
+struct Cte {
+    name: String,
+    columns: Vec<String>,
+    keyed: bool,
 }
 
-struct Ctx<'a, 'r> {
+struct Planner<'a> {
     schema: &'a Schema,
-    params: Params,
-    ctes: HashMap<String, Rel>,
-    runner: &'a mut Runner<'r>,
-    next: usize,
-    plan: Vec<String>,
-    /// The query's deadline, cancel flag and memory budget
-    /// ([`run_checked`]), steps of the joins since the deadline was last
-    /// checked, and what the query holds.
-    opts: &'a ExecOptions,
-    steps: u32,
-    charge: Charge,
+    params: &'a Params,
+    /// The `WITH` results in scope, the innermost last.
+    ctes: RefCell<Vec<Cte>>,
 }
 
 /// One table of a join.
@@ -310,298 +257,196 @@ struct Src {
     alias: String,
     kind: SrcKind,
     /// How it joins the tables before it (none for the first).
-    join: Option<(JoinKind, Expr)>,
+    join: Option<(ir::JoinKind, Expr)>,
 }
 
 enum SrcKind {
     /// The table, scanned with the conditions that name only this side.
     Table,
-    /// Rows of the table a `WITH` result holds, scanned likewise.
-    TableRows(Vec<Value>),
+    /// Rows of the table a `WITH` result holds (by its name), scanned
+    /// likewise.
+    TableRows(String),
     /// Rows held in memory (a `WITH` result of aggregates, a derived table).
-    Rows(Rel),
+    Rows(Planned),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum JoinKind {
-    Inner,
-    Left,
-}
+/// An ORDER BY key: its expression, DESC, and NULLS FIRST.
+type OrderKey = (Expr, bool, bool);
 
-/// Rows of several tables side by side: `cols[i]` is (alias, column), and
-/// `multi[i]` whether that is a multi-valued field of the table.
-struct Joined {
-    cols: Vec<(String, String)>,
-    multi: Vec<bool>,
-    rows: Vec<Vec<Value>>,
-    /// The first table's key and score of each row.
-    keys: Vec<Value>,
-    scores: Vec<f64>,
-}
-
-impl<'a, 'r> Ctx<'a, 'r> {
-    /// One step of a join: [`ExecOptions::check`] every 1,024.
-    fn tick(&mut self) -> Result<()> {
-        self.steps += 1;
-        if self.steps < 1024 {
-            return Ok(());
-        }
-        self.steps = 0;
-        self.opts.check()
+impl Planner<'_> {
+    fn cte(&self, name: &str) -> Option<Cte> {
+        self.ctes.borrow().iter().rev().find(|c| c.name.eq_ignore_ascii_case(name)).cloned()
     }
 
-    /// A new list or value parameter.
-    fn param(&mut self, v: Value) -> Expr {
-        let name = format!("_s{}", self.next);
-        self.next += 1;
-        self.params = std::mem::take(&mut self.params).set(&name, v);
-        Expr::Value(sql::Value::Placeholder(format!(":{name}")).into())
+    fn pk(&self) -> Result<usize> {
+        self.schema.primary_key.ok_or_else(|| err("this needs a primary key"))
     }
 
-    fn pk_name(&self) -> Result<String> {
-        let pk = self.schema.primary_key.ok_or_else(|| err("this needs a primary key"))?;
-        Ok(self.schema.fields[pk].name.clone())
+    fn query(&self, q: &sql::Query) -> Result<Planned> {
+        let mark = self.ctes.borrow().len();
+        let r = self.scoped(q);
+        self.ctes.borrow_mut().truncate(mark);
+        r
     }
 
-    /// Binds a step's syntax tree and runs it.
-    fn run_step(&mut self, q: &sql::Query, what: &str) -> Result<Rel> {
-        let text = printable(q);
-        let at = |e: Error| match e {
-            Error::Query(m) => err(format!("{m} (in {what}: {text})")),
-            e => e,
-        };
-        let plan = ir::Plan::of_select(self.schema, &super::sql::bind_query(q, self.schema, &self.params).map_err(&at)?);
-        let rs = (self.runner)(&Step { plan: &plan, sql: &text, params: &self.params }).map_err(at)?;
-        self.plan.push(format!("{what}: {} rows: {text}", rs.rows.len()));
-        for l in &rs.stats.plan {
-            self.plan.push(format!("  {l}"));
-        }
-        for r in &rs.rows {
-            self.charge.row(r)?;
-        }
-        Ok(Rel::of(rs))
-    }
-
-    fn query(&mut self, q: &sql::Query) -> Result<Rel> {
+    /// [`Planner::query`], its `WITH` results in scope until it returns.
+    fn scoped(&self, q: &sql::Query) -> Result<Planned> {
+        let mut defs = Vec::new();
         if let Some(w) = &q.with {
             if w.recursive {
                 return Err(err("WITH RECURSIVE is not supported: REACHABLE and PATH traverse links"));
             }
             for cte in &w.cte_tables {
-                let mut rel = self.query(&cte.query)?;
+                let mut p = self.query(&cte.query)?;
                 if !cte.alias.columns.is_empty() {
-                    if cte.alias.columns.len() != rel.columns.len() {
-                        return Err(err(format!("WITH {}: {} column names for {} columns", cte.alias.name, cte.alias.columns.len(), rel.columns.len())));
+                    if cte.alias.columns.len() != p.columns.len() {
+                        return Err(err(format!("WITH {}: {} column names for {} columns", cte.alias.name, cte.alias.columns.len(), p.columns.len())));
                     }
-                    rel.columns = cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
+                    let columns: Vec<String> = cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
+                    let exprs = columns.iter().enumerate().map(|(i, name)| ir::Column { name: name.clone(), expr: ir::Expr::Output(i as u32) }).collect();
+                    p = Planned { node: ir::Node::Project { input: Box::new(p.node), columns: exprs }, columns, keyed: false };
                 }
-                if rel.rows.len() > MAX_ROWS {
-                    return Err(err(format!("WITH {} holds more than {MAX_ROWS} rows", cte.alias.name)));
-                }
-                // No rows: rows of the table only if its columns are the table's.
-                let own = |c: &String| self.schema.field(c).is_some() || c == "score()" || c == "hops()";
-                if rel.rows.is_empty() && !rel.columns.iter().all(own) {
-                    rel.keys = None;
-                }
-                self.plan.push(format!("WITH {}: {} rows", cte.alias.name, rel.rows.len()));
-                self.ctes.insert(cte.alias.name.value.to_ascii_lowercase(), rel);
+                let name = cte.alias.name.value.clone();
+                self.ctes.borrow_mut().push(Cte { name: name.clone(), columns: p.columns, keyed: p.keyed });
+                defs.push(ir::Cte { name, input: p.node });
             }
         }
         let mut q = q.clone();
         q.with = None;
+        let body = self.body(&q)?;
+        Ok(match defs.is_empty() {
+            true => body,
+            false => Planned { node: ir::Node::With { ctes: defs, input: Box::new(body.node) }, ..body },
+        })
+    }
+
+    fn body(&self, q: &sql::Query) -> Result<Planned> {
         let sql::SetExpr::Select(s) = q.body.as_ref() else { return Err(err("UNION, INTERSECT and EXCEPT are not supported")) };
-        let s = s.as_ref().clone();
         if s.from.len() != 1 {
             return Err(err("FROM takes one table; join others with JOIN ... ON"));
         }
         if !s.from[0].joins.is_empty() {
-            return self.join(&q, &s);
+            return self.join(q, s);
         }
         match &s.from[0].relation {
-            TableFactor::Table { name, .. } if self.ctes.contains_key(&name.to_string().to_ascii_lowercase()) => {
-                let rel = self.ctes[&name.to_string().to_ascii_lowercase()].clone();
-                match rel.keys {
-                    Some(keys) => self.over_rows(&q, &s, keys),
-                    None => self.join(&q, &s),
+            TableFactor::Table { name, .. } if self.cte(&name.to_string()).is_some() => {
+                let cte = self.cte(&name.to_string()).expect("in scope");
+                match cte.keyed {
+                    true => self.over_rows(q, s, &cte),
+                    false => self.join(q, s),
                 }
             }
-            TableFactor::Table { name, .. } if is_table(name, self.schema) => self.single(&q, &s),
+            TableFactor::Table { name, .. } if is_table(name, self.schema) => self.single(q, s),
             TableFactor::Table { name, .. } => Err(err(format!("no such table: {name}"))),
-            TableFactor::Derived { .. } => self.join(&q, &s),
+            TableFactor::Derived { .. } => self.join(q, s),
             t => Err(err(format!("unsupported FROM: {t}"))),
         }
     }
 
-    /// A SELECT over the table: its subqueries run first.
-    fn single(&mut self, q: &sql::Query, s: &sql::Select) -> Result<Rel> {
+    /// A SELECT over the table: a leaf, its subqueries planned within it.
+    fn single(&self, q: &sql::Query, s: &sql::Select) -> Result<Planned> {
         let mut q = q.clone();
         let mut s = s.clone();
-        self.resolve_select(&mut s)?;
-        if let Some(order) = q.order_by.as_mut() {
-            if let sql::OrderByKind::Expressions(es) = &mut order.kind {
-                for e in es {
-                    self.resolve(&mut e.expr)?;
-                }
-            }
-        }
         if s.distinct.is_some() {
             distinct_to_group(&mut s)?;
         }
         q.body = Box::new(sql::SetExpr::Select(Box::new(s)));
-        self.run_step(&q, "query")
+        self.leaf(&q, "query")
+    }
+
+    /// Binds a leaf's syntax tree; a subquery in a condition or as seeds
+    /// plans into the condition ([`Planner::subquery`]).
+    fn leaf(&self, q: &sql::Query, what: &str) -> Result<Planned> {
+        // A subquery's error names the subquery, not each query around it.
+        let at = |e: Error| match e {
+            Error::Query(m) if !m.contains(" (in ") => err(format!("{m} (in {what}: {})", printable(q))),
+            e => e,
+        };
+        let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind);
+        let select = super::sql::bind_query_with(q, self.schema, self.params, &subs as &Subs).map_err(at)?;
+        let aggregated = !select.group_by.is_empty() || select.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
+        let keyed = !aggregated
+            && select.projection.iter().all(|(name, p)| match p {
+                Projection::Field(f) => self.schema.fields[*f].name.eq_ignore_ascii_case(name),
+                Projection::Score | Projection::Hops(_) => true,
+                _ => false,
+            });
+        let columns = select.projection.iter().map(|(n, _)| n.clone()).collect();
+        Ok(Planned { node: ir::Plan::of_select(self.schema, &select).root, columns, keyed })
+    }
+
+    /// The expression a subquery stands for: its one column's values (`IN`),
+    /// whether it has a row (`EXISTS`), its one value (a comparison), or the
+    /// keys of its rows (seeds; `None` for a subquery of the table the
+    /// executor runs itself).
+    fn subquery(&self, q: &sql::Query, kind: Sub) -> Result<Option<ir::Expr>> {
+        if kind == Sub::Seeds && !needs(q, self.schema) {
+            return Ok(None);
+        }
+        let p = self.query(q)?;
+        let one = |what: &str| match p.columns.len() {
+            1 => Ok(()),
+            n => Err(err(format!("{what} returns one column, not {n}"))),
+        };
+        let node = Box::new(p.node.clone());
+        Ok(Some(match kind {
+            Sub::In => {
+                one("a subquery in IN")?;
+                ir::Expr::Values(node)
+            }
+            Sub::Exists => ir::Expr::Exists(node),
+            Sub::Scalar => {
+                one("a scalar subquery")?;
+                ir::Expr::Scalar(node)
+            }
+            Sub::Seeds if p.keyed => ir::Expr::Keys(node),
+            Sub::Seeds => {
+                one("a subquery of seeds")?;
+                ir::Expr::Values(node)
+            }
+        }))
+    }
+
+    /// A subquery of an expression over rows in memory.
+    fn in_memory(&self, q: &sql::Query, kind: Sub) -> Result<ir::Expr> {
+        self.subquery(q, kind)?.ok_or_else(|| err("a traversal's seeds name one table's rows, in its scan"))
     }
 
     /// A SELECT over the rows of the table that a `WITH` result holds:
     /// the table, restricted to their keys, in their order.
-    fn over_rows(&mut self, q: &sql::Query, s: &sql::Select, keys: Vec<Value>) -> Result<Rel> {
-        let pk = self.pk_name()?;
+    fn over_rows(&self, q: &sql::Query, s: &sql::Select, cte: &Cte) -> Result<Planned> {
+        let pk = self.pk()?;
         let mut q = q.clone();
         let mut s = s.clone();
-        let TableFactor::Table { name, .. } = &mut s.from[0].relation else { unreachable!() };
+        let TableFactor::Table { name, .. } = &mut s.from[0].relation else { unreachable!("a table") };
         *name = sql::ObjectName::from(vec![sql::Ident::new(self.schema.table.clone())]);
-        let keyp = self.param(Value::List(keys.clone()));
-        let in_keys = Expr::InList { expr: Box::new(Expr::Identifier(sql::Ident::new(pk))), list: vec![keyp], negated: false };
-        s.selection = Some(match s.selection.take() {
-            Some(w) => Expr::BinaryOp { left: Box::new(in_keys), op: BinaryOperator::And, right: Box::new(Expr::Nested(Box::new(w))) },
-            None => in_keys,
-        });
-        let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(&s);
+        let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(&s) || s.distinct.is_some();
         // Without an ORDER BY, rows keep the WITH result's order, so the
         // cut happens after reordering.
         let reorder = q.order_by.is_none() && !grouped;
         let cut = if reorder { q.limit_clause.take() } else { None };
-        q.body = Box::new(sql::SetExpr::Select(Box::new(s.clone())));
-        let mut rel = self.single(&q, &s)?;
+        let mut p = self.single(&q, &s)?;
+        let rows = ir::Node::Ref { name: cte.name.clone() };
+        restrict(&mut p.node, ir::Expr::In { expr: Box::new(ir::Expr::Field(pk as u32)), list: vec![ir::Expr::Keys(Box::new(rows.clone()))] });
         if reorder {
-            if let Some(got) = rel.keys.clone() {
-                let at: HashMap<Part, usize> = keys.iter().enumerate().map(|(i, k)| (Part::of(k), i)).collect();
-                let mut idx: Vec<usize> = (0..rel.rows.len()).collect();
-                idx.sort_by_key(|&i| at.get(&Part::of(&got[i])).copied().unwrap_or(usize::MAX));
-                let (offset, limit) = limits(&cut, &self.params)?;
-                let idx: Vec<usize> = idx.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).collect();
-                rel.rows = idx.iter().map(|&i| rel.rows[i].clone()).collect();
-                rel.keys = Some(idx.iter().map(|&i| got[i].clone()).collect());
-                rel.scores = if rel.scores.len() == got.len() { idx.iter().map(|&i| rel.scores[i]).collect() } else { Vec::new() };
+            p.node = ir::Node::KeyOrder { input: Box::new(p.node), by: Box::new(rows) };
+            let (offset, limit) = limits(&cut, self.params)?;
+            if offset > 0 || limit.is_some() {
+                p.node = ir::Node::Limit { input: Box::new(p.node), offset: offset as u64, limit: limit.map(|l| l as u64) };
             }
         }
-        Ok(rel)
+        Ok(p)
     }
 
-    fn resolve_select(&mut self, s: &mut sql::Select) -> Result<()> {
-        for item in s.projection.iter_mut() {
-            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
-                self.resolve(e)?;
-            }
-        }
-        if let Some(w) = s.selection.as_mut() {
-            self.resolve(w)?;
-        }
-        if let Some(h) = s.having.as_mut() {
-            self.resolve(h)?;
-        }
-        Ok(())
-    }
-
-    /// Runs the subqueries of `e` and puts their results in its place: `IN
-    /// (SELECT ...)` becomes `IN (:list)`, `EXISTS` true or false, a scalar
-    /// subquery its value. A graph's seed subquery over the table stays for
-    /// the executor; any other becomes the list of its rows' keys.
-    fn resolve(&mut self, e: &mut Expr) -> Result<()> {
-        match e {
-            Expr::InSubquery { expr, subquery, negated } => {
-                self.resolve(expr)?;
-                let rel = self.query(subquery)?;
-                let values = rel.first_column()?;
-                self.plan.push(format!("IN (SELECT ...): {} values", values.len()));
-                let p = self.param(Value::List(values));
-                *e = Expr::InList { expr: expr.clone(), list: vec![p], negated: *negated };
-            }
-            Expr::Exists { subquery, negated } => {
-                let rel = self.query(subquery)?;
-                let b = rel.rows.is_empty() == *negated;
-                *e = Expr::Value(sql::Value::Boolean(b).into());
-            }
-            Expr::Subquery(q) => {
-                let rel = self.query(q)?;
-                if rel.columns.len() != 1 {
-                    return Err(err(format!("a scalar subquery returns one column, not {}", rel.columns.len())));
-                }
-                if rel.rows.len() > 1 {
-                    return Err(err(format!("a scalar subquery returned {} rows; add LIMIT 1 or an aggregate", rel.rows.len())));
-                }
-                let v = rel.rows.first().map_or(Value::Null, |r| r[0].clone());
-                *e = self.param(v);
-            }
-            Expr::Function(f) if matches!(fname(f).as_str(), "reachable" | "path" | "ppr") => {
-                for (i, a) in func_args_mut(f).into_iter().enumerate() {
-                    match a {
-                        Expr::Subquery(q) if i > 0 => {
-                            if !needs(q, self.schema) {
-                                continue;
-                            }
-                            let rel = self.query(q)?;
-                            let keys = match rel.keys {
-                                Some(k) => k,
-                                None => rel.first_column()?,
-                            };
-                            self.plan.push(format!("seeds: {} keys", keys.len()));
-                            *a = self.param(Value::List(keys));
-                        }
-                        a => self.resolve(a)?,
-                    }
-                }
-            }
-            Expr::Function(f) => {
-                for a in func_args_mut(f) {
-                    self.resolve(a)?;
-                }
-            }
-            Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::Cast { expr: x, .. } => self.resolve(x)?,
-            Expr::BinaryOp { left, right, .. } => {
-                self.resolve(left)?;
-                self.resolve(right)?;
-            }
-            Expr::Between { expr, low, high, .. } => {
-                self.resolve(expr)?;
-                self.resolve(low)?;
-                self.resolve(high)?;
-            }
-            Expr::InList { expr, list, .. } => {
-                self.resolve(expr)?;
-                for x in list {
-                    self.resolve(x)?;
-                }
-            }
-            Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-                self.resolve(expr)?;
-                self.resolve(pattern)?;
-            }
-            Expr::Case { operand, conditions, else_result, .. } => {
-                if let Some(o) = operand {
-                    self.resolve(o)?;
-                }
-                for c in conditions {
-                    self.resolve(&mut c.condition)?;
-                    self.resolve(&mut c.result)?;
-                }
-                if let Some(x) = else_result {
-                    self.resolve(x)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn source(&mut self, t: &TableFactor) -> Result<(String, SrcKind)> {
+    fn source(&self, t: &TableFactor) -> Result<(String, SrcKind)> {
         let alias_of = |a: &Option<sql::TableAlias>, d: &str| a.as_ref().map_or(d.to_string(), |a| a.name.value.clone());
         match t {
             TableFactor::Table { name, alias, .. } => {
                 let n = name.to_string();
-                if let Some(rel) = self.ctes.get(&n.to_ascii_lowercase()) {
-                    let kind = match &rel.keys {
-                        Some(k) => SrcKind::TableRows(k.clone()),
-                        None => SrcKind::Rows(rel.clone()),
+                if let Some(cte) = self.cte(&n) {
+                    let kind = match cte.keyed {
+                        true => SrcKind::TableRows(cte.name),
+                        false => SrcKind::Rows(Planned { node: ir::Node::Ref { name: cte.name }, columns: cte.columns, keyed: false }),
                     };
                     return Ok((alias_of(alias, &n), kind));
                 }
@@ -611,29 +456,24 @@ impl<'a, 'r> Ctx<'a, 'r> {
                 Ok((alias_of(alias, &n), SrcKind::Table))
             }
             TableFactor::Derived { subquery, alias, .. } => {
-                let rel = self.query(subquery)?;
+                let p = self.query(subquery)?;
                 let alias = alias.as_ref().map(|a| a.name.value.clone()).ok_or_else(|| err("a subquery in FROM needs an alias: FROM (SELECT ...) AS t"))?;
-                Ok((alias, SrcKind::Rows(Rel { keys: None, ..rel })))
+                Ok((alias, SrcKind::Rows(Planned { keyed: false, ..p })))
             }
             t => Err(err(format!("unsupported FROM: {t}"))),
         }
     }
 
     /// Joins (and any SELECT over rows held in memory).
-    fn join(&mut self, q: &sql::Query, s: &sql::Select) -> Result<Rel> {
-        let mut s = s.clone();
-        self.resolve_select(&mut s)?;
-        let mut order: Vec<sql::OrderByExpr> = match &q.order_by {
+    fn join(&self, q: &sql::Query, s: &sql::Select) -> Result<Planned> {
+        let order: Vec<sql::OrderByExpr> = match &q.order_by {
             None => Vec::new(),
             Some(ob) => match &ob.kind {
                 sql::OrderByKind::Expressions(es) => es.clone(),
                 _ => return Err(err("ORDER BY ALL is not supported")),
             },
         };
-        for o in order.iter_mut() {
-            self.resolve(&mut o.expr)?;
-        }
-        let (offset, limit) = limits(&q.limit_clause, &self.params)?;
+        let (offset, limit) = limits(&q.limit_clause, self.params)?;
 
         // The tables.
         let twj = &s.from[0];
@@ -642,8 +482,8 @@ impl<'a, 'r> Ctx<'a, 'r> {
         srcs.push(Src { alias, kind, join: None });
         for j in &twj.joins {
             let (kind, c) = match &j.join_operator {
-                sql::JoinOperator::Join(c) | sql::JoinOperator::Inner(c) => (JoinKind::Inner, c),
-                sql::JoinOperator::Left(c) | sql::JoinOperator::LeftOuter(c) => (JoinKind::Left, c),
+                sql::JoinOperator::Join(c) | sql::JoinOperator::Inner(c) => (ir::JoinKind::Inner, c),
+                sql::JoinOperator::Left(c) | sql::JoinOperator::LeftOuter(c) => (ir::JoinKind::Left, c),
                 o => return Err(err(format!("unsupported join {o:?}: use JOIN or LEFT JOIN ... ON")))?,
             };
             let sql::JoinConstraint::On(on) = c else { return Err(err("JOIN needs ON, e.g. JOIN papers b ON a.cites = b.id")) };
@@ -660,15 +500,16 @@ impl<'a, 'r> Ctx<'a, 'r> {
         let aliases: Vec<String> = srcs.iter().map(|s| s.alias.to_ascii_lowercase()).collect();
         let vectors: Vec<String> = self.schema.fields.iter().filter(|f| matches!(f.ty, FieldType::Vector { .. })).map(|f| f.name.clone()).collect();
         let sides = Sides { aliases: &aliases, cols: &cols_of, vectors: &vectors };
+        let in_memory = |i: usize| matches!(srcs[i].kind, SrcKind::Rows(_));
 
         // WHERE: each condition naming one scanned side goes to its scan.
         let mut pushed: Vec<Vec<Expr>> = vec![Vec::new(); srcs.len()];
         let mut residual: Vec<Expr> = Vec::new();
         for c in s.selection.iter().flat_map(split_and) {
             let at = sides.of(&c)?;
-            let left_join_right = |i: usize| srcs[i].join.as_ref().is_some_and(|(k, _)| *k == JoinKind::Left);
+            let left_join_right = |i: usize| srcs[i].join.as_ref().is_some_and(|(k, _)| *k == ir::JoinKind::Left);
             match at.as_slice() {
-                [i] if !matches!(srcs[*i].kind, SrcKind::Rows(_)) && !left_join_right(*i) => pushed[*i].push(c),
+                [i] if !in_memory(*i) && !left_join_right(*i) => pushed[*i].push(c),
                 _ => residual.push(c),
             }
         }
@@ -677,22 +518,22 @@ impl<'a, 'r> Ctx<'a, 'r> {
         let mut keys: Vec<Vec<(Expr, String)>> = vec![Vec::new(); srcs.len()];
         let mut on_rest: Vec<Vec<Expr>> = vec![Vec::new(); srcs.len()];
         for i in 1..srcs.len() {
-            let (_, on) = srcs[i].join.clone().unwrap();
+            let (_, on) = srcs[i].join.clone().expect("a joined table");
             for c in split_and(&on) {
                 let at = sides.of(&c)?;
                 if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = &c {
                     let (l, r) = (sides.of(left)?, sides.of(right)?);
                     let col = |e: &Expr| sides.column(e).ok().flatten();
                     if r == [i] && l.iter().all(|&x| x < i) && !l.is_empty() && col(right).is_some() {
-                        keys[i].push(((**left).clone(), col(right).unwrap().1));
+                        keys[i].push(((**left).clone(), col(right).expect("a column").1));
                         continue;
                     }
                     if l == [i] && r.iter().all(|&x| x < i) && !r.is_empty() && col(left).is_some() {
-                        keys[i].push(((**right).clone(), col(left).unwrap().1));
+                        keys[i].push(((**right).clone(), col(left).expect("a column").1));
                         continue;
                     }
                 }
-                if at == [i] && !matches!(srcs[i].kind, SrcKind::Rows(_)) {
+                if at == [i] && !in_memory(i) {
                     pushed[i].push(c);
                 } else if at.iter().any(|&x| x > i) {
                     return Err(err(format!("ON of {} names a table joined later", srcs[i].alias)));
@@ -703,28 +544,36 @@ impl<'a, 'r> Ctx<'a, 'r> {
             if keys[i].is_empty() {
                 return Err(err(format!("JOIN {} needs an equality with the tables before it in ON, e.g. a.cites = {}.id or a.category = {}.category", srcs[i].alias, srcs[i].alias, srcs[i].alias)));
             }
+            // A scanned side is restricted to the left's join values.
+            for (_, c) in &keys[i] {
+                if !in_memory(i) && !self.is_edges(c) && !self.schema.field(c).is_some_and(|f| matches!(f.ty, FieldType::Keyword | FieldType::Int | FieldType::Float)) {
+                    return Err(err(format!("joins compare KEYWORD, INT or FLOAT fields, the key or EDGES links, not {c}")));
+                }
+            }
         }
 
         // ORDER BY a score: the scan of its table ranks by it.
-        let mut scan_order: Vec<Option<(Expr, bool)>> = vec![None; srcs.len()];
-        let mut mem_order: Vec<(Expr, bool)> = Vec::new();
+        let mut scan_order: Vec<Option<OrderKey>> = vec![None; srcs.len()];
+        let mut mem_order: Vec<OrderKey> = Vec::new();
         for o in &order {
             let desc = o.options.asc == Some(false);
+            let nulls_first = o.options.nulls_first == Some(true);
             if is_score(&o.expr) {
                 let at = sides.of(&o.expr)?;
                 let [i] = at.as_slice() else { return Err(err(format!("ORDER BY {}: a score ranks one table's rows", o.expr))) };
-                if matches!(srcs[*i].kind, SrcKind::Rows(_)) || scan_order[*i].is_some() {
+                if in_memory(*i) || scan_order[*i].is_some() {
                     return Err(err(format!("ORDER BY {}: one score per scanned table", o.expr)));
                 }
-                scan_order[*i] = Some((o.expr.clone(), desc));
-                mem_order.push((qualified(&srcs[*i].alias, "__score"), true));
+                scan_order[*i] = Some((o.expr.clone(), desc, false));
+                mem_order.push((qualified(&srcs[*i].alias, "__score"), true, false));
             } else {
-                mem_order.push((o.expr.clone(), desc));
+                mem_order.push((o.expr.clone(), desc, nulls_first));
             }
         }
-        let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(&s) || s.having.is_some();
-        // The first table drives: when the order is its own, scans of a
-        // growing number of its rows stop once enough rows join.
+        let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(s) || s.having.is_some();
+        // The first table drives: when the order is its own, its rows come
+        // in that order and keep it through the joins, so a cut needs only
+        // as many of them as join into enough rows ([`ops`] grows its scan).
         let driver_order = !grouped
             && s.distinct.is_none()
             && match order.first() {
@@ -733,216 +582,95 @@ impl<'a, 'r> Ctx<'a, 'r> {
                 // The executor orders by a score or a numeric field.
                 Some(o) => {
                     scan_order[0].is_some()
-                        || (!matches!(srcs[0].kind, SrcKind::Rows(_))
+                        || (!in_memory(0)
                             && sides.column(&o.expr)?.is_some_and(|(i, c)| i == 0 && self.schema.field(&c).is_some_and(|f| matches!(f.ty, FieldType::Int | FieldType::Float) && !f.multi)))
                 }
             };
         if driver_order && order.len() == 1 && scan_order[0].is_none() {
-            let (e, desc) = mem_order[0].clone();
-            scan_order[0] = Some((e, desc));
+            scan_order[0] = Some(mem_order[0].clone());
         }
-        let want = limit.map(|l| l.saturating_add(offset));
-        let mut lim = match (driver_order, want) {
-            (true, Some(w)) => Some(w.saturating_mul(2).clamp(32, MAX_ROWS)),
-            _ => None,
-        };
-        let needed = sides.needed(&s, &order, &srcs)?;
-        loop {
-            let (joined, driver_rows) = self.scan_and_join(&srcs, &needed, &pushed, &keys, &on_rest, &scan_order, lim)?;
-            let joined = filter_rows(joined, &residual, &self.params)?;
-            let enough = want.is_some_and(|w| joined.rows.len() >= w);
-            match lim {
-                Some(l) if !enough && driver_rows >= l && l < MAX_ROWS => lim = Some((l * 4).min(MAX_ROWS)),
-                _ => return evaluate(&s, joined, &mem_order, offset, limit, &self.params, srcs.len() > 1),
-            }
+        let needed = sides.needed(s, &order, &srcs)?;
+
+        // The scans, joined left to right: rows of `cols` (alias, column),
+        // multi-valued where `multi` says.
+        let mut node: Option<ir::Node> = None;
+        let mut cols: Vec<(String, String)> = Vec::new();
+        let mut multi: Vec<bool> = Vec::new();
+        let subs = |q: &sql::Query, kind: Sub| self.in_memory(q, kind);
+        for (i, src) in srcs.iter().enumerate() {
+            let side = self.scan(src, &needed[i], &pushed[i], &scan_order[i], if i == 0 { "scan" } else { "join" })?;
+            let alias = src.alias.to_ascii_lowercase();
+            let side_cols: Vec<(String, String)> = needed[i].iter().map(|c| (alias.clone(), c.clone())).collect();
+            let side_multi: Vec<bool> = needed[i].iter().map(|c| !in_memory(i) && self.schema.field(c).is_some_and(|f| f.multi)).collect();
+            let Some(left) = node.take() else {
+                node = Some(side);
+                cols = side_cols;
+                multi = side_multi;
+                continue;
+            };
+            let (kind, _) = src.join.clone().expect("a joined table");
+            let join_keys = keys[i]
+                .iter()
+                .map(|(le, rc)| {
+                    let right = needed[i].iter().position(|x| x.eq_ignore_ascii_case(rc)).expect("key column scanned");
+                    Ok(ir::JoinKey {
+                        left: compile_row(le, &cols, &multi, self.params, &subs)?,
+                        right: ir::Expr::Output(right as u32),
+                        left_links: self.links(le, &cols),
+                        right_links: self.is_edges(rc),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            cols.extend(side_cols);
+            multi.extend(side_multi);
+            let on = and(compile_all(&on_rest[i], &cols, &multi, self.params, &subs)?);
+            node = Some(ir::Node::Join { left: Box::new(left), right: Box::new(side), kind, keys: join_keys, on });
         }
+        let mut node = node.expect("a table");
+        // Conditions over several tables, or rows in memory.
+        if let Some(cond) = and(compile_all(&residual, &cols, &multi, self.params, &subs)?) {
+            node = ir::Node::Filter { input: Box::new(node), cond };
+        }
+        self.evaluate(s, node, &cols, &multi, &mem_order, offset, limit, srcs.len() > 1, driver_order)
     }
 
     /// Columns a side offers.
     fn columns_of(&self, src: &Src) -> Vec<String> {
         match &src.kind {
-            SrcKind::Rows(rel) => rel.columns.clone(),
+            SrcKind::Rows(p) => p.columns.clone(),
             _ => self.schema.fields.iter().map(|f| f.name.clone()).chain(["__score".to_string()]).collect(),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn scan_and_join(
-        &mut self,
-        srcs: &[Src],
-        needed: &[Vec<String>],
-        pushed: &[Vec<Expr>],
-        keys: &[Vec<(Expr, String)>],
-        on_rest: &[Vec<Expr>],
-        scan_order: &[Option<(Expr, bool)>],
-        lim: Option<usize>,
-    ) -> Result<(Joined, usize)> {
-        let first = self.scan(&srcs[0], &needed[0], &pushed[0], &[], &scan_order[0], lim, "scan")?;
-        let driver_rows = first.rows.len();
-        let multi = |i: usize| -> Vec<bool> { needed[i].iter().map(|c| !matches!(srcs[i].kind, SrcKind::Rows(_)) && self.schema.field(c).is_some_and(|f| f.multi)).collect() };
-        let mut joined = Joined {
-            cols: needed[0].iter().map(|c| (srcs[0].alias.to_ascii_lowercase(), c.clone())).collect(),
-            multi: multi(0),
-            keys: first.keys.clone().unwrap_or_else(|| vec![Value::Null; first.rows.len()]),
-            scores: if first.scores.len() == first.rows.len() { first.scores.clone() } else { vec![0.0; first.rows.len()] },
-            rows: first.rows,
-        };
-        for i in 1..srcs.len() {
-            // The join values the rows so far hold, for each key.
-            let lefts_at: Vec<ir::Expr> = keys[i].iter().map(|(le, _)| compile_row(le, &joined.cols, &joined.multi, &self.params)).collect::<Result<_>>()?;
-            let mut lefts: Vec<Vec<Value>> = Vec::new();
-            for ((le, _), at) in keys[i].iter().zip(&lefts_at) {
-                let mut seen = HashSet::new();
-                let mut vals = Vec::new();
-                for r in &joined.rows {
-                    for v in self.join_values(&value(at, r)?, &joined.cols, le)? {
-                        if seen.insert(Part::of(&v)) {
-                            vals.push(v);
-                        }
-                    }
-                }
-                lefts.push(vals);
-            }
-            let (kind, _) = srcs[i].join.clone().unwrap();
-            let right = if lefts.iter().any(|v| v.is_empty()) {
-                Rel { columns: needed[i].clone(), ..Rel::default() }
-            } else {
-                let restrict: Vec<(String, Vec<Value>)> = keys[i].iter().map(|(_, c)| c.clone()).zip(lefts).collect();
-                self.scan(&srcs[i], &needed[i], &pushed[i], &restrict, &scan_order[i], None, "join")?
-            };
-            // Hash the right side on its key columns.
-            let rcols: Vec<(String, String)> = needed[i].iter().map(|c| (srcs[i].alias.to_ascii_lowercase(), c.clone())).collect();
-            let key_idx: Vec<usize> = keys[i].iter().map(|(_, c)| needed[i].iter().position(|x| x.eq_ignore_ascii_case(c)).expect("key column scanned")).collect();
-            let mut table: HashMap<Vec<Part>, Vec<usize>> = HashMap::new();
-            for (ri, r) in right.rows.iter().enumerate() {
-                self.tick()?;
-                let mut combos: Vec<Vec<Part>> = vec![Vec::new()];
-                for &k in &key_idx {
-                    let vals = self.key_parts(&r[k], &needed[i][k])?;
-                    combos = combos.into_iter().flat_map(|c| vals.iter().map(move |v| [c.clone(), vec![v.clone()]].concat())).collect();
-                }
-                for c in combos {
-                    self.charge.add(64 + c.iter().map(Part::bytes).sum::<u64>())?;
-                    table.entry(c).or_default().push(ri);
-                }
-            }
-            let mut cols = joined.cols.clone();
-            cols.extend(rcols);
-            let width = needed[i].len();
-            let both = [joined.multi.clone(), multi(i)].concat();
-            let on = compile_all(&on_rest[i], &cols, &both, &self.params)?;
-            let mut out = Joined { cols, multi: both, rows: Vec::new(), keys: Vec::new(), scores: Vec::new() };
-            for (li, l) in joined.rows.iter().enumerate() {
-                self.tick()?;
-                let mut combos: Vec<Vec<Part>> = vec![Vec::new()];
-                for ((le, _), at) in keys[i].iter().zip(&lefts_at) {
-                    let v = value(at, l)?;
-                    let vals: Vec<Part> = self.join_values(&v, &joined.cols, le)?.iter().map(Part::of).collect();
-                    combos = combos.into_iter().flat_map(|c| vals.iter().map(move |v| [c.clone(), vec![v.clone()]].concat())).collect();
-                }
-                let mut matched: Vec<usize> = combos.iter().filter_map(|c| table.get(c)).flatten().copied().collect();
-                matched.sort_unstable();
-                matched.dedup();
-                let mut any = false;
-                for ri in matched {
-                    self.tick()?;
-                    let row: Vec<Value> = l.iter().chain(&right.rows[ri]).cloned().collect();
-                    if pass_all(&on, &row)? {
-                        self.charge.row(&row)?;
-                        out.rows.push(row);
-                        out.keys.push(joined.keys[li].clone());
-                        out.scores.push(joined.scores[li]);
-                        any = true;
-                    }
-                }
-                if !any && kind == JoinKind::Left {
-                    let row: Vec<Value> = l.iter().cloned().chain(std::iter::repeat_n(Value::Null, width)).collect();
-                    self.charge.row(&row)?;
-                    out.rows.push(row);
-                    out.keys.push(joined.keys[li].clone());
-                    out.scores.push(joined.scores[li]);
-                }
-                if out.rows.len() > MAX_ROWS {
-                    return Err(err(format!("the join makes more than {MAX_ROWS} rows; add conditions or a LIMIT")));
-                }
-            }
-            self.plan.push(format!("join {} ({}): {} rows", srcs[i].alias, if kind == JoinKind::Left { "left" } else { "inner" }, out.rows.len()));
-            joined = out;
-        }
-        Ok((joined, driver_rows))
-    }
-
-    /// Join values of a value: each of a list's, each target of an EDGES
-    /// field's links.
-    fn join_values(&self, v: &Value, cols: &[(String, String)], e: &Expr) -> Result<Vec<Value>> {
-        let edges = match e {
+    /// Whether join values of `e` are the targets of an EDGES field's links.
+    fn links(&self, e: &Expr, cols: &[(String, String)]) -> bool {
+        match e {
             Expr::Identifier(id) => self.is_edges(&id.value) && cols.iter().filter(|(_, c)| c.eq_ignore_ascii_case(&id.value)).count() == 1,
-            Expr::CompoundIdentifier(ids) => self.is_edges(&ids.last().unwrap().value),
+            Expr::CompoundIdentifier(ids) => self.is_edges(&ids.last().expect("a name").value),
             _ => false,
-        };
-        if edges {
-            let int = self.schema.primary_key.is_some_and(|p| self.schema.fields[p].ty == FieldType::Int);
-            return Ok(crate::graph::parse_edges(v, int)?.into_iter().map(|e| e.to).collect());
         }
-        Ok(match v {
-            Value::Null => Vec::new(),
-            Value::List(xs) => xs.clone(),
-            v => vec![v.clone()],
-        })
-    }
-
-    fn key_parts(&self, v: &Value, column: &str) -> Result<Vec<Part>> {
-        if self.is_edges(column) {
-            let int = self.schema.primary_key.is_some_and(|p| self.schema.fields[p].ty == FieldType::Int);
-            return Ok(crate::graph::parse_edges(v, int)?.iter().map(|e| Part::of(&e.to)).collect());
-        }
-        Ok(match v {
-            Value::Null => Vec::new(),
-            Value::List(xs) => xs.iter().map(Part::of).collect(),
-            // Numbers join by value whatever their type.
-            Value::Float(x) if x.fract() == 0.0 && x.abs() < 9e15 => vec![Part::Int(*x as i64)],
-            v => vec![Part::of(v)],
-        })
     }
 
     fn is_edges(&self, column: &str) -> bool {
         self.schema.field(column).is_some_and(|f| f.ty == FieldType::Edges)
     }
 
-    /// Scans one side: its own conditions, its key values (`restrict`) and
-    /// its ranking, returning the `columns` it needs.
-    #[allow(clippy::too_many_arguments)]
-    fn scan(&mut self, src: &Src, columns: &[String], conds: &[Expr], restrict: &[(String, Vec<Value>)], order: &Option<(Expr, bool)>, lim: Option<usize>, what: &str) -> Result<Rel> {
-        if let SrcKind::Rows(rel) = &src.kind {
+    /// One side of a join: a leaf with its own conditions and ranking,
+    /// returning the `columns` it needs, or rows in memory.
+    fn scan(&self, src: &Src, columns: &[String], conds: &[Expr], order: &Option<OrderKey>, what: &str) -> Result<ir::Node> {
+        if let SrcKind::Rows(p) = &src.kind {
             // Held in memory: pick the columns.
-            let idx: Vec<usize> = columns.iter().map(|c| rel.columns.iter().position(|x| x.eq_ignore_ascii_case(c)).ok_or_else(|| err(format!("{} has no column {c}", src.alias)))).collect::<Result<_>>()?;
-            let mut rows: Vec<Vec<Value>> = rel.rows.iter().map(|r| idx.iter().map(|&i| r[i].clone()).collect()).collect();
-            if !restrict.is_empty() {
-                let sets: Vec<(usize, HashSet<Part>)> = restrict.iter().map(|(c, vs)| (columns.iter().position(|x| x.eq_ignore_ascii_case(c)).unwrap(), vs.iter().map(Part::of).collect())).collect();
-                rows.retain(|r| sets.iter().all(|(i, set)| self.key_parts(&r[*i], &columns[*i]).is_ok_and(|ps| ps.iter().any(|p| set.contains(p)))));
-            }
-            self.plan.push(format!("{what} {}: {} rows held in memory", src.alias, rows.len()));
-            return Ok(Rel { columns: columns.to_vec(), rows, keys: None, scores: Vec::new() });
+            let picked = columns
+                .iter()
+                .map(|c| {
+                    let i = p.columns.iter().position(|x| x.eq_ignore_ascii_case(c)).ok_or_else(|| err(format!("{} has no column {c}", src.alias)))?;
+                    Ok(ir::Column { name: c.clone(), expr: ir::Expr::Output(i as u32) })
+                })
+                .collect::<Result<_>>()?;
+            return Ok(ir::Node::Project { input: Box::new(p.node.clone()), columns: picked });
         }
         let alias = src.alias.to_ascii_lowercase();
         let column = |c: &str| Expr::Identifier(sql::Ident::new(c));
-        let mut where_: Vec<Expr> = conds.iter().map(|c| unqualify(c, &alias)).collect();
-        if let SrcKind::TableRows(keys) = &src.kind {
-            let p = self.param(Value::List(keys.clone()));
-            where_.push(Expr::InList { expr: Box::new(column(&self.pk_name()?)), list: vec![p], negated: false });
-        }
-        for (col, vals) in restrict {
-            let p = self.param(Value::List(vals.clone()));
-            if self.is_edges(col) {
-                where_.push(linking_to(column(col), p)?);
-            } else {
-                let f = self.schema.field(col).ok_or_else(|| err(format!("no such column: {col}")))?;
-                if !matches!(f.ty, FieldType::Keyword | FieldType::Int | FieldType::Float) {
-                    return Err(err(format!("joins compare KEYWORD, INT or FLOAT fields, the key or EDGES links, not {col}")));
-                }
-                where_.push(Expr::InList { expr: Box::new(column(col)), list: vec![p], negated: false });
-            }
-        }
         let mut q = super::sql::parse_query("SELECT score() AS __score FROM t")?;
         let sql::SetExpr::Select(s) = q.body.as_mut() else { unreachable!("a SELECT") };
         let score = s.projection.pop().expect("score() AS __score");
@@ -950,24 +678,44 @@ impl<'a, 'r> Ctx<'a, 'r> {
         if let TableFactor::Table { name, .. } = &mut s.from[0].relation {
             *name = sql::ObjectName::from(vec![sql::Ident::new(self.schema.table.clone())]);
         }
-        s.selection = where_.into_iter().map(|w| Expr::Nested(Box::new(w))).reduce(|a, b| Expr::BinaryOp { left: Box::new(a), op: BinaryOperator::And, right: Box::new(b) });
-        let ranked = order.as_ref().is_some_and(|(e, _)| is_score(e));
-        if let Some((e, desc)) = order {
-            let options = sql::OrderByOptions { asc: desc.then_some(false), nulls_first: None };
+        s.selection = conds.iter().map(|c| Expr::Nested(Box::new(unqualify(c, &alias)))).reduce(|a, b| Expr::BinaryOp { left: Box::new(a), op: BinaryOperator::And, right: Box::new(b) });
+        let ranked = order.as_ref().is_some_and(|(e, ..)| is_score(e));
+        if let Some((e, desc, nulls_first)) = order {
+            let options = sql::OrderByOptions { asc: desc.then_some(false), nulls_first: nulls_first.then_some(true) };
             q.order_by = Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(vec![sql::OrderByExpr { expr: unqualify(e, &alias), options, with_fill: None }]), interpolate: None });
         }
-        let limit = match lim {
-            Some(l) => Some(l),
-            // A ranked scan without a LIMIT would stop at the executor's default.
-            None if ranked => Some(MAX_ROWS + 1),
-            None => None,
-        };
-        q.limit_clause = limit.map(|l| sql::LimitClause::LimitOffset { limit: Some(Expr::value(sql::Value::Number(l.to_string(), false))), offset: None, limit_by: Vec::new() });
-        let rel = self.run_step(&q, &format!("{what} {}", src.alias))?;
-        if rel.rows.len() > MAX_ROWS {
-            return Err(err(format!("{} would read more than {MAX_ROWS} rows; add conditions on it", src.alias)));
+        // A ranked scan without a LIMIT would stop at the executor's default.
+        if ranked {
+            q.limit_clause = Some(sql::LimitClause::LimitOffset { limit: Some(Expr::value(sql::Value::Number((MAX_ROWS + 1).to_string(), false))), offset: None, limit_by: Vec::new() });
         }
-        Ok(rel)
+        let mut p = self.leaf(&q, &format!("{what} {}", src.alias))?;
+        if let SrcKind::TableRows(cte) = &src.kind {
+            let rows = ir::Expr::Keys(Box::new(ir::Node::Ref { name: cte.clone() }));
+            restrict(&mut p.node, ir::Expr::In { expr: Box::new(ir::Expr::Field(self.pk()? as u32)), list: vec![rows] });
+        }
+        Ok(p.node)
+    }
+}
+
+/// Adds condition `c` to a leaf's Search.
+fn restrict(leaf: &mut ir::Node, c: ir::Expr) {
+    let s = leaf.search_mut().expect("a leaf");
+    s.filter = match std::mem::replace(&mut s.filter, ir::Expr::Lit(Value::Bool(true))) {
+        ir::Expr::Lit(Value::Bool(true)) => c,
+        ir::Expr::And(mut xs) => {
+            xs.insert(0, c);
+            ir::Expr::And(xs)
+        }
+        f => ir::Expr::And(vec![c, f]),
+    };
+}
+
+/// The conditions as one, `None` without any.
+fn and(mut cs: Vec<ir::Expr>) -> Option<ir::Expr> {
+    match cs.len() {
+        0 => None,
+        1 => cs.pop(),
+        _ => Some(ir::Expr::And(cs)),
     }
 }
 
@@ -1134,28 +882,15 @@ fn unqualify(e: &Expr, alias: &str) -> Expr {
     e
 }
 
-/// Rows whose links (EDGES field `col`) point at `keys`.
-fn linking_to(col: Expr, keys: Expr) -> Result<Expr> {
-    // `min_hops => 0`: a value's own row may link to another value.
-    let q = super::sql::parse_query(&format!("SELECT f FROM t WHERE REACHABLE(f, k, dir => 'in', min_hops => 0, max_nodes => {})", MAX_ROWS + 1))?;
-    let sql::SetExpr::Select(s) = *q.body else { unreachable!("a SELECT") };
-    let mut r = s.selection.expect("a WHERE");
-    if let Expr::Function(f) = &mut r {
-        let mut args = func_args_mut(f);
-        *args[0] = col;
-        *args[1] = keys;
-    }
-    Ok(r)
-}
-
 fn qualified(alias: &str, column: &str) -> Expr {
     Expr::CompoundIdentifier(vec![sql::Ident::new(alias), sql::Ident::new(column)])
 }
 
-/// `q` as SQL that parses back to it: a column named like a keyword, or
-/// other than a plain identifier, quoted (`"order"`, `"doc id"`), and the
-/// operand of a sign in parentheses when it starts with a sign itself
-/// (`- -1` would print as `--1`, which starts a comment).
+/// `q` as SQL that parses back to it, as an error names it: a column
+/// named like a keyword, or other than a plain identifier, quoted
+/// (`"order"`, `"doc id"`), and the operand of a sign in parentheses when
+/// it starts with a sign itself (`- -1` would print as `--1`, which
+/// starts a comment).
 fn printable(q: &sql::Query) -> String {
     let mut q = q.clone();
     query_mut(&mut q, &mut |e| match e {
@@ -1298,7 +1033,7 @@ fn distinct_to_group(s: &mut sql::Select) -> Result<()> {
 
 fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Option<usize>)> {
     let n = |e: &Expr| -> Result<usize> {
-        match value(&compile(e, params, &|_| None, &[])?, &[])? {
+        match value(&compile(e, params, &|_| None, &[])?)? {
             Value::Int(x) if x >= 0 => Ok(x as usize),
             v => Err(err(format!("LIMIT and OFFSET take non-negative integers, not {v:?}"))),
         }
@@ -1310,12 +1045,15 @@ fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Optio
     })
 }
 
-// ---- evaluation in memory ------------------------------------------------
+// ---- expressions over rows in memory -------------------------------------
 //
-// Expressions over rows in memory compile, once per query, into the plan
-// IR's expressions, each column (grouped: each aggregate and group value)
-// a slot of the row, and run on its one three-valued evaluator, as HAVING
-// and the single-table queries' conditions do.
+// Expressions over rows in memory compile into the plan IR's expressions,
+// each column (grouped: each group value and aggregate) an output of the
+// node below, and the operators evaluate them on the IR's one three-valued
+// evaluator, as HAVING and the single-table queries' conditions do.
+
+/// Plans a subquery of an expression over rows in memory.
+type InMemory<'s> = dyn Fn(&sql::Query, Sub) -> Result<ir::Expr> + 's;
 
 /// The slot of a column in rows of joined tables; `None` when `e` is not a
 /// column.
@@ -1333,9 +1071,10 @@ fn slot(e: &Expr, cols: &[(String, String)]) -> Option<Result<u32>> {
     })
 }
 
-/// `e` over rows of joined tables ([`Joined`]'s `cols` and `multi`).
-fn compile_row(e: &Expr, cols: &[(String, String)], multi: &[bool], params: &Params) -> Result<ir::Expr> {
-    compile(e, params, &|x| at(slot(x, cols)), multi)
+/// `e` over rows of joined tables (`cols` and `multi` as [`Planner::join`]
+/// keeps them).
+fn compile_row(e: &Expr, cols: &[(String, String)], multi: &[bool], params: &Params, subs: &InMemory) -> Result<ir::Expr> {
+    compile_with(e, params, &|x| at(slot(x, cols)), multi, Some(subs))
 }
 
 /// A slot as the column of rows in memory it is.
@@ -1343,49 +1082,13 @@ fn at(slot: Option<Result<u32>>) -> Option<Result<ir::Expr>> {
     slot.map(|r| r.map(ir::Expr::Output))
 }
 
-fn compile_all(es: &[Expr], cols: &[(String, String)], multi: &[bool], params: &Params) -> Result<Vec<ir::Expr>> {
-    es.iter().map(|e| compile_row(e, cols, multi, params)).collect()
+fn compile_all(es: &[Expr], cols: &[(String, String)], multi: &[bool], params: &Params, subs: &InMemory) -> Result<Vec<ir::Expr>> {
+    es.iter().map(|e| compile_row(e, cols, multi, params, subs)).collect()
 }
 
-/// A row in memory, as the evaluator reads it.
-fn reader(row: &[Value]) -> impl Fn(Ref) -> Result<Value> + '_ {
-    |r| match r {
-        Ref::Output(i) => Ok(row[i as usize].clone()),
-        r => Err(err(format!("{r:?} is not a column of rows in memory"))),
-    }
-}
-
-fn value(e: &ir::Expr, row: &[Value]) -> Result<Value> {
-    eval::eval(e, &reader(row))
-}
-
-/// Whether `row` passes every condition: UNKNOWN fails it, as FALSE does.
-fn pass_all(conds: &[ir::Expr], row: &[Value]) -> Result<bool> {
-    let read = reader(row);
-    for c in conds {
-        if !eval::holds(c, &read)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn filter_rows(mut j: Joined, conds: &[Expr], params: &Params) -> Result<Joined> {
-    if conds.is_empty() {
-        return Ok(j);
-    }
-    let conds = compile_all(conds, &j.cols, &j.multi, params)?;
-    let mut keep = Vec::with_capacity(j.rows.len());
-    for r in &j.rows {
-        keep.push(pass_all(&conds, r)?);
-    }
-    let mut it = keep.iter();
-    j.rows.retain(|_| *it.next().unwrap());
-    let mut it = keep.iter();
-    j.keys.retain(|_| *it.next().unwrap());
-    let mut it = keep.iter();
-    j.scores.retain(|_| *it.next().unwrap());
-    Ok(j)
+/// The value of an expression of no row.
+fn value(e: &ir::Expr) -> Result<Value> {
+    eval::eval(e, &|r| Err(err(format!("{r:?} is not a value of no row"))))
 }
 
 fn literal(v: &sql::Value, params: &Params) -> Result<Value> {
@@ -1406,10 +1109,15 @@ fn literal(v: &sql::Value, params: &Params) -> Result<Value> {
 /// as an empty list, as the executor compares it: `tags = 'a'` is FALSE
 /// there and `NOT (tags = 'a')` TRUE, not UNKNOWN.
 pub(crate) fn compile(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]) -> Result<ir::Expr> {
+    compile_with(e, params, slot, multi, None)
+}
+
+/// [`compile`], with the subqueries `subs` plans (over rows in memory).
+fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool], subs: Option<&InMemory>) -> Result<ir::Expr> {
     if let Some(x) = slot(e) {
         return x;
     }
-    let go = |x: &Expr| compile(x, params, slot, multi);
+    let go = |x: &Expr| compile_with(x, params, slot, multi, subs);
     let bx = |x: &Expr| go(x).map(Box::new);
     // An operand of a comparison.
     let listy = |x: &Expr| -> Result<Box<ir::Expr>> {
@@ -1424,6 +1132,10 @@ pub(crate) fn compile(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<
         }))
     };
     let not_if = |negated: bool, x: ir::Expr| if negated { ir::Expr::Not(Box::new(x)) } else { x };
+    let sub = |q: &sql::Query, kind: Sub| match subs {
+        Some(subs) => subs(q, kind),
+        None => Err(err(format!("a subquery is not supported here: {e}"))),
+    };
     Ok(match e {
         Expr::Nested(x) | Expr::UnaryOp { op: UnaryOperator::Plus, expr: x } => go(x)?,
         Expr::Value(v) => ir::Expr::Lit(literal(&v.value, params)?),
@@ -1464,6 +1176,9 @@ pub(crate) fn compile(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<
         }
         Expr::Between { expr, negated, low, high } => not_if(*negated, ir::Expr::Between { expr: listy(expr)?, lo: Some(bx(low)?), hi: Some(bx(high)?) }),
         Expr::InList { expr, list, negated } => not_if(*negated, ir::Expr::In { expr: listy(expr)?, list: list.iter().map(go).collect::<Result<_>>()? }),
+        Expr::InSubquery { expr, subquery, negated } => not_if(*negated, ir::Expr::In { expr: listy(expr)?, list: vec![sub(subquery, Sub::In)?] }),
+        Expr::Exists { subquery, negated } => not_if(*negated, sub(subquery, Sub::Exists)?),
+        Expr::Subquery(q) => sub(q, Sub::Scalar)?,
         Expr::Like { negated, any, expr, pattern, escape_char } | Expr::ILike { negated, any, expr, pattern, escape_char } => {
             if *any || escape_char.is_some() {
                 return Err(err(format!("unsupported expression: {e}")));
@@ -1532,191 +1247,145 @@ fn agg_calls(exprs: &[&Expr]) -> Result<Vec<AggCall>> {
     Ok(out)
 }
 
-/// WHERE (already applied), GROUP BY, HAVING, ORDER BY, OFFSET, LIMIT and
-/// the projection, over rows in memory.
-fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, limit: Option<usize>, params: &Params, joined: bool) -> Result<Rel> {
-    // The output columns.
-    let mut items: Vec<(String, Expr)> = Vec::new();
-    for item in &s.projection {
-        match item {
-            SelectItem::UnnamedExpr(e) => items.push((super::sql::name_of(e), e.clone())),
-            SelectItem::ExprWithAlias { expr, alias } => items.push((alias.value.clone(), expr.clone())),
-            SelectItem::Wildcard(_) => {
-                for (a, c) in j.cols.iter().filter(|(_, c)| c != "__score") {
-                    items.push((if joined { format!("{a}.{c}") } else { c.clone() }, qualified(a, c)));
+impl Planner<'_> {
+    /// WHERE (already applied), GROUP BY, HAVING, ORDER BY, OFFSET, LIMIT
+    /// and the projection, as operators over rows in memory. With `driver`
+    /// the rows come in the order asked for (the first table's scan's).
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate(&self, s: &sql::Select, input: ir::Node, cols: &[(String, String)], multi: &[bool], order: &[OrderKey], offset: usize, limit: Option<usize>, joined: bool, driver: bool) -> Result<Planned> {
+        let params = self.params;
+        let subs = |q: &sql::Query, kind: Sub| self.in_memory(q, kind);
+        // The output columns.
+        let mut items: Vec<(String, Expr)> = Vec::new();
+        for item in &s.projection {
+            match item {
+                SelectItem::UnnamedExpr(e) => items.push((super::sql::name_of(e), e.clone())),
+                SelectItem::ExprWithAlias { expr, alias } => items.push((alias.value.clone(), expr.clone())),
+                SelectItem::Wildcard(_) => {
+                    for (a, c) in cols.iter().filter(|(_, c)| c != "__score") {
+                        items.push((if joined { format!("{a}.{c}") } else { c.clone() }, qualified(a, c)));
+                    }
                 }
-            }
-            SelectItem::QualifiedWildcard(sql::SelectItemQualifiedWildcardKind::ObjectName(n), _) => {
-                let a = n.to_string().to_ascii_lowercase();
-                for (_, c) in j.cols.iter().filter(|(x, c)| *x == a && c != "__score") {
-                    items.push((format!("{a}.{c}"), qualified(&a, c)));
+                SelectItem::QualifiedWildcard(sql::SelectItemQualifiedWildcardKind::ObjectName(n), _) => {
+                    let a = n.to_string().to_ascii_lowercase();
+                    for (_, c) in cols.iter().filter(|(x, c)| *x == a && c != "__score") {
+                        items.push((format!("{a}.{c}"), qualified(&a, c)));
+                    }
                 }
-            }
-            i => return Err(err(format!("unsupported select item {i}"))),
-        }
-    }
-    // `score()`: the first ranked table's score.
-    let score_col = j.cols.iter().find(|(_, c)| c == "__score").map(|(a, _)| qualified(a, "__score"));
-    let fix_score = |e: &Expr| -> Result<Expr> {
-        match e {
-            Expr::Function(f) if fname(f) == "score" => score_col.clone().ok_or_else(|| err("score() needs ORDER BY a score (bm25, similarity, ppr, ...)")),
-            e => Ok(e.clone()),
-        }
-    };
-    for it in items.iter_mut() {
-        it.1 = fix_score(&it.1)?;
-    }
-    let group_exprs: Vec<Expr> = match &s.group_by {
-        sql::GroupByExpr::Expressions(es, _) => es
-            .iter()
-            .map(|e| match e {
-                // GROUP BY 1, or a selected column's alias.
-                Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => {
-                    let n: usize = e.to_string().parse().unwrap_or(0);
-                    items.get(n.wrapping_sub(1)).map(|i| i.1.clone()).ok_or_else(|| err(format!("GROUP BY {n}: no such column")))
-                }
-                Expr::Identifier(id) if slot(e, &j.cols).is_none_or(|r| r.is_err()) => {
-                    items.iter().find(|(n, _)| n.eq_ignore_ascii_case(&id.value)).map(|i| i.1.clone()).ok_or_else(|| err(format!("no such column: {e}")))
-                }
-                e => Ok(e.clone()),
-            })
-            .collect::<Result<_>>()?,
-        _ => return Err(err("GROUP BY ALL is not supported")),
-    };
-    let mut item_exprs: Vec<&Expr> = items.iter().map(|i| &i.1).collect();
-    item_exprs.extend(s.having.iter());
-    item_exprs.extend(order.iter().map(|o| &o.0));
-    let calls = agg_calls(&item_exprs)?;
-    let grouped = !group_exprs.is_empty() || !calls.is_empty();
-    let mut out: Vec<(Vec<Value>, Vec<Value>, Value, f64)> = Vec::new(); // row, sort keys, key, score
-    // ORDER BY an output column's name or number, or an expression over
-    // the input row.
-    let by_alias = |e: &Expr| -> Option<usize> {
-        match e {
-            Expr::Identifier(id) => items.iter().position(|(n, _)| n.eq_ignore_ascii_case(&id.value)),
-            Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => e.to_string().parse::<usize>().ok().filter(|n| (1..=items.len()).contains(n)).map(|n| n - 1),
-            _ => None,
-        }
-    };
-    let sort_keys = |slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<Vec<SortKey>> {
-        order.iter().map(|(e, _)| Ok(match by_alias(e) { Some(i) => SortKey::Item(i), None => SortKey::Expr(compile(e, params, slot, multi)?) })).collect()
-    };
-    let sort = |keys: &[SortKey], row: &[Value], input: &[Value]| -> Result<Vec<Value>> {
-        keys.iter().map(|k| match k { SortKey::Item(i) => Ok(row[*i].clone()), SortKey::Expr(e) => value(e, input) }).collect()
-    };
-    if grouped {
-        let mut groups: HashMap<Vec<Part>, (Vec<Value>, Vec<Acc>, usize)> = HashMap::new();
-        let mut order_seen: Vec<Vec<Part>> = Vec::new();
-        let projections: Vec<Projection> = calls.iter().map(|c| Projection::Agg { func: c.func.unwrap_or(AggFn::Count), field: 0 }).collect();
-        let group_at = compile_all(&group_exprs, &j.cols, &j.multi, params)?;
-        let args_at: Vec<Option<ir::Expr>> = calls.iter().map(|c| c.arg.as_ref().map(|a| compile_row(a, &j.cols, &j.multi, params)).transpose()).collect::<Result<_>>()?;
-        for r in &j.rows {
-            let vals: Vec<Value> = group_at.iter().map(|g| value(g, r)).collect::<Result<_>>()?;
-            let key: Vec<Part> = vals.iter().map(|v| if let Value::List(_) = v { Part::Str(format!("{v:?}")) } else { Part::of(v) }).collect();
-            let entry = groups.entry(key.clone()).or_insert_with(|| {
-                order_seen.push(key);
-                (vals, projections.iter().map(Acc::new).collect(), 0)
-            });
-            entry.2 += 1;
-            for (acc, arg) in entry.1.iter_mut().zip(&args_at) {
-                match arg {
-                    None => acc.add_row(),
-                    Some(a) => match value(a, r)? {
-                        Value::List(xs) => xs.iter().for_each(|x| {
-                            acc.add(x);
-                        }),
-                        v => {
-                            acc.add(&v);
-                        }
-                    },
-                }
+                i => return Err(err(format!("unsupported select item {i}"))),
             }
         }
-        if groups.is_empty() && group_exprs.is_empty() {
-            let k: Vec<Part> = Vec::new();
-            order_seen.push(k.clone());
-            groups.insert(k, (Vec::new(), projections.iter().map(Acc::new).collect(), 0));
+        // `score()`: the first ranked table's score.
+        let score_col = cols.iter().find(|(_, c)| c == "__score").map(|(a, _)| qualified(a, "__score"));
+        for it in items.iter_mut() {
+            if matches!(&it.1, Expr::Function(f) if fname(f) == "score") {
+                it.1 = score_col.clone().ok_or_else(|| err("score() needs ORDER BY a score (bm25, similarity, ppr, ...)"))?;
+            }
         }
-        // A group's row: its aggregates, then its group values.
-        let group_slot = |e: &Expr| -> Option<Result<ir::Expr>> {
-            if let Some(i) = calls.iter().position(|c| c.text == e.to_string()) {
-                return Some(Ok(ir::Expr::Output(i as u32)));
-            }
-            if let Some(i) = group_exprs.iter().position(|g| g.to_string() == e.to_string() || same_column(g, e, &j.cols)) {
-                return Some(Ok(ir::Expr::Output((calls.len() + i) as u32)));
-            }
+        let group_exprs: Vec<Expr> = match &s.group_by {
+            sql::GroupByExpr::Expressions(es, _) => es
+                .iter()
+                .map(|e| match e {
+                    // GROUP BY 1, or a selected column's alias.
+                    Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => {
+                        let n: usize = e.to_string().parse().unwrap_or(0);
+                        items.get(n.wrapping_sub(1)).map(|i| i.1.clone()).ok_or_else(|| err(format!("GROUP BY {n}: no such column")))
+                    }
+                    Expr::Identifier(id) if slot(e, cols).is_none_or(|r| r.is_err()) => {
+                        items.iter().find(|(n, _)| n.eq_ignore_ascii_case(&id.value)).map(|i| i.1.clone()).ok_or_else(|| err(format!("no such column: {e}")))
+                    }
+                    e => Ok(e.clone()),
+                })
+                .collect::<Result<_>>()?,
+            _ => return Err(err("GROUP BY ALL is not supported")),
+        };
+        let mut item_exprs: Vec<&Expr> = items.iter().map(|i| &i.1).collect();
+        item_exprs.extend(s.having.iter());
+        item_exprs.extend(order.iter().map(|o| &o.0));
+        let calls = agg_calls(&item_exprs)?;
+        let grouped = !group_exprs.is_empty() || !calls.is_empty();
+        // ORDER BY an output column's name or number, or an expression over
+        // the input row.
+        let by_alias = |e: &Expr| -> Option<usize> {
             match e {
-                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(Err(err(format!("{e} must be in GROUP BY or inside an aggregate")))),
+                Expr::Identifier(id) => items.iter().position(|(n, _)| n.eq_ignore_ascii_case(&id.value)),
+                Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => e.to_string().parse::<usize>().ok().filter(|n| (1..=items.len()).contains(n)).map(|n| n - 1),
                 _ => None,
             }
         };
-        let having = s.having.as_ref().map(|h| compile(&having_with_aliases(h, &items), params, &group_slot, &[])).transpose()?;
-        let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile(e, params, &group_slot, &[])).collect::<Result<_>>()?;
-        let keys = sort_keys(&group_slot, &[])?;
-        for key in order_seen {
-            let (vals, accs, rows) = &groups[&key];
-            let input: Vec<Value> = accs.iter().map(Acc::value).chain(vals.iter().cloned()).collect();
-            if let Some(h) = &having {
-                if !eval::holds(h, &reader(&input))? {
-                    continue;
+        let sort_keys = |items_at: &[ir::Expr], slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<Vec<ir::SortKey>> {
+            order
+                .iter()
+                .map(|(e, desc, nulls_first)| {
+                    let expr = match by_alias(e) {
+                        Some(i) => items_at[i].clone(),
+                        None => compile_with(e, params, slot, multi, Some(&subs))?,
+                    };
+                    Ok(ir::SortKey { expr, desc: *desc, nulls_first: *nulls_first })
+                })
+                .collect()
+        };
+        let mut node = input;
+        let items_at: Vec<ir::Expr> = if grouped {
+            // The Aggregate's rows: its group values, its aggregates, and
+            // the rows of each group, which order groups by default.
+            let k = group_exprs.len();
+            let keys = group_exprs.iter().map(|g| compile_row(g, cols, multi, params, &subs)).collect::<Result<Vec<_>>>()?;
+            let mut aggs: Vec<ir::Agg> = calls
+                .iter()
+                .map(|c| Ok(ir::Agg { func: c.func.unwrap_or(AggFn::Count), arg: c.arg.as_ref().map(|a| compile_row(a, cols, multi, params, &subs)).transpose()? }))
+                .collect::<Result<_>>()?;
+            aggs.push(ir::Agg { func: AggFn::Count, arg: None });
+            node = ir::Node::Aggregate { input: Box::new(node), keys, aggs };
+            let group_slot = |e: &Expr| -> Option<Result<ir::Expr>> {
+                if let Some(i) = calls.iter().position(|c| c.text == e.to_string()) {
+                    return Some(Ok(ir::Expr::Output((k + i) as u32)));
                 }
-            }
-            let row: Vec<Value> = items_at.iter().map(|e| value(e, &input)).collect::<Result<_>>()?;
-            let sort = sort(&keys, &row, &input)?;
-            // The group's rows stand in the score until the order is set.
-            out.push((row, sort, Value::Null, *rows as f64));
-        }
-    } else {
-        let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_row(e, &j.cols, &j.multi, params)).collect::<Result<_>>()?;
-        let keys = sort_keys(&|e| at(slot(e, &j.cols)), &j.multi)?;
-        for (i, r) in j.rows.iter().enumerate() {
-            let row: Vec<Value> = items_at.iter().map(|e| value(e, r)).collect::<Result<_>>()?;
-            let sort = sort(&keys, &row, r)?;
-            out.push((row, sort, j.keys[i].clone(), j.scores[i]));
-        }
-    }
-    if s.distinct.is_some() {
-        let mut seen = HashSet::new();
-        out.retain(|(row, ..)| seen.insert(row.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>()));
-    }
-    if !order.is_empty() {
-        out.sort_by(|a, b| {
-            for (i, (_, desc)) in order.iter().enumerate() {
-                let c = agg::cmp(&a.1[i], &b.1[i]);
-                let c = if *desc { c.reverse() } else { c };
-                if c != Ordering::Equal {
-                    return c;
+                if let Some(i) = group_exprs.iter().position(|g| g.to_string() == e.to_string() || same_column(g, e, cols)) {
+                    return Some(Ok(ir::Expr::Output(i as u32)));
                 }
+                match e {
+                    Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(Err(err(format!("{e} must be in GROUP BY or inside an aggregate")))),
+                    _ => None,
+                }
+            };
+            if let Some(h) = &s.having {
+                let cond = compile_with(&having_with_aliases(h, &items), params, &group_slot, &[], Some(&subs))?;
+                node = ir::Node::Filter { input: Box::new(node), cond };
             }
-            Ordering::Equal
-        });
-    } else if grouped {
-        // As the executor: the largest groups first, then by value.
-        out.sort_by(|a, b| b.3.total_cmp(&a.3).then_with(|| a.0.iter().zip(&b.0).map(|(x, y)| agg::cmp(x, y)).find(|c| c.is_ne()).unwrap_or(Ordering::Equal)));
+            let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_with(e, params, &group_slot, &[], Some(&subs))).collect::<Result<_>>()?;
+            let keys = match order.is_empty() {
+                false => sort_keys(&items_at, &group_slot, &[])?,
+                // As the executor: the largest groups first, then by value.
+                true => std::iter::once(ir::SortKey { expr: ir::Expr::Output((k + calls.len()) as u32), desc: true, nulls_first: false })
+                    .chain(items_at.iter().map(|x| ir::SortKey { expr: x.clone(), desc: false, nulls_first: true }))
+                    .collect(),
+            };
+            node = ir::Node::Sort { input: Box::new(node), keys };
+            items_at
+        } else {
+            let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_row(e, cols, multi, params, &subs)).collect::<Result<_>>()?;
+            if !order.is_empty() && !driver {
+                let keys = sort_keys(&items_at, &|e| at(slot(e, cols)), multi)?;
+                node = ir::Node::Sort { input: Box::new(node), keys };
+            }
+            items_at
+        };
+        let columns: Vec<String> = items.into_iter().map(|i| i.0).collect();
+        let project = |node: ir::Node| ir::Node::Project {
+            input: Box::new(node),
+            columns: columns.iter().zip(items_at).map(|(name, expr)| ir::Column { name: name.clone(), expr }).collect(),
+        };
+        let cut = |node: ir::Node| match (offset, limit) {
+            (0, None) => node,
+            (o, l) => ir::Node::Limit { input: Box::new(node), offset: o as u64, limit: l.map(|l| l as u64) },
+        };
+        let node = match s.distinct.is_some() {
+            true => cut(ir::Node::Distinct { input: Box::new(project(node)) }),
+            false => project(cut(node)),
+        };
+        Ok(Planned { node, columns, keyed: false })
     }
-    let out: Vec<_> = out.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).collect();
-    let n = out.len();
-    let mut rel = Rel { columns: items.into_iter().map(|i| i.0).collect(), rows: Vec::with_capacity(n), keys: None, scores: Vec::with_capacity(n) };
-    let mut keys = Vec::with_capacity(n);
-    for (row, _, k, sc) in out {
-        rel.rows.push(row);
-        keys.push(k);
-        rel.scores.push(sc);
-    }
-    if grouped {
-        rel.scores.clear();
-    }
-    // Rows of one table keep their keys, so a WITH of them filters the table.
-    if !joined && !grouped && keys.iter().all(|k| !matches!(k, Value::Null)) {
-        rel.keys = Some(keys);
-    }
-    Ok(rel)
-}
-
-/// An ORDER BY key: an output column, or an expression over the input row.
-enum SortKey {
-    Item(usize),
-    Expr(ir::Expr),
 }
 
 /// Whether `a` and `b` name the same column.
@@ -1769,7 +1438,7 @@ mod tests {
         let params = Params::new().set("min", Value::Int(i64::MIN)).set("n", Value::Null);
         let ev = |src: &str| {
             let e = sqlparser::parser::Parser::new(&sqlparser::dialect::GenericDialect {}).try_with_sql(src).unwrap().parse_expr().unwrap();
-            value(&compile(&e, &params, &|_| None, &[]).unwrap(), &[]).unwrap()
+            value(&compile(&e, &params, &|_| None, &[]).unwrap()).unwrap()
         };
         for (src, want) in [
             ("NULL = 1", Value::Null),

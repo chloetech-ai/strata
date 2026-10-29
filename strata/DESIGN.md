@@ -522,18 +522,17 @@ handing a query to its shards) are to make instead of writing SQL text.
   the statement for the shapes the executor runs: `Project [Limit]
   Search` and `Project [Limit] [Sort] [Filter] Aggregate Search`. A test
   takes every kind of statement the binder accepts through JSON and back
-  to the same bound statement. A compound query (`WITH`, a subquery, a
-  join, `SELECT DISTINCT`) runs as several queries and has no plan of its
-  own yet.
+  to the same bound statement. A compound query's plan has operators
+  over these shapes (below).
 * **Every query runs as a plan.** `Db::query`, `Db::sql` and the server
   bind a statement into its plan and run the plan, whose `Search` the
-  executor answers (each step of a compound query too). `Db::run` runs a
+  executor answers (each leaf of a compound query too). `Db::run` runs a
   plan made elsewhere, `POST /v1/plan` takes one as JSON, and Python has
   `Database.plan` and `run`. A plan made elsewhere is checked against the
   table's schema as the binder checks SQL. Going through the plan adds
   0.4 to 1.3 µs to a query whose binding takes 9 to 22 µs (cloud
-  container, 2026-10-29). A coordinator still takes SQL: its shards take
-  plans with the shard protocol.
+  container, 2026-10-29). A coordinator runs a read's plan, and sends
+  its shards a compound query's leaves as plans (below).
 * **One evaluator.** `ir::eval` gives an expression's value over a row,
   in SQL's three-valued logic: NULL is UNKNOWN, `AND` and `OR` are
   Kleene's, `NOT` of UNKNOWN is UNKNOWN, and a row or group is kept only
@@ -571,14 +570,37 @@ handing a query to its shards) are to make instead of writing SQL text.
   step as SQL, printed so that it parses back to the step's plan (a
   column named like a keyword quoted, the operand of a sign that starts
   with a sign in parentheses), and a test checks that it does.
+* **Operators.** A compound query (`WITH`, a subquery, a join,
+  `SELECT DISTINCT` over rows in memory) plans into one tree, which
+  `ops::run` runs: its leaves are single-table queries the executor
+  answers, and above them `Join` (a hash join, inner or left, on key
+  columns or along an `EDGES` field's links, with any other `ON`
+  condition after), `With` and `Ref` (named results), `Distinct`,
+  `KeyOrder` (rows in a `WITH` result's order) and `Project`, `Filter`,
+  `Sort`, `Limit` and `Aggregate` over rows in memory, all through the one
+  evaluator. A subquery is an expression of the condition it sits in
+  (`Values`, `Keys`, `Exists`, `Scalar`) and runs before its leaf, whose
+  filter then holds its values, so the leaf's indexes serve it. A join's
+  second side reads only the rows whose join values the first side holds;
+  under a `LIMIT` whose order is the first side's, scans of a growing
+  number of its rows stop once enough rows join. Each part holds at most
+  1,000,000 rows and counts against the query's memory budget. A plan
+  with operators needs the feature `operators`, so an older reader
+  refuses it by name. Rows sorted in memory put NULLs last unless
+  `NULLS FIRST`, as the executor does; they came first in an ascending
+  sort. A `SELECT DISTINCT` over rows of a `WITH` result kept every
+  distinct value and dropped its `LIMIT`; it keeps the `LIMIT` now. A
+  coordinator runs the operators and sends each leaf to its shards as its
+  plan (`QueryRequest.plan_json`, JSON until the shard protocol takes
+  typed plans), where it sent SQL text printed to parse back to the
+  leaf.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next, in order: a compound query as one plan, its joins, `WITH` and
-subqueries as operators in place of the compound-query code, then the
-Python builder, joins across tables, and plans as the shard protocol.
+Next, in order: the Python builder, joins across tables, and typed
+plans as the shard protocol.
 
 ## 7. Planning and execution
 

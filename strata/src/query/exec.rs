@@ -452,6 +452,12 @@ fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
 }
 
+/// A compound query's condition on a subquery reached the executor, which
+/// runs plans whose subqueries already ran ([`crate::query::ops`]).
+fn unresolved() -> Error {
+    err("a subquery's condition reached the executor before the subquery ran; run the query's plan with operators")
+}
+
 /// Keeps the rows of `v` that `better` puts among its first `k`, and every
 /// row tied with the `k`-th (all of them when `k` is 0 or `v` has no more).
 fn keep_best<T: Copy>(v: &mut Vec<T>, k: usize, better: impl Fn(&T, &T) -> std::cmp::Ordering) {
@@ -832,6 +838,7 @@ impl<'a> Executor<'a> {
             },
             Pred::In { field, values } => self.materialize_in(s, *field, values)?,
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
+            Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => self.materialize(s, c)?.complement(),
             Pred::Or(cs) => {
                 let mut acc = DocSet::empty(n);
@@ -916,6 +923,7 @@ impl<'a> Executor<'a> {
                 }
             },
             Pred::Graph { id } => ProbeNode::Leaf(Box::new(self.graph_set(*id, s.ord, s.r.n_docs))),
+            Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => ProbeNode::Not(Box::new(self.compile_probe(s, c)?)),
             Pred::Or(cs) => ProbeNode::Or(cs.iter().map(|c| self.compile_probe(s, c)).collect::<Result<_>>()?),
             Pred::And(cs) => {

@@ -36,6 +36,12 @@ pub enum Pred {
     /// Membership in the result of `Select::graphs[id]` (`REACHABLE`,
     /// `PATH`), computed before the rest of the query.
     Graph { id: usize },
+    /// A condition on a subquery's rows (`IN (SELECT ...)`, `EXISTS`, a
+    /// comparison with a scalar subquery), as the plan expression the
+    /// subquery's plan sits in. A compound query's binder makes it
+    /// ([`crate::query::compound`]); its plan runs the subquery first and
+    /// hands the executor the condition on its values, never this.
+    Sub(Box<crate::query::ir::Expr>),
 }
 
 /// How a full-text search widens its words (`MATCH(.., synonyms => 1,
@@ -115,6 +121,10 @@ pub enum Seeds {
     /// The rows of a subquery over the same table (with their scores, which
     /// `ppr(..., weighted => 1)` uses as restart weights).
     Query(Box<Select>),
+    /// The keys or values of a compound subquery's plan
+    /// ([`crate::query::ir::Expr::Keys`], [`crate::query::ir::Expr::Values`]),
+    /// which runs first: like [`Pred::Sub`], never the executor's.
+    Plan(Box<crate::query::ir::Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

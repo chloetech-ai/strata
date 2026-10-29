@@ -452,6 +452,12 @@ fn coerce(field: &Field, v: Value) -> Result<Value> {
     }
 }
 
+/// A value compared with `field` in its type, as a condition reads it
+/// ([`coerce`]): a subquery's values, which [`crate::query::ops`] runs.
+pub(crate) fn coerced(field: &Field, v: Value) -> Result<Value> {
+    coerce(field, v)
+}
+
 /// The value an expression gives `field` in `SET` ([`Assign::Expr`]), in
 /// the form its column holds: [`coerce`]d, a whole FLOAT as an INT, and
 /// one value as a multi-valued field's list of it.
@@ -512,9 +518,44 @@ pub(crate) fn bind_query(q: &sql::Query, schema: &Schema, params: &Params) -> Re
     Binder::new(schema, params).query(q)
 }
 
+/// Where a subquery sits in a compound query's SELECT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sub {
+    /// `x IN (SELECT ...)`: its one column's values.
+    In,
+    /// `EXISTS (SELECT ...)`.
+    Exists,
+    /// `x < (SELECT ...)`, or a bound of `BETWEEN`: its one value.
+    Scalar,
+    /// A traversal's seeds: its rows' keys.
+    Seeds,
+}
+
+/// Plans a subquery for the binder ([`bind_query_with`]): the expression
+/// it stands for, or for seeds `None` when the executor runs it itself.
+pub(crate) type Subs<'s> = dyn Fn(&sql::Query, Sub) -> Result<Option<ir::Expr>> + 's;
+
+/// [`bind_query`] of a compound query's SELECT, whose subqueries in
+/// conditions and seeds `subs` plans: they bind as [`Pred::Sub`] and
+/// [`Seeds::Plan`], which its plan runs first.
+pub(crate) fn bind_query_with(q: &sql::Query, schema: &Schema, params: &Params, subs: &Subs) -> Result<Select> {
+    Binder { subs: Some(subs), ..Binder::new(schema, params) }.query(q)
+}
+
+/// The query of `(SELECT ...)`, in parentheses or not.
+fn subquery_of(e: &Expr) -> Option<&sql::Query> {
+    match e {
+        Expr::Subquery(q) => Some(q),
+        Expr::Nested(x) => subquery_of(x),
+        _ => None,
+    }
+}
+
 struct Binder<'a> {
     schema: &'a Schema,
     params: &'a Params,
+    /// A compound query's subqueries ([`bind_query_with`]).
+    subs: Option<&'a Subs<'a>>,
     /// Graph computations bound so far (`Select::graphs`).
     graphs: RefCell<Vec<GraphQuery>>,
     /// The statement's time, in microseconds since the epoch: `now()` in
@@ -524,7 +565,13 @@ struct Binder<'a> {
 
 impl<'a> Binder<'a> {
     fn new(schema: &'a Schema, params: &'a Params) -> Self {
-        Binder { schema, params, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now() }
+        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now() }
+    }
+
+    /// The expression a compound query's subquery stands for.
+    fn sub(&self, q: &sql::Query, kind: Sub) -> Result<ir::Expr> {
+        let subs = self.subs.ok_or_else(|| err("a subquery runs as a compound query (Db::query), not in one SELECT"))?;
+        subs(q, kind)?.ok_or_else(|| err("the subquery has no plan"))
     }
 
     fn query(&self, q: &sql::Query) -> Result<Select> {
@@ -757,7 +804,12 @@ impl<'a> Binder<'a> {
     /// Seeds: a key, a parameter, a tuple or array of keys, or a subquery.
     fn seeds(&self, e: &Expr) -> Result<Seeds> {
         match e {
-            Expr::Subquery(q) => Ok(Seeds::Query(Box::new(Binder::new(self.schema, self.params).query(q)?))),
+            Expr::Subquery(q) => {
+                if let Some(e) = self.subs.map(|subs| subs(q, Sub::Seeds)).transpose()?.flatten() {
+                    return Ok(Seeds::Plan(Box::new(e)));
+                }
+                Ok(Seeds::Query(Box::new(Binder { subs: self.subs, ..Binder::new(self.schema, self.params) }.query(q)?)))
+            }
             Expr::Nested(inner) => self.seeds(inner),
             Expr::Tuple(items) => Ok(Seeds::Keys(items.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
             Expr::Array(a) => Ok(Seeds::Keys(a.elem.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
@@ -1170,7 +1222,29 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => Pred::And(vec![self.pred(left)?, self.pred(right)?]),
             Expr::BinaryOp { left, op: BinaryOperator::Or, right } => Pred::Or(vec![self.pred(left)?, self.pred(right)?]),
             Expr::UnaryOp { op: sql::UnaryOperator::Not, expr } => Pred::Not(Box::new(self.pred(expr)?)),
+            Expr::BinaryOp { left, op, right } if self.subs.is_some() && (subquery_of(left).is_some() || subquery_of(right).is_some()) => self.sub_comparison(left, op, right)?,
             Expr::BinaryOp { left, op, right } => self.comparison(left, op, right)?,
+            Expr::Between { expr, negated, low, high } if self.subs.is_some() && (subquery_of(low).is_some() || subquery_of(high).is_some()) => {
+                let f = self.numeric_field(expr)?;
+                let bound = |b: &Expr| match subquery_of(b) {
+                    Some(q) => self.sub(q, Sub::Scalar),
+                    None => Ok(ir::Expr::Lit(self.literal(b)?)),
+                };
+                let p = Pred::Sub(Box::new(ir::Expr::Between { expr: Box::new(ir::Expr::Field(f as u32)), lo: Some(Box::new(bound(low)?)), hi: Some(Box::new(bound(high)?)) }));
+                if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
+            Expr::InSubquery { expr, subquery, negated } if self.subs.is_some() => {
+                let f = self.field_of(expr)?;
+                if matches!(self.schema.fields[f].ty, FieldType::Edges | FieldType::Text { .. } | FieldType::Vector { .. } | FieldType::Sparse) {
+                    return Err(err(format!("IN compares KEYWORD, INT and FLOAT fields, not {}", self.schema.fields[f].name)));
+                }
+                let p = Pred::Sub(Box::new(ir::Expr::In { expr: Box::new(ir::Expr::Field(f as u32)), list: vec![self.sub(subquery, Sub::In)?] }));
+                if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
+            Expr::Exists { subquery, negated } if self.subs.is_some() => {
+                let p = Pred::Sub(Box::new(self.sub(subquery, Sub::Exists)?));
+                if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
             Expr::Between { expr, negated, low, high } => {
                 let f = self.numeric_field(expr)?;
                 let p = if self.schema.fields[f].ty == FieldType::Int {
@@ -1240,6 +1314,41 @@ impl<'a> Binder<'a> {
             }
             _ => return Err(err(format!("unsupported predicate: {e}"))),
         })
+    }
+
+    /// `field op (SELECT ...)`, or the other way round.
+    fn sub_comparison(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Result<Pred> {
+        use BinaryOperator::*;
+        let (field_e, q, op) = match (subquery_of(left), subquery_of(right)) {
+            (_, Some(q)) => (left, q, op.clone()),
+            (Some(q), None) => {
+                let flipped = match op {
+                    Lt => Gt,
+                    LtEq => GtEq,
+                    Gt => Lt,
+                    GtEq => LtEq,
+                    o => o.clone(),
+                };
+                (right, q, flipped)
+            }
+            (None, None) => unreachable!("a side is a subquery"),
+        };
+        let f = self.field_of(field_e).map_err(|_| err(format!("a scalar subquery compares with a field, not {field_e}")))?;
+        let op = match op {
+            Eq => ir::CmpOp::Eq,
+            NotEq => ir::CmpOp::Ne,
+            Lt => ir::CmpOp::Lt,
+            LtEq => ir::CmpOp::Le,
+            Gt => ir::CmpOp::Gt,
+            GtEq => ir::CmpOp::Ge,
+            o => return Err(err(format!("unsupported operator {o}"))),
+        };
+        match self.schema.fields[f].ty {
+            FieldType::Keyword if !matches!(op, ir::CmpOp::Eq | ir::CmpOp::Ne) => return Err(err("keyword fields support =, != and IN")),
+            FieldType::Keyword | FieldType::Int | FieldType::Float => {}
+            _ => return Err(err(format!("cannot compare field {}", self.schema.fields[f].name))),
+        }
+        Ok(Pred::Sub(Box::new(ir::Expr::Cmp { op, left: Box::new(ir::Expr::Field(f as u32)), right: Box::new(self.sub(q, Sub::Scalar)?) })))
     }
 
     fn comparison(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Result<Pred> {
@@ -1373,6 +1482,7 @@ impl<'a> Binder<'a> {
                 Err(err(format!("{} is a column, and a value is expected here (a string is quoted: '{}')", id.value, id.value)))
             }
             Expr::Identifier(id) => Err(err(format!("no such column: {} (a string is quoted: '{}')", id.value, id.value))),
+            Expr::Subquery(_) => Err(err(format!("{e}: a subquery works in a condition (IN, EXISTS, a comparison with a field) or as graph seeds, not as a value here"))),
             _ => Err(err(format!("expected a literal or parameter, got {e}"))),
         }
     }
