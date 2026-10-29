@@ -1108,3 +1108,96 @@ async fn admin_routes_checkpoint_check_and_vacuum() {
     let (status, r) = post(&c, &format!("{base}/v1/admin/checkpoint"), json!({"name": "x"})).await;
     assert_eq!(status, 400, "{r}");
 }
+
+/// BOOL and TIMESTAMP fields answer as JSON booleans and ISO 8601 text,
+/// take them as parameters and in writes, and come back the same from a
+/// coordinator over shards reached by gRPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn bool_and_timestamp_fields_over_http_and_grpc() {
+    use strata::schema::{Field, FieldType, Schema};
+    let schema = Schema::new("tasks", vec![Field::new("id", FieldType::Keyword), Field::boolean("done"), Field::timestamp("at"), Field::new("n", FieldType::Int)], Some("id")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let docs: Vec<Vec<Value>> = (0..40i64)
+        .map(|i| {
+            let done = if i % 4 == 3 { Value::Null } else { Value::Bool(i % 2 == 0) };
+            vec![Value::Str(format!("t{i:02}")), done, Value::Str(format!("2026-10-{:02}T{:02}:00:00Z", 1 + i % 28, i % 24)), Value::Int(i)]
+        })
+        .collect();
+    let open = |name: &str, keep: &dyn Fn(&Value) -> bool| {
+        let opts = DbOptions { publish_snapshots: true, ..DbOptions::default() };
+        let db = Db::create(&dir.path().join(name), schema.clone(), opts).unwrap();
+        db.load(docs.iter().filter(|d| keep(&d[0])).cloned()).unwrap();
+        db
+    };
+    let svc = |db: Db| Arc::new(Service::new(Backend::Local(Arc::new(db)), schema.clone(), agent_config("http://unused"), 16, Duration::from_secs(10)));
+
+    let base = http(svc(open("whole.strata", &|_| true)), None).await;
+    let c = reqwest::Client::new();
+    let (query_url, write_url) = (format!("{base}/v1/query"), format!("{base}/v1/write"));
+    let query = |sql: &str, params: Json| post(&c, &query_url, json!({"sql": sql, "params": params}));
+    let (status, r) = query("SELECT id, done, at FROM tasks WHERE done = :d AND at >= :since ORDER BY n LIMIT 2", json!({"d": true, "since": "2026-10-20"})).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["rows"], json!([["t20", true, "2026-10-21T20:00:00Z"], ["t22", true, "2026-10-23T22:00:00Z"]]));
+    let (_, r) = query("SELECT done, COUNT(*), MIN(at) FROM tasks WHERE done IS NOT NULL GROUP BY done", json!({})).await;
+    let mut groups = r["rows"].as_array().unwrap().clone();
+    groups.sort_by_key(|g| g[0].as_bool());
+    assert_eq!(groups, [json!([false, 10, "2026-10-02T01:00:00Z"]), json!([true, 20, "2026-10-01T00:00:00Z"])]);
+
+    // Writes take booleans and ISO 8601 text, and refuse what is neither.
+    let write = |ops: Json| post(&c, &write_url, json!({"ops": ops}));
+    let (status, r) = write(json!([
+        {"op": "insert", "doc": {"id": "x1", "done": true, "at": "2026-11-01T02:00:00+02:00", "n": 100}},
+        {"op": "set", "key": "x1", "field": "done", "value": false},
+        {"op": "set", "key": "t00", "field": "at", "value": "2026-12-24"},
+    ]))
+    .await;
+    assert_eq!((status, &r["written"]), (200, &json!(3)), "{r}");
+    let (_, r) = query("SELECT id, done, at FROM tasks WHERE id IN ('x1', 't00') ORDER BY n", json!({})).await;
+    assert_eq!(r["rows"], json!([["t00", true, "2026-12-24T00:00:00Z"], ["x1", false, "2026-11-01T00:00:00Z"]]));
+    for bad in [json!({"op": "insert", "doc": {"id": "x2", "at": 1790812800}}), json!({"op": "set", "key": "x1", "field": "done", "value": 3}), json!({"op": "add", "key": "x1", "field": "at", "value": 1})] {
+        let (status, r) = write(json!([bad])).await;
+        assert_eq!(status, 400, "{bad}: {r}");
+    }
+    let (status, r) = post(&c, &format!("{base}/v1/sql"), json!({"sql": "UPDATE tasks SET done = TRUE, at = '2026-11-02' WHERE id = 'x1'"})).await;
+    assert_eq!((status, &r["written"]), (200, &json!(1)), "{r}");
+    let (_, r) = query("SELECT done, at FROM tasks WHERE id = 'x1'", json!({})).await;
+    assert_eq!(r["rows"], json!([[true, "2026-11-02T00:00:00Z"]]));
+
+    // A coordinator over two shards answers like the whole database, and
+    // its shards carry the stored integers between them.
+    let whole = open("whole2.strata", &|_| true);
+    let mut urls = Vec::new();
+    for s in 0..2 {
+        urls.push(grpc(svc(open(&format!("s{s}.strata"), &|k| shard_of(k, 2) == s))).await);
+    }
+    let coord = Coordinator::connect(urls).await.unwrap();
+    let coord = Arc::new(Service::new(Backend::Cluster(Arc::new(coord)), schema.clone(), agent_config("http://unused"), 16, Duration::from_secs(10)));
+    for sql in [
+        "SELECT done, COUNT(*), MIN(at), MAX(at) FROM tasks GROUP BY done",
+        "SELECT id, done, at FROM tasks WHERE at < '2026-10-10' ORDER BY at DESC LIMIT 5",
+        "SELECT id, done, at FROM tasks WHERE done IS NOT TRUE AND at >= '2026-10-03T12:00:00+02:00' ORDER BY n LIMIT 6",
+    ] {
+        let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
+        let got = js::result(&coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap().rs, 0.0);
+        let sorted = |j: &Json| {
+            let mut rows = j["rows"].as_array().unwrap().clone();
+            if sql.contains("GROUP BY") {
+                rows.sort_by_key(|r| r.to_string());
+            }
+            rows
+        };
+        assert_eq!(sorted(&want), sorted(&got), "{sql}");
+        let values: Vec<Json> = sorted(&got).iter().flat_map(|r| r.as_array().unwrap().clone()).collect();
+        assert!(values.iter().any(Json::is_boolean) && values.iter().any(|v| v.as_str().is_some_and(|s| s.ends_with('Z'))), "{sql}: {got}");
+    }
+    // A parameter of each type reaches the shards.
+    let params = coord.params(Some(&json!({"d": false, "since": "2026-10-25"}))).await.unwrap();
+    let got = coord.query(QueryReq { sql: "SELECT id FROM tasks WHERE done = :d AND at >= :since ORDER BY n".into(), params, ..Default::default() }).await.unwrap();
+    let want = whole.query("SELECT id FROM tasks WHERE done = FALSE AND at >= '2026-10-25' ORDER BY n", &Params::new()).unwrap();
+    assert_eq!(got.rs.rows, want.rows);
+    assert!(!want.rows.is_empty());
+    // An INSERT through the coordinator reaches its key's shard as written.
+    coord.sql("INSERT INTO tasks (id, done, at, n) VALUES ('y1', TRUE, '2026-10-31T23:59:59.5-03:00', 200)", &Params::new(), 0).await.unwrap();
+    let got = coord.query(QueryReq { sql: "SELECT done, at FROM tasks WHERE id = 'y1'".into(), ..Default::default() }).await.unwrap();
+    assert_eq!(js::result(&got.rs, 0.0)["rows"], json!([[true, "2026-11-01T02:59:59.500Z"]]));
+}

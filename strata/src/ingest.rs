@@ -5,7 +5,9 @@
 //! CSV record under a header naming the fields. Formats: JSON Lines (one
 //! object a line), a JSON array of objects, CSV and TSV. In CSV an empty
 //! cell is null, a vector or a list is a JSON array (a list may also be
-//! values separated by `|`), and a SPARSE value a JSON object.
+//! values separated by `|`), and a SPARSE value a JSON object. A BOOL is
+//! `true`, `false`, 1 or 0 (in CSV also `t` and `f`), a TIMESTAMP ISO
+//! 8601 text ([`crate::timestamp`]).
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read};
@@ -15,7 +17,7 @@ use serde_json::Value as Json;
 
 use crate::db::Db;
 use crate::error::{Error, Result};
-use crate::schema::{FieldType, Schema};
+use crate::schema::{FieldType, Logical, Schema};
 use crate::value::{Document, Value};
 
 /// The value of field `f` from JSON. An array is a vector for a VECTOR
@@ -26,6 +28,16 @@ pub fn value(schema: &Schema, f: usize, j: &Json) -> Result<Value> {
     let bad = || Error::Schema(format!("bad value for {}: {}", field.name, short(j)));
     if j.is_null() {
         return Ok(Value::Null);
+    }
+    if let Some(l) = field.logical {
+        // A BOOL is true, false, 1, 0 or such text; a TIMESTAMP is text.
+        let v = match (l, j) {
+            (Logical::Bool, Json::Bool(b)) => Value::Bool(*b),
+            (Logical::Bool, Json::Number(n)) => Value::Int(n.as_i64().ok_or_else(bad)?),
+            (_, Json::String(s)) => Value::Str(s.clone()),
+            _ => return Err(Error::Schema(format!("bad value for {}: {} ({})", field.name, short(j), l.expects()))),
+        };
+        return field.store(v);
     }
     if field.multi {
         let items = match j {
@@ -99,6 +111,9 @@ pub fn cell(schema: &Schema, f: usize, s: &str) -> Result<Value> {
     if field.multi {
         let j = if t.starts_with('[') { json(t)? } else { Json::Array(t.split('|').map(|x| Json::String(x.trim().to_string())).collect()) };
         return value(schema, f, &j);
+    }
+    if field.logical.is_some() {
+        return field.store(Value::Str(t.to_string()));
     }
     Ok(match &field.ty {
         FieldType::Int => Value::Int(t.parse().map_err(|_| bad())?),

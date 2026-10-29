@@ -13,6 +13,9 @@
 //!   normalised over the merged candidates as one database would;
 //! * facet groups and counts by summing.
 //!
+//! Shards answer with BOOL and TIMESTAMP values as the integers stored,
+//! which the merged answer gives as such ([`Select::typed`]).
+//!
 //! When the shards hold the same segments as one database would, the
 //! merged answer is that database's: the same keys in the same order, and
 //! the same scores up to floating-point rounding. Rows that tie exactly may
@@ -56,7 +59,9 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         for s in &shards {
             groups.merge_rows(&s.rows, q.group_by.len(), &needed)?;
         }
-        return Ok(empty(agg::finish(q, groups, &needed), stats));
+        let mut rows = agg::finish(q, groups, &needed);
+        q.typed(&mut rows);
+        return Ok(empty(rows, stats));
     }
     if q.projection.iter().any(|(_, p)| *p == Projection::Count) {
         let n: i64 = shards.iter().filter_map(|s| s.rows.first().and_then(|r| r.first()).and_then(|v| v.as_i64())).sum();
@@ -106,6 +111,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         out.scores.push(r.score);
         out.rows.push(r.values);
     }
+    q.typed(&mut out.rows);
     Ok(out)
 }
 

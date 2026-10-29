@@ -27,6 +27,9 @@ def _default(o: Any) -> Any:
     # numpy arrays and scalars
     if hasattr(o, "tolist"):
         return o.tolist()
+    # datetimes and dates, as a TIMESTAMP's ISO 8601 text (naive is UTC)
+    if hasattr(o, "isoformat") and hasattr(o, "year"):
+        return o.isoformat()
     raise TypeError(f"cannot send a {type(o).__name__}")
 
 

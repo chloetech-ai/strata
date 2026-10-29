@@ -24,6 +24,8 @@ pub fn value_json(v: &Value, max_dims: Option<usize>) -> Json {
             json!({"dim": v.len(), "values": v[..n].to_vec()})
         }
         Value::List(xs) => Json::Array(xs.iter().map(|x| value_json(x, max_dims)).collect()),
+        Value::Bool(b) => json!(b),
+        Value::Timestamp(t) => json!(strata::timestamp::format(*t)),
     }
 }
 

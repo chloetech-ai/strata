@@ -70,7 +70,7 @@ A database file can be open in one process at a time. Within that process, threa
 
 ## Writing
 
-Rows are dicts of field name to value: `str`, `int`, `float`, `None`, a list for a `multi` field, a list of floats or a numpy array for a vector, a dict of term weights for a `sparse` field. A field the schema does not have is an error.
+Rows are dicts of field name to value: `str`, `int`, `float`, `None`, `bool` for a `bool` field, a `datetime` or `date` (or ISO 8601 text) for a `timestamp` field, a list for a `multi` field, a list of floats or a numpy array for a vector, a dict of term weights for a `sparse` field. A naive `datetime` is taken as UTC. A field the schema does not have is an error. Results give a `bool` field's values as `bool` and a `timestamp` field's as ISO 8601 text in UTC (`"2026-10-01T12:30:00Z"`), in-process and from the client alike; `datetime.fromisoformat` reads them.
 
 | method | what it does |
 |---|---|

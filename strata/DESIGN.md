@@ -150,6 +150,22 @@ need no table.
   directory with an error about its manifest. Dropping back to the first
   table writes format 1 again, into both meta slots (older versions check
   both), and older versions open the file again.
+* **Format 3 and features.** Format 3 is format 2 with the features the
+  database uses: `{format: 3, features: {required: [...]}, ...}`. A version
+  is written in format 3 only while a table uses a feature (a `BOOL` or
+  `TIMESTAMP` field is `"bool"` or `"timestamp"`), and falls back to 2 or 1,
+  in both meta slots, when the last one goes. A reader refuses a manifest
+  that requires a feature it does not know, naming the feature, and ignores
+  an `optional` list and other keys it does not know. Format 3 is the last
+  format number: versions from before it refuse it as newer, and every
+  later change that an older reader must not ignore is a feature.
+* **BOOL and TIMESTAMP** are logical types over an `INT` column (1 and 0;
+  microseconds since the epoch in UTC), so every index, zone map, merge and
+  shard message handles them as integers. Values are typed only at the
+  edges: writes turn booleans and ISO 8601 text into the integers
+  (`Field::store`), and a query's answer turns the integers of its
+  columns back (`Select::types`, applied by the executor and, for shards,
+  by `cluster::merge` after merging, so shards exchange integers).
 * **WAL.** Records carry no table while they write the first one; a `TABLE`
   record switches the table for the records after it in the transaction. A
   one-table WAL is therefore byte for byte what it was.
@@ -185,9 +201,9 @@ need no table.
 * **Later format changes.** Readers refuse a newer format number in a meta
   slot, `CURRENT` or a manifest, but ignore keys they do not know inside a
   schema. So a change that an older version must not ignore (stable field
-  ids, a schema id per segment, a field's analyzer, new value types) comes
-  with a new format number, written only by files that use it, as format 2
-  is written only by files with several tables.
+  ids, a schema id per segment, a field's analyzer, new value types) is a
+  required feature of format 3, recorded only by files that use it, as
+  format 2 is written only by files with several tables.
 
 ## 4. Segments
 

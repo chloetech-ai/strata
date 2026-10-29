@@ -975,6 +975,8 @@ impl Daemon {
                     }
                     strata::Value::Vector(v) => format!("vector({})", v.len()),
                     strata::Value::List(xs) => format!("list({})", xs.len()),
+                    strata::Value::Bool(b) => b.to_string(),
+                    strata::Value::Timestamp(t) => strata::timestamp::format(*t),
                 })
                 .collect();
             text += &cells.join(" | ");

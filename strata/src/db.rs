@@ -642,10 +642,11 @@ impl Db {
         let docs: Vec<Document> = docs
             .into_iter()
             .map(|mut d| {
+                crate::value::conform(schema, &mut d)?;
                 schema.fill_generated(&mut d);
-                d
+                Ok(d)
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let image = crate::segment::build::build_segment(schema, &docs, opts)?;
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(dest)?;
         std::io::Write::write_all(&mut f, &image)?;

@@ -32,7 +32,7 @@ use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArg
 use crate::error::{Error, Result};
 use crate::query::ddl;
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
-use crate::schema::{FieldType, Schema};
+use crate::schema::{FieldType, Logical, Schema};
 use crate::storage::DropOptions;
 use crate::value::Value;
 
@@ -496,7 +496,8 @@ impl<'a> Binder<'a> {
             }
         };
         let graphs = self.graphs.take();
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs })
+        let types = projection.iter().map(|(_, p)| self.typed_source(p).and_then(|f| self.schema.fields[f].logical)).collect();
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs, types })
     }
 
     /// The graph predicate `hops()` refers to: the first REACHABLE or PATH.
@@ -729,6 +730,9 @@ impl<'a> Binder<'a> {
             _ => AggFn::Max,
         };
         match func {
+            AggFn::Sum | AggFn::Avg if fld.logical == Some(Logical::Timestamp) => {
+                return Err(err(format!("{}({}): times do not add up; a TIMESTAMP takes MIN, MAX and COUNT", name.to_uppercase(), fld.name)))
+            }
             AggFn::Sum | AggFn::Avg if !numeric => return Err(err(format!("{}({}): not a numeric field", name.to_uppercase(), fld.name))),
             AggFn::Min | AggFn::Max | AggFn::CountDistinct if !(numeric || fld.ty == FieldType::Keyword) => {
                 return Err(err(format!("{}({}): needs a KEYWORD, INT or FLOAT field", name.to_uppercase(), fld.name)))
@@ -784,7 +788,8 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: Or, right } => Having::Or(vec![self.having(left, proj, group)?, self.having(right, proj, group)?]),
             Expr::UnaryOp { op: sql::UnaryOperator::Not, expr } => Having::Not(Box::new(self.having(expr, proj, group)?)),
             Expr::Between { expr, negated, low, high } => {
-                let h = Having::Range { what: self.group_value(expr, proj, group)?, lo: self.num_lit(low)?, hi: self.num_lit(high)? };
+                let what = self.group_value(expr, proj, group)?;
+                let h = Having::Range { lo: self.having_bound(&what, low)?, hi: self.having_bound(&what, high)?, what };
                 if *negated { Having::Not(Box::new(h)) } else { h }
             }
             Expr::BinaryOp { left, op, right } => {
@@ -801,7 +806,10 @@ impl<'a> Binder<'a> {
                         (self.group_value(right, proj, group)?, left, flipped)
                     }
                 };
-                let v = self.literal(lit)?;
+                let v = match self.typed_source(&what) {
+                    Some(f) => self.coerce(f, self.literal(lit)?)?,
+                    None => self.literal(lit)?,
+                };
                 let Some(x) = v.as_f64() else {
                     return match op {
                         Eq => Ok(Having::Eq { what, value: v }),
@@ -823,6 +831,24 @@ impl<'a> Binder<'a> {
             }
             _ => return Err(err(format!("unsupported HAVING condition: {e}"))),
         })
+    }
+
+    /// The BOOL or TIMESTAMP field whose values a group value or aggregate
+    /// holds: the field itself, or its MIN or MAX.
+    fn typed_source(&self, p: &Projection) -> Option<usize> {
+        match p {
+            Projection::Field(f) | Projection::Agg { func: AggFn::Min | AggFn::Max, field: f } => Some(*f).filter(|&f| self.schema.fields[f].logical.is_some()),
+            _ => None,
+        }
+    }
+
+    /// A bound of `BETWEEN` in HAVING: a number, or a value of the type of
+    /// a BOOL or TIMESTAMP field (as its stored integer).
+    fn having_bound(&self, what: &Projection, e: &Expr) -> Result<f64> {
+        match self.typed_source(what) {
+            Some(f) => Ok(self.field_value(f, e)?.as_f64().unwrap_or(f64::NAN)),
+            None => self.num_lit(e),
+        }
     }
 
     fn order(&self, e: &Expr, desc: bool, proj: &[(String, Projection)]) -> Result<OrderBy> {
@@ -966,7 +992,8 @@ impl<'a> Binder<'a> {
 
     /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
     /// 'exp' | 'gauss' | 'linear')`; the origin may be `now()` (seconds
-    /// since the Unix epoch).
+    /// since the Unix epoch). On a TIMESTAMP field the origin is `now()` or
+    /// a time, and the scale and offset are seconds.
     fn decay(&self, f: &sql::Function) -> Result<Score> {
         let (args, opts) = self.args(f)?;
         let usage = "decay(field, origin, scale, offset => .., decay => .., shape => 'exp' | 'gauss' | 'linear')";
@@ -975,17 +1002,22 @@ impl<'a> Binder<'a> {
         if self.schema.fields[field].multi {
             return Err(err(format!("cannot decay multi-valued field {}", self.schema.fields[field].name)));
         }
-        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        // A TIMESTAMP's origin is a time, and its scale and offset are
+        // seconds, as now() is for a number.
+        let time = self.schema.fields[field].logical == Some(Logical::Timestamp);
+        let unit = if time { 1e6 } else { 1.0 };
+        let now = || crate::timestamp::now() as f64 / 1e6 * unit;
         let origin = match origin {
             Expr::Function(g) if fname(g) == "now" => now(),
             e => match self.literal(e)? {
                 Value::Str(s) if s.eq_ignore_ascii_case("now") => now(),
+                v if time => self.coerce(field, v)?.as_f64().unwrap_or(0.0),
                 v => v.as_f64().ok_or_else(|| err("decay origin must be a number or now()"))?,
             },
         };
-        let scale = self.num_lit(scale)?;
+        let scale = self.num_lit(scale)? * unit;
         let num = |k: &str, d: f64| opts.get(k).map_or(Ok(d), |v| v.as_f64().ok_or_else(|| err(format!("decay {k} must be a number"))));
-        let (offset, decay) = (num("offset", 0.0)?, num("decay", 0.5)?);
+        let (offset, decay) = (num("offset", 0.0)? * unit, num("decay", 0.5)?);
         if scale <= 0.0 || offset < 0.0 || !(decay > 0.0 && decay < 1.0) {
             return Err(err("decay needs scale > 0, offset >= 0 and 0 < decay < 1"));
         }
@@ -1008,7 +1040,7 @@ impl<'a> Binder<'a> {
             Expr::Between { expr, negated, low, high } => {
                 let f = self.numeric_field(expr)?;
                 let p = if self.schema.fields[f].ty == FieldType::Int {
-                    int_range(f, ceil(&self.num_literal(low)?), floor(&self.num_literal(high)?))
+                    int_range(f, ceil(&self.int_bound(f, low)?), floor(&self.int_bound(f, high)?))
                 } else {
                     Pred::Range { field: f, lo: self.num_lit(low)?, hi: self.num_lit(high)? }
                 };
@@ -1062,6 +1094,16 @@ impl<'a> Binder<'a> {
             Expr::Value(v) if matches!(v.value, sql::Value::Boolean(_)) => {
                 if matches!(v.value, sql::Value::Boolean(true)) { Pred::True } else { Pred::False }
             }
+            e if self.bool_field(e).is_some() => int_range(self.bool_field(e).unwrap(), 1, 1),
+            Expr::IsTrue(x) | Expr::IsFalse(x) | Expr::IsNotTrue(x) | Expr::IsNotFalse(x) => {
+                let f = self.bool_field(x).ok_or_else(|| err(format!("{e}: IS TRUE and IS FALSE test a BOOL field")))?;
+                let want = matches!(e, Expr::IsTrue(_) | Expr::IsNotFalse(_)) as i128;
+                match e {
+                    Expr::IsTrue(_) | Expr::IsFalse(_) => int_range(f, want, want),
+                    // Unlike `NOT done`, `done IS NOT TRUE` holds for NULL.
+                    _ => Pred::Or(vec![Pred::Not(Box::new(Pred::Present { field: f })), int_range(f, want, want)]),
+                }
+            }
             _ => return Err(err(format!("unsupported predicate: {e}"))),
         })
     }
@@ -1097,7 +1139,7 @@ impl<'a> Binder<'a> {
         if matches!(ty, FieldType::Int) {
             // Integers compare exactly, in 128 bits so that the bounds of
             // `> i64::MAX` or `< 1e30` need no special cases.
-            let v = self.num_literal(lit_e)?;
+            let v = self.int_bound(f, lit_e)?;
             let (min, max) = (i64::MIN as i128, i64::MAX as i128);
             return Ok(match op {
                 Eq => int_range(f, ceil(&v), floor(&v)),
@@ -1178,7 +1220,7 @@ impl<'a> Binder<'a> {
                     Ok(s.parse::<i64>().map(Value::Int).or_else(|_| s.parse::<f64>().map(Value::Float)).map_err(|_| err("bad number"))?)
                 }
                 sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => Ok(Value::Str(s.clone())),
-                sql::Value::Boolean(b) => Ok(Value::Int(*b as i64)),
+                sql::Value::Boolean(b) => Ok(Value::Bool(*b)),
                 sql::Value::Null => Ok(Value::Null),
                 sql::Value::Placeholder(p) => Ok(self.params.get(p)?.clone()),
                 other => Err(err(format!("unsupported literal {other}"))),
@@ -1236,15 +1278,44 @@ impl<'a> Binder<'a> {
         self.coerce(f, self.literal(e)?)
     }
 
-    /// A value coerced to field `f`'s type.
+    /// A value coerced to field `f`'s type, in the form its column holds
+    /// ([`crate::schema::Field::store`]).
     fn coerce(&self, f: usize, v: Value) -> Result<Value> {
-        match (&self.schema.fields[f].ty, v) {
+        let field = &self.schema.fields[f];
+        if let Some(l) = field.logical {
+            // In SQL a time is text or a timestamp parameter; a bare
+            // number would be microseconds nobody meant.
+            if l == Logical::Timestamp && matches!(v, Value::Int(_) | Value::Float(_)) {
+                return Err(err(format!("{} is a TIMESTAMP: give it text such as '2026-10-01T12:30:00Z', not the number {v:?}", field.name)));
+            }
+            return field.store(v).map_err(|e| match e {
+                Error::Schema(m) => err(m),
+                e => e,
+            });
+        }
+        match (&field.ty, v) {
             (FieldType::Keyword, Value::Str(s)) => Ok(Value::Str(s)),
             (FieldType::Keyword, Value::Int(x)) => Ok(Value::Str(x.to_string())),
             (FieldType::Int, Value::Int(x)) => Ok(Value::Int(x)),
-            (FieldType::Float, v @ (Value::Int(_) | Value::Float(_))) => Ok(Value::Float(v.as_f64().unwrap())),
+            (FieldType::Int, Value::Bool(b)) => Ok(Value::Int(b as i64)),
+            (FieldType::Float, v @ (Value::Int(_) | Value::Float(_) | Value::Bool(_))) => Ok(Value::Float(v.as_f64().unwrap())),
             (t, v) => Err(err(format!("value {v:?} does not fit a {t:?} field"))),
         }
+    }
+
+    /// A bound of an INT field's range: a number, or for a BOOL or
+    /// TIMESTAMP field a value of its type, as the integer it is stored as.
+    fn int_bound(&self, f: usize, e: &Expr) -> Result<Value> {
+        if self.schema.fields[f].logical.is_some() {
+            self.field_value(f, e)
+        } else {
+            self.num_literal(e)
+        }
+    }
+
+    /// A BOOL field named alone (`WHERE done`, `NOT done`).
+    fn bool_field(&self, e: &Expr) -> Option<usize> {
+        self.field_of(e).ok().filter(|&f| self.schema.fields[f].logical == Some(Logical::Bool))
     }
 
     /// A value written to field `f`: a literal or parameter of its type,
@@ -1292,7 +1363,7 @@ impl<'a> Binder<'a> {
             }
             let assign = match &a.value {
                 Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if self.field_of(left).ok() == Some(f) => {
-                    if !matches!(fld.ty, FieldType::Int | FieldType::Float) {
+                    if !matches!(fld.ty, FieldType::Int | FieldType::Float) || fld.logical.is_some() {
                         return Err(err(format!("{} is not numeric", fld.name)));
                     }
                     if fld.multi {
@@ -1307,7 +1378,7 @@ impl<'a> Binder<'a> {
                 Expr::CompoundIdentifier(ids) if excluded && ids.len() == 2 && ids[0].value.eq_ignore_ascii_case("excluded") => {
                     let g = self.schema.field_index(&ids[1].value).ok_or_else(|| err(format!("no such column: {}", ids[1].value)))?;
                     let src = &self.schema.fields[g];
-                    if src.ty != fld.ty || src.multi != fld.multi {
+                    if src.ty != fld.ty || src.multi != fld.multi || src.logical != fld.logical {
                         return Err(err(format!("{} = excluded.{}: the columns have different types", fld.name, src.name)));
                     }
                     Assign::Excluded(g)

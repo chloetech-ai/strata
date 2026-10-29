@@ -52,3 +52,22 @@ def test_client_token(tmp_path, serve):
         strata.connect(url, token="wrong").query("SELECT id FROM books")
     assert e.value.status == 401
     assert len(strata.connect(url, token="s3cret")) == 0
+
+
+def test_client_bool_and_timestamp(tmp_path, serve):
+    from datetime import datetime, timezone
+
+    from test_database import TASKS
+
+    path = tmp_path / "tasks.strata"
+    strata.Database.create(path, TASKS).close()
+    client = strata.connect(serve(path))
+    assert client.insert([
+        {"id": "a", "done": True, "at": datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc), "n": 1},
+        {"id": "b", "done": False, "at": "2026-10-02", "n": 2},
+    ]) == 2
+    r = client.query("SELECT id, done, at FROM tasks WHERE at >= :t ORDER BY n", t=datetime(2026, 10, 1))
+    assert [list(row.values()) for row in r] == [["a", True, "2026-10-01T09:00:00Z"], ["b", False, "2026-10-02T00:00:00Z"]]
+    assert client.query("SELECT id FROM tasks WHERE done = :d", d=False).keys == ["b"]
+    with pytest.raises(strata.StrataError, match="HTTP 400"):
+        client.insert({"id": "x", "done": 2})

@@ -1189,6 +1189,8 @@ fn logic(v: &Value) -> Option<bool> {
 fn truthy(v: &Value) -> bool {
     match v {
         Value::Int(x) => *x != 0,
+        Value::Bool(b) => *b,
+        Value::Timestamp(_) => true,
         Value::Float(x) => *x != 0.0,
         Value::Str(s) => !s.is_empty(),
         _ => false,
@@ -1253,7 +1255,7 @@ fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>
         Expr::Value(v) => match &v.value {
             sql::Value::Number(s, _) => s.parse::<i64>().map(Value::Int).or_else(|_| s.parse::<f64>().map(Value::Float)).map_err(|_| err(format!("bad number {s}")))?,
             sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => Value::Str(s.clone()),
-            sql::Value::Boolean(b) => Value::Int(*b as i64),
+            sql::Value::Boolean(b) => Value::Bool(*b),
             sql::Value::Null => Value::Null,
             sql::Value::Placeholder(p) => params.0.get(p.trim_start_matches([':', '$', '@', '?'])).cloned().ok_or_else(|| err(format!("unbound parameter {p}")))?,
             v => return Err(err(format!("unsupported literal {v}"))),
@@ -1315,6 +1317,8 @@ fn eval(e: &Expr, params: &Params, look: &dyn Fn(&Expr) -> Option<Result<Value>>
                         Value::Null => String::new(),
                         Value::Int(x) => x.to_string(),
                         Value::Float(x) => x.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        Value::Timestamp(t) => crate::timestamp::format(t),
                         v => format!("{v:?}"),
                     };
                     Value::Str(s(ev(left)?) + &s(ev(right)?))

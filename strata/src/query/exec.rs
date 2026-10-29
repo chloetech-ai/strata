@@ -541,7 +541,13 @@ impl<'a> Executor<'a> {
             let groups = if agg::is_general(q, |f| self.facet_field(f)) { self.aggregate(q, &needed)? } else { self.facets(q, q.group_by[0], &needed)? };
             // Shards return every group with partial aggregates, for the
             // coordinator to combine.
-            let rows = if self.opts.shard { groups.partial_rows() } else { agg::finish(q, groups, &needed) };
+            let rows = if self.opts.shard {
+                groups.partial_rows()
+            } else {
+                let mut rows = agg::finish(q, groups, &needed);
+                q.typed(&mut rows);
+                rows
+            };
             return Ok(empty(columns, rows, self.stats));
         }
         let has_count = q.projection.iter().any(|(_, p)| *p == Projection::Count);
@@ -557,7 +563,11 @@ impl<'a> Executor<'a> {
         let hits = self.ordered_hits(q, self.opts.max_rows)?;
         let skip = if self.opts.shard { 0 } else { q.offset };
         let hits: Vec<Hit> = hits.into_iter().skip(skip).collect();
-        let rows = self.project(q, &hits)?;
+        let mut rows = self.project(q, &hits)?;
+        // Shards answer with the stored integers, which the merge types.
+        if !self.opts.shard {
+            q.typed(&mut rows);
+        }
         let keys = hits.iter().map(|h| self.key(h)).collect();
         let scores = hits.iter().map(|h| h.score).collect();
         let parts = self.parts.take().map(|(cands, scores, ranked)| {
@@ -2038,7 +2048,7 @@ fn group_by_seg(cands: &[(usize, DocId)]) -> Vec<(usize, std::ops::Range<usize>)
 pub fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(x) | Value::Timestamp(x), Value::Int(y) | Value::Timestamp(y)) => x.cmp(y),
         _ => match (a.as_f64(), b.as_f64()) {
             (Some(x), Some(y)) => x.total_cmp(&y),
             (x, y) => x.is_some().cmp(&y.is_some()),

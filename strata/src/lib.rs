@@ -6,7 +6,8 @@
 //! functions, planned by a cost-based optimizer. See `DESIGN.md`.
 //!
 //! * [`schema`], [`value`]: tables, field types, documents; [`ingest`]:
-//!   rows from JSON, CSV and files.
+//!   rows from JSON, CSV and files; [`timestamp`]: TIMESTAMP values as
+//!   text.
 //! * [`embed`]: the models that fill VECTOR fields declared with `embed`.
 //! * [`segment`]: the immutable unit of storage, a directory of aligned,
 //!   named sections, and the builder that turns documents into one.
@@ -45,11 +46,12 @@ pub mod segment;
 pub mod simd;
 pub mod storage;
 pub mod text;
+pub mod timestamp;
 pub mod value;
 pub mod vector;
 pub mod workload;
 
 pub use error::{Error, Result};
-pub use schema::{Embed, Field, FieldType, Schema, VectorCodes, VectorIndexKind};
+pub use schema::{Embed, Field, FieldType, Logical, Schema, VectorCodes, VectorIndexKind};
 pub use segment::DocId;
 pub use value::{Document, Value};

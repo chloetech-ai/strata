@@ -70,7 +70,12 @@ fn to_json(o: &Bound<'_, PyAny>) -> PyResult<Json> {
     if o.hasattr("tolist")? {
         return to_json(&o.call_method0("tolist")?);
     }
-    Err(PyValueError::new_err(format!("cannot store a {}: values are None, bool, int, float, str, lists and dicts", o.get_type().name()?)))
+    // A datetime or date, as ISO 8601 text (a TIMESTAMP's form; a naive
+    // datetime is taken as UTC).
+    if o.hasattr("isoformat")? && o.hasattr("year")? {
+        return Ok(Json::String(o.call_method0("isoformat")?.extract()?));
+    }
+    Err(PyValueError::new_err(format!("cannot store a {}: values are None, bool, int, float, str, datetime, lists and dicts", o.get_type().name()?)))
 }
 
 /// A stored value as Python.
@@ -82,6 +87,9 @@ fn to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
         Value::Str(s) => s.into_pyobject(py)?.into_any(),
         Value::Vector(xs) => PyList::new(py, xs.iter().map(|&x| x as f64))?.into_any(),
         Value::List(xs) => PyList::new(py, xs.iter().map(|x| to_py(py, x)).collect::<PyResult<Vec<_>>>()?)?.into_any(),
+        Value::Bool(b) => b.into_pyobject(py)?.to_owned().into_any(),
+        // As the HTTP API gives it, so that Database and Client agree.
+        Value::Timestamp(t) => strata::timestamp::format(*t).into_pyobject(py)?.into_any(),
     })
 }
 
@@ -105,7 +113,7 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
     let bad = |m: String| strata::Error::Query(m);
     Ok(match j {
         Json::Null => Value::Null,
-        Json::Bool(b) => Value::Int(*b as i64),
+        Json::Bool(b) => Value::Bool(*b),
         Json::Number(n) => match n.as_i64() {
             Some(x) => Value::Int(x),
             None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),

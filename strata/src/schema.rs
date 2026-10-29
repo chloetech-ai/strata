@@ -77,6 +77,58 @@ pub enum FieldType {
     Sparse,
 }
 
+/// What an INT column's integers stand for (format 3; a database is
+/// written in format 3 only while a table has such a field). Queries and
+/// writes see [`Value::Bool`](crate::value::Value::Bool) and
+/// [`Value::Timestamp`](crate::value::Value::Timestamp); the column, its
+/// filters, sorts and aggregates work on the integers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Logical {
+    /// `BOOL`: 1 for true, 0 for false.
+    Bool,
+    /// `TIMESTAMP`: microseconds since 1970-01-01T00:00:00Z
+    /// ([`crate::timestamp`]).
+    Timestamp,
+}
+
+impl Logical {
+    /// The type's name in SQL.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Logical::Bool => "BOOL",
+            Logical::Timestamp => "TIMESTAMP",
+        }
+    }
+
+    /// What a value of this type is, for error messages.
+    pub fn expects(self) -> &'static str {
+        match self {
+            Logical::Bool => "a BOOL is true or false",
+            Logical::Timestamp => "a TIMESTAMP is ISO 8601 text such as 2026-10-01 or 2026-10-01T12:30:00Z",
+        }
+    }
+
+    /// The format 3 feature a field of this type needs
+    /// ([`crate::storage::manifest`]).
+    pub fn feature(self) -> &'static str {
+        match self {
+            Logical::Bool => "bool",
+            Logical::Timestamp => "timestamp",
+        }
+    }
+
+    /// A stored integer as queries return it; other values as they are.
+    pub fn output(self, v: crate::value::Value) -> crate::value::Value {
+        use crate::value::Value;
+        match (self, v) {
+            (Logical::Bool, Value::Int(x)) => Value::Bool(x != 0),
+            (Logical::Timestamp, Value::Int(t)) => Value::Timestamp(t),
+            (_, v) => v,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
     pub name: String,
@@ -112,6 +164,10 @@ pub struct Field {
     /// keys of its own table, and may say so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<String>,
+    /// A single-valued INT field that holds booleans or timestamps
+    /// ([`Logical`]). Neither the primary key nor a reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical: Option<Logical>,
 }
 
 /// A VECTOR field that is the embedding of other fields: `model`'s vector
@@ -133,7 +189,67 @@ pub struct Embed {
 
 impl Field {
     pub fn new(name: &str, ty: FieldType) -> Self {
-        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false, codes: VectorCodes::Sq8, embed: None, references: None }
+        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false, codes: VectorCodes::Sq8, embed: None, references: None, logical: None }
+    }
+    /// A BOOL field ([`Logical::Bool`]).
+    pub fn boolean(name: &str) -> Self {
+        Field { logical: Some(Logical::Bool), ..Field::new(name, FieldType::Int) }
+    }
+    /// A TIMESTAMP field ([`Logical::Timestamp`]).
+    pub fn timestamp(name: &str) -> Self {
+        Field { logical: Some(Logical::Timestamp), ..Field::new(name, FieldType::Int) }
+    }
+    /// The field's type in SQL: `BOOL` and `TIMESTAMP` for those
+    /// ([`Logical`]), else [`type_name`] of its type.
+    pub fn type_name(&self) -> &'static str {
+        self.logical.map_or_else(|| type_name(&self.ty), Logical::type_name)
+    }
+    /// `v` in the form this field's column stores: a BOOL field's value
+    /// as 1 or 0 (from a boolean, 1 or 0, or the text `true`, `false`,
+    /// `t`, `f`, `1` or `0`), a TIMESTAMP field's as microseconds since
+    /// the epoch (from a timestamp, that integer, or ISO 8601 text), and a
+    /// boolean given to any other INT or FLOAT field as 1 or 0. Any other
+    /// value is returned as it is, for [`crate::value::validate`] to
+    /// judge.
+    pub fn store(&self, v: crate::value::Value) -> Result<crate::value::Value> {
+        use crate::value::Value;
+        let bad = |v: &Value, want: Logical| Error::Schema(format!("bad value for {}: {v:?} ({})", self.name, want.expects()));
+        const BOOL: Logical = Logical::Bool;
+        const TIME: Logical = Logical::Timestamp;
+        Ok(match (self.logical, v) {
+            (_, Value::Null) => Value::Null,
+            (Some(Logical::Bool), Value::Bool(b)) => Value::Int(b as i64),
+            (Some(Logical::Bool), Value::Int(x @ (0 | 1))) => Value::Int(x),
+            (Some(Logical::Bool), Value::Str(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "t" | "1" => Value::Int(1),
+                "false" | "f" | "0" => Value::Int(0),
+                _ => return Err(bad(&Value::Str(s), BOOL)),
+            },
+            (Some(Logical::Bool), v) => return Err(bad(&v, BOOL)),
+            (Some(Logical::Timestamp), Value::Timestamp(t) | Value::Int(t)) => Value::Int(t),
+            (Some(Logical::Timestamp), Value::Str(s)) => match crate::timestamp::parse(&s) {
+                Some(t) => Value::Int(t),
+                None => return Err(bad(&Value::Str(s), TIME)),
+            },
+            (Some(Logical::Timestamp), v) => return Err(bad(&v, TIME)),
+            (None, Value::Bool(b)) if matches!(self.ty, FieldType::Int | FieldType::Float) => Value::Int(b as i64),
+            (None, Value::List(xs)) if self.ty == FieldType::Int => Value::List(
+                xs.into_iter()
+                    .map(|x| match x {
+                        Value::Bool(b) => Value::Int(b as i64),
+                        x => x,
+                    })
+                    .collect(),
+            ),
+            (None, v) => v,
+        })
+    }
+    /// A stored value as queries return it ([`Logical::output`]).
+    pub fn output(&self, v: crate::value::Value) -> crate::value::Value {
+        match self.logical {
+            Some(l) => l.output(v),
+            None => v,
+        }
     }
     /// Makes a KEYWORD or INT field hold primary keys of `table`.
     pub fn references(mut self, table: &str) -> Self {
@@ -231,6 +347,15 @@ impl Schema {
                 return Err(Error::Schema(format!("EDGES field {} needs a primary key", f.name)));
             }
         }
+        for (i, f) in s.fields.iter().enumerate() {
+            let Some(l) = f.logical else { continue };
+            if f.ty != FieldType::Int {
+                return Err(Error::Schema(format!("field {}: only an INT column holds {} values", f.name, l.type_name())));
+            }
+            if f.multi || s.primary_key == Some(i) || f.references.is_some() {
+                return Err(Error::Schema(format!("field {}: a {} field holds one value, and is neither the primary key nor a reference", f.name, l.type_name())));
+            }
+        }
         s.check_references()?;
         // Names are matched in any case, so they must differ in more than case.
         let mut names: Vec<String> = s.fields.iter().map(|f| f.name.to_ascii_lowercase()).collect();
@@ -279,6 +404,12 @@ impl Schema {
             }
         }
         Ok(())
+    }
+
+    /// The format 3 features this table's fields need, as the manifest
+    /// names them ([`Logical::feature`]).
+    pub fn features(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.fields.iter().filter_map(|f| f.logical.map(Logical::feature))
     }
 
     /// The fields that reference table `table` (any case), by position.
@@ -355,8 +486,9 @@ impl Schema {
     /// ]}
     /// ```
     ///
-    /// Types are `text`, `keyword`, `int`, `float`, `vector`, `sparse` and
-    /// `edges`. A vector `embed`ded by a model Strata knows may leave out
+    /// Types are `text`, `keyword`, `int`, `float`, `bool`, `timestamp`,
+    /// `vector`, `sparse` and `edges` (`bool` and `timestamp` hold one
+    /// value, and make the database format 3: [`Logical`]). A vector `embed`ded by a model Strata knows may leave out
     /// `dim`. Every field is stored and indexed unless it says otherwise
     /// (`"stored": false`, `"indexed": false`), except that vectors and
     /// generated text (`from`) are not stored. Text keeps positions (for
@@ -416,7 +548,7 @@ impl Schema {
                         ("text", f.generated_from.is_empty())
                     }
                     FieldType::Keyword => ("keyword", true),
-                    FieldType::Int => ("int", true),
+                    FieldType::Int => (f.logical.map_or("int", Logical::feature), true),
                     FieldType::Float => ("float", true),
                     FieldType::Vector { dim, index } => {
                         // A known model's vectors have its dimension.
@@ -503,12 +635,21 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
             Some(_) => Err(bad(&format!("{k} lists field names"))),
         }
     };
-    let ty_name = j.get("type").and_then(J::as_str).ok_or_else(|| bad("needs a \"type\" (text, keyword, int, float, vector, sparse or edges)"))?;
+    let ty_name = j.get("type").and_then(J::as_str).ok_or_else(|| bad("needs a \"type\" (text, keyword, int, float, bool, timestamp, vector, sparse or edges)"))?;
+    let mut logical = None;
     let from = names("from")?;
     let ty = match ty_name.to_ascii_lowercase().as_str() {
         "text" => FieldType::Text { positions: flag("positions")?.unwrap_or(true) },
         "keyword" => FieldType::Keyword,
         "int" | "integer" => FieldType::Int,
+        "bool" | "boolean" => {
+            logical = Some(Logical::Bool);
+            FieldType::Int
+        }
+        "timestamp" => {
+            logical = Some(Logical::Timestamp);
+            FieldType::Int
+        }
         "float" | "double" | "real" => FieldType::Float,
         "sparse" => FieldType::Sparse,
         "edges" => FieldType::Edges,
@@ -535,10 +676,11 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
             };
             FieldType::Vector { dim, index }
         }
-        other => return Err(bad(&format!("unknown type {other:?} (text, keyword, int, float, vector, sparse or edges)"))),
+        other => return Err(bad(&format!("unknown type {other:?} (text, keyword, int, float, bool, timestamp, vector, sparse or edges)"))),
     };
     let is_vector = matches!(ty, FieldType::Vector { .. });
     let mut f = Field::new(name, ty);
+    f.logical = logical;
     f.generated_from = from;
     f.stored = flag("stored")?.unwrap_or(!is_vector && f.generated_from.is_empty());
     f.indexed = flag("indexed")?.unwrap_or(true);

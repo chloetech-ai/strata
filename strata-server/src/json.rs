@@ -1,6 +1,8 @@
 //! Strata values and results as JSON.
 //!
-//! Values: `null`, numbers, strings, arrays and objects. An array is a
+//! Values: `null`, numbers, strings, booleans, arrays and objects. A BOOL
+//! field's values are `true` and `false`, a TIMESTAMP field's ISO 8601
+//! text in UTC (`"2026-10-01T12:30:00Z"`). An array is a
 //! vector when the field is a VECTOR field, a list when it is multi-valued.
 //! An object of numbers is a SPARSE field's term weights (held as its JSON
 //! text, which SPARSE fields also accept). Parameters have no field, so an
@@ -24,6 +26,8 @@ pub fn to_json(v: &Value) -> Json {
         Value::Str(s) => json!(s),
         Value::Vector(v) => Json::Array(v.iter().map(|x| json!(x)).collect()),
         Value::List(xs) => Json::Array(xs.iter().map(to_json).collect()),
+        Value::Bool(b) => json!(b),
+        Value::Timestamp(t) => json!(strata::timestamp::format(*t)),
     }
 }
 
@@ -31,7 +35,7 @@ pub fn to_json(v: &Value) -> Json {
 pub fn param(j: &Json) -> Result<Value, ApiError> {
     Ok(match j {
         Json::Null => Value::Null,
-        Json::Bool(b) => Value::Int(*b as i64),
+        Json::Bool(b) => Value::Bool(*b),
         Json::Number(n) => match n.as_i64() {
             Some(x) => Value::Int(x),
             None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
@@ -77,7 +81,7 @@ pub fn document(schema: &Schema, j: &Json) -> Result<Document, ApiError> {
 pub fn document_json(schema: &Schema, doc: &[Value]) -> Json {
     let mut m = Map::new();
     for (f, v) in schema.fields.iter().zip(doc) {
-        m.insert(f.name.clone(), to_json(v));
+        m.insert(f.name.clone(), to_json(&f.output(v.clone())));
     }
     Json::Object(m)
 }
