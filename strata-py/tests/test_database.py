@@ -56,6 +56,13 @@ def test_queries_and_results(db):
     assert isinstance(r.stats, dict)
     assert db.sql("SELECT COUNT(*) FROM books").scalar() == 200
     assert db.sql("EXPLAIN SELECT id FROM books LIMIT 2").column("plan") == ["Project: id", "  Limit: 2", "    Search books"]
+    # A plan, as a dict, runs as its statement does.
+    plan = db.plan("SELECT id FROM books WHERE year >= :y ORDER BY year DESC LIMIT 3", y=2000)
+    assert plan["version"] == 1 and plan["root"]["node"] == "project"
+    assert db.run(plan).keys == db.query("SELECT id FROM books WHERE year >= 2000 ORDER BY year DESC LIMIT 3").keys
+    assert db.run(db.plan("UPDATE books SET rating = 1 WHERE id = 'b0002'")) == 1
+    with pytest.raises(strata.StrataError, match="newer"):
+        db.run({**plan, "version": 2})
     assert db.sql("UPDATE books SET rating = rating + 1 WHERE id = :k", k="b0001") == 1
     assert db.query("SELECT genres FROM books WHERE id = 'b0001'").scalar() == ["fantasy", "new"]
     # A vector, the text's embedding, and a stored row's vector.

@@ -17,6 +17,7 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::{Map, Number, Value as Json};
 use strata::db::{Db, SqlResult};
 use strata::ingest::{self, Format};
+use strata::query::ir::Plan;
 use strata::query::Params;
 use strata::query::exec::ResultSet;
 use strata::schema::Schema;
@@ -247,6 +248,25 @@ impl Database {
         let db = self.get()?;
         let p = params_json(params)?;
         match py.detach(|| self::params(&db, &p).and_then(|p| db.sql(sql, &p))).map_err(err)? {
+            SqlResult::Rows(rs) => Ok(result_py(py, &rs)?.into_any()),
+            SqlResult::Written(n) => Ok(n.into_pyobject(py)?.into_any()),
+        }
+    }
+
+    /// The plan of a SELECT, INSERT, UPDATE or DELETE as JSON text, without
+    /// running it.
+    #[pyo3(signature = (sql, params = None))]
+    fn plan(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyDict>>) -> PyResult<String> {
+        let db = self.get()?;
+        let p = params_json(params)?;
+        py.detach(|| self::params(&db, &p).and_then(|p| db.explain(sql, &p)).and_then(|plan| plan.to_json_text())).map_err(err)
+    }
+
+    /// Runs a plan given as JSON text, as `sql` runs a statement.
+    fn run<'py>(&self, py: Python<'py>, plan: &str) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.get()?;
+        let plan: Json = serde_json::from_str(plan).map_err(|e| StrataError::new_err(format!("a plan is JSON: {e}")))?;
+        match py.detach(|| Plan::from_json(&plan).and_then(|plan| db.run(&plan))).map_err(err)? {
             SqlResult::Rows(rs) => Ok(result_py(py, &rs)?.into_any()),
             SqlResult::Written(n) => Ok(n.into_pyobject(py)?.into_any()),
         }

@@ -14,7 +14,8 @@ use strata::ingest::{Format, Rows};
 use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
-use strata::query::{bind, compound, Params};
+use strata::query::ir::Plan;
+use strata::query::{compound, Params, Select};
 use strata::schema::Schema;
 use strata::storage::{CheckpointOptions, CheckpointStats, Layout, Snapshot, WriteTxn};
 use strata::text::Synonyms;
@@ -29,6 +30,12 @@ use crate::coord::Coordinator;
 use crate::idem;
 use crate::metrics::{self, Family, Metrics};
 use crate::{json as js, obs, ApiError};
+
+/// Binds one SELECT into its plan, and gives back what the executor runs
+/// of it: every query runs as a plan ([`strata::query::ir`]).
+fn bind(sql: &str, schema: &Schema, params: &Params) -> strata::Result<Select> {
+    Plan::bind(sql, schema, params)?.to_select(schema)
+}
 
 pub enum Backend {
     Local(Arc<Db>),
@@ -489,6 +496,39 @@ impl Service {
                 return Err(e.into());
             }
         };
+        self.select(req, select, t0, timeout).await
+    }
+
+    /// Runs a plan ([`strata::query::ir`]): a read of the database's first
+    /// table answers as [`Service::query`] does, and a write as
+    /// [`Service::sql`] does (on any table). A coordinator takes SQL until
+    /// its shards take plans.
+    pub async fn run_plan(self: &Arc<Self>, plan: Plan, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+        let t0 = Instant::now();
+        let Backend::Local(db) = &self.backend else {
+            return Err(ApiError::bad("a coordinator runs SQL; its shards do not take plans yet"));
+        };
+        // What the slow-query log shows of the plan.
+        let text = plan.explain(&[&self.schema]).join(" / ");
+        if plan.is_write() {
+            let n = self.write_local(db, move |db| db.prepare_plan(&plan).map(Some), timeout_ms).await;
+            let n = self.wrote(n, t0, Some(&text))?;
+            return Ok(SqlAnswer::Written { n, took_ms: t0.elapsed().as_secs_f64() * 1e3 });
+        }
+        let select = match plan.to_select(&self.schema) {
+            Ok(s) => s,
+            Err(e) => {
+                self.metrics.query("invalid", "error", t0.elapsed().as_secs_f64());
+                return Err(e.into());
+            }
+        };
+        let req = QueryReq { sql: text, timeout_ms, ..Default::default() };
+        let timeout = self.timeout_of(timeout_ms);
+        self.select(req, select, t0, timeout).await.map(SqlAnswer::Rows)
+    }
+
+    /// Runs a bound single-table query, on the database or over the shards.
+    async fn select(self: &Arc<Self>, req: QueryReq, select: Select, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = metrics::kind(&select);
         let Some(permit) = self.admit(timeout).await else {
             self.metrics.query(kind, "rejected", t0.elapsed().as_secs_f64());
@@ -707,36 +747,39 @@ impl Service {
         }
         let t0 = Instant::now();
         let r = match &self.backend {
-            Backend::Local(db) => match self.enqueue() {
-                Ok(q) => {
-                    async {
-                        // Bound, and its vectors computed, before it queues:
-                        // models run on a core of their own, not in the
-                        // writer thread.
-                        let core = match self.models.iter().any(|m| m.model.is_ok()) {
-                            true => Some(self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?),
-                            false => None,
-                        };
-                        let (db, text, p) = (db.clone(), sql.to_string(), params.clone());
-                        let prepared = tokio::task::spawn_blocking(move || {
-                            let _core = core;
-                            db.prepare_write(&text, &p)
-                        })
-                        .await
-                        .map_err(ApiError::internal)??
-                        .ok_or_else(|| ApiError::bad("not a write statement"))?;
-                        // The deadline bounds the wait for the writer, not the embedding.
-                        let deadline = Instant::now() + self.timeout_of(timeout_ms);
-                        self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q).await
-                    }
-                    .await
-                }
-                Err(e) => Err(e),
-            },
+            Backend::Local(db) => {
+                let (text, p) = (sql.to_string(), params.clone());
+                self.write_local(db, move |db| db.prepare_write(&text, &p), timeout_ms).await
+            }
             Backend::Cluster(c) => c.sql(sql, params).await,
         };
         let n = self.wrote(r, t0, Some(sql))?;
         Ok(SqlAnswer::Written { n, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
+    }
+
+    /// A write `prepare` binds (`None`: not a write), queued for the writer
+    /// thread. It is bound, and its vectors computed, before it queues:
+    /// models run on a core of their own, not in the writer thread.
+    async fn write_local<F>(self: &Arc<Self>, db: &Arc<Db>, prepare: F, timeout_ms: u64) -> Result<u64, ApiError>
+    where
+        F: FnOnce(&Db) -> strata::Result<Option<PreparedWrite>> + Send + 'static,
+    {
+        let q = self.enqueue()?;
+        let core = match self.models.iter().any(|m| m.model.is_ok()) {
+            true => Some(self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?),
+            false => None,
+        };
+        let db = db.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let _core = core;
+            prepare(&db)
+        })
+        .await
+        .map_err(ApiError::internal)??
+        .ok_or_else(|| ApiError::bad("not a write statement"))?;
+        // The deadline bounds the wait for the writer, not the embedding.
+        let deadline = Instant::now() + self.timeout_of(timeout_ms);
+        self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q).await
     }
 
     /// Applies write operations (see the proto's WriteRequest) in one

@@ -523,15 +523,23 @@ handing a query to its shards) are to make instead of writing SQL text.
   to the same bound statement. A compound query (`WITH`, a subquery, a
   join, `SELECT DISTINCT`) runs as several queries and has no plan of its
   own yet.
+* **Every query runs as a plan.** `Db::query`, `Db::sql` and the server
+  bind a statement into its plan and run the plan, whose `Search` the
+  executor answers (each step of a compound query too). `Db::run` runs a
+  plan made elsewhere, `POST /v1/plan` takes one as JSON, and Python has
+  `Database.plan` and `run`. A plan made elsewhere is checked against the
+  table's schema as the binder checks SQL. Going through the plan adds
+  0.4 to 1.3 µs to a query whose binding takes 9 to 22 µs (cloud
+  container, 2026-10-29). A coordinator still takes SQL: its shards take
+  plans with the shard protocol.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next, in order: the binder emits plans with the executor as the `Search`
-leaf; one three-valued evaluator for every filter; writes run as plans;
-then operators in place of the compound-query code, the Python builder,
-joins across tables, and plans as the shard protocol.
+Next, in order: one three-valued evaluator for every filter; writes run
+as plans; then operators in place of the compound-query code, the Python
+builder, joins across tables, and plans as the shard protocol.
 
 ## 7. Planning and execution
 

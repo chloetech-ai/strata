@@ -199,6 +199,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/query` | `{sql, params?, timeout_ms?}` | `{columns, rows, keys, scores, stats, took_ms}` |
 | `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows for a `SELECT`; `{written}` for `INSERT`, `UPDATE`, `DELETE` |
 | `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written}` |
+| `POST /v1/plan` | `{plan, timeout_ms?}`: a [plan](query-language.md#explain) in JSON, as `/v1/explain` gives it in `ir` | rows for a read of the first table, `{written}` for a write; a coordinator refuses it (400) until its shards take plans |
 | `POST /v1/import?format=F` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the bound query (`logical`) and counts; a compound query has no `ir` or `tree` yet |

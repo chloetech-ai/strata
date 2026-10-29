@@ -112,6 +112,17 @@ class Database(Search):
         r = self._db.sql(sql, _params(params, kw))
         return r if isinstance(r, int) else Result._of(r)
 
+    def plan(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> dict:
+        """The plan of a SELECT, INSERT, UPDATE or DELETE, without running
+        it: the plan IR as JSON, which `run` takes."""
+        return json.loads(self._db.plan(sql, _params(params, kw)))
+
+    def run(self, plan: Mapping[str, Any]) -> Result | int:
+        """Runs a plan (as `plan` or a server's /v1/explain gives it): a
+        read's `Result`, or the number of rows a write wrote."""
+        r = self._db.run(json.dumps(plan))
+        return r if isinstance(r, int) else Result._of(r)
+
     def insert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]]) -> int:
         """Inserts a row or rows, whose keys must be new; all or none are
         written. Returns how many."""

@@ -120,6 +120,12 @@ class Client(Search):
         bound query ("logical")."""
         return self._call("POST", "/v1/explain", {"sql": sql, "params": _params(params, kw)})
 
+    def run(self, plan: Mapping[str, Any]) -> Result | int:
+        """Runs a plan (the "ir" of `explain`): a read's `Result`, or the
+        number of rows a write wrote."""
+        r = self._call("POST", "/v1/plan", {"plan": plan})
+        return Result._of(r) if "rows" in r else int(r["written"])
+
     def write(self, ops: list[dict]) -> int:
         """Write operations as /v1/write takes them ({"op": "insert",
         "doc": {...}}, {"op": "delete", "key": k}, ...), in one request."""

@@ -419,6 +419,8 @@ A `Search` is the rows of one table that its `filter` holds for, ranked by its `
 
 `EXPLAIN FORMAT JSON` (or `EXPLAIN (FORMAT JSON)`) gives the plan as one row of JSON: fields by their position in the table, typed values (`{"int": 5}`, `{"text": "5"}`), a version and the features the plan needs. Strata refuses a plan from a newer version by name. A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as several queries and has no plan of its own yet; [`POST /v1/explain`](server.md#http-api) lists what each step ran. `EXPLAIN ANALYZE` and other formats are refused.
 
+Every statement runs as its plan, and a plan in JSON runs on its own: `Db::run` in Rust, `Database.run` in [Python](python.md#querying) and [`POST /v1/plan`](server.md#http-api) over HTTP take one, and check it against the table's schema as the SQL binder checks a statement.
+
 ## Reading a plan
 
 `--plan` shows what the planner decided, segment by segment. The same statement can get different plans as the data changes. In the evaluation, an `OR` filter matching about 15% of documents was scanned exactly on SciFact's 5,183 documents, but on the larger collections the planner measured 11% near the query and post-filtered the HNSW result. An RRF query's topic filter matched 11% of Quora globally but only 3.4% near the query, so the planner switched to an exact scan of its 58,767 members, at 3.1 ms. [Planning and execution](index.md#planning-and-execution) describes the choices.
