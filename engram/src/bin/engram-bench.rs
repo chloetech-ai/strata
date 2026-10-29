@@ -193,6 +193,21 @@ enum Cmd {
         #[arg(long, default_value_t = 0.01)]
         knowledge: f64,
     },
+    /// Appends tool calls back to back from one or more clients, as tool
+    /// hooks do, to an empty store, and reports how long each append took:
+    /// any wait for a flush or a merge shows in the tail.
+    Writes {
+        #[arg(long, default_value = "hash:256")]
+        embedder: String,
+        /// Records per configuration (an append stores two).
+        #[arg(long, default_value_t = 200_000)]
+        records: usize,
+        /// Clients appending at once, per configuration.
+        #[arg(long, value_delimiter = ',', default_value = "1,4")]
+        clients: Vec<usize>,
+        #[arg(long, default_value = "results/writes")]
+        out: PathBuf,
+    },
     /// Embeds a text field of every JSON line of a file into raw float32
     /// vectors (`<out>`, n × dim, little-endian), for other tools (Strata's
     /// graph benchmark embeds arXiv papers with it).
@@ -635,6 +650,7 @@ fn main() {
         Cmd::Concurrency { data, sizes, embedder, out, queries, readers, secs, write_every_ms, knowledge } => {
             concurrency_cmd(&data, &sizes, &embedder, &out, queries, &readers, secs, write_every_ms, knowledge)
         }
+        Cmd::Writes { embedder, records, clients, out } => writes_cmd(&embedder, records, &clients, &out),
         Cmd::Probes { transcript, probes, points, embedder, project, out, cache, dump_missing, dump_probes, per_turn, max_records } => {
             let d = PackParams::default();
             let pack = PackParams { per_turn: per_turn.unwrap_or(d.per_turn), max_records: max_records.unwrap_or(d.max_records), ..d };
@@ -1627,6 +1643,55 @@ fn tool_drafts(i: i64) -> Vec<engram::record::Draft> {
         engram::record::Draft::new(Kind::ToolCall, format!("$ cargo test --package p{i} -- --nocapture")).ctx("Turn 3 request: fix the parser"),
         engram::record::Draft::new(Kind::ToolResult, format!("running 12 tests\ntest parser::tests::case_{i} ... ok\ntest result: ok. {i} passed; 0 failed")).ctx("Turn 3 request: fix the parser"),
     ]
+}
+
+fn writes_cmd(embedder: &str, records: usize, clients: &[usize], out: &Path) {
+    let e = open_embedder(embedder);
+    std::fs::create_dir_all(out).unwrap();
+    let mut rows = Vec::new();
+    for &k in clients {
+        let dir = std::env::temp_dir().join(format!("engram-writes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("memory.strata"), e.clone(), StoreOptions::default()).unwrap();
+        let (appends, next) = (records / 2, AtomicUsize::new(0));
+        let t0 = Instant::now();
+        let mut lat: Vec<f64> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..k.max(1))
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut lat = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= appends {
+                                break lat;
+                            }
+                            let t = Instant::now();
+                            store.append("bench-writes", i as i64, i as i64, tool_drafts(i as i64)).unwrap();
+                            lat.push(ms_since(t));
+                        }
+                    })
+                })
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        let secs = t0.elapsed().as_secs_f64();
+        let segments = store.snapshot().segments().len();
+        // Closing waits for a merge under way.
+        drop(store);
+        let closed = t0.elapsed().as_secs_f64() - secs;
+        let over = |ms: f64| lat.iter().filter(|&&l| l >= ms).count();
+        let (over_100, over_1000) = (over(100.0), over(1000.0));
+        let row = json!({
+            "clients": k, "records": appends * 2, "secs": secs, "appends_per_sec": appends as f64 / secs,
+            "p50_ms": pct(&mut lat, 0.5), "p99_ms": pct(&mut lat, 0.99), "p999_ms": pct(&mut lat, 0.999), "max_ms": pct(&mut lat, 1.0),
+            "over_100ms": over_100, "over_1s": over_1000, "segments": segments, "close_secs": closed,
+        });
+        eprintln!("{row}");
+        rows.push(row);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    std::fs::write(out.join("writes.json"), serde_json::to_string_pretty(&rows).unwrap()).unwrap();
 }
 
 #[allow(clippy::too_many_arguments)]
