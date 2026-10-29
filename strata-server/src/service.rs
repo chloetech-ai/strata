@@ -29,6 +29,7 @@ pub const MAX_LEASES: usize = 10_000;
 
 use crate::coord::Coordinator;
 use crate::idem;
+use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
 use crate::{json as js, obs, ApiError};
 
@@ -146,6 +147,11 @@ pub struct Service {
     synonyms_file: Option<PathBuf>,
     /// Where `POST /v1/admin/checkpoint` writes checkpoints.
     backup_dir: Option<PathBuf>,
+    /// The slot map a coordinator gave this shard and its place in it
+    /// ([`Service::set_slots`]), and the file that keeps them (a new map
+    /// is set while its lock is held).
+    slots: RwLock<Option<(SlotMap, usize)>>,
+    slots_file: tokio::sync::Mutex<Option<PathBuf>>,
 }
 
 impl Service {
@@ -189,7 +195,119 @@ impl Service {
             synonyms: RwLock::new(None),
             synonyms_file: None,
             backup_dir: None,
+            slots: RwLock::new(None),
+            slots_file: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Keeps the slot map a coordinator gives this shard in `path`, and
+    /// reads the one kept there, if any. Without a file, the map lasts
+    /// until the server stops.
+    pub fn keep_slots_in(&mut self, path: PathBuf) -> Result<(), String> {
+        if path.exists() {
+            let j: Json = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())).map_err(|e| format!("{}: {e}", path.display()))?;
+            let map = SlotMap::from_json(&j["map"]).map_err(|e| format!("{}: {e}", path.display()))?;
+            let shard = j["shard"].as_u64().map(|s| s as usize).filter(|&s| s < map.shards()).ok_or_else(|| format!("{}: no shard of the map", path.display()))?;
+            *self.slots.get_mut().unwrap_or_else(|e| e.into_inner()) = Some((map, shard));
+        }
+        *self.slots_file.get_mut() = Some(path);
+        Ok(())
+    }
+
+    /// The epoch of this shard's slot map; 0 without one.
+    pub fn slot_epoch(&self) -> u64 {
+        self.slots.read().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |(m, _)| m.epoch)
+    }
+
+    /// This shard's slot map and its place in it, if a coordinator gave one.
+    pub fn slots(&self) -> Option<(SlotMap, usize)> {
+        self.slots.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Takes `map`, with this server as its shard `shard`, from a
+    /// coordinator: a map of an older epoch than this shard's is refused
+    /// (409), as is another map of the same epoch. Every row here must be
+    /// in the shard's slots, as no rows move between shards yet: a shard
+    /// loaded by another map, or by the hash before slots, refuses the map
+    /// (409) until it is loaded again. Returns the epoch now held.
+    pub async fn set_slots(&self, map: SlotMap, shard: usize) -> Result<u64, ApiError> {
+        if shard >= map.shards() {
+            return Err(ApiError::bad(format!("shard {shard} of a slot map of {} shards", map.shards())));
+        }
+        let db = self.local().cloned().ok_or_else(|| ApiError::bad("a coordinator holds no slots"))?;
+        let file = self.slots_file.lock().await;
+        let held = self.slots();
+        if let Some((m, s)) = &held {
+            if map.epoch < m.epoch {
+                return Err(conflict(format!("slot map epoch {} is older than this shard's ({}): the coordinator must load the newer map (--slot-map)", map.epoch, m.epoch)));
+            }
+            if map.epoch == m.epoch {
+                return match *m == map && *s == shard {
+                    true => Ok(map.epoch),
+                    false => Err(conflict(format!(
+                        "this shard holds a different slot map of epoch {}, as shard {s} of {}: list the shards as when it was given, or give a map of a higher epoch (--slot-map)",
+                        m.epoch,
+                        m.shards()
+                    ))),
+                };
+            }
+        }
+        if !held.as_ref().is_some_and(|(m, s)| *s == shard && m.same_slots(&map, shard)) {
+            let (m, schema) = (map.clone(), self.schema.clone());
+            let elsewhere = tokio::task::spawn_blocking(move || rows_elsewhere(&db, &schema, &m, shard)).await.map_err(ApiError::internal)??;
+            if let Some((n, key)) = elsewhere {
+                let other = map.shard_of(&key);
+                return Err(conflict(format!(
+                    "{n} rows here have keys in other shards' slots under slot map epoch {} (key {} is in slot {}, which shard {other} holds, not {shard}): load the collection again through the coordinator (or with --demo-shard), then connect",
+                    map.epoch,
+                    js::to_json(&key),
+                    slots::slot(&key)
+                )));
+            }
+        }
+        if let Some(path) = &*file {
+            save_slots(path, &map, shard).map_err(|e| ApiError::internal(format!("keep the slot map in {}: {e}", path.display())))?;
+        }
+        let epoch = map.epoch;
+        *self.slots.write().unwrap_or_else(|e| e.into_inner()) = Some((map, shard));
+        Ok(epoch)
+    }
+
+    /// Checks a request's slot map epoch against this shard's: 0 (a
+    /// request not from a coordinator with a map) passes; an older epoch
+    /// is refused (409), as the coordinator routes by a map the shards
+    /// left; a newer one, or one this shard lacks, is refused as
+    /// unavailable (503), so that the coordinator asks again and sends its
+    /// map.
+    pub fn check_epoch(&self, epoch: u64) -> Result<(), ApiError> {
+        if epoch == 0 {
+            return Ok(());
+        }
+        match self.slot_epoch() {
+            e if e == epoch => Ok(()),
+            e if e > epoch => Err(conflict(format!("slot map epoch {epoch} is older than this shard's ({e}): the coordinator must load the newer map (--slot-map)"))),
+            0 => Err(ApiError { status: 503, message: format!("this shard has no slot map; the request's is epoch {epoch}") }),
+            e => Err(ApiError { status: 503, message: format!("this shard has slot map epoch {e}, older than the request's {epoch}") }),
+        }
+    }
+
+    /// Refuses (400) to write a key whose slot another shard holds, when
+    /// this shard has a slot map.
+    fn check_keys<'a>(&self, keys: impl IntoIterator<Item = &'a Value>) -> Result<(), ApiError> {
+        let held = self.slots.read().unwrap_or_else(|e| e.into_inner());
+        let Some((map, shard)) = &*held else { return Ok(()) };
+        for key in keys {
+            let s = slots::slot(key);
+            if map.owner(s) != *shard {
+                return Err(ApiError::bad(format!(
+                    "key {} is in slot {s}, which shard {} holds under slot map epoch {}, not this shard ({shard}): write through the coordinator",
+                    js::to_json(key),
+                    map.owner(s),
+                    map.epoch
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Opens the model of each embedded VECTOR field from `dir`
@@ -358,6 +476,10 @@ impl Service {
     /// writer records `key`'s outcome, even if this future is dropped.
     async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue) -> Result<u64, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
+        match &job {
+            WriteJob::Ops(ops) => self.check_keys(&ops.iter().map(|op| op_key(&self.schema, op)).collect::<Result<Vec<_>, _>>()?)?,
+            WriteJob::Sql(p) => self.check_keys(p.inserted_keys())?,
+        }
         let (reply, rx) = tokio::sync::oneshot::channel();
         let keys = self.idempotency.clone();
         tx.send(Queued { job, deadline, reply: Some(reply), key, keys, _queued: queued }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
@@ -942,6 +1064,9 @@ impl Service {
             Backend::Local(db) => {
                 let s = db.snapshot();
                 let mut h = json!({"status": "ok", "role": "shard", "docs": s.n_live_docs(), "segments": s.segments().len(), "txn": s.txn()});
+                if let Some((m, shard)) = self.slots() {
+                    h["slots"] = json!({"epoch": m.epoch, "shard": shard, "of": m.shards()});
+                }
                 if let Some(why) = self.failing() {
                     h["status"] = json!("failing");
                     h["error"] = json!(why);
@@ -1036,8 +1161,6 @@ pub enum SqlAnswer {
     Written { n: u64, took_ms: f64 },
 }
 
-/// The shard of `key` among `n`: FNV-1a of its text (an integer key as
-/// decimal digits), modulo `n`. Loaders must split documents the same way.
 /// Rows one write request of an import carries.
 pub const IMPORT_OPS: usize = 1000;
 
@@ -1045,18 +1168,51 @@ pub const IMPORT_OPS: usize = 1000;
 /// a query, its parameters (vectors among them) or a synonym list.
 pub const SMALL_BODY: usize = 16 << 20;
 
+/// The shard of `key` among `n` under an even slot map
+/// ([`slots::shard_of`]), as a coordinator without a map of its own routes
+/// writes. Loaders must split documents the same way.
 pub fn shard_of(key: &Value, n: usize) -> usize {
-    let text = match key {
-        Value::Str(s) => s.clone(),
-        Value::Int(x) => x.to_string(),
-        v => format!("{v:?}"),
-    };
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in text.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    slots::shard_of(key, n.max(1))
+}
+
+fn conflict(message: String) -> ApiError {
+    ApiError { status: 409, message }
+}
+
+/// How many rows of `db` have keys outside shard `shard`'s slots under
+/// `map`, and one of those keys; `None` if every row is in them. Reads
+/// every key.
+fn rows_elsewhere(db: &Db, schema: &Schema, map: &SlotMap, shard: usize) -> Result<Option<(usize, Value)>, ApiError> {
+    let Some(pk) = schema.primary_key else { return Ok(None) };
+    let sql = format!("SELECT {} FROM {}", quoted(&schema.fields[pk].name), ident(&schema.table));
+    let select = bind(&sql, schema, &Params::new())?;
+    let opts = ExecOptions { max_rows: None, ..db.exec.clone() };
+    let rs = db.execute(&db.snapshot(), &select, &opts)?;
+    let mut out: Option<(usize, Value)> = None;
+    for key in rs.keys.into_iter().filter(|k| map.shard_of(k) != shard) {
+        match &mut out {
+            Some((n, _)) => *n += 1,
+            None => out = Some((1, key)),
+        }
     }
-    (h % n.max(1) as u64) as usize
+    Ok(out)
+}
+
+/// Writes `map` and `shard` to `path` and syncs it, through a new file
+/// renamed over the old one, so that a crash leaves one or the other.
+fn save_slots(path: &Path, map: &SlotMap, shard: usize) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let body = serde_json::to_vec_pretty(&json!({"shard": shard, "map": map.to_json()})).map_err(std::io::Error::other)?;
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&body)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => std::fs::File::open(dir)?.sync_all(),
+        None => Ok(()),
+    }
 }
 
 /// The primary key an operation names (`key`, or the document's).

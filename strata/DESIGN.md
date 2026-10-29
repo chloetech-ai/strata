@@ -620,15 +620,26 @@ handing a query to its shards) are to make instead of writing SQL text.
   lasted until its deadline and a second. Partial aggregates were in
   place already: shards send sums, counts, minimums, maximums and
   `COUNT(DISTINCT)`'s exact values, which the coordinator merges.
+* **Slots.** From protocol 4, a key's shard is its slot's: one of 4,096,
+  xxh3 of the key's type tag and bytes (an `INT` and a string of the same
+  digits differ), where it was FNV-1a of the key's text modulo the shard
+  count, which moved most keys when a shard was added. A versioned map
+  assigns slots to shards (equal runs by default, or `--slot-map`). The
+  coordinator gives each shard the map (`Slots`), which the shard keeps
+  beside its database, and sends the map's epoch with every request; a
+  shard refuses an older epoch, another map of its epoch, a write of a key
+  another shard holds, and a map under which rows here are in other
+  shards' slots. Online resharding is a map of a higher epoch once moved
+  slots' rows are copied; the copy is not built. While a replica speaks
+  an older protocol the coordinator routes by the old hash.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication on top of the shard protocol (slots and
-epochs, sequence numbers in the WAL, WAL shipping, catch-up,
-read-your-writes, promotion), and a coordinator and strata-server over
-every table.
+Next: the rest of replication on top of the shard protocol (sequence
+numbers in the WAL, WAL shipping, catch-up, read-your-writes,
+promotion), and a coordinator and strata-server over every table.
 
 ## 7. Planning and execution
 

@@ -6,7 +6,10 @@
 // leaf of a coordinator's compound query as a JSON plan (`plan_json`); 2
 // takes every query as a typed plan (`plan`); 3 holds a query's snapshot
 // for a fetch that follows (`hold`, `release` and `Release`), so that a
-// coordinator can query then fetch. A caller asks a server's versions with
+// coordinator can query then fetch; 4 places keys in slots: a coordinator
+// gives each shard its slot map (`Slots`) and sends the map's epoch with
+// every request (`epoch`), and a shard refuses an older epoch and keys of
+// other shards' slots. A caller asks a server's versions with
 // `Hello` (a server that answers Unimplemented speaks 1) and speaks the
 // newest both know; a coordinator speaks the oldest of those among its
 // shards' replicas.
@@ -30,6 +33,24 @@ service Strata {
   rpc Hello(HelloRequest) returns (HelloResponse);
   // Protocol 3: ends snapshot leases before they expire.
   rpc Release(ReleaseRequest) returns (Empty);
+  // Protocol 4: gives a shard the coordinator's slot map and its place in
+  // it, which it keeps. Refused for a map older than the shard's, another
+  // map of the same epoch, or while rows here have keys in other shards'
+  // slots under the map.
+  rpc Slots(SlotsRequest) returns (SlotsResponse);
+}
+
+message SlotsRequest {
+  // The map as JSON: {"epoch": 1, "shards": [[[0, 2048]], [[2048, 4096]]]},
+  // each shard's slots as [start, end) ranges of the 4,096.
+  bytes map_json = 1;
+  // This server's shard in the map.
+  uint32 shard = 2;
+}
+
+message SlotsResponse {
+  // The epoch the shard holds.
+  uint64 epoch = 1;
 }
 
 message ReleaseRequest {
@@ -51,6 +72,8 @@ message HelloResponse {
   repeated string plan_features = 4;
   // Its name and version, for messages: "strata-server 0.1.0".
   string server = 5;
+  // The epoch of the slot map it holds; 0 without one.
+  uint64 slot_epoch = 6;
 }
 
 message Empty {}
@@ -100,6 +123,8 @@ message QueryRequest {
   bool hold = 10;
   // Protocol 3: end the request's lease (snapshot) once answered.
   bool release = 11;
+  // Protocol 4: the epoch of the coordinator's slot map; 0 for none.
+  uint64 epoch = 12;
 }
 
 // A plan (strata::query::ir): a statement as a tree of operators over typed
@@ -521,6 +546,8 @@ message WriteRequest {
   // With ops_json: a retry of a request with the same key (and the same
   // operations) returns the first answer instead of writing again.
   string idempotency_key = 4;
+  // Protocol 4: the epoch of the coordinator's slot map; 0 for none.
+  uint64 epoch = 5;
 }
 
 message WriteResponse { uint64 written = 1; }

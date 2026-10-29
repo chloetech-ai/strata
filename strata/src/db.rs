@@ -47,6 +47,18 @@ pub struct PreparedWrite {
     known: Known,
 }
 
+impl PreparedWrite {
+    /// The primary keys of the documents an INSERT writes; none for an
+    /// UPDATE or a DELETE, which change rows already in the table (and
+    /// cannot change a key).
+    pub fn inserted_keys(&self) -> Vec<&Value> {
+        match (&self.write, self.schema.primary_key) {
+            (Write::Insert { docs, .. }, Some(pk)) => docs.iter().map(|d| &d[pk]).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// Vectors computed ahead of a write, by embedded field and source text.
 type Known = HashMap<usize, HashMap<String, Arc<[f32]>>>;
 

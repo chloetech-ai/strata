@@ -31,6 +31,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--wal-drop-damaged` | off | open a database whose write-ahead log was damaged after it was durable, dropping the transactions from the damage on (the log is copied to `<log>.damaged` first); without it the server refuses to start on one |
 | `--verify-checksums` | off | check every segment against its checksum before serving (reads the whole database once); a damaged newest version is skipped for the one before it |
 | `--shards URL,URL,…` | | run as a coordinator over these shard servers' gRPC addresses |
+| `--slot-map FILE` | equal runs, epoch 1 | with `--shards`: the [slot map](#slots) to route writes by, which the shards are given |
 | `--listen ADDR` | `127.0.0.1:7700` | HTTP: the API, `/metrics` and the UI |
 | `--grpc ADDR` | `127.0.0.1:7701` | gRPC (`off` to disable) |
 | `--token T` | `$STRATA_TOKEN` | require `Authorization: Bearer T` on the API and on gRPC; needed to listen beyond loopback ([security](#security)) |
@@ -281,9 +282,9 @@ Not yet: point-in-time recovery between checkpoints, which needs the write-ahead
 
 ## gRPC
 
-`proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `Schema` and `Health`, mirroring the HTTP routes, and `Hello` and `Release`. Values are typed (`int`, `float`, `str`, `vector`, `list`, `boolean`, `timestamp`); statistics and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
+`proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `Schema` and `Health`, mirroring the HTTP routes, and `Hello`, `Release` and `Slots`. Values are typed (`int`, `float`, `str`, `vector`, `list`, `boolean`, `timestamp`); statistics and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
 
-A query travels as SQL with its parameters or, from protocol 2, as a typed plan (`QueryRequest.plan`, with `protocol` 2 or newer): the tree of operators [`EXPLAIN`](query-language.md#explain) shows, its fields named by position in the schema and its values typed, with no SQL to parse. `sql` then only names the query in the shard's logs. Protocol 3 adds snapshot leases for a fetch that follows a query: a query with `hold` keeps the snapshot it read, its own lease or a new one lasting as a `TermStats` lease does, and names it in its answer (`QueryResponse.snapshot`); a query with `release` ends its lease once answered, and `Release` ends leases no fetch needs. `Hello` answers the protocol versions a server speaks (1 to 3), the plan version it reads and the plan features it has. A server refuses a protocol newer than its own, and a plan of a newer version or one that needs a feature it lacks, by name (`InvalidArgument`). Protocol 1, the servers before `Hello`, takes SQL, or a JSON plan (`plan_json`) for a compound query's leaf.
+A query travels as SQL with its parameters or, from protocol 2, as a typed plan (`QueryRequest.plan`, with `protocol` 2 or newer): the tree of operators [`EXPLAIN`](query-language.md#explain) shows, its fields named by position in the schema and its values typed, with no SQL to parse. `sql` then only names the query in the shard's logs. Protocol 3 adds snapshot leases for a fetch that follows a query: a query with `hold` keeps the snapshot it read, its own lease or a new one lasting as a `TermStats` lease does, and names it in its answer (`QueryResponse.snapshot`); a query with `release` ends its lease once answered, and `Release` ends leases no fetch needs. Protocol 4 places keys in [slots](#slots): `Slots` gives a shard its slot map and its place in it, and queries, statistics calls and writes carry the map's `epoch`. `Hello` answers the protocol versions a server speaks (1 to 4), the plan version it reads, the plan features it has and the epoch of the slot map it holds. A server refuses a protocol newer than its own, and a plan of a newer version or one that needs a feature it lacks, by name (`InvalidArgument`). Protocol 1, the servers before `Hello`, takes SQL, or a JSON plan (`plan_json`) for a compound query's leaf.
 
 ## Sharding: one coordinator, many shards
 
@@ -305,7 +306,25 @@ Query then fetch (from protocol 3): for a page of rows with stored columns, when
 
 A coordinator asks each replica the protocol versions it speaks (`Hello`) when it connects, again every minute and after the replica fails (it may have restarted on another version), and speaks the oldest any replica speaks, so shards can be upgraded one at a time: while one runs a server from before `Hello`, every shard gets SQL and JSON plans; once all speak protocol 2 they get typed plans, and once all speak 3, pages are fetched. `/v1/health` shows the protocol spoken (`protocol`).
 
-A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key (a hash of the key picks the shard); `UPDATE` and `DELETE` go to every shard. A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
+A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key, to the shard holding its [slot](#slots); `UPDATE` and `DELETE` go to every shard. A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
+
+### Slots
+
+A primary key hashes to one of 4,096 slots: xxh3 of the key's type and bytes, so the `INT` 5 and the string `'5'` are different keys in different slots (`strata_server::slots::slot`). A slot map assigns the slots to shards under an epoch, its version: by default the shards hold equal runs of slots in the order `--shards` lists them, under epoch 1, and `--slot-map FILE` gives another assignment as JSON, each shard's slots as `[start, end)` ranges:
+
+```json
+{"epoch": 2, "shards": [[[0, 1024], [2048, 4096]], [[1024, 2048]]]}
+```
+
+When a coordinator connects, it gives every replica its map and its place in it (`Slots`), and then sends the epoch with every query and write. A shard keeps its map in a file beside its database (`<db>.slots`), so it outlives a restart, and shows it in `/v1/health` (`slots`). It refuses (409, `FailedPrecondition` over gRPC):
+
+- a request with an older epoch than its map's, so a coordinator still on an old map cannot write where the new map says another shard holds a key; a coordinator that gets a 409 when it connects says so and stops;
+- another map of the same epoch, such as a coordinator listing the shards in another order or fewer of them; a new assignment needs a higher epoch;
+- a map while rows here have keys in other shards' slots under it, saying how many and one of them. Nothing moves rows between shards yet, so a map that moves slots is refused until the shards are loaded again under it.
+
+A shard also refuses (400) a write of a key whose slot another shard holds, so that a client writing to a shard directly cannot place a row where the coordinator will not look for it. `--demo-shard I/N` loads the demo rows of shard I's slots under the default map.
+
+A coordinator routes by slots once every replica speaks protocol 4. While any is older, it routes by the hash before slots (FNV-1a of the key's text, modulo the shard count), gives no map, and logs a warning; it refuses `--slot-map` then. The two hashes place keys differently, so a collection sharded before slots is refused once its shards are upgraded, and has to be loaded again through a coordinator (or with `--demo-shard`). Moving slots between running shards (resharding online) is not built yet: it needs a map of a higher epoch and the rows of the moved slots copied first.
 
 ## Deadlines, admission and metrics
 
@@ -369,6 +388,7 @@ It answers 503 for `down` and `failing`. `/livez` and `/readyz` answer 503 only 
 | `strata_shard_retries_total`, `strata_shard_hedges_total` | | calls a coordinator asked of another replica after one failed, or after the first had not answered within `--hedge-ms` |
 | `strata_shard_protocol` | | the protocol a coordinator speaks to its shards: the oldest a replica speaks |
 | `strata_fetch_queries_total`, `strata_fetch_lost_rows_total` | | a coordinator's queries answered by query then fetch, and rows of their pages no fetch found |
+| `strata_slot_epoch` | | the epoch of the [slot map](#slots) a coordinator routes writes by; 0 while it routes by the hash before slots |
 | `strata_replicas_avoided` | | replicas a coordinator asks last for now, after they failed or were outrun |
 
 A coordinator's `/metrics` does not ask its shards: each shard serves its own, and the coordinator shows how its calls to them went. `strata_query_ms` (milliseconds) became `strata_query_duration_seconds`.

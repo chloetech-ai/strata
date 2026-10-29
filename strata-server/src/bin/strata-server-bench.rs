@@ -139,18 +139,21 @@ struct Built {
 }
 
 /// Builds `docs` into one segment at `path`, or reopens it with `reuse`.
-fn build(args: &Args, name: &str, path: &Path, codes: VectorCodes, dim: usize, docs: Vec<Document>) -> strata::Result<Built> {
+/// A shard's rows are those of its slots (`placed`); a shard file split
+/// otherwise (by the hash before slots) is built again, as its shard would
+/// refuse the coordinator's slot map.
+fn build(args: &Args, name: &str, path: &Path, codes: VectorCodes, dim: usize, docs: Vec<Document>, placed: Option<&str>) -> strata::Result<Built> {
     let report = PathBuf::from(format!("{}.build.json", path.display()));
     let n = docs.len();
     let reused = if args.reuse && path.exists() {
-        std::fs::read(&report).ok().and_then(|b| serde_json::from_slice::<Json>(&b).ok()).and_then(|j| j["build_s"].as_f64())
+        std::fs::read(&report).ok().and_then(|b| serde_json::from_slice::<Json>(&b).ok()).filter(|j| j["placed"].as_str() == placed).and_then(|j| j["build_s"].as_f64())
     } else {
         None
     };
     let (db, build_s) = match reused {
         Some(s) => (Db::open(path, serve_opts())?, s),
         None => {
-            for p in [path.to_path_buf(), wal_path(path)] {
+            for p in [path.to_path_buf(), wal_path(path), strata_server::slots::file_of(path)] {
                 if p.exists() {
                     std::fs::remove_file(&p)?;
                 }
@@ -162,7 +165,7 @@ fn build(args: &Args, name: &str, path: &Path, codes: VectorCodes, dim: usize, d
             let db = Db::create(path, schema, opts)?;
             db.load(docs)?;
             let s = t.elapsed().as_secs_f64();
-            std::fs::write(&report, json!({"build_s": s}).to_string())?;
+            std::fs::write(&report, json!({"build_s": s, "placed": placed}).to_string())?;
             (db, s)
         }
     };
@@ -630,13 +633,13 @@ async fn run(args: Args) -> Result<(), String> {
 
     // 1. Builds.
     let base = work.join(&args.collection);
-    let sq8 = build(&args, "8-bit codes", &PathBuf::from(format!("{}.sq8.strata", base.display())), VectorCodes::Sq8, coll.dim, coll.docs.clone()).map_err(e)?;
-    let bin = build(&args, "1-bit codes", &PathBuf::from(format!("{}.binary.strata", base.display())), VectorCodes::Binary, coll.dim, coll.docs.clone()).map_err(e)?;
+    let sq8 = build(&args, "8-bit codes", &PathBuf::from(format!("{}.sq8.strata", base.display())), VectorCodes::Sq8, coll.dim, coll.docs.clone(), None).map_err(e)?;
+    let bin = build(&args, "1-bit codes", &PathBuf::from(format!("{}.binary.strata", base.display())), VectorCodes::Binary, coll.dim, coll.docs.clone(), None).map_err(e)?;
     let mut shards = Vec::new();
     for s in 0..args.shards {
         let docs: Vec<Document> = coll.docs.iter().filter(|d| shard_of(&d[col::ID], args.shards) == s).cloned().collect();
         let path = PathBuf::from(format!("{}.shard{s}of{}.strata", base.display(), args.shards));
-        shards.push(build(&args, &format!("shard {s} of {}", args.shards), &path, VectorCodes::Sq8, coll.dim, docs).map_err(e)?);
+        shards.push(build(&args, &format!("shard {s} of {}", args.shards), &path, VectorCodes::Sq8, coll.dim, docs, Some("slots")).map_err(e)?);
     }
     if args.build_only {
         return Ok(());

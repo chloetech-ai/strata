@@ -32,7 +32,8 @@ struct Args {
     /// Create the demo product catalogue with this many products.
     #[arg(long)]
     demo: Option<usize>,
-    /// With --demo: keep only the products of shard I of N ("I/N").
+    /// With --demo: keep only the products of shard I of N ("I/N"), those
+    /// in its slots when N shards hold equal runs of slots.
     #[arg(long)]
     demo_shard: Option<String>,
     /// Fill the new database (--db with --schema) with this database's rows,
@@ -106,6 +107,12 @@ struct Args {
     /// the public roots.
     #[arg(long)]
     shard_ca: Option<PathBuf>,
+    /// With --shards: the slot map to route writes by, which the shards are
+    /// given (JSON, each shard's slots as [start, end) ranges of the 4,096:
+    /// {"epoch": 2, "shards": [[[0, 2048]], [[2048, 4096]]]}). Default:
+    /// equal runs of slots, epoch 1.
+    #[arg(long)]
+    slot_map: Option<PathBuf>,
     /// Default query deadline.
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
@@ -272,6 +279,10 @@ async fn main() {
             partial: a.partial,
             token: a.shard_token.clone().filter(|t| !t.is_empty()).map(Secret::new).or_else(|| token.clone()),
             ca: a.shard_ca.as_ref().map(read),
+            slots: a.slot_map.as_ref().map(|p| {
+                let j: serde_json::Value = serde_json::from_slice(&read(p)).unwrap_or_else(|e| fail(&format!("{}: {e}", p.display())));
+                strata_server::slots::SlotMap::from_json(&j).unwrap_or_else(|e| fail(&format!("{}: {e}", p.display())))
+            }),
             ..Default::default()
         },
         timeout_ms: a.timeout_ms,

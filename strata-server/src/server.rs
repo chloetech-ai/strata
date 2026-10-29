@@ -103,13 +103,16 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         Copy(PathBuf),
     }
     let mut fill = None;
+    let mut slots_file = None;
     let (backend, schema) = if !o.shards.is_empty() {
         // A shard with no replica answering yet (the cluster is starting, or
         // one is down) is waited for; a wrong URL or schema is not.
         let c = loop {
             match Coordinator::connect_with(o.shards.clone(), o.coord.clone()).await {
                 Ok(c) => break c,
-                Err(e) if e.status != 400 => {
+                // A shard that refuses the request, or the slot map, will
+                // not change its mind.
+                Err(e) if e.status != 400 && e.status != 409 => {
                     tracing::warn!(error = %e.message, "waiting for the shards");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
@@ -120,6 +123,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         (Backend::Cluster(Arc::new(c)), schema)
     } else {
         let path = o.db.clone().ok_or("pass --db PATH (or --shards to coordinate shard servers)")?;
+        slots_file = Some(crate::slots::file_of(&path));
         if o.copy_from.is_some() && (path.exists() || o.schema.is_none()) {
             return Err("--copy-from fills a new database: pass a --db that does not exist and its --schema".into());
         }
@@ -152,6 +156,12 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         (Backend::Local(db), schema)
     };
     let mut svc = Service::new(backend, schema, agent, o.max_concurrent.max(1), timeout);
+    if let Some(path) = slots_file {
+        svc.keep_slots_in(path)?;
+        if let Some((m, shard)) = svc.slots() {
+            tracing::info!(epoch = m.epoch, shard, of = m.shards(), "holds slots");
+        }
+    }
     if o.max_timeout_ms > 0 {
         svc.max_timeout = Duration::from_millis(o.max_timeout_ms).max(timeout);
     }

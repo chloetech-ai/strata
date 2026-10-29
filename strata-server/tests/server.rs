@@ -16,6 +16,7 @@ use strata::value::Value;
 use strata_server::auth::{self, Access, Secret, Tls};
 use strata_server::service::{shard_of, AgentConfig, Backend, QueryReq, Service, MAX_LEASES};
 use strata_server::coord::{CoordOptions, Coordinator};
+use strata_server::slots::{self, SlotMap};
 use strata_server::{demo, json as js, pb, server};
 use tokio::net::TcpListener;
 
@@ -559,15 +560,17 @@ async fn coordinator_answers_like_one_database() {
     sql("DELETE FROM products WHERE price = 10".into()).await;
     assert_eq!(count("SELECT COUNT(*) FROM products").await, N as i64);
 
-    // A shard that is down: queries fail with its address, health says so.
-    let dead = Coordinator::connect(vec![urls[0].clone()]).await.unwrap();
-    drop(dead);
+    // A coordinator over other shards would route keys elsewhere: refused.
+    let e = Coordinator::connect(vec![urls[0].clone()]).await.err().unwrap();
+    assert!(e.status == 409 && e.message.contains("a different slot map of epoch 1, as shard 0 of 3"), "{}", e.message);
+    // A shard that is down: connecting fails with its address.
     let err = Coordinator::connect(vec![urls[0].clone(), "http://127.0.0.1:1".into()]).await.err().unwrap();
     assert!(err.message.contains("127.0.0.1:1"), "{}", err.message);
 }
 
-/// A shard server that answers `Schema` and `Hello` and never anything
-/// else, like one whose machine froze after the coordinator started.
+/// A shard server that answers `Schema`, `Hello` and `Slots` and never
+/// anything else, like one whose machine froze after the coordinator
+/// started.
 struct Stuck(String);
 
 #[tonic::async_trait]
@@ -592,6 +595,9 @@ impl pb::strata_server::Strata for Stuck {
     }
     async fn release(&self, _: tonic::Request<pb::ReleaseRequest>) -> Result<tonic::Response<pb::Empty>, tonic::Status> {
         Ok(tonic::Response::new(pb::Empty {}))
+    }
+    async fn slots(&self, _: tonic::Request<pb::SlotsRequest>) -> Result<tonic::Response<pb::SlotsResponse>, tonic::Status> {
+        Ok(tonic::Response::new(pb::SlotsResponse { epoch: 1 }))
     }
 }
 
@@ -620,6 +626,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn release(&self, _: tonic::Request<pb::ReleaseRequest>) -> Result<tonic::Response<pb::Empty>, tonic::Status> {
         Ok(tonic::Response::new(pb::Empty {}))
+    }
+    async fn slots(&self, _: tonic::Request<pb::SlotsRequest>) -> Result<tonic::Response<pb::SlotsResponse>, tonic::Status> {
+        Ok(tonic::Response::new(pb::SlotsResponse { epoch: 1 }))
     }
 }
 
@@ -729,13 +738,15 @@ struct Seen {
     typed: bool,
     hold: bool,
     release: bool,
+    epoch: u64,
 }
 
 /// A shard server that records each read, as a server of protocol
 /// `version` would take it: one of 1 is from before `Hello` (it answers
 /// Unimplemented, and the fields it does not know, `protocol` and `plan`,
-/// never reach it), and one of 2 has no leases for a fetch (`hold`,
-/// `release`, `Release`). While `down`, it fails every read, and while
+/// never reach it), one of 2 has no leases for a fetch (`hold`, `release`,
+/// `Release`), and one of 3 no slots (`epoch`, `Slots`). While `down`, it
+/// fails every read, and while
 /// `fail_fetch`, every fetch (a read that ends its lease). `after_hold` is
 /// a write it applies once, after answering a read that held its snapshot.
 struct Recording {
@@ -748,13 +759,21 @@ struct Recording {
 }
 
 impl Recording {
-    fn read(&self, mut r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Request<pb::QueryRequest>, tonic::Status> {
-        if self.down.load(Ordering::Relaxed) {
-            return Err(tonic::Status::unavailable("restarting"));
+    fn up(&self) -> Result<(), tonic::Status> {
+        match self.down.load(Ordering::Relaxed) {
+            true => Err(tonic::Status::unavailable("restarting")),
+            false => Ok(()),
         }
+    }
+
+    fn read(&self, mut r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Request<pb::QueryRequest>, tonic::Status> {
+        self.up()?;
         let q = r.get_mut();
-        self.seen.lock().unwrap().push(Seen { protocol: q.protocol, typed: q.plan.is_some(), hold: q.hold, release: q.release });
+        self.seen.lock().unwrap().push(Seen { protocol: q.protocol, typed: q.plan.is_some(), hold: q.hold, release: q.release, epoch: q.epoch });
         let v = self.version.load(Ordering::Relaxed);
+        if v < 4 {
+            q.epoch = 0;
+        }
         if v < 3 {
             (q.hold, q.release) = (false, false);
         }
@@ -793,24 +812,37 @@ impl pb::strata_server::Strata for Recording {
         self.inner.term_stats(self.read(r)?).await
     }
     async fn write(&self, r: tonic::Request<pb::WriteRequest>) -> Result<tonic::Response<pb::WriteResponse>, tonic::Status> {
+        self.up()?;
         self.inner.write(r).await
     }
     async fn schema(&self, r: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::SchemaResponse>, tonic::Status> {
+        self.up()?;
         self.inner.schema(r).await
     }
     async fn health(&self, r: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
         self.inner.health(r).await
     }
     async fn hello(&self, r: tonic::Request<pb::HelloRequest>) -> Result<tonic::Response<pb::HelloResponse>, tonic::Status> {
+        self.up()?;
         match self.version.load(Ordering::Relaxed) {
             1 => Err(tonic::Status::unimplemented("unknown method Hello")),
-            v => Ok(tonic::Response::new(pb::HelloResponse { max_protocol: v, ..self.inner.hello(r).await?.into_inner() })),
+            v => {
+                let h = self.inner.hello(r).await?.into_inner();
+                Ok(tonic::Response::new(pb::HelloResponse { max_protocol: v, slot_epoch: if v >= 4 { h.slot_epoch } else { 0 }, ..h }))
+            }
         }
     }
     async fn release(&self, r: tonic::Request<pb::ReleaseRequest>) -> Result<tonic::Response<pb::Empty>, tonic::Status> {
         match self.version.load(Ordering::Relaxed) {
-            3 => self.inner.release(r).await,
+            3.. => self.inner.release(r).await,
             _ => Err(tonic::Status::unimplemented("unknown method Release")),
+        }
+    }
+    async fn slots(&self, r: tonic::Request<pb::SlotsRequest>) -> Result<tonic::Response<pb::SlotsResponse>, tonic::Status> {
+        self.up()?;
+        match self.version.load(Ordering::Relaxed) {
+            4.. => self.inner.slots(r).await,
+            _ => Err(tonic::Status::unimplemented("unknown method Slots")),
         }
     }
 }
@@ -844,11 +876,12 @@ async fn leases_end(shards: &[Arc<Recording>]) {
 }
 
 /// A coordinator asks each shard the protocol versions it speaks and
-/// speaks the oldest any speaks, as in a rolling upgrade: query then fetch
-/// with typed plans (protocol 3) when every shard holds snapshots for a
-/// fetch, typed plans in one round (2) to all while one does not, and SQL
-/// and JSON plans (1) to all while one is from before `Hello`. The answers
-/// are the same, and from protocol 3 no lease outlives its query.
+/// speaks the oldest any speaks, as in a rolling upgrade: with its slot
+/// map's epoch (protocol 4) when every shard holds a map, query then fetch
+/// with typed plans (3) while one does not, typed plans in one round (2)
+/// while one holds no snapshots for a fetch, and SQL and JSON plans (1)
+/// while one is from before `Hello`. The answers are the same, and from
+/// protocol 3 no lease outlives its query.
 #[tokio::test(flavor = "multi_thread")]
 async fn shards_speak_the_oldest_protocol_among_them() {
     let dir = tempfile::tempdir().unwrap();
@@ -858,7 +891,7 @@ async fn shards_speak_the_oldest_protocol_among_them() {
         "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE a.year >= - -2022 AND b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
         "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > 100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
     ];
-    for (round, versions) in [[3, 3], [3, 2], [3, 1]].into_iter().enumerate() {
+    for (round, versions) in [[4, 4], [4, 3], [4, 2], [4, 1]].into_iter().enumerate() {
         let mut urls = Vec::new();
         let mut seen = Vec::new();
         for (s, version) in versions.into_iter().enumerate() {
@@ -872,6 +905,8 @@ async fn shards_speak_the_oldest_protocol_among_them() {
         assert_eq!(c.protocol(), want_protocol);
         let coord = cluster(c);
         assert_eq!(coord.health().await["protocol"], want_protocol, "{versions:?}");
+        // Writes go by slots once every shard has them.
+        assert_eq!(coord.health().await["slot_epoch"], (want_protocol >= 4) as u64, "{versions:?}");
         for (sql, params) in queries() {
             let p = if params["q"].is_object() { Params::new().set("q", vector_42(&whole)) } else { Params::new() };
             let want = js::result(&whole.query(sql, &p).unwrap(), 0.0);
@@ -900,6 +935,7 @@ async fn shards_speak_the_oldest_protocol_among_them() {
             assert!(log.len() > queries().len(), "{versions:?}: {}", log.len());
             assert!(log.iter().all(|s| s.protocol == want_protocol && s.typed == (want_protocol >= 2)), "{versions:?}: {log:?}");
             assert_eq!(log.iter().any(|s| s.hold), want_protocol >= 3, "{versions:?}: {log:?}");
+            assert!(log.iter().all(|s| s.epoch == (want_protocol >= 4) as u64), "{versions:?}: {log:?}");
         }
     }
 }
@@ -910,20 +946,44 @@ async fn shards_speak_the_oldest_protocol_among_them() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replica_is_asked_its_protocol_again_after_failing() {
     let dir = tempfile::tempdir().unwrap();
-    let (url, shard) = recording(create(dir.path(), "db.strata", |_| true), 3).await;
+    let (url, shard) = recording(create(dir.path(), "db.strata", |_| true), 4).await;
     let coord = cluster(Coordinator::connect(vec![url]).await.unwrap());
     let count = || {
         let coord = coord.clone();
         async move { coord.query(QueryReq { sql: "SELECT COUNT(*) FROM products WHERE year >= 2020".into(), ..Default::default() }).await }
     };
     let n = count().await.unwrap().rs.rows[0][0].clone();
-    assert_eq!(shard.last().map(|s| (s.protocol, s.typed)), Some((3, true)));
+    assert_eq!(shard.last().map(|s| (s.protocol, s.typed)), Some((4, true)));
     shard.down.store(true, Ordering::Relaxed);
     shard.version.store(1, Ordering::Relaxed);
     assert_eq!(count().await.err().unwrap().status, 503);
     shard.down.store(false, Ordering::Relaxed);
     assert_eq!(count().await.unwrap().rs.rows[0][0], n);
     assert_eq!(shard.last().map(|s| (s.protocol, s.typed)), Some((1, false)));
+}
+
+/// A replica down when the coordinator connected gets no slot map then; it
+/// is asked its protocol and given the map before its first write, which
+/// it would refuse (503) without one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_down_at_connect_is_given_the_slot_map_before_it_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, first) = recording(create(dir.path(), "a.strata", |_| true), 4).await;
+    let (b, second) = recording(create(dir.path(), "b.strata", |_| true), 4).await;
+    second.down.store(true, Ordering::Relaxed);
+    let coord = cluster(Coordinator::connect(vec![format!("{a}|{b}")]).await.unwrap());
+    assert_eq!((first.inner.0.slot_epoch(), second.inner.0.slot_epoch()), (1, 0));
+    // Refused while it has no map, as a write that skipped the handshake
+    // would be.
+    second.down.store(false, Ordering::Relaxed);
+    let e = second.inner.0.check_epoch(1).err().unwrap();
+    assert_eq!(e.status, 503, "{}", e.message);
+    coord.write_ops(vec![json!({"op": "upsert", "doc": {"id": "late", "title": "Lamp"}})], None).await.unwrap();
+    assert_eq!(second.inner.0.slots(), Some((SlotMap::even(1, 1), 0)));
+    for shard in [&first, &second] {
+        let n = shard.inner.0.query(QueryReq { sql: "SELECT COUNT(*) FROM products WHERE id = 'late'".into(), ..Default::default() }).await.unwrap().rs.rows[0][0].clone();
+        assert_eq!(n, Value::Int(1));
+    }
 }
 
 /// Query then fetch: for a deep page, the shards rank their rows and
@@ -947,7 +1007,7 @@ async fn a_page_is_fetched_from_the_snapshot_it_was_ranked_on() {
         let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
         let (mut urls, mut shards) = (Vec::new(), Vec::new());
         for s in 0..2 {
-            let (url, shard) = recording(create(dir.path(), &format!("p{n}s{s}.strata"), |i| shard_of(&key(i), 2) == s), 3).await;
+            let (url, shard) = recording(create(dir.path(), &format!("p{n}s{s}.strata"), |i| shard_of(&key(i), 2) == s), 4).await;
             *shard.after_hold.lock().unwrap() = Some("UPDATE products SET title = 'changed'".into());
             urls.push(url);
             shards.push(shard);
@@ -1008,7 +1068,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
     let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version), (1, 3, strata::query::ir::VERSION));
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 4, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1034,13 +1094,101 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 4, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: 5, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 4"), "{}", e.message());
+    assert!(e.message().contains("protocol 5"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
     assert!(e.message().contains("teleport"), "{}", e.message());
+}
+
+/// A shard serving `db`, keeping the slot map it is given beside `path`.
+fn holding_slots(db: Db, path: &std::path::Path) -> Arc<Service> {
+    let schema = db.schema().clone();
+    let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
+    svc.keep_slots_in(slots::file_of(path)).unwrap();
+    Arc::new(svc)
+}
+
+/// Keys live in slots. A coordinator gives each shard its slot map when it
+/// connects and routes writes by it. A shard keeps the map beside its
+/// database, refuses a key another shard holds and a coordinator with an
+/// older map, and refuses a map while rows here are in other shards'
+/// slots: rows placed by the hash before slots, or slots a new map moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_live_in_their_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = |i: usize| Value::Str(format!("p{i:07}"));
+    let path = |s: usize| dir.path().join(format!("s{s}.strata"));
+    let shards: Vec<Arc<Service>> = (0..2).map(|s| holding_slots(create(dir.path(), &format!("s{s}.strata"), |i| shard_of(&key(i), 2) == s), &path(s))).collect();
+    let mut urls = Vec::new();
+    for svc in &shards {
+        urls.push(grpc(svc.clone()).await);
+    }
+    let even = SlotMap::even(2, 1);
+    let first = cluster(Coordinator::connect(urls.clone()).await.unwrap());
+    assert_eq!(first.health().await["slot_epoch"], 1);
+    for (s, svc) in shards.iter().enumerate() {
+        assert_eq!(svc.slots(), Some((even.clone(), s)));
+        assert_eq!(svc.health().await["slots"], json!({"epoch": 1, "shard": s, "of": 2}));
+        assert!(slots::file_of(&path(s)).exists());
+    }
+
+    // Writes land on the shard holding their key's slot.
+    let ids: Vec<String> = (0..40).map(|i| format!("new{i}")).collect();
+    let values: Vec<String> = ids.iter().map(|id| format!("('{id}', 'Tent {id}', 'outdoor', 10.0, 0)")).collect();
+    first.sql(&format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), 0).await.unwrap();
+    for id in &ids {
+        let k = Value::Str(id.clone());
+        for (s, svc) in shards.iter().enumerate() {
+            let n = svc.query(QueryReq { sql: format!("SELECT COUNT(*) FROM products WHERE id = '{id}'"), ..Default::default() }).await.unwrap().rs.rows[0][0].clone();
+            assert_eq!(n, Value::Int((even.shard_of(&k) == s) as i64), "{id} on shard {s}");
+        }
+    }
+    // A shard refuses a key another holds, however it is written.
+    let theirs = (0..).map(|i| format!("x{i}")).find(|id| even.shard_of(&Value::Str(id.clone())) == 1).unwrap();
+    let e = shards[0].sql(&format!("INSERT INTO products (id, title) VALUES ('{theirs}', 'Lamp')"), &Params::new(), 0).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("which shard 1 holds under slot map epoch 1"), "{}", e.message);
+    let e = shards[0].write_ops(vec![json!({"op": "upsert", "doc": {"id": theirs, "title": "Lamp"}})], None).await.err().unwrap();
+    assert_eq!(e.status, 400, "{}", e.message);
+    shards[1].write_ops(vec![json!({"op": "upsert", "doc": {"id": theirs, "title": "Lamp"}})], None).await.unwrap();
+
+    // A newer map of the same slots: the coordinator with the older one is
+    // refused, reads and writes alike.
+    let second_map = SlotMap::from_json(&json!({"epoch": 2, "shards": [[[0, 2048]], [[2048, 4096]]]})).unwrap();
+    let second = cluster(Coordinator::connect_with(urls.clone(), CoordOptions { slots: Some(second_map.clone()), ..Default::default() }).await.unwrap());
+    assert_eq!(second.health().await["slot_epoch"], 2);
+    let e = first.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.err().unwrap();
+    assert!(e.status == 409 && e.message.contains("slot map epoch 1 is older than this shard's (2)"), "{}", e.message);
+    let e = first.write_ops(vec![json!({"op": "delete", "key": "new1"})], None).await.err().unwrap();
+    assert_eq!(e.status, 409, "{}", e.message);
+    assert_eq!(second.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.unwrap().rs.rows[0][0], Value::Int((N + ids.len() + 1) as i64));
+    // An older map is refused when given, too.
+    let e = Coordinator::connect(urls.clone()).await.err().unwrap();
+    assert!(e.status == 409 && e.message.contains("refused slot map epoch 1"), "{}", e.message);
+    let e = Coordinator::connect_with(vec![urls[0].clone()], CoordOptions { slots: Some(second_map.clone()), ..Default::default() }).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("2 shards, and --shards 1"), "{}", e.message);
+
+    // The map outlives the server: a shard opened again reads it back.
+    let mut again = Service::new(Backend::Local(Arc::new(create(dir.path(), "again.strata", |_| false))), demo::schema(N), agent_config("http://unused"), 16, Duration::from_secs(10));
+    again.keep_slots_in(slots::file_of(&path(0))).unwrap();
+    assert_eq!(again.slots(), Some((second_map.clone(), 0)));
+
+    // A map that moves slots between shards is refused while rows are in
+    // them, as nothing moves rows yet.
+    let moved = SlotMap::from_json(&json!({"epoch": 3, "shards": [[[0, 1024], [2048, 4096]], [[1024, 2048]]]})).unwrap();
+    let e = Coordinator::connect_with(urls.clone(), CoordOptions { slots: Some(moved), ..Default::default() }).await.err().unwrap();
+    assert!(e.status == 409 && e.message.contains("rows here have keys in other shards' slots under slot map epoch 3"), "{}", e.message);
+    assert_eq!(shards[0].slot_epoch(), 2);
+
+    // Rows placed by the hash before slots are refused too, by count.
+    let old_shard = |s: usize| move |i: usize| slots::hash_shard_of(&Value::Str(format!("p{i:07}")), 2) == s;
+    let hashed = holding_slots(create(dir.path(), "h0.strata", old_shard(0)), &dir.path().join("h0.strata"));
+    let misplaced = (0..N).filter(|&i| old_shard(0)(i) && shard_of(&key(i), 2) != 0).count();
+    let e = Coordinator::connect(vec![grpc(hashed.clone()).await, grpc(holding_slots(create(dir.path(), "h1.strata", old_shard(1)), &dir.path().join("h1.strata"))).await]).await.err().unwrap();
+    assert!(e.message.contains(&format!("{misplaced} rows here have keys in other shards' slots")), "{}", e.message);
+    assert_eq!(hashed.slots(), None);
 }
 
 /// The agent's tool loop, against a stand-in for the Messages API that
