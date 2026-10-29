@@ -194,7 +194,9 @@ pub struct ExecOptions {
     /// candidate with each input's raw score ([`FusionParts`]).
     pub shard: bool,
     /// Threads a query may use to search its segments in parallel (1: the
-    /// calling thread only).
+    /// calling thread only): the calling thread and up to `threads - 1` of
+    /// the process's shared pool ([`Pool::global`](super::pool::Pool::global)),
+    /// as they come free.
     pub threads: usize,
     /// Fail with `Error::Timeout` once this has passed (checked between
     /// segments).
@@ -738,9 +740,10 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Runs `f` on every segment, on up to [`ExecOptions::threads`] threads
-    /// (largest segments first), and returns the results in segment order
-    /// with what each recorded taken in.
+    /// Runs `f` on every segment, on this thread and up to
+    /// [`ExecOptions::threads`] `- 1` pool threads (largest segments first),
+    /// and returns the results in segment order with what each recorded
+    /// taken in.
     fn per_segment<T: Send>(&mut self, f: impl Fn(&Self, &Seg<'a>, &mut Local) -> Result<T> + Sync) -> Result<Vec<T>>
     where
         Self: Sync,
@@ -760,21 +763,19 @@ impl<'a> Executor<'a> {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let slots: Vec<std::sync::Mutex<Option<(Result<T>, Local)>>> = (0..segs.len()).map(|_| std::sync::Mutex::new(None)).collect();
             let this = &*self;
-            std::thread::scope(|sc| {
-                for _ in 0..threads {
-                    sc.spawn(|| loop {
-                        let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(&i) = order.get(j) else { break };
-                        let mut l = Local::default();
-                        let r = this.check_deadline().and_then(|_| f(this, &segs[i], &mut l));
-                        *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((r, l));
-                    });
-                }
+            // This thread and up to `threads - 1` of the shared pool's,
+            // each taking the next segment until none are left.
+            super::pool::Pool::global().run(threads - 1, &|| loop {
+                let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&i) = order.get(j) else { break };
+                let mut l = Local::default();
+                let r = this.check_deadline().and_then(|_| f(this, &segs[i], &mut l));
+                *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((r, l));
             });
             for (o, m) in outs.iter_mut().zip(slots) {
                 *o = m.into_inner().unwrap_or_else(|e| e.into_inner());
             }
-            self.stats.plan.push(format!("{} segments on {threads} threads", segs.len()));
+            self.stats.plan.push(format!("{} segments on up to {threads} threads", segs.len()));
         }
         let mut res = Vec::with_capacity(outs.len());
         for o in outs {

@@ -17,6 +17,7 @@ pub mod logical;
 pub mod memory;
 pub mod parse;
 pub mod plan;
+pub mod pool;
 pub mod sql;
 pub mod stats;
 pub mod tables;

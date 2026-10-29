@@ -133,8 +133,8 @@ jobs:
         include:
           - part: pyramid
             tests: "postings::codecs::pyramid::tests::miri_"
-          - part: bytes, loom, bit vectors
-            tests: "postings::bytes postings::codecs::loom::tests::miri_ postings::bits"
+          - part: bytes, loom, bit vectors, query pool
+            tests: "postings::bytes postings::codecs::loom::tests::miri_ postings::bits query::pool"
           - part: columns, graph, keys, text codec
             tests: "forward:: graph:: storage::pk::tests::collisions storage::pk::tests::section_written storage::live storage::updates::tests::round_trip text::codec --skip many_int_keys"
     steps:
