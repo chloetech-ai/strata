@@ -194,7 +194,8 @@ impl Database {
     }
 
     fn documents(db: &Db, rows: &[Json]) -> strata::Result<Vec<strata::Document>> {
-        let mut docs = rows.iter().enumerate().map(|(i, j)| ingest::document(db.schema(), j).map_err(|e| strata::Error::Schema(format!("row {}: {e}", i + 1)))).collect::<strata::Result<Vec<_>>>()?;
+        let now = strata::timestamp::now();
+        let mut docs = rows.iter().enumerate().map(|(i, j)| ingest::document_at(db.schema(), j, now).map_err(|e| strata::Error::Schema(format!("row {}: {e}", i + 1)))).collect::<strata::Result<Vec<_>>>()?;
         db.embed_missing(&mut docs);
         Ok(docs)
     }

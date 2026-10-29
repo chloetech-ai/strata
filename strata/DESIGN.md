@@ -153,7 +153,8 @@ need no table.
 * **Format 3 and features.** Format 3 is format 2 with the features the
   database uses: `{format: 3, features: {required: [...]}, ...}`. A version
   is written in format 3 only while a table uses a feature (a `BOOL` or
-  `TIMESTAMP` field is `"bool"` or `"timestamp"`), and falls back to 2 or 1,
+  `TIMESTAMP` field is `"bool"` or `"timestamp"`, a `NOT NULL` field
+  `"not_null"`, a default `"default"`), and falls back to 2 or 1,
   in both meta slots, when the last one goes. A reader refuses a manifest
   that requires a feature it does not know, naming the feature, and ignores
   an `optional` list and other keys it does not know. Format 3 is the last
@@ -166,6 +167,16 @@ need no table.
   (`Field::store`), and a query's answer turns the integers of its
   columns back (`Select::types`, applied by the executor and, for shards,
   by `cluster::merge` after merging, so shards exchange integers).
+* **NOT NULL and DEFAULT** are field options (`not_null`, `default`, a JSON
+  value; `"now"` on a `TIMESTAMP`). The engine enforces `NOT NULL` on every
+  write (`value::validate`, and `set`), so no front end can skip it.
+  Defaults belong to the front ends: SQL fills the columns an `INSERT`
+  leaves out and the `DEFAULT` keyword, and `ingest` the keys and columns a
+  JSON row or a file leaves out, each from `Schema::defaults(now)` with one
+  `now` per statement, request or file, while the Rust API writes a row as
+  given. A coordinator binds an `INSERT` once, so its shards store the
+  same time. The key needs no `NOT NULL` (it is implied, and not a
+  feature) and takes no default.
 * **WAL.** Records carry no table while they write the first one; a `TABLE`
   record switches the table for the records after it in the transaction. A
   one-table WAL is therefore byte for byte what it was.

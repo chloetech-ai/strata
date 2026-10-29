@@ -72,9 +72,11 @@ pub fn field_value(schema: &Schema, f: usize, j: &Json) -> Result<Value, ApiErro
     Ok(strata::ingest::value(schema, f, j)?)
 }
 
-/// A document from a JSON object of field values (missing fields null).
-pub fn document(schema: &Schema, j: &Json) -> Result<Document, ApiError> {
-    Ok(strata::ingest::document(schema, j)?)
+/// A document from a JSON object of field values (missing fields take
+/// their defaults or are null; a TIMESTAMP defaulting to `"now"` takes
+/// `now`, the time of the request).
+pub fn document(schema: &Schema, j: &Json, now: i64) -> Result<Document, ApiError> {
+    Ok(strata::ingest::document_at(schema, j, now)?)
 }
 
 /// A document as a JSON object.

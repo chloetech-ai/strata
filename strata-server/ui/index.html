@@ -1534,6 +1534,9 @@ function designJson() {
       if (f.index && f.index !== "hnsw") o.index = f.index;
       if (f.codes && f.codes !== "sq8") o.codes = f.codes;
     }
+    if (f.references) o.references = f.references;
+    if (f.not_null) o.not_null = true;
+    if (f.default != null) o.default = f.default;
     return o;
   });
   return D.key ? { table: D.table, key: D.key, fields } : { table: D.table, fields };
@@ -1572,7 +1575,7 @@ function fieldRow(f) {
   const type = el("select", {}, ...TYPES.map((t) => el("option", { value: t, text: t })));
   type.value = f.type;
   type.onchange = () => {
-    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored"]) delete f[k];
+    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored", "default"]) delete f[k];
     f.type = type.value;
     if (f.type === "vector") { const from = textFields(); f.embed = from.length ? { from, model: "potion-retrieval-32M" } : undefined; if (!f.embed) f.dim = 384; }
     designChanged(true);
@@ -1615,6 +1618,18 @@ function fieldRow(f) {
   }
   if (f.type === "keyword" || f.type === "int") opts.append(check("list", !!f.multi, (on) => { f.multi = on || undefined; if (on) delete f.stored; }, "Each row holds several values"));
   if (f.type === "text") opts.append(check("phrases", f.positions !== false, (on) => { f.positions = on ? undefined : false; }, "Keep word positions, for \"exact phrase\" searches"));
+  // NOT NULL and a default, for one value of a plain type that is not the key.
+  if (!vec && !gen && !f.multi && ["text", "keyword", "int", "float", "bool", "timestamp"].includes(f.type) && f.name !== D.key) {
+    opts.append(check("required", !!f.not_null, (on) => { f.not_null = on || undefined; }, "Every row holds a value (NOT NULL)"));
+    const def = el("input", { type: "text", value: f.default == null ? "" : String(f.default), placeholder: f.type === "timestamp" ? "now, or a date" : "none", spellcheck: "false", style: "width:96px" });
+    def.oninput = () => {
+      const v = def.value.trim();
+      const num = (f.type === "int" || f.type === "float") && /^-?\d+(\.\d+)?$/.test(v), bool = f.type === "bool" && /^(true|false)$/i.test(v);
+      f.default = v === "" ? undefined : num ? Number(v) : bool ? v.toLowerCase() === "true" : v;
+      designChanged(false);
+    };
+    opts.append(el("label", { title: "What a row that leaves this field out holds (now: the time it is written)" }, "default", def));
+  }
   const storedDefault = !vec && !gen;
   opts.append(check("indexed", f.indexed !== false, (on) => { f.indexed = on ? undefined : false; }, "Searchable and filterable"),
     check("stored", f.stored == null ? storedDefault : f.stored, (on) => { f.stored = on === storedDefault ? undefined : on; }, vec ? "Keep the full vectors to return them (search needs only the index)" : "Returned in results"));

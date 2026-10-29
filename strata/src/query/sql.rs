@@ -284,12 +284,14 @@ fn insert(ins: &sql::Insert, schema: &Schema, params: &Params) -> Result<Write> 
         Some(q) => return Err(err(format!("INSERT ... VALUES takes no {}", no_clauses(q).unwrap_or_default()))),
         None => return Err(err("INSERT needs VALUES")),
     };
+    // Columns the statement leaves out take their defaults.
+    let start = schema.defaults(b.now)?;
     let mut docs = Vec::with_capacity(values.rows.len());
     for row in &values.rows {
         if row.len() != cols.len() {
             return Err(err(format!("{} values for {} columns", row.len(), cols.len())));
         }
-        let mut doc = vec![Value::Null; schema.fields.len()];
+        let mut doc = start.clone();
         for (&f, e) in cols.iter().zip(row) {
             doc[f] = b.write_value(f, e)?;
         }
@@ -381,11 +383,14 @@ struct Binder<'a> {
     params: &'a Params,
     /// Graph computations bound so far (`Select::graphs`).
     graphs: RefCell<Vec<GraphQuery>>,
+    /// The statement's time, in microseconds since the epoch: `now()` in
+    /// `decay` and the `"now"` default of a TIMESTAMP.
+    now: i64,
 }
 
 impl<'a> Binder<'a> {
     fn new(schema: &'a Schema, params: &'a Params) -> Self {
-        Binder { schema, params, graphs: RefCell::new(Vec::new()) }
+        Binder { schema, params, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now() }
     }
 
     fn query(&self, q: &sql::Query) -> Result<Select> {
@@ -1006,7 +1011,7 @@ impl<'a> Binder<'a> {
         // seconds, as now() is for a number.
         let time = self.schema.fields[field].logical == Some(Logical::Timestamp);
         let unit = if time { 1e6 } else { 1.0 };
-        let now = || crate::timestamp::now() as f64 / 1e6 * unit;
+        let now = || self.now as f64 / 1e6 * unit;
         let origin = match origin {
             Expr::Function(g) if fname(g) == "now" => now(),
             e => match self.literal(e)? {
@@ -1319,9 +1324,13 @@ impl<'a> Binder<'a> {
     }
 
     /// A value written to field `f`: a literal or parameter of its type,
-    /// `ARRAY[...]` for lists and vectors.
+    /// `ARRAY[...]` for lists and vectors, or `DEFAULT`.
     fn write_value(&self, f: usize, e: &Expr) -> Result<Value> {
         let field = &self.schema.fields[f];
+        // `DEFAULT`: the column's default, or NULL without one.
+        if matches!(e, Expr::Identifier(id) if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default")) {
+            return field.default_value(self.now);
+        }
         if let Expr::Array(a) = e {
             return match &field.ty {
                 FieldType::Vector { .. } => {

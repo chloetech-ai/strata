@@ -217,9 +217,10 @@ impl Service {
         let writes_doc = |op: &Json| matches!(op.get("op").and_then(|o| o.as_str()), Some("insert" | "upsert" | "upsert_if_newer"));
         let mut at = Vec::new();
         let mut docs = Vec::new();
+        let now = strata::timestamp::now();
         for (i, op) in ops.iter().enumerate() {
             if writes_doc(op) && op.get("doc").is_some_and(|d| d.is_object()) {
-                docs.push(js::document(&self.schema, &op["doc"])?);
+                docs.push(js::document(&self.schema, &op["doc"], now)?);
                 at.push(i);
             }
         }
@@ -1225,11 +1226,14 @@ fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<Vec<u64>, ApiError> {
     Ok(counts)
 }
 
+/// Applies one request's `ops`; a TIMESTAMP defaulting to `"now"` takes
+/// the same time in all of them.
 fn apply_into(schema: &Schema, t: &mut WriteTxn<'_>, ops: &[Json]) -> Result<u64, ApiError> {
     let mut n = 0u64;
+    let now = strata::timestamp::now();
     for op in ops {
         let kind = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
-        let doc = || js::document(&schema, op.get("doc").unwrap_or(&Json::Null));
+        let doc = || js::document(schema, op.get("doc").unwrap_or(&Json::Null), now);
         let field = || op.get("field").and_then(|f| f.as_str()).ok_or_else(|| ApiError::bad(format!("{kind} needs a field")));
         let wrote = match kind {
             "insert" => {

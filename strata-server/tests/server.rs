@@ -1201,3 +1201,59 @@ async fn bool_and_timestamp_fields_over_http_and_grpc() {
     let got = coord.query(QueryReq { sql: "SELECT done, at FROM tasks WHERE id = 'y1'".into(), ..Default::default() }).await.unwrap();
     assert_eq!(js::result(&got.rs, 0.0)["rows"], json!([[true, "2026-11-01T02:59:59.500Z"]]));
 }
+
+/// NOT NULL and DEFAULT over HTTP writes and through a coordinator: a row
+/// that leaves a field out takes its default, and a NOT NULL field left
+/// NULL is refused with 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn defaults_and_not_null_over_http_and_grpc() {
+    use strata::schema::Schema;
+    let schema = Schema::from_json(
+        r#"{"table": "events", "key": "id", "fields": [
+            {"name": "id", "type": "keyword"},
+            {"name": "kind", "type": "keyword", "not_null": true, "default": "click"},
+            {"name": "n", "type": "int", "default": 1},
+            {"name": "at", "type": "timestamp", "not_null": true, "default": "now"}
+        ]}"#,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let open = |name: &str| Db::create(&dir.path().join(name), schema.clone(), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let svc = |db: Db| Arc::new(Service::new(Backend::Local(Arc::new(db)), schema.clone(), agent_config("http://unused"), 16, Duration::from_secs(10)));
+
+    let base = http(svc(open("one.strata")), None).await;
+    let c = reqwest::Client::new();
+    let (status, r) = c.get(format!("{base}/v1/schema")).send().await.unwrap().json::<Json>().await.map(|j| (200, j)).unwrap();
+    assert_eq!((status, &r["short"]["fields"][1]), (200, &json!({"name": "kind", "type": "keyword", "not_null": true, "default": "click"})));
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({"ops": [{"op": "insert", "doc": {"id": "a"}}, {"op": "insert", "doc": {"id": "b", "kind": "view", "n": null}}]})).await;
+    assert_eq!((status, &r["written"]), (200, &json!(2)), "{r}");
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id, kind, n FROM events WHERE at <= :t", "params": {"t": "2100-01-01"}})).await;
+    let mut got = r["rows"].as_array().cloned().unwrap_or_default();
+    got.sort_by_key(|r| r[0].to_string());
+    assert_eq!(got, [json!(["a", "click", 1]), json!(["b", "view", null])], "{r}");
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT COUNT(*), MIN(at), MAX(at) FROM events"})).await;
+    assert_eq!(r["rows"][0][0], json!(2), "{r}");
+    assert_eq!(r["rows"][0][1], r["rows"][0][2], "one time for the request: {r}");
+    for op in [json!({"op": "insert", "doc": {"id": "x", "kind": null}}), json!({"op": "set", "key": "a", "field": "at", "value": null})] {
+        let (status, r) = post(&c, &format!("{base}/v1/write"), json!({"ops": [op]})).await;
+        assert_eq!(status, 400, "{op}: {r}");
+        assert!(r["error"].as_str().unwrap_or("").contains("is NOT NULL"), "{r}");
+    }
+
+    // Through a coordinator, an INSERT's defaults are filled in once, so
+    // its shards store the same time.
+    let mut urls = Vec::new();
+    for s in 0..2 {
+        urls.push(grpc(svc(open(&format!("s{s}.strata")))).await);
+    }
+    let coord = Coordinator::connect(urls).await.unwrap();
+    let coord = Arc::new(Service::new(Backend::Cluster(Arc::new(coord)), schema.clone(), agent_config("http://unused"), 16, Duration::from_secs(10)));
+    let values: Vec<String> = (0..20).map(|i| format!("('k{i}')")).collect();
+    coord.sql(&format!("INSERT INTO events (id) VALUES {}", values.join(", ")), &Params::new(), 0).await.unwrap();
+    let got = coord.query(QueryReq { sql: "SELECT kind, n, COUNT(*), MIN(at), MAX(at) FROM events GROUP BY kind, n".into(), ..Default::default() }).await.unwrap();
+    let rows = js::result(&got.rs, 0.0)["rows"].clone();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!((&rows[0][0], &rows[0][1], &rows[0][2]), (&json!("click"), &json!(1), &json!(20)));
+    assert_eq!(rows[0][3], rows[0][4], "one time for the statement: {rows}");
+    assert!(coord.sql("INSERT INTO events (id, kind) VALUES ('y', NULL)", &Params::new(), 0).await.is_err());
+}

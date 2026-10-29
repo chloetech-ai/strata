@@ -180,3 +180,27 @@ def test_bool_and_timestamp(tmp_path):
             db.insert({"id": "x", "done": 2})
         with pytest.raises(strata.StrataError, match="at"):
             db.insert({"id": "x", "at": "next week"})
+
+
+def test_not_null_and_default(tmp_path):
+    schema = {
+        "table": "events",
+        "key": "id",
+        "fields": [
+            {"name": "id", "type": "keyword"},
+            {"name": "kind", "type": "keyword", "not_null": True, "default": "click"},
+            {"name": "n", "type": "int", "default": 1},
+            {"name": "at", "type": "timestamp", "default": "now"},
+        ],
+    }
+    with strata.Database.create(tmp_path / "events.strata", schema) as db:
+        assert db.schema["fields"][1] == {"name": "kind", "type": "keyword", "not_null": True, "default": "click"}
+        db.insert([{"id": "a"}, {"id": "b", "kind": "view", "n": None}])
+        r = db.query("SELECT id, kind, n FROM events WHERE at IS NOT NULL ORDER BY n")
+        assert sorted(list(row.values()) for row in r) == [["a", "click", 1], ["b", "view", None]]
+        with pytest.raises(strata.StrataError, match="kind is NOT NULL"):
+            db.insert({"id": "x", "kind": None})
+        assert db.sql("INSERT INTO events (id, n) VALUES ('c', DEFAULT)") == 1
+        assert db.query("SELECT kind, n FROM events WHERE id = 'c'")[0] == {"kind": "click", "n": 1}
+        with pytest.raises(strata.StrataError, match="kind is NOT NULL"):
+            db.sql("UPDATE events SET kind = NULL WHERE id = 'a'")

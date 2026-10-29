@@ -356,8 +356,10 @@ CREATE TABLE authors (
 );
 CREATE TABLE IF NOT EXISTS wrote (
   id INT PRIMARY KEY,
-  author KEYWORD REFERENCES authors,
-  paper KEYWORD REFERENCES papers (id)
+  author KEYWORD NOT NULL REFERENCES authors,
+  paper KEYWORD REFERENCES papers (id),
+  role KEYWORD NOT NULL DEFAULT 'author',
+  added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 DROP TABLE IF EXISTS wrote, authors;
 ```
@@ -366,8 +368,9 @@ DROP TABLE IF EXISTS wrote, authors;
 - **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), and `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone). Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
 - **The primary key** is one column: `PRIMARY KEY` on it, or a `PRIMARY KEY (column)` constraint. A table without one only takes plain `INSERT`.
 - **`REFERENCES table`**, or `FOREIGN KEY (column) REFERENCES table`, records that a `KEYWORD` or `INT` column holds primary keys of that table, which must exist (or be the table being created) and have a primary key of the column's type. References are not enforced: a row may name a key that is not there. Joins along them are the next step.
+- **`NOT NULL`** refuses a row without a value in that column, from any write: SQL, JSON, a file or the Rust API. **`DEFAULT value`** is the value a write that leaves the column out gets: a constant of the column's type on a single-valued `TEXT`, `KEYWORD`, `INT`, `FLOAT`, `BOOL` or `TIMESTAMP` column that is not the key, or `CURRENT_TIMESTAMP` (or `now()`) on a `TIMESTAMP`, the time of the statement, the same in all its rows. An `INSERT` that leaves a column out, a JSON row without its key and a CSV file without its column give it the default; a `NULL` that a write gives stays `NULL`, and a column with `NOT NULL` refuses it. In SQL the keyword `DEFAULT` stands for a column's default, in `VALUES` and in `SET`. The Rust API writes a row as it is given; `Schema::defaults` returns a row of the defaults to start from. The JSON schema's options are `"not_null": true` and `"default"` (`"now"` for the time of the write).
 - **`DROP TABLE`** drops tables other than the first. A table that another table references goes with it (`DROP TABLE wrote, authors`) or with `CASCADE`, which removes those references.
-- Every other clause (`NOT NULL`, `DEFAULT`, `UNIQUE`, `CHECK`, `ON DELETE`, constraint names, `CREATE TABLE ... AS SELECT`) is an error, and there is no `ALTER TABLE` yet.
+- Every other clause (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, a `DEFAULT` that is an expression, `CREATE TABLE ... AS SELECT`) is an error, and there is no `ALTER TABLE` yet.
 
 `CREATE TABLE` and `DROP TABLE` run through `Db::sql` and Python's in-process [`strata.Database`](python.md). [strata-server](server.md) serves a database's first table for now.
 
@@ -380,6 +383,7 @@ INSERT INTO products (id, title, price) VALUES ('p2', 'blue mug', 11.0) ON CONFL
 INSERT INTO products (id, title, price) VALUES ('p1', 'red mug', 12.0)
   ON CONFLICT (id) DO UPDATE SET price = excluded.price, stock = stock + 10;
 UPDATE products SET stock = stock - 1, price = 11.0 WHERE id = 'p1';
+UPDATE products SET stock = DEFAULT WHERE id = 'p2';
 DELETE FROM products WHERE MATCH(title, 'discontinued');
 DELETE FROM products WHERE stock = 0 ORDER BY price LIMIT 100;
 ```
