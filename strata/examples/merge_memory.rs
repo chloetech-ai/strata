@@ -1,5 +1,6 @@
 //! Peak memory of a merge per byte of input image, which
-//! `storage::merge::MEMORY_PER_IMAGE_BYTE` is set from: anonymous memory
+//! `storage::merge::memory_per_image_byte` and `memory_per_streamed_byte`
+//! are set from: anonymous memory
 //! (`RssAnon`, so Linux only) sampled every 5 ms while one merge runs, above
 //! what the process held before it. The database is built by one process
 //! and merged by another, so that nothing the load freed is held over.

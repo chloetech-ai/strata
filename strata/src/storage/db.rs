@@ -46,7 +46,7 @@ use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
 use crate::storage::manifest::{Manifest, SegmentMeta, TableMeta};
-use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
+use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MERGE_BATCH_BYTES, MERGE_BATCH_DOCS, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
 use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
@@ -351,13 +351,6 @@ pub(crate) struct Reserved {
     pub extent: Extent,
     pub file: Option<String>,
 }
-
-/// A merge decodes its input documents in batches of about this many
-/// bytes of their images, at least `MERGE_BATCH_DOCS.start` documents (so
-/// that a TEXT field still analyses a run per build thread) and at most
-/// `MERGE_BATCH_DOCS.end`.
-const MERGE_BATCH_BYTES: usize = 32 << 20;
-const MERGE_BATCH_DOCS: std::ops::Range<usize> = 16_384..262_144;
 
 /// Images are written in pieces of this size, each paced.
 const IMAGE_CHUNK: usize = 1 << 20;
