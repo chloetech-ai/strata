@@ -281,15 +281,65 @@ impl Builder<'_> {
     }
 }
 
-/// Builds the graph over the present rows.
-pub(crate) fn build(rows: &Rows, present: &(dyn Fn(u32) -> bool + Sync), cfg: &HnswConfig) -> Graph {
+/// A graph to start a build from: `view`'s node `v` is the build's node
+/// `base + v`, with the same vector (a merge's input that lost no
+/// documents).
+pub(crate) struct StartGraph<'a> {
+    pub view: &'a HnswView,
+    pub base: u32,
+    pub n: usize,
+}
+
+impl StartGraph<'_> {
+    /// Whether the graph's nodes are exactly the build's present rows in its
+    /// range (a node of a graph of several has links), so its links can be
+    /// kept as they are.
+    fn fits(&self, present: &(dyn Fn(u32) -> bool + Sync), n: usize, m: usize) -> bool {
+        self.view.m == m
+            && self.base as usize + self.n <= n
+            && (self.view.entry == NONE || (self.view.entry as usize) < self.n)
+            && (0..self.n as u32).all(|v| present(self.base + v) == (v == self.view.entry || !self.view.neighbours(v, 0).is_empty()))
+    }
+
+    /// Node `v`'s level: the highest upper layer holding it.
+    fn levels(&self) -> Vec<u8> {
+        let mut levels = vec![0u8; self.n];
+        for (l, (ids, _)) in self.view.upper.iter().enumerate() {
+            for &v in ids.iter() {
+                levels[v as usize] = levels[v as usize].max(l as u8 + 1);
+            }
+        }
+        levels
+    }
+}
+
+/// Builds the graph over the present rows. Started from a graph that
+/// fits, its nodes keep their levels and links and only the other rows are
+/// inserted, as Lucene does when merging (from 9.9): a merge of four
+/// segments of one size inserts three quarters of its rows.
+pub(crate) fn build(rows: &Rows, present: &(dyn Fn(u32) -> bool + Sync), cfg: &HnswConfig, start: Option<&StartGraph>) -> Graph {
     let n = rows.n;
     let (m, m0) = (cfg.m.max(2), 2 * cfg.m.max(2));
-    let levels: Vec<u8> = (0..n as u32).map(|i| if present(i) { level_of(i, cfg.seed, m) as u8 } else { 0 }).collect();
-    let links = (0..n as u32)
+    let start = start.filter(|s| s.view.entry != NONE && s.fits(present, n, m));
+    let started = |i: u32| start.is_some_and(|s| (s.base..s.base + s.n as u32).contains(&i));
+    let mut levels: Vec<u8> = (0..n as u32).map(|i| if present(i) { level_of(i, cfg.seed, m) as u8 } else { 0 }).collect();
+    if let Some(s) = start {
+        levels[s.base as usize..s.base as usize + s.n].copy_from_slice(&s.levels());
+    }
+    let links: Vec<Vec<Mutex<Vec<u32>>>> = (0..n as u32)
         .map(|i| if present(i) { (0..=levels[i as usize]).map(|l| Mutex::new(Vec::with_capacity(if l == 0 { m0 + 1 } else { m + 1 }))).collect() } else { Vec::new() })
         .collect();
-    let first = (0..n as u32).find(|&i| present(i));
+    if let Some(s) = start {
+        for v in 0..s.n as u32 {
+            for (l, g) in links[(s.base + v) as usize].iter().enumerate() {
+                g.lock().unwrap().extend(s.view.neighbours(v, l).iter().map(|&x| x + s.base));
+            }
+        }
+    }
+    let first = match start {
+        Some(s) => Some(s.base + s.view.entry),
+        None => (0..n as u32).find(|&i| present(i)),
+    };
     let Some(first) = first else {
         return Graph { m, entry: NONE, max_level: 0, layer0: vec![NONE; n * m0], upper: Vec::new() };
     };
@@ -310,7 +360,7 @@ pub(crate) fn build(rows: &Rows, present: &(dyn Fn(u32) -> bool + Sync), cfg: &H
     // neighbours) those pairs end up unlinked: 4 threads cut recall@10 at ef
     // 64 from 0.86 to 0.77 on MS MARCO passages (notes/scale.md). A seeded
     // permutation makes concurrent inserts unrelated.
-    let mut order: Vec<u32> = (first + 1..n as u32).filter(|&i| present(i)).collect();
+    let mut order: Vec<u32> = (0..n as u32).filter(|&i| i != first && present(i) && !started(i)).collect();
     if cfg.threads > 1 {
         use rand::{seq::SliceRandom, SeedableRng};
         order.shuffle(&mut rand::rngs::StdRng::seed_from_u64(cfg.seed));

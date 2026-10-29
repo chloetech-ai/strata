@@ -38,7 +38,7 @@ use serde::Serialize;
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};
-use crate::segment::build::{build_segment, build_threads, BuildOptions};
+use crate::segment::build::{build_segment, build_segment_from, build_threads, BuildOptions, GraphStart};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::freelist::FreeList;
 use crate::storage::io;
@@ -1573,7 +1573,26 @@ impl Database {
             inputs.push((id, live));
         }
         let n_new = docs.len() as u32;
-        let image = if docs.is_empty() { None } else { Some(build_segment(snap.schema(), &docs, &self.opts.build)?) };
+        // The merged vector graphs start from the largest input's, if it
+        // lost no documents.
+        let mut starts = Vec::new();
+        let mut base = 0u32;
+        let mut largest: Option<(usize, &SegmentFile, u32)> = None;
+        for (id, live) in &inputs {
+            let v = snap.segments().iter().find(|v| v.id == *id).expect("selected from this snapshot");
+            if live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
+                largest = Some((live.len(), &v.file, base));
+            }
+            base += live.len() as u32;
+        }
+        if let Some((_, seg, base)) = largest {
+            for (i, f) in snap.schema().fields.iter().enumerate() {
+                if matches!(f.ty, FieldType::Vector { .. }) {
+                    starts.push(GraphStart { field: i, segment: seg.clone(), base });
+                }
+            }
+        }
+        let image = if docs.is_empty() { None } else { Some(build_segment_from(snap.schema(), &docs, &self.opts.build, &starts)?) };
         drop(docs);
         // Written before the writer lock is taken, into space reserved for
         // it: commits go on meanwhile.
