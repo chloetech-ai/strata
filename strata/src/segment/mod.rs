@@ -93,6 +93,11 @@ impl SegmentWriter {
         }
     }
 
+    /// The length of the image [`finish`](Self::finish) would return.
+    pub fn len(&self) -> usize {
+        self.layout().2
+    }
+
     /// The segment image; its start must be placed at a page-aligned offset.
     pub fn finish(self) -> Vec<u8> {
         let (_, _, total) = self.layout();

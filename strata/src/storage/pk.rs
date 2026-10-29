@@ -118,6 +118,13 @@ pub fn build_pk_index(schema: &Schema, docs: &[Document], out: &mut crate::segme
     Ok(())
 }
 
+/// [`build_pk_index`] from the documents' keys alone, in docID order.
+pub fn build_pk_index_of(schema: &Schema, keys: &[Value], out: &mut crate::segment::SegmentWriter) -> Result<()> {
+    let Some(pk) = schema.primary_key else { return Ok(()) };
+    out.put(SECTION, build(&schema.fields[pk].ty, &keys.iter().collect::<Vec<&Value>>(), key_hash)?);
+    Ok(())
+}
+
 /// Encodes the index of `keys` (key of document `i` at position `i`).
 pub(crate) fn build(ty: &FieldType, keys: &[&Value], hash: HashFn) -> Result<Vec<u8>> {
     let n = keys.len();

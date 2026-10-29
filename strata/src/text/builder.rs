@@ -1,6 +1,8 @@
 //! Building a text field's sections from its values in docID order.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::binary_heap::PeekMut;
+use std::collections::{BinaryHeap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -218,8 +220,9 @@ fn write_runs(runs: &[&TextFieldBuilder], format: PostingsFormat, loom_min_df: u
         joined = runs.iter().flat_map(|r| r.norms.iter().copied()).collect::<Vec<u8>>();
         &joined
     };
-    // Each run's terms in byte order, merged: every term of the field, and
-    // the runs holding it with their term ids.
+    // Each run's terms in byte order, merged through a heap of the runs'
+    // next terms (a merge builds from many runs): every term of the field,
+    // and the runs holding it, in run order, with their term ids.
     let orders: Vec<Vec<u32>> = on_threads(runs.len(), |r| {
         let terms = &runs[r].terms;
         let mut o: Vec<u32> = (0..terms.len() as u32).collect();
@@ -232,17 +235,18 @@ fn write_runs(runs: &[&TextFieldBuilder], format: PostingsFormat, loom_min_df: u
     let mut df: Vec<u32> = Vec::new();
     let mut heads = vec![0usize; runs.len()];
     let head = |r: usize, at: usize| orders[r].get(at).map(|&t| runs[r].terms[t as usize].as_str());
-    loop {
-        let Some(min) = (0..runs.len()).filter_map(|r| head(r, heads[r])).min() else { break };
+    let mut heap: BinaryHeap<Reverse<(&str, usize)>> = (0..runs.len()).filter_map(|r| Some(Reverse((head(r, 0)?, r)))).collect();
+    while let Some(&Reverse((min, _))) = heap.peek() {
         first.push(holders.len());
         terms.push(min);
         let mut n = 0;
-        for r in 0..runs.len() {
-            if head(r, heads[r]) == Some(min) {
-                let t = orders[r][heads[r]];
-                holders.push((r, t));
-                n += runs[r].postings[t as usize].docs.len() as u32;
-                heads[r] += 1;
+        while let Some(Reverse((_, r))) = heap.peek_mut().filter(|h| h.0 .0 == min).map(PeekMut::pop) {
+            let t = orders[r][heads[r]];
+            holders.push((r, t));
+            n += runs[r].postings[t as usize].docs.len() as u32;
+            heads[r] += 1;
+            if let Some(next) = head(r, heads[r]) {
+                heap.push(Reverse((next, r)));
             }
         }
         df.push(n);
