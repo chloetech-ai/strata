@@ -241,6 +241,50 @@ impl Default for ExecOptions {
     }
 }
 
+impl ExecOptions {
+    /// `Error::Timeout` once [`Self::deadline`] has passed or [`Self::cancel`]
+    /// is set.
+    pub fn check(&self) -> Result<()> {
+        if self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Error::Timeout("the query was cancelled".into()));
+        }
+        match self.deadline {
+            Some(d) if Instant::now() >= d => Err(Error::Timeout("the query ran past its deadline".into())),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Counts the steps of a long loop and checks its query's deadline and
+/// cancel flag ([`ExecOptions::check`]) every `every` of them, so that a
+/// query stops within a few thousand steps instead of at its next segment.
+pub struct Ticker<'o> {
+    opts: &'o ExecOptions,
+    every: u32,
+    n: u32,
+}
+
+impl<'o> Ticker<'o> {
+    /// Steps between checks in a loop over documents (a check costs about
+    /// as much as reading the clock).
+    pub const DOCS: u32 = 1024;
+
+    pub fn new(opts: &'o ExecOptions, every: u32) -> Ticker<'o> {
+        Ticker { opts, every: every.max(1), n: 0 }
+    }
+
+    /// One step: [`ExecOptions::check`] every `every` steps.
+    #[inline]
+    pub fn tick(&mut self) -> Result<()> {
+        self.n += 1;
+        if self.n < self.every {
+            return Ok(());
+        }
+        self.n = 0;
+        self.opts.check()
+    }
+}
+
 /// What execution did, for EXPLAIN-style reporting and experiments.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExecStats {
@@ -881,6 +925,7 @@ impl<'a> Executor<'a> {
     fn unordered(&mut self, p: &Pred, want: Option<usize>) -> Result<Vec<Hit>> {
         let mut out = Vec::new();
         let segs = self.segs.clone();
+        let mut tick = self.ticker();
         for s in segs.iter() {
             self.check_deadline()?;
             if want.is_some_and(|w| out.len() >= w) {
@@ -888,6 +933,7 @@ impl<'a> Executor<'a> {
             }
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
+                tick.tick()?;
                 if want.is_some_and(|w| out.len() >= w) {
                     break;
                 }
@@ -908,11 +954,13 @@ impl<'a> Executor<'a> {
         let int = self.schema.fields[field].ty == FieldType::Int;
         let mut cands: Vec<(Hit, i64)> = Vec::new();
         let segs = self.segs.clone();
+        let mut tick = self.ticker();
         for s in segs.iter() {
             self.check_deadline()?;
             let col = self.numeric(s, field)?.col();
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
+                tick.tick()?;
                 if let Some(v) = self.num_value(s, field, col, d).or(null_score) {
                     let exact = if int { self.int_value(s, field, col, d).unwrap_or(0) } else { 0 };
                     cands.push((Hit { seg: s.ord, doc: d, score: v }, exact));
@@ -956,11 +1004,13 @@ impl<'a> Executor<'a> {
     fn decay_top(&mut self, field: usize, f: &Decay, p: &Pred, k: usize, key_desc: bool) -> Result<Vec<Hit>> {
         let mut cands = Vec::new();
         let segs = self.segs.clone();
+        let mut tick = self.ticker();
         for s in segs.iter() {
             self.check_deadline()?;
             let col = self.numeric(s, field)?.col();
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
+                tick.tick()?;
                 let score = self.num_value(s, field, col, d).map_or(0.0, |v| f.eval(v));
                 cands.push(Hit { seg: s.ord, doc: d, score });
             }
@@ -1316,6 +1366,7 @@ impl<'a> Executor<'a> {
         let mut groups = agg::Groups::limited(self.opts.max_groups);
         let segs = self.segs.clone();
         let (mut vals, mut gv) = (Vec::new(), Vec::new());
+        let mut tick = self.ticker();
         for s in segs.iter() {
             self.check_deadline()?;
             let set = self.filter_set(s, &q.filter)?;
@@ -1327,6 +1378,7 @@ impl<'a> Executor<'a> {
                     let kw = self.keyword(s, f)?;
                     let mut m: HashMap<DocId, Vec<u32>> = HashMap::new();
                     for c in 0..kw.n_values() as u32 {
+                        tick.tick()?;
                         for d in kw.docs_code(c).intersect(&set).iter() {
                             m.entry(d).or_default().push(c);
                         }
@@ -1335,6 +1387,7 @@ impl<'a> Executor<'a> {
                 }
             }
             for d in set.iter() {
+                tick.tick()?;
                 // A document belongs to one group per combination of its
                 // group values.
                 let mut keys: Vec<Vec<agg::Part>> = vec![Vec::new()];
@@ -1367,13 +1420,12 @@ impl<'a> Executor<'a> {
     /// `Error::Timeout` once [`ExecOptions::deadline`] has passed or the
     /// query was cancelled.
     fn check_deadline(&self) -> Result<()> {
-        if self.opts.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err(Error::Timeout("the query was cancelled".into()));
-        }
-        match self.opts.deadline {
-            Some(d) if Instant::now() >= d => Err(Error::Timeout("the query ran past its deadline".into())),
-            _ => Ok(()),
-        }
+        self.opts.check()
+    }
+
+    /// A [`Ticker`] of this query, for a loop over documents.
+    fn ticker(&self) -> Ticker<'a> {
+        Ticker::new(self.opts, Ticker::DOCS)
     }
 
     /// BM25's `k1` and `b` (`k1 >= 0` and `0 <= b <= 1`, under which a
@@ -1693,6 +1745,7 @@ impl<'a> Executor<'a> {
                 let terms = q.terms;
                 let (params, _) = self.bm25_params(opts)?;
                 for (seg, range) in by_seg {
+                    self.check_deadline()?;
                     let s = &self.seg_by_ord(seg);
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
                     let sc = self.text(s, *field)?.score_weighted(&terms, &stats, params, &docs);
@@ -1701,6 +1754,7 @@ impl<'a> Executor<'a> {
             }
             Score::Sparse { field, terms, .. } => {
                 for (seg, range) in by_seg {
+                    self.check_deadline()?;
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
                     let sc = self.text(&self.seg_by_ord(seg), *field)?.score_dot(terms, &docs);
                     out[range].copy_from_slice(&sc);
@@ -1708,6 +1762,7 @@ impl<'a> Executor<'a> {
             }
             Score::Similarity { field, vector, .. } => {
                 for (seg, range) in by_seg {
+                    self.check_deadline()?;
                     let s = &self.seg_by_ord(seg);
                     let vr = self.vector(s, *field)?;
                     for i in range {
@@ -1717,6 +1772,7 @@ impl<'a> Executor<'a> {
             }
             Score::Column { field } => {
                 for (seg, range) in by_seg {
+                    self.check_deadline()?;
                     let s = &self.seg_by_ord(seg);
                     let col = self.numeric(s, *field)?.col();
                     for i in range {
@@ -1726,6 +1782,7 @@ impl<'a> Executor<'a> {
             }
             Score::Decay { field, decay, .. } => {
                 for (seg, range) in by_seg {
+                    self.check_deadline()?;
                     let s = &self.seg_by_ord(seg);
                     let col = self.numeric(s, *field)?.col();
                     for i in range {

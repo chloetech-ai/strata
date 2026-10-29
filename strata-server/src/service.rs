@@ -592,10 +592,16 @@ impl Service {
                 let db = db.clone();
                 let r = tokio::task::spawn_blocking(move || {
                     let _held = (permit, running);
-                    compound::run(&req.sql, &schema, &req.params, &mut |text, p| {
-                        let select = bind(text, snap.schema(), p)?;
-                        db.execute(&snap, &select, &opts)
-                    })
+                    compound::run_checked(
+                        &req.sql,
+                        &schema,
+                        &req.params,
+                        &mut |text, p| {
+                            let select = bind(text, snap.schema(), p)?;
+                            db.execute(&snap, &select, &opts)
+                        },
+                        &|| opts.check(),
+                    )
                 })
                 .await;
                 r.map(|r| r.map(|rs| (rs, Vec::new())))
@@ -610,10 +616,10 @@ impl Service {
                     let _held = permit;
                     // Shards any step was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
-                    let rs = compound::run(&req.sql, &schema, &req.params, &mut |text, p| {
-                        if stop.load(Ordering::Relaxed) {
-                            return Err(strata::Error::Timeout("the query was cancelled".into()));
-                        }
+                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), ..ExecOptions::default() };
+                    let check = || checks.check();
+                    let rs = compound::run_checked(&req.sql, &schema, &req.params, &mut |text, p| {
+                        check()?;
                         let select = bind(text, &schema, p)?;
                         let step = QueryReq { sql: text.to_string(), params: p.clone(), partial: req.partial, ..Default::default() };
                         let m = rt.block_on(obs::scope(id.clone(), c.query(&step, &select, deadline))).map_err(|e| strata::Error::Query(e.message))?;
@@ -623,7 +629,7 @@ impl Service {
                             }
                         }
                         Ok(m.rs)
-                    });
+                    }, &check);
                     rs.map(|rs| (rs, missing))
                 })
                 .await
