@@ -150,6 +150,27 @@ numbers could equal later ones here. A deleted row keeps no number; there
 are no tombstones, which shipping the log in order and catching up from a
 checkpoint do not need.
 
+**Shipping the log.** A numbered database with `DbOptions::ship_log_bytes`
+keeps its most recent transactions in memory up to that many bytes (the
+newest always), each as the WAL records it logged, its commit record last
+(`storage::ship`); opening fills it with the transactions it replays, those
+since the last flush. `Database::log_from` reads them from a number on, or
+answers that the log no longer holds it (`LogRead::Gone`), when a replica
+needs the primary's segments first. `Database::on_commit` hears each number
+as it commits. A replica applies a batch with `Database::apply_shipped`,
+given the term and number of the transaction before the first: unless that
+is the replica's last, it applies nothing and answers its own last
+(`Applied::Mismatch`), from which the primary ships again or finds that
+their histories differ (Raft's log matching). Each transaction must follow
+the one before, and one of a term older than the replica's is refused,
+since it comes from a primary another has replaced; a newer term is raised
+at that transaction's number, so the replica's terms match the primary's
+where it has transactions. A transaction's operations go through the
+writer as the primary's did, and one that does not fit, an insert of a row
+the replica has or a delete or a set of one it lacks, fails the batch from
+there: the replica is not a copy of its primary. Each transaction commits
+under its primary's number, and a batch syncs once.
+
 ### 3.5 Deletes, updates, snapshots
 
 Documents have a primary key. Each segment has a primary-key index (sorted
@@ -677,7 +698,9 @@ handing a query to its shards) are to make instead of writing SQL text.
   own (§3.4): a numbered database gives each write transaction a term and
   a sequence number, logged in its commit record and kept across flushes,
   crashes, checkpoints and reopening, and each row the number of the
-  write that last changed it. Nothing ships the log yet.
+  write that last changed it. A replica applies its primary's log
+  transaction by transaction under the primary's numbers (§3.4);
+  strata-server does not ship it yet.
 * **Conditional writes.** `seq_no()` is a column of a query on one table
   (plan feature `seq_no`, so an older shard refuses the plan by name), read
   from the row's segment, its updates or the memtable. strata-server's

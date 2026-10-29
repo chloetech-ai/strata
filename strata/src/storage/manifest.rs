@@ -75,6 +75,18 @@ impl Numbering {
         SeqNo { term: self.term, seq: self.seq }
     }
 
+    /// The term of the transaction numbered `seq`: that of the last term
+    /// whose first number is at most `seq`; 0 for 0, which is no
+    /// transaction (the history before numbering).
+    pub fn term_at(&self, seq: u64) -> u64 {
+        self.terms.iter().rev().find(|&&(_, from)| from <= seq).map_or(0, |&(t, _)| t)
+    }
+
+    /// The last sequence number and its term, where a primary ships from.
+    pub fn last(&self) -> SeqNo {
+        SeqNo { term: self.term_at(self.seq), seq: self.seq }
+    }
+
     /// Whether the terms rise, their first numbers do not fall, and the
     /// last is the current term.
     fn valid(&self) -> bool {
