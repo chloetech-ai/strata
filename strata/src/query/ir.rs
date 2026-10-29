@@ -205,7 +205,7 @@ pub enum Func {
     Abs,
     /// To the nearest integer, or to `args[1]` decimals.
     Round,
-    /// The first argument that is not NULL.
+    /// The first argument that is not NULL (nor a list without values).
     Coalesce,
 }
 

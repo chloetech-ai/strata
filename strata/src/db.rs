@@ -18,9 +18,10 @@ use crate::error::{Error, Result};
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
 use crate::query::agg::Part;
 use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentReaders};
+use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::Plan;
 use crate::query::stats::TermStats;
-use crate::query::{bind, bind_command, compound, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
+use crate::query::{bind_command, compound, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
 use crate::schema::{Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn};
@@ -671,10 +672,8 @@ impl Db {
         if live.is_empty() {
             return Ok(Vec::new());
         }
-        let cols: Vec<String> = schema.fields.iter().map(|f| qsql::ident(&f.name)).collect();
-        let text = format!("SELECT {} FROM {} WHERE {} IN (:keys)", cols.join(", "), qsql::ident(&schema.table), qsql::ident(&schema.fields[pk].name));
-        let keys = Value::List(live.iter().map(|d| d[pk].clone()).collect());
-        let rows = self.execute(snap, &bind(&text, schema, &Params::new().set("keys", keys))?, &self.exec)?.rows;
+        let keys = live.iter().map(|d| d[pk].clone()).collect();
+        let rows = self.execute(snap, &qsql::keyed_rows(schema, keys)?, &self.exec)?.rows;
         let mut by_key: HashMap<Part, Vec<Value>> = rows.into_iter().map(|r| (Part::of(&r[pk]), r)).collect();
         Ok(live.into_iter().filter_map(|d| by_key.remove(&Part::of(&d[pk])).map(|r| (r, d))).collect())
     }
@@ -863,12 +862,33 @@ fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(V
             sets.iter().any(|(g, _)| from.iter().any(|s| schema.field_index(s) == Some(*g)) || generated_from_set(schema, from, *g))
         })
         .collect();
+    // Expressions read generated fields, which need not be stored.
+    let generated = schema.fields.iter().any(|f| !f.generated_from.is_empty()) && sets.iter().any(|(_, a)| matches!(a, Assign::Expr(_)));
     let (mut in_place, mut rewrites, mut n) = (Vec::new(), Vec::new(), 0u64);
-    for (row, proposed) in rows {
+    for (mut row, proposed) in rows {
+        if generated {
+            schema.fill_generated(&mut row);
+        }
+        // The row as an expression reads it: every right-hand side sees
+        // the row as it was. A multi-valued field without values is an
+        // empty list, as queries compare it.
+        let read = |r: Ref| -> Result<Value> {
+            let (doc, g) = match r {
+                Ref::Field(g) => (&row, g as usize),
+                Ref::Excluded(g) => (&proposed, g as usize),
+                r => return Err(Error::Query(format!("SET reads fields of the row, not {r:?}"))),
+            };
+            let field = schema.fields.get(g).ok_or_else(|| Error::Query(format!("{} has no field #{g}", schema.table)))?;
+            Ok(match doc.get(g).cloned().unwrap_or(Value::Null) {
+                Value::Null if field.multi => Value::List(Vec::new()),
+                v => field.output(v),
+            })
+        };
         let new = |f: usize, a: &Assign| -> Result<Value> {
             Ok(match a {
                 Assign::Value(v) => v.clone(),
                 Assign::Excluded(g) => proposed[*g].clone(),
+                Assign::Expr(e) => qsql::assigned(&schema.fields[f], eval::eval(e, &read)?)?,
                 // NULL counts as zero; a sum that overflows is an
                 // error, as in Postgres.
                 Assign::Add(x) => {

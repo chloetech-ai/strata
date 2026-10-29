@@ -15,6 +15,7 @@ use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
+use strata::query::sql::{ident, quoted};
 use strata::query::{compound, Params, Select};
 use strata::schema::Schema;
 use strata::storage::{CheckpointOptions, CheckpointStats, Layout, Snapshot, WriteTxn};
@@ -473,7 +474,8 @@ impl Service {
         if !matches!(self.schema.fields[f].ty, strata::FieldType::Vector { .. }) {
             return Err(ApiError::bad(format!("{field} is not a VECTOR field")));
         }
-        let sql = format!("SELECT {field} FROM {} WHERE {} = :k LIMIT 1", self.schema.table, self.schema.fields[pk].name);
+        // Quoted: a field may be named like a keyword (`order`).
+        let sql = format!("SELECT {} FROM {} WHERE {} = :k LIMIT 1", quoted(field), ident(&self.schema.table), quoted(&self.schema.fields[pk].name));
         let params = Params::new().set("k", js::field_value(&self.schema, pk, key)?);
         let a = self.query(QueryReq { sql, params, ..Default::default() }).await?;
         match a.rs.rows.into_iter().next().and_then(|r| r.into_iter().next()) {

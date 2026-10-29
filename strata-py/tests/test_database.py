@@ -77,6 +77,15 @@ def test_queries_and_results(db):
         db.query("SELECT nope FROM books")
 
 
+def test_vector_of_any_field_name(tmp_path):
+    # The SQL it ran did not quote the names, so a space broke it.
+    schema = {"table": "t", "primary_key": "doc id", "fields": [{"name": "doc id", "type": "keyword"}, {"name": "my vec", "type": "vector", "dim": 2}]}
+    with strata.open(tmp_path / "v.strata", schema) as db:
+        db.insert([{"doc id": f"n{i}", "my vec": [1.0, float(i)]} for i in range(4)])
+        near = db.query('SELECT "doc id" FROM t ORDER BY similarity("my vec", :v) DESC LIMIT 1', v={"vector_of": "n3", "field": "my vec"}).keys
+        assert near == ["n3"]
+
+
 def test_numpy_values(db):
     np = pytest.importorskip("numpy")
     v = np.array(db.embed("winter star"), dtype=np.float32)

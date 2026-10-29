@@ -246,6 +246,7 @@ impl Lower<'_> {
             Assign::Value(v) => self.lit(f, v),
             Assign::Add(v) => Expr::Arith { op: super::ArithOp::Add, left: Box::new(Expr::Field(f as u32)), right: Box::new(Expr::Lit(v.clone())) },
             Assign::Excluded(g) => Expr::Excluded(*g as u32),
+            Assign::Expr(e) => e.clone(),
         };
         Set { field: f as u32, value }
     }

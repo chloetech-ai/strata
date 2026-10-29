@@ -806,6 +806,24 @@ async fn sparse_and_binary_vector_fields_over_http() {
     assert!(metrics.contains(r#"kind="sparse",outcome="ok"} 1"#), "{metrics}");
 }
 
+/// `{"vector_of": key}` reads a row's vector whatever the fields are named:
+/// the SQL it ran did not quote them, so a space broke it.
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_of_any_field_name() {
+    use strata::{Field, FieldType, Schema, VectorIndexKind};
+    let schema = Schema::new("notes", vec![Field::new("doc id", FieldType::Keyword), Field::new("my vec", FieldType::Vector { dim: 2, index: VectorIndexKind::Flat })], Some("doc id")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("v.strata"), schema, DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let base = http(service(db, "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let ops: Vec<Json> = (0..4).map(|i| json!({"op": "insert", "doc": {"doc id": format!("n{i}"), "my vec": [1.0, i as f64]}})).collect();
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({ "ops": ops })).await;
+    assert_eq!(status, 200, "{r}");
+    let sql = "SELECT \"doc id\" FROM notes ORDER BY similarity(\"my vec\", :q) DESC LIMIT 1";
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": sql, "params": {"q": {"vector_of": "n3", "field": "my vec"}}})).await;
+    assert_eq!((status, r["keys"].clone()), (200, json!(["n3"])), "{r}");
+}
+
 /// A field declared as the embedding of others: the server embeds the rows
 /// writes send without it and the text of `{"embed": ...}` parameters with
 /// the same model, and says so in /v1/schema.

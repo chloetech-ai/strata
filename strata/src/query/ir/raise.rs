@@ -522,10 +522,11 @@ impl<'a> Raise<'a> {
         if Some(f) == self.schema.primary_key {
             return Err(err("the primary key cannot be updated; delete and insert instead"));
         }
+        let fld = &self.schema.fields[f];
         let a = match &s.value {
             Expr::Lit(v) => Assign::Value(self.stored(f, v.clone())?),
-            Expr::Arith { op, left, right } if **left == Expr::Field(f as u32) => {
-                let fld = &self.schema.fields[f];
+            // A counter: `f = f + number` counts a NULL as zero.
+            Expr::Arith { op: op @ (ArithOp::Add | ArithOp::Sub), left, right } if **left == Expr::Field(f as u32) && matches!(**right, Expr::Lit(_)) => {
                 if !matches!(fld.ty, FieldType::Int | FieldType::Float) || fld.logical.is_some() || fld.multi {
                     return Err(err(format!("{} is not a single numeric field", fld.name)));
                 }
@@ -533,14 +534,49 @@ impl<'a> Raise<'a> {
                     (ArithOp::Add, v @ (Value::Int(_) | Value::Float(_))) => Assign::Add(v),
                     (ArithOp::Sub, Value::Int(x)) => Assign::Add(x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int)),
                     (ArithOp::Sub, Value::Float(x)) => Assign::Add(Value::Float(-x)),
-                    (ArithOp::Add | ArithOp::Sub, v) => return Err(err(format!("{} adds a number, not {v:?}", fld.name))),
-                    (op, _) => return Err(err(format!("SET adds a number to {} or subtracts one from it, not {op:?}", fld.name))),
+                    (_, v) => return Err(err(format!("{} adds a number, not {v:?}", fld.name))),
                 }
             }
-            Expr::Excluded(g) if excluded => Assign::Excluded(self.field(*g)?),
-            e => return Err(err(format!("SET takes a value, the field plus or minus a number, or (on conflict) excluded.field, not {e:?}"))),
+            Expr::Excluded(g) if excluded => {
+                let g = self.field(*g)?;
+                let src = &self.schema.fields[g];
+                if src.ty != fld.ty || src.multi != fld.multi || src.logical != fld.logical {
+                    return Err(err(format!("{} = excluded.{}: the columns have different types", fld.name, src.name)));
+                }
+                Assign::Excluded(g)
+            }
+            e => {
+                self.row_expr(e, excluded)?;
+                Assign::Expr(e.clone())
+            }
         };
         Ok((f, a))
+    }
+
+    /// Checks an expression `SET` computes from each row: of its fields
+    /// and, on conflict, the proposed row's (`excluded.f`), with no search,
+    /// score or traversal.
+    fn row_expr(&self, e: &Expr, excluded: bool) -> Result<()> {
+        let go = |x: &Expr| self.row_expr(x, excluded);
+        let all = |xs: &[Expr]| xs.iter().try_for_each(go);
+        match e {
+            Expr::Field(f) => self.field(*f).map(|_| ()),
+            Expr::Excluded(f) if excluded => self.field(*f).map(|_| ()),
+            Expr::Excluded(f) => Err(err(format!("excluded.{} is the row an INSERT proposed, in ON CONFLICT DO UPDATE", self.schema.fields[self.field(*f)?].name))),
+            Expr::Lit(_) => Ok(()),
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => go(x),
+            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) => all(xs),
+            Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => go(left).and_then(|_| go(right)),
+            Expr::Like { expr, pattern, .. } => go(expr).and_then(|_| go(pattern)),
+            Expr::Between { expr, lo, hi } => [Some(expr), lo.as_ref(), hi.as_ref()].into_iter().flatten().try_for_each(|x| go(x)),
+            Expr::In { expr, list } => go(expr).and_then(|_| all(list)),
+            Expr::Case { operand, whens, otherwise } => {
+                operand.iter().chain(otherwise).try_for_each(|x| go(x))?;
+                whens.iter().try_for_each(|w| go(&w.when).and_then(|_| go(&w.then)))
+            }
+            Expr::Call { args, .. } => all(args),
+            e => Err(err(format!("SET takes an expression of the row's fields, not {e:?}"))),
+        }
     }
 }
 

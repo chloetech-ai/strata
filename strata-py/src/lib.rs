@@ -18,6 +18,7 @@ use serde_json::{Map, Number, Value as Json};
 use strata::db::{Db, SqlResult};
 use strata::ingest::{self, Format};
 use strata::query::ir::Plan;
+use strata::query::sql::{ident, quoted};
 use strata::query::Params;
 use strata::query::exec::ResultSet;
 use strata::schema::Schema;
@@ -140,7 +141,8 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
                 Some(f) => f.to_string(),
                 None => s.fields.iter().find(|f| matches!(f.ty, FieldType::Vector { .. })).map(|f| f.name.clone()).ok_or_else(|| bad("the table has no VECTOR field".into()))?,
             };
-            let sql = format!("SELECT {field} FROM {} WHERE {} = :k LIMIT 1", s.table, s.fields[pk].name);
+            // Quoted: a field may be named like a keyword (`order`).
+            let sql = format!("SELECT {} FROM {} WHERE {} = :k LIMIT 1", quoted(&field), ident(&s.table), quoted(&s.fields[pk].name));
             let rs = db.query(&sql, &Params::new().set("k", ingest::value(s, pk, &o["vector_of"])?))?;
             match rs.rows.into_iter().next().and_then(|r| r.into_iter().next()) {
                 Some(v @ Value::Vector(_)) => v,

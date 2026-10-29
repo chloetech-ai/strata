@@ -1210,7 +1210,12 @@ fn slot(e: &Expr, cols: &[(String, String)]) -> Option<Result<u32>> {
 
 /// `e` over rows of joined tables ([`Joined`]'s `cols` and `multi`).
 fn compile_row(e: &Expr, cols: &[(String, String)], multi: &[bool], params: &Params) -> Result<ir::Expr> {
-    compile(e, params, &|x| slot(x, cols), multi)
+    compile(e, params, &|x| at(slot(x, cols)), multi)
+}
+
+/// A slot as the column of rows in memory it is.
+fn at(slot: Option<Result<u32>>) -> Option<Result<ir::Expr>> {
+    slot.map(|r| r.map(ir::Expr::Output))
 }
 
 fn compile_all(es: &[Expr], cols: &[(String, String)], multi: &[bool], params: &Params) -> Result<Vec<ir::Expr>> {
@@ -1269,21 +1274,27 @@ fn literal(v: &sql::Value, params: &Params) -> Result<Value> {
     })
 }
 
-/// Compiles `e` into the plan IR's expression: `slot` places columns (and,
-/// grouped, aggregates and group values) in the row, and parameters become
-/// literals. A multi-valued field (`multi[slot]`) with no values compares
+/// Compiles `e` into the plan IR's expression: `slot` gives what a column
+/// (and, grouped, an aggregate or group value) is, a slot of rows in
+/// memory or (in `SET`) a field of the row, and parameters become
+/// literals. A multi-valued slot (`multi[slot]`) with no values compares
 /// as an empty list, as the executor compares it: `tags = 'a'` is FALSE
 /// there and `NOT (tags = 'a')` TRUE, not UNKNOWN.
-fn compile(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result<u32>>, multi: &[bool]) -> Result<ir::Expr> {
-    if let Some(i) = slot(e) {
-        return Ok(ir::Expr::Output(i?));
+pub(crate) fn compile(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]) -> Result<ir::Expr> {
+    if let Some(x) = slot(e) {
+        return x;
     }
     let go = |x: &Expr| compile(x, params, slot, multi);
     let bx = |x: &Expr| go(x).map(Box::new);
     // An operand of a comparison.
     let listy = |x: &Expr| -> Result<Box<ir::Expr>> {
         Ok(Box::new(match go(x)? {
-            ir::Expr::Output(i) if multi.get(i as usize) == Some(&true) => ir::Expr::Call { func: Func::Coalesce, args: vec![ir::Expr::Output(i), ir::Expr::Lit(Value::List(Vec::new()))] },
+            // NULL as the empty list (coalesce would skip the empty list).
+            x @ ir::Expr::Output(i) if multi.get(i as usize) == Some(&true) => ir::Expr::Case {
+                operand: None,
+                whens: vec![When { when: ir::Expr::IsNull(Box::new(x.clone())), then: ir::Expr::Lit(Value::List(Vec::new())) }],
+                otherwise: Some(Box::new(x)),
+            },
             x => x,
         }))
     };
@@ -1347,8 +1358,10 @@ fn compile(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result<u32>
                 "abs" => Func::Abs,
                 "round" => Func::Round,
                 "coalesce" => Func::Coalesce,
-                n if NATIVE.contains(&n) => return Err(err(format!("{}(...) works on one table's scan: give it that table's column (a.body) and use it in WHERE or ORDER BY, not across tables", n.to_uppercase()))),
-                n if AGGREGATES.contains(&n) => return Err(err(format!("{}(...) needs GROUP BY or a SELECT of aggregates", n.to_uppercase()))),
+                n if NATIVE.contains(&n) => {
+                    return Err(err(format!("{}(...) works on one table's scan, in its WHERE or ORDER BY (in a join, on that table's column: a.body), not on values of rows", n.to_uppercase())))
+                }
+                n if AGGREGATES.contains(&n) => return Err(err(format!("{}(...) is an aggregate: it needs GROUP BY or a SELECT of aggregates, not a value of one row", n.to_uppercase()))),
                 n => return Err(err(format!("unknown function {n}"))),
             };
             ir::Expr::Call { func, args: func_args(f).into_iter().map(go).collect::<Result<_>>()? }
@@ -1460,7 +1473,7 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
             _ => None,
         }
     };
-    let sort_keys = |slot: &dyn Fn(&Expr) -> Option<Result<u32>>, multi: &[bool]| -> Result<Vec<SortKey>> {
+    let sort_keys = |slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<Vec<SortKey>> {
         order.iter().map(|(e, _)| Ok(match by_alias(e) { Some(i) => SortKey::Item(i), None => SortKey::Expr(compile(e, params, slot, multi)?) })).collect()
     };
     let sort = |keys: &[SortKey], row: &[Value], input: &[Value]| -> Result<Vec<Value>> {
@@ -1500,12 +1513,12 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
             groups.insert(k, (Vec::new(), projections.iter().map(Acc::new).collect(), 0));
         }
         // A group's row: its aggregates, then its group values.
-        let group_slot = |e: &Expr| -> Option<Result<u32>> {
+        let group_slot = |e: &Expr| -> Option<Result<ir::Expr>> {
             if let Some(i) = calls.iter().position(|c| c.text == e.to_string()) {
-                return Some(Ok(i as u32));
+                return Some(Ok(ir::Expr::Output(i as u32)));
             }
             if let Some(i) = group_exprs.iter().position(|g| g.to_string() == e.to_string() || same_column(g, e, &j.cols)) {
-                return Some(Ok((calls.len() + i) as u32));
+                return Some(Ok(ir::Expr::Output((calls.len() + i) as u32)));
             }
             match e {
                 Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(Err(err(format!("{e} must be in GROUP BY or inside an aggregate")))),
@@ -1530,7 +1543,7 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
         }
     } else {
         let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_row(e, &j.cols, &j.multi, params)).collect::<Result<_>>()?;
-        let keys = sort_keys(&|e| slot(e, &j.cols), &j.multi)?;
+        let keys = sort_keys(&|e| at(slot(e, &j.cols)), &j.multi)?;
         for (i, r) in j.rows.iter().enumerate() {
             let row: Vec<Value> = items_at.iter().map(|e| value(e, r)).collect::<Result<_>>()?;
             let sort = sort(&keys, &row, r)?;
