@@ -63,12 +63,14 @@ impl Filter {
         }
     }
 
-    /// The filter's conditions. Entity records are never results unless
-    /// asked for by kind.
+    /// The filter's conditions, which name the values of
+    /// [`Filter::params`] (`:window_session`, `:session`) rather than
+    /// quote them. Entity records are never results unless asked for by
+    /// kind.
     pub fn conds(&self) -> Vec<String> {
         let mut parts = Vec::new();
-        if let Some((s, w)) = &self.exclude_window {
-            parts.push(format!("NOT (session = '{}' AND seq >= {w})", quote(s)));
+        if let Some((_, w)) = &self.exclude_window {
+            parts.push(format!("NOT (session = :window_session AND seq >= {w})"));
         }
         if !self.kinds.is_empty() {
             let ks: Vec<String> = self.kinds.iter().map(|k| format!("'{}'", k.as_str())).collect();
@@ -80,13 +82,25 @@ impl Filter {
         if let Some(t) = self.until_ts {
             parts.push(format!("ts < {t}"));
         }
-        if let Some(s) = &self.session {
-            parts.push(format!("session = '{}'", quote(s)));
+        if self.session.is_some() {
+            parts.push("session = :session".into());
         }
         if self.kinds.is_empty() {
             parts.push("kind != 'entity'".into());
         }
         parts
+    }
+
+    /// The values [`Filter::conds`] names, for a query that runs them.
+    pub fn params(&self) -> Params {
+        let mut p = Params::new();
+        if let Some((s, _)) = &self.exclude_window {
+            p = p.set("window_session", Value::Str(s.clone()));
+        }
+        if let Some(s) = &self.session {
+            p = p.set("session", Value::Str(s.clone()));
+        }
+        p
     }
 }
 
@@ -98,10 +112,6 @@ pub struct Reach {
     pub through: Vec<Kind>,
     /// Stop after meeting this many records.
     pub max_nodes: usize,
-}
-
-fn quote(s: &str) -> String {
-    s.replace('\'', "''")
 }
 
 #[derive(Clone, Debug)]
@@ -331,18 +341,16 @@ impl Store {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let list: Vec<String> = ids.iter().map(|i| format!("'{}'", quote(i))).collect();
-        let rs = self.query(&format!("SELECT {COLUMNS} FROM memory WHERE id IN ({}) LIMIT {}", list.join(", "), ids.len()))?;
+        let rs = self.query_with(&format!("SELECT {COLUMNS} FROM memory WHERE id IN (:ids) LIMIT {}", ids.len()), &Params::new().set("ids", strs(ids)))?;
         Ok(rs.rows.iter().filter_map(|r| row_record(r)).collect())
     }
 
     /// The records of `session` with `seq` in `[lo, hi]`, in order.
     pub fn range(&self, session: &str, lo: i64, hi: i64) -> Result<Vec<Record>> {
-        let rs = self.query(&format!(
-            "SELECT {COLUMNS} FROM memory WHERE session = '{}' AND seq BETWEEN {lo} AND {hi} ORDER BY seq ASC LIMIT {}",
-            quote(session),
-            (hi - lo + 1).max(1)
-        ))?;
+        let rs = self.query_with(
+            &format!("SELECT {COLUMNS} FROM memory WHERE session = :session AND seq BETWEEN {lo} AND {hi} ORDER BY seq ASC LIMIT {}", (hi - lo + 1).max(1)),
+            &Params::new().set("session", Value::Str(session.to_string())),
+        )?;
         Ok(rs.rows.iter().filter_map(|r| row_record(r)).collect())
     }
 
@@ -350,14 +358,14 @@ impl Store {
     pub fn latest(&self, kinds: &[Kind], limit: usize, filter: &Filter) -> Result<Vec<Record>> {
         let mut f = filter.clone();
         f.kinds = kinds.to_vec();
-        let rs = self.query(&format!("SELECT {COLUMNS} FROM memory {} ORDER BY seq DESC LIMIT {limit}", f.sql()))?;
+        let rs = self.query_with(&format!("SELECT {COLUMNS} FROM memory {} ORDER BY seq DESC LIMIT {limit}", f.sql()), &f.params())?;
         Ok(rs.rows.iter().filter_map(|r| row_record(r)).collect())
     }
 
     /// The top `n` by BM25 over `body`, with raw scores.
     pub fn bm25_top(&self, query: &str, n: usize, filter: &Filter) -> Result<Vec<(Record, f64)>> {
         let sql = format!("SELECT {COLUMNS}, score() FROM memory {} ORDER BY bm25(body, :q) DESC LIMIT {n}", filter.sql());
-        let rs = self.query_with(&sql, &Params::new().set("q", Value::Str(query.to_string())))?;
+        let rs = self.query_with(&sql, &filter.params().set("q", Value::Str(query.to_string())))?;
         Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).collect())
     }
 
@@ -368,7 +376,6 @@ impl Store {
         if seeds.is_empty() || r.hops == 0 {
             return Ok(Vec::new());
         }
-        let list: Vec<String> = seeds.iter().map(|i| format!("'{}'", quote(i))).collect();
         let through = if r.through.is_empty() {
             String::new()
         } else {
@@ -376,9 +383,9 @@ impl Store {
             format!(", through => kind IN ({})", ks.join(", "))
         };
         let mut conds = filter.conds();
-        conds.push(format!("REACHABLE(links, ({}), hops => {}, dir => 'both', max_nodes => {}{through})", list.join(", "), r.hops, r.max_nodes));
+        conds.push(format!("REACHABLE(links, :seeds, hops => {}, dir => 'both', max_nodes => {}{through})", r.hops, r.max_nodes));
         let sql = format!("SELECT {COLUMNS}, score() FROM memory WHERE {} ORDER BY similarity(emb, :v) DESC LIMIT {n}", conds.join(" AND "));
-        let rs = self.query_with(&sql, &Params::new().set("v", Value::Vector(v.to_vec().into())))?;
+        let rs = self.query_with(&sql, &filter.params().set("v", Value::Vector(v.to_vec().into())).set("seeds", strs(seeds)))?;
         let seeds: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
         Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).filter(|(r, _)| !seeds.contains(r.id.as_str())).collect())
     }
@@ -386,7 +393,7 @@ impl Store {
     /// The top `n` by cosine similarity to `v`.
     pub fn vector_top(&self, v: &[f32], n: usize, filter: &Filter) -> Result<Vec<(Record, f64)>> {
         let sql = format!("SELECT {COLUMNS}, score() FROM memory {} ORDER BY similarity(emb, :v) DESC LIMIT {n}", filter.sql());
-        let rs = self.query_with(&sql, &Params::new().set("v", Value::Vector(v.to_vec().into())))?;
+        let rs = self.query_with(&sql, &filter.params().set("v", Value::Vector(v.to_vec().into())))?;
         Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).collect())
     }
 
@@ -583,6 +590,11 @@ fn apply(db: &Db, next_seq: &AtomicI64, group: &mut [Job]) -> std::result::Resul
 }
 
 /// A row projected with [`COLUMNS`] as a record.
+/// Strings as a list parameter (`id IN (:ids)`, `REACHABLE(links, :seeds)`).
+fn strs(xs: &[String]) -> Value {
+    Value::List(xs.iter().map(|x| Value::Str(x.clone())).collect())
+}
+
 pub fn row_record(r: &[Value]) -> Option<Record> {
     let s = |i: usize| r.get(i).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let n = |i: usize| r.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -679,6 +691,34 @@ mod tests {
         assert_eq!(s.latest(&[Kind::Decision], 5, &Filter::default()).unwrap().len(), 1);
         assert!(s.delete("sessb:3").unwrap());
         assert_eq!(s.len(), 2);
+    }
+
+    /// Sessions, ids and entities with quotes reach Strata as query
+    /// parameters, not as text quoted by hand.
+    #[test]
+    fn values_with_quotes_are_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let sid = "it's \"a\" session; DROP TABLE memory --";
+        let p = s.append(sid, 1, 100, vec![Draft::new(Kind::Prompt, "Where is Roberto's laptop charger")]).unwrap()[0].id.clone();
+        let f = s.append(sid, 1, 101, vec![Draft::new(Kind::Fact, "Roberto's laptop charger is in the drawer").entities(vec!["Roberto's laptop".into()]).link("from", p.clone())]).unwrap()[0].id.clone();
+        s.append("other", 1, 200, vec![Draft::new(Kind::Fact, "The office's printer is on the second floor")]).unwrap();
+        assert_eq!(s.range(sid, 1, 2).unwrap().len(), 2);
+        let e = entity_id("Roberto's laptop").unwrap();
+        assert!(e.contains('\''), "{e}");
+        let entity = s.get(&[p.clone(), e.clone()]).unwrap();
+        assert_eq!(entity.len(), 2, "{entity:?}");
+        let only = Filter { session: Some(sid.into()), ..Default::default() };
+        assert_eq!(s.latest(&[Kind::Fact], 5, &only).unwrap().len(), 1);
+        assert_eq!(s.bm25_top("roberto's charger", 5, &only).unwrap().len(), 2);
+        let window = Filter { exclude_window: Some((sid.into(), 1)), ..Default::default() };
+        assert!(s.bm25_top("charger", 5, &window).unwrap().is_empty());
+        let v = s.embedder.embed_query("charger");
+        assert_eq!(s.vector_top(&v, 5, &window).unwrap().len(), 1);
+        let r = Reach { hops: 2, through: crate::recall::THROUGH.to_vec(), max_nodes: 100 };
+        let got: Vec<String> = s.reach(&[e], &v, 10, &Filter::default(), &r).unwrap().into_iter().map(|(r, _)| r.id).collect();
+        assert!(got.contains(&f), "{got:?}");
+        assert_eq!(s.len(), 4);
     }
 
     #[test]

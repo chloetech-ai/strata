@@ -23,6 +23,7 @@ use std::time::Instant;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
+use strata::Value;
 
 use crate::anchor::Checker;
 use crate::distill::DistillConfig;
@@ -392,14 +393,15 @@ pub fn run_query(store: &Store, q: &Query, filter: &Filter, n: usize) -> Result<
             store.reach(&seeds, &qv, n, &f, &reach)?.into_iter().map(|x| x.0).collect()
         }
         "file" => {
-            let terms: Vec<String> = strata::text::analyze(&q.path).into_iter().map(|t| t.replace('\'', "")).collect();
+            let terms: Vec<String> = strata::text::analyze(&q.path);
             if terms.is_empty() {
                 Vec::new()
             } else {
                 let mut conds = f.conds();
-                conds.push(format!("MATCH(files, '{}')", terms.join(" AND ")));
-                let order = if strata::text::analyze_query(&q.q).is_empty() { "seq DESC".to_string() } else { format!("bm25(body, '{}') DESC", q.q.replace('\'', " ")) };
-                let rs = store.query(&format!("SELECT {COLUMNS} FROM memory WHERE {} ORDER BY {order} LIMIT {n}", conds.join(" AND ")))?;
+                conds.push("MATCH(files, :files)".into());
+                let order = if strata::text::analyze_query(&q.q).is_empty() { "seq DESC" } else { "bm25(body, :q) DESC" };
+                let params = f.params().set("files", Value::Str(terms.join(" AND "))).set("q", Value::Str(q.q.clone()));
+                let rs = store.query_with(&format!("SELECT {COLUMNS} FROM memory WHERE {} ORDER BY {order} LIMIT {n}", conds.join(" AND ")), &params)?;
                 rs.rows.iter().filter_map(|r| row_record(r)).collect()
             }
         }
@@ -407,7 +409,7 @@ pub fn run_query(store: &Store, q: &Query, filter: &Filter, n: usize) -> Result<
             let mut conds = f.conds();
             conds.push(format!("({})", text_to_body(&q.sql_where)));
             let order = if q.sql_order.is_empty() { "seq DESC".to_string() } else { text_to_body(&q.sql_order) };
-            let rs = store.query(&format!("SELECT {COLUMNS} FROM memory WHERE {} ORDER BY {order} LIMIT {n}", conds.join(" AND ")))?;
+            let rs = store.query_with(&format!("SELECT {COLUMNS} FROM memory WHERE {} ORDER BY {order} LIMIT {n}", conds.join(" AND ")), &f.params())?;
             rs.rows.iter().filter_map(|r| row_record(r)).collect()
         }
         _ => Vec::new(),
@@ -769,6 +771,13 @@ mod tests {
             assert!(got.iter().all(|r| r.kind != Kind::Entity), "{k}");
         }
         assert_eq!(run_query(&s, &q("sql"), &f, 5).unwrap()[0].kind, Kind::Error);
+        // The live window reaches the file and SQL searches as a parameter,
+        // and a text with quotes is a value, not SQL.
+        let window = Filter { exclude_window: Some(("a".into(), 1)), ..Default::default() };
+        for k in ["file", "sql"] {
+            let got = run_query(&s, &Query { q: "it's 'tomllib'".into(), ..q(k) }, &window, 5).unwrap();
+            assert_eq!(got.iter().map(|r| r.session.as_str()).collect::<Vec<_>>(), ["b"], "{k}");
+        }
         // A full-text call on the stored column searches the index instead.
         let on_text = Query { sql_where: "MATCH(text, 'tomllib')".into(), sql_order: "bm25(text, 'tomllib') DESC".into(), ..q("sql") };
         assert_eq!(run_query(&s, &on_text, &f, 5).unwrap().len(), 2);
