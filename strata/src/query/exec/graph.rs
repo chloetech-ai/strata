@@ -279,6 +279,7 @@ impl<'a> Executor<'a> {
                 self.stats.plan.extend(sub.stats.plan.into_iter().map(|l| format!("  seeds: {l}")));
                 hits.into_iter().map(|h| (node(h.seg, h.doc), h.score)).collect()
             }
+            Seeds::Plan(_) => return Err(super::unresolved()),
         })
     }
 

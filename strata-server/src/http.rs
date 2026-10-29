@@ -227,6 +227,7 @@ async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         stats,
         snapshot: body_u64(&b, "snapshot"),
         partial: b.get("partial").and_then(|v| v.as_bool()),
+        plan: None,
     };
     let a = app.svc.query(req).await?;
     Ok(AxJson(answer(&a)))
@@ -319,16 +320,16 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
 async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let sql = body_str(&b, "sql")?;
     let params = app.svc.params(b.get("params")).await?;
-    // A compound query's plan lists the queries it ran; it has no plan IR
-    // of its own yet.
-    let (logical, ir, tree) = match strata::query::compound::is_compound(sql, &app.svc.schema) {
-        true => ("a compound query: its steps and their plans are in \"plan\"".to_string(), Json::Null, Json::Null),
+    // A compound query is operators over single-table queries; what each
+    // of those ran is in "plan".
+    let (logical, plan) = match strata::query::compound::is_compound(sql, &app.svc.schema) {
+        true => ("a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(), strata::query::compound::plan(sql, &app.svc.schema, &params)?),
         false => {
             let select = strata::query::bind(sql, &app.svc.schema, &params)?;
-            let plan = strata::query::ir::Plan::of_select(&app.svc.schema, &select);
-            (format!("{select:#?}"), plan.to_json()?, json!(plan.explain(&[&app.svc.schema])))
+            (format!("{select:#?}"), strata::query::ir::Plan::of_select(&app.svc.schema, &select))
         }
     };
+    let (ir, tree) = (plan.to_json()?, json!(plan.explain(&[&app.svc.schema])));
     let a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await?;
     Ok(AxJson(json!({
         "kind": a.kind,
@@ -359,7 +360,7 @@ async fn put_synonyms(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 
 async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
-    let (stats, snapshot) = app.svc.term_stats(body_str(&b, "sql")?, &params, body_u64(&b, "timeout_ms")).await?;
+    let (stats, snapshot) = app.svc.term_stats(body_str(&b, "sql")?, None, &params, body_u64(&b, "timeout_ms")).await?;
     Ok(AxJson(json!({"stats": stats, "snapshot": snapshot})))
 }
 

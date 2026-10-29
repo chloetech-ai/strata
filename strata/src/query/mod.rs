@@ -17,6 +17,7 @@ pub mod fusion;
 pub mod ir;
 pub mod logical;
 pub mod memory;
+pub mod ops;
 pub mod parse;
 pub mod plan;
 pub mod pool;

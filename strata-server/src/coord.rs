@@ -36,6 +36,7 @@ use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value as Json};
 use strata::query::exec::ResultSet;
+use strata::query::ir::Plan;
 use strata::query::stats::TermStats;
 use strata::query::{bind_write, Conflict, Params, Select, Write};
 use strata::schema::Schema;
@@ -176,6 +177,14 @@ impl HedgeBudget {
 
 fn ms_left(deadline: Instant) -> u32 {
     deadline.saturating_duration_since(Instant::now()).as_millis().clamp(1, u32::MAX as u128) as u32
+}
+
+/// A plan as a request carries it (`plan_json`; empty without one).
+fn plan_json(plan: Option<&Plan>) -> Result<Vec<u8>, ApiError> {
+    match plan {
+        Some(p) => Ok(serde_json::to_vec(&p.to_json()?).map_err(|e| ApiError::internal(format!("plan: {e}")))?),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Whether another replica may answer where this one failed: not when the
@@ -399,8 +408,8 @@ impl Coordinator {
 
     /// The statistics of shards `which`, and the replica and lease each
     /// came from. A lease lasts until `deadline` and a second.
-    async fn shard_stats(&self, sql: &str, params: &Params, which: Vec<usize>, start: usize, deadline: Instant) -> Vec<(usize, Result<(TermStats, usize, u64), ApiError>)> {
-        let req = pb::QueryRequest { sql: sql.into(), params: params_to_pb(params), timeout_ms: ms_left(deadline), ..Default::default() };
+    async fn shard_stats(&self, sql: &str, plan_json: &[u8], params: &Params, which: Vec<usize>, start: usize, deadline: Instant) -> Vec<(usize, Result<(TermStats, usize, u64), ApiError>)> {
+        let req = pb::QueryRequest { sql: sql.into(), params: params_to_pb(params), timeout_ms: ms_left(deadline), plan_json: plan_json.to_vec(), ..Default::default() };
         let calls = which.into_iter().map(|i| {
             let req = req.clone();
             async move {
@@ -420,12 +429,13 @@ impl Coordinator {
         join_all(calls).await
     }
 
-    /// Summed statistics, from every shard.
-    pub async fn term_stats(&self, sql: &str, params: &Params, deadline: Instant) -> Result<(TermStats, Vec<u64>), ApiError> {
+    /// Summed statistics, from every shard, of `sql` or of `plan`.
+    pub async fn term_stats(&self, sql: &str, plan: Option<&Plan>, params: &Params, deadline: Instant) -> Result<(TermStats, Vec<u64>), ApiError> {
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let mut sum = TermStats::default();
         let mut leases = Vec::new();
-        for (_, a) in self.shard_stats(sql, params, (0..self.replicas.len()).collect(), start, deadline).await {
+        let plan_json = plan_json(plan)?;
+        for (_, a) in self.shard_stats(sql, &plan_json, params, (0..self.replicas.len()).collect(), start, deadline).await {
             let (s, _, lease) = a?;
             sum.add(&s);
             leases.push(lease);
@@ -435,6 +445,7 @@ impl Coordinator {
 
     pub async fn query(&self, req: &QueryReq, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
         let partial = req.partial.unwrap_or(self.opts.partial);
+        let plan_json = &plan_json(req.plan.as_deref())?;
         let n = self.replicas.len();
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let ranked_text = matches!(crate::metrics::kind(select), "bm25" | "hybrid" | "boosted");
@@ -464,7 +475,7 @@ impl Coordinator {
             None if ranked_text && n > 1 => {
                 let mut sum = TermStats::default();
                 let which = (0..n).filter(|&i| failed[i].is_none()).collect();
-                for (i, a) in self.shard_stats(&req.sql, &req.params, which, start, deadline).await {
+                for (i, a) in self.shard_stats(&req.sql, plan_json, &req.params, which, start, deadline).await {
                     match a {
                         Ok((s, r, lease)) => {
                             sum.add(&s);
@@ -493,6 +504,7 @@ impl Coordinator {
                         // The lease holds on the replica that granted it; another
                         // replica scores from its latest version.
                         snapshot: leased[i].filter(|(lr, _)| *lr == r).map_or(0, |(_, l)| l),
+                        plan_json: plan_json.clone(),
                     };
                     async move { c.query(q).await }
                 });

@@ -68,10 +68,15 @@ fn name(n: &Node) -> &'static str {
         Node::Insert { .. } => "Insert",
         Node::Update { .. } => "Update",
         Node::Delete { .. } => "Delete",
+        Node::Join { .. } => "Join",
+        Node::With { .. } => "With",
+        Node::Ref { .. } => "Ref",
+        Node::Distinct { .. } => "Distinct",
+        Node::KeyOrder { .. } => "KeyOrder",
     }
 }
 
-const SHAPES: &str = "the executor runs Project [Limit] Search and Project [Limit] [Sort] [Filter] Aggregate Search";
+const SHAPES: &str = "the executor runs Project [Limit] Search and Project [Limit] [Sort] [Filter] Aggregate Search (other plans run with operators)";
 
 struct Raise<'a> {
     schema: &'a Schema,

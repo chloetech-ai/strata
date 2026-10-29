@@ -24,6 +24,10 @@ def test_client_reads_and_writes(client):
     assert plan["tree"] == ["Project: id", "  Limit: 3", "    Search books", "      filter: year >= 2000"]
     assert plan["ir"]["root"]["node"] == "project" and plan["ir"]["version"] == 1
     assert client.run(plan["ir"]).keys == client.query("SELECT id FROM books WHERE year >= 2000 LIMIT 3").keys
+    sql = "SELECT id FROM books WHERE year > (SELECT AVG(year) FROM books) ORDER BY year DESC LIMIT 5"
+    plan = client.explain(sql)
+    assert plan["ir"]["features"] == ["operators"]
+    assert len(client.run(plan["ir"]).keys) == 5 and client.run(plan["ir"]).keys == client.query(sql).keys
     assert client.insert([book(i) for i in range(300, 2300)]) == 2000
     assert client.upsert({**book(1), "title": "Changed"}) == 1
     assert client.sql("UPDATE books SET year = 1 WHERE id = :k", k="b0002") == 1

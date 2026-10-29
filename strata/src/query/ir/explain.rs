@@ -1,7 +1,10 @@
 //! Plans as text, for `EXPLAIN`: a line per node, its input indented under
 //! it, with fields by name and expressions in SQL's words.
 
-use super::{Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, OnConflict, Plan, SortKey};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use super::{Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, OnConflict, Plan, SortKey};
 use crate::query::logical::{AggFn, DecayShape, Direction, Expand, Fuzzy, Opts};
 use crate::query::sql::ident;
 use crate::schema::{FieldType, Logical, Schema};
@@ -15,16 +18,19 @@ impl Plan {
     /// indented under it. `schemas` name the fields of the tables the plan
     /// reads (a field of another table shows as `#id`).
     pub fn explain(&self, schemas: &[&Schema]) -> Vec<String> {
-        Text { schemas }.node(&self.root).0
+        Text { schemas, refs: RefCell::default() }.node(&self.root).0
     }
 }
 
 struct Text<'a> {
     schemas: &'a [&'a Schema],
+    /// The columns of the plans a With names.
+    refs: RefCell<HashMap<String, Names<'a>>>,
 }
 
 /// What the expressions over a node name: the fields of the table a
-/// Search reads, or the columns an Aggregate gives.
+/// Search reads, or the columns a node gives (an Aggregate's, a
+/// Project's, a Join's).
 #[derive(Clone, Default)]
 struct Names<'a> {
     schema: Option<&'a Schema>,
@@ -78,16 +84,62 @@ impl<'a> Text<'a> {
                 (Some(l), o) => format!("Limit: {l} offset {o}"),
                 (None, o) => format!("Offset: {o}"),
             }),
-            Node::Project { input, columns } => over(input, &|names| {
-                let cols: Vec<String> = columns
-                    .iter()
-                    .map(|c| {
-                        let e = self.expr(&c.expr, names);
-                        if e == c.name { e } else { format!("{e} AS {}", ident(&c.name)) }
-                    })
-                    .collect();
-                format!("Project: {}", cols.join(", "))
-            }),
+            Node::Project { input, columns } => {
+                let (lines, names) = over(input, &|names| {
+                    let cols: Vec<String> = columns
+                        .iter()
+                        .map(|c| {
+                            let e = self.expr(&c.expr, names);
+                            if e == c.name || e == ident(&c.name) { e } else { format!("{e} AS {}", ident(&c.name)) }
+                        })
+                        .collect();
+                    format!("Project: {}", cols.join(", "))
+                });
+                (lines, Names { schema: names.schema, outputs: columns.iter().map(|c| ident(&c.name)).collect() })
+            }
+            Node::Join { left, right, kind, keys, on } => {
+                let (l, ln) = self.node(left);
+                let (r, rn) = self.node(right);
+                let names = Names { schema: None, outputs: ln.outputs.iter().chain(&rn.outputs).cloned().collect() };
+                let mut head = match kind {
+                    JoinKind::Inner => "Join".to_string(),
+                    JoinKind::Left => "Left join".to_string(),
+                };
+                let mut conds: Vec<String> = keys.iter().map(|k| self.join_key(k, &ln, &rn)).collect();
+                conds.extend(on.iter().map(|c| self.operand(c, &names)));
+                if !conds.is_empty() {
+                    head += &format!(" on {}", conds.join(" AND "));
+                }
+                (std::iter::once(head).chain(indent(l)).chain(indent(r)).collect(), names)
+            }
+            Node::With { ctes, input } => {
+                let mut lines = vec!["With".to_string()];
+                for c in ctes {
+                    let (cl, cn) = self.node(&c.input);
+                    lines.push(format!("  {} AS", ident(&c.name)));
+                    lines.extend(indent(indent(cl).collect()));
+                    self.refs.borrow_mut().insert(c.name.to_ascii_lowercase(), cn);
+                }
+                let (il, names) = self.node(input);
+                lines.extend(indent(il));
+                (lines, names)
+            }
+            Node::Ref { name } => {
+                let names = self.refs.borrow().get(&name.to_ascii_lowercase()).cloned().unwrap_or_default();
+                (vec![format!("Ref {}", ident(name))], Names { schema: None, outputs: names.outputs })
+            }
+            Node::Distinct { input } => over(input, &|_| "Distinct".into()),
+            Node::KeyOrder { input, by } => {
+                let (il, names) = self.node(input);
+                let lines = match &**by {
+                    Node::Ref { name } => std::iter::once(format!("Key order of {}", ident(name))).chain(indent(il)).collect(),
+                    by => {
+                        let (bl, _) = self.node(by);
+                        std::iter::once("Key order".to_string()).chain(indent(il)).chain(std::iter::once("  of:".to_string())).chain(indent(indent(bl).collect())).collect()
+                    }
+                };
+                (lines, names)
+            }
             Node::Insert { table, rows, on_conflict } => {
                 let names = Names { schema: self.schema(table), outputs: Vec::new() };
                 let mut head = format!("Insert into {}: {} row{}", ident(table), rows.len(), if rows.len() == 1 { "" } else { "s" });
@@ -119,6 +171,20 @@ impl<'a> Text<'a> {
                 (std::iter::once(format!("Delete from {}", ident(table))).chain(indent(lines)).collect(), names)
             }
         }
+    }
+
+    fn join_key(&self, k: &JoinKey, left: &Names, right: &Names) -> String {
+        let side = |e: &Expr, names: &Names, links: bool| {
+            let x = self.operand(e, names);
+            if links { format!("targets({x})") } else { x }
+        };
+        format!("{} = {}", side(&k.left, left, k.left_links), side(&k.right, right, k.right_links))
+    }
+
+    /// A subquery's plan on one line.
+    fn subquery(&self, n: &Node) -> String {
+        let (lines, _) = self.node(n);
+        format!("({})", lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join("; "))
     }
 
     fn keys(&self, keys: &[SortKey], names: &Names) -> String {
@@ -190,6 +256,7 @@ impl<'a> Text<'a> {
                 }
             }
             Expr::In { expr, list } => match &list[..] {
+                [v @ (Expr::Values(_) | Expr::Keys(_))] => format!("{} IN {}", self.operand(expr, names), self.expr(v, names)),
                 [v] => format!("{} = {}", self.operand(expr, names), self.expr(v, names)),
                 vs => format!("{} IN ({})", self.operand(expr, names), vs.iter().map(|v| self.expr(v, names)).collect::<Vec<_>>().join(", ")),
             },
@@ -279,10 +346,11 @@ impl<'a> Text<'a> {
                 s
             }
             Expr::Product(xs) => xs.iter().map(|x| self.operand(x, names)).collect::<Vec<_>>().join(" * "),
-            Expr::Subquery(n) => {
-                let (lines, _) = self.node(n);
-                format!("({})", lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join("; "))
-            }
+            Expr::Subquery(n) => self.subquery(n),
+            Expr::Values(n) => format!("values of {}", self.subquery(n)),
+            Expr::Keys(n) => format!("keys of {}", self.subquery(n)),
+            Expr::Exists(n) => format!("EXISTS {}", self.subquery(n)),
+            Expr::Scalar(n) => self.subquery(n),
         }
     }
 

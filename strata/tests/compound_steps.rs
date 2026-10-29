@@ -1,9 +1,9 @@
-//! A compound query's steps (each side of a join, a subquery, a `WITH`)
+//! A compound query's leaves (each side of a join, a subquery, a `WITH`)
 //! bind from syntax trees built for them, where they were printed as SQL
 //! and parsed again: `- -1` printed as `--1`, which starts a comment, and
 //! a column named like a keyword (`order`) or with a space did not parse.
-//! Each step's SQL, which a coordinator sends its shards, parses back to
-//! the step's plan.
+//! The query is one plan, whose leaves a coordinator sends its shards as
+//! JSON: each leaf, and the whole plan, reads back from JSON as it was.
 
 use strata::db::Db;
 use strata::graph::{edges_value, Edge};
@@ -46,27 +46,30 @@ fn s(x: &str) -> Value {
     Value::Str(x.into())
 }
 
-/// The query's rows, run with a runner that checks that each step's SQL
-/// binds to the step's plan, against the same from `Db::query`.
+/// The query's rows, run with a runner that checks that each leaf reads
+/// back from JSON as it was and needs no operators, against the same from
+/// `Db::query` and from running the whole plan.
 fn rows(db: &Db, sql: &str) -> Vec<Vec<Value>> {
     let schema = schema();
     let snap = db.snapshot();
-    let mut texts = Vec::new();
-    let got = compound::run(sql, &schema, &Params::new(), &mut |step| {
-        let again = Plan::bind(step.sql, &schema, step.params).unwrap_or_else(|e| panic!("{}: {e}", step.sql));
-        assert_eq!(&again, step.plan, "{}", step.sql);
-        texts.push(step.sql.to_string());
-        db.run_at(&snap, step.plan, &ExecOptions::default())
+    let got = compound::run(sql, &schema, &Params::new(), &mut |leaf| {
+        assert_eq!(&Plan::from_json(&leaf.to_json().unwrap()).unwrap(), leaf, "{sql}");
+        assert!(!leaf.root.uses_operators() && leaf.features.is_empty(), "{sql}: {leaf:?}");
+        db.run_at(&snap, leaf, &ExecOptions::default())
     })
     .unwrap_or_else(|e| panic!("{sql}: {e}"));
-    assert!(texts.iter().all(|t| !t.contains("--")), "{texts:?}");
     let want = db.query(sql, &Params::new()).unwrap_or_else(|e| panic!("{sql}: {e}"));
     assert_eq!(got.rows, want.rows, "{sql}");
+    let plan = compound::plan(sql, &schema, &Params::new()).unwrap();
+    // `SELECT DISTINCT` of the table is a GROUP BY the executor runs.
+    assert_eq!(plan.features.is_empty(), !plan.root.uses_operators(), "{sql}");
+    assert_eq!(Plan::from_json(&plan.to_json().unwrap()).unwrap(), plan, "{sql}");
+    assert_eq!(db.run_at(&snap, &plan, &ExecOptions::default()).unwrap().rows, want.rows, "{sql}");
     got.rows
 }
 
 #[test]
-fn steps_bind_their_own_syntax_trees() {
+fn leaves_bind_their_own_syntax_trees() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     let cases: Vec<(&str, Vec<Vec<Value>>)> = vec![
@@ -93,7 +96,7 @@ fn steps_bind_their_own_syntax_trees() {
     for (sql, want) in cases {
         assert_eq!(rows(&db, sql), want, "{sql}");
     }
-    // What the query's plan shows of a step is SQL that parses back.
+    // What the query's run shows of a leaf: its rows and its plan.
     let plan = db.query("SELECT a.id FROM t a JOIN t b ON a.links = b.id WHERE a.n >= - -1", &Params::new()).unwrap().stats.plan;
-    assert!(plan.iter().any(|l| l.starts_with("scan a: 2 rows: ") && l.contains("n >= -(-1)")), "{plan:?}");
+    assert!(plan.iter().any(|l| l.starts_with("scan: 2 rows: ") && l.contains("n >= 1")), "{plan:?}");
 }

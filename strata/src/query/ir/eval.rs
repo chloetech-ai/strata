@@ -192,6 +192,7 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
         | Expr::Product(_)
         | Expr::Ppr(_)
         | Expr::Subquery(_) => return Err(err("full-text, graph and score expressions are answered by indexes in a Search, not row by row")),
+        Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_) => return Err(err("a subquery is run before the rows it is evaluated over")),
     })
 }
 

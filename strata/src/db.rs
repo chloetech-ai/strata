@@ -21,7 +21,7 @@ use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentRea
 use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::Plan;
 use crate::query::stats::TermStats;
-use crate::query::{bind_command, compound, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
+use crate::query::{bind_command, compound, ops, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
 use crate::schema::{Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn};
@@ -405,29 +405,34 @@ impl Db {
     /// see the same version share one), on the table it names (`FROM`).
     ///
     /// A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs
-    /// as several single-table queries on the same snapshot. Its steps may
+    /// as a plan of operators over single-table queries
+    /// ([`crate::query::compound`]), all on the same snapshot. Its parts may
     /// hold up to [`crate::query::compound::MAX_ROWS`] rows each; its answer
     /// is held to [`ExecOptions::max_rows`]. A query reads one table: joins
     /// and subqueries across tables are not supported yet.
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         let q = qsql::parse_query(sql)?;
         let view = view_of(snap, &q)?;
-        if compound::needs(&q, view.schema()) {
-            let steps = ExecOptions { max_rows: None, ..opts.clone() };
-            let rs = compound::run_query(
-                &q,
-                view.schema(),
-                params,
-                &mut |step| self.execute(&view, &step.plan.to_select(view.schema())?, &steps),
-                opts,
-            )?;
-            if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
-                return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
-            }
-            return Ok(rs);
+        let plan = match compound::needs(&q, view.schema()) {
+            true => compound::plan_query(&q, view.schema(), params)?,
+            false => Plan::of_select(view.schema(), &qsql::bind_query(&q, view.schema(), params)?),
+        };
+        self.run_on(&view, &plan, opts)
+    }
+
+    /// Runs a plan that reads `view`'s table: a leaf on the executor, any
+    /// other with operators ([`crate::query::ops`]), whose leaves may hold
+    /// up to [`crate::query::compound::MAX_ROWS`] rows each.
+    fn run_on(&self, view: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
+        if !plan.root.uses_operators() {
+            return self.execute(view, &plan.to_select(view.schema())?, opts);
         }
-        let plan = Plan::of_select(view.schema(), &qsql::bind_query(&q, view.schema(), params)?);
-        self.execute(&view, &plan.to_select(view.schema())?, opts)
+        let leaves = ExecOptions { max_rows: None, ..opts.clone() };
+        let rs = ops::run(plan, view.schema(), &mut |leaf| self.execute(view, &leaf.to_select(view.schema())?, &leaves), opts)?;
+        if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
+            return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
+        }
+        Ok(rs)
     }
 
     /// Runs a plan ([`crate::query::ir`]) on the table it names: a read
@@ -446,7 +451,7 @@ impl Db {
     /// [`Db::run`] of a plan that reads, against a given snapshot.
     pub fn run_at(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
         let view = snap.table(plan.table()).ok_or_else(|| Error::Query(format!("no such table: {}", plan.table())))?;
-        self.execute(&view, &plan.to_select(view.schema())?, opts)
+        self.run_on(&view, plan, opts)
     }
 
     /// [`Db::prepare_write`] of a plan that writes.
@@ -505,8 +510,8 @@ impl Db {
     /// The plan of one statement ([`crate::query::ir`]): a SELECT, INSERT,
     /// UPDATE or DELETE, bound as it would run but not run. `EXPLAIN
     /// <statement>` in [`Db::sql`] gives it as text or JSON. A compound
-    /// SELECT (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as
-    /// several queries, and has no plan of its own yet.
+    /// SELECT (`WITH`, a subquery, a join, `SELECT DISTINCT`) plans into
+    /// operators over single-table queries ([`crate::query::compound`]).
     pub fn explain(&self, sql: &str, params: &Params) -> Result<Plan> {
         self.explain_statement(&qsql::parse_one(sql)?, params)
     }
@@ -515,9 +520,7 @@ impl Db {
         if let sqlparser::ast::Statement::Query(q) = stmt {
             let view = view_of(&self.snapshot(), q)?;
             if compound::needs(q, view.schema()) {
-                return Err(Error::Query(
-                    "a compound query (WITH, a subquery, a join, SELECT DISTINCT) runs as several queries and has no plan of its own yet: EXPLAIN its steps, or POST it to /v1/explain to see what each ran".into(),
-                ));
+                return compound::plan_query(q, view.schema(), params);
             }
             return Ok(Plan::of_select(view.schema(), &qsql::bind_query(q, view.schema(), params)?));
         }

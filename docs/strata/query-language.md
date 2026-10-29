@@ -271,15 +271,15 @@ SELECT b.id, COUNT(*) AS n FROM papers a JOIN papers b ON a.cites = b.id GROUP B
 SELECT a.id, b.id FROM papers a JOIN papers b ON a.category = b.category AND b.id != a.id WHERE a.id = 'p1';
 ```
 
-These run as a sequence of the single-table queries above, all on one snapshot, so every step uses the indexes. Each step is bound as it is built, never printed as SQL and parsed again:
+Each plans into operators over the single-table queries above ([`EXPLAIN`](#explain) shows them), all run on one snapshot, so every single-table query uses the indexes. Each is bound as it is built, never printed as SQL and parsed again:
 
-- **`IN (SELECT ...)`** and **`NOT IN`** run the subquery first and filter with its values (a multi-valued column contributes each value). **`EXISTS`** is true or false, and a **scalar subquery** must return one column and at most one row.
+- **`IN (SELECT ...)`** and **`NOT IN`** run the subquery first and filter with its values (a multi-valued column contributes each value). **`EXISTS`** is true or false, and a **scalar subquery** must return one column and at most one row. A subquery's values reach the outer query's filter as values, so its indexes serve it: `year > (SELECT AVG(year) ...)` is a range of `year`.
 - **`WITH`** results and **`FROM (SELECT ...)`** are read like a table. A `WITH` whose rows are rows of the table (no aggregates) keeps their keys, so an outer query over it reads the table restricted to those rows, in the `WITH`'s order unless it orders them itself, and `(SELECT id FROM top)` can seed a graph. `WITH RECURSIVE` is not supported: `REACHABLE` and `PATH` walk links.
 - **Joins** are `JOIN` (inner) and `LEFT JOIN`, of the table with itself or with a `WITH` result; name each side (`papers a JOIN papers b`). `ON` needs an equality between the sides; comparing an `EDGES` field with the key follows its links (`a.cites = b.id`: *b* is a row *a* links to; `b.cites = a.id`: *b* links to *a*). Each `WHERE` or `ON` condition on one side filters that side's scan, and the second side reads only the rows whose join values the first side holds (`b.id IN (...)`, or for links the rows linking to them), before a hash join in memory. Text, vector and graph functions name one side (`MATCH(a.body, ...)`); `ORDER BY` a score ranks by that side's scan, and when the order is the first side's, scans of a growing number of its rows stop once `LIMIT` rows join. Joined columns are named by their expression (`b.title`) unless aliased.
-- Over joined or derived rows, `WHERE`, `GROUP BY`, aggregates, `HAVING`, `ORDER BY`, `DISTINCT` and `LIMIT` also take arithmetic, `||`, `LIKE`, `ILIKE`, `CASE`, `COALESCE`, `LOWER`, `UPPER`, `LENGTH`, `ABS` and `ROUND`. Their conditions follow the same three-valued logic as a single table's, multi-valued columns included (`NOT (b.tags = 'red')` keeps rows without tags). Integer arithmetic is exact, and a result too big for an integer is a `FLOAT`; `/` gives a `FLOAT`, and dividing by zero gives `NULL`. `||` skips `NULL`s, and `LIKE` with a `NULL` side is `NULL`.
-- Each step reads at most 1,000,000 rows. `UNION`, `INTERSECT`, `EXCEPT`, window functions, and `RIGHT`, `FULL` and `CROSS` joins are not supported.
+- Over joined or derived rows, `WHERE`, `GROUP BY`, aggregates, `HAVING`, `ORDER BY`, `DISTINCT` and `LIMIT` also take arithmetic, `||`, `LIKE`, `ILIKE`, `CASE`, `COALESCE`, `LOWER`, `UPPER`, `LENGTH`, `ABS` and `ROUND`. Their conditions follow the same three-valued logic as a single table's, multi-valued columns included (`NOT (b.tags = 'red')` keeps rows without tags). Integer arithmetic is exact, and a result too big for an integer is a `FLOAT`; `/` gives a `FLOAT`, and dividing by zero gives `NULL`. `||` skips `NULL`s, and `LIKE` with a `NULL` side is `NULL`. `ORDER BY` puts rows without a value last in either direction unless `NULLS FIRST`, as over a single table.
+- Each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. `UNION`, `INTERSECT`, `EXCEPT`, window functions, and `RIGHT`, `FULL` and `CROSS` joins are not supported.
 
-The plan lists each step with its rows and its own plan.
+The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-table query that ran, with its rows and its own plan.
 
 ## Graphs
 
@@ -421,7 +421,26 @@ Project: category, COUNT(*) AS n
 
 A `Search` is the rows of one table that its `filter` holds for, ranked by its `order`; the operators above it group, keep, sort, cut and name them, and a write's operator (`Insert`, `Update`, `Delete`) sits on top. The plan is the statement as bound: values have their field's type, and a `NOT` over a field that can be null also says `x IS NOT NULL`, since a row without a value matches neither a comparison nor its negation.
 
-`EXPLAIN FORMAT JSON` (or `EXPLAIN (FORMAT JSON)`) gives the plan as one row of JSON: fields by their position in the table, typed values (`{"int": 5}`, `{"text": "5"}`), a version and the features the plan needs. Strata refuses a plan from a newer version by name. A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as several queries and has no plan of its own yet; [`POST /v1/explain`](server.md#http-api) lists what each step ran. `EXPLAIN ANALYZE` and other formats are refused.
+`EXPLAIN FORMAT JSON` (or `EXPLAIN (FORMAT JSON)`) gives the plan as one row of JSON: fields by their position in the table, typed values (`{"int": 5}`, `{"text": "5"}`), a version and the features the plan needs. Strata refuses a plan from a newer version by name. `EXPLAIN ANALYZE` and other formats are refused.
+
+A compound query's plan has operators over rows in memory above its `Search`es, and its JSON needs the feature `operators`:
+
+```sql
+EXPLAIN SELECT a.id, b.title FROM papers a JOIN papers b ON a.cites = b.id WHERE a.year >= 2019 ORDER BY a.year DESC LIMIT 5;
+```
+```text
+Project: id AS "a.id", title AS "b.title"
+  Limit: 5
+    Join on targets(cites) = id
+      Project: id, year, cites
+        Search papers
+          filter: year >= 2019
+          order: year DESC
+      Project: title, id
+        Search papers
+```
+
+`Join` (or `Left join`) matches its two inputs on the keys after `on`, `targets(f)` being the rows an `EDGES` field links to, with any other `ON` condition after `AND`; `With` names its results, which `Ref` reads; `Key order of top` puts rows in the order of the `WITH` result `top`; `Distinct` keeps each row once. A subquery sits in its condition: `IN values of (...)` (its values), `IN keys of (...)` (its rows' keys), `EXISTS (...)` and a scalar `(...)`, each shown on one line with `;` between its operators. `SELECT DISTINCT` of the table alone is a `GROUP BY`, a single-table query.
 
 Every statement runs as its plan, and a plan in JSON runs on its own: `Db::run` in Rust, `Database.run` in [Python](python.md#querying) and [`POST /v1/plan`](server.md#http-api) over HTTP take one, and check it against the table's schema as the SQL binder checks a statement.
 

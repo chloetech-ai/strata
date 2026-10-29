@@ -495,9 +495,8 @@ async fn coordinator_answers_like_one_database() {
         let got = coord.query(QueryReq { sql: sql.into(), params, ..Default::default() }).await.unwrap();
         same(sql, &want, &js::result(&got.rs, 0.0));
     }
-    // A compound query's steps reach the shards as SQL that parses back to
-    // each step's plan, `- -1` and a column named like a keyword (`year`)
-    // included.
+    // A compound query's leaves reach the shards as their plans, `- -1` and
+    // a column named like a keyword (`year`) included.
     for sql in [
         "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE a.year >= - -2022 AND b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
         "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > - -100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
@@ -509,9 +508,24 @@ async fn coordinator_answers_like_one_database() {
     }
     let h = coord.health().await;
     assert_eq!((h["status"].as_str(), h["docs"].as_u64()), (Some("ok"), Some(N as u64)), "{h}");
-    // A coordinator takes SQL, not plans, until its shards take plans.
-    let plan = strata::query::ir::Plan::bind("SELECT id FROM products LIMIT 3", &coord.schema, &Params::new()).unwrap();
-    let e = coord.run_plan(plan, 0).await.err().unwrap();
+    // A coordinator runs a read's plan, a compound query's included, as it
+    // runs the SQL: the shards take the plan's leaves. It takes writes as
+    // SQL until its shards take write plans.
+    for sql in [
+        "SELECT id, price FROM products WHERE year >= 2020 ORDER BY price DESC, id LIMIT 7",
+        "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > 100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
+        "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
+    ] {
+        let plan = match strata::query::compound::is_compound(sql, &coord.schema) {
+            true => strata::query::compound::plan(sql, &coord.schema, &Params::new()).unwrap(),
+            false => strata::query::ir::Plan::bind(sql, &coord.schema, &Params::new()).unwrap(),
+        };
+        let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
+        let Ok(strata_server::service::SqlAnswer::Rows(got)) = coord.run_plan(plan, 0).await else { panic!("{sql}") };
+        same(sql, &want, &js::result(&got.rs, 0.0));
+    }
+    let strata::query::Command::Write { write, .. } = strata::query::bind_command("DELETE FROM products WHERE id = 'p0000001'", &[&coord.schema], &Params::new()).unwrap() else { panic!() };
+    let e = coord.run_plan(strata::query::ir::Plan::of_write(&coord.schema, &write), 0).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("coordinator"), "{}", e.message);
 
     // Writes: inserts go to their key's shard, UPDATE and DELETE to all.
@@ -1010,7 +1024,7 @@ async fn snapshot_leases_end_with_their_query() {
     let dir = tempfile::tempdir().unwrap();
     let svc = service(create(dir.path(), "db.strata", |_| true), "http://unused");
     let sql = "SELECT id FROM products ORDER BY bm25(body, 'waterproof hiking boots') DESC LIMIT 5";
-    let (_, lease) = svc.term_stats(sql, &Params::new(), 200).await.unwrap();
+    let (_, lease) = svc.term_stats(sql, None, &Params::new(), 200).await.unwrap();
     let q = |snapshot| QueryReq { sql: sql.into(), snapshot, ..Default::default() };
     svc.query(q(lease)).await.unwrap();
     assert_eq!(svc.sweep_leases(), 1);
@@ -1338,8 +1352,8 @@ async fn a_simple_analyzer_over_http() {
 }
 
 /// `/v1/explain` gives the plan IR of a query, as JSON that reads back to
-/// the query it was bound from, and as lines of text; a compound query has
-/// none yet. `/v1/plan` runs a plan.
+/// the query it was bound from, and as lines of text; a compound query's
+/// plan has operators over single-table queries. `/v1/plan` runs a plan.
 #[tokio::test(flavor = "multi_thread")]
 async fn explain_gives_the_plan_ir() {
     use strata::query::ir::Plan;
@@ -1387,8 +1401,17 @@ async fn explain_gives_the_plan_ir() {
     newer["features"] = json!(["hash_join"]);
     let (status, e) = post(&c, &format!("{base}/v1/plan"), json!({ "plan": newer })).await;
     assert!(status == 400 && e["error"].as_str().unwrap().contains("hash_join"), "{e}");
-    let compound = "SELECT id FROM products WHERE id IN (SELECT id FROM products WHERE price < 10)";
+    // A compound query's plan is operators over single-table queries, and
+    // runs as its SQL does.
+    let compound = "SELECT id FROM products WHERE id IN (SELECT id FROM products WHERE price < 10) ORDER BY price DESC LIMIT 20";
     let (status, r) = post(&c, &format!("{base}/v1/explain"), json!({ "sql": compound })).await;
     assert_eq!(status, 200, "{r}");
-    assert!(r["ir"].is_null() && r["tree"].is_null(), "{r}");
+    assert_eq!(r["ir"]["features"], json!(["operators"]), "{r}");
+    let tree: Vec<&str> = r["tree"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+    assert!(tree.iter().any(|l| l.contains("id IN values of (Project: id; Search products; filter: price <")), "{tree:?}");
+    let (_, want) = post(&c, &format!("{base}/v1/query"), json!({ "sql": compound })).await;
+    let (status, got) = post(&c, &format!("{base}/v1/plan"), json!({ "plan": r["ir"] })).await;
+    assert_eq!(status, 200, "{got}");
+    assert!(!want["rows"].as_array().unwrap().is_empty(), "{want}");
+    same(compound, &want, &got);
 }

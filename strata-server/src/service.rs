@@ -16,7 +16,7 @@ use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
 use strata::query::sql::{ident, quoted};
-use strata::query::{compound, Params, Select};
+use strata::query::{compound, ops, Params, Select};
 use strata::schema::Schema;
 use strata::storage::{CheckpointOptions, CheckpointStats, Layout, Snapshot, WriteTxn};
 use strata::text::Synonyms;
@@ -59,6 +59,9 @@ pub struct QueryReq {
     /// From a coordinator: answer without shards that cannot answer
     /// (`None`: its default, [`crate::coord::CoordOptions::partial`]).
     pub partial: Option<bool>,
+    /// A plan to run instead of `sql` (which then only names it in logs):
+    /// a leaf of a coordinator's compound query.
+    pub plan: Option<Arc<Plan>>,
 }
 
 pub struct Answer {
@@ -485,13 +488,28 @@ impl Service {
         }
     }
 
-    pub async fn query(self: &Arc<Self>, req: QueryReq) -> Result<Answer, ApiError> {
+    pub async fn query(self: &Arc<Self>, mut req: QueryReq) -> Result<Answer, ApiError> {
         let t0 = Instant::now();
         let timeout = self.timeout_of(req.timeout_ms);
-        if compound::is_compound(&req.sql, &self.schema) {
-            return self.compound(req, t0, timeout).await;
+        // A compound query runs as its plan; a coordinator sends the shards
+        // the plan's leaves.
+        if req.plan.is_none() && compound::is_compound(&req.sql, &self.schema) {
+            match compound::plan(&req.sql, &self.schema, &req.params) {
+                Ok(p) => req.plan = Some(Arc::new(p)),
+                Err(e) => {
+                    self.metrics.query("invalid", "error", t0.elapsed().as_secs_f64());
+                    return Err(e.into());
+                }
+            }
         }
-        let select = match bind(&req.sql, &self.schema, &req.params) {
+        if let Some(plan) = req.plan.clone().filter(|p| p.root.uses_operators()) {
+            return self.compound(req, plan, t0, timeout).await;
+        }
+        let bound = match &req.plan {
+            Some(plan) => plan.to_select(&self.schema),
+            None => bind(&req.sql, &self.schema, &req.params),
+        };
+        let select = match bound {
             Ok(s) => s,
             Err(e) => {
                 self.metrics.query("invalid", "error", t0.elapsed().as_secs_f64());
@@ -501,32 +519,24 @@ impl Service {
         self.select(req, select, t0, timeout).await
     }
 
-    /// Runs a plan ([`strata::query::ir`]): a read of the database's first
-    /// table answers as [`Service::query`] does, and a write as
-    /// [`Service::sql`] does (on any table). A coordinator takes SQL until
-    /// its shards take plans.
+    /// Runs a plan ([`strata::query::ir`]): a read answers as
+    /// [`Service::query`] does, and a write as [`Service::sql`] does (on any
+    /// table). A coordinator takes writes as SQL until its shards take write
+    /// plans.
     pub async fn run_plan(self: &Arc<Self>, plan: Plan, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
         let t0 = Instant::now();
-        let Backend::Local(db) = &self.backend else {
-            return Err(ApiError::bad("a coordinator runs SQL; its shards do not take plans yet"));
-        };
         // What the slow-query log shows of the plan.
         let text = plan.explain(&[&self.schema]).join(" / ");
         if plan.is_write() {
+            let Backend::Local(db) = &self.backend else {
+                return Err(ApiError::bad("a coordinator takes writes as SQL; its shards do not take write plans yet"));
+            };
             let n = self.write_local(db, move |db| db.prepare_plan(&plan).map(Some), timeout_ms).await;
             let n = self.wrote(n, t0, Some(&text))?;
             return Ok(SqlAnswer::Written { n, took_ms: t0.elapsed().as_secs_f64() * 1e3 });
         }
-        let select = match plan.to_select(&self.schema) {
-            Ok(s) => s,
-            Err(e) => {
-                self.metrics.query("invalid", "error", t0.elapsed().as_secs_f64());
-                return Err(e.into());
-            }
-        };
-        let req = QueryReq { sql: text, timeout_ms, ..Default::default() };
-        let timeout = self.timeout_of(timeout_ms);
-        self.select(req, select, t0, timeout).await.map(SqlAnswer::Rows)
+        let req = QueryReq { sql: text, timeout_ms, plan: Some(Arc::new(plan)), ..Default::default() };
+        self.query(req).await.map(SqlAnswer::Rows)
     }
 
     /// Runs a bound single-table query, on the database or over the shards.
@@ -551,7 +561,7 @@ impl Service {
                         cancel: Some(cancel.0.clone()),
                         synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
                         // A coordinator's compound queries ask a shard for
-                        // as many rows as a compound step may hold.
+                        // as many rows as a compound query's leaf may hold.
                         max_rows: if req.shard { self.max_rows.map(|m| m.max(compound::MAX_ROWS + 1)) } else { self.max_rows },
                         max_groups: self.max_groups,
                         memory: self.query_memory.clone(),
@@ -613,9 +623,10 @@ impl Service {
         res.map(|(rs, missing)| Answer { rs, took_ms: secs * 1e3, kind, missing })
     }
 
-    /// A compound query ([`compound`]): its single-table steps run on one
-    /// snapshot here, or each through the coordinator.
-    async fn compound(self: &Arc<Self>, req: QueryReq, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
+    /// A compound query ([`compound`]): its plan's leaves run on one
+    /// snapshot here, or each through the coordinator, and its operators
+    /// here.
+    async fn compound(self: &Arc<Self>, req: QueryReq, plan: Arc<Plan>, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = "compound";
         let Some(permit) = self.admit(timeout).await else {
             self.metrics.query(kind, "rejected", t0.elapsed().as_secs_f64());
@@ -624,13 +635,13 @@ impl Service {
         let schema = self.schema.clone();
         let deadline = t0 + timeout;
         let req_sql = req.sql.clone();
-        // Each step checks it: the caller may have stopped waiting.
+        // Each leaf checks it: the caller may have stopped waiting.
         let cancel = Cancel::default();
         let r = match &self.backend {
             Backend::Local(db) => {
                 let snap = self.snapshot(db, req.snapshot)?;
                 let (running, n) = Running::start(&self.running);
-                // Steps hold up to compound::MAX_ROWS rows; the answer is
+                // Leaves hold up to compound::MAX_ROWS rows; the answer is
                 // held to the window below.
                 let opts = ExecOptions {
                     threads: (self.cores / n).max(1),
@@ -644,13 +655,7 @@ impl Service {
                 let db = db.clone();
                 let r = tokio::task::spawn_blocking(move || {
                     let _held = (permit, running);
-                    compound::run_checked(
-                        &req.sql,
-                        &schema,
-                        &req.params,
-                        &mut |step| db.execute(&snap, &step.plan.to_select(snap.schema())?, &opts),
-                        &opts,
-                    )
+                    ops::run(&plan, &schema, &mut |leaf| db.execute(&snap, &leaf.to_select(snap.schema())?, &opts), &opts)
                 })
                 .await;
                 r.map(|r| r.map(|rs| (rs, Vec::new())))
@@ -660,18 +665,19 @@ impl Service {
                 let rt = tokio::runtime::Handle::current();
                 let stop = cancel.0.clone();
                 let memory = self.query_memory.clone();
-                // The steps' calls to the shards carry the request's id.
+                // The leaves' calls to the shards carry the request's id.
                 let id = obs::current();
                 tokio::task::spawn_blocking(move || {
                     let _held = permit;
-                    // Shards any step was answered without (partial answers).
+                    // Shards any leaf was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
                     let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, ..ExecOptions::default() };
-                    let rs = compound::run_checked(&req.sql, &schema, &req.params, &mut |step| {
+                    let rs = ops::run(&plan, &schema, &mut |leaf| {
                         checks.check()?;
-                        let select = step.plan.to_select(&schema)?;
-                        // Shards take SQL until they take plans.
-                        let step = QueryReq { sql: step.sql.to_string(), params: step.params.clone(), partial: req.partial, ..Default::default() };
+                        let select = leaf.to_select(&schema)?;
+                        // The shards run the leaf's plan; its text names it in their logs.
+                        let sql = leaf.explain(&[&schema]).join(" / ");
+                        let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, ..Default::default() };
                         let m = rt.block_on(obs::scope(id.clone(), c.query(&step, &select, deadline))).map_err(|e| strata::Error::Query(e.message))?;
                         for s in m.missing {
                             if !missing.contains(&s) {
@@ -723,8 +729,11 @@ impl Service {
     /// came from (0 from a coordinator, which sums its shards'). The lease
     /// lasts for the query round that follows: the request's deadline
     /// (`timeout_ms`, or the default) and a second.
-    pub async fn term_stats(self: &Arc<Self>, sql: &str, params: &Params, timeout_ms: u64) -> Result<(TermStats, u64), ApiError> {
-        let select = bind(sql, &self.schema, params)?;
+    pub async fn term_stats(self: &Arc<Self>, sql: &str, plan: Option<&Plan>, params: &Params, timeout_ms: u64) -> Result<(TermStats, u64), ApiError> {
+        let select = match plan {
+            Some(p) => p.to_select(&self.schema)?,
+            None => bind(sql, &self.schema, params)?,
+        };
         match &self.backend {
             Backend::Local(db) => {
                 let ttl = self.lease_ttl.min(self.timeout_of(timeout_ms) + Duration::from_secs(1));
@@ -735,7 +744,7 @@ impl Service {
                 let stats = tokio::task::spawn_blocking(move || db.term_stats_with(&snap, &select, &opts)).await.map_err(ApiError::internal)??;
                 Ok((stats, lease))
             }
-            Backend::Cluster(c) => Ok((c.term_stats(sql, params, Instant::now() + self.timeout_of(timeout_ms)).await?.0, 0)),
+            Backend::Cluster(c) => Ok((c.term_stats(sql, plan, params, Instant::now() + self.timeout_of(timeout_ms)).await?.0, 0)),
         }
     }
 

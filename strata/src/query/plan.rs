@@ -164,6 +164,8 @@ impl<E: Estimator> Planner<'_, E> {
                 let card = self.est.graph_count(*id).min(n);
                 PredEstimate { card, mat_cost: c.leaf + card * c.emit, probe_cost: c.probe_keyword, probeable: true }
             }
+            // Never planned: its plan runs the subquery first.
+            Pred::Sub(_) => PredEstimate { card: n, mat_cost: c.leaf + n * c.emit, probe_cost: c.probe_keyword, probeable: false },
             Pred::Not(inner) => {
                 let e = self.estimate(inner);
                 PredEstimate { card: n - e.card, mat_cost: e.mat_cost + n * c.emit / 64.0, probe_cost: e.probe_cost, probeable: e.probeable }
