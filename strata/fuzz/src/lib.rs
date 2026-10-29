@@ -11,11 +11,13 @@
 //!   an error, and a list that passes [`Loom::validate`] decodes, seeks and
 //!   combines like its docIDs.
 //! - `segment` must open without panicking (a damaged segment is an error)
-//!   but may panic inside a query: Strata trusts a segment's sections as
-//!   far as their structure checks go (checksums are checked on demand,
-//!   by merges and with `DbOptions::verify_checksums`), and a reader that
-//!   finds one inconsistent may stop the query. It must not read outside
-//!   the file, which AddressSanitizer checks.
+//!   but may panic inside a query: it opens the database without
+//!   `DbOptions::check_sections`, so that damage reaches the readers
+//!   rather than stopping at a section's checksum, and Strata then trusts
+//!   a segment's sections as far as their structure checks go (whole
+//!   segments are checked by merges and with `DbOptions::verify_checksums`);
+//!   a reader that finds one inconsistent may stop the query. It must not
+//!   read outside the file, which AddressSanitizer checks.
 
 use std::ops::Range;
 use std::cell::Cell;
@@ -317,7 +319,7 @@ fn write_db(dir: &Path, main: &[u8], wal: Option<&[u8]>) -> PathBuf {
 pub fn segment(data: &[u8]) {
     let s = seed();
     let path = write_db(&scratch(), &damage(&s.file, data, &s.segments), None);
-    if let Ok(db) = Db::open(&path, opts()) {
+    if let Ok(db) = Db::open(&path, DbOptions { check_sections: false, ..opts() }) {
         run_queries(&db);
     }
 }

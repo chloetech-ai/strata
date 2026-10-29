@@ -85,7 +85,7 @@ impl RangeIndex {
 
     /// Opens the range postings of `field` if the segment has them.
     pub fn open_if_present(seg: &SegmentFile, field: &str) -> Result<Option<Self>> {
-        if seg.section(&format!("range.{field}")).is_none() {
+        if !seg.has(&format!("range.{field}")) {
             return Ok(None);
         }
         RangeIndex::open(seg, field).map(Some)

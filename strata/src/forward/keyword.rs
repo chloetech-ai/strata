@@ -278,7 +278,7 @@ impl KeywordColumn {
         {
             return Err(corrupt(format!("bad keyword column {field}")));
         }
-        let multi = seg.section(&format!("kw.{field}.multi")).is_some();
+        let multi = seg.has(&format!("kw.{field}.multi"));
         let mut col = KeywordColumn { name: field.to_string(), n: seg.n_docs(), dict_offs, dict_bytes, codes, rare_offs, rare, pyr_codes, lists, multi };
         if col.needs_values() && !multi {
             let mut count = vec![0u32; nv];

@@ -62,25 +62,36 @@ fn verify_segment(meta: &SegmentMeta, image: Option<&[u8]>, deletes: Option<&[u8
     Ok(())
 }
 
+/// When an opened segment's image is checked against its checksums.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// Whole, as it opens.
+    Open,
+    /// Each section the first time it is read
+    /// ([`SegmentFile::checked_on_read`]).
+    Read,
+    /// Not (only as far as its structure checks go).
+    Never,
+}
+
 impl SegHandle {
     /// `random_hints`: advise the segment's random-access sections
     /// `MADV_RANDOM` ([`SegmentFile::advise_random_sections`]). The delete
     /// set and updates are checked against their checksums (they are small
-    /// and read whole); the image only with `verify`, since that reads
-    /// every byte of the segment.
-    pub fn open(map: &OwnedBytes, meta: &SegmentMeta, random_hints: bool, verify: bool) -> Result<SegHandle> {
+    /// and read whole); the image as `check` says.
+    pub fn open(map: &OwnedBytes, meta: &SegmentMeta, read_ahead: bool, random_hints: bool, check: Check) -> Result<SegHandle> {
         let within = |e: &Extent| e.range().end <= map.len();
         if !within(&meta.extent) || [meta.deletes, meta.updates].iter().flatten().any(|e| !within(e)) {
             return Err(corrupt(format!("segment {} lies outside the file", meta.id)));
         }
         let deletes = meta.deletes.map(|e| map.slice(e.range()));
         let updates = meta.updates.map(|e| map.slice(e.range()));
-        SegHandle::from_bytes(map.slice(meta.extent.range()), deletes, updates, map.clone(), meta, random_hints, verify)
+        SegHandle::from_bytes(map.slice(meta.extent.range()), deletes, updates, map.clone(), meta, read_ahead, random_hints, check)
     }
 
     /// Opens a segment of the directory layout from its own files (see
     /// [`SegHandle::open`]).
-    pub fn open_in(dir: &Path, meta: &SegmentMeta, read_ahead: bool, random_hints: bool, verify: bool) -> Result<SegHandle> {
+    pub fn open_in(dir: &Path, meta: &SegmentMeta, read_ahead: bool, random_hints: bool, check: Check) -> Result<SegHandle> {
         let name = meta.file.as_deref().ok_or_else(|| corrupt(format!("segment {} has no file", meta.id)))?;
         let map = crate::storage::dir::map(dir, name, read_ahead)?;
         if map.len() as u64 != meta.extent.len {
@@ -94,7 +105,7 @@ impl SegHandle {
             Some(u) => Some(OwnedBytes::new(std::fs::read(dir.join(u))?)),
             None => None,
         };
-        SegHandle::from_bytes(map.clone(), deletes, updates, map, meta, random_hints, verify)
+        SegHandle::from_bytes(map.clone(), deletes, updates, map, meta, read_ahead, random_hints, check)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -104,11 +115,18 @@ impl SegHandle {
         updates: Option<OwnedBytes>,
         map: OwnedBytes,
         meta: &SegmentMeta,
+        read_ahead: bool,
         random_hints: bool,
-        verify: bool,
+        check: Check,
     ) -> Result<SegHandle> {
-        verify_segment(meta, verify.then_some(&image[..]), deletes.as_deref(), updates.as_deref())?;
-        let file = SegmentFile::open(image)?;
+        verify_segment(meta, (check == Check::Open).then_some(&image[..]), deletes.as_deref(), updates.as_deref())?;
+        let mut file = SegmentFile::open(image)?;
+        if check == Check::Read {
+            file = file.checked_on_read();
+        }
+        if !read_ahead {
+            file = file.mapped_random();
+        }
         if random_hints {
             file.advise_random_sections();
         }

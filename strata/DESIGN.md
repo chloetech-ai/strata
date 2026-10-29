@@ -209,7 +209,8 @@ need no table.
 
 A segment is `n` documents with local docIDs `0..n`, stored as a header and a
 directory of named sections (`text.body.terms`, `text.body.post`,
-`col.year`, `vec.emb.ivf`, ...). Sections are 64-byte aligned, and those over
+`col.year`, `vec.emb.ivf`, ...), each with its CRC32, which a query checks
+the first time it reads the section. Sections are 64-byte aligned, and those over
 one page are page-aligned, so any `&[u64]` view of a section is aligned and
 an index structure can be used straight from the mapped file. Every index
 component has a builder (documents in docID order to section bytes) and a
