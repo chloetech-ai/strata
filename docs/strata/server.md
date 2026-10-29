@@ -30,6 +30,10 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--directory` | off | create the new database as a directory of segment files instead of one file |
 | `--wal-drop-damaged` | off | open a database whose write-ahead log was damaged after it was durable, dropping the transactions from the damage on (the log is copied to `<log>.damaged` first); without it the server refuses to start on one |
 | `--seq-no` | off | number the database's writes, for [conditional writes](#conditional-writes) and `seq_no()`; it cannot be undone, and versions of Strata from before it refuse the database |
+| `--replicas URL,URL,…` | | be the [primary](#replication-a-primary-and-its-replicas) of this database: ship its writes to these replicas' gRPC addresses; needs `--seq-no` |
+| `--replica` | off | be a [replica](#replication-a-primary-and-its-replicas): apply the writes a primary ships here, and refuse writes from clients; needs `--seq-no` and `--grpc` |
+| `--write-acks A` | `all` | with `--replicas`: the copies that hold a write before it is answered: `all`, `majority` or `primary` |
+| `--ship-log-mb N` | 64 | with `--replicas` or `--replica`: the latest transactions kept in memory to ship; a replica further behind needs a copy of the primary |
 | `--verify-checksums` | off | check every segment against its checksum before serving (reads the whole database once); a damaged newest version is skipped for the one before it |
 | `--shards URL,URL,…` | | run as a coordinator over these shard servers' gRPC addresses |
 | `--slot-map FILE` | equal runs, epoch 1 | with `--shards`: the [slot map](#slots) to route writes by, which the shards are given |
@@ -39,8 +43,8 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--no-token` | off | listen beyond loopback without a token anyway |
 | `--allow-host NAME` | | also answer HTTP requests for this host name (repeatable) |
 | `--tls-cert FILE`, `--tls-key FILE` | | serve HTTP and gRPC over TLS with this PEM certificate chain and key |
-| `--shard-token T` | `$STRATA_SHARD_TOKEN`, else `--token` | a coordinator's token for its shards |
-| `--shard-ca FILE` | | a CA certificate (PEM) a coordinator trusts for `https://` shards, besides the public roots |
+| `--shard-token T` | `$STRATA_SHARD_TOKEN`, else `--token` | a coordinator's token for its shards, and a primary's for its replicas |
+| `--shard-ca FILE` | | a CA certificate (PEM) a coordinator trusts for `https://` shards, and a primary for `https://` replicas, besides the public roots |
 | `--timeout-ms N` | 5000 | default query deadline |
 | `--max-timeout-ms N` | 60000 | the longest deadline a request's `timeout_ms` may ask for |
 | `--max-concurrent N` | 64 | queries running at once; more wait for a slot until their deadline |
@@ -295,9 +299,9 @@ Not yet: point-in-time recovery between checkpoints, which needs the write-ahead
 
 ## gRPC
 
-`proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `Schema` and `Health`, mirroring the HTTP routes, and `Hello`, `Release` and `Slots`. Values are typed (`int`, `float`, `str`, `vector`, `list`, `boolean`, `timestamp`); statistics and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
+`proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `Schema` and `Health`, mirroring the HTTP routes, and `Hello`, `Release`, `Slots` and `Replicate` (a primary's call to its [replicas](#replication-a-primary-and-its-replicas)). Values are typed (`int`, `float`, `str`, `vector`, `list`, `boolean`, `timestamp`); statistics and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
 
-A query travels as SQL with its parameters or, from protocol 2, as a typed plan (`QueryRequest.plan`, with `protocol` 2 or newer): the tree of operators [`EXPLAIN`](query-language.md#explain) shows, its fields named by position in the schema and its values typed, with no SQL to parse. `sql` then only names the query in the shard's logs. Protocol 3 adds snapshot leases for a fetch that follows a query: a query with `hold` keeps the snapshot it read, its own lease or a new one lasting as a `TermStats` lease does, and names it in its answer (`QueryResponse.snapshot`); a query with `release` ends its lease once answered, and `Release` ends leases no fetch needs. Protocol 4 places keys in [slots](#slots): `Slots` gives a shard its slot map and its place in it, and queries, statistics calls and writes carry the map's `epoch`. `Hello` answers the protocol versions a server speaks (1 to 4), the plan version it reads, the plan features it has and the epoch of the slot map it holds. A server refuses a protocol newer than its own, and a plan of a newer version or one that needs a feature it lacks, by name (`InvalidArgument`). Protocol 1, the servers before `Hello`, takes SQL, or a JSON plan (`plan_json`) for a compound query's leaf.
+A query travels as SQL with its parameters or, from protocol 2, as a typed plan (`QueryRequest.plan`, with `protocol` 2 or newer): the tree of operators [`EXPLAIN`](query-language.md#explain) shows, its fields named by position in the schema and its values typed, with no SQL to parse. `sql` then only names the query in the shard's logs. Protocol 3 adds snapshot leases for a fetch that follows a query: a query with `hold` keeps the snapshot it read, its own lease or a new one lasting as a `TermStats` lease does, and names it in its answer (`QueryResponse.snapshot`); a query with `release` ends its lease once answered, and `Release` ends leases no fetch needs. Protocol 4 places keys in [slots](#slots): `Slots` gives a shard its slot map and its place in it, and queries, statistics calls and writes carry the map's `epoch`. `Hello` answers the protocol versions a server speaks (1 to 4), the plan version it reads, the plan features it has, the epoch of the slot map it holds, and its role in replication (`STANDALONE`, `PRIMARY` or `REPLICA`) with its term and last sequence number. A server refuses a protocol newer than its own, and a plan of a newer version or one that needs a feature it lacks, by name (`InvalidArgument`). Protocol 1, the servers before `Hello`, takes SQL, or a JSON plan (`plan_json`) for a compound query's leaf.
 
 ## Sharding: one coordinator, many shards
 
@@ -319,7 +323,7 @@ Query then fetch (from protocol 3): for a page of rows with stored columns, when
 
 A coordinator asks each replica the protocol versions it speaks (`Hello`) when it connects, again every minute and after the replica fails (it may have restarted on another version), and speaks the oldest any replica speaks, so shards can be upgraded one at a time: while one runs a server from before `Hello`, every shard gets SQL and JSON plans; once all speak protocol 2 they get typed plans, and once all speak 3, pages are fetched. `/v1/health` shows the protocol spoken (`protocol`).
 
-A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key, to the shard holding its [slot](#slots); `UPDATE` and `DELETE` go to every shard. Start each shard with `--seq-no` for [conditional writes](#conditional-writes): a coordinator passes `if_seq_no` and `seq_no()` on while every shard has one replica (replicas number the writes they take in their own order until replication ships the primary's log), and its write answers carry no `seq_no`, since a batch can span shards. A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
+A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key, to the shard holding its [slot](#slots); `UPDATE` and `DELETE` go to every shard. Within a shard, a write goes to every replica, or to its primary alone when it has one ([replication](#replication-a-primary-and-its-replicas)). Start each shard with `--seq-no` for [conditional writes](#conditional-writes): a coordinator passes `if_seq_no` and `seq_no()` on while every shard has one replica, or a primary that its replicas [follow](#replication-a-primary-and-its-replicas) (replicas that each take a shard's writes number them in their own order), and its write answers carry no `seq_no`, since a batch can span shards. A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
 
 ### Slots
 
@@ -338,6 +342,34 @@ When a coordinator connects, it gives every replica its map and its place in it 
 A shard also refuses (400) a write of a key whose slot another shard holds, so that a client writing to a shard directly cannot place a row where the coordinator will not look for it. `--demo-shard I/N` loads the demo rows of shard I's slots under the default map.
 
 A coordinator routes by slots once every replica speaks protocol 4. While any is older, it routes by the hash before slots (FNV-1a of the key's text, modulo the shard count), gives no map, and logs a warning; it refuses `--slot-map` then. The two hashes place keys differently, so a collection sharded before slots is refused once its shards are upgraded, and has to be loaded again through a coordinator (or with `--demo-shard`). Moving slots between running shards (resharding online) is not built yet: it needs a map of a higher epoch and the rows of the moved slots copied first.
+
+## Replication: a primary and its replicas
+
+```sh
+strata-server --demo 20000 --seq-no --db a0.strata --listen 127.0.0.1:7710 --grpc 127.0.0.1:7711 --replicas http://127.0.0.1:7721,http://127.0.0.1:7731
+strata-server --demo 20000 --seq-no --db a1.strata --listen 127.0.0.1:7720 --grpc 127.0.0.1:7721 --replica
+strata-server --demo 20000 --seq-no --db a2.strata --listen 127.0.0.1:7730 --grpc 127.0.0.1:7731 --replica
+```
+
+A shard's copies can hold the same rows under the same [sequence numbers](#conditional-writes). One server is the primary, started with `--replicas` naming the others' gRPC addresses; each of the others is a replica, started with `--replica`. Both need `--seq-no`. The primary takes the writes and ships its numbered transactions, as its write-ahead log holds them, to each replica's `Replicate` call, in order and in batches of up to 4 MiB. A replica applies a batch only if it follows the replica's last transaction (`Database::apply_shipped`), under the primary's numbers and term, and refuses writes from clients (409). So every copy starts from the same rows: an empty database of the same schema, the same `--demo`, or a [checkpoint](#backups) of the primary. `--demo` and `--copy-from` load each copy on its own, and are not shipped.
+
+**When a write is answered** (`--write-acks`):
+
+- `all`, the default: once the primary and every replica in sync hold it. A replica that has not acknowledged it by the write's deadline (`timeout_ms`, or `--timeout-ms`) drops out of sync, and the write is answered.
+- `majority`: once more than half the copies hold it, the primary among them. While fewer than a majority are in sync, a write is refused before it is applied (503). A write that a majority has not acknowledged by its deadline is answered 504, which says that it is durable on the primary under its sequence number; a retry with the same idempotency key answers it once a majority holds it, without applying it again.
+- `primary`: once the primary holds it; the replicas get it afterwards.
+
+A replica is in sync while it holds what the primary committed, as far as the primary has shipped it. It drops out when a call to it fails or takes over 10 s, when its history differs from the primary's, when the primary's log no longer holds the transactions after its last, or, under `all`, when it misses a write's deadline. It is back in once it holds the primary's last transaction again. Every call carries the global checkpoint, the highest number every in-sync replica holds. A replica with nothing to apply is called every second, and one whose call failed is called again within 2 s.
+
+**The ship log.** The primary keeps its latest transactions in memory to ship, `--ship-log-mb` of them (64 MiB), and refills it on a restart from its write-ahead log since the last flush. A replica further behind than that drops out of sync with an error saying it needs a copy of the primary: start it again from a checkpoint of the primary. Copying the primary's segments to it automatically is not built yet.
+
+**Terms.** Each server keeps a random id beside its database (`<db>.replication`), and a replica keeps there the id and term of the primary it follows. It refuses (409) a second primary of the same term, whose history would differ, and follows the primary of a newer term. A primary of an older term than a replica's is told so, and refuses writes from then on (409): another primary replaced it. A replica is checked by the number and term of its last transaction. One that wrote rows of its own under the same numbers before it became a replica is found out only when a shipped write does not fit its rows, until digests compare the copies.
+
+**Through a coordinator.** A coordinator asks each replica its role (`Hello`) and sends a shard's writes to its primary alone. While a shard has replicas but none answers as its primary, its writes are refused (503). Queries go to any copy, as before, so a query can read a replica that has not applied the latest writes yet.
+
+`/v1/health` shows `replication`. On a primary: its `id`, `term`, last number (`seq_no`), `write_acks`, `global_checkpoint`, and each replica's `url`, `seq_no`, `behind`, `in_sync` and `error`. On a replica: its `id`, `term`, `seq_no`, the primary it `follows` and that primary's term, the `global_checkpoint` the primary last sent, and `called_ms_ago`. The [metrics](#health) are the `strata_replica*` families.
+
+Not built yet: copying a primary's segments to a replica its log no longer reaches, reads that wait until a replica holds a given write, digests that compare copies, and promoting a replica when its primary fails.
 
 ## Deadlines, admission and metrics
 
@@ -403,6 +435,11 @@ It answers 503 for `down` and `failing`. `/livez` and `/readyz` answer 503 only 
 | `strata_fetch_queries_total`, `strata_fetch_lost_rows_total` | | a coordinator's queries answered by query then fetch, and rows of their pages no fetch found |
 | `strata_slot_epoch` | | the epoch of the [slot map](#slots) a coordinator routes writes by; 0 while it routes by the hash before slots |
 | `strata_replicas_avoided` | | replicas a coordinator asks last for now, after they failed or were outrun |
+| `strata_replication_role` | | 1 on a [primary](#replication-a-primary-and-its-replicas), 2 on a replica |
+| `strata_global_checkpoint` | | the highest sequence number every in-sync replica holds (on a replica, as its primary last said) |
+| `strata_replica_in_sync`, `strata_replica_behind` | `replica` | on a primary: 1 while a replica is in sync, and the transactions it does not hold yet |
+| `strata_replica_shipped_total`, `strata_replica_failures_total` | `replica` | on a primary: transactions a replica applied from it, and calls to it that failed or that it refused |
+| `strata_replica_applied_total` | | on a replica: transactions it applied from its primary |
 
 A coordinator's `/metrics` does not ask its shards: each shard serves its own, and the coordinator shows how its calls to them went. `strata_query_ms` (milliseconds) became `strata_query_duration_seconds`.
 

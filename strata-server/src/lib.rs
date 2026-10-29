@@ -8,6 +8,7 @@
 //!   a coordinator uses to reach its shards; [`plan_pb`]: plans as protobuf.
 //! * [`agent`]: answers a question in words by letting a Claude model
 //!   query the table.
+//! * [`replication`]: a primary shipping its writes to its replicas.
 //! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves.
 
 pub mod agent;
@@ -21,6 +22,7 @@ pub mod json;
 pub mod metrics;
 pub mod obs;
 pub mod plan_pb;
+pub mod replication;
 pub mod server;
 pub mod service;
 pub mod slots;

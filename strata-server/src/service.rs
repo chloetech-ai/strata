@@ -29,9 +29,10 @@ pub const MAX_LEASES: usize = 10_000;
 
 use crate::coord::Coordinator;
 use crate::idem;
+use crate::replication::{Follow, Primary};
 use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
-use crate::{json as js, obs, ApiError};
+use crate::{json as js, obs, pb, ApiError};
 
 /// Binds one SELECT into its plan, and gives back what the executor runs
 /// of it: every query runs as a plan ([`strata::query::ir`]).
@@ -152,6 +153,20 @@ pub struct Service {
     /// is set while its lock is held).
     slots: RwLock<Option<(SlotMap, usize)>>,
     slots_file: tokio::sync::Mutex<Option<PathBuf>>,
+    /// Its part in replication ([`crate::replication`]).
+    pub replication: Replication,
+}
+
+/// A server's part in replication.
+#[derive(Default)]
+pub enum Replication {
+    #[default]
+    None,
+    /// Ships its writes to its replicas (`--replicas`).
+    Primary(Arc<Primary>),
+    /// Applies its primary's writes and takes none from clients
+    /// (`--replica`).
+    Replica(Arc<Follow>),
 }
 
 impl Service {
@@ -197,6 +212,56 @@ impl Service {
             backup_dir: None,
             slots: RwLock::new(None),
             slots_file: tokio::sync::Mutex::new(None),
+            replication: Replication::None,
+        }
+    }
+
+    /// Its role in replication, as `Hello` says it.
+    pub fn role(&self) -> pb::Role {
+        match &self.replication {
+            Replication::None => pb::Role::Standalone,
+            Replication::Primary(_) => pb::Role::Primary,
+            Replication::Replica(_) => pb::Role::Replica,
+        }
+    }
+
+    /// Refuses a client's write on a replica (409), and one a primary may
+    /// not apply now ([`Self::admit_write`]).
+    fn writable(&self) -> Result<(), ApiError> {
+        self.takes_writes()?;
+        self.admit_write()
+    }
+
+    /// Refuses a client's write on a replica (409).
+    fn takes_writes(&self) -> Result<(), ApiError> {
+        match &self.replication {
+            Replication::Replica(_) => Err(conflict("this server is a replica: it applies its primary's writes and takes none from clients; write to the primary".into())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuses a write a primary may not apply now ([`Primary::admit`]).
+    fn admit_write(&self) -> Result<(), ApiError> {
+        match &self.replication {
+            Replication::Primary(p) => p.admit(),
+            _ => Ok(()),
+        }
+    }
+
+    /// Answers a committed write once the copies `--write-acks` asks for
+    /// hold it, waiting up to `timeout` ([`Primary::acknowledged`]).
+    async fn replicated(&self, w: Written, timeout: Duration) -> Result<Written, ApiError> {
+        if let (Replication::Primary(p), Some(seq)) = (&self.replication, w.seq_no) {
+            p.acknowledged(seq, Instant::now() + timeout).await?;
+        }
+        Ok(w)
+    }
+
+    /// Applies a batch its primary shipped (`Replicate`), on a replica.
+    pub async fn replicate(&self, r: pb::ReplicateRequest) -> Result<pb::ReplicateResponse, ApiError> {
+        match &self.replication {
+            Replication::Replica(f) => f.replicate(r).await,
+            _ => Err(conflict("this server is not a replica (--replica): it takes no shipped transactions".into())),
         }
     }
 
@@ -931,6 +996,7 @@ impl Service {
     where
         F: FnOnce(&Db) -> strata::Result<Option<PreparedWrite>> + Send + 'static,
     {
+        self.writable()?;
         let q = self.enqueue()?;
         let core = match self.models.iter().any(|m| m.model.is_ok()) {
             true => Some(self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?),
@@ -946,7 +1012,8 @@ impl Service {
         .ok_or_else(|| ApiError::bad("not a write statement"))?;
         // The deadline bounds the wait for the writer, not the embedding.
         let deadline = Instant::now() + self.timeout_of(timeout_ms);
-        self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q).await
+        let w = self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q).await?;
+        self.replicated(w, self.timeout_of(timeout_ms)).await
     }
 
     /// Applies write operations (see the proto's WriteRequest) in one
@@ -957,8 +1024,9 @@ impl Service {
         let t0 = Instant::now();
         let n = match &self.backend {
             Backend::Local(db) => {
-                // Before any work: a full queue refuses the request.
-                let queued = match self.enqueue() {
+                // Before any work: a replica, or a full queue, refuses the
+                // request.
+                let queued = match self.takes_writes().and_then(|_| self.enqueue()) {
                     Ok(q) => q,
                     Err(e) => return self.wrote(Err(e), t0, None),
                 };
@@ -967,13 +1035,18 @@ impl Service {
                         idem::Begin::New => {}
                         idem::Begin::Done(n) => {
                             self.metrics.replay();
-                            return Ok(n);
+                            // A retry after a write its copies did not all
+                            // acknowledge waits for them again.
+                            return self.replicated(n, self.timeout).await;
                         }
                         idem::Begin::Busy => return Err(ApiError { status: 409, message: "a write with this idempotency key is still running".into() }),
                         idem::Begin::Mismatch => return Err(ApiError { status: 422, message: "this idempotency key was used for different operations".into() }),
                     }
                 }
                 let r = async {
+                    // Not a retry of a write applied: a primary may refuse
+                    // it before applying it.
+                    self.admit_write()?;
                     if self.models.iter().any(|m| m.model.is_ok()) {
                         // Queued writes wait for a core to embed on.
                         let core = self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?;
@@ -993,7 +1066,12 @@ impl Service {
                     // Not committed (the writer reports a commit as Ok).
                     self.idempotency.finish(k, None);
                 }
-                r
+                // Committed: a retry with its key answers it, whatever its
+                // copies say.
+                match r {
+                    Ok(w) => self.replicated(w, self.timeout).await,
+                    e => e,
+                }
             }
             Backend::Cluster(c) => c.write_ops(ops, key).await.map(Written::rows),
         };
@@ -1066,6 +1144,11 @@ impl Service {
                 let mut h = json!({"status": "ok", "role": "shard", "docs": s.n_live_docs(), "segments": s.segments().len(), "txn": s.txn()});
                 if let Some((m, shard)) = self.slots() {
                     h["slots"] = json!({"epoch": m.epoch, "shard": shard, "of": m.shards()});
+                }
+                match &self.replication {
+                    Replication::None => {}
+                    Replication::Primary(p) => h["replication"] = p.health(),
+                    Replication::Replica(f) => h["replication"] = f.health().await,
                 }
                 if let Some(why) = self.failing() {
                     h["status"] = json!("failing");
@@ -1149,6 +1232,11 @@ impl Service {
                     one("strata_merges_interrupted", "gauge", "Groups of segments whose merge a crash interrupted.", m.interrupted as f64),
                     one("strata_merge_failing", "gauge", "1 while merges fail.", m.error.is_some() as u8 as f64),
                 ]);
+                match &self.replication {
+                    Replication::None => {}
+                    Replication::Primary(p) => more.extend(p.metrics()),
+                    Replication::Replica(f) => more.extend(f.metrics()),
+                }
             }
             Backend::Cluster(c) => more.extend(c.metrics()),
         }
@@ -1214,13 +1302,18 @@ fn rows_elsewhere(db: &Db, schema: &Schema, map: &SlotMap, shard: usize) -> Resu
     Ok(out)
 }
 
-/// Writes `map` and `shard` to `path` and syncs it, through a new file
-/// renamed over the old one, so that a crash leaves one or the other.
+/// Writes `map` and `shard` to `path` ([`save_json`]).
 fn save_slots(path: &Path, map: &SlotMap, shard: usize) -> std::io::Result<()> {
+    save_json(path, &json!({"shard": shard, "map": map.to_json()}))
+}
+
+/// Writes `j` to `path` and syncs it, through a new file renamed over the
+/// old one, so that a crash leaves one or the other.
+pub(crate) fn save_json(path: &Path, j: &Json) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
-    let body = serde_json::to_vec_pretty(&json!({"shard": shard, "map": map.to_json()})).map_err(std::io::Error::other)?;
+    let body = serde_json::to_vec_pretty(j).map_err(std::io::Error::other)?;
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(&body)?;
     f.sync_all()?;
@@ -1459,7 +1552,7 @@ fn checkpoint_name(name: &str) -> Result<&str, ApiError> {
 /// Runs `write` until it gets the writer or `deadline` passes: Strata
 /// answers `Busy` (503) rather than queueing while another write, or a
 /// background merge's commit, holds it. A busy write has changed nothing.
-fn wait_for_writer<T>(deadline: Instant, mut write: impl FnMut() -> Result<T, ApiError>) -> Result<T, ApiError> {
+pub(crate) fn wait_for_writer<T>(deadline: Instant, mut write: impl FnMut() -> Result<T, ApiError>) -> Result<T, ApiError> {
     loop {
         match write() {
             Err(e) if e.status == 503 && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
