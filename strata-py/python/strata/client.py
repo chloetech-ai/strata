@@ -115,7 +115,9 @@ class Client(Search):
         return Result._of(r) if "rows" in r else int(r["written"])
 
     def explain(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> dict:
-        """The bound query and its plan."""
+        """Runs the query and returns its plan: the plan IR as JSON ("ir")
+        and as lines ("tree"), the executor's plan lines ("plan") and the
+        bound query ("logical")."""
         return self._call("POST", "/v1/explain", {"sql": sql, "params": _params(params, kw)})
 
     def write(self, ops: list[dict]) -> int:

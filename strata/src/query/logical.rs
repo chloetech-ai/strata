@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::value::Value;
 
 /// A row predicate over schema fields (indices into `Schema::fields`).
@@ -38,17 +40,20 @@ pub enum Pred {
 
 /// How a full-text search widens its words (`MATCH(.., synonyms => 1,
 /// fuzzy => 'auto')`, the same options on `bm25`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Expand {
     /// Each word also matches its synonyms from the synonym list
     /// ([`crate::text::synonyms`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub synonyms: bool,
     /// Each word also matches indexed terms within this many edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuzzy: Option<Fuzzy>,
 }
 
 /// Edits a typo-tolerant word may be away from an indexed term.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Fuzzy {
     /// By the word's length: none up to 2 letters, 1 up to 5, else 2.
     Auto,
@@ -92,7 +97,8 @@ impl Expand {
 }
 
 /// Which way edges are followed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Direction {
     /// From a row to the targets of its edges.
     Out,
@@ -284,7 +290,8 @@ impl Score {
 }
 
 /// How a decay function falls off.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecayShape {
     /// `exp(λ·d)`: halves (by default) every `scale`.
     Exp,
@@ -297,7 +304,7 @@ pub enum DecayShape {
 /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`,
 /// as Elasticsearch's decay functions: the distance `d = max(0, |x −
 /// origin| − offset)` maps to 1 at `d = 0` and to `decay` at `d = scale`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Decay {
     pub origin: f64,
     pub scale: f64,
@@ -338,7 +345,8 @@ pub enum OrderBy {
 }
 
 /// An aggregate function.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AggFn {
     /// `COUNT(f)`: rows with a value.
     Count,

@@ -109,6 +109,10 @@ pub enum Command {
     CreateTable { schema: Schema, if_not_exists: bool },
     /// `DROP TABLE [IF EXISTS] a, b [CASCADE | RESTRICT]`.
     DropTable { tables: Vec<String>, opts: DropOptions },
+    /// `EXPLAIN [FORMAT JSON] <statement>`: the statement's plan
+    /// ([`crate::query::ir`]), as lines of text or as JSON, made when it
+    /// runs ([`crate::db::Db::explain`]).
+    Explain { json: bool },
 }
 
 /// Parses one statement.
@@ -142,13 +146,45 @@ pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Op
 /// a SELECT (bound when it runs), an INSERT, UPDATE or DELETE of one of
 /// them, `CREATE TABLE` or `DROP TABLE`.
 pub fn bind_command(sql_text: &str, tables: &[&Schema], params: &Params) -> Result<Command> {
+    bind_statement(&parse_one(sql_text)?, tables, params)
+}
+
+/// [`bind_command`] of a parsed statement.
+pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: &Params) -> Result<Command> {
     let table = |name: &sql::ObjectName| -> Result<&Schema> {
         let n = name.to_string();
         tables.iter().copied().find(|t| t.table.eq_ignore_ascii_case(&n)).ok_or_else(|| err(format!("no such table: {n}")))
     };
     let write = |schema: &Schema, write: Write| Command::Write { table: schema.table.clone(), write };
-    Ok(match &parse_one(sql_text)? {
+    Ok(match stmt {
         sql::Statement::Query(_) => Command::Query,
+        sql::Statement::Explain { describe_alias: _, analyze, verbose, query_plan: _, estimate, statement, format, options } => {
+            if *analyze || *verbose || *estimate {
+                return Err(err("EXPLAIN shows a statement's plan without running it: ANALYZE, VERBOSE and ESTIMATE are not supported (POST /v1/explain runs a query and reports what it did)"));
+            }
+            if matches!(**statement, sql::Statement::Explain { .. }) {
+                return Err(err("EXPLAIN of EXPLAIN"));
+            }
+            let mut json = false;
+            let mut format_of = |f: &str| -> Result<()> {
+                match f.to_ascii_uppercase().as_str() {
+                    "JSON" => json = true,
+                    "TEXT" | "TREE" => json = false,
+                    f => return Err(err(format!("EXPLAIN FORMAT {f} is not supported: TEXT or JSON"))),
+                }
+                Ok(())
+            };
+            if let Some(sql::AnalyzeFormatKind::Keyword(f) | sql::AnalyzeFormatKind::Assignment(f)) = format {
+                format_of(&f.to_string())?;
+            }
+            for o in options.iter().flatten() {
+                match (o.name.value.to_ascii_uppercase().as_str(), &o.arg) {
+                    ("FORMAT", Some(Expr::Identifier(f))) => format_of(&f.value)?,
+                    _ => return Err(err(format!("EXPLAIN option {o} is not supported: FORMAT TEXT or FORMAT JSON"))),
+                }
+            }
+            Command::Explain { json }
+        }
         sql::Statement::Insert(ins) => {
             let sql::TableObject::TableName(n) = &ins.table else { return Err(err("INSERT needs a table name")) };
             let schema = table(n)?;
@@ -192,7 +228,7 @@ pub fn bind_command(sql_text: &str, tables: &[&Schema], params: &Params) -> Resu
             let (tables, opts) = ddl::drop_table(stmt)?;
             Command::DropTable { tables, opts }
         }
-        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE and DROP TABLE are supported")),
+        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE and EXPLAIN are supported")),
     })
 }
 
@@ -501,7 +537,7 @@ impl<'a> Binder<'a> {
             }
         };
         let graphs = self.graphs.take();
-        let types = projection.iter().map(|(_, p)| self.typed_source(p).and_then(|f| self.schema.fields[f].logical)).collect();
+        let types = projection_types(self.schema, &projection);
         Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs, types })
     }
 
@@ -838,13 +874,8 @@ impl<'a> Binder<'a> {
         })
     }
 
-    /// The BOOL or TIMESTAMP field whose values a group value or aggregate
-    /// holds: the field itself, or its MIN or MAX.
     fn typed_source(&self, p: &Projection) -> Option<usize> {
-        match p {
-            Projection::Field(f) | Projection::Agg { func: AggFn::Min | AggFn::Max, field: f } => Some(*f).filter(|&f| self.schema.fields[f].logical.is_some()),
-            _ => None,
-        }
+        typed_source(self.schema, p)
     }
 
     /// A bound of `BETWEEN` in HAVING: a number, or a value of the type of
@@ -1419,6 +1450,20 @@ impl<'a> Binder<'a> {
     }
 }
 
+/// The BOOL or TIMESTAMP field whose values a group value or aggregate
+/// holds: the field itself, or its MIN or MAX.
+fn typed_source(schema: &Schema, p: &Projection) -> Option<usize> {
+    match p {
+        Projection::Field(f) | Projection::Agg { func: AggFn::Min | AggFn::Max, field: f } => Some(*f).filter(|&f| schema.fields[f].logical.is_some()),
+        _ => None,
+    }
+}
+
+/// [`Select::types`] of a projection.
+pub(crate) fn projection_types(schema: &Schema, projection: &[(String, Projection)]) -> Vec<Option<Logical>> {
+    projection.iter().map(|(_, p)| typed_source(schema, p).and_then(|f| schema.fields[f].logical)).collect()
+}
+
 /// Refuses the clauses of a SELECT that the binder does not handle, so that
 /// none is silently ignored.
 fn check_select(s: &sql::Select) -> Result<()> {
@@ -1490,7 +1535,7 @@ fn literal_usize(e: &Expr) -> Option<usize> {
 
 /// The smallest integer at least `v` (a number), in 128 bits so that
 /// doubles beyond the 64-bit range stay beyond it.
-fn ceil(v: &Value) -> i128 {
+pub(crate) fn ceil(v: &Value) -> i128 {
     match v {
         Value::Int(x) => *x as i128,
         v => v.as_f64().unwrap_or(0.0).ceil().clamp(-1e20, 1e20) as i128,
@@ -1498,7 +1543,7 @@ fn ceil(v: &Value) -> i128 {
 }
 
 /// The largest integer at most `v` (a number).
-fn floor(v: &Value) -> i128 {
+pub(crate) fn floor(v: &Value) -> i128 {
     match v {
         Value::Int(x) => *x as i128,
         v => v.as_f64().unwrap_or(0.0).floor().clamp(-1e20, 1e20) as i128,
@@ -1506,7 +1551,7 @@ fn floor(v: &Value) -> i128 {
 }
 
 /// INT field `f` within `[lo, hi]`, cut to the 64-bit range.
-fn int_range(f: usize, lo: i128, hi: i128) -> Pred {
+pub(crate) fn int_range(f: usize, lo: i128, hi: i128) -> Pred {
     let (lo, hi) = (lo.max(i64::MIN as i128), hi.min(i64::MAX as i128));
     if lo > hi {
         return Pred::False;
@@ -1514,7 +1559,7 @@ fn int_range(f: usize, lo: i128, hi: i128) -> Pred {
     Pred::IntRange { field: f, lo: lo as i64, hi: hi as i64 }
 }
 
-fn next_up(x: f64) -> f64 {
+pub(crate) fn next_up(x: f64) -> f64 {
     if x.is_nan() || x == f64::INFINITY {
         return x;
     }
@@ -1525,7 +1570,7 @@ fn next_up(x: f64) -> f64 {
     f64::from_bits(if x > 0.0 { b + 1 } else { b - 1 })
 }
 
-fn next_down(x: f64) -> f64 {
+pub(crate) fn next_down(x: f64) -> f64 {
     -next_up(-x)
 }
 

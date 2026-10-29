@@ -55,6 +55,7 @@ def test_queries_and_results(db):
     assert [row["id"] for row in r] == r.column("id") == r.keys
     assert isinstance(r.stats, dict)
     assert db.sql("SELECT COUNT(*) FROM books").scalar() == 200
+    assert db.sql("EXPLAIN SELECT id FROM books LIMIT 2").column("plan") == ["Project: id", "  Limit: 2", "    Search books"]
     assert db.sql("UPDATE books SET rating = rating + 1 WHERE id = :k", k="b0001") == 1
     assert db.query("SELECT genres FROM books WHERE id = 'b0001'").scalar() == ["fantasy", "new"]
     # A vector, the text's embedding, and a stored row's vector.

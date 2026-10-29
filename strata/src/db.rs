@@ -17,7 +17,8 @@ use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
 use crate::query::agg::Part;
-use crate::query::exec::{ExecOptions, Executor, ResultSet, SegmentReaders};
+use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentReaders};
+use crate::query::ir::Plan;
 use crate::query::stats::TermStats;
 use crate::query::{bind, bind_command, compound, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
 use crate::schema::{Embed, FieldType, Schema};
@@ -409,18 +410,7 @@ impl Db {
     /// and subqueries across tables are not supported yet.
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         let q = qsql::parse_query(sql)?;
-        let view = match tables::read_by(&q).as_slice() {
-            // No table: the binder says what is missing.
-            [] => snap.clone(),
-            [t] => snap.table(t).ok_or_else(|| Error::Query(format!("no such table: {t}")))?,
-            [all @ .., last] => {
-                let all: Vec<&str> = all.iter().map(|t| t.as_str()).collect();
-                return Err(Error::Query(format!(
-                    "a query reads one table for now, and this one reads {} and {last}: joins and subqueries across tables are not supported yet",
-                    all.join(", ")
-                )));
-            }
-        };
+        let view = view_of(snap, &q)?;
         if compound::needs(&q, view.schema()) {
             let steps = ExecOptions { max_rows: None, ..opts.clone() };
             let rs = compound::run_query(
@@ -456,6 +446,16 @@ impl Db {
         let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
         match bind_command(sql, &tables, params)? {
             Command::Query => self.query(sql, params).map(SqlResult::Rows),
+            Command::Explain { json } => {
+                let sqlparser::ast::Statement::Explain { statement, .. } = qsql::parse_one(sql)? else { unreachable!("bound as EXPLAIN") };
+                let plan = self.explain_statement(&statement, params)?;
+                let rows = match json {
+                    true => vec![vec![Value::Str(plan.to_json_text()?)]],
+                    false => plan.explain(&tables).into_iter().map(|l| vec![Value::Str(l)]).collect(),
+                };
+                let stats = ExecStats::default();
+                Ok(SqlResult::Rows(ResultSet { columns: vec!["plan".into()], rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats }))
+            }
             Command::CreateTable { schema, if_not_exists } => {
                 if !(if_not_exists && self.storage.table(&schema.table).is_some()) {
                     self.create_table(schema)?;
@@ -471,6 +471,36 @@ impl Db {
                 let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
                 self.write_prepared(&self.prepare(schema.clone(), write)).map(SqlResult::Written)
             }
+        }
+    }
+
+    /// The plan of one statement ([`crate::query::ir`]): a SELECT, INSERT,
+    /// UPDATE or DELETE, bound as it would run but not run. `EXPLAIN
+    /// <statement>` in [`Db::sql`] gives it as text or JSON. A compound
+    /// SELECT (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as
+    /// several queries, and has no plan of its own yet.
+    pub fn explain(&self, sql: &str, params: &Params) -> Result<Plan> {
+        self.explain_statement(&qsql::parse_one(sql)?, params)
+    }
+
+    fn explain_statement(&self, stmt: &sqlparser::ast::Statement, params: &Params) -> Result<Plan> {
+        if let sqlparser::ast::Statement::Query(q) = stmt {
+            let view = view_of(&self.snapshot(), q)?;
+            if compound::needs(q, view.schema()) {
+                return Err(Error::Query(
+                    "a compound query (WITH, a subquery, a join, SELECT DISTINCT) runs as several queries and has no plan of its own yet: EXPLAIN its steps, or POST it to /v1/explain to see what each ran".into(),
+                ));
+            }
+            return Ok(Plan::of_select(view.schema(), &qsql::bind_query(q, view.schema(), params)?));
+        }
+        let catalog = self.catalog();
+        let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
+        match qsql::bind_statement(stmt, &tables, params)? {
+            Command::Write { table, write } => {
+                let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
+                Ok(Plan::of_write(schema, &write))
+            }
+            _ => Err(Error::Query("EXPLAIN shows the plan of a SELECT, INSERT, UPDATE or DELETE".into())),
         }
     }
 
@@ -952,5 +982,21 @@ impl DocumentSource for StoredSource {
             out.push(doc);
         }
         Ok(out)
+    }
+}
+
+/// The table a SELECT reads, in `snap`; with no table, `snap` itself (the
+/// binder says what is missing). A query reads one table for now.
+fn view_of(snap: &Snapshot, q: &sqlparser::ast::Query) -> Result<Snapshot> {
+    match tables::read_by(q).as_slice() {
+        [] => Ok(snap.clone()),
+        [t] => snap.table(t).ok_or_else(|| Error::Query(format!("no such table: {t}"))),
+        [all @ .., last] => {
+            let all: Vec<&str> = all.iter().map(|t| t.as_str()).collect();
+            Err(Error::Query(format!(
+                "a query reads one table for now, and this one reads {} and {last}: joins and subqueries across tables are not supported yet",
+                all.join(", ")
+            )))
+        }
     }
 }
