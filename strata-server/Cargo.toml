@@ -25,6 +25,8 @@ hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "json"] }
 libc = "0.2"
+# The slot hash (`slots`): xxh3, 64 bits.
+twox-hash = { version = "2", default-features = false, features = ["xxhash3_64"] }
 
 [features]
 # BERT embedding models (bge-small-en-v1.5, snowflake-arctic-embed-m-v1.5) through candle.

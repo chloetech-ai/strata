@@ -23,6 +23,7 @@ pub mod obs;
 pub mod plan_pb;
 pub mod server;
 pub mod service;
+pub mod slots;
 
 pub mod pb {
     tonic::include_proto!("strata.v1");
@@ -70,6 +71,7 @@ impl From<tonic::Status> for ApiError {
         use tonic::Code;
         let status = match s.code() {
             Code::InvalidArgument => 400,
+            Code::FailedPrecondition => 409,
             Code::DeadlineExceeded => 504,
             Code::ResourceExhausted => 429,
             Code::Unavailable => 503,
@@ -84,6 +86,9 @@ impl From<ApiError> for tonic::Status {
         use tonic::Code;
         let code = match e.status {
             400 => Code::InvalidArgument,
+            // Refused in the state the server is in: an older slot map, a
+            // write with the same idempotency key still running.
+            409 => Code::FailedPrecondition,
             // Too many queries running: another replica would only be
             // loaded more ([`crate::coord`] does not retry it elsewhere).
             429 => Code::ResourceExhausted,

@@ -87,12 +87,13 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 }
 
 /// The protocol versions this server speaks (`proto/strata.proto`): 1
-/// takes SQL or a JSON plan, 2 a typed plan, and 3 holds a query's
-/// snapshot for the fetch that follows.
+/// takes SQL or a JSON plan, 2 a typed plan, 3 holds a query's snapshot
+/// for the fetch that follows, and 4 places keys in slots.
 pub const MIN_PROTOCOL: u32 = 1;
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
-/// What [`pb::strata_server::Strata::hello`] answers.
+/// What [`pb::strata_server::Strata::hello`] answers, but the slot map's
+/// epoch, which is the server's.
 pub fn hello() -> pb::HelloResponse {
     pb::HelloResponse {
         min_protocol: MIN_PROTOCOL,
@@ -100,6 +101,7 @@ pub fn hello() -> pb::HelloResponse {
         plan_version: ir::VERSION,
         plan_features: ir::FEATURES.iter().map(|f| f.to_string()).collect(),
         server: format!("strata-server {}", env!("CARGO_PKG_VERSION")),
+        slot_epoch: 0,
     }
 }
 
@@ -214,6 +216,7 @@ impl Grpc {
 impl pb::strata_server::Strata for Grpc {
     async fn query(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::QueryResponse>, Status> {
         self.serve("Query", req, |svc, r| async move {
+            svc.check_epoch(r.epoch)?;
             let a = svc.query(query_req(r)?).await?;
             Ok(pb::QueryResponse { snapshot: a.lease, ..result_to_pb(&a.rs, a.took_ms) })
         })
@@ -222,6 +225,7 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn term_stats(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::TermStatsResponse>, Status> {
         self.serve("TermStats", req, |svc, r| async move {
+            svc.check_epoch(r.epoch)?;
             let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
             let (stats, snapshot) = svc.term_stats(&r.sql, plan.as_ref(), &params_from_pb(r.params), r.timeout_ms as u64).await?;
             Ok(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot })
@@ -231,6 +235,7 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn write(&self, req: Request<pb::WriteRequest>) -> Result<Response<pb::WriteResponse>, Status> {
         self.serve("Write", req, |svc, r| async move {
+            svc.check_epoch(r.epoch)?;
             let written = if !r.ops_json.is_empty() {
                 let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
                 let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
@@ -251,7 +256,16 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {
-        self.serve("Hello", req, |_, _| async move { Ok(hello()) }).await
+        self.serve("Hello", req, |svc, _| async move { Ok(pb::HelloResponse { slot_epoch: svc.slot_epoch(), ..hello() }) }).await
+    }
+
+    async fn slots(&self, req: Request<pb::SlotsRequest>) -> Result<Response<pb::SlotsResponse>, Status> {
+        self.serve("Slots", req, |svc, r| async move {
+            let j: serde_json::Value = from_json(&r.map_json, "slot map")?;
+            let map = crate::slots::SlotMap::from_json(&j).map_err(ApiError::bad)?;
+            Ok(pb::SlotsResponse { epoch: svc.set_slots(map, r.shard as usize).await? })
+        })
+        .await
     }
 
     async fn release(&self, req: Request<pb::ReleaseRequest>) -> Result<Response<pb::Empty>, Status> {
