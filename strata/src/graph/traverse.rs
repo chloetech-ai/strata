@@ -55,7 +55,16 @@ pub trait Adjacency {
     fn passable(&mut self, _n: Node) -> bool {
         true
     }
+    /// Told about the bytes the traversal holds more (a node met, a list
+    /// of neighbours kept), so that a query can count them against its
+    /// memory budget; an error stops the traversal.
+    fn hold(&mut self, _bytes: u64) -> Result<()> {
+        Ok(())
+    }
 }
+
+/// About the bytes a node met holds: its map entry and frontier place.
+const NODE_BYTES: u64 = 32;
 
 /// Hop distances from a set of seeds.
 #[derive(Debug, Default)]
@@ -93,6 +102,7 @@ pub fn bfs(adj: &mut dyn Adjacency, seeds: &[Node], max_hops: u32, max_nodes: us
                     return Ok(out);
                 }
                 out.dist.insert(v, depth);
+                adj.hold(NODE_BYTES)?;
                 if depth < max_hops && adj.passable(v) {
                     next.push(v);
                 }
@@ -136,6 +146,7 @@ pub fn shortest_path(adj: &mut dyn Adjacency, from: &[Node], to: &[Node], max_ho
                     continue;
                 }
                 mine.insert(v, u);
+                adj.hold(NODE_BYTES)?;
                 if other.contains_key(&v) {
                     meet = Some(v);
                     break 'outer;
@@ -216,6 +227,7 @@ pub fn ppr(adj: &mut dyn Adjacency, seeds: &[(Node, f64)], reverse: bool, alpha:
         if !nbrs.contains_key(&u) {
             let mut list = Vec::with_capacity(16);
             adj.neighbors(u, reverse, &mut list)?;
+            adj.hold(NODE_BYTES + (list.capacity() * std::mem::size_of::<(Node, f32)>()) as u64)?;
             let deg = list.iter().map(|x| x.1 as f64).sum::<f64>();
             nbrs.insert(u, (list, deg));
         }
@@ -232,6 +244,7 @@ pub fn ppr(adj: &mut dyn Adjacency, seeds: &[(Node, f64)], reverse: bool, alpha:
         *p.entry(u).or_insert(0.0) += alpha * ru;
         let spread = (1.0 - alpha) * ru / deg;
         edges += list.len() as u64;
+        let before = r.len();
         for &(v, w) in list {
             let rv = r.entry(v).or_insert(0.0);
             *rv += spread * w as f64;
@@ -241,6 +254,7 @@ pub fn ppr(adj: &mut dyn Adjacency, seeds: &[(Node, f64)], reverse: bool, alpha:
                 queue.push_back(v);
             }
         }
+        adj.hold(NODE_BYTES * (r.len() - before) as u64)?;
     }
     Ok(Ppr { scores: p, pushes, edges })
 }
