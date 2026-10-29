@@ -229,7 +229,7 @@ async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         stats,
         snapshot: body_u64(&b, "snapshot"),
         partial: b.get("partial").and_then(|v| v.as_bool()),
-        plan: None,
+        ..Default::default()
     };
     let a = app.svc.query(req).await?;
     Ok(AxJson(answer(&a)))

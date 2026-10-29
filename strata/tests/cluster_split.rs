@@ -1,8 +1,9 @@
 //! A collection split into shards answers like the unsplit one: every
 //! query runs on one database holding all documents, and on two shards that
 //! hold the same segments, queried with their summed statistics in shard
-//! mode and merged by `cluster::merge`. Keys must match in order and scores
-//! to 1e-6 (rows tied on score may swap).
+//! mode and merged by `cluster::merge`, in one round or as query then
+//! fetch. Keys must match in order and scores to 1e-6 (rows tied on score
+//! may swap).
 
 use std::sync::Arc;
 
@@ -36,6 +37,31 @@ fn sharded(shards: &[&Db], sql: &str, params: &Params) -> ResultSet {
     let opts = ExecOptions { stats: Some(stats), shard: true, ..ExecOptions::default() };
     let answers = shards.iter().zip(&snaps).map(|(d, s)| d.execute(s, &select, &opts).unwrap()).collect();
     cluster::merge(&select, answers).unwrap()
+}
+
+/// The rounds again, as query then fetch: the shards rank the keys, and
+/// those that hold the page's rows fetch their columns.
+fn fetched(shards: &[&Db], sql: &str, params: &Params) -> ResultSet {
+    let snaps: Vec<_> = shards.iter().map(|d| d.snapshot()).collect();
+    let schema = snaps[0].schema();
+    let select = bind(sql, schema, params).unwrap();
+    assert!(cluster::fetches(&select, schema), "{sql}");
+    let parts: Vec<TermStats> = shards.iter().zip(&snaps).map(|(d, s)| d.term_stats(s, &select).unwrap()).collect();
+    let opts = ExecOptions { stats: Some(Arc::new(TermStats::sum(&parts))), shard: true, ..ExecOptions::default() };
+    let ids = cluster::ids(&select, schema).unwrap();
+    let answers: Vec<ResultSet> = shards.iter().zip(&snaps).map(|(d, s)| d.execute(s, &ids, &opts).unwrap()).collect();
+    // Each answer is the key alone.
+    assert!(answers.iter().all(|a| a.rows.iter().zip(&a.keys).all(|(r, k)| r == std::slice::from_ref(k))), "{sql}");
+    let owner: std::collections::HashMap<String, usize> = answers.iter().enumerate().flat_map(|(i, a)| a.keys.iter().map(move |k| (format!("{k:?}"), i))).collect();
+    let ranked = cluster::merge(&ids, answers).unwrap();
+    let mut keys = vec![Vec::new(); shards.len()];
+    for k in &ranked.keys {
+        keys[owner[&format!("{k:?}")]].push(k.clone());
+    }
+    let fetched = shards.iter().zip(&snaps).zip(keys).map(|((d, s), k)| d.execute(s, &cluster::fetch(&select, schema, k).unwrap(), &opts).unwrap()).collect();
+    let (rs, lost) = cluster::fill(&select, ranked, fetched).unwrap();
+    assert_eq!(lost, 0, "{sql}");
+    rs
 }
 
 fn same(sql: &str, whole: &ResultSet, split: &ResultSet) {
@@ -109,6 +135,41 @@ fn split_collection_answers_like_the_whole() {
         same(sql, &want, &got);
         eprintln!("ok ({} rows): {sql}", want.rows.len());
     }
+    // Query then fetch, for queries that select stored columns.
+    let wide = [
+        "SELECT id, title, year, score() FROM docs ORDER BY bm25(body, :t) DESC LIMIT 10",
+        "SELECT title, id, category FROM docs WHERE year >= 2005 ORDER BY bm25(body, :t) DESC LIMIT 7 OFFSET 4",
+        "SELECT score(), text FROM docs ORDER BY similarity(emb, :q) DESC LIMIT 10",
+        "SELECT id, title, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10",
+        "SELECT id, rating, title FROM docs WHERE category = 'c03' ORDER BY rating DESC, id LIMIT 12 OFFSET 3",
+        "SELECT year, topic FROM docs WHERE MATCH(body, :t) ORDER BY year, id LIMIT 25",
+    ];
+    for sql in wide {
+        let want = whole.query(sql, &params).unwrap();
+        assert!(!want.rows.is_empty(), "{sql}");
+        same(sql, &want, &fetched(&[&a, &b], sql, &params));
+    }
+    // Groups, counts, the key and score alone, and every row come in one
+    // round.
+    for sql in [
+        "SELECT id, score() FROM docs ORDER BY bm25(body, :t) DESC LIMIT 10",
+        "SELECT COUNT(*) FROM docs",
+        "SELECT topic, COUNT(*) FROM docs GROUP BY topic",
+        "SELECT id, title FROM docs WHERE year >= 2005",
+    ] {
+        assert!(!cluster::fetches(&bind(sql, a.schema(), &params).unwrap(), a.schema()), "{sql}");
+    }
+    // A row that changed between the phases is left out, and counted.
+    let sql = wide[0];
+    let select = bind(sql, a.schema(), &params).unwrap();
+    let ids = cluster::ids(&select, a.schema()).unwrap();
+    let ranked = a.execute(&a.snapshot(), &ids, &ExecOptions { shard: true, ..ExecOptions::default() }).unwrap();
+    let mut keys = ranked.keys.clone();
+    let gone = keys.remove(0);
+    let one = a.execute(&a.snapshot(), &cluster::fetch(&select, a.schema(), keys).unwrap(), &ExecOptions { shard: true, ..ExecOptions::default() }).unwrap();
+    let (rs, lost) = cluster::fill(&select, cluster::merge(&ids, vec![ranked]).unwrap(), vec![one]).unwrap();
+    assert_eq!((lost, rs.rows.len()), (1, 9));
+    assert!(!rs.keys.contains(&gone));
 
     // Without the summed statistics, a shard's BM25 scores differ.
     let sql = &queries[0];

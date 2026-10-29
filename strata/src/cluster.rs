@@ -13,6 +13,13 @@
 //!   normalised over the merged candidates as one database would;
 //! * facet groups and counts by summing.
 //!
+//! Rows can also come in two phases, query then fetch: every shard answers
+//! [`ids`], the query with only the primary key selected, and the merge of
+//! those answers ranks the rows as the query's would; then the shards that
+//! hold the rows of the page answer [`fetch`], the query's columns of
+//! those rows alone, and [`fill`] puts them in the merged order. Stored
+//! fields are read for the page, not for every shard's top rows.
+//!
 //! Shards answer with BOOL and TIMESTAMP values as the integers stored,
 //! which the merged answer gives as such ([`Select::typed`]).
 //!
@@ -33,7 +40,8 @@ use crate::error::{Error, Result};
 use crate::query::exec::{cmp_values, ExecStats, ResultSet, DEFAULT_K};
 use crate::query::agg;
 use crate::query::fusion::{self, Norm};
-use crate::query::logical::{OrderBy, Projection, Score, Select, Tiebreak};
+use crate::query::logical::{OrderBy, Pred, Projection, Score, Select, Tiebreak};
+use crate::schema::Schema;
 use crate::value::Value;
 
 fn err(m: impl Into<String>) -> Error {
@@ -113,6 +121,79 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     }
     q.typed(&mut out.rows);
     Ok(out)
+}
+
+/// Whether a fetch phase reads less than one round would: `q` returns a
+/// page of rows (not groups or counts, and with a LIMIT, as a query
+/// without one keeps every shard's rows) and selects a column besides the
+/// primary key and the score, which [`ids`] answers by themselves.
+pub fn fetches(q: &Select, schema: &Schema) -> bool {
+    let Some(pk) = schema.primary_key else { return false };
+    let rows = q.limit.is_some() && q.group_by.is_empty() && !agg::is_general(q, |_| false) && !q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
+    // A BOOL or TIMESTAMP key would come back as its stored integer.
+    rows && q.graphs.is_empty() && schema.fields[pk].logical.is_none() && q.projection.iter().any(|(_, p)| matches!(p, Projection::Field(f) if *f != pk))
+}
+
+/// `q` answering only its rows' primary keys (with their scores, as every
+/// shard-mode answer has them): the query phase of query then fetch.
+pub fn ids(q: &Select, schema: &Schema) -> Result<Select> {
+    let pk = schema.primary_key.ok_or_else(|| err(format!("{} has no primary key", schema.table)))?;
+    Ok(Select { projection: vec![(schema.fields[pk].name.clone(), Projection::Field(pk))], types: vec![None], ..q.clone() })
+}
+
+/// `q`'s columns of the rows with primary keys `keys`, in no order: the
+/// fetch phase, which a shard answers from the snapshot it ranked from.
+pub fn fetch(q: &Select, schema: &Schema, keys: Vec<Value>) -> Result<Select> {
+    let pk = schema.primary_key.ok_or_else(|| err(format!("{} has no primary key", schema.table)))?;
+    Ok(Select {
+        projection: q.projection.clone(),
+        limit: Some(keys.len()),
+        filter: if keys.is_empty() { Pred::False } else { Pred::In { field: pk, values: keys } },
+        order: None,
+        group_by: Vec::new(),
+        having: None,
+        tiebreak: None,
+        offset: 0,
+        graphs: Vec::new(),
+        types: q.types.clone(),
+    })
+}
+
+/// The answer to `q`: the rows of `ranked` (the merge of the shards'
+/// answers to [`ids`]) in its order, their columns from `fetched` (the
+/// shards' answers to [`fetch`]) and their scores from `ranked`. A row
+/// that none fetched (it changed between the phases, read from another
+/// version) is left out; the count of those comes back too.
+pub fn fill(q: &Select, ranked: ResultSet, fetched: Vec<ResultSet>) -> Result<(ResultSet, usize)> {
+    let mut rows: std::collections::HashMap<agg::Part, Vec<Value>> = std::collections::HashMap::new();
+    let mut stats = ranked.stats;
+    for f in fetched {
+        if f.keys.len() != f.rows.len() {
+            return Err(err("a shard fetched rows without their keys (not in shard mode?)"));
+        }
+        stats.plan.extend(f.stats.plan.into_iter().map(|l| format!("fetch: {l}")));
+        rows.extend(f.keys.iter().map(agg::Part::of).zip(f.rows));
+    }
+    let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
+    let mut out = ResultSet { columns, rows: Vec::with_capacity(ranked.keys.len()), keys: Vec::new(), scores: Vec::new(), parts: None, stats };
+    let mut lost = 0;
+    for (key, score) in ranked.keys.into_iter().zip(ranked.scores) {
+        let Some(mut row) = rows.remove(&agg::Part::of(&key)) else {
+            lost += 1;
+            continue;
+        };
+        for (v, (_, p)) in row.iter_mut().zip(&q.projection) {
+            if *p == Projection::Score {
+                // Rows without the ordering column's value score ±inf.
+                *v = if score.is_finite() { Value::Float(score) } else { Value::Null };
+            }
+        }
+        out.keys.push(key);
+        out.scores.push(score);
+        out.rows.push(row);
+    }
+    q.typed(&mut out.rows);
+    Ok((out, lost))
 }
 
 /// One row of a shard's answer.

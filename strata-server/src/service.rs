@@ -62,6 +62,11 @@ pub struct QueryReq {
     /// A plan to run instead of `sql` (which then only names it in logs):
     /// a leaf of a coordinator's compound query.
     pub plan: Option<Arc<Plan>>,
+    /// Keep the snapshot read, `snapshot` or a new lease, for a fetch that
+    /// follows ([`Answer::lease`]).
+    pub hold: bool,
+    /// End the lease `snapshot` once answered.
+    pub release: bool,
 }
 
 pub struct Answer {
@@ -70,6 +75,8 @@ pub struct Answer {
     pub kind: &'static str,
     /// Shards a coordinator answered without (see [`QueryReq::partial`]).
     pub missing: Vec<String>,
+    /// The lease on the snapshot read, with [`QueryReq::hold`]; else 0.
+    pub lease: u64,
 }
 
 /// An embedded VECTOR field ([`strata::Embed`]) and its model, which
@@ -391,6 +398,25 @@ impl Service {
         Ok((id, txn))
     }
 
+    /// Ends `leases` before they expire, and releases the versions only
+    /// they held. Leases unknown or expired are passed over.
+    pub fn release(&self, leases: &[u64]) {
+        let mut l = self.leases.lock().unwrap_or_else(|e| e.into_inner());
+        for id in leases {
+            l.remove(id);
+        }
+    }
+
+    /// The lease a query reads with `hold` ([`QueryReq::hold`]): the one
+    /// it names, or a new one lasting as a [`Service::term_stats`] lease.
+    fn held(&self, req: &QueryReq, timeout: Duration) -> Result<u64, ApiError> {
+        match (req.hold, req.snapshot) {
+            (true, 0) => Ok(self.lease_for(self.lease_ttl.min(timeout + Duration::from_secs(1)))?.0),
+            (true, l) => Ok(l),
+            (false, _) => Ok(0),
+        }
+    }
+
     /// Releases expired leases, and the versions only they held; returns
     /// how many are held still. The maintenance loop calls it, so that a
     /// version is not kept until the next lease is made.
@@ -546,8 +572,12 @@ impl Service {
             self.metrics.query(kind, "rejected", t0.elapsed().as_secs_f64());
             return Err(ApiError { status: 429, message: "too many queries running; try again".into() });
         };
+        let mut lease = 0;
         let res = match &self.backend {
-            Backend::Local(db) => match self.snapshot(db, req.snapshot) {
+            Backend::Local(db) => match self.held(&req, timeout).and_then(|l| {
+                lease = l;
+                self.snapshot(db, req.snapshot.max(l))
+            }) {
                 Ok(snap) => {
                     let (running, n) = Running::start(&self.running);
                     let cancel = Cancel::default();
@@ -594,7 +624,13 @@ impl Service {
             }
         };
         // A shard's answer to a coordinator is not a client's.
-        self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), res)
+        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), res);
+        // A lease made for a query that failed holds nothing to fetch.
+        let made = (lease != req.snapshot).then_some(lease).filter(|_| a.is_err());
+        if let Some(l) = (req.release && req.snapshot != 0).then_some(req.snapshot).or(made) {
+            self.release(&[l]);
+        }
+        a.map(|a| Answer { lease, ..a })
     }
 
     /// Counts a query's outcome, logs it if it was slow, and makes its
@@ -620,7 +656,7 @@ impl Service {
             let rows = res.as_ref().map_or(0, |(rs, _)| rs.rows.len());
             tracing::warn!(kind, outcome, secs, rows, sql = %obs::truncate(sql, 2000), "slow query");
         }
-        res.map(|(rs, missing)| Answer { rs, took_ms: secs * 1e3, kind, missing })
+        res.map(|(rs, missing)| Answer { rs, took_ms: secs * 1e3, kind, missing, lease: 0 })
     }
 
     /// A compound query ([`compound`]): its plan's leaves run on one

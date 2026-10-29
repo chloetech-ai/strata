@@ -8,6 +8,17 @@
 //! would, from the version it counted, and [`strata::cluster::merge`]
 //! combines the answers. Other queries take one round.
 //!
+//! A query for a page of rows with stored columns is answered by query
+//! then fetch ([`strata::cluster::fetches`], from protocol 3), when the
+//! shards would send many more rows than the page in one round (a deep
+//! page, many shards or a fused score: [`FETCH_FROM`]): every shard ranks
+//! its rows and answers their keys, scores and sort values only, holding
+//! the snapshot it read; the coordinator merges them, and the shards
+//! holding the page's rows fetch their columns from that snapshot and end
+//! its lease ([`CoordOptions::fetch`]). The other shards' leases are ended
+//! alongside. Columns are read and sent for the page, not for each shard's
+//! top `LIMIT + OFFSET` rows.
+//!
 //! A shard may be served by several replicas, servers holding the same
 //! documents (`--shards a0|a1,b0|b1`). A read goes to one replica of each
 //! shard, in turn; when a replica fails, the next one is asked, and when
@@ -34,7 +45,7 @@
 //! read reaches the shards as a typed plan ([`crate::plan_pb`]); a server
 //! from before `Hello` takes SQL, or a JSON plan, as it did.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -42,11 +53,13 @@ use std::time::{Duration, Instant};
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value as Json};
+use strata::query::agg::Part;
 use strata::query::exec::ResultSet;
 use strata::query::ir::Plan;
 use strata::query::stats::TermStats;
 use strata::query::{bind_write, Conflict, Params, Select, Write};
 use strata::schema::Schema;
+use strata::value::Value;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::Code;
@@ -75,11 +88,15 @@ pub struct CoordOptions {
     /// A CA certificate (PEM) that `https://` shards' certificates are
     /// checked against, besides the public roots.
     pub ca: Option<Vec<u8>>,
+    /// Answer pages of rows by query then fetch when the shards speak
+    /// protocol 3; otherwise in one round, every shard sending the columns
+    /// of its top rows.
+    pub fetch: bool,
 }
 
 impl Default for CoordOptions {
     fn default() -> CoordOptions {
-        CoordOptions { hedge: Duration::from_millis(100), cool_off: Duration::from_secs(5), shard_timeout: None, partial: false, token: None, ca: None }
+        CoordOptions { hedge: Duration::from_millis(100), cool_off: Duration::from_secs(5), shard_timeout: None, partial: false, token: None, ca: None, fetch: true }
     }
 }
 
@@ -120,6 +137,14 @@ impl Replica {
         Replica { url: url.to_string(), client, avoid_until: AtomicU64::new(0), protocol: AtomicU32::new(0), hello_at: AtomicU64::new(0) }
     }
 }
+
+/// Query then fetch costs a second round, so it is taken when one round
+/// would send at least this many times the page's rows
+/// ([`Coordinator::fetch_pays`]). Over localhost, with 3 shards of 20,000
+/// demo products and a 10-row page on a 4-core cloud container, one round
+/// was faster by up to 0.5 ms up to 6 times the page's rows, the two were
+/// even at 9, and query then fetch was faster from 15 (2026-10-29).
+pub const FETCH_FROM: usize = 8;
 
 /// How long a replica's answer to `Hello` is trusted before it is asked
 /// again, so that the coordinator follows a rolling upgrade or a rollback.
@@ -195,6 +220,10 @@ pub struct Coordinator {
     hedge_budget: HedgeBudget,
     /// Per shard: calls answered, failed and timed out ([`Self::call`]).
     outcomes: Vec<[AtomicU64; 3]>,
+    /// Queries answered by query then fetch, and rows of their pages that
+    /// no fetch found.
+    fetches: AtomicU64,
+    fetch_lost: AtomicU64,
 }
 
 /// A query's merged answer, and the shards it lacks (with
@@ -362,6 +391,8 @@ impl Coordinator {
             hedges: AtomicU64::new(0),
             hedge_budget: HedgeBudget::new(),
             outcomes,
+            fetches: AtomicU64::new(0),
+            fetch_lost: AtomicU64::new(0),
         })
     }
 
@@ -378,6 +409,8 @@ impl Coordinator {
             Family::one("strata_shard_hedges_total", "counter", "Calls asked of another replica too after the first had not answered within --hedge-ms.", self.hedges.load(Ordering::Relaxed) as f64),
             Family::one("strata_replicas_avoided", "gauge", "Replicas asked last for now, after they failed or were outrun.", avoided as f64),
             Family::one("strata_shard_protocol", "gauge", "The protocol reads speak to the shards: the oldest a replica speaks.", self.protocol() as f64),
+            Family::one("strata_fetch_queries_total", "counter", "Queries answered by query then fetch.", self.fetches.load(Ordering::Relaxed) as f64),
+            Family::one("strata_fetch_lost_rows_total", "counter", "Rows of query-then-fetch pages that no fetch found: their shard did not answer the fetch (partial answers), or another replica did, without them.", self.fetch_lost.load(Ordering::Relaxed) as f64),
         ]
     }
 
@@ -548,8 +581,19 @@ impl Coordinator {
     pub async fn query(&self, req: &QueryReq, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
         let partial = req.partial.unwrap_or(self.opts.partial);
         let protocol = self.protocol();
-        let read = &Read::new(&req.sql, &req.params, req.plan.as_deref(), protocol, || Ok(Plan::of_select(&self.schema, select)))?;
         let n = self.replicas.len();
+        // Query then fetch: the query round answers the keys alone.
+        let ids = match protocol >= 3 && self.opts.fetch && n > 1 && strata::cluster::fetches(select, &self.schema) && self.fetch_pays(select) {
+            true => Some(strata::cluster::ids(select, &self.schema)?),
+            false => None,
+        };
+        let ids_plan = ids.as_ref().map(|q| Plan::of_select(&self.schema, q));
+        let none = Params::new();
+        let (params, given) = match &ids_plan {
+            Some(p) => (&none, Some(p)),
+            None => (&req.params, req.plan.as_deref()),
+        };
+        let read = &Read::new(&req.sql, params, given, protocol, || Ok(Plan::of_select(&self.schema, select)))?;
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let ranked_text = matches!(crate::metrics::kind(select), "bm25" | "hybrid" | "boosted");
         // Per shard: the replica holding a lease for this query, and the lease.
@@ -563,16 +607,6 @@ impl Coordinator {
                 }
             }
         }
-        // A shard that cannot answer is left out of a partial answer (and of
-        // the next second's), but a request it rejects fails the query.
-        let missing = |i: usize, e: ApiError, failed: &mut Vec<Option<ApiError>>| {
-            if !partial || e.status == 400 {
-                return Err(e);
-            }
-            self.skip_until[i].store(self.now_ms() + 1000, Ordering::Relaxed);
-            failed[i] = Some(e);
-            Ok(())
-        };
         let stats = match &req.stats {
             Some(s) => Some(s.clone()),
             None if ranked_text && n > 1 => {
@@ -584,7 +618,7 @@ impl Coordinator {
                             sum.add(&s);
                             leased[i] = Some((r, lease));
                         }
-                        Err(e) => missing(i, e, &mut failed)?,
+                        Err(e) => self.leave_out(partial, i, e, &mut failed)?,
                     }
                 }
                 Some(sum)
@@ -593,6 +627,7 @@ impl Coordinator {
         };
         let stats_json = stats.map(|s| serde_json::to_vec(&s).unwrap_or_default()).unwrap_or_default();
         let leased = &leased;
+        let hold = ids.is_some();
         let calls = (0..n).filter(|&i| failed[i].is_none()).map(|i| {
             let stats_json = stats_json.clone();
             let first = leased[i].map(|(r, _)| r);
@@ -604,25 +639,127 @@ impl Coordinator {
                     let snapshot = leased[i].filter(|(lr, _)| *lr == r).map_or(0, |(_, l)| l);
                     async move {
                         let p = self.speak(i, r, &mut c, protocol).await?;
-                        c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, ..read.request(p) }).await
+                        // From protocol 3, the lease is held for the fetch
+                        // round, or ended once answered.
+                        let (hold, release) = (hold && p >= 3, !hold && snapshot != 0 && p >= 3);
+                        c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, hold, release, ..read.request(p) }).await
                     }
                 });
                 (i, rs.await)
             }
         });
         let mut shards = Vec::new();
+        // Per shard answering: the replica that did, and the lease it holds.
+        let mut held = Vec::new();
         for (i, a) in join_all(calls).await {
             match a {
-                Ok((_, a)) => shards.push(result_from_pb(a)?),
-                Err(e) => missing(i, e, &mut failed)?,
+                Ok((r, a)) => {
+                    held.push((i, r, a.snapshot));
+                    shards.push(result_from_pb(a)?);
+                }
+                Err(e) => self.leave_out(partial, i, e, &mut failed)?,
             }
         }
         if shards.is_empty() {
             let e = failed.into_iter().flatten().next();
             return Err(e.unwrap_or_else(|| ApiError::internal("no shard answered")));
         }
+        let rs = match &ids {
+            None => strata::cluster::merge(select, shards)?,
+            Some(ids) => {
+                // Each key's shard, for the fetch round.
+                let mut owner = HashMap::new();
+                for (&(i, _, _), a) in held.iter().zip(&shards) {
+                    owner.extend(a.keys.iter().map(|k| (Part::of(k), i)));
+                }
+                let ranked = strata::cluster::merge(ids, shards)?;
+                let mut keys = vec![Vec::new(); n];
+                for k in &ranked.keys {
+                    let i = owner.get(&Part::of(k)).ok_or_else(|| ApiError::internal("a merged key no shard answered"))?;
+                    keys[*i].push(k.clone());
+                }
+                self.fetch(&req.sql, select, ranked, &held, keys, (start, deadline, protocol, partial), &mut failed).await?
+            }
+        };
         let missing = failed.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| self.shards[i].clone()).collect();
-        Ok(Merged { rs: strata::cluster::merge(select, shards)?, missing })
+        Ok(Merged { rs, missing })
+    }
+
+    /// Whether query then fetch pays for its second round: when one round
+    /// would send at least [`FETCH_FROM`] times the page's rows, every shard
+    /// its top `LIMIT + OFFSET`, as it does for a fused score, whose shards
+    /// send each input's candidates to its depth.
+    fn fetch_pays(&self, select: &Select) -> bool {
+        let page = select.limit.unwrap_or(0);
+        matches!(crate::metrics::kind(select), "hybrid" | "boosted") || self.replicas.len() * (page + select.offset) >= FETCH_FROM * page
+    }
+
+    /// Leaves shard `i` out of a partial answer (and the next second's)
+    /// after it failed with `e`; a request it rejected fails the query, as
+    /// does any failure without `partial`.
+    fn leave_out(&self, partial: bool, i: usize, e: ApiError, failed: &mut [Option<ApiError>]) -> Result<(), ApiError> {
+        if !partial || e.status == 400 {
+            return Err(e);
+        }
+        self.skip_until[i].store(self.now_ms() + 1000, Ordering::Relaxed);
+        failed[i] = Some(e);
+        Ok(())
+    }
+
+    /// The fetch round of query then fetch: the columns of the page
+    /// `ranked`, `keys[i]` from shard `i`, read from the snapshot its
+    /// query round held (`held`: shard, replica, lease), whose lease the
+    /// fetch ends. The leases of shards holding none of the page's rows
+    /// are ended alongside, without waiting.
+    async fn fetch(
+        &self,
+        sql: &str,
+        select: &Select,
+        ranked: ResultSet,
+        held: &[(usize, usize, u64)],
+        mut keys: Vec<Vec<Value>>,
+        (start, deadline, protocol, partial): (usize, Instant, u32, bool),
+        failed: &mut [Option<ApiError>],
+    ) -> Result<ResultSet, ApiError> {
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        let mut reads = Vec::new();
+        for &(i, r, lease) in held {
+            if !keys[i].is_empty() {
+                let q = strata::cluster::fetch(select, &self.schema, std::mem::take(&mut keys[i]))?;
+                let plan = Plan::of_select(&self.schema, &q);
+                reads.push((i, r, lease, Read::new(sql, &Params::new(), Some(&plan), protocol, || Ok(plan.clone()))?));
+            } else if lease != 0 {
+                let mut c = self.replicas[i][r].client.clone();
+                tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(5), c.release(pb::ReleaseRequest { snapshots: vec![lease] })).await });
+            }
+        }
+        let calls = reads.iter().map(|(i, held_r, lease, read)| {
+            let (i, held_r, lease) = (*i, *held_r, *lease);
+            async move {
+                let a = self.call(i, start, Some(held_r), deadline, |r, mut c| {
+                    // Another replica reads its latest version.
+                    let snapshot = if r == held_r { lease } else { 0 };
+                    async move {
+                        let p = self.speak(i, r, &mut c, protocol).await?;
+                        c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, snapshot, release: snapshot != 0, ..read.request(p) }).await
+                    }
+                });
+                (i, a.await)
+            }
+        });
+        let mut fetched = Vec::new();
+        for (i, a) in join_all(calls).await {
+            match a {
+                Ok((_, a)) => fetched.push(result_from_pb(a)?),
+                Err(e) => self.leave_out(partial, i, e, failed)?,
+            }
+        }
+        let (mut rs, lost) = strata::cluster::fill(select, ranked, fetched)?;
+        if lost > 0 {
+            self.fetch_lost.fetch_add(lost as u64, Ordering::Relaxed);
+            rs.stats.plan.push(format!("fetch: {lost} rows of the page left out: their shard did not answer the fetch, or another replica did, without them"));
+        }
+        Ok(rs)
     }
 
     /// Writes to every replica of shard `i`; the count is the first's.
