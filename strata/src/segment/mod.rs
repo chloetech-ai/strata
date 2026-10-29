@@ -86,6 +86,13 @@ impl SegmentWriter {
         self.sections.push((name, data));
     }
 
+    /// Adds `other`'s sections after this writer's, in their order.
+    pub fn append(&mut self, other: SegmentWriter) {
+        for (name, data) in other.sections {
+            self.put(name, data);
+        }
+    }
+
     /// The segment image; its start must be placed at a page-aligned offset.
     pub fn finish(self) -> Vec<u8> {
         let (_, _, total) = self.layout();
