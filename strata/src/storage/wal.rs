@@ -2,14 +2,22 @@
 //!
 //! ```text
 //! header:  "STRWAL01" | db_id: u64
+//!     or   "STRWAL02" | db_id: u64 | len: u32 | features, comma-separated
 //! record:  len: u32 | crc32(body): u32 | body = kind: u8, payload
 //!          kind 1 insert: document     kind 2 delete: key value
 //!          kind 3 commit: txn: u64, n_ops: u32
+//!                 (STRWAL02: then term: u64, seq: u64)
 //!          kind 4 set: key value, field: u16, value
 //!          kind 5 table: id: u32 (the operations up to the next table
 //!                 record or the commit are on this table; before any,
 //!                 on table 0)
 //! ```
+//!
+//! A database that numbers its writes
+//! ([`crate::storage::Database::start_seq_no`]) logs in `STRWAL02`, whose
+//! header names the features its records use (`seq_no`: each commit
+//! carries the transaction's term and sequence number); a reader refuses a
+//! log naming one it does not know. Others log in `STRWAL01`, as before.
 //!
 //! A transaction is its operation records followed by a commit record,
 //! written with one `write` and made durable with one `fdatasync`. Replay
@@ -44,12 +52,16 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::error::{corrupt, Result};
+use crate::error::{corrupt, Error, Result};
 use crate::storage::io;
+use crate::storage::manifest::SeqNo;
 use crate::value::{Document, Value};
 
 const MAGIC: &[u8; 8] = b"STRWAL01";
-const HEADER: u64 = 16;
+/// A log whose header names its features.
+const MAGIC_2: &[u8; 8] = b"STRWAL02";
+/// The features a log may name, all of which this version reads.
+const FEATURES: &[&str] = &["seq_no"];
 
 const INSERT: u8 = 1;
 const DELETE: u8 = 2;
@@ -67,11 +79,13 @@ pub enum Op {
     Set { key: Value, field: u16, value: Value },
 }
 
-/// A committed transaction read back from the log: its operations, each
-/// with the id of the table it writes.
+/// A committed transaction read back from the log: its sequence number
+/// (in a numbered log), and its operations, each with the id of the table
+/// it writes.
 #[derive(Debug, PartialEq)]
 pub struct WalTxn {
     pub txn: u64,
+    pub seq: Option<SeqNo>,
     pub ops: Vec<(u32, Op)>,
 }
 
@@ -79,6 +93,10 @@ pub struct WalTxn {
 pub struct Wal {
     file: File,
     db_id: u64,
+    /// Whether its transactions carry sequence numbers (`STRWAL02`).
+    numbered: bool,
+    /// The header's length.
+    header: u64,
     len: u64,
     /// What opening cut off past damage that committed transactions follow.
     dropped: Option<String>,
@@ -86,11 +104,46 @@ pub struct Wal {
     unsynced: bool,
 }
 
+/// What a log's header says: whether its transactions are numbered, and
+/// the header's length. `None` for a file that is no log of database
+/// `db_id` (or whose header a crash cut short); an error for a log that
+/// uses a feature this version does not have.
+fn header(buf: &[u8], db_id: u64, path: &Path) -> Result<Option<(bool, u64)>> {
+    if buf.len() < 16 || buf[8..16] != db_id.to_le_bytes() {
+        return Ok(None);
+    }
+    if &buf[..8] == MAGIC {
+        return Ok(Some((false, 16)));
+    }
+    if &buf[..8] != MAGIC_2 {
+        return Ok(None);
+    }
+    let Some(n) = buf.get(16..20).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize) else { return Ok(None) };
+    let Some(names) = buf.get(20..20 + n) else { return Ok(None) };
+    let names = std::str::from_utf8(names).map_err(|_| corrupt(format!("{}: the header's features are not text", path.display())))?;
+    if let Some(x) = names.split(',').find(|x| !FEATURES.contains(x)) {
+        return Err(Error::Schema(format!("the write-ahead log {} uses feature {x:?}, which this version of Strata does not have: open it with a newer one", path.display())));
+    }
+    Ok(Some((true, 20 + n as u64)))
+}
+
+/// The header of a log of database `db_id`: numbered or not.
+fn header_bytes(db_id: u64, numbered: bool) -> Vec<u8> {
+    let mut h = if numbered { MAGIC_2.to_vec() } else { MAGIC.to_vec() };
+    h.extend_from_slice(&db_id.to_le_bytes());
+    if numbered {
+        let names = FEATURES.join(",");
+        h.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        h.extend_from_slice(names.as_bytes());
+    }
+    h
+}
+
 impl Wal {
-    /// Creates (or truncates) the log.
-    pub fn create(path: &Path, db_id: u64, sync: bool) -> Result<Wal> {
+    /// Creates (or truncates) the log, numbered (`STRWAL02`) or not.
+    pub fn create(path: &Path, db_id: u64, numbered: bool, sync: bool) -> Result<Wal> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
-        let mut wal = Wal { file, db_id, len: 0, dropped: None, unsynced: true };
+        let mut wal = Wal { file, db_id, numbered, header: 0, len: 0, dropped: None, unsynced: true };
         wal.reset(sync)?;
         Ok(wal)
     }
@@ -106,21 +159,38 @@ impl Wal {
     /// not yet written back.)
     /// `fits(table, op)` says whether an operation could have been
     /// committed; one that could not counts as damage.
-    pub fn open(path: &Path, db_id: u64, sync: bool, drop_damaged: bool, fits: &dyn Fn(u32, &Op) -> bool) -> Result<(Wal, Vec<WalTxn>)> {
+    ///
+    /// `numbered` says whether the database numbers its writes. A log that
+    /// does otherwise is started again in the database's kind when it holds
+    /// no transaction, and refused when it does.
+    pub fn open(path: &Path, db_id: u64, numbered: bool, sync: bool, drop_damaged: bool, fits: &dyn Fn(u32, &Op) -> bool) -> Result<(Wal, Vec<WalTxn>)> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         let size = file.metadata()?.len();
         let mut buf = vec![0u8; size as usize];
         file.read_exact_at(&mut buf, 0)?;
         // What an earlier process appended may not be durable yet.
-        let mut wal = Wal { file, db_id, len: size, dropped: None, unsynced: true };
-        if size < HEADER || &buf[..8] != MAGIC || buf[8..16] != db_id.to_le_bytes() {
+        let mut wal = Wal { file, db_id, numbered, header: 0, len: size, dropped: None, unsynced: true };
+        let Some((logged, header)) = header(&buf, db_id, path)? else {
+            wal.reset(sync)?;
+            return Ok((wal, Vec::new()));
+        };
+        let (txns, end) = decode(&buf[header as usize..], logged, fits);
+        if logged != numbered {
+            if !txns.is_empty() {
+                return Err(corrupt(format!(
+                    "{} holds transactions {} sequence numbers, and the database {}",
+                    path.display(),
+                    if logged { "with" } else { "without" },
+                    if numbered { "numbers its writes" } else { "does not number its writes" }
+                )));
+            }
             wal.reset(sync)?;
             return Ok((wal, Vec::new()));
         }
-        let (txns, end) = decode(&buf[HEADER as usize..], fits);
-        let end = HEADER + end as u64;
+        wal.header = header;
+        let end = header + end as u64;
         if end < size {
-            let later = commits_after(&buf[end as usize..], txns.last().map_or(0, |t| t.txn));
+            let later = commits_after(&buf[end as usize..], txns.last().map_or(0, |t| t.txn), numbered);
             let saved = damaged_path(path);
             if !later.is_empty() {
                 let what = format!(
@@ -151,9 +221,15 @@ impl Wal {
     }
 
     /// Appends a committed transaction (operations with the id of the table
-    /// each writes); durable on return when `sync`.
-    pub fn append(&mut self, txn: u64, ops: &[(u32, Op)], sync: bool) -> Result<()> {
-        let buf = encode_txn(txn, ops);
+    /// each writes) and its sequence number, which a numbered log needs and
+    /// any other refuses; durable on return when `sync`.
+    pub fn append(&mut self, txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)], sync: bool) -> Result<()> {
+        match (seq.is_some(), self.numbered) {
+            (true, false) => return Err(Error::Schema("a numbered transaction, in a log without sequence numbers".into())),
+            (false, true) => return Err(Error::Schema("a transaction without a sequence number, in a numbered log".into())),
+            _ => {}
+        }
+        let buf = encode_txn(txn, seq, ops);
         let res = io::write_at(&self.file, &buf, self.len).and_then(|_| if sync { io::sync(&self.file) } else { Ok(()) });
         if let Err(e) = res {
             // Cut off whatever part landed, so that later commits stay
@@ -179,22 +255,34 @@ impl Wal {
     /// Empties the log (after a flush made its contents durable elsewhere).
     pub fn reset(&mut self, sync: bool) -> Result<()> {
         io::set_len(&self.file, 0)?;
-        let mut h = MAGIC.to_vec();
-        h.extend_from_slice(&self.db_id.to_le_bytes());
+        let h = header_bytes(self.db_id, self.numbered);
         io::write_at(&self.file, &h, 0)?;
         if sync {
             io::sync(&self.file)?;
         }
         self.unsynced = !sync;
-        self.len = HEADER;
+        self.header = h.len() as u64;
+        self.len = self.header;
         Ok(())
+    }
+
+    /// Empties the log and starts it again numbered (`STRWAL02`), for a
+    /// database that has just begun numbering its writes.
+    pub fn renumber(&mut self, sync: bool) -> Result<()> {
+        self.numbered = true;
+        self.reset(sync)
+    }
+
+    /// Whether its transactions carry sequence numbers.
+    pub fn numbered(&self) -> bool {
+        self.numbered
     }
 
     /// Starts an empty log at `path` in place of this one, which the caller
     /// made durable ([`Wal::sync_appends`]) and renamed ([`sealed_path`]).
     pub fn restart(&mut self, path: &Path, sync: bool) -> Result<()> {
         let dropped = self.dropped.take();
-        *self = Wal::create(path, self.db_id, sync)?;
+        *self = Wal::create(path, self.db_id, self.numbered, sync)?;
         self.dropped = dropped;
         Ok(())
     }
@@ -205,13 +293,13 @@ impl Wal {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len <= HEADER
+        self.len <= self.header
     }
 }
 
 /// The records of one transaction. A database with one table never writes
 /// a table record, so its log reads the same as before there were tables.
-fn encode_txn(txn: u64, ops: &[(u32, Op)]) -> Vec<u8> {
+fn encode_txn(txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut body = Vec::new();
     let mut table = 0;
@@ -246,6 +334,10 @@ fn encode_txn(txn: u64, ops: &[(u32, Op)]) -> Vec<u8> {
     body.push(COMMIT);
     body.extend_from_slice(&txn.to_le_bytes());
     body.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    if let Some(n) = seq {
+        body.extend_from_slice(&n.term.to_le_bytes());
+        body.extend_from_slice(&n.seq.to_le_bytes());
+    }
     frame(&mut out, &body);
     out
 }
@@ -293,29 +385,29 @@ pub fn sealed_files(path: &Path) -> Result<Vec<(u64, PathBuf)>> {
 
 /// The committed transactions of the sealed log at `path`, and the byte
 /// where it is damaged, if it is; `None` for a log of another database
-/// (`db_id`) or a file that is not a log.
+/// (`db_id`) or a file that is not a log. Its transactions carry sequence
+/// numbers if it is numbered.
 pub fn read_sealed(path: &Path, db_id: u64, fits: &dyn Fn(u32, &Op) -> bool) -> Result<Option<(Vec<WalTxn>, Option<u64>)>> {
     let buf = std::fs::read(path)?;
-    if buf.len() < HEADER as usize || &buf[..8] != MAGIC || buf[8..16] != db_id.to_le_bytes() {
-        return Ok(None);
-    }
-    let (txns, end) = decode(&buf[HEADER as usize..], fits);
-    let end = HEADER + end as u64;
+    let Some((numbered, header)) = header(&buf, db_id, path)? else { return Ok(None) };
+    let (txns, end) = decode(&buf[header as usize..], numbered, fits);
+    let end = header + end as u64;
     Ok(Some((txns, (end < buf.len() as u64).then_some(end))))
 }
 
 /// The txns of the intact commit records in `rest` (the log past the last
 /// transaction replay reached) that come after txn `last`. A commit record
-/// is 21 bytes (length 13, checksum, kind, txn, op count), so finding one
-/// in damaged bytes by chance takes a checksum collision.
-fn commits_after(rest: &[u8], last: u64) -> Vec<u64> {
-    const BODY: usize = 13;
+/// is 21 bytes (length 13, checksum, kind, txn, op count), or 37 in a
+/// numbered log (length 29: then term and sequence number), so finding
+/// one in damaged bytes by chance takes a checksum collision.
+fn commits_after(rest: &[u8], last: u64, numbered: bool) -> Vec<u64> {
+    let body_len = if numbered { 29 } else { 13 };
     let mut found = Vec::new();
-    for p in 0..rest.len().saturating_sub(8 + BODY - 1) {
-        if u32::from_le_bytes(rest[p..p + 4].try_into().unwrap()) as usize != BODY {
+    for p in 0..rest.len().saturating_sub(8 + body_len - 1) {
+        if u32::from_le_bytes(rest[p..p + 4].try_into().unwrap()) as usize != body_len {
             continue;
         }
-        let body = &rest[p + 8..p + 8 + BODY];
+        let body = &rest[p + 8..p + 8 + body_len];
         if body[0] == COMMIT && crc32fast::hash(body) == u32::from_le_bytes(rest[p + 4..p + 8].try_into().unwrap()) {
             let txn = u64::from_le_bytes(body[1..9].try_into().unwrap());
             if txn > last {
@@ -328,8 +420,10 @@ fn commits_after(rest: &[u8], last: u64) -> Vec<u64> {
 
 /// Committed transactions in `buf` (the log after its header) and the
 /// length of the prefix they occupy, up to the first operation that does
-/// not `fit`.
-fn decode(buf: &[u8], fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<WalTxn>, usize) {
+/// not `fit`. In a `numbered` log, sequence numbers rise from one
+/// transaction to the next and terms never fall; one that does not is
+/// damage too.
+fn decode(buf: &[u8], numbered: bool, fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<WalTxn>, usize) {
     let mut txns = Vec::new();
     let mut ops = Vec::new();
     let mut table = 0u32;
@@ -364,10 +458,23 @@ fn decode(buf: &[u8], fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<WalTxn>, usize) {
             }
             COMMIT => {
                 let (Ok(txn), Ok(n)) = (r.u64(), r.u32()) else { break };
-                if n as usize != ops.len() || txns.last().is_some_and(|t: &WalTxn| t.txn >= txn) {
+                let seq = match numbered {
+                    false => None,
+                    true => match (r.u64(), r.u64()) {
+                        (Ok(term), Ok(seq)) => Some(SeqNo { term, seq }),
+                        _ => break,
+                    },
+                };
+                let last = txns.last();
+                if n as usize != ops.len() || last.is_some_and(|t: &WalTxn| t.txn >= txn) {
                     break;
                 }
-                txns.push(WalTxn { txn, ops: std::mem::take(&mut ops) });
+                if let (Some(a), Some(b)) = (last.and_then(|t| t.seq), seq) {
+                    if b.seq <= a.seq || b.term < a.term {
+                        break;
+                    }
+                }
+                txns.push(WalTxn { txn, seq, ops: std::mem::take(&mut ops) });
                 table = 0;
                 end = pos;
                 continue;
@@ -518,7 +625,21 @@ mod tests {
         ])
     }
 
-    fn sample() -> Vec<(u64, Vec<(u32, Op)>)> {
+    type Txns = Vec<(u64, Option<SeqNo>, Vec<(u32, Op)>)>;
+
+    /// Transactions without sequence numbers, as a database that does not
+    /// number its writes logs them.
+    fn sample() -> Txns {
+        unnumbered().into_iter().map(|(t, ops)| (t, None, ops)).collect()
+    }
+
+    /// The same, numbered: from 5, with a new term from the fourth.
+    fn numbered() -> Txns {
+        let terms = [1, 1, 1, 2, 2, 7];
+        unnumbered().into_iter().enumerate().map(|(i, (t, ops))| (t, Some(SeqNo { term: terms[i], seq: 5 + i as u64 }), ops)).collect()
+    }
+
+    fn unnumbered() -> Vec<(u64, Vec<(u32, Op)>)> {
         vec![
             (3, vec![(0, Op::Insert(doc(1))), (0, Op::Insert(doc(2)))]),
             (4, vec![(0, Op::Delete(Value::Str("key1".into())))]),
@@ -535,7 +656,7 @@ mod tests {
     #[test]
     fn one_table_writes_no_table_records() {
         let ops = [(0, Op::Insert(doc(1))), (0, Op::Delete(Value::Int(2)))];
-        let buf = encode_txn(3, &ops);
+        let buf = encode_txn(3, None, &ops);
         let mut want = Vec::new();
         let mut body = vec![INSERT];
         put_doc(&mut body, &doc(1));
@@ -550,16 +671,43 @@ mod tests {
         assert_eq!(buf, want);
     }
 
+    fn encode(txns: &Txns) -> (Vec<u8>, Vec<usize>) {
+        let (mut buf, mut ends) = (Vec::new(), Vec::new());
+        for (t, seq, ops) in txns {
+            buf.extend(encode_txn(*t, *seq, ops));
+            ends.push(buf.len());
+        }
+        (buf, ends)
+    }
+
     #[test]
     fn roundtrip() {
-        let mut buf = Vec::new();
-        for (t, ops) in sample() {
-            buf.extend(encode_txn(t, &ops));
+        for (txns, numbered) in [(sample(), false), (numbered(), true)] {
+            let (buf, _) = encode(&txns);
+            let (got, end) = decode(&buf, numbered, &any);
+            assert_eq!(end, buf.len());
+            let want: Vec<WalTxn> = txns.into_iter().map(|(txn, seq, ops)| WalTxn { txn, seq, ops }).collect();
+            assert_eq!(got, want);
         }
-        let (txns, end) = decode(&buf, &any);
-        assert_eq!(end, buf.len());
-        let want: Vec<WalTxn> = sample().into_iter().map(|(txn, ops)| WalTxn { txn, ops }).collect();
-        assert_eq!(txns, want);
+    }
+
+    /// In a numbered log a sequence number that does not rise, or a term
+    /// that falls, is damage: replay stops before it.
+    #[test]
+    fn sequence_numbers_rise() {
+        let mut txns = numbered();
+        txns[3].1 = Some(SeqNo { term: 2, seq: 7 });
+        let (buf, ends) = encode(&txns);
+        assert_eq!(decode(&buf, true, &any), (decode(&buf[..ends[2]], true, &any).0, ends[2]));
+        let mut txns = numbered();
+        txns[4].1 = Some(SeqNo { term: 1, seq: 9 });
+        let (buf, ends) = encode(&txns);
+        assert_eq!(decode(&buf, true, &any).1, ends[3]);
+        // Gaps are allowed: what the log holds is what was numbered.
+        let mut txns = numbered();
+        txns[5].1 = Some(SeqNo { term: 7, seq: 100 });
+        let (buf, _) = encode(&txns);
+        assert_eq!(decode(&buf, true, &any).0.len(), 6);
     }
 
     /// Cutting the log at every byte (a torn write) and appending garbage
@@ -567,50 +715,88 @@ mod tests {
     /// zero tail can restore zero bytes the cut removed).
     #[test]
     fn torn_tail_at_every_offset() {
-        let mut buf = Vec::new();
-        let mut ends = Vec::new();
-        for (t, ops) in sample() {
-            buf.extend(encode_txn(t, &ops));
-            ends.push(buf.len());
-        }
-        for cut in 0..=buf.len() {
-            for tail in [&[][..], &[0u8; 16][..], &[0xffu8; 7][..]] {
-                let mut b = buf[..cut].to_vec();
-                b.extend_from_slice(tail);
-                let committed = ends.iter().filter(|&&e| b.starts_with(&buf[..e])).count();
-                let (txns, end) = decode(&b, &any);
-                assert_eq!(txns.len(), committed, "cut at {cut}");
-                assert_eq!(end, if committed == 0 { 0 } else { ends[committed - 1] });
+        for (txns, numbered) in [(sample(), false), (numbered(), true)] {
+            let (buf, ends) = encode(&txns);
+            for cut in 0..=buf.len() {
+                for tail in [&[][..], &[0u8; 16][..], &[0xffu8; 7][..]] {
+                    let mut b = buf[..cut].to_vec();
+                    b.extend_from_slice(tail);
+                    let committed = ends.iter().filter(|&&e| b.starts_with(&buf[..e])).count();
+                    let (txns, end) = decode(&b, numbered, &any);
+                    assert_eq!(txns.len(), committed, "cut at {cut}");
+                    assert_eq!(end, if committed == 0 { 0 } else { ends[committed - 1] });
+                }
             }
+            // A flipped bit inside the second transaction loses it and the rest.
+            let mut b = buf.clone();
+            b[ends[0] + 12] ^= 4;
+            assert_eq!(decode(&b, numbered, &any).0.len(), 1);
         }
-        // A flipped bit inside the second transaction loses it and the rest.
-        let mut b = buf.clone();
-        b[ends[0] + 12] ^= 4;
-        assert_eq!(decode(&b, &any).0.len(), 1);
     }
 
     #[test]
     fn file_append_reopen_and_foreign_log() {
+        for (txns, numbered) in [(sample(), false), (numbered(), true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("db-wal");
+            let mut wal = Wal::create(&p, 11, numbered, false).unwrap();
+            for (t, seq, ops) in &txns {
+                wal.append(*t, *seq, ops, true).unwrap();
+            }
+            let len = wal.len();
+            drop(wal);
+            assert_eq!(&std::fs::read(&p).unwrap()[..8], if numbered { b"STRWAL02" } else { b"STRWAL01" });
+            // Torn tail: half a record after the last commit is cut on open.
+            let next = numbered.then_some(SeqNo { term: 7, seq: 11 });
+            let f = OpenOptions::new().write(true).open(&p).unwrap();
+            f.write_all_at(&encode_txn(9, next, &[(0, Op::Insert(doc(4)))])[..20], len).unwrap();
+            let (mut wal, got) = Wal::open(&p, 11, numbered, false, false, &any).unwrap();
+            assert_eq!(got.len(), 6);
+            assert_eq!(got.last().unwrap().seq, txns.last().unwrap().1);
+            assert_eq!(wal.len(), len);
+            // A transaction must be numbered as its log is.
+            assert!(wal.append(10, next.xor(Some(SeqNo { term: 7, seq: 11 })), &[(0, Op::Insert(doc(5)))], false).is_err());
+            wal.append(10, next, &[(0, Op::Insert(doc(5)))], false).unwrap();
+            drop(wal);
+            let (_, got) = Wal::open(&p, 11, numbered, false, false, &any).unwrap();
+            assert_eq!((got.last().unwrap().txn, got.last().unwrap().seq), (10, next));
+            // A log of the other kind is refused while it holds transactions.
+            let e = Wal::open(&p, 11, !numbered, false, false, &any).err().unwrap().to_string();
+            assert!(e.contains("sequence numbers, and the database"), "{e}");
+            let (wal, got) = Wal::open(&p, 12, numbered, false, false, &any).unwrap();
+            assert!(got.is_empty() && wal.is_empty());
+        }
+    }
+
+    /// An empty log of the other kind starts again in the database's; a log
+    /// naming a feature this version lacks is refused by name.
+    #[test]
+    fn a_log_says_what_it_holds() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("db-wal");
-        let mut wal = Wal::create(&p, 11, false).unwrap();
-        for (t, ops) in sample() {
-            wal.append(t, &ops, true).unwrap();
-        }
-        let len = wal.len();
+        let mut wal = Wal::create(&p, 11, false, false).unwrap();
+        assert_eq!((wal.numbered(), wal.len()), (false, 16));
+        wal.renumber(false).unwrap();
+        assert_eq!((wal.numbered(), wal.len()), (true, 26));
         drop(wal);
-        // Torn tail: half a record after the last commit is cut on open.
-        let f = OpenOptions::new().write(true).open(&p).unwrap();
-        f.write_all_at(&encode_txn(9, &[(0, Op::Insert(doc(4)))])[..20], len).unwrap();
-        let (mut wal, txns) = Wal::open(&p, 11, false, false, &any).unwrap();
-        assert_eq!(txns.len(), 6);
-        assert_eq!(wal.len(), len);
-        wal.append(10, &[(0, Op::Insert(doc(5)))], false).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(&bytes[..8], b"STRWAL02");
+        assert_eq!(&bytes[16..], b"\x06\0\0\0seq_no");
+        let (wal, _) = Wal::open(&p, 11, false, false, false, &any).unwrap();
+        assert!(!wal.numbered() && wal.is_empty());
         drop(wal);
-        let (_, txns) = Wal::open(&p, 11, false, false, &any).unwrap();
-        assert_eq!(txns.last().unwrap().txn, 10);
-        let (wal, txns) = Wal::open(&p, 12, false, false, &any).unwrap();
-        assert!(txns.is_empty() && wal.is_empty());
+        assert_eq!(&std::fs::read(&p).unwrap()[..8], b"STRWAL01");
+        let (wal, _) = Wal::open(&p, 11, true, false, false, &any).unwrap();
+        assert!(wal.numbered() && wal.is_empty());
+        drop(wal);
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes.truncate(16);
+        bytes.extend_from_slice(&13u32.to_le_bytes());
+        bytes.extend_from_slice(b"seq_no,zstd:1");
+        std::fs::write(&p, &bytes).unwrap();
+        let e = Wal::open(&p, 11, true, false, false, &any).err().unwrap().to_string();
+        assert!(e.contains(r#"uses feature "zstd:1""#), "{e}");
+        assert!(read_sealed(&p, 11, &any).is_err());
     }
 
     /// An operation that does not fit (intact records the schema could
@@ -618,30 +804,28 @@ mod tests {
     /// failed checksum.
     #[test]
     fn an_operation_that_does_not_fit_is_damage() {
-        let mut buf = Vec::new();
-        let mut ends = Vec::new();
-        for (t, ops) in sample() {
-            buf.extend(encode_txn(t, &ops));
-            ends.push(buf.len());
-        }
-        let no_set = |_: u32, op: &Op| !matches!(op, Op::Set { .. });
-        assert_eq!(decode(&buf, &no_set), (decode(&buf[..ends[2]], &any).0, ends[2]));
-        let no_table_5 = |t: u32, _: &Op| t != 5;
-        assert_eq!(decode(&buf, &no_table_5).1, ends[3]);
+        for (txns, numbered) in [(sample(), false), (numbered(), true)] {
+            let (buf, ends) = encode(&txns);
+            let no_set = |_: u32, op: &Op| !matches!(op, Op::Set { .. });
+            assert_eq!(decode(&buf, numbered, &no_set), (decode(&buf[..ends[2]], numbered, &any).0, ends[2]));
+            let no_table_5 = |t: u32, _: &Op| t != 5;
+            assert_eq!(decode(&buf, numbered, &no_table_5).1, ends[3]);
 
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("db-wal");
-        let mut wal = Wal::create(&p, 11, false).unwrap();
-        for (t, ops) in sample() {
-            wal.append(t, &ops, true).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("db-wal");
+            let mut wal = Wal::create(&p, 11, numbered, false).unwrap();
+            for (t, seq, ops) in &txns {
+                wal.append(*t, *seq, ops, true).unwrap();
+            }
+            let header = wal.header;
+            drop(wal);
+            // With sync, three commits after the damage: refused unless asked.
+            let err = Wal::open(&p, 11, numbered, true, false, &no_set).err().unwrap();
+            assert!(err.to_string().contains("3 committed transactions follow the damage (up to txn 9)"), "{err}");
+            let (wal, got) = Wal::open(&p, 11, numbered, true, true, &no_set).unwrap();
+            assert_eq!(got.len(), 3);
+            assert_eq!(wal.len(), header + ends[2] as u64);
+            assert!(wal.dropped().is_some());
         }
-        drop(wal);
-        // With sync, three commits after the damage: refused unless asked.
-        let err = Wal::open(&p, 11, true, false, &no_set).err().unwrap();
-        assert!(err.to_string().contains("3 committed transactions follow the damage"), "{err}");
-        let (wal, txns) = Wal::open(&p, 11, true, true, &no_set).unwrap();
-        assert_eq!(txns.len(), 3);
-        assert_eq!(wal.len(), HEADER + ends[2] as u64);
-        assert!(wal.dropped().is_some());
     }
 }

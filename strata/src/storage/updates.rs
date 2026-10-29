@@ -12,6 +12,11 @@
 //! field are corrected for the documents they name, and orders, scores and
 //! projections read the new value.
 //!
+//! In a database that numbers its writes, a document's sequence number
+//! (`crate::storage::rowseq`) changes with each value written in place: it
+//! is kept here too, as the integer of field [`SEQ`], which is no field of
+//! the document's.
+//!
 //! Encoding: `u32` entry count, then per entry `u16` field, `u32` docID, a
 //! tag (0 null, 1 integer, 2 float) and 8 bytes of value, little-endian,
 //! sorted by (field, docID).
@@ -24,6 +29,10 @@ use crate::segment::DocId;
 use crate::value::{Document, Value};
 
 type Map = BTreeMap<(u16, DocId), Value>;
+
+/// The field under which a document's sequence number is kept, when a
+/// value written in place changed it; no schema has this many fields.
+pub const SEQ: usize = u16::MAX as usize;
 
 /// A segment's values written in place, by (field, docID).
 ///
@@ -151,9 +160,13 @@ impl Updates {
         Updates { layers }
     }
 
-    /// Writes document `d`'s updated fields into `doc`.
+    /// Writes document `d`'s updated fields into `doc` (not its sequence
+    /// number, [`SEQ`]).
     pub fn apply(&self, d: DocId, doc: &mut Document) {
         for f in self.fields() {
+            if f as usize == SEQ {
+                continue;
+            }
             if let Some(v) = self.get(f as usize, d) {
                 doc[f as usize] = v.clone();
             }

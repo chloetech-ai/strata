@@ -42,7 +42,7 @@ fn damaged_segments() {
 
 #[test]
 fn damaged_wals() {
-    for data in inputs(3, 600, 30) {
+    for data in inputs(3, 1200, 30) {
         harness::wal(&data);
     }
 }

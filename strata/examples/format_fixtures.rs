@@ -1,4 +1,4 @@
-//! Writes the format 2 and format 3 fixtures that
+//! Writes the fixtures of formats 2 and 3 and of numbered writes that
 //! `tests/format_fixtures.rs` opens with every later version of Strata
 //! (`tests/fixtures/README.md`):
 //!

@@ -26,6 +26,7 @@ pub mod manifest;
 pub mod merge;
 pub mod pager;
 pub mod pk;
+pub mod rowseq;
 mod snapshot;
 mod state;
 pub mod updates;
@@ -35,6 +36,7 @@ use std::sync::{Mutex, MutexGuard};
 
 pub use db::{CheckpointOptions, CheckpointStats, Database, DbOptions, DocumentSource, DropOptions, FileStats, Layout, SegmentStats, TableTxn, WriteTxn, LOCK_WAIT};
 pub use live::LiveDocs;
+pub use manifest::{Numbering, SeqNo};
 pub use merge::{memory_limit, merge_memory, MergePolicy, MergeStats, MergeStatus, MergerOptions, SegmentInfo};
 pub use pk::{build_pk_index, build_pk_index_of, key_hash, KeyList, KeyRef, PkIndex};
 pub use snapshot::{SegmentView, Snapshot};

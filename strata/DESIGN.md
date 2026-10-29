@@ -110,6 +110,46 @@ writes immediately and the memtable needs no index code of its own. When the mem
 segment by the shadow-paging commit and the WAL is truncated. Bulk loads
 bypass the WAL and write segments directly.
 
+**Sequence numbers and terms.** A database can number its writes, which
+replication orders them by (`Database::start_seq_no`, opt-in and not
+undone). Every write transaction then gets the next sequence number, from
+1, under the database's term, 1 at first and raised by
+`Database::begin_term` when a replica becomes primary; a transaction that
+writes nothing takes none (`WriteTxn::commit_seq` returns it). The commit
+record carries both, in a WAL whose header (`STRWAL02`) names the features
+its records use, so a reader that lacks one refuses the log rather than
+misread it; a database that does not number its writes logs in
+`STRWAL01`, byte for byte as before. Within a log the numbers rise and the
+term never falls, or replay treats it as damage. The manifest keeps the
+term and a floor for the count (`seq_no`): every commit of a version
+records at least the last number given, so after the WAL is truncated
+opening counts on from the manifest, and otherwise from the log's last
+commit. A failed commit uses no number. Without `sync` a crash can lose
+the last transactions of the log, and their numbers are given again; with
+it a number, once returned, is never given again. Starting flushes, so
+the log it empties is restarted numbered after the commit that records
+the feature; a crash between the two leaves an empty `STRWAL01` log,
+which opening restarts numbered, while one holding transactions of the
+other kind fails the open. Checkpoints keep the numbers and the term.
+Bulk loads and attached segments take no number. The manifest also keeps
+every term with the first number it gave (`Database::numbering`), so that
+a replica back after a failover can find where its log left the new
+primary's.
+
+**Row versions.** In a numbered database each row keeps the number of the
+write that last changed it (`Database::seq_of`; `WriteTxn::seq_of` reads
+it under the writer lock, for a write conditional on it). The memtable
+keeps it per document; a segment built from numbered documents keeps them
+in section `seq` (`storage::rowseq`: a width, a base and one number per
+docID); a value set in place keeps its document's new number beside it in
+the segment's updates (as field `SEQ`, which no schema has), which a merge
+folds into the merged segment's section and carries for values set while
+it ran. Rows written before numbering, bulk loaded or attached have number
+0: an attached image's section is dropped, since another database's
+numbers could equal later ones here. A deleted row keeps no number; there
+are no tombstones, which shipping the log in order and catching up from a
+checkpoint do not need.
+
 ### 3.5 Deletes, updates, snapshots
 
 Documents have a primary key. Each segment has a primary-key index (sorted
@@ -155,7 +195,8 @@ need no table.
   is written in format 3 only while a table uses a feature (a `BOOL` or
   `TIMESTAMP` field is `"bool"` or `"timestamp"`, a `NOT NULL` field
   `"not_null"`, a default `"default"`, a TEXT field's analyzer other than
-  `english` `"analyzer:<name>:<version>"`), and falls back to 2 or 1,
+  `english` `"analyzer:<name>:<version>"`; a database that numbers its
+  writes `"seq_no"`, for good), and falls back to 2 or 1,
   in both meta slots, when the last one goes. A reader refuses a manifest
   that requires a feature it does not know, naming the feature, and ignores
   an `optional` list and other keys it does not know. Format 3 is the last
@@ -632,13 +673,19 @@ handing a query to its shards) are to make instead of writing SQL text.
   shards' slots. Online resharding is a map of a higher epoch once moved
   slots' rows are copied; the copy is not built. While a replica speaks
   an older protocol the coordinator routes by the old hash.
+* **Sequence numbers.** Replication's order of writes is a database's
+  own (§3.4): a numbered database gives each write transaction a term and
+  a sequence number, logged in its commit record and kept across flushes,
+  crashes, checkpoints and reopening, and each row the number of the
+  write that last changed it. Nothing ships the log yet, and SQL and the
+  server do not read the numbers yet.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication on top of the shard protocol (sequence
-numbers in the WAL, WAL shipping, catch-up, read-your-writes,
+Next: the rest of replication on top of the shard protocol (conditional
+writes through SQL and the server, WAL shipping, catch-up, read-your-writes,
 promotion), and a coordinator and strata-server over every table.
 
 ## 7. Planning and execution
