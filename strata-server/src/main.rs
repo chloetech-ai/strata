@@ -86,7 +86,7 @@ struct Args {
     #[arg(long, default_value = "all")]
     write_acks: String,
     /// With --replicas or --replica: the latest transactions kept in
-    /// memory to ship, in MiB. A replica further behind needs a copy of
+    /// memory to ship, in MiB. A replica further behind is sent a copy of
     /// the primary.
     #[arg(long, default_value_t = 64)]
     ship_log_mb: usize,

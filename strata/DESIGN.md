@@ -161,7 +161,8 @@ as it commits. A replica applies a batch with `Database::apply_shipped`,
 given the term and number of the transaction before the first: unless that
 is the replica's last, it applies nothing and answers its own last
 (`Applied::Mismatch`), from which the primary ships again or finds that
-their histories differ (Raft's log matching). Each transaction must follow
+their histories differ (Raft's log matching); a call with no transactions
+only compares, and so does not wait for the writer. Each transaction must follow
 the one before, and one of a term older than the replica's is refused,
 since it comes from a primary another has replaced; a newer term is raised
 at that transaction's number, so the replica's terms match the primary's
@@ -170,6 +171,23 @@ writer as the primary's did, and one that does not fit, an insert of a row
 the replica has or a delete or a set of one it lacks, fails the batch from
 there: the replica is not a copy of its primary. Each transaction commits
 under its primary's number, and a batch syncs once.
+
+**Installing a copy.** A replica the primary's log no longer reaches takes
+a copy of the primary instead: `Database::install_copy` puts a checkpoint
+of the primary (opened as a database) in place of every segment, row
+number and term, in one commit. Under the writer lock it flushes the
+memtables, empties the WAL and commits a version holding the copy's
+segments, written into this database's file or directory, with the copy's
+numbering; the ship log starts empty, so the replica's own transactions
+are not shipped on. A crash before the commit finds the database as it
+was, and one after it finds the copy. Snapshots taken before go on reading
+their version, and a merge running meanwhile installs nothing, since its
+inputs are gone. The copy must hold the same tables, by name and schema,
+and must not be of an older term than the database: a copy of a primary
+another replaced is refused. While a replica takes a copy, the primary
+holds the transactions that follow it (`Database::hold_log`): the ship
+log keeps them past its bytes, up to four times, until the replica has
+them.
 
 ### 3.5 Deletes, updates, snapshots
 
@@ -705,8 +723,11 @@ handing a query to its shards) are to make instead of writing SQL text.
   replica: a call with no transactions asks the replica's last, and the
   batches that follow carry the term and number before their first. A
   mismatch the primary's own history explains (a replica behind) is shipped
-  again from the replica's last; any other means the histories differ, and
-  a replica the log no longer reaches needs a copy of the primary. A write
+  again from the replica's last; any other means the histories differ. A
+  replica the log no longer reaches is sent a copy (`Restore`): the
+  primary writes a checkpoint beside its database and streams it in
+  chunks, and the replica writes it beside its own, opens it checking
+  every segment's checksum, and installs it (§3.4). A write
   is answered once the copies `--write-acks` names hold it, within its
   deadline: every replica in sync (`all`, which drops a replica that misses
   the deadline out of sync), a majority (`majority`, which refuses a write
@@ -733,8 +754,8 @@ handing a query to its shards) are to make instead of writing SQL text.
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication (catch-up by copying segments,
-read-your-writes and digests, promotion), and a coordinator and
+Next: the rest of replication (read-your-writes and digests, promotion),
+and a coordinator and
 strata-server over every table.
 
 ## 7. Planning and execution

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value as Json};
 use strata::db::Db;
 use strata::query::Params;
-use strata::storage::{CheckpointOptions, DbOptions};
+use strata::storage::{CheckpointOptions, Database, DbOptions, Layout, LogRead};
 use strata::value::Value;
 use strata_server::auth::Access;
 use strata_server::coord::Coordinator;
@@ -403,23 +403,98 @@ async fn a_replica_follows_one_primary_a_term_and_fences_an_older_one() {
     assert_eq!(Follow::open(rdb.clone(), Some(&file)).unwrap().follows().await, Some("p3".into()));
 }
 
+/// Copies of a database that `dir` holds beside it, which a copy leaves
+/// only while it runs.
+fn copies_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.contains(".copy-") || n.contains(".restore-")).collect()
+}
+
+/// Sends `data`, said to be `size` bytes, to `url`'s `Restore` in chunks of
+/// 1,000 bytes, as primary `primary` of `term`.
+async fn restore(url: &str, term: u64, primary: &str, size: u64, data: &[u8]) -> Result<pb::ReplicateResponse, tonic::Status> {
+    let mut c = pb::strata_client::StrataClient::connect(url.to_string()).await.unwrap();
+    let mut chunks: Vec<pb::RestoreChunk> = data.chunks(1000).map(|d| pb::RestoreChunk { data: d.to_vec(), ..Default::default() }).collect();
+    if chunks.is_empty() {
+        chunks.push(pb::RestoreChunk::default());
+    }
+    chunks[0] = pb::RestoreChunk { term, primary: primary.into(), size, ..chunks[0].clone() };
+    c.restore(futures::stream::iter(chunks)).await.map(|r| r.into_inner())
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn a_replica_the_log_does_not_reach_needs_a_copy() {
+async fn a_replica_the_log_does_not_reach_is_sent_a_copy() {
     let dir = tempfile::tempdir().unwrap();
-    let ((fresh, fresh_at), (restored, restored_at), (ahead, ahead_at)) = (nobody().await, nobody().await, nobody().await);
-    // A ship log of a few transactions.
+    let [(fresh, fresh_at), (dir_layout, dir_at), (other, other_at), (restored, restored_at), (ahead, ahead_at)] =
+        [nobody().await, nobody().await, nobody().await, nobody().await, nobody().await];
+    // A ship log of a few transactions, and copies sent in chunks of 64 KiB.
     let pdb = create_with(dir.path(), "p.strata", 2000, |_| true);
-    let p = primary(pdb.clone(), None, ships_to(&[&fresh, &restored, &ahead], Acks::All), Duration::from_secs(5));
+    let opts = PrimaryOptions { copy_chunk_bytes: 64 << 10, copy_retry: Duration::from_millis(300), ..ships_to(&[&fresh, &dir_layout, &other, &restored, &ahead], Acks::All) };
+    let p = primary(pdb.clone(), None, opts, Duration::from_secs(5));
+    let pu = grpc(p.clone()).await;
     for i in 0..100 {
         p.write_ops(vec![set(&format!("p{:07}", i), "sold", json!(i))], None).await.unwrap();
     }
-    // A replica from before the first transaction the log holds cannot
-    // follow.
-    replica_on(create(dir.path(), "fresh.strata"), None, Some(TcpListener::bind(fresh_at).await.unwrap())).await;
-    until("the fresh replica is found too far behind", || async { follower(&p, 0).await["error"].as_str().is_some_and(|e| e.contains("it needs a copy of the primary")) }).await;
-    let f = follower(&p, 0).await;
-    assert!(f["in_sync"] == false && f["error"].as_str().unwrap().contains("it holds transactions up to 0, and this primary keeps them from"), "{f}");
-    // One started from a checkpoint of the primary follows from there.
+    let id = p.health().await["replication"]["id"].as_str().unwrap().to_string();
+
+    // Replicas from before the first transaction the log holds are sent a
+    // copy of the primary while it takes writes, one in each layout, and
+    // then follow it.
+    let fdb = create(dir.path(), "fresh.strata");
+    let ddb = {
+        let o = DbOptions { layout: Layout::Directory, ..options(64 << 20) };
+        let db = Db::create(&dir.path().join("dir.strata"), demo::schema(N), o).unwrap();
+        db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
+        db.storage().start_seq_no().unwrap();
+        Arc::new(db)
+    };
+    let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let writer = {
+        let (p, writing) = (p.clone(), writing.clone());
+        tokio::spawn(async move {
+            let mut i = 0;
+            while writing.load(std::sync::atomic::Ordering::Relaxed) {
+                p.write_ops(vec![set(&format!("p{:07}", i % N), "reviews", json!(i))], None).await.unwrap();
+                i += 1;
+            }
+            i
+        })
+    };
+    let (fr, _) = replica_on(fdb.clone(), None, Some(TcpListener::bind(fresh_at).await.unwrap())).await;
+    let (dr, _) = replica_on(ddb.clone(), None, Some(TcpListener::bind(dir_at).await.unwrap())).await;
+    until("both are sent a copy", || async { follower(&p, 0).await["copies"] == 1 && follower(&p, 1).await["copies"] == 1 }).await;
+    writing.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(writer.await.unwrap() > 0);
+    let end = last(&pdb);
+    until("both hold the primary's last", || async { follower(&p, 0).await["seq_no"] == end && follower(&p, 1).await["seq_no"] == end }).await;
+    for (k, db, r) in [(0, &fdb, &fr), (1, &ddb, &dr)] {
+        let f = follower(&p, k).await;
+        assert!(f["in_sync"] == true && f["copying"] == false && f.get("error").is_none(), "{f}");
+        assert_eq!(rows(db), rows(&pdb), "the copy holds the primary's rows, each with the primary's number");
+        assert_eq!(r.health().await["replication"]["restores"], 1);
+        assert!(r.prometheus().await.contains("strata_replica_restores_total 1"));
+        db.storage().check().unwrap();
+    }
+    assert!(p.prometheus().await.contains(&format!("strata_replica_copies_total{{replica=\"{fresh}\"}} 1")));
+    // Then shipped to as any replica.
+    p.write_ops(vec![set("p0000001", "sold", json!(-1))], None).await.unwrap();
+    assert_eq!(last(&fdb), last(&pdb));
+    assert_eq!(rows(&ddb), rows(&pdb));
+
+    // One whose tables are not the primary's is not changed by the copy.
+    let odb = {
+        let schema = strata::Schema::new("products", vec![strata::Field::new("id", strata::FieldType::Keyword)], Some("id")).unwrap();
+        let db = Db::create(&dir.path().join("other.strata"), schema, options(64 << 20)).unwrap();
+        db.storage().start_seq_no().unwrap();
+        Arc::new(db)
+    };
+    replica_on(odb.clone(), None, Some(TcpListener::bind(other_at).await.unwrap())).await;
+    until("the copy is refused", || async { follower(&p, 2).await["error"].as_str().is_some_and(|e| e.contains("sending it a copy of the primary failed")) }).await;
+    let f = follower(&p, 2).await;
+    assert!(f["in_sync"] == false && f["copies"] == 0 && f["error"].as_str().unwrap().contains("the copy's tables (products) are not this database's (products), or their schemas differ"), "{f}");
+    assert_eq!(odb.snapshot().n_live_docs(), 0);
+
+    // One started from a checkpoint of the primary follows from there,
+    // with no copy.
     let copy = dir.path().join("restored.strata");
     pdb.storage().checkpoint(&copy, &CheckpointOptions::default()).unwrap();
     for i in 100..103 {
@@ -428,18 +503,137 @@ async fn a_replica_the_log_does_not_reach_needs_a_copy() {
     let rdb = Arc::new(Db::open(&copy, options(1 << 20)).unwrap());
     rdb.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
     replica_on(rdb.clone(), None, Some(TcpListener::bind(restored_at).await.unwrap())).await;
-    until("the restored replica is in sync", || async { follower(&p, 1).await["in_sync"] == true }).await;
+    until("the restored replica is in sync", || async { follower(&p, 3).await["in_sync"] == true }).await;
     assert_eq!(rows(&rdb), rows(&pdb));
-    // One that took writes of its own past the primary's is not a copy.
+    assert_eq!(follower(&p, 3).await["copies"], 0);
+    // One that took writes of its own past the primary's is not a copy,
+    // and is not sent one.
     let adb = create(dir.path(), "ahead.strata");
-    for i in 0..120 {
+    let far = last(&pdb) + 20;
+    for i in 0..far {
         let mut t = adb.storage().begin().unwrap();
-        t.set(&Value::Str(format!("p{i:07}")), "sold", Value::Int(1)).unwrap();
+        t.set(&Value::Str(format!("p{:07}", i as usize % N)), "sold", Value::Int(1)).unwrap();
         t.commit().unwrap();
     }
     replica_on(adb.clone(), None, Some(TcpListener::bind(ahead_at).await.unwrap())).await;
-    until("the replica ahead is found to differ", || async { follower(&p, 2).await["error"].as_str().is_some_and(|e| e.contains("its history differs")) }).await;
-    assert_eq!(last(&adb), 120, "it applied nothing");
+    until("the replica ahead is found to differ", || async { follower(&p, 4).await["error"].as_str().is_some_and(|e| e.contains("its history differs")) }).await;
+    assert_eq!((last(&adb), follower(&p, 4).await["copies"].clone()), (far, json!(0)), "it applied nothing");
+
+    // Copies refused, changing nothing: to a server that is not a replica,
+    // from a primary of an older term or a second one of the term, cut
+    // short, damaged, or not a database.
+    let before = rows(&fdb);
+    let image = {
+        let to = dir.path().join("image.strata");
+        pdb.storage().checkpoint(&to, &CheckpointOptions::default()).unwrap();
+        std::fs::read(&to).unwrap()
+    };
+    let size = image.len() as u64;
+    let e = restore(&pu, 1, &id, size, &image).await.unwrap_err();
+    assert!(e.message().contains("not a replica"), "{e}");
+    let fu = &fresh;
+    let r = restore(fu, 0, "old", size, &image).await.unwrap();
+    assert_eq!((r.matched, r.seq, r.replica_term), (false, last(&fdb), 1), "an older term's primary is told the replica's");
+    let e = restore(fu, 1, "another", size, &image).await.unwrap_err();
+    assert!(e.message().contains("a shard has one primary in a term"), "{e}");
+    let e = restore(fu, 1, &id, size + 5, &image).await.unwrap_err();
+    assert!(e.message().contains(&format!("the copy ended at {size} of its {} bytes", size + 5)), "{e}");
+    let e = restore(fu, 1, &id, size - 5, &image).await.unwrap_err();
+    assert!(e.message().contains("the copy is longer than"), "{e}");
+    // A byte that only the segments' checksums find wrong, and one that
+    // opening finds.
+    let damaged = (1..image.len() / 4096)
+        .find_map(|page| {
+            let mut d = image.clone();
+            d[page * 4096 + 2000] ^= 0x5a;
+            let at = dir.path().join(format!("damaged-{page}.strata"));
+            std::fs::write(&at, &d).unwrap();
+            let clean = |verify_checksums| Database::open(&at, DbOptions { verify_checksums, ..DbOptions::default() }).is_ok_and(|db| db.damaged().is_none());
+            let found = clean(false) && !clean(true);
+            for p in [at.clone(), dir.path().join(format!("damaged-{page}.strata-wal"))] {
+                let _ = std::fs::remove_file(p);
+            }
+            found.then_some(d)
+        })
+        .expect("a byte only the checksums find");
+    let e = restore(fu, 1, &id, size, &damaged).await.unwrap_err();
+    assert!(e.message().starts_with("the copy"), "{e}");
+    let mut damaged = image.clone();
+    for b in damaged.iter_mut().skip(100).step_by(4096) {
+        *b ^= 0x5a;
+    }
+    let e = restore(fu, 1, &id, size, &damaged).await.unwrap_err();
+    assert!(e.message().starts_with("the copy: "), "{e}");
+    let e = restore(fu, 1, &id, 3, b"abc").await.unwrap_err();
+    assert!(e.message().starts_with("the copy: "), "{e}");
+    assert_eq!(rows(&fdb), before);
+    assert_eq!(fr.health().await["replication"]["restores"], 1);
+    // The copy of the primary itself is taken as the copy the primary sends.
+    let r = restore(fu, 1, &id, size, &image).await.unwrap();
+    assert!(r.matched && r.replica_term == 1, "{r:?}");
+    assert_eq!(rows(&fdb), rows(&pdb));
+    assert!(copies_in(dir.path()).is_empty(), "{:?}", copies_in(dir.path()));
+}
+
+/// Waits until a replica in `dir` holds all of the copy its primary sends
+/// beside it, and is installing it.
+async fn copy_arrived(dir: &Path) {
+    until("the replica holds the whole copy", || async {
+        let sizes = |what: &str| std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()).filter(|e| e.file_name().to_string_lossy().contains(what)).map(|e| e.metadata().unwrap().len()).collect::<Vec<_>>();
+        // The copy, and the log that opening it made.
+        let (sent, got) = (sizes(".copy-"), sizes(".restore-"));
+        sent.len() == 1 && got.contains(&sent[0])
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_is_followed_by_what_was_written_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let ((near, near_at), (far, far_at)) = (nobody().await, nobody().await);
+    let pdb = create_with(dir.path(), "p.strata", 2000, |_| true);
+    let p = primary(pdb.clone(), None, ships_to(&[&near, &far], Acks::All), Duration::from_secs(5));
+    let write = |from: usize, n: usize| {
+        let p = p.clone();
+        async move {
+            for i in from..from + n {
+                p.write_ops(vec![set(&format!("p{:07}", i % N), "sold", json!(i))], None).await.unwrap();
+            }
+        }
+    };
+    write(0, 100).await;
+    // The replica's writer is held while it installs the copy, and the
+    // primary takes more than its 2,000-byte log meanwhile: it holds them,
+    // and the replica follows from the copy.
+    let ndb = create(dir.path(), "near.strata");
+    let held = stall(&ndb);
+    let (nr, _) = replica_on(ndb.clone(), None, Some(TcpListener::bind(near_at).await.unwrap())).await;
+    copy_arrived(dir.path()).await;
+    let from = last(&pdb) + 1;
+    write(100, 40).await;
+    let LogRead::Txns(meanwhile) = pdb.storage().log_from(from, usize::MAX) else { panic!("the log holds what follows the copy") };
+    let bytes: usize = meanwhile.iter().map(|t| t.bytes.len()).sum();
+    assert!(meanwhile.len() == 40 && bytes > 2000 && bytes < 4 * 2000, "{} transactions, {bytes} bytes", meanwhile.len());
+    drop(held);
+    until("the replica is in sync", || async { follower(&p, 0).await["in_sync"] == true }).await;
+    assert_eq!((follower(&p, 0).await["copies"].clone(), nr.health().await["replication"]["restores"].clone()), (json!(1), json!(1)), "one copy");
+    assert_eq!(rows(&ndb), rows(&pdb));
+    // Released once it caught up: the log keeps its 2,000 bytes again.
+    write(200, 30).await;
+    assert!(matches!(pdb.storage().log_from(from, usize::MAX), LogRead::Gone { .. }));
+
+    // Past four times the log, what came meanwhile is gone, and the
+    // replica is sent another copy.
+    let fdb = create(dir.path(), "far.strata");
+    let held = stall(&fdb);
+    let (fr, _) = replica_on(fdb.clone(), None, Some(TcpListener::bind(far_at).await.unwrap())).await;
+    copy_arrived(dir.path()).await;
+    write(300, 200).await;
+    drop(held);
+    until("the replica is in sync", || async { follower(&p, 1).await["in_sync"] == true }).await;
+    assert_eq!((follower(&p, 1).await["copies"].clone(), fr.health().await["replication"]["restores"].clone()), (json!(2), json!(2)), "two copies");
+    assert_eq!(rows(&fdb), rows(&pdb));
+    assert!(copies_in(dir.path()).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

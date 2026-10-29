@@ -1094,6 +1094,20 @@ impl Database {
         self.opts.ship_log_bytes > 0
     }
 
+    /// Holds the transactions from number `from` on in the ship log until
+    /// [`Database::release_log`], as a primary does for a replica it sends
+    /// a copy, which then follows from the copy's last transaction: the
+    /// log keeps them past [`DbOptions::ship_log_bytes`], up to
+    /// [`crate::storage::ship::HELD`] times that. Returns the hold's id.
+    pub fn hold_log(&self, from: u64) -> u64 {
+        lock(&self.state).ship.hold(from)
+    }
+
+    /// Ends hold `id` ([`Database::hold_log`]).
+    pub fn release_log(&self, id: u64) {
+        lock(&self.state).ship.release(id);
+    }
+
     /// Has `f` told the term and number of each numbered transaction once
     /// it is committed, in the order they commit (replacing any earlier
     /// `f`). It runs in the writer, so it must not block or write.
@@ -1120,12 +1134,16 @@ impl Database {
     /// means that the two databases were not copies of each other: it is
     /// not applied, and those before it are.
     pub fn apply_shipped(&self, prev: SeqNo, txns: &[&[u8]]) -> Result<Applied> {
-        let WriteTxn { mut wal, .. } = self.begin()?;
-        let now = self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?;
+        let now = || self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()));
+        // None: a primary asks the last transaction, which needs no writer
+        // (a flush or a merge may hold it).
+        let held = if txns.is_empty() { None } else { Some(self.begin()?) };
+        let now = now()?;
         if now.last() != prev {
             let last = now.last();
             return Ok(Applied::Mismatch { seq: last.seq, term: last.term });
         }
+        let Some(WriteTxn { mut wal, .. }) = held else { return Ok(Applied::At(prev)) };
         let schemas: Vec<(u32, Arc<Schema>)> = lock(&self.state).tables.iter().map(|t| (t.id, t.schema.clone())).collect();
         let fits = |table: u32, op: &Op| schemas.iter().find(|(id, _)| *id == table).is_some_and(|(_, s)| op_fits(s, op));
         let mut shipped = Vec::with_capacity(txns.len());
@@ -1210,6 +1228,91 @@ impl Database {
         let t = &st.tables[pos];
         TableRef { id: t.id, pos, schema: t.schema.clone() }.key_of(key)?;
         st.find_live(pos, key).map(|loc| st.seq_at(pos, loc)).transpose()
+    }
+
+    /// Replaces this database's rows with those of `copy`, a checkpoint of
+    /// its primary ([`Database::checkpoint`]), in one commit, and numbers
+    /// on from the copy's last transaction under the copy's terms: what a
+    /// replica that its primary's ship log no longer reaches does, before
+    /// it applies the transactions that follow
+    /// ([`Database::apply_shipped`]). Every row, row number and term here
+    /// is replaced, the WAL and the ship log are emptied, and snapshots
+    /// taken before go on reading what they read; a merge running here
+    /// installs nothing. Both must number their writes and hold the same
+    /// tables (names and schemas, in order), and the copy's term must not
+    /// be older than this database's: a copy of a replaced primary is
+    /// refused. Durable on return. Returns the copy's last transaction.
+    pub fn install_copy(&self, copy: &Database) -> Result<SeqNo> {
+        if std::ptr::eq(self, copy) {
+            return Err(Error::Schema("a database is not a copy of itself".into()));
+        }
+        // What the copy's memtables hold goes into its segments first.
+        copy.flush()?;
+        let (theirs, tables) = {
+            let st = lock(&copy.state);
+            let n = st.manifest.seq_no.clone().ok_or_else(|| Error::Schema("the copy does not number its writes".into()))?;
+            let mut tables = Vec::new();
+            for t in &st.manifest.tables {
+                let segs = t.segments.iter().map(|m| Ok((m.n_docs, st.handle(m.id).cloned().ok_or_else(|| corrupt(format!("segment {} is in the manifest but not open", m.id)))?))).collect::<Result<Vec<_>>>()?;
+                tables.push((t.schema.clone(), segs));
+            }
+            (Numbering { seq: st.seq, ..n }, tables)
+        };
+        // No background flush may seal the log in between.
+        let _one = lock(&self.background);
+        let mut wal = self.try_writer()?;
+        self.check_poisoned()?;
+        let ours = self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?;
+        {
+            let st = lock(&self.state);
+            let names = |ts: &mut dyn Iterator<Item = &Schema>| ts.map(|s| s.table.clone()).collect::<Vec<_>>().join(", ");
+            if st.manifest.tables.len() != tables.len() || st.manifest.tables.iter().zip(&tables).any(|(t, (s, _))| t.schema != *s) {
+                return Err(Error::Schema(format!(
+                    "the copy's tables ({}) are not this database's ({}), or their schemas differ",
+                    names(&mut tables.iter().map(|t| &t.0)),
+                    names(&mut st.manifest.tables.iter().map(|t| &t.schema))
+                )));
+            }
+        }
+        if theirs.term < ours.term {
+            return Err(Error::Schema(format!("the copy is of term {}, older than this database's ({}): it is a copy of a replaced primary", theirs.term, ours.term)));
+        }
+        // What the memtables and pending deletes hold goes into segments,
+        // which the commit below drops with the others, and the log they
+        // were in is emptied: a crash before that commit finds this
+        // database as it was, and one after it finds the copy.
+        self.flush_locked(&mut wal)?;
+        if !wal.is_empty() {
+            wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
+        }
+        let mut vw = VersionWriter::begin(self);
+        let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).collect();
+        for id in vw.manifest.tables.iter().flat_map(|t| &t.segments).map(|s| s.id).collect::<Vec<_>>() {
+            vw.remove_segment(id);
+        }
+        for ((_, segs), &to) in tables.iter().zip(&ids) {
+            for (n_docs, h) in segs {
+                vw.add_segment(to, None, h.file.image(), *n_docs, h.base.as_deref(), h.updates.as_deref())?;
+            }
+        }
+        vw.manifest.seq_no = Some(theirs.clone());
+        // The commit keeps the last number given here when it is higher: the
+        // copy's is the one to keep.
+        let before = std::mem::replace(&mut lock(&self.state).seq, theirs.seq);
+        let c = match vw.commit(&mut wal) {
+            Ok(c) => c,
+            Err(e) => {
+                lock(&self.state).seq = before;
+                return Err(e);
+            }
+        };
+        let max = self.opts.ship_log_bytes;
+        self.publish(c, |st| {
+            st.live_cache.clear();
+            st.updates_cache.clear();
+            st.ship = ShipLog::new(max);
+        })?;
+        Ok(theirs.last())
     }
 
     /// How the database numbers its writes ([`Numbering`]): its term, the
@@ -2080,9 +2183,13 @@ impl Database {
     fn install_merge(&self, wal: &mut Wal, claim: &MergeClaim, written: Option<&(Reserved, u32)>, inputs: &[(u64, Vec<DocId>)], n_new: u32, stats: &mut MergeStats) -> Result<bool> {
         let (table, snap, ids) = (claim.table, &claim.snap, &claim.ids[..]);
         self.check_poisoned()?;
-        if lock(&self.state).table_index(table).is_none() {
-            // Dropped while the merge was building.
-            return Ok(false);
+        {
+            let st = lock(&self.state);
+            if st.table_index(table).is_none() || inputs.iter().any(|(id, _)| st.handle(*id).is_none()) {
+                // Dropped while the merge was building, or replaced by a
+                // copy of the primary ([`Database::install_copy`]).
+                return Ok(false);
+            }
         }
         // Documents of the inputs deleted after the snapshot, as docIDs of
         // the merged segment (inputs are concatenated in order), and values

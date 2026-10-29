@@ -29,9 +29,17 @@
 //! than a replica's is answered with the replica's term, and stops taking
 //! writes: another primary replaced it.
 //!
-//! Not here yet: a replica the primary's log no longer reaches needs a
-//! copy of the primary (start it from a checkpoint), and replacing a
-//! primary by one of its replicas.
+//! A replica the primary's log no longer reaches is sent a copy of the
+//! primary (`Restore`): a checkpoint, written beside the primary's
+//! database and streamed in chunks, which the replica writes beside its
+//! own, opens, and puts in place of its rows, numbers and terms in one
+//! commit ([`strata::storage::Database::install_copy`]). It then follows
+//! from the copy's last transaction, which the primary's log holds until
+//! the replica has caught up ([`strata::storage::Database::hold_log`]). A
+//! replica whose history differs from the primary's is not copied: the
+//! error says so.
+//!
+//! Not here yet: replacing a primary by one of its replicas.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
 use strata::db::Db;
-use strata::storage::{Applied, LogRead, SeqNo};
+use strata::storage::{Applied, CheckpointOptions, Database, DbOptions, Layout, LogRead, SeqNo};
 use tokio::sync::watch;
 
 use crate::auth::Secret;
@@ -100,8 +108,14 @@ pub struct PrimaryOptions {
     pub heartbeat: Duration,
     /// The longest wait before calling a replica that failed again.
     pub retry_max: Duration,
-    /// How long a call may take.
+    /// How long a call may take. A copy may take a second more for each
+    /// MiB it holds.
     pub call_timeout: Duration,
+    /// The bytes of a copy each `Restore` chunk carries.
+    pub copy_chunk_bytes: usize,
+    /// How long to wait before sending a replica a copy again after one
+    /// failed: each copy writes a checkpoint of the database.
+    pub copy_retry: Duration,
 }
 
 impl Default for PrimaryOptions {
@@ -115,6 +129,8 @@ impl Default for PrimaryOptions {
             heartbeat: Duration::from_secs(1),
             retry_max: Duration::from_secs(2),
             call_timeout: Duration::from_secs(10),
+            copy_chunk_bytes: 1 << 20,
+            copy_retry: Duration::from_secs(30),
         }
     }
 }
@@ -177,6 +193,49 @@ fn conflict(message: String) -> ApiError {
     ApiError { status: 409, message }
 }
 
+/// A path beside the database at `db` for a copy of it, which no other
+/// copy has.
+fn beside(db: &Path, what: &str) -> PathBuf {
+    let name = db.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    db.with_file_name(format!(".{name}.{what}-{}", new_id()))
+}
+
+/// Removes the copy at its path, and its log, when dropped.
+struct Removed(PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let mut wal = self.0.as_os_str().to_owned();
+        wal.push("-wal");
+        for p in [self.0.as_path(), Path::new(&wal)] {
+            match std::fs::remove_file(p) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!(path = %p.display(), error = %e, "could not remove a copy of the database"),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Keeps a primary's transactions from a number on in its ship log until
+/// dropped ([`strata::storage::Database::hold_log`]).
+struct LogHold {
+    db: Arc<Db>,
+    id: u64,
+}
+
+impl LogHold {
+    fn new(db: Arc<Db>, from: u64) -> LogHold {
+        let id = db.storage().hold_log(from);
+        LogHold { db, id }
+    }
+}
+
+impl Drop for LogHold {
+    fn drop(&mut self) {
+        self.db.storage().release_log(self.id);
+    }
+}
+
 /// A replica, as its primary sees it.
 struct Follower {
     url: String,
@@ -189,6 +248,10 @@ struct Follower {
     /// Transactions it applied from this primary, and calls that failed.
     shipped: AtomicU64,
     failures: AtomicU64,
+    /// Whether it is being sent a copy of the primary, and the copies it
+    /// installed.
+    copying: AtomicBool,
+    copies: AtomicU64,
 }
 
 impl Follower {
@@ -262,6 +325,8 @@ impl Primary {
                     error: Mutex::new(None),
                     shipped: AtomicU64::new(0),
                     failures: AtomicU64::new(0),
+                    copying: AtomicBool::new(false),
+                    copies: AtomicU64::new(0),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -366,7 +431,10 @@ impl Primary {
             .followers
             .iter()
             .map(|f| {
-                let mut j = json!({"url": f.url, "seq_no": f.acked(), "behind": last.saturating_sub(f.acked()), "in_sync": f.in_sync()});
+                let mut j = json!({
+                    "url": f.url, "seq_no": f.acked(), "behind": last.saturating_sub(f.acked()), "in_sync": f.in_sync(),
+                    "copying": f.copying.load(Ordering::Relaxed), "copies": f.copies.load(Ordering::Relaxed),
+                });
                 if let Some(e) = f.error() {
                     j["error"] = json!(e);
                 }
@@ -394,18 +462,22 @@ impl Primary {
             Family { name: "strata_replica_behind", ty: "gauge", help: "Transactions the primary committed that a replica does not hold yet.", values: by(&|f| last.saturating_sub(f.acked()) as f64) },
             Family { name: "strata_replica_shipped_total", ty: "counter", help: "Transactions a replica applied from this primary.", values: by(&|f| f.shipped.load(Ordering::Relaxed) as f64) },
             Family { name: "strata_replica_failures_total", ty: "counter", help: "Calls to a replica that failed or that it refused.", values: by(&|f| f.failures.load(Ordering::Relaxed) as f64) },
+            Family { name: "strata_replica_copies_total", ty: "counter", help: "Copies of the primary a replica the log no longer reached installed.", values: by(&|f| f.copies.load(Ordering::Relaxed) as f64) },
         ]
     }
 }
 
 /// Ships `p`'s transactions to its replica `k` until `p` is dropped:
 /// asks the replica its last transaction, sends what follows in batches,
-/// and calls it every heartbeat while there is nothing to send.
+/// sends it a copy of the primary when the log no longer reaches it, and
+/// calls it every heartbeat while there is nothing to send.
 async fn ship(p: Weak<Primary>, k: usize) {
     let Some(mut committed) = p.upgrade().map(|p| p.committed.subscribe()) else { return };
     // The next number to send; `None` until the replica said its last.
     let mut next: Option<u64> = None;
     let mut retry = Duration::from_millis(50);
+    // What follows a copy, kept until the replica has it.
+    let mut _hold: Option<LogHold> = None;
     loop {
         let Some(p) = p.upgrade() else { return };
         let f = &p.followers[k];
@@ -413,56 +485,76 @@ async fn ship(p: Weak<Primary>, k: usize) {
         let last = numbering.seq;
         let from = next.unwrap_or(last + 1);
         let txns = match from > last {
-            true => Vec::new(),
+            true => Some(Vec::new()),
             false => match p.db.storage().log_from(from, p.opts.batch_bytes) {
-                LogRead::Txns(t) => t,
-                LogRead::Gone { oldest } => {
-                    f.drop_out(format!(
-                        "it holds transactions up to {}, and this primary keeps them from {oldest} on: it needs a copy of the primary (start it from a checkpoint of the primary)",
-                        from - 1
-                    ));
-                    p.changed();
-                    next = None;
-                    let wait = p.opts.retry_max;
-                    drop(p);
-                    tokio::time::sleep(wait).await;
-                    continue;
-                }
+                LogRead::Txns(t) => Some(t),
+                LogRead::Gone { .. } => None,
             },
         };
-        let prev = SeqNo { term: numbering.term_at(from - 1), seq: from - 1 };
-        let end = txns.last().map_or(prev.seq, |t| t.seq.seq);
-        let n = txns.len() as u64;
-        let req = pb::ReplicateRequest {
-            term: numbering.term,
-            prev_term: prev.term,
-            prev_seq: prev.seq,
-            txns: txns.iter().map(|t| t.bytes.to_vec()).collect(),
-            global_checkpoint: p.global_checkpoint(),
-            primary: p.id.clone(),
+        // What it answered, the transactions sent and the last of them
+        // (none for a copy).
+        let (answer, n, end) = match txns {
+            Some(txns) => {
+                let prev = SeqNo { term: numbering.term_at(from - 1), seq: from - 1 };
+                let end = txns.last().map_or(prev.seq, |t| t.seq.seq);
+                let n = txns.len() as u64;
+                let req = pb::ReplicateRequest {
+                    term: numbering.term,
+                    prev_term: prev.term,
+                    prev_seq: prev.seq,
+                    txns: txns.iter().map(|t| t.bytes.to_vec()).collect(),
+                    global_checkpoint: p.global_checkpoint(),
+                    primary: p.id.clone(),
+                };
+                drop(txns);
+                let mut c = f.client.clone();
+                let answer = match tokio::time::timeout(p.opts.call_timeout, c.replicate(req)).await {
+                    Ok(Ok(r)) => Ok(r.into_inner()),
+                    Ok(Err(s)) => Err(format!("{}: {}", crate::grpc::code_name(s.code()), s.message())),
+                    Err(_) => Err(format!("no answer within {} s", p.opts.call_timeout.as_secs())),
+                };
+                (answer, n, Some(end))
+            }
+            None => {
+                f.drop_out(format!("it holds transactions up to {}, and this primary's log no longer reaches them: it is sent a copy of the primary", from - 1));
+                p.changed();
+                f.copying.store(true, Ordering::Relaxed);
+                // The copy holds at least what was committed by now.
+                _hold = Some(LogHold::new(p.db.clone(), last + 1));
+                let answer = send_copy(&p, f, numbering.term).await;
+                f.copying.store(false, Ordering::Relaxed);
+                (answer.map_err(|e| format!("sending it a copy of the primary failed: {e}")), 0, None)
+            }
         };
-        drop(txns);
-        let mut c = f.client.clone();
-        let failed = match tokio::time::timeout(p.opts.call_timeout, c.replicate(req)).await {
-            Ok(Ok(r)) => {
-                let r = r.into_inner();
+        let failed = match answer {
+            Ok(r) => {
                 if r.replica_term > numbering.term {
                     p.fenced.fetch_max(r.replica_term, Ordering::Relaxed);
                     tracing::error!(replica = %f.url, term = numbering.term, replica_term = r.replica_term, "a replica holds a newer term: another primary replaced this one, which takes no more writes");
                     Some(format!("it holds term {}, newer than this primary's ({}): another primary replaced this one", r.replica_term, numbering.term))
                 } else if r.matched {
-                    debug_assert_eq!(r.seq, end);
+                    debug_assert!(end.is_none_or(|e| e == r.seq));
                     f.acked.store(r.seq, Ordering::Relaxed);
                     f.shipped.fetch_add(n, Ordering::Relaxed);
+                    if end.is_none() {
+                        f.copies.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(replica = %f.url, seq_no = r.seq, "a replica installed a copy of the primary");
+                    }
                     next = Some(r.seq + 1);
-                    // It holds what was committed when the batch was read.
-                    if end >= last {
+                    // It holds what was committed when the batch was read
+                    // (the copy, taken after that, holds more).
+                    if r.seq >= last {
                         f.caught_up();
+                        // Shipped up to the last, and not just copied: what
+                        // followed the copy is no longer needed.
+                        if end.is_some() {
+                            _hold = None;
+                        }
                     }
                     p.changed();
                     retry = Duration::from_millis(50);
                     None
-                } else if r.seq <= last && numbering.term_at(r.seq) == r.term {
+                } else if end.is_some() && r.seq <= last && numbering.term_at(r.seq) == r.term {
                     // It holds a run of this primary's history: send what
                     // follows its last.
                     f.acked.store(r.seq, Ordering::Relaxed);
@@ -475,15 +567,16 @@ async fn ship(p: Weak<Primary>, k: usize) {
                     ))
                 }
             }
-            Ok(Err(s)) => Some(format!("{}: {}", crate::grpc::code_name(s.code()), s.message())),
-            Err(_) => Some(format!("no answer within {} s", p.opts.call_timeout.as_secs())),
+            Err(why) => Some(why),
         };
         if let Some(why) = failed {
             f.failures.fetch_add(1, Ordering::Relaxed);
             f.drop_out(why);
             p.changed();
             next = None;
-            let wait = retry;
+            _hold = None;
+            // A copy is a checkpoint of the database: not again at once.
+            let wait = if end.is_none() { p.opts.copy_retry } else { retry };
             retry = (retry * 2).min(p.opts.retry_max);
             drop(p);
             tokio::time::sleep(wait).await;
@@ -494,6 +587,53 @@ async fn ship(p: Weak<Primary>, k: usize) {
             drop(p);
             let _ = tokio::time::timeout(beat, committed.changed()).await;
         }
+    }
+}
+
+/// Sends replica `f` a copy of `p`'s database (`Restore`) under `term`: a
+/// checkpoint written beside the database and removed once sent, in
+/// chunks. Returns the replica's answer.
+async fn send_copy(p: &Primary, f: &Follower, term: u64) -> Result<pb::ReplicateResponse, String> {
+    let path = beside(p.db.storage().path(), "copy");
+    let _removed = Removed(path.clone());
+    let (db, to) = (p.db.clone(), path.clone());
+    tokio::task::spawn_blocking(move || db.storage().checkpoint(&to, &CheckpointOptions::default()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("checkpoint: {e}"))?;
+    let mut file = std::fs::File::open(&path).map_err(|e| format!("open the checkpoint: {e}"))?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    // A thread reads the file a chunk ahead of the call.
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let (chunk, primary) = (p.opts.copy_chunk_bytes.max(1), p.id.clone());
+    let at = path.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut first = Some((term, primary, size));
+        let mut sent = 0;
+        loop {
+            let mut data = Vec::with_capacity(chunk);
+            if let Err(e) = (&mut file).take(chunk as u64).read_to_end(&mut data) {
+                // The replica finds the copy short.
+                tracing::warn!(path = %at.display(), error = %e, "could not read the checkpoint to copy");
+                return;
+            }
+            if data.is_empty() && first.is_none() {
+                return;
+            }
+            sent += data.len() as u64;
+            let (term, primary, said) = first.take().unwrap_or_default();
+            if tx.blocking_send(pb::RestoreChunk { term, primary, size: said, data }).is_err() || sent >= size {
+                return;
+            }
+        }
+    });
+    let timeout = p.opts.call_timeout + Duration::from_secs(size >> 20);
+    let mut c = f.client.clone();
+    match tokio::time::timeout(timeout, c.restore(tokio_stream::wrappers::ReceiverStream::new(rx))).await {
+        Ok(Ok(r)) => Ok(r.into_inner()),
+        Ok(Err(s)) => Err(format!("{}: {}", crate::grpc::code_name(s.code()), s.message())),
+        Err(_) => Err(format!("no answer within {} s", timeout.as_secs())),
     }
 }
 
@@ -508,8 +648,10 @@ pub struct Follow {
     kept: tokio::sync::Mutex<Kept>,
     /// The global checkpoint its primary last sent.
     global_checkpoint: AtomicU64,
-    /// Transactions applied, and when its primary last called.
+    /// Transactions applied, copies of the primary installed, and when its
+    /// primary last called.
     applied: AtomicU64,
+    restores: AtomicU64,
     called_at: Mutex<Option<Instant>>,
 }
 
@@ -521,7 +663,7 @@ impl Follow {
             return Err("a replica numbers its writes as its primary does: start it with --seq-no".into());
         }
         let kept = Kept::open(file)?;
-        Ok(Follow { db, file: file.map(Path::to_path_buf), kept: tokio::sync::Mutex::new(kept), global_checkpoint: AtomicU64::new(0), applied: AtomicU64::new(0), called_at: Mutex::new(None) })
+        Ok(Follow { db, file: file.map(Path::to_path_buf), kept: tokio::sync::Mutex::new(kept), global_checkpoint: AtomicU64::new(0), applied: AtomicU64::new(0), restores: AtomicU64::new(0), called_at: Mutex::new(None) })
     }
 
     /// The primary it follows, if one has called.
@@ -538,18 +680,7 @@ impl Follow {
         if r.term < term {
             return Ok(answer(false, numbering.last(), term));
         }
-        match &kept.follows {
-            Some((id, t)) if *t == r.term && *id != r.primary => {
-                return Err(conflict(format!("this replica follows primary {id} in term {t}, and primary {} ships in the same term: a shard has one primary in a term", r.primary)));
-            }
-            Some((_, t)) if *t == r.term => {}
-            _ => {
-                let next = Kept { follows: Some((r.primary.clone(), r.term)), ..kept.clone() };
-                next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the primary followed: {e}")))?;
-                *kept = next;
-            }
-        }
-        *self.called_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        self.follow(&mut kept, &r.primary, r.term)?;
         let (db, prev, txns) = (self.db.clone(), SeqNo { term: r.prev_term, seq: r.prev_seq }, r.txns);
         let n = txns.len() as u64;
         let applied = tokio::task::spawn_blocking(move || {
@@ -570,11 +701,97 @@ impl Follow {
         })
     }
 
+    /// Follows `primary` in `term`, which is not older than this
+    /// replica's, keeping it on disk: refused when another primary is
+    /// followed in the same term.
+    fn follow(&self, kept: &mut Kept, primary: &str, term: u64) -> Result<(), ApiError> {
+        match &kept.follows {
+            Some((id, t)) if *t == term && id != primary => {
+                return Err(conflict(format!("this replica follows primary {id} in term {t}, and primary {primary} ships in the same term: a shard has one primary in a term")));
+            }
+            Some((_, t)) if *t == term => {}
+            _ => {
+                let next = Kept { follows: Some((primary.to_string(), term)), ..kept.clone() };
+                next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the primary followed: {e}")))?;
+                *kept = next;
+            }
+        }
+        *self.called_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Puts the copy of its primary that `chunks` carry (`Restore`) in
+    /// place of its database: writes it beside the database, opens it,
+    /// checking every segment's checksum, and installs it in one commit
+    /// ([`strata::storage::Database::install_copy`]). The primary's term
+    /// is checked as [`Follow::replicate`] checks it. Answers the copy's
+    /// last transaction.
+    pub async fn restore(&self, mut chunks: tonic::Streaming<pb::RestoreChunk>) -> Result<pb::ReplicateResponse, ApiError> {
+        let cut = |s: tonic::Status| ApiError::bad(format!("the copy was cut off: {}", s.message()));
+        let first = chunks.message().await.map_err(cut)?.ok_or_else(|| ApiError::bad("the copy is empty"))?;
+        let mut kept = self.kept.lock().await;
+        let numbering = self.db.storage().numbering().ok_or_else(|| ApiError::internal("the replica does not number its writes"))?;
+        let term = numbering.term.max(kept.follows.as_ref().map_or(0, |f| f.1));
+        if first.term < term {
+            return Ok(pb::ReplicateResponse { matched: false, seq: numbering.seq, term: numbering.last().term, replica_term: term });
+        }
+        self.follow(&mut kept, &first.primary, first.term)?;
+        let path = beside(self.db.storage().path(), "restore");
+        let _removed = Removed(path.clone());
+        let size = first.size;
+        let mut file = std::fs::File::create_new(&path).map_err(|e| ApiError::internal(format!("write the copy beside the database: {e}")))?;
+        let (mut got, mut data) = (0u64, Some(first.data));
+        loop {
+            let d = match data.take() {
+                Some(d) => d,
+                None => match chunks.message().await.map_err(cut)? {
+                    Some(c) => c.data,
+                    None => break,
+                },
+            };
+            got += d.len() as u64;
+            if got > size {
+                return Err(ApiError::bad(format!("the copy is longer than the {size} bytes it said")));
+            }
+            file = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                file.write_all(&d).map(|_| file)
+            })
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(|e| ApiError::internal(format!("write the copy beside the database: {e}")))?;
+        }
+        if got != size {
+            return Err(ApiError::bad(format!("the copy ended at {got} of its {size} bytes")));
+        }
+        let db = self.db.clone();
+        let at = tokio::task::spawn_blocking(move || {
+            file.sync_all().map_err(|e| ApiError::internal(format!("write the copy beside the database: {e}")))?;
+            drop(file);
+            let copy = Database::open(&path, DbOptions { layout: Layout::SingleFile, verify_checksums: true, ..DbOptions::default() }).map_err(|e| ApiError::bad(format!("the copy: {e}")))?;
+            // Opening falls back past a damaged version; a copy must not.
+            if let Some(what) = copy.damaged() {
+                return Err(ApiError::bad(format!("the copy is damaged: {what}")));
+            }
+            // A flush or a merge may hold the writer for a moment.
+            crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.storage().install_copy(&copy).map_err(ApiError::from))
+        })
+        .await
+        .map_err(ApiError::internal)??;
+        self.restores.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(primary = %first.primary, seq_no = at.seq, "installed a copy of the primary");
+        let replica_term = self.db.storage().numbering().map_or(0, |n| n.term).max(first.term);
+        Ok(pb::ReplicateResponse { matched: true, seq: at.seq, term: at.term, replica_term })
+    }
+
     /// What `/v1/health` shows of replication.
     pub async fn health(&self) -> Json {
         let kept = self.kept.lock().await.clone();
         let n = self.db.storage().numbering().unwrap_or_default();
-        let mut h = json!({"role": "replica", "id": kept.id, "term": n.term, "seq_no": n.seq, "global_checkpoint": self.global_checkpoint.load(Ordering::Relaxed)});
+        let mut h = json!({
+            "role": "replica", "id": kept.id, "term": n.term, "seq_no": n.seq, "global_checkpoint": self.global_checkpoint.load(Ordering::Relaxed),
+            "restores": self.restores.load(Ordering::Relaxed),
+        });
         if let Some((primary, term)) = kept.follows {
             h["follows"] = json!({"primary": primary, "term": term});
         }
@@ -589,6 +806,7 @@ impl Follow {
             Family::one("strata_replication_role", "gauge", "1 on a primary (--replicas), 2 on a replica (--replica).", 2.0),
             Family::one("strata_global_checkpoint", "gauge", "The highest sequence number every in-sync replica holds, as the primary last said.", self.global_checkpoint.load(Ordering::Relaxed) as f64),
             Family::one("strata_replica_applied_total", "counter", "Transactions this replica applied from its primary.", self.applied.load(Ordering::Relaxed) as f64),
+            Family::one("strata_replica_restores_total", "counter", "Copies of its primary this replica installed.", self.restores.load(Ordering::Relaxed) as f64),
         ]
     }
 }

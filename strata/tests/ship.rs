@@ -242,6 +242,14 @@ fn a_replica_applies_only_what_follows() {
     assert_eq!(last(&replica).seq, 3, "nothing of a refused batch");
     assert!(replica.storage().apply_shipped(prev(&primary, 3), &[&log[3].bytes[..20]]).is_err());
     assert_eq!(replica.storage().apply_shipped(prev(&primary, 3), &bytes(3..6)).unwrap(), Applied::At(SeqNo { term: 1, seq: 6 }));
+    // Asking its last needs no writer, which a flush or a merge may hold;
+    // a batch waits for it.
+    {
+        let _held = replica.storage().begin().unwrap();
+        assert_eq!(replica.storage().apply_shipped(prev(&primary, 6), &[]).unwrap(), Applied::At(SeqNo { term: 1, seq: 6 }));
+        assert_eq!(replica.storage().apply_shipped(prev(&primary, 5), &[]).unwrap(), Applied::Mismatch { seq: 6, term: 1 });
+        assert!(matches!(replica.storage().apply_shipped(prev(&primary, 6), &bytes(5..6)), Err(strata::Error::Busy(_))));
+    }
 
     // An old primary: a copy that went on under term 1 after the primary
     // began term 2.
@@ -382,4 +390,119 @@ fn the_commit_hook_hears_every_number() {
     assert_eq!(primary.storage().file_stats().segments.len(), 1, "a commit flushed");
     ship(&primary, &replica, usize::MAX);
     assert_eq!(numbers("replica"), [1, 2, 3, 4, 5]);
+}
+
+/// A replica the primary's log no longer reaches takes a copy of the
+/// primary (a checkpoint) in place of its rows, numbers and terms, in
+/// either layout, and then applies what the primary ships from the copy's
+/// last transaction on. Snapshots taken before read what they read, the
+/// replica's own log is emptied, and a merge building meanwhile installs
+/// nothing; a copy of other tables, of an older term or not numbered is
+/// refused.
+#[test]
+fn a_replica_takes_a_copy_of_its_primary() {
+    for (seed, pl, rl) in [(4, Layout::SingleFile, Layout::Directory), (5, Layout::Directory, Layout::SingleFile)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (pp, rp) = (path_for(dir.path(), "primary", pl), path_for(dir.path(), "replica", rl));
+        let ro = options(rl);
+        let primary = Db::create(&pp, schema(), options(pl)).unwrap();
+        let mut replica = Db::create(&rp, schema(), ro.clone()).unwrap();
+        for db in [&primary, &replica] {
+            db.create_table(other()).unwrap();
+            db.storage().start_seq_no().unwrap();
+        }
+        let mut rng = StdRng::seed_from_u64(seed);
+        for _ in 0..60 {
+            write(&primary, &mut rng, 200);
+        }
+        ship(&primary, &replica, usize::MAX);
+        // The replica falls behind: flushed and merged on both sides, a
+        // new term, values set in place and deleted rows in segments, and
+        // more in the memtables.
+        replica.storage().flush().unwrap();
+        for _ in 0..60 {
+            write(&primary, &mut rng, 200);
+        }
+        primary.storage().flush().unwrap();
+        primary.storage().merge(&MergePolicy { merge_factor: 2, floor_docs: 1_000, ..MergePolicy::default() }).unwrap();
+        primary.storage().begin_term(2).unwrap();
+        for _ in 0..40 {
+            write(&primary, &mut rng, 200);
+        }
+        primary.storage().flush().unwrap();
+        for _ in 0..20 {
+            write(&primary, &mut rng, 200);
+        }
+        for _ in 0..20 {
+            write(&replica, &mut rng, 200);
+        }
+        replica.storage().flush().unwrap();
+        // Its own transactions end at the primary's last number, which its
+        // log would run on from if it kept it.
+        while last(&replica).seq < last(&primary).seq {
+            write(&replica, &mut rng, 200);
+        }
+        let before = replica.snapshot();
+        let read_before: Vec<Document> = replica.documents(&before).map(|d| d.unwrap()).collect();
+        assert_ne!(documents(&replica), documents(&primary));
+
+        let to = path_for(dir.path(), "copy", Layout::SingleFile);
+        primary.storage().checkpoint(&to, &CheckpointOptions::default()).unwrap();
+        let copy = Db::open(&to, options(Layout::SingleFile)).unwrap();
+        // Installed while a merge of the replica's segments is building.
+        let mut installed = None;
+        replica
+            .storage()
+            .merge_with(&MergePolicy { merge_factor: 2, floor_docs: 1_000, ..MergePolicy::default() }, || {
+                installed.get_or_insert_with(|| replica.storage().install_copy(copy.storage()).unwrap());
+                true
+            })
+            .unwrap();
+        assert_eq!(installed, Some(last(&primary)), "seed {seed}: a merge built, and the copy was installed meanwhile");
+        same(&primary, &replica, &format!("seed {seed}: copied"));
+        assert_eq!(replica.documents(&before).map(|d| d.unwrap()).collect::<Vec<_>>(), read_before, "a snapshot from before reads what it read");
+        let at = last(&replica).seq;
+        assert_eq!(replica.storage().log_from(at, usize::MAX), LogRead::Gone { oldest: at + 1 }, "its own transactions are not shipped on");
+
+        // It follows from the copy, and is the same opened again.
+        for _ in 0..30 {
+            write(&primary, &mut rng, 200);
+        }
+        assert!(ship(&primary, &replica, 2_000) > 0);
+        same(&primary, &replica, &format!("seed {seed}: shipped after the copy"));
+        assert_eq!(replica.storage().log_from(1, usize::MAX), LogRead::Gone { oldest: at + 1 }, "its log starts at the copy");
+        drop((before, replica));
+        replica = Db::open(&rp, ro.clone()).unwrap();
+        same(&primary, &replica, &format!("seed {seed}: opened again"));
+        replica.storage().check().unwrap();
+        write(&primary, &mut rng, 200);
+        ship(&primary, &replica, usize::MAX);
+        same(&primary, &replica, &format!("seed {seed}: and shipped to"));
+
+        // Refused, changing nothing.
+        let refused = |copy: &Db, why: &str| {
+            let e = replica.storage().install_copy(copy.storage()).unwrap_err().to_string();
+            assert!(e.contains(why), "{e}");
+            same(&primary, &replica, why);
+        };
+        let lone = Db::create(&dir.path().join("lone.strata"), schema(), options(Layout::SingleFile)).unwrap();
+        lone.storage().start_seq_no().unwrap();
+        refused(&lone, "the copy's tables (t) are not this database's (t, u)");
+        lone.create_table(other()).unwrap();
+        refused(&lone, "the copy is of term 1, older than this database's (2)");
+        let plain = Db::create(&dir.path().join("plain.strata"), schema(), options(Layout::SingleFile)).unwrap();
+        plain.create_table(other()).unwrap();
+        refused(&plain, "the copy does not number its writes");
+        refused(&replica, "not a copy of itself");
+
+        // What a copy holds in its memtables comes too.
+        let to = path_for(dir.path(), "copy2", Layout::SingleFile);
+        primary.storage().checkpoint(&to, &CheckpointOptions::default()).unwrap();
+        let copy = Db::open(&to, options(Layout::SingleFile)).unwrap();
+        for _ in 0..5 {
+            write(&copy, &mut rng, 200);
+        }
+        assert_eq!(replica.storage().install_copy(copy.storage()).unwrap(), last(&copy));
+        same(&copy, &replica, &format!("seed {seed}: a copy with rows in its memtables"));
+    }
 }

@@ -15,9 +15,10 @@
 // shards' replicas.
 //
 // Replication takes no protocol version: a primary ships its writes to its
-// replicas with `Replicate`, which a server from before it answers
-// Unimplemented, and `Hello` names a server's role, which an older one
-// leaves out (STANDALONE).
+// replicas with `Replicate`, and sends a copy of itself to one its log no
+// longer reaches with `Restore`, which a server from before them answers
+// Unimplemented; `Hello` names a server's role, which an older one leaves
+// out (STANDALONE).
 syntax = "proto3";
 
 package strata.v1;
@@ -47,6 +48,21 @@ service Strata {
   // a replica (--replica), which applies them in order under the
   // primary's term and numbers.
   rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+  // Replication: a primary sends a replica that its log no longer reaches
+  // a copy of its database (a checkpoint, in chunks). The replica puts the
+  // copy's rows, numbers and terms in place of its own in one commit, and
+  // answers its last transaction, which is the copy's.
+  rpc Restore(stream RestoreChunk) returns (ReplicateResponse);
+}
+
+message RestoreChunk {
+  // In the first chunk: the primary's term and id, which the replica
+  // checks as it checks a ReplicateRequest's, and the copy's length.
+  uint64 term = 1;
+  string primary = 2;
+  uint64 size = 3;
+  // The copy's next bytes: a checkpoint of the primary in one file.
+  bytes data = 4;
 }
 
 message ReplicateRequest {
