@@ -10,6 +10,7 @@ once, and a database someone wrote with that version looks the same.
 | `format1/` | 1, one table | main 6b85211, before a database could hold several tables ([its README](format1/README.md)) | `tests/storage_tables.rs` |
 | `format2/` | 2, two tables | 835ca9a | `tests/format_fixtures.rs` |
 | `format3/` | 3, with `analyzer:simple:1`, `bool`, `default`, `not_null` and `timestamp` | 835ca9a | `tests/format_fixtures.rs` |
+| `seqno/` | 3, with `seq_no`: numbered writes, and a numbered WAL (`STRWAL02`) | 51211f5 | `tests/format_fixtures.rs` |
 
 `format2/`, `format3/` and `seqno/` each hold `db.strata` (with its WAL,
 `db.strata-wal`) and `db.dir`: the same writes in the single-file and the
