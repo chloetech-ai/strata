@@ -13,6 +13,11 @@
 // `Hello` (a server that answers Unimplemented speaks 1) and speaks the
 // newest both know; a coordinator speaks the oldest of those among its
 // shards' replicas.
+//
+// Replication takes no protocol version: a primary ships its writes to its
+// replicas with `Replicate`, which a server from before it answers
+// Unimplemented, and `Hello` names a server's role, which an older one
+// leaves out (STANDALONE).
 syntax = "proto3";
 
 package strata.v1;
@@ -38,6 +43,42 @@ service Strata {
   // map of the same epoch, or while rows here have keys in other shards'
   // slots under the map.
   rpc Slots(SlotsRequest) returns (SlotsResponse);
+  // Replication: a primary (--replicas) ships its numbered transactions to
+  // a replica (--replica), which applies them in order under the
+  // primary's term and numbers.
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+}
+
+message ReplicateRequest {
+  // The primary's term. A replica whose term is newer applies nothing and
+  // says so (ReplicateResponse.replica_term): another primary replaced
+  // this one.
+  uint64 term = 1;
+  // The term and number of the transaction before the first of `txns`
+  // (0 and 0 before the first numbered one). The replica applies them
+  // only if that is its last transaction.
+  uint64 prev_term = 2;
+  uint64 prev_seq = 3;
+  // Transactions as the primary logged them, in order: each its WAL
+  // records, its commit record last. None: a heartbeat, which asks the
+  // replica's last transaction.
+  repeated bytes txns = 4;
+  // The highest number every in-sync replica holds.
+  uint64 global_checkpoint = 5;
+  // The primary's id. A replica follows one primary per term, and refuses
+  // another of the same term.
+  string primary = 6;
+}
+
+message ReplicateResponse {
+  // Whether the transaction before the first was the replica's last, so
+  // that it applied them all.
+  bool matched = 1;
+  // The replica's last transaction after the call, and its term.
+  uint64 seq = 2;
+  uint64 term = 3;
+  // The term the replica is at.
+  uint64 replica_term = 4;
 }
 
 message SlotsRequest {
@@ -74,6 +115,21 @@ message HelloResponse {
   string server = 5;
   // The epoch of the slot map it holds; 0 without one.
   uint64 slot_epoch = 6;
+  // Its part in replication: a coordinator sends a shard's writes to its
+  // primary alone, and to every replica while none has a role.
+  Role role = 7;
+  // Its term and last sequence number, when it numbers its writes.
+  uint64 term = 8;
+  uint64 seq_no = 9;
+}
+
+enum Role {
+  // Not replicated: its writes are its own.
+  STANDALONE = 0;
+  // Ships its writes to its replicas (--replicas).
+  PRIMARY = 1;
+  // Applies its primary's writes and takes none from clients (--replica).
+  REPLICA = 2;
 }
 
 message Empty {}

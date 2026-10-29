@@ -599,6 +599,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn slots(&self, _: tonic::Request<pb::SlotsRequest>) -> Result<tonic::Response<pb::SlotsResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::SlotsResponse { epoch: 1 }))
     }
+    async fn replicate(&self, _: tonic::Request<pb::ReplicateRequest>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not a replica"))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -629,6 +632,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn slots(&self, _: tonic::Request<pb::SlotsRequest>) -> Result<tonic::Response<pb::SlotsResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::SlotsResponse { epoch: 1 }))
+    }
+    async fn replicate(&self, _: tonic::Request<pb::ReplicateRequest>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not a replica"))
     }
 }
 
@@ -844,6 +850,10 @@ impl pb::strata_server::Strata for Recording {
             4.. => self.inner.slots(r).await,
             _ => Err(tonic::Status::unimplemented("unknown method Slots")),
         }
+    }
+    async fn replicate(&self, r: tonic::Request<pb::ReplicateRequest>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.replicate(r).await
     }
 }
 

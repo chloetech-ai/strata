@@ -13,7 +13,8 @@ use tokio::net::TcpListener;
 
 use crate::auth::{self, Access};
 use crate::coord::{CoordOptions, Coordinator};
-use crate::service::{shard_of, AgentConfig, Backend, Service};
+use crate::replication::{self, Acks, Follow, Primary, PrimaryOptions};
+use crate::service::{shard_of, AgentConfig, Backend, Replication, Service};
 use crate::{demo, grpc, http, pb};
 
 #[derive(Clone, Debug, Default)]
@@ -40,6 +41,18 @@ pub struct Options {
     /// for `seq_no()` and conditional writes (`if_seq_no`); once started,
     /// for good.
     pub seq_no: bool,
+    /// Ship the database's writes to these replicas (gRPC URLs of servers
+    /// started with `replica`), as their primary
+    /// ([`crate::replication`]); the replicas' token and CA are
+    /// `coord.token` and `coord.ca`.
+    pub replicas: Vec<String>,
+    /// Apply the writes a primary ships, and take none from clients.
+    pub replica: bool,
+    /// With `replicas`: which copies hold a write before it is answered.
+    pub write_acks: Acks,
+    /// On a primary or a replica: the latest transactions kept to ship, in
+    /// MiB (0: 64).
+    pub ship_log_mb: usize,
     /// Coordinate these shard servers (gRPC URLs; replicas of a shard
     /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
@@ -111,6 +124,18 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if o.seq_no && !o.shards.is_empty() {
         return Err("--seq-no numbers a database's writes: start each shard server with it, not the coordinator".into());
     }
+    let replicating = !o.replicas.is_empty() || o.replica;
+    if replicating && !o.shards.is_empty() {
+        return Err("--replicas and --replica are for the servers holding a shard's copies, not the coordinator".into());
+    }
+    if !o.replicas.is_empty() && o.replica {
+        return Err("a server is a primary (--replicas) or a replica (--replica), not both".into());
+    }
+    let ship_log_bytes = match replicating {
+        true => (if o.ship_log_mb > 0 { o.ship_log_mb } else { 64 }) << 20,
+        false => 0,
+    };
+    let mut replication_file = None;
     let (backend, schema) = if !o.shards.is_empty() {
         // A shard with no replica answering yet (the cluster is starting, or
         // one is down) is waited for; a wrong URL or schema is not.
@@ -131,28 +156,33 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     } else {
         let path = o.db.clone().ok_or("pass --db PATH (or --shards to coordinate shard servers)")?;
         slots_file = Some(crate::slots::file_of(&path));
+        replication_file = Some(replication::file_of(&path));
         if o.copy_from.is_some() && (path.exists() || o.schema.is_none()) {
             return Err("--copy-from fills a new database: pass a --db that does not exist and its --schema".into());
         }
         let db = if path.exists() {
-            let db = Db::open(&path, DbOptions { wal_drop_damaged: o.wal_drop_damaged, verify_checksums: o.verify_checksums, ..db_options(o.directory) }).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let db = Db::open(&path, DbOptions { wal_drop_damaged: o.wal_drop_damaged, verify_checksums: o.verify_checksums, ship_log_bytes, ..db_options(o.directory) })
+                .map_err(|e| format!("open {}: {e}", path.display()))?;
             if let Some(what) = db.storage().damaged() {
                 tracing::warn!(db = %path.display(), damage = %what, "opened the database past damage");
             }
             db
         } else if let Some(n) = o.demo {
             fill = Some(Fill::Demo(n));
-            Db::create(&path, demo::schema(n), db_options(o.directory)).map_err(|e| e.to_string())?
+            Db::create(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
         } else if let Some(s) = &o.schema {
             let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
             let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
             fill = o.copy_from.clone().map(Fill::Copy);
-            Db::create(&path, schema, db_options(o.directory)).map_err(|e| e.to_string())?
+            Db::create(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
         } else {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
         if o.seq_no {
             db.storage().start_seq_no().map_err(|e| format!("--seq-no on {}: {e}", path.display()))?;
+        }
+        if replicating && db.storage().seq_no().is_none() {
+            return Err(format!("{} does not number its writes, which replication ships by: pass --seq-no", path.display()));
         }
         let db = Arc::new(db);
         // Writes go on while a full memtable becomes segments, and while
@@ -220,6 +250,18 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     if let Some(dir) = &o.backup_dir {
         svc.set_backup_dir(dir).map_err(|e| e.message)?;
+    }
+    // Once loaded: bulk loads are not shipped, so every copy loads the same.
+    if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
+        if !o.replicas.is_empty() {
+            let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, token: o.coord.token.clone(), ca: o.coord.ca.clone(), ..Default::default() };
+            let p = Primary::start(db.clone(), Some(file), opts)?;
+            tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
+            svc.replication = Replication::Primary(p);
+        } else if o.replica {
+            svc.replication = Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?));
+            tracing::info!("replica: applies the writes its primary ships, and takes none from clients");
+        }
     }
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);

@@ -699,8 +699,23 @@ handing a query to its shards) are to make instead of writing SQL text.
   a sequence number, logged in its commit record and kept across flushes,
   crashes, checkpoints and reopening, and each row the number of the
   write that last changed it. A replica applies its primary's log
-  transaction by transaction under the primary's numbers (§3.4);
-  strata-server does not ship it yet.
+  transaction by transaction under the primary's numbers (§3.4).
+* **Replication.** A strata-server primary (`--replicas`) ships its ship
+  log to each replica (`--replica`) over gRPC (`Replicate`), a task per
+  replica: a call with no transactions asks the replica's last, and the
+  batches that follow carry the term and number before their first. A
+  mismatch the primary's own history explains (a replica behind) is shipped
+  again from the replica's last; any other means the histories differ, and
+  a replica the log no longer reaches needs a copy of the primary. A write
+  is answered once the copies `--write-acks` names hold it, within its
+  deadline: every replica in sync (`all`, which drops a replica that misses
+  the deadline out of sync), a majority (`majority`, which refuses a write
+  before applying it while too few copies are in sync, and answers 504
+  after, the write durable on the primary), or the primary alone. A
+  replica keeps the id and term of the primary it follows, refuses a second
+  primary of that term, and answers a primary of an older term with its
+  own, which fences that primary. A coordinator learns each copy's role
+  from `Hello` and writes to a shard's primary.
 * **Conditional writes.** `seq_no()` is a column of a query on one table
   (plan feature `seq_no`, so an older shard refuses the plan by name), read
   from the row's segment, its updates or the memtable. strata-server's
@@ -711,16 +726,16 @@ handing a query to its shards) are to make instead of writing SQL text.
   request with 409. Several requests share a group commit, so a conflict
   fails the group and each request is then applied alone, which leaves
   exactly one of the racing writers applied. A coordinator passes both on
-  only while each shard has one replica, since replicas number their writes
-  independently until the log is shipped.
+  while each shard has one replica or a primary, since replicas that each
+  take writes number them independently.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication on top of the shard protocol (WAL shipping,
-catch-up, read-your-writes, promotion), and a coordinator and strata-server
-over every table.
+Next: the rest of replication (catch-up by copying segments,
+read-your-writes and digests, promotion), and a coordinator and
+strata-server over every table.
 
 ## 7. Planning and execution
 

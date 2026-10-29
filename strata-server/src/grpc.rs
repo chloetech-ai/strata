@@ -92,8 +92,8 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 pub const MIN_PROTOCOL: u32 = 1;
 pub const PROTOCOL: u32 = 4;
 
-/// What [`pb::strata_server::Strata::hello`] answers, but the slot map's
-/// epoch, which is the server's.
+/// What [`pb::strata_server::Strata::hello`] answers, but what is the
+/// server's own: its slot map's epoch, role, term and last number.
 pub fn hello() -> pb::HelloResponse {
     pb::HelloResponse {
         min_protocol: MIN_PROTOCOL,
@@ -101,7 +101,7 @@ pub fn hello() -> pb::HelloResponse {
         plan_version: ir::VERSION,
         plan_features: ir::FEATURES.iter().map(|f| f.to_string()).collect(),
         server: format!("strata-server {}", env!("CARGO_PKG_VERSION")),
-        slot_epoch: 0,
+        ..Default::default()
     }
 }
 
@@ -257,7 +257,15 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {
-        self.serve("Hello", req, |svc, _| async move { Ok(pb::HelloResponse { slot_epoch: svc.slot_epoch(), ..hello() }) }).await
+        self.serve("Hello", req, |svc, _| async move {
+            let n = svc.local_db().and_then(|db| db.storage().numbering()).unwrap_or_default();
+            Ok(pb::HelloResponse { slot_epoch: svc.slot_epoch(), role: svc.role() as i32, term: n.term, seq_no: n.seq, ..hello() })
+        })
+        .await
+    }
+
+    async fn replicate(&self, req: Request<pb::ReplicateRequest>) -> Result<Response<pb::ReplicateResponse>, Status> {
+        self.serve("Replicate", req, |svc, r| async move { svc.replicate(r).await }).await
     }
 
     async fn slots(&self, req: Request<pb::SlotsRequest>) -> Result<Response<pb::SlotsResponse>, Status> {

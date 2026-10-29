@@ -33,14 +33,17 @@
 //! is answered from the other shards and says which are missing, and the
 //! queries of the next second leave that shard out without asking it.
 //!
-//! Writes go to the shard of their key, on every replica: the shard
-//! holding its slot ([`crate::slots`]) in the coordinator's slot map, which
-//! it gives every shard when it connects and whose epoch it sends with
-//! every request, so that a shard refuses a coordinator routing by an
-//! older map, and keys another shard holds. UPDATE and DELETE statements
-//! go to every shard. A write that spans
-//! shards is one transaction per replica, not one across them, and a
-//! replica that misses a write (it was down) is not caught up: rebuild it.
+//! Writes go to the shard of their key: the shard holding its slot
+//! ([`crate::slots`]) in the coordinator's slot map, which it gives every
+//! shard when it connects and whose epoch it sends with every request, so
+//! that a shard refuses a coordinator routing by an older map, and keys
+//! another shard holds. UPDATE and DELETE statements go to every shard. A
+//! shard whose replicas replicate (`Hello` names their roles) takes its
+//! writes at its primary, which ships them to the others
+//! ([`crate::replication`]); otherwise every replica takes every write,
+//! and one that misses a write (it was down) is not caught up: rebuild it.
+//! A write that spans shards is one transaction per shard, not one across
+//! them.
 //!
 //! The coordinator asks each replica the protocol versions it speaks
 //! (`Hello`, [`crate::grpc::PROTOCOL`]) when it connects, again every
@@ -51,7 +54,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
@@ -126,7 +129,27 @@ impl tonic::service::Interceptor for Credentials {
     }
 }
 
-type Client = StrataClient<InterceptedService<Channel, Credentials>>;
+pub(crate) type Client = StrataClient<InterceptedService<Channel, Credentials>>;
+
+/// A client of the server at gRPC URL `url`, sending `token` with every
+/// call; an `https://` server's certificate is checked against the public
+/// roots and `ca`. It connects on its first call.
+pub(crate) fn client(url: &str, token: Option<&Secret>, ca: Option<&[u8]>) -> Result<Client, ApiError> {
+    let credentials = match token {
+        Some(t) => Some(format!("Bearer {}", t.0).parse().map_err(|_| ApiError::bad("the shards' token must be printable ASCII"))?),
+        None => None,
+    };
+    let mut ep = Channel::from_shared(url.to_string()).map_err(|e| ApiError::bad(format!("bad shard URL {url}: {e}")))?;
+    if url.starts_with("https://") {
+        let mut tls = tonic::transport::ClientTlsConfig::new().with_webpki_roots();
+        if let Some(ca) = ca {
+            tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(ca));
+        }
+        ep = ep.tls_config(tls).map_err(|e| ApiError::bad(format!("TLS to {url}: {e}")))?;
+    }
+    let ch = ep.connect_timeout(Duration::from_secs(5)).tcp_nodelay(true).connect_lazy();
+    Ok(StrataClient::with_interceptor(ch, Credentials(credentials)).max_decoding_message_size(256 << 20))
+}
 
 /// One server holding a copy of a shard.
 struct Replica {
@@ -138,11 +161,17 @@ struct Replica {
     /// when it said so (ms after [`Coordinator::epoch`]).
     protocol: AtomicU32,
     hello_at: AtomicU64,
+    /// Its part in replication, as it last said ([`pb::Role`]).
+    role: AtomicI32,
 }
 
 impl Replica {
     fn new(url: &str, client: Client) -> Replica {
-        Replica { url: url.to_string(), client, avoid_until: AtomicU64::new(0), protocol: AtomicU32::new(0), hello_at: AtomicU64::new(0) }
+        Replica { url: url.to_string(), client, avoid_until: AtomicU64::new(0), protocol: AtomicU32::new(0), hello_at: AtomicU64::new(0), role: AtomicI32::new(0) }
+    }
+
+    fn role(&self) -> pb::Role {
+        pb::Role::try_from(self.role.load(Ordering::Relaxed)).unwrap_or_default()
     }
 }
 
@@ -158,10 +187,9 @@ pub const FETCH_FROM: usize = 8;
 /// again, so that the coordinator follows a rolling upgrade or a rollback.
 const HELLO_EVERY_MS: u64 = 60_000;
 
-/// Why `seq_no()` and `if_seq_no` need one replica per shard: each
-/// replica numbers the writes it takes in its own order until replication
-/// ships the primary's log.
-const ONE_REPLICA: &str = "seq_no() and if_seq_no need one replica per shard: each replica numbers its own writes until replication ships the primary's log";
+/// Why `seq_no()` and `if_seq_no` need a shard of several replicas to
+/// replicate: otherwise each numbers the writes it takes in its own order.
+const ONE_REPLICA: &str = "seq_no() and if_seq_no need one replica per shard, or a shard whose replicas replicate from a primary (--replicas): otherwise each replica numbers its own writes";
 
 /// The protocol to speak with a server that answered `Hello`: the newest
 /// both speak.
@@ -173,16 +201,23 @@ fn agree(h: &pb::HelloResponse) -> Result<u32, String> {
     Ok(p)
 }
 
-/// Asks a server the protocol to speak with it ([`agree`]) and the epoch
-/// of the slot map it holds. One from before `Hello` (it answers
+/// What a server said to `Hello`: the protocol to speak with it
+/// ([`agree`]), the epoch of the slot map it holds and its role.
+struct Said {
+    protocol: u32,
+    epoch: u64,
+    role: pb::Role,
+}
+
+/// Asks a server what [`Said`] holds. One from before `Hello` (it answers
 /// Unimplemented) speaks protocol 1.
-async fn hello(c: &mut Client) -> Result<(u32, u64), tonic::Status> {
+async fn hello(c: &mut Client) -> Result<Said, tonic::Status> {
     match c.hello(pb::HelloRequest { min_protocol: MIN_PROTOCOL, max_protocol: PROTOCOL }).await {
         Ok(h) => {
             let h = h.into_inner();
-            Ok((agree(&h).map_err(tonic::Status::failed_precondition)?, h.slot_epoch))
+            Ok(Said { protocol: agree(&h).map_err(tonic::Status::failed_precondition)?, epoch: h.slot_epoch, role: h.role() })
         }
-        Err(s) if s.code() == Code::Unimplemented => Ok((1, 0)),
+        Err(s) if s.code() == Code::Unimplemented => Ok(Said { protocol: 1, epoch: 0, role: pb::Role::Standalone }),
         Err(s) => Err(s),
     }
 }
@@ -351,25 +386,11 @@ impl Coordinator {
         if shards.is_empty() {
             return Err(ApiError::bad("a coordinator needs at least one shard"));
         }
-        let credentials = match &opts.token {
-            Some(t) => Some(format!("Bearer {}", t.0).parse().map_err(|_| ApiError::bad("the shards' token must be printable ASCII"))?),
-            None => None,
-        };
-        let mut tls = tonic::transport::ClientTlsConfig::new().with_webpki_roots();
-        if let Some(ca) = &opts.ca {
-            tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(ca));
-        }
         let mut replicas = Vec::new();
         for group in &shards {
             let mut rs = Vec::new();
             for url in group.split('|').map(str::trim).filter(|u| !u.is_empty()) {
-                let mut ep = Channel::from_shared(url.to_string()).map_err(|e| ApiError::bad(format!("bad shard URL {url}: {e}")))?;
-                if url.starts_with("https://") {
-                    ep = ep.tls_config(tls.clone()).map_err(|e| ApiError::bad(format!("TLS to {url}: {e}")))?;
-                }
-                let ch = ep.connect_timeout(Duration::from_secs(5)).tcp_nodelay(true).connect_lazy();
-                let client = StrataClient::with_interceptor(ch, Credentials(credentials.clone())).max_decoding_message_size(256 << 20);
-                rs.push(Replica::new(url, client));
+                rs.push(Replica::new(url, client(url, opts.token.as_ref(), opts.ca.as_deref())?));
             }
             if rs.is_empty() {
                 return Err(ApiError::bad(format!("shard {group:?} has no URL")));
@@ -382,7 +403,7 @@ impl Coordinator {
                 let mut c = r.client.clone();
                 let ask = async move {
                     let s = c.schema(pb::Empty {}).await?.into_inner().schema_json;
-                    Ok::<_, tonic::Status>((s, hello(&mut c).await?.0))
+                    Ok::<_, tonic::Status>((s, hello(&mut c).await?))
                 };
                 tokio::time::timeout(Duration::from_secs(5), ask)
             }))
@@ -390,9 +411,10 @@ impl Coordinator {
             let mut errors = Vec::new();
             for (r, a) in rs.iter().zip(answers) {
                 match a {
-                    Ok(Ok((s, p))) => {
+                    Ok(Ok((s, said))) => {
                         schemas.push(s);
-                        r.protocol.store(p, Ordering::Relaxed);
+                        r.protocol.store(said.protocol, Ordering::Relaxed);
+                        r.role.store(said.role as i32, Ordering::Relaxed);
                     }
                     Ok(Err(e)) => errors.push(format!("{}: {}", r.url, e.message())),
                     Err(_) => errors.push(format!("{}: no answer within 5 s", r.url)),
@@ -508,13 +530,14 @@ impl Coordinator {
         if p != 0 && self.now_ms() < rep.hello_at.load(Ordering::Relaxed) + HELLO_EVERY_MS {
             return Ok(p.min(max));
         }
-        let (p, epoch) = hello(c).await?;
-        if let Some(m) = self.slots.as_ref().filter(|m| p >= 4 && epoch != m.epoch) {
+        let said = hello(c).await?;
+        if let Some(m) = self.slots.as_ref().filter(|m| said.protocol >= 4 && said.epoch != m.epoch) {
             give_slots(c, m, i).await?;
         }
-        rep.protocol.store(p, Ordering::Relaxed);
+        rep.protocol.store(said.protocol, Ordering::Relaxed);
+        rep.role.store(said.role as i32, Ordering::Relaxed);
         rep.hello_at.store(self.now_ms(), Ordering::Relaxed);
-        Ok(p.min(max))
+        Ok(said.protocol.min(max))
     }
 
     fn avoid(&self, i: usize, r: usize) {
@@ -658,7 +681,7 @@ impl Coordinator {
     }
 
     pub async fn query(&self, req: &QueryReq, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
-        if select.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && self.replicas.iter().any(|r| r.len() > 1) {
+        if select.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && !(0..self.replicas.len()).all(|i| self.numbered_alike(i)) {
             return Err(ApiError::bad(ONE_REPLICA));
         }
         let partial = req.partial.unwrap_or(self.opts.partial);
@@ -844,9 +867,42 @@ impl Coordinator {
         Ok(rs)
     }
 
-    /// Writes to every replica of shard `i`; the count is the first's.
+    /// Whether every replica of shard `i` holds the same sequence numbers:
+    /// it has one, or a primary that ships its writes to the others.
+    fn numbered_alike(&self, i: usize) -> bool {
+        self.replicas[i].len() == 1 || self.replicas[i].iter().any(|r| r.role() == pb::Role::Primary)
+    }
+
+    /// The replica of shard `i` that takes its writes: its primary, asking
+    /// every replica again when one says it is a replica but none that it
+    /// is the primary (a failover may have moved it). `None` when no
+    /// replica has a role, and every one takes every write.
+    async fn primary(&self, i: usize) -> Result<Option<usize>, ApiError> {
+        let find = || self.replicas[i].iter().position(|r| r.role() == pb::Role::Primary);
+        if let Some(k) = find() {
+            return Ok(Some(k));
+        }
+        if self.replicas[i].iter().all(|r| r.role() == pb::Role::Standalone) {
+            return Ok(None);
+        }
+        let asks = self.replicas[i].iter().enumerate().map(|(k, rep)| {
+            let mut c = rep.client.clone();
+            rep.protocol.store(0, Ordering::Relaxed);
+            async move { self.speak(i, k, &mut c, PROTOCOL).await }
+        });
+        join_all(asks).await;
+        find().map(Some).ok_or_else(|| ApiError { status: 503, message: format!("shard {i} has no primary answering: its replicas take writes from their primary alone") })
+    }
+
+    /// Writes to shard `i`: to its primary, or to every replica while none
+    /// has a role; the count is the first's.
     async fn write(&self, i: usize, r: pb::WriteRequest) -> Result<u64, ApiError> {
-        let calls = self.replicas[i].iter().enumerate().map(|(k, rep)| {
+        let to: Vec<usize> = match self.primary(i).await? {
+            Some(k) => vec![k],
+            None => (0..self.replicas[i].len()).collect(),
+        };
+        let calls = to.into_iter().map(|k| {
+            let rep = &self.replicas[i][k];
             let (mut c, r) = (rep.client.clone(), r.clone());
             async move {
                 // A replica not asked yet (it was down at connect), or one
@@ -904,7 +960,7 @@ impl Coordinator {
         let mut by_shard: BTreeMap<usize, Vec<Json>> = BTreeMap::new();
         for op in ops {
             let s = self.shard_of(&op_key(&self.schema, &op)?);
-            if op.get("if_seq_no").is_some() && self.replicas[s].len() > 1 {
+            if op.get("if_seq_no").is_some() && !self.numbered_alike(s) {
                 return Err(ApiError::bad(ONE_REPLICA));
             }
             by_shard.entry(s).or_default().push(op);
@@ -951,6 +1007,9 @@ impl Coordinator {
                 all_up &= j["status"] == "ok";
                 if r.avoid_until.load(Ordering::Relaxed) > now {
                     j["avoided"] = json!(true);
+                }
+                if r.role() != pb::Role::Standalone {
+                    j["role"] = json!(r.role().as_str_name().to_lowercase());
                 }
                 replicas.push(j);
             }

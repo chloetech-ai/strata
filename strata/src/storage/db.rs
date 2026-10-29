@@ -1089,6 +1089,11 @@ impl Database {
         st.ship.read(from, st.seq, max_bytes)
     }
 
+    /// Whether it keeps a ship log ([`DbOptions::ship_log_bytes`]).
+    pub fn keeps_ship_log(&self) -> bool {
+        self.opts.ship_log_bytes > 0
+    }
+
     /// Has `f` told the term and number of each numbered transaction once
     /// it is committed, in the order they commit (replacing any earlier
     /// `f`). It runs in the writer, so it must not block or write.

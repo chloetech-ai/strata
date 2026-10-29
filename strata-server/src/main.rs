@@ -6,6 +6,8 @@
 //! STRATA_TOKEN=... strata-server --db my.strata --listen 0.0.0.0:7700   # beyond loopback: a token
 //! strata-server --shards http://a:7701,http://b:7701   # a coordinator over shard servers
 //! strata-server --shards 'http://a0:7701|http://a1:7701,http://b0:7701|http://b1:7701'   # two replicas each
+//! strata-server --db a0.strata --seq-no --replicas http://a1:7701   # a primary shipping its writes to a replica
+//! strata-server --db a1.strata --seq-no --replica                    # and that replica
 //! strata-server --db new.strata --schema new.json --copy-from my.strata   # re-embed into a new schema
 //! strata-server fetch-model potion-retrieval-32M       # download an embedding model
 //! strata-server import --db my.strata --schema my.json rows.jsonl more.csv   # load files
@@ -66,6 +68,28 @@ struct Args {
     /// Strata or a later one.
     #[arg(long)]
     seq_no: bool,
+    /// Ship this database's writes to these replicas, as their primary
+    /// (comma-separated gRPC URLs of servers started with --replica), so
+    /// that each holds the same rows under the same sequence numbers.
+    /// Needs --seq-no.
+    #[arg(long, value_delimiter = ',')]
+    replicas: Vec<String>,
+    /// Serve as a replica: apply the writes a primary ships here (its
+    /// --replicas names this server's gRPC URL), and refuse writes from
+    /// clients. Needs --seq-no, and the rows the primary had when it
+    /// started numbering (the same --demo, or a checkpoint of it).
+    #[arg(long)]
+    replica: bool,
+    /// With --replicas: the copies that hold a write before it is
+    /// answered: all (the primary and every replica in sync), majority (of
+    /// all copies), or primary.
+    #[arg(long, default_value = "all")]
+    write_acks: String,
+    /// With --replicas or --replica: the latest transactions kept in
+    /// memory to ship, in MiB. A replica further behind needs a copy of
+    /// the primary.
+    #[arg(long, default_value_t = 64)]
+    ship_log_mb: usize,
     /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
     /// of one shard joined by '|').
     #[arg(long, value_delimiter = ',')]
@@ -107,11 +131,12 @@ struct Args {
     /// The private key of --tls-cert (PEM).
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
-    /// With --shards: the token the shards require (default: --token).
+    /// With --shards or --replicas: the token the shards or replicas
+    /// require (default: --token).
     #[arg(long, env = "STRATA_SHARD_TOKEN", hide_env_values = true)]
     shard_token: Option<String>,
-    /// With --shards: a CA certificate (PEM) for https:// shards, besides
-    /// the public roots.
+    /// With --shards or --replicas: a CA certificate (PEM) for https://
+    /// shards or replicas, besides the public roots.
     #[arg(long)]
     shard_ca: Option<PathBuf>,
     /// With --shards: the slot map to route writes by, which the shards are
@@ -270,6 +295,10 @@ async fn main() {
         auth::server_config(t).unwrap_or_else(|e| fail(&e));
     }
     let token = a.token.clone().filter(|t| !t.is_empty()).map(Secret::new);
+    let write_acks = strata_server::replication::Acks::parse(&a.write_acks).unwrap_or_else(|| fail(&format!("--write-acks is all, majority or primary, not {:?}", a.write_acks)));
+    if a.replica && a.grpc == "off" {
+        fail("a replica takes its primary's writes over gRPC: --replica needs --grpc");
+    }
     let o = Options {
         db: a.db,
         schema: a.schema,
@@ -280,6 +309,10 @@ async fn main() {
         wal_drop_damaged: a.wal_drop_damaged,
         verify_checksums: a.verify_checksums,
         seq_no: a.seq_no,
+        replicas: a.replicas,
+        replica: a.replica,
+        write_acks,
+        ship_log_mb: a.ship_log_mb,
         shards: a.shards,
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),
