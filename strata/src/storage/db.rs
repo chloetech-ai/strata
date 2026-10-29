@@ -45,7 +45,7 @@ use crate::storage::io;
 use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
-use crate::storage::manifest::{Manifest, SegmentMeta, TableMeta};
+use crate::storage::manifest::{Manifest, SegmentMeta, SeqNo, TableMeta};
 use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MERGE_BATCH_BYTES, MERGE_BATCH_DOCS, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
@@ -679,7 +679,7 @@ impl Database {
         };
         pager::write_meta(&file, 0, &meta)?;
         io::sync_all(&file)?;
-        Wal::create(&wal_path(path), db_id, true)?;
+        Wal::create(&wal_path(path), db_id, false, true)?;
         let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         io::sync_dir(dir)?;
         Database::load(path, file, opts)
@@ -709,7 +709,7 @@ impl Database {
         let name = dir::manifest_name(1);
         dir::write_file(path, &name, &mbytes, true)?;
         dir::write_current(path, &Current { db_id, txn: 1, manifest: name, crc: crc32fast::hash(&mbytes), format: manifest.format() }, true)?;
-        Wal::create(&path.join(dir::WAL), db_id, true)?;
+        Wal::create(&path.join(dir::WAL), db_id, false, true)?;
         dir::sync_dir(path)?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         io::sync_dir(parent)?;
@@ -806,10 +806,11 @@ impl Database {
         handles: Vec<Vec<Arc<SegHandle>>>,
     ) -> Result<Database> {
         let fits = |table: u32, op: &Op| manifest.table(table).is_none_or(|t| op_fits(&t.schema, op));
+        let numbered = manifest.seq_no.is_some();
         let (sealed, mut txns, cut) = read_sealed_wals(&wal_path, &manifest, meta.db_id, opts.wal_drop_damaged, &fits)?;
         let (mut wal, wal_dropped) = match cut {
             None => {
-                let (wal, active) = Wal::open(&wal_path, meta.db_id, opts.sync, opts.wal_drop_damaged, &fits)?;
+                let (wal, active) = Wal::open(&wal_path, meta.db_id, numbered, opts.sync, opts.wal_drop_damaged, &fits)?;
                 txns.extend(active);
                 let dropped = wal.dropped().map(str::to_string);
                 (wal, dropped)
@@ -819,7 +820,7 @@ impl Database {
                 if std::fs::metadata(&wal_path).is_ok_and(|m| m.len() > 0) {
                     std::fs::copy(&wal_path, wal::damaged_path(&wal_path))?;
                 }
-                (Wal::create(&wal_path, meta.db_id, opts.sync)?, Some(what))
+                (Wal::create(&wal_path, meta.db_id, numbered, opts.sync)?, Some(what))
             }
         };
         let tables: Vec<TableState> = manifest
@@ -829,6 +830,7 @@ impl Database {
             .map(|(t, h)| TableState::new(t.id, Arc::new(t.schema.clone()), h, opts.memtable_chunk_docs, 0))
             .collect();
         let schema = tables[0].schema.clone();
+        let seq = manifest.seq_no.map_or(0, |n| n.seq);
         let mut st = State {
             manifest,
             meta,
@@ -838,6 +840,7 @@ impl Database {
             map,
             tables,
             txn: meta.txn,
+            seq,
             version: 0,
             pending: Default::default(),
             pending_updates: Default::default(),
@@ -850,6 +853,10 @@ impl Database {
         };
         let mut flushed = false;
         for t in txns {
+            if t.seq.is_some() != numbered {
+                return Err(corrupt(format!("a sealed write-ahead log holds transactions {} sequence numbers, and the database {}", if numbered { "without" } else { "with" }, if numbered { "numbers its writes" } else { "does not number its writes" })));
+            }
+            st.seq = st.seq.max(t.seq.map_or(0, |n| n.seq));
             if t.txn <= st.manifest.wal_txn {
                 // Flushed before a crash cut the WAL truncation short.
                 flushed = true;
@@ -975,6 +982,65 @@ impl Database {
         vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new() });
         let c = vw.commit(&mut wal)?;
         self.publish(c, |_| {})
+    }
+
+    /// Numbers this database's writes from now on: every write transaction
+    /// gets the next sequence number (from 1), under the database's term
+    /// (1 at first, raised by [`Database::begin_term`]), logged with it and
+    /// kept across flushes, crashes and reopening. Replication orders
+    /// writes by them. The memtables are flushed first, and the WAL starts
+    /// again numbered (`STRWAL02`).
+    ///
+    /// It cannot be undone: the database then requires feature `seq_no`
+    /// (format 3), so versions of Strata from before it refuse to open it
+    /// rather than lose its numbers. Bulk loads and attached segments,
+    /// which skip the WAL, take no sequence number. Starting again is a
+    /// no-op.
+    pub fn start_seq_no(&self) -> Result<()> {
+        // No background flush may seal the log in between.
+        let _one = lock(&self.background);
+        let mut wal = self.try_writer()?;
+        self.check_poisoned()?;
+        if lock(&self.state).manifest.seq_no.is_some() {
+            return Ok(());
+        }
+        self.flush_locked(&mut wal)?;
+        // What a flush left in the log is in the segments already; a crash
+        // after the commit below finds the log empty, and starts it again
+        // numbered.
+        if !wal.is_empty() {
+            wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
+        }
+        let mut vw = VersionWriter::begin(self);
+        vw.manifest.seq_no = Some(SeqNo { term: 1, seq: 0 });
+        let c = vw.commit(&mut wal)?;
+        self.publish(c, |_| {})?;
+        wal.renumber(self.opts.sync).map_err(|e| self.poison(e))
+    }
+
+    /// Raises the term this database numbers its writes under to `term`,
+    /// which must be greater than its term now; durable on return. A
+    /// replica made primary does this, so that its writes are told apart
+    /// from those of the primary before it.
+    pub fn begin_term(&self, term: u64) -> Result<()> {
+        let mut wal = self.try_writer()?;
+        self.check_poisoned()?;
+        let now = lock(&self.state).manifest.seq_no.ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?;
+        if term <= now.term {
+            return Err(Error::Schema(format!("term {term} is not after the database's term, {}", now.term)));
+        }
+        let mut vw = VersionWriter::begin(self);
+        vw.manifest.seq_no = Some(SeqNo { term, ..now });
+        let c = vw.commit(&mut wal)?;
+        self.publish(c, |_| {})
+    }
+
+    /// The term writes are numbered under and the last sequence number
+    /// given, once the database numbers its writes
+    /// ([`Database::start_seq_no`]).
+    pub fn seq_no(&self) -> Option<SeqNo> {
+        let st = lock(&self.state);
+        st.manifest.seq_no.map(|n| SeqNo { term: n.term, seq: st.seq })
     }
 
     /// Drops the table named `name` (any case) and its rows, in one commit.
@@ -1987,7 +2053,11 @@ impl Database {
             if !st.pending.is_empty() || !st.pending_updates.is_empty() {
                 return Err(Error::Busy("deletes or updates are pending after a flush".into()));
             }
-            (snap, st.manifest.clone(), st.handles().cloned().collect::<Vec<_>>())
+            let mut manifest = st.manifest.clone();
+            if let Some(n) = &mut manifest.seq_no {
+                n.seq = st.seq;
+            }
+            (snap, manifest, st.handles().cloned().collect::<Vec<_>>())
         };
         let name = dest.file_name().ok_or_else(|| Error::Schema(format!("{} names no file", dest.display())))?.to_string_lossy();
         let tmp = dest.with_file_name(format!(".{name}.checkpoint-{:016x}", rand::random::<u64>()));
@@ -2041,6 +2111,8 @@ impl Database {
                 }
             }
             vw.manifest.next_segment_id = manifest.next_segment_id;
+            // The copy numbers its writes on from the source's.
+            vw.manifest.seq_no = manifest.seq_no;
             stats.segments_linked = vw.segments_linked;
             let c = vw.commit(&mut wal)?;
             stats.bytes_written = c.bytes_written;
@@ -2432,9 +2504,11 @@ impl Database {
         })
     }
 
-    fn commit_ops(&self, wal: &mut Wal, ops: Vec<(u32, Op)>) -> Result<()> {
+    /// Commits `ops` as one transaction; returns its sequence number when
+    /// the database numbers its writes.
+    fn commit_ops(&self, wal: &mut Wal, ops: Vec<(u32, Op)>) -> Result<Option<u64>> {
         if ops.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         self.check_poisoned()?;
         // While flushes fail or the flusher falls behind, the memtable
@@ -2444,11 +2518,14 @@ impl Database {
         if self.over_twice() && (flusher.is_some() || self.flush_error().is_some()) {
             self.flush_locked(wal).map_err(|e| Error::Io(std::io::Error::other(format!("writes wait for a flush to succeed: {e}"))))?;
         }
-        let txn = lock(&self.state).txn + 1;
+        let (txn, seq) = {
+            let st = lock(&self.state);
+            (st.txn + 1, st.manifest.seq_no.map(|n| SeqNo { term: n.term, seq: st.seq + 1 }))
+        };
         // A failed append is cut off the log, so the transaction is not
         // committed; but the page cache may be in doubt after a failed
         // fsync, so stop writing.
-        wal.append(txn, &ops, self.opts.sync).map_err(|e| self.poison(e))?;
+        wal.append(txn, seq, &ops, self.opts.sync).map_err(|e| self.poison(e))?;
         let full = {
             let mut st = lock(&self.state);
             for (table, op) in ops {
@@ -2457,8 +2534,12 @@ impl Database {
                 st.apply(t, op);
             }
             st.txn = txn;
+            if let Some(n) = seq {
+                st.seq = n.seq;
+            }
             st.mem_len() + st.n_pending > self.opts.memtable_max_docs
         };
+        let seq = seq.map(|n| n.seq);
         // From here the transaction is durable, and its result is Ok: an
         // error would make callers retry a write that already happened (an
         // `add` applied twice). A failed flush is kept in `flush_error`
@@ -2467,12 +2548,12 @@ impl Database {
             match flusher {
                 Some(sig) => sig.wake(),
                 // The flush published its version.
-                None if self.flush_locked(wal).is_ok() => return Ok(()),
+                None if self.flush_locked(wal).is_ok() => return Ok(seq),
                 None => {}
             }
         }
         self.republish();
-        Ok(())
+        Ok(seq)
     }
 }
 
@@ -2767,6 +2848,13 @@ impl<'a> WriteTxn<'a> {
     /// are flushed; a failed flush does not fail the commit, and shows in
     /// [`Database::flush_error`].
     pub fn commit(self) -> Result<()> {
+        self.commit_seq().map(|_| ())
+    }
+
+    /// Commits, and returns the transaction's sequence number when the
+    /// database numbers its writes ([`Database::start_seq_no`]); `None`
+    /// then only for a transaction that wrote nothing.
+    pub fn commit_seq(self) -> Result<Option<u64>> {
         let WriteTxn { db, mut wal, ops, .. } = self;
         db.commit_ops(&mut wal, ops)
     }
@@ -3111,6 +3199,11 @@ impl<'a> VersionWriter<'a> {
         // hold their effects (a merge drops the documents they deleted):
         // without `sync` they are made durable now, before it can be.
         wal.sync_appends()?;
+        // The last sequence number given so far, below which none is given
+        // again after a crash, even once the WAL that held it is gone.
+        if let Some(n) = &mut self.manifest.seq_no {
+            n.seq = n.seq.max(lock(&self.db.state).seq);
+        }
 
         if let Some(d) = self.db.dir.clone() {
             return self.commit_dir(&d);

@@ -164,6 +164,10 @@ struct Seed {
     /// A database whose WAL holds transactions of every kind, and the WAL.
     wal_db: Vec<u8>,
     wal: Vec<u8>,
+    /// The same, numbering its writes: a numbered WAL (`STRWAL02`) with
+    /// transactions under two terms.
+    numbered_db: Vec<u8>,
+    numbered_wal: Vec<u8>,
 }
 
 const WORDS: [&str; 12] = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima"];
@@ -231,27 +235,40 @@ fn seed() -> &'static Seed {
         let freelist = read_extent(&f, meta.freelist, meta.freelist_crc).unwrap();
         let segments = Manifest::decode(&manifest).unwrap().segments().map(|s| s.extent.range()).collect();
 
-        let wal_path = dir.path().join("wal.strata");
-        {
-            let db = Db::create(&wal_path, schema(), opts()).unwrap();
-            let st = db.storage();
-            for t in 0..6u64 {
-                let mut tx = st.begin().unwrap();
-                for i in t * 10..t * 10 + 10 {
-                    tx.insert(doc(i, &mut r)).unwrap();
+        let logged = |name: &str, numbered: bool, r: &mut Lcg| {
+            let path = dir.path().join(name);
+            {
+                let db = Db::create(&path, schema(), opts()).unwrap();
+                let st = db.storage();
+                if numbered {
+                    st.start_seq_no().unwrap();
                 }
-                if t > 0 {
-                    tx.delete(&Value::Str(key(t * 10 - 3))).unwrap();
-                    tx.set(&Value::Str(key(t * 10 - 5)), "n", Value::Int(t as i64)).unwrap();
+                for t in 0..6u64 {
+                    if numbered && t == 3 {
+                        st.begin_term(2).unwrap();
+                    }
+                    let mut tx = st.begin().unwrap();
+                    for i in t * 10..t * 10 + 10 {
+                        tx.insert(doc(i, r)).unwrap();
+                    }
+                    if t > 0 {
+                        tx.delete(&Value::Str(key(t * 10 - 3))).unwrap();
+                        tx.set(&Value::Str(key(t * 10 - 5)), "n", Value::Int(t as i64)).unwrap();
+                    }
+                    tx.commit().unwrap();
                 }
-                tx.commit().unwrap();
             }
-        }
-        let mut wal_file = wal_path.clone().into_os_string();
-        wal_file.push("-wal");
+            let mut wal = path.clone().into_os_string();
+            wal.push("-wal");
+            (std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap())
+        };
+        let (wal_db, wal) = logged("wal.strata", false, &mut r);
+        let (numbered_db, numbered_wal) = logged("numbered.strata", true, &mut r);
         Seed {
-            wal_db: std::fs::read(&wal_path).unwrap(),
-            wal: std::fs::read(&wal_file).unwrap(),
+            wal_db,
+            wal,
+            numbered_db,
+            numbered_wal,
             _dir: dir,
             path,
             file,
@@ -324,10 +341,10 @@ pub fn segment(data: &[u8]) {
     }
 }
 
-/// Fixes the checksum of every whole record of a WAL, so that damage
-/// reaches the record decoder rather than stopping at the checksum.
-fn reseal_wal(b: &mut [u8]) {
-    let mut pos = 16;
+/// Fixes the checksum of every whole record of a WAL whose records start
+/// at `pos`, so that damage reaches the record decoder rather than
+/// stopping at the checksum.
+fn reseal_wal(b: &mut [u8], mut pos: usize) {
     while pos + 8 <= b.len() {
         let len = u32::from_le_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
         let Some(end) = (pos + 8).checked_add(len).filter(|&e| e <= b.len()) else { break };
@@ -337,18 +354,20 @@ fn reseal_wal(b: &mut [u8]) {
     }
 }
 
-/// The seed database with a damaged WAL (resealed or not, opened with or
-/// without `sync`), opened and queried. Must not panic.
+/// A seed database with a damaged WAL (numbered or not, resealed or not,
+/// opened with or without `sync`), opened and queried. Must not panic.
 pub fn wal(data: &[u8]) {
     let Some((&mode, data)) = data.split_first() else { return };
     let s = seed();
-    // Past the header, which only says whose log it is.
-    let records = 16..s.wal.len();
-    let mut wal = damage(&s.wal, data, std::slice::from_ref(&records));
+    let (db, intact) = if mode & 8 == 8 { (&s.numbered_db, &s.numbered_wal) } else { (&s.wal_db, &s.wal) };
+    // Past the database id, which only says whose log it is; a numbered
+    // log's features are damaged too.
+    let records = if mode & 8 == 8 { 20 + u32::from_le_bytes(intact[16..20].try_into().unwrap()) as usize } else { 16 };
+    let mut wal = damage(intact, data, std::slice::from_ref(&(16..intact.len())));
     if mode & 1 == 1 {
-        reseal_wal(&mut wal);
+        reseal_wal(&mut wal, records);
     }
-    let path = write_db(&scratch(), &s.wal_db, Some(&wal));
+    let path = write_db(&scratch(), db, Some(&wal));
     if let Ok(db) = Db::open(&path, DbOptions { sync: mode & 2 == 2, wal_drop_damaged: mode & 4 == 4, ..opts() }) {
         let p = params();
         for q in &QUERIES[..4] {

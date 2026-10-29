@@ -329,6 +329,9 @@ pub(crate) struct State {
     pub tables: Vec<TableState>,
     /// Latest committed txn (WAL commits included).
     pub txn: u64,
+    /// The last sequence number given to a write, when the database
+    /// numbers its writes (`manifest.seq_no`); 0 otherwise.
+    pub seq: u64,
     /// Bumped by every change; a snapshot is cached only if it is current.
     pub version: u64,
     /// Deletes of on-disk documents by segment id (ids are unique across

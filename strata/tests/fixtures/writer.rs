@@ -1,5 +1,6 @@
-//! The writes behind the format 2 and format 3 fixtures in this directory
-//! (README.md): `examples/format_fixtures.rs` writes them with this module,
+//! The writes behind the fixtures of formats 2 and 3 and of numbered writes
+//! in this directory (README.md): `examples/format_fixtures.rs` writes them
+//! with this module,
 //! and `tests/format_fixtures.rs` writes them again to check that Strata
 //! still writes the same bytes. The writes are deterministic: two runs give
 //! the same manifests, segments, delete sets, updates and WAL records, and
@@ -147,10 +148,53 @@ fn format3(path: &Path, layout: Layout) {
     tx.commit().unwrap();
 }
 
-/// Writes every fixture set into `out`: `format2/` and `format3/`, each
-/// with `db.strata` (and its WAL) and `db.dir`.
+/// Numbered writes (format 3 with `seq_no`): the first table, with the
+/// rows of format 2's: a write before numbering started, then under term 2
+/// rows written and flushed, deletes and a value set in place (flushed
+/// again), and a transaction left in the WAL. Five transactions are
+/// numbered, 1 to 5.
+fn seqno(path: &Path, layout: Layout) {
+    let db = create(path, t(), layout);
+    let mut tx = db.begin().unwrap();
+    for i in 0..10 {
+        tx.insert(t_doc(i, 0)).unwrap();
+    }
+    tx.commit().unwrap();
+    db.start_seq_no().unwrap();
+    db.begin_term(2).unwrap();
+    for r in [10..20, 20..30] {
+        let mut tx = db.begin().unwrap();
+        for i in r {
+            tx.insert(t_doc(i, 0)).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    db.flush().unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..5 {
+        tx.delete(&key(i)).unwrap();
+    }
+    tx.commit().unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 5..8 {
+        tx.set(&key(i), "n", Value::Int(7)).unwrap();
+    }
+    tx.commit().unwrap();
+    db.flush().unwrap();
+    // Left in the WAL.
+    let mut tx = db.begin().unwrap();
+    for i in 30..40 {
+        tx.insert(t_doc(i, 1)).unwrap();
+    }
+    tx.delete(&key(10)).unwrap();
+    tx.upsert(t_doc(11, 2)).unwrap();
+    tx.commit().unwrap();
+}
+
+/// Writes every fixture set into `out`: `format2/`, `format3/` and
+/// `seqno/`, each with `db.strata` (and its WAL) and `db.dir`.
 pub fn write_all(out: &Path) {
-    for (dir, write) in [("format2", format2 as fn(&Path, Layout)), ("format3", format3)] {
+    for (dir, write) in [("format2", format2 as fn(&Path, Layout)), ("format3", format3), ("seqno", seqno)] {
         let d = out.join(dir);
         std::fs::create_dir_all(&d).unwrap();
         write(&d.join("db.strata"), Layout::SingleFile);

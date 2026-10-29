@@ -1,7 +1,8 @@
 //! The format 2 and format 3 fixtures (`tests/fixtures/README.md`), which
 //! older versions of Strata wrote, open with this one in both layouts:
 //! their rows, filters and searches are as written, they take writes,
-//! flushes and merges and stay in the format they were written in. And
+//! flushes and merges and stay in the format they were written in. So do
+//! the fixtures of numbered writes, which go on counting from theirs. And
 //! this version still writes the same bytes for the same writes, so a
 //! change to what Strata writes is a choice, made with a new fixture set.
 
@@ -282,6 +283,48 @@ fn format_3_fixtures_open_and_stay_format_3() {
     }
 }
 
+/// The fixtures of numbered writes hold format 2's table `t`, written
+/// under term 2 in five numbered transactions. A write takes the next
+/// number, through a flush, a merge and opening again.
+#[test]
+fn numbered_fixtures_open_and_go_on_counting() {
+    use strata::storage::SeqNo;
+    for set in sets("seqno") {
+        let dir = tempfile::tempdir().unwrap();
+        for path in copies(&set, dir.path()) {
+            let what = path.display().to_string();
+            let t = Format2::written().t;
+            let ids = |t: &BTreeMap<u64, (i64, i64)>, n: Option<i64>| t.iter().filter(|(_, r)| n.is_none_or(|n| r.0 == n)).map(|(&i, _)| key(i)).collect::<Vec<_>>();
+            let check = |db: &Db, t: &BTreeMap<u64, (i64, i64)>| {
+                assert_eq!(firsts(db, "SELECT id FROM t LIMIT 1000"), ids(t, None), "{what}");
+                for n in [0, 1, 2, 7, 9] {
+                    assert_eq!(firsts(db, &format!("SELECT id FROM t WHERE n = {n} LIMIT 1000")), ids(t, Some(n)), "{what}: n = {n}");
+                }
+            };
+            let db = Db::open(&path, options(&path)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            check(&db, &t);
+            assert_eq!(db.storage().seq_no(), Some(SeqNo { term: 2, seq: 5 }), "{what}");
+
+            let mut t = t;
+            run(&db, "INSERT INTO t (id, n, body) VALUES ('k000100', 9, 'document 100 version 1 lorem ipsum')");
+            run(&db, "UPDATE t SET n = 9 WHERE id = 'k000012'");
+            t.insert(100, (9, 1));
+            t.get_mut(&12).unwrap().0 = 9;
+            assert_eq!(db.storage().seq_no(), Some(SeqNo { term: 2, seq: 7 }), "{what}");
+            db.storage().flush().unwrap();
+            merge(&db);
+            db.storage().check().unwrap();
+            check(&db, &t);
+            assert_eq!(format_on_disk(&path), 3, "{what}");
+            drop(db);
+
+            let db = Db::open(&path, options(&path)).unwrap();
+            check(&db, &t);
+            assert_eq!(db.storage().seq_no(), Some(SeqNo { term: 2, seq: 7 }), "{what}");
+        }
+    }
+}
+
 /// `new` holds the bytes of `old` but for the database id: in a WAL's
 /// header, and in a single file's two meta pages.
 fn same_bytes(old: &Path, new: &Path) {
@@ -314,7 +357,7 @@ fn same_bytes(old: &Path, new: &Path) {
 fn this_version_writes_the_fixtures_byte_for_byte() {
     let dir = tempfile::tempdir().unwrap();
     writer::write_all(dir.path());
-    for set in ["format2", "format3"] {
+    for set in ["format2", "format3", "seqno"] {
         let (old, new) = (fixtures().join(set), dir.path().join(set));
         same_bytes(&old.join("db.strata"), &new.join("db.strata"));
         same_bytes(&old.join("db.strata-wal"), &new.join("db.strata-wal"));
