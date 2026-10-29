@@ -142,9 +142,10 @@ pub fn merge_memory(segs: &[SegmentInfo], threads: usize) -> u64 {
 /// A merge's peak memory per byte of input image, over its first four
 /// batches, when its build uses `threads` threads, with a margin over what
 /// was measured (`examples/merge_memory.rs`, merges of 15 to 937 MB of
-/// short text, long text, and text with 64- and 384-dim vectors): up to 4.0 on one
-/// thread, 6.6 on four and 8.2 on eight, in merges of short texts small
-/// enough to fit one batch (each thread analyses its own run of documents).
+/// short text, long text, and text with 64- and 384-dim vectors): up to
+/// 4.0 on one thread, 6.6 on four and 8.2 on eight, in merges of short
+/// texts small enough to fit one batch (each thread analyses its own run
+/// of documents).
 pub fn memory_per_image_byte(threads: usize) -> f64 {
     5.5 + 0.5 * threads.max(1) as f64
 }
