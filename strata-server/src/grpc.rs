@@ -274,6 +274,10 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("Restore", req, |svc, chunks| async move { svc.restore(chunks).await }).await
     }
 
+    async fn verify(&self, req: Request<pb::VerifyRequest>) -> Result<Response<pb::VerifyResponse>, Status> {
+        self.serve("Verify", req, |svc, r| async move { svc.verify_for(r).await }).await
+    }
+
     async fn slots(&self, req: Request<pb::SlotsRequest>) -> Result<Response<pb::SlotsResponse>, Status> {
         self.serve("Slots", req, |svc, r| async move {
             let j: serde_json::Value = from_json(&r.map_json, "slot map")?;

@@ -30,7 +30,7 @@
 //! ([`crate::auth`]).
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Query, Request, State};
@@ -99,6 +99,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/checkpoint", post(admin_checkpoint))
         .route("/v1/admin/check", post(admin_check))
         .route("/v1/admin/vacuum", post(admin_vacuum))
+        .route("/v1/admin/verify", post(admin_verify))
         .route("/v1/agent", post(agent_run))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -437,6 +438,16 @@ async fn admin_check(State(app): State<App>) -> Res {
 async fn admin_vacuum(State(app): State<App>) -> Res {
     Ok(AxJson(json!({"bytes_freed": app.svc.vacuum().await?})))
 }
+
+async fn admin_verify(State(app): State<App>, body: Option<AxJson<Json>>) -> Res {
+    let timeout_ms = body.as_ref().and_then(|b| b.get("timeout_ms")).and_then(|v| v.as_u64()).unwrap_or(0);
+    let timeout = if timeout_ms > 0 { Duration::from_millis(timeout_ms) } else { VERIFY_WAIT };
+    Ok(AxJson(app.svc.verify_replicas(timeout).await?))
+}
+
+/// How long `POST /v1/admin/verify` waits for the replicas' digests by
+/// default.
+const VERIFY_WAIT: Duration = Duration::from_secs(60);
 
 async fn agent_run(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let req = agent::AgentReq {

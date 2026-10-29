@@ -90,6 +90,11 @@ struct Args {
     /// the primary.
     #[arg(long, default_value_t = 64)]
     ship_log_mb: usize,
+    /// With --replicas: compare each replica's rows with the primary's
+    /// every this many seconds, and send a replica whose rows differ a
+    /// copy of the primary (0: only when asked, POST /v1/admin/verify).
+    #[arg(long, default_value_t = 600)]
+    verify_every_s: u64,
     /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
     /// of one shard joined by '|').
     #[arg(long, value_delimiter = ',')]
@@ -313,6 +318,7 @@ async fn main() {
         replica: a.replica,
         write_acks,
         ship_log_mb: a.ship_log_mb,
+        verify_every_s: a.verify_every_s,
         shards: a.shards,
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),

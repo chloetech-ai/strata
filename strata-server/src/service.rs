@@ -312,6 +312,24 @@ impl Service {
         }
     }
 
+    /// A replica's digests of its rows at the version its primary pinned
+    /// (`Verify`).
+    pub async fn verify_for(&self, r: pb::VerifyRequest) -> Result<pb::VerifyResponse, ApiError> {
+        match &self.replication {
+            Replication::Replica(f) => f.verify(r).await,
+            _ => Err(conflict("this server is not a replica (--replica): it has no rows of a primary's to compare".into())),
+        }
+    }
+
+    /// Compares each replica's rows with this primary's now
+    /// ([`Primary::verify`]), waiting up to `timeout`.
+    pub async fn verify_replicas(&self, timeout: Duration) -> Result<Json, ApiError> {
+        match &self.replication {
+            Replication::Primary(p) => Ok(p.verify(Instant::now() + timeout).await),
+            _ => Err(conflict("this server is not a primary (--replicas): it has no replicas to compare".into())),
+        }
+    }
+
     /// Keeps the slot map a coordinator gives this shard in `path`, and
     /// reads the one kept there, if any. Without a file, the map lasts
     /// until the server stops.

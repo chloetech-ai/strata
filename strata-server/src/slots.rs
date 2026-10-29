@@ -52,7 +52,7 @@ pub fn slot(key: &Value) -> usize {
 /// then its bytes. Integers (and BOOL and TIMESTAMP keys, stored as
 /// integers) are tag 1 and 8 bytes little-endian, text tag 2 and its
 /// UTF-8, a float tag 3 and its bits (0.0 for -0.0), and NULL tag 0 alone.
-fn encode(key: &Value, mut out: impl FnMut(&[u8])) {
+pub(crate) fn encode(key: &Value, mut out: impl FnMut(&[u8])) {
     match key {
         Value::Null => out(&[0]),
         Value::Int(x) | Value::Timestamp(x) => {
