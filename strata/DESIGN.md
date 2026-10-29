@@ -131,7 +131,24 @@ the log it empties is restarted numbered after the commit that records
 the feature; a crash between the two leaves an empty `STRWAL01` log,
 which opening restarts numbered, while one holding transactions of the
 other kind fails the open. Checkpoints keep the numbers and the term.
-Bulk loads and attached segments take no number.
+Bulk loads and attached segments take no number. The manifest also keeps
+every term with the first number it gave (`Database::numbering`), so that
+a replica back after a failover can find where its log left the new
+primary's.
+
+**Row versions.** In a numbered database each row keeps the number of the
+write that last changed it (`Database::seq_of`; `WriteTxn::seq_of` reads
+it under the writer lock, for a write conditional on it). The memtable
+keeps it per document; a segment built from numbered documents keeps them
+in section `seq` (`storage::rowseq`: a width, a base and one number per
+docID); a value set in place keeps its document's new number beside it in
+the segment's updates (as field `SEQ`, which no schema has), which a merge
+folds into the merged segment's section and carries for values set while
+it ran. Rows written before numbering, bulk loaded or attached have number
+0: an attached image's section is dropped, since another database's
+numbers could equal later ones here. A deleted row keeps no number; there
+are no tombstones, which shipping the log in order and catching up from a
+checkpoint do not need.
 
 ### 3.5 Deletes, updates, snapshots
 
@@ -659,14 +676,16 @@ handing a query to its shards) are to make instead of writing SQL text.
 * **Sequence numbers.** Replication's order of writes is a database's
   own (§3.4): a numbered database gives each write transaction a term and
   a sequence number, logged in its commit record and kept across flushes,
-  crashes, checkpoints and reopening. Nothing ships the log yet.
+  crashes, checkpoints and reopening, and each row the number of the
+  write that last changed it. Nothing ships the log yet, and SQL and the
+  server do not read the numbers yet.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication on top of the shard protocol (row versions
-and conditional writes, WAL shipping, catch-up, read-your-writes,
+Next: the rest of replication on top of the shard protocol (conditional
+writes through SQL and the server, WAL shipping, catch-up, read-your-writes,
 promotion), and a coordinator and strata-server over every table.
 
 ## 7. Planning and execution

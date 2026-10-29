@@ -284,8 +284,9 @@ fn format_3_fixtures_open_and_stay_format_3() {
 }
 
 /// The fixtures of numbered writes hold format 2's table `t`, written
-/// under term 2 in five numbered transactions. A write takes the next
-/// number, through a flush, a merge and opening again.
+/// under term 2 in five numbered transactions, and each row the number of
+/// its last write (0 for rows from before numbering). A write takes the
+/// next number, through a flush, a merge and opening again.
 #[test]
 fn numbered_fixtures_open_and_go_on_counting() {
     use strata::storage::SeqNo;
@@ -301,9 +302,21 @@ fn numbered_fixtures_open_and_go_on_counting() {
                     assert_eq!(firsts(db, &format!("SELECT id FROM t WHERE n = {n} LIMIT 1000")), ids(t, Some(n)), "{what}: n = {n}");
                 }
             };
+            // Each row's number: the two inserts are 1 and 2, the deletes 3,
+            // the values set in place 4, and the transaction left in the WAL 5.
+            let mut seqs: BTreeMap<u64, u64> = (5..40).map(|i| (i, [0, 1, 2, 5][i as usize / 10])).collect();
+            seqs.extend([(5, 4), (6, 4), (7, 4), (11, 5)]);
+            seqs.remove(&10);
+            let check_seqs = |db: &Db, seqs: &BTreeMap<u64, u64>| {
+                for i in (0..40).chain([100]) {
+                    assert_eq!(db.storage().seq_of(None, &Value::Str(key(i))).unwrap(), seqs.get(&i).copied(), "{what}: {}", key(i));
+                }
+            };
             let db = Db::open(&path, options(&path)).unwrap_or_else(|e| panic!("{what}: {e}"));
             check(&db, &t);
             assert_eq!(db.storage().seq_no(), Some(SeqNo { term: 2, seq: 5 }), "{what}");
+            assert_eq!(db.storage().numbering().unwrap().terms, vec![(1, 1), (2, 1)], "{what}");
+            check_seqs(&db, &seqs);
 
             let mut t = t;
             run(&db, "INSERT INTO t (id, n, body) VALUES ('k000100', 9, 'document 100 version 1 lorem ipsum')");
@@ -311,16 +324,20 @@ fn numbered_fixtures_open_and_go_on_counting() {
             t.insert(100, (9, 1));
             t.get_mut(&12).unwrap().0 = 9;
             assert_eq!(db.storage().seq_no(), Some(SeqNo { term: 2, seq: 7 }), "{what}");
+            seqs.extend([(100, 6), (12, 7)]);
+            check_seqs(&db, &seqs);
             db.storage().flush().unwrap();
             merge(&db);
             db.storage().check().unwrap();
             check(&db, &t);
+            check_seqs(&db, &seqs);
             assert_eq!(format_on_disk(&path), 3, "{what}");
             drop(db);
 
             let db = Db::open(&path, options(&path)).unwrap();
             check(&db, &t);
             assert_eq!(db.storage().seq_no(), Some(SeqNo { term: 2, seq: 7 }), "{what}");
+            check_seqs(&db, &seqs);
         }
     }
 }

@@ -16,8 +16,9 @@ use crate::storage::live::{words_for, LiveDocs};
 use crate::storage::manifest::{Manifest, SegmentMeta};
 use crate::storage::pager::{Extent, Meta};
 use crate::storage::pk::PkIndex;
+use crate::storage::rowseq;
 use crate::storage::snapshot::{MemSeg, SnapInner};
-use crate::storage::updates::Updates;
+use crate::storage::updates::{Updates, SEQ};
 use crate::storage::wal::Op;
 use crate::value::{Document, Value};
 
@@ -184,6 +185,10 @@ pub(crate) struct Memtable {
     pub keys: HashMap<Key, u32>,
     /// In-place updates by memtable position, applied at flush.
     pub updates: Updates,
+    /// In a database that numbers its writes, the sequence number of the
+    /// write that inserted each document, by memtable position (one that
+    /// set a value in place since is in `updates`); empty otherwise.
+    pub seqs: Vec<u64>,
 }
 
 impl Memtable {
@@ -199,6 +204,7 @@ impl Memtable {
             chunk_deleted: Vec::new(),
             keys: HashMap::new(),
             updates: Updates::default(),
+            seqs: Vec::new(),
         }
     }
 
@@ -207,9 +213,14 @@ impl Memtable {
         *self = Memtable::new(self.chunk, self.gen + 1);
     }
 
-    /// Appends a document; returns its position.
-    pub fn push(&mut self, doc: Document) -> u32 {
+    /// Appends a document written by the transaction numbered `seq` (0 if
+    /// the database does not number its writes); returns its position.
+    pub fn push(&mut self, doc: Document, seq: u64) -> u32 {
         let i = self.len;
+        if seq > 0 {
+            self.seqs.resize(i, 0);
+            self.seqs.push(seq);
+        }
         if i.is_multiple_of(self.chunk) {
             self.chunks.push(Arc::new(Vec::new()));
             self.chunk_deleted.push(0);
@@ -227,10 +238,24 @@ impl Memtable {
         self.chunk_deleted[i as usize / self.chunk] += 1;
     }
 
+    /// The sequence number of the write that last changed document `i`.
+    pub fn seq(&self, i: u32) -> u64 {
+        mem_seq(&self.updates, &self.seqs, i)
+    }
+
     /// The deleted bits of chunk `k`'s documents.
     pub fn chunk_deleted_words(&self, k: usize) -> Vec<u64> {
         let first = k * self.chunk / 64;
         self.deleted[first..first + words_for(self.chunks[k].len() as u32)].to_vec()
+    }
+}
+
+/// The sequence number of the write that last changed memtable document
+/// `i`, from the memtable's (or a copy's) updates and insert numbers.
+pub(crate) fn mem_seq(updates: &Updates, seqs: &[u64], i: u32) -> u64 {
+    match updates.get(SEQ, i) {
+        Some(v) => v.as_i64().unwrap_or(0) as u64,
+        None => seqs.get(i as usize).copied().unwrap_or(0),
     }
 }
 
@@ -299,7 +324,7 @@ impl TableState {
             self.mem_live = self.mem_live.drain(..).skip(k).collect();
         } else {
             for p in n..old.len {
-                let i = mem.push(old.chunks[p / old.chunk][p % old.chunk].clone());
+                let i = mem.push(old.chunks[p / old.chunk][p % old.chunk].clone(), 0);
                 if old.deleted[p / 64] >> (p % 64) & 1 == 1 {
                     mem.delete(i);
                 }
@@ -307,6 +332,7 @@ impl TableState {
             self.memsegs.clear();
             self.mem_live.clear();
         }
+        mem.seqs = old.seqs.get(n..).unwrap_or_default().to_vec();
         let n32 = n as u32;
         mem.keys = old.keys.into_iter().filter(|&(_, p)| p >= n32).map(|(k, p)| (k, p - n32)).collect();
         for (f, p, v) in old.updates.iter().filter(|&(_, p, _)| p >= n32) {
@@ -408,14 +434,15 @@ impl State {
     }
 
     /// Applies a committed operation on table `t` (a position in `tables`),
-    /// at commit and on WAL replay.
-    pub fn apply(&mut self, t: usize, op: Op) {
+    /// at commit and on WAL replay, of the transaction numbered `seq` (0 if
+    /// the database does not number its writes).
+    pub fn apply(&mut self, t: usize, op: Op, seq: u64) {
         match op {
             Op::Insert(doc) => {
                 let table = &mut self.tables[t];
                 let key = table.schema.primary_key.and_then(|pk| Key::of(&doc[pk]));
                 // The transaction owned the only reference.
-                let i = table.mem.push(Arc::try_unwrap(doc).unwrap_or_else(|d| (*d).clone()));
+                let i = table.mem.push(Arc::try_unwrap(doc).unwrap_or_else(|d| (*d).clone()), seq);
                 if let Some(k) = key {
                     table.mem.keys.insert(k, i);
                 }
@@ -434,7 +461,11 @@ impl State {
             },
             Op::Set { key, field, value } => match self.find_live(t, &key) {
                 Some(Loc::Mem(i)) => {
-                    self.tables[t].mem.updates.set(field as usize, i, value);
+                    let u = &mut self.tables[t].mem.updates;
+                    u.set(field as usize, i, value);
+                    if seq > 0 {
+                        u.set(SEQ, i, Value::Int(seq as i64));
+                    }
                 }
                 Some(Loc::Disk(id, d)) => {
                     let (n, u) = self.pending_updates.entry(id).or_default();
@@ -442,11 +473,30 @@ impl State {
                     if u.set(field as usize, d, value) {
                         self.n_pending += 1;
                     }
+                    if seq > 0 {
+                        u.set(SEQ, d, Value::Int(seq as i64));
+                    }
                 }
                 None => {}
             },
         }
         self.changed();
+    }
+
+    /// The sequence number of the write that last changed the document at
+    /// `loc` of table `t` (a position in `tables`).
+    pub fn seq_at(&self, t: usize, loc: Loc) -> Result<u64> {
+        match loc {
+            Loc::Mem(i) => Ok(self.tables[t].mem.seq(i)),
+            Loc::Disk(id, d) => {
+                let h = self.handle(id).ok_or_else(|| corrupt(format!("segment {id} is not open")))?;
+                let written = self.pending_updates.get(&id).and_then(|(_, u)| u.get(SEQ, d)).or_else(|| h.updates.as_ref().and_then(|u| u.get(SEQ, d)));
+                match written {
+                    Some(v) => Ok(v.as_i64().unwrap_or(0) as u64),
+                    None => rowseq::of(&h.file, d),
+                }
+            }
+        }
     }
 
     /// Segment `h`'s stored updates with its pending ones written over.

@@ -27,14 +27,15 @@ directory layout. [`writer.rs`](writer.rs) makes the writes:
 - numbered writes: format 2's table `t` with the same rows, its first write
   made before numbering started (`Database::start_seq_no`) and the rest
   under term 2 (`Database::begin_term`), numbered 1 to 5, the last left in
-  the WAL.
+  the WAL; each row keeps the number of its last write (in a segment's
+  section `seq` and beside values set in place), 0 for rows from before.
 
 `tests/format_fixtures.rs` opens copies of every set in both layouts with
 the current code, checks their rows, filters and searches (`simple` against
 `english`, `BOOL` and `TIMESTAMP` filters, defaults and `NOT NULL` on new
 rows), writes, flushes and merges, checks that each stays in its format and
 opens it again. A numbered set must also go on counting from its last
-number.
+number and give each row the number of its last write.
 
 It also writes the sets again with `writer.rs` and checks that the bytes
 are the same, but for the database id (in the single file's meta pages,

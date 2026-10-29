@@ -1,11 +1,14 @@
-//! Sequence numbers and terms. A database that numbers its writes
-//! (`Database::start_seq_no`) gives every write transaction the next
-//! number under its term, logs it in a numbered WAL (`STRWAL02`), and goes
-//! on counting across flushes, background flushes, crashes, checkpoints,
-//! merges and reopening; a new term (`Database::begin_term`) numbers the
-//! writes after it. Starting is one commit that makes the database format
-//! 3 with feature `seq_no`, which older versions refuse. A database that
-//! does not number its writes is written as before.
+//! Sequence numbers, terms and row versions. A database that numbers its
+//! writes (`Database::start_seq_no`) gives every write transaction the
+//! next number under its term, logs it in a numbered WAL (`STRWAL02`), and
+//! goes on counting across flushes, background flushes, crashes,
+//! checkpoints, merges and reopening; a new term (`Database::begin_term`)
+//! numbers the writes after it, and the manifest keeps where each term
+//! began. Each row keeps the number of the write that last changed it
+//! (`Database::seq_of`) through all of those too. Starting is one commit
+//! that makes the database format 3 with feature `seq_no`, which older
+//! versions refuse. A database that does not number its writes is written
+//! as before.
 
 mod storage_util;
 
@@ -14,6 +17,8 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use storage_util::*;
 use strata::db::Db;
 use strata::storage::pager::{Meta, PAGE};
@@ -21,6 +26,8 @@ use strata::storage::{wal, CheckpointOptions, DbOptions, Layout, MergePolicy, Se
 use strata::Value;
 
 type Rows = BTreeMap<String, i64>;
+/// Each live key's sequence number.
+type Seqs = BTreeMap<String, u64>;
 
 fn options(layout: Layout) -> DbOptions {
     // Commits never fill the memtable: only the test flushes.
@@ -150,6 +157,8 @@ fn writes_are_numbered_once_started() {
         drop(db);
         let db = Db::open(&path, options(layout)).unwrap();
         assert_eq!(db.storage().seq_no(), seq(3, 9));
+        // The manifest keeps where each term began.
+        assert_eq!(db.storage().numbering().unwrap().terms, vec![(1, 1), (3, 9)]);
         // A merge commits a version too, and keeps the count.
         for i in 0..3 {
             upsert(&db, &mut model, 20 + i, 0);
@@ -160,6 +169,7 @@ fn writes_are_numbered_once_started() {
         drop(db);
         let db = Db::open(&path, options(layout)).unwrap();
         assert_eq!((db.storage().seq_no(), rows(&db)), (seq(3, 12), model.clone()));
+        assert_eq!(db.storage().numbering().unwrap().terms, vec![(1, 1), (3, 9)]);
         db.storage().check().unwrap();
     }
 }
@@ -260,8 +270,165 @@ fn checkpoints_keep_the_count() {
         let copy_path = copy;
         let copy = Db::open(&copy_path, options(layout)).unwrap();
         assert_eq!((copy.storage().seq_no(), rows(&copy)), (seq(4, 4), model.clone()));
+        assert_eq!(copy.storage().numbering().unwrap().terms, vec![(1, 1), (4, 1)]);
         assert_eq!(on_disk(&copy_path), 3);
         assert_eq!(upsert(&copy, &mut model, 7, 7), Some(5));
         assert_eq!(magic(&copy_path), "STRWAL02");
+    }
+}
+
+/// Commits `n` random transactions on keys below `keys` (upserts, deletes,
+/// values set in place and added to), applying them to `rows` and `seqs`;
+/// in between, a transaction's `seq_of` gives the committed number of a
+/// row it has not written, and `None` for one it has.
+fn churn(db: &Db, rng: &mut StdRng, rows: &mut Rows, seqs: &mut Seqs, n: usize, keys: u64) {
+    for _ in 0..n {
+        let mut tx = db.storage().begin().unwrap();
+        let mut r = rows.clone();
+        let mut touched: Vec<String> = Vec::new();
+        for _ in 0..rng.gen_range(1..5) {
+            let i = rng.gen_range(0..keys);
+            let (k, v) = (key(i), rng.gen_range(0..1000));
+            let kv = Value::Str(k.clone());
+            let wrote = match rng.gen_range(0..6) {
+                0 | 1 => {
+                    tx.upsert(doc(i, v)).unwrap();
+                    r.insert(k.clone(), v);
+                    true
+                }
+                2 => tx.delete(&kv).unwrap() && r.remove(&k).is_some(),
+                3 => tx.set(&kv, "n", Value::Int(v)).unwrap() && r.insert(k.clone(), v).is_some(),
+                4 => tx.add(&kv, "n", &Value::Int(1)).unwrap() && r.get_mut(&k).map(|x| *x += 1).is_some(),
+                _ => {
+                    let want = if touched.contains(&k) { None } else { seqs.get(&k).copied() };
+                    assert_eq!(tx.seq_of(&kv).unwrap(), want, "{k} in a transaction");
+                    false
+                }
+            };
+            if wrote {
+                touched.push(k);
+            }
+        }
+        let seq = tx.commit_seq().unwrap();
+        assert_eq!(seq.is_some(), !touched.is_empty());
+        for k in touched {
+            match r.contains_key(&k) {
+                true => seqs.insert(k, seq.unwrap()),
+                false => seqs.remove(&k),
+            };
+        }
+        *rows = r;
+    }
+}
+
+/// The rows and every key's number are as the model has them.
+fn check_seqs(db: &Db, want: &Rows, seqs: &Seqs, keys: u64, what: &str) {
+    assert_eq!(&rows(db), want, "{what}");
+    for i in 0..keys {
+        let k = key(i);
+        assert_eq!(db.storage().seq_of(Some("t"), &Value::Str(k.clone())).unwrap(), seqs.get(&k).copied(), "{what}: {k}");
+    }
+}
+
+/// Rows keep the number of the write that last changed them, through the
+/// memtable, flushes, background flushes and merges with writes during
+/// them, reopening and checkpoints, against a model; rows from before
+/// numbering and bulk loaded ones have number 0.
+#[test]
+fn rows_keep_the_number_of_their_last_write() {
+    for (seed, layout) in [(1, Layout::SingleFile), (2, Layout::Directory), (3, Layout::SingleFile), (4, Layout::Directory)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_for(dir.path(), "db", layout);
+        let opts = DbOptions { segment_max_docs: 40, ..options(layout) };
+        let mut rng = StdRng::seed_from_u64(seed);
+        let (mut rows, mut seqs, keys) = (Rows::new(), Seqs::new(), 300);
+        let mut db = Db::create(&path, schema(), opts.clone()).unwrap();
+        assert!(db.storage().seq_of(None, &Value::Str(key(0))).unwrap_err().to_string().contains("does not number its writes"));
+        // Before numbering: number 0.
+        let mut tx = db.storage().begin().unwrap();
+        for i in 0..20 {
+            tx.upsert(doc(i, 5)).unwrap();
+            rows.insert(key(i), 5);
+            seqs.insert(key(i), 0);
+        }
+        tx.commit().unwrap();
+        db.storage().start_seq_no().unwrap();
+        // Bulk loaded: number 0 too.
+        db.storage().bulk_load((20..30).map(|i| doc(i, 6))).unwrap();
+        for i in 20..30 {
+            rows.insert(key(i), 6);
+            seqs.insert(key(i), 0);
+        }
+        check_seqs(&db, &rows, &seqs, keys, "start");
+        let copies = dir.path().join("copies");
+        std::fs::create_dir(&copies).unwrap();
+        for round in 0..24 {
+            churn(&db, &mut rng, &mut rows, &mut seqs, 15, keys);
+            let what = format!("seed {seed}, round {round}");
+            check_seqs(&db, &rows, &seqs, keys, &format!("{what}, written"));
+            match rng.gen_range(0..6) {
+                0 => db.storage().flush().unwrap(),
+                1 => db.storage().background_flush_with(|| churn(&db, &mut rng, &mut rows, &mut seqs, 10, keys)).unwrap(),
+                2 => {
+                    db.storage().flush().unwrap();
+                    let policy = MergePolicy { merge_factor: 2, floor_docs: 1_000, ..MergePolicy::default() };
+                    db.storage()
+                        .merge_with(&policy, || {
+                            churn(&db, &mut rng, &mut rows, &mut seqs, 5, keys);
+                            true
+                        })
+                        .unwrap();
+                }
+                3 => {
+                    drop(db);
+                    db = Db::open(&path, opts.clone()).unwrap();
+                }
+                4 => {
+                    let to = path_for(&copies, &format!("c{round}"), layout);
+                    db.storage().checkpoint(&to, &CheckpointOptions { layout, ..CheckpointOptions::default() }).unwrap();
+                    let copy = Db::open(&to, opts.clone()).unwrap();
+                    check_seqs(&copy, &rows, &seqs, keys, &format!("{what}, checkpoint"));
+                }
+                _ => {}
+            }
+            check_seqs(&db, &rows, &seqs, keys, &what);
+        }
+        db.storage().check().unwrap();
+        let segments = db.storage().file_stats().segments.len();
+        assert!(segments > 2, "seed {seed}: {segments} segments");
+    }
+}
+
+/// Rows of an attached segment have number 0, like loaded ones, also when
+/// the segment was exported from a database that numbered them: its
+/// numbers could equal those of later writes here.
+#[test]
+fn attached_rows_have_number_0() {
+    for layout in [Layout::SingleFile, Layout::Directory] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut model, mut other) = (Rows::new(), Rows::new());
+        let from = Db::create(&path_for(dir.path(), "from", layout), schema(), options(layout)).unwrap();
+        from.storage().start_seq_no().unwrap();
+        for i in 0..5 {
+            upsert(&from, &mut other, i, i as i64);
+        }
+        from.storage().flush().unwrap();
+        assert_eq!(from.storage().seq_of(None, &Value::Str(key(4))).unwrap(), Some(5));
+        let exported = dir.path().join("seg");
+        from.storage().export_segment(from.snapshot().segments()[0].id, &exported).unwrap();
+
+        let db = Db::create(&path_for(dir.path(), "db", layout), schema(), options(layout)).unwrap();
+        db.storage().start_seq_no().unwrap();
+        assert_eq!(upsert(&db, &mut model, 10, 10), Some(1));
+        let ids = db.storage().attach_segments(&[exported]).unwrap();
+        model.extend(other);
+        assert_eq!(rows(&db), model);
+        for i in 0..5 {
+            assert_eq!(db.storage().seq_of(None, &Value::Str(key(i))).unwrap(), Some(0), "{}", key(i));
+        }
+        assert_eq!(db.storage().seq_of(None, &Value::Str(key(10))).unwrap(), Some(1));
+        let attached: Vec<_> = db.snapshot().segments().iter().filter(|s| ids.contains(&s.id)).map(|s| s.file.has("seq")).collect();
+        assert_eq!(attached, [false]);
+        db.storage().check().unwrap();
     }
 }

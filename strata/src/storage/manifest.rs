@@ -45,11 +45,41 @@ pub struct Manifest {
     /// with: its id is 0 and it cannot be dropped.
     pub tables: Vec<TableMeta>,
     /// Set once the database numbers its writes
-    /// ([`crate::storage::Database::start_seq_no`]): the term writes are
-    /// numbered under, and the last sequence number given when this
-    /// version was committed (those of transactions still in the WAL come
-    /// back with them). Feature `seq_no`.
-    pub seq_no: Option<SeqNo>,
+    /// ([`crate::storage::Database::start_seq_no`]). Feature `seq_no`.
+    pub seq_no: Option<Numbering>,
+}
+
+/// How a database that numbers its writes stands, as a version records
+/// it: the term writes are numbered under, the last sequence number given
+/// when the version was committed (those of transactions still in the WAL
+/// come back with them), and every term so far with the first number it
+/// gave, oldest first. A primary's history is the terms' runs of numbers:
+/// a replica that comes back after a failover finds where its own log
+/// left the new primary's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Numbering {
+    pub term: u64,
+    pub seq: u64,
+    /// (term, first sequence number), rising in both; the last is `term`.
+    pub terms: Vec<(u64, u64)>,
+}
+
+impl Numbering {
+    /// Numbering from now on: term 1, from sequence number 1.
+    pub fn start() -> Numbering {
+        Numbering { term: 1, seq: 0, terms: vec![(1, 1)] }
+    }
+
+    /// The term and the last sequence number.
+    pub fn at(&self) -> SeqNo {
+        SeqNo { term: self.term, seq: self.seq }
+    }
+
+    /// Whether the terms rise, their first numbers do not fall, and the
+    /// last is the current term.
+    fn valid(&self) -> bool {
+        self.terms.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1) && self.terms.last().is_some_and(|&(t, from)| t == self.term && from <= self.seq + 1)
+    }
 }
 
 /// A write transaction's place in a database's history: the term of the
@@ -175,7 +205,7 @@ impl Manifest {
                 next_segment_id: self.next_segment_id,
                 next_table_id: self.next_table_id,
                 tables: &self.tables,
-                seq_no: self.seq_no,
+                seq_no: self.seq_no.as_ref(),
             })
         };
         bytes.expect("manifest serialises")
@@ -206,6 +236,9 @@ impl Manifest {
                 let m: V2 = serde_json::from_value(v).map_err(bad)?;
                 if m.tables.first().is_none_or(|t| t.id != 0) {
                     return Err(corrupt("manifest: the first table must have id 0"));
+                }
+                if m.seq_no.as_ref().is_some_and(|n| !n.valid()) {
+                    return Err(corrupt("manifest: the terms of its sequence numbers are out of order"));
                 }
                 Ok(Manifest { txn: m.txn, wal_txn: m.wal_txn, next_segment_id: m.next_segment_id, next_table_id: m.next_table_id, tables: m.tables, seq_no: m.seq_no })
             }
@@ -256,7 +289,7 @@ struct V2Ref<'a> {
     next_table_id: u32,
     tables: &'a [TableMeta],
     #[serde(skip_serializing_if = "Option::is_none")]
-    seq_no: Option<SeqNo>,
+    seq_no: Option<&'a Numbering>,
 }
 
 /// Every feature Strata writes so far is required. (A reader ignores the
@@ -280,7 +313,7 @@ struct V2 {
     next_table_id: u32,
     tables: Vec<TableMeta>,
     #[serde(default)]
-    seq_no: Option<SeqNo>,
+    seq_no: Option<Numbering>,
 }
 
 #[cfg(test)]
@@ -424,11 +457,17 @@ mod tests {
     #[test]
     fn sequence_numbers_are_a_feature() {
         let mut m = Manifest::new(schema("docs"));
-        m.seq_no = Some(SeqNo { term: 2, seq: 41 });
+        m.seq_no = Some(Numbering { term: 2, seq: 41, terms: vec![(1, 1), (2, 30)] });
         assert_eq!((m.format(), m.features()), (3, strings(&["seq_no"])));
         let text = String::from_utf8(m.encode()).unwrap();
-        assert!(text.starts_with(r#"{"format":3,"features":{"required":["seq_no"]},"#) && text.ends_with(r#""seq_no":{"term":2,"seq":41}}"#), "{text}");
+        assert!(text.starts_with(r#"{"format":3,"features":{"required":["seq_no"]},"#) && text.ends_with(r#""seq_no":{"term":2,"seq":41,"terms":[[1,1],[2,30]]}}"#), "{text}");
         assert_eq!(Manifest::decode(text.as_bytes()).unwrap(), m);
+        // Terms out of order, or a last term that is not the current one,
+        // are damage.
+        for bad in [r#""terms":[[2,30],[1,1]]"#, r#""terms":[[1,1],[3,30]]"#, r#""terms":[]"#, r#""terms":[[1,1],[2,43]]"#] {
+            let e = Manifest::decode(text.replace(r#""terms":[[1,1],[2,30]]"#, bad).as_bytes()).unwrap_err().to_string();
+            assert!(e.contains("out of order"), "{bad}: {e}");
+        }
         // With another feature, and with several tables.
         m.tables[0].schema = typed("tasks");
         m.tables.push(TableMeta { id: 1, schema: schema("authors"), segments: Vec::new() });
