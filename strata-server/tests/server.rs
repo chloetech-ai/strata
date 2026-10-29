@@ -1257,3 +1257,48 @@ async fn defaults_and_not_null_over_http_and_grpc() {
     assert_eq!(rows[0][3], rows[0][4], "one time for the statement: {rows}");
     assert!(coord.sql("INSERT INTO events (id, kind) VALUES ('y', NULL)", &Params::new(), 0).await.is_err());
 }
+
+/// A TEXT field's analyzer over HTTP: the schema names it, and searches
+/// of the field analyse their words with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_simple_analyzer_over_http() {
+    use strata::schema::Schema;
+    let schema = Schema::from_json(
+        r#"{"table": "notes", "key": "id", "fields": [
+            {"name": "id", "type": "keyword"},
+            {"name": "title", "type": "text", "analyzer": "simple"},
+            {"name": "body", "type": "text"}
+        ]}"#,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("n.strata"), schema.clone(), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let svc = Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://unused"), 16, Duration::from_secs(10)));
+    let base = http(svc, None).await;
+    let c = reqwest::Client::new();
+    let r = c.get(format!("{base}/v1/schema")).send().await.unwrap().json::<Json>().await.unwrap();
+    assert_eq!(r["short"]["fields"][1], json!({"name": "title", "type": "text", "analyzer": "simple"}));
+    assert_eq!(r["schema"]["fields"][1]["analyzer"], json!({"name": "simple", "version": 1}));
+    let (status, r) = post(&c, &format!("{base}/v1/schema/check"), json!({"table": "t", "fields": [{"name": "t", "type": "text", "analyzer": "klingon"}]})).await;
+    assert_eq!(status, 400, "{r}");
+    assert!(r["error"].as_str().unwrap_or("").contains("analyzer klingon"), "{r}");
+
+    let doc = |id: &str, t: &str| json!({"op": "insert", "doc": {"id": id, "title": t, "body": t}});
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({"ops": [doc("a", "The Running Cats"), doc("b", "they run")]})).await;
+    assert_eq!(status, 200, "{r}");
+    let ids = |r: &Json| {
+        let mut v: Vec<String> = r["rows"].as_array().unwrap().iter().map(|x| x[0].as_str().unwrap().to_string()).collect();
+        v.sort();
+        v
+    };
+    for (sql, want) in [
+        ("SELECT id FROM notes WHERE MATCH(title, 'run')", vec!["b"]),
+        ("SELECT id FROM notes WHERE MATCH(body, 'run')", vec!["a", "b"]),
+        ("SELECT id FROM notes WHERE MATCH(title, 'the')", vec!["a"]),
+        ("SELECT id FROM notes ORDER BY bm25(title, 'the running') DESC LIMIT 1", vec!["a"]),
+    ] {
+        let (status, r) = post(&c, &format!("{base}/v1/query"), json!({ "sql": sql })).await;
+        assert_eq!(status, 200, "{sql}: {r}");
+        assert_eq!(ids(&r), want, "{sql}: {r}");
+    }
+}

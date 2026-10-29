@@ -37,7 +37,7 @@ pub mod reader;
 pub mod sparse;
 pub mod synonyms;
 
-pub use analyzer::{analyze, analyze_query, analyze_query_with, analyze_with_positions, query_term_seq, QUERY_STOPWORDS};
+pub use analyzer::{analyze, analyze_query, analyze_query_with, analyze_with_positions, query_term_seq, Analyzer, QUERY_STOPWORDS};
 pub use bm25::{Bm25Params, CollectionStats, FilterStrategy, TopKAlgo};
 pub use builder::TextFieldBuilder;
 pub use cursor::{PostingCursor, END};
@@ -63,5 +63,5 @@ pub fn text_builder(field: &Field, opts: &BuildOptions) -> Result<TextFieldBuild
         return Err(Error::Schema(format!("field {} is not TEXT", field.name)));
     };
     let (format, loom_min_df) = builder::options(opts)?;
-    Ok(TextFieldBuilder::new(&field.name, positions, format, loom_min_df))
+    Ok(TextFieldBuilder::new(&field.name, positions, format, loom_min_df).with_analyzer(field.text_analyzer()))
 }

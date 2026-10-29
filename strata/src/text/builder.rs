@@ -6,7 +6,7 @@ use std::collections::{BinaryHeap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use super::analyzer::{for_each_word, term_of};
+use super::analyzer::{for_each_word, Analyzer};
 use super::codec::{encode_norm, get_varint, put_varint};
 use super::cursor::write_positions;
 use super::dict::DictBuilder;
@@ -67,6 +67,7 @@ pub struct TextFieldBuilder {
     positions: bool,
     format: PostingsFormat,
     loom_min_df: u32,
+    analyzer: Analyzer,
     /// Analysis cache: folded word -> term id (`None`: stopword).
     words: HashMap<String, Option<u32>>,
     term_ids: HashMap<String, u32>,
@@ -90,6 +91,7 @@ impl TextFieldBuilder {
             positions,
             format,
             loom_min_df,
+            analyzer: Analyzer::English,
             words: HashMap::new(),
             term_ids: HashMap::new(),
             terms: Vec::new(),
@@ -100,6 +102,12 @@ impl TextFieldBuilder {
             scratch: Vec::new(),
             sealed: false,
         }
+    }
+
+    /// Analyses text with `analyzer` (`english` unless set).
+    pub fn with_analyzer(mut self, analyzer: Analyzer) -> Self {
+        self.analyzer = analyzer;
+        self
     }
 
     /// Frees the lookups only adding documents needs (each distinct word
@@ -187,7 +195,7 @@ impl TextFieldBuilder {
             let id = match self.words.get(w) {
                 Some(&id) => id,
                 None => {
-                    let id = term_of(w).map(|t| match self.term_ids.get(t.as_ref()) {
+                    let id = self.analyzer.term_of(w).map(|t| match self.term_ids.get(t.as_ref()) {
                         Some(&id) => id,
                         None => {
                             let id = self.terms.len() as u32;

@@ -1260,9 +1260,10 @@ impl<'a> Executor<'a> {
         if let Some(q) = self.expanded.lock().unwrap_or_else(|e| e.into_inner()).matches.get(&key) {
             return Ok(q.clone());
         }
-        let mut q = text::parse_match(query)?;
+        let analyzer = self.schema.fields[field].text_analyzer();
+        let mut q = text::query::parse_match_with(query, analyzer)?;
         if !expand.is_none() {
-            let syn = if expand.synonyms { Some(self.synonyms()?) } else { None };
+            let syn = if expand.synonyms { Some(self.synonyms()?.of(analyzer)) } else { None };
             let edits = |t: &str| expand.fuzzy.map_or(0, |f| f.edits(t.chars().count()));
             q = text::query::expand(q, syn, &edits);
         }
@@ -1295,7 +1296,8 @@ impl<'a> Executor<'a> {
     /// and fuzzy queries do, so that a rare misspelling does not outrank
     /// the word it misspells.
     fn bm25_query(&self, field: usize, text: &str, opts: &Opts) -> Result<Bm25Query> {
-        let seq = query_term_seq(text, opts);
+        let analyzer = self.schema.fields[field].text_analyzer();
+        let seq = query_term_seq(text, opts, analyzer);
         let expand = Expand::from_opts(opts).map_err(err)?;
         let mut out = Bm25Query::default();
         for t in &seq {
@@ -1319,7 +1321,7 @@ impl<'a> Executor<'a> {
         };
         let base_of = |t: &str, out: &Bm25Query| out.terms[..n_base].iter().position(|(x, _)| x == t);
         if expand.synonyms {
-            let syn = self.synonyms()?;
+            let syn = self.synonyms()?.of(analyzer);
             for i in 0..seq.len() {
                 for len in 1..=syn.max_len().min(seq.len() - i) {
                     for alt in syn.get(&seq[i..i + len]) {
@@ -2002,11 +2004,12 @@ fn has_graphs(q: &Select) -> bool {
     !q.graphs.is_empty()
 }
 
-/// The terms of a `bm25` query in order, repeats included; `stopwords =>
-/// 0` keeps query stopwords.
-fn query_term_seq(q: &str, opts: &Opts) -> Vec<String> {
-    let drop = opts.get("stopwords").and_then(|v| v.as_f64()).map_or(true, |x| x != 0.0);
-    text::query_term_seq(q, drop)
+/// The terms of a `bm25` query in order, repeats included, as the field's
+/// `analyzer` analyses them; `stopwords => 0` keeps query stopwords and
+/// `stopwords => 1` drops them (by default only an `english` field does).
+fn query_term_seq(q: &str, opts: &Opts, analyzer: text::Analyzer) -> Vec<String> {
+    let drop = opts.get("stopwords").and_then(|v| v.as_f64()).map_or(analyzer.drops_query_stopwords(), |x| x != 0.0);
+    analyzer.query_term_seq(q, drop)
 }
 
 /// The weighted terms of a `bm25` query ([`Executor::bm25_query`]).

@@ -25,7 +25,8 @@
 //! ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
 //! the schema's short JSON form ([`crate::schema::Schema::from_json`]):
 //! `positions`, `stored` and `indexed` (true or false), `from` (the fields
-//! a generated TEXT field joins), `index` (`'hnsw'` with `m` and
+//! a generated TEXT field joins), `analyzer` (`'english'`, the default, or
+//! `'simple'`; another than `english` makes the database format 3), `index` (`'hnsw'` with `m` and
 //! `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'`
 //! or `'binary'`), `dim`, and `embed` with `model` (the fields a VECTOR
 //! field is the model's embedding of). Field lists are a string, `'title,
@@ -201,12 +202,12 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let bad = |m: String| err(format!("column {name}: {m}"));
     let (ty, multi, dim) = column_type(ty).map_err(bad)?;
     let allowed: &[&str] = match ty {
-        "text" => &["positions", "stored", "indexed", "from"],
+        "text" => &["positions", "stored", "indexed", "from", "analyzer"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
         _ => &["stored", "indexed"],
     };
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {

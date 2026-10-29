@@ -204,3 +204,27 @@ def test_not_null_and_default(tmp_path):
         assert db.query("SELECT kind, n FROM events WHERE id = 'c'")[0] == {"kind": "click", "n": 1}
         with pytest.raises(strata.StrataError, match="kind is NOT NULL"):
             db.sql("UPDATE events SET kind = NULL WHERE id = 'a'")
+
+
+def test_simple_analyzer(tmp_path):
+    schema = {
+        "table": "notes",
+        "key": "id",
+        "fields": [
+            {"name": "id", "type": "keyword"},
+            {"name": "title", "type": "text", "analyzer": "simple"},
+            {"name": "body", "type": "text"},
+        ],
+    }
+    with strata.Database.create(tmp_path / "notes.strata", schema) as db:
+        assert db.schema["fields"][1] == {"name": "title", "type": "text", "analyzer": "simple"}
+        db.insert([{"id": "a", "title": "The Running Cats", "body": "The Running Cats"}, {"id": "b", "title": "they run", "body": "they run"}])
+
+        def ids(field, q):
+            return sorted(row["id"] for row in db.query(f"SELECT id FROM notes WHERE MATCH({field}, '{q}')"))
+
+        assert ids("title", "run") == ["b"]
+        assert ids("body", "run") == ["a", "b"]
+        assert ids("title", "the") == ["a"]
+    with pytest.raises(strata.StrataError, match="analyzer"):
+        strata.Database.create(tmp_path / "bad.strata", {"table": "t", "fields": [{"name": "t", "type": "text", "analyzer": "klingon"}]})
