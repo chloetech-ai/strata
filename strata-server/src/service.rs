@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
-use strata::db::{Db, SqlResult};
+use strata::db::{Db, PreparedWrite};
 use strata::embed::Embedder;
 use strata::ingest::{Format, Rows};
 use strata::query::exec::{ExecOptions, ResultSet};
@@ -705,10 +705,31 @@ impl Service {
             return Ok(SqlAnswer::Rows(a));
         }
         let t0 = Instant::now();
-        let deadline = t0 + self.timeout_of(timeout_ms);
         let r = match &self.backend {
-            Backend::Local(_) => match self.enqueue() {
-                Ok(q) => self.write(WriteJob::Sql(sql.to_string(), params.clone()), deadline, None, q).await,
+            Backend::Local(db) => match self.enqueue() {
+                Ok(q) => {
+                    async {
+                        // Bound, and its vectors computed, before it queues:
+                        // models run on a core of their own, not in the
+                        // writer thread.
+                        let core = match self.models.iter().any(|m| m.model.is_ok()) {
+                            true => Some(self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?),
+                            false => None,
+                        };
+                        let (db, text, p) = (db.clone(), sql.to_string(), params.clone());
+                        let prepared = tokio::task::spawn_blocking(move || {
+                            let _core = core;
+                            db.prepare_write(&text, &p)
+                        })
+                        .await
+                        .map_err(ApiError::internal)??
+                        .ok_or_else(|| ApiError::bad("not a write statement"))?;
+                        // The deadline bounds the wait for the writer, not the embedding.
+                        let deadline = Instant::now() + self.timeout_of(timeout_ms);
+                        self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q).await
+                    }
+                    .await
+                }
                 Err(e) => Err(e),
             },
             Backend::Cluster(c) => c.sql(sql, params).await,
@@ -963,8 +984,8 @@ pub fn op_key(schema: &Schema, op: &Json) -> Result<Value, ApiError> {
 enum WriteJob {
     /// Operations of `/v1/write` (or gRPC `Write`).
     Ops(Vec<Json>),
-    /// An `INSERT`, `UPDATE` or `DELETE`.
-    Sql(String, Params),
+    /// An `INSERT`, `UPDATE` or `DELETE`, its vectors computed.
+    Sql(Box<PreparedWrite>),
 }
 
 struct Queued {
@@ -1132,11 +1153,8 @@ fn apply_group(db: &Db, group: Vec<Queued>) {
         q.answer(Err(ApiError { status: 503, message: "the deadline passed while waiting for the writer".into() }));
     }
     let Some(deadline) = group.iter().map(|q| q.deadline).max() else { return };
-    if let [Queued { job: WriteJob::Sql(sql, params), .. }] = &group[..] {
-        let r = wait_for_writer(deadline, || match db.sql(sql, params)? {
-            SqlResult::Written(n) => Ok(n),
-            SqlResult::Rows(_) => Err(ApiError::bad("not a write statement")),
-        });
+    if let [Queued { job: WriteJob::Sql(p), .. }] = &group[..] {
+        let r = wait_for_writer(deadline, || Ok(db.write_prepared(p)?));
         group.into_iter().next().expect("one").answer(r);
         return;
     }

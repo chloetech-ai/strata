@@ -35,6 +35,19 @@ pub enum SqlResult {
     Written(u64),
 }
 
+/// An INSERT, UPDATE or DELETE bound to its table, with the vectors it
+/// writes computed ([`Db::prepare_write`]), to run with
+/// [`Db::write_prepared`].
+#[derive(Clone, Debug)]
+pub struct PreparedWrite {
+    schema: Arc<Schema>,
+    write: Write,
+    known: Known,
+}
+
+/// Vectors computed ahead of a write, by embedded field and source text.
+type Known = HashMap<usize, HashMap<String, Arc<[f32]>>>;
+
 pub struct Db {
     storage: Arc<Database>,
     /// Readers by segment id, with the address of the image they read.
@@ -456,14 +469,76 @@ impl Db {
             }
             Command::Write { table, write } => {
                 let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
-                self.write(schema, write).map(SqlResult::Written)
+                self.write_prepared(&self.prepare(schema.clone(), write)).map(SqlResult::Written)
             }
         }
     }
 
-    /// Runs a bound write of the table `schema` describes, in one
-    /// transaction.
-    fn write(&self, schema: &Schema, write: Write) -> Result<u64> {
+    /// Binds an INSERT, UPDATE or DELETE, and computes the vectors it
+    /// writes (of the embedded fields it leaves out, and of those whose
+    /// sources an UPDATE changes) before [`Db::write_prepared`] takes the
+    /// writer lock: a model is slow, and every other write waits while the
+    /// lock is held. `None` for any other statement. [`Db::sql`] does both.
+    pub fn prepare_write(&self, sql: &str, params: &Params) -> Result<Option<PreparedWrite>> {
+        let catalog = self.catalog();
+        let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
+        let Command::Write { table, write } = bind_command(sql, &tables, params)? else { return Ok(None) };
+        let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
+        Ok(Some(self.prepare(schema.clone(), write)))
+    }
+
+    fn prepare(&self, schema: Arc<Schema>, mut write: Write) -> PreparedWrite {
+        if let Write::Insert { docs, .. } = &mut write {
+            docs.iter_mut().for_each(|d| schema.fill_generated(d));
+        }
+        let known = self.embed_ahead(&schema, &write);
+        PreparedWrite { schema, write, known }
+    }
+
+    /// The vectors `write` will compute, from the latest version. The rows
+    /// an UPDATE or `ON CONFLICT DO UPDATE` rewrites are read here and
+    /// again under the writer lock, where only the texts that changed in
+    /// between are embedded. An error here (the table dropped, a sum that
+    /// overflows) is left for the write to report.
+    fn embed_ahead(&self, schema: &Schema, write: &Write) -> Known {
+        let models = self.models_of(schema);
+        if models.iter().all(Option::is_none) {
+            return Known::new();
+        }
+        let docs = || -> Result<Vec<Document>> {
+            let Some(snap) = self.snapshot().table(&schema.table) else { return Ok(Vec::new()) };
+            let pk = || schema.primary_key.ok_or_else(|| Error::Query(format!("{} has no primary key", schema.table)));
+            Ok(match write {
+                Write::Insert { docs, conflict: Conflict::Fail | Conflict::Replace } => docs.clone(),
+                Write::Insert { docs, conflict: Conflict::Skip } => not_live(&snap, pk()?, docs.clone()),
+                Write::Insert { docs, conflict: Conflict::Update(sets) } => {
+                    let pk = pk()?;
+                    let (live, mut new): (Vec<Document>, Vec<Document>) = docs.iter().cloned().partition(|d| snap.lookup(&d[pk]).is_some());
+                    if !in_place(schema, sets) {
+                        new.extend(plan_sets(schema, &models, self.conflict_rows(&snap, schema, pk, live)?, sets)?.rewrites);
+                    }
+                    new
+                }
+                // Numbers set in place embed nothing.
+                Write::Update { sets, .. } if in_place(schema, sets) => Vec::new(),
+                Write::Update { select, sets } => {
+                    let rows = self.execute(&snap, select, &self.exec)?.rows;
+                    plan_sets(schema, &models, rows.into_iter().map(|r| (r, Vec::new())).collect(), sets)?.rewrites
+                }
+                Write::Delete { .. } => Vec::new(),
+            })
+        };
+        docs().map_or_else(|_| Known::new(), |docs| vectors_of(&models, schema, &docs))
+    }
+
+    /// Runs a write [`Db::prepare_write`] bound, in one transaction, and
+    /// returns the number of documents written. The rows an UPDATE or
+    /// DELETE changes are read under the writer lock, so no other write
+    /// lands between; vectors computed ahead are used where their source
+    /// texts did not change. It can run again after an error (a busy
+    /// writer).
+    pub fn write_prepared(&self, p: &PreparedWrite) -> Result<u64> {
+        let schema = &*p.schema;
         let mut t = self.storage.begin()?;
         let mut tt = t.table(&schema.table)?;
         if tt.schema() != schema {
@@ -474,12 +549,11 @@ impl Db {
         let snap = self.snapshot().table(&schema.table).expect("the writer lock keeps the table");
         let pk = || schema.primary_key.ok_or_else(|| Error::Query(format!("{} has no primary key", schema.table)));
         let mut n = 0u64;
-        match write {
+        match p.write.clone() {
             Write::Insert { mut docs, conflict } => {
-                docs.iter_mut().for_each(|d| schema.fill_generated(d));
                 match conflict {
                     Conflict::Fail | Conflict::Replace => {
-                        embed_with(&models, schema, &mut docs);
+                        embed_known(&models, schema, &mut docs, &p.known);
                         for d in docs {
                             if conflict == Conflict::Replace {
                                 tt.upsert(d)?;
@@ -490,11 +564,8 @@ impl Db {
                         }
                     }
                     Conflict::Skip => {
-                        let pk = pk()?;
-                        // Neither live nor written earlier by this statement.
-                        let mut seen = HashSet::new();
-                        docs.retain(|d| snap.lookup(&d[pk]).is_none() && seen.insert(Part::of(&d[pk])));
-                        embed_with(&models, schema, &mut docs);
+                        let mut docs = not_live(&snap, pk()?, docs);
+                        embed_known(&models, schema, &mut docs, &p.known);
                         for d in docs {
                             tt.insert(d)?;
                             n += 1;
@@ -507,21 +578,13 @@ impl Db {
                             return Err(Error::Query(format!("ON CONFLICT DO UPDATE: key {:?} comes twice; a statement updates a row once", d[pk])));
                         }
                         let (live, mut new): (Vec<Document>, Vec<Document>) = docs.into_iter().partition(|d| snap.lookup(&d[pk]).is_some());
-                        embed_with(&models, schema, &mut new);
+                        embed_known(&models, schema, &mut new, &p.known);
                         for d in new {
                             tt.insert(d)?;
                             n += 1;
                         }
-                        if !live.is_empty() {
-                            // The live rows, every field, matched to the documents the INSERT proposed.
-                            let cols: Vec<String> = schema.fields.iter().map(|f| qsql::ident(&f.name)).collect();
-                            let text = format!("SELECT {} FROM {} WHERE {} IN (:keys)", cols.join(", "), qsql::ident(&schema.table), qsql::ident(&schema.fields[pk].name));
-                            let keys = Value::List(live.iter().map(|d| d[pk].clone()).collect());
-                            let rows = self.execute(&snap, &bind(&text, schema, &Params::new().set("keys", keys))?, &self.exec)?.rows;
-                            let mut by_key: HashMap<Part, Vec<Value>> = rows.into_iter().map(|r| (Part::of(&r[pk]), r)).collect();
-                            let pairs: Vec<(Vec<Value>, Document)> = live.into_iter().filter_map(|d| by_key.remove(&Part::of(&d[pk])).map(|r| (r, d))).collect();
-                            n += self.set_rows(&mut tt, schema, &models, pairs, &sets)?;
-                        }
+                        let pairs = self.conflict_rows(&snap, schema, pk, live)?;
+                        n += set_rows(&mut tt, schema, &models, pairs, &sets, &p.known)?;
                     }
                 }
             }
@@ -533,7 +596,7 @@ impl Db {
             }
             Write::Update { select, sets } => {
                 let rows = self.execute(&snap, &select, &self.exec)?.rows;
-                n += self.set_rows(&mut tt, schema, &models, rows.into_iter().map(|r| (r, Vec::new())).collect(), &sets)?;
+                n += set_rows(&mut tt, schema, &models, rows.into_iter().map(|r| (r, Vec::new())).collect(), &sets, &p.known)?;
             }
         }
         drop(tt);
@@ -541,82 +604,18 @@ impl Db {
         Ok(n)
     }
 
-    /// Sets fields of live rows: each pair is a row (every field, as a
-    /// SELECT of them all returns it) and, for `ON CONFLICT DO UPDATE`, the
-    /// document the INSERT proposed ([`Assign::Excluded`]). Only single-valued
-    /// numbers change in place; any other field rewrites the row, which
-    /// needs every text field stored or generated.
-    fn set_rows(&self, tt: &mut TableTxn, schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)]) -> Result<u64> {
-        let pk = schema.primary_key.ok_or_else(|| Error::Query(format!("UPDATE needs a primary key, and {} has none", schema.table)))?;
-        let in_place = |f: usize| {
-            let fld = &schema.fields[f];
-            matches!(fld.ty, FieldType::Int | FieldType::Float) && !fld.multi
-        };
-        let rewrite = !sets.iter().all(|(f, _)| in_place(*f));
-        if rewrite {
-            if let Some(f) = schema.fields.iter().find(|f| matches!(f.ty, FieldType::Text { .. }) && !f.stored && f.generated_from.is_empty()) {
-                return Err(Error::Query(format!("UPDATE of non-numeric fields rewrites documents, and {} is not stored", f.name)));
-            }
+    /// The live rows of the documents an INSERT proposed (`live`), every
+    /// field, each paired with its document, for `ON CONFLICT DO UPDATE`.
+    fn conflict_rows(&self, snap: &Snapshot, schema: &Schema, pk: usize, live: Vec<Document>) -> Result<Vec<(Vec<Value>, Document)>> {
+        if live.is_empty() {
+            return Ok(Vec::new());
         }
-        // A rewrite that changes a source of an embedded field recomputes
-        // its vector, unless it sets the vector itself.
-        let stale: Vec<usize> = (0..schema.fields.len())
-            .filter(|&f| models[f].is_some() && !sets.iter().any(|(g, _)| *g == f))
-            .filter(|&f| {
-                let from = &schema.fields[f].embed.as_ref().expect("embedded").from;
-                sets.iter().any(|(g, _)| from.iter().any(|s| schema.field_index(s) == Some(*g)) || generated_from_set(schema, from, *g))
-            })
-            .collect();
-        let mut n = 0u64;
-        let mut rewrites = Vec::new();
-        for (row, proposed) in rows {
-            let new = |f: usize, a: &Assign| -> Result<Value> {
-                Ok(match a {
-                    Assign::Value(v) => v.clone(),
-                    Assign::Excluded(g) => proposed[*g].clone(),
-                    // NULL counts as zero; a sum that overflows is an
-                    // error, as in Postgres.
-                    Assign::Add(x) => {
-                        let overflow = || Error::Query(format!("{} + {x:?} overflows", schema.fields[f].name));
-                        match (&schema.fields[f].ty, x) {
-                            (FieldType::Int, Value::Int(x)) => Value::Int(row[f].as_i64().unwrap_or(0).checked_add(*x).ok_or_else(overflow)?),
-                            (FieldType::Int, Value::Float(y)) if y.fract() == 0.0 && y.abs() < 9.2e18 => {
-                                Value::Int(row[f].as_i64().unwrap_or(0).checked_add(*y as i64).ok_or_else(overflow)?)
-                            }
-                            (FieldType::Int, _) => return Err(Error::Query(format!("{} is INT: add an integer", schema.fields[f].name))),
-                            _ => {
-                                let y = row[f].as_f64().unwrap_or(0.0) + x.as_f64().unwrap_or(0.0);
-                                if !y.is_finite() {
-                                    return Err(overflow());
-                                }
-                                Value::Float(y)
-                            }
-                        }
-                    }
-                })
-            };
-            if !rewrite {
-                for (f, a) in sets {
-                    tt.set(&row[pk], &schema.fields[*f].name, new(*f, a)?)?;
-                }
-            } else {
-                let mut doc = row.clone();
-                for (f, a) in sets {
-                    doc[*f] = new(*f, a)?;
-                }
-                for &f in &stale {
-                    doc[f] = Value::Null;
-                }
-                schema.fill_generated(&mut doc);
-                rewrites.push(doc);
-            }
-            n += 1;
-        }
-        embed_with(models, schema, &mut rewrites);
-        for doc in rewrites {
-            tt.upsert(doc)?;
-        }
-        Ok(n)
+        let cols: Vec<String> = schema.fields.iter().map(|f| qsql::ident(&f.name)).collect();
+        let text = format!("SELECT {} FROM {} WHERE {} IN (:keys)", cols.join(", "), qsql::ident(&schema.table), qsql::ident(&schema.fields[pk].name));
+        let keys = Value::List(live.iter().map(|d| d[pk].clone()).collect());
+        let rows = self.execute(snap, &bind(&text, schema, &Params::new().set("keys", keys))?, &self.exec)?.rows;
+        let mut by_key: HashMap<Part, Vec<Value>> = rows.into_iter().map(|r| (Part::of(&r[pk]), r)).collect();
+        Ok(live.into_iter().filter_map(|d| by_key.remove(&Part::of(&d[pk])).map(|r| (r, d))).collect())
     }
 
     pub fn execute(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions) -> Result<ResultSet> {
@@ -726,14 +725,22 @@ fn generated_from_set(schema: &Schema, from: &[String], g: usize) -> bool {
 /// (by field of `schema`), one batch per field split across the cores. A
 /// document whose sources are all empty gets no vector.
 fn embed_with(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut [Document]) {
+    embed_known(models, schema, docs, &Known::new());
+}
+
+/// [`embed_with`], taking the vectors of the texts `known` has from it.
+fn embed_known(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut [Document], known: &Known) {
     for (f, e) in models.iter().enumerate() {
         let Some(e) = e else { continue };
+        let ahead = known.get(&f);
         let mut todo = Vec::new();
         let mut texts = Vec::new();
-        for (j, d) in docs.iter().enumerate() {
+        for (j, d) in docs.iter_mut().enumerate() {
             if matches!(d[f], Value::Null) {
                 let t = schema.embed_text(f, d);
-                if !t.is_empty() {
+                if let Some(v) = ahead.and_then(|a| a.get(&t)) {
+                    d[f] = Value::Vector(v.clone());
+                } else if !t.is_empty() {
                     todo.push(j);
                     texts.push(t);
                 }
@@ -743,6 +750,130 @@ fn embed_with(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut 
             docs[j][f] = Value::Vector(v.into());
         }
     }
+}
+
+/// The vectors `docs` leave out (null) of their embedded fields, each text
+/// embedded once.
+fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Document]) -> Known {
+    let mut known = Known::new();
+    for (f, e) in models.iter().enumerate() {
+        let Some(e) = e else { continue };
+        let mut seen = HashSet::new();
+        let texts: Vec<String> = docs.iter().filter(|d| matches!(d[f], Value::Null)).map(|d| schema.embed_text(f, d)).filter(|t| !t.is_empty() && seen.insert(t.clone())).collect();
+        if !texts.is_empty() {
+            let vectors = embed_all(e.as_ref(), &texts);
+            known.insert(f, texts.into_iter().zip(vectors).map(|(t, v)| (t, v.into())).collect());
+        }
+    }
+    known
+}
+
+/// What setting fields of live rows writes ([`plan_sets`]).
+struct Planned {
+    /// Key, field and value of each number set in place.
+    in_place: Vec<(Value, usize, Value)>,
+    /// The rows rewritten, the vectors their new sources make stale left
+    /// out (null).
+    rewrites: Vec<Document>,
+    rows: u64,
+}
+
+/// Plans setting fields of live rows: each pair is a row (every field, as
+/// a SELECT of them all returns it) and, for `ON CONFLICT DO UPDATE`, the
+/// document the INSERT proposed ([`Assign::Excluded`]). Only single-valued
+/// numbers change in place; any other field rewrites the row, which needs
+/// every text field stored or generated.
+fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)]) -> Result<Planned> {
+    let pk = schema.primary_key.ok_or_else(|| Error::Query(format!("UPDATE needs a primary key, and {} has none", schema.table)))?;
+    let rewrite = !in_place(schema, sets);
+    if rewrite {
+        if let Some(f) = schema.fields.iter().find(|f| matches!(f.ty, FieldType::Text { .. }) && !f.stored && f.generated_from.is_empty()) {
+            return Err(Error::Query(format!("UPDATE of non-numeric fields rewrites documents, and {} is not stored", f.name)));
+        }
+    }
+    // A rewrite that changes a source of an embedded field recomputes
+    // its vector, unless it sets the vector itself.
+    let stale: Vec<usize> = (0..schema.fields.len())
+        .filter(|&f| models[f].is_some() && !sets.iter().any(|(g, _)| *g == f))
+        .filter(|&f| {
+            let from = &schema.fields[f].embed.as_ref().expect("embedded").from;
+            sets.iter().any(|(g, _)| from.iter().any(|s| schema.field_index(s) == Some(*g)) || generated_from_set(schema, from, *g))
+        })
+        .collect();
+    let (mut in_place, mut rewrites, mut n) = (Vec::new(), Vec::new(), 0u64);
+    for (row, proposed) in rows {
+        let new = |f: usize, a: &Assign| -> Result<Value> {
+            Ok(match a {
+                Assign::Value(v) => v.clone(),
+                Assign::Excluded(g) => proposed[*g].clone(),
+                // NULL counts as zero; a sum that overflows is an
+                // error, as in Postgres.
+                Assign::Add(x) => {
+                    let overflow = || Error::Query(format!("{} + {x:?} overflows", schema.fields[f].name));
+                    match (&schema.fields[f].ty, x) {
+                        (FieldType::Int, Value::Int(x)) => Value::Int(row[f].as_i64().unwrap_or(0).checked_add(*x).ok_or_else(overflow)?),
+                        (FieldType::Int, Value::Float(y)) if y.fract() == 0.0 && y.abs() < 9.2e18 => {
+                            Value::Int(row[f].as_i64().unwrap_or(0).checked_add(*y as i64).ok_or_else(overflow)?)
+                        }
+                        (FieldType::Int, _) => return Err(Error::Query(format!("{} is INT: add an integer", schema.fields[f].name))),
+                        _ => {
+                            let y = row[f].as_f64().unwrap_or(0.0) + x.as_f64().unwrap_or(0.0);
+                            if !y.is_finite() {
+                                return Err(overflow());
+                            }
+                            Value::Float(y)
+                        }
+                    }
+                }
+            })
+        };
+        if !rewrite {
+            for (f, a) in sets {
+                in_place.push((row[pk].clone(), *f, new(*f, a)?));
+            }
+        } else {
+            let mut doc = row.clone();
+            for (f, a) in sets {
+                doc[*f] = new(*f, a)?;
+            }
+            for &f in &stale {
+                doc[f] = Value::Null;
+            }
+            schema.fill_generated(&mut doc);
+            rewrites.push(doc);
+        }
+        n += 1;
+    }
+    Ok(Planned { in_place, rewrites, rows: n })
+}
+
+/// Whether setting `sets` changes rows in place: every field set is a
+/// single-valued number.
+fn in_place(schema: &Schema, sets: &[(usize, Assign)]) -> bool {
+    sets.iter().all(|(f, _)| matches!(schema.fields[*f].ty, FieldType::Int | FieldType::Float) && !schema.fields[*f].multi)
+}
+
+/// Sets fields of live rows ([`plan_sets`]), embedding the vectors the
+/// rewrites leave out (from `known` where it has their text).
+fn set_rows(tt: &mut TableTxn, schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)], known: &Known) -> Result<u64> {
+    let mut p = plan_sets(schema, models, rows, sets)?;
+    for (key, f, v) in p.in_place {
+        tt.set(&key, &schema.fields[f].name, v)?;
+    }
+    embed_known(models, schema, &mut p.rewrites, known);
+    for doc in p.rewrites {
+        tt.upsert(doc)?;
+    }
+    Ok(p.rows)
+}
+
+/// The documents of an INSERT whose key is neither live nor proposed
+/// earlier by the same statement (`INSERT OR IGNORE`, `ON CONFLICT DO
+/// NOTHING`).
+fn not_live(snap: &Snapshot, pk: usize, mut docs: Vec<Document>) -> Vec<Document> {
+    let mut seen = HashSet::new();
+    docs.retain(|d| snap.lookup(&d[pk]).is_none() && seen.insert(Part::of(&d[pk])));
+    docs
 }
 
 /// `e`'s vectors of `texts`, split across the cores.
