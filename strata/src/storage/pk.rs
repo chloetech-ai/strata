@@ -242,7 +242,7 @@ pub struct PkIndex {
 impl PkIndex {
     /// The index of a segment, or `None` if it has no `pk` section.
     pub fn open(seg: &SegmentFile) -> Result<Option<PkIndex>> {
-        seg.section(SECTION).map(PkIndex::from_section).transpose()
+        seg.section(SECTION)?.map(PkIndex::from_section).transpose()
     }
 
     pub fn from_section(bytes: OwnedBytes) -> Result<PkIndex> {

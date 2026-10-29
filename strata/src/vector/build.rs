@@ -151,11 +151,11 @@ impl VectorBuilder {
 /// `seg`'s HNSW graph of `field` and its node count, if it has one of
 /// `dim` dimensions.
 fn start_graph(seg: &SegmentFile, field: &str, dim: usize) -> Option<(HnswView, usize)> {
-    let info: VectorInfo = serde_json::from_slice(&seg.section(&section(field, "meta"))?).ok()?;
+    let info: VectorInfo = serde_json::from_slice(&seg.section(&section(field, "meta")).ok()??).ok()?;
     if info.index != "hnsw" || info.dim != dim || info.n != seg.n_docs() {
         return None;
     }
-    let g = HnswView::open(info.m?, info.entry?, seg.section(&section(field, "hnsw"))?, seg.section(&section(field, "hnsw_upper"))?, info.n).ok()?;
+    let g = HnswView::open(info.m?, info.entry?, seg.section(&section(field, "hnsw")).ok()??, seg.section(&section(field, "hnsw_upper")).ok()??, info.n).ok()?;
     Some((g, info.n))
 }
 

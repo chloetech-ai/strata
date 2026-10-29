@@ -50,7 +50,7 @@ fn opts(seed: u64) -> BuildOptions {
 }
 
 fn graph(seg: &SegmentFile) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let s = |part: &str| seg.section(&format!("vec.emb.{part}")).unwrap().to_vec();
+    let s = |part: &str| seg.require(&format!("vec.emb.{part}")).unwrap().to_vec();
     (s("meta"), s("hnsw"), s("hnsw_upper"))
 }
 

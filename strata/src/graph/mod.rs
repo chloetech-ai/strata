@@ -397,7 +397,7 @@ pub struct GraphReader {
 impl GraphReader {
     /// The reader of field `field`, or `None` if the segment has no such section.
     pub fn open(seg: &SegmentFile, field: &str) -> Result<Option<GraphReader>> {
-        seg.section(&section(field)).map(GraphReader::from_section).transpose()
+        seg.section(&section(field))?.map(GraphReader::from_section).transpose()
     }
 
     pub fn from_section(bytes: OwnedBytes) -> Result<GraphReader> {
