@@ -110,7 +110,7 @@ A segment is *n* documents with local docIDs `0..n`, stored as a header and a di
 
 ### Full text
 
-- **Analyzer.** Unicode word split, lowercase, ASCII folding, an English stopword list and a light English stemmer; queries use the same analyzer.
+- **Analyzer.** Unicode word split, lowercase, ASCII folding, an English stopword list and a light English stemmer (words longer than 64 bytes are kept whole: the stemmer takes time in the square of a word's length); queries use the same analyzer.
 - **Term dictionary.** Sorted terms in front-coded blocks of 32, with a sparse in-memory index over block first-terms. Each entry gives the document frequency and the posting list's location.
 - **Postings.** DocIDs, term frequencies and per-block maximum scores, so that top-k can skip blocks. DocIDs of terms in at least 512 documents are [Loom](../posting-lists.md#loom) lists; rarer terms use BP128 blocks. Frequencies are bit-packed in 128-posting blocks addressed by posting rank. Against BP128 for every list, Loom is 2–4% smaller with 7.6–11× faster conjunctions.
 - **Top-k.** MaxScore by default; on the BEIR queries it beats Block-Max WAND by 1.9–2.6×. A filter either drives scoring (its members are scored directly) or is probed per candidate, by a fitted crossover.

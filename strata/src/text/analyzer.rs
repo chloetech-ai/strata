@@ -106,11 +106,19 @@ pub fn is_stopword(word: &str) -> bool {
     STOPWORDS.binary_search(&word).is_ok()
 }
 
+/// Words longer than this many bytes are not stemmed: no English word is,
+/// and the stemmer takes time in the square of a word's length (a write
+/// of one 900 KB word took 52 s).
+pub const MAX_STEM_BYTES: usize = 64;
+
 /// The term for a lowercased, folded word: `None` for stopwords, else its
-/// stem.
+/// stem (the word itself past [`MAX_STEM_BYTES`]).
 pub fn term_of(word: &str) -> Option<Cow<'_, str>> {
     if is_stopword(word) {
         return None;
+    }
+    if word.len() > MAX_STEM_BYTES {
+        return Some(Cow::Borrowed(word));
     }
     static STEMMER: OnceLock<Stemmer> = OnceLock::new();
     Some(STEMMER.get_or_init(|| Stemmer::create(Algorithm::English)).stem(word))
@@ -224,6 +232,19 @@ fn fold(c: char) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_words_are_kept_whole_and_fast() {
+        let at = "ing".repeat(20) + "s";
+        assert_eq!(at.len(), 61);
+        assert_ne!(term_of(&at).unwrap(), at, "stemmed");
+        let past = "ing".repeat(25);
+        assert_eq!(term_of(&past).unwrap(), past);
+        let t0 = std::time::Instant::now();
+        let huge = "y".repeat(1 << 20);
+        assert_eq!(analyze(&huge), [huge.clone()]);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1), "{:?}", t0.elapsed());
+    }
 
     #[test]
     fn stopwords_sorted() {

@@ -93,11 +93,24 @@ pub struct Service {
     /// Queries and writes that take this long or longer are logged as
     /// slow (`None`: none are).
     pub slow: Option<Duration>,
+    /// The most rows a query may reach, OFFSET included
+    /// ([`ExecOptions::max_rows`]; `None`: no limit).
+    pub max_rows: Option<usize>,
+    /// The most groups a query may make ([`ExecOptions::max_groups`]).
+    pub max_groups: Option<usize>,
+    /// The most write requests in the write path at once (embedding,
+    /// waiting for the writer or being applied); more are refused with 429.
+    pub max_queued_writes: usize,
+    /// The largest body `/v1/write` and `/v1/import` (and a gRPC message)
+    /// may have, in bytes; other routes take [`SMALL_BODY`].
+    pub max_body: usize,
     pub lease_ttl: Duration,
     leases: Mutex<HashMap<u64, (Snapshot, Instant)>>,
     next_lease: AtomicU64,
     /// Queries allowed to run at once; the rest wait until their deadline.
     admission: Arc<Semaphore>,
+    /// Texts embedded at once (one per core): writes' and queries'.
+    embedding: Arc<Semaphore>,
     cores: usize,
     /// Queries running, counted until their work ends ([`Running`]).
     running: Arc<AtomicUsize>,
@@ -136,10 +149,15 @@ impl Service {
             timeout,
             max_timeout: timeout.max(Duration::from_secs(60)),
             slow: None,
+            max_rows: None,
+            max_groups: None,
+            max_queued_writes: usize::MAX,
+            max_body: 256 << 20,
             lease_ttl: Duration::from_secs(60),
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
             admission: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            embedding: Arc::new(Semaphore::new(cores)),
             cores,
             running: Arc::new(AtomicUsize::new(0)),
             writes,
@@ -305,13 +323,19 @@ impl Service {
         self.local_db().cloned().ok_or_else(|| ApiError::bad("a coordinator has no database of its own: ask each shard server"))
     }
 
+    /// A place in the write path, held until the request is answered;
+    /// 429 when [`Self::max_queued_writes`] requests hold one.
+    fn enqueue(&self) -> Result<InQueue, ApiError> {
+        InQueue::start(&self.writer_state, self.max_queued_writes)
+            .ok_or_else(|| ApiError { status: 429, message: format!("{} writes are queued, the most this server takes; try again", self.max_queued_writes) })
+    }
+
     /// Hands a write to the writer thread and waits for its commit. The
     /// writer records `key`'s outcome, even if this future is dropped.
-    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>) -> Result<u64, ApiError> {
+    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue) -> Result<u64, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         let keys = self.idempotency.clone();
-        let queued = InQueue::start(&self.writer_state);
         tx.send(Queued { job, deadline, reply: Some(reply), key, keys, _queued: queued }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
         rx.await.map_err(|_| ApiError::internal("the writer thread stopped"))?
     }
@@ -405,7 +429,16 @@ impl Service {
                     let text = o["embed"].as_str().unwrap_or_default().to_string();
                     let e = e.clone();
                     let t0 = Instant::now();
-                    let v = tokio::task::spawn_blocking(move || e.embed_query(&text)).await.map_err(ApiError::internal)?;
+                    let core = match tokio::time::timeout(self.timeout, self.embedding.clone().acquire_owned()).await {
+                        Ok(p) => p.map_err(ApiError::internal)?,
+                        Err(_) => return Err(ApiError { status: 429, message: "every core is embedding; try again".into() }),
+                    };
+                    let v = tokio::task::spawn_blocking(move || {
+                        let _core = core;
+                        e.embed_query(&text)
+                    })
+                    .await
+                    .map_err(ApiError::internal)?;
                     self.metrics.embedded("query", 1, t0.elapsed().as_secs_f64());
                     Value::Vector(v.into())
                 }
@@ -469,6 +502,10 @@ impl Service {
                         deadline: Some(t0 + timeout),
                         cancel: Some(cancel.0.clone()),
                         synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
+                        // A coordinator's compound queries ask a shard for
+                        // as many rows as a compound step may hold.
+                        max_rows: if req.shard { self.max_rows.map(|m| m.max(compound::MAX_ROWS + 1)) } else { self.max_rows },
+                        max_groups: self.max_groups,
                         ..db.exec.clone()
                     };
                     let db = db.clone();
@@ -488,17 +525,27 @@ impl Service {
                 Err(e) => Err(e),
             },
             Backend::Cluster(c) => {
-                let r = c.query(&req, &select, t0 + timeout).await.map(|m| (m.rs, m.missing));
+                let reach = select.limit.unwrap_or(0).saturating_add(select.offset);
+                let r = match self.max_rows.filter(|&m| reach > m) {
+                    Some(m) => Err(ApiError::bad(format!("query error: LIMIT and OFFSET reach row {reach}; a query returns at most {m} rows"))),
+                    None => c.query(&req, &select, t0 + timeout).await.map(|m| (m.rs, m.missing)),
+                };
                 drop(permit);
                 r
             }
         };
-        self.done(&req.sql, kind, t0, res)
+        // A shard's answer to a coordinator is not a client's.
+        self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), res)
     }
 
     /// Counts a query's outcome, logs it if it was slow, and makes its
-    /// answer.
-    fn done(&self, sql: &str, kind: &'static str, t0: Instant, res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
+    /// answer. One with more rows than `window` (a compound query's, or a
+    /// coordinator's without a LIMIT) fails.
+    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
+        let res = match (res, window) {
+            (Ok((rs, _)), Some(m)) if rs.rows.len() > m => Err(ApiError::bad(format!("query error: the query matches more than {m} rows, the most a query returns; add a LIMIT"))),
+            (r, _) => r,
+        };
         let secs = t0.elapsed().as_secs_f64();
         let outcome = match &res {
             Ok((_, missing)) if !missing.is_empty() => "partial",
@@ -532,11 +579,14 @@ impl Service {
             Backend::Local(db) => {
                 let snap = self.snapshot(db, req.snapshot)?;
                 let (running, n) = Running::start(&self.running);
+                // Steps hold up to compound::MAX_ROWS rows; the answer is
+                // held to the window below.
                 let opts = ExecOptions {
                     threads: (self.cores / n).max(1),
                     deadline: Some(deadline),
                     cancel: Some(cancel.0.clone()),
                     synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
+                    max_groups: self.max_groups,
                     ..db.exec.clone()
                 };
                 let db = db.clone();
@@ -588,7 +638,7 @@ impl Service {
             Err(_) if Instant::now() > deadline => Err(ApiError { status: 504, message: format!("the query ran past its {} ms deadline", timeout.as_millis()) }),
             r => r,
         };
-        self.done(&req_sql, kind, t0, res)
+        self.done(&req_sql, kind, t0, self.max_rows, res)
     }
 
     /// A query slot, waited for until `timeout`; `None` (counted as
@@ -642,7 +692,10 @@ impl Service {
         let t0 = Instant::now();
         let deadline = t0 + self.timeout_of(timeout_ms);
         let r = match &self.backend {
-            Backend::Local(_) => self.write(WriteJob::Sql(sql.to_string(), params.clone()), deadline, None).await,
+            Backend::Local(_) => match self.enqueue() {
+                Ok(q) => self.write(WriteJob::Sql(sql.to_string(), params.clone()), deadline, None, q).await,
+                Err(e) => Err(e),
+            },
             Backend::Cluster(c) => c.sql(sql, params).await,
         };
         let n = self.wrote(r, t0, Some(sql))?;
@@ -657,6 +710,11 @@ impl Service {
         let t0 = Instant::now();
         let n = match &self.backend {
             Backend::Local(db) => {
+                // Before any work: a full queue refuses the request.
+                let queued = match self.enqueue() {
+                    Ok(q) => q,
+                    Err(e) => return self.wrote(Err(e), t0, None),
+                };
                 if let Some(k) = &key {
                     match self.idempotency.begin(k, idem::hash_ops(&ops)) {
                         idem::Begin::New => {}
@@ -670,11 +728,18 @@ impl Service {
                 }
                 let r = async {
                     if self.models.iter().any(|m| m.model.is_ok()) {
+                        // Queued writes wait for a core to embed on.
+                        let core = self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?;
                         let (svc, db) = (self.clone(), db.clone());
-                        ops = tokio::task::spawn_blocking(move || svc.embed_ops(&db, &mut ops).map(|_| ops)).await.map_err(ApiError::internal)??;
+                        ops = tokio::task::spawn_blocking(move || {
+                            let _core = core;
+                            svc.embed_ops(&db, &mut ops).map(|_| ops)
+                        })
+                        .await
+                        .map_err(ApiError::internal)??;
                     }
                     // The deadline bounds the wait for the writer, not the embedding.
-                    self.write(WriteJob::Ops(ops), Instant::now() + self.timeout, key.clone()).await
+                    self.write(WriteJob::Ops(ops), Instant::now() + self.timeout, key.clone(), queued).await
                 }
                 .await;
                 if let (Err(_), Some(k)) = (&r, &key) {
@@ -709,21 +774,37 @@ impl Service {
 
     /// Imports rows of `format` from `body` ([`strata::ingest`]): upserted
     /// through the writer (or routed to the shards) [`IMPORT_OPS`] rows a
-    /// request, so the rows before a failed request stay written. Returns
-    /// the rows written and the fields the schema lacks (skipped).
+    /// request, so the rows before a failed request stay written. Every
+    /// row is read once first, so that a bad one writes nothing; then read
+    /// again a request's worth at a time, the next while the last is
+    /// written, so that an import holds its body and two requests' rows,
+    /// not every row. Returns the rows written and the fields the schema
+    /// lacks (skipped).
     pub async fn import(self: &Arc<Self>, body: axum::body::Bytes, format: Format) -> Result<(u64, Vec<String>), ApiError> {
         let schema = self.schema.clone();
-        let (ops, unknown) = tokio::task::spawn_blocking(move || -> strata::Result<_> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<strata::Result<Vec<Json>>>(1);
+        let reader = tokio::task::spawn_blocking(move || -> strata::Result<Vec<String>> {
+            let mut check = Rows::new(&schema, std::io::Cursor::new(body.clone()), format)?;
+            check.by_ref().try_for_each(|d| d.map(drop))?;
             let mut rows = Rows::new(&schema, std::io::Cursor::new(body), format)?;
-            let ops: Vec<Json> = rows.by_ref().map(|d| d.map(|d| json!({"op": "upsert", "doc": js::document_json(&schema, &d)}))).collect::<strata::Result<_>>()?;
-            Ok((ops, rows.unknown.into_iter().collect::<Vec<_>>()))
-        })
-        .await
-        .map_err(ApiError::internal)??;
+            loop {
+                let chunk: strata::Result<Vec<Json>> = rows.by_ref().take(IMPORT_OPS).map(|d| d.map(|d| json!({"op": "upsert", "doc": js::document_json(&schema, &d)}))).collect();
+                let last = chunk.as_ref().map_or(true, |c| c.len() < IMPORT_OPS);
+                // The writing side stopped: a write failed.
+                if tx.blocking_send(chunk).is_err() || last {
+                    break;
+                }
+            }
+            Ok(rows.unknown.into_iter().collect())
+        });
         let mut n = 0;
-        for chunk in ops.chunks(IMPORT_OPS) {
-            n += self.write_ops(chunk.to_vec(), None).await?;
+        while let Some(chunk) = rx.recv().await {
+            let ops = chunk?;
+            if !ops.is_empty() {
+                n += self.write_ops(ops, None).await?;
+            }
         }
+        let unknown = reader.await.map_err(ApiError::internal)??;
         Ok((n, unknown))
     }
 
@@ -798,7 +879,7 @@ impl Service {
                     one("strata_snapshot_leases", "gauge", "Snapshot leases held.", self.sweep_leases() as f64),
                     one("strata_failing", "gauge", "1 when the database cannot write until the server restarts.", self.failing().is_some() as u8 as f64),
                     one("strata_flush_failing", "gauge", "1 while flushes fail (a full disk).", db.storage().flush_error().is_some() as u8 as f64),
-                    one("strata_write_queue_requests", "gauge", "Write requests waiting for the writer or being applied.", w.queued.load(Ordering::Relaxed) as f64),
+                    one("strata_write_queue_requests", "gauge", "Write requests in the write path: embedding, waiting for the writer, or being applied.", w.queued.load(Ordering::Relaxed) as f64),
                     one("strata_write_batches_total", "counter", "Groups of write requests the writer applied in one transaction.", w.batches.load(Ordering::Relaxed) as f64),
                     one("strata_writer_panics_total", "counter", "Groups of writes whose application panicked.", w.panics.load(Ordering::Relaxed) as f64),
                     one("strata_merges_running", "gauge", "Merges running now.", m.running as f64),
@@ -824,6 +905,10 @@ pub enum SqlAnswer {
 /// decimal digits), modulo `n`. Loaders must split documents the same way.
 /// Rows one write request of an import carries.
 pub const IMPORT_OPS: usize = 1000;
+
+/// The largest body a route other than `/v1/write` and `/v1/import` takes:
+/// a query, its parameters (vectors among them) or a synonym list.
+pub const SMALL_BODY: usize = 16 << 20;
 
 pub fn shard_of(key: &Value, n: usize) -> usize {
     let text = match key {
@@ -916,9 +1001,12 @@ impl Default for WriterState {
 struct InQueue(Arc<AtomicUsize>);
 
 impl InQueue {
-    fn start(state: &WriterState) -> InQueue {
-        state.queued.fetch_add(1, Ordering::Relaxed);
-        InQueue(state.queued.clone())
+    /// Counts a request as queued, unless `max` already are.
+    fn start(state: &WriterState, max: usize) -> Option<InQueue> {
+        let before = state.queued.fetch_add(1, Ordering::Relaxed);
+        // Dropped at once when refused, which uncounts it.
+        let q = InQueue(state.queued.clone());
+        (before < max).then_some(q)
     }
 }
 
@@ -1153,7 +1241,7 @@ mod tests {
         assert_eq!(keys.begin("k", 1), idem::Begin::New);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let state = WriterState::default();
-        let q = Queued { job: WriteJob::Ops(Vec::new()), deadline: Instant::now(), reply: Some(tx), key: Some("k".into()), keys: keys.clone(), _queued: InQueue::start(&state) };
+        let q = Queued { job: WriteJob::Ops(Vec::new()), deadline: Instant::now(), reply: Some(tx), key: Some("k".into()), keys: keys.clone(), _queued: InQueue::start(&state, 1).unwrap() };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _held = q;
             panic!("a bug while applying a write");
