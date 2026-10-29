@@ -81,19 +81,27 @@ fn stops_midway(db: &Db, sql: &str) {
         took
     });
     assert!(took < first + loops / 2, "{sql}: stopped after {took:?} of {full:?} ({first:?} before its first check)");
-    let took = faster(&|| {
+    // Timed from the cancel: a sleeping thread can wake tens of
+    // milliseconds late on a macOS runner, so the canceller spins instead,
+    // and what counts is how soon the query stops once the flag is set.
+    let after = faster(&|| {
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
+        let at = Instant::now() + first + loops / 10;
         let canceller = std::thread::spawn(move || {
-            std::thread::sleep(first + loops / 10);
+            while Instant::now() < at {
+                std::hint::spin_loop();
+            }
             flag.store(true, Ordering::Relaxed);
+            Instant::now()
         });
-        let (r, took) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
-        canceller.join().unwrap();
+        let (r, _) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
+        let stopped = Instant::now();
+        let set = canceller.join().unwrap();
         assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("cancelled")), "{sql}: {r:?}");
-        took
+        stopped.saturating_duration_since(set)
     });
-    assert!(took < first + loops / 2, "{sql}: stopped after {took:?} of {full:?} ({first:?} before its first check)");
+    assert!(after < loops / 2, "{sql}: stopped {after:?} after the cancel, in a run of {full:?}");
 }
 
 #[test]
