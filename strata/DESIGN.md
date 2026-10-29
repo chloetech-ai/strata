@@ -161,6 +161,17 @@ need no table.
   an `optional` list and other keys it does not know. Format 3 is the last
   format number: versions from before it refuse it as newer, and every
   later change that an older reader must not ignore is a feature.
+* **Fixtures of each format.** `tests/fixtures` keeps databases that
+  earlier versions wrote, in both layouts, byte for byte: format 1 from
+  before tables, format 2 with two tables and format 3 with every feature,
+  each with deletes, values set in place and a transaction left in the
+  WAL. The tests open copies with the current code, check their rows and
+  searches, write, flush and merge them and check the format they stay in.
+  The writes behind formats 2 and 3 are deterministic, and a test writes
+  them again and compares the bytes (but for the database id), so a change
+  to what Strata writes fails until its pull request keeps the old set
+  under a new name and adds one written by the new code
+  (`tests/fixtures/README.md`).
 * **BOOL and TIMESTAMP** are logical types over an `INT` column (1 and 0;
   microseconds since the epoch in UTC), so every index, zone map, merge and
   shard message handles them as integers. Values are typed only at the
