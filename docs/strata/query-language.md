@@ -384,6 +384,9 @@ INSERT INTO products (id, title, price) VALUES ('p1', 'red mug', 12.0)
   ON CONFLICT (id) DO UPDATE SET price = excluded.price, stock = stock + 10;
 UPDATE products SET stock = stock - 1, price = 11.0 WHERE id = 'p1';
 UPDATE products SET stock = DEFAULT WHERE id = 'p2';
+UPDATE products SET price = round(price * 0.9, 2), title = title || ' (sale)' WHERE tags = 'gift';
+INSERT INTO products (id, stock) VALUES ('p1', 5)
+  ON CONFLICT (id) DO UPDATE SET stock = coalesce(stock, 0) + excluded.stock;
 DELETE FROM products WHERE MATCH(title, 'discontinued');
 DELETE FROM products WHERE stock = 0 ORDER BY price LIMIT 100;
 ```
@@ -391,6 +394,7 @@ DELETE FROM products WHERE stock = 0 ORDER BY price LIMIT 100;
 - A write names its table, any table of the database.
 - **`INSERT`** fails on a primary key that already exists. **`INSERT OR REPLACE`** (or `REPLACE INTO`) replaces that row, an upsert. **`ON CONFLICT (key) DO NOTHING`** (or `INSERT OR IGNORE`) writes only the rows whose key is new, and the first of a key the statement repeats. **`ON CONFLICT (key) DO UPDATE SET ...`** inserts the new keys and sets fields of the rows already there, where `excluded.column` is the value the statement gave; a key that comes twice in one such statement is an error. Lists are `ARRAY[…]`; a vector is a parameter, `ARRAY[…]` or a JSON array string; a `SPARSE` value is a JSON object string.
 - **`UPDATE`** takes any `WHERE`, and a `LIMIT`. Setting only single-valued `INT` and `FLOAT` fields (`SET clicks = clicks + 1`) changes them in place, without rewriting the row, which suits counters and prices that change often. Setting any other field rewrites the row, which needs every text field stored or generated.
+- **`SET`** takes a value or any expression of the row: arithmetic, `||`, `CASE`, `NOT`, comparisons, `lower`, `upper`, `length`, `abs`, `round` and `coalesce` over the row's columns, and in `ON CONFLICT DO UPDATE` over `excluded.column` too. Every expression reads the row as it was, so `SET a = b, b = a` swaps two fields. The result is stored as the field's type: a whole number fits an `INT` (`clicks = price * 2`), but `7 / 2` is 3.5 and an error there (`round(clicks / 2)` fits); one value set to a multi-valued field becomes a list of it. NULL in gives NULL out, as in SQL, except `field + number` and `field - number`, which count a NULL as zero, as a counter does; `coalesce(field, 0) + other` does the same elsewhere. A multi-valued field without values is NULL to `coalesce` and `IS NULL`. Searches, scores and aggregates (`MATCH`, `bm25`, `score()`, `COUNT`) are errors in `SET`. A statement that cannot set one of its rows sets none.
 - **`DELETE`** takes any `WHERE`, and `ORDER BY` with `LIMIT` to delete the first rows in that order.
 - `RETURNING`, `UPDATE ... FROM`, `DELETE ... USING`, `INSERT ... SELECT`, `ON DUPLICATE KEY UPDATE` and `DO UPDATE ... WHERE` are errors.
 

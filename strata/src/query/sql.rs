@@ -30,9 +30,9 @@ use std::sync::Arc;
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::error::{Error, Result};
-use crate::query::ddl;
+use crate::query::{ddl, ir};
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
-use crate::schema::{FieldType, Logical, Schema};
+use crate::schema::{Field, FieldType, Logical, Schema};
 use crate::storage::DropOptions;
 use crate::value::Value;
 
@@ -96,6 +96,13 @@ pub enum Assign {
     /// `field = excluded.g`, in `ON CONFLICT DO UPDATE`: field `g` of the
     /// document the INSERT proposed.
     Excluded(usize),
+    /// Any other expression of the row's fields (and, in `ON CONFLICT DO
+    /// UPDATE`, of `excluded.g`), computed for each row by the plan IR's
+    /// evaluator ([`crate::query::ir::eval`]) and stored as the field's
+    /// type: a whole FLOAT fits an INT, and one value a multi-valued field.
+    /// NULL in gives NULL out, as in SQL; only `field + number` counts a
+    /// NULL as zero.
+    Expr(crate::query::ir::Expr),
 }
 
 /// A bound statement ([`bind_command`]).
@@ -201,8 +208,12 @@ pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: 
                 return Err(err(format!("UPDATE {o} is not supported")));
             }
             let schema = table(plain_table(&t.relation, "UPDATE")?)?;
-            let sets = Binder::new(schema, params).assignments(assignments, false)?;
-            write(schema, Write::Update { select: selecting(schema, params, selection, &[], limit)?, sets })
+            let alias = match &t.relation {
+                sql::TableFactor::Table { alias: Some(a), .. } => Some(a.name.value.as_str()),
+                _ => None,
+            };
+            let sets = Binder::new(schema, params).assignments(assignments, alias, false)?;
+            write(schema, Write::Update { select: selecting(schema, params, &t.relation, selection, &[], limit)?, sets })
         }
         sql::Statement::Delete(d) => {
             let sql::Delete { tables: named, from, using, selection, returning, order_by, limit } = d;
@@ -218,7 +229,7 @@ pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: 
                 return Err(err("DELETE from exactly one table"));
             }
             let schema = table(plain_table(&t.relation, "DELETE")?)?;
-            write(schema, Write::Delete { select: selecting(schema, params, selection, order_by, limit)? })
+            write(schema, Write::Delete { select: selecting(schema, params, &t.relation, selection, order_by, limit)? })
         }
         sql::Statement::CreateTable(ct) => {
             let (schema, if_not_exists) = ddl::create_table(ct, tables)?;
@@ -301,7 +312,7 @@ fn insert(ins: &sql::Insert, schema: &Schema, params: &Params) -> Result<Write> 
                     if u.selection.is_some() {
                         return Err(err("ON CONFLICT ... DO UPDATE ... WHERE is not supported"));
                     }
-                    Conflict::Update(b.assignments(&u.assignments, true)?)
+                    Conflict::Update(b.assignments(&u.assignments, None, true)?)
                 }
             };
         }
@@ -379,28 +390,105 @@ fn unsupported_query_clause(
 
 /// The rows a WHERE clause selects, as a query of every field (an UPDATE
 /// may rewrite them; a DELETE needs their keys), cut by `ORDER BY` and
-/// `LIMIT` as a SELECT's rows are.
-fn selecting(schema: &Schema, params: &Params, selection: &Option<Expr>, order_by: &[sql::OrderByExpr], limit: &Option<Expr>) -> Result<Select> {
-    let cols: Vec<String> = schema.fields.iter().map(|f| ident(&f.name)).collect();
-    let mut text = format!("SELECT {} FROM {}", cols.join(", "), ident(&schema.table));
-    if let Some(e) = selection {
-        text += &format!(" WHERE {e}");
-    }
+/// `LIMIT` as a SELECT's rows are. The statement's own table and clauses
+/// are bound, never printed and parsed again: printed, `- -1` is `--1`, a
+/// comment, and a column named `order` is a keyword.
+fn selecting(schema: &Schema, params: &Params, table: &sql::TableFactor, selection: &Option<Expr>, order_by: &[sql::OrderByExpr], limit: &Option<Expr>) -> Result<Select> {
+    let mut q = parse_query("SELECT * FROM t")?;
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(err("a SELECT of every field")) };
+    s.from[0].relation = table.clone();
+    s.selection = selection.clone();
     if !order_by.is_empty() {
-        text += &format!(" ORDER BY {}", order_by.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(", "));
+        q.order_by = Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(order_by.to_vec()), interpolate: None });
     }
-    if let Some(l) = limit {
-        text += &format!(" LIMIT {l}");
+    q.limit_clause = limit.clone().map(|l| sql::LimitClause::LimitOffset { limit: Some(l), offset: None, limit_by: Vec::new() });
+    let mut select = bind_query(&q, schema, params)?;
+    select.projection = every_field(schema);
+    select.types = projection_types(schema, &select.projection);
+    Ok(select)
+}
+
+/// Every field of the rows whose primary key is one of `keys`, as a query
+/// (`ON CONFLICT DO UPDATE` reads the live rows of its keys).
+pub(crate) fn keyed_rows(schema: &Schema, keys: Vec<Value>) -> Result<Select> {
+    let pk = schema.primary_key.ok_or_else(|| err(format!("{} has no primary key", schema.table)))?;
+    let projection = every_field(schema);
+    let types = projection_types(schema, &projection);
+    let filter = if keys.is_empty() { Pred::False } else { Pred::In { field: pk, values: keys } };
+    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, limit: None, offset: 0, graphs: Vec::new(), types })
+}
+
+fn every_field(schema: &Schema) -> Vec<(String, Projection)> {
+    schema.fields.iter().enumerate().map(|(i, f)| (f.name.clone(), Projection::Field(i))).collect()
+}
+
+/// A column's name quoted, which SQL reads as that column whatever it is:
+/// a keyword such as `order`, or any characters.
+pub fn quoted(n: &str) -> String {
+    format!("\"{}\"", n.replace('"', "\"\""))
+}
+
+/// A value coerced to `field`'s type, in the form its column holds
+/// ([`crate::schema::Field::store`]).
+fn coerce(field: &Field, v: Value) -> Result<Value> {
+    if let Some(l) = field.logical {
+        // In SQL a time is text or a timestamp parameter; a bare
+        // number would be microseconds nobody meant.
+        if l == Logical::Timestamp && matches!(v, Value::Int(_) | Value::Float(_)) {
+            return Err(err(format!("{} is a TIMESTAMP: give it text such as '2026-10-01T12:30:00Z', not the number {v:?}", field.name)));
+        }
+        return field.store(v).map_err(|e| match e {
+            Error::Schema(m) => err(m),
+            e => e,
+        });
     }
-    bind(&text, schema, params)
+    match (&field.ty, v) {
+        (FieldType::Keyword, Value::Str(s)) => Ok(Value::Str(s)),
+        (FieldType::Keyword, Value::Int(x)) => Ok(Value::Str(x.to_string())),
+        (FieldType::Int, Value::Int(x)) => Ok(Value::Int(x)),
+        (FieldType::Int, Value::Bool(b)) => Ok(Value::Int(b as i64)),
+        (FieldType::Float, v @ (Value::Int(_) | Value::Float(_) | Value::Bool(_))) => Ok(Value::Float(v.as_f64().unwrap())),
+        (t, v) => Err(err(format!("value {v:?} does not fit a {t:?} field"))),
+    }
+}
+
+/// The value an expression gives `field` in `SET` ([`Assign::Expr`]), in
+/// the form its column holds: [`coerce`]d, a whole FLOAT as an INT, and
+/// one value as a multi-valued field's list of it.
+pub(crate) fn assigned(field: &Field, v: Value) -> Result<Value> {
+    let one = |v: Value| match (&field.ty, v) {
+        (FieldType::Int, Value::Float(x)) if field.logical.is_none() => {
+            if x.fract() == 0.0 && x.abs() < 9.2e18 {
+                Ok(Value::Int(x as i64))
+            } else {
+                Err(err(format!("{} is INT, and {x} is not an integer it holds", field.name)))
+            }
+        }
+        (FieldType::Float, Value::Float(x)) if !x.is_finite() => Err(err(format!("{} is FLOAT, and {x} is not a finite number", field.name))),
+        (_, v) => coerce(field, v),
+    };
+    Ok(match (&field.ty, v) {
+        (_, Value::Null) => Value::Null,
+        (FieldType::Vector { .. }, v @ Value::Vector(_)) => v,
+        (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
+        (FieldType::Sparse, v @ Value::Str(_)) => {
+            crate::text::sparse::parse(&v)?;
+            v
+        }
+        (FieldType::Vector { .. } | FieldType::Text { .. } | FieldType::Edges | FieldType::Sparse, v) => return Err(err(format!("{} is a {} field: SET cannot give it {v:?}", field.name, field.type_name()))),
+        (_, Value::List(xs)) if field.multi => Value::List(xs.into_iter().map(one).collect::<Result<_>>()?),
+        (_, Value::List(xs)) => return Err(err(format!("{} holds one value, not the list {xs:?}", field.name))),
+        (_, v) if field.multi => Value::List(vec![one(v)?]),
+        (_, v) => one(v)?,
+    })
 }
 
 /// A name as SQL spells it: quoted unless it is a plain identifier.
-pub(crate) fn ident(n: &str) -> String {
+pub fn ident(n: &str) -> String {
     if n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         n.to_string()
     } else {
-        format!("\"{}\"", n.replace('"', "\"\""))
+        quoted(n)
     }
 }
 
@@ -1317,26 +1405,7 @@ impl<'a> Binder<'a> {
     /// A value coerced to field `f`'s type, in the form its column holds
     /// ([`crate::schema::Field::store`]).
     fn coerce(&self, f: usize, v: Value) -> Result<Value> {
-        let field = &self.schema.fields[f];
-        if let Some(l) = field.logical {
-            // In SQL a time is text or a timestamp parameter; a bare
-            // number would be microseconds nobody meant.
-            if l == Logical::Timestamp && matches!(v, Value::Int(_) | Value::Float(_)) {
-                return Err(err(format!("{} is a TIMESTAMP: give it text such as '2026-10-01T12:30:00Z', not the number {v:?}", field.name)));
-            }
-            return field.store(v).map_err(|e| match e {
-                Error::Schema(m) => err(m),
-                e => e,
-            });
-        }
-        match (&field.ty, v) {
-            (FieldType::Keyword, Value::Str(s)) => Ok(Value::Str(s)),
-            (FieldType::Keyword, Value::Int(x)) => Ok(Value::Str(x.to_string())),
-            (FieldType::Int, Value::Int(x)) => Ok(Value::Int(x)),
-            (FieldType::Int, Value::Bool(b)) => Ok(Value::Int(b as i64)),
-            (FieldType::Float, v @ (Value::Int(_) | Value::Float(_) | Value::Bool(_))) => Ok(Value::Float(v.as_f64().unwrap())),
-            (t, v) => Err(err(format!("value {v:?} does not fit a {t:?} field"))),
-        }
+        coerce(&self.schema.fields[f], v)
     }
 
     /// A bound of an INT field's range: a number, or for a BOOL or
@@ -1387,13 +1456,16 @@ impl<'a> Binder<'a> {
         })
     }
 
-    /// `SET f = value, g = g + 1, ...`; with `excluded`, as in `ON CONFLICT
-    /// DO UPDATE`, also `h = excluded.h` (the value the INSERT proposed).
-    fn assignments(&self, assignments: &[sql::Assignment], excluded: bool) -> Result<Vec<(usize, Assign)>> {
+    /// `SET f = value, g = g + 1, h = expression, ...`, of the table or its
+    /// `alias`; with `excluded`, as in `ON CONFLICT DO UPDATE`, also of the
+    /// row the INSERT proposed (`excluded.h`).
+    fn assignments(&self, assignments: &[sql::Assignment], alias: Option<&str>, excluded: bool) -> Result<Vec<(usize, Assign)>> {
         let mut sets: Vec<(usize, Assign)> = Vec::new();
         for a in assignments {
             let sql::AssignmentTarget::ColumnName(name) = &a.target else { return Err(err("SET one column at a time")) };
-            let f = self.schema.field_index(&name.to_string()).ok_or_else(|| err(format!("no such column: {name}")))?;
+            // The name, not its SQL (`"order"`, quoted).
+            let column = name.0.last().and_then(|p| p.as_ident()).map_or_else(|| name.to_string(), |id| id.value.clone());
+            let f = self.schema.field_index(&column).ok_or_else(|| err(format!("no such column: {name}")))?;
             let fld = &self.schema.fields[f];
             if Some(f) == self.schema.primary_key {
                 return Err(err("the primary key cannot be updated; delete and insert instead"));
@@ -1402,7 +1474,7 @@ impl<'a> Binder<'a> {
                 return Err(err(format!("{} is set twice", fld.name)));
             }
             let assign = match &a.value {
-                Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if self.field_of(left).ok() == Some(f) => {
+                Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if matches!(self.set_ref(left, alias, excluded), Some(Ok(ir::Expr::Field(g))) if g as usize == f) && self.num_literal(right).is_ok() => {
                     if !matches!(fld.ty, FieldType::Int | FieldType::Float) || fld.logical.is_some() {
                         return Err(err(format!("{} is not numeric", fld.name)));
                     }
@@ -1423,11 +1495,49 @@ impl<'a> Binder<'a> {
                     }
                     Assign::Excluded(g)
                 }
-                e => Assign::Value(self.write_value(f, e)?),
+                e => match self.write_value(f, e) {
+                    Ok(v) => Assign::Value(v),
+                    Err(not_value) => self.set_expr(e, alias, excluded, not_value)?,
+                },
             };
             sets.push((f, assign));
         }
         Ok(sets)
+    }
+
+    /// What a column names in `SET`: a field of the row (`f`, or `t.f` of
+    /// the table or its alias), or with `excluded` of the row an INSERT
+    /// proposed (`excluded.f`); `None` when `x` is no column.
+    fn set_ref(&self, x: &Expr, alias: Option<&str>, excluded: bool) -> Option<Result<ir::Expr>> {
+        let ids = match x {
+            Expr::Identifier(_) => return Some(self.field_of(x).map(|f| ir::Expr::Field(f as u32))),
+            Expr::CompoundIdentifier(ids) if ids.len() == 2 => ids,
+            Expr::CompoundIdentifier(_) => return Some(Err(err(format!("no such column: {x}")))),
+            _ => return None,
+        };
+        let (t, name) = (&ids[0].value, &ids[1].value);
+        let f = || self.schema.field_index(name).ok_or_else(|| err(format!("no such column: {x}")));
+        Some(if excluded && t.eq_ignore_ascii_case("excluded") {
+            f().map(|g| ir::Expr::Excluded(g as u32))
+        } else if t.eq_ignore_ascii_case(&self.schema.table) || alias.is_some_and(|a| t.eq_ignore_ascii_case(a)) {
+            f().map(|g| ir::Expr::Field(g as u32))
+        } else {
+            Err(err(format!("no such column: {x}")))
+        })
+    }
+
+    /// `SET field = e` for an `e` that is not a value: an expression of the
+    /// row, which the plan's checks of a SET take or refuse
+    /// ([`crate::query::ir::Plan::to_write`]). `not_value` is the error of
+    /// `e` as a value.
+    fn set_expr(&self, e: &Expr, alias: Option<&str>, excluded: bool, not_value: Error) -> Result<Assign> {
+        match super::compound::compile(e, self.params, &|x| self.set_ref(x, alias, excluded), &[]) {
+            Ok(ir::Expr::Lit(_)) => Err(not_value),
+            Ok(x) => Ok(Assign::Expr(x)),
+            // A list, or a name that is no column: the value's error says more.
+            Err(_) if matches!(e, Expr::Array(_) | Expr::Identifier(_)) => Err(not_value),
+            Err(e) => Err(e),
+        }
     }
 
     fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {

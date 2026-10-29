@@ -92,6 +92,10 @@ const WRITES: &[&str] = &[
     "UPDATE papers SET published = '2026-01-01T10:00:00Z', tags = ARRAY['a'] WHERE id IN ('p1', 'p2')",
     "DELETE FROM papers WHERE year < 2000",
     "DELETE FROM papers WHERE done ORDER BY year DESC LIMIT 3",
+    // SET to expressions of the row.
+    "UPDATE papers SET rating = rating * 2 + year, title = lower(coalesce(title, 'untitled')) || '!', done = NOT done WHERE category = 'db'",
+    "INSERT INTO papers (id, year, rating) VALUES ('p2', 3, 1.5) ON CONFLICT (id) DO UPDATE SET year = CASE WHEN excluded.year > year THEN excluded.year ELSE year END, rating = coalesce(rating, 0) + excluded.rating",
+    "DELETE FROM papers WHERE year > - -2024",
 ];
 
 /// The plan of `sql`, through JSON and back.
@@ -274,6 +278,35 @@ fn db_runs_plans() {
     assert!(b.prepare_plan(&read).err().unwrap().to_string().contains("reads"));
 }
 
+/// A SET of a plan is an expression of the row, checked as SQL's is.
+#[test]
+fn set_plans_are_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = db(&dir.path().join("d.strata"));
+    fill(&db);
+    let schema = db.storage().table("papers").unwrap();
+    let year = schema.field_index("year").unwrap();
+    let j = db.explain("UPDATE papers SET year = year * 2 WHERE id = 'p1'", &Params::new()).unwrap().to_json().unwrap();
+    let set = serde_json::json!({"arith": {"op": "mul", "left": {"field": year}, "right": {"lit": {"int": 2}}}});
+    assert_eq!(j["root"]["sets"][0]["value"], set, "{j}");
+    let with = |value: serde_json::Value| {
+        let mut j = j.clone();
+        j["root"]["sets"][0]["value"] = value;
+        Plan::from_json(&j).unwrap()
+    };
+    for (value, want) in [
+        (serde_json::json!("score"), "SET takes an expression of the row's fields"),
+        (serde_json::json!({"call": {"func": "abs", "args": ["hops"]}}), "SET takes an expression of the row's fields"),
+        (serde_json::json!({"arith": {"op": "add", "left": {"excluded": year}, "right": {"lit": {"int": 1}}}}), "excluded.year is the row an INSERT proposed"),
+        (serde_json::json!({"neg": {"field": 99}}), "papers has no field 99"),
+    ] {
+        let e = db.run(&with(value.clone())).err().unwrap_or_else(|| panic!("{value} ran")).to_string();
+        assert!(e.contains(want), "{value}: {e}");
+    }
+    assert!(matches!(db.run(&with(set)).unwrap(), SqlResult::Written(1)));
+    assert_eq!(rows(run(&db, "SELECT year FROM papers WHERE id = 'p1'")), [[Value::Int(2 * 2016)]]);
+}
+
 fn lines(db: &Db, sql: &str) -> Vec<String> {
     let SqlResult::Rows(r) = run(db, sql) else { panic!("{sql}: rows") };
     assert_eq!(r.columns, ["plan"]);
@@ -313,6 +346,10 @@ fn explain_shows_the_plan() {
     assert_eq!(
         lines(&db, "EXPLAIN INSERT INTO papers (id, year) VALUES ('a', 1) ON CONFLICT (id) DO UPDATE SET year = excluded.year")[0],
         "Insert into papers: 1 row, on a live key SET year = excluded.year"
+    );
+    assert_eq!(
+        lines(&db, "EXPLAIN UPDATE papers SET rating = rating * 2 + year, title = upper(title) || '!' WHERE year > - -2")[0],
+        "Update papers SET rating = (rating * 2) + year, title = upper(title) || '!'"
     );
     assert_eq!(
         lines(&db, "EXPLAIN SELECT id FROM papers WHERE REACHABLE(cites, 'p1', hops => 2) ORDER BY hops()")[2..],

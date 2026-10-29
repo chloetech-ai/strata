@@ -362,7 +362,8 @@ fn call(func: Func, args: &[Value]) -> Result<Value> {
             let r = (x * m).round() / m;
             Ok(if d <= 0 { Value::Int(r as i64) } else { Value::Float(r) })
         }
-        Func::Coalesce => Ok(args.iter().find(|v| !matches!(v, Value::Null)).cloned().unwrap_or(Value::Null)),
+        // A list without values is NULL here, as to IS NULL.
+        Func::Coalesce => Ok(args.iter().find(|v| !matches!(v, Value::Null) && !matches!(v, Value::List(xs) if xs.is_empty())).cloned().unwrap_or(Value::Null)),
     }
 }
 
@@ -501,6 +502,7 @@ mod tests {
         assert_eq!(f(Func::Round, vec![Value::Float(2.567), Value::Int(2)]), Value::Float(2.57));
         assert_eq!(f(Func::Round, vec![Value::Float(2.5)]), Value::Int(3));
         assert_eq!(f(Func::Coalesce, vec![N, Value::Int(4), Value::Int(5)]), Value::Int(4));
+        assert_eq!(f(Func::Coalesce, vec![Value::List(Vec::new()), Value::Int(4)]), Value::Int(4));
         assert_eq!(f(Func::Upper, vec![N]), N);
     }
 

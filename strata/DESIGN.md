@@ -550,13 +550,28 @@ handing a query to its shards) are to make instead of writing SQL text.
   no values keeps no group (`HAVING` was two-valued before, and joins
   compared a list with a value by its text, so `b.tags = 'x'` never
   held, and read a field with no values as NULL).
+* **Writes as plans.** An `Update` (and an insert's `update` on a live
+  key) sets each field to an expression of the row, which the evaluator
+  computes from the row as it was (every right-hand side sees the old
+  values) and stores as the field's type: a whole FLOAT fits an INT, one
+  value a multi-valued field. In an insert's `update`, `excluded.f` is the
+  row the statement proposed. A literal, `f + number` (a counter, where
+  NULL counts as zero) and a bare `excluded.f` of the same type keep their
+  faster forms; every other expression gives NULL for NULL, as in SQL, and
+  may not search, score or traverse. A statement that fails on one row
+  writes none. `UPDATE` and `DELETE` bind the statement's own `WHERE`,
+  `ORDER BY` and `LIMIT`, and `ON CONFLICT` reads its live rows with a
+  query it builds, where each used to print SQL text and parse it again:
+  printed, `- -1` is the comment `--1`, and a column named `order` stopped
+  `SELECT id, order, ...` from parsing.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next, in order: writes run as plans; then operators in place of the compound-query code, the Python
-builder, joins across tables, and plans as the shard protocol.
+Next, in order: operators in place of the compound-query code (which
+still prints SQL for each step, so a join's `- -1` is still a comment),
+the Python builder, joins across tables, and plans as the shard protocol.
 
 ## 7. Planning and execution
 
