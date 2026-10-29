@@ -76,6 +76,22 @@ impl Outputs {
     }
 }
 
+/// A HAVING condition as an expression; `column` gives the expression of
+/// each group value or aggregate it names.
+pub(crate) fn having(h: &Having, column: &mut dyn FnMut(&Projection) -> Expr) -> Expr {
+    match h {
+        Having::Range { what, lo, hi } => Expr::Between {
+            expr: Box::new(column(what)),
+            lo: (*lo != f64::NEG_INFINITY).then(|| Box::new(Expr::Lit(Value::Float(*lo)))),
+            hi: (*hi != f64::INFINITY).then(|| Box::new(Expr::Lit(Value::Float(*hi)))),
+        },
+        Having::Eq { what, value } => Expr::Cmp { op: super::CmpOp::Eq, left: Box::new(column(what)), right: Box::new(Expr::Lit(value.clone())) },
+        Having::And(hs) => Expr::And(hs.iter().map(|h| having(h, column)).collect()),
+        Having::Or(hs) => Expr::Or(hs.iter().map(|h| having(h, column)).collect()),
+        Having::Not(h) => Expr::Not(Box::new(having(h, column))),
+    }
+}
+
 fn aggregated(s: &Select) -> bool {
     !s.group_by.is_empty()
         || s.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }))
@@ -222,17 +238,7 @@ impl Lower<'_> {
     }
 
     fn having(&self, h: &Having, out: &mut Outputs) -> Expr {
-        match h {
-            Having::Range { what, lo, hi } => Expr::Between {
-                expr: Box::new(out.of(what)),
-                lo: (*lo != f64::NEG_INFINITY).then(|| Box::new(Expr::Lit(Value::Float(*lo)))),
-                hi: (*hi != f64::INFINITY).then(|| Box::new(Expr::Lit(Value::Float(*hi)))),
-            },
-            Having::Eq { what, value } => Expr::Cmp { op: super::CmpOp::Eq, left: Box::new(out.of(what)), right: Box::new(Expr::Lit(value.clone())) },
-            Having::And(hs) => Expr::And(hs.iter().map(|h| self.having(h, out)).collect()),
-            Having::Or(hs) => Expr::Or(hs.iter().map(|h| self.having(h, out)).collect()),
-            Having::Not(h) => Expr::Not(Box::new(self.having(h, out))),
-        }
+        having(h, &mut |p| out.of(p))
     }
 
     fn set(&self, f: usize, a: &Assign) -> Set {

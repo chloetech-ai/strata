@@ -533,7 +533,8 @@ impl<'a> Raise<'a> {
                     (ArithOp::Add, v @ (Value::Int(_) | Value::Float(_))) => Assign::Add(v),
                     (ArithOp::Sub, Value::Int(x)) => Assign::Add(x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int)),
                     (ArithOp::Sub, Value::Float(x)) => Assign::Add(Value::Float(-x)),
-                    (_, v) => return Err(err(format!("{} adds a number, not {v:?}", fld.name))),
+                    (ArithOp::Add | ArithOp::Sub, v) => return Err(err(format!("{} adds a number, not {v:?}", fld.name))),
+                    (op, _) => return Err(err(format!("SET adds a number to {} or subtracts one from it, not {op:?}", fld.name))),
                 }
             }
             Expr::Excluded(g) if excluded => Assign::Excluded(self.field(*g)?),

@@ -1,7 +1,7 @@
 //! Plans as text, for `EXPLAIN`: a line per node, its input indented under
 //! it, with fields by name and expressions in SQL's words.
 
-use super::{Agg, ArithOp, CmpOp, Expr, Graph, GraphKind, Node, OnConflict, Plan, SortKey};
+use super::{Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, OnConflict, Plan, SortKey};
 use crate::query::logical::{AggFn, DecayShape, Direction, Expand, Fuzzy, Opts};
 use crate::query::sql::ident;
 use crate::schema::{FieldType, Logical, Schema};
@@ -144,10 +144,10 @@ impl<'a> Text<'a> {
         }
     }
 
-    /// `e`, in parentheses if it is AND or OR.
+    /// `e`, in parentheses if it is AND, OR or an operator's.
     fn operand(&self, e: &Expr, names: &Names) -> String {
         match e {
-            Expr::And(_) | Expr::Or(_) | Expr::Weighted(_) => format!("({})", self.expr(e, names)),
+            Expr::And(_) | Expr::Or(_) | Expr::Weighted(_) | Expr::Arith { .. } | Expr::Concat(_) | Expr::Like { .. } => format!("({})", self.expr(e, names)),
             e => self.expr(e, names),
         }
     }
@@ -193,7 +193,45 @@ impl<'a> Text<'a> {
                 [v] => format!("{} = {}", self.operand(expr, names), self.expr(v, names)),
                 vs => format!("{} IN ({})", self.operand(expr, names), vs.iter().map(|v| self.expr(v, names)).collect::<Vec<_>>().join(", ")),
             },
-            Expr::Arith { op, left, right } => format!("{} {} {}", self.operand(left, names), if *op == ArithOp::Add { "+" } else { "-" }, self.operand(right, names)),
+            Expr::Arith { op, left, right } => {
+                let op = match op {
+                    ArithOp::Add => "+",
+                    ArithOp::Sub => "-",
+                    ArithOp::Mul => "*",
+                    ArithOp::Div => "/",
+                    ArithOp::Mod => "%",
+                };
+                format!("{} {op} {}", self.operand(left, names), self.operand(right, names))
+            }
+            Expr::Neg(x) => format!("-{}", self.operand(x, names)),
+            Expr::Concat(xs) => xs.iter().map(|x| self.operand(x, names)).collect::<Vec<_>>().join(" || "),
+            Expr::Like { expr, pattern, case_insensitive } => {
+                format!("{} {} {}", self.operand(expr, names), if *case_insensitive { "ILIKE" } else { "LIKE" }, self.operand(pattern, names))
+            }
+            Expr::Case { operand, whens, otherwise } => {
+                let mut s = "CASE".to_string();
+                if let Some(o) = operand {
+                    s += &format!(" {}", self.operand(o, names));
+                }
+                for w in whens {
+                    s += &format!(" WHEN {} THEN {}", self.expr(&w.when, names), self.expr(&w.then, names));
+                }
+                if let Some(x) = otherwise {
+                    s += &format!(" ELSE {}", self.expr(x, names));
+                }
+                s + " END"
+            }
+            Expr::Call { func, args } => {
+                let name = match func {
+                    Func::Lower => "lower",
+                    Func::Upper => "upper",
+                    Func::Length => "length",
+                    Func::Abs => "abs",
+                    Func::Round => "round",
+                    Func::Coalesce => "coalesce",
+                };
+                format!("{name}({})", args.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", "))
+            }
             Expr::Match { field: f, query, expand } => format!("MATCH({}, {}{})", field(names, *f), quote(query), expansion(expand)),
             Expr::Graph(g) | Expr::Ppr(g) => self.graph(g, names),
             Expr::Bm25 { field: f, text, opts } => format!("bm25({}, {}{})", field(names, *f), quote(text), options(opts)),

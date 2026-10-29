@@ -544,7 +544,7 @@ impl<'a> Executor<'a> {
             let rows = if self.opts.shard {
                 groups.partial_rows()
             } else {
-                let mut rows = agg::finish(q, groups, &needed);
+                let mut rows = agg::finish(q, groups, &needed)?;
                 q.typed(&mut rows);
                 rows
             };
