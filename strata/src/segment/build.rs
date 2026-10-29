@@ -3,12 +3,15 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
+use crate::forward::StoreBuilder;
+use crate::graph::GraphBuilder;
+use crate::storage::KeyList;
 use crate::text::TextFieldBuilder;
 use crate::value::Document;
 
@@ -69,11 +72,27 @@ pub fn build_threads(opts: &BuildOptions) -> Result<usize> {
     }
 }
 
-/// One piece of a build, run on any thread.
-enum Part {
-    Field(usize, Box<dyn FieldIndexBuilder>),
-    /// Documents `range` of TEXT field `.0`, run `.1` of the field's runs.
-    TextRun(usize, usize, Range<usize>, TextFieldBuilder),
+/// A field's index under construction.
+enum Slot {
+    /// A builder given every document's value.
+    Index(Box<dyn FieldIndexBuilder>),
+    /// An EDGES field, which needs every document's key when it is written.
+    Graph(GraphBuilder),
+    /// A TEXT field, analysed in runs of documents (as many per batch as
+    /// threads), joined when it is written.
+    Text(Vec<Option<TextFieldBuilder>>),
+}
+
+/// One piece of a batch, run on any thread.
+enum Task {
+    /// The batch's values for slot `.0`.
+    Slot(usize),
+    /// Documents `range` of the batch for TEXT slot `slot`, whose run
+    /// `run` it is.
+    TextRun { slot: usize, run: usize, range: Range<usize>, builder: TextFieldBuilder },
+    /// Writes TEXT slot `.0` from runs of earlier batches (a last batch
+    /// with no documents).
+    TextJoin(usize),
     DocStore,
     Keys,
 }
@@ -88,6 +107,10 @@ fn kind(ty: &FieldType) -> &'static str {
         FieldType::Sparse => "sparse",
         FieldType::Edges => "edges",
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Builds the segment image for `docs` (local docIDs follow slice order) on
@@ -111,132 +134,239 @@ pub struct GraphStart {
 /// those segments' graphs (ignored where the field's graph does not fit:
 /// another `M`, no graph, other documents).
 pub fn build_segment_from(schema: &Schema, docs: &[Document], opts: &BuildOptions, starts: &[GraphStart]) -> Result<Vec<u8>> {
-    for d in docs {
-        crate::value::validate(schema, d)?;
+    Ok(SegmentBuild::with_starts(schema, opts, docs.len(), starts)?.finish(docs)?.finish())
+}
+
+/// A segment built from batches of documents in docID order, so that a
+/// merge holds one batch of decoded documents at a time instead of all of
+/// them: the same image as [`build_segment`] over all of them. Each batch
+/// builds on [`build_threads`] threads, its fields at once and TEXT fields
+/// in runs of documents; the last batch goes to [`SegmentBuild::finish`],
+/// which also writes the indexes.
+pub struct SegmentBuild<'a> {
+    schema: &'a Schema,
+    opts: &'a BuildOptions,
+    threads: usize,
+    n_docs: usize,
+    added: usize,
+    /// The field of each slot, and the slot (taken when written).
+    fields: Vec<usize>,
+    slots: Vec<Mutex<Option<Slot>>>,
+    store: Mutex<Option<StoreBuilder>>,
+    /// Every document's primary key so far, for the key index and EDGES
+    /// fields.
+    keys: KeyList,
+}
+
+impl<'a> SegmentBuild<'a> {
+    /// A build of `n_docs` documents in all.
+    pub fn new(schema: &'a Schema, opts: &'a BuildOptions, n_docs: usize) -> Result<Self> {
+        Self::with_starts(schema, opts, n_docs, &[])
     }
-    let threads = build_threads(opts)?;
-    let threads = if docs.len() < PARALLEL_MIN_DOCS { 1 } else { threads };
-    // In the order their sections are written.
-    let mut parts: Vec<Part> = Vec::new();
-    for (i, f) in schema.fields.iter().enumerate() {
-        let b: Option<Box<dyn FieldIndexBuilder>> = match &f.ty {
-            FieldType::Text { .. } if f.indexed => {
-                let runs = (docs.len() / TEXT_RUN_DOCS).clamp(1, threads);
-                let per = docs.len().div_ceil(runs).max(1);
-                for (r, at) in (0..docs.len().max(1)).step_by(per).enumerate() {
-                    parts.push(Part::TextRun(i, r, at..(at + per).min(docs.len()), crate::text::text_builder(f, opts)?));
+
+    /// A build of `n_docs` documents in all, with the vector graphs
+    /// `starts` names started from those segments' graphs
+    /// ([`build_segment_from`]).
+    pub fn with_starts(schema: &'a Schema, opts: &'a BuildOptions, n_docs: usize, starts: &[GraphStart]) -> Result<Self> {
+        let threads = build_threads(opts)?;
+        let threads = if n_docs < PARALLEL_MIN_DOCS { 1 } else { threads };
+        let (mut fields, mut slots) = (Vec::new(), Vec::new());
+        for (i, f) in schema.fields.iter().enumerate() {
+            let slot = match &f.ty {
+                FieldType::Text { .. } if f.indexed => {
+                    // Checks the field's options now rather than in a batch.
+                    crate::text::text_builder(f, opts)?;
+                    Some(Slot::Text(Vec::new()))
                 }
-                None
+                FieldType::Sparse if f.indexed => Some(Slot::Index(crate::text::sparse::field_builder(f, opts)?)),
+                FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => Some(Slot::Index(crate::forward::field_builder(f, opts)?)),
+                // Vector fields always store their vectors; `indexed` adds the ANN index.
+                FieldType::Vector { .. } => Some(Slot::Index(match starts.iter().find(|g| g.field == i) {
+                    Some(g) => crate::vector::field_builder_from(f, opts, g.segment.clone(), g.base)?,
+                    None => crate::vector::field_builder(f, opts)?,
+                })),
+                FieldType::Edges if f.indexed => Some(Slot::Graph(crate::graph::keyless_builder(f, schema)?)),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                fields.push(i);
+                slots.push(Mutex::new(Some(slot)));
             }
-            FieldType::Text { .. } => None,
-            FieldType::Sparse if f.indexed => Some(crate::text::sparse::field_builder(f, opts)?),
-            FieldType::Sparse => None,
-            FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => {
-                Some(crate::forward::field_builder(f, opts)?)
-            }
-            FieldType::Keyword | FieldType::Int | FieldType::Float => None,
-            // Vector fields always store their vectors; `indexed` adds the ANN index.
-            FieldType::Vector { .. } => Some(match starts.iter().find(|g| g.field == i) {
-                Some(g) => crate::vector::field_builder_from(f, opts, g.segment.clone(), g.base)?,
-                None => crate::vector::field_builder(f, opts)?,
-            }),
-            FieldType::Edges if f.indexed => {
-                let keys = schema.primary_key.map_or_else(Vec::new, |pk| docs.iter().map(|d| d[pk].clone()).collect());
-                Some(crate::graph::field_builder(f, schema, keys)?)
-            }
-            FieldType::Edges => None,
-        };
-        if let Some(b) = b {
-            parts.push(Part::Field(i, b));
         }
-    }
-    parts.push(Part::DocStore);
-    parts.push(Part::Keys);
-    // A TEXT field's runs, kept until the last one is analysed; that
-    // run's thread writes the field.
-    let mut text_runs: Vec<Mutex<Vec<Option<TextFieldBuilder>>>> = (0..schema.fields.len()).map(|_| Mutex::new(Vec::new())).collect();
-    for p in &parts {
-        if let Part::TextRun(i, ..) = p {
-            text_runs[*i].get_mut().unwrap_or_else(|e| e.into_inner()).push(None);
-        }
-    }
-    // A part's sections; none for the TEXT runs whose thread did not write
-    // their field.
-    let run = |part: Part| -> Result<Option<SegmentWriter>> {
-        let t = Instant::now();
-        let mut out = SegmentWriter::new(docs.len());
-        let name = match part {
-            Part::Field(i, mut b) => {
-                for (d, doc) in docs.iter().enumerate() {
-                    b.add(d as DocId, &doc[i])?;
-                }
-                b.finish(&mut out)?;
-                format!("{} ({})", schema.fields[i].name, kind(&schema.fields[i].ty))
-            }
-            Part::TextRun(i, r, range, mut b) => {
-                for (d, doc) in docs[range].iter().enumerate() {
-                    b.add(d as DocId, &doc[i])?;
-                }
-                b.seal();
-                add_build_time(&format!("{} (text)", schema.fields[i].name), t);
-                let mut runs = text_runs[i].lock().unwrap_or_else(|e| e.into_inner());
-                runs[r] = Some(b);
-                if runs.iter().any(Option::is_none) {
-                    return Ok(None);
-                }
-                let runs: Vec<TextFieldBuilder> = runs.drain(..).flatten().collect();
-                let t = Instant::now();
-                TextFieldBuilder::write_joined(runs, threads, &mut out)?;
-                add_build_time(&format!("{} (text)", schema.fields[i].name), t);
-                return Ok(Some(out));
-            }
-            Part::DocStore => {
-                crate::forward::build_doc_store(schema, docs, opts, &mut out)?;
-                "doc store".to_string()
-            }
-            Part::Keys => {
-                crate::storage::build_pk_index(schema, docs, &mut out)?;
-                "keys".to_string()
-            }
+        let store = Mutex::new(Some(StoreBuilder::new(schema, opts)?));
+        let keys = match schema.primary_key {
+            Some(pk) => KeyList::new(&schema.fields[pk].ty)?,
+            None => KeyList::of(false),
         };
-        add_build_time(&name, t);
-        Ok(Some(out))
-    };
-    // Longest first, so that no thread starts a vector graph last.
-    let cost = |p: &Part| match p {
-        Part::Field(i, _) if matches!(schema.fields[*i].ty, FieldType::Vector { .. }) => 0,
-        Part::TextRun(..) => 1,
-        Part::DocStore => 2,
-        _ => 3,
-    };
-    let mut order: Vec<usize> = (0..parts.len()).collect();
-    order.sort_by_key(|&j| cost(&parts[j]));
-    let n_parts = parts.len();
-    let parts: Vec<Mutex<Option<Part>>> = parts.into_iter().map(|p| Mutex::new(Some(p))).collect();
-    let built: Vec<Mutex<Option<Result<Option<SegmentWriter>>>>> = (0..n_parts).map(|_| Mutex::new(None)).collect();
-    let next = AtomicUsize::new(0);
-    let work = || loop {
-        let Some(&j) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
-        let part = parts[j].lock().unwrap_or_else(|e| e.into_inner()).take().expect("each part runs once");
-        let r = run(part);
-        *built[j].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-    };
-    if threads > 1 {
-        std::thread::scope(|s| {
-            for _ in 0..threads.min(n_parts) {
-                s.spawn(work);
-            }
-        });
-    } else {
-        work();
+        Ok(SegmentBuild { schema, opts, threads, n_docs, added: 0, fields, slots, store, keys })
     }
-    // A TEXT field's runs are adjacent parts, so its sections, written by
-    // one of them, land where the field's go.
-    let mut out = SegmentWriter::new(docs.len());
-    for b in built {
-        if let Some(s) = b.into_inner().unwrap_or_else(|e| e.into_inner()).expect("every part ran")? {
+
+    /// Adds the next documents.
+    pub fn add(&mut self, docs: &[Document]) -> Result<()> {
+        if !docs.is_empty() {
+            self.batch(docs, false)?;
+        }
+        Ok(())
+    }
+
+    /// Adds the last documents (any number, none included) and writes the
+    /// segment's sections.
+    pub fn finish(mut self, docs: &[Document]) -> Result<SegmentWriter> {
+        let built = self.batch(docs, true)?;
+        // A TEXT field's runs are adjacent tasks, so its sections, written
+        // by one of them, land where the field's go.
+        let mut out = SegmentWriter::new(self.n_docs);
+        for s in built.into_iter().flatten() {
             out.append(s);
         }
+        Ok(out)
     }
-    Ok(out.finish())
+
+    /// Runs a batch's tasks; on the last batch, each task's sections, in
+    /// the order they are written (none for the TEXT runs whose thread did
+    /// not write their field).
+    fn batch(&mut self, docs: &[Document], last: bool) -> Result<Vec<Option<SegmentWriter>>> {
+        for d in docs {
+            crate::value::validate(self.schema, d)?;
+        }
+        let total = self.added + docs.len();
+        if total > self.n_docs || (last && total != self.n_docs) {
+            return Err(Error::Schema(format!("a segment build of {} documents was given {total}", self.n_docs)));
+        }
+        if let Some(pk) = self.schema.primary_key {
+            for d in docs {
+                self.keys.push(&d[pk])?;
+            }
+        }
+        let (schema, threads, n_docs, base) = (self.schema, self.threads, self.n_docs, self.added);
+        // In the order their sections are written.
+        let mut tasks: Vec<Task> = Vec::new();
+        for (j, slot) in self.slots.iter_mut().enumerate() {
+            match slot.get_mut().unwrap_or_else(|e| e.into_inner()) {
+                Some(Slot::Text(runs)) if docs.is_empty() && !runs.is_empty() => tasks.push(Task::TextJoin(j)),
+                Some(Slot::Text(runs)) => {
+                    let n = (docs.len() / TEXT_RUN_DOCS).clamp(1, threads);
+                    let per = docs.len().div_ceil(n).max(1);
+                    for at in (0..docs.len().max(1)).step_by(per) {
+                        let builder = crate::text::text_builder(&schema.fields[self.fields[j]], self.opts)?;
+                        tasks.push(Task::TextRun { slot: j, run: runs.len(), range: at..(at + per).min(docs.len()), builder });
+                        runs.push(None);
+                    }
+                }
+                _ => tasks.push(Task::Slot(j)),
+            }
+        }
+        tasks.push(Task::DocStore);
+        if last {
+            tasks.push(Task::Keys);
+        }
+        let (fields, slots, store, keys) = (&self.fields, &self.slots, &self.store, &self.keys);
+        let run = |task: Task| -> Result<Option<SegmentWriter>> {
+            let t = Instant::now();
+            let mut out = SegmentWriter::new(n_docs);
+            let name = match task {
+                Task::Slot(j) => {
+                    let i = fields[j];
+                    let mut slot = lock(&slots[j]);
+                    match slot.as_mut().expect("a slot is taken by the last batch only") {
+                        Slot::Index(b) => {
+                            for (d, doc) in docs.iter().enumerate() {
+                                b.add((base + d) as DocId, &doc[i])?;
+                            }
+                        }
+                        Slot::Graph(b) => {
+                            for (d, doc) in docs.iter().enumerate() {
+                                b.add((base + d) as DocId, &doc[i])?;
+                            }
+                        }
+                        Slot::Text(_) => unreachable!("TEXT slots run as runs"),
+                    }
+                    if last {
+                        match slot.take() {
+                            Some(Slot::Index(b)) => b.finish(&mut out)?,
+                            Some(Slot::Graph(b)) => b.finish_with_keys(keys, &mut out)?,
+                            _ => unreachable!("taken once"),
+                        }
+                    }
+                    format!("{} ({})", schema.fields[i].name, kind(&schema.fields[i].ty))
+                }
+                Task::TextRun { slot: j, run, range, mut builder } => {
+                    let i = fields[j];
+                    for (d, doc) in docs[range].iter().enumerate() {
+                        builder.add(d as DocId, &doc[i])?;
+                    }
+                    builder.seal();
+                    if !last {
+                        // Held until the last batch's runs are done.
+                        builder.pack();
+                    }
+                    let name = format!("{} (text)", schema.fields[i].name);
+                    add_build_time(&name, t);
+                    let mut slot = lock(&slots[j]);
+                    let Some(Slot::Text(runs)) = slot.as_mut() else { unreachable!("a TEXT slot") };
+                    runs[run] = Some(builder);
+                    if !last || runs.iter().any(Option::is_none) {
+                        return Ok(None);
+                    }
+                    let runs: Vec<TextFieldBuilder> = runs.drain(..).flatten().collect();
+                    drop(slot);
+                    let t = Instant::now();
+                    TextFieldBuilder::write_joined(runs, threads, &mut out)?;
+                    add_build_time(&name, t);
+                    return Ok(Some(out));
+                }
+                Task::TextJoin(j) => {
+                    let Some(Slot::Text(runs)) = lock(&slots[j]).take() else { unreachable!("a TEXT slot") };
+                    TextFieldBuilder::write_joined(runs.into_iter().flatten().collect(), threads, &mut out)?;
+                    format!("{} (text)", schema.fields[fields[j]].name)
+                }
+                Task::DocStore => {
+                    let mut b = lock(store);
+                    for doc in docs {
+                        b.as_mut().expect("taken by the last batch only").add(doc);
+                    }
+                    if last {
+                        b.take().expect("taken once").finish(&mut out);
+                    }
+                    "doc store".to_string()
+                }
+                Task::Keys => {
+                    crate::storage::build_pk_index_of(schema, keys, &mut out)?;
+                    "keys".to_string()
+                }
+            };
+            add_build_time(&name, t);
+            Ok(last.then_some(out))
+        };
+        // Longest first, so that no thread starts a vector graph last.
+        let cost = |t: &Task| match t {
+            Task::Slot(j) if matches!(schema.fields[fields[*j]].ty, FieldType::Vector { .. }) => 0,
+            Task::TextRun { .. } | Task::TextJoin(_) => 1,
+            Task::DocStore => 2,
+            _ => 3,
+        };
+        let mut order: Vec<usize> = (0..tasks.len()).collect();
+        order.sort_by_key(|&k| cost(&tasks[k]));
+        let n_tasks = tasks.len();
+        let tasks: Vec<Mutex<Option<Task>>> = tasks.into_iter().map(|t| Mutex::new(Some(t))).collect();
+        let built: Vec<Mutex<Option<Result<Option<SegmentWriter>>>>> = (0..n_tasks).map(|_| Mutex::new(None)).collect();
+        let next = AtomicUsize::new(0);
+        let work = || loop {
+            let Some(&k) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+            let task = lock(&tasks[k]).take().expect("each task runs once");
+            let r = run(task);
+            *lock(&built[k]) = Some(r);
+        };
+        if threads > 1 {
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(n_tasks) {
+                    s.spawn(work);
+                }
+            });
+        } else {
+            work();
+        }
+        self.added = total;
+        built.into_iter().map(|b| b.into_inner().unwrap_or_else(|e| e.into_inner()).expect("every task ran")).collect()
+    }
 }

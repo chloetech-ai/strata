@@ -38,8 +38,8 @@ use serde::Serialize;
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};
-use crate::segment::build::{build_segment, build_segment_from, build_threads, BuildOptions, GraphStart};
-use crate::segment::{DocId, SegmentFile};
+use crate::segment::build::{build_segment, build_threads, BuildOptions, GraphStart, SegmentBuild};
+use crate::segment::{DocId, SegmentFile, SegmentWriter};
 use crate::storage::freelist::FreeList;
 use crate::storage::io;
 use crate::storage::dir::{self, Current};
@@ -350,6 +350,58 @@ pub(crate) struct Reserved {
     pub id: u64,
     pub extent: Extent,
     pub file: Option<String>,
+}
+
+/// A merge decodes its input documents in batches of about this many
+/// bytes of their images, at least `MERGE_BATCH_DOCS.start` documents (so
+/// that a TEXT field still analyses a run per build thread) and at most
+/// `MERGE_BATCH_DOCS.end`.
+const MERGE_BATCH_BYTES: usize = 32 << 20;
+const MERGE_BATCH_DOCS: std::ops::Range<usize> = 16_384..262_144;
+
+/// Images are written in pieces of this size, each paced.
+const IMAGE_CHUNK: usize = 1 << 20;
+
+/// Writes an image streamed to it at `at` in `file`, in [`IMAGE_CHUNK`]
+/// pieces, and sums its checksum.
+struct ImageOut<'a> {
+    file: &'a File,
+    at: u64,
+    buf: Vec<u8>,
+    pacer: Option<&'a Pacer>,
+    crc: crc32fast::Hasher,
+}
+
+impl ImageOut<'_> {
+    /// Writes what is buffered.
+    fn drain(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if let Some(p) = self.pacer {
+            p.pace(self.buf.len());
+        }
+        io::write_at(self.file, &self.buf, self.at)?;
+        self.crc.update(&self.buf);
+        self.at += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl std::io::Write for ImageOut<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let n = data.len().min(IMAGE_CHUNK - self.buf.len());
+        self.buf.extend_from_slice(&data[..n]);
+        if self.buf.len() == IMAGE_CHUNK {
+            self.drain()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.drain()
+    }
 }
 
 /// The background merger's settings and wake-ups ([`Database::spawn_merger`]).
@@ -1548,8 +1600,9 @@ impl Database {
 
     fn merge_group(&self, claim: &MergeClaim, source: &dyn DocumentSource, pacer: Option<&Pacer>, between: &mut dyn FnMut() -> bool, stats: &mut MergeStats) -> Result<()> {
         let (snap, ids) = (&claim.snap, &claim.ids[..]);
+        let schema = snap.schema();
+        let mut views = Vec::with_capacity(ids.len());
         let mut inputs: Vec<(u64, Vec<DocId>)> = Vec::new();
-        let mut docs: Vec<Document> = Vec::new();
         for &id in ids {
             let v = snap.segments().iter().find(|v| v.id == id).expect("selected from this snapshot");
             // The merged segment gets a checksum of its own, so a damaged
@@ -1558,49 +1611,94 @@ impl Database {
             h.verify(self.dir.as_deref())?;
             let n = v.file.n_docs() as DocId;
             let live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
-            let mut got = source.documents(snap.schema(), &v.file, &live)?;
-            if got.len() != live.len() {
-                return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
-            }
-            // The merged segment holds the values written in place.
-            if let Some(u) = &v.updates {
-                for (doc, &d) in got.iter_mut().zip(&live) {
-                    u.apply(d, doc);
-                }
-            }
             stats.docs_dropped += (n as usize - live.len()) as u64;
-            docs.extend(got);
+            views.push(v);
             inputs.push((id, live));
         }
-        let n_new = docs.len() as u32;
+        let n_new = inputs.iter().map(|(_, l)| l.len()).sum::<usize>();
+        // The inputs' live documents in batches of about MERGE_BATCH_BYTES
+        // of their images (a batch can span inputs), each decoded while the
+        // segment builds from the one before, and the image streamed to its
+        // reserved space: the merge never holds every document decoded, nor
+        // the whole image.
+        let mut batches: Vec<Vec<(usize, &[DocId])>> = Vec::new();
+        let (mut batch, mut docs, mut bytes) = (Vec::new(), 0usize, 0usize);
+        for (k, (_, live)) in inputs.iter().enumerate() {
+            let per_doc = (views[k].file.image().len() / views[k].file.n_docs().max(1)).max(1);
+            let mut rest = &live[..];
+            while !rest.is_empty() {
+                // Documents until the batch is full.
+                let room = (MERGE_BATCH_DOCS.end - docs).min(MERGE_BATCH_BYTES.saturating_sub(bytes).div_ceil(per_doc).max(MERGE_BATCH_DOCS.start.saturating_sub(docs)));
+                let (piece, after) = rest.split_at(room.clamp(1, rest.len()));
+                batch.push((k, piece));
+                (docs, bytes, rest) = (docs + piece.len(), bytes + piece.len() * per_doc, after);
+                if docs >= MERGE_BATCH_DOCS.end || (docs >= MERGE_BATCH_DOCS.start && bytes >= MERGE_BATCH_BYTES) {
+                    batches.push(std::mem::take(&mut batch));
+                    (docs, bytes) = (0, 0);
+                }
+            }
+        }
+        if !batch.is_empty() {
+            batches.push(batch);
+        }
+        let decode = |batch: &[(usize, &[DocId])]| -> Result<Vec<Document>> {
+            let mut all = Vec::with_capacity(batch.iter().map(|(_, l)| l.len()).sum());
+            for &(k, live) in batch {
+                let v = views[k];
+                let mut got = source.documents(schema, &v.file, live)?;
+                if got.len() != live.len() {
+                    return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
+                }
+                // The merged segment holds the values written in place.
+                if let Some(u) = &v.updates {
+                    for (doc, &d) in got.iter_mut().zip(live) {
+                        u.apply(d, doc);
+                    }
+                }
+                all.append(&mut got);
+            }
+            Ok(all)
+        };
         // The merged vector graphs start from the largest input's, if it
         // lost no documents.
         let mut starts = Vec::new();
         let mut base = 0u32;
         let mut largest: Option<(usize, &SegmentFile, u32)> = None;
-        for (id, live) in &inputs {
-            let v = snap.segments().iter().find(|v| v.id == *id).expect("selected from this snapshot");
+        for (k, (_, live)) in inputs.iter().enumerate() {
+            let v = views[k];
             if live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
                 largest = Some((live.len(), &v.file, base));
             }
             base += live.len() as u32;
         }
         if let Some((_, seg, base)) = largest {
-            for (i, f) in snap.schema().fields.iter().enumerate() {
+            for (i, f) in schema.fields.iter().enumerate() {
                 if matches!(f.ty, FieldType::Vector { .. }) {
                     starts.push(GraphStart { field: i, segment: seg.clone(), base });
                 }
             }
         }
-        let image = if docs.is_empty() { None } else { Some(build_segment_from(snap.schema(), &docs, &self.opts.build, &starts)?) };
-        drop(docs);
         // Written before the writer lock is taken, into space reserved for
         // it: commits go on meanwhile.
-        let written = match &image {
-            Some(image) => Some((self.write_reserved(image, pacer)?, crc32fast::hash(image))),
-            None => None,
+        let written = match batches.len() {
+            0 => None,
+            n => {
+                let mut build = SegmentBuild::with_starts(schema, &self.opts.build, n_new, &starts)?;
+                let sections = std::thread::scope(|s| {
+                    let mut next = decode(&batches[0]);
+                    for i in 1..n {
+                        let (decode, batch) = (&decode, &batches[i]);
+                        let ahead = s.spawn(move || decode(batch));
+                        let added = next.and_then(|docs| build.add(&docs));
+                        next = ahead.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                        added?;
+                    }
+                    build.finish(&next?)
+                })?;
+                Some(self.write_reserved(sections, pacer)?)
+            }
         };
-        drop(image);
+        let n_new = n_new as u32;
         let go = between();
         let mut wal = self.background_writer();
         let r = if go { self.install_merge(&mut wal, claim, written.as_ref(), &inputs, n_new, stats) } else { Ok(false) };
@@ -1687,16 +1785,32 @@ impl Database {
         Ok(true)
     }
 
-    /// Reserves space for a merged image, writes it there and syncs it, at
-    /// the pace `pacer` allows. Takes the writer lock only to reserve.
-    fn write_reserved(&self, image: &[u8], pacer: Option<&Pacer>) -> Result<Reserved> {
-        let r = self.reserve(image.len() as u64)?;
-        if let Err(e) = self.write_image(&r, image, pacer) {
-            let wal = self.background_writer();
-            self.unreserve(&wal, &r);
-            return Err(e);
+    /// Reserves space for the merged image of `sections`, streams it there
+    /// (each section released once written) and syncs it, at the pace
+    /// `pacer` allows; returns the reservation and the image's checksum.
+    /// Takes the writer lock only to reserve.
+    fn write_reserved(&self, sections: SegmentWriter, pacer: Option<&Pacer>) -> Result<(Reserved, u32)> {
+        let r = self.reserve(sections.len() as u64)?;
+        let written = (|| -> Result<u32> {
+            let (f, base) = match (&self.dir, &r.file) {
+                (Some(d), Some(name)) => (Some(OpenOptions::new().write(true).create_new(true).open(d.join(name))?), 0),
+                _ => (None, r.extent.page * PAGE),
+            };
+            let f = f.as_ref().unwrap_or(&self.file);
+            let mut out = ImageOut { file: f, at: base, buf: Vec::with_capacity(IMAGE_CHUNK), pacer, crc: crc32fast::Hasher::new() };
+            sections.write_to(&mut out)?;
+            out.drain()?;
+            io::sync(f)?;
+            Ok(out.crc.finalize())
+        })();
+        match written {
+            Ok(crc) => Ok((r, crc)),
+            Err(e) => {
+                let wal = self.background_writer();
+                self.unreserve(&wal, &r);
+                Err(e)
+            }
         }
-        Ok(r)
     }
 
     /// A segment id and room for an image of `len` bytes ([`Reserved`]).
@@ -1725,24 +1839,6 @@ impl Database {
         st.next_segment_id = id + 1;
         st.reserved.push(r.clone());
         Ok(r)
-    }
-
-    fn write_image(&self, r: &Reserved, image: &[u8], pacer: Option<&Pacer>) -> Result<()> {
-        const CHUNK: usize = 1 << 20;
-        let write = |f: &File, base: u64| -> Result<()> {
-            for (i, c) in image.chunks(CHUNK).enumerate() {
-                if let Some(p) = pacer {
-                    p.pace(c.len());
-                }
-                io::write_at(f, c, base + (i * CHUNK) as u64)?;
-            }
-            io::sync(f)?;
-            Ok(())
-        };
-        match (&self.dir, &r.file) {
-            (Some(d), Some(name)) => write(&OpenOptions::new().write(true).create_new(true).open(d.join(name))?, 0),
-            _ => write(&self.file, r.extent.page * PAGE),
-        }
     }
 
     /// Gives back a reservation that will not be installed. The caller

@@ -86,12 +86,14 @@ fn measure(shape: &str, per: usize, segs: usize, db: &Db) {
         })
     };
     let policy = MergePolicy { merge_factor: segs, floor_docs: per * segs * 10, ..MergePolicy::default() };
+    let t = std::time::Instant::now();
     let stats = db.storage().merge(&policy).unwrap();
+    let secs = t.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
     sampler.join().unwrap();
     let used = peak.load(Ordering::Relaxed) - base;
     println!(
-        "{shape}: {segs} x {per} docs, {} merge(s), inputs {:.1} MB, merge peak {:.1} MB: {:.2} x input",
+        "{shape}: {segs} x {per} docs, {} merge(s) in {secs:.1} s, inputs {:.1} MB, merge peak {:.1} MB: {:.2} x input",
         stats.merges,
         input as f64 / 1e6,
         used as f64 / 1e6,
