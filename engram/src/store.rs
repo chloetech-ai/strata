@@ -7,7 +7,8 @@
 //! (`DbOptions::publish_snapshots`), so a caller reads its own writes, and a
 //! reader never waits for a write or for the index build that follows it. A
 //! full memtable becomes a segment, and segments merge, on Strata's
-//! background threads, so a write never waits for either.
+//! background threads; a write waits for a flush only once the memtable
+//! holds twice `flush_docs` before the flush under way ends.
 
 use std::collections::HashSet;
 use std::path::Path;

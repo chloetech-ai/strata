@@ -289,7 +289,7 @@ differ.
 | `PostToolUse`, `Stop` client | < 10 ms (queued, embedded and committed in the background) |
 | `UserPromptSubmit` | < 100 ms p99 at 1M records (measured on an Apple M2: 24.9 ms p50, 38.6 ms p99 as a hook process, with 1% knowledge records; the knowledge query runs beside the main search; about 10 ms of it is process start) |
 | `SessionStart` | < 150 ms (daemon already up), < 1 s with daemon spawn |
-| background | the writer thread commits queued writes together and builds the new in-memory segment (at most 256 records, no graph) before they return, so no query does; flushes and merges run on threads of their own, so no write waits for them |
+| background | the writer thread commits queued writes together and builds the new in-memory segment (at most 256 records, no graph) before they return, so no query does; flushes and merges run on Strata's flusher and merger threads, so a write waits for a flush only once the memtable holds twice `flush_docs` before the flush under way ends (`results/writes/`) |
 | ingest | > 1,000 records per second with the static embedder |
 
 The default embedder is static (Model2Vec potion-retrieval-32M: token
