@@ -303,13 +303,26 @@ impl Db {
     /// see the same version share one).
     ///
     /// A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs
-    /// as several single-table queries on the same snapshot.
+    /// as several single-table queries on the same snapshot. Its steps may
+    /// hold up to [`crate::query::compound::MAX_ROWS`] rows each; its answer
+    /// is held to [`ExecOptions::max_rows`].
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         if crate::query::compound::is_compound(sql, snap.schema()) {
-            return crate::query::compound::run(sql, snap.schema(), params, &mut |text, p| {
-                let select = bind(text, snap.schema(), p)?;
-                self.execute(snap, &select, opts)
-            });
+            let steps = ExecOptions { max_rows: None, ..opts.clone() };
+            let rs = crate::query::compound::run_checked(
+                sql,
+                snap.schema(),
+                params,
+                &mut |text, p| {
+                    let select = bind(text, snap.schema(), p)?;
+                    self.execute(snap, &select, &steps)
+                },
+                &|| opts.check(),
+            )?;
+            if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
+                return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
+            }
+            return Ok(rs);
         }
         let select = bind(sql, snap.schema(), params)?;
         self.execute(snap, &select, opts)
