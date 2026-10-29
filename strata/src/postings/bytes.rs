@@ -8,8 +8,9 @@
 //! freshly built and on memory-mapped data.
 //!
 //! Serialised arrays are little-endian and 8-byte aligned within their
-//! buffer; views require the buffer itself to be 8-byte aligned (a mapped
-//! file and any section of it at an 8-byte offset are).
+//! buffer, and [`OwnedBytes`] always starts 8-byte aligned: a mapped file
+//! does, and bytes that do not (a `Vec<u8>` need not) are copied into
+//! storage that does. So any section at an 8-byte offset can be viewed.
 
 use std::fmt;
 use std::ops::{Deref, Range};
@@ -28,10 +29,15 @@ unsafe impl Send for OwnedBytes {}
 unsafe impl Sync for OwnedBytes {}
 
 impl OwnedBytes {
-    /// Wraps any byte owner (a `Vec<u8>`, a memory map, ...).
+    /// Wraps any byte owner (a `Vec<u8>`, a memory map, ...), copying the
+    /// bytes when they do not start 8-byte aligned: the allocator promises
+    /// a `Vec<u8>` no alignment, and views of `u64` arrays need it.
     pub fn new<S: AsRef<[u8]> + Send + Sync + 'static>(owner: S) -> Self {
         let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(owner);
         let s = (*owner).as_ref();
+        if s.as_ptr() as usize % ALIGN != 0 {
+            return OwnedBytes::new(Aligned::copy_of(s));
+        }
         let (ptr, len) = (s.as_ptr(), s.len());
         OwnedBytes { owner, ptr, len }
     }
@@ -57,6 +63,31 @@ impl OwnedBytes {
     pub fn slice(&self, r: Range<usize>) -> OwnedBytes {
         assert!(r.start <= r.end && r.end <= self.len, "slice {r:?} out of 0..{}", self.len);
         OwnedBytes { owner: self.owner.clone(), ptr: unsafe { self.ptr.add(r.start) }, len: r.end - r.start }
+    }
+}
+
+/// The alignment [`OwnedBytes`] starts at: that of the widest [`Pod`].
+const ALIGN: usize = 8;
+
+/// Bytes copied into 8-byte-aligned storage.
+struct Aligned {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl Aligned {
+    fn copy_of(b: &[u8]) -> Aligned {
+        let mut words = vec![0u64; b.len().div_ceil(8)];
+        // SAFETY: `words` holds at least `b.len()` bytes, and the two do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), words.as_mut_ptr() as *mut u8, b.len()) };
+        Aligned { words, len: b.len() }
+    }
+}
+
+impl AsRef<[u8]> for Aligned {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the first `len` bytes of `words` were copied in by `copy_of`.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, self.len) }
     }
 }
 
@@ -230,12 +261,11 @@ impl ByteReader {
     }
 
     pub fn array<T: Pod>(&mut self) -> Result<Slice<T>, String> {
-        let n = self.u64()? as usize;
+        let n = self.u64()?;
         let start = self.pos;
-        let end = start + n * std::mem::size_of::<T>();
-        if end > self.bytes.len() {
+        let Some(end) = usize::try_from(n).ok().and_then(|n| n.checked_mul(std::mem::size_of::<T>())).and_then(|b| start.checked_add(b)).filter(|&e| e <= self.bytes.len()) else {
             return Err(format!("array of {n} elements runs past the buffer"));
-        }
+        };
         self.pos = end.next_multiple_of(8);
         Slice::view(self.bytes.slice(start..end))
     }
@@ -269,5 +299,26 @@ mod tests {
         assert!(matches!(b, Slice::Shared { .. }));
         assert_eq!(b.as_ptr() as usize % 8, 0);
         assert!(b.as_ptr() as usize > base as usize);
+    }
+
+    /// Bytes that start misaligned are copied to an aligned start, so their
+    /// arrays can still be viewed; a length the buffer cannot hold is an
+    /// error, not an overflow.
+    #[test]
+    fn misaligned_bytes_and_huge_lengths() {
+        let mut w = ByteWriter::new();
+        w.array(&[1u64, 2, 3]);
+        let mut buf = vec![0u8];
+        buf.extend(w.finish());
+        let odd = OwnedBytes::new(buf).slice(1..33);
+        assert_ne!(odd.as_ptr() as usize % 8, 0);
+        let mut r = ByteReader::new(OwnedBytes::new(odd.to_vec()));
+        assert_eq!(&*r.array::<u64>().unwrap(), &[1, 2, 3]);
+        assert!(Slice::<u64>::view(odd).is_err());
+
+        let mut w = ByteWriter::new();
+        w.u64(u64::MAX / 4);
+        w.u64(0);
+        assert!(ByteReader::new(OwnedBytes::new(w.finish())).array::<u64>().is_err());
     }
 }

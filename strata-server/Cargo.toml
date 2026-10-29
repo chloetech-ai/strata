@@ -21,6 +21,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+# Logs: text or JSON lines on stderr, filtered by level per module.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "json"] }
+libc = "0.2"
 
 [features]
 # BERT embedding models (bge-small-en-v1.5, snowflake-arctic-embed-m-v1.5) through candle.

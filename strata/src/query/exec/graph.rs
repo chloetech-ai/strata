@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::{err, unsafe_extend, Executor, Hit, ProbeNode};
+use super::{err, Executor, Hit, ProbeNode, Seg, Ticker};
 use crate::error::Result;
 use crate::graph::traverse::{self, node, split, Adjacency, Node, NodeMap};
 use crate::graph::GraphReader;
@@ -47,6 +47,8 @@ struct GraphAdj<'x> {
     /// Target keys resolved during this query, by key hash.
     memo: NodeMap<Option<Node>>,
     int_keys: bool,
+    /// The query's deadline, checked as the traversal expands rows.
+    tick: Ticker<'x>,
 }
 
 impl GraphAdj<'_> {
@@ -87,6 +89,7 @@ impl SegRef<'_> {
 
 impl Adjacency for GraphAdj<'_> {
     fn neighbors(&mut self, n: Node, reverse: bool, out: &mut Vec<(Node, f32)>) -> Result<()> {
+        self.tick.tick()?;
         let (s, d) = split(n);
         if let Some((k, min_sim, params)) = &self.knn {
             let Some(v) = self.segs[s].as_ref().and_then(|r| r.vectors).filter(|v| v.has_vector(d)).map(|v| v.vector(d).to_vec()) else {
@@ -195,7 +198,8 @@ impl<'a> Executor<'a> {
             GraphKind::Path { to, .. } => self.resolve_seeds(to)?.into_iter().map(|s| s.0).collect(),
             _ => Vec::new(),
         };
-        let mut adj = self.adjacency(g)?;
+        let from = self.segs.clone();
+        let mut adj = self.adjacency(g, &from)?;
         let mut nodes: NodeMap<(u32, f64)> = traverse::node_map();
         let (what, edges, extra) = match &g.kind {
             GraphKind::Reach { min_hops, max_hops } => {
@@ -265,12 +269,13 @@ impl<'a> Executor<'a> {
         })
     }
 
-    fn adjacency(&self, g: &GraphQuery) -> Result<GraphAdj<'a>> {
+    /// The traversal's view of `from`, the executor's segments (a copy of
+    /// [`Executor::segs`] the caller keeps while it traverses).
+    fn adjacency<'s>(&self, g: &GraphQuery, from: &'s [Seg<'a>]) -> Result<GraphAdj<'s>> {
         let field = &self.schema.fields[g.field];
         let vector = matches!(field.ty, FieldType::Vector { .. });
-        let mut segs: Vec<Option<SegRef<'a>>> = (0..self.snap.segments().len()).map(|_| None).collect();
-        for s in &self.segs {
-            let s: &'a super::Seg<'a> = unsafe_extend(s);
+        let mut segs: Vec<Option<SegRef<'s>>> = (0..self.snap.segments().len()).map(|_| None).collect();
+        for s in from {
             let graph = if vector { None } else { s.r.graph(g.field)? };
             let vectors = if vector { s.r.vector(g.field)? } else { None };
             let labels = match (graph, g.labels.is_empty()) {
@@ -285,7 +290,9 @@ impl<'a> Executor<'a> {
         }
         let knn = vector.then(|| (g.k, g.min_sim, self.opts.vector_params.clone()));
         let int_keys = crate::graph::int_keys(self.schema);
-        Ok(GraphAdj { snap: self.snap, segs, dir: g.dir, has_through: g.through.is_some(), knn, memo: traverse::node_map(), int_keys })
+        // A row's neighbours by similarity take a vector search each.
+        let tick = Ticker::new(self.opts, if vector { 16 } else { Ticker::DOCS });
+        Ok(GraphAdj { snap: self.snap, segs, dir: g.dir, has_through: g.through.is_some(), knn, memo: traverse::node_map(), int_keys, tick })
     }
 
     /// Top rows by PageRank or hop distance, among those passing `p`.
@@ -314,8 +321,8 @@ impl<'a> Executor<'a> {
                 by_seg.entry(s).or_default().push((d, value(x)));
             }
         }
-        let segs: Vec<&'a super::Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
+        let segs = self.segs.clone();
+        for s in segs.iter() {
             let Some(cands) = by_seg.remove(&s.ord) else { continue };
             let probeable = {
                 let est = super::SegEst { ex: self, s, params: None, local_sel: None };

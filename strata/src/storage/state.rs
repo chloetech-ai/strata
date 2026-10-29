@@ -10,6 +10,7 @@ use crate::postings::bytes::OwnedBytes;
 use crate::error::{corrupt, Result};
 use crate::schema::Schema;
 use crate::segment::{DocId, SegmentFile};
+use crate::storage::db::Reserved;
 use crate::storage::freelist::FreeList;
 use crate::storage::live::{words_for, LiveDocs};
 use crate::storage::manifest::{Manifest, SegmentMeta};
@@ -248,6 +249,52 @@ impl TableState {
         self.mem_live.clear();
         self.memsegs.clear();
     }
+
+    /// Drops the memtable's first `n` documents (after a background flush
+    /// wrote them to segments); the others stay, as a memtable of the next
+    /// generation. When `n` ends a chunk, the chunks after it stay as they
+    /// are, with their live filters and segments.
+    pub fn split_mem(&mut self, n: usize) {
+        let next = Memtable::new(self.mem.chunk, self.mem.gen + 1);
+        let old = std::mem::replace(&mut self.mem, next);
+        let mem = &mut self.mem;
+        if n.is_multiple_of(old.chunk) {
+            let k = n / old.chunk;
+            mem.chunks = old.chunks[k..].to_vec();
+            mem.len = old.len - n;
+            mem.deleted = old.deleted[n / 64..].to_vec();
+            mem.chunk_deleted = old.chunk_deleted[k..].to_vec();
+            mem.n_deleted = mem.chunk_deleted.iter().sum();
+            let gen = mem.gen;
+            self.memsegs = self
+                .memsegs
+                .drain(..)
+                .skip(k)
+                .map(|s| {
+                    s.map(|mut s| {
+                        s.gen = gen;
+                        s.chunk -= k;
+                        s
+                    })
+                })
+                .collect();
+            self.mem_live = self.mem_live.drain(..).skip(k).collect();
+        } else {
+            for p in n..old.len {
+                let i = mem.push(old.chunks[p / old.chunk][p % old.chunk].clone());
+                if old.deleted[p / 64] >> (p % 64) & 1 == 1 {
+                    mem.delete(i);
+                }
+            }
+            self.memsegs.clear();
+            self.mem_live.clear();
+        }
+        let n32 = n as u32;
+        mem.keys = old.keys.into_iter().filter(|&(_, p)| p >= n32).map(|(k, p)| (k, p - n32)).collect();
+        for (f, p, v) in old.updates.iter().filter(|&(_, p, _)| p >= n32) {
+            mem.updates.set(f, p - n32, v.clone());
+        }
+    }
 }
 
 pub(crate) struct State {
@@ -281,6 +328,12 @@ pub(crate) struct State {
     /// by the number of pending deletes it includes.
     pub live_cache: HashMap<u64, (usize, Arc<LiveDocs>)>,
     pub cached: Option<Arc<SnapInner>>,
+    /// Space reserved for merged images being written, which no commit may
+    /// hand out until they are installed or given back.
+    pub reserved: Vec<Reserved>,
+    /// Segment ids below this are taken (by reservations), even when the
+    /// manifest's `next_segment_id` is lower.
+    pub next_segment_id: u64,
 }
 
 impl State {

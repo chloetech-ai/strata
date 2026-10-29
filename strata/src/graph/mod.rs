@@ -51,7 +51,7 @@ use serde_json::Value as Json;
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{Field, FieldType, Schema};
 use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
-use crate::storage::{key_hash, KeyRef};
+use crate::storage::{key_hash, KeyList, KeyRef};
 use crate::value::Value;
 
 const VERSION: u64 = 3;
@@ -177,11 +177,23 @@ pub fn field_builder(field: &Field, schema: &Schema, keys: Vec<Value>) -> Result
     if schema.primary_key.is_none() {
         return Err(Error::Schema(format!("EDGES field {} needs a primary key", field.name)));
     }
-    Ok(Box::new(GraphBuilder { name: field.name.clone(), int_keys: int_keys(schema), offsets: vec![0], keys, ..Default::default() }))
+    let mut b = keyless_builder(field, schema)?;
+    b.keys = keys;
+    Ok(Box::new(b))
 }
 
+/// [`field_builder`] for a segment built from batches of documents, whose
+/// keys are given when it is written ([`GraphBuilder::finish_with_keys`]).
+pub fn keyless_builder(field: &Field, schema: &Schema) -> Result<GraphBuilder> {
+    if schema.primary_key.is_none() {
+        return Err(Error::Schema(format!("EDGES field {} needs a primary key", field.name)));
+    }
+    Ok(GraphBuilder { name: field.name.clone(), int_keys: int_keys(schema), offsets: vec![0], ..Default::default() })
+}
+
+/// Builds `graph.<f>` for an indexed EDGES field.
 #[derive(Default)]
-struct GraphBuilder {
+pub struct GraphBuilder {
     name: String,
     int_keys: bool,
     offsets: Vec<u64>,
@@ -236,7 +248,20 @@ impl FieldIndexBuilder for GraphBuilder {
     }
 
     fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
-        let b = *self;
+        let mut b = *self;
+        let mut keys = KeyList::of(b.int_keys);
+        for k in std::mem::take(&mut b.keys) {
+            keys.push(&k)?;
+        }
+        b.finish_with_keys(&keys, out)
+    }
+}
+
+impl GraphBuilder {
+    /// Writes the field for a segment whose rows have primary keys `keys`
+    /// (in docID order).
+    pub fn finish_with_keys(self, keys: &KeyList, out: &mut SegmentWriter) -> Result<()> {
+        let b = self;
         let n_edges = b.edge_src.len();
         let has_labels = b.labels.iter().any(|&l| l != 0);
         let has_weights = b.weights.iter().any(|&w| w != 1.0);
@@ -272,17 +297,15 @@ impl FieldIndexBuilder for GraphBuilder {
         // Same-segment targets: the last row holding the key (a memtable
         // segment keeps deleted versions; the newest is the one that can be live).
         let mut by_key: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
-        for (d, k) in b.keys.iter().enumerate() {
-            if let Some(k) = KeyRef::of(k) {
-                by_key.entry(key_hash(k)).or_default().push(d as u32);
-            }
+        for d in 0..keys.len() {
+            by_key.entry(key_hash(keys.get(d))).or_default().push(d as u32);
         }
         let local: Vec<u32> = (0..n_edges as u32)
             .map(|e| {
                 let k = key_of(e);
                 by_key
                     .get(&b.hashes[e as usize])
-                    .and_then(|ds| ds.iter().rev().find(|&&d| KeyRef::of(&b.keys[d as usize]) == Some(k)))
+                    .and_then(|ds| ds.iter().rev().find(|&&d| keys.get(d as usize) == k))
                     .copied()
                     .unwrap_or(u32::MAX)
             })

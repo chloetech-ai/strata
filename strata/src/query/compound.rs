@@ -202,12 +202,18 @@ fn is_star(f: &sql::Function) -> bool {
 
 /// Runs a compound SELECT; `runner` runs each single-table step.
 pub fn run(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner) -> Result<ResultSet> {
-    run_query(&*parse(sql_text)?, schema, params, runner)
+    run_checked(sql_text, schema, params, runner, &|| Ok(()))
 }
 
-/// [`run`] of a parsed query.
-pub(crate) fn run_query(q: &sql::Query, schema: &Schema, params: &Params, runner: &mut Runner) -> Result<ResultSet> {
-    let mut cx = Ctx { schema, params: params.clone(), ctes: HashMap::new(), runner, next: 0, plan: Vec::new() };
+/// [`run`], calling `check` (a deadline, a cancel flag) as it joins rows,
+/// every 1,024 of them, and stopping at its first error.
+pub fn run_checked(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner, check: &dyn Fn() -> Result<()>) -> Result<ResultSet> {
+    run_query(&*parse(sql_text)?, schema, params, runner, check)
+}
+
+/// [`run_checked`] of a parsed query.
+pub(crate) fn run_query(q: &sql::Query, schema: &Schema, params: &Params, runner: &mut Runner, check: &dyn Fn() -> Result<()>) -> Result<ResultSet> {
+    let mut cx = Ctx { schema, params: params.clone(), ctes: HashMap::new(), runner, next: 0, plan: Vec::new(), check, steps: 0 };
     let rel = cx.query(q)?;
     let n = rel.rows.len();
     Ok(ResultSet {
@@ -272,6 +278,10 @@ struct Ctx<'a, 'r> {
     runner: &'a mut Runner<'r>,
     next: usize,
     plan: Vec<String>,
+    /// The query's deadline and cancel flag ([`run_checked`]), and steps
+    /// of the joins since it was last checked.
+    check: &'a dyn Fn() -> Result<()>,
+    steps: u32,
 }
 
 /// One table of a join.
@@ -307,6 +317,16 @@ struct Joined {
 }
 
 impl<'a, 'r> Ctx<'a, 'r> {
+    /// One step of a join: [`Ctx::check`] every 1,024.
+    fn tick(&mut self) -> Result<()> {
+        self.steps += 1;
+        if self.steps < 1024 {
+            return Ok(());
+        }
+        self.steps = 0;
+        (self.check)()
+    }
+
     /// A new list or value parameter.
     fn param(&mut self, v: Value) -> Expr {
         let name = format!("_s{}", self.next);
@@ -763,6 +783,7 @@ impl<'a, 'r> Ctx<'a, 'r> {
             let key_idx: Vec<usize> = keys[i].iter().map(|(_, c)| needed[i].iter().position(|x| x.eq_ignore_ascii_case(c)).expect("key column scanned")).collect();
             let mut table: HashMap<Vec<Part>, Vec<usize>> = HashMap::new();
             for (ri, r) in right.rows.iter().enumerate() {
+                self.tick()?;
                 let mut combos: Vec<Vec<Part>> = vec![Vec::new()];
                 for &k in &key_idx {
                     let vals = self.key_parts(&r[k], &needed[i][k])?;
@@ -777,6 +798,7 @@ impl<'a, 'r> Ctx<'a, 'r> {
             let width = needed[i].len();
             let mut out = Joined { cols, rows: Vec::new(), keys: Vec::new(), scores: Vec::new() };
             for (li, l) in joined.rows.iter().enumerate() {
+                self.tick()?;
                 let mut combos: Vec<Vec<Part>> = vec![Vec::new()];
                 for (le, _) in &keys[i] {
                     let v = eval_row(le, &joined.cols, l, &self.params)?;
@@ -788,6 +810,7 @@ impl<'a, 'r> Ctx<'a, 'r> {
                 matched.dedup();
                 let mut any = false;
                 for ri in matched {
+                    self.tick()?;
                     let row: Vec<Value> = l.iter().chain(&right.rows[ri]).cloned().collect();
                     if pass_all(&on_rest[i], &out.cols, &row, &self.params)? {
                         out.rows.push(row);

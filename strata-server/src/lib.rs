@@ -8,6 +8,7 @@
 //!   a coordinator uses to reach its shards.
 //! * [`agent`]: answers a question in words by letting a Claude model
 //!   query the table.
+//! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves.
 
 pub mod agent;
 pub mod auth;
@@ -18,6 +19,7 @@ pub mod http;
 pub mod idem;
 pub mod json;
 pub mod metrics;
+pub mod obs;
 pub mod server;
 pub mod service;
 

@@ -118,55 +118,108 @@ pub fn build_pk_index(schema: &Schema, docs: &[Document], out: &mut crate::segme
     Ok(())
 }
 
+/// [`build_pk_index`] from the documents' keys alone.
+pub fn build_pk_index_of(schema: &Schema, keys: &KeyList, out: &mut crate::segment::SegmentWriter) -> Result<()> {
+    if schema.primary_key.is_some() {
+        out.put(SECTION, keys.build(key_hash));
+    }
+    Ok(())
+}
+
 /// Encodes the index of `keys` (key of document `i` at position `i`).
 pub(crate) fn build(ty: &FieldType, keys: &[&Value], hash: HashFn) -> Result<Vec<u8>> {
-    let n = keys.len();
-    let kind = match ty {
-        FieldType::Keyword => KIND_STR,
-        FieldType::Int => KIND_INT,
-        _ => return Err(Error::Schema("primary key must be KEYWORD or INT".into())),
-    };
-    let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(n);
-    for (d, v) in keys.iter().enumerate() {
-        let k = match (kind, v) {
-            (KIND_STR, Value::Str(s)) => KeyRef::Str(s.as_bytes()),
-            (KIND_INT, Value::Int(x)) => KeyRef::Int(*x),
+    let mut list = KeyList::new(ty)?;
+    for v in keys {
+        list.push(v)?;
+    }
+    Ok(list.build(hash))
+}
+
+/// Primary keys in docID order, packed as the section stores them: what a
+/// segment build keeps of its documents' keys, for the key index and EDGES
+/// fields, while the documents arrive in batches.
+pub struct KeyList {
+    int: bool,
+    ints: Vec<i64>,
+    /// KEYWORD keys: `offsets[d]..offsets[d + 1]` of `bytes`.
+    offsets: Vec<u64>,
+    bytes: Vec<u8>,
+}
+
+impl KeyList {
+    /// No keys yet, of a KEYWORD or INT primary key.
+    pub fn new(ty: &FieldType) -> Result<KeyList> {
+        match ty {
+            FieldType::Keyword | FieldType::Int => Ok(KeyList::of(*ty == FieldType::Int)),
+            _ => Err(Error::Schema("primary key must be KEYWORD or INT".into())),
+        }
+    }
+
+    /// No keys yet, INT keys if `int`, else KEYWORD.
+    pub fn of(int: bool) -> KeyList {
+        KeyList { int, ints: Vec::new(), offsets: if int { Vec::new() } else { vec![0] }, bytes: Vec::new() }
+    }
+
+    /// Adds the next document's key.
+    pub fn push(&mut self, v: &Value) -> Result<()> {
+        match (self.int, v) {
+            (false, Value::Str(s)) => {
+                self.bytes.extend_from_slice(s.as_bytes());
+                self.offsets.push(self.bytes.len() as u64);
+            }
+            (true, Value::Int(x)) => self.ints.push(*x),
             _ => return Err(Error::Schema(format!("bad primary key value {v:?}"))),
-        };
-        pairs.push((hash(k), d as u32));
-    }
-    pairs.sort_unstable();
-    let bits = dir_bits(n);
-    let mut dir = vec![0u32; (1usize << bits) + 1];
-    let mut i = 0;
-    for (b, slot) in dir.iter_mut().enumerate() {
-        while i < n && bucket(pairs[i].0, bits) < b {
-            i += 1;
         }
-        *slot = i as u32;
+        Ok(())
     }
-    let entries: Vec<u64> = pairs.iter().flat_map(|&(h, d)| [h, d as u64]).collect();
-    let mut w = ByteWriter::new();
-    w.u64(kind);
-    w.u64(n as u64);
-    w.u64(bits as u64);
-    w.array(&dir);
-    w.array(&entries);
-    if kind == KIND_STR {
-        let mut offsets = Vec::with_capacity(n + 1);
-        let mut bytes = Vec::new();
-        offsets.push(0u64);
-        for v in keys {
-            bytes.extend_from_slice(v.as_str().unwrap().as_bytes());
-            offsets.push(bytes.len() as u64);
+
+    /// The keys added.
+    pub fn len(&self) -> usize {
+        if self.int { self.ints.len() } else { self.offsets.len() - 1 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Document `d`'s key.
+    pub fn get(&self, d: usize) -> KeyRef<'_> {
+        if self.int {
+            KeyRef::Int(self.ints[d])
+        } else {
+            KeyRef::Str(&self.bytes[self.offsets[d] as usize..self.offsets[d + 1] as usize])
         }
-        w.array(&offsets);
-        w.array(&bytes);
-    } else {
-        let ints: Vec<i64> = keys.iter().map(|v| v.as_i64().unwrap()).collect();
-        w.array(&ints);
     }
-    Ok(w.finish())
+
+    /// The `pk` section of these keys.
+    fn build(&self, hash: HashFn) -> Vec<u8> {
+        let n = self.len();
+        let mut pairs: Vec<(u64, u32)> = (0..n).map(|d| (hash(self.get(d)), d as u32)).collect();
+        pairs.sort_unstable();
+        let bits = dir_bits(n);
+        let mut dir = vec![0u32; (1usize << bits) + 1];
+        let mut i = 0;
+        for (b, slot) in dir.iter_mut().enumerate() {
+            while i < n && bucket(pairs[i].0, bits) < b {
+                i += 1;
+            }
+            *slot = i as u32;
+        }
+        let entries: Vec<u64> = pairs.iter().flat_map(|&(h, d)| [h, d as u64]).collect();
+        let mut w = ByteWriter::new();
+        w.u64(if self.int { KIND_INT } else { KIND_STR });
+        w.u64(n as u64);
+        w.u64(bits as u64);
+        w.array(&dir);
+        w.array(&entries);
+        if self.int {
+            w.array(&self.ints);
+        } else {
+            w.array(&self.offsets);
+            w.array(&self.bytes);
+        }
+        w.finish()
+    }
 }
 
 /// Zero-copy reader of a `pk` section.

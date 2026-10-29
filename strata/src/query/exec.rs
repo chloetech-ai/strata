@@ -137,12 +137,17 @@ impl SegmentReaders {
     pub fn keyword(&self, field: usize) -> Result<Option<&KeywordColumn>> {
         let f = &self.schema.fields[field];
         opened(&self.keyword[field], || {
-            Ok(match f.ty {
-                FieldType::Keyword if f.indexed => Some(KeywordColumn::open(&self.seg, &f.name)?),
-                // Multi-valued INT fields are keyword columns of int_key strings.
-                FieldType::Int if f.indexed && f.multi => Some(KeywordColumn::open(&self.seg, &f.name)?),
-                _ => None,
-            })
+            // Multi-valued INT fields are keyword columns of int_key strings.
+            if !(f.indexed && (matches!(f.ty, FieldType::Keyword) || matches!(f.ty, FieldType::Int) && f.multi)) {
+                return Ok(None);
+            }
+            let mut col = KeywordColumn::open(&self.seg, &f.name)?;
+            if col.needs_values() {
+                // Multi-valued fields are stored.
+                let store = self.store()?.ok_or_else(|| crate::error::corrupt(format!("keyword column {}: no stored values to repair it from", f.name)))?;
+                col.repair(&store.field_values(field))?;
+            }
+            Ok(Some(col))
         })
     }
 
@@ -203,6 +208,13 @@ pub struct ExecOptions {
     /// lists of disjoint subsets merge by score into the whole query's. For
     /// experiments that run a query's segments in parallel from outside.
     pub segments: Option<Arc<[usize]>>,
+    /// The most rows a query may reach: one whose LIMIT plus OFFSET is
+    /// larger, or that has no LIMIT and matches more rows, fails, as
+    /// Elasticsearch's `max_result_window` does (`None`: no limit).
+    pub max_rows: Option<usize>,
+    /// The most groups a GROUP BY or a facet may make before the query
+    /// fails, as Elasticsearch's `search.max_buckets` (`None`: no limit).
+    pub max_groups: Option<usize>,
 }
 
 impl Default for ExecOptions {
@@ -223,7 +235,53 @@ impl Default for ExecOptions {
             cancel: None,
             synonyms: None,
             segments: None,
+            max_rows: None,
+            max_groups: None,
         }
+    }
+}
+
+impl ExecOptions {
+    /// `Error::Timeout` once [`Self::deadline`] has passed or [`Self::cancel`]
+    /// is set.
+    pub fn check(&self) -> Result<()> {
+        if self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Error::Timeout("the query was cancelled".into()));
+        }
+        match self.deadline {
+            Some(d) if Instant::now() >= d => Err(Error::Timeout("the query ran past its deadline".into())),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Counts the steps of a long loop and checks its query's deadline and
+/// cancel flag ([`ExecOptions::check`]) every `every` of them, so that a
+/// query stops within a few thousand steps instead of at its next segment.
+pub struct Ticker<'o> {
+    opts: &'o ExecOptions,
+    every: u32,
+    n: u32,
+}
+
+impl<'o> Ticker<'o> {
+    /// Steps between checks in a loop over documents (a check costs about
+    /// as much as reading the clock).
+    pub const DOCS: u32 = 1024;
+
+    pub fn new(opts: &'o ExecOptions, every: u32) -> Ticker<'o> {
+        Ticker { opts, every: every.max(1), n: 0 }
+    }
+
+    /// One step: [`ExecOptions::check`] every `every` steps.
+    #[inline]
+    pub fn tick(&mut self) -> Result<()> {
+        self.n += 1;
+        if self.n < self.every {
+            return Ok(());
+        }
+        self.n = 0;
+        self.opts.check()
     }
 }
 
@@ -274,6 +332,7 @@ struct Hit {
     score: f64,
 }
 
+#[derive(Clone)]
 struct Seg<'a> {
     ord: usize,
     view: &'a SegmentView,
@@ -349,10 +408,10 @@ struct Local {
 pub struct Executor<'a> {
     schema: &'a Schema,
     snap: &'a Snapshot,
-    segs: Vec<Seg<'a>>,
+    segs: Arc<[Seg<'a>]>,
     /// Every non-empty segment, for collection statistics; empty unless
     /// `ExecOptions::segments` restricts `segs`.
-    stat_segs: Vec<Seg<'a>>,
+    stat_segs: Arc<[Seg<'a>]>,
     opts: &'a ExecOptions,
     stats: ExecStats,
     /// Materialised filters by segment, shared by the operators of a query.
@@ -393,9 +452,9 @@ impl<'a> Executor<'a> {
             .filter(|(_, (v, _))| v.file.n_docs() > 0)
             .map(|(ord, (view, r))| Seg { ord, view, r: r.clone() })
             .collect();
-        let (segs, stat_segs) = match &opts.segments {
-            None => (all, Vec::new()),
-            Some(only) => (all.iter().filter(|s| only.contains(&s.ord)).map(|s| Seg { ord: s.ord, view: s.view, r: s.r.clone() }).collect(), all),
+        let (segs, stat_segs): (Arc<[Seg<'a>]>, Arc<[Seg<'a>]>) = match &opts.segments {
+            None => (all.into(), Arc::new([])),
+            Some(only) => (all.iter().filter(|s| only.contains(&s.ord)).cloned().collect(), all.into()),
         };
         Executor {
             schema: snap.schema(),
@@ -473,7 +532,7 @@ impl<'a> Executor<'a> {
             let rows = if one { vec![vec![Value::Int(n); columns.len()]] } else { Vec::new() };
             return Ok(empty(columns, rows, self.stats));
         }
-        let hits = self.ordered_hits(q)?;
+        let hits = self.ordered_hits(q, self.opts.max_rows)?;
         let skip = if self.opts.shard { 0 } else { q.offset };
         let hits: Vec<Hit> = hits.into_iter().skip(skip).collect();
         let rows = self.project(q, &hits)?;
@@ -499,14 +558,29 @@ impl<'a> Executor<'a> {
             return Err(err("a seed subquery returns rows, not counts or aggregates"));
         }
         self.run_graphs(&q.graphs)?;
-        let hits = self.ordered_hits(q)?;
+        let hits = self.ordered_hits(q, None)?;
         Ok(hits.into_iter().skip(q.offset).collect())
     }
 
-    fn ordered_hits(&mut self, q: &Select) -> Result<Vec<Hit>> {
+    /// The rows of `q` in order, OFFSET included; at most `max` of them
+    /// ([`ExecOptions::max_rows`]).
+    fn ordered_hits(&mut self, q: &Select, max: Option<usize>) -> Result<Vec<Hit>> {
+        let reach = q.limit.unwrap_or(0).saturating_add(q.offset);
+        if let Some(max) = max.filter(|&m| reach > m) {
+            return Err(err(format!("LIMIT and OFFSET reach row {reach}; a query returns at most {max} rows")));
+        }
         // No query returns more rows than are live, so a larger LIMIT asks
-        // for nothing more (and sizes nothing by itself).
-        let want = q.limit.map(|l| l.saturating_add(q.offset).min(self.n_live()));
+        // for nothing more (and sizes nothing by itself). Without a LIMIT,
+        // one row past `max` shows that the query matches too many.
+        let want = q.limit.map(|l| l.saturating_add(q.offset)).or(max.map(|m| m + 1)).map(|w| w.min(self.n_live()));
+        let hits = self.ordered_hits_to(q, want)?;
+        if let Some(max) = max.filter(|&m| q.limit.is_none() && hits.len() > m) {
+            return Err(err(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
+        }
+        Ok(hits)
+    }
+
+    fn ordered_hits_to(&mut self, q: &Select, want: Option<usize>) -> Result<Vec<Hit>> {
         Ok(match &q.order {
             None => self.unordered(&q.filter, want)?,
             Some(OrderBy::Score { score: Score::Column { field }, desc, nulls_first }) => {
@@ -515,7 +589,7 @@ impl<'a> Executor<'a> {
             // Without a LIMIT, DEFAULT_K rows after the OFFSET, as a
             // coordinator cuts them.
             Some(OrderBy::Score { score, desc: true, .. }) => {
-                let k = want.unwrap_or_else(|| DEFAULT_K.saturating_add(q.offset).min(self.n_live()));
+                let k = if q.limit.is_some() { want.unwrap_or(0) } else { DEFAULT_K.saturating_add(q.offset).min(self.n_live()) };
                 self.ranked(score, &q.filter, k, q.tiebreak.as_ref())?
             }
             Some(OrderBy::Score { .. }) => return Err(err("relevance scores can only be ordered DESC")),
@@ -525,24 +599,24 @@ impl<'a> Executor<'a> {
 
     // ---- readers ---------------------------------------------------------
 
-    fn text(&self, s: &'a Seg, field: usize) -> Result<&'a TextFieldReader> {
+    fn text<'s>(&self, s: &'s Seg<'a>, field: usize) -> Result<&'s TextFieldReader> {
         s.r.text(field)?.ok_or_else(|| err(format!("{} has no text index", self.schema.fields[field].name)))
     }
-    fn numeric(&self, s: &'a Seg, field: usize) -> Result<&'a Numeric> {
+    fn numeric<'s>(&self, s: &'s Seg<'a>, field: usize) -> Result<&'s Numeric> {
         s.r.numeric(field)?.ok_or_else(|| err(format!("{} has no column", self.schema.fields[field].name)))
     }
-    fn keyword(&self, s: &'a Seg, field: usize) -> Result<&'a KeywordColumn> {
+    fn keyword<'s>(&self, s: &'s Seg<'a>, field: usize) -> Result<&'s KeywordColumn> {
         s.r.keyword(field)?.ok_or_else(|| err(format!("{} has no keyword index", self.schema.fields[field].name)))
     }
 
     /// Segment `s`'s values of `field` written in place, if any.
-    fn updates(&self, s: &'a Seg, field: usize) -> Option<&'a Updates> {
+    fn updates(&self, s: &Seg<'a>, field: usize) -> Option<&'a Updates> {
         s.view.updates.as_deref().filter(|u| u.has(field))
     }
 
     /// Document `d`'s value of numeric `field`: written in place, else
     /// the column's.
-    fn num_value(&self, s: &'a Seg, field: usize, col: &NumericColumn, d: DocId) -> Option<f64> {
+    fn num_value(&self, s: &Seg<'a>, field: usize, col: &NumericColumn, d: DocId) -> Option<f64> {
         match self.updates(s, field).and_then(|u| u.get(field, d)) {
             Some(v) => v.as_f64(),
             None => col.get_f64(d),
@@ -550,7 +624,7 @@ impl<'a> Executor<'a> {
     }
 
     /// Document `d`'s value of INT `field`, exactly.
-    fn int_value(&self, s: &'a Seg, field: usize, col: &NumericColumn, d: DocId) -> Option<i64> {
+    fn int_value(&self, s: &Seg<'a>, field: usize, col: &NumericColumn, d: DocId) -> Option<i64> {
         match self.updates(s, field).and_then(|u| u.get(field, d)) {
             Some(v) => v.as_i64(),
             None => col.get_i64(d),
@@ -559,7 +633,7 @@ impl<'a> Executor<'a> {
 
     /// `set`, the documents whose column value of `field` passes `keep`,
     /// corrected for the values written in place.
-    fn patch(&self, s: &'a Seg, field: usize, set: DocSet, keep: impl Fn(&Value) -> bool) -> DocSet {
+    fn patch(&self, s: &Seg<'a>, field: usize, set: DocSet, keep: impl Fn(&Value) -> bool) -> DocSet {
         let Some(u) = self.updates(s, field) else { return set };
         let n = s.r.n_docs;
         let (mut add, mut drop) = (Vec::new(), Vec::new());
@@ -572,7 +646,7 @@ impl<'a> Executor<'a> {
         }
         set.union(&DocSet::from_sorted(add, n)).intersect(&DocSet::from_sorted(drop, n).complement())
     }
-    fn vector(&self, s: &'a Seg, field: usize) -> Result<&'a VectorReader> {
+    fn vector<'s>(&self, s: &'s Seg<'a>, field: usize) -> Result<&'s VectorReader> {
         s.r.vector(field)?.ok_or_else(|| err(format!("{} has no vectors", self.schema.fields[field].name)))
     }
 
@@ -583,14 +657,14 @@ impl<'a> Executor<'a> {
     // ---- filters ---------------------------------------------------------
 
     /// The segment's filter in the given mode, deleted documents excluded.
-    fn seg_filter(&mut self, s: &'a Seg, p: &Pred, mode: FilterMode) -> Result<SegFilter> {
+    fn seg_filter(&mut self, s: &Seg<'a>, p: &Pred, mode: FilterMode) -> Result<SegFilter> {
         let mut l = Local::default();
         let r = self.seg_filter_l(s, p, mode, &mut l);
         self.absorb(l);
         r
     }
 
-    fn seg_filter_l(&self, s: &'a Seg, p: &Pred, mode: FilterMode, l: &mut Local) -> Result<SegFilter> {
+    fn seg_filter_l(&self, s: &Seg<'a>, p: &Pred, mode: FilterMode, l: &mut Local) -> Result<SegFilter> {
         if *p == Pred::True || mode == FilterMode::None {
             return Ok(match &s.view.live {
                 None => SegFilter::All,
@@ -612,14 +686,14 @@ impl<'a> Executor<'a> {
     }
 
     /// The materialised filter of a segment, live documents only (cached).
-    fn filter_set(&mut self, s: &'a Seg, p: &Pred) -> Result<Arc<DocSet>> {
+    fn filter_set(&mut self, s: &Seg<'a>, p: &Pred) -> Result<Arc<DocSet>> {
         let mut l = Local::default();
         let r = self.filter_set_l(s, p, &mut l);
         self.absorb(l);
         r
     }
 
-    fn filter_set_l(&self, s: &'a Seg, p: &Pred, l: &mut Local) -> Result<Arc<DocSet>> {
+    fn filter_set_l(&self, s: &Seg<'a>, p: &Pred, l: &mut Local) -> Result<Arc<DocSet>> {
         if let Some(set) = self.sets.get(&s.ord).or_else(|| l.sets.iter().find(|(o, _)| *o == s.ord).map(|(_, x)| x)) {
             return Ok(set.clone());
         }
@@ -647,11 +721,11 @@ impl<'a> Executor<'a> {
     /// Runs `f` on every segment, on up to [`ExecOptions::threads`] threads
     /// (largest segments first), and returns the results in segment order
     /// with what each recorded taken in.
-    fn per_segment<T: Send>(&mut self, f: impl Fn(&Self, &'a Seg<'a>, &mut Local) -> Result<T> + Sync) -> Result<Vec<T>>
+    fn per_segment<T: Send>(&mut self, f: impl Fn(&Self, &Seg<'a>, &mut Local) -> Result<T> + Sync) -> Result<Vec<T>>
     where
         Self: Sync,
     {
-        let segs: Vec<&'a Seg<'a>> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
+        let segs = self.segs.clone();
         let threads = self.opts.threads.clamp(1, segs.len().max(1));
         let mut outs: Vec<Option<(Result<T>, Local)>> = (0..segs.len()).map(|_| None).collect();
         if threads == 1 {
@@ -672,7 +746,7 @@ impl<'a> Executor<'a> {
                         let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(&i) = order.get(j) else { break };
                         let mut l = Local::default();
-                        let r = this.check_deadline().and_then(|_| f(this, segs[i], &mut l));
+                        let r = this.check_deadline().and_then(|_| f(this, &segs[i], &mut l));
                         *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((r, l));
                     });
                 }
@@ -691,7 +765,7 @@ impl<'a> Executor<'a> {
         Ok(res)
     }
 
-    fn materialize(&self, s: &'a Seg, p: &Pred) -> Result<DocSet> {
+    fn materialize(&self, s: &Seg<'a>, p: &Pred) -> Result<DocSet> {
         let n = s.r.n_docs;
         Ok(match p {
             Pred::True => DocSet::all(n),
@@ -763,7 +837,7 @@ impl<'a> Executor<'a> {
         })
     }
 
-    fn materialize_in(&self, s: &'a Seg, field: usize, values: &[Value]) -> Result<DocSet> {
+    fn materialize_in(&self, s: &Seg<'a>, field: usize, values: &[Value]) -> Result<DocSet> {
         let f = &self.schema.fields[field];
         match f.ty {
             _ if f.ty == FieldType::Keyword || f.multi => {
@@ -782,7 +856,7 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn compile_probe(&self, s: &'a Seg, p: &Pred) -> Result<ProbeNode> {
+    fn compile_probe(&self, s: &Seg<'a>, p: &Pred) -> Result<ProbeNode> {
         Ok(match p {
             Pred::True => ProbeNode::Const(true),
             Pred::False => ProbeNode::Const(false),
@@ -827,8 +901,8 @@ impl<'a> Executor<'a> {
 
     fn count(&mut self, p: &Pred) -> Result<u64> {
         let mut total = 0u64;
-        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
+        let segs = self.segs.clone();
+        for s in segs.iter() {
             self.check_deadline()?;
             total += match (p, &s.view.live) {
                 (Pred::True, None) => s.r.n_docs as u64,
@@ -850,14 +924,16 @@ impl<'a> Executor<'a> {
 
     fn unordered(&mut self, p: &Pred, want: Option<usize>) -> Result<Vec<Hit>> {
         let mut out = Vec::new();
-        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
+        let segs = self.segs.clone();
+        let mut tick = self.ticker();
+        for s in segs.iter() {
             self.check_deadline()?;
             if want.is_some_and(|w| out.len() >= w) {
                 break;
             }
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
+                tick.tick()?;
                 if want.is_some_and(|w| out.len() >= w) {
                     break;
                 }
@@ -877,12 +953,14 @@ impl<'a> Executor<'a> {
         // integers beyond 2^53 (0 for FLOAT columns and missing values).
         let int = self.schema.fields[field].ty == FieldType::Int;
         let mut cands: Vec<(Hit, i64)> = Vec::new();
-        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
+        let segs = self.segs.clone();
+        let mut tick = self.ticker();
+        for s in segs.iter() {
             self.check_deadline()?;
             let col = self.numeric(s, field)?.col();
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
+                tick.tick()?;
                 if let Some(v) = self.num_value(s, field, col, d).or(null_score) {
                     let exact = if int { self.int_value(s, field, col, d).unwrap_or(0) } else { 0 };
                     cands.push((Hit { seg: s.ord, doc: d, score: v }, exact));
@@ -925,12 +1003,14 @@ impl<'a> Executor<'a> {
     /// without a value score 0), rows tied on it by key.
     fn decay_top(&mut self, field: usize, f: &Decay, p: &Pred, k: usize, key_desc: bool) -> Result<Vec<Hit>> {
         let mut cands = Vec::new();
-        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
+        let segs = self.segs.clone();
+        let mut tick = self.ticker();
+        for s in segs.iter() {
             self.check_deadline()?;
             let col = self.numeric(s, field)?.col();
             let set = self.filter_set(s, p)?;
             for d in set.iter() {
+                tick.tick()?;
                 let score = self.num_value(s, field, col, d).map_or(0.0, |v| f.eval(v));
                 cands.push(Hit { seg: s.ord, doc: d, score });
             }
@@ -1079,7 +1159,7 @@ impl<'a> Executor<'a> {
     fn local_stats(&self, field: usize, terms: &[String]) -> Result<CollectionStats> {
         let mut st = CollectionStats { n_docs: 0, total_len: 0, df: HashMap::new() };
         for s in self.stat_segs() {
-            let t = self.text(unsafe_extend(s), field)?;
+            let t = self.text(s, field)?;
             st.n_docs += t.n_docs_with_terms() as u64;
             st.total_len += t.total_len();
             for w in terms {
@@ -1120,7 +1200,7 @@ impl<'a> Executor<'a> {
         }
         let mut found: HashMap<String, (u64, u8)> = HashMap::new();
         for s in self.stat_segs() {
-            for (t, info, d) in self.text(unsafe_extend(s), field)?.fuzzy_terms(term, edits) {
+            for (t, info, d) in self.text(s, field)?.fuzzy_terms(term, edits) {
                 found.entry(t).or_insert((0, d)).0 += info.df as u64;
             }
         }
@@ -1248,7 +1328,7 @@ impl<'a> Executor<'a> {
     /// Document `d`'s values of `field` for aggregates: one for a
     /// single-valued field (none when missing), each of a multi-valued
     /// field's (from `multi`, the documents' value codes).
-    fn agg_values(&self, s: &'a Seg, field: usize, d: DocId, multi: &HashMap<usize, HashMap<DocId, Vec<u32>>>, out: &mut Vec<Value>) -> Result<()> {
+    fn agg_values(&self, s: &Seg<'a>, field: usize, d: DocId, multi: &HashMap<usize, HashMap<DocId, Vec<u32>>>, out: &mut Vec<Value>) -> Result<()> {
         out.clear();
         let f = &self.schema.fields[field];
         if let Some(codes) = multi.get(&field) {
@@ -1283,10 +1363,11 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        let mut groups = agg::Groups::default();
-        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
+        let mut groups = agg::Groups::limited(self.opts.max_groups);
+        let segs = self.segs.clone();
         let (mut vals, mut gv) = (Vec::new(), Vec::new());
-        for s in segs {
+        let mut tick = self.ticker();
+        for s in segs.iter() {
             self.check_deadline()?;
             let set = self.filter_set(s, &q.filter)?;
             self.stats.plan.push(format!("seg {}: aggregate {} rows into groups of {}", s.ord, set.len(), q.group_by.len()));
@@ -1297,6 +1378,7 @@ impl<'a> Executor<'a> {
                     let kw = self.keyword(s, f)?;
                     let mut m: HashMap<DocId, Vec<u32>> = HashMap::new();
                     for c in 0..kw.n_values() as u32 {
+                        tick.tick()?;
                         for d in kw.docs_code(c).intersect(&set).iter() {
                             m.entry(d).or_default().push(c);
                         }
@@ -1305,6 +1387,7 @@ impl<'a> Executor<'a> {
                 }
             }
             for d in set.iter() {
+                tick.tick()?;
                 // A document belongs to one group per combination of its
                 // group values.
                 let mut keys: Vec<Vec<agg::Part>> = vec![Vec::new()];
@@ -1316,7 +1399,7 @@ impl<'a> Executor<'a> {
                     keys = keys.into_iter().flat_map(|k| gv.iter().map(move |v| [k.clone(), vec![agg::Part::of(v)]].concat())).collect();
                 }
                 for key in keys {
-                    let accs = groups.entry(key, needed);
+                    let accs = groups.entry(key, needed)?;
                     for (a, p) in accs.iter_mut().zip(needed) {
                         match p {
                             Projection::Agg { field, .. } => {
@@ -1337,13 +1420,12 @@ impl<'a> Executor<'a> {
     /// `Error::Timeout` once [`ExecOptions::deadline`] has passed or the
     /// query was cancelled.
     fn check_deadline(&self) -> Result<()> {
-        if self.opts.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err(Error::Timeout("the query was cancelled".into()));
-        }
-        match self.opts.deadline {
-            Some(d) if Instant::now() >= d => Err(Error::Timeout("the query ran past its deadline".into())),
-            _ => Ok(()),
-        }
+        self.opts.check()
+    }
+
+    /// A [`Ticker`] of this query, for a loop over documents.
+    fn ticker(&self) -> Ticker<'a> {
+        Ticker::new(self.opts, Ticker::DOCS)
     }
 
     /// BM25's `k1` and `b` (`k1 >= 0` and `0 <= b <= 1`, under which a
@@ -1482,7 +1564,7 @@ impl<'a> Executor<'a> {
     /// must go to collect k matches. Only measured when the global
     /// selectivity leaves the choice open.
     #[allow(clippy::too_many_arguments)]
-    fn local_selectivity(&self, s: &'a Seg, vr: &VectorReader, q: &[f32], p: &Pred, base: &SearchParams, global: f64, l: &mut Local) -> Result<Option<f64>> {
+    fn local_selectivity(&self, s: &Seg<'a>, vr: &VectorReader, q: &[f32], p: &Pred, base: &SearchParams, global: f64, l: &mut Local) -> Result<Option<f64>> {
         if !(0.0005..0.6).contains(&global) {
             return Ok(None);
         }
@@ -1526,8 +1608,8 @@ impl<'a> Executor<'a> {
         };
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         if exact {
-            let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-            for s in segs {
+            let segs = self.segs.clone();
+            for s in segs.iter() {
                 self.check_deadline()?;
                 let set = self.filter_set(s, p)?;
                 cands.extend(set.iter().map(|d| (s.ord, d)));
@@ -1608,8 +1690,8 @@ impl<'a> Executor<'a> {
         }
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         if exact {
-            let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-            for s in segs {
+            let segs = self.segs.clone();
+            for s in segs.iter() {
                 self.check_deadline()?;
                 let set = self.filter_set(s, p)?;
                 cands.extend(set.iter().map(|d| (s.ord, d)));
@@ -1663,7 +1745,8 @@ impl<'a> Executor<'a> {
                 let terms = q.terms;
                 let (params, _) = self.bm25_params(opts)?;
                 for (seg, range) in by_seg {
-                    let s = self.seg_by_ord(seg);
+                    self.check_deadline()?;
+                    let s = &self.seg_by_ord(seg);
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
                     let sc = self.text(s, *field)?.score_weighted(&terms, &stats, params, &docs);
                     out[range].copy_from_slice(&sc);
@@ -1671,14 +1754,17 @@ impl<'a> Executor<'a> {
             }
             Score::Sparse { field, terms, .. } => {
                 for (seg, range) in by_seg {
+                    self.check_deadline()?;
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
-                    let sc = self.text(self.seg_by_ord(seg), *field)?.score_dot(terms, &docs);
+                    let sc = self.text(&self.seg_by_ord(seg), *field)?.score_dot(terms, &docs);
                     out[range].copy_from_slice(&sc);
                 }
             }
             Score::Similarity { field, vector, .. } => {
                 for (seg, range) in by_seg {
-                    let vr = self.vector(self.seg_by_ord(seg), *field)?;
+                    self.check_deadline()?;
+                    let s = &self.seg_by_ord(seg);
+                    let vr = self.vector(s, *field)?;
                     for i in range {
                         out[i] = vr.similarity(cands[i].1, vector);
                     }
@@ -1686,7 +1772,8 @@ impl<'a> Executor<'a> {
             }
             Score::Column { field } => {
                 for (seg, range) in by_seg {
-                    let s = self.seg_by_ord(seg);
+                    self.check_deadline()?;
+                    let s = &self.seg_by_ord(seg);
                     let col = self.numeric(s, *field)?.col();
                     for i in range {
                         out[i] = self.num_value(s, *field, col, cands[i].1).unwrap_or(f64::NEG_INFINITY) as f32;
@@ -1695,7 +1782,8 @@ impl<'a> Executor<'a> {
             }
             Score::Decay { field, decay, .. } => {
                 for (seg, range) in by_seg {
-                    let s = self.seg_by_ord(seg);
+                    self.check_deadline()?;
+                    let s = &self.seg_by_ord(seg);
                     let col = self.numeric(s, *field)?.col();
                     for i in range {
                         out[i] = self.num_value(s, *field, col, cands[i].1).map_or(0.0, |v| decay.eval(v)) as f32;
@@ -1712,8 +1800,8 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
-    fn seg_by_ord(&self, ord: usize) -> &'a Seg<'a> {
-        unsafe_extend(self.segs.iter().find(|s| s.ord == ord).expect("candidate from a known segment"))
+    fn seg_by_ord(&self, ord: usize) -> Seg<'a> {
+        self.segs.iter().find(|s| s.ord == ord).expect("candidate from a known segment").clone()
     }
 
     // ---- facets ----------------------------------------------------------
@@ -1722,8 +1810,8 @@ impl<'a> Executor<'a> {
     /// facet counters (no per-document work).
     fn facets(&mut self, q: &Select, g: usize, needed: &[Projection]) -> Result<agg::Groups> {
         let mut counts: HashMap<String, u64> = HashMap::new();
-        let segs: Vec<&'a Seg> = self.segs.iter().map(|s| unsafe_extend(s)).collect();
-        for s in segs {
+        let segs = self.segs.clone();
+        for s in segs.iter() {
             self.check_deadline()?;
             let set = self.filter_set(s, &q.filter)?;
             let kw = self.keyword(s, g)?;
@@ -1737,13 +1825,16 @@ impl<'a> Executor<'a> {
                     *counts.entry(kw.value(code as u32).to_string()).or_insert(0) += c;
                 }
             }
+            if let Some(max) = self.opts.max_groups.filter(|&m| counts.len() > m) {
+                return Err(agg::too_many_groups(max));
+            }
         }
         // A multi-valued INT field's values are int_key strings.
         let ints = self.schema.fields[g].ty == FieldType::Int;
         let mut groups = agg::Groups::default();
         for (v, c) in counts {
             let key = if ints { forward::int_of_key(&v).map_or(agg::Part::Null, agg::Part::Int) } else { agg::Part::Str(v) };
-            for a in groups.entry(vec![key], needed) {
+            for a in groups.entry(vec![key], needed)? {
                 *a = agg::Acc::Count(c as i64);
             }
         }
@@ -1788,7 +1879,7 @@ impl<'a> Executor<'a> {
             .collect();
         let mut rows = Vec::with_capacity(hits.len());
         for h in hits {
-            let s = self.seg_by_ord(h.seg);
+            let s = &self.seg_by_ord(h.seg);
             let fetched = match (s.r.store()?, stored.is_empty()) {
                 (Some(store), false) => store.get_fields(h.doc, &stored),
                 _ => Vec::new(),
@@ -1816,7 +1907,7 @@ impl<'a> Executor<'a> {
         Ok(rows)
     }
 
-    fn unstored_value(&self, s: &'a Seg, field: usize, d: DocId) -> Value {
+    fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {
         match self.schema.fields[field].ty {
             FieldType::Vector { .. } => s.r.vector(field).ok().flatten().map_or(Value::Null, |v| Value::Vector(v.vector(d).into())),
             FieldType::Int | FieldType::Float => s.r.numeric(field).ok().flatten().map_or(Value::Null, |n| n.col().get(d)),
@@ -1825,15 +1916,6 @@ impl<'a> Executor<'a> {
             FieldType::Edges => s.r.graph(field).ok().flatten().map_or(Value::Null, |g| g.edges_value(d)),
         }
     }
-}
-
-/// The executor's segments live as long as the executor's borrows (`'a`);
-/// this re-borrows one at that lifetime so that `&mut self` methods can be
-/// called while holding it. Segments are never removed during execution.
-fn unsafe_extend<'a, T>(x: &T) -> &'a T {
-    // SAFETY: `segs` is built once in `new` and never mutated afterwards, and
-    // every `Seg` it holds borrows data that outlives the executor.
-    unsafe { &*(x as *const T) }
 }
 
 fn merge_top(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
@@ -1938,7 +2020,7 @@ fn to_vector_strategy(s: VectorStrategy, index_kind: &str, filtered: bool) -> ve
 /// Planner statistics for one segment, answered by its indexes.
 struct SegEst<'e, 'a> {
     ex: &'e Executor<'a>,
-    s: &'a Seg<'a>,
+    s: &'e Seg<'a>,
     /// Vector field and search parameters, for vector cost estimates.
     params: Option<(usize, SearchParams)>,
     /// Selectivity of the filter near the query (see

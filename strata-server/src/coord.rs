@@ -45,6 +45,7 @@ use tonic::Code;
 
 use crate::auth::Secret;
 use crate::grpc::{params_to_pb, result_from_pb};
+use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{op_key, shard_of, QueryReq};
 use crate::{json as js, ApiError};
@@ -74,14 +75,19 @@ impl Default for CoordOptions {
     }
 }
 
-/// Adds the shards' token to every call.
+/// Adds the shards' token to every call, and the request's id.
 #[derive(Clone)]
 pub struct Credentials(Option<tonic::metadata::AsciiMetadataValue>);
 
 impl tonic::service::Interceptor for Credentials {
+    /// Also passes on the id of the request the call serves
+    /// ([`crate::obs`]).
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         if let Some(v) = &self.0 {
             req.metadata_mut().insert("authorization", v.clone());
+        }
+        if let Some(id) = crate::obs::current().and_then(|id| id.parse().ok()) {
+            req.metadata_mut().insert(crate::obs::HEADER, id);
         }
         Ok(req)
     }
@@ -113,6 +119,8 @@ pub struct Coordinator {
     retries: AtomicU64,
     hedges: AtomicU64,
     hedge_budget: HedgeBudget,
+    /// Per shard: calls answered, failed and timed out ([`Self::call`]).
+    outcomes: Vec<[AtomicU64; 3]>,
 }
 
 /// A query's merged answer, and the shards it lacks (with
@@ -252,6 +260,7 @@ impl Coordinator {
             return Err(ApiError::bad("a sharded table needs a primary key to route writes"));
         }
         let skip_until = replicas.iter().map(|_| AtomicU64::new(0)).collect();
+        let outcomes = replicas.iter().map(|_| Default::default()).collect();
         Ok(Coordinator {
             shards,
             replicas,
@@ -263,7 +272,23 @@ impl Coordinator {
             retries: AtomicU64::new(0),
             hedges: AtomicU64::new(0),
             hedge_budget: HedgeBudget::new(),
+            outcomes,
         })
+    }
+
+    /// What `/metrics` shows of the shards: calls by outcome, retries and
+    /// hedges, and replicas avoided now after failing or being outrun.
+    pub fn metrics(&self) -> Vec<Family> {
+        let outcomes = ["ok", "error", "timeout"];
+        let calls = self.outcomes.iter().enumerate().flat_map(|(i, o)| outcomes.iter().zip(o).map(move |(name, n)| (format!("shard=\"{i}\",outcome=\"{name}\""), n.load(Ordering::Relaxed) as f64))).collect();
+        let now = self.now_ms();
+        let avoided = self.replicas.iter().flatten().filter(|r| r.avoid_until.load(Ordering::Relaxed) > now).count();
+        vec![
+            Family { name: "strata_shard_calls_total", ty: "counter", help: "Calls to a shard (its replicas, hedges and retries together), by outcome: ok, error, timeout.", values: calls },
+            Family::one("strata_shard_retries_total", "counter", "Calls asked of another replica after one failed.", self.retries.load(Ordering::Relaxed) as f64),
+            Family::one("strata_shard_hedges_total", "counter", "Calls asked of another replica too after the first had not answered within --hedge-ms.", self.hedges.load(Ordering::Relaxed) as f64),
+            Family::one("strata_replicas_avoided", "gauge", "Replicas asked last for now, after they failed or were outrun.", avoided as f64),
+        ]
     }
 
     fn now_ms(&self) -> u64 {
@@ -318,6 +343,7 @@ impl Coordinator {
                         for &other in asked.iter().filter(|&&o| o != r) {
                             self.avoid(i, other);
                         }
+                        self.outcomes[i][0].fetch_add(1, Ordering::Relaxed);
                         return Ok((r, answer.into_inner()));
                     }
                     Err(s) if try_elsewhere(&s) => {
@@ -333,10 +359,14 @@ impl Coordinator {
                             if order.len() > 1 {
                                 e.message = format!("every replica of shard {i} failed; the last: {}", e.message);
                             }
+                            self.outcomes[i][1].fetch_add(1, Ordering::Relaxed);
                             return Err(e);
                         }
                     }
-                    Err(s) => return Err(self.named(&self.replicas[i][r].url, s)),
+                    Err(s) => {
+                        self.outcomes[i][1].fetch_add(1, Ordering::Relaxed);
+                        return Err(self.named(&self.replicas[i][r].url, s));
+                    }
                 },
                 _ = tokio::time::sleep_until(hedge_at.into()), if more && hedging => {
                     if !self.hedge_budget.spend() {
@@ -354,6 +384,7 @@ impl Coordinator {
                         self.avoid(i, r);
                     }
                     let urls: Vec<&str> = asked.iter().map(|&r| self.replicas[i][r].url.as_str()).collect();
+                    self.outcomes[i][2].fetch_add(1, Ordering::Relaxed);
                     return Err(ApiError { status: 504, message: format!("shard {i} ({}): no answer in time", urls.join(", ")) });
                 }
             }

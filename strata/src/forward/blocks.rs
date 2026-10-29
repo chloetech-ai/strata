@@ -585,6 +585,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "compares the SIMD kernel with the scalar one, which is what Miri runs")]
     fn mask_kernel_matches_scalar() {
         let mut rng = StdRng::seed_from_u64(2);
         for _ in 0..2000 {
@@ -600,6 +601,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "compares the SIMD kernel with the scalar one, which is what Miri runs")]
     fn mask_kernel_matches_scalar_on_edges() {
         let mut rng = StdRng::seed_from_u64(3);
         // Every lane on its own: each maps to its bit.

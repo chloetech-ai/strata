@@ -123,6 +123,21 @@ impl FreeList {
         }
     }
 
+    /// Drops free pages that end the file, down to `floor` pages at
+    /// least.
+    pub fn trim_tail_to(&mut self, floor: u64) {
+        if let Some((&s, &l)) = self.runs.iter().next_back() {
+            if s + l == self.page_count && self.page_count > floor {
+                let end = s.max(floor);
+                self.remove_run(s, l);
+                if end > s {
+                    self.insert_run(s, end - s);
+                }
+                self.page_count = end;
+            }
+        }
+    }
+
     pub fn free_pages(&self) -> u64 {
         self.runs.values().sum()
     }

@@ -17,6 +17,10 @@
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
 //! | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the steps taken |
 //!
+//! Every answer carries the request's id in `x-request-id`: the one the
+//! client sent, if it is 1 to 64 letters, digits, '-', '_', '.' or ':', or
+//! a new one ([`crate::obs`]).
+//!
 //! With a token set, every route but `/`, `/livez`, `/readyz` and
 //! `/v1/health` needs
 //! `Authorization: Bearer <token>`. Every route checks the `Host` header
@@ -24,29 +28,40 @@
 //! ([`crate::auth`]).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json as AxJson, Router};
 use serde_json::{json, Value as Json};
+use tracing::Instrument;
 
 use strata::ingest::Format;
 use strata::storage::Layout;
 
 use crate::auth::{self, Access, Secret};
 use crate::service::{QueryReq, Service, SqlAnswer};
-use crate::{agent, json as js, ApiError};
+use crate::{agent, json as js, obs, ApiError};
 
 const UI: &str = include_str!("../ui/index.html");
+
+/// Why a request failed on the server's side, for [`observe`] to log.
+#[derive(Clone)]
+struct Failure(Arc<str>);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (code, AxJson(json!({"error": self.message}))).into_response()
+        let failure = (self.status >= 500).then(|| Failure(self.message.as_str().into()));
+        let mut r = (code, AxJson(json!({"error": self.message}))).into_response();
+        if let Some(f) = failure {
+            r.extensions_mut().insert(f);
+        }
+        r
     }
 }
 
@@ -60,6 +75,8 @@ struct App {
 }
 
 pub fn router(svc: Arc<Service>, access: &Access) -> Router {
+    // Rows come in writes and imports; every other body is small.
+    let rows = DefaultBodyLimit::max(svc.max_body);
     let app = App { svc, token: access.token.clone(), hosts: access.hosts.clone().map(Into::into) };
     let api = Router::new()
         .route("/v1/stats", get(stats))
@@ -68,8 +85,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/query", post(query))
         .route("/v1/sql", post(sql))
-        .route("/v1/write", post(write))
-        .route("/v1/import", post(import))
+        .route("/v1/write", post(write).layer(rows.clone()))
+        .route("/v1/import", post(import).layer(rows))
         .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
@@ -87,8 +104,32 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/readyz", get(live))
         .merge(api)
         .layer(middleware::from_fn_with_state(app.clone(), browsers))
-        .layer(DefaultBodyLimit::max(256 << 20))
+        .layer(DefaultBodyLimit::max(crate::service::SMALL_BODY))
+        .layer(middleware::from_fn_with_state(app.clone(), observe))
         .with_state(app)
+}
+
+/// Gives the request its id (answered in `x-request-id`), serves it in a
+/// span that names it, counts it by route and status, and logs it: at
+/// debug level, or as an error when it failed on the server's side.
+async fn observe(State(app): State<App>, req: Request, next: Next) -> Response {
+    let id = obs::request_id(header_str(req.headers(), header::HeaderName::from_static(obs::HEADER)));
+    let route = req.extensions().get::<MatchedPath>().map_or("other", |p| p.as_str()).to_string();
+    let span = tracing::info_span!("request", id = %id, method = %req.method(), route = %route);
+    let t0 = Instant::now();
+    let mut res = obs::scope(Some(id.clone()), next.run(req)).instrument(span.clone()).await;
+    let secs = t0.elapsed().as_secs_f64();
+    let status = res.status().as_u16();
+    app.svc.metrics.http(&route, status, secs);
+    if let Ok(v) = header::HeaderValue::from_str(&id) {
+        res.headers_mut().insert(obs::HEADER, v);
+    }
+    let _in = span.enter();
+    match res.extensions().get::<Failure>() {
+        Some(Failure(why)) => obs::server_error(status, why),
+        None => tracing::debug!(status, secs, "answered"),
+    }
+    res
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: header::HeaderName) -> Option<&'a str> {
@@ -209,9 +250,9 @@ async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 
 /// The body's `ops`, applied once per idempotency key (the body's
 /// `idempotency_key` or an `Idempotency-Key` header).
-async fn write(State(app): State<App>, headers: HeaderMap, AxJson(b): AxJson<Json>) -> Res {
-    let ops = match b.get("ops") {
-        Some(Json::Array(ops)) => ops.clone(),
+async fn write(State(app): State<App>, headers: HeaderMap, AxJson(mut b): AxJson<Json>) -> Res {
+    let ops = match b.get_mut("ops").map(Json::take) {
+        Some(Json::Array(ops)) => ops,
         _ => return Err(ApiError::bad("the body needs an array \"ops\"")),
     };
     let key = match (b.get("idempotency_key"), headers.get("idempotency-key")) {

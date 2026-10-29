@@ -12,6 +12,10 @@
 //! <dir>/del-<id>-<txn>.bits           a segment's delete set
 //! <dir>/upd-<id>-<txn>.bin            a segment's in-place updates
 //! <dir>/wal                           the write-ahead log
+//! <dir>/wal.<txn>                     a log sealed by a background flush
+//!                                     that is not installed yet
+//! <dir>/MERGING                       the merges running, and those a
+//!                                     crash interrupted (JSON)
 //! ```
 //!
 //! A commit writes its new segment and delete-set files and its manifest,
@@ -35,6 +39,8 @@ use crate::storage::manifest::Manifest;
 pub const CURRENT: &str = "CURRENT";
 pub const LOCK: &str = "LOCK";
 pub const WAL: &str = "wal";
+/// [`crate::storage::merge::MergeRecord`]; beside a single file, `<file>-merging`.
+pub const MERGE_RECORD: &str = "MERGING";
 
 /// The contents of `CURRENT`: which manifest is the database.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -160,9 +166,10 @@ pub fn orphans(dir: &Path, keep: &HashSet<String>) -> Result<Vec<(PathBuf, u64)>
     Ok(out)
 }
 
-/// Total size of the directory's files (the WAL excluded).
+/// Total size of the directory's files (the WAL and sealed logs excluded).
 pub fn size(dir: &Path) -> u64 {
+    let log = |name: &str| name == WAL || name.strip_prefix("wal.").is_some_and(|t| t.len() == 20 && t.bytes().all(|b| b.is_ascii_digit()));
     std::fs::read_dir(dir)
-        .map(|it| it.filter_map(|e| e.ok()).filter(|e| e.file_name() != WAL).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
+        .map(|it| it.filter_map(|e| e.ok()).filter(|e| !log(&e.file_name().to_string_lossy())).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
         .unwrap_or(0)
 }

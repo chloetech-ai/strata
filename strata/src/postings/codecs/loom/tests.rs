@@ -530,3 +530,86 @@ fn damaged_lists_fail_or_behave() {
     eprintln!("{rejected} rejected when read, {by_validate} by validate, {usable} usable");
     assert!(by_validate > 100 && rejected > usable, "{rejected} rejected when read, {by_validate} by validate, {usable} usable");
 }
+
+/// Small lists with every partition kind, read back from bytes and used:
+/// sized for Miri (`cargo miri test --lib miri_`), which checks the views'
+/// alignment and pointer arithmetic, and the bounds of the unsafe decoding
+/// and search kernels, on every access.
+#[test]
+fn miri_views_of_every_kind() {
+    use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes};
+    let mut rng = StdRng::seed_from_u64(5);
+    let params = Params { chunk: 8, lambda: (5, 4) };
+    let lists: Vec<Vec<u32>> = vec![
+        vec![],
+        vec![7],
+        (0..200u32).chain((1000..3000).filter(|x| x % 3 == 0)).chain((1 << 17..(1 << 17) + 120).map(|x| x * 7)).collect(),
+        random_sorted(&mut rng, 300, 1 << 16),
+        random_sorted(&mut rng, 100, u32::MAX - 1),
+    ];
+    assert!(kinds(&Loom::build_with(&lists[2], params)).iter().all(|&c| c > 0), "{:?}", kinds(&Loom::build_with(&lists[2], params)));
+    let built: Vec<Loom> = lists.iter().map(|l| Loom::build_with(l, params)).collect();
+    let mut w = ByteWriter::new();
+    for l in &built {
+        l.write_to(&mut w);
+    }
+    // Bytes at an odd address are no view, until copied.
+    let mut odd = vec![0u8];
+    odd.extend(w.finish());
+    let odd = OwnedBytes::new(odd);
+    let odd = odd.slice(1..odd.len());
+    assert!(Loom::read_from(&mut ByteReader::new(odd.clone())).is_err());
+    let mut r = ByteReader::new(OwnedBytes::new(odd.to_vec()));
+    let views: Vec<Loom> = built.iter().map(|_| Loom::read_from(&mut r).unwrap()).collect();
+    for (docs, v) in lists.iter().zip(&views) {
+        v.validate().unwrap();
+        let mut out = Vec::new();
+        v.decode_into(&mut out);
+        assert!(out == *docs);
+        let mut c = v.cursor();
+        for (i, &d) in docs.iter().enumerate() {
+            assert_eq!((c.docid(), c.rank()), (d, i));
+            c.next();
+        }
+        assert_eq!(c.docid(), END);
+        let mut c = v.clone().into_cursor();
+        for &d in docs.iter().step_by(3) {
+            let t = d.saturating_sub(1);
+            let i = docs.partition_point(|&x| x < t);
+            assert_eq!(c.next_geq(t), docs[i]);
+            assert_eq!(c.rank(), i);
+        }
+    }
+    for i in 1..lists.len() {
+        for j in i..lists.len() {
+            let refs = [&lists[i], &lists[j]];
+            let mut out = Vec::new();
+            Loom::intersect(&[&views[i], &built[j]], &mut out);
+            assert!(out == reference_and(&refs), "AND of lists {i} and {j}");
+            assert_eq!(Loom::and_count(&[&views[i], &views[j]]), out.len() as u64);
+            out.clear();
+            Loom::union(&[&built[i], &views[j]], &mut out);
+            assert!(out == reference_or(&refs), "OR of lists {i} and {j}");
+            assert_eq!(Loom::or_count(&[&views[i], &views[j]]), out.len() as u64);
+        }
+    }
+    // Damaged bytes: rejected, or a list that decodes and combines safely.
+    let good = built[2].to_bytes();
+    for _ in 0..40 {
+        let mut b = good.clone();
+        let i = rng.gen_range(0..b.len());
+        b[i] ^= 1 << rng.gen_range(0..8);
+        let Ok(list) = Loom::from_bytes(OwnedBytes::new(b)) else { continue };
+        if list.validate().is_err() {
+            continue;
+        }
+        let mut got = Vec::new();
+        list.decode_into(&mut got);
+        let mut out = Vec::new();
+        Loom::intersect(&[&list, &views[3]], &mut out);
+        assert!(out == reference_and(&[&got, &lists[3]]));
+        out.clear();
+        Loom::union(&[&list, &views[3]], &mut out);
+        assert!(out == reference_or(&[&got, &lists[3]]));
+    }
+}

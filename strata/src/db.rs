@@ -36,7 +36,7 @@ pub enum SqlResult {
 }
 
 pub struct Db {
-    storage: Database,
+    storage: Arc<Database>,
     /// Readers by segment id, with the address of the image they read.
     /// On-disk segments keep their id for life (deletes travel with the
     /// snapshot, not the readers), but a vacuum can move their bytes;
@@ -72,11 +72,21 @@ impl Db {
     }
 
     fn wrap(storage: Database) -> Db {
-        Db { storage, readers: RwLock::new(HashMap::new()), exec: ExecOptions::default(), embedders: RwLock::new(Vec::new()), models: RwLock::new(None) }
+        Db { storage: Arc::new(storage), readers: RwLock::new(HashMap::new()), exec: ExecOptions::default(), embedders: RwLock::new(Vec::new()), models: RwLock::new(None) }
     }
 
     pub fn storage(&self) -> &Database {
         &self.storage
+    }
+
+    /// Flushes in the background from now on ([`Database::spawn_flusher`]).
+    pub fn spawn_flusher(&self) {
+        self.storage.spawn_flusher();
+    }
+
+    /// Merges in the background from now on ([`Database::spawn_merger`]).
+    pub fn spawn_merger(&self, opts: crate::storage::MergerOptions) {
+        self.storage.spawn_merger(opts);
     }
 
     /// The schema of the database's first table, which the methods here
@@ -380,8 +390,10 @@ impl Db {
     /// see the same version share one), on the table it names (`FROM`).
     ///
     /// A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs
-    /// as several single-table queries on the same snapshot. A query reads
-    /// one table: joins and subqueries across tables are not supported yet.
+    /// as several single-table queries on the same snapshot. Its steps may
+    /// hold up to [`crate::query::compound::MAX_ROWS`] rows each; its answer
+    /// is held to [`ExecOptions::max_rows`]. A query reads one table: joins
+    /// and subqueries across tables are not supported yet.
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         let q = qsql::parse_query(sql)?;
         let view = match tables::read_by(&q).as_slice() {
@@ -397,10 +409,21 @@ impl Db {
             }
         };
         if compound::needs(&q, view.schema()) {
-            return compound::run_query(&q, view.schema(), params, &mut |text, p| {
-                let select = bind(text, view.schema(), p)?;
-                self.execute(&view, &select, opts)
-            });
+            let steps = ExecOptions { max_rows: None, ..opts.clone() };
+            let rs = compound::run_query(
+                &q,
+                view.schema(),
+                params,
+                &mut |text, p| {
+                    let select = bind(text, view.schema(), p)?;
+                    self.execute(&view, &select, &steps)
+                },
+                &|| opts.check(),
+            )?;
+            if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
+                return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
+            }
+            return Ok(rs);
         }
         let select = qsql::bind_query(&q, view.schema(), params)?;
         self.execute(&view, &select, opts)

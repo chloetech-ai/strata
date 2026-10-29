@@ -15,6 +15,9 @@
 //! * A flush, a bulk load and a merge each write a new on-disk version with
 //!   the shadow-paging commit ([`VersionWriter`]): new extents into free
 //!   pages, `fsync`, then the other meta slot, `fsync`.
+//! * Merges run on segments no other merge has claimed, several at once.
+//!   A merge writes its image before it takes the writer lock, into pages
+//!   (or a file) reserved for it, and holds the lock only to install it.
 //! * Readers never take the writer lock; the state lock is held only to
 //!   copy pointers, never across I/O or index builds.
 //! * With [`DbOptions::publish_snapshots`] the writer also builds each new
@@ -26,29 +29,30 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, TryLockError, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};
-use crate::segment::build::{build_segment, BuildOptions};
-use crate::segment::{DocId, SegmentFile};
+use crate::segment::build::{build_segment, build_threads, BuildOptions, GraphStart, SegmentBuild};
+use crate::segment::{DocId, SegmentFile, SegmentWriter};
 use crate::storage::freelist::FreeList;
 use crate::storage::io;
 use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
 use crate::storage::manifest::{Manifest, SegmentMeta, TableMeta};
-use crate::storage::merge::{MergePolicy, MergeStats, SegmentInfo};
+use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
 use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
 use crate::storage::state::{Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::Updates;
-use crate::storage::wal::{Op, Wal};
+use crate::storage::wal::{self, Op, Wal, WalTxn};
 use crate::value::{validate, Document, Value};
 
 /// Ids of in-memory segments have this bit set.
@@ -229,7 +233,13 @@ pub struct Database {
     build_lock: Mutex<()>,
     /// The snapshot readers get, with `DbOptions::publish_snapshots`.
     published: RwLock<Option<Snapshot>>,
-    merge_lock: Mutex<()>,
+    /// The merges running, with what a crash interrupted ([`Merging`]).
+    merging: Mutex<Merging>,
+    /// Where `merging.record` is kept.
+    merge_record_path: PathBuf,
+    /// Set by [`Database::spawn_merger`].
+    merger: OnceLock<Arc<Merger>>,
+    merger_threads: Mutex<Vec<JoinHandle<()>>>,
     pins: Arc<Pins>,
     mem_ids: AtomicU64,
     /// Set when a write failed in a way that leaves memory and disk out of
@@ -240,6 +250,387 @@ pub struct Database {
     /// What opening found damaged and skipped: the newest version on disk
     /// (the one before it was opened), commits at the end of the WAL.
     damaged: Option<String>,
+    /// The txns of the sealed WAL files a background flush has not
+    /// installed yet ([`wal::sealed_path`]), oldest first.
+    sealed_wals: Mutex<Vec<u64>>,
+    /// One background flush at a time.
+    background: Mutex<()>,
+    /// Set by [`Database::spawn_flusher`]: commits that fill the memtable
+    /// wake the flusher instead of flushing.
+    flush_signal: OnceLock<Arc<FlushSignal>>,
+    flusher: Mutex<Option<JoinHandle<()>>>,
+    /// How many background flushes and merges wait for the writer lock,
+    /// and hold it (at most one): writes that find the lock taken wait for
+    /// it ([`Database::try_writer`]).
+    background_waiting: AtomicUsize,
+    background_holding: AtomicUsize,
+}
+
+/// The writer lock as a background flush or a merge holds it, briefly: to
+/// seal the memtables, to reserve space for an image, or to install
+/// segments. Until it is released, writes that find the lock taken wait
+/// instead of failing with `Busy`.
+struct BackgroundWriter<'a> {
+    wal: Option<MutexGuard<'a, Wal>>,
+    holding: &'a AtomicUsize,
+}
+
+impl std::ops::Deref for BackgroundWriter<'_> {
+    type Target = Wal;
+    fn deref(&self) -> &Wal {
+        self.wal.as_ref().expect("held until dropped")
+    }
+}
+
+impl std::ops::DerefMut for BackgroundWriter<'_> {
+    fn deref_mut(&mut self) -> &mut Wal {
+        self.wal.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for BackgroundWriter<'_> {
+    fn drop(&mut self) {
+        // Released first, so that a waiting write finds it free.
+        self.wal = None;
+        self.holding.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The merges running: each one's inputs, which no other merge may take,
+/// and estimated memory, in `record.running`, with the merges a crash
+/// interrupted before ([`MergeRecord`]).
+#[derive(Default)]
+struct Merging {
+    record: MergeRecord,
+    /// Counters and the last error, for [`MergeStatus`].
+    merges: u64,
+    limited: u64,
+    error: Option<String>,
+}
+
+impl Merging {
+    fn claimed(&self, id: u64) -> bool {
+        self.record.running.iter().any(|m| m.segments.contains(&id))
+    }
+
+    fn memory(&self) -> u64 {
+        self.record.running.iter().map(|m| m.memory).sum()
+    }
+}
+
+/// A merge's claim on its input segments, which it releases when dropped.
+struct MergeClaim<'a> {
+    db: &'a Database,
+    table: u32,
+    snap: Snapshot,
+    /// Oldest first, so the merged segment keeps documents in age order.
+    ids: Vec<u64>,
+    /// Selected larger and cut to fit its memory budget.
+    cut: bool,
+}
+
+impl Drop for MergeClaim<'_> {
+    fn drop(&mut self) {
+        let live: HashSet<u64> = lock(&self.db.state).handles().map(|h| h.meta.id).collect();
+        let mut m = lock(&self.db.merging);
+        m.record.running.retain(|e| e.segments != self.ids);
+        m.record.retain_live(|s| live.contains(&s));
+        let _ = m.record.store(&self.db.merge_record_path);
+    }
+}
+
+/// Space reserved for a merged image while it is written without the
+/// writer lock: a segment id, and pages of the file (or the segment's file,
+/// in the directory layout) that no commit hands out meanwhile. Until the
+/// image is installed, the freelist on disk counts the pages as free (and
+/// opening removes a file no version names), so a crash leaves nothing
+/// behind.
+#[derive(Clone, Debug)]
+pub(crate) struct Reserved {
+    pub id: u64,
+    pub extent: Extent,
+    pub file: Option<String>,
+}
+
+/// A merge decodes its input documents in batches of about this many
+/// bytes of their images, at least `MERGE_BATCH_DOCS.start` documents (so
+/// that a TEXT field still analyses a run per build thread) and at most
+/// `MERGE_BATCH_DOCS.end`.
+const MERGE_BATCH_BYTES: usize = 32 << 20;
+const MERGE_BATCH_DOCS: std::ops::Range<usize> = 16_384..262_144;
+
+/// Images are written in pieces of this size, each paced.
+const IMAGE_CHUNK: usize = 1 << 20;
+
+/// Writes an image streamed to it at `at` in `file`, in [`IMAGE_CHUNK`]
+/// pieces, and sums its checksum.
+struct ImageOut<'a> {
+    file: &'a File,
+    at: u64,
+    buf: Vec<u8>,
+    pacer: Option<&'a Pacer>,
+    crc: crc32fast::Hasher,
+}
+
+impl ImageOut<'_> {
+    /// Writes what is buffered.
+    fn drain(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if let Some(p) = self.pacer {
+            p.pace(self.buf.len());
+        }
+        io::write_at(self.file, &self.buf, self.at)?;
+        self.crc.update(&self.buf);
+        self.at += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl std::io::Write for ImageOut<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let n = data.len().min(IMAGE_CHUNK - self.buf.len());
+        self.buf.extend_from_slice(&data[..n]);
+        if self.buf.len() == IMAGE_CHUNK {
+            self.drain()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.drain()
+    }
+}
+
+/// The background merger's settings and wake-ups ([`Database::spawn_merger`]).
+struct Merger {
+    policy: MergePolicy,
+    budget: Option<u64>,
+    pacer: Option<Pacer>,
+    wake: Mutex<MergerWake>,
+    cv: Condvar,
+    /// The table a merger thread looks at first, in turn.
+    next_table: AtomicUsize,
+}
+
+#[derive(Default)]
+struct MergerWake {
+    /// Bumped by each version a commit publishes: segments may be due a
+    /// merge. Every merger thread looks.
+    generation: u64,
+    closed: bool,
+}
+
+impl Merger {
+    fn wake(&self) {
+        lock(&self.wake).generation += 1;
+        self.cv.notify_all();
+    }
+
+    fn close(&self) {
+        lock(&self.wake).closed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// A merger thread: merges what the policy selects whenever a version is
+/// published (new segments, deletes written) and every few seconds, while
+/// other threads take other segments. A failed merge is retried after a
+/// pause that doubles up to a minute.
+fn merger(db: Weak<Database>, m: Arc<Merger>) {
+    let mut seen = u64::MAX;
+    let mut backoff = Duration::ZERO;
+    loop {
+        {
+            let mut w = lock(&m.wake);
+            let t0 = Instant::now();
+            let wait = if backoff.is_zero() { Duration::from_secs(5) } else { backoff };
+            while !w.closed && (!backoff.is_zero() || w.generation == seen) {
+                let left = wait.saturating_sub(t0.elapsed());
+                if left.is_zero() {
+                    break;
+                }
+                w = m.cv.wait_timeout(w, left).unwrap_or_else(|e| e.into_inner()).0;
+            }
+            if w.closed {
+                return;
+            }
+            seen = w.generation;
+        }
+        let Some(db) = db.upgrade() else { return };
+        let mut failed = false;
+        while let Some(claim) = db.next_merge(&m) {
+            let mut stats = MergeStats::default();
+            let t0 = Instant::now();
+            let r = db.merge_claimed(&claim, m.pacer.as_ref(), &mut stats);
+            let segments = claim.ids.len();
+            drop(claim);
+            let mut st = lock(&db.merging);
+            if let Err(e) = r {
+                tracing::warn!(segments, error = %e, "a merge failed; merging pauses, then tries again");
+                st.error = Some(e.to_string());
+                failed = true;
+                break;
+            }
+            tracing::debug!(segments, docs = stats.docs_merged, dropped = stats.docs_dropped, bytes = stats.bytes_written, secs = t0.elapsed().as_secs_f64(), "merged");
+            st.error = None;
+        }
+        backoff = if failed { (backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(60)) } else { Duration::ZERO };
+        drop(db);
+    }
+}
+
+/// Wakes the flusher thread.
+#[derive(Default)]
+struct FlushSignal {
+    state: Mutex<FlushWake>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct FlushWake {
+    /// A commit filled the memtable since the flusher last looked.
+    due: bool,
+    /// The flusher is flushing.
+    running: bool,
+    /// The database is closing.
+    closed: bool,
+}
+
+impl FlushSignal {
+    fn wake(&self) {
+        lock(&self.state).due = true;
+        self.cv.notify_all();
+    }
+
+    fn set_running(&self, running: bool) {
+        lock(&self.state).running = running;
+        self.cv.notify_all();
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// The flusher thread: a background flush each time a commit fills the
+/// memtable, until the database closes. A flush that failed is retried
+/// after a pause rather than at every commit.
+fn flusher(db: Weak<Database>, sig: Arc<FlushSignal>) {
+    loop {
+        {
+            let mut w = lock(&sig.state);
+            while !w.due && !w.closed {
+                w = sig.cv.wait(w).unwrap_or_else(|e| e.into_inner());
+            }
+            if w.closed {
+                return;
+            }
+            w.due = false;
+        }
+        let Some(db) = db.upgrade() else { return };
+        let mut failed = false;
+        if db.flush_due() {
+            sig.set_running(true);
+            failed = db.background_flush().is_err();
+            sig.set_running(false);
+        }
+        drop(db);
+        if failed {
+            let w = lock(&sig.state);
+            let _ = sig.cv.wait_timeout_while(w, Duration::from_secs(1), |w| !w.closed);
+        }
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(sig) = self.flush_signal.get() {
+            sig.close();
+        }
+        if let Some(m) = self.merger.get() {
+            m.close();
+        }
+        let mut threads: Vec<JoinHandle<()>> = self.flusher.get_mut().unwrap_or_else(|e| e.into_inner()).take().into_iter().collect();
+        threads.append(self.merger_threads.get_mut().unwrap_or_else(|e| e.into_inner()));
+        for h in threads {
+            // The flusher and the mergers hold a reference only while they
+            // work; when one held the last one, the database closes on its
+            // thread.
+            if h.thread().id() != std::thread::current().id() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+/// What a background flush took from a table's memtable when it sealed
+/// it: its `len` documents, with the deletes and values written in place
+/// up to then.
+struct SealedMem {
+    table: u32,
+    schema: Arc<Schema>,
+    gen: u64,
+    len: usize,
+    chunks: Vec<Arc<Vec<Document>>>,
+    deleted: Vec<u64>,
+    updates: Updates,
+}
+
+/// A sealed position that was deleted when the memtable was sealed.
+const GONE: u32 = u32::MAX;
+
+impl SealedMem {
+    /// Seals the whole memtable: the version the flush installs holds every
+    /// transaction up to the seal (the WAL from there on is all the
+    /// memtable keeps).
+    fn of(t: &TableState) -> SealedMem {
+        let m = &t.mem;
+        SealedMem { table: t.id, schema: t.schema.clone(), gen: m.gen, len: m.len, chunks: m.chunks.clone(), deleted: m.deleted.clone(), updates: m.updates.clone() }
+    }
+
+    fn was_deleted(&self, p: usize) -> bool {
+        self.deleted[p / 64] >> (p % 64) & 1 == 1
+    }
+
+    /// The live documents, with their values written in place, and each
+    /// position's docID among them (`GONE` for deleted ones).
+    fn live(&self) -> (Vec<Document>, Vec<u32>) {
+        let mut docids = vec![GONE; self.len];
+        let mut live = Vec::new();
+        for (p, d) in self.chunks.iter().flat_map(|c| c.iter()).take(self.len).enumerate() {
+            if !self.was_deleted(p) {
+                docids[p] = live.len() as u32;
+                let mut d = d.clone();
+                self.updates.apply(p as DocId, &mut d);
+                live.push(d);
+            }
+        }
+        (live, docids)
+    }
+
+    /// The deletes and values written in place since the seal on sealed
+    /// documents, as docIDs of the segments built from them (`max`
+    /// documents each, `n_segs` of them), or `None` when the table is gone.
+    fn since(&self, st: &State, docids: &[u32], n_segs: usize, max: usize) -> Option<Vec<(Vec<DocId>, Updates)>> {
+        let mem = &st.tables[st.table_index(self.table)?].mem;
+        let mut out = vec![(Vec::new(), Updates::default()); n_segs];
+        for (p, &d) in docids.iter().enumerate() {
+            if d != GONE && mem.deleted[p / 64] >> (p % 64) & 1 == 1 {
+                out[d as usize / max].0.push(d % max as u32);
+            }
+        }
+        for (f, p, v) in mem.updates.iter() {
+            let Some(&d) = docids.get(p as usize).filter(|&&d| d != GONE) else { continue };
+            if self.updates.get(f, p) != Some(v) {
+                out[d as usize / max].1.set(f, d % max as u32, v.clone());
+            }
+        }
+        Some(out)
+    }
 }
 
 impl Database {
@@ -260,7 +651,7 @@ impl Database {
         let mut fl = FreeList::new(META_PAGES);
         let mbytes = manifest.encode();
         let mext = Extent { page: fl.alloc(pages_for(mbytes.len())), len: mbytes.len() as u64 };
-        let (fext, fbytes) = place_freelist(&mut fl);
+        let (fext, fbytes) = place_freelist(&mut fl, &[]);
         io::set_len(&file, fl.page_count() * PAGE)?;
         io::write_at(&file, &mbytes, mext.page * PAGE)?;
         io::write_at(&file, &fbytes, fext.page * PAGE)?;
@@ -403,8 +794,22 @@ impl Database {
         handles: Vec<Vec<Arc<SegHandle>>>,
     ) -> Result<Database> {
         let fits = |table: u32, op: &Op| manifest.table(table).is_none_or(|t| op_fits(&t.schema, op));
-        let (mut wal, txns) = Wal::open(&wal_path, meta.db_id, opts.sync, opts.wal_drop_damaged, &fits)?;
-        let wal_dropped = wal.dropped().map(str::to_string);
+        let (sealed, mut txns, cut) = read_sealed_wals(&wal_path, &manifest, meta.db_id, opts.wal_drop_damaged, &fits)?;
+        let (mut wal, wal_dropped) = match cut {
+            None => {
+                let (wal, active) = Wal::open(&wal_path, meta.db_id, opts.sync, opts.wal_drop_damaged, &fits)?;
+                txns.extend(active);
+                let dropped = wal.dropped().map(str::to_string);
+                (wal, dropped)
+            }
+            Some(what) => {
+                // Every transaction after the damage goes, the open log's too.
+                if std::fs::metadata(&wal_path).is_ok_and(|m| m.len() > 0) {
+                    std::fs::copy(&wal_path, wal::damaged_path(&wal_path))?;
+                }
+                (Wal::create(&wal_path, meta.db_id, opts.sync)?, Some(what))
+            }
+        };
         let tables: Vec<TableState> = manifest
             .tables
             .iter()
@@ -428,6 +833,8 @@ impl Database {
             live_cache: HashMap::new(),
             updates_cache: HashMap::new(),
             cached: None,
+            reserved: Vec::new(),
+            next_segment_id: 0,
         };
         let mut flushed = false;
         for t in txns {
@@ -445,9 +852,26 @@ impl Database {
             }
             st.txn = st.txn.max(t.txn);
         }
-        if flushed && st.mem_len() == 0 && st.pending.is_empty() {
+        let mut sealed = sealed;
+        if flushed && st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
             wal.reset(opts.sync)?;
+            for t in sealed.drain(..) {
+                let _ = io::remove_file(&wal::sealed_path(&wal_path, t));
+            }
         }
+        // Merges a crash interrupted; those of segments that are gone are
+        // forgotten.
+        let merge_record_path = match &dir {
+            Some(d) => d.join(dir::MERGE_RECORD),
+            None => {
+                let mut s = path.as_os_str().to_owned();
+                s.push("-merging");
+                PathBuf::from(s)
+            }
+        };
+        let mut record = MergeRecord::load(&merge_record_path);
+        record.retain_live(|id| st.handle(id).is_some());
+        record.store(&merge_record_path)?;
         let db = Database {
             path: path.to_path_buf(),
             wal_path,
@@ -459,12 +883,21 @@ impl Database {
             state: Mutex::new(st),
             build_lock: Mutex::new(()),
             published: RwLock::new(None),
-            merge_lock: Mutex::new(()),
+            merging: Mutex::new(Merging { record, ..Merging::default() }),
+            merge_record_path,
+            merger: OnceLock::new(),
+            merger_threads: Mutex::new(Vec::new()),
             pins: Arc::new(Pins::default()),
             mem_ids: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             flush_error: Mutex::new(None),
             damaged: wal_dropped,
+            sealed_wals: Mutex::new(sealed),
+            background: Mutex::new(()),
+            flush_signal: OnceLock::new(),
+            flusher: Mutex::new(None),
+            background_waiting: AtomicUsize::new(0),
+            background_holding: AtomicUsize::new(0),
         };
         db.republish();
         Ok(db)
@@ -622,6 +1055,7 @@ impl Database {
     /// Starts the write transaction; `Error::Busy` while another one (or a
     /// flush, bulk load or merge commit) is in progress.
     pub fn begin(&self) -> Result<WriteTxn<'_>> {
+        self.wait_for_flusher();
         let wal = self.try_writer()?;
         self.check_poisoned()?;
         Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new() })
@@ -769,7 +1203,197 @@ impl Database {
             st.updates_cache.clear();
             st.n_pending = 0;
         })?;
-        wal.reset(self.opts.sync).map_err(|e| self.poison(e))
+        wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
+        self.remove_sealed(txn);
+        Ok(())
+    }
+
+    /// Deletes the sealed WAL files the on-disk version holds (sealed at or
+    /// before `txn`). One that stays is deleted when the database opens.
+    fn remove_sealed(&self, txn: u64) {
+        lock(&self.sealed_wals).retain(|&t| {
+            let flushed = t <= txn;
+            if flushed {
+                let _ = io::remove_file(&wal::sealed_path(&self.wal_path, t));
+            }
+            !flushed
+        });
+    }
+
+    /// Whether the memtables and pending deletes are past
+    /// `memtable_max_docs`.
+    fn flush_due(&self) -> bool {
+        let st = lock(&self.state);
+        st.mem_len() + st.n_pending > self.opts.memtable_max_docs
+    }
+
+    /// Whether the memtables and pending deletes are past twice
+    /// `memtable_max_docs`, where commits stop leaving flushes to the
+    /// flusher.
+    fn over_twice(&self) -> bool {
+        let st = lock(&self.state);
+        st.mem_len() + st.n_pending > 2 * self.opts.memtable_max_docs.max(1)
+    }
+
+    /// Past twice `memtable_max_docs` while the flusher flushes (or is about
+    /// to), waits for it, without the writer lock: writes then go at the
+    /// pace of flushes, rather than a commit flushing the whole memtable
+    /// itself. A flusher whose flushes fail is not waited for (commits
+    /// flush, or are refused).
+    fn wait_for_flusher(&self) {
+        let Some(sig) = self.flush_signal.get() else { return };
+        let mut w = lock(&sig.state);
+        while (w.running || w.due) && !w.closed && self.over_twice() {
+            w = sig.cv.wait_timeout(w, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    /// Starts a thread that flushes in the background
+    /// ([`Database::background_flush`]) when a commit fills the memtable,
+    /// in place of that commit flushing before it returns. Past twice
+    /// `memtable_max_docs` (the flusher fell behind), new writes wait for
+    /// its flush; if its flushes fail, commits flush the memtable whole or
+    /// are refused, as without a flusher. The thread ends with the
+    /// database; calling this again does nothing.
+    pub fn spawn_flusher(self: &Arc<Self>) {
+        let sig = Arc::new(FlushSignal::default());
+        if self.flush_signal.set(sig.clone()).is_err() {
+            return;
+        }
+        let db = Arc::downgrade(self);
+        let h = std::thread::Builder::new().name("strata-flusher".into()).spawn(move || flusher(db, sig)).expect("spawn the flusher thread");
+        *lock(&self.flusher) = Some(h);
+        if self.flush_due() {
+            if let Some(sig) = self.flush_signal.get() {
+                sig.wake();
+            }
+        }
+    }
+
+    /// Flushes as [`Database::flush`] does, but holds the writer lock only
+    /// to seal the memtables and to install the segments built from them,
+    /// so that commits go on while they build: into a new WAL file (the
+    /// sealed one, `<wal>.<txn>`, is deleted once the flush is installed)
+    /// and into the memtable, which keeps them. A sealed document deleted
+    /// or written in place meanwhile is so in its new segment. A flush of
+    /// everything meanwhile ([`Database::flush`], a bulk load, dropping a
+    /// table) makes this one a no-op. Writes that start while it holds the
+    /// lock wait for it rather than fail with `Busy`. It waits for the
+    /// writer lock, so it must not be called from a thread that holds a
+    /// [`WriteTxn`].
+    pub fn background_flush(&self) -> Result<()> {
+        self.background_flush_with(|| {})
+    }
+
+    /// [`Database::background_flush`], running `between` after the seal and
+    /// before the install (tests write there).
+    #[doc(hidden)]
+    pub fn background_flush_with(&self, between: impl FnOnce()) -> Result<()> {
+        let _one = lock(&self.background);
+        let t0 = Instant::now();
+        let r = self.background_flush_inner(between);
+        let now = r.as_ref().err().map(|e| e.to_string());
+        let mut before = lock(&self.flush_error);
+        // A failing flush is tried again every second: logged when it
+        // starts failing (or fails otherwise) and when it works again.
+        match (&now, &*before) {
+            (None, None) => tracing::debug!(secs = t0.elapsed().as_secs_f64(), "flushed the memtable"),
+            (None, Some(_)) => tracing::info!("background flushes work again"),
+            (Some(e), b) if b.as_ref() != Some(e) => tracing::warn!(error = %e, "a background flush failed; writes go on into the write-ahead log"),
+            _ => {}
+        }
+        *before = now;
+        r
+    }
+
+    /// The writer lock, for a background flush or a merge
+    /// ([`BackgroundWriter`]).
+    fn background_writer(&self) -> BackgroundWriter<'_> {
+        self.background_waiting.fetch_add(1, Ordering::AcqRel);
+        let wal = lock(&self.writer);
+        self.background_holding.fetch_add(1, Ordering::AcqRel);
+        self.background_waiting.fetch_sub(1, Ordering::AcqRel);
+        BackgroundWriter { wal: Some(wal), holding: &self.background_holding }
+    }
+
+    fn background_flush_inner(&self, between: impl FnOnce()) -> Result<()> {
+        let (sealed, txn) = {
+            let mut wal = self.background_writer();
+            self.check_poisoned()?;
+            let st = lock(&self.state);
+            if st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
+                return Ok(());
+            }
+            let sealed: Vec<SealedMem> = st.tables.iter().filter(|t| t.mem.len > 0).map(SealedMem::of).collect();
+            let txn = st.txn;
+            drop(st);
+            // A log with no commits since the last seal stays as it is.
+            if !wal.is_empty() {
+                wal.sync_appends()?;
+                let to = wal::sealed_path(&self.wal_path, txn);
+                io::rename(&self.wal_path, &to)?;
+                lock(&self.sealed_wals).push(txn);
+                // Commits must not go on in the sealed file: the install
+                // deletes it.
+                wal.restart(&self.wal_path, self.opts.sync).and_then(|_| Ok(io::sync_dir(self.wal_dir())?)).map_err(|e| self.poison(e))?;
+            }
+            (sealed, txn)
+        };
+        between();
+        let max = self.opts.segment_max_docs.max(1);
+        let mut built = Vec::with_capacity(sealed.len());
+        for s in &sealed {
+            let (live, docids) = s.live();
+            let images = live.chunks(max).map(|c| Ok((build_segment(&s.schema, c, &self.opts.build)?, c.len() as u32))).collect::<Result<Vec<_>>>()?;
+            built.push((images, docids));
+        }
+
+        let mut wal = self.background_writer();
+        self.check_poisoned()?;
+        let (carried, pending, pending_updates) = {
+            let st = lock(&self.state);
+            // A flush of everything since the seal holds what this one built.
+            if st.manifest.wal_txn >= txn || sealed.iter().any(|s| st.table_index(s.table).is_some_and(|i| st.tables[i].mem.gen != s.gen)) {
+                return Ok(());
+            }
+            let carried: Vec<_> = sealed.iter().zip(&built).map(|(s, (images, docids))| s.since(&st, docids, images.len(), max)).collect();
+            (carried, st.pending.clone(), st.pending_updates.clone())
+        };
+        let mut vw = VersionWriter::begin(self);
+        vw.manifest.wal_txn = txn;
+        for ((s, (images, _)), carried) in sealed.iter().zip(&built).zip(carried) {
+            let Some(carried) = carried else { continue };
+            for ((image, n), (deleted, updated)) in images.iter().zip(carried) {
+                let dels = (!deleted.is_empty()).then(|| LiveDocs::with_deleted(None, *n, deleted.iter().copied()));
+                vw.add_segment(s.table, None, image, *n, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
+            }
+        }
+        for (&id, docs) in &pending {
+            vw.add_deletes(id, docs)?;
+        }
+        for (&id, (_, ups)) in &pending_updates {
+            vw.add_updates(id, ups)?;
+        }
+        let c = vw.commit(&mut wal)?;
+        self.publish(c, |st| {
+            for s in &sealed {
+                if let Some(i) = st.table_index(s.table) {
+                    st.tables[i].split_mem(s.len);
+                }
+            }
+            st.pending.clear();
+            st.pending_updates.clear();
+            st.updates_cache.clear();
+            st.n_pending = 0;
+        })?;
+        drop(wal);
+        self.remove_sealed(txn);
+        Ok(())
+    }
+
+    /// The directory that holds the WAL.
+    fn wal_dir(&self) -> &Path {
+        self.wal_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
     }
 
     /// Loads documents into the first table straight into segments of
@@ -903,18 +1527,31 @@ impl Database {
 
     /// Merges each table's on-disk segments as `policy` selects until it
     /// selects nothing. Inputs are rebuilt from `DbOptions::doc_source`
-    /// without blocking writers; the commit then marks documents deleted in
-    /// the meantime as deleted in the merged segment. Must not be called by
-    /// a thread that holds a [`WriteTxn`] (the commit waits for the writer
-    /// lock).
+    /// and the merged image is written without blocking writers; the
+    /// install, under the writer lock, marks documents deleted in the
+    /// meantime as deleted in the merged segment. Merges running at once
+    /// (other calls, the threads of [`Database::spawn_merger`]) take
+    /// different segments: this one leaves those another merge holds
+    /// alone, and returns when the policy selects nothing among the rest.
+    /// Segments of a merge a crash interrupted are merged in smaller
+    /// groups ([`MergeRecord`]). Must not be called by a thread that holds
+    /// a [`WriteTxn`] (the install waits for the writer lock).
     pub fn merge(&self, policy: &MergePolicy) -> Result<MergeStats> {
-        let _m = lock(&self.merge_lock);
+        self.merge_with(policy, || true)
+    }
+
+    /// [`Database::merge`], calling `between` once each merged image is
+    /// written and before it is installed; the merge is given up when it
+    /// returns false (tests write, check and fail there).
+    #[doc(hidden)]
+    pub fn merge_with(&self, policy: &MergePolicy, mut between: impl FnMut() -> bool) -> Result<MergeStats> {
         let source = self.opts.doc_source.clone().ok_or_else(|| Error::Schema("merging needs DbOptions::doc_source".into()))?;
         // A database that cannot commit would build the merged segment
         // only to throw it away.
         self.check_poisoned()?;
         let t0 = Instant::now();
         let mut stats = MergeStats::default();
+        let pacer = self.merger.get().and_then(|m| m.pacer.as_ref());
         let tables: Vec<(u32, usize)> = lock(&self.state).tables.iter().map(|t| (t.id, t.handles.len())).collect();
         for (table, n) in tables {
             // Each merge removes a segment, except rewrites of a single
@@ -923,23 +1560,119 @@ impl Database {
             let mut rounds = 2 * n + 1;
             while rounds > 0 {
                 rounds -= 1;
-                // The table may have been dropped meanwhile.
-                let Some(snap) = self.snapshot_inner(false).table_by_id(table) else { break };
-                let infos: Vec<SegmentInfo> =
-                    snap.segments().iter().map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live }).collect();
-                let Some(mut group) = policy.select(&infos) else { break };
-                // Oldest first, so the merged segment keeps documents in age order.
-                group.sort_by_key(|id| infos.iter().position(|s| s.id == *id));
-                self.merge_group(table, &snap, &group, source.as_ref(), &mut stats)?;
+                let Some(claim) = self.claim_merge(table, policy, None) else { break };
+                self.merge_group(&claim, source.as_ref(), pacer, &mut between, &mut stats)?;
             }
         }
         stats.seconds = t0.elapsed().as_secs_f64();
         Ok(stats)
     }
 
-    fn merge_group(&self, table: u32, snap: &Snapshot, ids: &[u64], source: &dyn DocumentSource, stats: &mut MergeStats) -> Result<()> {
+    /// Starts `opts.threads` threads that merge segments as `opts.policy`
+    /// selects, in place of calls to [`Database::merge`]: whenever a commit
+    /// publishes a version (a flush, a load, a merge, deletes written) and
+    /// every 5 s. Up to that many merges run at once, on different
+    /// segments, within `opts.memory_budget`, writing no faster than
+    /// `opts.write_bytes_per_sec` (calls to [`Database::merge`] keep to that
+    /// rate too). [`Database::merge_status`] says what they do. The threads
+    /// end with the database; calling this again does nothing.
+    pub fn spawn_merger(self: &Arc<Self>, opts: MergerOptions) {
+        let m = Arc::new(Merger {
+            policy: opts.policy,
+            budget: opts.memory_budget.or_else(|| memory_limit().map(|l| l / 4)),
+            pacer: opts.write_bytes_per_sec.map(Pacer::new),
+            wake: Mutex::new(MergerWake::default()),
+            cv: Condvar::new(),
+            next_table: AtomicUsize::new(0),
+        });
+        if self.merger.set(m.clone()).is_err() {
+            return;
+        }
+        if self.opts.doc_source.is_none() {
+            lock(&self.merging).error = Some("merging needs DbOptions::doc_source".into());
+            return;
+        }
+        let mut threads = lock(&self.merger_threads);
+        for i in 0..opts.threads.max(1) {
+            let (db, m) = (Arc::downgrade(self), m.clone());
+            threads.push(std::thread::Builder::new().name(format!("strata-merger-{i}")).spawn(move || merger(db, m)).expect("spawn a merger thread"));
+        }
+    }
+
+    /// What the merges are doing.
+    pub fn merge_status(&self) -> MergeStatus {
+        let m = lock(&self.merging);
+        MergeStatus {
+            running: m.record.running.len(),
+            segments_merging: m.record.running.iter().map(|e| e.segments.len()).sum(),
+            memory: m.memory(),
+            memory_budget: self.merger.get().and_then(|x| x.budget),
+            merges: m.merges,
+            merges_limited: m.limited,
+            interrupted: m.record.interrupted.len(),
+            error: m.error.clone(),
+        }
+    }
+
+    /// The next merge for a merger thread: of the tables in turn, the first
+    /// one with segments to merge within the budget.
+    fn next_merge(&self, m: &Merger) -> Option<MergeClaim<'_>> {
+        if self.is_poisoned() {
+            return None;
+        }
+        let tables: Vec<u32> = lock(&self.state).tables.iter().map(|t| t.id).collect();
+        let first = m.next_table.fetch_add(1, Ordering::Relaxed);
+        (0..tables.len()).find_map(|i| self.claim_merge(tables[(first + i) % tables.len()], &m.policy, m.budget))
+    }
+
+    /// Claims the next group of `table`'s segments that `policy` selects
+    /// among those no running merge holds, cut to fit what is left of
+    /// `budget` and the record of interrupted merges ([`MergeRecord`]).
+    /// The merge is recorded as running until the claim is dropped.
+    fn claim_merge(&self, table: u32, policy: &MergePolicy, budget: Option<u64>) -> Option<MergeClaim<'_>> {
+        // The snapshot is taken under the lock that claims are given up
+        // under: a merge installed (and its claim given up) after a snapshot
+        // taken before the lock would leave its inputs, gone by then, to
+        // this one.
+        let mut m = lock(&self.merging);
+        let snap = self.snapshot_inner(false).table_by_id(table)?;
+        let bytes: HashMap<u64, u64> = lock(&self.state).handles().map(|h| (h.meta.id, h.meta.extent.len)).collect();
+        let infos: Vec<SegmentInfo> = snap
+            .segments()
+            .iter()
+            .map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live, bytes: bytes.get(&v.id).copied().unwrap_or(0) })
+            .collect();
+        let cap = |g: &[u64]| match (m.record.cap(g), budget) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let threads = build_threads(&self.opts.build).unwrap_or(1);
+        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id), cap, threads);
+        let mut group = group?;
+        let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>(), threads);
+        // It fits the budget alone: it waits for running merges to finish.
+        if budget.is_some_and(|b| m.memory() + memory > b) {
+            return None;
+        }
+        group.sort_by_key(|id| infos.iter().position(|s| s.id == *id));
+        m.record.running.push(MergeEntry { segments: group.clone(), memory, times: 0 });
+        m.limited += cut as u64;
+        let _ = m.record.store(&self.merge_record_path);
+        Some(MergeClaim { db: self, table, snap, ids: group, cut })
+    }
+
+    /// Runs a merge a merger thread claimed.
+    fn merge_claimed(&self, claim: &MergeClaim, pacer: Option<&Pacer>, stats: &mut MergeStats) -> Result<()> {
+        let source = self.opts.doc_source.clone().ok_or_else(|| Error::Schema("merging needs DbOptions::doc_source".into()))?;
+        self.check_poisoned()?;
+        self.merge_group(claim, source.as_ref(), pacer, &mut || true, stats)
+    }
+
+    fn merge_group(&self, claim: &MergeClaim, source: &dyn DocumentSource, pacer: Option<&Pacer>, between: &mut dyn FnMut() -> bool, stats: &mut MergeStats) -> Result<()> {
+        let (snap, ids) = (&claim.snap, &claim.ids[..]);
+        let schema = snap.schema();
+        let mut views = Vec::with_capacity(ids.len());
         let mut inputs: Vec<(u64, Vec<DocId>)> = Vec::new();
-        let mut docs: Vec<Document> = Vec::new();
         for &id in ids {
             let v = snap.segments().iter().find(|v| v.id == id).expect("selected from this snapshot");
             // The merged segment gets a checksum of its own, so a damaged
@@ -948,29 +1681,119 @@ impl Database {
             h.verify(self.dir.as_deref())?;
             let n = v.file.n_docs() as DocId;
             let live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
-            let mut got = source.documents(snap.schema(), &v.file, &live)?;
-            if got.len() != live.len() {
-                return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
-            }
-            // The merged segment holds the values written in place.
-            if let Some(u) = &v.updates {
-                for (doc, &d) in got.iter_mut().zip(&live) {
-                    u.apply(d, doc);
-                }
-            }
             stats.docs_dropped += (n as usize - live.len()) as u64;
-            docs.extend(got);
+            views.push(v);
             inputs.push((id, live));
         }
-        let n_new = docs.len() as u32;
-        let image = if docs.is_empty() { None } else { Some(build_segment(snap.schema(), &docs, &self.opts.build)?) };
-        drop(docs);
+        let n_new = inputs.iter().map(|(_, l)| l.len()).sum::<usize>();
+        // The inputs' live documents in batches of about MERGE_BATCH_BYTES
+        // of their images (a batch can span inputs), each decoded while the
+        // segment builds from the one before, and the image streamed to its
+        // reserved space: the merge never holds every document decoded, nor
+        // the whole image.
+        let mut batches: Vec<Vec<(usize, &[DocId])>> = Vec::new();
+        let (mut batch, mut docs, mut bytes) = (Vec::new(), 0usize, 0usize);
+        for (k, (_, live)) in inputs.iter().enumerate() {
+            let per_doc = (views[k].file.image().len() / views[k].file.n_docs().max(1)).max(1);
+            let mut rest = &live[..];
+            while !rest.is_empty() {
+                // Documents until the batch is full.
+                let room = (MERGE_BATCH_DOCS.end - docs).min(MERGE_BATCH_BYTES.saturating_sub(bytes).div_ceil(per_doc).max(MERGE_BATCH_DOCS.start.saturating_sub(docs)));
+                let (piece, after) = rest.split_at(room.clamp(1, rest.len()));
+                batch.push((k, piece));
+                (docs, bytes, rest) = (docs + piece.len(), bytes + piece.len() * per_doc, after);
+                if docs >= MERGE_BATCH_DOCS.end || (docs >= MERGE_BATCH_DOCS.start && bytes >= MERGE_BATCH_BYTES) {
+                    batches.push(std::mem::take(&mut batch));
+                    (docs, bytes) = (0, 0);
+                }
+            }
+        }
+        if !batch.is_empty() {
+            batches.push(batch);
+        }
+        let decode = |batch: &[(usize, &[DocId])]| -> Result<Vec<Document>> {
+            let mut all = Vec::with_capacity(batch.iter().map(|(_, l)| l.len()).sum());
+            for &(k, live) in batch {
+                let v = views[k];
+                let mut got = source.documents(schema, &v.file, live)?;
+                if got.len() != live.len() {
+                    return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
+                }
+                // The merged segment holds the values written in place.
+                if let Some(u) = &v.updates {
+                    for (doc, &d) in got.iter_mut().zip(live) {
+                        u.apply(d, doc);
+                    }
+                }
+                all.append(&mut got);
+            }
+            Ok(all)
+        };
+        // The merged vector graphs start from the largest input's, if it
+        // lost no documents.
+        let mut starts = Vec::new();
+        let mut base = 0u32;
+        let mut largest: Option<(usize, &SegmentFile, u32)> = None;
+        for (k, (_, live)) in inputs.iter().enumerate() {
+            let v = views[k];
+            if live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
+                largest = Some((live.len(), &v.file, base));
+            }
+            base += live.len() as u32;
+        }
+        if let Some((_, seg, base)) = largest {
+            for (i, f) in schema.fields.iter().enumerate() {
+                if matches!(f.ty, FieldType::Vector { .. }) {
+                    starts.push(GraphStart { field: i, segment: seg.clone(), base });
+                }
+            }
+        }
+        // Written before the writer lock is taken, into space reserved for
+        // it: commits go on meanwhile.
+        let written = match batches.len() {
+            0 => None,
+            n => {
+                let mut build = SegmentBuild::with_starts(schema, &self.opts.build, n_new, &starts)?;
+                let sections = std::thread::scope(|s| {
+                    let mut next = decode(&batches[0]);
+                    for i in 1..n {
+                        let (decode, batch) = (&decode, &batches[i]);
+                        let ahead = s.spawn(move || decode(batch));
+                        let added = next.and_then(|docs| build.add(&docs));
+                        next = ahead.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                        added?;
+                    }
+                    build.finish(&next?)
+                })?;
+                Some(self.write_reserved(sections, pacer)?)
+            }
+        };
+        let n_new = n_new as u32;
+        let go = between();
+        let mut wal = self.background_writer();
+        let r = if go { self.install_merge(&mut wal, claim, written.as_ref(), &inputs, n_new, stats) } else { Ok(false) };
+        // A commit that failed before it could reach the disk leaves
+        // nothing naming the image; one that may have reached it poisons
+        // the database, and then the image stays (opening removes it if no
+        // version names it).
+        if !matches!(r, Ok(true)) && !self.is_poisoned() {
+            if let Some((res, _)) = &written {
+                self.unreserve(&wal, res);
+            }
+        }
+        r.map(|_| ())
+    }
 
-        let mut wal = lock(&self.writer);
+    /// Replaces a merge's inputs with the merged segment (`written`, of
+    /// `n_new` documents; none when every input document was deleted) in
+    /// one commit. Returns whether it did: not when the table was dropped
+    /// meanwhile.
+    fn install_merge(&self, wal: &mut Wal, claim: &MergeClaim, written: Option<&(Reserved, u32)>, inputs: &[(u64, Vec<DocId>)], n_new: u32, stats: &mut MergeStats) -> Result<bool> {
+        let (table, snap, ids) = (claim.table, &claim.snap, &claim.ids[..]);
         self.check_poisoned()?;
         if lock(&self.state).table_index(table).is_none() {
             // Dropped while the merge was building.
-            return Ok(());
+            return Ok(false);
         }
         // Documents of the inputs deleted after the snapshot, as docIDs of
         // the merged segment (inputs are concatenated in order), and values
@@ -980,7 +1803,7 @@ impl Database {
         {
             let mut st = lock(&self.state);
             let mut base = 0u32;
-            for (id, live) in &inputs {
+            for (id, live) in inputs {
                 let h = st.handle(*id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
                 deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| base + j as u32));
                 let then = snap.segments().iter().find(|v| v.id == *id).and_then(|v| v.updates.clone());
@@ -1002,12 +1825,12 @@ impl Database {
         for &id in ids {
             vw.remove_segment(id);
         }
-        if let Some(image) = image {
+        if let Some((r, crc)) = written {
             let dels = (!deleted.is_empty()).then(|| LiveDocs::with_deleted(None, n_new, deleted.iter().copied()));
-            vw.add_segment(table, Some(pos), &image, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
+            vw.add_reserved_segment(table, Some(pos), r, *crc, n_new, dels.as_ref(), Some(&updated).filter(|u| !u.is_empty()))?;
         }
-        let c = vw.commit(&mut wal)?;
-        stats.bytes_written += c.bytes_written;
+        let c = vw.commit(wal)?;
+        stats.bytes_written += c.bytes_written + written.map_or(0, |(r, _)| r.extent.len);
         // Pending deletes of the inputs are now either dropped documents or
         // stored in the merged segment's delete set.
         self.publish(c, |st| {
@@ -1020,11 +1843,92 @@ impl Database {
                 }
                 st.updates_cache.remove(id);
             }
+            if let Some((r, _)) = written {
+                st.reserved.retain(|x| x.id != r.id);
+            }
         })?;
         stats.merges += 1;
+        stats.merges_limited += claim.cut as usize;
         stats.segments_in += ids.len();
         stats.docs_merged += (n_new as usize - deleted.len()) as u64;
-        Ok(())
+        lock(&self.merging).merges += 1;
+        Ok(true)
+    }
+
+    /// Reserves space for the merged image of `sections`, streams it there
+    /// (each section released once written) and syncs it, at the pace
+    /// `pacer` allows; returns the reservation and the image's checksum.
+    /// Takes the writer lock only to reserve.
+    fn write_reserved(&self, sections: SegmentWriter, pacer: Option<&Pacer>) -> Result<(Reserved, u32)> {
+        let r = self.reserve(sections.len() as u64)?;
+        let written = (|| -> Result<u32> {
+            let (f, base) = match (&self.dir, &r.file) {
+                (Some(d), Some(name)) => (Some(OpenOptions::new().write(true).create_new(true).open(d.join(name))?), 0),
+                _ => (None, r.extent.page * PAGE),
+            };
+            let f = f.as_ref().unwrap_or(&self.file);
+            let mut out = ImageOut { file: f, at: base, buf: Vec::with_capacity(IMAGE_CHUNK), pacer, crc: crc32fast::Hasher::new() };
+            sections.write_to(&mut out)?;
+            out.drain()?;
+            io::sync(f)?;
+            Ok(out.crc.finalize())
+        })();
+        match written {
+            Ok(crc) => Ok((r, crc)),
+            Err(e) => {
+                let wal = self.background_writer();
+                self.unreserve(&wal, &r);
+                Err(e)
+            }
+        }
+    }
+
+    /// A segment id and room for an image of `len` bytes ([`Reserved`]).
+    fn reserve(&self, len: u64) -> Result<Reserved> {
+        let _wal = self.background_writer();
+        self.check_poisoned()?;
+        let mut st = lock(&self.state);
+        let id = st.next_segment_id.max(st.manifest.next_segment_id);
+        let r = match &self.dir {
+            Some(_) => Reserved { id, extent: Extent { page: 0, len }, file: Some(dir::segment_name(id)) },
+            None => {
+                let pages = pages_for(len as usize);
+                let page = st.freelist.alloc(pages);
+                if st.freelist.page_count() > st.file_pages {
+                    if let Err(e) = io::set_len(&self.file, st.freelist.page_count() * PAGE) {
+                        st.freelist.free(page, pages);
+                        let floor = st.meta.page_count;
+                        st.freelist.trim_tail_to(floor);
+                        return Err(e.into());
+                    }
+                    st.file_pages = st.freelist.page_count();
+                }
+                Reserved { id, extent: Extent { page, len }, file: None }
+            }
+        };
+        st.next_segment_id = id + 1;
+        st.reserved.push(r.clone());
+        Ok(r)
+    }
+
+    /// Gives back a reservation that will not be installed. The caller
+    /// holds the writer lock (`_wal`), so no version is being built from
+    /// the freelist meanwhile.
+    fn unreserve(&self, _wal: &Wal, r: &Reserved) {
+        {
+            let mut st = lock(&self.state);
+            st.reserved.retain(|x| x.id != r.id);
+            if self.dir.is_none() {
+                st.freelist.free(r.extent.page, r.extent.pages());
+                // Pages the reservation added to the end of the file are
+                // not in the version on disk.
+                let floor = st.meta.page_count;
+                st.freelist.trim_tail_to(floor);
+            }
+        }
+        if let (Some(d), Some(f)) = (&self.dir, &r.file) {
+            let _ = io::remove_file(&d.join(f));
+        }
     }
 
     /// Writes a consistent copy of the database to `dest`, which must not
@@ -1150,7 +2054,10 @@ impl Database {
                     crc: st.meta.manifest_crc,
                     format: st.meta.format,
                 };
-                dir::referenced(&cur, &st.manifest)
+                let mut keep = dir::referenced(&cur, &st.manifest);
+                // Merged images being written.
+                keep.extend(st.reserved.iter().filter_map(|r| r.file.clone()));
+                keep
             };
             let mut freed = 0;
             for (f, len) in dir::orphans(d, &keep)? {
@@ -1172,6 +2079,12 @@ impl Database {
         Ok(before.saturating_sub(lock(&self.state).meta.page_count) * PAGE)
     }
 
+    /// The size of the WAL, sealed files included.
+    fn wal_bytes(&self) -> u64 {
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        size(&self.wal_path) + lock(&self.sealed_wals).iter().map(|&t| size(&wal::sealed_path(&self.wal_path, t))).sum::<u64>()
+    }
+
     pub fn file_stats(&self) -> FileStats {
         let st = lock(&self.state);
         if let Some(d) = &self.dir {
@@ -1181,7 +2094,7 @@ impl Database {
                 live_pages: 0,
                 free_pages: 0,
                 pending_pages: 0,
-                wal_bytes: std::fs::metadata(&self.wal_path).map_or(0, |m| m.len()),
+                wal_bytes: self.wal_bytes(),
                 memtable_docs: st.mem_live_docs(),
                 pending_deletes: st.n_pending,
                 segments: segment_stats(&st.manifest),
@@ -1196,7 +2109,7 @@ impl Database {
             live_pages: META_PAGES + st.meta.manifest.pages() + st.meta.freelist.pages() + seg_pages,
             free_pages: st.freelist.free_pages(),
             pending_pages: st.freelist.pending_pages(),
-            wal_bytes: std::fs::metadata(&self.wal_path).map_or(0, |m| m.len()),
+            wal_bytes: self.wal_bytes(),
             memtable_docs: st.mem_live_docs(),
             pending_deletes: st.n_pending,
             segments,
@@ -1215,9 +2128,10 @@ impl Database {
         }
         // The writer lock keeps the version still; copy it so readers are
         // not held up while every byte is checksummed.
-        let (st_meta, st_slot, st_manifest, freelist, handles, map) = {
+        let (st_meta, st_slot, st_manifest, freelist, handles, map, reserved) = {
             let st = lock(&self.state);
-            (st.meta, st.slot, st.manifest.clone(), st.freelist.clone(), st.handles().cloned().collect::<Vec<_>>(), st.map.clone())
+            let reserved: Vec<Extent> = st.reserved.iter().map(|r| r.extent).collect();
+            (st.meta, st.slot, st.manifest.clone(), st.freelist.clone(), st.handles().cloned().collect::<Vec<_>>(), st.map.clone(), reserved)
         };
         // The open version's slot: after opening fell back from a damaged
         // newer version, the other slot names that one until a commit.
@@ -1276,6 +2190,14 @@ impl Database {
         for p in freelist.pending() {
             claim("pending free", p.page, p.pages)?;
         }
+        // Reserved for merged images being written: the version on disk
+        // counts them free, and may end before them.
+        for e in reserved {
+            let end = (e.page + e.pages()).min(meta.page_count);
+            if e.page < end {
+                claim("reserved for a merge", e.page, end - e.page)?;
+            }
+        }
         match used.iter().position(|u| !u) {
             Some(p) => Err(corrupt(format!("page {p} is neither used nor free"))),
             None => Ok(()),
@@ -1286,9 +2208,9 @@ impl Database {
     /// version, every file matches its checksum, every key is found, and no
     /// file is left over.
     fn check_dir(&self, d: &Path) -> Result<()> {
-        let (manifest, handles, meta) = {
+        let (manifest, handles, meta, reserved) = {
             let st = lock(&self.state);
-            (st.manifest.clone(), st.handles().cloned().collect::<Vec<_>>(), st.meta)
+            (st.manifest.clone(), st.handles().cloned().collect::<Vec<_>>(), st.meta, st.reserved.iter().filter_map(|r| r.file.clone()).collect::<Vec<_>>())
         };
         let (cur, on_disk) = dir::read_current(d)?;
         if on_disk.encode() != manifest.encode() || cur.txn != meta.txn {
@@ -1321,17 +2243,34 @@ impl Database {
                 }
             }
         }
-        match dir::orphans(d, &dir::referenced(&cur, &manifest))?.first() {
+        // Merged images being written are named by no version yet.
+        let mut keep = dir::referenced(&cur, &manifest);
+        keep.extend(reserved);
+        match dir::orphans(d, &keep)?.first() {
             Some((f, _)) => Err(corrupt(format!("{} is named by no version", f.display()))),
             None => Ok(()),
         }
     }
 
+    /// The writer lock, or `Busy` when another write holds it. A background
+    /// flush holds it only to seal or install, briefly: that is waited for.
+    /// While one waits for the lock, so does this, for a few milliseconds,
+    /// in case the lock is being handed to the flush.
     fn try_writer(&self) -> Result<MutexGuard<'_, Wal>> {
-        match self.writer.try_lock() {
-            Ok(g) => Ok(g),
-            Err(TryLockError::Poisoned(p)) => Ok(p.into_inner()),
-            Err(TryLockError::WouldBlock) => Err(Error::Busy("another write is in progress".into())),
+        let t0 = Instant::now();
+        loop {
+            match self.writer.try_lock() {
+                Ok(g) => return Ok(g),
+                Err(TryLockError::Poisoned(p)) => return Ok(p.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    let holding = self.background_holding.load(Ordering::Acquire) > 0;
+                    let waiting = self.background_waiting.load(Ordering::Acquire) > 0;
+                    if !holding && !(waiting && t0.elapsed() < Duration::from_millis(5)) {
+                        return Err(Error::Busy("another write is in progress".into()));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_micros(100));
         }
     }
 
@@ -1343,7 +2282,9 @@ impl Database {
     }
 
     fn poison(&self, e: Error) -> Error {
-        self.poisoned.store(true, Ordering::Release);
+        if !self.poisoned.swap(true, Ordering::AcqRel) {
+            tracing::error!(error = %e, "a write failed partway: the database refuses writes until it is reopened");
+        }
         e
     }
 
@@ -1411,6 +2352,9 @@ impl Database {
             st.changed();
         }
         self.republish();
+        if let Some(m) = self.merger.get() {
+            m.wake();
+        }
         // Directory layout: files the new version no longer names. Open
         // snapshots keep reading them through their mappings.
         if let Some(d) = &self.dir {
@@ -1476,13 +2420,11 @@ impl Database {
             return Ok(());
         }
         self.check_poisoned()?;
-        // While flushes fail, the memtable grows; past twice its limit,
-        // writes wait for a flush to succeed, refused before they are logged.
-        let over = {
-            let st = lock(&self.state);
-            st.mem_len() + st.n_pending > 2 * self.opts.memtable_max_docs.max(1)
-        };
-        if over && self.flush_error().is_some() {
+        // While flushes fail or the flusher falls behind, the memtable
+        // grows; past twice its limit, writes wait for a flush to succeed,
+        // refused before they are logged.
+        let flusher = self.flush_signal.get();
+        if self.over_twice() && (flusher.is_some() || self.flush_error().is_some()) {
             self.flush_locked(wal).map_err(|e| Error::Io(std::io::Error::other(format!("writes wait for a flush to succeed: {e}"))))?;
         }
         let txn = lock(&self.state).txn + 1;
@@ -1504,9 +2446,13 @@ impl Database {
         // error would make callers retry a write that already happened (an
         // `add` applied twice). A failed flush is kept in `flush_error`
         // and tried again by the next commit.
-        if full && self.flush_locked(wal).is_ok() {
-            // The flush published its version.
-            return Ok(());
+        if full {
+            match flusher {
+                Some(sig) => sig.wake(),
+                // The flush published its version.
+                None if self.flush_locked(wal).is_ok() => return Ok(()),
+                None => {}
+            }
         }
         self.republish();
         Ok(())
@@ -1857,6 +2803,8 @@ struct VersionWriter<'a> {
     /// files' checksums and lengths, by name.
     link: Option<(PathBuf, HashMap<String, (u32, u64)>)>,
     segments_linked: usize,
+    /// Ids of the reservations this version installs.
+    installs: Vec<u64>,
 }
 
 impl<'a> VersionWriter<'a> {
@@ -1867,10 +2815,13 @@ impl<'a> VersionWriter<'a> {
         // meta slot cannot reach them) and by a commit no live snapshot
         // predates.
         fl.release((st.meta.txn - 1).min(db.pins.min().unwrap_or(u64::MAX)));
+        let mut manifest = st.manifest.clone();
+        // Past the ids reserved for merges.
+        manifest.next_segment_id = manifest.next_segment_id.max(st.next_segment_id);
         VersionWriter {
             db,
             txn: st.txn + 1,
-            manifest: st.manifest.clone(),
+            manifest,
             fl,
             meta: st.meta,
             slot: st.slot,
@@ -1880,6 +2831,7 @@ impl<'a> VersionWriter<'a> {
             obsolete: Vec::new(),
             link: None,
             segments_linked: 0,
+            installs: Vec::new(),
         }
     }
 
@@ -1935,6 +2887,39 @@ impl<'a> VersionWriter<'a> {
             }
             _ => self.write_as(image, dir::segment_name(id))?,
         };
+        self.insert_segment(table, pos, id, extent, file, crc32fast::hash(image), n_docs, deleted, updates)
+    }
+
+    /// Adds a segment whose image was written into space reserved for it
+    /// ([`Reserved`]), with checksum `crc`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_reserved_segment(
+        &mut self,
+        table: u32,
+        pos: Option<usize>,
+        r: &Reserved,
+        crc: u32,
+        n_docs: u32,
+        deleted: Option<&LiveDocs>,
+        updates: Option<&Updates>,
+    ) -> Result<()> {
+        self.installs.push(r.id);
+        self.insert_segment(table, pos, r.id, r.extent, r.file.clone(), crc, n_docs, deleted, updates)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_segment(
+        &mut self,
+        table: u32,
+        pos: Option<usize>,
+        id: u64,
+        extent: Extent,
+        file: Option<String>,
+        crc: u32,
+        n_docs: u32,
+        deleted: Option<&LiveDocs>,
+        updates: Option<&Updates>,
+    ) -> Result<()> {
         let (mut deletes, mut deletes_crc, mut n_deleted, mut deletes_file) = (None, 0, 0, None);
         if let Some(l) = deleted.filter(|l| l.n_deleted() > 0) {
             let b = l.encode();
@@ -1952,7 +2937,7 @@ impl<'a> VersionWriter<'a> {
         let meta = SegmentMeta {
             id,
             extent,
-            crc: crc32fast::hash(image),
+            crc,
             n_docs,
             n_deleted,
             deletes,
@@ -2117,7 +3102,8 @@ impl<'a> VersionWriter<'a> {
         self.manifest.txn = c;
         let mbytes = self.manifest.encode();
         let manifest = self.write(&mbytes)?;
-        let (freelist, fbytes) = place_freelist(&mut self.fl);
+        let reserved: Vec<Extent> = lock(&db.state).reserved.iter().filter(|r| !self.installs.contains(&r.id)).map(|r| r.extent).collect();
+        let (freelist, fbytes) = place_freelist(&mut self.fl, &reserved);
         self.grow()?;
         io::write_at(&db.file, &fbytes, freelist.page * PAGE)?;
         self.bytes_written += fbytes.len() as u64;
@@ -2221,11 +3207,21 @@ fn check_table_name(name: &str) -> Result<()> {
 
 /// Allocates the freelist's own extent and encodes the freelist after that
 /// allocation, padded to the size measured before it (allocating never adds
-/// a run, so the encoding only shrinks).
-fn place_freelist(fl: &mut FreeList) -> (Extent, Vec<u8>) {
-    let bound = fl.encoded_len();
+/// a run, so the encoding only shrinks). Space `reserved` for merged images
+/// not installed yet is free on disk, as pages a commit freed before any
+/// other (reusable at once), so that a crash before their install leaves
+/// no page that is neither used nor free.
+fn place_freelist(fl: &mut FreeList, reserved: &[Extent]) -> (Extent, Vec<u8>) {
+    let on_disk = |fl: &FreeList| {
+        let mut d = fl.clone();
+        for &e in reserved {
+            d.defer(0, e);
+        }
+        d
+    };
+    let bound = if reserved.is_empty() { fl.encoded_len() } else { on_disk(fl).encoded_len() };
     let page = fl.alloc(pages_for(bound));
-    let mut bytes = fl.encode();
+    let mut bytes = if reserved.is_empty() { fl.encode() } else { on_disk(fl).encode() };
     bytes.resize(bound, 0);
     (Extent { page, len: bound as u64 }, bytes)
 }
@@ -2259,6 +3255,55 @@ fn op_fits(schema: &Schema, op: &Op) -> bool {
                 })
         }
     }
+}
+
+/// The sealed WAL files ([`wal::sealed_path`]) a background flush did not
+/// install, oldest first: their txns, their committed transactions, and,
+/// when one is damaged and `drop_damaged` says to drop what follows, what
+/// was dropped (opening then drops the open log's transactions too). The
+/// ones a flush installed (sealed at or before `manifest.wal_txn`) and
+/// other databases' are deleted.
+#[allow(clippy::type_complexity)]
+fn read_sealed_wals(
+    wal_path: &Path,
+    manifest: &Manifest,
+    db_id: u64,
+    drop_damaged: bool,
+    fits: &dyn Fn(u32, &Op) -> bool,
+) -> Result<(Vec<u64>, Vec<WalTxn>, Option<String>)> {
+    let (mut kept, mut txns, mut cut) = (Vec::new(), Vec::new(), None::<String>);
+    for (t, p) in wal::sealed_files(wal_path)? {
+        if t <= manifest.wal_txn {
+            let _ = io::remove_file(&p);
+            continue;
+        }
+        if cut.is_some() {
+            std::fs::copy(&p, wal::damaged_path(&p))?;
+            io::remove_file(&p)?;
+            continue;
+        }
+        let Some((got, damage)) = wal::read_sealed(&p, db_id, fits)? else {
+            let _ = io::remove_file(&p);
+            continue;
+        };
+        txns.extend(got);
+        kept.push(t);
+        if let Some(at) = damage {
+            // It was durable before it was sealed: this is no torn append.
+            let what = format!("{} is damaged at byte {at}", p.display());
+            if !drop_damaged {
+                return Err(corrupt(format!(
+                    "{what}; open with DbOptions::wal_drop_damaged to drop the transactions from there on, in it and in the logs after it (each is copied to <log>.damaged first)"
+                )));
+            }
+            std::fs::copy(&p, wal::damaged_path(&p))?;
+            let f = OpenOptions::new().write(true).open(&p)?;
+            io::set_len(&f, at)?;
+            io::sync(&f)?;
+            cut = Some(format!("{what}: dropped the transactions from there on, in it and in the logs after it, each copied to <log>.damaged"));
+        }
+    }
+    Ok((kept, txns, cut))
 }
 
 fn wal_path(path: &Path) -> PathBuf {

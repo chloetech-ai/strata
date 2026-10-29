@@ -1,6 +1,8 @@
 //! Power losses, full disks and failing syncs, simulated by `storage::io`
-//! (feature `fault-injection`): a workload of transactions, flushes,
-//! merges, vacuums and bulk loads runs with the `n`-th change to its files
+//! (feature `fault-injection`): a workload of transactions, flushes (also
+//! in the background, with a transaction committing while one builds),
+//! merges (also with a transaction committing while a merged image waits
+//! to be installed), vacuums and bulk loads runs with the `n`-th change to its files
 //! failing, for every `n`, and the database is reopened from what the
 //! failure left.
 //!
@@ -23,10 +25,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use storage_util::*;
 use strata::storage::io::{self, Fault};
-use strata::storage::{Database, DbOptions, Layout, MergePolicy};
+use strata::storage::{wal, Database, DbOptions, Layout, MergePolicy};
 use strata::Value;
 
 type Keys = BTreeSet<u64>;
@@ -88,26 +91,57 @@ fn workload(path: &Path, src: &Arc<MapSource>, sync: bool, seed: u64, ops: usize
         // How far back a power loss may go without `sync`: to this op's
         // state (0), the one before it (1), or further (None).
         let (res, floor) = match rng.gen_range(0..100) {
-            0..=69 => {
-                let res = db.begin().and_then(|mut tx| {
-                    for _ in 0..rng.gen_range(1..12) {
-                        let i = rng.gen_range(0..300u64);
-                        if next.contains(&i) && rng.gen_bool(0.4) {
-                            tx.delete(&Value::Str(key(i)))?;
-                            next.remove(&i);
-                        } else {
-                            let d = doc(i, n as i64);
-                            src.put(&d);
-                            tx.upsert(d)?;
-                            next.insert(i);
+            0..=69 => (transaction(&db, &mut rng, src, &mut next, n), None),
+            70..=74 => (db.flush(), Some(0)),
+            75..=79 => {
+                // The transaction stands on its own: it commits or fails
+                // whatever the flush around it does.
+                let (mut inner, mut with) = (None, live.clone());
+                let res = db.background_flush_with(|| inner = Some(transaction(&db, &mut rng, src, &mut with, n)));
+                match inner {
+                    Some(Ok(())) => {
+                        live = with;
+                        run.states.push(live.clone());
+                    }
+                    Some(Err(_)) => {
+                        run.failed.push((run.states.len() - 1, with, db.is_poisoned()));
+                        if stop {
+                            break;
                         }
                     }
-                    tx.commit()
-                });
-                (res, None)
+                    None => {}
+                }
+                next = live.clone();
+                (res, Some(0))
             }
-            70..=79 => (db.flush(), Some(0)),
-            80..=87 => (db.merge(&policy).map(|_| ()), None),
+            80..=83 => (db.merge(&policy).map(|_| ()), None),
+            84..=87 => {
+                // A transaction while the first merged image waits to be
+                // installed; as with the background flush, it stands on its
+                // own.
+                let (mut inner, mut with) = (None, live.clone());
+                let res = db.merge_with(&policy, || {
+                    if inner.is_none() {
+                        inner = Some(transaction(&db, &mut rng, src, &mut with, n));
+                    }
+                    true
+                });
+                match inner {
+                    Some(Ok(())) => {
+                        live = with;
+                        run.states.push(live.clone());
+                    }
+                    Some(Err(_)) => {
+                        run.failed.push((run.states.len() - 1, with, db.is_poisoned()));
+                        if stop {
+                            break;
+                        }
+                    }
+                    None => {}
+                }
+                next = live.clone();
+                (res.map(|_| ()), None)
+            }
             88..=91 => (db.vacuum().map(|_| ()), None),
             _ => {
                 let ids: Vec<u64> = (fresh..fresh + rng.gen_range(1..40)).collect();
@@ -138,6 +172,25 @@ fn workload(path: &Path, src: &Arc<MapSource>, sync: bool, seed: u64, ops: usize
         run.last_flush = Some((db.flush().is_ok(), db.is_poisoned()));
     }
     run
+}
+
+/// A transaction of upserts and deletes of keys below 300, applied to
+/// `next` as it goes.
+fn transaction(db: &Database, rng: &mut StdRng, src: &MapSource, next: &mut Keys, n: usize) -> strata::Result<()> {
+    let mut tx = db.begin()?;
+    for _ in 0..rng.gen_range(1..12) {
+        let i = rng.gen_range(0..300u64);
+        if next.contains(&i) && rng.gen_bool(0.4) {
+            tx.delete(&Value::Str(key(i)))?;
+            next.remove(&i);
+        } else {
+            let d = doc(i, n as i64);
+            src.put(&d);
+            tx.upsert(d)?;
+            next.insert(i);
+        }
+    }
+    tx.commit()
 }
 
 /// The calls a workload makes.
@@ -175,6 +228,12 @@ fn power_loss(sync: bool, seed: u64, ops: usize) {
         for image in 0..3 {
             crash.copy(&path, &copy).unwrap();
             crash.copy(&wal_of(&path), &wal_of(&copy)).unwrap();
+            for (_, p) in wal::sealed_files(&wal_of(&copy)).unwrap() {
+                std::fs::remove_file(p).unwrap();
+            }
+            for (t, p) in wal::sealed_files(&wal_of(&path)).unwrap() {
+                crash.copy(&p, &wal::sealed_path(&wal_of(&copy), t)).unwrap();
+            }
             let what = format!("sync {sync}, power lost at call {at} of {calls}, image {image}");
             let db = Database::open(&copy, options(&src, sync)).unwrap_or_else(|e| panic!("{what}: {e}"));
             db.check().unwrap_or_else(|e| panic!("{what}: {e}"));
