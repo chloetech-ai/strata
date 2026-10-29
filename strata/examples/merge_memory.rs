@@ -5,10 +5,11 @@
 //! and merged by another, so that nothing the load freed is held over.
 //!
 //! ```text
-//! merge_memory SHAPE DOCS_PER_SEGMENT SEGMENTS PATH make
-//! merge_memory SHAPE DOCS_PER_SEGMENT SEGMENTS PATH merge
+//! merge_memory SHAPE DOCS_PER_SEGMENT SEGMENTS PATH make [KEY=VALUE ...]
+//! merge_memory SHAPE DOCS_PER_SEGMENT SEGMENTS PATH merge [KEY=VALUE ...]
 //! ```
 //!
+//! `KEY=VALUE` pairs are build options, such as `build.threads=1`.
 //! SHAPE: `short` (10 words of text), `long` (300 words), `vector` (30 words
 //! and a 64-dim HNSW vector) or `big-vector` (30 words and 384 dims).
 use std::path::PathBuf;
@@ -32,12 +33,12 @@ fn rss_anon() -> u64 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (shape, per, segs, path) = (args[1].as_str(), args[2].parse::<usize>().unwrap(), args[3].parse::<usize>().unwrap(), PathBuf::from(&args[4]));
-    let opts = DbOptions {
-        memtable_max_docs: 1_000_000_000,
-        segment_max_docs: 1_000_000_000,
-        build: BuildOptions::default().set("vector.threads", 4),
-        ..DbOptions::default()
-    };
+    let mut build = BuildOptions::default().set("vector.threads", 4);
+    for kv in &args[6..] {
+        let (k, v) = kv.split_once('=').expect("KEY=VALUE");
+        build = build.set(k, v);
+    }
+    let opts = DbOptions { memtable_max_docs: 1_000_000_000, segment_max_docs: 1_000_000_000, build, ..DbOptions::default() };
     if args[5] == "merge" {
         return measure(shape, per, segs, &Db::open(&path, opts).unwrap());
     }
@@ -85,12 +86,14 @@ fn measure(shape: &str, per: usize, segs: usize, db: &Db) {
         })
     };
     let policy = MergePolicy { merge_factor: segs, floor_docs: per * segs * 10, ..MergePolicy::default() };
+    let t = std::time::Instant::now();
     let stats = db.storage().merge(&policy).unwrap();
+    let secs = t.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
     sampler.join().unwrap();
     let used = peak.load(Ordering::Relaxed) - base;
     println!(
-        "{shape}: {segs} x {per} docs, {} merge(s), inputs {:.1} MB, merge peak {:.1} MB: {:.2} x input",
+        "{shape}: {segs} x {per} docs, {} merge(s) in {secs:.1} s, inputs {:.1} MB, merge peak {:.1} MB: {:.2} x input",
         stats.merges,
         input as f64 / 1e6,
         used as f64 / 1e6,
