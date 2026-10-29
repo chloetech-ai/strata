@@ -77,7 +77,7 @@ pub fn is_compound(sql_text: &str, schema: &Schema) -> bool {
 }
 
 fn is_table(name: &sql::ObjectName, schema: &Schema) -> bool {
-    name.to_string().eq_ignore_ascii_case(&schema.table)
+    super::sql::table_name(name).eq_ignore_ascii_case(&schema.table)
 }
 
 /// [`is_compound`] of a parsed query.
@@ -329,8 +329,8 @@ impl Planner<'_> {
             return self.join(q, s);
         }
         match &s.from[0].relation {
-            TableFactor::Table { name, .. } if self.cte(&name.to_string()).is_some() => {
-                let cte = self.cte(&name.to_string()).expect("in scope");
+            TableFactor::Table { name, .. } if self.cte(&super::sql::table_name(name)).is_some() => {
+                let cte = self.cte(&super::sql::table_name(name)).expect("in scope");
                 match cte.keyed {
                     true => self.over_rows(q, s, &cte),
                     false => self.join(q, s),
@@ -442,7 +442,7 @@ impl Planner<'_> {
         let alias_of = |a: &Option<sql::TableAlias>, d: &str| a.as_ref().map_or(d.to_string(), |a| a.name.value.clone());
         match t {
             TableFactor::Table { name, alias, .. } => {
-                let n = name.to_string();
+                let n = super::sql::table_name(name);
                 if let Some(cte) = self.cte(&n) {
                     let kind = match cte.keyed {
                         true => SrcKind::TableRows(cte.name),
@@ -799,7 +799,7 @@ impl Sides<'_> {
                     }
                 }
                 SelectItem::QualifiedWildcard(sql::SelectItemQualifiedWildcardKind::ObjectName(n), _) => {
-                    let a = n.to_string().to_ascii_lowercase();
+                    let a = super::sql::table_name(n).to_ascii_lowercase();
                     let i = self.aliases.iter().position(|x| *x == a).ok_or_else(|| err(format!("no table {a} in FROM")))?;
                     for c in self.cols[i].iter().filter(|c| self.in_star(i, c, srcs)) {
                         add(i, c);
@@ -1267,7 +1267,7 @@ impl Planner<'_> {
                     }
                 }
                 SelectItem::QualifiedWildcard(sql::SelectItemQualifiedWildcardKind::ObjectName(n), _) => {
-                    let a = n.to_string().to_ascii_lowercase();
+                    let a = super::sql::table_name(n).to_ascii_lowercase();
                     for (_, c) in cols.iter().filter(|(x, c)| *x == a && c != "__score") {
                         items.push((format!("{a}.{c}"), qualified(&a, c)));
                     }

@@ -147,6 +147,41 @@ fn tables_through_sql(layout: Layout) {
     assert!(fails(&db, "INSERT INTO authors (id, name) VALUES ('ada', 'Ada')").contains("does not fit"));
 }
 
+/// A quoted table name is the name inside the quotes, wherever a statement
+/// names a table: `"papers"` reads papers. Before, the quotes stayed in the
+/// name and every quoted table was "no such table".
+#[test]
+fn quoted_table_names_name_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("t.strata"), papers(), DbOptions { sync: false, ..DbOptions::default() }).unwrap();
+    assert_eq!(written(&db, r#"CREATE TABLE "authors" (id KEYWORD PRIMARY KEY, name TEXT, born INT)"#), 0);
+    assert_eq!(names(&db), ["papers", "authors"]);
+    assert_eq!(written(&db, r#"INSERT INTO "authors" (id, name, born) VALUES ('ada', 'Ada Lovelace', 1815), ('alan', 'Alan Turing', 1912)"#), 2);
+    assert_eq!(written(&db, r#"INSERT INTO "papers" (id, title, year, author) VALUES ('p1', 'computable numbers', 1936, 'alan'), ('p2', 'the analytical engine', 1843, 'ada')"#), 2);
+
+    assert_eq!(rows(&db, r#"SELECT id FROM "papers" WHERE year > 1900"#), [[s("p1")]]);
+    assert_eq!(rows(&db, r#"SELECT id FROM "Authors" WHERE MATCH(name, 'turing')"#), [[s("alan")]]);
+    assert_eq!(rows(&db, r#"SELECT p.id FROM "papers" AS p WHERE p.year < 1900"#), [[s("p2")]]);
+    // Compound queries: WITH (quoted result names too), subqueries, joins
+    // and their qualified wildcards.
+    assert_eq!(rows(&db, r#"WITH "old" AS (SELECT id FROM "authors" WHERE born < 1900) SELECT COUNT(*) FROM "old""#), [[Value::Int(1)]]);
+    assert_eq!(rows(&db, r#"SELECT id FROM "papers" WHERE year IN (SELECT year FROM "papers" WHERE year > 1900)"#), [[s("p1")]]);
+    assert_eq!(
+        rows(&db, r#"SELECT "a".id, b.id FROM "papers" "a" JOIN "papers" b ON "a".author = b.author WHERE "a".year < 1900"#),
+        [[s("p2"), s("p2")]]
+    );
+    assert_eq!(rows(&db, r#"SELECT "a".* FROM "papers" "a" JOIN papers b ON "a".id = b.id WHERE b.year > 1900"#), [[s("p1"), s("computable numbers"), Value::Int(1936), s("alan")]]);
+    assert_eq!(rows(&db, r#"SELECT DISTINCT author FROM "papers" ORDER BY author"#), [[s("ada")], [s("alan")]]);
+    assert!(!rows(&db, r#"EXPLAIN SELECT id FROM "papers" WHERE year > 1900"#).is_empty());
+
+    assert_eq!(written(&db, r#"UPDATE "authors" SET born = 1816 WHERE id = 'ada'"#), 1);
+    assert_eq!(written(&db, r#"DELETE FROM "authors" WHERE id = 'alan'"#), 1);
+    assert_eq!(rows(&db, "SELECT id, born FROM authors"), [[s("ada"), Value::Int(1816)]]);
+    assert!(fails(&db, r#"SELECT id FROM "nope""#).contains("no such table: nope"));
+    assert_eq!(written(&db, r#"DROP TABLE "authors""#), 0);
+    assert_eq!(names(&db), ["papers"]);
+}
+
 #[test]
 fn references_are_recorded_and_kept_consistent() {
     let dir = tempfile::tempdir().unwrap();
