@@ -103,15 +103,10 @@ fn tables_through_sql(layout: Layout) {
     assert_eq!(rows(&db, "SELECT id FROM authors WHERE id IN (SELECT id FROM authors WHERE topics = 'math') ORDER BY born DESC"), [[s("alan")], [s("ada")]]);
     assert_eq!(rows(&db, "WITH authors AS (SELECT id, born FROM authors WHERE born > 1900) SELECT COUNT(*) FROM authors"), [[Value::Int(2)]]);
 
-    // A query reads one table for now.
-    for mixed in [
-        "SELECT id FROM papers WHERE author IN (SELECT id FROM authors WHERE born > 1900)",
-        "SELECT p.id FROM papers p JOIN authors a ON p.author = a.id",
-        "WITH a AS (SELECT id FROM authors) SELECT id FROM papers WHERE author IN (SELECT id FROM a)",
-    ] {
-        let e = fails(&db, mixed);
-        assert!(e.contains("a query reads one table for now"), "{mixed}: {e}");
-    }
+    // And across tables (tests/joins_across_tables.rs has more).
+    assert_eq!(rows(&db, "SELECT id FROM papers WHERE author IN (SELECT id FROM authors WHERE born > 1900)"), [[s("p1")]]);
+    assert_eq!(rows(&db, "SELECT p.id, a.name FROM papers p JOIN authors a ON p.author = a.id ORDER BY p.id"), [[s("p1"), s("Alan Turing")], [s("p2"), s("Ada Lovelace")]]);
+    assert_eq!(rows(&db, "WITH a AS (SELECT id FROM authors) SELECT id FROM papers WHERE author IN (SELECT id FROM a) ORDER BY year"), [[s("p2")], [s("p1")]]);
     assert!(fails(&db, "SELECT id FROM nope").contains("no such table: nope"));
 
     // Writes go to the table they name.

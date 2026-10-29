@@ -406,29 +406,38 @@ impl Db {
     ///
     /// A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs
     /// as a plan of operators over single-table queries
-    /// ([`crate::query::compound`]), all on the same snapshot. Its parts may
-    /// hold up to [`crate::query::compound::MAX_ROWS`] rows each; its answer
-    /// is held to [`ExecOptions::max_rows`]. A query reads one table: joins
-    /// and subqueries across tables are not supported yet.
+    /// ([`crate::query::compound`]), all on the same snapshot; its parts
+    /// may read different tables (a join of two tables, a subquery over
+    /// another). Its parts may hold up to
+    /// [`crate::query::compound::MAX_ROWS`] rows each; its answer is held
+    /// to [`ExecOptions::max_rows`].
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         let q = qsql::parse_query(sql)?;
-        let view = view_of(snap, &q)?;
-        let plan = match compound::needs(&q, view.schema()) {
-            true => compound::plan_query(&q, view.schema(), params)?,
-            false => Plan::of_select(view.schema(), &qsql::bind_query(&q, view.schema(), params)?),
-        };
-        self.run_on(&view, &plan, opts)
+        let plan = plan_of(snap, &q, params)?;
+        self.run_on(snap, &plan, opts)
     }
 
-    /// Runs a plan that reads `view`'s table: a leaf on the executor, any
-    /// other with operators ([`crate::query::ops`]), whose leaves may hold
-    /// up to [`crate::query::compound::MAX_ROWS`] rows each.
-    fn run_on(&self, view: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
+    /// Runs a read plan on `snap`'s version: a leaf on the executor, any
+    /// other with operators ([`crate::query::ops`]), each of whose leaves
+    /// reads its own table and may hold up to
+    /// [`crate::query::compound::MAX_ROWS`] rows.
+    fn run_on(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
+        let view_of = |table: &str| snap.table(table).ok_or_else(|| Error::Query(format!("no such table: {table}")));
         if !plan.root.uses_operators() {
-            return self.execute(view, &plan.to_select(view.schema())?, opts);
+            let view = view_of(plan.table())?;
+            return self.execute(&view, &plan.to_select(view.schema())?, opts);
         }
         let leaves = ExecOptions { max_rows: None, ..opts.clone() };
-        let rs = ops::run(plan, view.schema(), &mut |leaf| self.execute(view, &leaf.to_select(view.schema())?, &leaves), opts)?;
+        let catalog: Vec<&Schema> = snap.schemas().collect();
+        let rs = ops::run_in(
+            plan,
+            &catalog,
+            &mut |leaf| {
+                let view = view_of(leaf.table())?;
+                self.execute(&view, &leaf.to_select(view.schema())?, &leaves)
+            },
+            opts,
+        )?;
         if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
             return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
         }
@@ -450,8 +459,7 @@ impl Db {
 
     /// [`Db::run`] of a plan that reads, against a given snapshot.
     pub fn run_at(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
-        let view = snap.table(plan.table()).ok_or_else(|| Error::Query(format!("no such table: {}", plan.table())))?;
-        self.run_on(&view, plan, opts)
+        self.run_on(snap, plan, opts)
     }
 
     /// [`Db::prepare_write`] of a plan that writes.
@@ -518,11 +526,7 @@ impl Db {
 
     fn explain_statement(&self, stmt: &sqlparser::ast::Statement, params: &Params) -> Result<Plan> {
         if let sqlparser::ast::Statement::Query(q) = stmt {
-            let view = view_of(&self.snapshot(), q)?;
-            if compound::needs(q, view.schema()) {
-                return compound::plan_query(q, view.schema(), params);
-            }
-            return Ok(Plan::of_select(view.schema(), &qsql::bind_query(q, view.schema(), params)?));
+            return plan_of(&self.snapshot(), q, params);
         }
         let catalog = self.catalog();
         let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
@@ -1036,18 +1040,16 @@ impl DocumentSource for StoredSource {
     }
 }
 
-/// The table a SELECT reads, in `snap`; with no table, `snap` itself (the
-/// binder says what is missing). A query reads one table for now.
-fn view_of(snap: &Snapshot, q: &sqlparser::ast::Query) -> Result<Snapshot> {
-    match tables::read_by(q).as_slice() {
-        [] => Ok(snap.clone()),
-        [t] => snap.table(t).ok_or_else(|| Error::Query(format!("no such table: {t}"))),
-        [all @ .., last] => {
-            let all: Vec<&str> = all.iter().map(|t| t.as_str()).collect();
-            Err(Error::Query(format!(
-                "a query reads one table for now, and this one reads {} and {last}: joins and subqueries across tables are not supported yet",
-                all.join(", ")
-            )))
-        }
+/// The plan of a SELECT over `snap`'s tables: the executor's query of one
+/// table, or a compound one's operators ([`compound::needs`]) over any.
+fn plan_of(snap: &Snapshot, q: &sqlparser::ast::Query, params: &Params) -> Result<Plan> {
+    let view = match tables::read_by(q).first() {
+        None => snap.clone(),
+        Some(t) => snap.table(t).ok_or_else(|| Error::Query(format!("no such table: {t}")))?,
+    };
+    if compound::needs(q, view.schema()) {
+        let catalog: Vec<&Schema> = snap.schemas().collect();
+        return compound::plan_query(q, &catalog, params);
     }
+    Ok(Plan::of_select(view.schema(), &qsql::bind_query(q, view.schema(), params)?))
 }
