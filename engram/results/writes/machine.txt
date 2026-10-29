@@ -1,0 +1,19 @@
+Machine: cloud container
+cpu: Intel(R) Xeon(R) Processor @ 2.30GHz, 4 cores; memory: 15 GiB; kernel 6.18.44-fc-v185
+rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
+
+Binaries (release builds, separate target dirs)
+main:   d84a967 (main after PR #46), plus the `writes` subcommand of engram-bench (87f5994)
+branch: e13b9c2 (claude/project-thread-hq5p4t-engram-merges; later commits change only docs and results)
+
+Command (each side, each run): engram-bench writes --records 300000 --clients 1,4 --out <dir>
+  default embedder hash:256, StoreOptions::default(), a fresh store in a temp dir per configuration.
+
+Runs went one after another, alternating sides, with no build or other benchmark running. The first
+started 11 s after a Strata merge-memory measurement ended, so its 1-minute load average was still
+high; its numbers match the second main run.
+Load average (1 min) at the start of each run, 2026-10-29 (UTC):
+  main   r1 | 03:42:34 | 3.37 | end 03:49:34
+  branch r1 | 03:49:34 | 1.07 | end 03:55:45
+  main   r2 | 03:55:45 | 1.52 | end 04:02:53
+  branch r2 | 04:02:53 | 1.22 | end 04:09:11

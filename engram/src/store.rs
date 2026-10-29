@@ -2,11 +2,13 @@
 //!
 //! Reads run on the caller's thread against a snapshot, any number at once.
 //! Writes go to one writer thread ([`Writer`]), which commits whatever is
-//! queued as one transaction, numbers new records in commit order, and
-//! flushes and merges between transactions. Strata publishes each version
-//! before the writer answers (`DbOptions::publish_snapshots`), so a caller
-//! reads its own writes, and a reader never waits for a write or for the
-//! index build that follows it.
+//! queued as one transaction and numbers new records in commit order.
+//! Strata publishes each version before the writer answers
+//! (`DbOptions::publish_snapshots`), so a caller reads its own writes, and a
+//! reader never waits for a write or for the index build that follows it. A
+//! full memtable becomes a segment, and segments merge, on Strata's
+//! background threads; a write waits for a flush only once the memtable
+//! holds twice `flush_docs` before the flush under way ends.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -17,7 +19,7 @@ use serde::Serialize;
 use strata::db::Db;
 use strata::query::exec::ResultSet;
 use strata::query::Params;
-use strata::storage::{DbOptions, MergePolicy, Snapshot};
+use strata::storage::{DbOptions, MergerOptions, Snapshot};
 use strata::{Document, Value, VectorIndexKind};
 
 use crate::embed::Embedder;
@@ -105,7 +107,8 @@ fn quote(s: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     pub vector_index: VectorIndexKind,
-    /// Flush the memtable to a segment past this many records.
+    /// Flush the memtable to a segment past this many records (in the
+    /// background; writes wait for a flush only once it holds twice this).
     pub flush_docs: usize,
     /// fsync every commit.
     pub sync: bool,
@@ -135,7 +138,7 @@ impl Store {
     pub fn open(path: &Path, embedder: Arc<dyn Embedder>, opts: StoreOptions) -> Result<Store> {
         let mut dbo = DbOptions::default();
         dbo.sync = opts.sync;
-        dbo.memtable_max_docs = opts.flush_docs * 4;
+        dbo.memtable_max_docs = opts.flush_docs;
         dbo.memtable_chunk_docs = opts.mem_chunk_docs.max(64);
         dbo.publish_snapshots = true;
         if opts.mem_flat {
@@ -165,7 +168,11 @@ impl Store {
         let last = db.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1", &Params::new())?;
         let next = last.rows.first().and_then(|r| r[0].as_i64()).map_or(1, |s| s + 1);
         let db = Arc::new(db);
-        let writer = Arc::new(Writer::start(db.clone(), next, opts.flush_docs)?);
+        db.spawn_flusher();
+        // One merge at a time: a daemon serves one project, and there may be
+        // several daemons.
+        db.spawn_merger(MergerOptions { threads: 1, ..MergerOptions::default() });
+        let writer = Arc::new(Writer::start(db.clone(), next)?);
         Ok(Store { db, embedder, writer, snap: None })
     }
 
@@ -450,11 +457,11 @@ struct Writer {
 }
 
 impl Writer {
-    fn start(db: Arc<Db>, next: i64, flush_docs: usize) -> Result<Writer> {
+    fn start(db: Arc<Db>, next: i64) -> Result<Writer> {
         let next_seq = Arc::new(AtomicI64::new(next));
         let (tx, rx) = mpsc::channel();
         let seq = next_seq.clone();
-        let thread = std::thread::Builder::new().name("engram-writer".into()).spawn(move || write_loop(&db, &rx, &seq, flush_docs))?;
+        let thread = std::thread::Builder::new().name("engram-writer".into()).spawn(move || write_loop(&db, &rx, &seq))?;
         Ok(Writer { jobs: Some(tx), thread: Some(thread), next_seq })
     }
 
@@ -478,9 +485,8 @@ impl Drop for Writer {
 }
 
 /// The writer thread. Whatever is queued when it is free is committed
-/// together (one WAL sync for all of it); between transactions a large
-/// memtable becomes a segment and small segments merge.
-fn write_loop(db: &Db, jobs: &mpsc::Receiver<Job>, next_seq: &AtomicI64, flush_docs: usize) {
+/// together (one WAL sync for all of it).
+fn write_loop(db: &Db, jobs: &mpsc::Receiver<Job>, next_seq: &AtomicI64) {
     while let Ok(first) = jobs.recv() {
         let mut group = Vec::new();
         for (op, reply) in std::iter::once(first).chain(std::iter::from_fn(|| jobs.try_recv().ok()).take(MAX_GROUP - 1)) {
@@ -501,11 +507,6 @@ fn write_loop(db: &Db, jobs: &mpsc::Receiver<Job>, next_seq: &AtomicI64, flush_d
             let _ = reply.send(r.map(|_| Done::default()).map_err(Error::from));
         }
         commit_group(db, next_seq, group);
-        if db.storage().file_stats().memtable_docs >= flush_docs {
-            if let Err(e) = db.storage().flush().and_then(|_| db.storage().merge(&MergePolicy::default()).map(|_| ())) {
-                eprintln!("engram: flushing the memtable: {e}");
-            }
-        }
     }
 }
 
@@ -760,6 +761,52 @@ mod tests {
         drop(s);
         let s = store(dir.path());
         assert_eq!((s.len(), s.last_seq()), (648, 649));
+    }
+
+    /// Strata's background threads flush the memtable and merge segments
+    /// while appends and reads go on: nothing is lost or seen out of order,
+    /// and the segments get merged without the writer doing it.
+    #[test]
+    fn flushes_and_merges_run_beside_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions { sync: false, flush_docs: 64, mem_chunk_docs: 64, ..Default::default() };
+        let open = || Store::open(&dir.path().join("m.strata"), Arc::new(HashEmbedder { dim: 64 }), opts.clone()).unwrap();
+        let s = open();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let p = s.pinned();
+                    let max = p.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1").unwrap().rows.first().map_or(0, |r| r[0].as_i64().unwrap());
+                    assert_eq!(p.len() as i64, max, "every number up to the newest is stored");
+                }
+            });
+            let ws: Vec<_> = (0..4)
+                .map(|t| {
+                    let s = &s;
+                    sc.spawn(move || {
+                        for i in 0..300 {
+                            let drafts = vec![Draft::new(Kind::ToolCall, format!("cargo test {t} {i}")), Draft::new(Kind::ToolResult, format!("test result {t} {i}: ok"))];
+                            s.append(&format!("sess-{t}"), i, 100, drafts).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            ws.into_iter().for_each(|h| h.join().unwrap());
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!((s.len(), s.last_seq()), (2400, 2400));
+        // About 37 flushes of 64 records; the merger brings them down.
+        let t = std::time::Instant::now();
+        while s.snapshot().segments().len() > 15 && t.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let segs = s.snapshot().segments().len();
+        assert!((1..=15).contains(&segs), "{segs} segments");
+        assert_eq!(s.bm25_top("result 3 299", 1, &Filter::default()).unwrap()[0].0.text, "test result 3 299: ok");
+        drop(s);
+        let s = open();
+        assert_eq!((s.len(), s.last_seq()), (2400, 2400));
     }
 
     #[test]
