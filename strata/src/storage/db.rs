@@ -1617,28 +1617,47 @@ impl Database {
         }
         let n_new = inputs.iter().map(|(_, l)| l.len()).sum::<usize>();
         // The inputs' live documents in batches of about MERGE_BATCH_BYTES
-        // of their images, decoded one batch at a time as the segment
-        // builds, and the image streamed to its reserved space: the merge
-        // never holds every document decoded, nor the whole image.
-        let mut batches: Vec<(usize, &[DocId])> = Vec::new();
+        // of their images (a batch can span inputs), each decoded while the
+        // segment builds from the one before, and the image streamed to its
+        // reserved space: the merge never holds every document decoded, nor
+        // the whole image.
+        let mut batches: Vec<Vec<(usize, &[DocId])>> = Vec::new();
+        let (mut batch, mut docs, mut bytes) = (Vec::new(), 0usize, 0usize);
         for (k, (_, live)) in inputs.iter().enumerate() {
-            let per_doc = views[k].file.image().len() / views[k].file.n_docs().max(1);
-            let size = (MERGE_BATCH_BYTES / per_doc.max(1)).clamp(MERGE_BATCH_DOCS.start, MERGE_BATCH_DOCS.end);
-            batches.extend(live.chunks(size).map(|c| (k, c)));
-        }
-        let decode = |&(k, live): &(usize, &[DocId])| -> Result<Vec<Document>> {
-            let v = views[k];
-            let mut got = source.documents(schema, &v.file, live)?;
-            if got.len() != live.len() {
-                return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
-            }
-            // The merged segment holds the values written in place.
-            if let Some(u) = &v.updates {
-                for (doc, &d) in got.iter_mut().zip(live) {
-                    u.apply(d, doc);
+            let per_doc = (views[k].file.image().len() / views[k].file.n_docs().max(1)).max(1);
+            let mut rest = &live[..];
+            while !rest.is_empty() {
+                // Documents until the batch is full.
+                let room = (MERGE_BATCH_DOCS.end - docs).min(MERGE_BATCH_BYTES.saturating_sub(bytes).div_ceil(per_doc).max(MERGE_BATCH_DOCS.start.saturating_sub(docs)));
+                let (piece, after) = rest.split_at(room.clamp(1, rest.len()));
+                batch.push((k, piece));
+                (docs, bytes, rest) = (docs + piece.len(), bytes + piece.len() * per_doc, after);
+                if docs >= MERGE_BATCH_DOCS.end || (docs >= MERGE_BATCH_DOCS.start && bytes >= MERGE_BATCH_BYTES) {
+                    batches.push(std::mem::take(&mut batch));
+                    (docs, bytes) = (0, 0);
                 }
             }
-            Ok(got)
+        }
+        if !batch.is_empty() {
+            batches.push(batch);
+        }
+        let decode = |batch: &[(usize, &[DocId])]| -> Result<Vec<Document>> {
+            let mut all = Vec::with_capacity(batch.iter().map(|(_, l)| l.len()).sum());
+            for &(k, live) in batch {
+                let v = views[k];
+                let mut got = source.documents(schema, &v.file, live)?;
+                if got.len() != live.len() {
+                    return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
+                }
+                // The merged segment holds the values written in place.
+                if let Some(u) = &v.updates {
+                    for (doc, &d) in got.iter_mut().zip(live) {
+                        u.apply(d, doc);
+                    }
+                }
+                all.append(&mut got);
+            }
+            Ok(all)
         };
         // The merged vector graphs start from the largest input's, if it
         // lost no documents.
@@ -1661,14 +1680,21 @@ impl Database {
         }
         // Written before the writer lock is taken, into space reserved for
         // it: commits go on meanwhile.
-        let written = match batches.split_last() {
-            None => None,
-            Some((last, rest)) => {
+        let written = match batches.len() {
+            0 => None,
+            n => {
                 let mut build = SegmentBuild::with_starts(schema, &self.opts.build, n_new, &starts)?;
-                for b in rest {
-                    build.add(&decode(b)?)?;
-                }
-                let sections = build.finish(&decode(last)?)?;
+                let sections = std::thread::scope(|s| {
+                    let mut next = decode(&batches[0]);
+                    for i in 1..n {
+                        let (decode, batch) = (&decode, &batches[i]);
+                        let ahead = s.spawn(move || decode(batch));
+                        let added = next.and_then(|docs| build.add(&docs));
+                        next = ahead.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                        added?;
+                    }
+                    build.finish(&next?)
+                })?;
                 Some(self.write_reserved(sections, pacer)?)
             }
         };

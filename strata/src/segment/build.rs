@@ -11,8 +11,9 @@ use crate::schema::{FieldType, Schema};
 use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
 use crate::forward::StoreBuilder;
 use crate::graph::GraphBuilder;
+use crate::storage::KeyList;
 use crate::text::TextFieldBuilder;
-use crate::value::{Document, Value};
+use crate::value::Document;
 
 /// Build-time knobs, mostly for experiments that compare encodings
 /// (e.g. `text.postings = loom | bp128`). Components document their keys.
@@ -154,7 +155,7 @@ pub struct SegmentBuild<'a> {
     store: Mutex<Option<StoreBuilder>>,
     /// Every document's primary key so far, for the key index and EDGES
     /// fields.
-    keys: Vec<Value>,
+    keys: KeyList,
 }
 
 impl<'a> SegmentBuild<'a> {
@@ -193,7 +194,11 @@ impl<'a> SegmentBuild<'a> {
             }
         }
         let store = Mutex::new(Some(StoreBuilder::new(schema, opts)?));
-        Ok(SegmentBuild { schema, opts, threads, n_docs, added: 0, fields, slots, store, keys: Vec::new() })
+        let keys = match schema.primary_key {
+            Some(pk) => KeyList::new(&schema.fields[pk].ty)?,
+            None => KeyList::of(false),
+        };
+        Ok(SegmentBuild { schema, opts, threads, n_docs, added: 0, fields, slots, store, keys })
     }
 
     /// Adds the next documents.
@@ -229,7 +234,9 @@ impl<'a> SegmentBuild<'a> {
             return Err(Error::Schema(format!("a segment build of {} documents was given {total}", self.n_docs)));
         }
         if let Some(pk) = self.schema.primary_key {
-            self.keys.extend(docs.iter().map(|d| d[pk].clone()));
+            for d in docs {
+                self.keys.push(&d[pk])?;
+            }
         }
         let (schema, threads, n_docs, base) = (self.schema, self.threads, self.n_docs, self.added);
         // In the order their sections are written.
@@ -289,6 +296,10 @@ impl<'a> SegmentBuild<'a> {
                         builder.add(d as DocId, &doc[i])?;
                     }
                     builder.seal();
+                    if !last {
+                        // Held until the last batch's runs are done.
+                        builder.pack();
+                    }
                     let name = format!("{} (text)", schema.fields[i].name);
                     add_build_time(&name, t);
                     let mut slot = lock(&slots[j]);

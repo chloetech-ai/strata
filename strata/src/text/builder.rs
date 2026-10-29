@@ -7,7 +7,7 @@ use std::collections::{BinaryHeap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use super::analyzer::{for_each_word, term_of};
-use super::codec::encode_norm;
+use super::codec::{encode_norm, get_varint, put_varint};
 use super::cursor::write_positions;
 use super::dict::DictBuilder;
 use super::postings::{write_bp128, write_loom, ListSizes, PostingsFormat, LOOM_MIN_DF};
@@ -51,6 +51,16 @@ struct TermPostings {
     positions: Vec<u32>,
 }
 
+/// A sealed builder's posting lists packed as varints (docID gaps,
+/// frequencies, and position gaps within each document), as a build of
+/// many batches holds its earlier batches' runs: a third or less of their
+/// memory unpacked.
+struct Packed {
+    bytes: Vec<u8>,
+    /// Per term: where its list starts in `bytes`, and its df.
+    lists: Vec<(usize, u32)>,
+}
+
 /// Builds `text.<field>.{meta,dict,post,pos,norms}`.
 pub struct TextFieldBuilder {
     field: String,
@@ -62,6 +72,8 @@ pub struct TextFieldBuilder {
     term_ids: HashMap<String, u32>,
     terms: Vec<String>,
     postings: Vec<TermPostings>,
+    /// The posting lists once [packed](Self::pack) (`postings` is empty then).
+    packed: Option<Packed>,
     norms: Vec<u8>,
     total_len: u64,
     /// The current document's (term, position) pairs.
@@ -82,6 +94,7 @@ impl TextFieldBuilder {
             term_ids: HashMap::new(),
             terms: Vec::new(),
             postings: Vec::new(),
+            packed: None,
             norms: Vec::new(),
             total_len: 0,
             scratch: Vec::new(),
@@ -96,6 +109,71 @@ impl TextFieldBuilder {
         self.term_ids = HashMap::new();
         self.scratch = Vec::new();
         self.sealed = true;
+    }
+
+    /// Packs a sealed builder's posting lists ([`Packed`]): for a build
+    /// that holds this run while it adds more.
+    pub fn pack(&mut self) {
+        assert!(self.sealed, "a text builder packed before it is sealed");
+        if self.packed.is_some() {
+            return;
+        }
+        let mut bytes = Vec::new();
+        let mut lists = Vec::with_capacity(self.postings.len());
+        for p in std::mem::take(&mut self.postings) {
+            lists.push((bytes.len(), p.docs.len() as u32));
+            let (mut prev, mut at) = (0, 0);
+            for (&d, &f) in p.docs.iter().zip(&p.freqs) {
+                put_varint(&mut bytes, (d - prev) as u64);
+                put_varint(&mut bytes, f as u64);
+                prev = d;
+                if self.positions {
+                    let mut last = 0;
+                    for &x in &p.positions[at..at + f as usize] {
+                        put_varint(&mut bytes, (x - last) as u64);
+                        last = x;
+                    }
+                    at += f as usize;
+                }
+            }
+        }
+        bytes.shrink_to_fit();
+        self.terms.shrink_to_fit();
+        self.packed = Some(Packed { bytes, lists });
+    }
+
+    /// Term `t`'s document frequency.
+    fn df(&self, t: u32) -> u32 {
+        match &self.packed {
+            Some(p) => p.lists[t as usize].1,
+            None => self.postings[t as usize].docs.len() as u32,
+        }
+    }
+
+    /// Appends term `t`'s postings, its docIDs shifted by `base`.
+    fn append_list(&self, t: u32, base: DocId, docs: &mut Vec<DocId>, freqs: &mut Vec<u32>, ps: &mut Vec<u32>) {
+        let Some(p) = &self.packed else {
+            let q = &self.postings[t as usize];
+            docs.extend(q.docs.iter().map(|&x| x + base));
+            freqs.extend_from_slice(&q.freqs);
+            ps.extend_from_slice(&q.positions);
+            return;
+        };
+        let (mut at, n) = p.lists[t as usize];
+        let mut d = 0;
+        for _ in 0..n {
+            d += get_varint(&p.bytes, &mut at) as DocId;
+            let f = get_varint(&p.bytes, &mut at) as u32;
+            docs.push(d + base);
+            freqs.push(f);
+            if self.positions {
+                let mut x = 0;
+                for _ in 0..f {
+                    x += get_varint(&p.bytes, &mut at) as u32;
+                    ps.push(x);
+                }
+            }
+        }
     }
 
     /// Adds the next document's text.
@@ -243,7 +321,7 @@ fn write_runs(runs: &[&TextFieldBuilder], format: PostingsFormat, loom_min_df: u
         while let Some(Reverse((_, r))) = heap.peek_mut().filter(|h| h.0 .0 == min).map(PeekMut::pop) {
             let t = orders[r][heads[r]];
             holders.push((r, t));
-            n += runs[r].postings[t as usize].docs.len() as u32;
+            n += runs[r].df(t);
             heads[r] += 1;
             if let Some(next) = head(r, heads[r]) {
                 heap.push(Reverse((next, r)));
@@ -269,27 +347,26 @@ fn write_runs(runs: &[&TextFieldBuilder], format: PostingsFormat, loom_min_df: u
         let (mut docs, mut freqs, mut ps) = (Vec::new(), Vec::new(), Vec::new());
         for i in cuts[k]..cuts[k + 1] {
             let hs = &holders[first[i]..first[i + 1]];
-            let (d, f, p): (&[DocId], &[u32], &[u32]) = if let [(r, t)] = hs {
-                if base[*r] == 0 {
+            let (d, f, p): (&[DocId], &[u32], &[u32]) = match hs {
+                [(r, t)] if runs[*r].packed.is_none() && base[*r] == 0 => {
                     let q = &runs[*r].postings[*t as usize];
                     (&q.docs, &q.freqs, &q.positions)
-                } else {
+                }
+                [(r, t)] if runs[*r].packed.is_none() => {
                     let q = &runs[*r].postings[*t as usize];
                     docs.clear();
                     docs.extend(q.docs.iter().map(|&x| x + base[*r]));
                     (&docs, &q.freqs, &q.positions)
                 }
-            } else {
-                docs.clear();
-                freqs.clear();
-                ps.clear();
-                for &(r, t) in hs {
-                    let q = &runs[r].postings[t as usize];
-                    docs.extend(q.docs.iter().map(|&x| x + base[r]));
-                    freqs.extend_from_slice(&q.freqs);
-                    ps.extend_from_slice(&q.positions);
+                _ => {
+                    docs.clear();
+                    freqs.clear();
+                    ps.clear();
+                    for &(r, t) in hs {
+                        runs[r].append_list(t, base[r], &mut docs, &mut freqs, &mut ps);
+                    }
+                    (&docs, &freqs, &ps)
                 }
-                (&docs, &freqs, &ps)
             };
             let loom = format == PostingsFormat::Loom && df[i] >= loom_min_df;
             if loom {
