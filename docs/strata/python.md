@@ -80,7 +80,7 @@ Rows are dicts of field name to value: `str`, `int`, `float`, `None`, `bool` for
 | `sql("UPDATE ...")` | `INSERT`, `UPDATE` and `DELETE` statements; returns the rows written. In-process it also runs `CREATE TABLE` and `DROP TABLE` ([tables](query-language.md#tables)), which return 0, and writes any table |
 | `import_file(path, format=None)` | loads a JSON Lines, JSON, CSV or TSV file ([how files are read](server.md#loading-rows)); returns `{rows, bulk, skipped_fields}` |
 
-`insert`, `upsert`, `delete` and `import_file` write the database's first table, the one its schema describes; `sql` names the table it writes. A server serves only its first table.
+`insert`, `upsert`, `delete` and `import_file` write the database's first table, the one its schema describes; `sql` names the table it writes. A server serves only its first table. A key a row leaves out gets its field's `default`, and a field with `not_null` refuses a row without a value ([schema options](server.md#schemas)); a `timestamp` defaulting to `"now"` takes one time for all the rows of a call.
 
 Vectors of embedded fields that a row leaves out are computed by the field's model when it is open; `db.embed_errors` lists the embedded fields whose model did not open, whose vectors rows must then bring.
 

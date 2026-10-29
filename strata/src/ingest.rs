@@ -1,8 +1,10 @@
 //! Rows from JSON, CSV and files, by a table's schema: what `/v1/write`,
 //! `strata-server import`, `POST /v1/import` and the Python package read.
 //!
-//! A row is a JSON object of field values (missing fields are null) or a
-//! CSV record under a header naming the fields. Formats: JSON Lines (one
+//! A row is a JSON object of field values or a CSV record under a header
+//! naming the fields. A field the row leaves out (a key it lacks, a column
+//! the header lacks) takes its default ([`crate::schema::Field::default`])
+//! or is null; a null value or an empty cell is null. Formats: JSON Lines (one
 //! object a line), a JSON array of objects, CSV and TSV. In CSV an empty
 //! cell is null, a vector or a list is a JSON array (a list may also be
 //! values separated by `|`), and a SPARSE value a JSON object. A BOOL is
@@ -17,14 +19,18 @@ use serde_json::Value as Json;
 
 use crate::db::Db;
 use crate::error::{Error, Result};
-use crate::schema::{FieldType, Logical, Schema};
+use crate::schema::{Field, FieldType, Logical, Schema};
 use crate::value::{Document, Value};
 
 /// The value of field `f` from JSON. An array is a vector for a VECTOR
 /// field and a list for a multi-valued one; EDGES take a JSON array (or
 /// its text) and SPARSE an object of term weights (or its text).
 pub fn value(schema: &Schema, f: usize, j: &Json) -> Result<Value> {
-    let field = &schema.fields[f];
+    field_value(&schema.fields[f], schema.primary_key == Some(f), j)
+}
+
+/// [`value`] of `field`, which is its table's primary key when `key`.
+pub fn field_value(field: &Field, key: bool, j: &Json) -> Result<Value> {
     let bad = || Error::Schema(format!("bad value for {}: {}", field.name, short(j)));
     if j.is_null() {
         return Ok(Value::Null);
@@ -58,7 +64,7 @@ pub fn value(schema: &Schema, f: usize, j: &Json) -> Result<Value> {
         (FieldType::Int, Json::Number(n)) => Value::Int(n.as_i64().ok_or_else(bad)?),
         (FieldType::Int, Json::Bool(b)) => Value::Int(*b as i64),
         (FieldType::Float, Json::Number(n)) => Value::Float(n.as_f64().ok_or_else(bad)?),
-        (FieldType::Keyword, Json::Number(n)) if schema.primary_key == Some(f) => Value::Str(n.to_string()),
+        (FieldType::Keyword, Json::Number(n)) if key => Value::Str(n.to_string()),
         (FieldType::Text { .. } | FieldType::Keyword | FieldType::Edges, Json::String(s)) => Value::Str(s.clone()),
         (FieldType::Edges, Json::Array(_)) => Value::Str(j.to_string()),
         (FieldType::Sparse, Json::Object(_) | Json::String(_)) => {
@@ -73,17 +79,24 @@ pub fn value(schema: &Schema, f: usize, j: &Json) -> Result<Value> {
     })
 }
 
-/// A document from a JSON object of field values (missing fields null,
-/// generated fields filled in). A field the schema lacks is an error.
+/// A document from a JSON object of field values (missing fields take
+/// their defaults or are null, generated fields are filled in). A field
+/// the schema lacks is an error.
 pub fn document(schema: &Schema, j: &Json) -> Result<Document> {
-    document_with(schema, j, &mut None)
+    document_at(schema, j, crate::timestamp::now())
 }
 
-/// [`document`], adding the names of fields the schema lacks to `unknown`
-/// instead of failing when it is given.
-fn document_with(schema: &Schema, j: &Json, unknown: &mut Option<&mut BTreeSet<String>>) -> Result<Document> {
+/// [`document`] with `now` as the time a TIMESTAMP defaulting to `"now"`
+/// takes, so that the rows of one request or file share it.
+pub fn document_at(schema: &Schema, j: &Json, now: i64) -> Result<Document> {
+    document_with(schema, j, now, &mut None)
+}
+
+/// [`document_at`], adding the names of fields the schema lacks to
+/// `unknown` instead of failing when it is given.
+fn document_with(schema: &Schema, j: &Json, now: i64, unknown: &mut Option<&mut BTreeSet<String>>) -> Result<Document> {
     let Json::Object(m) = j else { return Err(Error::Schema(format!("a row is a JSON object, not {}", short(j)))) };
-    let mut doc = vec![Value::Null; schema.fields.len()];
+    let mut doc = start(schema, now)?;
     for (k, v) in m {
         match schema.field_index(k) {
             Some(f) => doc[f] = value(schema, f, v)?,
@@ -96,7 +109,28 @@ fn document_with(schema: &Schema, j: &Json, unknown: &mut Option<&mut BTreeSet<S
         }
     }
     schema.fill_generated(&mut doc);
+    required(schema, &doc)?;
     Ok(doc)
+}
+
+/// Fails if `doc` has no value for a `NOT NULL` field, so that a file's
+/// row is refused with its line rather than when the rows load. Embedded
+/// vectors are computed later, so they are left to the write.
+fn required(schema: &Schema, doc: &Document) -> Result<()> {
+    match schema.fields.iter().zip(doc).find(|(f, v)| f.not_null && f.embed.is_none() && matches!(v, Value::Null)) {
+        Some((f, _)) => Err(Error::Schema(format!("{} is NOT NULL: give it a value", f.name))),
+        None => Ok(()),
+    }
+}
+
+/// A row before its values: the fields' defaults ([`Schema::defaults`]),
+/// which a field the row leaves out keeps.
+fn start(schema: &Schema, now: i64) -> Result<Document> {
+    if schema.has_defaults() {
+        schema.defaults(now)
+    } else {
+        Ok(vec![Value::Null; schema.fields.len()])
+    }
 }
 
 /// The value of field `f` from a CSV cell.
@@ -157,10 +191,12 @@ impl Format {
 
 /// Reads rows: every row as a document, or the first error, naming the
 /// line or record. Fields the schema lacks are skipped and listed in
-/// `unknown`.
+/// `unknown`. A TIMESTAMP defaulting to `"now"` takes the time the rows
+/// were opened, the same in every row.
 pub struct Rows<'a> {
     schema: &'a Schema,
     inner: Inner,
+    now: i64,
     /// Columns or keys the schema has no field for (skipped).
     pub unknown: BTreeSet<String>,
 }
@@ -203,7 +239,7 @@ impl<'a> Rows<'a> {
                 Inner::Csv(r.into_records(), columns)
             }
         };
-        Ok(Rows { schema, inner, unknown })
+        Ok(Rows { schema, inner, now: crate::timestamp::now(), unknown })
     }
 
     /// Opens `path`, in `format` or the one its extension names.
@@ -217,7 +253,7 @@ impl Iterator for Rows<'_> {
     type Item = Result<Document>;
 
     fn next(&mut self) -> Option<Result<Document>> {
-        let schema = self.schema;
+        let (schema, now) = (self.schema, self.now);
         let unknown = &mut Some(&mut self.unknown);
         match &mut self.inner {
             Inner::Lines(lines, n) => loop {
@@ -230,12 +266,12 @@ impl Iterator for Rows<'_> {
                     continue;
                 }
                 let at = *n;
-                return Some(serde_json::from_str::<Json>(&line).map_err(|e| Error::Schema(e.to_string())).and_then(|j| document_with(schema, &j, unknown)).map_err(|e| at_row("line", at, e)));
+                return Some(serde_json::from_str::<Json>(&line).map_err(|e| Error::Schema(e.to_string())).and_then(|j| document_with(schema, &j, now, unknown)).map_err(|e| at_row("line", at, e)));
             },
             Inner::Array(rows, n) => {
                 *n += 1;
                 let at = *n;
-                rows.next().map(|j| document_with(schema, &j, unknown).map_err(|e| at_row("row", at, e)))
+                rows.next().map(|j| document_with(schema, &j, now, unknown).map_err(|e| at_row("row", at, e)))
             }
             Inner::Csv(records, columns) => {
                 let rec = match records.next()? {
@@ -243,7 +279,10 @@ impl Iterator for Rows<'_> {
                     Err(e) => return Some(Err(Error::Schema(format!("CSV: {e}")))),
                 };
                 let line = rec.position().map_or(0, |p| p.line());
-                let mut doc = vec![Value::Null; schema.fields.len()];
+                let mut doc = match start(schema, now) {
+                    Ok(d) => d,
+                    Err(e) => return Some(Err(e)),
+                };
                 for (cellv, f) in rec.iter().zip(columns.iter()) {
                     if let Some(f) = *f {
                         match cell(schema, f, cellv) {
@@ -253,7 +292,7 @@ impl Iterator for Rows<'_> {
                     }
                 }
                 schema.fill_generated(&mut doc);
-                Some(Ok(doc))
+                Some(required(schema, &doc).map(|()| doc).map_err(|e| at_row("line", line, e)))
             }
         }
     }

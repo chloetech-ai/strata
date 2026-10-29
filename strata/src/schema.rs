@@ -168,6 +168,17 @@ pub struct Field {
     /// ([`Logical`]). Neither the primary key nor a reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical: Option<Logical>,
+    /// Every row holds a value (SQL `NOT NULL`): a write that leaves the
+    /// field NULL is refused. (The primary key always holds one, and does
+    /// not say so.)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_null: bool,
+    /// The value a written row takes when it leaves the field out (SQL
+    /// `DEFAULT`), as JSON: a value of the field's type, written as a row
+    /// would give it, or for a TIMESTAMP `"now"`, the time of the write.
+    /// A row that gives NULL keeps it ([`Field::default_value`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 /// A VECTOR field that is the embedding of other fields: `model`'s vector
@@ -189,7 +200,20 @@ pub struct Embed {
 
 impl Field {
     pub fn new(name: &str, ty: FieldType) -> Self {
-        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false, codes: VectorCodes::Sq8, embed: None, references: None, logical: None }
+        Field {
+            name: name.to_string(),
+            ty,
+            stored: true,
+            indexed: true,
+            generated_from: Vec::new(),
+            multi: false,
+            codes: VectorCodes::Sq8,
+            embed: None,
+            references: None,
+            logical: None,
+            not_null: false,
+            default: None,
+        }
     }
     /// A BOOL field ([`Logical::Bool`]).
     pub fn boolean(name: &str) -> Self {
@@ -243,6 +267,27 @@ impl Field {
             ),
             (None, v) => v,
         })
+    }
+    /// Makes the field `NOT NULL` ([`Field::not_null`]).
+    pub fn not_null(mut self) -> Self {
+        self.not_null = true;
+        self
+    }
+    /// Gives the field a default ([`Field::default`]).
+    pub fn default(mut self, value: serde_json::Value) -> Self {
+        self.default = Some(value);
+        self
+    }
+    /// The value, in stored form, that a row written at `now`
+    /// (microseconds since the epoch) takes when it leaves the field out:
+    /// its default, or NULL without one.
+    pub fn default_value(&self, now: i64) -> Result<crate::value::Value> {
+        use crate::value::Value;
+        match &self.default {
+            None => Ok(Value::Null),
+            Some(serde_json::Value::String(s)) if self.logical == Some(Logical::Timestamp) && s.eq_ignore_ascii_case("now") => Ok(Value::Int(now)),
+            Some(j) => crate::ingest::field_value(self, false, j).map_err(|e| Error::Schema(format!("the default of {}: {e}", self.name))),
+        }
     }
     /// A stored value as queries return it ([`Logical::output`]).
     pub fn output(&self, v: crate::value::Value) -> crate::value::Value {
@@ -356,6 +401,26 @@ impl Schema {
                 return Err(Error::Schema(format!("field {}: a {} field holds one value, and is neither the primary key nor a reference", f.name, l.type_name())));
             }
         }
+        for (i, f) in s.fields.iter_mut().enumerate() {
+            // The key always holds a value: saying so needs no feature.
+            if s.primary_key == Some(i) {
+                f.not_null = false;
+            }
+            if f.default.as_ref().is_some_and(serde_json::Value::is_null) {
+                f.default = None;
+            }
+        }
+        for (i, f) in s.fields.iter().enumerate() {
+            if f.default.is_none() {
+                continue;
+            }
+            let bad = |m: &str| Err(Error::Schema(format!("field {}: {m}", f.name)));
+            if s.primary_key == Some(i) || f.multi || !f.generated_from.is_empty() || !matches!(f.ty, FieldType::Text { .. } | FieldType::Keyword | FieldType::Int | FieldType::Float) {
+                return bad("only a single-valued TEXT, KEYWORD, INT, FLOAT, BOOL or TIMESTAMP field that is not the key or generated takes a default");
+            }
+            // A value of the field's type (ingest checks it as a row's).
+            f.default_value(0)?;
+        }
         s.check_references()?;
         // Names are matched in any case, so they must differ in more than case.
         let mut names: Vec<String> = s.fields.iter().map(|f| f.name.to_ascii_lowercase()).collect();
@@ -407,9 +472,24 @@ impl Schema {
     }
 
     /// The format 3 features this table's fields need, as the manifest
-    /// names them ([`Logical::feature`]).
+    /// names them: [`Logical::feature`], `not_null` and `default`.
     pub fn features(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.fields.iter().filter_map(|f| f.logical.map(Logical::feature))
+        let constraints = self.fields.iter().flat_map(|f| [f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default")]).flatten();
+        self.fields.iter().filter_map(|f| f.logical.map(Logical::feature)).chain(constraints)
+    }
+
+    /// A row that holds each field's default, written at `now`
+    /// (microseconds since the epoch), and NULL in the others: what a write
+    /// that gives no values stores. SQL `INSERT`s and rows read from JSON
+    /// or CSV start from it; a row given to the Rust API holds what it
+    /// holds.
+    pub fn defaults(&self, now: i64) -> Result<Vec<crate::value::Value>> {
+        self.fields.iter().map(|f| f.default_value(now)).collect()
+    }
+
+    /// Whether any field has a default ([`Schema::defaults`]).
+    pub fn has_defaults(&self) -> bool {
+        self.fields.iter().any(|f| f.default.is_some())
     }
 
     /// The fields that reference table `table` (any case), by position.
@@ -498,6 +578,10 @@ impl Schema {
     /// `{"ivf": {"nlist": ..}}`, and its `codes` `"sq8"` (default) or
     /// `"binary"`. A KEYWORD or INT field may name the table whose primary
     /// keys it holds (`"references": "authors"`; see [`Field::references`]).
+    /// `"not_null": true` refuses rows without a value, and `"default"` is
+    /// the value a row that leaves the field out takes (`"now"` for a
+    /// TIMESTAMP is the time of the write); either makes the database
+    /// format 3 ([`Field::not_null`], [`Field::default`]).
     ///
     /// The long form is this type's own serialization (what
     /// `GET /v1/schema` returns), with `primary_key` the key field's
@@ -592,6 +676,12 @@ impl Schema {
                 if let Some(r) = &f.references {
                     m.insert("references".into(), json!(r));
                 }
+                if f.not_null {
+                    m.insert("not_null".into(), json!(true));
+                }
+                if let Some(d) = &f.default {
+                    m.insert("default".into(), d.clone());
+                }
                 // "name" and "type" first, for people reading it.
                 let mut out = Map::new();
                 for k in ["name", "type"] {
@@ -616,7 +706,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -693,6 +783,8 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
         Some(J::String(t)) => f.references = Some(t.clone()),
         Some(_) => return Err(bad("references names a table")),
     }
+    f.not_null = flag("not_null")?.unwrap_or(false);
+    f.default = j.get("default").filter(|d| !d.is_null()).cloned();
     match j.get("embed") {
         None | Some(J::Null) => {}
         Some(e) => {

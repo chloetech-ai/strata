@@ -113,6 +113,9 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
         return Err(Error::Schema(format!("document has {} values, table has {} fields", doc.len(), schema.fields.len())));
     }
     for (f, v) in schema.fields.iter().zip(doc) {
+        if f.not_null && matches!(v, Value::Null) {
+            return Err(Error::Schema(format!("{} is NOT NULL: give it a value", f.name)));
+        }
         if f.multi {
             let ok = v.items().iter().all(|x| matches!((&f.ty, x), (FieldType::Keyword, Value::Str(_)) | (FieldType::Int, Value::Int(_))));
             if !ok {

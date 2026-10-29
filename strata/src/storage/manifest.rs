@@ -14,9 +14,10 @@
 //! format number: later changes add features instead. A reader refuses a
 //! manifest that requires a feature it does not know, naming it, and
 //! ignores optional ones. A version is written in format 3 only while it
-//! uses a feature ([`Manifest::features`]: a BOOL or TIMESTAMP field), so
-//! a database that uses none stays readable by versions of Strata from
-//! before format 3, which refuse format 3 as newer than they read.
+//! uses a feature ([`Manifest::features`]: a BOOL or TIMESTAMP field, a
+//! NOT NULL field or a field with a DEFAULT), so a database that uses
+//! none stays readable by versions of Strata from before format 3, which
+//! refuse format 3 as newer than they read.
 
 use std::collections::BTreeSet;
 
@@ -114,8 +115,8 @@ impl Manifest {
         }
     }
 
-    /// The format 3 features the tables need, sorted: one per BOOL or
-    /// TIMESTAMP type in use ([`crate::schema::Logical::feature`]).
+    /// The format 3 features the tables need, sorted
+    /// ([`crate::schema::Schema::features`]).
     pub fn features(&self) -> Vec<&'static str> {
         let used: BTreeSet<&'static str> = self.tables.iter().flat_map(|t| t.schema.features()).collect();
         used.into_iter().collect()
@@ -211,7 +212,7 @@ struct V1 {
 }
 
 /// The features this version of Strata reads.
-pub const FEATURES: &[&str] = &["bool", "timestamp"];
+pub const FEATURES: &[&str] = &["bool", "default", "not_null", "timestamp"];
 
 /// Format 2, and format 3 with its features.
 #[derive(Serialize)]
@@ -339,6 +340,23 @@ mod tests {
         m.tables.remove(1);
         assert_eq!((m.format(), m.features()), (2, Vec::<&str>::new()));
         assert!(!String::from_utf8(m.encode()).unwrap().contains("features"));
+    }
+
+    #[test]
+    fn constraints_are_features() {
+        let fields = vec![
+            Field::new("id", FieldType::Keyword).not_null(),
+            Field::new("state", FieldType::Keyword).default(serde_json::json!("open")),
+            Field::new("n", FieldType::Int).not_null(),
+        ];
+        let mut m = Manifest::new(Schema::new("t", fields, Some("id")).unwrap());
+        assert_eq!((m.format(), m.features()), (3, vec!["default", "not_null"]));
+        assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
+        m.tables.push(TableMeta { id: 1, schema: typed("tasks"), segments: Vec::new() });
+        assert_eq!(m.features(), ["bool", "default", "not_null", "timestamp"]);
+        // A key said to be NOT NULL needs nothing: keys always are.
+        let key = Schema::new("k", vec![Field::new("id", FieldType::Keyword).not_null()], Some("id")).unwrap();
+        assert_eq!(Manifest::new(key).format(), 1);
     }
 
     #[test]

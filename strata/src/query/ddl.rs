@@ -35,9 +35,13 @@
 //! constraint. `REFERENCES table [(key)]` on a column, or `FOREIGN KEY
 //! (column) REFERENCES table [(key)]`, records that a KEYWORD or INT
 //! column holds primary keys of `table` ([`crate::schema::Field::references`]);
-//! it is not enforced. Every other clause and column option (`NOT NULL`,
-//! `DEFAULT`, `UNIQUE`, `CHECK`, `ON DELETE`, constraint names, `AS
-//! SELECT`, ...) is an error, never ignored.
+//! it is not enforced. `NOT NULL` refuses writes that leave the column
+//! NULL, and `DEFAULT value` (a constant, or `CURRENT_TIMESTAMP` for a
+//! TIMESTAMP) is what a write that leaves the column out stores; either
+//! makes the database format 3 ([`crate::schema::Field::not_null`],
+//! [`crate::schema::Field::default`]). Every other clause and column
+//! option (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, `AS SELECT`,
+//! ...) is an error, never ignored.
 
 use serde_json::{json, Map, Value as J};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
@@ -52,7 +56,7 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// The forms this module binds, for error messages.
-const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table])";
+const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table])";
 const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE or EDGES, and KEYWORD[] or INT[] for lists";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
@@ -86,12 +90,19 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
     let mut fields = Vec::with_capacity(ct.columns.len());
     for c in &ct.columns {
         let mut opts = Map::new();
+        let (mut null, mut not_null, mut default) = (false, false, None);
         for o in &c.options {
             if let Some(n) = &o.name {
                 return Err(err(format!("column {}: constraint names ({n}) are not supported", c.name.value)));
             }
             match &o.option {
-                ColumnOption::Null => {}
+                ColumnOption::Null => null = true,
+                ColumnOption::NotNull => not_null = true,
+                ColumnOption::Default(e) => {
+                    if default.replace(default_value(e).map_err(|m| err(format!("column {}: {m}", c.name.value)))?).is_some() {
+                        return Err(err(format!("column {}: DEFAULT is given twice", c.name.value)));
+                    }
+                }
                 ColumnOption::Unique { is_primary: true, characteristics: None } => set_key(&c.name.value)?,
                 ColumnOption::ForeignKey { foreign_table, referred_columns, on_delete, on_update, characteristics } => {
                     refs.push((c.name.value.clone(), reference(foreign_table, referred_columns, on_delete, on_update, characteristics)?, referred_columns.first().map(|k| k.value.clone())));
@@ -104,12 +115,21 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
                         }
                     }
                 }
-                ColumnOption::NotNull => return Err(err(format!("column {}: NOT NULL is not supported (every column may be NULL)", c.name.value))),
                 ColumnOption::Unique { is_primary: false, .. } => return Err(err(format!("column {}: UNIQUE is not supported (the primary key is unique)", c.name.value))),
                 o => return Err(err(format!("column {}: {o} is not supported", c.name.value))),
             }
         }
-        fields.push(field(&c.name.value, &c.data_type, opts)?);
+        if null && not_null {
+            return Err(err(format!("column {}: NULL and NOT NULL", c.name.value)));
+        }
+        let mut f = field(&c.name.value, &c.data_type, opts)?;
+        if not_null {
+            f["not_null"] = json!(true);
+        }
+        if let Some(d) = default {
+            f["default"] = d;
+        }
+        fields.push(f);
     }
     for t in &ct.constraints {
         match t {
@@ -297,6 +317,37 @@ fn column_type(t: &DataType) -> std::result::Result<(&'static str, bool, Option<
     }
 }
 
+/// A column's `DEFAULT`, as the schema's JSON form keeps it: a constant
+/// (`'open'`, `0`, `-1.5`, `TRUE`, `'2026-01-01'`, `NULL`), or the time
+/// of each write as `"now"` (`CURRENT_TIMESTAMP`, `now()`,
+/// `LOCALTIMESTAMP`), which a TIMESTAMP column takes.
+fn default_value(e: &Expr) -> std::result::Result<J, String> {
+    let now = |n: &str| matches!(n.to_ascii_lowercase().as_str(), "current_timestamp" | "now" | "localtimestamp");
+    let no_args = |f: &sql::Function| match &f.args {
+        sql::FunctionArguments::None => true,
+        sql::FunctionArguments::List(l) => l.args.is_empty(),
+        _ => false,
+    };
+    match e {
+        Expr::Nested(x) => default_value(x),
+        Expr::Value(v) => match &v.value {
+            sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => Ok(json!(s)),
+            sql::Value::Boolean(b) => Ok(json!(b)),
+            sql::Value::Null => Ok(J::Null),
+            sql::Value::Number(n, _) => n.parse::<i64>().map(|n| json!(n)).or_else(|_| n.parse::<f64>().map(|x| json!(x))).map_err(|_| format!("DEFAULT {n} is not a number")),
+            _ => Err(format!("DEFAULT {e} is not a constant")),
+        },
+        Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => match default_value(expr)? {
+            J::Number(n) if n.is_i64() => Ok(json!(-n.as_i64().unwrap_or(0))),
+            J::Number(n) if n.is_f64() => Ok(json!(-n.as_f64().unwrap_or(0.0))),
+            _ => Err(format!("DEFAULT {e} is not a constant")),
+        },
+        Expr::Function(f) if now(&f.name.to_string()) && no_args(f) => Ok(json!("now")),
+        Expr::Identifier(id) if id.quote_style.is_none() && now(&id.value) => Ok(json!("now")),
+        _ => Err(format!("DEFAULT {e} is not a constant (or CURRENT_TIMESTAMP for a TIMESTAMP)")),
+    }
+}
+
 /// An option's value: a string, number or boolean literal, or an `ARRAY`
 /// of strings.
 fn option_value(e: &Expr) -> Result<J> {
@@ -408,8 +459,13 @@ mod tests {
     fn refuses_what_it_does_not_handle() {
         let p = papers();
         for bad in [
-            "CREATE TABLE t (a INT NOT NULL)",
-            "CREATE TABLE t (a INT DEFAULT 1)",
+            "CREATE TABLE t (a INT NULL NOT NULL)",
+            "CREATE TABLE t (a INT DEFAULT 1 DEFAULT 2)",
+            "CREATE TABLE t (a INT DEFAULT 1 + 1)",
+            "CREATE TABLE t (a INT DEFAULT 'one')",
+            "CREATE TABLE t (a INT PRIMARY KEY DEFAULT 1)",
+            "CREATE TABLE t (a INT, b INT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE t (a INT, b KEYWORD[] DEFAULT 'x')",
             "CREATE TABLE t (a INT UNIQUE)",
             "CREATE TABLE t (a INT CHECK (a > 0))",
             "CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)",

@@ -2696,6 +2696,7 @@ impl<'a> WriteTxn<'a> {
             _ if f.multi || Some(i) == t.schema.primary_key => {
                 return Err(Error::Schema(format!("{field} cannot be set in place: it is multi-valued or the key")))
             }
+            (_, Value::Null) if f.not_null => return Err(Error::Schema(format!("{field} is NOT NULL: give it a value"))),
             (FieldType::Int, v @ (Value::Int(_) | Value::Null)) => v,
             (FieldType::Float, Value::Int(x)) => Value::Float(x as f64),
             (FieldType::Float, Value::Float(x)) if !x.is_finite() => return Err(Error::Schema(format!("bad value for {field}: {x} (FLOAT values are finite)"))),
