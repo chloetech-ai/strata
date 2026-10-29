@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
+use strata::query::Params;
+use strata::Value;
 
 use crate::anchor::{self, Checker};
 use crate::capture::{self, EpisodeAcc};
@@ -525,7 +527,10 @@ impl Daemon {
                 // Each note links to the turn it was written from.
                 let source = self
                     .store
-                    .query(&format!("SELECT id FROM memory WHERE session = '{}' AND turn = {turn} AND kind = 'prompt' ORDER BY seq ASC LIMIT 1", sid.replace('\'', "''")))
+                    .query_with(
+                        &format!("SELECT id FROM memory WHERE session = :session AND turn = {turn} AND kind = 'prompt' ORDER BY seq ASC LIMIT 1"),
+                        &Params::new().set("session", Value::Str(sid.to_string())),
+                    )
                     .ok()
                     .and_then(|rs| rs.rows.first().and_then(|r| r[0].as_str().map(String::from)));
                 let n = d.drafts.len();
@@ -883,12 +888,12 @@ impl Daemon {
         if terms.is_empty() {
             return Ok(String::new());
         }
-        let m = terms.iter().map(|t| t.replace('\'', "")).collect::<Vec<_>>().join(" AND ");
-        let filter = Filter { exclude_window: Some((sid.to_string(), w)), ..Default::default() };
-        let mut where_ = filter_sql(&filter);
-        where_.push(format!("MATCH(files, '{m}')"));
-        where_.push("kind IN ('error', 'decision', 'preference', 'fact', 'note', 'episode')".into());
-        let rs = self.store.query(&format!("SELECT {} FROM memory WHERE {} ORDER BY seq DESC LIMIT 3", crate::record::COLUMNS, where_.join(" AND ")))?;
+        let kinds = vec![Kind::Error, Kind::Decision, Kind::Preference, Kind::Fact, Kind::Note, Kind::Episode];
+        let filter = Filter { exclude_window: Some((sid.to_string(), w)), kinds, ..Default::default() };
+        let mut where_ = filter.conds();
+        where_.push("MATCH(files, :files)".into());
+        let params = filter.params().set("files", Value::Str(terms.join(" AND ")));
+        let rs = self.store.query_with(&format!("SELECT {} FROM memory WHERE {} ORDER BY seq DESC LIMIT 3", crate::record::COLUMNS, where_.join(" AND ")), &params)?;
         let recs: Vec<Record> = rs.rows.iter().filter_map(|r| crate::store::row_record(r)).collect();
         if recs.is_empty() {
             return Ok(String::new());
@@ -1066,14 +1071,6 @@ impl Daemon {
             "segments": fs.segments.len(), "memtable_docs": fs.memtable_docs, "store": self.paths.db,
         }))
     }
-}
-
-fn filter_sql(f: &Filter) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Some((s, w)) = &f.exclude_window {
-        v.push(format!("NOT (session = '{}' AND seq >= {w})", s.replace('\'', "''")));
-    }
-    v
 }
 
 // ---------------------------------------------------------------- server
