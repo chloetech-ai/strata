@@ -791,7 +791,7 @@ impl Database {
         let handles = manifest
             .tables
             .iter()
-            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints, opts.check_at_open()).map(Arc::new)).collect())
+            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead, opts.read_ahead && opts.random_hints, opts.check_at_open()).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
         Ok((manifest, freelist, map, handles))
     }
@@ -2329,7 +2329,7 @@ impl Database {
                     .map(|m| match (old.iter().find(|h| h.meta == *m), &self.dir) {
                         (Some(h), _) => Ok(h.clone()),
                         (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints, check).map(Arc::new),
-                        (None, None) => SegHandle::open(&map, m, hints, check).map(Arc::new),
+                        (None, None) => SegHandle::open(&map, m, self.opts.read_ahead, hints, check).map(Arc::new),
                     })
                     .collect::<Result<Vec<_>>>()
             })

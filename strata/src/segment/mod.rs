@@ -188,6 +188,18 @@ pub struct SegmentFile {
     /// With [`checked_on_read`](Self::checked_on_read): what is known of
     /// each section's checksum, by [`Section::slot`].
     checked: Option<Arc<[AtomicU8]>>,
+    random: Random,
+}
+
+/// Which sections of a mapped segment the kernel was advised to read
+/// without read-ahead (`MADV_RANDOM`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Random {
+    None,
+    /// [`SegmentFile::advise_random_sections`]
+    Sections,
+    /// [`SegmentFile::mapped_random`]
+    All,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -224,7 +236,7 @@ impl SegmentFile {
             }
             sections.insert(e.name, Section { offset, len, crc: e.crc32, slot });
         }
-        Ok(SegmentFile { n_docs, bytes, sections, checked: None })
+        Ok(SegmentFile { n_docs, bytes, sections, checked: None, random: Random::None })
     }
 
     /// Builds a segment in memory (tests, memtable snapshots).
@@ -253,7 +265,7 @@ impl SegmentFile {
             let state = &checked[s.slot];
             let known = match state.load(Ordering::Acquire) {
                 UNCHECKED => {
-                    let now = if self.matches(s) { GOOD } else { BAD };
+                    let now = if self.matches(name, s) { GOOD } else { BAD };
                     state.store(now, Ordering::Release);
                     now
                 }
@@ -279,15 +291,31 @@ impl SegmentFile {
     /// segment; the error names the first section that fails.
     pub fn verify_sections(&self) -> Result<()> {
         for (name, s) in &self.sections {
-            if !self.matches(s) {
+            if !self.matches(name, s) {
                 return Err(corrupt(format!("section {name} fails its checksum")));
             }
         }
         Ok(())
     }
 
-    fn matches(&self, s: &Section) -> bool {
-        s.crc.is_none_or(|crc| crc32fast::hash(&self.bytes[s.offset..s.offset + s.len]) == crc)
+    fn matches(&self, name: &str, s: &Section) -> bool {
+        let Some(crc) = s.crc else { return true };
+        let bytes = &self.bytes[s.offset..s.offset + s.len];
+        // Without read-ahead the kernel would read the section from disk a
+        // page per fault; let it read ahead while the section is checked.
+        let random = match self.random {
+            Random::None => false,
+            Random::Sections => self.read_at_random(name),
+            Random::All => true,
+        };
+        if random {
+            advise(bytes, libc::MADV_NORMAL);
+        }
+        let ok = crc32fast::hash(bytes) == crc;
+        if random {
+            advise(bytes, libc::MADV_RANDOM);
+        }
+        ok
     }
 
     /// Section names with sizes in bytes, for size breakdowns.
@@ -308,24 +336,42 @@ impl SegmentFile {
     /// segment without read-ahead (`MADV_RANDOM`), so a cold page fault there
     /// reads one page instead of up to 32. Only whole pages inside a section
     /// are advised.
-    pub fn advise_random_sections(&self) {
-        let base = self.bytes.as_ptr() as usize;
-        // HNSW computes its traversal distances on the SQ8 codes, so in a
-        // segment with a graph the codes are read at random positions too.
-        let graph = self.sections.keys().any(|n| n.contains(".hnsw"));
-        for (name, &Section { offset: o, len: l, .. }) in &self.sections {
-            let random = random_access(name) || (graph && name.ends_with(".sq8"));
-            if !random || l < PAGE {
-                continue;
-            }
-            let start = (base + o).next_multiple_of(PAGE);
-            let end = (base + o + l) / PAGE * PAGE;
-            if end > start {
-                // SAFETY: the range lies inside this segment's mapped bytes;
-                // MADV_RANDOM only changes read-ahead, never the contents.
-                unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_RANDOM) };
+    pub fn advise_random_sections(&mut self) {
+        if self.random == Random::None {
+            self.random = Random::Sections;
+        }
+        for (name, s) in &self.sections {
+            if self.read_at_random(name) {
+                advise(&self.bytes[s.offset..s.offset + s.len], libc::MADV_RANDOM);
             }
         }
+    }
+
+    /// Says that the whole mapping was advised `MADV_RANDOM`, so that a
+    /// check of a section ([`checked_on_read`](Self::checked_on_read)) lets
+    /// the kernel read ahead meanwhile.
+    pub fn mapped_random(mut self) -> Self {
+        self.random = Random::All;
+        self
+    }
+
+    /// Whether [`advise_random_sections`](Self::advise_random_sections)
+    /// advises section `name`.
+    fn read_at_random(&self, name: &str) -> bool {
+        // HNSW computes its traversal distances on the SQ8 codes, so in a
+        // segment with a graph the codes are read at random positions too.
+        random_access(name) || (name.ends_with(".sq8") && self.sections.keys().any(|n| n.contains(".hnsw")))
+    }
+}
+
+/// Advises the whole pages inside `bytes`, part of a mapping.
+fn advise(bytes: &[u8], advice: libc::c_int) {
+    let start = (bytes.as_ptr() as usize).next_multiple_of(PAGE);
+    let end = (bytes.as_ptr() as usize + bytes.len()) / PAGE * PAGE;
+    if end > start {
+        // SAFETY: the range lies inside `bytes`; advice only changes
+        // read-ahead, never the contents.
+        unsafe { libc::madvise(start as *mut libc::c_void, end - start, advice) };
     }
 }
 

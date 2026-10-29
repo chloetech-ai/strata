@@ -7,12 +7,16 @@
 //! ```text
 //! section_checks PATH make DOCS DIM
 //! section_checks PATH measure ROUNDS
+//! section_checks PATH sizes
+//! section_checks PATH scan
 //! ```
 //!
 //! `make` bulk-loads DOCS documents (30 words of text with positions, an
 //! integer, a DIM-dimensional HNSW vector) in segments of 100,000.
 //! `measure` alternates check on and off, cold then warm, ROUNDS times,
-//! each in a fresh `Db`, and prints one JSON line per run.
+//! each in a fresh `Db`, and prints one JSON line per run. `sizes` prints
+//! the bytes of each kind of section, `scan` the time to check each kind,
+//! cold.
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -98,12 +102,48 @@ fn measure(path: &Path, rounds: usize) {
     }
 }
 
+/// Bytes of each kind of section (`text.body.post`, `vec.v.f32`, ...),
+/// summed over the segments.
+fn sizes(path: &Path) {
+    let db = Db::open(path, options(false)).unwrap();
+    let mut by = std::collections::BTreeMap::<String, usize>::new();
+    for seg in db.snapshot().segments() {
+        for (name, len) in seg.file.section_sizes() {
+            *by.entry(name).or_default() += len;
+        }
+    }
+    for (name, len) in by {
+        println!("{name}\t{len}");
+    }
+}
+
+/// Time to check each kind of section, cold, one segment at a time.
+fn scan(path: &Path) {
+    strata::iostat::evict(path).unwrap();
+    let db = Db::open(path, options(true)).unwrap();
+    let mut by = std::collections::BTreeMap::<String, (usize, f64)>::new();
+    for seg in db.snapshot().segments() {
+        for (name, len) in seg.file.section_sizes() {
+            let t = Instant::now();
+            seg.file.section(&name).unwrap();
+            let e = by.entry(name).or_default();
+            e.0 += len;
+            e.1 += ms(t);
+        }
+    }
+    for (name, (len, ms)) in by {
+        println!("{name}\t{:.1} MB\t{ms:.1} ms\t{:.0} MB/s", len as f64 / 1e6, len as f64 / 1e3 / ms.max(1e-9));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = PathBuf::from(&args[1]);
     match args[2].as_str() {
         "make" => make(&path, args[3].parse().unwrap(), args[4].parse().unwrap()),
         "measure" => measure(&path, args[3].parse().unwrap()),
+        "sizes" => sizes(&path),
+        "scan" => scan(&path),
         other => panic!("unknown command {other}"),
     }
 }
