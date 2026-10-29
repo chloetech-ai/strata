@@ -113,26 +113,51 @@ pub struct MergeStatus {
     pub error: Option<String>,
 }
 
+/// A merge decodes its input documents in batches of about this many
+/// bytes of their images, at least `MERGE_BATCH_DOCS.start` documents (so
+/// that a TEXT field still analyses a run per build thread) and at most
+/// `MERGE_BATCH_DOCS.end`.
+pub(crate) const MERGE_BATCH_BYTES: usize = 32 << 20;
+pub(crate) const MERGE_BATCH_DOCS: std::ops::Range<usize> = 16_384..262_144;
+
 /// The estimated peak memory of merging segments with a build on
-/// `threads` threads: their live documents decoded, the structures the
-/// segment builder keeps for them, and the merged image, which together
-/// come to at most about [`memory_per_image_byte`] times the inputs' image
-/// bytes that hold live documents.
+/// `threads` threads. A merge holds a batch of decoded documents, the next
+/// one being decoded, and the builder's structures for the batch; it keeps
+/// compact forms of the batches before (packed postings, keys, the
+/// compressed doc store, columns, a vector graph) and finally the merged
+/// sections. Over the first four batches' worth of input image that comes
+/// to at most about [`memory_per_image_byte`] times the bytes; each byte
+/// after them adds about [`memory_per_streamed_byte`]. Only image bytes
+/// that hold live documents count.
 pub fn merge_memory(segs: &[SegmentInfo], threads: usize) -> u64 {
-    let per_byte = memory_per_image_byte(threads);
-    segs.iter().map(|s| (s.bytes as f64 * s.n_live as f64 / s.n_docs.max(1) as f64 * per_byte) as u64).sum()
+    let live: f64 = segs.iter().map(|s| s.bytes as f64 * s.n_live as f64 / s.n_docs.max(1) as f64).sum();
+    // A batch is MERGE_BATCH_BYTES, unless that is fewer documents than a
+    // batch takes at least.
+    let per_doc = segs.iter().map(|s| s.bytes as f64 / s.n_docs.max(1) as f64).fold(0.0, f64::max);
+    let batch = (MERGE_BATCH_BYTES as f64).max(MERGE_BATCH_DOCS.start as f64 * per_doc);
+    let first = live.min(4.0 * batch);
+    (first * memory_per_image_byte(threads) + (live - first) * memory_per_streamed_byte(threads)) as u64
 }
 
-/// A merge's peak memory per byte of input image, when its build uses
-/// `threads` threads, with a margin over what was measured
-/// (`examples/merge_memory.rs`, inputs of 15 to 443 MB of short text, long
-/// text, and text with 64-dim vectors): 1.7 to 4.0 on one thread, 2.3 to
-/// 6.6 on four and 3.7 to 8.2 on eight. Merges small enough to fit one
-/// batch of decoded documents take the most, short texts most of all (each
-/// thread analyses its own run of documents); bigger ones hold one batch at
-/// a time and take less, so this overestimates them.
+/// A merge's peak memory per byte of input image, over its first four
+/// batches, when its build uses `threads` threads, with a margin over what
+/// was measured (`examples/merge_memory.rs`, merges of 15 to 937 MB of
+/// short text, long text, and text with 64- and 384-dim vectors): up to
+/// 4.0 on one thread, 6.6 on four and 8.2 on eight, in merges of short
+/// texts small enough to fit one batch (each thread analyses its own run
+/// of documents).
 pub fn memory_per_image_byte(threads: usize) -> f64 {
     5.5 + 0.5 * threads.max(1) as f64
+}
+
+/// What each byte of input image past a merge's first four batches adds to
+/// its peak memory, with a margin over what was measured between merges of
+/// 148 to 937 MB: up to 1.8 on one thread and 2.1 on four, long texts and
+/// texts with 64-dim vectors taking the most (postings with positions
+/// packed per run, a vector graph, and the merged sections they become),
+/// 384-dim vectors 1.2 to 1.4 and short texts 0.4 to 0.5.
+pub fn memory_per_streamed_byte(threads: usize) -> f64 {
+    2.0 + 0.25 * threads.max(1) as f64
 }
 
 /// The memory this process may use: the tightest cgroup limit that
@@ -394,6 +419,29 @@ mod tests {
         let gone = [seg(7, 1000, 100)];
         assert_eq!(p.select_within(&gone, none, |_| Some(1), 1), (None, true));
         assert_eq!(p.select_within(&gone, none, |_| None, 1), (Some(vec![7]), false));
+    }
+
+    #[test]
+    fn merges_past_four_batches_cost_less_per_byte() {
+        const MB: u64 = 1 << 20;
+        // Short documents, 128 bytes each: a batch is 32 MB of image.
+        let segs = |mb: u64| -> Vec<SegmentInfo> { (1..=4).map(|id| SegmentInfo { id, n_docs: (mb * MB / 4 / 128) as u32, n_live: (mb * MB / 4 / 128) as u32, bytes: mb * MB / 4 }).collect() };
+        let at = |mb: u64, threads: usize| merge_memory(&segs(mb), threads) as f64;
+        for threads in [1, 4, 8] {
+            // Up to four batches, each byte costs the full estimate.
+            assert!((at(100, threads) - 100.0 * MB as f64 * memory_per_image_byte(threads)).abs() < 1e3);
+            // Past them, each byte adds the streamed cost.
+            let added = (at(1000, threads) - at(500, threads)) / (500 * MB) as f64;
+            assert!((added - memory_per_streamed_byte(threads)).abs() < 1e-6, "{added}");
+            assert!(memory_per_streamed_byte(threads) < memory_per_image_byte(threads) / 2.0);
+        }
+        // Deleted documents' bytes do not count.
+        let half: Vec<SegmentInfo> = segs(1000).into_iter().map(|s| SegmentInfo { n_live: s.n_docs / 2, ..s }).collect();
+        assert!((merge_memory(&half, 1) as f64 - at(500, 1)).abs() < 1e3);
+        // Long documents make a batch of at least 16,384 of them, so four
+        // batches of 8 KB documents are 512 MB.
+        let long: Vec<SegmentInfo> = (1..=4).map(|id| SegmentInfo { id, n_docs: 32_768, n_live: 32_768, bytes: 32_768 * 8192 }).collect();
+        assert!((merge_memory(&long, 1) as f64 - 1024.0 * MB as f64 * memory_per_image_byte(1) + 512.0 * MB as f64 * (memory_per_image_byte(1) - memory_per_streamed_byte(1))).abs() < 1e3);
     }
 
     #[test]
