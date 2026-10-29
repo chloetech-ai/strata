@@ -29,6 +29,10 @@ message Value {
     string str = 4;
     Floats vector = 5;
     Values list = 6;
+    // A BOOL field's value.
+    bool boolean = 7;
+    // A TIMESTAMP field's value: microseconds since 1970-01-01T00:00:00Z.
+    int64 timestamp = 8;
   }
 }
 

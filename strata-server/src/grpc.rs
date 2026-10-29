@@ -23,6 +23,8 @@ pub fn to_pb(v: &Value) -> pb::Value {
         Value::Str(s) => Kind::Str(s.clone()),
         Value::Vector(v) => Kind::Vector(pb::Floats { v: v.to_vec() }),
         Value::List(xs) => Kind::List(pb::Values { v: xs.iter().map(to_pb).collect() }),
+        Value::Bool(b) => Kind::Boolean(*b),
+        Value::Timestamp(t) => Kind::Timestamp(*t),
     };
     pb::Value { kind: Some(kind) }
 }
@@ -35,6 +37,8 @@ pub fn from_pb(v: pb::Value) -> Value {
         Some(Kind::Str(s)) => Value::Str(s),
         Some(Kind::Vector(f)) => Value::Vector(f.v.into()),
         Some(Kind::List(xs)) => Value::List(xs.v.into_iter().map(from_pb).collect()),
+        Some(Kind::Boolean(b)) => Value::Bool(b),
+        Some(Kind::Timestamp(t)) => Value::Timestamp(t),
     }
 }
 

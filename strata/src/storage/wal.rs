@@ -392,9 +392,16 @@ const LIST: u8 = 5;
 fn put_value(out: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => out.push(NULL),
-        Value::Int(x) => {
+        // Writes log documents as stored (`value::conform`), where BOOL and
+        // TIMESTAMP fields hold integers; any other boolean or timestamp
+        // is logged as the same integer.
+        Value::Int(x) | Value::Timestamp(x) => {
             out.push(INT);
             out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Bool(b) => {
+            out.push(INT);
+            out.extend_from_slice(&(*b as i64).to_le_bytes());
         }
         Value::Float(x) => {
             out.push(FLOAT);

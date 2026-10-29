@@ -18,8 +18,11 @@
 //! ```
 //!
 //! Types are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or
-//! `DOUBLE`, `REAL`), `VECTOR(dimensions)`, `SPARSE` and `EDGES`;
-//! `KEYWORD[]` and `INT[]` hold lists. `OPTIONS(...)` takes the options of
+//! `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (microseconds,
+//! UTC; or `TIMESTAMPTZ`, `DATETIME`), `VECTOR(dimensions)`, `SPARSE` and
+//! `EDGES`; `KEYWORD[]` and `INT[]` hold lists. A table with a BOOL or
+//! TIMESTAMP column makes the database format 3
+//! ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
 //! the schema's short JSON form ([`crate::schema::Schema::from_json`]):
 //! `positions`, `stored` and `indexed` (true or false), `from` (the fields
 //! a generated TEXT field joins), `index` (`'hnsw'` with `m` and
@@ -50,7 +53,7 @@ fn err(m: impl Into<String>) -> Error {
 
 /// The forms this module binds, for error messages.
 const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table])";
-const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, VECTOR(dimensions), SPARSE or EDGES, and KEYWORD[] or INT[] for lists";
+const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE or EDGES, and KEYWORD[] or INT[] for lists";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
 /// EXISTS`. `tables` are the database's tables, which references name.
@@ -283,6 +286,9 @@ fn column_type(t: &DataType) -> std::result::Result<(&'static str, bool, Option<
     match t.to_string().to_ascii_uppercase().as_str() {
         "TEXT" => Ok(("text", false, None)),
         "INT" | "INTEGER" | "BIGINT" | "INT64" => Ok(("int", false, None)),
+        "BOOL" | "BOOLEAN" => Ok(("bool", false, None)),
+        "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "DATETIME" => Ok(("timestamp", false, None)),
+        "DATE" => Err(format!("{t} is not a type here: a TIMESTAMP holds dates (as midnight UTC) and times")),
         "FLOAT" | "DOUBLE" | "REAL" | "DOUBLE PRECISION" | "FLOAT64" => Ok(("float", false, None)),
         s if s.starts_with("VARCHAR") || s.starts_with("CHAR") || s.starts_with("STRING") => {
             Err(format!("{t} is not a type here: use TEXT for text searched by its words, KEYWORD for exact values"))

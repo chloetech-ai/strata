@@ -18,6 +18,15 @@ pub enum Value {
     /// The values of a multi-valued KEYWORD or INT field
     /// ([`crate::schema::Field::multi`]).
     List(Vec<Value>),
+    /// A BOOL field's value. Its column holds 1 or 0
+    /// ([`crate::schema::Logical`]): queries return this, and writes take
+    /// it or the integer.
+    Bool(bool),
+    /// A TIMESTAMP field's value, in microseconds since
+    /// 1970-01-01T00:00:00Z ([`crate::timestamp`]). Its column holds the
+    /// integer: queries return this, and writes take it, the integer or
+    /// ISO 8601 text.
+    Timestamp(i64),
 }
 
 impl Value {
@@ -27,16 +36,20 @@ impl Value {
             _ => None,
         }
     }
+    /// An integer, or a boolean as 1 or 0.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Int(v) => Some(*v),
+            Value::Bool(b) => Some(*b as i64),
             _ => None,
         }
     }
+    /// A number, or a boolean as 1 or 0.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
+            Value::Bool(b) => Some(*b as i64 as f64),
             _ => None,
         }
     }
@@ -78,7 +91,23 @@ impl From<i64> for Value {
 /// One row: a value per schema field, in schema order.
 pub type Document = Vec<Value>;
 
-/// Checks that `doc` has one value of the right type per field.
+/// Puts `doc`'s values in the form the table stores
+/// ([`crate::schema::Field::store`]: BOOL and TIMESTAMP values as
+/// integers, a boolean in another INT or FLOAT field as 1 or 0) and
+/// [`validate`]s it. Writes call this; documents read back hold the
+/// stored form.
+pub fn conform(schema: &Schema, doc: &mut Document) -> Result<()> {
+    let typed = |v: &Value| matches!(v, Value::Bool(_) | Value::Timestamp(_));
+    for (f, v) in schema.fields.iter().zip(doc.iter_mut()) {
+        if f.logical.is_some() || typed(v) || matches!(v, Value::List(xs) if xs.iter().any(typed)) {
+            *v = f.store(std::mem::replace(v, Value::Null))?;
+        }
+    }
+    validate(schema, doc)
+}
+
+/// Checks that `doc` has one value of the right type per field, in the
+/// stored form ([`conform`]).
 pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
     if doc.len() != schema.fields.len() {
         return Err(Error::Schema(format!("document has {} values, table has {} fields", doc.len(), schema.fields.len())));
@@ -94,7 +123,7 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
         let ok = match (&f.ty, v) {
             (_, Value::Null) => schema.primary_key.map_or(true, |pk| schema.fields[pk].name != f.name),
             (FieldType::Text { .. } | FieldType::Keyword, Value::Str(_)) => true,
-            (FieldType::Int, Value::Int(_)) => true,
+            (FieldType::Int, Value::Int(x)) => f.logical != Some(crate::schema::Logical::Bool) || matches!(x, 0 | 1),
             // NaN and infinities have no place in an order or a sum (as in
             // Elasticsearch and Lucene, which refuse them too).
             (FieldType::Float, Value::Float(x)) => x.is_finite(),

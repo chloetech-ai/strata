@@ -70,6 +70,8 @@ fn show(v: &Value) -> String {
         }
         Value::Vector(v) => format!("vector({})", v.len()),
         Value::List(xs) => format!("[{}]", xs.iter().map(show).collect::<Vec<_>>().join(", ")),
+        Value::Bool(b) => b.to_string(),
+        Value::Timestamp(t) => strata::timestamp::format(*t),
     }
 }
 

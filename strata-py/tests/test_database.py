@@ -135,3 +135,48 @@ def test_threads_and_close(tmp_path, db):
     assert db.closed and "closed" in repr(db)
     with pytest.raises(strata.StrataError, match="closed"):
         db.query("SELECT id FROM books")
+
+
+TASKS = {
+    "table": "tasks",
+    "key": "id",
+    "fields": [
+        {"name": "id", "type": "keyword"},
+        {"name": "done", "type": "bool"},
+        {"name": "at", "type": "timestamp"},
+        {"name": "n", "type": "int"},
+    ],
+}
+
+
+def test_bool_and_timestamp(tmp_path):
+    from datetime import date, datetime, timedelta, timezone
+
+    with strata.Database.create(tmp_path / "tasks.strata", TASKS) as db:
+        assert [f["type"] for f in db.schema["fields"]] == ["keyword", "bool", "timestamp", "int"]
+        db.insert([
+            {"id": "a", "done": True, "at": datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc), "n": 1},
+            {"id": "b", "done": False, "at": date(2026, 10, 2), "n": 2},
+            {"id": "c", "done": None, "at": datetime(2026, 10, 1, 3, 30, tzinfo=timezone(timedelta(hours=2))), "n": 3},
+            {"id": "d", "done": "true", "at": "2026-10-03T12:00:00.25Z", "n": 4},
+        ])
+        # Booleans come back as bool, times as ISO 8601 text in UTC (as the
+        # HTTP API gives them).
+        r = db.query("SELECT id, done, at FROM tasks ORDER BY n")
+        assert [list(row.values()) for row in r] == [
+            ["a", True, "2026-10-01T09:00:00Z"],
+            ["b", False, "2026-10-02T00:00:00Z"],
+            ["c", None, "2026-10-01T01:30:00Z"],
+            ["d", True, "2026-10-03T12:00:00.250Z"],
+        ]
+        assert db.query("SELECT id FROM tasks WHERE done = :d ORDER BY n", d=True).keys == ["a", "d"]
+        since = datetime(2026, 10, 1, 12, 0)
+        assert db.query("SELECT id FROM tasks WHERE at >= :t ORDER BY n", t=since).keys == ["b", "d"]
+        assert db.query("SELECT id FROM tasks WHERE NOT done AND at < '2026-10-05'").keys == ["b"]
+        assert db.query("SELECT MAX(at) FROM tasks").scalar() == "2026-10-03T12:00:00.250Z"
+        assert db.sql("UPDATE tasks SET done = :d, at = :t WHERE id = 'c'", d=False, t=date(2026, 11, 1)) == 1
+        assert db.query("SELECT done, at FROM tasks WHERE id = 'c'")[0] == {"done": False, "at": "2026-11-01T00:00:00Z"}
+        with pytest.raises(strata.StrataError, match="done"):
+            db.insert({"id": "x", "done": 2})
+        with pytest.raises(strata.StrataError, match="at"):
+            db.insert({"id": "x", "at": "next week"})

@@ -53,7 +53,7 @@ use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
 use crate::storage::state::{Check, Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::Updates;
 use crate::storage::wal::{self, Op, Wal, WalTxn};
-use crate::value::{validate, Document, Value};
+use crate::value::{conform, validate, Document, Value};
 
 /// Ids of in-memory segments have this bit set.
 const MEM_ID: u64 = 1 << 63;
@@ -668,7 +668,7 @@ impl Database {
         io::write_at(&file, &mbytes, mext.page * PAGE)?;
         io::write_at(&file, &fbytes, fext.page * PAGE)?;
         let meta = Meta {
-            format: 1,
+            format: manifest.format(),
             db_id,
             txn: 1,
             manifest: mext,
@@ -708,7 +708,7 @@ impl Database {
         let mbytes = manifest.encode();
         let name = dir::manifest_name(1);
         dir::write_file(path, &name, &mbytes, true)?;
-        dir::write_current(path, &Current { db_id, txn: 1, manifest: name, crc: crc32fast::hash(&mbytes), format: 1 }, true)?;
+        dir::write_current(path, &Current { db_id, txn: 1, manifest: name, crc: crc32fast::hash(&mbytes), format: manifest.format() }, true)?;
         Wal::create(&path.join(dir::WAL), db_id, true)?;
         dir::sync_dir(path)?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -1040,16 +1040,18 @@ impl Database {
                 }
             }
         }
+        let before = lock(&self.state).manifest.format();
         let c = vw.commit(&mut wal)?;
         self.publish(c, |st| {
             st.live_cache.clear();
             st.updates_cache.clear();
         })?;
-        if self.dir.is_none() && lock(&self.state).manifest.format() == 1 {
-            // The other meta slot still names a version with several
-            // tables, and versions of Strata from before tables refuse a
-            // file with such a slot even when it is the older one. Commit
-            // again so that both slots hold format 1.
+        if self.dir.is_none() && lock(&self.state).manifest.format() < before {
+            // The other meta slot still names a version of the newer
+            // format (several tables, or a format 3 feature), and versions
+            // of Strata that do not read it refuse a file with such a slot
+            // even when it is the older one. Commit again so that both
+            // slots hold the older format.
             let c = VersionWriter::begin(self).commit(&mut wal)?;
             self.publish(c, |_| {})?;
         }
@@ -1445,8 +1447,8 @@ impl Database {
         let mut chunk = Vec::new();
         let max = self.opts.segment_max_docs.max(1);
         for doc in docs {
-            let doc = doc?;
-            validate(schema, &doc)?;
+            let mut doc = doc?;
+            conform(schema, &mut doc)?;
             if let Some(pk) = pk {
                 let dup = !seen.insert(Key::of(&doc[pk]).expect("validated key"))
                     || (check_existing && lock(&self.state).find_live(t.pos, &doc[pk]).is_some());
@@ -2618,8 +2620,8 @@ impl<'a> WriteTxn<'a> {
         self.add_in(&t, key, field, delta)
     }
 
-    fn insert_in(&mut self, t: &TableRef, doc: Document) -> Result<()> {
-        validate(&t.schema, &doc)?;
+    fn insert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
+        conform(&t.schema, &mut doc)?;
         if let Some(pk) = t.schema.primary_key {
             let key = Key::of(&doc[pk]).expect("validated key");
             if self.is_live(t, &key, &doc[pk]) {
@@ -2636,8 +2638,8 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
-    fn upsert_in(&mut self, t: &TableRef, doc: Document) -> Result<()> {
-        validate(&t.schema, &doc)?;
+    fn upsert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
+        conform(&t.schema, &mut doc)?;
         let pk = t.primary_key()?;
         self.delete_in(t, &doc[pk].clone())?;
         let key = Key::of(&doc[pk]).expect("validated key");
@@ -2649,12 +2651,12 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
-    fn upsert_if_newer_in(&mut self, t: &TableRef, doc: Document, version: &str) -> Result<bool> {
-        validate(&t.schema, &doc)?;
+    fn upsert_if_newer_in(&mut self, t: &TableRef, mut doc: Document, version: &str) -> Result<bool> {
+        conform(&t.schema, &mut doc)?;
         let pk = t.primary_key()?;
         let vf = t.schema.fields.iter().position(|f| f.name == version).ok_or_else(|| Error::Schema(format!("no field {version}")))?;
-        if t.schema.fields[vf].ty != FieldType::Int || t.schema.fields[vf].multi {
-            return Err(Error::Schema(format!("version field {version} must be a single-valued INT")));
+        if t.schema.fields[vf].ty != FieldType::Int || t.schema.fields[vf].multi || t.schema.fields[vf].logical == Some(crate::schema::Logical::Bool) {
+            return Err(Error::Schema(format!("version field {version} must be a single-valued INT or TIMESTAMP")));
         }
         let new = doc[vf].as_i64().ok_or_else(|| Error::Schema(format!("document has no {version}")))?;
         let key = Key::of(&doc[pk]).expect("validated key");
@@ -2690,7 +2692,7 @@ impl<'a> WriteTxn<'a> {
         let k = t.key_of(key)?;
         let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
         let f = &t.schema.fields[i];
-        let value = match (&f.ty, value) {
+        let value = match (&f.ty, f.store(value)?) {
             _ if f.multi || Some(i) == t.schema.primary_key => {
                 return Err(Error::Schema(format!("{field} cannot be set in place: it is multi-valued or the key")))
             }
@@ -2718,6 +2720,9 @@ impl<'a> WriteTxn<'a> {
     fn add_in(&mut self, t: &TableRef, key: &Value, field: &str, delta: &Value) -> Result<bool> {
         let k = t.key_of(key)?;
         let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        if let Some(l) = t.schema.fields[i].logical {
+            return Err(Error::Schema(format!("{field} is a {}: set it rather than add to it", l.type_name())));
+        }
         if !self.is_live(t, &k, key) {
             return Ok(false);
         }

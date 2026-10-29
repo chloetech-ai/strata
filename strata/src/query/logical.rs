@@ -392,6 +392,30 @@ pub struct Select {
     /// Graph computations that `Pred::Graph`, `Score::Ppr`, `Score::Hops`
     /// and `Projection::Hops` refer to by index.
     pub graphs: Vec<GraphQuery>,
+    /// Per output column, the type of a BOOL or TIMESTAMP field whose
+    /// values it holds (the field, or its MIN or MAX), which the answer
+    /// gives as such rather than as the stored integers
+    /// ([`Select::typed`]).
+    pub types: Vec<Option<crate::schema::Logical>>,
+}
+
+impl Select {
+    /// `rows` with the values of BOOL and TIMESTAMP columns as
+    /// [`Value::Bool`](crate::value::Value::Bool) and
+    /// [`Value::Timestamp`](crate::value::Value::Timestamp)
+    /// ([`Select::types`]). Executors and the shard merge call it last.
+    pub fn typed(&self, rows: &mut [Vec<crate::value::Value>]) {
+        if self.types.iter().all(Option::is_none) {
+            return;
+        }
+        for row in rows {
+            for (v, t) in row.iter_mut().zip(&self.types) {
+                if let Some(t) = t {
+                    *v = t.output(std::mem::replace(v, crate::value::Value::Null));
+                }
+            }
+        }
+    }
 }
 
 /// A secondary ORDER BY key (`ORDER BY rating DESC, id`; `ORDER BY 2 DESC, 1`).

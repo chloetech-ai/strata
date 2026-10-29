@@ -28,9 +28,11 @@ pub enum Part {
 }
 
 impl Part {
+    /// A BOOL or TIMESTAMP value as the integer it is stored as.
     pub fn of(v: &Value) -> Part {
         match v {
-            Value::Int(x) => Part::Int(*x),
+            Value::Int(x) | Value::Timestamp(x) => Part::Int(*x),
+            Value::Bool(b) => Part::Int(*b as i64),
             Value::Float(x) => Part::Float(x.to_bits()),
             Value::Str(s) => Part::Str(s.clone()),
             _ => Part::Null,
@@ -102,8 +104,8 @@ impl Acc {
         match self {
             Acc::Count(n) => *n += 1,
             Acc::Sum { sum, isum, int, any } => match v {
-                Value::Int(x) => {
-                    *isum += *x as i128;
+                Value::Int(_) | Value::Bool(_) => {
+                    *isum += v.as_i64().unwrap_or(0) as i128;
                     *any = true;
                 }
                 v => {
@@ -194,14 +196,19 @@ impl Acc {
     }
 }
 
-/// Orders values of one column: numbers by value, strings by bytes, NULL first.
+/// Orders values of one column: numbers by value (booleans as 1 and 0,
+/// timestamps by time, also against text naming a time), strings by bytes,
+/// NULL first.
 pub fn cmp(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Less,
         (_, Value::Null) => Ordering::Greater,
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(x) | Value::Timestamp(x), Value::Int(y) | Value::Timestamp(y)) => x.cmp(y),
+        // A time written as text compares as the time it names.
+        (Value::Timestamp(x), Value::Str(s)) if crate::timestamp::parse(s).is_some() => x.cmp(&crate::timestamp::parse(s).unwrap()),
+        (Value::Str(s), Value::Timestamp(y)) if crate::timestamp::parse(s).is_some() => crate::timestamp::parse(s).unwrap().cmp(y),
         (Value::Int(x), Value::Float(y)) => cmp_int_float(*x, *y),
         (Value::Float(x), Value::Int(y)) => cmp_int_float(*y, *x).reverse(),
         _ => match (a.as_f64(), b.as_f64()) {

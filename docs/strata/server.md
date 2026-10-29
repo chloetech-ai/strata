@@ -82,7 +82,9 @@ The server serves a database's first table, whose schema is set when the databas
 |---|---|---|
 | `text` | words, searched by relevance | `MATCH`, `bm25()` |
 | `keyword` | exact values: ids, categories, tags | `=`, `IN`, `GROUP BY` (facets) |
-| `int`, `float` | numbers (an `int` also holds dates as Unix seconds) | ranges, sorting, sums, boosts |
+| `int`, `float` | numbers | ranges, sorting, sums, boosts |
+| `bool` | true or false | conditions (`WHERE done`), `GROUP BY` |
+| `timestamp` | a moment in UTC, to the microsecond, as ISO 8601 text (`"2026-10-01T12:30:00Z"`) | ranges, sorting, `MIN`/`MAX`, boosts by age |
 | `vector` | a fixed number of floats | `similarity()`, `distance()` |
 | `sparse` | learned term weights (SPLADE, BGE-M3), `{"term": weight}` | `similarity()` |
 | `edges` | links to other rows by key, a JSON array | [graph queries](graphs.md) |
@@ -103,7 +105,7 @@ The server serves a database's first table, whose schema is set when the databas
 
 ## Loading rows
 
-Rows come as JSON Lines (an object per line), a JSON array of objects, or CSV or TSV with a header row. Each column goes to the field of its name; columns the schema has no field for are skipped and reported. A row's values are what a write takes: a list for a `multi` field, an array of numbers for a vector, an object of weights for a `sparse` field. In CSV and TSV an empty cell is empty (null), a list is `a|b|c` or a JSON array, and vectors, sparse weights and edges are JSON. Vectors of [embedded fields](#embedded-vector-fields) that a row leaves out are computed from its other fields.
+Rows come as JSON Lines (an object per line), a JSON array of objects, or CSV or TSV with a header row. Each column goes to the field of its name; columns the schema has no field for are skipped and reported. A row's values are what a write takes: `true` or `false` for a `bool` (or 1, 0, `"true"`, `"false"`), ISO 8601 text for a `timestamp`, a list for a `multi` field, an array of numbers for a vector, an object of weights for a `sparse` field. In CSV and TSV an empty cell is empty (null), a list is `a|b|c` or a JSON array, and vectors, sparse weights and edges are JSON. Vectors of [embedded fields](#embedded-vector-fields) that a row leaves out are computed from its other fields.
 
 From the command line, into a database no server has open (an open database is locked):
 

@@ -440,7 +440,7 @@ async function loadSchema() {
   const s = j.schema;
   S = {
     table: s.table, pk: j.primary_key, embeddings: j.embeddings || [], short: j.short,
-    fields: s.fields.map((f) => ({ name: f.name, kind: kindOf(f.ty), dim: f.ty.Vector ? f.ty.Vector.dim : null, stored: f.stored, indexed: f.indexed, multi: !!f.multi, generated: (f.generated_from || []).length > 0 })),
+    fields: s.fields.map((f) => ({ name: f.name, kind: f.logical || kindOf(f.ty), dim: f.ty.Vector ? f.ty.Vector.dim : null, stored: f.stored, indexed: f.indexed, multi: !!f.multi, generated: (f.generated_from || []).length > 0 })),
   };
   $("table").textContent = S.table;
   renderFields();
@@ -460,7 +460,7 @@ function renderFields() {
     const row = el("div", { class: "field", title: e ? `${f.name}: ${e.model}'s embedding of ${e.from.join(" + ")}` : f.name },
       el("span", { class: "name", text: f.name }), el("span", { class: "row", style: "gap:4px;flex-wrap:nowrap" }, badges));
     row.onclick = async () => {
-      if (f.kind === "keyword" || (f.kind === "int" && f.multi)) {
+      if (f.kind === "keyword" || f.kind === "bool" || (f.kind === "int" && f.multi)) {
         if (!vals.classList.contains("hidden")) { vals.classList.add("hidden"); return; }
         vals.classList.remove("hidden"); vals.replaceChildren(el("span", { class: "small muted", text: "counting…" }));
         try {
@@ -516,11 +516,11 @@ function setupBuilder() {
   $("bVecRow").classList.toggle("hidden", vecFields.length === 0 || !S.pk);
   $("bVecField").replaceChildren(...vecFields.map((f) => { const e = embeddingOf(f.name); return opt(f.name, e ? `${f.name} ← ${e.from.join(" + ")}` : f.name); }));
   $("bVecField").addEventListener("input", () => { vecFieldChanged(); updateSql(); }); vecFieldChanged();
-  $("bSort").replaceChildren(opt("", "relevance / none"), ...S.fields.filter((f) => isNum(f) && !f.multi).map((f) => opt(f.name)));
-  $("bBoostField").replaceChildren(opt("", "no boost"), ...S.fields.filter((f) => isNum(f) && !f.multi).map((f) => opt(f.name)));
+  $("bSort").replaceChildren(opt("", "relevance / none"), ...S.fields.filter((f) => (isNum(f) || f.kind === "timestamp") && !f.multi).map((f) => opt(f.name)));
+  $("bBoostField").replaceChildren(opt("", "no boost"), ...S.fields.filter((f) => (isNum(f) || f.kind === "timestamp") && !f.multi).map((f) => opt(f.name)));
   $("bBoostField").addEventListener("input", () => { for (const id of ["bBoostOrigin", "bBoostScale", "bBoostShape"]) $(id).disabled = !$("bBoostField").value; updateSql(); });
   for (const id of ["bBoostOrigin", "bBoostScale", "bBoostShape"]) $(id).addEventListener("input", updateSql);
-  $("bFacet").replaceChildren(opt("", "nothing"), ...S.fields.filter((f) => (f.kind === "keyword" && f.name !== S.pk) || (f.kind === "int" && f.multi)).map((f) => opt(f.name)));
+  $("bFacet").replaceChildren(opt("", "nothing"), ...S.fields.filter((f) => (f.kind === "keyword" && f.name !== S.pk) || f.kind === "bool" || (f.kind === "int" && f.multi)).map((f) => opt(f.name)));
   const selectable = S.fields.filter((f) => f.kind !== "vector" && (f.stored || f.name === S.pk));
   if (!B.cols) B.cols = new Set(selectable.slice(0, 8).map((f) => f.name));
   $("bCols").replaceChildren(...selectable.map((f) => {
@@ -545,7 +545,8 @@ function setupBuilder() {
 function opsFor(f) {
   if (!f) return ["="];
   if (f.kind === "text") return ["matches", "matches, allowing typos", "matches, with synonyms"];
-  if (isNum(f) && !f.multi) return ["=", "!=", "<", "<=", ">", ">=", "between", "in"];
+  if ((isNum(f) || f.kind === "timestamp") && !f.multi) return ["=", "!=", "<", "<=", ">", ">=", "between", "in"];
+  if (f.kind === "bool") return ["=", "!="];
   if (f.multi) return ["has", "has any of", "has none of"];
   return ["=", "!=", "in", "not in"];
 }
@@ -662,13 +663,14 @@ function joinSpec() {
 // ---- summaries: GROUP BY and aggregates ---------------------------------------------
 const METRICS = [["COUNT", "count rows"], ["COUNT DISTINCT", "count different"], ["SUM", "sum of"], ["AVG", "average of"], ["MIN", "minimum of"], ["MAX", "maximum of"]];
 function metricFields(fn) {
-  const ok = (f) => f.indexed && (fn === "SUM" || fn === "AVG" ? isNum(f) : (f.kind === "keyword" || isNum(f)));
+  // SUM of a bool counts its trues; times have a MIN and MAX but no sum.
+  const ok = (f) => f.indexed && (fn === "SUM" || fn === "AVG" ? isNum(f) || (fn === "SUM" && f.kind === "bool") : (f.kind === "keyword" || isNum(f) || f.kind === "bool" || f.kind === "timestamp"));
   const mine = S.fields.filter(ok).map((f) => f.name);
   return $("bJoinHow").value ? [...mine, ...mine.map((n) => "b." + n)] : mine;
 }
 function renderSummary() {
   const joined = !!$("bJoinHow").value;
-  const groupable = S.fields.filter((f) => f.indexed && (f.kind === "keyword" || isNum(f))).map((f) => f.name);
+  const groupable = S.fields.filter((f) => f.indexed && (f.kind === "keyword" || isNum(f) || f.kind === "bool")).map((f) => f.name);
   const names = joined ? [...groupable, ...groupable.map((n) => "b." + n)] : groupable;
   B.groupBy = B.groupBy.filter((n) => names.includes(n));
   $("bGroupBy").replaceChildren(...names.map((n) => {
@@ -757,8 +759,10 @@ function builderQuery() {
   const bf = $("bBoostField").value, bo = $("bBoostOrigin").value.trim(), bs = $("bBoostScale").value.trim();
   if (bf) {
     const num = (v) => /^-?\d+(\.\d+)?$/.test(v);
-    const origin = bo.toLowerCase() === "now" ? "now()" : num(bo) ? bo : null;
-    if (!origin || !num(bs) || Number(bs) <= 0) $("bBoostNote").textContent = "Give a number (or now) and a scale above 0.";
+    // A TIMESTAMP's origin is a date or time, and its scale seconds.
+    const time = S.fields.find((f) => f.name === bf)?.kind === "timestamp";
+    const origin = bo.toLowerCase() === "now" ? "now()" : time ? (/^\d{4}-\d\d-\d\d/.test(bo) ? sqlStr(bo) : null) : num(bo) ? bo : null;
+    if (!origin || !num(bs) || Number(bs) <= 0) $("bBoostNote").textContent = time ? "Give a date (or now) and a scale in seconds above 0." : "Give a number (or now) and a scale above 0.";
     else if (textScore && vecScore) $("bBoostNote").textContent = "A boost multiplies one ranking: clear the text or the similarity.";
     else if (!agg) boost = `decay(${A}${ident(bf)}, ${origin}, ${bs}${$("bBoostShape").value !== "exp" ? `, shape => '${$("bBoostShape").value}'` : ""})`;
   }
@@ -1448,7 +1452,7 @@ async function refreshHealth() {
   } catch (e) { $("dot").className = "dot bad"; $("counts").textContent = e.message; }
 }
 // ---- schema and import ----------------------------------------------------------
-const TYPES = ["text", "keyword", "int", "float", "vector", "sparse", "edges"];
+const TYPES = ["text", "keyword", "int", "float", "bool", "timestamp", "vector", "sparse", "edges"];
 const MODELS = { "potion-retrieval-32M": 512, "potion-base-8M": 256, "bge-small-en-v1.5": 384, "snowflake-arctic-embed-m-v1.5": 768 };
 const modelDim = (m) => !m ? null : m.startsWith("hash:") ? Number(m.slice(5)) || null : (MODELS[m] || null);
 const FORMATS = { jsonl: "jsonl", ndjson: "jsonl", json: "json", csv: "csv", tsv: "tsv", tab: "tsv" };
@@ -1725,7 +1729,9 @@ function guessField(name, values, delimited) {
     return /^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t) ? Number(t) : v;
   });
   if (!vs.length) return { name, type: "text" };
+  if (vs.every((v) => typeof v === "boolean" || /^(true|false)$/i.test(v))) return { name, type: "bool" };
   if (vs.every((v) => typeof v === "number" || typeof v === "boolean")) return { name, type: vs.every((v) => typeof v === "boolean" || Number.isInteger(v)) ? "int" : "float" };
+  if (vs.every((v) => typeof v === "string" && /^\d{4}-\d\d-\d\d([Tt ]\d\d:\d\d(:\d\d([.,]\d+)?)?([Zz]|[+-]\d\d(:?\d\d)?)?)?$/.test(v.trim()))) return { name, type: "timestamp" };
   if (vs.every(Array.isArray)) {
     const flat = vs.flat();
     if (flat.length && flat.every((x) => typeof x === "number")) {

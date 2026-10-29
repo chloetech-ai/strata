@@ -29,10 +29,12 @@ pub const META_PAGES: u64 = 2;
 const MAGIC: &[u8; 8] = b"STRATADB";
 /// On-disk format version, bumped on incompatible changes: 1 for a
 /// database holding the one table it was created with, 2 for one with
-/// several tables (see [`crate::storage::manifest`]). A file is written in
-/// the oldest format that holds it, so older versions of Strata keep opening
-/// databases with one table.
-pub const FORMAT_VERSION: u32 = 2;
+/// several tables, 3 for one using a feature that format names (see
+/// [`crate::storage::manifest`]); 3 is the last, and later changes add
+/// features instead. A file is written in the oldest format that holds it,
+/// so older versions of Strata keep opening databases that need nothing
+/// newer.
+pub const FORMAT_VERSION: u32 = 3;
 const META_LEN: usize = 84;
 
 /// A run of pages holding `len` bytes, starting at page `page`.
