@@ -79,7 +79,8 @@ fn is_table(name: &sql::ObjectName, schema: &Schema) -> bool {
     name.to_string().eq_ignore_ascii_case(&schema.table)
 }
 
-fn needs(q: &sql::Query, schema: &Schema) -> bool {
+/// [`is_compound`] of a parsed query.
+pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
     if q.with.is_some() {
         return true;
     }
@@ -135,7 +136,7 @@ fn select_exprs(s: &sql::Select) -> Vec<&Expr> {
 }
 
 /// Calls `f` on `e` and then its subexpressions, outside subqueries.
-fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+pub(crate) fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     match e {
         Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::Cast { expr: x, .. } => walk(x, f),
@@ -210,10 +211,14 @@ pub fn run(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner
 /// tables and the joined rows are counted against while the query runs.
 /// The steps themselves run under whatever options `runner` gives them.
 pub fn run_checked(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let q = parse(sql_text)?;
+    run_query(&*parse(sql_text)?, schema, params, runner, opts)
+}
+
+/// [`run_checked`] of a parsed query.
+pub(crate) fn run_query(q: &sql::Query, schema: &Schema, params: &Params, runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
     let charge = Charge::new(opts.memory.clone());
     let mut cx = Ctx { schema, params: params.clone(), ctes: HashMap::new(), runner, next: 0, plan: Vec::new(), opts, steps: 0, charge };
-    let rel = cx.query(&q)?;
+    let rel = cx.query(q)?;
     let n = rel.rows.len();
     Ok(ResultSet {
         columns: rel.columns,

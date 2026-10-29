@@ -77,8 +77,10 @@ Rows are dicts of field name to value: `str`, `int`, `float`, `None`, a list for
 | `insert(rows)` | adds a row (a dict) or rows (any iterable of dicts) whose keys must be new; all or none are written. From 1,000 rows on, they are bulk-loaded straight into segments. |
 | `upsert(rows)` | adds rows, replacing the rows with their keys, in transactions of 10,000 |
 | `delete(keys)` | deletes the rows with a key or keys; returns how many there were |
-| `sql("UPDATE ...")` | `INSERT`, `UPDATE` and `DELETE` statements; returns the rows written |
+| `sql("UPDATE ...")` | `INSERT`, `UPDATE` and `DELETE` statements; returns the rows written. In-process it also runs `CREATE TABLE` and `DROP TABLE` ([tables](query-language.md#tables)), which return 0, and writes any table |
 | `import_file(path, format=None)` | loads a JSON Lines, JSON, CSV or TSV file ([how files are read](server.md#loading-rows)); returns `{rows, bulk, skipped_fields}` |
+
+`insert`, `upsert`, `delete` and `import_file` write the database's first table, the one its schema describes; `sql` names the table it writes. A server serves only its first table.
 
 Vectors of embedded fields that a row leaves out are computed by the field's model when it is open; `db.embed_errors` lists the embedded fields whose model did not open, whose vectors rows must then bring.
 
