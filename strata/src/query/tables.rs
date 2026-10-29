@@ -88,7 +88,7 @@ impl Names {
     fn factor(&mut self, f: &TableFactor) {
         match f {
             TableFactor::Table { name, .. } => {
-                let name = name.to_string();
+                let name = crate::query::sql::table_name(name);
                 if !self.ctes.contains(&name.to_ascii_lowercase()) {
                     self.tables.push(name);
                 }

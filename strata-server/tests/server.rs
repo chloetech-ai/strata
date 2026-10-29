@@ -882,6 +882,20 @@ async fn embedded_fields_over_http() {
     // Only an embedded field with a model embeds text.
     let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id FROM products ORDER BY similarity(emb, :q) DESC LIMIT 1", "params": {"q": {"embed": "x", "field": "title"}}})).await;
     assert_eq!(status, 400, "{r}");
+
+    // /v1/embed gives the vector an {"embed": ...} parameter stands for, for
+    // a plan or a client that sends vectors: the same rows come back.
+    let (status, e) = post(&c, &format!("{base}/v1/embed"), json!({"text": "giraffe lamp"})).await;
+    assert_eq!((status, &e["field"]), (200, &json!("emb")), "{e}");
+    assert_eq!(e["vector"].as_array().map(|v| v.len()), Some(64), "{e}");
+    let (_, named) = post(&c, &format!("{base}/v1/embed"), json!({"text": "giraffe lamp", "field": "EMB"})).await;
+    assert_eq!(named, e);
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id FROM products ORDER BY similarity(emb, :q) DESC LIMIT 1", "params": {"q": e["vector"]}})).await;
+    assert_eq!(r["rows"][0][0], json!("zz1"), "{r}");
+    for bad in [json!({"text": "x", "field": "title"}), json!({"text": "x", "field": 3}), json!({"field": "emb"})] {
+        let (status, r) = post(&c, &format!("{base}/v1/embed"), bad.clone()).await;
+        assert_eq!(status, 400, "{bad}: {r}");
+    }
 }
 
 const ITEMS: &str = r#"{"table": "items", "key": "id", "fields": [

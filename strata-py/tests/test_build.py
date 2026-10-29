@@ -1,0 +1,124 @@
+"""Queries built from Python values (`strata.build`): each runs as the SQL
+it stands for, names any field, and takes values as they are."""
+
+import datetime
+
+import pytest
+
+import strata
+from strata import bm25, col, count, lit, match, rrf, score, similarity
+from conftest import BOOKS, book
+
+
+def same(db, q, sql, **params):
+    """The builder's query answers as its SQL does."""
+    got, want = db.run(q), db.query(sql, params or None)
+    assert got.columns == want.columns, sql
+    assert got.rows == want.rows, sql
+    assert list(q) == list(want), sql
+    return got
+
+
+def test_builder_runs_as_its_sql(db):
+    t = db.table()
+    r = same(db, t.select("id", "year").where((col("year") >= 1950) & (col("rating") < 3)).order_by(col("year").desc()).limit(5),
+             "SELECT id, year FROM books WHERE year >= 1950 AND rating < 3 ORDER BY year DESC LIMIT 5")
+    assert len(r) == 5
+    r = same(db, t.select("id", score()).where(match("description", "dragon ship")).order_by(bm25("description", "dragon ship")).limit(5),
+             "SELECT id, score() FROM books WHERE MATCH(description, 'dragon ship') ORDER BY bm25(description, 'dragon ship') DESC LIMIT 5")
+    assert len(r) == 5
+    same(db, t.select("id").where(col("genres").isin(["classic"]) & ~col("year").between(1950, 1999)).order_by(col("year")),
+         "SELECT id FROM books WHERE genres IN ('classic') AND NOT (year BETWEEN 1950 AND 1999) ORDER BY year")
+    same(db, t.select("id").where((col("year") < 1910) | (col("year") > 2015)).order_by(col("year").desc()).limit(4).offset(2),
+         "SELECT id FROM books WHERE year < 1910 OR year > 2015 ORDER BY year DESC LIMIT 4 OFFSET 2")
+    same(db, t.select("id").order_by(rrf(bm25("title", "dragon"), bm25("description", "dragon"), k=30)).limit(5),
+         "SELECT id FROM books ORDER BY rrf(bm25(title, 'dragon'), bm25(description, 'dragon'), k => 30) DESC LIMIT 5")
+    same(db, t.select("id").order_by(0.7 * bm25("title", "river") + 0.3 * bm25("description", "river")).limit(5),
+         "SELECT id FROM books ORDER BY 0.7 * bm25(title, 'river') + 0.3 * bm25(description, 'river') DESC LIMIT 5")
+    # Without select: the stored fields but vectors, as SELECT * gives.
+    same(db, t.where(col("id") == "b0007"), "SELECT * FROM books WHERE id = 'b0007'")
+
+
+def test_groups(db):
+    t = db.table()
+    r = same(db, t.select("genres", count().alias("n"), col("rating").avg().alias("r")).group_by("genres").having(count() > 50).order_by(col("genres")),
+             "SELECT genres, COUNT(*) AS n, AVG(rating) AS r FROM books GROUP BY genres HAVING COUNT(*) > 50 ORDER BY genres")
+    assert r.column("genres") == ["fantasy", "mystery", "new"]
+    same(db, t.select("genres", count()).group_by("genres").having(count() != 100, col("year").max() <= 2018).order_by(count().desc()),
+         "SELECT genres, COUNT(*) FROM books GROUP BY genres HAVING COUNT(*) != 100 AND MAX(year) <= 2018 ORDER BY COUNT(*) DESC")
+    assert t.select(count()).run().scalar() == 200
+    same(db, t.select(count(), col("year").count(distinct=True)).where(col("rating") >= 4),
+         "SELECT COUNT(*), COUNT(DISTINCT year) FROM books WHERE rating >= 4")
+
+
+def test_values_need_no_quoting(tmp_path):
+    """Any field name, and any text, with no escaping: a name SQL reserves,
+    one with a space or a quote, text with quotes."""
+    schema = {"table": "notes", "key": "id", "fields": [
+        {"name": "id", "type": "keyword"},
+        {"name": "order", "type": "int"},
+        {"name": "doc no", "type": "keyword"},
+        {"name": 'say "hi"', "type": "text"},
+        {"name": "when", "type": "timestamp"},
+        {"name": "done", "type": "bool"},
+    ]}
+    with strata.Database.create(tmp_path / "n.strata", schema) as db:
+        db.insert([
+            {"id": "a", "order": 1, "doc no": "O'Brien \"7\"", "say \"hi\"": "it's a 'quoted' word", "when": "2026-10-01T00:00:00Z", "done": True},
+            {"id": "b", "order": 2, "doc no": "x", "say \"hi\"": "plain words", "when": "2026-10-20T12:00:00Z", "done": False},
+            {"id": "c", "order": 3, "doc no": "y", "say \"hi\"": "more plain words"},
+        ])
+        ids = lambda q: [r["id"] for r in q]
+        t = db.table()
+        assert ids(t.select("id").where(col("doc no") == "O'Brien \"7\"")) == ["a"]
+        assert ids(t.select("id").where(match('say "hi"', "quoted"))) == ["a"]
+        assert ids(t.select("id").where(col("order") > 1).order_by(col("order").desc())) == ["c", "b"]
+        assert ids(t.select("id").where(col("when") >= datetime.date(2026, 10, 10))) == ["b"]
+        assert ids(t.select("id").where(col("when") < datetime.datetime(2026, 10, 10, tzinfo=datetime.timezone.utc))) == ["a"]
+        assert ids(t.select("id").where(col("done") == True).order_by(col("order"))) == ["a"]  # noqa: E712
+        assert ids(t.select("id").where(col("done").is_null())) == ["c"]
+        assert ids(t.select("id").where(col("when").is_not_null()).order_by(col("order"))) == ["a", "b"]
+        # Names in another case find the field; a column is named as
+        # written, as in SQL.
+        assert [r["ID"] for r in t.select("ID").where(col("ORDER") == 2)] == ["b"]
+        # The SQL condition of search() names fields quoted too.
+        assert ids(db.search("words", where=col("order") >= 3)) == ["c"]
+        assert ids(db.search("words", where='"order" >= 3')) == ["c"]
+
+
+def test_search_takes_a_condition(db):
+    a = db.search("dragon", limit=5, where=col("year") >= 1950)
+    b = db.search("dragon", limit=5, where="year >= 1950")
+    assert a.column("id") == b.column("id") and len(a) == 5
+    assert all(r["year"] >= 1950 for r in a)
+    assert db.search("dragon", where="").column("id") == db.search("dragon").column("id")
+    a = db.search("dragon", limit=5, where=col("year") >= 1950, columns=["id", "year", "score()"])
+    b = db.search("dragon", limit=5, where="year >= 1950", columns=["id", "year", "score()"])
+    assert a.columns == b.columns == ["id", "year", "score()"] and a.rows == b.rows
+    v = db.embed("dragon ship", "emb")
+    near = db.table().select("id").order_by(similarity("emb", v)).limit(3)
+    assert near.run().rows == db.query("SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 3", {"v": {"embed": "dragon ship"}}).rows
+
+
+def test_mistakes_are_errors(db):
+    t = db.table()
+    with pytest.raises(strata.StrataError, match="no field 'nope'"):
+        t.where(col("nope") == 1).plan()
+    with pytest.raises(TypeError, match="&, \\| and ~"):
+        t.where(col("year") > 1950 and col("year") < 2000)
+    with pytest.raises(TypeError):
+        t.where(1950 < col("year") < 2000)
+    with pytest.raises(strata.StrataError, match="is_null"):
+        t.where(col("year") == None).plan()  # noqa: E711
+    with pytest.raises(strata.StrataError, match="group_by"):
+        t.select("id").having(count() > 1).plan()
+    with pytest.raises(strata.StrataError, match="not a group key"):
+        t.select("id", count()).group_by("genres").plan()
+    with pytest.raises(strata.StrataError, match="embed the text"):
+        t.order_by(similarity("emb", "dragon")).plan()
+    with pytest.raises(strata.StrataError, match="no table"):
+        db.table("other")
+    with pytest.raises(TypeError):
+        t.where(col("year") == object()).plan()
+    # A value where an expression is wanted.
+    assert t.select("id").where(col("year") == lit(1950)).run().column("id") == db.query("SELECT id FROM books WHERE year = 1950").column("id")

@@ -13,6 +13,7 @@ from typing import Any, Iterable, Mapping
 
 from ._search import Search, ordered_schema, params as _params
 from ._strata import StrataError
+from .build import Query
 from .result import Result
 
 # Rows a write request carries.
@@ -120,11 +121,19 @@ class Client(Search):
         bound query ("logical")."""
         return self._call("POST", "/v1/explain", {"sql": sql, "params": _params(params, kw)})
 
-    def run(self, plan: Mapping[str, Any]) -> Result | int:
-        """Runs a plan (the "ir" of `explain`): a read's `Result`, or the
-        number of rows a write wrote."""
+    def run(self, plan: Mapping[str, Any] | Query) -> Result | int:
+        """Runs a plan (the "ir" of `explain`, or a `Query`): a read's
+        `Result`, or the number of rows a write wrote."""
+        if isinstance(plan, Query):
+            plan = plan.plan()
         r = self._call("POST", "/v1/plan", {"plan": plan})
         return Result._of(r) if "rows" in r else int(r["written"])
+
+    def embed(self, text: str, field: str | None = None) -> list[float]:
+        """The query vector of `text` by an embedded field's model, on the
+        server."""
+        body = {"text": text} if field is None else {"text": text, "field": field}
+        return self._call("POST", "/v1/embed", body)["vector"]
 
     def write(self, ops: list[dict]) -> int:
         """Write operations as /v1/write takes them ({"op": "insert",

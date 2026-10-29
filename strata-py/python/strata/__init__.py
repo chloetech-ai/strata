@@ -37,11 +37,33 @@ from typing import Any, Iterable, Mapping
 
 from . import _strata
 from ._search import Search, ordered_schema, params as _params
+from .build import Expr, Query, bm25, col, count, hops, lit, match, path, ppr, reachable, rrf, score, similarity
 from ._strata import StrataError
 from .client import Client
 from .result import Result
 
-__all__ = ["Database", "Client", "Result", "StrataError", "open", "connect"]
+__all__ = [
+    "Database",
+    "Client",
+    "Result",
+    "StrataError",
+    "open",
+    "connect",
+    "Query",
+    "Expr",
+    "col",
+    "lit",
+    "match",
+    "bm25",
+    "similarity",
+    "rrf",
+    "score",
+    "hops",
+    "count",
+    "reachable",
+    "path",
+    "ppr",
+]
 
 
 def _schema_json(schema: Any) -> str:
@@ -117,9 +139,11 @@ class Database(Search):
         it: the plan IR as JSON, which `run` takes."""
         return json.loads(self._db.plan(sql, _params(params, kw)))
 
-    def run(self, plan: Mapping[str, Any]) -> Result | int:
-        """Runs a plan (as `plan` or a server's /v1/explain gives it): a
-        read's `Result`, or the number of rows a write wrote."""
+    def run(self, plan: Mapping[str, Any] | Query) -> Result | int:
+        """Runs a plan (as `plan`, a `Query` or a server's /v1/explain gives
+        it): a read's `Result`, or the number of rows a write wrote."""
+        if isinstance(plan, Query):
+            plan = plan.plan()
         r = self._db.run(json.dumps(plan))
         return r if isinstance(r, int) else Result._of(r)
 

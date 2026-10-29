@@ -52,6 +52,30 @@ def test_client_search_and_import(client, tmp_path):
     assert client.query("SELECT id FROM books WHERE MATCH(title, 'zebra')").keys == ["z1"]
 
 
+def test_client_builder_and_embed(client, tmp_path):
+    """A built query runs on the server as its SQL does; /v1/embed gives the
+    vector the server's model gives a text, the local model's too."""
+    from strata import bm25, col, count, similarity
+
+    t = client.table()
+    q = t.select("id", "year").where((col("year") >= 1950) & ~col("genres").isin(["classic"])).order_by(bm25("description", "dragon ship")).limit(5)
+    want = client.query("SELECT id, year FROM books WHERE year >= 1950 AND NOT (genres IN ('classic')) ORDER BY bm25(description, 'dragon ship') DESC LIMIT 5")
+    assert client.run(q).rows == want.rows and [r["id"] for r in q] == want.keys
+    g = t.select("genres", count().alias("n")).group_by("genres").having(count() > 50).order_by(col("genres"))
+    assert client.run(g).rows == client.query("SELECT genres, COUNT(*) AS n FROM books GROUP BY genres HAVING COUNT(*) > 50 ORDER BY genres").rows
+    v = client.embed("dragon ship")
+    assert len(v) == 32 and client.embed("dragon ship", "emb") == v
+    with strata.Database.create(tmp_path / "local.strata", BOOKS) as local:
+        assert local.embed("dragon ship", "emb") == pytest.approx(v)
+    near = client.run(t.select("id").order_by(similarity("emb", v)).limit(3))
+    assert near.rows == client.query("SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 3", v={"embed": "dragon ship"}).rows
+    with pytest.raises(strata.StrataError, match="HTTP 400"):
+        client.embed("x", "title")
+    a = client.search("dragon", limit=5, where=col("year") >= 1950)
+    b = client.search("dragon", limit=5, where="year >= 1950")
+    assert a.keys == b.keys and len(a) == 5
+
+
 def test_client_token(tmp_path, serve):
     path = tmp_path / "t.strata"
     strata.Database.create(path, BOOKS).close()

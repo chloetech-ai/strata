@@ -13,6 +13,7 @@
 //! | `POST /v1/import?format=jsonl` | rows as JSON Lines, JSON, CSV or TSV | `{written, skipped_fields}` |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?}` | the bound query, its plan IR and the executor's plan |
+//! | `POST /v1/embed` | `{text, field?}` | `{field, vector}`: the text's vector by an embedded field's model |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
@@ -91,6 +92,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/import", post(import).layer(rows))
         .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
+        .route("/v1/embed", post(embed))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
         .route("/v1/snapshot", post(snapshot))
@@ -315,6 +317,20 @@ async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMa
 async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
     let s = strata::schema::Schema::from_json_value(&b)?;
     Ok(AxJson(json!({"schema": s, "short": s.to_short_json()})))
+}
+
+/// The vector of a text, as `{"embed": text}` gives a query's parameter:
+/// for a plan, whose vectors are values.
+async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let text = body_str(&b, "text")?;
+    let field = match b.get("field") {
+        None | Some(Json::Null) => None,
+        Some(f) => Some(f.as_str().ok_or_else(|| ApiError::bad("field is a field's name"))?),
+    };
+    let field = app.svc.model(field)?.0.to_string();
+    let p = app.svc.params(Some(&json!({ "v": { "embed": text, "field": field } }))).await?;
+    let Some(strata::value::Value::Vector(v)) = p.0.get("v") else { return Err(ApiError::internal("the text has no vector")) };
+    Ok(AxJson(json!({ "field": field, "vector": &v[..] })))
 }
 
 async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {

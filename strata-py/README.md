@@ -3,7 +3,8 @@
 `import strata` runs a Strata database in your process (`strata.open`,
 `strata.Database`), or talks to a running `strata-server` (`strata.connect`,
 `strata.Client`), with the same methods: `insert`, `upsert`, `delete`,
-`import_file`, `query`, `sql` and `search`.
+`import_file`, `query`, `sql`, `search`, and `table()` for queries built
+from Python values instead of SQL text.
 
 ```sh
 pip install ./strata-py          # from the repository's root; needs Rust
@@ -22,6 +23,10 @@ db = strata.open("books.strata", schema={
 })
 db.insert({"id": "b1", "title": "The river and the dragon", "year": 1999})
 print(db.search("dragon").dicts())
+
+from strata import col, bm25
+for row in db.table().where(col("year") >= 1990).order_by(bm25("title", "dragon")).limit(5):
+    print(row["title"])
 ```
 
 The guide is [docs/strata/python.md](../docs/strata/python.md). Tests:

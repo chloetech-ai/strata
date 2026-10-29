@@ -159,7 +159,7 @@ pub fn bind_command(sql_text: &str, tables: &[&Schema], params: &Params) -> Resu
 /// [`bind_command`] of a parsed statement.
 pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: &Params) -> Result<Command> {
     let table = |name: &sql::ObjectName| -> Result<&Schema> {
-        let n = name.to_string();
+        let n = table_name(name);
         tables.iter().copied().find(|t| t.table.eq_ignore_ascii_case(&n)).ok_or_else(|| err(format!("no such table: {n}")))
     };
     let write = |schema: &Schema, write: Write| Command::Write { table: schema.table.clone(), write };
@@ -244,6 +244,15 @@ pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: 
 }
 
 /// The name of a plain table in FROM (an alias allowed), for `what`.
+/// The table a name names: a quoted name is the name inside the quotes
+/// (`"books"` is books, `"my table"` is my table).
+pub(crate) fn table_name(n: &sql::ObjectName) -> String {
+    match n.0.as_slice() {
+        [sql::ObjectNamePart::Identifier(id)] => id.value.clone(),
+        _ => n.to_string(),
+    }
+}
+
 fn plain_table<'t>(t: &'t sql::TableFactor, what: &str) -> Result<&'t sql::ObjectName> {
     match t {
         sql::TableFactor::Table { name, alias: _, args: None, with_hints, version: None, with_ordinality: false, partitions, json_path: None, sample: None, index_hints }
@@ -587,7 +596,7 @@ impl<'a> Binder<'a> {
         if s.from.len() != 1 || !s.from[0].joins.is_empty() {
             return Err(err("exactly one table, no joins"));
         }
-        let t = plain_table(&s.from[0].relation, "SELECT")?.to_string();
+        let t = table_name(plain_table(&s.from[0].relation, "SELECT")?);
         if !t.eq_ignore_ascii_case(&self.schema.table) {
             return Err(err(format!("no such table: {t}")));
         }

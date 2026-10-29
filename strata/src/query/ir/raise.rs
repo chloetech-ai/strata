@@ -518,7 +518,19 @@ impl<'a> Raise<'a> {
             Expr::Not(x) => Having::Not(Box::new(self.having(x, out)?)),
             Expr::Between { expr, lo, hi } => Having::Range { what: out(expr)?, lo: bound(lo, f64::NEG_INFINITY)?, hi: bound(hi, f64::INFINITY)? },
             Expr::Cmp { op: CmpOp::Eq, left, right } => Having::Eq { what: out(left)?, value: self.lit(right)? },
-            e => return Err(err(format!("groups are kept by ranges and equalities of their outputs, not {e:?}"))),
+            Expr::Cmp { op: CmpOp::Ne, left, right } => Having::Not(Box::new(Having::Eq { what: out(left)?, value: self.lit(right)? })),
+            // `n > 2` is the range above 2, as SQL's binder reads it.
+            Expr::Cmp { op, left, right } => {
+                let x = self.lit(right)?.as_f64().ok_or_else(|| err("a range of groups has numeric bounds"))?;
+                let (lo, hi) = match op {
+                    CmpOp::Gt => (sql::next_up(x), f64::INFINITY),
+                    CmpOp::Ge => (x, f64::INFINITY),
+                    CmpOp::Lt => (f64::NEG_INFINITY, sql::next_down(x)),
+                    _ => (f64::NEG_INFINITY, x),
+                };
+                Having::Range { what: out(left)?, lo, hi }
+            }
+            e => return Err(err(format!("groups are kept by ranges and comparisons of their outputs, not {e:?}"))),
         })
     }
 

@@ -203,6 +203,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/import?format=F` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the bound query (`logical`) and counts |
+| `POST /v1/embed` | `{text, field?}` | `{field, vector}`: the text's vector by an embedded field's model (the first whose model is open, unless `field` names one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
 | `POST /v1/snapshot` | | a snapshot lease for 60 s: `{snapshot, txn, ttl_s}` (at most 10,000 are held at once; more get 429) |
 | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the queries it ran |

@@ -278,6 +278,52 @@ fn db_runs_plans() {
     assert!(b.prepare_plan(&read).err().unwrap().to_string().contains("reads"));
 }
 
+/// A plan keeps groups by comparisons of their outputs (`n > 3`, `n != 6`),
+/// as the Python builder writes HAVING, and runs as the SQL with the same
+/// condition. They were refused: only ranges and equalities were taken.
+#[test]
+fn grouped_plans_keep_groups_by_comparisons() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = db(&dir.path().join("d.strata"));
+    fill(&db);
+    // ml has 6 rows with a year, the latest 2025; db has 3, the latest 2024.
+    let base = "SELECT category, COUNT(*) AS n, MAX(year) AS last FROM papers WHERE year IS NOT NULL GROUP BY category";
+    let mut j = db.explain(&format!("{base} HAVING COUNT(*) BETWEEN 0 AND 100"), &Params::new()).unwrap().to_json().unwrap();
+    // The filter over the groups, and the outputs it can name.
+    fn filter(j: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
+        if j["node"] == "filter" {
+            return Some(j);
+        }
+        filter(j.get_mut("input")?)
+    }
+    let cond = |op: &str, out: usize, v: serde_json::Value| serde_json::json!({"cmp": {"op": op, "left": {"output": out}, "right": {"lit": v}}});
+    let cases = [
+        (cond("gt", 1, serde_json::json!({"int": 3})), "COUNT(*) > 3", vec!["ml"]),
+        (cond("ge", 1, serde_json::json!({"int": 3})), "COUNT(*) >= 3", vec!["db", "ml"]),
+        (cond("lt", 1, serde_json::json!({"int": 6})), "COUNT(*) < 6", vec!["db"]),
+        (cond("le", 1, serde_json::json!({"int": 3})), "COUNT(*) <= 3", vec!["db"]),
+        (cond("ne", 1, serde_json::json!({"int": 6})), "COUNT(*) != 6", vec!["db"]),
+        (cond("gt", 2, serde_json::json!({"int": 2024})), "MAX(year) > 2024", vec!["ml"]),
+        (cond("le", 2, serde_json::json!({"float": 2024.5})), "MAX(year) <= 2024.5", vec!["db"]),
+        (serde_json::json!({"not": cond("lt", 1, serde_json::json!({"int": 4}))}), "NOT (COUNT(*) < 4)", vec!["ml"]),
+    ];
+    let names = |r: SqlResult| {
+        let mut v: Vec<String> = rows(r).into_iter().map(|r| r[0].as_str().unwrap().to_string()).collect();
+        v.sort();
+        v
+    };
+    for (c, having, want) in cases {
+        *filter(&mut j["root"]).expect("a filter over the groups").get_mut("cond").unwrap() = c;
+        let plan = Plan::from_json(&j).unwrap();
+        assert_eq!(names(db.run(&plan).unwrap_or_else(|e| panic!("{having}: {e}"))), want, "{having}");
+        assert_eq!(names(run(&db, &format!("{base} HAVING {having}"))), want, "{having}");
+    }
+    // A comparison with a text bound is not a range.
+    *filter(&mut j["root"]).unwrap().get_mut("cond").unwrap() = cond("gt", 1, serde_json::json!({"text": "x"}));
+    let e = db.run(&Plan::from_json(&j).unwrap()).err().unwrap().to_string();
+    assert!(e.contains("numeric bounds"), "{e}");
+}
+
 /// A SET of a plan is an expression of the row, checked as SQL's is.
 #[test]
 fn set_plans_are_checked() {

@@ -1,11 +1,12 @@
 """What `Database` and `Client` share: the schema's reading order,
-parameters, and `search`."""
+parameters, `table` and `search`."""
 
 from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
 from ._strata import StrataError
+from .build import Expr, Query, bm25, hops, rrf, score, similarity
 from .result import Result
 
 
@@ -26,17 +27,31 @@ def params(given: Mapping[str, Any] | None, kw: Mapping[str, Any]) -> dict | Non
     return {**(given or {}), **kw}
 
 
+def quote(name: str) -> str:
+    """A name as an SQL identifier, whatever it is."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 class Search:
-    """`search`, shared by `Database` and `Client`, which give `schema`,
-    `_embedded()` (the embedded vector fields whose model is open) and
-    `query`."""
+    """`table` and `search`, shared by `Database` and `Client`, which give
+    `schema`, `_embedded()` (the embedded vector fields whose model is
+    open), `embed`, `query` and `run`."""
+
+    def table(self, name: str | None = None) -> Query:
+        """A query of the table, built from Python values (`strata.build`):
+        `db.table().where(col("year") >= 2019).order_by(bm25("body",
+        q)).limit(10)`."""
+        s = self.schema
+        if name is not None and name.lower() != s["table"].lower():
+            raise StrataError(f"no table {name}: this serves {s['table']}")
+        return Query(self, s)
 
     def search(
         self,
         text: str,
         *,
         limit: int = 10,
-        where: str | None = None,
+        where: Expr | str | None = None,
         columns: str | Iterable[str] = "*",
         mode: str = "auto",
         text_fields: Iterable[str] | None = None,
@@ -51,7 +66,8 @@ class Search:
         the table has an embedded field whose model is open here, and text
         otherwise. The text fields are those generated from other fields if
         there are any (a combined "body"), else every indexed text field.
-        `where` is an SQL condition, with `params` for its placeholders.
+        `where` is a condition (`col("year") >= 2000`), or an SQL condition
+        with `params` for its placeholders.
         """
         s = self.schema
         if text_fields is None:
@@ -68,22 +84,38 @@ class Search:
         if mode in ("text", "hybrid"):
             if not text_fields:
                 raise StrataError(f"{s['table']} has no indexed text field to search")
-            scores += [f"bm25({f}, :_q)" for f in text_fields]
+            scores += [f"bm25({quote(f)}, :_q)" for f in text_fields]
         if mode in ("vector", "hybrid"):
             if not vector_field:
                 raise StrataError(f"{s['table']} has no embedded vector field with its model open")
-            scores.append(f"similarity({vector_field}, :_v)")
+            scores.append(f"similarity({quote(vector_field)}, :_v)")
         if mode not in ("text", "vector", "hybrid"):
             raise ValueError('mode is "auto", "text", "vector" or "hybrid"')
-        order = scores[0] if len(scores) == 1 else f"rrf({', '.join(scores)})"
-        cols = columns if isinstance(columns, str) else ", ".join(columns)
-        sql = f"SELECT {cols} FROM {s['table']}"
-        if where:
-            sql += f" WHERE {where}"
-        sql += f" ORDER BY {order} DESC LIMIT {int(limit)}"
-        p = dict(params or {})
-        if "bm25" in order:
-            p["_q"] = text
-        if "similarity" in order:
-            p["_v"] = {"embed": text, "field": vector_field}
-        return self.query(sql, p)
+        if isinstance(where, str) and not where.strip():
+            where = None
+        if not isinstance(where, Expr):
+            # SQL, as before: the names of fields quoted, so that any name
+            # works; other columns (score(), an expression) as written.
+            fields = {f["name"].lower() for f in s["fields"]}
+            name = lambda c: quote(c) if c.lower() in fields else c
+            cols = columns if isinstance(columns, str) else ", ".join(name(c.strip()) for c in columns)
+            order = scores[0] if len(scores) == 1 else f"rrf({', '.join(scores)})"
+            sql = f"SELECT {cols} FROM {s['table']}"
+            if where is not None:
+                sql += f" WHERE {where}"
+            sql += f" ORDER BY {order} DESC LIMIT {int(limit)}"
+            p = dict(params or {})
+            if "bm25" in order:
+                p["_q"] = text
+            if "similarity" in order:
+                p["_v"] = {"embed": text, "field": vector_field}
+            return self.query(sql, p)
+        # A condition built in Python: the query is a plan.
+        ranks = [bm25(f, text) for f in text_fields] if mode in ("text", "hybrid") else []
+        if mode in ("vector", "hybrid"):
+            ranks.append(similarity(vector_field, self.embed(text, vector_field)))
+        q = self.table().where(where).order_by(ranks[0] if len(ranks) == 1 else rrf(*ranks)).limit(limit)
+        if columns != "*":
+            names = [c.strip() for c in columns.split(",")] if isinstance(columns, str) else list(columns)
+            q = q.select(*[{"score()": score(), "hops()": hops()}.get(c.lower(), c) for c in names])
+        return q.run()
