@@ -10,11 +10,128 @@
 //!    terms, so the phrase `"quick the fox"` (analysed `[quick, fox]`)
 //!    matches `quick fox` and `quick the fox`.
 //! 4. **Stem** with Snowball English (Porter 2).
+//!
+//! That is the `english` [`Analyzer`], every TEXT field's unless its schema
+//! names another: `simple` stops after step 2.
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use rust_stemmers::{Algorithm, Stemmer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// How a TEXT field's text becomes terms, for its documents and the
+/// searches of it alike. A field's schema records its analyzer's name and
+/// version, so a version of Strata whose analysis differs never reads a
+/// field it did not index; a later change to an analyzer is a new version
+/// (or a new name), and the old one stays as it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Analyzer {
+    /// `english` version 1: words lowercased and folded, Lucene's English
+    /// stopwords removed, stemmed with Snowball English. A ranked query
+    /// also drops [`QUERY_STOPWORDS`].
+    #[default]
+    English,
+    /// `simple` version 1: words lowercased and folded, nothing removed or
+    /// stemmed, for names, codes and text in other languages.
+    Simple,
+}
+
+impl Analyzer {
+    /// Every analyzer this version of Strata has.
+    pub const ALL: [Analyzer; 2] = [Analyzer::English, Analyzer::Simple];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Analyzer::English => "english",
+            Analyzer::Simple => "simple",
+        }
+    }
+
+    pub fn version(self) -> u32 {
+        1
+    }
+
+    /// The analyzer of that name and version, or an error naming them.
+    pub fn of(name: &str, version: u32) -> Result<Analyzer, String> {
+        Analyzer::ALL.into_iter().find(|a| a.name() == name && a.version() == version).ok_or_else(|| {
+            let known: Vec<String> = Analyzer::ALL.iter().map(|a| format!("{} {}", a.name(), a.version())).collect();
+            format!("analyzer {name} version {version} is not one this version of Strata has (it has {})", known.join(", "))
+        })
+    }
+
+    /// The format 3 feature a field with this analyzer needs
+    /// (`analyzer:simple:1`), or none for `english`, which every version
+    /// has.
+    pub fn feature(self) -> Option<String> {
+        (self != Analyzer::English).then(|| format!("analyzer:{}:{}", self.name(), self.version()))
+    }
+
+    /// The term for a lowercased, folded word, or `None` if it is dropped.
+    pub fn term_of(self, word: &str) -> Option<Cow<'_, str>> {
+        match self {
+            Analyzer::English => term_of(word),
+            Analyzer::Simple => Some(Cow::Borrowed(word)),
+        }
+    }
+
+    /// The analysed terms of `text`, in order.
+    pub fn analyze(self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for_each_word(text, |w| {
+            if let Some(t) = self.term_of(w) {
+                out.push(t.into_owned());
+            }
+        });
+        out
+    }
+
+    /// The terms of a ranked query in order, repeats included, dropping
+    /// [`QUERY_STOPWORDS`] if `drop_stopwords` (by default only `english`
+    /// does: [`Analyzer::drops_query_stopwords`]).
+    pub fn query_term_seq(self, text: &str, drop_stopwords: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        for_each_word_in(text, |w, contraction| {
+            if drop_stopwords && is_query_stopword(w, contraction) {
+                return;
+            }
+            if let Some(t) = self.term_of(w) {
+                out.push(t.into_owned());
+            }
+        });
+        out
+    }
+
+    /// Whether a ranked query drops [`QUERY_STOPWORDS`] unless told
+    /// otherwise: English function words, which only `english` expects.
+    pub fn drops_query_stopwords(self) -> bool {
+        self == Analyzer::English
+    }
+}
+
+/// As a schema records it: `{"name": "simple", "version": 1}`.
+impl Serialize for Analyzer {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Named {
+            name: &'static str,
+            version: u32,
+        }
+        Named { name: self.name(), version: self.version() }.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Analyzer {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Named {
+            name: String,
+            version: u32,
+        }
+        let n = Named::deserialize(d)?;
+        Analyzer::of(&n.name, n.version).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Lucene's classic English stopword set (`EnglishAnalyzer`).
 pub const STOPWORDS: [&str; 33] = [
@@ -72,27 +189,12 @@ pub fn analyze_query_with(text: &str, drop_stopwords: bool) -> Vec<String> {
 /// The terms of a ranked query in order, repeats included (a repeated
 /// term weighs more), as [`analyze_query_with`] analyses them.
 pub fn query_term_seq(text: &str, drop_stopwords: bool) -> Vec<String> {
-    let mut out = Vec::new();
-    for_each_word_in(text, |w, contraction| {
-        if drop_stopwords && is_query_stopword(w, contraction) {
-            return;
-        }
-        if let Some(t) = term_of(w) {
-            out.push(t.into_owned());
-        }
-    });
-    out
+    Analyzer::English.query_term_seq(text, drop_stopwords)
 }
 
-/// The analysed terms of `text`, in order.
+/// The analysed terms of `text`, in order (`english`).
 pub fn analyze(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for_each_word(text, |w| {
-        if let Some(t) = term_of(w) {
-            out.push(t.into_owned());
-        }
-    });
-    out
+    Analyzer::English.analyze(text)
 }
 
 /// The analysed terms of `text` with their positions (0, 1, 2, ... over the

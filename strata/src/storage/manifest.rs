@@ -117,8 +117,8 @@ impl Manifest {
 
     /// The format 3 features the tables need, sorted
     /// ([`crate::schema::Schema::features`]).
-    pub fn features(&self) -> Vec<&'static str> {
-        let used: BTreeSet<&'static str> = self.tables.iter().flat_map(|t| t.schema.features()).collect();
+    pub fn features(&self) -> Vec<String> {
+        let used: BTreeSet<String> = self.tables.iter().flat_map(|t| t.schema.features()).collect();
         used.into_iter().collect()
     }
 
@@ -177,7 +177,7 @@ impl Manifest {
             Some(f @ (2 | 3)) => {
                 if f == 3 {
                     let features: Features = serde_json::from_value(v.get("features").cloned().unwrap_or_default()).map_err(bad)?;
-                    if let Some(x) = features.required.iter().find(|x| !FEATURES.contains(&x.as_str())) {
+                    if let Some(x) = features.required.iter().find(|x| !known_feature(x)) {
                         return Err(Error::Schema(format!("the database uses feature {x:?}, which this version of Strata does not have: open it with a newer one")));
                     }
                 }
@@ -211,8 +211,16 @@ struct V1 {
     segments: Vec<SegmentMeta>,
 }
 
-/// The features this version of Strata reads.
+/// The features this version of Strata reads, besides its analyzers'
+/// ([`known_feature`]).
 pub const FEATURES: &[&str] = &["bool", "default", "not_null", "timestamp"];
+
+/// Whether this version of Strata reads a database that requires feature
+/// `x`: one of [`FEATURES`], or a TEXT field's analyzer it has
+/// ([`crate::text::analyzer::Analyzer::feature`]).
+pub fn known_feature(x: &str) -> bool {
+    FEATURES.contains(&x) || crate::text::analyzer::Analyzer::ALL.iter().any(|a| a.feature().as_deref() == Some(x))
+}
 
 /// Format 2, and format 3 with its features.
 #[derive(Serialize)]
@@ -232,7 +240,7 @@ struct V2Ref<'a> {
 #[derive(Serialize)]
 struct FeaturesRef {
     /// A reader that does not know one of these refuses the database.
-    required: Vec<&'static str>,
+    required: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -325,7 +333,7 @@ mod tests {
         // The first table alone, with a TIMESTAMP and two BOOLs.
         let mut m = Manifest::new(typed("tasks"));
         m.tables[0].segments.push(segment(1));
-        assert_eq!((m.format(), m.features()), (3, vec!["bool", "timestamp"]));
+        assert_eq!((m.format(), m.features()), (3, strings(&["bool", "timestamp"])));
         let text = String::from_utf8(m.encode()).unwrap();
         assert!(text.starts_with(r#"{"format":3,"features":{"required":["bool","timestamp"]},"#), "{text}");
         assert_eq!(Manifest::decode(text.as_bytes()).unwrap(), m);
@@ -338,8 +346,36 @@ mod tests {
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
         m.tables.push(TableMeta { id: 2, schema: schema("authors"), segments: Vec::new() });
         m.tables.remove(1);
-        assert_eq!((m.format(), m.features()), (2, Vec::<&str>::new()));
+        assert_eq!((m.format(), m.features()), (2, strings(&[])));
         assert!(!String::from_utf8(m.encode()).unwrap().contains("features"));
+    }
+
+    fn strings(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn analyzers_are_features() {
+        use crate::schema::Analyzer;
+        let text = || Field::new("body", FieldType::Text { positions: true });
+        // Saying english is saying nothing: every version has it.
+        let english = Schema::new("t", vec![Field::new("id", FieldType::Keyword), text().analyzer(Analyzer::English)], Some("id")).unwrap();
+        assert_eq!(english.fields[1].analyzer, None);
+        assert_eq!(Manifest::new(english).format(), 1);
+        let simple = Schema::new("t", vec![Field::new("id", FieldType::Keyword), text().analyzer(Analyzer::Simple)], Some("id")).unwrap();
+        let m = Manifest::new(simple);
+        assert_eq!((m.format(), m.features()), (3, strings(&["analyzer:simple:1"])));
+        let bytes = m.encode();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains(r#""analyzer":{"name":"simple","version":1}"#), "{text}");
+        assert_eq!(Manifest::decode(&bytes).unwrap(), m);
+        // A version that lacks an analyzer refuses the database by its
+        // feature, and a field naming one it lacks even without it.
+        let e = Manifest::decode(text.replace("analyzer:simple:1", "analyzer:simple:2").as_bytes()).unwrap_err().to_string();
+        assert!(e.contains(r#"feature "analyzer:simple:2""#), "{e}");
+        let e = Manifest::decode(text.replace(r#""version":1}"#, r#""version":2}"#).as_bytes()).unwrap_err().to_string();
+        assert!(e.contains("analyzer simple version 2"), "{e}");
+        assert!(Schema::new("t", vec![Field::new("k", FieldType::Keyword).analyzer(Analyzer::Simple)], None).is_err());
     }
 
     #[test]
@@ -350,7 +386,7 @@ mod tests {
             Field::new("n", FieldType::Int).not_null(),
         ];
         let mut m = Manifest::new(Schema::new("t", fields, Some("id")).unwrap());
-        assert_eq!((m.format(), m.features()), (3, vec!["default", "not_null"]));
+        assert_eq!((m.format(), m.features()), (3, strings(&["default", "not_null"])));
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
         m.tables.push(TableMeta { id: 1, schema: typed("tasks"), segments: Vec::new() });
         assert_eq!(m.features(), ["bool", "default", "not_null", "timestamp"]);

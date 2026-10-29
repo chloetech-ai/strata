@@ -1092,7 +1092,7 @@ impl<'a> Binder<'a> {
                 }
                 let expand = Expand::from_opts(&opts).map_err(err)?;
                 let query = self.literal(q)?.as_str().ok_or_else(|| err("MATCH query must be a string"))?.to_string();
-                crate::text::parse_match(&query)?;
+                crate::text::query::parse_match_with(&query, self.schema.fields[field].text_analyzer())?;
                 Pred::Match { field, query, expand }
             }
             Expr::Function(func) if matches!(fname(func).as_str(), "reachable" | "path") => Pred::Graph { id: self.graph(func, &fname(func))? },

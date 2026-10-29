@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+pub use crate::text::analyzer::Analyzer;
 
 /// How a vector field is indexed (every vector field also keeps float32
 /// vectors and compressed codes in the forward index, so `Flat` adds
@@ -179,6 +180,11 @@ pub struct Field {
     /// A row that gives NULL keeps it ([`Field::default_value`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
+    /// How a TEXT field's text becomes terms; `None` is `english`
+    /// ([`Analyzer`]), which every version of Strata has, and another makes
+    /// the database format 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzer: Option<Analyzer>,
 }
 
 /// A VECTOR field that is the embedding of other fields: `model`'s vector
@@ -213,6 +219,7 @@ impl Field {
             logical: None,
             not_null: false,
             default: None,
+            analyzer: None,
         }
     }
     /// A BOOL field ([`Logical::Bool`]).
@@ -272,6 +279,15 @@ impl Field {
     pub fn not_null(mut self) -> Self {
         self.not_null = true;
         self
+    }
+    /// Gives a TEXT field an analyzer ([`Field::analyzer`]).
+    pub fn analyzer(mut self, analyzer: Analyzer) -> Self {
+        self.analyzer = Some(analyzer);
+        self
+    }
+    /// The analyzer of a TEXT field's text ([`Field::analyzer`]).
+    pub fn text_analyzer(&self) -> Analyzer {
+        self.analyzer.unwrap_or_default()
     }
     /// Gives the field a default ([`Field::default`]).
     pub fn default(mut self, value: serde_json::Value) -> Self {
@@ -409,6 +425,13 @@ impl Schema {
             if f.default.as_ref().is_some_and(serde_json::Value::is_null) {
                 f.default = None;
             }
+            // Every version analyses `english`: naming it needs no feature.
+            if f.analyzer == Some(Analyzer::English) {
+                f.analyzer = None;
+            }
+            if f.analyzer.is_some() && !matches!(f.ty, FieldType::Text { .. }) {
+                return Err(Error::Schema(format!("field {}: only a TEXT field has an analyzer", f.name)));
+            }
         }
         for (i, f) in s.fields.iter().enumerate() {
             if f.default.is_none() {
@@ -472,10 +495,13 @@ impl Schema {
     }
 
     /// The format 3 features this table's fields need, as the manifest
-    /// names them: [`Logical::feature`], `not_null` and `default`.
-    pub fn features(&self) -> impl Iterator<Item = &'static str> + '_ {
-        let constraints = self.fields.iter().flat_map(|f| [f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default")]).flatten();
-        self.fields.iter().filter_map(|f| f.logical.map(Logical::feature)).chain(constraints)
+    /// names them: [`Logical::feature`], `not_null`, `default` and
+    /// [`Analyzer::feature`].
+    pub fn features(&self) -> impl Iterator<Item = String> + '_ {
+        self.fields.iter().flat_map(|f| {
+            let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default")];
+            named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
+        })
     }
 
     /// A row that holds each field's default, written at `now`
@@ -572,7 +598,10 @@ impl Schema {
     /// `dim`. Every field is stored and indexed unless it says otherwise
     /// (`"stored": false`, `"indexed": false`), except that vectors and
     /// generated text (`from`) are not stored. Text keeps positions (for
-    /// phrases) unless `"positions": false`. A vector's `index` is
+    /// phrases) unless `"positions": false`, and is analysed by
+    /// `"analyzer"`: `"english"` (the default) or `"simple"`, version 1, or
+    /// `{"name": .., "version": ..}` ([`Analyzer`]; another than `english`
+    /// makes the database format 3). A vector's `index` is
     /// `"hnsw"` (the default, m 16 and ef_construction 200), `"flat"`,
     /// `{"hnsw": {"m": .., "ef_construction": ..}}` or
     /// `{"ivf": {"nlist": ..}}`, and its `codes` `"sq8"` (default) or
@@ -682,6 +711,10 @@ impl Schema {
                 if let Some(d) = &f.default {
                     m.insert("default".into(), d.clone());
                 }
+                if let Some(a) = f.analyzer {
+                    // Version 1 by its name alone, as short_field reads it.
+                    m.insert("analyzer".into(), if a.version() == 1 { json!(a.name()) } else { json!(a) });
+                }
                 // "name" and "type" first, for people reading it.
                 let mut out = Map::new();
                 for k in ["name", "type"] {
@@ -706,7 +739,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default", "analyzer"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -785,6 +818,12 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     }
     f.not_null = flag("not_null")?.unwrap_or(false);
     f.default = j.get("default").filter(|d| !d.is_null()).cloned();
+    f.analyzer = match j.get("analyzer") {
+        None | Some(J::Null) => None,
+        Some(J::String(n)) => Some(Analyzer::of(&n.to_ascii_lowercase(), 1).map_err(|e| bad(&e))?),
+        Some(a @ J::Object(_)) => Some(serde_json::from_value(a.clone()).map_err(|e| bad(&e.to_string()))?),
+        Some(_) => return Err(bad("analyzer is a name (\"english\" or \"simple\") or {\"name\": .., \"version\": ..}")),
+    };
     match j.get("embed") {
         None | Some(J::Null) => {}
         Some(e) => {

@@ -1524,6 +1524,7 @@ function designJson() {
   const fields = D.fields.map((f) => {
     const o = { name: f.name, type: f.type }, vec = f.type === "vector", gen = !!(f.from && f.from.length);
     if (f.type === "text" && f.positions === false) o.positions = false;
+    if (f.type === "text" && f.analyzer && f.analyzer !== "english") o.analyzer = f.analyzer;
     if (gen) o.from = f.from;
     if (f.multi) o.multi = true;
     if (f.stored != null && f.stored !== (!vec && !gen)) o.stored = f.stored;
@@ -1575,7 +1576,7 @@ function fieldRow(f) {
   const type = el("select", {}, ...TYPES.map((t) => el("option", { value: t, text: t })));
   type.value = f.type;
   type.onchange = () => {
-    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored", "default"]) delete f[k];
+    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored", "default", "analyzer"]) delete f[k];
     f.type = type.value;
     if (f.type === "vector") { const from = textFields(); f.embed = from.length ? { from, model: "potion-retrieval-32M" } : undefined; if (!f.embed) f.dim = 384; }
     designChanged(true);
@@ -1617,7 +1618,15 @@ function fieldRow(f) {
     opts.append(el("label", { title: "How nearest rows are found" }, "index", index), el("label", { title: "How the vectors are compressed for search; the full vectors rescore the best" }, "codes", codes));
   }
   if (f.type === "keyword" || f.type === "int") opts.append(check("list", !!f.multi, (on) => { f.multi = on || undefined; if (on) delete f.stored; }, "Each row holds several values"));
-  if (f.type === "text") opts.append(check("phrases", f.positions !== false, (on) => { f.positions = on ? undefined : false; }, "Keep word positions, for \"exact phrase\" searches"));
+  if (f.type === "text") {
+    opts.append(check("phrases", f.positions !== false, (on) => { f.positions = on ? undefined : false; }, "Keep word positions, for \"exact phrase\" searches"));
+    const named = (f.analyzer && f.analyzer.name) || f.analyzer || "english";
+    const an = el("select", {}, el("option", { value: "english", text: "English" }), el("option", { value: "simple", text: "simple" }));
+    an.value = named;
+    an.disabled = typeof f.analyzer === "object" && f.analyzer !== null;
+    an.onchange = () => { f.analyzer = an.value === "english" ? undefined : an.value; designChanged(false); };
+    opts.append(el("label", { title: "How text becomes words to search: English drops stopwords and stems (running finds run); simple keeps every word as written, for names, codes and other languages" }, "words", an));
+  }
   // NOT NULL and a default, for one value of a plain type that is not the key.
   if (!vec && !gen && !f.multi && ["text", "keyword", "int", "float", "bool", "timestamp"].includes(f.type) && f.name !== D.key) {
     opts.append(check("required", !!f.not_null, (on) => { f.not_null = on || undefined; }, "Every row holds a value (NOT NULL)"));

@@ -115,7 +115,7 @@ primary := "(" query ")" | "\"phrase\"" | word | word* | word~ | word~N
 | `vacine~`, `vacine~1` | the word and the indexed terms an edit or two from it ([typos](#typos-and-synonyms)) |
 | `vaccine AND (mrna OR "messenger rna") -animal` | any combination, with parentheses |
 
-Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like documents: a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it.
+Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it.
 
 ## Scores
 
@@ -127,7 +127,7 @@ BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains
 |---|---|---|
 | `k1`, `b` | 1.2, 0.75 | BM25 parameters (`k1 >= 0`, `0 <= b <= 1`) |
 | `algo` | planner's choice (MaxScore) | `'maxscore'`, `'bmw'` (Block-Max WAND) or `'exhaustive'` |
-| `stopwords` | 1 | `0` keeps function words in the query |
+| `stopwords` | 1 (0 on a `simple` field) | `0` keeps English function words in the query, `1` drops them |
 | `fuzzy` | 0 | `1`, `2` or `'auto'`: also score the indexed terms that many edits from each word ([typos](#typos-and-synonyms)) |
 | `synonyms` | 0 | `1`: also score each word's synonyms |
 
@@ -348,7 +348,7 @@ A database starts with the table it was created with, and `CREATE TABLE` adds mo
 ```sql
 CREATE TABLE authors (
   id KEYWORD PRIMARY KEY,
-  name TEXT,
+  name TEXT OPTIONS(analyzer = 'simple'),
   born INT,
   topics KEYWORD[],
   bio TEXT OPTIONS(positions = false),
@@ -365,7 +365,7 @@ DROP TABLE IF EXISTS wrote, authors;
 ```
 
 - **Types** are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (or `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`, `DATETIME`; a `DATE` is a `TIMESTAMP` at midnight UTC), `VECTOR(dimensions)`, `SPARSE` and `EDGES`; `KEYWORD[]` and `INT[]` hold lists. A `BOOL` or `TIMESTAMP` column holds one value and is neither the primary key nor a reference.
-- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), and `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone). Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
+- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), and `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone). Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
 - **The primary key** is one column: `PRIMARY KEY` on it, or a `PRIMARY KEY (column)` constraint. A table without one only takes plain `INSERT`.
 - **`REFERENCES table`**, or `FOREIGN KEY (column) REFERENCES table`, records that a `KEYWORD` or `INT` column holds primary keys of that table, which must exist (or be the table being created) and have a primary key of the column's type. References are not enforced: a row may name a key that is not there. Joins along them are the next step.
 - **`NOT NULL`** refuses a row without a value in that column, from any write: SQL, JSON, a file or the Rust API. **`DEFAULT value`** is the value a write that leaves the column out gets: a constant of the column's type on a single-valued `TEXT`, `KEYWORD`, `INT`, `FLOAT`, `BOOL` or `TIMESTAMP` column that is not the key, or `CURRENT_TIMESTAMP` (or `now()`) on a `TIMESTAMP`, the time of the statement, the same in all its rows. An `INSERT` that leaves a column out, a JSON row without its key and a CSV file without its column give it the default; a `NULL` that a write gives stays `NULL`, and a column with `NOT NULL` refuses it. In SQL the keyword `DEFAULT` stands for a column's default, in `VALUES` and in `SET`. The Rust API writes a row as it is given; `Schema::defaults` returns a row of the defaults to start from. The JSON schema's options are `"not_null": true` and `"default"` (`"now"` for the time of the write).

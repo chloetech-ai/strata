@@ -154,7 +154,8 @@ need no table.
   database uses: `{format: 3, features: {required: [...]}, ...}`. A version
   is written in format 3 only while a table uses a feature (a `BOOL` or
   `TIMESTAMP` field is `"bool"` or `"timestamp"`, a `NOT NULL` field
-  `"not_null"`, a default `"default"`), and falls back to 2 or 1,
+  `"not_null"`, a default `"default"`, a TEXT field's analyzer other than
+  `english` `"analyzer:<name>:<version>"`), and falls back to 2 or 1,
   in both meta slots, when the last one goes. A reader refuses a manifest
   that requires a feature it does not know, naming the feature, and ignores
   an `optional` list and other keys it does not know. Format 3 is the last
@@ -233,7 +234,14 @@ reader (sections to a zero-copy view). Global docIDs are
 ### 5.1 Full text (inverted index)
 
 * **Analyzer.** Unicode word split, lowercase, ASCII folding, an English
-  stopword list, a light English stemmer. Queries use the same analyzer.
+  stopword list, a light English stemmer (`english`, version 1); `simple`
+  (version 1) stops after folding. A field's schema records its analyzer
+  by name and version (absent: `english`), and its queries (`MATCH`
+  words, phrases, prefixes and typos, `bm25` terms, synonym rules) use
+  the same one. Any other than `english` is a format 3 feature named
+  after it (`analyzer:simple:1`), so a version of Strata that lacks it, or
+  analyses differently, refuses the database rather than misread its
+  terms; a change to an analyzer's output is a new version.
 * **Term dictionary.** Sorted terms in blocks of 32, front-coded, with a
   sparse in-memory index over block first-terms. Each entry gives the
   document frequency and the posting list's location.

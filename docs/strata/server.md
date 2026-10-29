@@ -95,6 +95,7 @@ The server serves a database's first table, whose schema is set when the databas
 | `indexed` | all | true | the value can be searched and filtered on |
 | `multi` | `keyword`, `int` | false | a list of values per row (stored, not the key) |
 | `positions` | `text` | true | keep word positions, for phrase searches |
+| `analyzer` | `text` | `"english"` | how text becomes words to search: `"english"` drops stopwords and stems (`running` finds `run`), `"simple"` keeps every word as written; another than `"english"` makes the database format 3 |
 | `from` | `text` | | generated: the named fields' text joined, such as a `body` of title and description to search at once |
 | `dim` | `vector` | the model's, for a known `embed` model | the number of dimensions |
 | `index` | `vector` | `"hnsw"` (m 16, ef_construction 200) | `"flat"` (an exact scan), `{"hnsw": {"m": 32, "ef_construction": 400}}` or `{"ivf": {"nlist": 1024}}` |
