@@ -648,10 +648,7 @@ impl Service {
                         &req.sql,
                         &schema,
                         &req.params,
-                        &mut |text, p| {
-                            let select = bind(text, snap.schema(), p)?;
-                            db.execute(&snap, &select, &opts)
-                        },
+                        &mut |step| db.execute(&snap, &step.plan.to_select(snap.schema())?, &opts),
                         &opts,
                     )
                 })
@@ -670,10 +667,11 @@ impl Service {
                     // Shards any step was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
                     let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, ..ExecOptions::default() };
-                    let rs = compound::run_checked(&req.sql, &schema, &req.params, &mut |text, p| {
+                    let rs = compound::run_checked(&req.sql, &schema, &req.params, &mut |step| {
                         checks.check()?;
-                        let select = bind(text, &schema, p)?;
-                        let step = QueryReq { sql: text.to_string(), params: p.clone(), partial: req.partial, ..Default::default() };
+                        let select = step.plan.to_select(&schema)?;
+                        // Shards take SQL until they take plans.
+                        let step = QueryReq { sql: step.sql.to_string(), params: step.params.clone(), partial: req.partial, ..Default::default() };
                         let m = rt.block_on(obs::scope(id.clone(), c.query(&step, &select, deadline))).map_err(|e| strata::Error::Query(e.message))?;
                         for s in m.missing {
                             if !missing.contains(&s) {
