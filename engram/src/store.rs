@@ -763,6 +763,52 @@ mod tests {
         assert_eq!((s.len(), s.last_seq()), (648, 649));
     }
 
+    /// Strata's background threads flush the memtable and merge segments
+    /// while appends and reads go on: nothing is lost or seen out of order,
+    /// and the segments get merged without the writer doing it.
+    #[test]
+    fn flushes_and_merges_run_beside_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions { sync: false, flush_docs: 64, mem_chunk_docs: 64, ..Default::default() };
+        let open = || Store::open(&dir.path().join("m.strata"), Arc::new(HashEmbedder { dim: 64 }), opts.clone()).unwrap();
+        let s = open();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let p = s.pinned();
+                    let max = p.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1").unwrap().rows.first().map_or(0, |r| r[0].as_i64().unwrap());
+                    assert_eq!(p.len() as i64, max, "every number up to the newest is stored");
+                }
+            });
+            let ws: Vec<_> = (0..4)
+                .map(|t| {
+                    let s = &s;
+                    sc.spawn(move || {
+                        for i in 0..300 {
+                            let drafts = vec![Draft::new(Kind::ToolCall, format!("cargo test {t} {i}")), Draft::new(Kind::ToolResult, format!("test result {t} {i}: ok"))];
+                            s.append(&format!("sess-{t}"), i, 100, drafts).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            ws.into_iter().for_each(|h| h.join().unwrap());
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!((s.len(), s.last_seq()), (2400, 2400));
+        // About 37 flushes of 64 records; the merger brings them down.
+        let t = std::time::Instant::now();
+        while s.snapshot().segments().len() > 15 && t.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let segs = s.snapshot().segments().len();
+        assert!((1..=15).contains(&segs), "{segs} segments");
+        assert_eq!(s.bm25_top("result 3 299", 1, &Filter::default()).unwrap()[0].0.text, "test result 3 299: ok");
+        drop(s);
+        let s = open();
+        assert_eq!((s.len(), s.last_seq()), (2400, 2400));
+    }
+
     #[test]
     fn stores_without_links_are_migrated() {
         let dir = tempfile::tempdir().unwrap();
