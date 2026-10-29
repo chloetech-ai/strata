@@ -550,6 +550,15 @@ impl Node {
     }
 
     /// The Search of a leaf.
+    /// A leaf's Search.
+    pub(crate) fn search(&self) -> Option<&Search> {
+        match self {
+            Node::Search(s) => Some(s),
+            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } => input.search(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn search_mut(&mut self) -> Option<&mut Search> {
         match self {
             Node::Search(s) => Some(s),

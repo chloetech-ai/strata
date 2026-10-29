@@ -1,6 +1,7 @@
-//! Compound queries over the table: `WITH`, `IN (SELECT ...)`, `EXISTS`,
-//! scalar subqueries, `FROM (SELECT ...)`, `SELECT DISTINCT`, and joins of
-//! the table with itself or with a `WITH` result.
+//! Compound queries: `WITH`, `IN (SELECT ...)`, `EXISTS`, scalar
+//! subqueries, `FROM (SELECT ...)`, `SELECT DISTINCT`, and joins of tables
+//! (a table with itself, with another table of the database, or with a
+//! `WITH` result).
 //!
 //! A compound query ([`is_compound`]) plans into one plan tree ([`plan`]):
 //! the single-table queries the executor answers are its leaves, each bound
@@ -25,7 +26,12 @@
 //!
 //! A join condition compares columns of two sides with `=`; comparing an
 //! EDGES field with a key follows the edges (`a.cites = b.id`: b is a row
-//! a links to). Text searches, scores and graph predicates name one side.
+//! a links to), within one table, whose keys the links name. Text
+//! searches, scores and graph predicates name one side.
+//!
+//! The parts of a query may read any tables of the database
+//! ([`plan_in`]): each leaf names its table, and a join or subquery across
+//! tables runs as one within a table does.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -202,16 +208,21 @@ fn is_star(f: &sql::Function) -> bool {
     matches!(&f.args, FunctionArguments::List(l) if l.args.iter().any(|a| matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Wildcard)))) || func_args(f).is_empty()
 }
 
-/// The plan of a compound SELECT ([`is_compound`]): its single-table
-/// queries are leaves, and its joins, `WITH`, subqueries and `DISTINCT`
-/// operators over them.
+/// The plan of a compound SELECT ([`is_compound`]) over `schema`'s table:
+/// its single-table queries are leaves, and its joins, `WITH`, subqueries
+/// and `DISTINCT` operators over them.
 pub fn plan(sql_text: &str, schema: &Schema, params: &Params) -> Result<ir::Plan> {
-    plan_query(&*parse(sql_text)?, schema, params)
+    plan_in(sql_text, &[schema], params)
 }
 
-/// [`plan`] of a parsed query.
-pub(crate) fn plan_query(q: &sql::Query, schema: &Schema, params: &Params) -> Result<ir::Plan> {
-    let p = Planner { schema, params, ctes: RefCell::new(Vec::new()) };
+/// [`plan`] of a query that may read any of the tables of `catalog`.
+pub fn plan_in(sql_text: &str, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
+    plan_query(&*parse(sql_text)?, catalog, params)
+}
+
+/// [`plan_in`] of a parsed query.
+pub(crate) fn plan_query(q: &sql::Query, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
+    let p = Planner { catalog, params, ctes: RefCell::new(Vec::new()) };
     Ok(ir::Plan::new(p.query(q)?.node))
 }
 
@@ -227,14 +238,14 @@ pub fn run_checked(sql_text: &str, schema: &Schema, params: &Params, runner: &mu
     ops::run(&plan(sql_text, schema, params)?, schema, runner, opts)
 }
 
-/// A query's plan, its columns, and whether its rows are rows of the
-/// table (with their keys), which a `WITH` of them keeps: a SELECT of the
-/// table's fields, not of aggregates.
+/// A query's plan, its columns, and the table whose rows its rows are
+/// (with their keys), which a `WITH` of them keeps: a SELECT of a table's
+/// fields, not of aggregates.
 #[derive(Clone, Debug)]
 struct Planned {
     node: ir::Node,
     columns: Vec<String>,
-    keyed: bool,
+    keyed: Option<String>,
 }
 
 /// A `WITH` result in scope.
@@ -242,44 +253,64 @@ struct Planned {
 struct Cte {
     name: String,
     columns: Vec<String>,
-    keyed: bool,
+    keyed: Option<String>,
 }
 
 struct Planner<'a> {
-    schema: &'a Schema,
+    /// The tables a query may read.
+    catalog: &'a [&'a Schema],
     params: &'a Params,
     /// The `WITH` results in scope, the innermost last.
     ctes: RefCell<Vec<Cte>>,
 }
 
 /// One table of a join.
-struct Src {
+struct Src<'a> {
     alias: String,
-    kind: SrcKind,
+    kind: SrcKind<'a>,
     /// How it joins the tables before it (none for the first).
     join: Option<(ir::JoinKind, Expr)>,
 }
 
-enum SrcKind {
-    /// The table, scanned with the conditions that name only this side.
-    Table,
-    /// Rows of the table a `WITH` result holds (by its name), scanned
+enum SrcKind<'a> {
+    /// A table, scanned with the conditions that name only this side.
+    Table(&'a Schema),
+    /// Rows of a table a `WITH` result holds (by its name), scanned
     /// likewise.
-    TableRows(String),
+    TableRows(String, &'a Schema),
     /// Rows held in memory (a `WITH` result of aggregates, a derived table).
     Rows(Planned),
+}
+
+impl<'a> SrcKind<'a> {
+    /// The table it scans; none for rows in memory.
+    fn schema(&self) -> Option<&'a Schema> {
+        match self {
+            SrcKind::Table(s) | SrcKind::TableRows(_, s) => Some(s),
+            SrcKind::Rows(_) => None,
+        }
+    }
+}
+
+fn pk(schema: &Schema) -> Result<usize> {
+    schema.primary_key.ok_or_else(|| err(format!("this needs a primary key, and {} has none", schema.table)))
+}
+
+fn is_edges(schema: Option<&Schema>, column: &str) -> bool {
+    schema.and_then(|s| s.field(column)).is_some_and(|f| f.ty == FieldType::Edges)
 }
 
 /// An ORDER BY key: its expression, DESC, and NULLS FIRST.
 type OrderKey = (Expr, bool, bool);
 
-impl Planner<'_> {
+impl<'a> Planner<'a> {
     fn cte(&self, name: &str) -> Option<Cte> {
         self.ctes.borrow().iter().rev().find(|c| c.name.eq_ignore_ascii_case(name)).cloned()
     }
 
-    fn pk(&self) -> Result<usize> {
-        self.schema.primary_key.ok_or_else(|| err("this needs a primary key"))
+    /// The table named `name` (any case).
+    fn table(&self, name: &str) -> Option<&'a Schema> {
+        self.catalog.iter().find(|s| s.table.eq_ignore_ascii_case(name)).copied()
     }
 
     fn query(&self, q: &sql::Query) -> Result<Planned> {
@@ -304,7 +335,7 @@ impl Planner<'_> {
                     }
                     let columns: Vec<String> = cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
                     let exprs = columns.iter().enumerate().map(|(i, name)| ir::Column { name: name.clone(), expr: ir::Expr::Output(i as u32) }).collect();
-                    p = Planned { node: ir::Node::Project { input: Box::new(p.node), columns: exprs }, columns, keyed: false };
+                    p = Planned { node: ir::Node::Project { input: Box::new(p.node), columns: exprs }, columns, keyed: None };
                 }
                 let name = cte.alias.name.value.clone();
                 self.ctes.borrow_mut().push(Cte { name: name.clone(), columns: p.columns, keyed: p.keyed });
@@ -331,56 +362,59 @@ impl Planner<'_> {
         match &s.from[0].relation {
             TableFactor::Table { name, .. } if self.cte(&super::sql::table_name(name)).is_some() => {
                 let cte = self.cte(&super::sql::table_name(name)).expect("in scope");
-                match cte.keyed {
-                    true => self.over_rows(q, s, &cte),
-                    false => self.join(q, s),
+                match cte.keyed.as_deref().and_then(|t| self.table(t)) {
+                    Some(schema) => self.over_rows(q, s, &cte, schema),
+                    None => self.join(q, s),
                 }
             }
-            TableFactor::Table { name, .. } if is_table(name, self.schema) => self.single(q, s),
-            TableFactor::Table { name, .. } => Err(err(format!("no such table: {name}"))),
+            TableFactor::Table { name, .. } => match self.table(&super::sql::table_name(name)) {
+                Some(schema) => self.single(q, s, schema),
+                None => Err(err(format!("no such table: {}", super::sql::table_name(name)))),
+            },
             TableFactor::Derived { .. } => self.join(q, s),
             t => Err(err(format!("unsupported FROM: {t}"))),
         }
     }
 
-    /// A SELECT over the table: a leaf, its subqueries planned within it.
-    fn single(&self, q: &sql::Query, s: &sql::Select) -> Result<Planned> {
+    /// A SELECT over a table: a leaf, its subqueries planned within it.
+    fn single(&self, q: &sql::Query, s: &sql::Select, schema: &Schema) -> Result<Planned> {
         let mut q = q.clone();
         let mut s = s.clone();
         if s.distinct.is_some() {
             distinct_to_group(&mut s)?;
         }
         q.body = Box::new(sql::SetExpr::Select(Box::new(s)));
-        self.leaf(&q, "query")
+        self.leaf(&q, "query", schema)
     }
 
-    /// Binds a leaf's syntax tree; a subquery in a condition or as seeds
-    /// plans into the condition ([`Planner::subquery`]).
-    fn leaf(&self, q: &sql::Query, what: &str) -> Result<Planned> {
+    /// Binds a leaf's syntax tree on `schema`'s table; a subquery in a
+    /// condition or as seeds plans into the condition
+    /// ([`Planner::subquery`]).
+    fn leaf(&self, q: &sql::Query, what: &str, schema: &Schema) -> Result<Planned> {
         // A subquery's error names the subquery, not each query around it.
         let at = |e: Error| match e {
             Error::Query(m) if !m.contains(" (in ") => err(format!("{m} (in {what}: {})", printable(q))),
             e => e,
         };
-        let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind);
-        let select = super::sql::bind_query_with(q, self.schema, self.params, &subs as &Subs).map_err(at)?;
+        let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind, Some(schema));
+        let select = super::sql::bind_query_with(q, schema, self.params, &subs as &Subs).map_err(at)?;
         let aggregated = !select.group_by.is_empty() || select.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
         let keyed = !aggregated
             && select.projection.iter().all(|(name, p)| match p {
-                Projection::Field(f) => self.schema.fields[*f].name.eq_ignore_ascii_case(name),
+                Projection::Field(f) => schema.fields[*f].name.eq_ignore_ascii_case(name),
                 Projection::Score | Projection::Hops(_) => true,
                 _ => false,
             });
         let columns = select.projection.iter().map(|(n, _)| n.clone()).collect();
-        Ok(Planned { node: ir::Plan::of_select(self.schema, &select).root, columns, keyed })
+        Ok(Planned { node: ir::Plan::of_select(schema, &select).root, columns, keyed: keyed.then(|| schema.table.clone()) })
     }
 
     /// The expression a subquery stands for: its one column's values (`IN`),
     /// whether it has a row (`EXISTS`), its one value (a comparison), or the
-    /// keys of its rows (seeds; `None` for a subquery of the table the
-    /// executor runs itself).
-    fn subquery(&self, q: &sql::Query, kind: Sub) -> Result<Option<ir::Expr>> {
-        if kind == Sub::Seeds && !needs(q, self.schema) {
+    /// keys of its rows (seeds; `None` for a subquery of the scanned table
+    /// `scanned`, which the executor runs itself).
+    fn subquery(&self, q: &sql::Query, kind: Sub, scanned: Option<&Schema>) -> Result<Option<ir::Expr>> {
+        if kind == Sub::Seeds && scanned.is_some_and(|s| !needs(q, s)) {
             return Ok(None);
         }
         let p = self.query(q)?;
@@ -399,7 +433,7 @@ impl Planner<'_> {
                 one("a scalar subquery")?;
                 ir::Expr::Scalar(node)
             }
-            Sub::Seeds if p.keyed => ir::Expr::Keys(node),
+            Sub::Seeds if p.keyed.is_some() => ir::Expr::Keys(node),
             Sub::Seeds => {
                 one("a subquery of seeds")?;
                 ir::Expr::Values(node)
@@ -409,23 +443,23 @@ impl Planner<'_> {
 
     /// A subquery of an expression over rows in memory.
     fn in_memory(&self, q: &sql::Query, kind: Sub) -> Result<ir::Expr> {
-        self.subquery(q, kind)?.ok_or_else(|| err("a traversal's seeds name one table's rows, in its scan"))
+        self.subquery(q, kind, None)?.ok_or_else(|| err("a traversal's seeds name one table's rows, in its scan"))
     }
 
-    /// A SELECT over the rows of the table that a `WITH` result holds:
-    /// the table, restricted to their keys, in their order.
-    fn over_rows(&self, q: &sql::Query, s: &sql::Select, cte: &Cte) -> Result<Planned> {
-        let pk = self.pk()?;
+    /// A SELECT over the rows of a table that a `WITH` result holds: the
+    /// table, restricted to their keys, in their order.
+    fn over_rows(&self, q: &sql::Query, s: &sql::Select, cte: &Cte, schema: &Schema) -> Result<Planned> {
+        let pk = pk(schema)?;
         let mut q = q.clone();
         let mut s = s.clone();
         let TableFactor::Table { name, .. } = &mut s.from[0].relation else { unreachable!("a table") };
-        *name = sql::ObjectName::from(vec![sql::Ident::new(self.schema.table.clone())]);
+        *name = sql::ObjectName::from(vec![sql::Ident::new(schema.table.clone())]);
         let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(&s) || s.distinct.is_some();
         // Without an ORDER BY, rows keep the WITH result's order, so the
         // cut happens after reordering.
         let reorder = q.order_by.is_none() && !grouped;
         let cut = if reorder { q.limit_clause.take() } else { None };
-        let mut p = self.single(&q, &s)?;
+        let mut p = self.single(&q, &s, schema)?;
         let rows = ir::Node::Ref { name: cte.name.clone() };
         restrict(&mut p.node, ir::Expr::In { expr: Box::new(ir::Expr::Field(pk as u32)), list: vec![ir::Expr::Keys(Box::new(rows.clone()))] });
         if reorder {
@@ -438,27 +472,25 @@ impl Planner<'_> {
         Ok(p)
     }
 
-    fn source(&self, t: &TableFactor) -> Result<(String, SrcKind)> {
+    fn source(&self, t: &TableFactor) -> Result<(String, SrcKind<'a>)> {
         let alias_of = |a: &Option<sql::TableAlias>, d: &str| a.as_ref().map_or(d.to_string(), |a| a.name.value.clone());
         match t {
             TableFactor::Table { name, alias, .. } => {
                 let n = super::sql::table_name(name);
                 if let Some(cte) = self.cte(&n) {
-                    let kind = match cte.keyed {
-                        true => SrcKind::TableRows(cte.name),
-                        false => SrcKind::Rows(Planned { node: ir::Node::Ref { name: cte.name }, columns: cte.columns, keyed: false }),
+                    let kind = match cte.keyed.as_deref().and_then(|t| self.table(t)) {
+                        Some(schema) => SrcKind::TableRows(cte.name, schema),
+                        None => SrcKind::Rows(Planned { node: ir::Node::Ref { name: cte.name }, columns: cte.columns, keyed: None }),
                     };
                     return Ok((alias_of(alias, &n), kind));
                 }
-                if !is_table(name, self.schema) {
-                    return Err(err(format!("no such table: {n}")));
-                }
-                Ok((alias_of(alias, &n), SrcKind::Table))
+                let schema = self.table(&n).ok_or_else(|| err(format!("no such table: {n}")))?;
+                Ok((alias_of(alias, &n), SrcKind::Table(schema)))
             }
             TableFactor::Derived { subquery, alias, .. } => {
                 let p = self.query(subquery)?;
                 let alias = alias.as_ref().map(|a| a.name.value.clone()).ok_or_else(|| err("a subquery in FROM needs an alias: FROM (SELECT ...) AS t"))?;
-                Ok((alias, SrcKind::Rows(Planned { keyed: false, ..p })))
+                Ok((alias, SrcKind::Rows(Planned { keyed: None, ..p })))
             }
             t => Err(err(format!("unsupported FROM: {t}"))),
         }
@@ -496,11 +528,13 @@ impl Planner<'_> {
                 return Err(err(format!("table alias {} is used twice: name each side, e.g. FROM papers a JOIN papers b", src.alias)));
             }
         }
-        let cols_of: Vec<Vec<String>> = srcs.iter().map(|s| self.columns_of(s)).collect();
+        let cols_of: Vec<Vec<String>> = srcs.iter().map(|s| columns_of(s)).collect();
         let aliases: Vec<String> = srcs.iter().map(|s| s.alias.to_ascii_lowercase()).collect();
-        let vectors: Vec<String> = self.schema.fields.iter().filter(|f| matches!(f.ty, FieldType::Vector { .. })).map(|f| f.name.clone()).collect();
+        let vectors: Vec<Vec<String>> =
+            srcs.iter().map(|s| s.kind.schema().map_or_else(Vec::new, |t| t.fields.iter().filter(|f| matches!(f.ty, FieldType::Vector { .. })).map(|f| f.name.clone()).collect())).collect();
         let sides = Sides { aliases: &aliases, cols: &cols_of, vectors: &vectors };
         let in_memory = |i: usize| matches!(srcs[i].kind, SrcKind::Rows(_));
+        let table = |i: usize| srcs[i].kind.schema();
 
         // WHERE: each condition naming one scanned side goes to its scan.
         let mut pushed: Vec<Vec<Expr>> = vec![Vec::new(); srcs.len()];
@@ -545,9 +579,38 @@ impl Planner<'_> {
                 return Err(err(format!("JOIN {} needs an equality with the tables before it in ON, e.g. a.cites = {}.id or a.category = {}.category", srcs[i].alias, srcs[i].alias, srcs[i].alias)));
             }
             // A scanned side is restricted to the left's join values.
-            for (_, c) in &keys[i] {
-                if !in_memory(i) && !self.is_edges(c) && !self.schema.field(c).is_some_and(|f| matches!(f.ty, FieldType::Keyword | FieldType::Int | FieldType::Float)) {
+            for (le, c) in &keys[i] {
+                if !in_memory(i) && !is_edges(table(i), c) && !table(i).and_then(|t| t.field(c)).is_some_and(|f| matches!(f.ty, FieldType::Keyword | FieldType::Int | FieldType::Float)) {
                     return Err(err(format!("joins compare KEYWORD, INT or FLOAT fields, the key or EDGES links, not {c}")));
+                }
+                // Keys of two kinds never equal (INT and FLOAT compare as numbers).
+                if let (Some(rf), Some((j, lc))) = (table(i).and_then(|t| t.field(c)), sides.column(le)?) {
+                    if let Some(lf) = table(j).and_then(|t| t.field(&lc)) {
+                        let kind = |f: &crate::schema::Field| match (f.logical, &f.ty) {
+                            (Some(l), _) => l.type_name(),
+                            (None, FieldType::Int | FieldType::Float) => "number",
+                            _ => f.type_name(),
+                        };
+                        if lf.ty != FieldType::Edges && rf.ty != FieldType::Edges && kind(lf) != kind(rf) {
+                            return Err(err(format!(
+                                "{le} = {}.{c}: a {} field never equals a {} field; join keys are of one type (INT and FLOAT compare as numbers)",
+                                srcs[i].alias,
+                                lf.type_name(),
+                                rf.type_name()
+                            )));
+                        }
+                    }
+                }
+                // Links name keys of their own table.
+                let left = sides.column(le)?.map(|(j, lc)| (j, is_edges(table(j), &lc)));
+                let (Some(t), Some((j, left_links))) = (table(i), left) else { continue };
+                let Some(u) = table(j).filter(|u| !u.table.eq_ignore_ascii_case(&t.table)) else { continue };
+                if left_links || is_edges(Some(t), c) {
+                    let (links, keys) = if left_links { (u, t) } else { (t, u) };
+                    return Err(err(format!(
+                        "{le} = {}.{c}: an EDGES field of {} links rows of {} by their keys, not rows of {}",
+                        srcs[i].alias, links.table, links.table, keys.table
+                    )));
                 }
             }
         }
@@ -582,8 +645,7 @@ impl Planner<'_> {
                 // The executor orders by a score or a numeric field.
                 Some(o) => {
                     scan_order[0].is_some()
-                        || (!in_memory(0)
-                            && sides.column(&o.expr)?.is_some_and(|(i, c)| i == 0 && self.schema.field(&c).is_some_and(|f| matches!(f.ty, FieldType::Int | FieldType::Float) && !f.multi)))
+                        || sides.column(&o.expr)?.is_some_and(|(i, c)| i == 0 && table(0).and_then(|t| t.field(&c)).is_some_and(|f| matches!(f.ty, FieldType::Int | FieldType::Float) && !f.multi))
                 }
             };
         if driver_order && order.len() == 1 && scan_order[0].is_none() {
@@ -601,7 +663,7 @@ impl Planner<'_> {
             let side = self.scan(src, &needed[i], &pushed[i], &scan_order[i], if i == 0 { "scan" } else { "join" })?;
             let alias = src.alias.to_ascii_lowercase();
             let side_cols: Vec<(String, String)> = needed[i].iter().map(|c| (alias.clone(), c.clone())).collect();
-            let side_multi: Vec<bool> = needed[i].iter().map(|c| !in_memory(i) && self.schema.field(c).is_some_and(|f| f.multi)).collect();
+            let side_multi: Vec<bool> = needed[i].iter().map(|c| table(i).and_then(|t| t.field(c)).is_some_and(|f| f.multi)).collect();
             let Some(left) = node.take() else {
                 node = Some(side);
                 cols = side_cols;
@@ -616,8 +678,8 @@ impl Planner<'_> {
                     Ok(ir::JoinKey {
                         left: compile_row(le, &cols, &multi, self.params, &subs)?,
                         right: ir::Expr::Output(right as u32),
-                        left_links: self.links(le, &cols),
-                        right_links: self.is_edges(rc),
+                        left_links: sides.column(le)?.is_some_and(|(j, c)| is_edges(table(j), &c)),
+                        right_links: is_edges(table(i), rc),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -634,41 +696,23 @@ impl Planner<'_> {
         self.evaluate(s, node, &cols, &multi, &mem_order, offset, limit, srcs.len() > 1, driver_order)
     }
 
-    /// Columns a side offers.
-    fn columns_of(&self, src: &Src) -> Vec<String> {
-        match &src.kind {
-            SrcKind::Rows(p) => p.columns.clone(),
-            _ => self.schema.fields.iter().map(|f| f.name.clone()).chain(["__score".to_string()]).collect(),
-        }
-    }
-
-    /// Whether join values of `e` are the targets of an EDGES field's links.
-    fn links(&self, e: &Expr, cols: &[(String, String)]) -> bool {
-        match e {
-            Expr::Identifier(id) => self.is_edges(&id.value) && cols.iter().filter(|(_, c)| c.eq_ignore_ascii_case(&id.value)).count() == 1,
-            Expr::CompoundIdentifier(ids) => self.is_edges(&ids.last().expect("a name").value),
-            _ => false,
-        }
-    }
-
-    fn is_edges(&self, column: &str) -> bool {
-        self.schema.field(column).is_some_and(|f| f.ty == FieldType::Edges)
-    }
-
     /// One side of a join: a leaf with its own conditions and ranking,
     /// returning the `columns` it needs, or rows in memory.
     fn scan(&self, src: &Src, columns: &[String], conds: &[Expr], order: &Option<OrderKey>, what: &str) -> Result<ir::Node> {
-        if let SrcKind::Rows(p) = &src.kind {
-            // Held in memory: pick the columns.
-            let picked = columns
-                .iter()
-                .map(|c| {
-                    let i = p.columns.iter().position(|x| x.eq_ignore_ascii_case(c)).ok_or_else(|| err(format!("{} has no column {c}", src.alias)))?;
-                    Ok(ir::Column { name: c.clone(), expr: ir::Expr::Output(i as u32) })
-                })
-                .collect::<Result<_>>()?;
-            return Ok(ir::Node::Project { input: Box::new(p.node.clone()), columns: picked });
-        }
+        let schema = match &src.kind {
+            SrcKind::Table(t) | SrcKind::TableRows(_, t) => *t,
+            SrcKind::Rows(p) => {
+                // Held in memory: pick the columns.
+                let picked = columns
+                    .iter()
+                    .map(|c| {
+                        let i = p.columns.iter().position(|x| x.eq_ignore_ascii_case(c)).ok_or_else(|| err(format!("{} has no column {c}", src.alias)))?;
+                        Ok(ir::Column { name: c.clone(), expr: ir::Expr::Output(i as u32) })
+                    })
+                    .collect::<Result<_>>()?;
+                return Ok(ir::Node::Project { input: Box::new(p.node.clone()), columns: picked });
+            }
+        };
         let alias = src.alias.to_ascii_lowercase();
         let column = |c: &str| Expr::Identifier(sql::Ident::new(c));
         let mut q = super::sql::parse_query("SELECT score() AS __score FROM t")?;
@@ -676,7 +720,7 @@ impl Planner<'_> {
         let score = s.projection.pop().expect("score() AS __score");
         s.projection = columns.iter().map(|c| if c == "__score" { score.clone() } else { SelectItem::UnnamedExpr(column(c)) }).collect();
         if let TableFactor::Table { name, .. } = &mut s.from[0].relation {
-            *name = sql::ObjectName::from(vec![sql::Ident::new(self.schema.table.clone())]);
+            *name = sql::ObjectName::from(vec![sql::Ident::new(schema.table.clone())]);
         }
         s.selection = conds.iter().map(|c| Expr::Nested(Box::new(unqualify(c, &alias)))).reduce(|a, b| Expr::BinaryOp { left: Box::new(a), op: BinaryOperator::And, right: Box::new(b) });
         let ranked = order.as_ref().is_some_and(|(e, ..)| is_score(e));
@@ -688,12 +732,20 @@ impl Planner<'_> {
         if ranked {
             q.limit_clause = Some(sql::LimitClause::LimitOffset { limit: Some(Expr::value(sql::Value::Number((MAX_ROWS + 1).to_string(), false))), offset: None, limit_by: Vec::new() });
         }
-        let mut p = self.leaf(&q, &format!("{what} {}", src.alias))?;
-        if let SrcKind::TableRows(cte) = &src.kind {
+        let mut p = self.leaf(&q, &format!("{what} {}", src.alias), schema)?;
+        if let SrcKind::TableRows(cte, _) = &src.kind {
             let rows = ir::Expr::Keys(Box::new(ir::Node::Ref { name: cte.clone() }));
-            restrict(&mut p.node, ir::Expr::In { expr: Box::new(ir::Expr::Field(self.pk()? as u32)), list: vec![rows] });
+            restrict(&mut p.node, ir::Expr::In { expr: Box::new(ir::Expr::Field(pk(schema)? as u32)), list: vec![rows] });
         }
         Ok(p.node)
+    }
+}
+
+/// Columns a side offers.
+fn columns_of(src: &Src) -> Vec<String> {
+    match &src.kind {
+        SrcKind::Rows(p) => p.columns.clone(),
+        SrcKind::Table(t) | SrcKind::TableRows(_, t) => t.fields.iter().map(|f| f.name.clone()).chain(["__score".to_string()]).collect(),
     }
 }
 
@@ -723,8 +775,8 @@ fn and(mut cs: Vec<ir::Expr>) -> Option<ir::Expr> {
 struct Sides<'s> {
     aliases: &'s [String],
     cols: &'s [Vec<String>],
-    /// VECTOR fields, which `*` leaves out.
-    vectors: &'s [String],
+    /// Each table's VECTOR fields, which `*` leaves out.
+    vectors: &'s [Vec<String>],
 }
 
 impl Sides<'_> {
@@ -778,7 +830,7 @@ impl Sides<'_> {
 
     /// Whether `*` shows column `c` of table `i`.
     fn in_star(&self, i: usize, c: &str, srcs: &[Src]) -> bool {
-        c != "__score" && (matches!(srcs[i].kind, SrcKind::Rows(_)) || !self.vectors.iter().any(|v| v == c))
+        c != "__score" && (matches!(srcs[i].kind, SrcKind::Rows(_)) || !self.vectors[i].iter().any(|v| v == c))
     }
 
     /// The columns each table must return.
@@ -1384,7 +1436,7 @@ impl Planner<'_> {
             true => cut(ir::Node::Distinct { input: Box::new(project(node)) }),
             false => project(cut(node)),
         };
-        Ok(Planned { node, columns, keyed: false })
+        Ok(Planned { node, columns, keyed: None })
     }
 }
 

@@ -43,7 +43,12 @@ fn err(m: impl Into<String>) -> Error {
 /// Runs a plan that reads `schema`'s table: its leaves with `runner`, the
 /// rest here, under `opts`' deadline, cancel flag and memory budget.
 pub fn run(plan: &Plan, schema: &Schema, runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let mut ops = Ops { schema, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, plan: Vec::new() };
+    run_in(plan, &[schema], runner, opts)
+}
+
+/// [`run`] of a plan whose leaves read any tables of `catalog`.
+pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
+    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, plan: Vec::new() };
     let rows = ops.node(&plan.root, "query")?;
     let keys = rows.keys.filter(|k| k.iter().all(|k| !matches!(k, Value::Null)));
     Ok(ResultSet {
@@ -80,7 +85,8 @@ impl Rows {
 }
 
 struct Ops<'a, 'r> {
-    schema: &'a Schema,
+    /// The tables leaves read.
+    catalog: &'a [&'a Schema],
     runner: &'a mut Runner<'r>,
     opts: &'a ExecOptions,
     /// What the query holds.
@@ -95,7 +101,13 @@ struct Ops<'a, 'r> {
     plan: Vec<String>,
 }
 
-impl Ops<'_, '_> {
+impl<'a> Ops<'a, '_> {
+    /// The table a leaf reads.
+    fn table(&self, leaf: &Node) -> Result<&'a Schema> {
+        let name = leaf.search().map(|s| s.table.as_str()).unwrap_or_default();
+        self.catalog.iter().find(|s| s.table.eq_ignore_ascii_case(name)).copied().ok_or_else(|| err(format!("no such table: {name}")))
+    }
+
     /// [`ExecOptions::check`] every 1,024 rows.
     fn tick(&mut self) -> Result<()> {
         self.steps += 1;
@@ -199,8 +211,9 @@ impl Ops<'_, '_> {
     /// `restrict` added to its Search's filter.
     fn leaf(&mut self, n: &Node, what: &str, restrict: Vec<(Expr, usize)>) -> Result<Rows> {
         self.opts.check()?;
+        let schema = self.table(n)?;
         let mut leaf = n.clone();
-        leaf.leaf_exprs_mut(&mut |e| e.visit_mut(&mut |x| self.resolve(x)))?;
+        leaf.leaf_exprs_mut(&mut |e| e.visit_mut(&mut |x| self.resolve(x, Some(schema))))?;
         let mut restricted = 0;
         if !restrict.is_empty() {
             let s = leaf.search_mut().expect("a leaf");
@@ -233,7 +246,7 @@ impl Ops<'_, '_> {
         }
         // The leaf as the plan has it: a subquery's values, or a join's,
         // would make the line as long as they are.
-        let text: Vec<String> = Plan::new(n.clone()).explain(&[self.schema]).iter().map(|l| l.trim().to_string()).collect();
+        let text: Vec<String> = Plan::new(n.clone()).explain(self.catalog).iter().map(|l| l.trim().to_string()).collect();
         let mut line = format!("{what}: {} rows: {}", rs.rows.len(), text.join(" / "));
         if restricted > 0 {
             line += &format!(" (restricted to {restricted} join values)");
@@ -252,16 +265,17 @@ impl Ops<'_, '_> {
         })
     }
 
-    /// `e` with its subqueries run.
+    /// `e`, over rows in memory, with its subqueries run.
     fn resolved(&mut self, e: &Expr) -> Result<Expr> {
         let mut e = e.clone();
-        e.visit_mut(&mut |x| self.resolve(x))?;
+        e.visit_mut(&mut |x| self.resolve(x, None))?;
         Ok(e)
     }
 
     /// Runs the subqueries `e` holds itself and puts their results in their
-    /// place: values a field is compared with in the field's type.
-    fn resolve(&mut self, e: &mut Expr) -> Result<()> {
+    /// place: values a field of `schema`'s table (a leaf's) is compared
+    /// with in the field's type.
+    fn resolve(&mut self, e: &mut Expr, schema: Option<&Schema>) -> Result<()> {
         let field = |x: &Expr| match x {
             Expr::Field(f) => Some(*f as usize),
             _ => None,
@@ -273,7 +287,7 @@ impl Ops<'_, '_> {
                 let mut out = Vec::with_capacity(list.len());
                 for x in std::mem::take(list) {
                     match x {
-                        x @ (Expr::Values(_) | Expr::Keys(_)) => out.extend(self.values(&x, f)?.into_iter().map(Expr::Lit)),
+                        x @ (Expr::Values(_) | Expr::Keys(_)) => out.extend(self.values(&x, schema, f)?.into_iter().map(Expr::Lit)),
                         x => out.push(x),
                     }
                 }
@@ -283,7 +297,7 @@ impl Ops<'_, '_> {
                 let (fl, fr) = (field(left), field(right));
                 for (side, f) in [(left, fr), (right, fl)] {
                     if let Expr::Scalar(n) = side.as_ref() {
-                        **side = Expr::Lit(self.scalar(n, f)?);
+                        **side = Expr::Lit(self.scalar(n, schema, f)?);
                     }
                 }
             }
@@ -291,33 +305,33 @@ impl Ops<'_, '_> {
                 let f = field(expr);
                 for b in lo.iter_mut().chain(hi.iter_mut()) {
                     if let Expr::Scalar(n) = b.as_ref() {
-                        **b = Expr::Lit(self.scalar(n, f)?);
+                        **b = Expr::Lit(self.scalar(n, schema, f)?);
                     }
                 }
             }
             Expr::Graph(g) | Expr::Ppr(g) => {
-                let pk = self.schema.primary_key;
+                let pk = schema.and_then(|s| s.primary_key);
                 let Graph { seeds, kind, .. } = g.as_mut();
                 for s in std::iter::once(seeds).chain(match kind {
                     GraphKind::Path { to, .. } => Some(to),
                     _ => None,
                 }) {
                     if matches!(s, Expr::Values(_) | Expr::Keys(_)) {
-                        *s = Expr::Lit(Value::List(self.values(s, pk)?));
+                        *s = Expr::Lit(Value::List(self.values(s, schema, pk)?));
                     }
                 }
             }
-            Expr::Values(_) | Expr::Keys(_) => *e = Expr::Lit(Value::List(self.values(e, None)?)),
+            Expr::Values(_) | Expr::Keys(_) => *e = Expr::Lit(Value::List(self.values(e, None, None)?)),
             Expr::Exists(n) => *e = Expr::Lit(Value::Bool(!self.node(n, "subquery")?.rows.is_empty())),
-            Expr::Scalar(n) => *e = Expr::Lit(self.scalar(n, None)?),
+            Expr::Scalar(n) => *e = Expr::Lit(self.scalar(n, None, None)?),
             _ => {}
         }
         Ok(())
     }
 
     /// The values of [`Expr::Values`] (each once, a list's each, no NULL)
-    /// or [`Expr::Keys`], as field `f`'s values.
-    fn values(&mut self, e: &Expr, f: Option<usize>) -> Result<Vec<Value>> {
+    /// or [`Expr::Keys`], as the values of field `f` of `schema`'s table.
+    fn values(&mut self, e: &Expr, schema: Option<&Schema>, f: Option<usize>) -> Result<Vec<Value>> {
         let (Expr::Values(n) | Expr::Keys(n)) = e else { unreachable!("a subquery") };
         let rows = self.node(n, "subquery")?;
         let vals = match e {
@@ -340,46 +354,19 @@ impl Ops<'_, '_> {
             }
         };
         self.plan.push(format!("subquery: {} {}", vals.len(), if matches!(e, Expr::Keys(_)) { "keys" } else { "values" }));
-        self.equal_to(f, vals)
+        equal_to(schema, f, vals)
     }
 
     /// The value of [`Expr::Scalar`]: NULL without a row.
-    fn scalar(&mut self, n: &Node, f: Option<usize>) -> Result<Value> {
+    fn scalar(&mut self, n: &Node, schema: Option<&Schema>, f: Option<usize>) -> Result<Value> {
         let rows = self.node(n, "subquery")?;
         if rows.rows.len() > 1 {
             return Err(err(format!("a scalar subquery returned {} rows; add LIMIT 1 or an aggregate", rows.rows.len())));
         }
         match rows.rows.into_iter().next().and_then(|r| r.into_iter().next()) {
             None | Some(Value::Null) => Ok(Value::Null),
-            Some(v) => self.coerce(f, v),
+            Some(v) => coerce(schema, f, v),
         }
-    }
-
-    /// `v` in field `f`'s type, as the binder reads a value compared with
-    /// it; a BOOL or TIMESTAMP field's as it is, which the plan's raising
-    /// stores, and a fraction compared with an INT field too, which the
-    /// raising rounds (`n > 2.5` is `n >= 3`).
-    fn coerce(&self, f: Option<usize>, v: Value) -> Result<Value> {
-        match f.and_then(|f| self.schema.fields.get(f)) {
-            Some(field) if field.ty == FieldType::Int && matches!(v, Value::Float(_)) => Ok(v),
-            Some(field) if field.logical.is_none() => super::sql::coerced(field, v),
-            _ => Ok(v),
-        }
-    }
-
-    /// Values field `f` is to equal ([`Ops::coerce`]d): an INT field holds
-    /// no fraction, so a whole FLOAT is its INT and another FLOAT equals no
-    /// row.
-    fn equal_to(&self, f: Option<usize>, vals: Vec<Value>) -> Result<Vec<Value>> {
-        let int = f.and_then(|f| self.schema.fields.get(f)).is_some_and(|field| field.ty == FieldType::Int && field.logical.is_none());
-        vals.into_iter()
-            .filter_map(|v| match v {
-                Value::Float(x) if int && x.fract() == 0.0 && x.abs() < 9e18 => Some(Value::Int(x as i64)),
-                Value::Float(_) if int => None,
-                v => Some(v),
-            })
-            .map(|v| self.coerce(f, v))
-            .collect()
     }
 
     /// LIMIT; over joins whose first table's scan is a leaf, that scan reads
@@ -417,11 +404,12 @@ impl Ops<'_, '_> {
         if l.rows.len() > MAX_ROWS {
             return Err(err(format!("a table of the join would read more than {MAX_ROWS} rows; add conditions on it")));
         }
-        let int = self.schema.primary_key.is_some_and(|p| self.schema.fields[p].ty == FieldType::Int);
         let lefts_at: Vec<Expr> = keys.iter().map(|k| self.resolved(&k.left)).collect::<Result<_>>()?;
+        // Whether each key's links, on either side, name INT keys.
+        let ints: Vec<(bool, bool)> = keys.iter().map(|k| Ok((k.left_links && self.int_links(left, &k.left)?, k.right_links && self.int_links(right, &k.right)?))).collect::<Result<_>>()?;
         // The join values the left rows hold, for each key.
         let mut lefts: Vec<Vec<Value>> = Vec::new();
-        for (k, at) in keys.iter().zip(&lefts_at) {
+        for ((k, at), &(int, _)) in keys.iter().zip(&lefts_at).zip(&ints) {
             let mut seen = HashSet::new();
             let mut vals = Vec::new();
             for r in &l.rows {
@@ -450,7 +438,7 @@ impl Ops<'_, '_> {
         for (ri, row) in r.rows.iter().enumerate() {
             self.tick()?;
             let mut combos: Vec<Vec<Part>> = vec![Vec::new()];
-            for (k, &j) in keys.iter().zip(&right_at) {
+            for ((k, &j), &(_, int)) in keys.iter().zip(&right_at).zip(&ints) {
                 let v = row.get(j).ok_or_else(|| err(format!("no column {j} in the join's right rows of {} columns", row.len())))?;
                 let vals: Vec<Part> = join_values(v, k.right_links, int)?.iter().map(part).collect();
                 combos = combos.into_iter().flat_map(|c| vals.iter().map(move |v| [c.clone(), vec![v.clone()]].concat())).collect();
@@ -467,7 +455,7 @@ impl Ops<'_, '_> {
         for (li, lrow) in l.rows.iter().enumerate() {
             self.tick()?;
             let mut combos: Vec<Vec<Part>> = vec![Vec::new()];
-            for (k, at) in keys.iter().zip(&lefts_at) {
+            for ((k, at), &(int, _)) in keys.iter().zip(&lefts_at).zip(&ints) {
                 let vals: Vec<Part> = join_values(&value(at, lrow)?, k.left_links, int)?.iter().map(part).collect();
                 combos = combos.into_iter().flat_map(|c| vals.iter().map(move |v| [c.clone(), vec![v.clone()]].concat())).collect();
             }
@@ -504,11 +492,12 @@ impl Ops<'_, '_> {
     /// `vals` of key `k` (on its column `j`): the field holds one of them,
     /// or for an EDGES field links to one.
     fn restriction(&self, leaf: &Node, j: usize, k: &JoinKey, vals: Vec<Value>) -> Result<Expr> {
+        let schema = self.table(leaf)?;
         let Node::Project { columns, .. } = leaf else { unreachable!("a leaf") };
         let Some(c) = columns.get(j) else { return Err(err(format!("no column {j} in the join's right rows of {} columns", columns.len()))) };
         let Expr::Field(f) = &c.expr else { return Err(err("a join key of a scanned table is one of its fields")) };
         if k.right_links {
-            let vals = vals.into_iter().map(|v| self.coerce(self.schema.primary_key, v)).collect::<Result<_>>()?;
+            let vals = vals.into_iter().map(|v| coerce(Some(schema), schema.primary_key, v)).collect::<Result<_>>()?;
             // `min_hops => 0`: a value's own row may link to another value.
             return Ok(Expr::Graph(Box::new(Graph {
                 field: *f,
@@ -522,7 +511,7 @@ impl Ops<'_, '_> {
                 min_sim: None,
             })));
         }
-        let vals = self.equal_to(Some(*f as usize), vals)?;
+        let vals = equal_to(Some(schema), Some(*f as usize), vals)?;
         Ok(Expr::In { expr: Box::new(Expr::Field(*f)), list: vals.into_iter().map(Expr::Lit).collect::<Vec<_>>() })
     }
 
@@ -569,6 +558,41 @@ impl Ops<'_, '_> {
     }
 
     /// The columns a node gives, without running it.
+    /// Whether the links of column `at` of `n`'s rows (an EDGES field) name
+    /// INT keys: links name keys of their own table.
+    fn int_links(&self, n: &Node, at: &Expr) -> Result<bool> {
+        let leaf = match at {
+            Expr::Output(i) => self.source(n, *i as usize),
+            _ => None,
+        };
+        let t = self.table(leaf.ok_or_else(|| err("a join along links needs the EDGES field of a scanned table"))?)?;
+        Ok(t.primary_key.is_some_and(|p| t.fields[p].ty == FieldType::Int))
+    }
+
+    /// The leaf whose field is column `i` of `n`'s rows, through joins,
+    /// projections of columns and the nodes that keep rows as they are.
+    fn source<'n>(&self, n: &'n Node, i: usize) -> Option<&'n Node> {
+        if n.is_leaf() {
+            return Some(n);
+        }
+        match n {
+            Node::Join { left, right, .. } => {
+                let w = self.columns(left).len();
+                if i < w {
+                    self.source(left, i)
+                } else {
+                    self.source(right, i - w)
+                }
+            }
+            Node::Project { input, columns } => match columns.get(i)?.expr {
+                Expr::Output(j) => self.source(input, j as usize),
+                _ => None,
+            },
+            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Distinct { input } | Node::KeyOrder { input, .. } => self.source(input, i),
+            _ => None,
+        }
+    }
+
     fn columns(&self, n: &Node) -> Vec<String> {
         match n {
             Node::Project { columns, .. } => columns.iter().map(|c| c.name.clone()).collect(),
@@ -579,6 +603,32 @@ impl Ops<'_, '_> {
             _ => Vec::new(),
         }
     }
+}
+
+/// `v` in the type of field `f` of `schema`'s table, as the binder reads a
+/// value compared with it; a BOOL or TIMESTAMP field's as it is, which the
+/// plan's raising stores, and a fraction compared with an INT field too,
+/// which the raising rounds (`n > 2.5` is `n >= 3`).
+fn coerce(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Value> {
+    match f.and_then(|f| schema?.fields.get(f)) {
+        Some(field) if field.ty == FieldType::Int && matches!(v, Value::Float(_)) => Ok(v),
+        Some(field) if field.logical.is_none() => super::sql::coerced(field, v),
+        _ => Ok(v),
+    }
+}
+
+/// Values field `f` is to equal ([`coerce`]d): an INT field holds no
+/// fraction, so a whole FLOAT is its INT and another FLOAT equals no row.
+fn equal_to(schema: Option<&Schema>, f: Option<usize>, vals: Vec<Value>) -> Result<Vec<Value>> {
+    let int = f.and_then(|f| schema?.fields.get(f)).is_some_and(|field| field.ty == FieldType::Int && field.logical.is_none());
+    vals.into_iter()
+        .filter_map(|v| match v {
+            Value::Float(x) if int && x.fract() == 0.0 && x.abs() < 9e18 => Some(Value::Int(x as i64)),
+            Value::Float(_) if int => None,
+            v => Some(v),
+        })
+        .map(|v| coerce(schema, f, v))
+        .collect()
 }
 
 /// The first table's scan of the joins under a LIMIT, through the nodes

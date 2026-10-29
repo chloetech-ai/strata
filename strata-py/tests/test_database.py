@@ -250,3 +250,14 @@ def test_simple_analyzer(tmp_path):
         assert ids("title", "the") == ["a"]
     with pytest.raises(strata.StrataError, match="analyzer"):
         strata.Database.create(tmp_path / "bad.strata", {"table": "t", "fields": [{"name": "t", "type": "text", "analyzer": "klingon"}]})
+
+
+def test_joins_across_tables(db):
+    assert db.sql("CREATE TABLE genres (name KEYWORD PRIMARY KEY, shelf INT)") == 0
+    assert db.sql("INSERT INTO genres (name, shelf) VALUES ('fantasy', 1), ('mystery', 2), ('classic', 3)") == 3
+    # Each 1910 book with the shelf of each of its genres that has one.
+    r = db.query("SELECT b.id, g.shelf FROM books b JOIN genres g ON b.genres = g.name WHERE b.year = 1910 ORDER BY b.id, g.shelf")
+    want = sorted((book(i)["id"], {"fantasy": 1, "mystery": 2, "classic": 3}[g]) for i in range(200) if book(i)["year"] == 1910 for g in book(i)["genres"] if g != "new")
+    assert [tuple(row.values()) for row in r] == want
+    r = db.query("SELECT COUNT(*) AS n FROM books WHERE genres IN (SELECT name FROM genres WHERE shelf >= :s)", {"s": 3})
+    assert r[0]["n"] == sum(1 for i in range(200) if "classic" in book(i)["genres"])

@@ -212,11 +212,15 @@ need no table.
   the same commit. An older version ignores the key and drops it when it
   rewrites the schema, which loses nothing it could use: a format 1 file
   has one table, which can only reference itself.
-* **SQL.** A statement names its table. `Db::query` finds the tables a
-  query reads (`FROM` and `JOIN`, subqueries and `WITH` queries, but not the
-  names of `WITH` results) and runs it, compound or not, on that table's
-  view of one snapshot; a query that reads two tables is refused until
-  joins across tables exist. A write binds against the catalog, takes the
+* **SQL.** A statement names its table. `Db::query` plans a query over
+  the catalog of one snapshot: a query of one table binds against it, and
+  a compound one's leaves each bind against the table they read, so a
+  join, a subquery or a `WITH` may read another table (joins across
+  tables). Each leaf runs on its table's view of the same snapshot. Join
+  keys are of one kind, `KEYWORD`, or `INT` and `FLOAT` compared as
+  numbers, and planning refuses two kinds, since a `KEYWORD` never equals
+  an `INT`; an `EDGES` field links rows of its own table by their keys, so
+  a join along links stays in one table. A write binds against the catalog, takes the
   writer lock, checks that its table was not dropped and created again
   meanwhile, and reads the rows it changes at that version. `CREATE TABLE`
   binds to the schema's short JSON form, so both take the same options.
@@ -599,8 +603,8 @@ handing a query to its shards) are to make instead of writing SQL text.
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next, in order: the Python builder, joins across tables, and typed
-plans as the shard protocol.
+Next: typed plans as the shard protocol, then a coordinator and
+strata-server over every table.
 
 ## 7. Planning and execution
 
