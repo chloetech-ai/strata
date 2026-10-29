@@ -660,6 +660,7 @@ impl Db {
         let schema = self.schema().clone();
         for p in images {
             let file = SegmentFile::open(crate::postings::bytes::OwnedBytes::new(std::fs::read(p)?))?;
+            file.verify_sections().map_err(|e| crate::Error::Schema(format!("{}: {e}", p.display())))?;
             let r = SegmentReaders::open(&file, &schema)?;
             for (i, f) in schema.fields.iter().enumerate() {
                 let ok = match f.ty {

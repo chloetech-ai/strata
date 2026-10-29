@@ -50,7 +50,7 @@ use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MergePolicy,
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
 use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
-use crate::storage::state::{Key, Loc, SegHandle, State, TableState};
+use crate::storage::state::{Check, Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::Updates;
 use crate::storage::wal::{self, Op, Wal, WalTxn};
 use crate::value::{validate, Document, Value};
@@ -124,6 +124,13 @@ pub struct DbOptions {
     /// [`Database::check`] runs. Delete sets and updates are checked
     /// either way, and merges check the segments they read.
     pub verify_checksums: bool,
+    /// Check each section of an on-disk segment against its crc32 the
+    /// first time a query reads it, which reads that whole section once
+    /// (and a segment's keys when it opens); a query that needs a damaged
+    /// section fails. Segments written before sections had a crc32 are
+    /// left to the checks above. Off, sections are trusted as far as
+    /// their structure checks go.
+    pub check_sections: bool,
 }
 
 /// How a database is laid out on disk.
@@ -136,6 +143,17 @@ pub enum Layout {
     /// A directory with one file per segment and delete set, and versioned
     /// manifests named by `CURRENT` ([`crate::storage::dir`]).
     Directory,
+}
+
+impl DbOptions {
+    /// How the segments of the version a database opens at are checked.
+    fn check_at_open(&self) -> Check {
+        match (self.verify_checksums, self.check_sections) {
+            (true, _) => Check::Open,
+            (false, true) => Check::Read,
+            (false, false) => Check::Never,
+        }
+    }
 }
 
 impl Default for DbOptions {
@@ -154,6 +172,7 @@ impl Default for DbOptions {
             layout: Layout::SingleFile,
             wal_drop_damaged: false,
             verify_checksums: false,
+            check_sections: true,
         }
     }
 }
@@ -714,7 +733,7 @@ impl Database {
         let handles = manifest
             .tables
             .iter()
-            .map(|t| t.segments.iter().map(|m| SegHandle::open_in(path, m, opts.read_ahead, opts.read_ahead && opts.random_hints, opts.verify_checksums).map(Arc::new)).collect())
+            .map(|t| t.segments.iter().map(|m| SegHandle::open_in(path, m, opts.read_ahead, opts.read_ahead && opts.random_hints, opts.check_at_open()).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
         let meta = dir_meta(&cur);
         Database::assemble(path, path.join(dir::WAL), Some(path.to_path_buf()), lockf, opts, manifest, meta, 0, FreeList::new(META_PAGES), OwnedBytes::empty(), handles)
@@ -772,7 +791,7 @@ impl Database {
         let handles = manifest
             .tables
             .iter()
-            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints, opts.verify_checksums).map(Arc::new)).collect())
+            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead && opts.random_hints, opts.check_at_open()).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
         Ok((manifest, freelist, map, handles))
     }
@@ -1495,7 +1514,9 @@ impl Database {
         let mut loaded = Vec::with_capacity(images.len());
         for path in images {
             let bytes = std::fs::read(path)?;
-            let file = SegmentFile::open(OwnedBytes::new(bytes.clone())).map_err(|e| Error::Schema(format!("{}: {e}", path.display())))?;
+            let file = SegmentFile::open(OwnedBytes::new(bytes.clone()))
+                .and_then(|f| f.verify_sections().map(|()| f))
+                .map_err(|e| Error::Schema(format!("{}: {e}", path.display())))?;
             let keys = crate::storage::pk::PkIndex::open(&file)?;
             if pk.is_some() != keys.is_some() {
                 return Err(Error::Schema(format!("{}: primary key index does not match the table", path.display())));
@@ -2297,6 +2318,7 @@ impl Database {
         let grown = self.dir.is_none() && c.meta.page_count * PAGE > map.len() as u64;
         let map = if grown { pager::map_file(&self.file, self.opts.read_ahead).map_err(|e| self.poison(e))? } else { map };
         let hints = self.opts.read_ahead && self.opts.random_hints;
+        let check = if self.opts.check_sections { Check::Read } else { Check::Never };
         let handles = c
             .manifest
             .tables
@@ -2306,8 +2328,8 @@ impl Database {
                     .iter()
                     .map(|m| match (old.iter().find(|h| h.meta == *m), &self.dir) {
                         (Some(h), _) => Ok(h.clone()),
-                        (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints, false).map(Arc::new),
-                        (None, None) => SegHandle::open(&map, m, hints, false).map(Arc::new),
+                        (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints, check).map(Arc::new),
+                        (None, None) => SegHandle::open(&map, m, hints, check).map(Arc::new),
                     })
                     .collect::<Result<Vec<_>>>()
             })

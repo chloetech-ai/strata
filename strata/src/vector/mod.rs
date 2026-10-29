@@ -306,7 +306,7 @@ impl VectorReader {
             VectorCodes::Sq8 => Quantiser::Sq8(Sq8 { min: a, scale: b }),
             VectorCodes::Binary => Quantiser::Bits(Bits { mean: a, spread: b }),
         };
-        let present = match seg.section(&section(field, "present")) {
+        let present = match seg.section(&section(field, "present"))? {
             Some(b) => {
                 let p: Slice<u64> = Slice::view(b).map_err(corrupt)?;
                 if p.len() != n.div_ceil(64) {
