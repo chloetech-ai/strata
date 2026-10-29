@@ -106,6 +106,12 @@ pub struct Field {
     /// given the model ([`crate::db::Db::set_embedder`]) also computes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed: Option<Embed>,
+    /// The table whose primary keys this KEYWORD or INT field holds (SQL
+    /// `REFERENCES`), recorded for readers and joins but not enforced: a
+    /// value need not be a live key of that table. An EDGES field holds
+    /// keys of its own table, and may say so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<String>,
 }
 
 /// A VECTOR field that is the embedding of other fields: `model`'s vector
@@ -127,7 +133,12 @@ pub struct Embed {
 
 impl Field {
     pub fn new(name: &str, ty: FieldType) -> Self {
-        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false, codes: VectorCodes::Sq8, embed: None }
+        Field { name: name.to_string(), ty, stored: true, indexed: true, generated_from: Vec::new(), multi: false, codes: VectorCodes::Sq8, embed: None, references: None }
+    }
+    /// Makes a KEYWORD or INT field hold primary keys of `table`.
+    pub fn references(mut self, table: &str) -> Self {
+        self.references = Some(table.to_string());
+        self
     }
     /// Sets a VECTOR field's compressed codes.
     pub fn codes(mut self, codes: VectorCodes) -> Self {
@@ -220,10 +231,12 @@ impl Schema {
                 return Err(Error::Schema(format!("EDGES field {} needs a primary key", f.name)));
             }
         }
-        let mut names: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
+        s.check_references()?;
+        // Names are matched in any case, so they must differ in more than case.
+        let mut names: Vec<String> = s.fields.iter().map(|f| f.name.to_ascii_lowercase()).collect();
         names.sort();
-        if names.windows(2).any(|w| w[0] == w[1]) {
-            return Err(Error::Schema("duplicate field name".into()));
+        if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+            return Err(Error::Schema(format!("duplicate field name {}", w[0])));
         }
         Ok(s)
     }
@@ -234,6 +247,44 @@ impl Schema {
     /// still hold one.
     pub fn unrebuildable(&self) -> Option<&Field> {
         self.fields.iter().find(|f| f.indexed && !f.stored && f.generated_from.is_empty() && matches!(f.ty, FieldType::Text { .. } | FieldType::Sparse))
+    }
+
+    /// Checks the fields that reference a table, and spells a reference to
+    /// this table as its name. References to other tables are checked
+    /// against them when the table joins a database
+    /// ([`crate::storage::Database::create_table`]).
+    fn check_references(&mut self) -> Result<()> {
+        let pk_ty = self.primary_key.map(|k| self.fields[k].ty.clone());
+        let table = self.table.clone();
+        for f in &mut self.fields {
+            let Some(r) = &f.references else { continue };
+            let bad = |m: String| Err(Error::Schema(format!("field {}: {m}", f.name)));
+            if r.is_empty() {
+                return bad("references names no table".into());
+            }
+            let own = r.eq_ignore_ascii_case(&table);
+            match f.ty {
+                FieldType::Keyword | FieldType::Int => {}
+                FieldType::Edges if own => {}
+                FieldType::Edges => return bad(format!("an EDGES field links rows of its own table, not of {r}")),
+                _ => return bad("only a KEYWORD, INT or EDGES field references a table".into()),
+            }
+            if own {
+                match &pk_ty {
+                    None => return bad(format!("references {table}, which has no primary key")),
+                    Some(t) if f.ty != FieldType::Edges && *t != f.ty => return bad(format!("references {table}, whose primary key is not {}", type_name(&f.ty))),
+                    _ => {}
+                }
+                f.references = Some(table.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The fields that reference table `table` (any case), by position.
+    pub fn referencing(&self, table: &str) -> impl Iterator<Item = usize> + '_ {
+        let table = table.to_string();
+        self.fields.iter().enumerate().filter(move |(_, f)| f.references.as_ref().is_some_and(|r| r.eq_ignore_ascii_case(&table))).map(|(i, _)| i)
     }
 
     pub fn field_index(&self, name: &str) -> Option<usize> {
@@ -265,6 +316,19 @@ impl Schema {
     fn joined(&self, sources: &[String], doc: &[crate::value::Value]) -> String {
         let parts: Vec<&str> = sources.iter().filter_map(|src| self.field_index(src).and_then(|j| doc[j].as_str())).filter(|s| !s.is_empty()).collect();
         parts.join("\n")
+    }
+}
+
+/// A field type's name in SQL and in the short JSON form.
+pub fn type_name(t: &FieldType) -> &'static str {
+    match t {
+        FieldType::Text { .. } => "TEXT",
+        FieldType::Keyword => "KEYWORD",
+        FieldType::Int => "INT",
+        FieldType::Float => "FLOAT",
+        FieldType::Vector { .. } => "VECTOR",
+        FieldType::Edges => "EDGES",
+        FieldType::Sparse => "SPARSE",
     }
 }
 
@@ -300,7 +364,8 @@ impl Schema {
     /// `"hnsw"` (the default, m 16 and ef_construction 200), `"flat"`,
     /// `{"hnsw": {"m": .., "ef_construction": ..}}` or
     /// `{"ivf": {"nlist": ..}}`, and its `codes` `"sq8"` (default) or
-    /// `"binary"`.
+    /// `"binary"`. A KEYWORD or INT field may name the table whose primary
+    /// keys it holds (`"references": "authors"`; see [`Field::references`]).
     ///
     /// The long form is this type's own serialization (what
     /// `GET /v1/schema` returns), with `primary_key` the key field's
@@ -392,6 +457,9 @@ impl Schema {
                 if !f.indexed {
                     m.insert("indexed".into(), json!(false));
                 }
+                if let Some(r) = &f.references {
+                    m.insert("references".into(), json!(r));
+                }
                 // "name" and "type" first, for people reading it.
                 let mut out = Map::new();
                 for k in ["name", "type"] {
@@ -416,7 +484,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -477,6 +545,11 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     f.multi = flag("multi")?.unwrap_or(false);
     if let Some(c) = j.get("codes").filter(|c| !c.is_null()) {
         f.codes = c.as_str().and_then(VectorCodes::parse).ok_or_else(|| bad("codes is \"sq8\" or \"binary\""))?;
+    }
+    match j.get("references") {
+        None | Some(J::Null) => {}
+        Some(J::String(t)) => f.references = Some(t.clone()),
+        Some(_) => return Err(bad("references names a table")),
     }
     match j.get("embed") {
         None | Some(J::Null) => {}

@@ -7,7 +7,7 @@ nav_order: 1
 # Strata's query language
 {: .no_toc }
 
-Strata speaks standard SQL `SELECT` over one table, with functions for full text, vectors, rank fusion and graphs, aggregates, typo-tolerant and synonym searches, and subqueries, `WITH` and joins of the table with itself. Text, structured and vector conditions mix freely in one statement, and the planner decides how to evaluate them together.
+Strata speaks standard SQL over the tables of a database: `SELECT` with functions for full text, vectors, rank fusion and graphs, aggregates, typo-tolerant and synonym searches, and subqueries, `WITH` and joins of a table with itself; `INSERT`, `UPDATE` and `DELETE`; and `CREATE TABLE` and `DROP TABLE`. Text, structured and vector conditions mix freely in one statement, and the planner decides how to evaluate them together.
 {: .fs-5 .fw-300 }
 
 1. TOC
@@ -58,7 +58,9 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [LIMIT n [OFFSET m]]
 ```
 
-- **One table per database.** The table name must match the schema's. Queries join it with itself or with a `WITH` result ([below](#subqueries-with-and-joins)).
+- **One table per query.** A database holds one or more [tables](#tables), and a query reads the one it names (in any case), joining it with itself or with a `WITH` result ([below](#subqueries-with-and-joins)). Joins and subqueries across tables are not supported yet: a query that names two tables is an error.
+- **Strings** are single-quoted, `'sale'`. Where a value goes, a double-quoted `"sale"` is a string too, as SQLite and MySQL read it, and a bare name is an error rather than a string: `WHERE tag = sale` says `no such column: sale`.
+- **Clauses Strata does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `WINDOW`, `QUALIFY`, `GROUP BY ... WITH ROLLUP` and the like.
 - **`SELECT *`** returns every stored, non-vector column.
 - **`score()`** is the value of the `ORDER BY` score for each row; **`hops()`** is a row's distance in a graph traversal ([below](#graphs)).
 - **`ORDER BY`** takes one key, plus an optional tie-break that must be the primary key (or, in a facet query, the group column). Ranking by a score is always best first; `ORDER BY distance(…) ASC` ranks like `similarity(…) DESC`.
@@ -331,22 +333,58 @@ target/release/strata db.strata --param t='rapid covid tests' < queries.sql
 | `--plan` | prints the plan lines the executor recorded for each statement |
 | `--repeat n` | runs each statement *n* times and reports the median time |
 
-From Rust, `Db::query` takes a `SELECT` and a `Params` map, and `Db::sql` takes any statement, writes included. Over the network, [strata-server](server.md) serves the same SQL.
+From Rust, `Db::query` takes a `SELECT` and a `Params` map, and `Db::sql` takes any statement, on any table, writes and `CREATE TABLE` included. Over the network, [strata-server](server.md) serves the same SQL over a database's first table.
+
+## Tables
+
+A database starts with the table it was created with, and `CREATE TABLE` adds more. Each table has its own columns, primary key, indexes and merges; the tables share the file, its write-ahead log and transactions.
+
+```sql
+CREATE TABLE authors (
+  id KEYWORD PRIMARY KEY,
+  name TEXT,
+  born INT,
+  topics KEYWORD[],
+  bio TEXT OPTIONS(positions = false),
+  emb VECTOR OPTIONS(embed = 'name, bio', model = 'potion-retrieval-32M')
+);
+CREATE TABLE IF NOT EXISTS wrote (
+  id INT PRIMARY KEY,
+  author KEYWORD REFERENCES authors,
+  paper KEYWORD REFERENCES papers (id)
+);
+DROP TABLE IF EXISTS wrote, authors;
+```
+
+- **Types** are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or `DOUBLE`, `REAL`), `VECTOR(dimensions)`, `SPARSE` and `EDGES`; `KEYWORD[]` and `INT[]` hold lists.
+- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), and `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone). Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
+- **The primary key** is one column: `PRIMARY KEY` on it, or a `PRIMARY KEY (column)` constraint. A table without one only takes plain `INSERT`.
+- **`REFERENCES table`**, or `FOREIGN KEY (column) REFERENCES table`, records that a `KEYWORD` or `INT` column holds primary keys of that table, which must exist (or be the table being created) and have a primary key of the column's type. References are not enforced: a row may name a key that is not there. Joins along them are the next step.
+- **`DROP TABLE`** drops tables other than the first. A table that another table references goes with it (`DROP TABLE wrote, authors`) or with `CASCADE`, which removes those references.
+- Every other clause (`NOT NULL`, `DEFAULT`, `UNIQUE`, `CHECK`, `ON DELETE`, constraint names, `CREATE TABLE ... AS SELECT`) is an error, and there is no `ALTER TABLE` yet.
+
+`CREATE TABLE` and `DROP TABLE` run through `Db::sql` and Python's in-process [`strata.Database`](python.md). [strata-server](server.md) serves a database's first table for now.
 
 ## Writes
 
 ```sql
 INSERT INTO products (id, title, price, tags, emb) VALUES ('p1', 'red mug', 12.5, ARRAY['kitchen', 'gift'], :v);
 INSERT OR REPLACE INTO products (id, title, price) VALUES ('p1', 'red mug, large', 14.0);
+INSERT INTO products (id, title, price) VALUES ('p2', 'blue mug', 11.0) ON CONFLICT (id) DO NOTHING;
+INSERT INTO products (id, title, price) VALUES ('p1', 'red mug', 12.0)
+  ON CONFLICT (id) DO UPDATE SET price = excluded.price, stock = stock + 10;
 UPDATE products SET stock = stock - 1, price = 11.0 WHERE id = 'p1';
 DELETE FROM products WHERE MATCH(title, 'discontinued');
+DELETE FROM products WHERE stock = 0 ORDER BY price LIMIT 100;
 ```
 
-- **`INSERT`** fails on a primary key that already exists; **`INSERT OR REPLACE`** replaces that row (an upsert). Lists are `ARRAY[…]`; a vector is a parameter, `ARRAY[…]` or a JSON array string; a `SPARSE` value is a JSON object string.
-- **`UPDATE`** takes any `WHERE`. Setting only single-valued `INT` and `FLOAT` fields (`SET clicks = clicks + 1`) changes them in place, without rewriting the row, which suits counters and prices that change often. Setting any other field rewrites the row, which needs every text field stored or generated.
-- **`DELETE`** takes any `WHERE`.
+- A write names its table, any table of the database.
+- **`INSERT`** fails on a primary key that already exists. **`INSERT OR REPLACE`** (or `REPLACE INTO`) replaces that row, an upsert. **`ON CONFLICT (key) DO NOTHING`** (or `INSERT OR IGNORE`) writes only the rows whose key is new, and the first of a key the statement repeats. **`ON CONFLICT (key) DO UPDATE SET ...`** inserts the new keys and sets fields of the rows already there, where `excluded.column` is the value the statement gave; a key that comes twice in one such statement is an error. Lists are `ARRAY[…]`; a vector is a parameter, `ARRAY[…]` or a JSON array string; a `SPARSE` value is a JSON object string.
+- **`UPDATE`** takes any `WHERE`, and a `LIMIT`. Setting only single-valued `INT` and `FLOAT` fields (`SET clicks = clicks + 1`) changes them in place, without rewriting the row, which suits counters and prices that change often. Setting any other field rewrites the row, which needs every text field stored or generated.
+- **`DELETE`** takes any `WHERE`, and `ORDER BY` with `LIMIT` to delete the first rows in that order.
+- `RETURNING`, `UPDATE ... FROM`, `DELETE ... USING`, `INSERT ... SELECT`, `ON DUPLICATE KEY UPDATE` and `DO UPDATE ... WHERE` are errors.
 
-Each statement is one transaction, and returns the number of rows it wrote. From Rust, the transaction API (`Database::begin`, `WriteTxn::insert`, `upsert`, `set`, `delete`, `commit`) groups several writes into one; `WriteTxn::upsert_if_newer` keeps whichever version of a row has the highest version number, for replaying a feed out of order.
+Each statement is one transaction, and returns the number of rows it wrote. From Rust, the transaction API (`Database::begin`, `WriteTxn::insert`, `upsert`, `set`, `delete`, `commit`, and `WriteTxn::table` for the other tables) groups several writes into one, across tables too; `WriteTxn::upsert_if_newer` keeps whichever version of a row has the highest version number, for replaying a feed out of order.
 
 ## Reading a plan
 

@@ -163,6 +163,25 @@ need no table.
 * **Flushes and merges.** A flush writes every table's memtable in one
   commit. A merge works on one table's segments and commits only that
   table's list.
+* **References.** A KEYWORD or INT field may record the table whose primary
+  keys it holds (`"references"` in the schema, SQL `REFERENCES`): a table
+  with a primary key of the field's type, or the field's own table. It
+  names the table, not its id, because a file that drops back to format 1
+  and is reopened can give a new table a dropped table's id. References are
+  not enforced on writes; dropping a referenced table needs the tables that
+  reference it dropped too, or `CASCADE`, which removes their references in
+  the same commit. An older version ignores the key and drops it when it
+  rewrites the schema, which loses nothing it could use: a format 1 file
+  has one table, which can only reference itself.
+* **SQL.** A statement names its table. `Db::query` finds the tables a
+  query reads (`FROM` and `JOIN`, subqueries and `WITH` queries, but not the
+  names of `WITH` results) and runs it, compound or not, on that table's
+  view of one snapshot; a query that reads two tables is refused until
+  joins across tables exist. A write binds against the catalog, takes the
+  writer lock, checks that its table was not dropped and created again
+  meanwhile, and reads the rows it changes at that version. `CREATE TABLE`
+  binds to the schema's short JSON form, so both take the same options.
+  strata-server binds statements against the first table only.
 * **Later format changes.** Readers refuse a newer format number in a meta
   slot, `CURRENT` or a manifest, but ignore keys they do not know inside a
   schema. So a change that an older version must not ignore (stable field
