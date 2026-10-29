@@ -4,7 +4,7 @@
 //! stand-in for the Messages API.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -590,6 +590,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn hello(&self, _: tonic::Request<pb::HelloRequest>) -> Result<tonic::Response<pb::HelloResponse>, tonic::Status> {
         Ok(tonic::Response::new(strata_server::grpc::hello()))
     }
+    async fn release(&self, _: tonic::Request<pb::ReleaseRequest>) -> Result<tonic::Response<pb::Empty>, tonic::Status> {
+        Ok(tonic::Response::new(pb::Empty {}))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -614,6 +617,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn hello(&self, _: tonic::Request<pb::HelloRequest>) -> Result<tonic::Response<pb::HelloResponse>, tonic::Status> {
         Ok(tonic::Response::new(strata_server::grpc::hello()))
+    }
+    async fn release(&self, _: tonic::Request<pb::ReleaseRequest>) -> Result<tonic::Response<pb::Empty>, tonic::Status> {
+        Ok(tonic::Response::new(pb::Empty {}))
     }
 }
 
@@ -716,15 +722,29 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
     }
 }
 
-/// A shard server that records each read's protocol and whether it came as
-/// a typed plan. While `old`, it is a server from before `Hello`: it
-/// answers Unimplemented, and the fields it does not know (`protocol`,
-/// `plan`) never reach it. While `down`, it fails every read.
+/// What a read brought a shard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Seen {
+    protocol: u32,
+    typed: bool,
+    hold: bool,
+    release: bool,
+}
+
+/// A shard server that records each read, as a server of protocol
+/// `version` would take it: one of 1 is from before `Hello` (it answers
+/// Unimplemented, and the fields it does not know, `protocol` and `plan`,
+/// never reach it), and one of 2 has no leases for a fetch (`hold`,
+/// `release`, `Release`). While `down`, it fails every read, and while
+/// `fail_fetch`, every fetch (a read that ends its lease). `after_hold` is
+/// a write it applies once, after answering a read that held its snapshot.
 struct Recording {
     inner: strata_server::grpc::Grpc,
-    old: AtomicBool,
+    version: AtomicU32,
     down: AtomicBool,
-    seen: std::sync::Mutex<Vec<(u32, bool)>>,
+    fail_fetch: AtomicBool,
+    after_hold: std::sync::Mutex<Option<String>>,
+    seen: std::sync::Mutex<Vec<Seen>>,
 }
 
 impl Recording {
@@ -733,23 +753,41 @@ impl Recording {
             return Err(tonic::Status::unavailable("restarting"));
         }
         let q = r.get_mut();
-        self.seen.lock().unwrap().push((q.protocol, q.plan.is_some()));
-        if self.old.load(Ordering::Relaxed) {
+        self.seen.lock().unwrap().push(Seen { protocol: q.protocol, typed: q.plan.is_some(), hold: q.hold, release: q.release });
+        let v = self.version.load(Ordering::Relaxed);
+        if v < 3 {
+            (q.hold, q.release) = (false, false);
+        }
+        if v < 2 {
             q.protocol = 0;
             q.plan = None;
+        }
+        if self.fail_fetch.load(Ordering::Relaxed) && q.release && !q.hold {
+            return Err(tonic::Status::unavailable("restarting"));
         }
         Ok(r)
     }
 
-    fn last(&self) -> Option<(u32, bool)> {
+    fn last(&self) -> Option<Seen> {
         self.seen.lock().unwrap().last().copied()
+    }
+
+    fn leases(&self) -> usize {
+        self.inner.0.sweep_leases()
     }
 }
 
 #[tonic::async_trait]
 impl pb::strata_server::Strata for Recording {
     async fn query(&self, r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
-        self.inner.query(self.read(r)?).await
+        let r = self.read(r)?;
+        let hold = r.get_ref().hold;
+        let a = self.inner.query(r).await?;
+        let write = self.after_hold.lock().unwrap().take_if(|_| hold);
+        if let Some(sql) = write {
+            self.inner.0.sql(&sql, &Params::new(), 0).await.unwrap();
+        }
+        Ok(a)
     }
     async fn term_stats(&self, r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::TermStatsResponse>, tonic::Status> {
         self.inner.term_stats(self.read(r)?).await
@@ -764,26 +802,53 @@ impl pb::strata_server::Strata for Recording {
         self.inner.health(r).await
     }
     async fn hello(&self, r: tonic::Request<pb::HelloRequest>) -> Result<tonic::Response<pb::HelloResponse>, tonic::Status> {
-        match self.old.load(Ordering::Relaxed) {
-            true => Err(tonic::Status::unimplemented("unknown method Hello")),
-            false => self.inner.hello(r).await,
+        match self.version.load(Ordering::Relaxed) {
+            1 => Err(tonic::Status::unimplemented("unknown method Hello")),
+            v => Ok(tonic::Response::new(pb::HelloResponse { max_protocol: v, ..self.inner.hello(r).await?.into_inner() })),
+        }
+    }
+    async fn release(&self, r: tonic::Request<pb::ReleaseRequest>) -> Result<tonic::Response<pb::Empty>, tonic::Status> {
+        match self.version.load(Ordering::Relaxed) {
+            3 => self.inner.release(r).await,
+            _ => Err(tonic::Status::unimplemented("unknown method Release")),
         }
     }
 }
 
-async fn recording(db: Db, old: bool) -> (String, Arc<Recording>) {
+async fn recording(db: Db, version: u32) -> (String, Arc<Recording>) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    let shard = Arc::new(Recording { inner: strata_server::grpc::Grpc(service(db, "http://unused")), old: AtomicBool::new(old), down: AtomicBool::new(false), seen: Default::default() });
+    let shard = Arc::new(Recording {
+        inner: strata_server::grpc::Grpc(service(db, "http://unused")),
+        version: AtomicU32::new(version),
+        down: AtomicBool::new(false),
+        fail_fetch: AtomicBool::new(false),
+        after_hold: Default::default(),
+        seen: Default::default(),
+    });
     let svc = pb::strata_server::StrataServer::from_arc(shard.clone()).max_decoding_message_size(256 << 20);
     tokio::spawn(tonic::transport::Server::builder().add_service(svc).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
     (format!("http://{addr}"), shard)
 }
 
+/// Waits for the shards to hold no snapshot lease: the coordinator ends
+/// those of shards without rows on a page without waiting.
+async fn leases_end(shards: &[Arc<Recording>]) {
+    for _ in 0..100 {
+        if shards.iter().all(|s| s.leases() == 0) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("leases held: {:?}", shards.iter().map(|s| s.leases()).collect::<Vec<_>>());
+}
+
 /// A coordinator asks each shard the protocol versions it speaks and
-/// speaks the oldest any speaks: typed plans (protocol 2) when every shard
-/// takes them, SQL and JSON plans (protocol 1) to all while one is from
-/// before `Hello`, as in a rolling upgrade. The answers are the same.
+/// speaks the oldest any speaks, as in a rolling upgrade: query then fetch
+/// with typed plans (protocol 3) when every shard holds snapshots for a
+/// fetch, typed plans in one round (2) to all while one does not, and SQL
+/// and JSON plans (1) to all while one is from before `Hello`. The answers
+/// are the same, and from protocol 3 no lease outlives its query.
 #[tokio::test(flavor = "multi_thread")]
 async fn shards_speak_the_oldest_protocol_among_them() {
     let dir = tempfile::tempdir().unwrap();
@@ -793,20 +858,20 @@ async fn shards_speak_the_oldest_protocol_among_them() {
         "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE a.year >= - -2022 AND b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
         "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > 100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
     ];
-    for (round, olds) in [[false, false], [false, true]].into_iter().enumerate() {
+    for (round, versions) in [[3, 3], [3, 2], [3, 1]].into_iter().enumerate() {
         let mut urls = Vec::new();
         let mut seen = Vec::new();
-        for (s, old) in olds.into_iter().enumerate() {
+        for (s, version) in versions.into_iter().enumerate() {
             let db = create(dir.path(), &format!("r{round}s{s}.strata"), |i| shard_of(&key(i), 2) == s);
-            let (url, log) = recording(db, old).await;
+            let (url, log) = recording(db, version).await;
             urls.push(url);
             seen.push(log);
         }
         let c = Coordinator::connect(urls).await.unwrap();
-        let want_protocol = if olds.contains(&true) { 1 } else { 2 };
+        let want_protocol = versions[1];
         assert_eq!(c.protocol(), want_protocol);
         let coord = cluster(c);
-        assert_eq!(coord.health().await["protocol"], want_protocol, "{olds:?}");
+        assert_eq!(coord.health().await["protocol"], want_protocol, "{versions:?}");
         for (sql, params) in queries() {
             let p = if params["q"].is_object() { Params::new().set("q", vector_42(&whole)) } else { Params::new() };
             let want = js::result(&whole.query(sql, &p).unwrap(), 0.0);
@@ -819,15 +884,22 @@ async fn shards_speak_the_oldest_protocol_among_them() {
             let got = coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
             same(sql, &want, &js::result(&got.rs, 0.0));
         }
+        // Before protocol 3, a statistics round's leases last until they
+        // expire.
+        if want_protocol >= 3 {
+            leases_end(&seen).await;
+        }
         // Statistics alone, as a coordinator in front of this one asks.
         let (stats, _) = coord.term_stats("SELECT id FROM products ORDER BY bm25(body, 'waterproof') DESC LIMIT 3", None, &Params::new(), 0).await.unwrap();
         let (local, _) = service(create(dir.path(), &format!("r{round}w.strata"), |_| true), "http://unused").term_stats("SELECT id FROM products ORDER BY bm25(body, 'waterproof') DESC LIMIT 3", None, &Params::new(), 0).await.unwrap();
         assert_eq!(serde_json::to_value(&stats).unwrap(), serde_json::to_value(&local).unwrap());
-        // Every read reached every shard in the protocol spoken, typed from 2.
+        // Every read reached every shard in the protocol spoken, typed from
+        // 2, and pages were fetched from 3.
         for shard in &seen {
             let log = shard.seen.lock().unwrap();
-            assert!(log.len() > queries().len(), "{olds:?}: {}", log.len());
-            assert!(log.iter().all(|&(p, typed)| p == want_protocol && typed == (want_protocol >= 2)), "{olds:?}: {log:?}");
+            assert!(log.len() > queries().len(), "{versions:?}: {}", log.len());
+            assert!(log.iter().all(|s| s.protocol == want_protocol && s.typed == (want_protocol >= 2)), "{versions:?}: {log:?}");
+            assert_eq!(log.iter().any(|s| s.hold), want_protocol >= 3, "{versions:?}: {log:?}");
         }
     }
 }
@@ -838,34 +910,105 @@ async fn shards_speak_the_oldest_protocol_among_them() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replica_is_asked_its_protocol_again_after_failing() {
     let dir = tempfile::tempdir().unwrap();
-    let (url, shard) = recording(create(dir.path(), "db.strata", |_| true), false).await;
+    let (url, shard) = recording(create(dir.path(), "db.strata", |_| true), 3).await;
     let coord = cluster(Coordinator::connect(vec![url]).await.unwrap());
     let count = || {
         let coord = coord.clone();
         async move { coord.query(QueryReq { sql: "SELECT COUNT(*) FROM products WHERE year >= 2020".into(), ..Default::default() }).await }
     };
     let n = count().await.unwrap().rs.rows[0][0].clone();
-    assert_eq!(shard.last(), Some((2, true)));
+    assert_eq!(shard.last().map(|s| (s.protocol, s.typed)), Some((3, true)));
     shard.down.store(true, Ordering::Relaxed);
-    shard.old.store(true, Ordering::Relaxed);
+    shard.version.store(1, Ordering::Relaxed);
     assert_eq!(count().await.err().unwrap().status, 503);
     shard.down.store(false, Ordering::Relaxed);
     assert_eq!(count().await.unwrap().rs.rows[0][0], n);
-    assert_eq!(shard.last(), Some((1, false)));
+    assert_eq!(shard.last().map(|s| (s.protocol, s.typed)), Some((1, false)));
+}
+
+/// Query then fetch: for a deep page, the shards rank their rows and
+/// answer the keys, and those holding the page's rows fetch its columns
+/// from the snapshot they ranked on, though a write came between the
+/// rounds; then every lease ends. A shard that fails the fetch is left out
+/// of a partial answer with its rows, which are counted, and fails a whole
+/// one. A shallow page comes in one round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_is_fetched_from_the_snapshot_it_was_ranked_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = create(dir.path(), "whole.strata", |_| true);
+    let key = |i: usize| Value::Str(format!("p{i:07}"));
+    let pages = [
+        // Without a statistics round, the query round makes the leases.
+        "SELECT id, title, price FROM products WHERE year >= 2020 ORDER BY price DESC, id LIMIT 10 OFFSET 40",
+        // With one, its leases are held on.
+        "SELECT title, id, score() FROM products ORDER BY bm25(body, 'waterproof hiking boots') DESC LIMIT 10 OFFSET 30",
+    ];
+    for (n, sql) in pages.into_iter().enumerate() {
+        let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
+        let (mut urls, mut shards) = (Vec::new(), Vec::new());
+        for s in 0..2 {
+            let (url, shard) = recording(create(dir.path(), &format!("p{n}s{s}.strata"), |i| shard_of(&key(i), 2) == s), 3).await;
+            *shard.after_hold.lock().unwrap() = Some("UPDATE products SET title = 'changed'".into());
+            urls.push(url);
+            shards.push(shard);
+        }
+        let coord = cluster(Coordinator::connect(urls.clone()).await.unwrap());
+        let got = coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap();
+        same(sql, &want, &js::result(&got.rs, 0.0));
+        for shard in &shards {
+            // The write came between the rounds.
+            assert!(shard.after_hold.lock().unwrap().is_none());
+            let log = shard.seen.lock().unwrap();
+            assert!(log.iter().any(|s| s.hold) && log.iter().all(|s| !(s.hold && s.release)), "{log:?}");
+        }
+        assert!(shards.iter().any(|s| s.seen.lock().unwrap().iter().any(|s| s.release)));
+        leases_end(&shards).await;
+        let title = want["columns"].as_array().unwrap().iter().position(|c| c == "title").unwrap();
+        let later = js::result(&coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap().rs, 0.0);
+        assert!(later["rows"].as_array().unwrap().iter().all(|r| r[title] == "changed"), "{later}");
+        leases_end(&shards).await;
+        // In one round, the shards hold nothing: so asked, or for a page
+        // the shards' rows of which are few.
+        let one = cluster(Coordinator::connect_with(urls.clone(), CoordOptions { fetch: false, ..Default::default() }).await.unwrap());
+        let before = shards[0].seen.lock().unwrap().len();
+        same(sql, &later, &js::result(&one.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap().rs, 0.0));
+        let shallow = sql.split(" OFFSET").next().unwrap();
+        let by_default = js::result(&coord.query(QueryReq { sql: shallow.into(), ..Default::default() }).await.unwrap().rs, 0.0);
+        same(shallow, &js::result(&one.query(QueryReq { sql: shallow.into(), ..Default::default() }).await.unwrap().rs, 0.0), &by_default);
+        assert!(shards[0].seen.lock().unwrap()[before..].iter().all(|s| !s.hold));
+
+        // A shard that fails the fetch.
+        shards[1].fail_fetch.store(true, Ordering::Relaxed);
+        let lenient = cluster(Coordinator::connect_with(urls.clone(), CoordOptions { partial: true, ..Default::default() }).await.unwrap());
+        let a = lenient.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap();
+        assert_eq!(a.missing, vec![urls[1].clone()]);
+        let idc = want["columns"].as_array().unwrap().iter().position(|c| c == "id").unwrap();
+        let id = |r: &Json| Value::Str(r[idc].as_str().unwrap().to_string());
+        let kept: Vec<&Json> = later["rows"].as_array().unwrap().iter().filter(|r| shard_of(&id(r), 2) == 0).collect();
+        let a = js::result(&a.rs, 0.0);
+        assert_eq!(a["rows"].as_array().unwrap().iter().collect::<Vec<_>>(), kept, "{sql}");
+        assert!(kept.len() < 10, "{sql}");
+        let lost = 10 - kept.len();
+        assert!(a["stats"]["plan"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains(&format!("fetch: {lost} rows of the page left out"))), "{a}");
+        assert!(lenient.prometheus().await.contains(&format!("strata_fetch_lost_rows_total {lost}\n")));
+        assert_eq!(coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.err().unwrap().status, 503);
+    }
 }
 
 /// A server says which protocol versions and plans it takes, takes a typed
-/// plan as its SQL, and refuses a protocol newer than its own and a plan
-/// that needs a feature it lacks, by name.
+/// plan as its SQL, holds a query's snapshot for a fetch and ends it, and
+/// refuses a protocol newer than its own and a plan that needs a feature
+/// it lacks, by name.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let dir = tempfile::tempdir().unwrap();
     let db = create(dir.path(), "db.strata", |_| true);
     let schema = db.schema().clone();
-    let url = grpc(service(db, "http://unused")).await;
+    let svc = service(db, "http://unused");
+    let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
     let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version), (1, 2, strata::query::ir::VERSION));
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version), (1, 3, strata::query::ir::VERSION));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -877,9 +1020,23 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     assert!(!by_sql.rows.is_empty());
     assert_eq!((by_plan.columns, by_plan.rows), (by_sql.columns, by_sql.rows));
 
-    let e = c.query(pb::QueryRequest { protocol: 3, ..typed.clone() }).await.unwrap_err();
+    // Protocol 3: a read holds the snapshot it read, a fetch reads it and
+    // ends it, and Release ends one that no fetch needs.
+    let typed = pb::QueryRequest { protocol: 3, ..typed };
+    let held = c.query(pb::QueryRequest { hold: true, ..typed.clone() }).await.unwrap().into_inner();
+    assert!(held.snapshot != 0 && svc.sweep_leases() == 1, "{}", held.snapshot);
+    assert_eq!(c.query(typed.clone()).await.unwrap().into_inner().snapshot, 0);
+    let fetched = c.query(pb::QueryRequest { snapshot: held.snapshot, release: true, ..typed.clone() }).await.unwrap().into_inner();
+    assert_eq!((fetched.rows, svc.sweep_leases()), (held.rows, 0));
+    let e = c.query(pb::QueryRequest { snapshot: held.snapshot, ..typed.clone() }).await.unwrap_err();
+    assert!(e.message().contains("expired"), "{}", e.message());
+    let unused = c.query(pb::QueryRequest { hold: true, ..typed.clone() }).await.unwrap().into_inner().snapshot;
+    c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
+    assert_eq!(svc.sweep_leases(), 0);
+
+    let e = c.query(pb::QueryRequest { protocol: 4, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 3"), "{}", e.message());
+    assert!(e.message().contains("protocol 4"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);

@@ -607,15 +607,28 @@ handing a query to its shards) are to make instead of writing SQL text.
   newer than its own, and reads a protobuf plan with the checks JSON's
   reading makes: version and features by name, every node and expression
   present, every number finite.
+* **Query then fetch.** From protocol 3, a page of rows with stored
+  columns whose shards would send at least 8 times its rows in one round
+  (`FETCH_FROM`: a deep page, many shards, or a fused score's candidates)
+  comes in two rounds. Each shard answers the query with its rows' keys
+  alone (`cluster::ids`) and holds the snapshot it read (`hold`); the
+  merge ranks the keys; the shards holding the page's rows answer
+  `cluster::fetch`, the query's columns of those rows, from that snapshot,
+  ending its lease (`release`; `Release` ends the others'); and
+  `cluster::fill` puts them in the merged order with the merged scores. A
+  statistics round's lease is ended by its query round too, where it
+  lasted until its deadline and a second. Partial aggregates were in
+  place already: shards send sums, counts, minimums, maximums and
+  `COUNT(DISTINCT)`'s exact values, which the coordinator merges.
 * **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
   fields by name and expressions in SQL's words, without running it;
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication on top of the shard protocol (query then
-fetch with partial aggregates, slots and epochs, sequence numbers in the
-WAL, WAL shipping, catch-up, read-your-writes, promotion), and a
-coordinator and strata-server over every table.
+Next: the rest of replication on top of the shard protocol (slots and
+epochs, sequence numbers in the WAL, WAL shipping, catch-up,
+read-your-writes, promotion), and a coordinator and strata-server over
+every table.
 
 ## 7. Planning and execution
 

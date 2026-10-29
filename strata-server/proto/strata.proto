@@ -4,10 +4,12 @@
 //
 // Protocol versions: 1, servers before `Hello`, take a query as SQL, or a
 // leaf of a coordinator's compound query as a JSON plan (`plan_json`); 2
-// takes every query as a typed plan (`plan`). A caller asks a server's
-// versions with `Hello` (a server that answers Unimplemented speaks 1) and
-// speaks the newest both know; a coordinator speaks the oldest of those
-// among its shards' replicas.
+// takes every query as a typed plan (`plan`); 3 holds a query's snapshot
+// for a fetch that follows (`hold`, `release` and `Release`), so that a
+// coordinator can query then fetch. A caller asks a server's versions with
+// `Hello` (a server that answers Unimplemented speaks 1) and speaks the
+// newest both know; a coordinator speaks the oldest of those among its
+// shards' replicas.
 syntax = "proto3";
 
 package strata.v1;
@@ -26,6 +28,12 @@ service Strata {
   rpc Health(Empty) returns (HealthResponse);
   // The protocol versions the server speaks, and the plans it reads.
   rpc Hello(HelloRequest) returns (HelloResponse);
+  // Protocol 3: ends snapshot leases before they expire.
+  rpc Release(ReleaseRequest) returns (Empty);
+}
+
+message ReleaseRequest {
+  repeated uint64 snapshots = 1;
 }
 
 message HelloRequest {
@@ -85,6 +93,13 @@ message QueryRequest {
   // coordinator's compound query), with its values in it, instead of sql
   // and params; sql then only names it in logs.
   Plan plan = 9;
+  // Protocol 3: keep the snapshot the query read, for a fetch that
+  // follows: a lease, which the answer names (QueryResponse.snapshot) and
+  // which lasts as a TermStats lease does. A request that names a lease
+  // keeps that one.
+  bool hold = 10;
+  // Protocol 3: end the request's lease (snapshot) once answered.
+  bool release = 11;
 }
 
 // A plan (strata::query::ir): a statement as a tree of operators over typed
@@ -485,6 +500,8 @@ message QueryResponse {
   // ExecStats (JSON): plan lines and counters.
   bytes stats_json = 6;
   double took_ms = 7;
+  // With hold: the lease on the snapshot the query read.
+  uint64 snapshot = 8;
 }
 
 message TermStatsResponse {

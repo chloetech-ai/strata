@@ -71,6 +71,7 @@ pub fn result_to_pb(rs: &ResultSet, took_ms: f64) -> pb::QueryResponse {
         parts_json: rs.parts.as_ref().map(json_bytes).unwrap_or_default(),
         stats_json: json_bytes(&rs.stats),
         took_ms,
+        snapshot: 0,
     }
 }
 
@@ -86,9 +87,10 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 }
 
 /// The protocol versions this server speaks (`proto/strata.proto`): 1
-/// takes SQL or a JSON plan, 2 a typed plan.
+/// takes SQL or a JSON plan, 2 a typed plan, and 3 holds a query's
+/// snapshot for the fetch that follows.
 pub const MIN_PROTOCOL: u32 = 1;
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// What [`pb::strata_server::Strata::hello`] answers.
 pub fn hello() -> pb::HelloResponse {
@@ -112,6 +114,8 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         snapshot: r.snapshot,
         partial: None,
         plan: plan.map(Arc::new),
+        hold: r.hold,
+        release: r.release,
     })
 }
 
@@ -211,7 +215,7 @@ impl pb::strata_server::Strata for Grpc {
     async fn query(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::QueryResponse>, Status> {
         self.serve("Query", req, |svc, r| async move {
             let a = svc.query(query_req(r)?).await?;
-            Ok(result_to_pb(&a.rs, a.took_ms))
+            Ok(pb::QueryResponse { snapshot: a.lease, ..result_to_pb(&a.rs, a.took_ms) })
         })
         .await
     }
@@ -248,6 +252,14 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {
         self.serve("Hello", req, |_, _| async move { Ok(hello()) }).await
+    }
+
+    async fn release(&self, req: Request<pb::ReleaseRequest>) -> Result<Response<pb::Empty>, Status> {
+        self.serve("Release", req, |svc, r| async move {
+            svc.release(&r.snapshots);
+            Ok(pb::Empty {})
+        })
+        .await
     }
 
     async fn health(&self, req: Request<pb::Empty>) -> Result<Response<pb::HealthResponse>, Status> {
