@@ -10,7 +10,12 @@
 //! and numbers, so that every copy holds the same rows with the same
 //! numbers. Opening fills the log with the transactions it replays from
 //! the WAL, those since the last flush; a replica further behind than the
-//! log reaches needs a copy of the primary's segments first.
+//! log reaches installs a copy of the primary first
+//! ([`crate::storage::Database::install_copy`]). While it does, the
+//! primary holds the transactions that follow the copy
+//! ([`crate::storage::Database::hold_log`]), so that the replica can
+//! catch up from the copy however many were written meanwhile, up to
+//! [`HELD`] times the log's bytes.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -48,12 +53,19 @@ pub enum Applied {
     Mismatch { seq: u64, term: u64 },
 }
 
-/// The most recent transactions, up to a number of bytes.
+/// How many times its bytes a log grows to keep held transactions.
+pub const HELD: usize = 4;
+
+/// The most recent transactions, up to a number of bytes, and those
+/// held from a number on, up to [`HELD`] times that.
 #[derive(Debug, Default)]
 pub(crate) struct ShipLog {
     txns: VecDeque<Shipped>,
     bytes: usize,
     max: usize,
+    /// Holds by id, each the first number it keeps.
+    holds: Vec<(u64, u64)>,
+    next_hold: u64,
 }
 
 impl ShipLog {
@@ -78,10 +90,34 @@ impl ShipLog {
         }
         self.bytes += t.bytes.len();
         self.txns.push_back(t);
+        self.trim();
+    }
+
+    /// Drops the oldest transactions past `max` bytes, but those held
+    /// while the log holds at most [`HELD`] times that.
+    fn trim(&mut self) {
+        let floor = self.holds.iter().map(|h| h.1).min();
         while self.bytes > self.max && self.txns.len() > 1 {
+            let front = self.txns.front().expect("not empty").seq.seq;
+            if floor.is_some_and(|f| front >= f) && self.bytes <= self.max.saturating_mul(HELD) {
+                break;
+            }
             let old = self.txns.pop_front().expect("not empty");
             self.bytes -= old.bytes.len();
         }
+    }
+
+    /// Keeps the transactions from number `from` on until
+    /// [`ShipLog::release`]; returns the hold's id.
+    pub fn hold(&mut self, from: u64) -> u64 {
+        self.next_hold += 1;
+        self.holds.push((self.next_hold, from));
+        self.next_hold
+    }
+
+    pub fn release(&mut self, id: u64) {
+        self.holds.retain(|h| h.0 != id);
+        self.trim();
     }
 
     /// The transactions from number `from` on, up to `max_bytes` of them
@@ -153,5 +189,33 @@ mod tests {
         let mut none = ShipLog::new(0);
         none.push(t(1, 10));
         assert_eq!(none.read(1, 1, usize::MAX), LogRead::Gone { oldest: 2 });
+    }
+
+    #[test]
+    fn a_hold_keeps_what_follows_it() {
+        let mut log = ShipLog::new(100);
+        for s in 1..=5 {
+            log.push(t(s, 30));
+        }
+        let (a, b) = (log.hold(4), log.hold(5));
+        for s in 6..=12 {
+            log.push(t(s, 30));
+        }
+        // Up to four times 100 bytes, from the oldest hold on.
+        assert_eq!(seqs(log.read(4, 12, usize::MAX)), (4..=12).collect::<Vec<_>>());
+        assert_eq!(log.read(3, 12, usize::MAX), LogRead::Gone { oldest: 4 });
+        log.release(a);
+        assert_eq!(seqs(log.read(5, 12, usize::MAX)), (5..=12).collect::<Vec<_>>());
+        assert_eq!(log.read(4, 12, usize::MAX), LogRead::Gone { oldest: 5 });
+        // Past four times, held ones go too.
+        for s in 13..=20 {
+            log.push(t(s, 30));
+        }
+        assert_eq!(log.read(5, 20, usize::MAX), LogRead::Gone { oldest: 8 });
+        assert_eq!(log.bytes, 13 * 30);
+        // Released, the log keeps its 100 bytes again.
+        log.release(b);
+        assert_eq!(log.read(17, 20, usize::MAX), LogRead::Gone { oldest: 18 });
+        assert_eq!(seqs(log.read(18, 20, usize::MAX)), [18, 19, 20]);
     }
 }

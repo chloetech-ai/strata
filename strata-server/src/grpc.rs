@@ -268,6 +268,10 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("Replicate", req, |svc, r| async move { svc.replicate(r).await }).await
     }
 
+    async fn restore(&self, req: Request<tonic::Streaming<pb::RestoreChunk>>) -> Result<Response<pb::ReplicateResponse>, Status> {
+        self.serve("Restore", req, |svc, chunks| async move { svc.restore(chunks).await }).await
+    }
+
     async fn slots(&self, req: Request<pb::SlotsRequest>) -> Result<Response<pb::SlotsResponse>, Status> {
         self.serve("Slots", req, |svc, r| async move {
             let j: serde_json::Value = from_json(&r.map_json, "slot map")?;

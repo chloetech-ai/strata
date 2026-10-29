@@ -265,6 +265,14 @@ impl Service {
         }
     }
 
+    /// Installs a copy of its primary (`Restore`), on a replica.
+    pub async fn restore(&self, chunks: tonic::Streaming<pb::RestoreChunk>) -> Result<pb::ReplicateResponse, ApiError> {
+        match &self.replication {
+            Replication::Replica(f) => f.restore(chunks).await,
+            _ => Err(conflict("this server is not a replica (--replica): it takes no copy of a primary".into())),
+        }
+    }
+
     /// Keeps the slot map a coordinator gives this shard in `path`, and
     /// reads the one kept there, if any. Without a file, the map lasts
     /// until the server stops.
