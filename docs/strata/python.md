@@ -115,7 +115,7 @@ db.search("dragon", where="year >= :y", params={"y": 1990}, columns=["id", "titl
 
 ## A server from Python
 
-`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to 256 MB) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
+`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
 
 ```python
 client = strata.connect("http://127.0.0.1:7700")   # token= or $STRATA_TOKEN for a server with --token

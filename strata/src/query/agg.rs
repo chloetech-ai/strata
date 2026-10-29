@@ -253,11 +253,34 @@ pub fn is_general(q: &Select, facet_field: impl Fn(usize) -> bool) -> bool {
 #[derive(Default)]
 pub struct Groups {
     pub map: HashMap<Vec<Part>, Vec<Acc>>,
+    /// The most groups there may be ([`crate::query::exec::ExecOptions::max_groups`]).
+    pub max: Option<usize>,
+}
+
+/// The error of a query that makes more than `max` groups.
+pub fn too_many_groups(max: usize) -> Error {
+    err(format!("the query makes more than {max} groups, the most a query may; add conditions or group by fewer values"))
 }
 
 impl Groups {
-    pub fn entry(&mut self, key: Vec<Part>, needed: &[Projection]) -> &mut Vec<Acc> {
-        self.map.entry(key).or_insert_with(|| needed.iter().map(Acc::new).collect())
+    /// No groups yet, and at most `max` of them.
+    pub fn limited(max: Option<usize>) -> Groups {
+        Groups { map: HashMap::new(), max }
+    }
+
+    /// The accumulators of group `key`, a new group's if there is room for
+    /// one.
+    pub fn entry(&mut self, key: Vec<Part>, needed: &[Projection]) -> Result<&mut Vec<Acc>> {
+        let n = self.map.len();
+        match self.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                if let Some(max) = self.max.filter(|&m| n >= m) {
+                    return Err(too_many_groups(max));
+                }
+                Ok(e.insert(needed.iter().map(Acc::new).collect()))
+            }
+        }
     }
 
     /// Shard-mode rows: the group values, then each needed aggregate's partial.
@@ -271,7 +294,7 @@ impl Groups {
             if r.len() != group_cols + needed.len() {
                 return Err(err("a shard's aggregate row has the wrong width"));
             }
-            let accs = self.entry(r[..group_cols].iter().map(Part::of).collect(), needed);
+            let accs = self.entry(r[..group_cols].iter().map(Part::of).collect(), needed)?;
             for (a, v) in accs.iter_mut().zip(&r[group_cols..]) {
                 a.merge(v)?;
             }
@@ -284,7 +307,7 @@ impl Groups {
 /// group. A query without `GROUP BY` has one group, even over no rows.
 pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Vec<Vec<Value>> {
     if q.group_by.is_empty() && groups.map.is_empty() {
-        groups.entry(Vec::new(), needed);
+        groups.map.insert(Vec::new(), needed.iter().map(Acc::new).collect());
     }
     let value_of = |key: &[Part], accs: &[Acc], p: &Projection| -> Value {
         match p {

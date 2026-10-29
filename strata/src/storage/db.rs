@@ -38,7 +38,7 @@ use serde::Serialize;
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};
-use crate::segment::build::{build_segment, build_threads, BuildOptions, SegmentBuild};
+use crate::segment::build::{build_segment, build_threads, BuildOptions, GraphStart, SegmentBuild};
 use crate::segment::{DocId, SegmentFile, SegmentWriter};
 use crate::storage::freelist::FreeList;
 use crate::storage::io;
@@ -1640,12 +1640,31 @@ impl Database {
             }
             Ok(got)
         };
+        // The merged vector graphs start from the largest input's, if it
+        // lost no documents.
+        let mut starts = Vec::new();
+        let mut base = 0u32;
+        let mut largest: Option<(usize, &SegmentFile, u32)> = None;
+        for (k, (_, live)) in inputs.iter().enumerate() {
+            let v = views[k];
+            if live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
+                largest = Some((live.len(), &v.file, base));
+            }
+            base += live.len() as u32;
+        }
+        if let Some((_, seg, base)) = largest {
+            for (i, f) in schema.fields.iter().enumerate() {
+                if matches!(f.ty, FieldType::Vector { .. }) {
+                    starts.push(GraphStart { field: i, segment: seg.clone(), base });
+                }
+            }
+        }
         // Written before the writer lock is taken, into space reserved for
         // it: commits go on meanwhile.
         let written = match batches.split_last() {
             None => None,
             Some((last, rest)) => {
-                let mut build = SegmentBuild::new(schema, &self.opts.build, n_new)?;
+                let mut build = SegmentBuild::with_starts(schema, &self.opts.build, n_new, &starts)?;
                 for b in rest {
                     build.add(&decode(b)?)?;
                 }

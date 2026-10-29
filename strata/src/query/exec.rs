@@ -208,6 +208,13 @@ pub struct ExecOptions {
     /// lists of disjoint subsets merge by score into the whole query's. For
     /// experiments that run a query's segments in parallel from outside.
     pub segments: Option<Arc<[usize]>>,
+    /// The most rows a query may reach: one whose LIMIT plus OFFSET is
+    /// larger, or that has no LIMIT and matches more rows, fails, as
+    /// Elasticsearch's `max_result_window` does (`None`: no limit).
+    pub max_rows: Option<usize>,
+    /// The most groups a GROUP BY or a facet may make before the query
+    /// fails, as Elasticsearch's `search.max_buckets` (`None`: no limit).
+    pub max_groups: Option<usize>,
 }
 
 impl Default for ExecOptions {
@@ -228,6 +235,8 @@ impl Default for ExecOptions {
             cancel: None,
             synonyms: None,
             segments: None,
+            max_rows: None,
+            max_groups: None,
         }
     }
 }
@@ -479,7 +488,7 @@ impl<'a> Executor<'a> {
             let rows = if one { vec![vec![Value::Int(n); columns.len()]] } else { Vec::new() };
             return Ok(empty(columns, rows, self.stats));
         }
-        let hits = self.ordered_hits(q)?;
+        let hits = self.ordered_hits(q, self.opts.max_rows)?;
         let skip = if self.opts.shard { 0 } else { q.offset };
         let hits: Vec<Hit> = hits.into_iter().skip(skip).collect();
         let rows = self.project(q, &hits)?;
@@ -505,14 +514,29 @@ impl<'a> Executor<'a> {
             return Err(err("a seed subquery returns rows, not counts or aggregates"));
         }
         self.run_graphs(&q.graphs)?;
-        let hits = self.ordered_hits(q)?;
+        let hits = self.ordered_hits(q, None)?;
         Ok(hits.into_iter().skip(q.offset).collect())
     }
 
-    fn ordered_hits(&mut self, q: &Select) -> Result<Vec<Hit>> {
+    /// The rows of `q` in order, OFFSET included; at most `max` of them
+    /// ([`ExecOptions::max_rows`]).
+    fn ordered_hits(&mut self, q: &Select, max: Option<usize>) -> Result<Vec<Hit>> {
+        let reach = q.limit.unwrap_or(0).saturating_add(q.offset);
+        if let Some(max) = max.filter(|&m| reach > m) {
+            return Err(err(format!("LIMIT and OFFSET reach row {reach}; a query returns at most {max} rows")));
+        }
         // No query returns more rows than are live, so a larger LIMIT asks
-        // for nothing more (and sizes nothing by itself).
-        let want = q.limit.map(|l| l.saturating_add(q.offset).min(self.n_live()));
+        // for nothing more (and sizes nothing by itself). Without a LIMIT,
+        // one row past `max` shows that the query matches too many.
+        let want = q.limit.map(|l| l.saturating_add(q.offset)).or(max.map(|m| m + 1)).map(|w| w.min(self.n_live()));
+        let hits = self.ordered_hits_to(q, want)?;
+        if let Some(max) = max.filter(|&m| q.limit.is_none() && hits.len() > m) {
+            return Err(err(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
+        }
+        Ok(hits)
+    }
+
+    fn ordered_hits_to(&mut self, q: &Select, want: Option<usize>) -> Result<Vec<Hit>> {
         Ok(match &q.order {
             None => self.unordered(&q.filter, want)?,
             Some(OrderBy::Score { score: Score::Column { field }, desc, nulls_first }) => {
@@ -521,7 +545,7 @@ impl<'a> Executor<'a> {
             // Without a LIMIT, DEFAULT_K rows after the OFFSET, as a
             // coordinator cuts them.
             Some(OrderBy::Score { score, desc: true, .. }) => {
-                let k = want.unwrap_or_else(|| DEFAULT_K.saturating_add(q.offset).min(self.n_live()));
+                let k = if q.limit.is_some() { want.unwrap_or(0) } else { DEFAULT_K.saturating_add(q.offset).min(self.n_live()) };
                 self.ranked(score, &q.filter, k, q.tiebreak.as_ref())?
             }
             Some(OrderBy::Score { .. }) => return Err(err("relevance scores can only be ordered DESC")),
@@ -1289,7 +1313,7 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        let mut groups = agg::Groups::default();
+        let mut groups = agg::Groups::limited(self.opts.max_groups);
         let segs = self.segs.clone();
         let (mut vals, mut gv) = (Vec::new(), Vec::new());
         for s in segs.iter() {
@@ -1322,7 +1346,7 @@ impl<'a> Executor<'a> {
                     keys = keys.into_iter().flat_map(|k| gv.iter().map(move |v| [k.clone(), vec![agg::Part::of(v)]].concat())).collect();
                 }
                 for key in keys {
-                    let accs = groups.entry(key, needed);
+                    let accs = groups.entry(key, needed)?;
                     for (a, p) in accs.iter_mut().zip(needed) {
                         match p {
                             Projection::Agg { field, .. } => {
@@ -1744,13 +1768,16 @@ impl<'a> Executor<'a> {
                     *counts.entry(kw.value(code as u32).to_string()).or_insert(0) += c;
                 }
             }
+            if let Some(max) = self.opts.max_groups.filter(|&m| counts.len() > m) {
+                return Err(agg::too_many_groups(max));
+            }
         }
         // A multi-valued INT field's values are int_key strings.
         let ints = self.schema.fields[g].ty == FieldType::Int;
         let mut groups = agg::Groups::default();
         for (v, c) in counts {
             let key = if ints { forward::int_of_key(&v).map_or(agg::Part::Null, agg::Part::Int) } else { agg::Part::Str(v) };
-            for a in groups.entry(vec![key], needed) {
+            for a in groups.entry(vec![key], needed)? {
                 *a = agg::Acc::Count(c as i64);
             }
         }

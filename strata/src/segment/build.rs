@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
-use crate::segment::{DocId, FieldIndexBuilder, SegmentWriter};
+use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
 use crate::forward::StoreBuilder;
 use crate::graph::GraphBuilder;
 use crate::text::TextFieldBuilder;
@@ -115,7 +115,25 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Builds the segment image for `docs` (local docIDs follow slice order) on
 /// [`build_threads`] threads.
 pub fn build_segment(schema: &Schema, docs: &[Document], opts: &BuildOptions) -> Result<Vec<u8>> {
-    Ok(SegmentBuild::new(schema, opts, docs.len())?.finish(docs)?.finish())
+    build_segment_from(schema, docs, opts, &[])
+}
+
+/// A vector field's HNSW graph to start a build from: `segment`'s graph of
+/// the field, whose documents are the build's from docID `base` on, all of
+/// them, with the same vectors. A merge starts from its largest input that
+/// lost no documents.
+#[derive(Clone)]
+pub struct GraphStart {
+    pub field: usize,
+    pub segment: SegmentFile,
+    pub base: u32,
+}
+
+/// [`build_segment`], with the vector graphs `starts` names started from
+/// those segments' graphs (ignored where the field's graph does not fit:
+/// another `M`, no graph, other documents).
+pub fn build_segment_from(schema: &Schema, docs: &[Document], opts: &BuildOptions, starts: &[GraphStart]) -> Result<Vec<u8>> {
+    Ok(SegmentBuild::with_starts(schema, opts, docs.len(), starts)?.finish(docs)?.finish())
 }
 
 /// A segment built from batches of documents in docID order, so that a
@@ -142,6 +160,13 @@ pub struct SegmentBuild<'a> {
 impl<'a> SegmentBuild<'a> {
     /// A build of `n_docs` documents in all.
     pub fn new(schema: &'a Schema, opts: &'a BuildOptions, n_docs: usize) -> Result<Self> {
+        Self::with_starts(schema, opts, n_docs, &[])
+    }
+
+    /// A build of `n_docs` documents in all, with the vector graphs
+    /// `starts` names started from those segments' graphs
+    /// ([`build_segment_from`]).
+    pub fn with_starts(schema: &'a Schema, opts: &'a BuildOptions, n_docs: usize, starts: &[GraphStart]) -> Result<Self> {
         let threads = build_threads(opts)?;
         let threads = if n_docs < PARALLEL_MIN_DOCS { 1 } else { threads };
         let (mut fields, mut slots) = (Vec::new(), Vec::new());
@@ -155,7 +180,10 @@ impl<'a> SegmentBuild<'a> {
                 FieldType::Sparse if f.indexed => Some(Slot::Index(crate::text::sparse::field_builder(f, opts)?)),
                 FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => Some(Slot::Index(crate::forward::field_builder(f, opts)?)),
                 // Vector fields always store their vectors; `indexed` adds the ANN index.
-                FieldType::Vector { .. } => Some(Slot::Index(crate::vector::field_builder(f, opts)?)),
+                FieldType::Vector { .. } => Some(Slot::Index(match starts.iter().find(|g| g.field == i) {
+                    Some(g) => crate::vector::field_builder_from(f, opts, g.segment.clone(), g.base)?,
+                    None => crate::vector::field_builder(f, opts)?,
+                })),
                 FieldType::Edges if f.indexed => Some(Slot::Graph(crate::graph::keyless_builder(f, schema)?)),
                 _ => None,
             };

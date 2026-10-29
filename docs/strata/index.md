@@ -90,7 +90,7 @@ A database can hold several tables, each with its own schema, segments, memtable
 
 ### Merges
 
-A tiered policy merges segments of similar size. A merge reads the live documents of its inputs back (stored fields from the doc store, vectors and unstored fields from their indexes, generated columns recomputed) and rebuilds every index, which drops deleted documents and re-optimises encodings for the longer lists. `vacuum` moves data down and shrinks the file.
+A tiered policy merges segments of similar size. A merge reads the live documents of its inputs back (stored fields from the doc store, vectors and unstored fields from their indexes, generated columns recomputed) and rebuilds every index, which drops deleted documents and re-optimises encodings for the longer lists. An HNSW graph starts from the graph of the largest input that lost no documents, as Lucene's does from 9.9: that input's nodes keep their levels and links, and only the other inputs' vectors are inserted. Building the merged segment of four segments of 25,000 vectors so takes 5.2 s instead of 6.9 to 7.2 s on four threads at 64 dimensions (24.2 to 24.7 s instead of 30.1 to 32.2 s on one), and 9.1 to 9.3 s instead of 11.9 to 12.2 s at 256, with the same recall@10 (two runs each on the cloud container's 4-core Xeon, `examples/graph_start.rs`). `vacuum` moves data down and shrinks the file.
 
 Merges stay out of the way of writes. A merge builds its segment with no lock held, then reserves a segment id and space for the image (free pages of the file, or a file of its own in the directory layout) and writes it there, also with no lock held. It takes the writer lock only to install the image, in a commit that marks the input documents deleted since it started as deleted in the merged segment; writes that start meanwhile wait for it instead of failing with `Busy`. Until the install, commits leave the reserved space alone and the free list on disk counts it as free, so a crash leaves nothing behind. Several merges can run at once, each on segments no other merge has claimed. With merger threads (`Database::spawn_merger`; strata-server starts them) the database merges by itself whenever a version is published and every 5 s:
 
@@ -110,7 +110,7 @@ A segment is *n* documents with local docIDs `0..n`, stored as a header and a di
 
 ### Full text
 
-- **Analyzer.** Unicode word split, lowercase, ASCII folding, an English stopword list and a light English stemmer; queries use the same analyzer.
+- **Analyzer.** Unicode word split, lowercase, ASCII folding, an English stopword list and a light English stemmer (words longer than 64 bytes are kept whole: the stemmer takes time in the square of a word's length); queries use the same analyzer.
 - **Term dictionary.** Sorted terms in front-coded blocks of 32, with a sparse in-memory index over block first-terms. Each entry gives the document frequency and the posting list's location.
 - **Postings.** DocIDs, term frequencies and per-block maximum scores, so that top-k can skip blocks. DocIDs of terms in at least 512 documents are [Loom](../posting-lists.md#loom) lists; rarer terms use BP128 blocks. Frequencies are bit-packed in 128-posting blocks addressed by posting rank. Against BP128 for every list, Loom is 2–4% smaller with 7.6–11× faster conjunctions.
 - **Top-k.** MaxScore by default; on the BEIR queries it beats Block-Max WAND by 1.9–2.6×. A filter either drives scoring (its members are scored directly) or is probed per candidate, by a fitted crossover.

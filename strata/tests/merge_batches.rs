@@ -9,7 +9,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use strata::db::{Db, StoredSource};
 use strata::graph::{edges_value, Edge};
 use strata::query::Params;
-use strata::segment::build::{build_segment, BuildOptions, SegmentBuild};
+use strata::segment::build::{build_segment, build_segment_from, BuildOptions, GraphStart, SegmentBuild};
 use strata::segment::{DocId, SegmentFile};
 use strata::storage::{DbOptions, DocumentSource, MergePolicy};
 use strata::text::sparse::to_value;
@@ -79,6 +79,17 @@ fn batches_build_the_same_segment() {
             assert!(image == whole, "{threads} threads, batches of {sizes:?}");
         }
     }
+    // A vector graph started from an input's graph, as merges do.
+    let opts = BuildOptions::default().set("build.threads", 2);
+    let input = SegmentFile::from_vec(build_segment(&schema, &docs[2000..7000], &opts).unwrap()).unwrap();
+    let starts = [GraphStart { field: 6, segment: input, base: 2000 }];
+    let whole = build_segment_from(&schema, &docs, &opts, &starts).unwrap();
+    assert!(whole != build_segment(&schema, &docs, &opts).unwrap(), "the start is used");
+    let mut b = SegmentBuild::with_starts(&schema, &opts, docs.len(), &starts).unwrap();
+    for c in docs[..9000].chunks(3000) {
+        b.add(c).unwrap();
+    }
+    assert!(b.finish(&docs[9000..]).unwrap().finish() == whole, "batches with a graph start");
     // The documents must add up to the count the build was made for.
     let opts = BuildOptions::default();
     let mut b = SegmentBuild::new(&schema, &opts, 10).unwrap();
