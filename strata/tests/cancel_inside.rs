@@ -49,51 +49,51 @@ fn alone() -> MutexGuard<'static, ()> {
 }
 
 /// `sql` stops with a timeout, well before it would have finished, when
-/// its deadline passes a tenth of the way in, and when another thread
-/// cancels it then.
+/// its deadline passes a tenth of the way into its loops, and when another
+/// thread cancels it then.
 fn stops_midway(db: &Db, sql: &str) {
     let run = |opts: &ExecOptions| {
         let t0 = Instant::now();
         let r = db.query_with(sql, &Params::new(), opts);
         (r.map(|r| r.rows.len()), t0.elapsed())
     };
-    // The faster of two full runs (the first may still be reading pages).
-    let full = (0..2)
-        .map(|_| {
-            let (r, took) = run(&ExecOptions::default());
-            r.unwrap();
-            took
-        })
-        .min()
-        .unwrap();
-    assert!(full >= Duration::from_millis(25), "{sql} took {full:?}: too short to stop in the middle");
-    // The faster of two stops each way, as a runner can stall a thread
-    // for tens of milliseconds.
-    let took = (0..2)
-        .map(|_| {
-            let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + full / 10), ..ExecOptions::default() });
-            assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
-            took
-        })
-        .min()
-        .unwrap();
-    assert!(took < full / 2, "{sql}: stopped after {took:?} of {full:?}");
-    let took = (0..2)
-        .map(|_| {
-            let cancel = Arc::new(AtomicBool::new(false));
-            let flag = cancel.clone();
-            let canceller = std::thread::spawn(move || {
-                std::thread::sleep(full / 10);
-                flag.store(true, Ordering::Relaxed);
-            });
-            let (r, took) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
-            canceller.join().unwrap();
-            assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("cancelled")), "{sql}: {r:?}");
-            took
-        })
-        .min()
-        .unwrap();
-    assert!(took < full / 2, "{sql}: stopped after {took:?} of {full:?}");
+    // The faster of two runs each time, as a runner can stall a thread for
+    // tens of milliseconds (and the first full run may still read pages).
+    let faster = |f: &dyn Fn() -> Duration| f().min(f());
+    let full = faster(&|| {
+        let (r, took) = run(&ExecOptions::default());
+        r.unwrap();
+        took
+    });
+    // What the query does before its first check (its plan, and on a
+    // macOS runner tens of milliseconds more): the time it takes to stop
+    // when its deadline has already passed. The rest is the loops.
+    let first = faster(&|| {
+        let (r, took) = run(&ExecOptions { deadline: Some(Instant::now()), ..ExecOptions::default() });
+        assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
+        took
+    });
+    let loops = full.saturating_sub(first);
+    assert!(loops >= Duration::from_millis(25), "{sql} took {full:?}, {first:?} before its first check: too short to stop in the middle");
+    let took = faster(&|| {
+        let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + first + loops / 10), ..ExecOptions::default() });
+        assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
+        took
+    });
+    assert!(took < first + loops / 2, "{sql}: stopped after {took:?} of {full:?} ({first:?} before its first check)");
+    let took = faster(&|| {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(first + loops / 10);
+            flag.store(true, Ordering::Relaxed);
+        });
+        let (r, took) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
+        canceller.join().unwrap();
+        assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("cancelled")), "{sql}: {r:?}");
+        took
+    });
+    assert!(took < first + loops / 2, "{sql}: stopped after {took:?} of {full:?} ({first:?} before its first check)");
 }
 
 #[test]
