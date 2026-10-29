@@ -20,6 +20,9 @@ def test_client_reads_and_writes(client):
     r = client.query("SELECT id, year FROM books WHERE year >= :y ORDER BY year DESC LIMIT 3", y=2000)
     assert len(r) == 3 and r[0]["year"] >= 2000 and r.took_ms is not None
     assert client.sql("SELECT COUNT(*) FROM books").scalar() == 200
+    plan = client.explain("SELECT id FROM books WHERE year >= :y LIMIT 3", y=2000)
+    assert plan["tree"] == ["Project: id", "  Limit: 3", "    Search books", "      filter: year >= 2000"]
+    assert plan["ir"]["root"]["node"] == "project" and plan["ir"]["version"] == 1
     assert client.insert([book(i) for i in range(300, 2300)]) == 2000
     assert client.upsert({**book(1), "title": "Changed"}) == 1
     assert client.sql("UPDATE books SET year = 1 WHERE id = :k", k="b0002") == 1

@@ -11,7 +11,7 @@
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`) | `{written}` |
 //! | `POST /v1/import?format=jsonl` | rows as JSON Lines, JSON, CSV or TSV | `{written, skipped_fields}` |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
-//! | `POST /v1/explain` | `{sql, params?}` | the bound query and its plan |
+//! | `POST /v1/explain` | `{sql, params?}` | the bound query, its plan IR and the executor's plan |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
@@ -308,15 +308,22 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
 async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let sql = body_str(&b, "sql")?;
     let params = app.svc.params(b.get("params")).await?;
-    // A compound query's plan lists the queries it ran.
-    let logical = match strata::query::compound::is_compound(sql, &app.svc.schema) {
-        true => "a compound query: its steps and their plans are in \"plan\"".to_string(),
-        false => format!("{:#?}", strata::query::bind(sql, &app.svc.schema, &params)?),
+    // A compound query's plan lists the queries it ran; it has no plan IR
+    // of its own yet.
+    let (logical, ir, tree) = match strata::query::compound::is_compound(sql, &app.svc.schema) {
+        true => ("a compound query: its steps and their plans are in \"plan\"".to_string(), Json::Null, Json::Null),
+        false => {
+            let select = strata::query::bind(sql, &app.svc.schema, &params)?;
+            let plan = strata::query::ir::Plan::of_select(&app.svc.schema, &select);
+            (format!("{select:#?}"), plan.to_json()?, json!(plan.explain(&[&app.svc.schema])))
+        }
     };
     let a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await?;
     Ok(AxJson(json!({
         "kind": a.kind,
         "logical": logical,
+        "ir": ir,
+        "tree": tree,
         "plan": a.rs.stats.plan,
         "filter_docs": a.rs.stats.filter_docs,
         "scored": a.rs.stats.scored,

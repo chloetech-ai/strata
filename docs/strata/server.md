@@ -201,7 +201,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written}` |
 | `POST /v1/import?format=F` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
-| `POST /v1/explain` | `{sql, params?}` | the bound query and its plan lines |
+| `POST /v1/explain` | `{sql, params?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the bound query (`logical`) and counts; a compound query has no `ir` or `tree` yet |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
 | `POST /v1/snapshot` | | a snapshot lease for 60 s: `{snapshot, txn, ttl_s}` (at most 10,000 are held at once; more get 429) |
 | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the queries it ran |

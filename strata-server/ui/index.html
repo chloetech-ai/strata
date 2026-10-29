@@ -828,7 +828,9 @@ $("sqlExplain").onclick = async () => {
     const j = await api("/v1/explain", { sql: $("sqlText").value, params: p });
     out.replaceChildren(el("div", { class: "card" },
       el("div", { class: "status" }, el("span", {}, "kind ", el("b", { text: j.kind })), el("span", {}, el("b", { text: fmtMs(j.took_ms) })), el("span", {}, el("b", { text: j.rows }), " rows"), el("span", {}, el("b", { text: j.filter_docs }), " passed the filter"), el("span", {}, el("b", { text: j.scored }), " scored")),
-      el("h2", { text: "Plan" }), el("pre", { class: "sql", text: j.plan.join("\n") }),
+      j.tree ? el("h2", { text: "Plan" }) : null, j.tree ? el("pre", { class: "sql", text: j.tree.join("\n") }) : null,
+      el("h2", { text: j.tree ? "What ran" : "Plan" }), el("pre", { class: "sql", text: j.plan.join("\n") }),
+      j.ir ? el("details", { class: "plan", style: "margin-top:12px" }, el("summary", { text: "The plan as JSON" }), el("pre", { style: "max-height:40vh", text: JSON.stringify(j.ir, null, 2) })) : null,
       el("details", { class: "plan", style: "margin-top:12px" }, el("summary", { text: "The query as bound to the schema" }), el("pre", { style: "max-height:40vh", text: j.logical }))));
   } catch (e) { showError(e.message); }
 };

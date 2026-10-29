@@ -396,6 +396,29 @@ DELETE FROM products WHERE stock = 0 ORDER BY price LIMIT 100;
 
 Each statement is one transaction, and returns the number of rows it wrote. From Rust, the transaction API (`Database::begin`, `WriteTxn::insert`, `upsert`, `set`, `delete`, `commit`, and `WriteTxn::table` for the other tables) groups several writes into one, across tables too; `WriteTxn::upsert_if_newer` keeps whichever version of a row has the highest version number, for replaying a feed out of order.
 
+## EXPLAIN
+
+`EXPLAIN <statement>` shows the plan of a `SELECT`, `INSERT`, `UPDATE` or `DELETE` without running it: a row per line, in a column named `plan`, the root first and each operator's input indented under it.
+
+```sql
+EXPLAIN SELECT category, COUNT(*) AS n FROM papers WHERE published >= '2026-10-01'
+GROUP BY category HAVING COUNT(*) >= 2 ORDER BY n DESC, category LIMIT 5;
+```
+
+```text
+Project: category, COUNT(*) AS n
+  Limit: 5
+    Sort: COUNT(*) DESC, category
+      Filter: COUNT(*) >= 2.0
+        Aggregate by category: COUNT(*)
+          Search papers
+            filter: published >= TIMESTAMP '2026-10-01T00:00:00Z'
+```
+
+A `Search` is the rows of one table that its `filter` holds for, ranked by its `order`; the operators above it group, keep, sort, cut and name them, and a write's operator (`Insert`, `Update`, `Delete`) sits on top. The plan is the statement as bound: values have their field's type, and a `NOT` over a field that can be null also says `x IS NOT NULL`, since a row without a value matches neither a comparison nor its negation.
+
+`EXPLAIN FORMAT JSON` (or `EXPLAIN (FORMAT JSON)`) gives the plan as one row of JSON: fields by their position in the table, typed values (`{"int": 5}`, `{"text": "5"}`), a version and the features the plan needs. Strata refuses a plan from a newer version by name. A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as several queries and has no plan of its own yet; [`POST /v1/explain`](server.md#http-api) lists what each step ran. `EXPLAIN ANALYZE` and other formats are refused.
+
 ## Reading a plan
 
 `--plan` shows what the planner decided, segment by segment. The same statement can get different plans as the data changes. In the evaluation, an `OR` filter matching about 15% of documents was scanned exactly on SciFact's 5,183 documents, but on the larger collections the planner measured 11% near the query and post-filtered the HNSW result. An RRF query's topic filter matched 11% of Quora globally but only 3.4% near the query, so the planner switched to an exact scan of its 58,767 members, at 3.1 ms. [Planning and execution](index.md#planning-and-execution) describes the choices.

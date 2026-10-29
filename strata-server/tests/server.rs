@@ -1302,3 +1302,38 @@ async fn a_simple_analyzer_over_http() {
         assert_eq!(ids(&r), want, "{sql}: {r}");
     }
 }
+
+/// `/v1/explain` gives the plan IR of a query, as JSON that reads back to
+/// the query it was bound from, and as lines of text; a compound query has
+/// none yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_gives_the_plan_ir() {
+    use strata::query::ir::Plan;
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(dir.path(), "e.strata", |i| i < 300);
+    let schema = db.schema().clone();
+    let base = http(service(db, "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let sql = "SELECT id, price, score() FROM products WHERE category = 'kitchen' ORDER BY bm25(body, 'quiet kettle') DESC LIMIT 5";
+    let (status, r) = post(&c, &format!("{base}/v1/explain"), json!({ "sql": sql })).await;
+    assert_eq!(status, 200, "{r}");
+    let select = strata::query::bind(sql, &schema, &Params::new()).unwrap();
+    assert_eq!(Plan::from_json(&r["ir"]).unwrap().to_select(&schema).unwrap(), select, "{r}");
+    let tree: Vec<&str> = r["tree"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+    assert_eq!(
+        tree,
+        [
+            "Project: id, price, score()",
+            "  Limit: 5",
+            "    Search products",
+            "      filter: category = 'kitchen'",
+            "      order: bm25(body, 'quiet kettle') DESC",
+        ],
+        "{r}"
+    );
+    assert!(r["plan"].as_array().is_some_and(|p| !p.is_empty()), "{r}");
+    let compound = "SELECT id FROM products WHERE id IN (SELECT id FROM products WHERE price < 10)";
+    let (status, r) = post(&c, &format!("{base}/v1/explain"), json!({ "sql": compound })).await;
+    assert_eq!(status, 200, "{r}");
+    assert!(r["ir"].is_null() && r["tree"].is_null(), "{r}");
+}

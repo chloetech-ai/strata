@@ -213,7 +213,7 @@ Strata is built for embedded retrieval: local search over documents with metadat
 | `strata/src/forward/` | columns with zone maps, keyword dictionaries and Pyramid lists, range histograms, facets, doc store |
 | `strata/src/vector/` | float32 vectors with SQ8 or binary codes, flat, IVF and HNSW, filtered search |
 | `strata/src/graph/` | EDGES fields: out-edge CSR and reverse index per segment; BFS, shortest paths, personalized PageRank |
-| `strata/src/query/` | SQL binder, logical plan, cost-based planner, executor, fusion, graph predicates and scores |
+| `strata/src/query/` | SQL binder, plan IR and `EXPLAIN`, logical plan, cost-based planner, executor, fusion, graph predicates and scores |
 | `strata/src/baselines/` | SQLite + FTS5 and Tantivy baselines (feature `baselines`) |
 | `strata/src/bin/` | `strata` shell, `strata-eval`, component benchmarks, `strata-baselines`, `strata-graph-bench` |
 

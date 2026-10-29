@@ -4,6 +4,7 @@
 //! * [`ddl`]: `CREATE TABLE` and `DROP TABLE`.
 //! * [`tables`]: the tables a query reads.
 //! * [`logical`]: the bound query: projection, predicate tree, score.
+//! * [`ir`]: the plan of a statement, in JSON and in `EXPLAIN`.
 //! * [`agg`]: aggregates and groups.
 //! * [`stats`]: collection statistics exchanged with a coordinator.
 //! * [`memory`]: the memory breaker queries count what they hold against.
@@ -13,6 +14,7 @@ pub mod compound;
 pub mod ddl;
 pub mod exec;
 pub mod fusion;
+pub mod ir;
 pub mod logical;
 pub mod memory;
 pub mod parse;

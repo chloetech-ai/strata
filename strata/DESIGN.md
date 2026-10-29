@@ -489,6 +489,50 @@ ORDER BY rrf(bm25(body, :t), ppr(cites, (SELECT id FROM papers ORDER BY similari
 * With a VECTOR field as the first argument, `REACHABLE` and `PATH` follow
   similarity edges: `k => 10` neighbours per row, `min_sim => ..`.
 
+### 6.2 The plan IR
+
+Every statement becomes one typed, versioned, serialisable plan
+(`strata/src/query/ir.rs`): a tree of operators over expressions, which
+SQL makes today and other front-ends (a Python builder, a coordinator
+handing a query to its shards) are to make instead of writing SQL text.
+
+* **Operators.** `Search` is the leaf: the rows of one table that a filter
+  holds for, ranked by an order, which is what the executor (§7) answers.
+  Above it, `Aggregate` groups rows, `Filter` keeps groups, `Sort` orders
+  them, `Limit` cuts the rows and `Project` names the columns. Writes are
+  operators too: `Insert` with its rows and what a live key does
+  (`fail`, `replace`, `skip` or `update`), and `Update` and `Delete` over
+  a `Search`.
+* **Expressions.** Fields by id (their position in the table's schema,
+  which never changes, since there is no `ALTER`), typed literals
+  (`{"int": 5}`, `{"float": 5.0}`, `{"text": "5"}`, `{"timestamp": ...}`),
+  `NOT`, `AND`, `OR`, `IS NULL`, comparisons, `BETWEEN` with open ends,
+  `IN`, arithmetic, `MATCH`, the graph predicates, every score (BM25,
+  similarity, sparse, decay, RRF, weighted sums, products, PageRank), and
+  a subquery. A filter is in three-valued logic as the binder makes it: a
+  negation over a field that can be null carries `x IS NOT NULL`.
+* **Versions and features.** A plan carries its version (1) and the
+  features it uses. A reader refuses a newer version, or a feature it
+  does not know, by name, as a database refuses a format 3 feature; a
+  later operator or expression is a new feature, not a new version.
+* **What runs.** `Plan::of_select` and `Plan::of_write` make the plan of a
+  bound statement, and `Plan::to_select` and `Plan::to_write` give back
+  the statement for the shapes the executor runs: `Project [Limit]
+  Search` and `Project [Limit] [Sort] [Filter] Aggregate Search`. A test
+  takes every kind of statement the binder accepts through JSON and back
+  to the same bound statement. A compound query (`WITH`, a subquery, a
+  join, `SELECT DISTINCT`) runs as several queries and has no plan of its
+  own yet.
+* **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
+  fields by name and expressions in SQL's words, without running it;
+  `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
+  next to the executor's plan lines.
+
+Next, in order: the binder emits plans with the executor as the `Search`
+leaf; one three-valued evaluator for every filter; writes run as plans;
+then operators in place of the compound-query code, the Python builder,
+joins across tables, and plans as the shard protocol.
+
 ## 7. Planning and execution
 
 The binder turns the `WHERE` clause into a predicate tree over three kinds of
