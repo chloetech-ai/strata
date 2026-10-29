@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 
 use crate::error::{Error, Result};
+use crate::query::memory::Charge;
 use crate::query::logical::{AggFn, Having, OrderBy, Projection, Select, Tiebreak};
 use crate::value::Value;
 
@@ -43,6 +44,15 @@ impl Part {
             Part::Float(b) => Value::Float(f64::from_bits(*b)),
             Part::Str(s) => Value::Str(s.clone()),
         }
+    }
+
+    /// About the bytes it holds, in place and on the heap.
+    pub fn bytes(&self) -> u64 {
+        let heap = match self {
+            Part::Str(s) => s.len() as u64,
+            _ => 0,
+        };
+        std::mem::size_of::<Part>() as u64 + heap
     }
 }
 
@@ -83,10 +93,11 @@ impl Acc {
         }
     }
 
-    /// Adds one value of the aggregated field.
-    pub fn add(&mut self, v: &Value) {
+    /// Adds one value of the aggregated field; returns about the bytes it
+    /// now holds more (a value `COUNT(DISTINCT)` had not seen).
+    pub fn add(&mut self, v: &Value) -> u64 {
         if matches!(v, Value::Null) {
-            return;
+            return 0;
         }
         match self {
             Acc::Count(n) => *n += 1,
@@ -120,9 +131,14 @@ impl Acc {
                 }
             }
             Acc::Distinct(s) => {
-                s.insert(Part::of(v));
+                let p = Part::of(v);
+                let bytes = 32 + p.bytes();
+                if s.insert(p) {
+                    return bytes;
+                }
             }
         }
+        0
     }
 
     /// The final value.
@@ -168,7 +184,9 @@ impl Acc {
                 *sum += xs[0].as_f64().ok_or_else(bad)?;
                 *n += xs[1].as_i64().ok_or_else(bad)?;
             }
-            (a @ (Acc::Min(_) | Acc::Max(_)), v) => a.add(v),
+            (a @ (Acc::Min(_) | Acc::Max(_)), v) => {
+                a.add(v);
+            }
             (Acc::Distinct(s), Value::List(xs)) => s.extend(xs.iter().map(Part::of)),
             _ => return Err(bad()),
         }
@@ -255,6 +273,8 @@ pub struct Groups {
     pub map: HashMap<Vec<Part>, Vec<Acc>>,
     /// The most groups there may be ([`crate::query::exec::ExecOptions::max_groups`]).
     pub max: Option<usize>,
+    /// What new groups are counted against.
+    pub charge: Charge,
 }
 
 /// The error of a query that makes more than `max` groups.
@@ -265,7 +285,7 @@ pub fn too_many_groups(max: usize) -> Error {
 impl Groups {
     /// No groups yet, and at most `max` of them.
     pub fn limited(max: Option<usize>) -> Groups {
-        Groups { map: HashMap::new(), max }
+        Groups { map: HashMap::new(), max, charge: Charge::default() }
     }
 
     /// The accumulators of group `key`, a new group's if there is room for
@@ -278,6 +298,8 @@ impl Groups {
                 if let Some(max) = self.max.filter(|&m| n >= m) {
                     return Err(too_many_groups(max));
                 }
+                let key: u64 = e.key().iter().map(Part::bytes).sum();
+                self.charge.add(64 + key + (needed.len() * std::mem::size_of::<Acc>()) as u64)?;
                 Ok(e.insert(needed.iter().map(Acc::new).collect()))
             }
         }

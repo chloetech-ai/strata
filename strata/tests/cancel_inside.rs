@@ -3,7 +3,7 @@
 //! check every so many rows, not only between segments.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use strata::db::Db;
@@ -41,42 +41,72 @@ fn db(dir: &std::path::Path, n: i64) -> Db {
     db
 }
 
+/// Held by each test for its whole run: a test's timings must not include
+/// another one's load or queries on the same cores (a CI runner has three).
+fn alone() -> MutexGuard<'static, ()> {
+    static ONE: Mutex<()> = Mutex::new(());
+    ONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `sql` stops with a timeout, well before it would have finished, when
-/// its deadline passes a tenth of the way in, and when another thread
-/// cancels it then.
+/// its deadline passes a tenth of the way into its loops, and when another
+/// thread cancels it then.
 fn stops_midway(db: &Db, sql: &str) {
     let run = |opts: &ExecOptions| {
         let t0 = Instant::now();
         let r = db.query_with(sql, &Params::new(), opts);
         (r.map(|r| r.rows.len()), t0.elapsed())
     };
-    // The faster of two full runs (the first may still be reading pages).
-    let full = (0..2)
-        .map(|_| {
-            let (r, took) = run(&ExecOptions::default());
-            r.unwrap();
-            took
-        })
-        .min()
-        .unwrap();
-    assert!(full >= Duration::from_millis(25), "{sql} took {full:?}: too short to stop in the middle");
-    let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + full / 10), ..ExecOptions::default() });
-    assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
-    assert!(took < full / 2, "{sql}: stopped after {took:?} of {full:?}");
-    let cancel = Arc::new(AtomicBool::new(false));
-    let flag = cancel.clone();
-    let canceller = std::thread::spawn(move || {
-        std::thread::sleep(full / 10);
-        flag.store(true, Ordering::Relaxed);
+    // The faster of two runs each time, as a runner can stall a thread for
+    // tens of milliseconds (and the first full run may still read pages).
+    let faster = |f: &dyn Fn() -> Duration| f().min(f());
+    let full = faster(&|| {
+        let (r, took) = run(&ExecOptions::default());
+        r.unwrap();
+        took
     });
-    let (r, took) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
-    canceller.join().unwrap();
-    assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("cancelled")), "{sql}: {r:?}");
-    assert!(took < full / 2, "{sql}: stopped after {took:?} of {full:?}");
+    // What the query does before its first check (its plan, and on a
+    // macOS runner tens of milliseconds more): the time it takes to stop
+    // when its deadline has already passed. The rest is the loops.
+    let first = faster(&|| {
+        let (r, took) = run(&ExecOptions { deadline: Some(Instant::now()), ..ExecOptions::default() });
+        assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
+        took
+    });
+    let loops = full.saturating_sub(first);
+    assert!(loops >= Duration::from_millis(25), "{sql} took {full:?}, {first:?} before its first check: too short to stop in the middle");
+    let took = faster(&|| {
+        let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + first + loops / 10), ..ExecOptions::default() });
+        assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
+        took
+    });
+    assert!(took < first + loops / 2, "{sql}: stopped after {took:?} of {full:?} ({first:?} before its first check)");
+    // Timed from the cancel: a sleeping thread can wake tens of
+    // milliseconds late on a macOS runner, so the canceller spins instead,
+    // and what counts is how soon the query stops once the flag is set.
+    let after = faster(&|| {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let at = Instant::now() + first + loops / 10;
+        let canceller = std::thread::spawn(move || {
+            while Instant::now() < at {
+                std::hint::spin_loop();
+            }
+            flag.store(true, Ordering::Relaxed);
+            Instant::now()
+        });
+        let (r, _) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
+        let stopped = Instant::now();
+        let set = canceller.join().unwrap();
+        assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("cancelled")), "{sql}: {r:?}");
+        stopped.saturating_duration_since(set)
+    });
+    assert!(after < loops / 2, "{sql}: stopped {after:?} after the cancel, in a run of {full:?}");
 }
 
 #[test]
 fn aggregation_and_ordering_stop_inside_a_segment() {
+    let _alone = alone();
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path(), 3_000_000);
     // Grouped document by document, 500,000 groups.
@@ -89,6 +119,7 @@ fn aggregation_and_ordering_stop_inside_a_segment() {
 
 #[test]
 fn graph_walks_stop_inside_a_segment() {
+    let _alone = alone();
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path(), 1_000_000);
     // A chain: each hop reaches one more row.
@@ -98,6 +129,7 @@ fn graph_walks_stop_inside_a_segment() {
 
 #[test]
 fn joins_stop_inside_a_segment() {
+    let _alone = alone();
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path(), 2_400);
     // Every row meets every row of its `c` (800 each), and none passes

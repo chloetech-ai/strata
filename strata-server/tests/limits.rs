@@ -1,13 +1,14 @@
 //! What one request may ask of a server: rows (`--max-result-window`),
 //! groups (`--max-groups`), body size (`--max-body-mb`, 16 MiB on other
-//! routes) and places in the write queue (`--max-queued-writes`), on a
-//! single server and through a coordinator.
+//! routes), places in the write queue (`--max-queued-writes`) and memory
+//! (`--query-memory-mb`), on a single server and through a coordinator.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value as Json};
 use strata::db::Db;
+use strata::query::memory::MemoryBudget;
 use strata::storage::DbOptions;
 use strata_server::coord::Coordinator;
 use strata_server::service::{shard_of, AgentConfig, Backend, Service};
@@ -193,4 +194,65 @@ async fn imports_write_as_they_read() {
     let r = import(rows.join("\n")).await.unwrap();
     assert_eq!(r.status(), 400);
     assert_eq!(db.snapshot().n_live_docs(), 2500);
+}
+
+/// Rows of every product with their text: about 200 KB counted.
+const WIDE: &str = "SELECT id, title, description FROM products LIMIT 100";
+
+async fn metric(base: &str, name: &str) -> f64 {
+    let m = reqwest::get(format!("{base}/metrics")).await.unwrap().text().await.unwrap();
+    m.lines().find_map(|l| l.strip_prefix(&format!("{name} "))).unwrap_or_else(|| panic!("no {name}")).parse().unwrap()
+}
+
+/// A server whose queries may hold 16 KiB together.
+fn tight(db: Arc<Db>) -> Service {
+    let mut s = capped(db);
+    s.query_memory = Some(MemoryBudget::new(16 << 10));
+    s
+}
+
+/// `sql` is refused with 429, naming the memory budget.
+async fn out_of_memory(base: &str, sql: &str) {
+    let (status, body) = query(base, sql).await;
+    assert_eq!(status, 429, "{sql}: {body}");
+    assert!(body["error"].as_str().unwrap().contains("the server lets queries hold"), "{sql}: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queries_past_the_memory_budget_get_429() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = http(Arc::new(tight(open(dir.path(), "m.strata", |_| true)))).await;
+    out_of_memory(&base, WIDE).await;
+    // A compound query's steps count too.
+    out_of_memory(&base, "SELECT id FROM products WHERE id IN (SELECT id FROM products WHERE price > 0) LIMIT 5").await;
+    let (status, body) = query(&base, "SELECT COUNT(*) FROM products").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(metric(&base, "strata_query_memory_trips_total").await, 2.0);
+    assert_eq!(metric(&base, "strata_query_memory_limit_bytes").await, (16 << 10) as f64);
+    assert_eq!(metric(&base, "strata_query_memory_bytes").await, 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coordinator_passes_on_its_shards_429_and_counts_its_joins() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = |s: usize| move |i: usize| shard_of(&strata::Value::Str(format!("p{i:07}")), 2) == s;
+    let connect = |shards: Vec<String>| async move {
+        let c = Coordinator::connect(shards).await.unwrap();
+        let schema = c.schema.clone();
+        Service::new(Backend::Cluster(Arc::new(c)), schema, agent(), 16, Duration::from_secs(10))
+    };
+    // Tight shards: the coordinator answers their 429.
+    let shards = vec![grpc(Arc::new(tight(open(dir.path(), "t0.strata", shard(0))))).await, grpc(Arc::new(tight(open(dir.path(), "t1.strata", shard(1))))).await];
+    let base = http(Arc::new(connect(shards).await)).await;
+    out_of_memory(&base, WIDE).await;
+    // Roomy shards and a tight coordinator: the steps' rows it holds for a
+    // compound query count against its own budget.
+    let shards = vec![grpc(Arc::new(capped(open(dir.path(), "r0.strata", shard(0))))).await, grpc(Arc::new(capped(open(dir.path(), "r1.strata", shard(1))))).await];
+    let mut coord = connect(shards).await;
+    coord.query_memory = Some(MemoryBudget::new(16 << 10));
+    let base = http(Arc::new(coord)).await;
+    let (status, body) = query(&base, WIDE).await;
+    assert_eq!(status, 200, "{body}");
+    out_of_memory(&base, "SELECT x.id, y.title FROM products x JOIN products y ON x.brand = y.brand LIMIT 5").await;
+    assert_eq!(metric(&base, "strata_query_memory_trips_total").await, 1.0);
 }
