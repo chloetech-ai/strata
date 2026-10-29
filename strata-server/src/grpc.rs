@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use strata::query::exec::ResultSet;
-use strata::query::ir::Plan;
+use strata::query::ir::{self, Plan};
 use strata::query::Params;
 use strata::value::Value;
 use tonic::{Request, Response, Status};
@@ -14,7 +14,7 @@ use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
 use crate::service::{QueryReq, Service};
-use crate::{obs, ApiError};
+use crate::{obs, plan_pb, ApiError};
 
 pub fn to_pb(v: &Value) -> pb::Value {
     let kind = match v {
@@ -85,7 +85,24 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
     })
 }
 
+/// The protocol versions this server speaks (`proto/strata.proto`): 1
+/// takes SQL or a JSON plan, 2 a typed plan.
+pub const MIN_PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
+
+/// What [`pb::strata_server::Strata::hello`] answers.
+pub fn hello() -> pb::HelloResponse {
+    pb::HelloResponse {
+        min_protocol: MIN_PROTOCOL,
+        max_protocol: PROTOCOL,
+        plan_version: ir::VERSION,
+        plan_features: ir::FEATURES.iter().map(|f| f.to_string()).collect(),
+        server: format!("strata-server {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
+    let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
     Ok(QueryReq {
         sql: r.sql,
         params: params_from_pb(r.params),
@@ -94,8 +111,21 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         stats: if r.stats_json.is_empty() { None } else { Some(from_json(&r.stats_json, "statistics")?) },
         snapshot: r.snapshot,
         partial: None,
-        plan: plan_of(&r.plan_json)?.map(Arc::new),
+        plan: plan.map(Arc::new),
     })
+}
+
+/// A request's plan, if it has one: typed (`plan`, protocol 2) or JSON
+/// (`plan_json`, protocol 1). A protocol newer than this server's is
+/// refused, as the caller should have asked [`hello`] first.
+pub fn request_plan(protocol: u32, plan: Option<pb::Plan>, json: &[u8]) -> Result<Option<Plan>, ApiError> {
+    if protocol > PROTOCOL {
+        return Err(ApiError::bad(format!("protocol {protocol} is newer than this server's ({MIN_PROTOCOL} to {PROTOCOL})")));
+    }
+    match plan {
+        Some(p) => Ok(Some(plan_pb::from_pb_plan(p)?)),
+        None => plan_of(json),
+    }
 }
 
 /// A request's plan (`plan_json`), if it has one.
@@ -188,7 +218,7 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn term_stats(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::TermStatsResponse>, Status> {
         self.serve("TermStats", req, |svc, r| async move {
-            let plan = plan_of(&r.plan_json)?;
+            let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
             let (stats, snapshot) = svc.term_stats(&r.sql, plan.as_ref(), &params_from_pb(r.params), r.timeout_ms as u64).await?;
             Ok(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot })
         })
@@ -214,6 +244,10 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn schema(&self, req: Request<pb::Empty>) -> Result<Response<pb::SchemaResponse>, Status> {
         self.serve("Schema", req, |svc, _| async move { Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&svc.schema).unwrap_or_default() }) }).await
+    }
+
+    async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {
+        self.serve("Hello", req, |_, _| async move { Ok(hello()) }).await
     }
 
     async fn health(&self, req: Request<pb::Empty>) -> Result<Response<pb::HealthResponse>, Status> {

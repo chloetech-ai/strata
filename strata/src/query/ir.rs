@@ -730,22 +730,26 @@ impl Plan {
     /// not know.
     pub fn from_json(j: &serde_json::Value) -> Result<Plan> {
         let version = j.get("version").and_then(|v| v.as_u64()).ok_or_else(|| err("a plan needs a version"))?;
+        let features = match j.get("features") {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(fs)) => fs.iter().map(|f| f.as_str().ok_or_else(|| err("a plan's features are names"))).collect::<Result<_>>()?,
+            Some(_) => return Err(err("a plan's features are a list of names")),
+        };
+        Plan::readable(version, &features)?;
+        serde_json::from_value(j.clone()).map_err(|e| err(format!("not a plan of version {VERSION}: {e}")))
+    }
+
+    /// Whether this version of Strata reads a plan of `version` that needs
+    /// `features`: an error naming what it lacks if not. A plan in another
+    /// form than JSON (a shard's protobuf) is checked with it too.
+    pub fn readable(version: u64, features: &[&str]) -> Result<()> {
         if version == 0 || version > VERSION as u64 {
             return Err(err(format!("plan version {version} is not one this version of Strata reads (it reads version {VERSION}): it may be newer")));
         }
-        match j.get("features") {
-            None => {}
-            Some(serde_json::Value::Array(fs)) => {
-                for f in fs {
-                    let name = f.as_str().ok_or_else(|| err("a plan's features are names"))?;
-                    if !FEATURES.contains(&name) {
-                        return Err(err(format!("the plan needs feature {name:?}, which this version of Strata does not have: it may be newer")));
-                    }
-                }
-            }
-            Some(_) => return Err(err("a plan's features are a list of names")),
+        match features.iter().find(|f| !FEATURES.contains(f)) {
+            Some(name) => Err(err(format!("the plan needs feature {name:?}, which this version of Strata does not have: it may be newer"))),
+            None => Ok(()),
         }
-        serde_json::from_value(j.clone()).map_err(|e| err(format!("not a plan of version {VERSION}: {e}")))
     }
 }
 

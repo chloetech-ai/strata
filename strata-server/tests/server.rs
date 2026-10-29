@@ -4,7 +4,7 @@
 //! stand-in for the Messages API.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -566,8 +566,8 @@ async fn coordinator_answers_like_one_database() {
     assert!(err.message.contains("127.0.0.1:1"), "{}", err.message);
 }
 
-/// A shard server that answers `Schema` and never anything else, like one
-/// whose machine froze after the coordinator started.
+/// A shard server that answers `Schema` and `Hello` and never anything
+/// else, like one whose machine froze after the coordinator started.
 struct Stuck(String);
 
 #[tonic::async_trait]
@@ -586,6 +586,9 @@ impl pb::strata_server::Strata for Stuck {
     }
     async fn health(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
         std::future::pending().await
+    }
+    async fn hello(&self, _: tonic::Request<pb::HelloRequest>) -> Result<tonic::Response<pb::HelloResponse>, tonic::Status> {
+        Ok(tonic::Response::new(strata_server::grpc::hello()))
     }
 }
 
@@ -608,6 +611,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn health(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::HealthResponse { status: "ok".into(), ..Default::default() }))
+    }
+    async fn hello(&self, _: tonic::Request<pb::HelloRequest>) -> Result<tonic::Response<pb::HelloResponse>, tonic::Status> {
+        Ok(tonic::Response::new(strata_server::grpc::hello()))
     }
 }
 
@@ -708,6 +714,176 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
             assert_eq!(r["docs"].as_u64(), Some(want as u64), "shard {s}: {r}");
         }
     }
+}
+
+/// A shard server that records each read's protocol and whether it came as
+/// a typed plan. While `old`, it is a server from before `Hello`: it
+/// answers Unimplemented, and the fields it does not know (`protocol`,
+/// `plan`) never reach it. While `down`, it fails every read.
+struct Recording {
+    inner: strata_server::grpc::Grpc,
+    old: AtomicBool,
+    down: AtomicBool,
+    seen: std::sync::Mutex<Vec<(u32, bool)>>,
+}
+
+impl Recording {
+    fn read(&self, mut r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Request<pb::QueryRequest>, tonic::Status> {
+        if self.down.load(Ordering::Relaxed) {
+            return Err(tonic::Status::unavailable("restarting"));
+        }
+        let q = r.get_mut();
+        self.seen.lock().unwrap().push((q.protocol, q.plan.is_some()));
+        if self.old.load(Ordering::Relaxed) {
+            q.protocol = 0;
+            q.plan = None;
+        }
+        Ok(r)
+    }
+
+    fn last(&self) -> Option<(u32, bool)> {
+        self.seen.lock().unwrap().last().copied()
+    }
+}
+
+#[tonic::async_trait]
+impl pb::strata_server::Strata for Recording {
+    async fn query(&self, r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
+        self.inner.query(self.read(r)?).await
+    }
+    async fn term_stats(&self, r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::TermStatsResponse>, tonic::Status> {
+        self.inner.term_stats(self.read(r)?).await
+    }
+    async fn write(&self, r: tonic::Request<pb::WriteRequest>) -> Result<tonic::Response<pb::WriteResponse>, tonic::Status> {
+        self.inner.write(r).await
+    }
+    async fn schema(&self, r: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::SchemaResponse>, tonic::Status> {
+        self.inner.schema(r).await
+    }
+    async fn health(&self, r: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
+        self.inner.health(r).await
+    }
+    async fn hello(&self, r: tonic::Request<pb::HelloRequest>) -> Result<tonic::Response<pb::HelloResponse>, tonic::Status> {
+        match self.old.load(Ordering::Relaxed) {
+            true => Err(tonic::Status::unimplemented("unknown method Hello")),
+            false => self.inner.hello(r).await,
+        }
+    }
+}
+
+async fn recording(db: Db, old: bool) -> (String, Arc<Recording>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let shard = Arc::new(Recording { inner: strata_server::grpc::Grpc(service(db, "http://unused")), old: AtomicBool::new(old), down: AtomicBool::new(false), seen: Default::default() });
+    let svc = pb::strata_server::StrataServer::from_arc(shard.clone()).max_decoding_message_size(256 << 20);
+    tokio::spawn(tonic::transport::Server::builder().add_service(svc).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
+    (format!("http://{addr}"), shard)
+}
+
+/// A coordinator asks each shard the protocol versions it speaks and
+/// speaks the oldest any speaks: typed plans (protocol 2) when every shard
+/// takes them, SQL and JSON plans (protocol 1) to all while one is from
+/// before `Hello`, as in a rolling upgrade. The answers are the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn shards_speak_the_oldest_protocol_among_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = create(dir.path(), "whole.strata", |_| true);
+    let key = |i: usize| Value::Str(format!("p{i:07}"));
+    let compound = [
+        "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE a.year >= - -2022 AND b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
+        "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > 100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
+    ];
+    for (round, olds) in [[false, false], [false, true]].into_iter().enumerate() {
+        let mut urls = Vec::new();
+        let mut seen = Vec::new();
+        for (s, old) in olds.into_iter().enumerate() {
+            let db = create(dir.path(), &format!("r{round}s{s}.strata"), |i| shard_of(&key(i), 2) == s);
+            let (url, log) = recording(db, old).await;
+            urls.push(url);
+            seen.push(log);
+        }
+        let c = Coordinator::connect(urls).await.unwrap();
+        let want_protocol = if olds.contains(&true) { 1 } else { 2 };
+        assert_eq!(c.protocol(), want_protocol);
+        let coord = cluster(c);
+        assert_eq!(coord.health().await["protocol"], want_protocol, "{olds:?}");
+        for (sql, params) in queries() {
+            let p = if params["q"].is_object() { Params::new().set("q", vector_42(&whole)) } else { Params::new() };
+            let want = js::result(&whole.query(sql, &p).unwrap(), 0.0);
+            let params = coord.params(Some(&params)).await.unwrap();
+            let got = coord.query(QueryReq { sql: sql.into(), params, ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+            same(sql, &want, &js::result(&got.rs, 0.0));
+        }
+        for sql in compound {
+            let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
+            let got = coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+            same(sql, &want, &js::result(&got.rs, 0.0));
+        }
+        // Statistics alone, as a coordinator in front of this one asks.
+        let (stats, _) = coord.term_stats("SELECT id FROM products ORDER BY bm25(body, 'waterproof') DESC LIMIT 3", None, &Params::new(), 0).await.unwrap();
+        let (local, _) = service(create(dir.path(), &format!("r{round}w.strata"), |_| true), "http://unused").term_stats("SELECT id FROM products ORDER BY bm25(body, 'waterproof') DESC LIMIT 3", None, &Params::new(), 0).await.unwrap();
+        assert_eq!(serde_json::to_value(&stats).unwrap(), serde_json::to_value(&local).unwrap());
+        // Every read reached every shard in the protocol spoken, typed from 2.
+        for shard in &seen {
+            let log = shard.seen.lock().unwrap();
+            assert!(log.len() > queries().len(), "{olds:?}: {}", log.len());
+            assert!(log.iter().all(|&(p, typed)| p == want_protocol && typed == (want_protocol >= 2)), "{olds:?}: {log:?}");
+        }
+    }
+}
+
+/// A replica that fails is asked its versions again before its next read,
+/// as it may have restarted on another: one rolled back to a server from
+/// before `Hello` gets SQL again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_is_asked_its_protocol_again_after_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, shard) = recording(create(dir.path(), "db.strata", |_| true), false).await;
+    let coord = cluster(Coordinator::connect(vec![url]).await.unwrap());
+    let count = || {
+        let coord = coord.clone();
+        async move { coord.query(QueryReq { sql: "SELECT COUNT(*) FROM products WHERE year >= 2020".into(), ..Default::default() }).await }
+    };
+    let n = count().await.unwrap().rs.rows[0][0].clone();
+    assert_eq!(shard.last(), Some((2, true)));
+    shard.down.store(true, Ordering::Relaxed);
+    shard.old.store(true, Ordering::Relaxed);
+    assert_eq!(count().await.err().unwrap().status, 503);
+    shard.down.store(false, Ordering::Relaxed);
+    assert_eq!(count().await.unwrap().rs.rows[0][0], n);
+    assert_eq!(shard.last(), Some((1, false)));
+}
+
+/// A server says which protocol versions and plans it takes, takes a typed
+/// plan as its SQL, and refuses a protocol newer than its own and a plan
+/// that needs a feature it lacks, by name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(dir.path(), "db.strata", |_| true);
+    let schema = db.schema().clone();
+    let url = grpc(service(db, "http://unused")).await;
+    let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
+    let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version), (1, 2, strata::query::ir::VERSION));
+    assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
+
+    let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
+    let by_sql = c.query(pb::QueryRequest { sql: sql.into(), ..Default::default() }).await.unwrap().into_inner();
+    let plan = strata_server::plan_pb::to_pb_plan(&strata::query::ir::Plan::bind(sql, &schema, &Params::new()).unwrap());
+    // The SQL only names the plan.
+    let typed = pb::QueryRequest { sql: "a label".into(), protocol: 2, plan: Some(plan.clone()), ..Default::default() };
+    let by_plan = c.query(typed.clone()).await.unwrap().into_inner();
+    assert!(!by_sql.rows.is_empty());
+    assert_eq!((by_plan.columns, by_plan.rows), (by_sql.columns, by_sql.rows));
+
+    let e = c.query(pb::QueryRequest { protocol: 3, ..typed.clone() }).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::InvalidArgument);
+    assert!(e.message().contains("protocol 3"), "{}", e.message());
+    let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
+    let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::InvalidArgument);
+    assert!(e.message().contains("teleport"), "{}", e.message());
 }
 
 /// The agent's tool loop, against a stand-in for the Messages API that
