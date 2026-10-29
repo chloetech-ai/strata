@@ -1,10 +1,12 @@
 //! VECTOR fields declared as the embedding of other fields: the schema
 //! records them, writes that leave the vector out get it computed, rewrites
-//! of a source recompute it, merges and copies do not re-embed, and a copy
-//! into a new schema embeds only what changed.
+//! of a source recompute it, merges and copies do not re-embed, a copy
+//! into a new schema embeds only what changed, and SQL writes embed before
+//! they take the writer lock.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use strata::db::Db;
 use strata::embed::{Embedder, HashEmbedder};
@@ -171,4 +173,109 @@ fn a_copy_into_a_new_schema_embeds_only_what_changed() {
     assert_eq!(r.rows[0][1].as_vector().unwrap(), &want("lamp 5\nbrass and glass")[..]);
     assert_eq!(r.rows[0][2].as_vector().unwrap(), &want("lamp 5")[..]);
     assert_eq!(new.query("SELECT COUNT(*) FROM docs WHERE id = 'd0007'", &Params::new()).unwrap().rows[0][0], Value::Int(0));
+}
+
+/// The hash model; once armed, its next call says it started and waits to
+/// be let go, so a write is stopped while it embeds.
+struct Gated {
+    inner: HashEmbedder,
+    armed: AtomicBool,
+    texts: AtomicUsize,
+    started: Mutex<mpsc::Sender<()>>,
+    go: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Embedder for Gated {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        self.texts.fetch_add(texts.len(), Ordering::Relaxed);
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.started.lock().unwrap().send(()).unwrap();
+            self.go.lock().unwrap().recv().unwrap();
+        }
+        self.inner.embed(texts)
+    }
+}
+
+/// Review ARCH-9: an INSERT, an UPDATE that rewrites a source and an `ON
+/// CONFLICT DO UPDATE` compute their vectors before they take the writer
+/// lock, so other writes commit while the model works, and nothing is
+/// embedded again under the lock.
+#[test]
+fn sql_writes_embed_before_taking_the_writer_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("e.strata"), schema(), DbOptions::default()).unwrap();
+    let (started_tx, started) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel();
+    let m = Arc::new(Gated { inner: HashEmbedder { dim: DIM }, armed: AtomicBool::new(false), texts: AtomicUsize::new(0), started: Mutex::new(started_tx), go: Mutex::new(go_rx) });
+    db.set_embedder("emb", m.clone()).unwrap();
+    db.sql("INSERT INTO docs (id, title, text, stock) VALUES ('a', 'red mug', 'ceramic', 1)", &Params::new()).unwrap();
+    let db = &db;
+    for sql in [
+        "INSERT INTO docs (id, title, text, stock) VALUES ('b', 'blue kettle', 'steel', 2)",
+        "UPDATE docs SET title = 'green teapot' WHERE id = 'a'",
+        "INSERT INTO docs (id, title, text, stock) VALUES ('a', 'red cup', 'glass', 3) ON CONFLICT (id) DO UPDATE SET title = excluded.title",
+    ] {
+        let texts = m.texts.load(Ordering::Relaxed);
+        m.armed.store(true, Ordering::SeqCst);
+        std::thread::scope(|s| {
+            let write = s.spawn(move || db.sql(sql, &Params::new()).unwrap());
+            started.recv_timeout(Duration::from_secs(30)).expect("the write embeds");
+            // Another write commits while the model works.
+            let (done_tx, done) = mpsc::channel();
+            s.spawn(move || {
+                db.sql("UPDATE docs SET stock = stock + 10 WHERE id = 'a'", &Params::new()).unwrap();
+                done_tx.send(()).unwrap();
+            });
+            let other = done.recv_timeout(Duration::from_secs(10));
+            go.send(()).unwrap();
+            write.join().unwrap();
+            assert!(other.is_ok(), "{sql}: another write could not commit while the model worked");
+        });
+        // One text, embedded ahead; none again under the lock.
+        assert_eq!(m.texts.load(Ordering::Relaxed), texts + 1, "{sql}");
+    }
+    assert_eq!(emb_of(db, "b").unwrap(), want("blue kettle\nsteel"));
+    // The row read under the lock has the other writes' stock and keeps its text.
+    assert_eq!(emb_of(db, "a").unwrap(), want("red cup\nceramic"));
+    let r = db.query("SELECT stock FROM docs WHERE id = 'a'", &Params::new()).unwrap();
+    assert_eq!(r.rows[0][0], Value::Int(31));
+}
+
+/// A write prepared ahead ([`Db::prepare_write`]) embeds, under the lock,
+/// only the rows whose sources changed after it was prepared.
+#[test]
+fn rows_changed_after_a_write_was_prepared_are_embedded_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("e.strata"), schema(), DbOptions::default()).unwrap();
+    let m = counting();
+    db.set_embedder("emb", m.clone()).unwrap();
+    db.sql("INSERT INTO docs (id, title, text, stock) VALUES ('a', 'red mug', 'ceramic', 1), ('b', 'blue kettle', 'steel', 2)", &Params::new()).unwrap();
+    let calls = || m.1.load(Ordering::Relaxed);
+    let n = calls();
+    let p = db.prepare_write("UPDATE docs SET title = 'green teapot' WHERE id IN ('a', 'b')", &Params::new()).unwrap().unwrap();
+    assert_eq!(calls(), n + 2);
+    db.sql("UPDATE docs SET text = 'porcelain' WHERE id = 'a'", &Params::new()).unwrap();
+    assert_eq!(calls(), n + 3);
+    assert_eq!(db.write_prepared(&p).unwrap(), 2);
+    // Only a's new text, "green teapot\nporcelain", was embedded again.
+    assert_eq!(calls(), n + 4);
+    assert_eq!(emb_of(&db, "a").unwrap(), want("green teapot\nporcelain"));
+    assert_eq!(emb_of(&db, "b").unwrap(), want("green teapot\nsteel"));
+
+    // Numbers set in place embed nothing, ahead or under the lock; a
+    // SELECT is not a write.
+    let p = db.prepare_write("UPDATE docs SET stock = 5", &Params::new()).unwrap().unwrap();
+    assert_eq!(db.write_prepared(&p).unwrap(), 2);
+    assert_eq!(calls(), n + 4);
+    assert!(db.prepare_write("SELECT id FROM docs", &Params::new()).unwrap().is_none());
+    // INSERT OR IGNORE embeds only the rows it writes.
+    db.sql("INSERT OR IGNORE INTO docs (id, title, text, stock) VALUES ('a', 'x', 'y', 1), ('c', 'yellow bowl', 'clay', 4)", &Params::new()).unwrap();
+    assert_eq!(calls(), n + 5);
+    assert_eq!(emb_of(&db, "c").unwrap(), want("yellow bowl\nclay"));
 }
