@@ -32,7 +32,8 @@ use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArg
 
 use crate::error::{Error, Result};
 use crate::query::agg::{self, Acc, Part};
-use crate::query::exec::{ExecStats, ResultSet};
+use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
+use crate::query::memory::Charge;
 use crate::query::{AggFn, Params, Projection};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
@@ -202,18 +203,21 @@ fn is_star(f: &sql::Function) -> bool {
 
 /// Runs a compound SELECT; `runner` runs each single-table step.
 pub fn run(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner) -> Result<ResultSet> {
-    run_checked(sql_text, schema, params, runner, &|| Ok(()))
+    run_checked(sql_text, schema, params, runner, &ExecOptions::default())
 }
 
-/// [`run`], calling `check` (a deadline, a cancel flag) as it joins rows,
-/// every 1,024 of them, and stopping at its first error.
-pub fn run_checked(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner, check: &dyn Fn() -> Result<()>) -> Result<ResultSet> {
-    run_query(&*parse(sql_text)?, schema, params, runner, check)
+/// [`run`] under `opts`' deadline and cancel flag, checked every 1,024 rows
+/// it joins, and its memory budget, which the steps' rows, the joins' hash
+/// tables and the joined rows are counted against while the query runs.
+/// The steps themselves run under whatever options `runner` gives them.
+pub fn run_checked(sql_text: &str, schema: &Schema, params: &Params, runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
+    run_query(&*parse(sql_text)?, schema, params, runner, opts)
 }
 
 /// [`run_checked`] of a parsed query.
-pub(crate) fn run_query(q: &sql::Query, schema: &Schema, params: &Params, runner: &mut Runner, check: &dyn Fn() -> Result<()>) -> Result<ResultSet> {
-    let mut cx = Ctx { schema, params: params.clone(), ctes: HashMap::new(), runner, next: 0, plan: Vec::new(), check, steps: 0 };
+pub(crate) fn run_query(q: &sql::Query, schema: &Schema, params: &Params, runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
+    let charge = Charge::new(opts.memory.clone());
+    let mut cx = Ctx { schema, params: params.clone(), ctes: HashMap::new(), runner, next: 0, plan: Vec::new(), opts, steps: 0, charge };
     let rel = cx.query(q)?;
     let n = rel.rows.len();
     Ok(ResultSet {
@@ -278,10 +282,12 @@ struct Ctx<'a, 'r> {
     runner: &'a mut Runner<'r>,
     next: usize,
     plan: Vec<String>,
-    /// The query's deadline and cancel flag ([`run_checked`]), and steps
-    /// of the joins since it was last checked.
-    check: &'a dyn Fn() -> Result<()>,
+    /// The query's deadline, cancel flag and memory budget
+    /// ([`run_checked`]), steps of the joins since the deadline was last
+    /// checked, and what the query holds.
+    opts: &'a ExecOptions,
     steps: u32,
+    charge: Charge,
 }
 
 /// One table of a join.
@@ -317,14 +323,14 @@ struct Joined {
 }
 
 impl<'a, 'r> Ctx<'a, 'r> {
-    /// One step of a join: [`Ctx::check`] every 1,024.
+    /// One step of a join: [`ExecOptions::check`] every 1,024.
     fn tick(&mut self) -> Result<()> {
         self.steps += 1;
         if self.steps < 1024 {
             return Ok(());
         }
         self.steps = 0;
-        (self.check)()
+        self.opts.check()
     }
 
     /// A new list or value parameter.
@@ -348,6 +354,9 @@ impl<'a, 'r> Ctx<'a, 'r> {
         self.plan.push(format!("{what}: {} rows: {text}", rs.rows.len()));
         for l in &rs.stats.plan {
             self.plan.push(format!("  {l}"));
+        }
+        for r in &rs.rows {
+            self.charge.row(r)?;
         }
         Ok(Rel::of(rs))
     }
@@ -790,6 +799,7 @@ impl<'a, 'r> Ctx<'a, 'r> {
                     combos = combos.into_iter().flat_map(|c| vals.iter().map(move |v| [c.clone(), vec![v.clone()]].concat())).collect();
                 }
                 for c in combos {
+                    self.charge.add(64 + c.iter().map(Part::bytes).sum::<u64>())?;
                     table.entry(c).or_default().push(ri);
                 }
             }
@@ -813,6 +823,7 @@ impl<'a, 'r> Ctx<'a, 'r> {
                     self.tick()?;
                     let row: Vec<Value> = l.iter().chain(&right.rows[ri]).cloned().collect();
                     if pass_all(&on_rest[i], &out.cols, &row, &self.params)? {
+                        self.charge.row(&row)?;
                         out.rows.push(row);
                         out.keys.push(joined.keys[li].clone());
                         out.scores.push(joined.scores[li]);
@@ -820,7 +831,9 @@ impl<'a, 'r> Ctx<'a, 'r> {
                     }
                 }
                 if !any && kind == JoinKind::Left {
-                    out.rows.push(l.iter().cloned().chain(std::iter::repeat_n(Value::Null, width)).collect());
+                    let row: Vec<Value> = l.iter().cloned().chain(std::iter::repeat_n(Value::Null, width)).collect();
+                    self.charge.row(&row)?;
+                    out.rows.push(row);
                     out.keys.push(joined.keys[li].clone());
                     out.scores.push(joined.scores[li]);
                 }
@@ -1558,8 +1571,12 @@ fn evaluate(s: &sql::Select, j: Joined, order: &[(Expr, bool)], offset: usize, l
                 match &c.arg {
                     None => acc.add_row(),
                     Some(a) => match eval_row(a, &j.cols, r, params)? {
-                        Value::List(xs) => xs.iter().for_each(|x| acc.add(x)),
-                        v => acc.add(&v),
+                        Value::List(xs) => xs.iter().for_each(|x| {
+                            acc.add(x);
+                        }),
+                        v => {
+                            acc.add(&v);
+                        }
                     },
                 }
             }

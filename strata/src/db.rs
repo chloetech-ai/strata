@@ -418,7 +418,7 @@ impl Db {
                     let select = bind(text, view.schema(), p)?;
                     self.execute(&view, &select, &steps)
                 },
-                &|| opts.check(),
+                opts,
             )?;
             if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
                 return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));

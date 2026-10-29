@@ -6,6 +6,7 @@
 //! * [`logical`]: the bound query: projection, predicate tree, score.
 //! * [`agg`]: aggregates and groups.
 //! * [`stats`]: collection statistics exchanged with a coordinator.
+//! * [`memory`]: the memory breaker queries count what they hold against.
 
 pub mod agg;
 pub mod compound;
@@ -13,6 +14,7 @@ pub mod ddl;
 pub mod exec;
 pub mod fusion;
 pub mod logical;
+pub mod memory;
 pub mod parse;
 pub mod plan;
 pub mod sql;

@@ -124,6 +124,12 @@ struct Args {
     /// limit).
     #[arg(long, default_value_t = 65_536)]
     max_groups: usize,
+    /// Memory the running queries may hold together, in MiB: their groups,
+    /// candidate rows, answers and joins; a query that needs more fails
+    /// with 429 (default: a third of the cgroup memory limit, or of RAM;
+    /// 0: no limit).
+    #[arg(long)]
+    query_memory_mb: Option<u64>,
     /// Write requests the server holds at once (embedding, waiting for the
     /// writer, or being applied); more are refused with 429 (0: no limit).
     #[arg(long, default_value_t = 1024)]
@@ -273,6 +279,7 @@ async fn main() {
         max_concurrent: a.max_concurrent,
         max_result_window: a.max_result_window,
         max_groups: a.max_groups,
+        query_memory_mb: a.query_memory_mb,
         max_queued_writes: a.max_queued_writes,
         max_body_mb: a.max_body_mb,
         model: a.model,

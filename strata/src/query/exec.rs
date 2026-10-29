@@ -16,6 +16,7 @@ use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, Ran
 use crate::graph::GraphReader;
 use crate::query::fusion::{self, Norm};
 use crate::query::agg;
+use crate::query::memory::{Charge, MemoryBudget};
 use crate::query::logical::{Decay, Expand, OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::stats::{FieldStats, TermStats};
@@ -215,6 +216,11 @@ pub struct ExecOptions {
     /// The most groups a GROUP BY or a facet may make before the query
     /// fails, as Elasticsearch's `search.max_buckets` (`None`: no limit).
     pub max_groups: Option<usize>,
+    /// The budget the query's groups, candidates and rows are counted
+    /// against; past it the query fails with `Error::Memory`
+    /// ([`crate::query::memory`];
+    /// `None`: not counted).
+    pub memory: Option<Arc<MemoryBudget>>,
 }
 
 impl Default for ExecOptions {
@@ -237,6 +243,7 @@ impl Default for ExecOptions {
             segments: None,
             max_rows: None,
             max_groups: None,
+            memory: None,
         }
     }
 }
@@ -425,6 +432,8 @@ pub struct Executor<'a> {
     parts: Option<(Vec<(usize, DocId)>, Vec<Vec<f32>>, Vec<Vec<bool>>)>,
     /// Expanded searches, worked out once for every segment.
     expanded: Mutex<Expanded>,
+    /// What the query holds of [`ExecOptions::memory`].
+    charge: Charge,
 }
 
 /// Searches with their synonyms and typos resolved to indexed terms.
@@ -439,6 +448,16 @@ struct Expanded {
 
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
+}
+
+/// Keeps the rows of `v` that `better` puts among its first `k`, and every
+/// row tied with the `k`-th (all of them when `k` is 0 or `v` has no more).
+fn keep_best<T: Copy>(v: &mut Vec<T>, k: usize, better: impl Fn(&T, &T) -> std::cmp::Ordering) {
+    if k > 0 && k < v.len() {
+        v.select_nth_unstable_by(k - 1, &better);
+        let cut = v[k - 1];
+        v.retain(|c| better(c, &cut) != std::cmp::Ordering::Greater);
+    }
 }
 
 impl<'a> Executor<'a> {
@@ -468,6 +487,7 @@ impl<'a> Executor<'a> {
             readers_all: readers.to_vec(),
             parts: None,
             expanded: Mutex::new(Expanded::default()),
+            charge: Charge::new(opts.memory.clone()),
         }
     }
 
@@ -937,6 +957,7 @@ impl<'a> Executor<'a> {
                 if want.is_some_and(|w| out.len() >= w) {
                     break;
                 }
+                self.charge.room(&mut out)?;
                 out.push(Hit { seg: s.ord, doc: d, score: 0.0 });
             }
         }
@@ -952,7 +973,15 @@ impl<'a> Executor<'a> {
         // Each row with its exact INT value: a double cannot order
         // integers beyond 2^53 (0 for FLOAT columns and missing values).
         let int = self.schema.fields[field].ty == FieldType::Int;
+        let better = |a: &(Hit, i64), b: &(Hit, i64)| {
+            let o = a.0.score.total_cmp(&b.0.score).then(a.1.cmp(&b.1));
+            if desc { o.reverse() } else { o }
+        };
         let mut cands: Vec<(Hit, i64)> = Vec::new();
+        // With a LIMIT, the candidates are cut to the best and their ties
+        // as they pile up, so they hold about twice the LIMIT, not every
+        // match.
+        let mut cut_at = want.map_or(usize::MAX, |k| (2 * k).max(4096));
         let segs = self.segs.clone();
         let mut tick = self.ticker();
         for s in segs.iter() {
@@ -963,19 +992,18 @@ impl<'a> Executor<'a> {
                 tick.tick()?;
                 if let Some(v) = self.num_value(s, field, col, d).or(null_score) {
                     let exact = if int { self.int_value(s, field, col, d).unwrap_or(0) } else { 0 };
+                    self.charge.room(&mut cands)?;
                     cands.push((Hit { seg: s.ord, doc: d, score: v }, exact));
+                    self.stats.scored += 1;
+                    if cands.len() >= cut_at {
+                        keep_best(&mut cands, want.unwrap_or(0), better);
+                        cut_at = cut_at.max(2 * cands.len());
+                    }
                 }
             }
         }
-        self.stats.scored += cands.len() as u64;
-        let better = |a: &(Hit, i64), b: &(Hit, i64)| {
-            let o = a.0.score.total_cmp(&b.0.score).then(a.1.cmp(&b.1));
-            if desc { o.reverse() } else { o }
-        };
-        if let Some(k) = want.filter(|&k| k > 0 && k < cands.len()) {
-            cands.select_nth_unstable_by(k - 1, better);
-            let cut = cands[k - 1];
-            cands.retain(|c| better(c, &cut) != std::cmp::Ordering::Greater);
+        if let Some(k) = want {
+            keep_best(&mut cands, k, better);
         }
         // Rows tied on the value go by key (`ORDER BY rating DESC, id`), or
         // in index order.
@@ -1002,7 +1030,9 @@ impl<'a> Executor<'a> {
     /// The `k` rows of the filter with the largest decay of `field` (rows
     /// without a value score 0), rows tied on it by key.
     fn decay_top(&mut self, field: usize, f: &Decay, p: &Pred, k: usize, key_desc: bool) -> Result<Vec<Hit>> {
+        let by_score = |a: &Hit, b: &Hit| b.score.total_cmp(&a.score);
         let mut cands = Vec::new();
+        let mut cut_at = if k > 0 { (2 * k).max(4096) } else { usize::MAX };
         let segs = self.segs.clone();
         let mut tick = self.ticker();
         for s in segs.iter() {
@@ -1012,16 +1042,17 @@ impl<'a> Executor<'a> {
             for d in set.iter() {
                 tick.tick()?;
                 let score = self.num_value(s, field, col, d).map_or(0.0, |v| f.eval(v));
+                self.charge.room(&mut cands)?;
                 cands.push(Hit { seg: s.ord, doc: d, score });
+                self.stats.scored += 1;
+                if cands.len() >= cut_at {
+                    keep_best(&mut cands, k, by_score);
+                    cut_at = cut_at.max(2 * cands.len());
+                }
             }
         }
-        self.stats.scored += cands.len() as u64;
         self.stats.plan.push(format!("decay {:?} of {} around {}, scale {}", f.shape, self.schema.fields[field].name, f.origin, f.scale));
-        if k > 0 && k < cands.len() {
-            cands.select_nth_unstable_by(k - 1, |a, b| b.score.total_cmp(&a.score));
-            let cut = cands[k - 1].score;
-            cands.retain(|h| h.score >= cut);
-        }
+        keep_best(&mut cands, k, by_score);
         self.sort_by_score_then_key(&mut cands, true, key_desc);
         cands.truncate(k);
         Ok(cands)
@@ -1364,6 +1395,7 @@ impl<'a> Executor<'a> {
             }
         }
         let mut groups = agg::Groups::limited(self.opts.max_groups);
+        groups.charge = self.charge.clone();
         let segs = self.segs.clone();
         let (mut vals, mut gv) = (Vec::new(), Vec::new());
         let mut tick = self.ticker();
@@ -1405,7 +1437,10 @@ impl<'a> Executor<'a> {
                             Projection::Agg { field, .. } => {
                                 self.agg_values(s, *field, d, &multi, &mut vals)?;
                                 for v in &vals {
-                                    a.add(v);
+                                    let more = a.add(v);
+                                    if more > 0 {
+                                        self.charge.add(more)?;
+                                    }
                                 }
                             }
                             _ => a.add_row(),
@@ -1822,7 +1857,12 @@ impl<'a> Executor<'a> {
             }
             for (code, c) in kw.facet_code_counts(&set, strategy).into_iter().enumerate() {
                 if c > 0 {
-                    *counts.entry(kw.value(code as u32).to_string()).or_insert(0) += c;
+                    let n = counts.len();
+                    let v = kw.value(code as u32);
+                    *counts.entry(v.to_string()).or_insert(0) += c;
+                    if counts.len() > n {
+                        self.charge.add(48 + v.len() as u64)?;
+                    }
                 }
             }
             if let Some(max) = self.opts.max_groups.filter(|&m| counts.len() > m) {
@@ -1902,6 +1942,7 @@ impl<'a> Executor<'a> {
                     },
                 });
             }
+            self.charge.row(&row)?;
             rows.push(row);
         }
         Ok(rows)

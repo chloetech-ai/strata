@@ -55,6 +55,8 @@ impl From<strata::Error> for ApiError {
         let status = match &e {
             strata::Error::Query(_) | strata::Error::Schema(_) => 400,
             strata::Error::Busy(_) => 503,
+            // As Elasticsearch's circuit breakers.
+            strata::Error::Memory(_) => 429,
             strata::Error::Timeout(_) => 504,
             strata::Error::Io(_) | strata::Error::Corrupt(_) => 500,
         };

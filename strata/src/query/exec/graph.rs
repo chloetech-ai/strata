@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::{err, Executor, Hit, ProbeNode, Seg, Ticker};
+use crate::query::memory::Charge;
 use crate::error::Result;
 use crate::graph::traverse::{self, node, split, Adjacency, Node, NodeMap};
 use crate::graph::GraphReader;
@@ -49,6 +50,10 @@ struct GraphAdj<'x> {
     int_keys: bool,
     /// The query's deadline, checked as the traversal expands rows.
     tick: Ticker<'x>,
+    /// What the traversal holds, counted against the query's memory every
+    /// 64 KiB.
+    charge: Charge,
+    held: u64,
 }
 
 impl GraphAdj<'_> {
@@ -88,6 +93,14 @@ impl SegRef<'_> {
 }
 
 impl Adjacency for GraphAdj<'_> {
+    fn hold(&mut self, bytes: u64) -> Result<()> {
+        self.held += bytes;
+        if self.held >= 1 << 16 {
+            self.charge.add(std::mem::take(&mut self.held))?;
+        }
+        Ok(())
+    }
+
     fn neighbors(&mut self, n: Node, reverse: bool, out: &mut Vec<(Node, f32)>) -> Result<()> {
         self.tick.tick()?;
         let (s, d) = split(n);
@@ -292,7 +305,8 @@ impl<'a> Executor<'a> {
         let int_keys = crate::graph::int_keys(self.schema);
         // A row's neighbours by similarity take a vector search each.
         let tick = Ticker::new(self.opts, if vector { 16 } else { Ticker::DOCS });
-        Ok(GraphAdj { snap: self.snap, segs, dir: g.dir, has_through: g.through.is_some(), knn, memo: traverse::node_map(), int_keys, tick })
+        let charge = self.charge.clone();
+        Ok(GraphAdj { snap: self.snap, segs, dir: g.dir, has_through: g.through.is_some(), knn, memo: traverse::node_map(), int_keys, tick, charge, held: 0 })
     }
 
     /// Top rows by PageRank or hop distance, among those passing `p`.
