@@ -222,8 +222,9 @@ impl Wal {
 
     /// Appends a committed transaction (operations with the id of the table
     /// each writes) and its sequence number, which a numbered log needs and
-    /// any other refuses; durable on return when `sync`.
-    pub fn append(&mut self, txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)], sync: bool) -> Result<()> {
+    /// any other refuses; durable on return when `sync`. Returns the
+    /// records it wrote.
+    pub fn append(&mut self, txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)], sync: bool) -> Result<Vec<u8>> {
         match (seq.is_some(), self.numbered) {
             (true, false) => return Err(Error::Schema("a numbered transaction, in a log without sequence numbers".into())),
             (false, true) => return Err(Error::Schema("a transaction without a sequence number, in a numbered log".into())),
@@ -240,7 +241,7 @@ impl Wal {
         }
         self.len += buf.len() as u64;
         self.unsynced |= !sync;
-        Ok(())
+        Ok(buf)
     }
 
     /// Makes appends made without `sync` durable.
@@ -299,7 +300,7 @@ impl Wal {
 
 /// The records of one transaction. A database with one table never writes
 /// a table record, so its log reads the same as before there were tables.
-fn encode_txn(txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)]) -> Vec<u8> {
+pub(crate) fn encode_txn(txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut body = Vec::new();
     let mut table = 0;
@@ -393,6 +394,16 @@ pub fn read_sealed(path: &Path, db_id: u64, fits: &dyn Fn(u32, &Op) -> bool) -> 
     let (txns, end) = decode(&buf[header as usize..], numbered, fits);
     let end = header + end as u64;
     Ok(Some((txns, (end < buf.len() as u64).then_some(end))))
+}
+
+/// The one numbered transaction `buf` holds, as [`Wal::append`] wrote it
+/// (a primary's, shipped to a replica: [`crate::storage::ship`]); an error
+/// if it holds anything else or an operation that does not `fit`.
+pub fn decode_shipped(buf: &[u8], fits: &dyn Fn(u32, &Op) -> bool) -> Result<WalTxn> {
+    match decode(buf, true, fits) {
+        (mut txns, end) if txns.len() == 1 && end == buf.len() => Ok(txns.pop().expect("one")),
+        _ => Err(corrupt("a shipped transaction is damaged, or is not one numbered transaction")),
+    }
 }
 
 /// The txns of the intact commit records in `rest` (the log past the last

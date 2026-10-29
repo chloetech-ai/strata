@@ -53,6 +53,7 @@ use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
 use crate::storage::rowseq::{self, Seqs};
 use crate::storage::state::{mem_seq, Check, Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::{Updates, SEQ};
+use crate::storage::ship::{Applied, LogRead, ShipLog, Shipped};
 use crate::storage::wal::{self, Op, Wal, WalTxn};
 use crate::value::{conform, validate, Document, Value};
 
@@ -132,6 +133,11 @@ pub struct DbOptions {
     /// left to the checks above. Off, sections are trusted as far as
     /// their structure checks go.
     pub check_sections: bool,
+    /// Bytes of recent numbered transactions to keep in memory, as they
+    /// were logged, for replicas to read ([`Database::log_from`]); 0 keeps
+    /// none. A replica further behind than this needs a copy of the
+    /// segments first.
+    pub ship_log_bytes: usize,
 }
 
 /// How a database is laid out on disk.
@@ -174,6 +180,7 @@ impl Default for DbOptions {
             wal_drop_damaged: false,
             verify_checksums: false,
             check_sections: true,
+            ship_log_bytes: 0,
         }
     }
 }
@@ -284,7 +291,12 @@ pub struct Database {
     /// it ([`Database::try_writer`]).
     background_waiting: AtomicUsize,
     background_holding: AtomicUsize,
+    /// Told the term and number of each numbered transaction once it is
+    /// committed ([`Database::on_commit`]).
+    commit_hook: RwLock<Option<CommitHook>>,
 }
+
+type CommitHook = Arc<dyn Fn(SeqNo) + Send + Sync>;
 
 /// The writer lock as a background flush or a merge holds it, briefly: to
 /// seal the memtables, to reserve space for an image, or to install
@@ -867,6 +879,7 @@ impl Database {
             cached: None,
             reserved: Vec::new(),
             next_segment_id: 0,
+            ship: ShipLog::new(opts.ship_log_bytes),
         };
         let mut flushed = false;
         for t in txns {
@@ -874,6 +887,9 @@ impl Database {
                 return Err(corrupt(format!("a sealed write-ahead log holds transactions {} sequence numbers, and the database {}", if numbered { "without" } else { "with" }, if numbered { "numbers its writes" } else { "does not number its writes" })));
             }
             st.seq = st.seq.max(t.seq.map_or(0, |n| n.seq));
+            if let Some(seq) = t.seq.filter(|_| st.ship.keeps()) {
+                st.ship.push(Shipped { seq, bytes: wal::encode_txn(t.txn, t.seq, &t.ops).into() });
+            }
             if t.txn <= st.manifest.wal_txn {
                 // Flushed before a crash cut the WAL truncation short.
                 flushed = true;
@@ -934,6 +950,7 @@ impl Database {
             flusher: Mutex::new(None),
             background_waiting: AtomicUsize::new(0),
             background_holding: AtomicUsize::new(0),
+            commit_hook: RwLock::new(None),
         };
         db.republish();
         Ok(db)
@@ -1042,6 +1059,11 @@ impl Database {
     pub fn begin_term(&self, term: u64) -> Result<()> {
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
+        self.raise_term(&mut wal, term)
+    }
+
+    /// [`Database::begin_term`], under the writer lock.
+    fn raise_term(&self, wal: &mut Wal, term: u64) -> Result<()> {
         let (now, seq) = {
             let st = lock(&self.state);
             (st.manifest.seq_no.clone().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?, st.seq)
@@ -1053,8 +1075,108 @@ impl Database {
         let n = vw.manifest.seq_no.as_mut().expect("numbered");
         n.term = term;
         n.terms.push((term, seq + 1));
-        let c = vw.commit(&mut wal)?;
+        let c = vw.commit(wal)?;
         self.publish(c, |_| {})
+    }
+
+    /// The numbered transactions from sequence number `from` on, as they
+    /// were logged, up to `max_bytes` of them (at least one), for a replica
+    /// to apply ([`Database::apply_shipped`]): none when `from` is past the
+    /// last number given, and [`LogRead::Gone`] when the ship log
+    /// ([`DbOptions::ship_log_bytes`]) no longer holds it.
+    pub fn log_from(&self, from: u64, max_bytes: usize) -> LogRead {
+        let st = lock(&self.state);
+        st.ship.read(from, st.seq, max_bytes)
+    }
+
+    /// Has `f` told the term and number of each numbered transaction once
+    /// it is committed, in the order they commit (replacing any earlier
+    /// `f`). It runs in the writer, so it must not block or write.
+    pub fn on_commit(&self, f: impl Fn(SeqNo) + Send + Sync + 'static) {
+        *self.commit_hook.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+    }
+
+    /// Applies transactions a primary shipped ([`Database::log_from`]), in
+    /// order, each as one transaction under the primary's term and number,
+    /// so that this database holds the same rows with the same numbers;
+    /// durable on return with `DbOptions::sync`. `prev` is the transaction
+    /// before the first, as the primary has it (its number, and that
+    /// number's term): when it is not this database's last
+    /// ([`Numbering::last`]), nothing is applied ([`Applied::Mismatch`]).
+    /// A transaction with a newer term than this database's raises its
+    /// term first.
+    ///
+    /// Each transaction is checked before any is applied: an error for one
+    /// that is damaged, does not follow the one before it, or comes from an
+    /// older term than the one before it (an old primary's, which a newer
+    /// one has replaced). An error also for one whose operations do not
+    /// apply to the rows here, as they did on the primary (a delete or a
+    /// set of a row that is not live, an insert of one that is), which
+    /// means that the two databases were not copies of each other: it is
+    /// not applied, and those before it are.
+    pub fn apply_shipped(&self, prev: SeqNo, txns: &[&[u8]]) -> Result<Applied> {
+        let WriteTxn { mut wal, .. } = self.begin()?;
+        let now = self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?;
+        if now.last() != prev {
+            let last = now.last();
+            return Ok(Applied::Mismatch { seq: last.seq, term: last.term });
+        }
+        let schemas: Vec<(u32, Arc<Schema>)> = lock(&self.state).tables.iter().map(|t| (t.id, t.schema.clone())).collect();
+        let fits = |table: u32, op: &Op| schemas.iter().find(|(id, _)| *id == table).is_some_and(|(_, s)| op_fits(s, op));
+        let mut shipped = Vec::with_capacity(txns.len());
+        let mut at = now.last();
+        for bytes in txns {
+            let t = wal::decode_shipped(bytes, &fits)?;
+            let s = t.seq.expect("a shipped transaction is numbered");
+            if s.seq != at.seq + 1 {
+                return Err(corrupt(format!("shipped transaction {} does not follow {}", s.seq, at.seq)));
+            }
+            if s.term < at.term.max(now.term) {
+                return Err(Error::Schema(format!(
+                    "shipped transaction {} has term {}, older than term {}: it comes from a primary that another has replaced",
+                    s.seq,
+                    s.term,
+                    at.term.max(now.term)
+                )));
+            }
+            at = s;
+            shipped.push((s, t.ops));
+        }
+        let mut at = now.last();
+        let mut failed = None;
+        for (s, ops) in shipped {
+            if s.term > lock(&self.state).manifest.seq_no.as_ref().map_or(0, |n| n.term) {
+                if let Err(e) = self.raise_term(&mut wal, s.term) {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            let mut txn = WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new() };
+            let replayed = txn.replay(ops);
+            let WriteTxn { wal: w, ops, .. } = txn;
+            wal = w;
+            // The term is the transaction's and it follows the last, so the
+            // commit gives it the primary's number, unless it wrote nothing.
+            match replayed.and_then(|_| self.commit_logged(&mut wal, ops, false)) {
+                Ok(Some(n)) if n == s.seq => {}
+                Ok(got) => {
+                    failed = Some(corrupt(format!("shipped transaction {} committed here as {got:?}", s.seq)));
+                    break;
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            at = s;
+        }
+        if self.opts.sync {
+            wal.sync_appends().map_err(|e| self.poison(e.into()))?;
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(Applied::At(at)),
+        }
     }
 
     /// The term writes are numbered under and the last sequence number
@@ -2587,6 +2709,11 @@ impl Database {
     /// Commits `ops` as one transaction; returns its sequence number when
     /// the database numbers its writes.
     fn commit_ops(&self, wal: &mut Wal, ops: Vec<(u32, Op)>) -> Result<Option<u64>> {
+        self.commit_logged(wal, ops, self.opts.sync)
+    }
+
+    /// [`Database::commit_ops`], logged durably only with `sync`.
+    fn commit_logged(&self, wal: &mut Wal, ops: Vec<(u32, Op)>, sync: bool) -> Result<Option<u64>> {
         if ops.is_empty() {
             return Ok(None);
         }
@@ -2605,7 +2732,7 @@ impl Database {
         // A failed append is cut off the log, so the transaction is not
         // committed; but the page cache may be in doubt after a failed
         // fsync, so stop writing.
-        wal.append(txn, seq, &ops, self.opts.sync).map_err(|e| self.poison(e))?;
+        let logged = wal.append(txn, seq, &ops, sync).map_err(|e| self.poison(e))?;
         let full = {
             let mut st = lock(&self.state);
             for (table, op) in ops {
@@ -2616,9 +2743,13 @@ impl Database {
             st.txn = txn;
             if let Some(n) = seq {
                 st.seq = n.seq;
+                if st.ship.keeps() {
+                    st.ship.push(Shipped { seq: n, bytes: logged.into() });
+                }
             }
             st.mem_len() + st.n_pending > self.opts.memtable_max_docs
         };
+        let numbered = seq;
         let seq = seq.map(|n| n.seq);
         // From here the transaction is durable, and its result is Ok: an
         // error would make callers retry a write that already happened (an
@@ -2628,12 +2759,31 @@ impl Database {
             match flusher {
                 Some(sig) => sig.wake(),
                 // The flush published its version.
-                None if self.flush_locked(wal).is_ok() => return Ok(seq),
+                None if self.flush_locked(wal).is_ok() => {
+                    self.committed(numbered);
+                    return Ok(seq);
+                }
                 None => {}
             }
         }
         self.republish();
+        self.committed(numbered);
         Ok(seq)
+    }
+
+    /// Tells the commit hook ([`Database::on_commit`]) of a numbered
+    /// transaction.
+    fn committed(&self, seq: Option<SeqNo>) {
+        if let (Some(n), Some(f)) = (seq, &*self.commit_hook.read().unwrap_or_else(|e| e.into_inner())) {
+            f(n);
+        }
+    }
+
+    /// The table with id `id`, under the writer lock as [`Database::table_ref`].
+    fn table_by_id(&self, id: u32) -> Result<TableRef> {
+        let st = lock(&self.state);
+        let pos = st.table_index(id).ok_or_else(|| Error::Schema(format!("no table has id {id}")))?;
+        Ok(TableRef { id, pos, schema: st.tables[pos].schema.clone() })
     }
 }
 
@@ -2969,6 +3119,30 @@ impl<'a> WriteTxn<'a> {
     }
 
     pub fn rollback(self) {}
+
+    /// Writes a primary's logged operations, which must apply here as they
+    /// did there ([`Database::apply_shipped`]).
+    fn replay(&mut self, ops: Vec<(u32, Op)>) -> Result<()> {
+        let differs = |what: String| Error::Schema(format!("a shipped transaction {what}: this database is not a copy of its primary's"));
+        for (table, op) in ops {
+            let t = self.db.table_by_id(table)?;
+            match op {
+                Op::Insert(doc) => self.insert_in(&t, Arc::unwrap_or_clone(doc)).map_err(|e| differs(format!("inserts a row it cannot ({e})")))?,
+                Op::Delete(key) => {
+                    if !self.delete_in(&t, &key)? {
+                        return Err(differs(format!("deletes {key:?}, which no row here has")));
+                    }
+                }
+                Op::Set { key, field, value } => {
+                    let name = t.schema.fields.get(field as usize).map(|f| f.name.clone()).ok_or_else(|| differs(format!("sets field #{field}")))?;
+                    if !self.set_in(&t, &key, &name, value)? {
+                        return Err(differs(format!("sets {name} of {key:?}, which no row here has")));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn keys(&mut self, table: u32) -> &mut TxnKeys {
         let i = match self.keys.iter().position(|(id, _)| *id == table) {

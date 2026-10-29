@@ -17,6 +17,7 @@ use crate::storage::manifest::{Manifest, SegmentMeta};
 use crate::storage::pager::{Extent, Meta};
 use crate::storage::pk::PkIndex;
 use crate::storage::rowseq;
+use crate::storage::ship::ShipLog;
 use crate::storage::snapshot::{MemSeg, SnapInner};
 use crate::storage::updates::{Updates, SEQ};
 use crate::storage::wal::Op;
@@ -381,6 +382,9 @@ pub(crate) struct State {
     /// Segment ids below this are taken (by reservations), even when the
     /// manifest's `next_segment_id` is lower.
     pub next_segment_id: u64,
+    /// The most recent numbered transactions, for replicas
+    /// ([`crate::storage::ship`]); updated with `seq`.
+    pub ship: ShipLog,
 }
 
 impl State {
