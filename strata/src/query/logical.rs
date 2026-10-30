@@ -469,6 +469,21 @@ pub enum OrderBy {
     Agg { what: Projection, desc: bool },
 }
 
+/// A rerank phase ([`Select::phases`]): the top `count` rows of the phase
+/// before it (the first phase is the query's `ORDER BY`), ranked again by
+/// `score`, best first. Rows tied on it keep the order they had, and only
+/// those `count` rows go on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Phase {
+    pub score: Score,
+    pub count: usize,
+    /// Scored once over every row the phase reranks, on the coordinator
+    /// over shards: a set function (`minmax`, `rank`, `rrf`) reads them
+    /// all. A phase that is not global is row-local, and each shard scores
+    /// its own rows.
+    pub global: bool,
+}
+
 /// An aggregate function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -524,6 +539,9 @@ pub struct Select {
     pub having: Option<Having>,
     /// Secondary order for rows that tie on the primary one.
     pub tiebreak: Option<Tiebreak>,
+    /// Rerank phases after `order`, in turn; LIMIT and OFFSET cut the
+    /// last one's rows.
+    pub phases: Vec<Phase>,
     pub limit: Option<usize>,
     pub offset: usize,
     /// Graph computations that `Pred::Graph`, `Score::Ppr`, `Score::Hops`

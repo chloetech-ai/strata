@@ -44,6 +44,8 @@ use crate::query::ir::eval;
 use crate::query::ir::{self, ArithOp, CmpOp, Func, When};
 use crate::query::ops;
 use crate::query::sql::{Sub, Subs};
+use crate::query::logical::{OrderBy, Phase, Select};
+use crate::query::rank::Rank;
 use crate::query::{AggFn, Params, Projection};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
@@ -322,6 +324,9 @@ impl<'a> Planner<'a> {
 
     /// [`Planner::query`], its `WITH` results in scope until it returns.
     fn scoped(&self, q: &sql::Query) -> Result<Planned> {
+        if let Some(p) = self.phased(q)? {
+            return Ok(p);
+        }
         let mut defs = Vec::new();
         if let Some(w) = &q.with {
             if w.recursive {
@@ -349,6 +354,139 @@ impl<'a> Planner<'a> {
             true => body,
             false => Planned { node: ir::Node::With { ctes: defs, input: Box::new(body.node) }, ..body },
         })
+    }
+
+    /// A `WITH` that ranks a table's rows and cuts them, ranked again by
+    /// the next `WITH` or the query itself, as one Search with rerank
+    /// phases ([`ir::Phase`]): each phase ranks the rows of the one before
+    /// by an expression, best first.
+    ///
+    /// ```sql
+    /// WITH top AS (SELECT * FROM docs WHERE year > 2020 ORDER BY bm25(body, :q) DESC LIMIT 100)
+    /// SELECT id, score() FROM top ORDER BY bm25(body, :q) * (1 + 0.1 * rating) DESC LIMIT 10
+    /// ```
+    ///
+    /// Every row a phase reads goes on, ranked by the phase (one it gives
+    /// no value last, rows tied in the order they had), and an outer
+    /// ranking may read any of the table's columns, as the rows are the
+    /// table's. Each `WITH` after the first, and the query, reads the one
+    /// before alone, with no `WHERE`, grouping or subquery, and ranks by one
+    /// expression `DESC`; each `WITH` keeps the table's columns (`*`) and
+    /// has a `LIMIT`. `None` for any other query, or one that does not
+    /// bind so, which plans as the table restricted to the `WITH` result's
+    /// keys ([`Planner::over_rows`]).
+    fn phased(&self, q: &sql::Query) -> Result<Option<Planned>> {
+        let Some(w) = q.with.as_ref().filter(|w| !w.recursive && w.cte_tables.iter().all(|c| c.alias.columns.is_empty())) else { return Ok(None) };
+        let mut body = q.clone();
+        body.with = None;
+        // The first `WITH`, its table and alias.
+        let first = &w.cte_tables[0].query;
+        let Some((s0, name)) = one_table(first) else { return Ok(None) };
+        let Some(schema) = self.table(&name).filter(|_| self.cte(&name).is_none()) else { return Ok(None) };
+        let simple = |s: &sql::Select| s.distinct.is_none() && s.having.is_none() && matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty());
+        if first.with.is_some() || !simple(s0) {
+            return Ok(None);
+        }
+        // Each later step: what it projects, ranks by and cuts, its
+        // columns named without the `WITH` it reads.
+        let mut steps = Vec::new();
+        let reads: Vec<&sql::Query> = w.cte_tables[1..].iter().map(|c| c.query.as_ref()).chain(std::iter::once(&body)).collect();
+        for (i, r) in reads.iter().enumerate() {
+            let read = &w.cte_tables[i].alias.name.value;
+            let Some((s, from)) = one_table(r) else { return Ok(None) };
+            let alias = match &s.from[0].relation {
+                TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+                _ => None,
+            };
+            let mut subquery = false;
+            let mut exprs = select_exprs(s);
+            if let Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) = &r.order_by {
+                exprs.extend(es.iter().map(|o| &o.expr));
+            }
+            for e in exprs {
+                walk(e, &mut |x| subquery |= matches!(x, Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }));
+            }
+            let order = match &r.order_by {
+                Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) if es.len() == 1 => &es[0],
+                _ => return Ok(None),
+            };
+            let ranks = order.options.asc == Some(false)
+                && order.options.nulls_first.is_none()
+                && !matches!(&order.expr, Expr::Value(_))
+                && !matches!(&order.expr, Expr::Function(f) if matches!(fname(f).as_str(), "hops" | "distance"));
+            if !from.eq_ignore_ascii_case(read) || r.with.is_some() || !simple(s) || s.selection.is_some() || subquery || !ranks {
+                return Ok(None);
+            }
+            let plain = |e: &Expr| {
+                let e = unqualify(e, read);
+                alias.as_deref().map_or(e.clone(), |a| unqualify(&e, a))
+            };
+            let projection = s
+                .projection
+                .iter()
+                .map(|item| match item {
+                    SelectItem::UnnamedExpr(e) => SelectItem::UnnamedExpr(plain(e)),
+                    SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias { expr: plain(expr), alias: alias.clone() },
+                    other => other.clone(),
+                })
+                .collect();
+            let mut o = order.clone();
+            o.expr = plain(&order.expr);
+            steps.push((projection, o, r.limit_clause.clone()));
+        }
+        // Each step binds as the first `WITH` with its own columns, ranking
+        // and cut, so that its graphs and parameters line up.
+        let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind, Some(schema));
+        let bind = |projection: Option<Vec<SelectItem>>, order: Option<sql::OrderByExpr>, cut: Option<sql::LimitClause>| -> Option<Select> {
+            let mut q = first.as_ref().clone();
+            let sql::SetExpr::Select(s) = q.body.as_mut() else { return None };
+            if let Some(p) = projection {
+                s.projection = p;
+            }
+            if let (Some(o), Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. })) = (order, &mut q.order_by) {
+                *es = vec![o];
+            }
+            q.limit_clause = cut;
+            super::sql::bind_query_with(&q, schema, self.params, &subs as &Subs).ok()
+        };
+        let keyed = |s: &Select| {
+            s.group_by.is_empty()
+                && s.projection.iter().all(|(name, p)| match p {
+                    Projection::Field(f) => schema.fields[*f].name.eq_ignore_ascii_case(name),
+                    Projection::Score | Projection::Hops(_) => true,
+                    _ => false,
+                })
+        };
+        let Some(base) = bind(None, None, first.limit_clause.clone()) else { return Ok(None) };
+        let mut count = match limits(&first.limit_clause, self.params) {
+            Ok((0, Some(n))) if n > 0 && base.order.is_some() && base.tiebreak.is_none() && keyed(&base) => n,
+            _ => return Ok(None),
+        };
+        let mut phases: Vec<Phase> = Vec::new();
+        let last = steps.len() - 1;
+        let mut out = None;
+        for (i, (projection, order, cut)) in steps.into_iter().enumerate() {
+            let Some(s) = bind(Some(projection), Some(order), cut.clone()) else { return Ok(None) };
+            let Some(OrderBy::Score { score, desc: true, nulls_first: false }) = s.order.clone() else { return Ok(None) };
+            if s.tiebreak.is_some() || s.graphs != base.graphs || s.projection.iter().any(|(_, p)| *p == Projection::SeqNo) {
+                return Ok(None);
+            }
+            let global = phases.last().is_some_and(|p| p.global) || Rank::is_global(&score);
+            phases.push(Phase { score, count, global });
+            if i < last {
+                count = match limits(&cut, self.params) {
+                    Ok((0, Some(n))) if n > 0 && keyed(&s) => n,
+                    _ => return Ok(None),
+                };
+            } else {
+                out = Some(s);
+            }
+        }
+        let Some(s) = out else { return Ok(None) };
+        let select = Select { order: base.order, phases, ..s };
+        let columns = select.projection.iter().map(|(n, _)| n.clone()).collect();
+        let keyed = keyed(&select).then(|| schema.table.clone());
+        Ok(Some(Planned { node: ir::Plan::of_select(schema, &select).root, columns, keyed }))
     }
 
     fn body(&self, q: &sql::Query) -> Result<Planned> {
@@ -935,6 +1073,18 @@ fn unqualify(e: &Expr, alias: &str) -> Expr {
     }
     go(&mut e, alias);
     e
+}
+
+/// A SELECT of one table or `WITH` result, with no join, and its name.
+fn one_table(q: &sql::Query) -> Option<(&sql::Select, String)> {
+    let sql::SetExpr::Select(s) = q.body.as_ref() else { return None };
+    match s.from.as_slice() {
+        [t] if t.joins.is_empty() => match &t.relation {
+            TableFactor::Table { name, .. } => Some((s, super::sql::table_name(name))),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn qualified(alias: &str, column: &str) -> Expr {

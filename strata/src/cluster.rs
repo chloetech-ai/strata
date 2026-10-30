@@ -57,6 +57,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     for (i, s) in shards.iter().enumerate() {
         stats.filter_docs += s.stats.filter_docs;
         stats.scored += s.stats.scored;
+        stats.reranked += s.stats.reranked;
         stats.plan.extend(s.stats.plan.iter().map(|l| format!("shard {i}: {l}")));
     }
     let empty = |rows, stats| ResultSet { columns: columns.clone(), rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
@@ -82,19 +83,28 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         if s.keys.len() != s.rows.len() || s.scores.len() != s.rows.len() {
             return Err(err(format!("shard {si} answered without keys and scores (not in shard mode?)")));
         }
-        let parts = s.parts.map(|p| p.scores.into_iter().zip(p.ranked));
-        let mut parts = parts.map(|it| it.collect::<Vec<_>>().into_iter());
+        let (mut inputs, mut phases) = match s.parts {
+            Some(p) => (p.scores.into_iter().zip(p.ranked).collect::<Vec<_>>().into_iter(), p.phases.into_iter()),
+            None => (Vec::new().into_iter(), Vec::new().into_iter()),
+        };
         for ((values, key), score) in s.rows.into_iter().zip(s.keys).zip(s.scores) {
-            let (inputs, ranked) = parts.as_mut().and_then(|p| p.next()).unwrap_or_default();
-            rows.push(Row { values, key, score, inputs, ranked });
+            let (inputs, ranked) = inputs.next().unwrap_or_default();
+            let phases = phases.next().unwrap_or_default();
+            if phases.len() != q.phases.len() {
+                return Err(err(format!("shard {si} answered without what its rerank phases need (not in shard mode?)")));
+            }
+            rows.push(Row { values, key, score, inputs, ranked, phases });
         }
     }
     let key_desc = matches!(q.tiebreak, Some(Tiebreak::Key { desc: true }));
+    // The first phase of a query with rerank phases ranks the top `count`
+    // rows, as a query with that LIMIT.
+    let first = q.phases.first().map(|p| p.count);
     let (mut rows, want) = match &q.order {
         None => (rows, q.limit),
         Some(OrderBy::Score { score, .. }) if Rank::of(score, 0).is_some() => {
             let want = q.limit.unwrap_or(DEFAULT_K);
-            (fuse(score, rows, want.saturating_add(q.offset))?, Some(want))
+            (fuse(score, rows, first.unwrap_or(want.saturating_add(q.offset)))?, Some(want))
         }
         Some(OrderBy::Score { score, desc, .. }) => {
             let desc = *desc || !matches!(score, Score::Column { .. });
@@ -107,6 +117,14 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     if matches!(&q.order, Some(OrderBy::Score { score, .. }) if Rank::of(score, 0).is_some()) {
         rows.sort_by(|a, b| by_score(a.score, b.score, true).then_with(|| by_key(&a.key, &b.key, key_desc)));
     }
+    let want = match first {
+        Some(count) => {
+            rows.truncate(count);
+            rows = rerank(q, rows, &mut stats);
+            q.limit
+        }
+        None => want,
+    };
     let end = want.map_or(rows.len(), |w| w.saturating_add(q.offset).min(rows.len()));
     let rows: Vec<Row> = rows.into_iter().take(end).skip(q.offset).collect();
     let score_cols: Vec<usize> = q.projection.iter().enumerate().filter(|(_, (_, p))| *p == Projection::Score).map(|(i, _)| i).collect();
@@ -154,6 +172,7 @@ pub fn fetch(q: &Select, schema: &Schema, keys: Vec<Value>) -> Result<Select> {
         group_by: Vec::new(),
         having: None,
         tiebreak: None,
+        phases: Vec::new(),
         offset: 0,
         graphs: Vec::new(),
         types: q.types.clone(),
@@ -206,6 +225,42 @@ struct Row {
     /// input's top `depth` of its shard.
     inputs: Vec<Option<f64>>,
     ranked: Vec<bool>,
+    /// What each rerank phase ranks the row by ([`RankParts::phases`]).
+    ///
+    /// [`RankParts::phases`]: crate::query::exec::RankParts::phases
+    phases: Vec<Vec<Option<f64>>>,
+}
+
+/// The rerank phases of `q` over `rows`, the top `count` of its first
+/// phase in order: each phase's rows, cut to its `count`, ranked by it as
+/// one database ranks them, rows tied keeping their order. A second phase
+/// ranks by the scores the shards sent; a global one is scored here, over
+/// every row it reranks, from its leaves' values.
+fn rerank(q: &Select, mut rows: Vec<Row>, stats: &mut ExecStats) -> Vec<Row> {
+    let nan = |x: Option<f64>| x.unwrap_or(f64::NAN);
+    for (j, p) in q.phases.iter().enumerate() {
+        rows.truncate(p.count);
+        let order = match p.global {
+            false => Rank::by_scores(rows.iter().map(|r| nan(r.phases[j].first().copied().flatten())).collect()),
+            true => {
+                let rank = Rank::of_phase(&p.score);
+                let values: Vec<Vec<f64>> = (0..rank.leaves.len()).map(|l| rows.iter().map(|r| nan(r.phases[j].get(l).copied().flatten())).collect()).collect();
+                stats.reranked += rows.len() as u64;
+                stats.plan.push(format!("global phase {}: scored {} rows", j + 1, rows.len()));
+                rank.rerank(rows.len(), &values)
+            }
+        };
+        let mut slots: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
+        rows = order
+            .into_iter()
+            .map(|(i, s)| {
+                let mut r = slots[i].take().expect("each row ranked once");
+                r.score = s;
+                r
+            })
+            .collect();
+    }
+    rows
 }
 
 fn by_score(a: f64, b: f64, desc: bool) -> Ordering {

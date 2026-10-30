@@ -281,6 +281,18 @@ message Search {
   // Absent: every row.
   Expr filter = 2;
   repeated SortKey order = 3;
+  // Rerank phases after `order`, in turn (plan feature rank_phases).
+  repeated Phase phases = 4;
+}
+
+// A rerank phase: the top `count` rows of the phase before it ranked again
+// by `expr`, best first, rows tied keeping their order. A `global` phase
+// runs once over every row it reranks (on the coordinator over shards); one
+// that is not, on each shard over its own rows.
+message Phase {
+  uint64 count = 1;
+  Expr expr = 2;
+  bool global = 3;
 }
 
 message Aggregate {

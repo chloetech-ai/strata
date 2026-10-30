@@ -425,7 +425,7 @@ pub(crate) fn keyed_rows(schema: &Schema, keys: Vec<Value>) -> Result<Select> {
     let projection = every_field(schema);
     let types = projection_types(schema, &projection);
     let filter = if keys.is_empty() { Pred::False } else { Pred::In { field: pk, values: keys } };
-    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, limit: None, offset: 0, graphs: Vec::new(), types })
+    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, phases: Vec::new(), limit: None, offset: 0, graphs: Vec::new(), types })
 }
 
 fn every_field(schema: &Schema) -> Vec<(String, Projection)> {
@@ -693,7 +693,7 @@ impl<'a> Binder<'a> {
         };
         let graphs = self.graphs.take();
         let types = projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs, types })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases: Vec::new(), limit, offset, graphs, types })
     }
 
     /// The graph predicate `hops()` refers to: the first REACHABLE or PATH.
