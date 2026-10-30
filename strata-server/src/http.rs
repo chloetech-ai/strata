@@ -46,6 +46,7 @@ use strata::ingest::Format;
 use strata::storage::Layout;
 
 use crate::auth::{self, Access, Secret};
+use crate::replication::Acks;
 use crate::service::{After, QueryReq, Service, SqlAnswer, Written};
 use crate::{agent, json as js, obs, ApiError};
 
@@ -100,6 +101,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/check", post(admin_check))
         .route("/v1/admin/vacuum", post(admin_vacuum))
         .route("/v1/admin/verify", post(admin_verify))
+        .route("/v1/admin/promote", post(admin_promote))
         .route("/v1/agent", post(agent_run))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -443,6 +445,27 @@ async fn admin_verify(State(app): State<App>, body: Option<AxJson<Json>>) -> Res
     let timeout_ms = body.as_ref().and_then(|b| b.get("timeout_ms")).and_then(|v| v.as_u64()).unwrap_or(0);
     let timeout = if timeout_ms > 0 { Duration::from_millis(timeout_ms) } else { VERIFY_WAIT };
     Ok(AxJson(app.svc.verify_replicas(timeout).await?))
+}
+
+/// Makes this replica the primary of a new term: `{"replicas": [gRPC
+/// URLs], "write_acks": "all", "force": false}`
+/// ([`crate::service::Service::promote`]).
+async fn admin_promote(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let urls = || ApiError::bad("replicas is a list of the gRPC URLs of the copies the new primary ships to");
+    let replicas = match b.get("replicas") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::Array(a)) => a.iter().map(|v| v.as_str().map(String::from).ok_or_else(urls)).collect::<Result<_, _>>()?,
+        Some(_) => return Err(urls()),
+    };
+    let acks = match b.get("write_acks") {
+        None | Some(Json::Null) => Acks::All,
+        Some(v) => v.as_str().and_then(Acks::parse).ok_or_else(|| ApiError::bad("write_acks is all, majority or primary"))?,
+    };
+    let force = match b.get("force") {
+        None | Some(Json::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| ApiError::bad("force is true or false"))?,
+    };
+    Ok(AxJson(app.svc.promote(replicas, acks, force).await?))
 }
 
 /// How long `POST /v1/admin/verify` waits for the replicas' digests by

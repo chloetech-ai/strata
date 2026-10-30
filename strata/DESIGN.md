@@ -767,6 +767,21 @@ handing a query to its shards) are to make instead of writing SQL text.
   sync and is sent a copy. The digests leave out values, which copies
   that applied the same writes share; a replica loaded with other values
   under the same keys before numbering is not found.
+* **Promotion.** Failover is by hand. A replica is made the primary of a
+  new term (`POST /v1/admin/promote`, `strata-server promote`; a stopped
+  one with `--promote`): it asks the copies it is to ship to for their
+  last transaction (`Hello`) and refuses while one holds a later one or a
+  newer term, unless forced; then it begins a term above every term it
+  knows, under the lock its primary's calls take, and starts shipping. A
+  replica holding transactions of an older term that the new primary
+  does not is sent a copy, which drops them. An old primary learns of the
+  new term from a copy of it, or from the new primary shipping to it, and
+  is fenced: no writes, no reads, a write waiting for acknowledgements
+  refused, `replaced_by_term` in `Hello`, and the term kept in
+  `<db>.replication`, so that it starts again as a primary only with
+  `--promote`. A coordinator writes to the unreplaced primary of the
+  newest term, and sends a write the old primary refused, or that found
+  it down, once to the copy that took its place.
 * **Conditional writes.** `seq_no()` is a column of a query on one table
   (plan feature `seq_no`, so an older shard refuses the plan by name), read
   from the row's segment, its updates or the memtable. strata-server's
@@ -784,8 +799,7 @@ handing a query to its shards) are to make instead of writing SQL text.
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication (promotion),
-and a coordinator and
+Next: a coordinator and
 strata-server over every table.
 
 ## 7. Planning and execution

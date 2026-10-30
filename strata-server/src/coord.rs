@@ -54,7 +54,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
@@ -161,17 +161,42 @@ struct Replica {
     /// when it said so (ms after [`Coordinator::epoch`]).
     protocol: AtomicU32,
     hello_at: AtomicU64,
-    /// Its part in replication, as it last said ([`pb::Role`]).
+    /// Its part in replication ([`pb::Role`]), its term, and whether a
+    /// primary of a newer term replaced it, as it last said.
     role: AtomicI32,
+    term: AtomicU64,
+    replaced: AtomicBool,
 }
 
 impl Replica {
     fn new(url: &str, client: Client) -> Replica {
-        Replica { url: url.to_string(), client, avoid_until: AtomicU64::new(0), protocol: AtomicU32::new(0), hello_at: AtomicU64::new(0), role: AtomicI32::new(0) }
+        Replica {
+            url: url.to_string(),
+            client,
+            avoid_until: AtomicU64::new(0),
+            protocol: AtomicU32::new(0),
+            hello_at: AtomicU64::new(0),
+            role: AtomicI32::new(0),
+            term: AtomicU64::new(0),
+            replaced: AtomicBool::new(false),
+        }
     }
 
     fn role(&self) -> pb::Role {
         pb::Role::try_from(self.role.load(Ordering::Relaxed)).unwrap_or_default()
+    }
+
+    /// Keeps what it said to `Hello`.
+    fn heard(&self, said: &Said) {
+        self.protocol.store(said.protocol, Ordering::Relaxed);
+        self.role.store(said.role as i32, Ordering::Relaxed);
+        self.term.store(said.term, Ordering::Relaxed);
+        self.replaced.store(said.replaced, Ordering::Relaxed);
+    }
+
+    /// Whether it takes its shard's writes: a primary no other replaced.
+    fn takes_writes(&self) -> bool {
+        self.role() == pb::Role::Primary && !self.replaced.load(Ordering::Relaxed)
     }
 }
 
@@ -202,11 +227,14 @@ fn agree(h: &pb::HelloResponse) -> Result<u32, String> {
 }
 
 /// What a server said to `Hello`: the protocol to speak with it
-/// ([`agree`]), the epoch of the slot map it holds and its role.
+/// ([`agree`]), the epoch of the slot map it holds, its role and term,
+/// and whether a primary of a newer term replaced it.
 struct Said {
     protocol: u32,
     epoch: u64,
     role: pb::Role,
+    term: u64,
+    replaced: bool,
 }
 
 /// Asks a server what [`Said`] holds. One from before `Hello` (it answers
@@ -215,9 +243,9 @@ async fn hello(c: &mut Client) -> Result<Said, tonic::Status> {
     match c.hello(pb::HelloRequest { min_protocol: MIN_PROTOCOL, max_protocol: PROTOCOL }).await {
         Ok(h) => {
             let h = h.into_inner();
-            Ok(Said { protocol: agree(&h).map_err(tonic::Status::failed_precondition)?, epoch: h.slot_epoch, role: h.role() })
+            Ok(Said { protocol: agree(&h).map_err(tonic::Status::failed_precondition)?, epoch: h.slot_epoch, role: h.role(), term: h.term, replaced: h.replaced_by_term > 0 })
         }
-        Err(s) if s.code() == Code::Unimplemented => Ok(Said { protocol: 1, epoch: 0, role: pb::Role::Standalone }),
+        Err(s) if s.code() == Code::Unimplemented => Ok(Said { protocol: 1, epoch: 0, role: pb::Role::Standalone, term: 0, replaced: false }),
         Err(s) => Err(s),
     }
 }
@@ -431,8 +459,7 @@ impl Coordinator {
                 match a {
                     Ok(Ok((s, said))) => {
                         schemas.push(s);
-                        r.protocol.store(said.protocol, Ordering::Relaxed);
-                        r.role.store(said.role as i32, Ordering::Relaxed);
+                        r.heard(&said);
                     }
                     Ok(Err(e)) => errors.push(format!("{}: {}", r.url, e.message())),
                     Err(_) => errors.push(format!("{}: no answer within 5 s", r.url)),
@@ -552,8 +579,7 @@ impl Coordinator {
         if let Some(m) = self.slots.as_ref().filter(|m| said.protocol >= 4 && said.epoch != m.epoch) {
             give_slots(c, m, i).await?;
         }
-        rep.protocol.store(said.protocol, Ordering::Relaxed);
-        rep.role.store(said.role as i32, Ordering::Relaxed);
+        rep.heard(&said);
         rep.hello_at.store(self.now_ms(), Ordering::Relaxed);
         Ok(said.protocol.min(max))
     }
@@ -668,7 +694,7 @@ impl Coordinator {
     /// not asked.
     fn next(&self, i: usize, order: &[usize], asked: &[usize], primary_first: bool) -> Option<usize> {
         let mut left = order.iter().copied().filter(|r| !asked.contains(r));
-        let primary = left.clone().find(|&r| primary_first && self.replicas[i][r].role() == pb::Role::Primary);
+        let primary = left.clone().find(|&r| primary_first && self.replicas[i][r].takes_writes());
         primary.or_else(|| left.next())
     }
 
@@ -946,12 +972,12 @@ impl Coordinator {
         self.replicas[i].len() == 1 || self.replicas[i].iter().any(|r| r.role() == pb::Role::Primary)
     }
 
-    /// The replica of shard `i` that takes its writes: its primary, asking
-    /// every replica again when one says it is a replica but none that it
-    /// is the primary (a failover may have moved it). `None` when no
-    /// replica has a role, and every one takes every write.
+    /// The replica of shard `i` that takes its writes: its primary (of the
+    /// newest term, and not replaced), asking every replica again when
+    /// none is (a promotion may have moved it). `None` when no replica has
+    /// a role, and every one takes every write.
     async fn primary(&self, i: usize) -> Result<Option<usize>, ApiError> {
-        let find = || self.replicas[i].iter().position(|r| r.role() == pb::Role::Primary);
+        let find = || self.newest_primary(i);
         if let Some(k) = find() {
             return Ok(Some(k));
         }
@@ -967,15 +993,61 @@ impl Coordinator {
         find().map(Some).ok_or_else(|| ApiError { status: 503, message: format!("shard {i} has no primary answering: its replicas take writes from their primary alone") })
     }
 
+    /// Of the replicas of shard `i`, the primary of the newest term that no
+    /// other replaced, as each last said.
+    fn newest_primary(&self, i: usize) -> Option<usize> {
+        let rs = &self.replicas[i];
+        (0..rs.len()).filter(|&r| rs[r].takes_writes()).max_by_key(|&r| rs[r].term.load(Ordering::Relaxed))
+    }
+
+    /// After copy `k`, shard `i`'s primary, refused a write with `code` as
+    /// one that is no longer its primary would (replaced, or down): the
+    /// copy that takes the shard's writes now, if another does. A refusal
+    /// (409) asks `k` again first, and the other copies only when it no
+    /// longer takes writes, so that a conditional write's refusal costs
+    /// one `Hello`.
+    async fn moved(&self, i: usize, k: usize, code: Code) -> Option<usize> {
+        let ask = |r: usize| {
+            let rep = &self.replicas[i][r];
+            let mut c = rep.client.clone();
+            rep.protocol.store(0, Ordering::Relaxed);
+            async move { self.speak(i, r, &mut c, PROTOCOL).await.is_ok() }
+        };
+        if code == Code::FailedPrecondition && ask(k).await && self.replicas[i][k].takes_writes() {
+            return None;
+        }
+        join_all((0..self.replicas[i].len()).map(ask)).await;
+        self.newest_primary(i).filter(|&r| r != k)
+    }
+
     /// Writes to shard `i`: to its primary, or to every replica while none
     /// has a role. Returns the first's count, and the transaction's
     /// sequence number on the shard: 0 where it numbers no writes, or
     /// where several replicas took the write, each numbering it its way.
+    /// A primary that refuses the write as a replaced one does, or does not
+    /// answer, is passed over for the copy that took its place, if any
+    /// (once).
     async fn write(&self, i: usize, r: pb::WriteRequest) -> Result<(u64, u64), ApiError> {
         let to: Vec<usize> = match self.primary(i).await? {
             Some(k) => vec![k],
             None => (0..self.replicas[i].len()).collect(),
         };
+        let named = |(k, s): (usize, tonic::Status)| self.named(&self.replicas[i][k].url, s);
+        if let (&[k], true) = (&to[..], self.replicas[i].len() > 1) {
+            return match self.write_to(i, vec![k], r.clone()).await {
+                Err((_, s)) if matches!(s.code(), Code::FailedPrecondition | Code::Unavailable) => match self.moved(i, k, s.code()).await {
+                    Some(m) => self.write_to(i, vec![m], r).await.map_err(named),
+                    None => Err(named((k, s))),
+                },
+                a => a.map_err(named),
+            };
+        }
+        self.write_to(i, to, r).await.map_err(named)
+    }
+
+    /// [`Self::write`] to replicas `to` of shard `i`; an error names the
+    /// replica that answered it.
+    async fn write_to(&self, i: usize, to: Vec<usize>, r: pb::WriteRequest) -> Result<(u64, u64), (usize, tonic::Status)> {
         let one = to.len() == 1;
         let calls = to.into_iter().map(|k| {
             let rep = &self.replicas[i][k];
@@ -983,12 +1055,12 @@ impl Coordinator {
             async move {
                 // A replica not asked yet (it was down at connect), or one
                 // that failed, is asked again and given the slot map first.
-                self.speak(i, k, &mut c, PROTOCOL).await.map_err(|s| self.named(&rep.url, s))?;
+                self.speak(i, k, &mut c, PROTOCOL).await.map_err(|s| (k, s))?;
                 let a = c.write(r).await;
                 if a.as_ref().is_err_and(try_elsewhere) {
                     rep.protocol.store(0, Ordering::Relaxed);
                 }
-                a.map_err(|s| self.named(&rep.url, s))
+                a.map_err(|s| (k, s))
             }
         });
         let mut written = None;

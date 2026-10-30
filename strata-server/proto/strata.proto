@@ -169,6 +169,9 @@ message HelloResponse {
   // Its term and last sequence number, when it numbers its writes.
   uint64 term = 8;
   uint64 seq_no = 9;
+  // On a primary that a primary of a newer term replaced: that term. It
+  // takes no writes and serves no reads.
+  uint64 replaced_by_term = 10;
 }
 
 enum Role {
