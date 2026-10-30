@@ -44,6 +44,7 @@ pub mod media;
 pub mod metrics;
 pub mod postings;
 pub mod query;
+pub mod rank_log;
 pub mod schema;
 pub mod segment;
 pub mod sid;

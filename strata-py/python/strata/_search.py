@@ -1,5 +1,5 @@
 """What `Database` and `Client` share: the schema's reading order,
-parameters, `table` and `search`."""
+parameters, `table`, `search` and the rank log."""
 
 from __future__ import annotations
 
@@ -33,10 +33,68 @@ def quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _time(t: Any) -> Any:
+    """A time as the rank log takes it: ISO 8601 text or microseconds."""
+    return t.isoformat() if hasattr(t, "isoformat") and hasattr(t, "year") else t
+
+
 class Search:
-    """`table` and `search`, shared by `Database` and `Client`, which give
-    `schema`, `_embedded()` (the embedded vector fields whose model is
-    open), `embed`, `query` and `run`."""
+    """`table`, `search` and the rank log, shared by `Database` and
+    `Client`, which give `schema`, `_embedded()` (the embedded vector fields
+    whose model is open), `embed`, `query`, `run`, `_query_logged` and
+    `_export_rank_log`."""
+
+    def query_logged(
+        self,
+        sql: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        context: str | None = None,
+        request: str | None = None,
+        variant: str | None = None,
+        candidates: int | None = None,
+        ts: Any = None,
+        table: str = "rank_log",
+    ) -> Result:
+        """Runs a SELECT ranked by an ORDER BY and logs what it served to a
+        log table, which the first query logged to it makes: one row per
+        row answered, with its position, its score and the values its
+        ranking read as they were computed (`features()`), for training on
+        later. `context` is whom it served (a user, a session), `variant`
+        the ranking's name (an A/B arm), `candidates` logs that many rows
+        past the OFFSET, those past the LIMIT as not shown, and `ts` (a
+        datetime or microseconds) when it was served, now by default.
+        `result.request` is the request's id (`request`, or a new one),
+        which labels its rows later: `UPDATE rank_log SET label = 1 WHERE
+        request = ... AND row_key = ...`."""
+        opts = {"table": table, "request": request, "context": context, "variant": variant, "candidates": candidates, "ts": _time(ts)}
+        return self._query_logged(sql, params, {k: v for k, v in opts.items() if v is not None})
+
+    def export_rank_log(
+        self,
+        *,
+        table: str = "rank_log",
+        events: Mapping[str, str] | None = None,
+        history: int = 0,
+        window: str | float | None = None,
+        grades: Mapping[str, float] | None = None,
+        since: Any = None,
+        until: Any = None,
+    ) -> list[dict]:
+        """The log table's rows as records for training, from one snapshot,
+        each context's in the order served: the row's columns, `features` as
+        served (a dict), and `label`. With `events` ({"table", "user",
+        "item", "time", "action"?}: a table of what contexts did, `time` a
+        TIMESTAMP or microseconds), each row gets its context's last
+        `history` events before the row's time (`history_items`,
+        `history_times`, `history_actions`), and with `window` (a period,
+        "30 minutes", or seconds) a label: the best grade (`grades`, action
+        to grade; every event 1 without) of the row's item's events by the
+        context in the window after it, 0 when there is none. A label
+        written on the row wins. `since` and `until` keep the rows served in
+        [since, until)."""
+        opts = {"table": table, "events": events, "history": history, "window": window, "grades": grades, "since": _time(since), "until": _time(until)}
+        return self._export_rank_log({k: v for k, v in opts.items() if v is not None})
 
     def table(self, name: str | None = None) -> Query:
         """A query of the first table or the one named, built from Python

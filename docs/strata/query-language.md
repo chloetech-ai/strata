@@ -374,6 +374,55 @@ SELECT id, score() FROM top ORDER BY sigmoid(gbdt('clicks', bm25(title, :t), bm2
 - **A plan names the model and the hash of its file** (`EXPLAIN` shows `ranking model: docs_ltr (hash …)`) and needs the plan feature `rank_models`. A database or shard whose file of that name is another refuses the plan rather than rank with another model; a plan without a hash runs with the file there. A coordinator scores the shards' rows with the model too, so it needs the same file in its own models directory.
 - `features()` lists a model's inputs' leaves and then the model's score, and from Python `gbdt("docs_ltr", bm25("title", t), col("rating"))` builds the same ranking.
 
+#### The rank log: what each query served
+
+A ranking is trained on what it served. A query run with a log writes one row per row it answered to a log table, with the values its ranking read as it computed them, so a model trained later sees what serving saw, however the tables change in between: new rows that move BM25's statistics, counters that grow, rows deleted.
+
+```sql
+-- what the first query logged to it makes (rank_log unless the log names another)
+CREATE TABLE IF NOT EXISTS rank_log (
+  id KEYWORD PRIMARY KEY,                 -- '<request>#<position>'
+  request KEYWORD NOT NULL, ts TIMESTAMP NOT NULL, context KEYWORD,
+  row_key KEYWORD NOT NULL, position INT NOT NULL, shown BOOL NOT NULL,
+  score FLOAT, features KEYWORD OPTIONS(indexed = false),
+  variant KEYWORD, label FLOAT
+) OPTIONS(cluster_by = 'context');
+
+-- a label written later: a judge's grade, an agent citing the row
+UPDATE rank_log SET label = 3 WHERE request = :r AND row_key = :k;
+```
+
+```sh
+curl -s localhost:7700/v1/query -d '{"sql": "SELECT id, title FROM docs ORDER BY bm25(body, :t) * (1 + 0.1 * coalesce(rating, 0)) DESC LIMIT 10",
+  "params": {"t": "mrna vaccine"}, "log": {"context": "u42", "variant": "b", "candidates": 50}}'
+# {"columns": ["id", "title"], "rows": [...], ..., "request": "9f0c...", "logged": {"rows": 50, "seq_no": 812}}
+```
+
+- **A logged query** is one `SELECT` ranked by an `ORDER BY` ([rerank phases](#rerank-phases) and [rank profiles](#rank-profiles-a-ranking-kept-with-its-table) included) of a table with a primary key: `"log"` in the body of `POST /v1/query` or `/v1/sql` (`true`, or an object of options), `db.query_logged(sql, params, context=...)` in [Python](python.md#the-rank-log), `Db::query_logged` in Rust. It runs with `score()` and [`features()`](#features-the-values-a-ranking-read) added to its columns, answers with the columns it asked for and the request's id (`request`), and writes its rows to the log in one transaction once it has answered: a logged query costs a write.
+- **Options**: `context`, whom the request served (a user, a session, a query class), which the export reads events by; `request`, the request's id (a random one when left out; logging a request's id again overwrites its rows at the same positions); `variant`, the client's name for the ranking that served (an A/B arm); `candidates`, a number of rows from the query's `OFFSET` to log, more than its `LIMIT` returns, those past the `LIMIT` logged as not shown (unshown negatives); `ts`, when it was served (ISO 8601 text or microseconds; now when left out), for replaying past traffic; `table`, another log table.
+- **A row** holds its request, time and context, the key of the row served (`row_key`, as text), its `position` from 0 (the `OFFSET` included), whether it was `shown`, its `score()`, and `features`: a JSON object of each `features()` column, named by its SQL text, whose numbers read back to the bits the ranking computed. A table made by hand serves as a log if it has these columns, of these types (with `retain = '90 days'`, say).
+- **Through a coordinator** the query is the coordinator's, so the values are one database's ([features over shards](#features-the-values-a-ranking-read)), and the rows go to the shards their keys place them on; the first logged query makes the table on every shard. A replica refuses a logged query, the log being a write, and so does a primary until its copies have the table (`CREATE TABLE` does not reach replicas yet). A shard's query (`"shard": true`) is not logged.
+- **Cost.** Computing the values is nearly free, since the ranking computes them anyway; the write is the cost. On a 4-core cloud VM over HTTP, with 100,000 documents and one client, a query took 1.87 ms at the median plain, 1.85 ms with its values added and 4.33 ms logged (7.81 ms logging 100 candidates); writing the same ten rows alone through `/v1/write` took 1.97 ms. Without the disk's flush (`--no-sync`) the logged query took 3.50 ms: the sync is a third of the log's cost here, and the rest is the write itself. Four clients got 1,620 plain and 670 logged queries a second. A row took 152 bytes in the segments (an Intel Xeon @ 2.10GHz, 16.9 GB, Linux 6.18; `strata-server/results/rank_log/vm.json` and `vm-no-sync.json`, from `strata-rank-log-bench`). The export read 70,000 records a second, each with a history of 20 events and a label.
+
+#### Exporting the log for training
+
+The export reads a log table back from one snapshot, one record per logged row, with what happened around it as of its time, from a table of events (a user's views, clicks, purchases): the context's last events before the row (its history, for a sequence model), and a label from the events on the row's key after it, within a window.
+
+```sh
+curl -s localhost:7700/v1/rank_log/export -d '{"events": {"table": "events", "user": "usr", "item": "item", "time": "ts", "action": "action"},
+  "history": 20, "window": "30 minutes", "grades": {"click": 1, "buy": 3}, "since": "2026-10-01"}'
+# {"id": "9f0c...#0", "request": "9f0c...", "ts": 1793338200000000, "context": "u42", "row_key": "d17", "position": 0, "shown": true,
+#  "score": 7.31, "variant": "b", "label": 3.0,
+#  "features": {"bm25(body, :t)": 6.09, "bm25(body, :t) * (1 + 0.1 * coalesce(rating, 0))": 7.31, "rating": 2.0},
+#  "history_items": ["d3", "d9", ...], "history_times": [...], "history_actions": ["view", "click", ...]}
+```
+
+- **Records** come as NDJSON from `POST /v1/rank_log/export`, as a list of dicts from `db.export_rank_log(...)` in Python, and from `Db::export_rank_log` in Rust, context by context, each context's rows in the order they were served. Times are microseconds since the epoch. `since` and `until` keep the rows served in `[since, until)`, and `table` names another log.
+- **`events`** names a table, its column of contexts (`user`, `KEYWORD` or `INT`), of the rows the events were about (`item`), of when they happened (`time`, a `TIMESTAMP` or an `INT` of microseconds), and optionally of what they were (`action`). `OPTIONS(shard_by = 'usr', cluster_by = 'usr')` keeps each user's events together, on one shard and in few pages.
+- **History**: with `history` set to n, the context's last n events before the row's time, oldest first. **Label**: with `window`, a period (`'30 minutes'`) or seconds, the best grade among the context's events on the row's key in the window after the row's time, `grades` giving each action's (an event whose action has none is not a label; without `grades` every event grades 1), and 0 when there is none. A label written on the row wins. A row without a context has no history and no label but its own.
+- **As of the row's time**, by the events' own times: an event timed before a row is in its history even when it arrived after the row was served, which a query at the time could not have seen. The features are the values served, never recomputed.
+- **A coordinator does not export**: export from each shard's server. Logs placed by context (a hand-made log with `context KEYWORD NOT NULL` and `shard_by = 'context'`) and events placed by user then give each shard every row and event of its contexts.
+
 ### `decay(field, origin, scale, …)`: closeness to a value
 
 A numeric column's closeness to `origin`, as in Elasticsearch's decay functions. With `d = max(0, |x − origin| − offset)`, the score is 1 at `d = 0` and `decay` at `d = scale`:
