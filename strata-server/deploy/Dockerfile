@@ -1,4 +1,4 @@
-# strata-server and its benchmark in a small Linux image.
+# strata-server, its benchmark and engine-compare in a small Linux image.
 #
 #   docker build -f strata-server/deploy/Dockerfile -t strata-server:dev .   # from the repository root
 #
@@ -19,7 +19,7 @@ COPY strata-server strata-server
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/strata-server/target \
     cargo build --release --manifest-path strata-server/Cargo.toml --bins \
-    && mkdir /out && cp strata-server/target/release/strata-server strata-server/target/release/strata-server-bench /out/
+    && mkdir /out && cp strata-server/target/release/strata-server strata-server/target/release/strata-server-bench strata-server/target/release/engine-compare /out/
 
 FROM debian:bookworm-slim
 # iproute2 for `tc`, to add network delay to a pod in tests.

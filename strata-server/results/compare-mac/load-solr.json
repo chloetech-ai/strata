@@ -1,0 +1,63 @@
+{
+  "batch": 500,
+  "clients": 4,
+  "collection": "quora",
+  "cores": [
+    {
+      "core": "quora_shard2_replica_n1",
+      "index": {
+        "current": true,
+        "deletedDocs": 0,
+        "directory": "NRTCachingDirectory(MMapDirectory@/var/solr/data/quora_shard2_replica_n1/data/index lockFactory=org.apache.lucene.store.NativeFSLockFactory@2934e9d5; maxCacheMB=48.0 maxMergeSizeMB=4.0)",
+        "hasDeletions": false,
+        "lastModified": "2026-10-28T03:48:39.530Z",
+        "maxDoc": 261548,
+        "numDocs": 261548,
+        "segmentCount": 1,
+        "segmentsFile": "segments_11",
+        "segmentsFileSizeInBytes": 224,
+        "size": "1.04 GB",
+        "sizeInBytes": 1120632975,
+        "userData": {
+          "commitCommandVer": "1880263269929713664",
+          "commitTimeMSec": "1793159319530"
+        },
+        "version": 630
+      }
+    },
+    {
+      "core": "quora_shard1_replica_n2",
+      "index": {
+        "current": true,
+        "deletedDocs": 0,
+        "directory": "NRTCachingDirectory(MMapDirectory@/var/solr/data/quora_shard1_replica_n2/data/index lockFactory=org.apache.lucene.store.NativeFSLockFactory@632507f4; maxCacheMB=48.0 maxMergeSizeMB=4.0)",
+        "hasDeletions": false,
+        "lastModified": "2026-10-28T03:49:20.858Z",
+        "maxDoc": 261383,
+        "numDocs": 261383,
+        "segmentCount": 1,
+        "segmentsFile": "segments_10",
+        "segmentsFileSizeInBytes": 224,
+        "size": "1.04 GB",
+        "sizeInBytes": 1120038914,
+        "userData": {
+          "commitCommandVer": "1880263269938102272",
+          "commitTimeMSec": "1793159360858"
+        },
+        "version": 600
+      }
+    }
+  ],
+  "docs": 522931,
+  "engine": "solr",
+  "index_bytes": 2240671889,
+  "indexed_docs": 522931,
+  "ingest_s": 513.300807025,
+  "json_bytes": 6791817070,
+  "merge_s": 572.495918846,
+  "refresh_s": 0.973044501,
+  "searchable_docs": 522931,
+  "segments": 2,
+  "setup_s": 4.074307127,
+  "total_s": 1086.769845121
+}
