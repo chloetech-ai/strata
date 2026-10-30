@@ -401,7 +401,7 @@ impl<'a> Text<'a> {
     }
 
     fn graph(&self, g: &Graph, names: &Names) -> String {
-        let f = field(names, g.field);
+        let f = g.edges.as_deref().map_or_else(|| field(names, g.field), ident);
         let seeds = self.seeds(&g.seeds, names);
         let dir = match g.dir {
             Direction::Out => "out",
@@ -427,7 +427,7 @@ impl<'a> Text<'a> {
         if let Some(t) = &g.through {
             s += &format!(", through => {}", self.expr(t, names));
         }
-        let vector = names.schema.and_then(|sc| sc.fields.get(g.field as usize)).is_some_and(|fl| matches!(fl.ty, FieldType::Vector { .. }));
+        let vector = g.edges.is_none() && names.schema.and_then(|sc| sc.fields.get(g.field as usize)).is_some_and(|fl| matches!(fl.ty, FieldType::Vector { .. }));
         if vector {
             s += &format!(", k => {}", g.k);
         }

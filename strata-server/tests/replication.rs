@@ -5,6 +5,7 @@
 //! sends a shard's writes to its primary.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -96,11 +97,19 @@ fn primary(db: Arc<Db>, file: Option<&Path>, opts: PrimaryOptions, timeout: Dura
 }
 
 /// A gRPC URL whose port nothing listens on, and the address to listen
-/// on later.
+/// on later. The port is below the ephemeral ranges (32768 and up on
+/// Linux, 49152 and up on macOS): a port taken with port 0 and let go
+/// can be handed to another test's listener or to a connection's own
+/// end before the replica binds it, which fails with "address in use".
 async fn nobody() -> (String, std::net::SocketAddr) {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    (format!("http://{addr}"), addr)
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    loop {
+        let port = 20_000 + (std::process::id() + NEXT.fetch_add(1, Ordering::Relaxed)) % 12_000;
+        if let Ok(l) = TcpListener::bind(("127.0.0.1", port as u16)).await {
+            let addr = l.local_addr().unwrap();
+            return (format!("http://{addr}"), addr);
+        }
+    }
 }
 
 /// Every row's stored fields and sequence number, in key order, and how

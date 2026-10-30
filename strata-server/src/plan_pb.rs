@@ -129,6 +129,7 @@ fn graph(g: &Graph) -> pb::Graph {
     };
     pb::Graph {
         field: g.field,
+        edges: g.edges.clone(),
         seeds: bex(&g.seeds),
         kind: Some(kind),
         dir: match g.dir {
@@ -441,6 +442,7 @@ fn from_graph(g: pb::Graph) -> Result<Graph, ApiError> {
     };
     Ok(Graph {
         field: g.field,
+        edges: g.edges,
         seeds: from_ex(g.seeds.map(|e| *e))?,
         kind,
         dir,

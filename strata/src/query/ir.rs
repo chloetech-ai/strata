@@ -62,8 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 11] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, PREFIX];
+pub const FEATURES: [&str; 12] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, PREFIX];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -87,6 +87,9 @@ pub const RANK_EXPRESSIONS: &str = "rank_expressions";
 pub const MAXSIM: &str = "maxsim";
 /// The feature of a plan that cuts semantic IDs ([`Func::SidAt`]).
 pub const SEMANTIC_ID: &str = "semantic_id";
+
+/// The feature of a plan with a walk over an edge table ([`Graph::edges`]).
+pub const EDGE_TABLE: &str = "edge_table";
 
 /// The feature of a plan whose Search reranks its top rows in phases
 /// ([`Search::phases`]).
@@ -684,11 +687,16 @@ pub enum Expr {
     Scalar(Box<Node>),
 }
 
-/// A traversal over an EDGES field, or over a VECTOR field whose `k` most
-/// similar rows count as a row's neighbours.
+/// A traversal over an EDGES field, over an edge table, or over a VECTOR
+/// field whose `k` most similar rows count as a row's neighbours.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
+    /// The EDGES or VECTOR field; with `edges`, the primary key.
     pub field: u32,
+    /// The edge table walked instead of a field, whose rows link this
+    /// table's (feature [`EDGE_TABLE`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges: Option<String>,
     /// Primary keys (a list literal), or a [`Expr::Subquery`].
     pub seeds: Expr,
     /// The weight of each of the keys `seeds` lists, which PageRank
@@ -909,6 +917,13 @@ impl Node {
             Node::With { ctes, input } => input.has_features() || ctes.iter().any(|c| c.input.has_features()),
             Node::Insert { .. } | Node::Ref { .. } => false,
         }
+    }
+
+    /// Whether a graph in the plan walks an edge table ([`EDGE_TABLE`]).
+    pub fn walks_edge_tables(&self) -> bool {
+        let mut found = false;
+        self.visit_exprs(&mut |e| found |= matches!(e, Expr::Graph(g) | Expr::Ppr(g) if g.edges.is_some()));
+        found
     }
 
     /// Whether the plan ranks with a model ([`RANK_MODELS`]).
@@ -1403,6 +1418,9 @@ impl Plan {
         });
         if distinct_on {
             features.push(DISTINCT_ON.to_string());
+        }
+        if root.walks_edge_tables() {
+            features.push(EDGE_TABLE.to_string());
         }
         Plan { version: VERSION, features, root }
     }

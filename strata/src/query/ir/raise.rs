@@ -450,8 +450,15 @@ impl<'a> Raise<'a> {
 
     fn graph(&mut self, g: &Graph) -> Result<usize> {
         let field = self.field(g.field)?;
-        if !matches!(self.schema.fields[field].ty, FieldType::Edges | FieldType::Vector { .. }) {
-            return Err(err(format!("a traversal needs an EDGES or VECTOR field, not {}", self.schema.fields[field].name)));
+        match &g.edges {
+            // The edge table is checked against this one when the walk runs.
+            Some(_) if self.schema.primary_key != Some(field) => return Err(err("a walk over an edge table names the primary key as its field")),
+            Some(_) if !g.labels.is_empty() => return Err(err("the edges of an edge table have no labels")),
+            Some(_) => {}
+            None if !matches!(self.schema.fields[field].ty, FieldType::Edges | FieldType::Vector { .. }) => {
+                return Err(err(format!("a traversal needs an EDGES or VECTOR field, not {}", self.schema.fields[field].name)));
+            }
+            None => {}
         }
         let seeds = match (self.seeds(&g.seeds)?, g.weights.as_slice()) {
             (s, []) => s,
@@ -476,6 +483,7 @@ impl<'a> Raise<'a> {
         };
         let g = GraphQuery {
             field,
+            edges: g.edges.clone(),
             seeds,
             kind,
             dir: g.dir,
