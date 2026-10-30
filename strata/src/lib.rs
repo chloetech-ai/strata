@@ -33,6 +33,7 @@ pub mod beir;
 pub mod cluster;
 pub mod data;
 pub mod db;
+pub mod derive;
 pub mod embed;
 pub mod error;
 pub mod forward;

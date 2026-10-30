@@ -1,0 +1,74 @@
+{
+  "captioned": 0,
+  "captioner": "blip-image-captioning-base",
+  "captions": 5000,
+  "captions_given": 1000,
+  "captions_load_seconds": 301.847032909,
+  "dimensions": 768,
+  "image_to_text": {
+    "R@1": 0.892,
+    "R@10": 0.993,
+    "R@5": 0.979
+  },
+  "image_to_text_bm25": {
+    "R@1": 0.211,
+    "R@10": 0.521,
+    "R@5": 0.42
+  },
+  "image_to_text_rrf": {
+    "R@1": 0.528,
+    "R@10": 0.884,
+    "R@5": 0.771
+  },
+  "image_to_text_weighted_0.8": {
+    "R@1": 0.827,
+    "R@10": 0.991,
+    "R@5": 0.971
+  },
+  "image_to_text_weighted_0.9": {
+    "R@1": 0.88,
+    "R@10": 0.991,
+    "R@5": 0.981
+  },
+  "image_to_text_weighted_0.95": {
+    "R@1": 0.89,
+    "R@10": 0.993,
+    "R@5": 0.983
+  },
+  "images": 1000,
+  "images_load_seconds": 672.968361723,
+  "machine": "cloud container, 4 vCPU Xeon 2.10 GHz, 15 GB",
+  "model": "siglip-base-patch16-224",
+  "search_seconds": 7.774009969,
+  "split": "test_1k_flickr.csv",
+  "text_to_image": {
+    "R@1": 0.7466,
+    "R@10": 0.9566,
+    "R@5": 0.923
+  },
+  "text_to_image_bm25": {
+    "R@1": 0.1458,
+    "R@10": 0.3846,
+    "R@5": 0.297
+  },
+  "text_to_image_rrf": {
+    "R@1": 0.3398,
+    "R@10": 0.6972,
+    "R@5": 0.5876
+  },
+  "text_to_image_weighted_0.8": {
+    "R@1": 0.6836,
+    "R@10": 0.9474,
+    "R@5": 0.9034
+  },
+  "text_to_image_weighted_0.9": {
+    "R@1": 0.7418,
+    "R@10": 0.9548,
+    "R@5": 0.919
+  },
+  "text_to_image_weighted_0.95": {
+    "R@1": 0.7472,
+    "R@10": 0.9566,
+    "R@5": 0.9234
+  }
+}
