@@ -1,0 +1,139 @@
+{
+  "condition": "v_k < 200 on INT columns uniform in 0..1000: an independent 20% of rows each",
+  "load_s": 2.5029884730000003,
+  "machine": {
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "os": "Linux 6.18.44-fc-v185"
+  },
+  "one_condition_ms_p50": 0.37170200000000003,
+  "reps": 9,
+  "rows": 1000000,
+  "runs": [
+    {
+      "conditions": 2,
+      "ms_min": 1.384314,
+      "ms_p50": 1.4368569999999998,
+      "need": 2,
+      "or_of_ands": {
+        "ands": 1,
+        "timed": {
+          "ms_min": 1.3861999999999999,
+          "ms_p50": 1.4176080000000002
+        }
+      },
+      "rows": 40072
+    },
+    {
+      "conditions": 4,
+      "ms_min": 2.918501,
+      "ms_p50": 2.98493,
+      "need": 2,
+      "or_of_ands": {
+        "ands": 6,
+        "timed": {
+          "ms_min": 8.093572,
+          "ms_p50": 8.201412
+        }
+      },
+      "rows": 180441
+    },
+    {
+      "conditions": 4,
+      "ms_min": 3.1006150000000003,
+      "ms_p50": 3.178588,
+      "need": 3,
+      "or_of_ands": {
+        "ands": 4,
+        "timed": {
+          "ms_min": 9.200465999999999,
+          "ms_p50": 9.488382999999999
+        }
+      },
+      "rows": 27403
+    },
+    {
+      "conditions": 8,
+      "ms_min": 6.115141,
+      "ms_p50": 6.254517,
+      "need": 2,
+      "or_of_ands": {
+        "ands": 28,
+        "timed": {
+          "ms_min": 24.967527999999998,
+          "ms_p50": 39.223239
+        }
+      },
+      "rows": 496082
+    },
+    {
+      "conditions": 8,
+      "ms_min": 3.976479,
+      "ms_p50": 4.086334,
+      "need": 4,
+      "or_of_ands": {
+        "ands": 70,
+        "timed": {
+          "ms_min": 109.681863,
+          "ms_p50": 114.361452
+        }
+      },
+      "rows": 56375
+    },
+    {
+      "conditions": 8,
+      "ms_min": 4.04577,
+      "ms_p50": 4.593359,
+      "need": 7,
+      "or_of_ands": {
+        "ands": 8,
+        "timed": {
+          "ms_min": 13.574465,
+          "ms_p50": 14.336567
+        }
+      },
+      "rows": 94
+    },
+    {
+      "conditions": 16,
+      "ms_min": 9.06003,
+      "ms_p50": 9.466843,
+      "need": 2,
+      "or_of_ands": {
+        "ands": 120,
+        "timed": {
+          "ms_min": 100.41587100000001,
+          "ms_p50": 106.704409
+        }
+      },
+      "rows": 859219
+    },
+    {
+      "conditions": 16,
+      "ms_min": 8.827638,
+      "ms_p50": 9.293054,
+      "need": 8,
+      "or_of_ands": {
+        "ands": 12870,
+        "timed": null
+      },
+      "rows": 7092
+    },
+    {
+      "conditions": 16,
+      "ms_min": 8.240657,
+      "ms_p50": 9.517496,
+      "need": 15,
+      "or_of_ands": {
+        "ands": 16,
+        "timed": {
+          "ms_min": 28.570353,
+          "ms_p50": 30.959192
+        }
+      },
+      "rows": 0
+    }
+  ],
+  "segments": 10
+}
