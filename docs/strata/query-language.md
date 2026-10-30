@@ -314,6 +314,26 @@ DROP RANK PROFILE IF EXISTS recall ON memories;            -- ON may go when one
 - **Kept and replicated as writes are**: a profile is logged in its own transaction (numbered where writes are, shipped to replicas), and dropped with its table. A database with a profile needs the format 3 feature `rank_profiles`, which a version of Strata from before profiles refuses by name; once the last profile is dropped and flushed, the database no longer needs it.
 - **A plan names its profile** and a hash of its definition (`EXPLAIN` shows `rank profile: recall (hash ...)`) and needs the plan feature `rank_profiles`. A database whose profile of that name is another (replaced since, or a shard that missed the change) refuses the plan rather than rank otherwise. Through a coordinator, `CREATE` and `DROP RANK PROFILE` run on every shard, and the coordinator serves the profiles every replica holds alike.
 
+#### Ranking models: `gbdt('model', features…)`
+
+A gradient-boosted tree model, trained by LightGBM or XGBoost on the [features](#features-the-values-a-ranking-read) a query logged, ranks rows as a ranking expression of them:
+
+```sql
+SELECT id, score() FROM docs
+ORDER BY gbdt('docs_ltr', bm25(title, :t), bm25(body, :t), coalesce(rating, 0), year % 6) DESC LIMIT 10;
+
+-- as a second phase over BM25's top 200, and a binary model's probability
+WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :t) DESC LIMIT 200)
+SELECT id, score() FROM top ORDER BY sigmoid(gbdt('clicks', bm25(title, :t), bm25(body, :t), rating)) DESC LIMIT 10;
+```
+
+- **The model** is the file `<models>/<model>/gbdt.json` in the models directory, the one embedded fields' models come from (`--models` on a server, `models=` in Python, else `~/.local/share/strata/models`): LightGBM's `booster.dump_model()` written with `json.dump` (numerical and categorical splits, any missing-value handling, a random forest too), or XGBoost's `booster.save_model("gbdt.json")` (a `gbtree`; categorical splits, multiclass and `dart` are refused). A name is letters, digits, `_`, `-` and `.`. A model is read when a query first uses it and again when its file changes.
+- **Its arguments are its features**, in the order it was trained on, each any ranking expression of the row (a score, a column, arithmetic); as many as the model reads. A `NULL` feature is a missing value, which goes where the model sends missing values (LightGBM: `NaN`; or 0 under `zero_as_missing`).
+- **The score is the model's raw one**, the sum of its trees, bit for bit what LightGBM's `predict(raw_score=True)` and XGBoost's `predict(output_margin=True)` give (XGBoost's in `f32`, from its base score): `sigmoid(gbdt(…))` is a binary model's probability. A random forest's score is the sum of its trees, as LightGBM's raw score is.
+- **Rank it over the top rows of a cheaper ranking.** In a [rerank phase](#rerank-phases) a model is a second phase, which each shard scores on its own rows, one tree at a time over them: a LambdaMART model of 300 trees over BM25's top 100 takes 0.7 to 1.0 ms a query at the median on SciFact, NFCorpus and FiQA, against 0.02 to 0.2 ms for BM25 alone (`strata/results/text/bm25_gbdt.json`, a 4-core cloud VM). `ORDER BY gbdt(bm25(…), columns…)` alone is exact, a [rank-safe boost](#rank-safe-boosts) bounded by the leaves each tree can reach from the text score's bound and each column's range; but summed over hundreds of trees such a bound sits well above what rows score, so the top-k loop skips few matches and scores the rest with every tree: 5.5 to 70 ms on the same collections.
+- **A plan names the model and the hash of its file** (`EXPLAIN` shows `ranking model: docs_ltr (hash …)`) and needs the plan feature `rank_models`. A database or shard whose file of that name is another refuses the plan rather than rank with another model; a plan without a hash runs with the file there. A coordinator scores the shards' rows with the model too, so it needs the same file in its own models directory.
+- `features()` lists a model's inputs' leaves and then the model's score, and from Python `gbdt("docs_ltr", bm25("title", t), col("rating"))` builds the same ranking.
+
 ### `decay(field, origin, scale, …)`: closeness to a value
 
 A numeric column's closeness to `origin`, as in Elasticsearch's decay functions. With `d = max(0, |x − origin| − offset)`, the score is 1 at `d = 0` and `decay` at `d = scale`:

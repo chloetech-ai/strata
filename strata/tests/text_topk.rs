@@ -218,12 +218,14 @@ impl Boost for Hand<'_> {
 /// it is known.
 type HandBoost = (&'static str, fn(f64, f64) -> f64, fn(f64, f64, f64) -> f64, Option<bool>);
 
-const BOOSTS: [HandBoost; 7] = [
+const BOOSTS: [HandBoost; 8] = [
     ("t * (1 + 0.2 v)", |t, v| t * (1.0 + 0.2 * v), |t, _, hi| t * (1.0 + 0.2 * hi), Some(true)),
     ("t + 3 v", |t, v| t + 3.0 * v, |t, _, hi| t + 3.0 * hi, Some(true)),
     ("ln(1 + t) * v", |t, v| (1.0 + t).ln() * v, |t, _, hi| (1.0 + t).ln() * hi, Some(true)),
     ("t / v", |t, v| t / v, |t, lo, _| t / lo, Some(true)),
     ("t * (1 + 0.2 coalesce(v, 0))", |t, v| t * (1.0 + 0.2 * if v.is_nan() { 0.0 } else { v }), |t, _, hi| t * (1.0 + 0.2 * hi), Some(true)),
+    // Flat above BM25 2, as a model's above its last split on BM25.
+    ("min(t, 2) * (1 + 0.2 v)", |t, v| t.min(2.0) * (1.0 + 0.2 * v), |t, _, hi| t.min(2.0) * (1.0 + 0.2 * hi), Some(true)),
     // A bound that is not monotone: none below 1.
     ("t * (1 + 0.2 v), bound from 1", |t, v| t * (1.0 + 0.2 * v), |t, _, hi| if t < 1.0 { f64::INFINITY } else { t * (1.0 + 0.2 * hi) }, None),
     // Falls as BM25 rises: no threshold skips anything.

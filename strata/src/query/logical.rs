@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::query::ir::{ArithOp, Func, NormKind};
+use crate::query::model::Opened;
 use crate::value::Value;
 
 /// A row predicate over schema fields (indices into `Schema::fields`).
@@ -300,16 +301,42 @@ pub enum Score {
     /// A set function of a ranking expression over the rows it ranks
     /// (`minmax(x)`, `rank(x)`).
     Norm { kind: NormKind, input: Box<Score> },
+    /// A ranking model's score of a row from its features
+    /// ([`crate::query::model`]): the model named `model`, of the file
+    /// whose hash is `hash`, once opened ([`super::ir::Expr::Gbdt`]).
+    Gbdt { model: String, hash: String, args: Vec<Score>, open: Opened },
     /// `CASE WHEN c THEN x ... ELSE y END`, each `c` a [`Score::Cond`]; NULL
     /// without an `ELSE`.
     Case { whens: Vec<(Score, Score)>, otherwise: Option<Box<Score>> },
 }
 
 impl Score {
+    /// Calls `f` on the expression and each within it.
+    pub fn visit(&self, f: &mut dyn FnMut(&Score)) {
+        f(self);
+        match self {
+            Score::Rrf { inputs: xs, .. } | Score::Product(xs) | Score::Call { args: xs, .. } | Score::Gbdt { args: xs, .. } => xs.iter().for_each(|x| x.visit(f)),
+            Score::Weighted(ts) => ts.iter().for_each(|(_, x)| x.visit(f)),
+            Score::Arith { left, right, .. } => {
+                left.visit(f);
+                right.visit(f);
+            }
+            Score::Neg(x) | Score::Norm { input: x, .. } => x.visit(f),
+            Score::Case { whens, otherwise } => {
+                for (c, x) in whens {
+                    c.visit(f);
+                    x.visit(f);
+                }
+                otherwise.iter().for_each(|x| x.visit(f));
+            }
+            _ => {}
+        }
+    }
+
     /// Every leaf (BM25, similarity, a column...) of the expression.
     pub fn leaves(&self) -> Vec<&Score> {
         match self {
-            Score::Rrf { inputs, .. } | Score::Product(inputs) | Score::Call { args: inputs, .. } => inputs.iter().flat_map(|s| s.leaves()).collect(),
+            Score::Rrf { inputs, .. } | Score::Product(inputs) | Score::Call { args: inputs, .. } | Score::Gbdt { args: inputs, .. } => inputs.iter().flat_map(|s| s.leaves()).collect(),
             Score::Weighted(ts) => ts.iter().flat_map(|(_, s)| s.leaves()).collect(),
             Score::Arith { left, right, .. } => [left.leaves(), right.leaves()].concat(),
             Score::Neg(x) | Score::Norm { input: x, .. } => x.leaves(),
@@ -414,6 +441,7 @@ impl Score {
             Score::Neg(x) => Score::Neg(shapes(x)),
             Score::Call { func, args } => Score::Call { func, args: args.into_iter().map(Score::fused_shapes).collect() },
             Score::Norm { kind, input } => Score::Norm { kind, input: shapes(input) },
+            Score::Gbdt { model, hash, args, open } => Score::Gbdt { model, hash, args: args.into_iter().map(Score::fused_shapes).collect(), open },
             Score::Case { whens, otherwise } => Score::Case { whens: whens.into_iter().map(|(c, x)| (c, x.fused_shapes())).collect(), otherwise: otherwise.map(shapes) },
             e => e,
         }
@@ -578,6 +606,29 @@ pub struct Select {
 }
 
 impl Select {
+    /// A ranking model the query ranks with that is not open
+    /// ([`crate::query::model::Models::open`]): the executor refuses the
+    /// query rather than rank by NULL.
+    pub fn unopened_model(&self) -> Option<String> {
+        let order = self.order.iter().filter_map(|o| match o {
+            OrderBy::Score { score, .. } => Some(score),
+            _ => None,
+        });
+        let features = self.projection.iter().filter_map(|(_, p)| match p {
+            Projection::Feature(s) => Some(s),
+            _ => None,
+        });
+        let mut found = None;
+        for s in order.chain(self.phases.iter().map(|p| &p.score)).chain(features) {
+            s.visit(&mut |x| {
+                if let Score::Gbdt { model, open: Opened(None), .. } = x {
+                    found.get_or_insert_with(|| model.clone());
+                }
+            });
+        }
+        found
+    }
+
     /// `rows` with the values of BOOL and TIMESTAMP columns as
     /// [`Value::Bool`](crate::value::Value::Bool) and
     /// [`Value::Timestamp`](crate::value::Value::Timestamp)

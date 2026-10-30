@@ -50,6 +50,7 @@ __all__ = [
     "rrf",
     "minmax",
     "rank",
+    "gbdt",
     "ln",
     "log",
     "exp",
@@ -660,6 +661,22 @@ def rank(x: Expr) -> Expr:
     rows with a greater value; NULL places after every other."""
     x = _num(x)
     return _Ranked("rank", [x], lambda ctx, a: {"norm": {"kind": "rank", "input": a[0]}}, f"rank({x!r})")
+
+
+def gbdt(model: str, *features: Any) -> Expr:
+    """A ranking model's score of a row from its features (scores, fields,
+    any ranking expression of the row), in the order it was trained on:
+    the gradient-boosted trees of `<models>/<model>/gbdt.json`, saved by
+    LightGBM (`json.dump(booster.dump_model(), f)`) or XGBoost
+    (`booster.save_model("gbdt.json")`). The raw score, as LightGBM's
+    `predict(raw_score=True)` and XGBoost's `output_margin=True` give it:
+    `sigmoid(gbdt(...))` is a binary model's probability. A plan names the
+    hash of the model's file, and a database whose file differs refuses
+    it."""
+    if not features:
+        raise StrataError("gbdt takes a model's name and the features it reads")
+    parts = [_num(f) for f in features]
+    return _Ranked("gbdt", parts, lambda ctx, a: {"gbdt": {"model": model, "args": a}}, f"gbdt({model!r}, {', '.join(map(repr, parts))})")
 
 
 def ln(x: Any) -> Expr:
