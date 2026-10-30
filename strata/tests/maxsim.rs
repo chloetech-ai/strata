@@ -353,22 +353,7 @@ fn value_seeds_carry_their_subquerys_scores() {
         let same = ppr(&db, &format!("SELECT id, score() FROM items ORDER BY ppr(cooc, (SELECT id FROM items WHERE id IN ({keys}) ORDER BY w DESC), weighted => 1, eps => 1e-12) DESC LIMIT 1000"));
         close(&across, &same, "weighted seeds from another table");
         // And against the plan of the keys with the weights written in.
-        let mut plan = db.explain(&format!("SELECT id, score() FROM items ORDER BY ppr(cooc, ({keys}), weighted => 1, eps => 1e-12) DESC LIMIT 1000"), &Params::new()).unwrap();
-        let mut set = false;
-        visit_graphs(&mut plan.root, &mut |g| {
-            g.weights = mine.iter().map(|i| weight[i]).collect();
-            set = true;
-        });
-        assert!(set);
-        let plan = Plan::new(plan.root);
-        assert!(plan.features.iter().any(|f| f == "maxsim"), "{:?}", plan.features);
-        let text = plan.explain(&db.catalog().iter().map(|s| s.as_ref()).collect::<Vec<&Schema>>()).join("\n");
-        assert!(text.contains("weights => ("), "{text}");
-        let written: Vec<(String, f64)> = match db.run(&plan).unwrap() {
-            SqlResult::Rows(r) => r.rows.into_iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap())).collect(),
-            SqlResult::Written(_) => panic!("rows"),
-        };
-        close(&across, &written, "weights written in the plan");
+        close(&across, &written(&db, mine, &weight), "weights written in the plan");
         // Unweighted, the scores do not matter: every seed weighs 1.
         let plain = ppr(&db, &format!("SELECT id, score() FROM items ORDER BY ppr(cooc, (SELECT item FROM events WHERE usr = 'u{u}' ORDER BY w DESC), eps => 1e-12) DESC LIMIT 1000"));
         let keys_only = ppr(&db, &format!("SELECT id, score() FROM items ORDER BY ppr(cooc, ({keys}), eps => 1e-12) DESC LIMIT 1000"));
@@ -377,7 +362,36 @@ fn value_seeds_carry_their_subquerys_scores() {
     }
     let lines = answer(&db, "SELECT id FROM items ORDER BY ppr(cooc, (SELECT item FROM events WHERE usr = 'u0' ORDER BY w DESC), weighted => 1) DESC LIMIT 5", &Params::new()).stats.plan;
     assert!(lines.iter().any(|l| l.contains("subquery: 15 weighted seeds")), "{lines:?}");
+    // Events ordered by decay (of their weight here, of their time in an
+    // application) weigh by it: a seed's weight is the sum of its events'
+    // decays.
+    let events = "SELECT item, score() FROM events WHERE usr = 'u1' ORDER BY decay(w, 1, 0.5) DESC";
+    let mut decays: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for r in rows(&db, events, &Params::new()) {
+        *decays.entry(r[0].as_str().unwrap().to_string()).or_default() += r[1].as_f64().unwrap();
+    }
+    let decayed = ppr(&db, &format!("SELECT id, score() FROM items ORDER BY ppr(cooc, ({}), weighted => 1, eps => 1e-12) DESC LIMIT 1000", events.replace("item, score()", "item")));
+    close(&decayed, &written(&db, &picked[1], &decays), "seeds weighted by decay");
+}
 
+/// PPR from `keys`, each with its weight written in the plan.
+fn written(db: &Db, keys: &[String], weight: &std::collections::HashMap<String, f64>) -> Vec<(String, f64)> {
+    let list = keys.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+    let mut plan = db.explain(&format!("SELECT id, score() FROM items ORDER BY ppr(cooc, ({list}), weighted => 1, eps => 1e-12) DESC LIMIT 1000"), &Params::new()).unwrap();
+    let mut set = false;
+    visit_graphs(&mut plan.root, &mut |g| {
+        g.weights = keys.iter().map(|i| weight[i]).collect();
+        set = true;
+    });
+    assert!(set);
+    let plan = Plan::new(plan.root);
+    assert!(plan.features.iter().any(|f| f == "maxsim"), "{:?}", plan.features);
+    let text = plan.explain(&db.catalog().iter().map(|s| s.as_ref()).collect::<Vec<&Schema>>()).join("\n");
+    assert!(text.contains("weights => ("), "{text}");
+    match db.run(&plan).unwrap() {
+        SqlResult::Rows(r) => r.rows.into_iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap())).collect(),
+        SqlResult::Written(_) => panic!("rows"),
+    }
 }
 
 fn visit_graphs(n: &mut Node, f: &mut dyn FnMut(&mut strata::query::ir::Graph)) {

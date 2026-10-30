@@ -42,6 +42,7 @@ __all__ = [
     "match",
     "bm25",
     "similarity",
+    "maxsim",
     "rrf",
     "minmax",
     "rank",
@@ -587,6 +588,24 @@ def similarity(field: str, query: Sequence[float] | Mapping[str, float]) -> Expr
         return {"similarity": {"field": i, "vector": [float(x) for x in query]}}
 
     return _Fn(build, f"similarity({field!r}, ...)")
+
+
+def maxsim(field: str, vectors: Iterable[Sequence[float]], *, max_vectors: int | None = None) -> Expr:
+    """The best similarity of a VECTOR field to any of `vectors` (a
+    user's recent items, a query's phrasings), as a score: one search
+    per vector, at most 64 of them unless `max_vectors` says more."""
+    vs = [[float(x) for x in v] for v in vectors]
+
+    def build(ctx: _Ctx) -> Any:
+        i, f = ctx.field(field)
+        if f["type"] != "vector":
+            raise StrataError(f"maxsim takes a VECTOR field, and {field} is not one")
+        m: dict[str, Any] = {"field": i, "vectors": {"lit": {"list": [{"vector": v} for v in vs]}}}
+        if max_vectors is not None:
+            m["opts"] = {"max_vectors": {"int": int(max_vectors)}}
+        return {"maxsim": m}
+
+    return _Fn(build, f"maxsim({field!r}, {len(vs)} vectors)")
 
 
 def rrf(*scores: Expr, k: float = 60, depth: int = 100) -> Expr:
