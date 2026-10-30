@@ -581,7 +581,9 @@ async fn a_replica_the_log_does_not_reach_is_sent_a_copy() {
 /// beside it, and is installing it.
 async fn copy_arrived(dir: &Path) {
     until("the replica holds the whole copy", || async {
-        let sizes = |what: &str| std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()).filter(|e| e.file_name().to_string_lossy().contains(what)).map(|e| e.metadata().unwrap().len()).collect::<Vec<_>>();
+        // The primary writes its checkpoint under a temporary name and
+        // renames it, so a file listed may be gone when it is read.
+        let sizes = |what: &str| std::fs::read_dir(dir).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().contains(what)).filter_map(|e| e.metadata().ok()).map(|m| m.len()).collect::<Vec<_>>();
         // The copy, and the log that opening it made.
         let (sent, got) = (sizes(".copy-"), sizes(".restore-"));
         sent.len() == 1 && got.contains(&sent[0])
@@ -1170,6 +1172,10 @@ async fn replicas_are_compared_while_writes_go_on() {
     let mut at = 0;
     for _ in 0..8 {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // A round compares the primary's last write when it starts, so one
+        // committed since the last round makes its version newer, however
+        // long commits take meanwhile (a slow fsync holds them all).
+        until("a write after the last round's version", || async { last(&pdb) > at }).await;
         let v = p.verify_replicas(Duration::from_secs(10)).await.unwrap();
         for k in 0..2 {
             let r = &v["replicas"][k];
