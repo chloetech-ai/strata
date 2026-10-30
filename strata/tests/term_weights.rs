@@ -264,6 +264,13 @@ fn integer_weights_are_repeated_words_and_plain_syntax_reads_words() {
     assert!(!r.keys.is_empty());
     same(&r, &query(&db, &by_match("topc"), "topc even"), "+topc");
     same(&query(&db, &fuzzy, "-topc even"), &query(&db, &by_match("even -topc"), "even"), "-topc");
+    // A word's typo terms take its weight: every score doubles.
+    let (one, two) = (query(&db, &fuzzy, "topc"), query(&db, &fuzzy, "topc^2"));
+    assert!(!one.keys.is_empty());
+    assert_eq!(one.keys, two.keys);
+    for (a, b) in one.scores.iter().zip(&two.scores) {
+        assert!((2.0 * a - b).abs() <= 1e-5 * b, "{a} {b}");
+    }
 }
 
 #[test]

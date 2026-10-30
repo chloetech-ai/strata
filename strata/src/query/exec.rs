@@ -1444,8 +1444,11 @@ impl<'a> Executor<'a> {
     }
 
     /// The weighted terms of `bm25(field, text, ...)`: the query's own,
-    /// each weighing as often as it occurs, then its synonyms' (1) and its
-    /// typo-tolerant words' nearest indexed terms (`1 − edits / length`).
+    /// each weighing the sum of its occurrences' weights (`word^w`, 1
+    /// without one), then its synonyms' and its typo-tolerant words'
+    /// nearest indexed terms (`1 − edits / length`), each times the
+    /// highest weight its word is written with: repeating a word does not
+    /// weigh its expansions more.
     fn bm25_terms(&self, field: usize, text: &str, opts: &Opts) -> Result<Vec<(String, f32)>> {
         Ok(self.bm25_query(field, text, opts)?.terms)
     }
@@ -1461,12 +1464,18 @@ impl<'a> Executor<'a> {
         let (weighted, filter) = ranked_terms(text, opts, analyzer)?;
         let seq: Vec<String> = weighted.iter().map(|(t, _)| t.clone()).collect();
         let mut out = Bm25Query { filter: filter.map(|query| Pred::Match { field, query, expand }), ..Bm25Query::default() };
+        // The highest weight of each base term, for its expansions.
+        let mut top: Vec<f32> = Vec::new();
         for (t, x) in &weighted {
-            match out.terms.iter_mut().find(|(y, _)| y == t) {
-                Some((_, w)) => *w += x,
+            match out.terms.iter().position(|(y, _)| y == t) {
+                Some(i) => {
+                    out.terms[i].1 += x;
+                    top[i] = top[i].max(*x);
+                }
                 None => {
                     out.groups.push(vec![out.terms.len()]);
                     out.terms.push((t.clone(), *x));
+                    top.push(*x);
                 }
             }
         }
@@ -1489,7 +1498,7 @@ impl<'a> Executor<'a> {
                         // A one-word synonym of one word stands for it; the
                         // words of longer ones score on their own.
                         let g = if len == 1 && alt.len() == 1 { base_of(&seq[i], &out) } else { None };
-                        let w = g.map_or(1.0, |g| out.terms[g].1);
+                        let w = if len == 1 { base_of(&seq[i], &out).map_or(1.0, |b| top[b]) } else { 1.0 };
                         for t in alt {
                             add(t, w, g, &mut out);
                         }
@@ -1499,7 +1508,7 @@ impl<'a> Executor<'a> {
         }
         if let Some(fz) = expand.fuzzy {
             for b in 0..n_base {
-                let (t, w) = out.terms[b].clone();
+                let (t, w) = (out.terms[b].0.clone(), top[b]);
                 let len = t.chars().count();
                 let e = fz.edits(len);
                 if e == 0 {
