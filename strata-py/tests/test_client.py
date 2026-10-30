@@ -171,3 +171,39 @@ def test_client_cross_encoder(tmp_path, serve):
     assert (got.keys, got.scores) == (r.keys, r.scores)
     with pytest.raises(strata.StrataError, match="at most 20 rows"):
         client.query(sql.replace("LIMIT 20", "LIMIT 21"), q="dragon ship winter")
+
+
+def test_client_streams_events_once(client):
+    client.sql("CREATE TABLE views (id INT PRIMARY KEY, book KEYWORD, ts INT)")
+    client.sql("CREATE TABLE counts (book KEYWORD PRIMARY KEY, n INT DEFAULT 0)")
+    client.insert([{"book": book(i)["id"]} for i in range(10)], table="counts")
+
+    def events(lo, hi):
+        for i in range(lo, hi):
+            b = book(i % 10)["id"]
+            yield {
+                "source": {"name": "views/0", "offset": i, "ts": 1_700_000_000_000 + i},
+                "ops": [
+                    {"op": "insert", "table": "views", "doc": {"id": i, "book": b, "ts": i}},
+                    {"op": "add", "table": "counts", "key": b, "field": "n", "value": 1},
+                ],
+            }
+
+    assert client.source("views/0") is None
+    done = client.stream(events(0, 3000))
+    assert (done["done"], done["lines"], done["written"], done["skipped"]) == (True, 3000, 6000, 0)
+    assert client.source("views/0") == 2999
+    # Resumed from before the offset kept: what was written is skipped.
+    done = client.stream(events(2500, 4000))
+    assert (done["written"], done["skipped"]) == (2000, 1000)
+    assert client.query("SELECT COUNT(*) FROM views").scalar() == 4000
+    assert client.query("SELECT SUM(n) FROM counts").scalar() == 4000
+    assert [s["name"] for s in client.sources()] == ["views/0"]
+    # A replay alone writes nothing; the same offset twice in one stream
+    # is refused, after the lines before it.
+    assert client.stream(events(10, 20))["skipped"] == 20
+    twice = [*events(4000, 4001), *events(4000, 4001)]
+    with pytest.raises(strata.StrataError, match="offset 4000 comes after 4000") as e:
+        client.stream(twice)
+    assert e.value.answer["lines"] == 1
+    assert client.source("views/0") == 4000

@@ -125,6 +125,10 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
         }
         let ok = match (&f.ty, v) {
             (_, Value::Null) => schema.primary_key.map_or(true, |pk| schema.fields[pk].name != f.name),
+            (FieldType::Keyword, Value::Str(t)) if f.media.is_some() => {
+                let m = crate::media::Media::parse(t).map_err(|e| Error::Schema(format!("field {}: {e} (a MEDIA value is stored with its uri, sha256, mime and bytes; a write's uri or data is resolved before the writer, by Db::fill_in or a server)", f.name)))?;
+                f.media.is_some_and(|k| k.accepts(&m.mime))
+            }
             (FieldType::Text { .. } | FieldType::Keyword, Value::Str(_)) => true,
             (FieldType::Int, Value::Int(x)) => f.logical != Some(crate::schema::Logical::Bool) || matches!(x, 0 | 1),
             // NaN and infinities have no place in an order or a sum (as in

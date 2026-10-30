@@ -8,7 +8,8 @@
 //! * [`schema`], [`value`]: tables, field types, documents; [`ingest`]:
 //!   rows from JSON, CSV and files; [`timestamp`]: TIMESTAMP values as
 //!   text.
-//! * [`embed`]: the models that fill VECTOR fields declared with `embed`.
+//! * [`embed`]: the models that fill VECTOR fields declared with `embed`;
+//!   [`media`]: MEDIA values, and the files they name.
 //! * [`segment`]: the immutable unit of storage, a directory of aligned,
 //!   named sections, and the builder that turns documents into one.
 //! * [`storage`]: the single-file pager, commit protocol, WAL, snapshots.
@@ -38,6 +39,7 @@ pub mod forward;
 pub mod graph;
 pub mod ingest;
 pub mod iostat;
+pub mod media;
 pub mod metrics;
 pub mod postings;
 pub mod query;

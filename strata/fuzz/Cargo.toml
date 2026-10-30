@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 strata = { path = "..", default-features = false }
 crc32fast = "1"
+serde_json = "1"
 tempfile = "3"
 
 # Its own workspace, so that `cargo fuzz` builds it apart from Strata.
@@ -51,6 +52,13 @@ bench = false
 [[bin]]
 name = "sql"
 path = "fuzz_targets/sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "media"
+path = "fuzz_targets/media.rs"
 test = false
 doc = false
 bench = false

@@ -205,7 +205,8 @@ impl Manifest {
 
     /// The format 3 features the database needs, sorted: its tables'
     /// ([`crate::schema::Schema::features`]), `seq_no` once it numbers its
-    /// writes, and `rank_profiles` while a table has a rank profile.
+    /// writes, `rank_profiles` while a table has a rank profile, and
+    /// `sources` once it has [`SOURCES`].
     pub fn features(&self) -> Vec<String> {
         let mut used: BTreeSet<String> = self.tables.iter().flat_map(|t| t.schema.features()).collect();
         if self.seq_no.is_some() {
@@ -213,6 +214,9 @@ impl Manifest {
         }
         if self.tables.iter().any(|t| !t.profiles.is_empty()) {
             used.insert(RANK_PROFILES.to_string());
+        }
+        if self.table(SOURCES_ID).is_some() {
+            used.insert("sources".to_string());
         }
         used.into_iter().collect()
     }
@@ -313,11 +317,35 @@ struct V1 {
 
 /// The features this version of Strata reads, besides its analyzers'
 /// ([`known_feature`]).
-pub const FEATURES: &[&str] = &["bool", "default", "not_null", RANK_PROFILES, "semantic_id", "seq_no", "shard_by", "timestamp"];
+pub const FEATURES: &[&str] = &["bool", "default", "media", "not_null", RANK_PROFILES, "semantic_id", "seq_no", "shard_by", "sources", "timestamp"];
 
 /// The feature of a database with a rank profile ([`RankProfile`]), and of
 /// a write-ahead log that may hold one ([`crate::storage::wal`]).
 pub const RANK_PROFILES: &str = "rank_profiles";
+
+/// The system table in which streams keep, per source (a Kafka partition,
+/// say), the offset of the last event they wrote, in the transaction that
+/// wrote it ([`crate::storage::Database::ensure_sources`]). The database
+/// then needs feature `sources`.
+pub const SOURCES: &str = "_sources";
+
+/// [`SOURCES`]'s table id, the same in every copy of a database and never
+/// one that `CREATE TABLE` gives, so that a replica applies its primary's
+/// offsets to a `_sources` of its own, made when the first of them
+/// arrives, without the table being shipped.
+pub const SOURCES_ID: u32 = u32::MAX - 1;
+
+/// [`SOURCES`]'s schema: a source's name, the last offset written, and
+/// when.
+pub fn sources_schema() -> Schema {
+    Schema::from_json(
+        r#"{"table": "_sources", "key": "name", "fields": [
+            {"name": "name", "type": "keyword"},
+            {"name": "last_offset", "type": "int", "not_null": true},
+            {"name": "updated", "type": "timestamp"}]}"#,
+    )
+    .expect("the _sources schema is valid")
+}
 
 /// Whether this version of Strata reads a database that requires feature
 /// `x`: one of [`FEATURES`], or a TEXT field's analyzer it has

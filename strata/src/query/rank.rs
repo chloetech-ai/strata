@@ -819,6 +819,7 @@ fn leaf_name(s: &Score, schema: &Schema) -> String {
     match s {
         Score::Bm25 { field, .. } => format!("bm25({})", name(field)),
         Score::Similarity { field, .. } | Score::Sparse { field, .. } => format!("similarity({})", name(field)),
+        Score::MaxSim { field, .. } => format!("maxsim({})", name(field)),
         Score::Column { field } => name(field).to_string(),
         Score::Decay { field, .. } => format!("decay({})", name(field)),
         Score::Ppr { .. } => "ppr()".into(),
@@ -972,7 +973,7 @@ mod tests {
                         let m = 10f64.powi(v.get(1).map_or(Some(0.0), |d| *d)?.clamp(-30.0, 30.0).trunc() as i32);
                         fin((v[0]? * m).round() / m)
                     }
-                    Func::Lower | Func::Upper | Func::Length | Func::SidAt => None,
+                    Func::Lower | Func::Upper | Func::Length | Func::Dot | Func::SidAt => None,
                 }
             }
             Score::Norm { kind: NormKind::MinMax, input } => {

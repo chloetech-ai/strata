@@ -4,6 +4,7 @@ standard library."""
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import urllib.error
@@ -133,10 +134,12 @@ class Client(Search):
         r = self._call("POST", "/v1/plan", {"plan": plan})
         return Result._of(r) if "rows" in r else int(r["written"])
 
-    def embed(self, text: str, field: str | None = None, *, table: str | None = None) -> list[float]:
+    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None) -> list[float]:
         """The query vector of `text` by an embedded field's model (of the
-        first table, or of `table`), on the server."""
-        body = {k: v for k, v in {"text": text, "field": field, "table": table}.items() if v is not None}
+        first table, or of `table`), or of `image`, the bytes of an image
+        file, by a model of images, on the server."""
+        data = None if image is None else base64.b64encode(image).decode()
+        body = {k: v for k, v in {"text": text, "image": data, "field": field, "table": table}.items() if v is not None}
         return self._call("POST", "/v1/embed", body)["vector"]
 
     def write(self, ops: list[dict]) -> int:
@@ -171,6 +174,66 @@ class Client(Search):
         for i in range(0, len(keys), WRITE_BATCH):
             n += self.write([{"op": "delete", **named, "key": k} for k in keys[i : i + WRITE_BATCH]])
         return n
+
+    def stream(self, events: Iterable[Mapping[str, Any]]) -> dict:
+        """Writes `events` through /v1/stream as they come, in batches the
+        server makes: each an operation, or one event's operations as
+        {"ops": [...], "source": {"name": ..., "offset": n, "ts": ...}},
+        which a batch never splits. A source's offsets increase along the
+        stream; one the server has reached already (a replay's) is skipped,
+        so resuming from `source(name) + 1`, or from before it, applies
+        each event once. Returns the last answer, {"done": True, "lines",
+        "written", "skipped", "batches"}; a failure raises StrataError,
+        whose `answer["lines"]` counts the events written before it.
+        `strata.ingest` reads Kafka into a stream."""
+
+        def chunks() -> Iterable[bytes]:
+            chunk: list[str] = []
+            for e in events:
+                chunk.append(json.dumps(e, default=_default))
+                if len(chunk) >= 256:
+                    yield ("\n".join(chunk) + "\n").encode()
+                    chunk = []
+            if chunk:
+                yield ("\n".join(chunk) + "\n").encode()
+
+        return self._stream(chunks())
+
+    def _stream(self, chunks: Iterable[bytes]) -> dict:
+        # Each chunk is some whole lines, sent as soon as it is made.
+        h = {"content-type": "application/x-ndjson"}
+        if self.token:
+            h["authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(self.url + "/v1/stream", data=chunks, method="POST", headers=h)
+        last: dict = {}
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                for raw in r:
+                    if raw.strip():
+                        try:
+                            last = json.loads(raw)
+                        except ValueError:
+                            last = {}  # cut short
+                            break
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            err = StrataError(f"{raw.decode(errors='replace')} (HTTP {e.code})")
+            err.status, err.answer = e.code, None
+            raise err from None
+        if "error" in last or not last.get("done"):
+            err = StrataError(f"{last.get('error', 'the stream ended early')} (HTTP {last.get('status', 500)})")
+            err.status, err.answer = last.get("status", 500), last
+            raise err
+        return last
+
+    def source(self, name: str) -> int | None:
+        """The offset of the last event written from stream source `name`,
+        or None for a source not written from: resume from the next."""
+        return self._call("GET", "/v1/sources/" + urllib.parse.quote(name, safe="/"))["offset"]
+
+    def sources(self) -> list[dict]:
+        """Every stream source written from: [{name, offset, updated}]."""
+        return self._call("GET", "/v1/sources")["sources"]
 
     def import_file(self, path: str | os.PathLike, format: str | None = None, *, table: str | None = None) -> dict:
         """Uploads a JSON Lines, JSON (an array), CSV or TSV file (up to the

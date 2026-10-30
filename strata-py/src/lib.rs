@@ -110,7 +110,8 @@ fn result_py<'py>(py: Python<'py>, rs: &ResultSet) -> PyResult<Bound<'py, PyDict
 
 /// A query parameter, as the HTTP API reads one: a number, string, None,
 /// a list of numbers (a vector), a list, a dict of term weights (SPARSE),
-/// `{"embed": text, "field": f}` (the text's vector by `f`'s model) or
+/// `{"embed": text, "field": f}` (the text's vector by `f`'s model, or an
+/// image file's for `{"embed": {"image": "<base64>"}}`) or
 /// `{"vector_of": key, "field": f}` (a stored row's vector), each with
 /// `"table"` for a field of another table than the first.
 fn param(db: &Db, j: &Json) -> strata::Result<Value> {
@@ -128,14 +129,21 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
         Json::Array(xs) if !xs.is_empty() && xs.iter().all(|x| x.is_i64()) => Value::List(xs.iter().map(|x| Value::Int(x.as_i64().unwrap_or(0))).collect()),
         Json::Array(xs) if !xs.is_empty() && xs.iter().all(|x| x.is_number()) => Value::Vector(xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect::<Vec<_>>().into()),
         Json::Array(xs) => Value::List(xs.iter().map(|x| param(db, x)).collect::<strata::Result<_>>()?),
-        Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string()) && o.keys().all(|k| k == "embed" || k == "field" || k == "table") => {
+        Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some()) && o.keys().all(|k| k == "embed" || k == "field" || k == "table") => {
             let s = table_of(db, o.get("table").and_then(|t| t.as_str()))?;
             let field = match o.get("field").and_then(|f| f.as_str()) {
                 Some(f) => f.to_string(),
                 None => s.fields.iter().find(|f| db.embedder_in(&s.table, &f.name).is_some()).map(|f| f.name.clone()).ok_or_else(|| bad("no embedded field has its model open".into()))?,
             };
             let e = db.embedder_in(&s.table, &field).ok_or_else(|| bad(format!("{field} has no embedding model open (see Database.open's models)")))?;
-            Value::Vector(e.embed_query(o["embed"].as_str().unwrap_or_default()).into())
+            match &o["embed"] {
+                Json::String(t) => Value::Vector(e.embed_query(t).into()),
+                Json::Object(i) if i.len() == 1 && i["image"].is_string() => {
+                    let data = strata::media::base64_bytes(i["image"].as_str().unwrap_or_default()).map_err(|m| bad(format!("{{\"embed\": {{\"image\": ...}}}} is an image file in base64: {m}")))?;
+                    Value::Vector(strata::embed::embed_image_file(e.as_ref(), &data)?.into())
+                }
+                _ => return Err(bad("\"embed\" is a text or {\"image\": \"<base64>\"}".into())),
+            }
         }
         Json::Object(o) if o.contains_key("vector_of") && o.keys().all(|k| k == "vector_of" || k == "field" || k == "table") => {
             let s = &*table_of(db, o.get("table").and_then(|t| t.as_str()))?;
@@ -202,7 +210,7 @@ impl Database {
     fn documents(db: &Db, schema: &Schema, rows: &[Json]) -> strata::Result<Vec<strata::Document>> {
         let now = strata::timestamp::now();
         let mut docs = rows.iter().enumerate().map(|(i, j)| ingest::document_at(schema, j, now).map_err(|e| strata::Error::Schema(format!("row {}: {e}", i + 1)))).collect::<strata::Result<Vec<_>>>()?;
-        db.embed_missing_in(&schema.table, &mut docs)?;
+        db.fill_in(&schema.table, &mut docs)?;
         Ok(docs)
     }
 }
@@ -372,10 +380,21 @@ impl Database {
         Ok((r.rows, r.bulk, r.unknown))
     }
 
-    /// The vector `field`'s model gives `text` as a query.
-    #[pyo3(signature = (text, field = None, table = None))]
-    fn embed(&self, py: Python<'_>, text: &str, field: Option<&str>, table: Option<&str>) -> PyResult<Vec<f32>> {
+    /// The vector `field`'s model gives `text` as a query, or `image`, the
+    /// bytes of an image file, for a model of images.
+    #[pyo3(signature = (text = None, field = None, table = None, image = None))]
+    fn embed(&self, py: Python<'_>, text: Option<&str>, field: Option<&str>, table: Option<&str>, image: Option<Vec<u8>>) -> PyResult<Vec<f32>> {
         let db = self.get()?;
+        if let Some(data) = image {
+            let s = table_of(&db, table).map_err(err)?;
+            let field = match field {
+                Some(f) => f.to_string(),
+                None => s.fields.iter().find(|f| db.embedder_in(&s.table, &f.name).is_some_and(|e| e.modalities().contains(&strata::embed::Modality::Image))).map(|f| f.name.clone()).ok_or_else(|| PyValueError::new_err("no embedded field has a model of images open"))?,
+            };
+            let e = db.embedder_in(&s.table, &field).ok_or_else(|| PyValueError::new_err(format!("{field} has no embedding model open (see Database.open's models)")))?;
+            return py.detach(|| strata::embed::embed_image_file(e.as_ref(), &data)).map_err(err);
+        }
+        let text = text.ok_or_else(|| PyValueError::new_err("embed takes a text or an image"))?;
         let mut o = Map::new();
         o.insert("embed".into(), Json::String(text.into()));
         if let Some(f) = field {
