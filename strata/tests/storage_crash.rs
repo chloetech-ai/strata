@@ -300,9 +300,11 @@ fn create_child() {
     let (folder, dir) = spec.split_once('|').unwrap();
     let layout = if dir == "dir" { strata::storage::Layout::Directory } else { strata::storage::Layout::SingleFile };
     let src = Arc::new(MapSource::default());
-    for n in 0.. {
+    let mut n = 0;
+    loop {
         let path = Path::new(folder).join(db_name(n, layout == strata::storage::Layout::Directory));
         drop(Database::create(&path, schema(), DbOptions { layout, sync: true, ..opts(&src) }).unwrap());
+        n += 1;
     }
 }
 
