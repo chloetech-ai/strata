@@ -1712,7 +1712,7 @@ fn imports_files_from_the_command_line() {
     std::fs::write(&rows, "{\"id\": \"a\", \"title\": \"first\"}\n{\"id\": \"b\", \"title\": \"second\", \"price\": 2}\n").unwrap();
     std::fs::write(&more, "id\ttitle\tprice\nb\tsecond again\t3\nc\tthird\t\n").unwrap();
     let db = dir.path().join("items.strata");
-    server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows.clone(), more]).unwrap();
+    server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows.clone(), more], Default::default()).unwrap();
     let opened = Db::open(&db, DbOptions::default()).unwrap();
     let r = opened.query("SELECT id, title, price FROM items", &Params::new()).unwrap();
     let mut got: Vec<String> = r.rows.iter().map(|r| format!("{:?}", r)).collect();
@@ -1721,7 +1721,34 @@ fn imports_files_from_the_command_line() {
     assert!(got[1].contains("second again") && got[1].contains("3.0"), "{got:?}");
     drop(opened);
     // An existing database takes no schema.
-    assert!(server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows]).unwrap_err().contains("exists"));
+    assert!(server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows], Default::default()).unwrap_err().contains("exists"));
+}
+
+#[test]
+fn sqlite_files_from_and_to_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let (schema, rows) = (dir.path().join("items.json"), dir.path().join("rows.jsonl"));
+    std::fs::write(&schema, ITEMS).unwrap();
+    std::fs::write(&rows, "{\"id\": \"a\", \"title\": \"first\"}\n{\"id\": \"b\", \"title\": \"second\", \"price\": 2}\n").unwrap();
+    let db = dir.path().join("items.strata");
+    server::import_files(&db, Some(&schema), dir.path(), None, false, std::slice::from_ref(&rows), Default::default()).unwrap();
+    let out = dir.path().join("items.sqlite");
+    server::export_sqlite(&db, &out, &Default::default()).unwrap();
+    assert!(strata::sqlite::is_sqlite_file(&out));
+    assert!(server::export_sqlite(&db, &out, &Default::default()).unwrap_err().contains("exists"));
+    // --plan writes nothing, and is for SQLite files.
+    let back = dir.path().join("back.strata");
+    let plan = || server::SqliteImport { plan: true, ..Default::default() };
+    server::import_files(&back, None, dir.path(), None, false, std::slice::from_ref(&out), plan()).unwrap();
+    assert!(!back.exists());
+    assert!(server::import_files(&back, None, dir.path(), None, false, std::slice::from_ref(&rows), plan()).unwrap_err().contains("--plan"));
+    // A new database from the SQLite file: the schema it kept, and the rows.
+    server::import_files(&back, None, dir.path(), None, false, &[out], Default::default()).unwrap();
+    let (a, b) = (Db::open(&db, DbOptions::default()).unwrap(), Db::open(&back, DbOptions::default()).unwrap());
+    assert_eq!(a.schema().to_short_json(), b.schema().to_short_json());
+    assert_eq!(b.snapshot().n_live_docs(), 2);
+    let r = b.query("SELECT price FROM items WHERE id = 'b'", &Params::new()).unwrap();
+    assert_eq!(r.rows[0][0], Value::Float(2.0));
 }
 
 // OPS-3: a replica that refused a query because too many were running was
