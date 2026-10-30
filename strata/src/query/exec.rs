@@ -26,7 +26,7 @@ use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
 use crate::storage::{rowseq, KeyRef, SegmentView, Snapshot, Updates};
 use crate::text::{self, Bm25Params, Boost, BoolQuery, CollectionStats, FilterStrategy, Synonyms, TextFieldReader, TopKAlgo};
 use crate::value::Value;
-use crate::vector::{self, SearchParams, VectorReader};
+use crate::vector::{self, multi, ExactQuery, SearchParams, VectorReader};
 
 /// Rows returned by ranked queries without a LIMIT.
 pub const DEFAULT_K: usize = 100;
@@ -1776,6 +1776,9 @@ impl<'a> Executor<'a> {
     }
 
     fn vector_top(&mut self, field: usize, q: &[f32], opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        if self.schema.fields[field].multi {
+            return Err(err(crate::query::sql::multi_similarity(&self.schema.fields[field].name)));
+        }
         let base = self.search_params(opts);
         let forced = match opts.get("strategy").and_then(|v| v.as_str()) {
             Some("prefilter") => Some(VectorStrategy::PreFilter),
@@ -1832,6 +1835,9 @@ impl<'a> Executor<'a> {
     /// similar to (else `k` rows beat it there, and so overall), so the
     /// union holds every row an exact search ranks first.
     fn maxsim_top(&mut self, field: usize, vectors: &Vectors, opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        if self.schema.fields[field].multi {
+            return self.multi_top(field, vectors, opts, p, k);
+        }
         let qs = query_vectors(vectors, opts)?;
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         let mut lines = None;
@@ -1860,6 +1866,13 @@ impl<'a> Executor<'a> {
             self.check_deadline()?;
             let s = &self.seg_by_ord(seg);
             let vr = self.vector(s, field)?;
+            if let Some(rows) = vr.rows() {
+                let eqs: Vec<ExactQuery> = qs.iter().map(|q| vr.prepare_exact(q)).collect();
+                for i in range {
+                    out[i] = multi_score(vr, rows, &eqs, cands[i].1);
+                }
+                continue;
+            }
             for i in range {
                 let d = cands[i].1;
                 if vr.has_vector(d) {
@@ -1868,6 +1881,62 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Top-`k` rows of a multi-vector field by `maxsim`, the sum over the
+    /// query vectors of each one's best match in the row: per segment, each
+    /// query vector's best `depth` vectors name the candidate rows, the
+    /// `candidates` of them with the largest sum of the best matches found
+    /// are kept, and those are scored over all their vectors
+    /// ([`crate::vector::multi`]).
+    fn multi_top(&mut self, field: usize, vectors: &Vectors, opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        let qs = query_vectors(vectors, opts)?;
+        let size = |key: &str, d: usize| opts.get(key).and_then(|v| v.as_f64()).map_or(d, |x| x as usize);
+        let (depth, cap) = (size("depth", multi::DEPTH), size("candidates", multi::CANDIDATES).max(k));
+        let base = self.search_params(opts);
+        // The searches only pick candidate rows: the index unless the query
+        // asks for an exact scan.
+        let strategy = match opts.get("strategy").and_then(|v| v.as_str()) {
+            Some("flat") | Some("prefilter") => vector::Strategy::Flat,
+            Some("auto") | Some("index") | Some("ivf") | Some("hnsw") | Some("postfilter") | None => vector::Strategy::Auto,
+            Some(other) => return Err(err(format!("unknown vector strategy {other}"))),
+        };
+        let name = self.schema.fields[field].name.clone();
+        let per = self.per_segment(|ex, s, l| {
+            let vr = ex.vector(s, field)?;
+            let Some(rows) = vr.rows() else { return Err(err(format!("{name} has one vector per row in segment {}", s.ord))) };
+            let f = ex.seg_filter_l(s, p, if *p == Pred::True { FilterMode::None } else { FilterMode::Materialize }, l)?;
+            let owners = f.as_dyn().map(|f| multi::OwnerFilter { rows, filter: f, n: vr.n_docs() as usize });
+            // Each candidate row's best match per query vector so far.
+            let mut found: HashMap<DocId, Vec<f32>> = HashMap::new();
+            let mut floor = vec![0f32; qs.len()];
+            let mut sp = base.clone();
+            sp.strategy = strategy;
+            for (i, q) in qs.iter().enumerate() {
+                let out = vr.search(q, depth, &sp, owners.as_ref().map(|o| o as &dyn DocFilter));
+                l.scored += out.stats.candidates as u64;
+                floor[i] = out.hits.last().map_or(0.0, |h| h.score);
+                for h in out.hits {
+                    let Some(r) = rows.owner(h.doc) else { continue };
+                    let best = found.entry(r).or_insert_with(|| vec![f32::NEG_INFINITY; qs.len()]);
+                    best[i] = best[i].max(h.score);
+                }
+            }
+            // A query vector that found nothing in a row scores it at most
+            // its search's last hit.
+            let mut cands: Vec<(f32, DocId)> = found.into_iter().map(|(r, b)| (b.iter().zip(&floor).map(|(&x, &f)| if x.is_finite() { x } else { f }).sum(), r)).collect();
+            let found = cands.len();
+            cands.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            cands.truncate(cap);
+            let eqs: Vec<ExactQuery> = qs.iter().map(|q| vr.prepare_exact(q)).collect();
+            let mut hits: Vec<Hit> = cands.iter().map(|&(_, r)| Hit { seg: s.ord, doc: r, score: multi_score(vr, rows, &eqs, r) as f64 }).collect();
+            let scored: usize = cands.iter().map(|&(_, r)| rows.vectors(r).len()).sum();
+            l.scored += (scored * qs.len()) as u64;
+            l.plan.push(format!("seg {}: maxsim({name}) over {} rows: {found} candidate rows from {} searches of {depth}, {} scored exactly", s.ord, rows.n_rows(), qs.len(), cands.len()));
+            hits.retain(|h| h.score.is_finite());
+            Ok(merge_top(hits, k))
+        })?;
+        Ok(merge_top(per.concat(), k))
     }
 
     /// The fraction of the query's nearest neighbours that pass the filter,
@@ -2347,13 +2416,24 @@ impl<'a> Executor<'a> {
 
     fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {
         match self.schema.fields[field].ty {
-            FieldType::Vector { .. } => s.r.vector(field).ok().flatten().filter(|v| v.has_vector(d)).map_or(Value::Null, |v| Value::Vector(v.vector(d).into())),
+            FieldType::Vector { .. } => s.r.vector(field).ok().flatten().map_or(Value::Null, |v| v.row_value(d)),
             FieldType::Int | FieldType::Float => s.r.numeric(field).ok().flatten().map_or(Value::Null, |n| n.col().get(d)),
             FieldType::Keyword => s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Value::Null, |v| Value::Str(v.to_string())),
             FieldType::Text { .. } | FieldType::Sparse => Value::Null,
             FieldType::Edges => s.r.graph(field).ok().flatten().map_or(Value::Null, |g| g.edges_value(d)),
         }
     }
+}
+
+/// `maxsim` of row `r` of a multi-vector field: the sum over the query
+/// vectors of each one's best match among the row's vectors (`-inf` for a
+/// row without vectors).
+fn multi_score(vr: &VectorReader, rows: &multi::Rows, eqs: &[ExactQuery], r: DocId) -> f32 {
+    let vs = rows.vectors(r);
+    if vs.is_empty() {
+        return f32::NEG_INFINITY;
+    }
+    eqs.iter().map(|q| vs.clone().map(|v| vr.exact_score(q, v)).fold(f32::NEG_INFINITY, f32::max)).sum()
 }
 
 /// The query vectors of `maxsim`, at most `max_vectors` of them.

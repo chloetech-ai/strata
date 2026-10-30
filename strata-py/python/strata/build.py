@@ -653,7 +653,9 @@ def similarity(field: str, query: Sequence[float] | Mapping[str, float]) -> Expr
 def maxsim(field: str, vectors: Iterable[Sequence[float]], *, max_vectors: int | None = None) -> Expr:
     """The best similarity of a VECTOR field to any of `vectors` (a
     user's recent items, a query's phrasings), as a score: one search
-    per vector, at most 64 of them unless `max_vectors` says more."""
+    per vector, at most 64 of them unless `max_vectors` says more. Over
+    a multi-vector field (VECTOR(d)[]), the sum over `vectors` of each
+    one's best match among a row's vectors."""
     vs = [[float(x) for x in v] for v in vectors]
 
     def build(ctx: _Ctx) -> Any:
