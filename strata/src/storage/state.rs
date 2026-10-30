@@ -284,11 +284,14 @@ pub(crate) struct TableState {
     /// logged since, which the next version writes
     /// ([`crate::storage::manifest::TableMeta::profiles`]).
     pub profiles: Arc<Vec<RankProfile>>,
+    /// The ties its semantic-ID fields have given ([`crate::sid::Ties`]),
+    /// once a write needed them; kept up to date by every insert.
+    pub ties: Option<crate::sid::Ties>,
 }
 
 impl TableState {
     pub fn new(id: u32, schema: Arc<Schema>, handles: Vec<Arc<SegHandle>>, chunk: usize, gen: u64) -> TableState {
-        TableState { id, schema, handles, mem: Memtable::new(chunk, gen), mem_live: Vec::new(), memsegs: Vec::new(), profiles: Arc::default() }
+        TableState { id, schema, handles, mem: Memtable::new(chunk, gen), mem_live: Vec::new(), memsegs: Vec::new(), profiles: Arc::default(), ties: None }
     }
 
     /// Empties the memtable (after a flush).
@@ -448,6 +451,9 @@ impl State {
         match op {
             Op::Insert(doc) => {
                 let table = &mut self.tables[t];
+                if let Some(ties) = &mut table.ties {
+                    ties.saw_doc(&table.schema, &doc);
+                }
                 let key = table.schema.primary_key.and_then(|pk| Key::of(&doc[pk]));
                 // The transaction owned the only reference.
                 let i = table.mem.push(Arc::try_unwrap(doc).unwrap_or_else(|d| (*d).clone()), seq);

@@ -346,6 +346,7 @@ fn call(func: Func, args: &[Value]) -> Result<Value> {
         Func::Lower => text(|s| Value::Str(s.to_lowercase())),
         Func::Upper => text(|s| Value::Str(s.to_uppercase())),
         Func::Length => text(|s| Value::Int(s.chars().count() as i64)),
+        Func::SidAt => crate::sid::sid_at(&one, args.get(1).unwrap_or(&Value::Null)),
         Func::Abs => Ok(match one {
             Value::Int(x) => x.checked_abs().map_or(Value::Float((x as f64).abs()), Value::Int),
             Value::Float(x) => Value::Float(x.abs()),

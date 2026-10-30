@@ -35,7 +35,7 @@ import json
 import os
 from typing import Any, Iterable, Mapping
 
-from . import _strata
+from . import _strata, train
 from ._search import Search, ordered_schema, params as _params
 from .build import (
     Expr,
@@ -106,6 +106,7 @@ __all__ = [
     "reachable",
     "path",
     "ppr",
+    "train",
 ]
 
 

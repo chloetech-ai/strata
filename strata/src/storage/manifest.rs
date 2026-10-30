@@ -313,7 +313,7 @@ struct V1 {
 
 /// The features this version of Strata reads, besides its analyzers'
 /// ([`known_feature`]).
-pub const FEATURES: &[&str] = &["bool", "default", "not_null", RANK_PROFILES, "seq_no", "shard_by", "timestamp"];
+pub const FEATURES: &[&str] = &["bool", "default", "not_null", RANK_PROFILES, "semantic_id", "seq_no", "shard_by", "timestamp"];
 
 /// The feature of a database with a rank profile ([`RankProfile`]), and of
 /// a write-ahead log that may hold one ([`crate::storage::wal`]).

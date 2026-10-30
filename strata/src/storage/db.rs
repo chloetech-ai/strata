@@ -38,6 +38,7 @@ use serde::Serialize;
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};
+use crate::sid::{Codebook, Ties};
 use crate::segment::build::{build_segment, build_threads, BuildOptions, GraphStart, SegmentBuild};
 use crate::segment::{DocId, SegmentFile, SegmentWriter};
 use crate::storage::freelist::FreeList;
@@ -294,6 +295,17 @@ pub struct Database {
     /// Told the term and number of each numbered transaction once it is
     /// committed ([`Database::on_commit`]).
     commit_hook: RwLock<Option<CommitHook>>,
+    /// The codebooks of semantic-ID fields ([`Database::set_codebook`]).
+    codebooks: RwLock<Vec<Coded>>,
+}
+
+/// The codebook of semantic-ID field `field` of the table with id `table`,
+/// the one whose file has hash `hash`.
+struct Coded {
+    table: u32,
+    field: usize,
+    hash: String,
+    codebook: Arc<Codebook>,
 }
 
 type CommitHook = Arc<dyn Fn(SeqNo) + Send + Sync>;
@@ -955,6 +967,7 @@ impl Database {
             background_waiting: AtomicUsize::new(0),
             background_holding: AtomicUsize::new(0),
             commit_hook: RwLock::new(None),
+            codebooks: RwLock::new(Vec::new()),
         };
         db.republish();
         Ok(db)
@@ -1237,7 +1250,7 @@ impl Database {
                     break;
                 }
             }
-            let mut txn = WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new() };
+            let mut txn = WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new() };
             let replayed = txn.replay(ops);
             let WriteTxn { wal: w, ops, .. } = txn;
             wal = w;
@@ -1377,6 +1390,9 @@ impl Database {
             st.live_cache.clear();
             st.updates_cache.clear();
             st.ship = ShipLog::new(max);
+            for t in &mut st.tables {
+                t.ties = None;
+            }
         })?;
         Ok(theirs.last())
     }
@@ -1484,7 +1500,7 @@ impl Database {
         self.wait_for_flusher();
         let wal = self.try_writer()?;
         self.check_poisoned()?;
-        Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new() })
+        Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new() })
     }
 
     /// The current version. Never waits for a writer; the first snapshot
@@ -1598,6 +1614,16 @@ impl Database {
         let mut vw = VersionWriter::begin(self);
         vw.manifest.wal_txn = txn;
         for (table, schema, chunks, deleted, mem_updates, mem_seqs) in mems {
+            // The codes of the deleted documents, which the segments drop.
+            let mut gone = Vec::new();
+            if !crate::sid::fields(&schema).is_empty() {
+                let (mut dropped, mut kept) = (Ties::default(), Ties::default());
+                for (i, d) in chunks.iter().flat_map(|c| c.iter()).enumerate() {
+                    let t = if deleted[i / 64] >> (i % 64) & 1 == 1 { &mut dropped } else { &mut kept };
+                    t.saw_doc(&schema, d);
+                }
+                gone = crate::sid::gone_sections(&schema, &dropped, &kept);
+            }
             let (live, seqs): (Vec<Document>, Vec<u64>) = chunks
                 .iter()
                 .flat_map(|c| c.iter())
@@ -1611,8 +1637,13 @@ impl Database {
                 .unzip();
             drop(chunks);
             let max = self.opts.segment_max_docs.max(1);
+            if live.is_empty() && !gone.is_empty() {
+                // A segment without documents keeps what they were given.
+                let image = rowseq::build_with(&schema, &[], numbered.then_some(&[]), &self.opts.build, std::mem::take(&mut gone))?;
+                vw.add_segment(table, None, &image, 0, None, None)?;
+            }
             for (chunk, seqs) in live.chunks(max).zip(seqs.chunks(max)) {
-                let image = rowseq::build(&schema, chunk, numbered.then_some(seqs), &self.opts.build)?;
+                let image = rowseq::build_with(&schema, chunk, numbered.then_some(seqs), &self.opts.build, std::mem::take(&mut gone))?;
                 vw.add_segment(table, None, &image, chunk.len() as u32, None, None)?;
             }
         }
@@ -1866,9 +1897,11 @@ impl Database {
         let mut seen = HashSet::new();
         let mut chunk = Vec::new();
         let max = self.opts.segment_max_docs.max(1);
+        let mut ties = Ties::default();
         for doc in docs {
             let mut doc = doc?;
             conform(schema, &mut doc)?;
+            self.fill_sids(&t, &mut doc, &mut ties, &[])?;
             if let Some(pk) = pk {
                 let dup = !seen.insert(Key::of(&doc[pk]).expect("validated key"))
                     || (check_existing && lock(&self.state).find_live(t.pos, &doc[pk]).is_some());
@@ -1891,7 +1924,11 @@ impl Database {
             return Ok(());
         }
         let c = vw.commit(&mut wal)?;
-        self.publish(c, |_| {})
+        self.publish(c, |st| {
+            if let Some(known) = st.table_index(t.id).and_then(|i| st.tables[i].ties.as_mut()) {
+                known.absorb(&ties);
+            }
+        })
     }
 
     /// Writes segment `id`'s image to `dest` (a new file), for another
@@ -1960,7 +1997,8 @@ impl Database {
             return Ok(ids);
         }
         let c = vw.commit(&mut wal)?;
-        self.publish(c, |_| {})?;
+        // Their semantic IDs are counted again when a write needs them.
+        self.publish(c, |st| st.tables[0].ties = None)?;
         Ok(ids)
     }
 
@@ -2150,6 +2188,17 @@ impl Database {
         if !batch.is_empty() {
             batches.push(batch);
         }
+        // Semantic-ID codes the merge drops (its inputs' deleted documents'
+        // and those they had dropped) stay in a section of the merged
+        // segment, unless a document it keeps has a higher one.
+        let sids = !crate::sid::fields(schema).is_empty();
+        let mut dropped = Ties::default();
+        if sids {
+            for v in &views {
+                dropped.scan(schema, &v.file)?;
+            }
+        }
+        let kept = Mutex::new(Ties::default());
         let decode = |batch: &[(usize, &[DocId])]| -> Result<Vec<Document>> {
             let mut all = Vec::with_capacity(batch.iter().map(|(_, l)| l.len()).sum());
             for &(k, live) in batch {
@@ -2165,6 +2214,12 @@ impl Database {
                     }
                 }
                 all.append(&mut got);
+            }
+            if sids {
+                let mut k = lock(&kept);
+                for d in &all {
+                    k.saw_doc(schema, d);
+                }
             }
             Ok(all)
         };
@@ -2207,7 +2262,22 @@ impl Database {
         };
         // Written before the writer lock is taken, into space reserved for
         // it: commits go on meanwhile.
+        let gone = |sections: &mut SegmentWriter| {
+            for (name, bytes) in crate::sid::gone_sections(schema, &dropped, &lock(&kept)) {
+                sections.put(name, bytes);
+            }
+        };
         let written = match batches.len() {
+            // Every document was deleted; a segment without documents keeps
+            // the codes they were given.
+            0 if sids && !crate::sid::gone_sections(schema, &dropped, &Ties::default()).is_empty() => {
+                let mut sections = SegmentBuild::new(schema, &self.opts.build, 0)?.finish(&[])?;
+                if seqs.is_some() {
+                    sections.put(rowseq::SECTION, rowseq::encode(&[]));
+                }
+                gone(&mut sections);
+                Some(self.write_reserved(sections, pacer)?)
+            }
             0 => None,
             n => {
                 let mut build = SegmentBuild::with_starts(schema, &self.opts.build, n_new, &starts)?;
@@ -2225,6 +2295,7 @@ impl Database {
                 if let Some(seqs) = &seqs {
                     sections.put(rowseq::SECTION, rowseq::encode(seqs));
                 }
+                gone(&mut sections);
                 Some(self.write_reserved(sections, pacer)?)
             }
         };
@@ -2867,15 +2938,128 @@ impl Database {
         TableRef { id: 0, pos: 0, schema: self.schema.clone() }
     }
 
+    /// Gives semantic-ID field `field` of the table named `table` its
+    /// codebook, whose file has hash `hash` ([`crate::sid::Codebook::open`]):
+    /// writes then fill the field from the row's vector. It must be the
+    /// codebook the field records.
+    pub fn set_codebook(&self, table: &str, field: &str, codebook: Arc<Codebook>, hash: &str) -> Result<()> {
+        let t = self.table_ref(Some(table))?;
+        let f = t.schema.field_index(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let Some(sid) = &t.schema.fields[f].semantic_id else { return Err(Error::Schema(format!("field {field} is not a semantic-ID field"))) };
+        if sid.hash != hash {
+            return Err(Error::Schema(format!("field {field} records codebook {} with hash {}, not {hash}", sid.codebook, sid.hash)));
+        }
+        let dim = t.schema.field(&sid.from).and_then(|v| if let FieldType::Vector { dim, .. } = v.ty { Some(dim) } else { None });
+        if dim != Some(codebook.dim) {
+            return Err(Error::Schema(format!("codebook {} codes {}-dimension vectors; {} holds {}", sid.codebook, codebook.dim, sid.from, dim.unwrap_or(0))));
+        }
+        let mut all = self.codebooks.write().unwrap_or_else(|e| e.into_inner());
+        all.retain(|c| !(c.table == t.id && c.field == f));
+        all.push(Coded { table: t.id, field: f, hash: hash.to_string(), codebook });
+        Ok(())
+    }
+
+    /// The codebook of semantic-ID field `field` of the table named `table`,
+    /// if it has one ([`Database::set_codebook`]).
+    pub fn codebook(&self, table: &str, field: &str) -> Option<Arc<Codebook>> {
+        let t = self.table_ref(Some(table)).ok()?;
+        self.codebook_of(&t, t.schema.field_index(field)?)
+    }
+
+    fn codebook_of(&self, t: &TableRef, f: usize) -> Option<Arc<Codebook>> {
+        let hash = &t.schema.fields.get(f)?.semantic_id.as_ref()?.hash;
+        let all = self.codebooks.read().unwrap_or_else(|e| e.into_inner());
+        all.iter().find(|c| c.table == t.id && c.field == f && c.hash == *hash).map(|c| c.codebook.clone())
+    }
+
+    /// Fills the semantic-ID fields of `doc`, a row of table `t` that a
+    /// write under the writer lock gives ([`crate::sid`]): a code given in
+    /// full is kept, one of the levels alone gets its tie, and a row with a
+    /// vector and no code gets one from the codebook. `live` holds the
+    /// fields' values in the row an upsert replaces, whose code the row
+    /// keeps when its levels are the same; `local` the ties the write gave
+    /// so far.
+    fn fill_sids(&self, t: &TableRef, doc: &mut Document, local: &mut Ties, live: &[(usize, Value)]) -> Result<()> {
+        for (f, vf) in crate::sid::fields(&t.schema) {
+            let field = &t.schema.fields[f];
+            let cb = self.codebook_of(t, f);
+            let levels = match &doc[f] {
+                Value::Null => match (&doc[vf], &cb) {
+                    (Value::Vector(v), Some(cb)) => cb.code(v),
+                    (Value::Vector(_), None) => {
+                        let sid = field.semantic_id.as_ref().expect("a semantic-ID field");
+                        return Err(Error::Schema(format!("field {}: its codebook {} is not open here, so rows cannot get codes (Db::open_codebooks)", field.name, sid.codebook)));
+                    }
+                    _ => continue,
+                },
+                v => {
+                    let code = crate::sid::code_of(v).filter(|c| c.len() >= 2).ok_or_else(|| Error::Schema(format!("bad value for {}: {v:?} (a semantic ID is every prefix of a code such as 12.7.201.0)", field.name)))?;
+                    match &cb {
+                        Some(cb) if code.len() == cb.n_levels() && code.iter().all(|&x| (x as usize) < cb.k) => code,
+                        Some(cb) if code.len() == cb.n_levels() + 1 && code[..cb.n_levels()].iter().all(|&x| (x as usize) < cb.k) => {
+                            local.saw(f, &code);
+                            continue;
+                        }
+                        Some(cb) => return Err(Error::Schema(format!("bad value for {}: {v:?} (codes have {} levels below {}, and a tie)", field.name, cb.n_levels(), cb.k))),
+                        // Without the codebook, a code is taken as given.
+                        None if code[..code.len() - 1].iter().all(|&x| x < 256) && code.len() <= crate::sid::MAX_LEVELS + 1 => {
+                            local.saw(f, &code);
+                            continue;
+                        }
+                        None => return Err(Error::Schema(format!("bad value for {}: {v:?}", field.name))),
+                    }
+                }
+            };
+            let kept = live.iter().find(|(g, _)| *g == f).and_then(|(_, v)| crate::sid::code_of(v).filter(|c| c.len() == levels.len() + 1 && c[..levels.len()] == levels[..]));
+            let code = match kept {
+                Some(c) => c,
+                None => {
+                    let p = crate::sid::pack(&levels);
+                    let tie = self.committed_tie(t, f, p)?.max(local.get(f, p));
+                    levels.iter().copied().chain([tie]).collect()
+                }
+            };
+            local.saw(f, &code);
+            doc[f] = crate::sid::value(&code[..code.len() - 1], code[code.len() - 1]);
+        }
+        Ok(())
+    }
+
+    /// The next tie of semantic-ID field `f` of table `t` under prefix `p`
+    /// that committed writes leave, counting the table's ties first if no
+    /// write has needed them since it opened. Under the writer lock, which
+    /// keeps its segments and memtable as they are.
+    fn committed_tie(&self, t: &TableRef, f: usize, p: u32) -> Result<u32> {
+        let (files, chunks) = {
+            let st = lock(&self.state);
+            let table = &st.tables[t.pos];
+            if let Some(ties) = &table.ties {
+                return Ok(ties.get(f, p));
+            }
+            (table.handles.iter().map(|h| h.file.clone()).collect::<Vec<_>>(), table.mem.chunks.clone())
+        };
+        let mut ties = Ties::default();
+        for file in &files {
+            ties.scan(&t.schema, file)?;
+        }
+        // Deleted memtable rows too: their numbers are not given again.
+        for doc in chunks.iter().flat_map(|c| c.iter()) {
+            ties.saw_doc(&t.schema, doc);
+        }
+        let next = ties.get(f, p);
+        lock(&self.state).tables[t.pos].ties = Some(ties);
+        Ok(next)
+    }
+
     /// INT field `f` of the live document of table `t` with primary key
     /// `key`: the value written in place if any, else the document's.
     fn live_int(&self, t: &TableRef, key: &Value, f: usize) -> Result<Option<i64>> {
         Ok(self.live_value(t, key, f)?.as_i64())
     }
 
-    /// Numeric field `f` of the live document of table `t` with primary
-    /// key `key` (NULL without one): the value written in place if any,
-    /// else the document's.
+    /// Field `f` of the live document of table `t` with primary key `key`
+    /// (NULL without one): a number's value written in place if any, else
+    /// the document's (a field not numeric must be stored).
     fn live_value(&self, t: &TableRef, key: &Value, f: usize) -> Result<Value> {
         let st = lock(&self.state);
         let (h, d) = match st.find_live(t.pos, key) {
@@ -2895,7 +3079,7 @@ impl Database {
         }
         drop(st);
         let field = &t.schema.fields[f];
-        Ok(if field.indexed {
+        Ok(if field.indexed && matches!(field.ty, FieldType::Int | FieldType::Float) {
             crate::forward::NumericColumn::open(&h.file, &field.name)?.get(d)
         } else {
             crate::forward::DocStore::open(&h.file, &t.schema)?.get_fields(d, &[f]).pop().unwrap_or(Value::Null)
@@ -2996,6 +3180,8 @@ pub struct WriteTxn<'a> {
     ops: Vec<(u32, Op)>,
     /// What the transaction did to each table it wrote, by table id.
     keys: Vec<(u32, TxnKeys)>,
+    /// The semantic-ID ties the transaction gave, by table id.
+    ties: Vec<(u32, Ties)>,
 }
 
 /// What a transaction did to one table's keys.
@@ -3171,6 +3357,7 @@ impl<'a> WriteTxn<'a> {
 
     fn insert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
         conform(&t.schema, &mut doc)?;
+        self.fill_sids(t, &mut doc, false)?;
         if let Some(pk) = t.schema.primary_key {
             let key = Key::of(&doc[pk]).expect("validated key");
             if self.is_live(t, &key, &doc[pk]) {
@@ -3190,6 +3377,7 @@ impl<'a> WriteTxn<'a> {
     fn upsert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
         conform(&t.schema, &mut doc)?;
         let pk = t.primary_key()?;
+        self.fill_sids(t, &mut doc, true)?;
         self.delete_in(t, &doc[pk].clone())?;
         let key = Key::of(&doc[pk]).expect("validated key");
         let doc = Arc::new(doc);
@@ -3354,6 +3542,37 @@ impl<'a> WriteTxn<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Fills the semantic-ID fields `doc` leaves out ([`crate::sid`]); an
+    /// upsert keeps the code of the row it replaces when the new vector has
+    /// the same levels.
+    fn fill_sids(&mut self, t: &TableRef, doc: &mut Document, upsert: bool) -> Result<()> {
+        let fields = crate::sid::fields(&t.schema);
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let mut live = Vec::new();
+        if let (true, Some(pk)) = (upsert, t.schema.primary_key) {
+            let key = Key::of(&doc[pk]).expect("validated key");
+            for &(f, _) in &fields {
+                let k = self.keys(t.id);
+                let v = match (k.touched.get(&key), k.written.get(&key)) {
+                    (Some(true), Some(d)) => d[f].clone(),
+                    (Some(false), _) => Value::Null,
+                    _ => self.db.live_value(t, &doc[pk], f)?,
+                };
+                live.push((f, v));
+            }
+        }
+        let i = match self.ties.iter().position(|(id, _)| *id == t.id) {
+            Some(i) => i,
+            None => {
+                self.ties.push((t.id, Ties::default()));
+                self.ties.len() - 1
+            }
+        };
+        self.db.fill_sids(t, doc, &mut self.ties[i].1, &live)
     }
 
     fn keys(&mut self, table: u32) -> &mut TxnKeys {

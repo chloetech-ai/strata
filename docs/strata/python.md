@@ -82,7 +82,7 @@ Rows are dicts of field name to value: `str`, `int`, `float`, `None`, `bool` for
 
 `insert`, `upsert`, `delete` and `import_file` write the database's first table, the one `schema` describes, or the one `table=` names (`db.insert(rows, table="events")`); `sql` names the table it writes, and `tables()` lists every table's schema. Through a coordinator, `delete` on a table placed by a column takes that column's value as `routing=` ([tables on shards](server.md#tables-on-shards)). A key a row leaves out gets its field's `default`, and a field with `not_null` refuses a row without a value ([schema options](server.md#schemas)); a `timestamp` defaulting to `"now"` takes one time for all the rows of a call.
 
-Vectors of embedded fields that a row leaves out are computed by the field's model when it is open; `db.embed_errors` lists the embedded fields whose model did not open, whose vectors rows must then bring.
+Vectors of embedded fields that a row leaves out are computed by the field's model when it is open; `db.embed_errors` lists the embedded fields whose model did not open, whose vectors rows must then bring, and the [semantic-ID fields](#semantic-id-codebooks) whose codebook did not open.
 
 ## Querying
 
@@ -159,6 +159,29 @@ db.table().order_by(rrf(bm25("title", text), similarity("emb", db.embed(text))))
 | `.alias(name)`, `.asc()`, `.desc(nulls_first=False)` | a column's name; an `order_by` direction |
 
 `select(...)` names the columns (without it, the stored fields but vectors, as `SELECT *`), `where(...)` keeps rows, `order_by(...)` ranks by a score best first or orders by fields ascending, `rerank(expr, count)` ranks its top `count` rows again ([rerank phases](query-language.md#rerank-phases)), `group_by(...)` and `having(...)` group, and `limit(n)` and `offset(n)` page. A query is a [plan](query-language.md#explain), the same JSON that `plan(sql)` gives: `q.plan()` shows it, and a `Client` runs it on a server the same way.
+
+## Semantic-ID codebooks
+
+A [semantic-ID field](server.md#semantic-ids) gives each row a code from its vector by a codebook, which `strata.train.codebook` trains and saves in the models directory before a table names it:
+
+```python
+h = strata.train.codebook(db, "items-rq", field="emb")       # a table's vectors
+h = strata.train.codebook(vectors, "items-rq")               # a list of lists, or a 2-D numpy array
+
+items = strata.open("items.strata", schema={
+    "table": "items", "key": "id",
+    "fields": [
+        {"name": "id", "type": "keyword"},
+        {"name": "emb", "type": "vector", "dim": 384},
+        {"name": "sid", "type": "keyword", "multi": True,
+         "semantic_id": {"from": "emb", "codebook": "items-rq"}},
+    ],
+})
+items.upsert(rows)                                            # each row gets its sid
+items.query("SELECT id FROM items WHERE sid = '12.7'")
+```
+
+It returns the SHA-256 of the file, which the table records. The options are `levels` (1 to 4, default 3), `k` centroids a level (up to 256), `iterations` of k-means a level (25), `sample`, the vectors it trains on (100 a centroid by default, drawn at random), `seed` (the same vectors and options give the same codebook), `table` (a database's first by default) and `models` (the default models directory, as for `Database.create`). Pass the same `models=` to `Database.create` and `Database.open`: a codebook that does not open is listed in `db.embed_errors`, and writes that need a code then fail.
 
 ## A server from Python
 
