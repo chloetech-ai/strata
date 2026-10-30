@@ -16,6 +16,7 @@ use std::sync::{Arc, RwLock};
 use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
+use crate::media::Resolver;
 use crate::query::agg::Part;
 use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentReaders};
 use crate::query::ir::eval::{self, Ref};
@@ -90,6 +91,8 @@ pub struct Db {
     /// Where [`Db::open_embedders`] found models, for the tables created
     /// after it.
     models: RwLock<Option<PathBuf>>,
+    /// How writes resolve MEDIA values ([`Db::set_media_resolver`]).
+    media: RwLock<Arc<Resolver>>,
 }
 
 /// The model of an embedded VECTOR field, and the field it was set for: it
@@ -130,7 +133,14 @@ impl Db {
     }
 
     fn wrap(storage: Database) -> Db {
-        Db { storage: Arc::new(storage), readers: RwLock::new(HashMap::new()), exec: ExecOptions::default(), embedders: RwLock::new(Vec::new()), models: RwLock::new(None) }
+        Db {
+            storage: Arc::new(storage),
+            readers: RwLock::new(HashMap::new()),
+            exec: ExecOptions::default(),
+            embedders: RwLock::new(Vec::new()),
+            models: RwLock::new(None),
+            media: RwLock::new(Arc::new(Resolver::default())),
+        }
     }
 
     pub fn storage(&self) -> &Database {
@@ -222,8 +232,9 @@ impl Db {
     pub fn try_load_into(&self, table: &str, docs: impl IntoIterator<Item = Result<Document>>) -> Result<()> {
         let schema = self.table(table)?;
         let models = self.models_of(&schema);
+        let media = self.media_resolver();
         let mut docs = docs.into_iter();
-        if models.iter().all(Option::is_none) {
+        if models.iter().all(Option::is_none) && !schema.fields.iter().any(|f| f.media.is_some()) {
             return self.storage.try_bulk_load_into(table, docs.map(move |d| {
                 d.map(|mut d| {
                     schema.fill_generated(&mut d);
@@ -231,7 +242,8 @@ impl Db {
                 })
             }));
         }
-        // Embedded in batches, so that a model sees many texts at once.
+        // Resolved and embedded in batches, so that fetches run together
+        // and a model sees many texts at once.
         let mut ready: std::vec::IntoIter<Result<Document>> = Vec::new().into_iter();
         self.storage.try_bulk_load_into(
             table,
@@ -253,6 +265,9 @@ impl Db {
                     return None;
                 }
                 batch.iter_mut().for_each(|d| schema.fill_generated(d));
+                if let Err(e) = resolve_media(&media, &schema, &mut batch) {
+                    return Some(Err(e));
+                }
                 embed_with(&models, &schema, &mut batch);
                 ready = batch.into_iter().map(Ok).collect::<Vec<_>>().into_iter();
             }),
@@ -319,7 +334,7 @@ impl Db {
                     (FieldType::Vector { dim: a, .. }, FieldType::Vector { dim: b, .. }) => a == b && f.embed == g.embed,
                     // Codes of another codebook are derived anew.
                     _ if f.semantic_id.is_some() || g.semantic_id.is_some() => f.semantic_id == g.semantic_id,
-                    (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b) && f.multi == g.multi,
+                    (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b) && f.multi == g.multi && f.media == g.media,
                 };
                 keep.then_some(j)
             })
@@ -496,6 +511,41 @@ impl Db {
         Ok(())
     }
 
+    /// Does for documents of the table named `table` the work a write does
+    /// before the writer, so that the rows it logs hold every value: their
+    /// MEDIA values are resolved ([`Db::resolve_media_in`]), then the
+    /// embedded vectors they leave out computed ([`Db::embed_missing_in`]).
+    /// Generated fields must be filled in first. [`Db::load`] and SQL
+    /// writes do this themselves.
+    pub fn fill_in(&self, table: &str, docs: &mut [Document]) -> Result<()> {
+        self.resolve_media_in(table, docs)?;
+        self.embed_missing_in(table, docs)
+    }
+
+    /// Sets how writes through this `Db` resolve the MEDIA values they give
+    /// ([`crate::media::Resolver`]: the sources it may fetch, its size cap
+    /// and its media store). The default fetches nothing and keeps
+    /// nothing: it takes complete values, and bytes given with a URI.
+    pub fn set_media_resolver(&self, r: Resolver) {
+        *self.media.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(r);
+    }
+
+    /// How writes resolve MEDIA values ([`Db::set_media_resolver`]).
+    pub fn media_resolver(&self) -> Arc<Resolver> {
+        self.media.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Turns the MEDIA values of documents of the table named `table`, as
+    /// writes give them ([`crate::media::input_text`]), into the values
+    /// they store ([`crate::media::Resolver::resolve`]): files fetched,
+    /// hashed and described here rather than in the writer, so that the
+    /// rows a primary logs hold them and replicas never fetch. The first
+    /// value that fails fails them all.
+    pub fn resolve_media_in(&self, table: &str, docs: &mut [Document]) -> Result<()> {
+        let schema = self.table(table)?;
+        resolve_media(&self.media_resolver(), &schema, docs)
+    }
+
     pub fn query(&self, sql: &str, params: &Params) -> Result<ResultSet> {
         self.query_with(sql, params, &self.exec)
     }
@@ -573,7 +623,7 @@ impl Db {
         }
         let schema = self.table(plan.table())?;
         let write = plan.to_write(&schema)?;
-        Ok(self.prepare(schema, write))
+        self.prepare(schema, write)
     }
 
     /// Runs any statement, on any table: a SELECT returns its rows; an
@@ -643,7 +693,7 @@ impl Db {
             Command::Write { table, write } => {
                 let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
                 let write = Plan::of_write(schema, &write).to_write(schema)?;
-                self.write_prepared(&self.prepare(schema.clone(), write)).map(SqlResult::Written)
+                self.write_prepared(&self.prepare(schema.clone(), write)?).map(SqlResult::Written)
             }
         }
     }
@@ -683,15 +733,24 @@ impl Db {
         let Command::Write { table, write } = bind_command(sql, &tables, params)? else { return Ok(None) };
         let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
         let write = Plan::of_write(schema, &write).to_write(schema)?;
-        Ok(Some(self.prepare(schema.clone(), write)))
+        Ok(Some(self.prepare(schema.clone(), write)?))
     }
 
-    fn prepare(&self, schema: Arc<Schema>, mut write: Write) -> PreparedWrite {
-        if let Write::Insert { docs, .. } = &mut write {
-            docs.iter_mut().for_each(|d| schema.fill_generated(d));
+    fn prepare(&self, schema: Arc<Schema>, mut write: Write) -> Result<PreparedWrite> {
+        let media = self.media_resolver();
+        match &mut write {
+            Write::Insert { docs, conflict } => {
+                docs.iter_mut().for_each(|d| schema.fill_generated(d));
+                resolve_media(&media, &schema, docs)?;
+                if let Conflict::Update(sets) = conflict {
+                    resolve_sets(&media, &schema, sets)?;
+                }
+            }
+            Write::Update { sets, .. } => resolve_sets(&media, &schema, sets)?,
+            Write::Delete { .. } => {}
         }
         let known = self.embed_ahead(&schema, &write);
-        PreparedWrite { schema, write, known }
+        Ok(PreparedWrite { schema, write, known })
     }
 
     /// The vectors `write` will compute, from the latest version. The rows
@@ -925,6 +984,40 @@ const EMBED_BATCH: usize = 4096;
 /// Whether field `g` is a source of a generated field among `from`.
 fn generated_from_set(schema: &Schema, from: &[String], g: usize) -> bool {
     from.iter().filter_map(|s| schema.field(s)).any(|f| f.generated_from.iter().any(|x| schema.field_index(x) == Some(g)))
+}
+
+/// [`Db::resolve_media_in`] with resolver `r`, for documents of `schema`.
+fn resolve_media(r: &Resolver, schema: &Schema, docs: &mut [Document]) -> Result<()> {
+    for (f, field) in schema.fields.iter().enumerate() {
+        let Some(kind) = field.media else { continue };
+        let at: Vec<usize> = (0..docs.len()).filter(|&j| matches!(docs[j][f], Value::Str(_))).collect();
+        let resolved = {
+            let inputs: Vec<&str> = at.iter().filter_map(|&j| docs[j][f].as_str()).collect();
+            r.resolve_all(kind, &inputs)
+        };
+        for (j, m) in at.into_iter().zip(resolved) {
+            docs[j][f] = Value::Str(m.map_err(|e| media_error(&field.name, e))?.media.to_text());
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the MEDIA values an UPDATE's `SET` gives as constants.
+fn resolve_sets(r: &Resolver, schema: &Schema, sets: &mut [(usize, Assign)]) -> Result<()> {
+    for (f, a) in sets {
+        let (Some(kind), Assign::Value(Value::Str(t))) = (schema.fields[*f].media, &*a) else { continue };
+        let m = r.resolve(kind, t).map_err(|e| media_error(&schema.fields[*f].name, e))?;
+        *a = Assign::Value(Value::Str(m.media.to_text()));
+    }
+    Ok(())
+}
+
+fn media_error(field: &str, e: Error) -> Error {
+    match e {
+        Error::Schema(m) => Error::Schema(format!("field {field}: {m}")),
+        Error::Timeout(m) => Error::Timeout(format!("field {field}: {m}")),
+        e => e,
+    }
 }
 
 /// Computes the embedded vectors `docs` leave out (null) with `models`

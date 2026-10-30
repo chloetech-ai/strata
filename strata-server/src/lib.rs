@@ -9,6 +9,7 @@
 //! * [`agent`]: answers a question in words by letting a Claude model
 //!   query the table.
 //! * [`replication`]: a primary shipping its writes to its replicas.
+//! * [`media`]: fetching the files MEDIA fields name over HTTP(S).
 //! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves.
 
 pub mod agent;
@@ -19,6 +20,7 @@ pub mod grpc;
 pub mod http;
 pub mod idem;
 pub mod json;
+pub mod media;
 pub mod metrics;
 pub mod obs;
 pub mod plan_pb;
