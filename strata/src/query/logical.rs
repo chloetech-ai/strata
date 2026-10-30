@@ -524,6 +524,11 @@ pub enum Projection {
     /// `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`, `COUNT(f)`, `COUNT(DISTINCT
     /// f)`: of the whole result, or per group.
     Agg { func: AggFn, field: usize },
+    /// A ranking expression that scores each row by itself (`bm25(title,
+    /// :q)`, `ln(1 + rating)`; no set function, RRF or fusion): the value
+    /// the query's ranking gives it ([`crate::query::rank`]), NULL where the
+    /// row has none. `features()` stands for those of the query's ranking.
+    Feature(Score),
 }
 
 #[derive(Clone, Debug, PartialEq)]

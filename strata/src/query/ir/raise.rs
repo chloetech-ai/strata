@@ -175,7 +175,17 @@ impl<'a> Raise<'a> {
                                 Expr::Score => Projection::Score,
                                 Expr::Hops => Projection::Hops(self.hops_graph()?),
                                 Expr::SeqNo => Projection::SeqNo,
-                                e => return Err(err(format!("a column of a Search is a field, score(), hops() or seq_no(), not {e:?}"))),
+                                // A ranking expression (feature
+                                // RANK_FEATURES), which scores each row by
+                                // itself.
+                                e => match self.rank(e, true).map(Score::fused_shapes) {
+                                    Ok(s) if Rank::is_global(&s) => {
+                                        return Err(err(format!("a column of a Search scores each row by itself: minmax(), rank(), rrf() and weighted sums rank rows against each other, not {e:?}")))
+                                    }
+                                    Ok(s) => Projection::Feature(s),
+                                    Err(crate::error::Error::Query(x)) => return Err(err(format!("a column of a Search is a field, score(), hops(), seq_no() or a ranking expression: {x}"))),
+                                    Err(x) => return Err(x),
+                                },
                             },
                         ))
                     })
@@ -447,7 +457,7 @@ impl<'a> Raise<'a> {
                 Some(p)
             }
         };
-        self.graphs.push(GraphQuery {
+        let g = GraphQuery {
             field,
             seeds,
             kind,
@@ -457,7 +467,13 @@ impl<'a> Raise<'a> {
             max_nodes: g.max_nodes as usize,
             k: g.k as usize,
             min_sim: g.min_sim.unwrap_or(f64::NEG_INFINITY),
-        });
+        };
+        // The same computation named twice (in a column and the order)
+        // runs once, as SQL binds it.
+        if let Some(i) = self.graphs.iter().position(|x| *x == g) {
+            return Ok(i);
+        }
+        self.graphs.push(g);
         Ok(self.graphs.len() - 1)
     }
 

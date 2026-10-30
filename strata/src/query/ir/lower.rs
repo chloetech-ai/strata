@@ -63,7 +63,9 @@ impl Outputs {
     fn of(&mut self, p: &Projection) -> Expr {
         let agg = match p {
             Projection::Field(f) => return self.keys.iter().position(|k| k == f).map_or(Expr::Field(*f as u32), |i| Expr::Output(i as u32)),
-            Projection::Score => return Expr::Score,
+            // A ranking expression scores rows, not groups: binding and
+            // the executor refuse it here.
+            Projection::Score | Projection::Feature(_) => return Expr::Score,
             Projection::Hops(_) => return Expr::Hops,
             Projection::SeqNo => return Expr::SeqNo,
             Projection::Count => Agg { func: logical::AggFn::Count, arg: None },
@@ -152,6 +154,7 @@ impl Lower<'_> {
                         Projection::Field(f) => Expr::Field(*f as u32),
                         Projection::Hops(_) => Expr::Hops,
                         Projection::SeqNo => Expr::SeqNo,
+                        Projection::Feature(s) => self.score(s),
                         _ => Expr::Score,
                     },
                 })

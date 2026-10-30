@@ -12,7 +12,7 @@
 //! | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}` (a plan as `/v1/explain` gives it) | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/import?format=jsonl` | rows as JSON Lines, JSON, CSV or TSV | `{written, skipped_fields}` |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
-//! | `POST /v1/explain` | `{sql, params?}` | the bound query, its plan IR and the executor's plan |
+//! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
 //! | `POST /v1/embed` | `{text, field?}` | `{field, vector}`: the text's vector by an embedded field's model |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
@@ -381,8 +381,20 @@ async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         }
     };
     let (ir, tree) = (plan.to_json()?, json!(plan.explain(&[&app.svc.schema])));
+    // `hits`: the top rows with the values they were ranked by.
+    let hits = match body_u64(&b, "hits") {
+        0 => None,
+        n => {
+            let sql = strata::query::sql::with_features(sql)?;
+            let h = app.svc.query(QueryReq { sql, params: params.clone(), timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await?;
+            let j = js::result(&h.rs, h.took_ms);
+            let names = j["columns"].as_array().cloned().unwrap_or_default();
+            let rows = j["rows"].as_array().cloned().unwrap_or_default();
+            Some(rows.iter().take(n as usize).map(|r| names.iter().zip(r.as_array().into_iter().flatten()).map(|(c, v)| (c.as_str().unwrap_or("").to_string(), v.clone())).collect::<serde_json::Map<_, _>>()).collect::<Vec<_>>())
+        }
+    };
     let a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await?;
-    Ok(AxJson(json!({
+    let mut out = json!({
         "kind": a.kind,
         "logical": logical,
         "ir": ir,
@@ -392,7 +404,11 @@ async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         "scored": a.rs.stats.scored,
         "rows": a.rs.rows.len(),
         "took_ms": a.took_ms,
-    })))
+    });
+    if let Some(h) = hits {
+        out["hits"] = json!(h);
+    }
+    Ok(AxJson(out))
 }
 
 async fn synonyms(State(app): State<App>) -> AxJson<Json> {

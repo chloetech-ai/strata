@@ -434,10 +434,18 @@ impl<'a> Planner<'a> {
             o.expr = plain(&order.expr);
             steps.push((projection, o, r.limit_clause.clone()));
         }
+        // Each phase's ranking, first to last, for `features()`.
+        let orders: Vec<Expr> = match &first.order_by {
+            Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) if !es.is_empty() => {
+                std::iter::once(es[0].expr.clone()).chain(steps.iter().map(|(_, o, _)| o.expr.clone())).collect()
+            }
+            _ => return Ok(None),
+        };
         // Each step binds as the first `WITH` with its own columns, ranking
-        // and cut, so that its graphs and parameters line up.
+        // and cut, so that its graphs and parameters line up; the last with
+        // the rankings before it.
         let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind, Some(schema));
-        let bind = |projection: Option<Vec<SelectItem>>, order: Option<sql::OrderByExpr>, cut: Option<sql::LimitClause>| -> Option<Select> {
+        let bind = |projection: Option<Vec<SelectItem>>, order: Option<sql::OrderByExpr>, cut: Option<sql::LimitClause>, earlier: &[Expr]| -> Option<Select> {
             let mut q = first.as_ref().clone();
             let sql::SetExpr::Select(s) = q.body.as_mut() else { return None };
             if let Some(p) = projection {
@@ -447,7 +455,7 @@ impl<'a> Planner<'a> {
                 *es = vec![o];
             }
             q.limit_clause = cut;
-            super::sql::bind_query_with(&q, schema, self.params, &subs as &Subs).ok()
+            super::sql::bind_phase_with(&q, schema, self.params, &subs as &Subs, earlier).ok()
         };
         let keyed = |s: &Select| {
             s.group_by.is_empty()
@@ -457,7 +465,7 @@ impl<'a> Planner<'a> {
                     _ => false,
                 })
         };
-        let Some(base) = bind(None, None, first.limit_clause.clone()) else { return Ok(None) };
+        let Some(base) = bind(None, None, first.limit_clause.clone(), &[]) else { return Ok(None) };
         let mut count = match limits(&first.limit_clause, self.params) {
             Ok((0, Some(n))) if n > 0 && base.order.is_some() && base.tiebreak.is_none() && keyed(&base) => n,
             _ => return Ok(None),
@@ -466,7 +474,8 @@ impl<'a> Planner<'a> {
         let last = steps.len() - 1;
         let mut out = None;
         for (i, (projection, order, cut)) in steps.into_iter().enumerate() {
-            let Some(s) = bind(Some(projection), Some(order), cut.clone()) else { return Ok(None) };
+            let earlier = if i == last { &orders[..=i] } else { &[] };
+            let Some(s) = bind(Some(projection), Some(order), cut.clone(), earlier) else { return Ok(None) };
             let Some(OrderBy::Score { score, desc: true, nulls_first: false }) = s.order.clone() else { return Ok(None) };
             if s.tiebreak.is_some() || s.graphs != base.graphs || s.projection.iter().any(|(_, p)| *p == Projection::SeqNo) {
                 return Ok(None);
