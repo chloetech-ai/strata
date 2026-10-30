@@ -385,6 +385,7 @@ pub fn mark(plan: Plan, table: &str, r: &ProfileRef) -> Plan {
             | Node::Limit { input, .. }
             | Node::Project { input, .. }
             | Node::Distinct { input }
+            | Node::DistinctOn { input, .. }
             | Node::KeyOrder { input, .. } => on(input, table, r),
             Node::With { input, .. } => on(input, table, r),
             _ => {}

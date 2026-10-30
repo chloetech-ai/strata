@@ -34,6 +34,10 @@ from ._strata import StrataError
 
 VERSION = 1
 
+# Rows a scan whose groups `distinct_on` keeps reads at most (Strata's
+# `compound::MAX_ROWS`).
+_MAX_ROWS = 1_000_000
+
 __all__ = [
     "Query",
     "Expr",
@@ -817,6 +821,7 @@ class Query:
         self._phases: list[tuple[Expr, int]] = []
         self._limit: int | None = None
         self._offset = 0
+        self._distinct_on: list[Expr] = []
 
     def _copy(self, **kw: Any) -> Query:
         q = Query.__new__(Query)
@@ -864,6 +869,14 @@ class Query:
         """Groups the rows by the values of fields (each value of a
         multi-valued field its own group)."""
         return self._copy(group=[col(f) if isinstance(f, str) else _expr(f) for f in fields])
+
+    def distinct_on(self, *keys: str | Expr) -> Query:
+        """Keeps the first row of each group of rows with equal keys
+        (fields or expressions), in the query's order, as SQL's
+        `SELECT DISTINCT ON (...)`: `.distinct_on("video")` with
+        `.order_by(score)` gives each video's best row, the best videos
+        first, and `limit` counts groups."""
+        return self._copy(distinct_on=[col(k) if isinstance(k, str) else _expr(k) for k in keys])
 
     def having(self, *conditions: Expr) -> Query:
         """Keeps the groups every condition on their aggregates holds for."""
@@ -927,14 +940,43 @@ class Query:
                 node = {"node": "filter", "input": node, "cond": cond._ir(ctx)}
             if self._order:
                 node = {"node": "sort", "input": node, "keys": [k._ir(ctx) for k in self._order]}
+        features: list[str] = []
+        if self._distinct_on:
+            if grouped:
+                raise StrataError("distinct_on keeps rows of the table: not with group_by or aggregates")
+            # The scan's rows with the answer's columns and the fields of
+            # the keys, which are computed over them, the first row of each
+            # group kept in their order. A LIMIT reads the scan in growing
+            # slices; the executor's own cap is lifted.
+            n = len(columns)
+            fields: list[int] = []
+            for k in self._distinct_on:
+                for name in _cols(k):
+                    i = ctx.field(name)[0]
+                    if i not in fields:
+                        fields.append(i)
+            scan = {"node": "limit", "input": node, "limit": _MAX_ROWS + 1}
+            exprs = [c._ir(ctx) for c in columns] + [{"field": i} for i in fields]
+            leaf = {"node": "project", "input": scan, "columns": [{"name": f"#{i}", "expr": e} for i, e in enumerate(exprs)]}
+            ctx.outputs = {("field", f): n + j for j, f in enumerate(fields)}
+            node = {"node": "distinct_on", "input": leaf, "keys": [k._ir(ctx) for k in self._distinct_on]}
+            ctx.outputs = None
+            features = ["operators", "distinct_on"]
         if self._limit is not None or self._offset:
             node = {"node": "limit", "input": node}
             if self._offset:
                 node["offset"] = self._offset
             if self._limit is not None:
                 node["limit"] = self._limit
-        root = {"node": "project", "input": node, "columns": [{"name": c._name(), "expr": c._ir(ctx)} for c in columns]}
-        return {"version": VERSION, "root": root}
+        if features:
+            out = [{"name": c._name(), "expr": {"output": i}} for i, c in enumerate(columns)]
+        else:
+            out = [{"name": c._name(), "expr": c._ir(ctx)} for c in columns]
+        root = {"node": "project", "input": node, "columns": out}
+        plan: dict[str, Any] = {"version": VERSION, "root": root}
+        if features:
+            plan["features"] = features
+        return plan
 
     def _features(self, ctx: _Ctx) -> list[Expr]:
         """What `features()` stands for: the leaves of every ranking, then
@@ -991,6 +1033,18 @@ def _reads_every_row(ir: Any) -> bool:
 
 def _bare(e: Expr) -> Expr:
     return e.e if isinstance(e, _Alias) else e
+
+
+def _cols(e: Any) -> list[str]:
+    """The fields an expression names."""
+    if isinstance(e, _Col):
+        return [e.name]
+    out: list[str] = []
+    for v in getattr(e, "__dict__", {}).values():
+        for x in v if isinstance(v, list) else [v]:
+            if isinstance(x, Expr):
+                out += _cols(x)
+    return out
 
 
 def _aggs(e: Any) -> list[_Agg]:

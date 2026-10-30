@@ -73,6 +73,7 @@ fn name(n: &Node) -> &'static str {
         Node::With { .. } => "With",
         Node::Ref { .. } => "Ref",
         Node::Distinct { .. } => "Distinct",
+        Node::DistinctOn { .. } => "DistinctOn",
         Node::KeyOrder { .. } => "KeyOrder",
     }
 }

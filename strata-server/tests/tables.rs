@@ -131,7 +131,7 @@ async fn query(svc: &Arc<Service>, s: &str) -> Json {
 
 /// Queries of every table, and across them: those whose order is total
 /// (`true`) answer in the same order, the others with the same rows.
-const QUERIES: [(&str, bool); 11] = [
+const QUERIES: [(&str, bool); 15] = [
     ("SELECT item, action, ts FROM events WHERE usr = 'u3' ORDER BY ts DESC, id LIMIT 50", true),
     ("SELECT COUNT(*) FROM events", true),
     ("SELECT usr, COUNT(*) FROM events GROUP BY usr LIMIT 100", false),
@@ -143,6 +143,12 @@ const QUERIES: [(&str, bool); 11] = [
     ("SELECT u.country, COUNT(*) FROM events e JOIN users u ON e.usr = u.id WHERE e.action = 'buy' GROUP BY u.country", false),
     ("WITH h AS (SELECT item FROM events WHERE usr = 'u9' ORDER BY ts DESC LIMIT 30) SELECT id, cat FROM items WHERE id IN (SELECT item FROM h) AND cat <> 'c1' ORDER BY price LIMIT 30", true),
     ("SELECT id, score() FROM items WHERE MATCH(title, 'kettle') ORDER BY bm25(title, 'kettle') DESC LIMIT 10", true),
+    // The first row of each group: of a column that places rows, of one
+    // that does not, by a score, and over groups.
+    ("SELECT DISTINCT ON (usr) usr, id, ts FROM events ORDER BY ts DESC, id LIMIT 20", true),
+    ("SELECT DISTINCT ON (item) item, id, ts FROM events WHERE action = 'buy' ORDER BY ts DESC LIMIT 15", true),
+    ("SELECT DISTINCT ON (cat) id, cat, score() FROM items WHERE MATCH(title, 'kettle rope') ORDER BY bm25(title, 'kettle rope') DESC LIMIT 5", true),
+    ("SELECT DISTINCT ON (action) action, usr, COUNT(*) AS n FROM events GROUP BY action, usr ORDER BY action, n DESC, usr", true),
 ];
 
 /// The same rows: in the same order when `ordered`, but for rows tied on
