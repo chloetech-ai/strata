@@ -593,6 +593,8 @@ mod whisper {
     use candle_core::{Module, Result, Tensor, D};
     use candle_nn::{conv1d, embedding, layer_norm, linear, linear_no_bias, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, VarBuilder};
 
+    use crate::audio::gelu;
+
     /// What of `config.json` the model needs.
     #[derive(serde::Deserialize)]
     pub struct Config {
@@ -607,26 +609,6 @@ mod whisper {
         pub max_source_positions: usize,
         pub max_target_positions: usize,
         pub vocab_size: usize,
-    }
-
-    /// GELU (the exact one, of `erf`) of `x`, its rows split among the
-    /// cores: candle computes it on one.
-    fn gelu(x: &Tensor) -> Result<Tensor> {
-        let dims = x.dims().to_vec();
-        let width = *dims.last().expect("a tensor of rows");
-        let rows = x.elem_count() / width.max(1);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(rows).max(1);
-        if threads == 1 {
-            return x.gelu_erf();
-        }
-        let flat = x.reshape((rows, width))?;
-        let per = rows.div_ceil(threads);
-        let parts = std::thread::scope(|s| {
-            let flat = &flat;
-            let jobs: Vec<_> = (0..rows).step_by(per).map(|at| s.spawn(move || flat.narrow(0, at, per.min(rows - at))?.gelu_erf())).collect();
-            jobs.into_iter().map(|j| j.join().expect("a GELU thread")).collect::<Result<Vec<_>>>()
-        })?;
-        Tensor::cat(&parts, 0)?.reshape(dims)
     }
 
     struct Attention {

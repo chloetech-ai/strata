@@ -630,12 +630,13 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
     Ok(AxJson(json!({"schema": s, "short": s.to_short_json()})))
 }
 
-/// The vector of a text, or of an image file (`"image"`, base64), as
-/// `{"embed": ...}` gives a query's parameter: for a plan, whose vectors
-/// are values.
+/// The vector of a text, or of an image or sound file (`"image"` or
+/// `"audio"`, base64), as `{"embed": ...}` gives a query's parameter: for
+/// a plan, whose vectors are values.
 async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
-    let what = match b.get("image") {
-        Some(i) => json!({ "image": i.as_str().ok_or_else(|| ApiError::bad("image is an image file in base64"))? }),
+    let file = ["image", "audio"].into_iter().find_map(|k| b.get(k).map(|v| (k, v)));
+    let what = match file {
+        Some((k, v)) => json!({ k: v.as_str().ok_or_else(|| ApiError::bad(format!("{k} is a file in base64")))? }),
         None => json!(body_str(&b, "text")?),
     };
     let name = |k: &str| match b.get(k) {
