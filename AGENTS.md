@@ -1,8 +1,10 @@
-# Engram: instructions for coding agents
+# Strata and Engram: instructions for coding agents
 
-This file is for a coding agent (Claude Code or another) that was asked to set
-Engram up for its user, or to work on this repository. People should start
-with [README.md](README.md) and [the install guide](docs/engram/setup.md).
+This repository holds Strata, an embedded search database with SQL, and
+Engram, long-term memory for Claude Code built on it. This file is for a
+coding agent (Claude Code or another) that was asked to set Engram up for its
+user, or to work on this repository. People should start with
+[README.md](README.md) and [the install guide](docs/engram/setup.md).
 
 ## Set Engram up for the user's Claude Code
 

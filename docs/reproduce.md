@@ -186,7 +186,7 @@ target/release/engram-bench latency --data data/longmemeval_s.jsonl --sizes 1000
 target/release/engram-bench probes --transcript <session.jsonl> --probes probes/lost_probes.json --points 1952:4632,4633:5392
 ```
 
-**Record structure and answers** (`engram-structure`, `scripts/extract_facts.py`, `scripts/reader_eval.py`) and **Claude Code with and without Engram** call a model; see the [Engram README](https://github.com/rkonow/engram/blob/main/engram/README.md#evaluation) for the full commands. The A/B statistics alone need nothing but the committed runs:
+**Record structure and answers** (`engram-structure`, `scripts/extract_facts.py`, `scripts/reader_eval.py`) and **Claude Code with and without Engram** call a model; see the [Engram README](https://github.com/rkonow/strata/blob/main/engram/README.md#evaluation) for the full commands. The A/B statistics alone need nothing but the committed runs:
 
 ```sh
 python3 scripts/ab_stats.py stockroom=results/ab/stockroom/runs.jsonl slotwise=results/ab/slotwise/runs.jsonl --out /tmp/ab_stats.json

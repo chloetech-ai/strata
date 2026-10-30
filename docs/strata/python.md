@@ -15,7 +15,7 @@ The `strata` package runs a Strata database inside a Python process, the way `sq
 
 ## Install
 
-The package is in [`strata-py/`](https://github.com/rkonow/engram/tree/main/strata-py): a Rust extension built with [maturin](https://www.maturin.rs), for CPython 3.10 and later. It needs Rust (stable) and a C compiler.
+The package is in [`strata-py/`](https://github.com/rkonow/strata/tree/main/strata-py): a Rust extension built with [maturin](https://www.maturin.rs), for CPython 3.10 and later. It needs Rust (stable) and a C compiler.
 
 ```sh
 pip install ./strata-py                    # from the repository's root: builds and installs a wheel
