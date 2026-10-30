@@ -451,6 +451,11 @@ pub fn quoted(n: &str) -> String {
     format!("\"{}\"", n.replace('"', "\"\""))
 }
 
+/// Why `similarity` refuses a multi-vector field.
+pub(crate) fn multi_similarity(field: &str) -> String {
+    format!("{field} is a multi-vector field: rank it with maxsim({field}, vectors), the sum of each query vector's best match")
+}
+
 /// A value coerced to `field`'s type, in the form its column holds
 /// ([`crate::schema::Field::store`]).
 fn coerce(field: &Field, v: Value) -> Result<Value> {
@@ -504,6 +509,7 @@ pub(crate) fn assigned(field: &Field, v: Value) -> Result<Value> {
     };
     Ok(match (&field.ty, v) {
         (_, Value::Null) => Value::Null,
+        (FieldType::Vector { .. }, v) if field.multi => crate::vector::multi::normalize(field, v)?,
         (FieldType::Vector { .. }, v @ Value::Vector(_)) => v,
         (_, Value::Str(t)) if field.media.is_some() => media_input(field, t)?,
         (_, v) if field.media.is_some() => return Err(err(format!("{} is a MEDIA field: SET gives it a URI or a JSON object's text, not {v:?}", field.name))),
@@ -843,6 +849,9 @@ impl<'a> Binder<'a> {
         }
         if vector && name == "ppr" {
             return Err(err("ppr() needs an EDGES field"));
+        }
+        if vector && self.schema.fields[field].multi {
+            return Err(err(format!("{name}() follows one vector per row: {} is a multi-vector field", self.schema.fields[field].name)));
         }
         let seeds = self.seeds(args[1])?;
         let mut opts = Opts::new();
@@ -1462,6 +1471,9 @@ impl<'a> Binder<'a> {
             return Ok(Score::Sparse { field, terms, opts: without_norm(opts) });
         }
         let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
+        if self.schema.fields[field].multi {
+            return Err(err(multi_similarity(&self.schema.fields[field].name)));
+        }
         let vector = self.vector(v)?;
         if vector.len() != dim {
             return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
@@ -1476,8 +1488,10 @@ impl<'a> Binder<'a> {
         let [field, vs] = args else { return Err(err("maxsim(field, vectors)")) };
         let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. }), "VECTOR")?;
         let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!("a VECTOR field") };
-        if let Some(v) = opts.get("max_vectors") {
-            v.as_f64().filter(|x| *x >= 1.0 && x.fract() == 0.0).ok_or_else(|| err("max_vectors => a whole number, at least 1"))?;
+        for k in ["max_vectors", "depth", "candidates"] {
+            if let Some(v) = opts.get(k) {
+                v.as_f64().filter(|x| *x >= 1.0 && x.fract() == 0.0).ok_or_else(|| err(format!("{k} => a whole number, at least 1")))?;
+            }
         }
         if let Some(q) = subquery_of(vs) {
             return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(self.sub(q, Sub::Vectors)?)), opts: without_norm(opts) });
@@ -1884,6 +1898,18 @@ impl<'a> Binder<'a> {
         }
         if let Expr::Array(a) = e {
             return match &field.ty {
+                // ARRAY[ARRAY[...], ...], or ARRAY[:v1, :v2] of vector parameters.
+                FieldType::Vector { .. } if field.multi => {
+                    let rows = a
+                        .elem
+                        .iter()
+                        .map(|x| match x {
+                            Expr::Array(r) => Ok(Value::Vector(r.elem.iter().map(|x| self.num_lit(x).map(|v| v as f32)).collect::<Result<Vec<f32>>>()?.into())),
+                            x => Ok(Value::Vector(self.vector(x)?)),
+                        })
+                        .collect::<Result<Vec<Value>>>()?;
+                    Ok(crate::vector::multi::normalize(field, Value::List(rows))?)
+                }
                 FieldType::Vector { .. } => {
                     let xs: Vec<f32> = a.elem.iter().map(|x| self.num_lit(x).map(|v| v as f32)).collect::<Result<_>>()?;
                     Ok(Value::Vector(xs.into()))
@@ -1895,6 +1921,7 @@ impl<'a> Binder<'a> {
         let v = self.literal(e)?;
         Ok(match (&field.ty, v) {
             (_, Value::Null) => Value::Null,
+            (FieldType::Vector { .. }, v) if field.multi => crate::vector::multi::normalize(field, v)?,
             (FieldType::Vector { .. }, _) => Value::Vector(self.vector(e)?),
             (_, Value::Str(t)) if field.media.is_some() => media_input(field, t)?,
             (_, v) if field.media.is_some() => return Err(err(format!("{} is a MEDIA field: give it a URI or a JSON object's text, not {v:?}", field.name))),

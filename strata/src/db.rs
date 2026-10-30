@@ -1690,8 +1690,9 @@ impl DocumentSource for StoredSource {
                 None => vec![Value::Null; schema.fields.len()],
             };
             for (i, v) in &vectors {
-                if v.has_vector(d) {
-                    doc[*i] = Value::Vector(v.vector(d).into());
+                match v.row_value(d) {
+                    Value::Null => {}
+                    x => doc[*i] = x,
                 }
             }
             for (i, c) in &numeric {

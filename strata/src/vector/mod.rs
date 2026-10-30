@@ -14,7 +14,9 @@
 //!
 //! plus the sections of its index: IVF (`ivf_centroids`, `ivf_dir`, `ivf`) or
 //! HNSW (`hnsw`, `hnsw_upper`); see [`ivf`] and [`hnsw`] for the layouts.
-//! [`VectorReader`] views all of them in place.
+//! [`VectorReader`] views all of them in place. A multi-vector field
+//! (`VECTOR(d)[]`) has the same sections over its vectors rather than its
+//! rows, and maps between the two ([`multi`]).
 //!
 //! **Search** scores SQ8 codes with an int8-quantised query (AVX-512 VNNI or
 //! NEON `usdot`), keeps the best `rerank` candidates and re-ranks them with
@@ -40,6 +42,7 @@ pub mod codes;
 pub mod cost;
 pub mod exact;
 pub mod kernels;
+pub mod multi;
 pub mod sq8;
 
 mod build;
@@ -51,8 +54,11 @@ mod topk;
 use crate::postings::bytes::{ByteReader, Slice};
 use serde::{Deserialize, Serialize};
 
+use std::sync::Arc;
+
 use crate::error::{corrupt, Result};
 use crate::schema::{Field, VectorCodes};
+use crate::value::Value;
 use crate::segment::build::BuildOptions;
 use crate::segment::{DocFilter, DocId, FieldIndexBuilder, SegmentFile};
 
@@ -108,10 +114,33 @@ pub struct VectorInfo {
     pub ef_construction: Option<usize>,
     pub entry: Option<u32>,
     pub max_level: Option<usize>,
+    /// A multi-vector field's rows; `n` then counts its vectors
+    /// ([`multi`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<usize>,
+    /// Whether section `f32` holds the float32 vectors: always for a
+    /// one-vector field, with `keep_f32` for a multi-vector one.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub f32: bool,
 }
 
 fn is_sq8(c: &VectorCodes) -> bool {
     *c == VectorCodes::Sq8
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+/// A query prepared for exact scores: float32, or the SQ8 codes that stand
+/// for vectors a multi-vector field does not keep in float32.
+pub enum ExactQuery {
+    F32(Vec<f32>),
+    Sq8(sq8::Sq8Query),
 }
 
 /// One search result.
@@ -272,6 +301,10 @@ pub struct VectorReader {
     vectors: Slice<f32>,
     codes: Slice<u8>,
     quant: Quantiser,
+    /// SQ8 codes and ranges of exact scores without float32 vectors (the
+    /// search codes when they are SQ8).
+    rescore: Option<(Slice<u8>, Sq8)>,
+    multi: Option<multi::Rows>,
     present: Option<Slice<u64>>,
     ivf: Option<IvfView>,
     hnsw: Option<HnswView>,
@@ -285,16 +318,17 @@ impl VectorReader {
     pub fn open(seg: &SegmentFile, field: &str) -> Result<Self> {
         let info: VectorInfo = serde_json::from_slice(&seg.require(&section(field, "meta"))?).map_err(corrupt)?;
         let (n, dim) = (info.n, info.dim);
-        if (info.stride_f32, info.stride_u8) != (build::strides(dim).0, info.codes.stride(dim)) || n != seg.n_docs() {
+        let rows = info.rows.unwrap_or(n);
+        if (info.stride_f32, info.stride_u8) != (build::strides(dim).0, info.codes.stride(dim)) || rows != seg.n_docs() || (info.rows.is_none() && !info.f32) {
             return Err(corrupt(format!("vector field {field}: header does not match the segment")));
         }
         let (codes_part, params_part) = match info.codes {
             VectorCodes::Sq8 => ("sq8", "sq8p"),
             VectorCodes::Binary => ("bin", "binp"),
         };
-        let vectors: Slice<f32> = Slice::view(seg.require(&section(field, "f32"))?).map_err(corrupt)?;
+        let vectors: Slice<f32> = if info.f32 { Slice::view(seg.require(&section(field, "f32"))?).map_err(corrupt)? } else { Slice::Owned(Vec::new()) };
         let codes: Slice<u8> = Slice::view(seg.require(&section(field, codes_part))?).map_err(corrupt)?;
-        if vectors.len() != n * info.stride_f32 || codes.len() != n * info.stride_u8 {
+        if (info.f32 && vectors.len() != n * info.stride_f32) || codes.len() != n * info.stride_u8 {
             return Err(corrupt(format!("vector field {field}: sections have the wrong size")));
         }
         let mut r = ByteReader::new(seg.require(&section(field, params_part))?);
@@ -305,6 +339,20 @@ impl VectorReader {
         let quant = match info.codes {
             VectorCodes::Sq8 => Quantiser::Sq8(Sq8 { min: a, scale: b }),
             VectorCodes::Binary => Quantiser::Bits(Bits { mean: a, spread: b }),
+        };
+        let multi = info.rows.map(|r| multi::Rows::open(seg, field, r, n)).transpose()?;
+        let rescore = match (&quant, info.f32) {
+            (_, true) => None,
+            (Quantiser::Sq8(sq), false) => Some((codes.clone(), sq.clone())),
+            (Quantiser::Bits(_), false) => {
+                let c: Slice<u8> = Slice::view(seg.require(&section(field, "rescore"))?).map_err(corrupt)?;
+                let mut r = ByteReader::new(seg.require(&section(field, "rescorep"))?);
+                let (min, scale): (Slice<f32>, Slice<f32>) = (r.array().map_err(corrupt)?, r.array().map_err(corrupt)?);
+                if c.len() != n * build::strides(dim).1 || min.len() != dim || scale.len() != dim {
+                    return Err(corrupt(format!("vector field {field}: bad rescoring codes")));
+                }
+                Some((c, Sq8 { min, scale }))
+            }
         };
         let present = match seg.section(&section(field, "present"))? {
             Some(b) => {
@@ -337,7 +385,7 @@ impl VectorReader {
             other => return Err(corrupt(format!("unknown vector index {other}"))),
         }
         let shape = IndexShape { n: n - info.missing, kind: info.index.clone(), nlist: info.nlist.unwrap_or(1), hnsw_m: info.m.unwrap_or(16) };
-        Ok(VectorReader { info, vectors, codes, quant, present, ivf, hnsw, shape, cost: CostModel::default(), io_hints: false, hnsw_filter: HnswFilterMode::Traverse })
+        Ok(VectorReader { info, vectors, codes, quant, rescore, multi, present, ivf, hnsw, shape, cost: CostModel::default(), io_hints: false, hnsw_filter: HnswFilterMode::Traverse })
     }
 
     pub fn dim(&self) -> usize {
@@ -393,6 +441,68 @@ impl VectorReader {
         self.present.as_ref().is_none_or(|p| p[doc as usize / 64] >> (doc % 64) & 1 == 1)
     }
 
+    /// A multi-vector field's rows, by vector and vector by row.
+    pub fn rows(&self) -> Option<&multi::Rows> {
+        self.multi.as_ref()
+    }
+
+    /// Whether the float32 vectors are kept ([`VectorInfo::f32`]).
+    pub fn has_f32(&self) -> bool {
+        self.info.f32
+    }
+
+    /// `query` prepared for [`VectorReader::exact_score`].
+    pub fn prepare_exact(&self, query: &[f32]) -> ExactQuery {
+        match &self.rescore {
+            None => ExactQuery::F32(query.to_vec()),
+            Some((_, sq)) => ExactQuery::Sq8(sq.prepare(query, build::strides(self.info.dim).1)),
+        }
+    }
+
+    /// The dot product of vector `v` with a prepared query: exact in
+    /// float32, or of the SQ8 codes that stand for it.
+    #[inline]
+    pub fn exact_score(&self, q: &ExactQuery, v: DocId) -> f32 {
+        match (q, &self.rescore) {
+            (ExactQuery::F32(q), _) => dot_f32(self.vector(v), q),
+            (ExactQuery::Sq8(q), Some((codes, _))) => {
+                let s = build::strides(self.info.dim).1;
+                q.score(q.dot(&codes[v as usize * s..(v as usize + 1) * s]))
+            }
+            (ExactQuery::Sq8(_), None) => unreachable!("prepared by this reader"),
+        }
+    }
+
+    /// Vector `v` as stored: float32, or its SQ8 codes' values.
+    pub fn vector_value(&self, v: DocId) -> Arc<[f32]> {
+        match &self.rescore {
+            None => self.vector(v).into(),
+            Some((codes, sq)) => {
+                let s = build::strides(self.info.dim).1;
+                let mut out = vec![0f32; self.info.dim];
+                sq.decode(&codes[v as usize * s..(v as usize + 1) * s], &mut out);
+                out.into()
+            }
+        }
+    }
+
+    /// Row `d`'s value: its vector, a multi-vector field's list of vectors,
+    /// or NULL.
+    pub fn row_value(&self, d: DocId) -> Value {
+        match &self.multi {
+            Some(rows) => {
+                let vs = rows.vectors(d);
+                if vs.is_empty() {
+                    Value::Null
+                } else {
+                    Value::List(vs.map(|v| Value::Vector(self.vector_value(v))).collect())
+                }
+            }
+            None if self.has_vector(d) => Value::Vector(self.vector(d).into()),
+            None => Value::Null,
+        }
+    }
+
     /// The stored vector of `doc` (zeros if it has none).
     pub fn vector(&self, doc: DocId) -> &[f32] {
         let s = self.info.stride_f32;
@@ -430,8 +540,9 @@ impl VectorReader {
 
     /// True when every array is a view of the segment's bytes (no copies).
     pub fn is_zero_copy(&self) -> bool {
-        matches!(self.vectors, Slice::Shared { .. })
+        (matches!(self.vectors, Slice::Shared { .. }) || !self.info.f32)
             && matches!(self.codes, Slice::Shared { .. })
+            && self.multi.as_ref().is_none_or(|m| m.is_shared())
             && match &self.quant {
                 Quantiser::Sq8(s) => matches!(s.min, Slice::Shared { .. }),
                 Quantiser::Bits(b) => matches!(b.mean, Slice::Shared { .. }),
@@ -514,9 +625,10 @@ impl VectorReader {
     /// Exact top-`k` by float32 over every document with a vector (or the
     /// filter's members): the reference for recall.
     pub fn exact(&self, query: &[f32], k: usize, filter: Option<&dyn DocFilter>) -> Vec<Hit> {
+        let q = self.prepare_exact(query);
         let mut all: Vec<Hit> = (0..self.n_docs())
             .filter(|&d| self.has_vector(d) && filter.is_none_or(|f| f.contains(d)))
-            .map(|d| Hit { doc: d, score: self.similarity(d, query) })
+            .map(|d| Hit { doc: d, score: self.exact_score(&q, d) })
             .collect();
         sort_hits(&mut all);
         all.truncate(k);
@@ -633,6 +745,15 @@ impl VectorReader {
     /// Float32 scores of the candidates (best code score first), best `k`
     /// kept.
     fn rerank(&self, query: &[f32], cands: &[(i32, DocId)], k: usize, stats: &mut SearchStats) -> Vec<Hit> {
+        if !self.info.f32 {
+            // A multi-vector field's SQ8 codes stand for its vectors.
+            let q = self.prepare_exact(query);
+            let mut hits: Vec<Hit> = cands.iter().map(|&(_, d)| Hit { doc: d, score: self.exact_score(&q, d) }).collect();
+            stats.f32_distances += hits.len();
+            sort_hits(&mut hits);
+            hits.truncate(k);
+            return hits;
+        }
         let row_bytes = self.info.stride_f32 * 4;
         if self.io_hints {
             io::will_need(&mut cands.iter().map(|&(_, d)| (self.vector(d).as_ptr() as usize, row_bytes)).collect::<Vec<_>>());
