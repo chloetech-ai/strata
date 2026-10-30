@@ -13,12 +13,13 @@ use serde_json::{json, Value as Json};
 use strata::db::Db;
 use strata::query::Params;
 use strata::storage::{CheckpointOptions, Database, DbOptions, Layout, LogRead};
+use strata::{Field, FieldType, Schema};
 use strata::value::Value;
 use strata_server::auth::Access;
 use strata_server::coord::Coordinator;
-use strata_server::replication::{self, Acks, Follow, Primary, PrimaryOptions};
+use strata_server::replication::{self, Acks, Digests, Follow, Primary, PrimaryOptions};
 use strata_server::service::{shard_of, After, AgentConfig, Backend, QueryReq, Replication, Service, SqlAnswer};
-use strata_server::{demo, pb, server};
+use strata_server::{demo, pb, server, slots};
 use tokio::net::TcpListener;
 
 const N: usize = 300;
@@ -948,6 +949,234 @@ fn written_all(a: SqlAnswer) -> strata_server::service::Written {
     }
 }
 
+/// Sets INT `field` of the row with key `key` in a transaction of its own.
+fn set_on(db: &Db, key: &str, field: &str, v: i64) {
+    let mut tx = db.storage().begin().unwrap();
+    assert!(tx.set(&Value::Str(key.into()), field, Value::Int(v)).unwrap());
+    tx.commit_seq().unwrap();
+}
+
+fn slot_of(key: &str) -> usize {
+    slots::slot(&Value::Str(key.into()))
+}
+
+/// The digests of `db`'s latest version.
+fn digests(db: &Db) -> Digests {
+    Digests::of(&db.snapshot()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn digests_cover_each_rows_table_key_and_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let keyed = |name: &str| Schema::new(name, vec![Field::new("id", FieldType::Keyword)], Some("id")).unwrap();
+    let keyless = Schema::new("log", vec![Field::new("line", FieldType::Keyword)], None).unwrap();
+    let dbs: Vec<Arc<Db>> = ["a", "b"]
+        .iter()
+        .map(|name| {
+            let db = create(dir.path(), &format!("{name}.strata"));
+            for s in [keyed("x"), keyed("y"), keyless.clone()] {
+                db.create_table(s).unwrap();
+            }
+            db
+        })
+        .collect();
+    let (a, b) = (&dbs[0], &dbs[1]);
+    let d = digests(a);
+    assert_eq!(d, digests(b), "the same rows");
+    assert_eq!((d.rows.len(), d.sums.len(), d.rows.iter().sum::<u64>()), (slots::SLOTS, slots::SLOTS, N as u64));
+    let mut slots_of: Vec<usize> = (0..N).map(|i| slot_of(&format!("p{i:07}"))).collect();
+    slots_of.sort();
+    slots_of.dedup();
+    assert_eq!(d.rows.iter().enumerate().filter(|(_, &n)| n > 0).map(|(i, _)| i).collect::<Vec<_>>(), slots_of, "each row in its key's slot");
+
+    // The same writes in another order: the rows differ in their numbers.
+    set_on(a, "p0000001", "sold", 5);
+    set_on(a, "p0000002", "sold", 6);
+    set_on(b, "p0000002", "sold", 6);
+    set_on(b, "p0000001", "sold", 5);
+    let mut want = vec![slot_of("p0000001"), slot_of("p0000002")];
+    want.sort();
+    want.dedup();
+    assert_eq!(digests(a).differ(&digests(b)), want);
+    // The same numbers with other values: the digests do not see values.
+    set_on(a, "p0000001", "sold", 7);
+    set_on(b, "p0000001", "sold", 8);
+    set_on(a, "p0000002", "sold", 7);
+    set_on(b, "p0000002", "sold", 8);
+    assert_eq!(digests(a), digests(b), "the last write of each row has the same number");
+    // A row missing, a row of another table under the same key and
+    // number, and a row of a table without a primary key.
+    let mut tx = a.storage().begin().unwrap();
+    assert!(tx.delete(&Value::Str("p0000003".into())).unwrap());
+    tx.commit_seq().unwrap();
+    set_on(b, "p0000004", "sold", 1);
+    for (db, table) in [(a, "x"), (b, "y")] {
+        let mut tx = db.storage().begin().unwrap();
+        tx.table(table).unwrap().insert(vec![Value::Str("k".into())]).unwrap();
+        tx.commit_seq().unwrap();
+    }
+    let mut tx = a.storage().begin().unwrap();
+    tx.table("log").unwrap().insert(vec![Value::Str("a line".into())]).unwrap();
+    tx.commit_seq().unwrap();
+    let (da, db) = (digests(a), digests(b));
+    let differ = da.differ(&db);
+    for (what, slot) in [("a missing row", slot_of("p0000003")), ("a row's number", slot_of("p0000004")), ("the table a row is in", slot_of("k"))] {
+        assert!(differ.contains(&slot), "{what}: {differ:?}");
+    }
+    assert_eq!(da.rows.iter().sum::<u64>(), N as u64 - 1 + 2, "the keyless table's row counts");
+    assert_eq!(differ.len(), 4, "{differ:?}");
+    // The answer of a replica must hold every slot.
+    assert!(Digests::from_pb(pb::VerifyResponse { rows: vec![0; 3], sums: vec![0; 3] }).unwrap_err().contains("not 4096"));
+    assert_eq!(Digests::from_pb(da.to_pb()).unwrap(), da);
+}
+
+/// The primary's view of replica `k` as `/metrics` counts it.
+async fn counted(p: &Arc<Service>, name: &str, url: &str) -> String {
+    let m = p.prometheus().await;
+    let line = format!("{name}{{replica=\"{url}\"}} ");
+    m.lines().find_map(|l| l.strip_prefix(&line)).unwrap_or_else(|| panic!("no {line} in {m}")).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_whose_rows_differ_is_sent_a_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdb = create(dir.path(), "p.strata");
+    let same_db = create(dir.path(), "same.strata");
+    // Loaded without p0000007, as a replica started from other rows is.
+    let short_db = create_with(dir.path(), "short.strata", 64 << 20, |i| i != 7);
+    let (same, su) = replica(same_db.clone(), None).await;
+    let (short, hu) = replica(short_db.clone(), None).await;
+    let opts = PrimaryOptions { verify_every: Duration::ZERO, ..ships_to(&[&su, &hu], Acks::All) };
+    let p = primary(pdb.clone(), None, opts, Duration::from_secs(5));
+    for i in 10..30 {
+        p.write_ops(vec![set(&format!("p{i:07}"), "sold", json!(i))], None).await.unwrap();
+    }
+    // Shipping alone does not find it: every write fits its rows.
+    let h = p.health().await["replication"].clone();
+    assert_eq!((&h["replicas"][0]["in_sync"], &h["replicas"][1]["in_sync"], &h["replicas"][1]["seq_no"]), (&json!(true), &json!(true), &json!(20)), "{h}");
+    assert!(h["replicas"][0].get("verified").is_none(), "not compared yet: {h}");
+
+    let v = p.verify_replicas(Duration::from_secs(10)).await.unwrap();
+    let (s, d) = (&v["replicas"][0], &v["replicas"][1]);
+    assert_eq!((&s["compared"], &s["seq_no"], &s["differing_slots"], &s["in_sync"]), (&json!(true), &json!(20), &json!(0), &json!(true)), "{v}");
+    assert_eq!((&d["compared"], &d["seq_no"], &d["differing_slots"], &d["first_differing_slot"]), (&json!(true), &json!(20), &json!(1), &json!(slot_of("p0000007"))), "{v}");
+    // It drops out, and is sent a copy.
+    until("the short replica installs a copy and catches up", || async { follower(&p, 1).await["copies"] == 1 && follower(&p, 1).await["in_sync"] == true }).await;
+    assert_eq!(rows(&short_db), rows(&pdb));
+    assert_eq!(rows(&same_db), rows(&pdb));
+    let f = follower(&p, 1).await;
+    assert_eq!((&f["verifications"], &f["divergences"], &f["verified"]["differing_slots"]), (&json!(1), &json!(1), &json!(1)), "{f}");
+    assert_eq!(short.health().await["replication"]["restores"], 1);
+
+    // Compared again, after more writes: both hold the primary's rows.
+    for i in 30..40 {
+        p.write_ops(vec![set(&format!("p{i:07}"), "sold", json!(i))], None).await.unwrap();
+    }
+    let v = p.verify_replicas(Duration::from_secs(10)).await.unwrap();
+    for k in 0..2 {
+        let r = &v["replicas"][k];
+        assert_eq!((&r["compared"], &r["seq_no"], &r["differing_slots"]), (&json!(true), &json!(last(&pdb)), &json!(0)), "{v}");
+    }
+    assert_eq!(follower(&p, 0).await["copies"], 0, "the same rows: no copy");
+    for (url, verifications, divergences, copies) in [(&su, "2", "0", "0"), (&hu, "2", "1", "1")] {
+        assert_eq!(counted(&p, "strata_replica_verifications_total", url).await, verifications);
+        assert_eq!(counted(&p, "strata_replica_divergences_total", url).await, divergences);
+        assert_eq!(counted(&p, "strata_replica_copies_total", url).await, copies);
+    }
+    for r in [&same, &short] {
+        assert_eq!(r.health().await["replication"]["digests"], 2);
+        assert!(r.prometheus().await.contains("strata_replica_digests_total 2"));
+    }
+
+    // A replica answers the primary it follows, at the version pinned.
+    let id = p.health().await["replication"]["id"].as_str().unwrap().to_string();
+    let mut c = pb::strata_client::StrataClient::connect(su.clone()).await.unwrap();
+    let ask = |primary: &str, term: u64, seq_no: u64| pb::VerifyRequest { term, primary: primary.into(), seq_no };
+    for (req, says) in [
+        (ask("someone", 1, last(&pdb)), "this replica follows primary"),
+        (ask(&id, 2, last(&pdb)), "not primary"),
+        (ask(&id, 1, last(&pdb)), "holds no version pinned at transaction"),
+    ] {
+        let e = c.verify(req).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
+        assert!(e.message().contains(says), "{says}: {}", e.message());
+    }
+    let mut pc = pb::strata_client::StrataClient::connect(grpc(p.clone()).await).await.unwrap();
+    assert!(pc.verify(ask(&id, 1, 1)).await.unwrap_err().message().contains("not a replica"));
+    assert_eq!(same.verify_replicas(Duration::from_secs(1)).await.unwrap_err().status, 409);
+    // A replica being sent a copy serves no reads until it is caught up.
+    assert_eq!(same.health().await["replication"]["serves_reads"], true);
+    assert!(restore(&su, 1, &id, 10, &[1, 2, 3]).await.unwrap_err().message().contains("ended at 3 of its 10 bytes"));
+    assert_eq!(same.health().await["replication"]["serves_reads"], false);
+    until("the next call finds it caught up", || async { same.health().await["replication"]["serves_reads"] == true }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replicas_are_compared_while_writes_go_on() {
+    let dir = tempfile::tempdir().unwrap();
+    // The primary lacks p0000009, and so do its replicas, but for one.
+    let pdb = create_with(dir.path(), "p.strata", 64 << 20, |i| i != 9);
+    let r0db = create_with(dir.path(), "r0.strata", 64 << 20, |i| i != 9);
+    let r1db = create(dir.path(), "r1.strata");
+    let (_r0, u0) = replica(r0db.clone(), None).await;
+    let (_r1, u1) = replica(r1db.clone(), None).await;
+    // Compared every 100 ms, with shipping in batches of a few
+    // transactions, so that a round's version falls inside a batch.
+    let opts = PrimaryOptions { verify_every: Duration::from_millis(100), batch_bytes: 500, ..ships_to(&[&u0, &u1], Acks::Primary) };
+    let p = primary(pdb.clone(), None, opts, Duration::from_secs(5));
+    // Found without asking, and sent a copy.
+    until("the replica with a row too many is sent a copy", || async { follower(&p, 1).await["copies"] == 1 && follower(&p, 1).await["in_sync"] == true }).await;
+    assert_eq!(rows(&r1db), rows(&pdb));
+    assert_eq!(follower(&p, 1).await["divergences"], 1);
+
+    // Writers at once, while rounds compare every 100 ms and when asked:
+    // each round compares one version on both sides.
+    let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let (p, writing) = (p.clone(), writing.clone());
+            tokio::spawn(async move {
+                let mut i = 0;
+                while writing.load(std::sync::atomic::Ordering::Relaxed) {
+                    let key = format!("p{:07}", (w * 50 + i) % N);
+                    if key != "p0000009" {
+                        p.write_ops(vec![set(&key, "reviews", json!(i))], None).await.unwrap();
+                    }
+                    i += 1;
+                }
+            })
+        })
+        .collect();
+    let before = [follower(&p, 0).await["verifications"].as_u64().unwrap(), follower(&p, 1).await["verifications"].as_u64().unwrap()];
+    let mut at = 0;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let v = p.verify_replicas(Duration::from_secs(10)).await.unwrap();
+        for k in 0..2 {
+            let r = &v["replicas"][k];
+            assert_eq!((&r["compared"], &r["differing_slots"]), (&json!(true), &json!(0)), "{v}");
+            assert!(r["seq_no"].as_u64().unwrap() > at, "a newer version each round: {v}");
+        }
+        at = v["replicas"][0]["seq_no"].as_u64().unwrap().min(v["replicas"][1]["seq_no"].as_u64().unwrap());
+    }
+    // And every 100 ms without asking.
+    let asked = [follower(&p, 0).await["verifications"].as_u64().unwrap(), follower(&p, 1).await["verifications"].as_u64().unwrap()];
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    writing.store(false, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        w.await.unwrap();
+    }
+    for k in 0..2 {
+        let f = follower(&p, k).await;
+        assert!(asked[k] >= before[k] + 8 && f["verifications"].as_u64().unwrap() >= asked[k] + 3, "{before:?} {asked:?} {f}");
+        assert_eq!((&f["divergences"], &f["copies"]), (&json!(k), &json!(k)), "no other: {f}");
+    }
+    let end = last(&pdb);
+    until("both hold the primary's last", || async { follower(&p, 0).await["seq_no"] == end && follower(&p, 1).await["seq_no"] == end }).await;
+    assert_eq!(rows(&r0db), rows(&pdb));
+    assert_eq!(rows(&r1db), rows(&pdb));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_server_starts_as_a_primary_or_a_replica() {
     let dir = tempfile::tempdir().unwrap();
@@ -956,7 +1185,7 @@ async fn the_server_starts_as_a_primary_or_a_replica() {
     assert_eq!(r.role(), pb::Role::Replica);
     assert!(replication::file_of(&dir.path().join("r.strata")).exists(), "a replica keeps its id");
     let ur = grpc(r.clone()).await;
-    let p = server::service(&server::Options { replicas: vec![ur], write_acks: Acks::Majority, ..opts("p.strata") }).await.unwrap();
+    let p = server::service(&server::Options { replicas: vec![ur], write_acks: Acks::Majority, verify_every_s: 3600, ..opts("p.strata") }).await.unwrap();
     assert_eq!(p.role(), pb::Role::Primary);
     assert!(p.local_db().unwrap().storage().keeps_ship_log());
     let w = p.write_ops(vec![set("p0000001", "sold", json!(7))], None).await.unwrap();
@@ -966,6 +1195,27 @@ async fn the_server_starts_as_a_primary_or_a_replica() {
     assert_eq!(last(rdb), 1);
     assert_eq!(rows(rdb), rows(pdb), "both loaded the same demo rows, and the write shipped");
     assert_eq!(p.health().await["replication"]["write_acks"], "majority");
+    assert_eq!(p.health().await["replication"]["verify_every_s"], 3600);
+    // Compared when asked over HTTP: both loaded the same rows.
+    let http = |svc: Arc<strata_server::service::Service>| async move {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(server::serve_http(svc, l, Access::default()));
+        url
+    };
+    let c = reqwest::Client::new();
+    for body in [None, Some(json!({"timeout_ms": 5000}))] {
+        let mut req = c.post(format!("{}/v1/admin/verify", http(p.clone()).await));
+        if let Some(b) = &body {
+            req = req.json(b);
+        }
+        let r = req.send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let v: Json = r.json().await.unwrap();
+        assert_eq!((&v["replicas"][0]["compared"], &v["replicas"][0]["seq_no"], &v["replicas"][0]["differing_slots"]), (&json!(true), &json!(1), &json!(0)), "{v}");
+    }
+    let r = c.post(format!("{}/v1/admin/verify", http(r.clone()).await)).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), 409);
 
     let e = server::service(&server::Options { replica: true, seq_no: false, ..opts("plain.strata") }).await.err().unwrap();
     assert!(e.contains("does not number its writes, which replication ships by: pass --seq-no"), "{e}");

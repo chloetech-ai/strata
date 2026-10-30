@@ -614,6 +614,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn restore(&self, _: tonic::Request<tonic::Streaming<pb::RestoreChunk>>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
     }
+    async fn verify(&self, _: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not a replica"))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -649,6 +652,9 @@ impl pb::strata_server::Strata for Overloaded {
         Err(tonic::Status::unimplemented("not a replica"))
     }
     async fn restore(&self, _: tonic::Request<tonic::Streaming<pb::RestoreChunk>>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not a replica"))
+    }
+    async fn verify(&self, _: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
     }
 }
@@ -782,6 +788,11 @@ struct Recording {
     /// Each `Replicate` call's transactions and whether it said the
     /// replica is behind.
     shipped: std::sync::Mutex<Vec<(usize, bool)>>,
+    /// False: answers `Verify` Unimplemented, as a server from before it.
+    verifies: AtomicBool,
+    /// How long each `Replicate` call waits first, as on a slow link; a
+    /// `Verify` waits five times that, as when hashing many rows.
+    delay: std::sync::Mutex<Duration>,
 }
 
 impl Recording {
@@ -876,12 +887,23 @@ impl pb::strata_server::Strata for Recording {
     }
     async fn replicate(&self, r: tonic::Request<pb::ReplicateRequest>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
         self.up()?;
+        let delay = *self.delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
         self.shipped.lock().unwrap().push((r.get_ref().txns.len(), r.get_ref().behind));
         self.inner.replicate(r).await
     }
     async fn restore(&self, r: tonic::Request<tonic::Streaming<pb::RestoreChunk>>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
         self.up()?;
         self.inner.restore(r).await
+    }
+    async fn verify(&self, r: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
+        self.up()?;
+        let delay = *self.delay.lock().unwrap();
+        tokio::time::sleep(delay * 5).await;
+        match self.verifies.load(Ordering::Relaxed) {
+            true => self.inner.verify(r).await,
+            false => Err(tonic::Status::unimplemented("unknown method Verify")),
+        }
     }
 }
 
@@ -900,6 +922,8 @@ async fn recording_of(svc: Arc<Service>, version: u32) -> (String, Arc<Recording
         after_hold: Default::default(),
         seen: Default::default(),
         shipped: Default::default(),
+        verifies: AtomicBool::new(true),
+        delay: std::sync::Mutex::new(Duration::ZERO),
     });
     let svc = pb::strata_server::StrataServer::from_arc(shard.clone()).max_decoding_message_size(256 << 20);
     tokio::spawn(tonic::transport::Server::builder().add_service(svc).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
@@ -1097,6 +1121,102 @@ async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
     let batches: Vec<bool> = shipped.iter().filter(|(n, _)| *n > 0).map(|&(_, behind)| behind).collect();
     assert!(batches.len() == 6 && batches[..5].iter().all(|&b| b) && !batches[5], "{shipped:?}");
     assert_eq!(r.health().await["replication"]["serves_reads"], true);
+
+    // A replica from before `Verify` is not compared: the round says why,
+    // and the replica stays in sync, with no copy.
+    replica.verifies.store(false, Ordering::Relaxed);
+    let v = p.verify_replicas(Duration::from_secs(10)).await.unwrap();
+    let f = &v["replicas"][0];
+    assert_eq!((&f["compared"], &f["in_sync"]), (&json!(true), &json!(true)), "{v}");
+    assert!(f["error"].as_str().unwrap().contains("Unimplemented: unknown method Verify") && f.get("seq_no").is_none(), "{v}");
+    let h = &p.health().await["replication"]["replicas"][0];
+    assert_eq!((&h["in_sync"], &h["copies"], &h["verifications"], &h["verify_failures"]), (&json!(true), &json!(0), &json!(0), &json!(1)), "{h}");
+    replica.verifies.store(true, Ordering::Relaxed);
+    let v = p.verify_replicas(Duration::from_secs(10)).await.unwrap();
+    assert_eq!((&v["replicas"][0]["seq_no"], &v["replicas"][0]["differing_slots"], v["replicas"][0].get("error")), (&json!(last), &json!(0), None), "{v}");
+}
+
+/// A replica a slow link keeps a few batches behind, under bursts of
+/// writes, is compared all the same: a round ships the replica up to its
+/// version in batches and not past it, and only the call that reaches the
+/// version pins it; rounds due every 50 ms do not overlap, though a
+/// `Verify` takes longer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_behind_is_compared_under_a_steady_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let numbered = |name: &str| {
+        let opts = DbOptions { publish_snapshots: true, ship_log_bytes: 64 << 20, ..DbOptions::default() };
+        let db = Db::create(&dir.path().join(name), demo::schema(N), opts).unwrap();
+        db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
+        db.load((0..300).map(|i| demo::product(i, 7))).unwrap();
+        db.storage().start_seq_no().unwrap();
+        Arc::new(db)
+    };
+    let (rdb, pdb) = (numbered("r.strata"), numbered("p.strata"));
+    // Two writes a batch: the size of one, written before shipping starts.
+    let set = |db: &Db, i: i64| {
+        let mut tx = db.storage().begin().unwrap();
+        assert!(tx.set(&Value::Str("p0000001".into()), "sold", Value::Int(1_000 + i)).unwrap());
+        tx.commit_seq().unwrap();
+    };
+    set(&pdb, 0);
+    set(&rdb, 0);
+    let strata::storage::LogRead::Txns(t) = pdb.storage().log_from(1, usize::MAX) else { panic!("the log holds it") };
+    let follow = Arc::new(Follow::open(rdb.clone(), None).unwrap());
+    let r = service_with(rdb.clone(), |s| s.replication = Replication::Replica(follow));
+    let (ru, replica) = recording_of(r.clone(), 5).await;
+    let opts = PrimaryOptions {
+        replicas: vec![ru.clone()],
+        acks: Acks::Primary,
+        heartbeat: Duration::from_millis(100),
+        retry_max: Duration::from_millis(200),
+        batch_bytes: 2 * t[0].bytes.len() + 1,
+        verify_every: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let p = service_with(pdb.clone(), |s| s.replication = Replication::Primary(Primary::start(pdb.clone(), None, opts).unwrap()));
+    for _ in 0..200 {
+        if p.health().await["replication"]["replicas"][0]["verifications"].as_u64().unwrap() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Five writes every 150 ms; a call takes 40 ms and carries two, and
+    // a Verify 200 ms.
+    *replica.delay.lock().unwrap() = Duration::from_millis(40);
+    let writing = Arc::new(AtomicBool::new(true));
+    let writer = {
+        let (p, writing) = (p.clone(), writing.clone());
+        tokio::spawn(async move {
+            let mut i = 0;
+            while writing.load(Ordering::Relaxed) {
+                for _ in 0..5 {
+                    p.write_ops(vec![json!({"op": "set", "key": format!("p{:07}", 10 + i % 200), "field": "sold", "value": i})], None).await.unwrap();
+                    i += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            i
+        })
+    };
+    let before = p.health().await["replication"]["replicas"][0]["verifications"].as_u64().unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let v = p.verify_replicas(Duration::from_secs(3)).await.unwrap();
+        let f = &v["replicas"][0];
+        assert_eq!((&f["compared"], &f["differing_slots"], f.get("error")), (&json!(true), &json!(0), None), "{v}");
+        seen.push(f["seq_no"].as_u64().unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    writing.store(false, Ordering::Relaxed);
+    assert!(writer.await.unwrap() > 30);
+    let shipped = replica.shipped.lock().unwrap().clone();
+    let h = &p.health().await["replication"]["replicas"][0];
+    assert!(h["verifications"].as_u64().unwrap() >= before + 6, "{h}");
+    assert_eq!((&h["verify_failures"], &h["divergences"], &h["copies"], &h["in_sync"]), (&json!(0), &json!(0), &json!(0), &json!(true)), "{h}");
+    assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+    // The replica was behind: batches of two.
+    assert!(shipped.iter().filter(|(n, _)| *n == 2).count() > 10, "{shipped:?}");
 }
 
 /// A replica down when the coordinator connected gets no slot map then; it

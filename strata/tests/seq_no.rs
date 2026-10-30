@@ -375,8 +375,21 @@ fn select_seqs(db: &Db) -> Seqs {
     r.rows.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap() as u64)).collect()
 }
 
+/// Each live row's number as `Snapshot::row_versions` lists them, once
+/// each.
+fn row_versions(db: &Db) -> Seqs {
+    let mut out = Seqs::new();
+    db.snapshot()
+        .row_versions(|k, seq| {
+            let k = k.expect("a keyed table").as_str().unwrap().to_string();
+            assert!(out.insert(k.clone(), seq).is_none(), "{k} listed twice");
+        })
+        .unwrap();
+    out
+}
+
 /// The rows and every key's number are as the model has them, by
-/// `seq_of` and by `seq_no()` in a SELECT.
+/// `seq_of`, by `seq_no()` in a SELECT and by `row_versions`.
 fn check_seqs(db: &Db, want: &Rows, seqs: &Seqs, keys: u64, what: &str) {
     assert_eq!(&rows(db), want, "{what}");
     for i in 0..keys {
@@ -384,6 +397,7 @@ fn check_seqs(db: &Db, want: &Rows, seqs: &Seqs, keys: u64, what: &str) {
         assert_eq!(db.storage().seq_of(Some("t"), &Value::Str(k.clone())).unwrap(), seqs.get(&k).copied(), "{what}: {k}");
     }
     assert_eq!(&select_seqs(db), seqs, "{what}: seq_no()");
+    assert_eq!(&row_versions(db), seqs, "{what}: row_versions");
 }
 
 /// Rows keep the number of the write that last changed them, through the
@@ -402,6 +416,7 @@ fn rows_keep_the_number_of_their_last_write() {
         let (mut rows, mut seqs, keys) = (Rows::new(), Seqs::new(), 300);
         let mut db = Db::create(&path, schema(), opts.clone()).unwrap();
         assert!(db.storage().seq_of(None, &Value::Str(key(0))).unwrap_err().to_string().contains("does not number its writes"));
+        assert!(db.snapshot().row_versions(|_, _| ()).unwrap_err().to_string().contains("does not number its writes"));
         // Before numbering: number 0.
         let mut tx = db.storage().begin().unwrap();
         for i in 0..20 {
@@ -487,7 +502,41 @@ fn attached_rows_have_number_0() {
         assert_eq!(db.storage().seq_of(None, &Value::Str(key(10))).unwrap(), Some(1));
         let attached: Vec<_> = db.snapshot().segments().iter().filter(|s| ids.contains(&s.id)).map(|s| s.file.has("seq")).collect();
         assert_eq!(attached, [false]);
+        let want: Seqs = (0..5).map(|i| (key(i), 0)).chain([(key(10), 1)]).collect();
+        assert_eq!(row_versions(&db), want);
         db.storage().check().unwrap();
+    }
+}
+
+/// `row_versions` lists the live rows of the table a snapshot looks at,
+/// also of a table without a primary key, before and after a flush.
+#[test]
+fn row_versions_list_each_table_s_live_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&path_for(dir.path(), "db", Layout::SingleFile), schema(), options(Layout::SingleFile)).unwrap();
+    db.storage().start_seq_no().unwrap();
+    let fields = vec![strata::Field::new("line", strata::FieldType::Text { positions: false })];
+    db.create_table(strata::Schema::new("log", fields, None).unwrap()).unwrap();
+    let mut model = Rows::new();
+    for i in 0..3 {
+        upsert(&db, &mut model, i, 0);
+        let mut tx = db.storage().begin().unwrap();
+        tx.table("log").unwrap().insert(vec![Value::Str(format!("line {i}"))]).unwrap();
+        tx.commit_seq().unwrap();
+    }
+    let mut tx = db.storage().begin().unwrap();
+    assert!(tx.delete(&Value::Str(key(1))).unwrap());
+    tx.commit_seq().unwrap();
+    for flushed in [false, true] {
+        let keyless = |s: &strata::storage::Snapshot| {
+            let mut out = Vec::new();
+            s.row_versions(|k, seq| out.push((k.cloned(), seq))).unwrap();
+            out.sort_by_key(|x| x.1);
+            out
+        };
+        assert_eq!(row_versions(&db), Seqs::from([(key(0), 1), (key(2), 5)]), "flushed {flushed}");
+        assert_eq!(keyless(&db.snapshot().table("log").unwrap()), [(None, 2), (None, 4), (None, 6)], "flushed {flushed}");
+        db.storage().flush().unwrap();
     }
 }
 

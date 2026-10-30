@@ -17,10 +17,11 @@
 // shards' replicas.
 //
 // Replication takes no protocol version: a primary ships its writes to its
-// replicas with `Replicate`, and sends a copy of itself to one its log no
-// longer reaches with `Restore`, which a server from before them answers
-// Unimplemented; `Hello` names a server's role, which an older one leaves
-// out (STANDALONE).
+// replicas with `Replicate`, sends a copy of itself to one its log no
+// longer reaches or whose rows differ with `Restore`, and compares a
+// replica's rows with its own with `Verify`, which a server from before
+// them answers Unimplemented; `Hello` names a server's role, which an
+// older one leaves out (STANDALONE).
 syntax = "proto3";
 
 package strata.v1;
@@ -55,6 +56,11 @@ service Strata {
   // copy's rows, numbers and terms in place of its own in one commit, and
   // answers its last transaction, which is the copy's.
   rpc Restore(stream RestoreChunk) returns (ReplicateResponse);
+  // Replication: a replica's digests of its rows at the version a call
+  // from its primary pinned (ReplicateRequest.pin), which the primary
+  // compares with its own at the same transaction. Answered once a
+  // version.
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
 }
 
 message RestoreChunk {
@@ -90,6 +96,26 @@ message ReplicateRequest {
   // them: the replica is catching up, and refuses reads until a call
   // reaches the primary's last.
   bool behind = 7;
+  // Keep the version this call leaves, at the last of `txns` (or the
+  // replica's last, for none), for the Verify that follows.
+  bool pin = 8;
+}
+
+message VerifyRequest {
+  // The primary's term and id: a replica answers the primary it follows.
+  uint64 term = 1;
+  string primary = 2;
+  // The transaction the version was pinned at.
+  uint64 seq_no = 3;
+}
+
+message VerifyResponse {
+  // For each of the 4,096 slots of the keys: the rows in it, and the
+  // wrapping sum of a 64-bit hash (xxh3) of each row's table, primary key
+  // and sequence number. A table without a primary key places a row by
+  // that hash.
+  repeated uint64 rows = 1;
+  repeated fixed64 sums = 2;
 }
 
 message ReplicateResponse {

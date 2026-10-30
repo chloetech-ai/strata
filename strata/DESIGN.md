@@ -750,6 +750,17 @@ handing a query to its shards) are to make instead of writing SQL text.
   asks a shard's primary first after a copy fails a read, and passes over
   a replica of a protocol before 5, which would not wait, without
   counting it as failed (protocol 5).
+* **Comparing copies.** Every `--verify-every-s` (600 s) and when asked,
+  a primary compares each in-sync replica's rows with its own. It takes a
+  version, ships the replica up to that version's last transaction and
+  not past it, in a call that has the replica keep the version that call
+  leaves (`pin`), and compares digests of the two (`Verify`), hashing on
+  both sides while shipping goes on: per slot of the keys, the row count
+  and the wrapping sum of xxh3 over each row's table, key and number
+  (`Snapshot::row_versions`). A replica whose digests differ drops out of
+  sync and is sent a copy. The digests leave out values, which copies
+  that applied the same writes share; a replica loaded with other values
+  under the same keys before numbering is not found.
 * **Conditional writes.** `seq_no()` is a column of a query on one table
   (plan feature `seq_no`, so an older shard refuses the plan by name), read
   from the row's segment, its updates or the memtable. strata-server's
@@ -767,7 +778,7 @@ handing a query to its shards) are to make instead of writing SQL text.
   `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
   next to the executor's plan lines.
 
-Next: the rest of replication (digests, promotion),
+Next: the rest of replication (promotion),
 and a coordinator and
 strata-server over every table.
 

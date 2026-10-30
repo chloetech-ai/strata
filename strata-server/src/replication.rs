@@ -50,6 +50,21 @@
 //! replica its primary cannot reach does not know it fell behind, and
 //! goes on serving what it holds.
 //!
+//! A primary compares each replica's rows with its own every
+//! [`PrimaryOptions::verify_every`] (`--verify-every-s`), and when asked
+//! ([`Primary::verify`], `POST /v1/admin/verify`). It takes a version of
+//! its database and ships the replica up to that version's last
+//! transaction, in a call that has the replica keep the version it leaves
+//! (`pin`); then it compares the [`Digests`] of the two versions
+//! (`Verify`): for each slot of the keys, how many rows it holds and the
+//! sum of a hash of each one's table, primary key and sequence number. A
+//! replica whose digests differ drops out of sync and is sent a copy of
+//! the primary. The digests cover which rows a replica holds and the
+//! number of the write that last changed each, not their values: copies
+//! that applied the same writes hold the same values, but a replica that
+//! held other values under the same keys before numbering began (loaded
+//! from other rows) is not found by them.
+//!
 //! Not here yet: replacing a primary by one of its replicas.
 
 use std::path::{Path, PathBuf};
@@ -65,6 +80,7 @@ use tokio::sync::watch;
 use crate::auth::Secret;
 use crate::coord::{self, Client};
 use crate::metrics::Family;
+use crate::slots::{self, SLOTS};
 use crate::{pb, ApiError};
 
 /// Which copies hold a write before it is answered (`--write-acks`).
@@ -103,6 +119,65 @@ impl Acks {
     }
 }
 
+/// Digests of a version's rows, slot by slot: what a primary and its
+/// replicas compare.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Digests {
+    /// For each of the [`SLOTS`] slots: the rows in it, and the wrapping
+    /// sum of each one's hash.
+    pub rows: Vec<u64>,
+    pub sums: Vec<u64>,
+}
+
+impl Digests {
+    /// Of every live row of every table `s` holds
+    /// ([`Snapshot::row_versions`]): a row hashes its table, its primary
+    /// key (as [`slots::slot`] encodes it) and the number of the write that
+    /// last changed it (xxh3, 64 bits) into its key's slot. A row of a
+    /// table without a primary key goes by its hash.
+    pub fn of(s: &Snapshot) -> strata::Result<Digests> {
+        let mut d = Digests { rows: vec![0; SLOTS], sums: vec![0; SLOTS] };
+        let mut buf = Vec::new();
+        for schema in s.schemas() {
+            let Some(t) = s.table(&schema.table) else { continue };
+            let name = schema.table.as_bytes();
+            t.row_versions(|key, seq| {
+                buf.clear();
+                buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                buf.extend_from_slice(name);
+                let at = buf.len();
+                let slot = key.map(|k| {
+                    slots::encode(k, |b| buf.extend_from_slice(b));
+                    (twox_hash::XxHash3_64::oneshot(&buf[at..]) % SLOTS as u64) as usize
+                });
+                buf.extend_from_slice(&seq.to_le_bytes());
+                let h = twox_hash::XxHash3_64::oneshot(&buf);
+                let slot = slot.unwrap_or((h % SLOTS as u64) as usize);
+                d.rows[slot] += 1;
+                d.sums[slot] = d.sums[slot].wrapping_add(h);
+            })?;
+        }
+        Ok(d)
+    }
+
+    /// The slots where `self` and `other` differ.
+    pub fn differ(&self, other: &Digests) -> Vec<usize> {
+        (0..SLOTS).filter(|&i| self.rows.get(i) != other.rows.get(i) || self.sums.get(i) != other.sums.get(i)).collect()
+    }
+
+    pub fn to_pb(&self) -> pb::VerifyResponse {
+        pb::VerifyResponse { rows: self.rows.clone(), sums: self.sums.clone() }
+    }
+
+    /// A replica's answer, which must hold every slot.
+    pub fn from_pb(r: pb::VerifyResponse) -> Result<Digests, String> {
+        if r.rows.len() != SLOTS || r.sums.len() != SLOTS {
+            return Err(format!("its digests hold {} and {} slots, not {SLOTS}", r.rows.len(), r.sums.len()));
+        }
+        Ok(Digests { rows: r.rows, sums: r.sums })
+    }
+}
+
 /// How a primary ships to its replicas.
 #[derive(Clone, Debug)]
 pub struct PrimaryOptions {
@@ -127,6 +202,9 @@ pub struct PrimaryOptions {
     /// How long to wait before sending a replica a copy again after one
     /// failed: each copy writes a checkpoint of the database.
     pub copy_retry: Duration,
+    /// How often each replica's rows are compared with the primary's
+    /// ([`Digests`]); zero: only when asked ([`Primary::verify`]).
+    pub verify_every: Duration,
 }
 
 impl Default for PrimaryOptions {
@@ -142,6 +220,7 @@ impl Default for PrimaryOptions {
             call_timeout: Duration::from_secs(10),
             copy_chunk_bytes: 1 << 20,
             copy_retry: Duration::from_secs(30),
+            verify_every: Duration::from_secs(600),
         }
     }
 }
@@ -263,6 +342,30 @@ struct Follower {
     /// installed.
     copying: AtomicBool,
     copies: AtomicU64,
+    /// What the last round comparing its rows with the primary's found
+    /// ([`verify`]), whether a round is comparing, and whether one found
+    /// its rows differ, until its shipper takes that up.
+    verified: Mutex<Verified>,
+    verifying: AtomicBool,
+    diverged: AtomicBool,
+    /// Rounds that compared its rows, those that found them differ, and
+    /// those that could not compare.
+    verifications: AtomicU64,
+    divergences: AtomicU64,
+    verify_failures: AtomicU64,
+    /// Wakes its shipper: a round ended, or one was asked for.
+    wake: Arc<tokio::sync::Notify>,
+}
+
+/// What the last round comparing a replica's rows with its primary's found.
+#[derive(Clone, Debug, Default)]
+struct Verified {
+    /// The transaction it compared at, when, and the slots that differed.
+    at: Option<(u64, Instant, Vec<usize>)>,
+    /// Why the last round could not compare.
+    error: Option<String>,
+    /// The latest request ([`Primary::verify`]) a round ended for.
+    answered: u64,
 }
 
 impl Follower {
@@ -288,6 +391,26 @@ impl Follower {
         *e = Some(why);
     }
 
+    fn verified(&self) -> std::sync::MutexGuard<'_, Verified> {
+        self.verified.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What its health shows of the last round comparing its rows.
+    fn verification(&self) -> Json {
+        let v = self.verified().clone();
+        let mut j = json!({});
+        if let Some((seq, when, differ)) = &v.at {
+            j = json!({"seq_no": seq, "ms_ago": when.elapsed().as_millis() as u64, "differing_slots": differ.len()});
+            if let Some(first) = differ.first() {
+                j["first_differing_slot"] = json!(first);
+            }
+        }
+        if let Some(e) = v.error {
+            j["error"] = json!(e);
+        }
+        j
+    }
+
     /// Puts it in sync: it holds the primary's last transaction.
     fn caught_up(&self) {
         if !self.in_sync.swap(true, Ordering::Relaxed) {
@@ -311,6 +434,8 @@ pub struct Primary {
     /// A newer term a replica holds (0: none): another primary replaced
     /// this one.
     fenced: AtomicU64,
+    /// Requests to compare the replicas now ([`Primary::verify`]).
+    verify_asked: AtomicU64,
 }
 
 impl Primary {
@@ -338,6 +463,13 @@ impl Primary {
                     failures: AtomicU64::new(0),
                     copying: AtomicBool::new(false),
                     copies: AtomicU64::new(0),
+                    verified: Mutex::new(Verified::default()),
+                    verifying: AtomicBool::new(false),
+                    diverged: AtomicBool::new(false),
+                    verifications: AtomicU64::new(0),
+                    divergences: AtomicU64::new(0),
+                    verify_failures: AtomicU64::new(0),
+                    wake: Arc::new(tokio::sync::Notify::new()),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -346,7 +478,7 @@ impl Primary {
         db.storage().on_commit(move |n| {
             hook.send_replace(n.seq);
         });
-        let p = Arc::new(Primary { db, id: kept.id, opts, followers, committed, progress: watch::channel(0).0, fenced: AtomicU64::new(0) });
+        let p = Arc::new(Primary { db, id: kept.id, opts, followers, committed, progress: watch::channel(0).0, fenced: AtomicU64::new(0), verify_asked: AtomicU64::new(0) });
         for k in 0..p.followers.len() {
             tokio::spawn(ship(Arc::downgrade(&p), k));
         }
@@ -435,6 +567,36 @@ impl Primary {
         }
     }
 
+    /// Compares each replica in sync with this primary now, as every
+    /// `verify_every` does, and answers what each comparison found,
+    /// waiting for them until `deadline`: `compared` is false for a
+    /// replica out of sync, or whose round did not end in time.
+    pub async fn verify(&self, deadline: Instant) -> Json {
+        let n = self.verify_asked.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut progress = self.progress.subscribe();
+        for f in &self.followers {
+            f.wake.notify_one();
+        }
+        let done = |f: &Follower| f.verified().answered >= n;
+        while !self.followers.iter().all(|f| done(f) || !f.in_sync()) {
+            if tokio::time::timeout_at(deadline.into(), progress.changed()).await.is_err() {
+                break;
+            }
+        }
+        let replicas: Vec<Json> = self
+            .followers
+            .iter()
+            .map(|f| {
+                let mut j = f.verification();
+                j["url"] = json!(f.url);
+                j["in_sync"] = json!(f.in_sync());
+                j["compared"] = json!(done(f));
+                j
+            })
+            .collect();
+        json!({"replicas": replicas})
+    }
+
     /// What `/v1/health` shows of replication.
     pub fn health(&self) -> Json {
         let last = *self.committed.borrow();
@@ -445,16 +607,22 @@ impl Primary {
                 let mut j = json!({
                     "url": f.url, "seq_no": f.acked(), "behind": last.saturating_sub(f.acked()), "in_sync": f.in_sync(),
                     "copying": f.copying.load(Ordering::Relaxed), "copies": f.copies.load(Ordering::Relaxed),
+                    "verifications": f.verifications.load(Ordering::Relaxed), "divergences": f.divergences.load(Ordering::Relaxed),
+                    "verify_failures": f.verify_failures.load(Ordering::Relaxed),
                 });
                 if let Some(e) = f.error() {
                     j["error"] = json!(e);
+                }
+                let v = f.verification();
+                if v.as_object().is_some_and(|o| !o.is_empty()) {
+                    j["verified"] = v;
                 }
                 j
             })
             .collect();
         let mut h = json!({
             "role": "primary", "id": self.id, "term": self.term(), "seq_no": last, "write_acks": self.opts.acks.name(),
-            "global_checkpoint": self.global_checkpoint(), "replicas": replicas,
+            "global_checkpoint": self.global_checkpoint(), "verify_every_s": self.opts.verify_every.as_secs(), "replicas": replicas,
         });
         let fenced = self.fenced.load(Ordering::Relaxed);
         if fenced > 0 {
@@ -473,15 +641,28 @@ impl Primary {
             Family { name: "strata_replica_behind", ty: "gauge", help: "Transactions the primary committed that a replica does not hold yet.", values: by(&|f| last.saturating_sub(f.acked()) as f64) },
             Family { name: "strata_replica_shipped_total", ty: "counter", help: "Transactions a replica applied from this primary.", values: by(&|f| f.shipped.load(Ordering::Relaxed) as f64) },
             Family { name: "strata_replica_failures_total", ty: "counter", help: "Calls to a replica that failed or that it refused.", values: by(&|f| f.failures.load(Ordering::Relaxed) as f64) },
-            Family { name: "strata_replica_copies_total", ty: "counter", help: "Copies of the primary a replica the log no longer reached installed.", values: by(&|f| f.copies.load(Ordering::Relaxed) as f64) },
+            Family { name: "strata_replica_copies_total", ty: "counter", help: "Copies of the primary a replica installed: the log no longer reached it, or its rows differed.", values: by(&|f| f.copies.load(Ordering::Relaxed) as f64) },
+            Family { name: "strata_replica_verifications_total", ty: "counter", help: "Times a replica's rows were compared with the primary's.", values: by(&|f| f.verifications.load(Ordering::Relaxed) as f64) },
+            Family { name: "strata_replica_divergences_total", ty: "counter", help: "Times a replica's rows differed from the primary's.", values: by(&|f| f.divergences.load(Ordering::Relaxed) as f64) },
+            Family { name: "strata_replica_verify_failures_total", ty: "counter", help: "Rounds that could not compare a replica's rows with the primary's.", values: by(&|f| f.verify_failures.load(Ordering::Relaxed) as f64) },
         ]
     }
 }
 
+/// A round comparing a replica's rows with its primary's: the primary's
+/// version, its last transaction, and the latest request
+/// ([`Primary::verify`]) the round answers.
+struct Round {
+    snap: Snapshot,
+    seq: u64,
+    asked: u64,
+}
+
 /// Ships `p`'s transactions to its replica `k` until `p` is dropped:
 /// asks the replica its last transaction, sends what follows in batches,
-/// sends it a copy of the primary when the log no longer reaches it, and
-/// calls it every heartbeat while there is nothing to send.
+/// sends it a copy of the primary when the log no longer reaches it or
+/// its rows differ, calls it every heartbeat while there is nothing to
+/// send, and starts the rounds that compare its rows with the primary's.
 async fn ship(p: Weak<Primary>, k: usize) {
     let Some(mut committed) = p.upgrade().map(|p| p.committed.subscribe()) else { return };
     // The next number to send; `None` until the replica said its last.
@@ -489,25 +670,60 @@ async fn ship(p: Weak<Primary>, k: usize) {
     let mut retry = Duration::from_millis(50);
     // What follows a copy, kept until the replica has it.
     let mut _hold: Option<LogHold> = None;
+    // A round under way, until the call that pins the replica's version
+    // at the round's transaction; when the next round is due; and whether
+    // a round found the replica's rows differ, until it installs a copy.
+    let mut round: Option<Round> = None;
+    let mut due = Instant::now() + p.upgrade().map_or(Duration::ZERO, |p| p.opts.verify_every);
+    let mut must_copy = false;
     loop {
         let Some(p) = p.upgrade() else { return };
         let f = &p.followers[k];
+        if f.diverged.swap(false, Ordering::Relaxed) {
+            must_copy = true;
+            round = None;
+        }
+        // A round starts when asked or due, once the replica holds a run
+        // of this primary's history and is in sync.
+        let every = p.opts.verify_every;
+        let asked = p.verify_asked.load(Ordering::Relaxed);
+        let wanted = asked > f.verified().answered || (!every.is_zero() && Instant::now() >= due);
+        if wanted && round.is_none() && !must_copy && next.is_some() && f.in_sync() && !f.verifying.load(Ordering::Relaxed) {
+            let snap = p.db.snapshot();
+            let seq = snap.seq_no().unwrap_or(0);
+            // The replica is shipped up to the version, and not past it.
+            if next.is_some_and(|n| n <= seq + 1) {
+                round = Some(Round { snap, seq, asked });
+                due = Instant::now() + every;
+            }
+        }
         let Some(numbering) = p.db.storage().numbering() else { return };
         let last = numbering.seq;
         let from = next.unwrap_or(last + 1);
-        let txns = match from > last {
-            true => Some(Vec::new()),
-            false => match p.db.storage().log_from(from, p.opts.batch_bytes) {
+        // A replica that said a last past the round's version holds rows
+        // the version does not.
+        if round.as_ref().is_some_and(|r| from > r.seq + 1) {
+            round = None;
+        }
+        let txns = match (must_copy, from > last) {
+            (true, _) => None,
+            (false, true) => Some(Vec::new()),
+            (false, false) => match p.db.storage().log_from(from, p.opts.batch_bytes) {
                 LogRead::Txns(t) => Some(t),
                 LogRead::Gone { .. } => None,
             },
         };
         // What it answered, the transactions sent and the last of them
-        // (none for a copy).
-        let (answer, n, end) = match txns {
-            Some(txns) => {
+        // (none for a copy), and whether the call pinned the round's
+        // version.
+        let (answer, n, end, pin) = match txns {
+            Some(mut txns) => {
+                if let Some(r) = &round {
+                    txns.retain(|t| t.seq.seq <= r.seq);
+                }
                 let prev = SeqNo { term: numbering.term_at(from - 1), seq: from - 1 };
                 let end = txns.last().map_or(prev.seq, |t| t.seq.seq);
+                let pin = round.as_ref().is_some_and(|r| r.seq == end);
                 let n = txns.len() as u64;
                 let req = pb::ReplicateRequest {
                     term: numbering.term,
@@ -517,6 +733,7 @@ async fn ship(p: Weak<Primary>, k: usize) {
                     global_checkpoint: p.global_checkpoint(),
                     primary: p.id.clone(),
                     behind: end < last,
+                    pin,
                 };
                 drop(txns);
                 let mut c = f.client.clone();
@@ -525,17 +742,20 @@ async fn ship(p: Weak<Primary>, k: usize) {
                     Ok(Err(s)) => Err(format!("{}: {}", crate::grpc::code_name(s.code()), s.message())),
                     Err(_) => Err(format!("no answer within {} s", p.opts.call_timeout.as_secs())),
                 };
-                (answer, n, Some(end))
+                (answer, n, Some(end), pin)
             }
             None => {
-                f.drop_out(format!("it holds transactions up to {}, and this primary's log no longer reaches them: it is sent a copy of the primary", from - 1));
+                // A round that found its rows differ said why already.
+                if !must_copy {
+                    f.drop_out(format!("it holds transactions up to {}, and this primary's log no longer reaches them: it is sent a copy of the primary", from - 1));
+                }
                 p.changed();
                 f.copying.store(true, Ordering::Relaxed);
                 // The copy holds at least what was committed by now.
                 _hold = Some(LogHold::new(p.db.clone(), last + 1));
                 let answer = send_copy(&p, f, numbering.term).await;
                 f.copying.store(false, Ordering::Relaxed);
-                (answer.map_err(|e| format!("sending it a copy of the primary failed: {e}")), 0, None)
+                (answer.map_err(|e| format!("sending it a copy of the primary failed: {e}")), 0, None, false)
             }
         };
         let failed = match answer {
@@ -550,6 +770,7 @@ async fn ship(p: Weak<Primary>, k: usize) {
                     f.shipped.fetch_add(n, Ordering::Relaxed);
                     if end.is_none() {
                         f.copies.fetch_add(1, Ordering::Relaxed);
+                        must_copy = false;
                         tracing::info!(replica = %f.url, seq_no = r.seq, "a replica installed a copy of the primary");
                     }
                     next = Some(r.seq + 1);
@@ -561,6 +782,14 @@ async fn ship(p: Weak<Primary>, k: usize) {
                         // followed the copy is no longer needed.
                         if end.is_some() {
                             _hold = None;
+                        }
+                    }
+                    // The replica keeps its version at the round's
+                    // transaction: compare them, while shipping goes on.
+                    if pin {
+                        if let Some(rd) = round.take() {
+                            f.verifying.store(true, Ordering::Relaxed);
+                            tokio::spawn(verify(Arc::downgrade(&p), k, rd));
                         }
                     }
                     p.changed();
@@ -587,6 +816,7 @@ async fn ship(p: Weak<Primary>, k: usize) {
             p.changed();
             next = None;
             _hold = None;
+            round = None;
             // A copy is a checkpoint of the database: not again at once.
             let wait = if end.is_none() { p.opts.copy_retry } else { retry };
             retry = (retry * 2).min(p.opts.retry_max);
@@ -594,12 +824,71 @@ async fn ship(p: Weak<Primary>, k: usize) {
             tokio::time::sleep(wait).await;
             continue;
         }
-        if next.is_some_and(|n| n > p.db.storage().numbering().map_or(0, |n| n.seq)) {
-            let beat = p.opts.heartbeat;
+        if round.is_none() && !must_copy && next.is_some_and(|n| n > p.db.storage().numbering().map_or(0, |n| n.seq)) {
+            let (beat, wake) = (p.opts.heartbeat, f.wake.clone());
             drop(p);
-            let _ = tokio::time::timeout(beat, committed.changed()).await;
+            let _ = tokio::time::timeout(beat, async {
+                tokio::select! {
+                    _ = committed.changed() => {}
+                    _ = wake.notified() => {}
+                }
+            })
+            .await;
         }
     }
+}
+
+/// Compares replica `k`'s digests at the version its last call pinned
+/// with `p`'s at the same transaction, the round's: a replica whose
+/// digests differ drops out of sync, and its shipper sends it a copy of
+/// the primary. Shipping goes on meanwhile.
+async fn verify(p: Weak<Primary>, k: usize, r: Round) {
+    let Some(pr) = p.upgrade() else { return };
+    let f = &pr.followers[k];
+    let req = pb::VerifyRequest { term: pr.term(), primary: pr.id.clone(), seq_no: r.seq };
+    // A second more for each 100,000 rows to hash.
+    let rows: u64 = r.snap.schemas().filter_map(|s| r.snap.table(&s.table)).map(|t| t.n_live_docs()).sum();
+    let timeout = pr.opts.call_timeout + Duration::from_secs(rows / 100_000);
+    let mut c = f.client.clone();
+    drop(pr);
+    let (seq, asked, snap) = (r.seq, r.asked, r.snap);
+    let (theirs, ours) = tokio::join!(tokio::time::timeout(timeout, c.verify(req)), tokio::task::spawn_blocking(move || Digests::of(&snap)));
+    let found = match (theirs, ours) {
+        (_, Err(e)) => Err(format!("the primary's digests: {e}")),
+        (_, Ok(Err(e))) => Err(format!("the primary's digests: {e}")),
+        (Err(_), _) => Err(format!("no digests within {} s", timeout.as_secs())),
+        (Ok(Err(s)), _) => Err(format!("{}: {}", crate::grpc::code_name(s.code()), s.message())),
+        (Ok(Ok(theirs)), Ok(Ok(ours))) => Digests::from_pb(theirs.into_inner()).map(|theirs| ours.differ(&theirs)),
+    };
+    let Some(pr) = p.upgrade() else { return };
+    let f = &pr.followers[k];
+    {
+        let mut v = f.verified();
+        match found {
+            Ok(differ) => {
+                f.verifications.fetch_add(1, Ordering::Relaxed);
+                if let Some(first) = differ.first() {
+                    f.divergences.fetch_add(1, Ordering::Relaxed);
+                    f.drop_out(format!(
+                        "its rows differ from the primary's at transaction {seq}, in {} of the {SLOTS} slots (the first: {first}): it is sent a copy of the primary",
+                        differ.len()
+                    ));
+                    f.diverged.store(true, Ordering::Relaxed);
+                }
+                v.at = Some((seq, Instant::now(), differ));
+                v.error = None;
+            }
+            Err(e) => {
+                f.verify_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(replica = %f.url, seq_no = seq, error = %e, "could not compare a replica's rows with the primary's");
+                v.error = Some(e);
+            }
+        }
+        v.answered = v.answered.max(asked);
+    }
+    f.verifying.store(false, Ordering::Relaxed);
+    f.wake.notify_one();
+    pr.changed();
 }
 
 /// Sends replica `f` a copy of `p`'s database (`Restore`) under `term`: a
@@ -679,6 +968,10 @@ pub struct Follow {
     /// Reads that waited for a write, and reads refused.
     read_waits: AtomicU64,
     reads_refused: AtomicU64,
+    /// The version a call from its primary pinned for the `Verify` that
+    /// follows, and the digests it computed for its primary.
+    pinned: Mutex<Option<Snapshot>>,
+    digests: AtomicU64,
 }
 
 impl Follow {
@@ -706,6 +999,8 @@ impl Follow {
             committed,
             read_waits: AtomicU64::new(0),
             reads_refused: AtomicU64::new(0),
+            pinned: Mutex::new(None),
+            digests: AtomicU64::new(0),
         })
     }
 
@@ -782,6 +1077,14 @@ impl Follow {
         let replica_term = self.db.storage().numbering().map_or(0, |n| n.term).max(r.term);
         // It serves reads while what it holds reaches the primary's last.
         self.serves_reads.store(matches!(applied, Ok(Applied::At(_))) && !r.behind, Ordering::Relaxed);
+        // Nothing else writes here: the latest version holds the batch's
+        // last transaction, and no later one.
+        if let (true, Ok(Applied::At(at))) = (r.pin, &applied) {
+            let snap = self.db.snapshot();
+            if snap.seq_no() == Some(at.seq) {
+                *self.pinned.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+            }
+        }
         Ok(match applied? {
             Applied::At(at) => {
                 self.applied.fetch_add(n, Ordering::Relaxed);
@@ -790,6 +1093,37 @@ impl Follow {
             }
             Applied::Mismatch { seq, term } => answer(false, SeqNo { term, seq }, replica_term),
         })
+    }
+
+    /// Its digests at the version a call from its primary pinned
+    /// (`Verify`): refused (409) for a primary or term it does not follow,
+    /// and when it holds no version pinned at that transaction. The
+    /// version is let go once answered.
+    pub async fn verify(&self, r: pb::VerifyRequest) -> Result<pb::VerifyResponse, ApiError> {
+        match &self.kept.lock().await.follows {
+            Some((id, t)) if *id == r.primary && *t == r.term => {}
+            f => {
+                let follows = f.as_ref().map_or("no primary".to_string(), |(id, t)| format!("primary {id} in term {t}"));
+                return Err(conflict(format!("this replica follows {follows}, not primary {} in term {}", r.primary, r.term)));
+            }
+        }
+        let snap = {
+            let mut pinned = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
+            match pinned.as_ref().map(|s| s.seq_no().unwrap_or(0)) {
+                Some(at) if at == r.seq_no => pinned.take(),
+                at => {
+                    let holds = at.map_or("none".to_string(), |at| format!("one at {at}"));
+                    return Err(conflict(format!(
+                        "this replica holds no version pinned at transaction {} (it holds {holds}): its primary pins one with the call that ships that transaction",
+                        r.seq_no
+                    )));
+                }
+            }
+        };
+        let d = tokio::task::spawn_blocking(move || snap.map(|s| Digests::of(&s))).await.map_err(ApiError::internal)?;
+        let d = d.ok_or_else(|| ApiError::internal("the pinned version went"))??;
+        self.digests.fetch_add(1, Ordering::Relaxed);
+        Ok(d.to_pb())
     }
 
     /// Follows `primary` in `term`, which is not older than this
@@ -827,6 +1161,10 @@ impl Follow {
             return Ok(pb::ReplicateResponse { matched: false, seq: numbering.seq, term: numbering.last().term, replica_term: term });
         }
         self.follow(&mut kept, &first.primary, first.term)?;
+        // Its rows are behind its primary's log, or differ: no reads
+        // until the copy is in and a call finds it caught up.
+        self.serves_reads.store(false, Ordering::Relaxed);
+        *self.pinned.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let path = beside(self.db.storage().path(), "restore");
         let _removed = Removed(path.clone());
         let size = first.size;
@@ -886,6 +1224,7 @@ impl Follow {
             "role": "replica", "id": kept.id, "term": n.term, "seq_no": n.seq, "global_checkpoint": self.global_checkpoint.load(Ordering::Relaxed),
             "restores": self.restores.load(Ordering::Relaxed), "serves_reads": self.serves_reads.load(Ordering::Relaxed),
             "read_waits": self.read_waits.load(Ordering::Relaxed), "reads_refused": self.reads_refused.load(Ordering::Relaxed),
+            "digests": self.digests.load(Ordering::Relaxed),
         });
         if let Some((primary, term)) = kept.follows {
             h["follows"] = json!({"primary": primary, "term": term});
@@ -905,6 +1244,7 @@ impl Follow {
             Family::one("strata_replica_serves_reads", "gauge", "1 while this replica serves reads: its primary's last call reached the primary's last transaction.", self.serves_reads.load(Ordering::Relaxed) as u8 as f64),
             Family::one("strata_replica_read_waits_total", "counter", "Reads that waited for this replica to apply a write they must see (min_seq_no).", self.read_waits.load(Ordering::Relaxed) as f64),
             Family::one("strata_replica_reads_refused_total", "counter", "Reads refused while this replica caught up, or because it had not applied a write they must see in time.", self.reads_refused.load(Ordering::Relaxed) as f64),
+            Family::one("strata_replica_digests_total", "counter", "Digests of its rows this replica computed for its primary to compare (Verify).", self.digests.load(Ordering::Relaxed) as f64),
         ]
     }
 }

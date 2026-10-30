@@ -53,6 +53,10 @@ pub struct Options {
     /// On a primary or a replica: the latest transactions kept to ship, in
     /// MiB (0: 64).
     pub ship_log_mb: usize,
+    /// With `replicas`: how often each replica's rows are compared with
+    /// the primary's, in seconds (0: only when asked, `POST
+    /// /v1/admin/verify`).
+    pub verify_every_s: u64,
     /// Coordinate these shard servers (gRPC URLs; replicas of a shard
     /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
@@ -254,7 +258,14 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     // Once loaded: bulk loads are not shipped, so every copy loads the same.
     if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
         if !o.replicas.is_empty() {
-            let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, token: o.coord.token.clone(), ca: o.coord.ca.clone(), ..Default::default() };
+            let opts = PrimaryOptions {
+                replicas: o.replicas.clone(),
+                acks: o.write_acks,
+                token: o.coord.token.clone(),
+                ca: o.coord.ca.clone(),
+                verify_every: Duration::from_secs(o.verify_every_s),
+                ..Default::default()
+            };
             let p = Primary::start(db.clone(), Some(file), opts)?;
             tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
             svc.replication = Replication::Primary(p);

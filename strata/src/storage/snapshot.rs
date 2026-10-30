@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::postings::bytes::OwnedBytes;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::schema::Schema;
 use crate::segment::build::BuildOptions;
 use crate::segment::{DocFilter, DocId, SegmentFile};
@@ -29,7 +29,7 @@ use crate::storage::lock;
 use crate::storage::pk::PkIndex;
 use crate::storage::rowseq;
 use crate::storage::state::{SegHandle, State};
-use crate::storage::updates::Updates;
+use crate::storage::updates::{Updates, SEQ};
 use crate::value::{Document, Value};
 
 /// One segment as seen by a snapshot.
@@ -102,6 +102,39 @@ impl Snapshot {
     /// in a database that numbers its writes (0 before the first).
     pub fn seq_no(&self) -> Option<u64> {
         self.inner.numbered.then_some(self.inner.seq)
+    }
+
+    /// Calls `f` with every live row of the table this snapshot looks at:
+    /// its primary key (`None` in a table without one) and the number of
+    /// the write that last changed it ([`rowseq`]; 0 for rows from before
+    /// numbering, loaded or attached), segment by segment. Replicas compare
+    /// their rows with their primary's by these. Refused for a database that
+    /// does not number its writes.
+    pub fn row_versions(&self, mut f: impl FnMut(Option<&Value>, u64)) -> Result<()> {
+        if !self.numbers_writes() {
+            return Err(Error::Schema("the database does not number its writes".into()));
+        }
+        let v = self.view();
+        let keyed = v.schema.primary_key.is_some();
+        for (seg, pk) in v.segments.iter().zip(&v.pks) {
+            let pk = match pk {
+                Some(pk) => Some(pk),
+                None if keyed => return Err(Error::Corrupt(format!("table {}: segment {} has no primary-key index", v.schema.table, seg.id))),
+                None => None,
+            };
+            let built = rowseq::Seqs::of(&seg.file)?;
+            for d in 0..seg.file.n_docs() as DocId {
+                if seg.live.as_ref().is_some_and(|l| !l.contains(d)) {
+                    continue;
+                }
+                let seq = match seg.updates.as_ref().and_then(|u| u.get(SEQ, d)) {
+                    Some(x) => x.as_i64().unwrap_or(0) as u64,
+                    None => built.as_ref().map_or(0, |s| s.get(d)),
+                };
+                f(pk.map(|pk| pk.key(d)).as_ref(), seq);
+            }
+        }
+        Ok(())
     }
 
     /// The schema of the table this snapshot looks at.
