@@ -303,6 +303,15 @@ message Search {
   repeated SortKey order = 3;
   // Rerank phases after `order`, in turn (plan feature rank_phases).
   repeated Phase phases = 4;
+  // The rank profile the query ranked by, written out above: a server
+  // whose profile of that name has another hash refuses the plan (plan
+  // feature rank_profiles).
+  RankProfileRef profile = 5;
+}
+
+message RankProfileRef {
+  string name = 1;
+  string hash = 2;
 }
 
 // A rerank phase: the top `count` rows of the phase before it ranked again
@@ -792,6 +801,9 @@ message SchemaResponse {
   // Every table's schema, the first first; empty from a server before
   // tables were served (it serves the first alone).
   repeated string tables_json = 2;
+  // Every table's rank profiles, each `{"table": name, "profile": {...}}`,
+  // by table, then name.
+  repeated string profiles_json = 3;
 }
 
 message HealthResponse {

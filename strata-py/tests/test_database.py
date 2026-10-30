@@ -285,3 +285,29 @@ def test_writes_to_any_table(db, tmp_path):
         db.table("nope")
     with pytest.raises(strata.StrataError, match="shard_by"):
         db.sql("UPDATE events SET usr = 'u2' WHERE id = 1")
+
+
+def test_rank_profiles(db):
+    liked = "CREATE RANK PROFILE liked ON books AS SELECT * FROM books ORDER BY bm25(title, :q) * (1 + :w * rating) DESC WITH (w => 0.5)"
+    assert db.sql(liked) == 0
+    sql = "SELECT id, score() FROM books WHERE year >= 1950 ORDER BY rank_profile('liked', q => :q) LIMIT 5"
+    written = "SELECT id, score() FROM books WHERE year >= 1950 ORDER BY bm25(title, :q) * (1 + {w} * rating) DESC LIMIT 5"
+    r, want = db.query(sql, q="dragon"), db.query(written.format(w=0.5), q="dragon")
+    assert len(r) == 5 and (r.keys, r.scores) == (want.keys, want.scores)
+    r = db.query(sql.replace("q => :q", "q => :q, w => 0"), q="dragon")
+    assert r.keys == db.query(written.format(w=0), q="dragon").keys
+    # A plan names the profile, and a database whose profile has changed
+    # since refuses it.
+    plan = db.plan(sql, q="dragon")
+    assert "rank_profiles" in plan["features"]
+    assert db.run(plan).keys == db.query(sql, q="dragon").keys
+    with pytest.raises(strata.StrataError, match="already"):
+        db.sql(liked)
+    assert db.sql(liked.replace("CREATE", "CREATE OR REPLACE").replace("w => 0.5", "w => 2")) == 0
+    with pytest.raises(strata.StrataError, match="is not the one the plan was made with"):
+        db.run(plan)
+    assert db.query(sql, q="dragon").keys == db.query(written.format(w=2), q="dragon").keys
+    assert db.sql("DROP RANK PROFILE liked") == 0
+    with pytest.raises(strata.StrataError, match="books has no rank profile named liked"):
+        db.query(sql, q="dragon")
+    assert db.sql("DROP RANK PROFILE IF EXISTS liked ON books") == 0

@@ -22,6 +22,7 @@ pub mod memory;
 pub mod ops;
 pub mod parse;
 pub mod plan;
+pub mod profile;
 pub mod pool;
 pub mod rank;
 pub mod sql;

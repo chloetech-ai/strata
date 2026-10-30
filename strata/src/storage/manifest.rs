@@ -15,11 +15,12 @@
 //! manifest that requires a feature it does not know, naming it, and
 //! ignores optional ones. A version is written in format 3 only while it
 //! uses a feature ([`Manifest::features`]: a BOOL or TIMESTAMP field, a
-//! NOT NULL field or a field with a DEFAULT, or sequence numbers), so a
-//! database that uses none stays readable by versions of Strata from
-//! before format 3, which refuse format 3 as newer than they read.
+//! NOT NULL field or a field with a DEFAULT, sequence numbers, or a rank
+//! profile), so a database that uses none stays readable by versions of
+//! Strata from before format 3, which refuse format 3 as newer than they
+//! read.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -112,6 +113,35 @@ pub struct TableMeta {
     pub schema: Schema,
     /// Oldest first.
     pub segments: Vec<SegmentMeta>,
+    /// The table's rank profiles, by name. Feature `rank_profiles`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<RankProfile>,
+}
+
+/// A named ranking of a table's rows, kept with the table
+/// (`CREATE RANK PROFILE`, [`crate::query::profile`]): the query that
+/// ranks, as SQL, and default values of its parameters. A query ranks by
+/// it with `ORDER BY rank_profile('name', ...)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RankProfile {
+    pub name: String,
+    /// `SELECT * FROM table ORDER BY ...`, or the `WITH` form of rerank
+    /// phases, as the binder prints it.
+    pub ranking: String,
+    /// Parameters the ranking reads and their values when a query does not
+    /// set them: numbers, strings and booleans.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub defaults: BTreeMap<String, serde_json::Value>,
+}
+
+impl RankProfile {
+    /// Names this definition: two profiles have the same hash when they
+    /// rank alike (FNV-1a of its JSON, as 16 hex digits). A plan made with
+    /// a profile carries it, so a database whose profile of that name
+    /// differs refuses the plan.
+    pub fn hash(&self) -> String {
+        format!("{:016x}", crate::embed::fnv(&serde_json::to_string(self).expect("a rank profile serialises")))
+    }
 }
 
 /// Where a segment and its delete set live.
@@ -158,13 +188,13 @@ impl SegmentMeta {
 impl Manifest {
     /// A new database's manifest: one empty table.
     pub fn new(schema: Schema) -> Manifest {
-        Manifest { txn: 1, wal_txn: 0, next_segment_id: 1, next_table_id: 1, tables: vec![TableMeta { id: 0, schema, segments: Vec::new() }], seq_no: None }
+        Manifest { txn: 1, wal_txn: 0, next_segment_id: 1, next_table_id: 1, tables: vec![TableMeta { id: 0, schema, segments: Vec::new(), profiles: Vec::new() }], seq_no: None }
     }
 
     /// 3 while the database uses a feature ([`Manifest::features`]), else
     /// 1 while it holds only the table it was created with, else 2.
     pub fn format(&self) -> u32 {
-        if self.seq_no.is_some() || self.tables.iter().any(|t| t.schema.features().next().is_some()) {
+        if self.seq_no.is_some() || self.tables.iter().any(|t| t.schema.features().next().is_some() || !t.profiles.is_empty()) {
             3
         } else if self.tables.len() == 1 && self.tables[0].id == 0 {
             1
@@ -174,12 +204,16 @@ impl Manifest {
     }
 
     /// The format 3 features the database needs, sorted: its tables'
-    /// ([`crate::schema::Schema::features`]), and `seq_no` once it numbers
-    /// its writes.
+    /// ([`crate::schema::Schema::features`]), `seq_no` once it numbers its
+    /// writes, `rank_profiles` while a table has a rank profile, and
+    /// `sources` once it has [`SOURCES`].
     pub fn features(&self) -> Vec<String> {
         let mut used: BTreeSet<String> = self.tables.iter().flat_map(|t| t.schema.features()).collect();
         if self.seq_no.is_some() {
             used.insert("seq_no".to_string());
+        }
+        if self.tables.iter().any(|t| !t.profiles.is_empty()) {
+            used.insert(RANK_PROFILES.to_string());
         }
         if self.table(SOURCES_ID).is_some() {
             used.insert("sources".to_string());
@@ -237,7 +271,7 @@ impl Manifest {
                     wal_txn: m.wal_txn,
                     next_segment_id: m.next_segment_id,
                     next_table_id: 1,
-                    tables: vec![TableMeta { id: 0, schema: m.schema, segments: m.segments }],
+                    tables: vec![TableMeta { id: 0, schema: m.schema, segments: m.segments, profiles: Vec::new() }],
                     seq_no: None,
                 })
             }
@@ -283,7 +317,11 @@ struct V1 {
 
 /// The features this version of Strata reads, besides its analyzers'
 /// ([`known_feature`]).
-pub const FEATURES: &[&str] = &["bool", "default", "media", "not_null", "semantic_id", "seq_no", "shard_by", "sources", "timestamp"];
+pub const FEATURES: &[&str] = &["bool", "default", "media", "not_null", RANK_PROFILES, "semantic_id", "seq_no", "shard_by", "sources", "timestamp"];
+
+/// The feature of a database with a rank profile ([`RankProfile`]), and of
+/// a write-ahead log that may hold one ([`crate::storage::wal`]).
+pub const RANK_PROFILES: &str = "rank_profiles";
 
 /// The system table in which streams keep, per source (a Kafka partition,
 /// say), the offset of the last event they wrote, in the transaction that
@@ -406,7 +444,7 @@ mod tests {
     fn several_tables_use_format_2() {
         let mut m = Manifest::new(schema("papers"));
         m.tables[0].segments.push(segment(1));
-        m.tables.push(TableMeta { id: 1, schema: schema("authors"), segments: vec![segment(2)] });
+        m.tables.push(TableMeta { id: 1, schema: schema("authors"), segments: vec![segment(2)], profiles: Vec::new() });
         m.next_table_id = 2;
         m.next_segment_id = 3;
         assert_eq!(m.format(), 2);
@@ -438,11 +476,11 @@ mod tests {
 
         // A second table that uses one: format 3 while it is there.
         let mut m = Manifest::new(schema("papers"));
-        m.tables.push(TableMeta { id: 1, schema: typed("tasks"), segments: Vec::new() });
+        m.tables.push(TableMeta { id: 1, schema: typed("tasks"), segments: Vec::new(), profiles: Vec::new() });
         m.next_table_id = 2;
         assert_eq!(m.format(), 3);
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
-        m.tables.push(TableMeta { id: 2, schema: schema("authors"), segments: Vec::new() });
+        m.tables.push(TableMeta { id: 2, schema: schema("authors"), segments: Vec::new(), profiles: Vec::new() });
         m.tables.remove(1);
         assert_eq!((m.format(), m.features()), (2, strings(&[])));
         assert!(!String::from_utf8(m.encode()).unwrap().contains("features"));
@@ -486,7 +524,7 @@ mod tests {
         let mut m = Manifest::new(Schema::new("t", fields, Some("id")).unwrap());
         assert_eq!((m.format(), m.features()), (3, strings(&["default", "not_null"])));
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
-        m.tables.push(TableMeta { id: 1, schema: typed("tasks"), segments: Vec::new() });
+        m.tables.push(TableMeta { id: 1, schema: typed("tasks"), segments: Vec::new(), profiles: Vec::new() });
         assert_eq!(m.features(), ["bool", "default", "not_null", "timestamp"]);
         // A key said to be NOT NULL needs nothing: keys always are.
         let key = Schema::new("k", vec![Field::new("id", FieldType::Keyword).not_null()], Some("id")).unwrap();
@@ -509,12 +547,42 @@ mod tests {
         }
         // With another feature, and with several tables.
         m.tables[0].schema = typed("tasks");
-        m.tables.push(TableMeta { id: 1, schema: schema("authors"), segments: Vec::new() });
+        m.tables.push(TableMeta { id: 1, schema: schema("authors"), segments: Vec::new(), profiles: Vec::new() });
         assert_eq!(m.features(), ["bool", "seq_no", "timestamp"]);
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
         // A version from before sequence numbers refuses it by name.
         let e = Manifest::decode(String::from_utf8(m.encode()).unwrap().replace(r#""seq_no","#, r#""seq_no2","#).as_bytes()).unwrap_err().to_string();
         assert!(e.contains(r#"feature "seq_no2""#), "{e}");
+    }
+
+    /// Rank profiles are kept with their table, and need format 3 and
+    /// `rank_profiles` while a table has one.
+    #[test]
+    fn rank_profiles_are_a_feature() {
+        let mut m = Manifest::new(schema("papers"));
+        m.tables.push(TableMeta { id: 1, schema: schema("authors"), segments: Vec::new(), profiles: Vec::new() });
+        m.next_table_id = 2;
+        let p = RankProfile { name: "recent".into(), ranking: "SELECT * FROM authors ORDER BY year DESC".into(), defaults: [("w".to_string(), serde_json::json!(0.5))].into() };
+        m.tables[1].profiles.push(p.clone());
+        assert_eq!((m.format(), m.features()), (3, strings(&[RANK_PROFILES])));
+        let text = String::from_utf8(m.encode()).unwrap();
+        assert!(text.starts_with(r#"{"format":3,"features":{"required":["rank_profiles"]},"#), "{text}");
+        assert!(text.contains(r#""profiles":[{"name":"recent","ranking":"SELECT * FROM authors ORDER BY year DESC","defaults":{"w":0.5}}]"#), "{text}");
+        assert_eq!(text.matches(r#""profiles""#).count(), 1, "a table without profiles writes none: {text}");
+        assert_eq!(Manifest::decode(text.as_bytes()).unwrap(), m);
+        // A version from before them refuses it by name.
+        let e = Manifest::decode(text.replace(r#"["rank_profiles"]"#, r#"["rank_profiles2"]"#).as_bytes()).unwrap_err().to_string();
+        assert!(e.contains(r#"feature "rank_profiles2""#), "{e}");
+        // Without profiles, format 2 again.
+        m.tables[1].profiles.clear();
+        assert_eq!((m.format(), m.features()), (2, strings(&[])));
+        assert!(!String::from_utf8(m.encode()).unwrap().contains("profiles"));
+        // A hash names the definition.
+        let mut q = p.clone();
+        assert_eq!(q.hash(), p.hash());
+        q.defaults.insert("w".into(), serde_json::json!(0.6));
+        assert_ne!(q.hash(), p.hash());
+        assert_eq!(p.hash().len(), 16);
     }
 
     #[test]
