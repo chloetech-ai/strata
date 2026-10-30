@@ -283,7 +283,7 @@ struct V1 {
 
 /// The features this version of Strata reads, besides its analyzers'
 /// ([`known_feature`]).
-pub const FEATURES: &[&str] = &["bool", "default", "media", "not_null", "semantic_id", "seq_no", "shard_by", "sources", "timestamp"];
+pub const FEATURES: &[&str] = &["bool", "cluster_by", "default", "media", "not_null", "retain", "semantic_id", "seq_no", "shard_by", "sources", "timestamp"];
 
 /// The system table in which streams keep, per source (a Kafka partition,
 /// say), the offset of the last event they wrote, in the transaction that

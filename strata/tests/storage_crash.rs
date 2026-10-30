@@ -7,6 +7,10 @@
 //! The child logs each transaction to a side file before committing it
 //! (`B`) and after the commit returns (`C`); file writes survive SIGKILL,
 //! so the log brackets the recovered state.
+//!
+//! The same runs on a table with `cluster_by` and `retain`, whose flushes
+//! and merges reorder rows and drop expired ones: a tenth of the keys get
+//! a time a day past the retention, and may be there or not.
 
 mod storage_util;
 
@@ -20,13 +24,52 @@ use std::time::Duration;
 
 use rand::{Rng, SeedableRng};
 use storage_util::*;
+use strata::schema::{Field, Schema};
 use strata::storage::{Database, DbOptions, MergePolicy};
+use strata::value::Document;
 use strata::Value;
 
 const CHILD_ENV: &str = "STRATA_CRASH_CHILD";
 
 fn id_of(k: &str) -> u64 {
     k[1..].parse().unwrap()
+}
+
+const DAY: i64 = 86_400_000_000;
+
+/// [`schema`] with a time, its rows ordered by `n` and kept for a day.
+fn clustered() -> Schema {
+    let s = schema();
+    let mut fields = s.fields.clone();
+    fields.push(Field::timestamp("ts"));
+    Schema::new("t", fields, Some("id")).unwrap().with_cluster_by("n").unwrap().with_retain("ts", 86_400).unwrap()
+}
+
+/// Keys whose rows in the clustered table are past its retention.
+fn expires(i: u64) -> bool {
+    i.is_multiple_of(10)
+}
+
+/// [`opts`], whose merges rebuild rows from the doc store stand-in, or
+/// for the clustered table from the segments' stored rows: the stand-in
+/// gives a key's latest row, not the one a segment holds, and the order a
+/// merge writes is checked.
+fn source(clustered: bool, src: &Arc<MapSource>) -> DbOptions {
+    match clustered {
+        true => DbOptions { doc_source: Some(Arc::new(strata::db::StoredSource)), ..opts(src) },
+        false => opts(src),
+    }
+}
+
+/// [`doc`], with a time when the table is the clustered one (as stored,
+/// an integer).
+fn doc_of(clustered: bool, i: u64, v: i64) -> Document {
+    let mut d = doc(i, v);
+    if clustered {
+        let now = strata::timestamp::now();
+        d.push(Value::Int(if expires(i) { now - 2 * DAY } else { now }));
+    }
+    d
 }
 
 /// The child: runs until killed. Not a real test unless `CHILD_ENV` is set.
@@ -36,6 +79,8 @@ fn crash_child() {
     let parts: Vec<&str> = spec.split('|').collect();
     let (db_path, log_path) = (Path::new(parts[0]), Path::new(parts[1]));
     let seed: u64 = parts[2].parse().unwrap();
+    let clustered = parts[3] == "clustered";
+    let doc = |i, v| doc_of(clustered, i, v);
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let src = Arc::new(MapSource::default());
     let o = DbOptions {
@@ -43,10 +88,15 @@ fn crash_child() {
         memtable_max_docs: rng.gen_range(20..300),
         memtable_chunk_docs: rng.gen_range(1..200),
         segment_max_docs: rng.gen_range(50..400),
-        ..opts(&src)
+        ..source(clustered, &src)
     };
-    let db = open_or_create(db_path, o);
-    let mut live: BTreeSet<u64> = live_keys(&db.snapshot()).keys().map(|k| id_of(k)).collect();
+    let db = match clustered && !db_path.exists() {
+        true => Database::create(db_path, self::clustered(), o).unwrap(),
+        false => open_or_create(db_path, o),
+    };
+    // Keys whose rows expire are written with upserts only: a flush or a
+    // merge may drop them at any time.
+    let mut live: BTreeSet<u64> = live_keys(&db.snapshot()).keys().map(|k| id_of(k)).filter(|&i| !(clustered && expires(i))).collect();
     for &i in &live {
         src.put(&doc(i, 0));
     }
@@ -61,7 +111,11 @@ fn crash_child() {
                 for _ in 0..rng.gen_range(1..30) {
                     let i = rng.gen_range(0..1500u64);
                     let d = doc(i, n as i64);
-                    if live.contains(&i) && rng.gen_bool(0.5) {
+                    if clustered && expires(i) {
+                        src.put(&d);
+                        tx.upsert(d).unwrap();
+                        ops.push(format!("u{i}"));
+                    } else if live.contains(&i) && rng.gen_bool(0.5) {
                         assert!(tx.delete(&Value::Str(key(i))).unwrap());
                         live.remove(&i);
                         ops.push(format!("d{i}"));
@@ -96,7 +150,7 @@ fn crash_child() {
                 let ops: Vec<String> = ids.iter().map(|i| format!("i{i}")).collect();
                 note(&mut log, format!("B {n} {}\n", ops.join(",")));
                 db.bulk_load(docs).unwrap();
-                live.extend(ids);
+                live.extend(ids.into_iter().filter(|&i| !(clustered && expires(i))));
                 note(&mut log, format!("C {n}\n"));
             }
         }
@@ -158,15 +212,20 @@ fn candidates(start: &BTreeSet<u64>, log: &str) -> Vec<BTreeSet<u64>> {
 
 #[test]
 fn killed_writer_recovers_a_committed_prefix() {
-    killed_writer_recovers("db.strata");
+    killed_writer_recovers("db.strata", false);
 }
 
 #[test]
 fn killed_writer_recovers_a_committed_prefix_in_directory_layout() {
-    killed_writer_recovers("db.dir");
+    killed_writer_recovers("db.dir", false);
 }
 
-fn killed_writer_recovers(name: &str) {
+#[test]
+fn killed_writer_of_a_clustered_table_recovers_a_committed_prefix() {
+    killed_writer_recovers("db.strata", true);
+}
+
+fn killed_writer_recovers(name: &str, clustered: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join(name);
     let exe = std::env::current_exe().unwrap();
@@ -176,7 +235,7 @@ fn killed_writer_recovers(name: &str) {
     let iterations = std::env::var("STRATA_CRASH_ITERS").map_or(20, |v| v.parse().unwrap());
     for iter in 0..iterations {
         let log_path = dir.path().join(format!("log{iter}"));
-        let spec = format!("{}|{}|{iter}", db_path.display(), log_path.display());
+        let spec = format!("{}|{}|{iter}|{}", db_path.display(), log_path.display(), if clustered { "clustered" } else { "plain" });
         let mut child = Command::new(&exe)
             .args(["crash_child", "--exact", "--test-threads=1"])
             .env(CHILD_ENV, spec)
@@ -191,20 +250,30 @@ fn killed_writer_recovers(name: &str) {
         child.wait().unwrap();
 
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        let cands = candidates(&state, &log);
-        let db = Database::open(&db_path, opts(&src)).unwrap();
+        // Keys that expire may be there or not.
+        let kept = |s: &BTreeSet<u64>| s.iter().copied().filter(|&i| !(clustered && expires(i))).collect::<BTreeSet<u64>>();
+        let cands: Vec<BTreeSet<u64>> = candidates(&state, &log).iter().map(kept).collect();
+        let db = Database::open(&db_path, source(clustered, &src)).unwrap();
         let snap = db.snapshot();
         let got = live_keys(&snap);
         assert!(got.values().all(|&c| c == 1), "iteration {iter}: a key is live twice");
         let got: BTreeSet<u64> = got.keys().map(|k| id_of(k)).collect();
-        let pos = cands.iter().position(|c| *c == got);
+        if clustered {
+            // Every segment on disk holds its rows in order of n.
+            for v in snap.segments().iter().filter(|v| !v.in_memory) {
+                let n = strata::forward::NumericColumn::open(&v.file, "n").unwrap();
+                let ns: Vec<Option<i64>> = (0..v.file.n_docs() as u32).map(|d| n.get_i64(d)).collect();
+                assert!(ns.is_sorted(), "iteration {iter}: segment {} is not in order of n", v.id);
+            }
+        }
+        let pos = cands.iter().position(|c| *c == kept(&got));
         let txns = log.lines().filter(|l| l.starts_with("C ")).count();
         assert!(pos.is_some(), "iteration {iter}: recovered {} keys, not a committed prefix ({} candidates)", got.len(), cands.len());
         assert_eq!(snap.n_live_docs(), got.len() as u64);
         drop(snap);
         db.check().unwrap();
         eprintln!("iteration {iter}: {txns} commits acknowledged, recovered {} keys", got.len());
-        state = got;
+        state = kept(&got);
     }
 }
 
