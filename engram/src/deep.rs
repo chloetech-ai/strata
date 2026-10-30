@@ -399,7 +399,7 @@ pub fn run_query(store: &Store, q: &Query, filter: &Filter, n: usize) -> Result<
             } else {
                 let mut conds = f.conds();
                 conds.push("MATCH(files, :files)".into());
-                let order = if strata::text::analyze_query(&q.q).is_empty() { "seq DESC" } else { "bm25(body, :q) DESC" };
+                let order = if strata::text::analyze_query(&q.q).is_empty() { "seq DESC" } else { "bm25(body, :q, syntax => 'plain') DESC" };
                 let params = f.params().set("files", Value::Str(terms.join(" AND "))).set("q", Value::Str(q.q.clone()));
                 let rs = store.query_with(&format!("SELECT {COLUMNS} FROM memory WHERE {} ORDER BY {order} LIMIT {n}", conds.join(" AND ")), &params)?;
                 rs.rows.iter().filter_map(|r| row_record(r)).collect()

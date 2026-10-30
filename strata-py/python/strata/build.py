@@ -48,6 +48,7 @@ __all__ = [
     "similarity",
     "maxsim",
     "rrf",
+    "ranked",
     "minmax",
     "rank",
     "gbdt",
@@ -615,9 +616,18 @@ def match(field: str, query: str) -> Expr:
     return _Fn(lambda ctx: {"match": {"field": ctx.field(field)[0], "query": query}}, f"match({field!r}, {query!r})", score=False)
 
 
-def bm25(field: str, text: str) -> Expr:
-    """BM25 of a TEXT field for `text`, as a score."""
-    return _Fn(lambda ctx: {"bm25": {"field": ctx.field(field)[0], "text": text}}, f"bm25({field!r}, {text!r})")
+def bm25(field: str, text: str, *, syntax: str | None = None) -> Expr:
+    """BM25 of a TEXT field for `text`, as a score. `text` may weigh a
+    word (`word^2`), require one (`+word`, `+"a phrase"`) or exclude one
+    (`-word`); `syntax="plain"` reads it as plain words."""
+
+    def build(ctx: _Ctx) -> Any:
+        m: dict[str, Any] = {"field": ctx.field(field)[0], "text": text}
+        if syntax is not None:
+            m["opts"] = {"syntax": {"text": syntax}}
+        return {"bm25": m}
+
+    return _Fn(build, f"bm25({field!r}, {text!r}" + ("" if syntax is None else f", syntax={syntax!r}") + ")")
 
 
 def similarity(field: str, query: Sequence[float] | Mapping[str, float]) -> Expr:
@@ -662,6 +672,21 @@ def rrf(*scores: Expr, k: float = 60, depth: int = 100) -> Expr:
     if not scores:
         raise StrataError("rrf takes rankings")
     return _Fn(lambda ctx: {"rrf": {"inputs": [s._ir(ctx) for s in scores], "k": float(k), "depth": int(depth)}}, f"rrf({', '.join(map(repr, scores))})", inputs=list(scores))
+
+
+def ranked(keys: Iterable[Any]) -> Expr:
+    """A ranking computed outside Strata, as a score: the rows of `keys`
+    (primary keys, best first), each scoring -(its position) from 1, and
+    rows not listed none. An input of `rrf`, or of an expression."""
+    keys = [keys] if isinstance(keys, (str, int)) else list(keys)
+
+    def build(ctx: _Ctx) -> Any:
+        if not ctx.key:
+            raise StrataError(f"ranked() ranks rows by their primary keys, and {ctx.table} has none")
+        key = ctx.field(ctx.key)[1]
+        return {"ranked": {"keys": [_value(k, key) for k in keys]}}
+
+    return _Fn(build, f"ranked({keys!r})")
 
 
 def minmax(x: Expr) -> Expr:

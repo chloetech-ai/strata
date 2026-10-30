@@ -706,7 +706,7 @@ fn make(
     let op = if kind == Kind::Or3 { " OR " } else { " AND " };
     let m = format!("MATCH(body, {})", quote(&words.join(op)));
     let (sql, count_sql) = match kind {
-        Kind::Bm25 | Kind::FilteredBm25 => (format!("SELECT id FROM docs{wh} ORDER BY bm25(body, {text}) DESC LIMIT {TOP_K}"), None),
+        Kind::Bm25 | Kind::FilteredBm25 => (format!("SELECT id FROM docs{wh} ORDER BY bm25(body, {text}, syntax => 'plain') DESC LIMIT {TOP_K}"), None),
         Kind::And2 | Kind::And3 | Kind::Or3 => {
             (format!("SELECT id FROM docs WHERE {m} LIMIT {TOP_K}"), Some(format!("SELECT COUNT(*) FROM docs WHERE {m}")))
         }
@@ -719,7 +719,7 @@ fn make(
         }
         Kind::Hybrid | Kind::FilteredHybrid => (
             format!(
-                "SELECT id FROM docs{wh} ORDER BY rrf(bm25(body, {text}), similarity(emb, :q), depth => {RRF_DEPTH}) DESC LIMIT {TOP_K}"
+                "SELECT id FROM docs{wh} ORDER BY rrf(bm25(body, {text}, syntax => 'plain'), similarity(emb, :q), depth => {RRF_DEPTH}) DESC LIMIT {TOP_K}"
             ),
             None,
         ),

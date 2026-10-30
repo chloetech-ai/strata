@@ -81,3 +81,45 @@ async fn queries_by_image_over_http() {
     let (status, r) = post(&c, &format!("{base}/v1/embed"), json!({"image": 3})).await;
     assert_eq!(status, 400, "{r}");
 }
+
+/// Text made from images (`derive`): write operations get it before the
+/// writer, BM25 reads it, and `/v1/schema` lists the field. The `colors`
+/// model names an image's colours.
+#[tokio::test(flavor = "multi_thread")]
+async fn derived_text_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = || FieldType::Text { positions: true };
+    let schema = Schema::new("photos", vec![Field::new("id", FieldType::Keyword), Field::media("image", MediaKind::Image), Field::new("caption", text()).derived("colors", "image")], Some("id")).unwrap();
+    let db = Db::create(&dir.path().join("p.strata"), schema.clone(), DbOptions { publish_snapshots: true, sync: false, ..DbOptions::default() }).unwrap();
+    let agent = AgentConfig { api_key: None, model: strata_server::agent::DEFAULT_MODEL.into(), base_url: "http://unused".into() };
+    let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent, 16, Duration::from_secs(10));
+    svc.open_models(dir.path());
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(server::serve_http(Arc::new(svc), l, Access::default()));
+    let c = reqwest::Client::new();
+
+    let ops = vec![
+        json!({"op": "insert", "doc": {"id": "r", "image": {"uri": "r.png", "data": png([250, 10, 10])}}}),
+        json!({"op": "upsert", "doc": {"id": "b", "image": {"uri": "b.png", "data": png([10, 10, 250])}}}),
+        json!({"op": "insert", "doc": {"id": "own", "image": {"uri": "o.png", "data": png([10, 10, 250])}, "caption": "a caption of my own"}}),
+    ];
+    let (status, w) = post(&c, &format!("{base}/v1/write"), json!({"ops": ops})).await;
+    assert_eq!((status, w["written"].as_u64()), (200, Some(3)), "{w}");
+    let sorted = |r: &Json| {
+        let mut rows = r["rows"].as_array().cloned().unwrap_or_default();
+        rows.sort_by_key(|r| r[0].as_str().map(String::from));
+        json!(rows)
+    };
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id, caption FROM photos LIMIT 10"})).await;
+    assert_eq!(sorted(&r), json!([["b", "blue"], ["own", "a caption of my own"], ["r", "red"]]), "{r}");
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id FROM photos WHERE MATCH(caption, 'blue')"})).await;
+    assert_eq!(r["rows"], json!([["b"]]), "{r}");
+    let (_, r) = post(&c, &format!("{base}/v1/sql"), json!({"sql": format!("UPDATE photos SET image = '{}' WHERE id = 'b'", json!({"uri": "r2.png", "data": png([250, 10, 10])}))})).await;
+    assert_eq!(r["written"], json!(1), "{r}");
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id FROM photos WHERE MATCH(caption, 'red')"})).await;
+    assert_eq!(sorted(&r), json!([["b"], ["r"]]), "{r}");
+    let s: Json = c.get(format!("{base}/v1/schema")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(s["derived"], json!([{"field": "caption", "from": "image", "model": "colors", "loaded": true}]), "{s}");
+    assert_eq!(s["short"]["fields"][2]["derive"], json!({"from": "image", "model": "colors"}), "{s}");
+}

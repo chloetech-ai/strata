@@ -500,8 +500,8 @@ fn sql(kind: &str, q: &Q, i: usize) -> String {
     let f = filter(q, i);
     let s = "SELECT id, score() FROM docs";
     match kind {
-        "bm25" => format!("{s} ORDER BY bm25(body, :t) DESC LIMIT 10"),
-        "bm25_filtered" => format!("{s} WHERE {f} ORDER BY bm25(body, :t) DESC LIMIT 10"),
+        "bm25" => format!("{s} ORDER BY bm25(body, :t, syntax => 'plain') DESC LIMIT 10"),
+        "bm25_filtered" => format!("{s} WHERE {f} ORDER BY bm25(body, :t, syntax => 'plain') DESC LIMIT 10"),
         "vector" => format!("{s} ORDER BY similarity(emb, :q) DESC LIMIT 10"),
         "vector_ef128" => format!("{s} ORDER BY similarity(emb, :q, ef => 128) DESC LIMIT 10"),
         "vector_ef256" => format!("{s} ORDER BY similarity(emb, :q, ef => 256) DESC LIMIT 10"),
@@ -510,9 +510,9 @@ fn sql(kind: &str, q: &Q, i: usize) -> String {
         "vector_flat_rerank200" => format!("{s} ORDER BY similarity(emb, :q, strategy => 'flat', rerank => 200) DESC LIMIT 10"),
         "vector_filtered" => format!("{s} WHERE {f} ORDER BY similarity(emb, :q) DESC LIMIT 10"),
         "vector_filtered_exact" => format!("{s} WHERE {f} ORDER BY similarity(emb, :q, strategy => 'prefilter', rerank => 100) DESC LIMIT 10"),
-        "hybrid_rrf" => format!("{s} ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10"),
-        "hybrid_weighted" => format!("{s} ORDER BY 0.3 * minmax(bm25(body, :t)) + 0.7 * minmax(similarity(emb, :q)) DESC LIMIT 10"),
-        "bm25_top100" => format!("{s} ORDER BY bm25(body, :t) DESC LIMIT 100"),
+        "hybrid_rrf" => format!("{s} ORDER BY rrf(bm25(body, :t, syntax => 'plain'), similarity(emb, :q)) DESC LIMIT 10"),
+        "hybrid_weighted" => format!("{s} ORDER BY 0.3 * minmax(bm25(body, :t, syntax => 'plain')) + 0.7 * minmax(similarity(emb, :q)) DESC LIMIT 10"),
+        "bm25_top100" => format!("{s} ORDER BY bm25(body, :t, syntax => 'plain') DESC LIMIT 100"),
         "vector_top100" => format!("{s} ORDER BY similarity(emb, :q) DESC LIMIT 100"),
         other => panic!("unknown kind {other}"),
     }

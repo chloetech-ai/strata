@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use crate::derive::Deriver;
 use crate::embed::{Embedder, Input, Modality};
 use crate::error::{Error, Result};
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
@@ -24,7 +25,7 @@ use crate::query::ir::Plan;
 use crate::query::model::Models;
 use crate::query::stats::TermStats;
 use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
-use crate::schema::{Embed, FieldType, Schema};
+use crate::schema::{Derive, Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn, SOURCES};
 use crate::value::{Document, Value};
@@ -47,6 +48,7 @@ pub struct PreparedWrite {
     schema: Arc<Schema>,
     write: Write,
     known: Known,
+    derived: Derived,
 }
 
 impl PreparedWrite {
@@ -79,6 +81,10 @@ impl PreparedWrite {
 /// Vectors computed ahead of a write, by embedded field and source text.
 type Known = HashMap<usize, HashMap<String, Arc<[f32]>>>;
 
+/// Text made ahead of a write, by derived field and the MEDIA value it is
+/// made from.
+type Derived = HashMap<usize, HashMap<String, String>>;
+
 /// A stream's source, as the system table [`SOURCES`] keeps it: the
 /// offset of the last event written from it, and when that was written
 /// (microseconds since the epoch).
@@ -99,6 +105,8 @@ pub struct Db {
     pub exec: ExecOptions,
     /// Models of embedded VECTOR fields ([`Db::set_embedder_in`]).
     embedders: RwLock<Vec<Model>>,
+    /// Models of derived TEXT fields ([`Db::set_deriver_in`]).
+    derivers: RwLock<Vec<Deriving>>,
     /// Where [`Db::open_embedders`] found models, for the tables created
     /// after it, and where ranking models are ([`Db::open_ranking_models`]).
     models: RwLock<Option<PathBuf>>,
@@ -118,6 +126,15 @@ struct Model {
     embed: Embed,
     dim: usize,
     model: Arc<dyn Embedder>,
+}
+
+/// The model of a derived TEXT field, and the field it was set for (as
+/// [`Model`] is).
+struct Deriving {
+    table: String,
+    field: String,
+    derive: Derive,
+    model: Arc<dyn Deriver>,
 }
 
 impl Db {
@@ -151,6 +168,7 @@ impl Db {
             readers: RwLock::new(HashMap::new()),
             exec: ExecOptions::default(),
             embedders: RwLock::new(Vec::new()),
+            derivers: RwLock::new(Vec::new()),
             models: RwLock::new(None),
             media: RwLock::new(Arc::new(Resolver::default())),
             ranking: Models::default(),
@@ -277,6 +295,7 @@ impl Db {
     pub fn try_load_into(&self, table: &str, docs: impl IntoIterator<Item = Result<Document>>) -> Result<()> {
         let schema = self.table(table)?;
         let models = self.models_of(&schema);
+        let derivers = self.derivers_of(&schema);
         let media = self.media_resolver();
         let mut docs = docs.into_iter();
         if models.iter().all(Option::is_none) && !schema.fields.iter().any(|f| f.media.is_some()) {
@@ -289,8 +308,8 @@ impl Db {
         }
         // Resolved and embedded in batches, so that fetches run together
         // and a model sees many texts at once; fewer rows of images, whose
-        // bytes are held until they are embedded.
-        let batch_size = if (0..schema.fields.len()).any(|f| schema.embeds_media(f).is_some()) { MEDIA_BATCH } else { EMBED_BATCH };
+        // bytes are held until a model has read them.
+        let batch_size = if (0..schema.fields.len()).any(|f| read_by_model(&schema, f)) { MEDIA_BATCH } else { EMBED_BATCH };
         let mut ready: std::vec::IntoIter<Result<Document>> = Vec::new().into_iter();
         self.storage.try_bulk_load_into(
             table,
@@ -312,7 +331,11 @@ impl Db {
                     return None;
                 }
                 batch.iter_mut().for_each(|d| schema.fill_generated(d));
-                let embedded = resolve_media(&media, &schema, &mut batch).and_then(|held| embed_with(&models, &schema, &mut batch, &Files { resolver: &media, held }));
+                let embedded = resolve_media(&media, &schema, &mut batch).and_then(|held| {
+                    let files = Files { resolver: &media, held };
+                    derive_known(&derivers, &schema, &mut batch, &Derived::new(), &files)?;
+                    embed_with(&models, &schema, &mut batch, &files)
+                });
                 if let Err(e) = embedded {
                     return Some(Err(e));
                 }
@@ -364,7 +387,8 @@ impl Db {
     /// embedding ([`crate::schema::Embed`]); otherwise this database embeds
     /// it anew (given the model, [`Db::set_embedder`]). A semantic-ID field
     /// is copied when the old field has the same codebook, and derived anew
-    /// otherwise: a new codebook means a new field, filled this way.
+    /// otherwise: a new codebook means a new field, filled this way. So is
+    /// a derived TEXT field, by its model ([`crate::schema::Derive`]).
     /// Returns the rows loaded.
     pub fn load_from(&self, other: &Db) -> Result<u64> {
         let (old, new) = (other.schema(), self.schema());
@@ -381,6 +405,8 @@ impl Db {
                     (FieldType::Vector { dim: a, .. }, FieldType::Vector { dim: b, .. }) => a == b && f.embed == g.embed,
                     // Codes of another codebook are derived anew.
                     _ if f.semantic_id.is_some() || g.semantic_id.is_some() => f.semantic_id == g.semantic_id,
+                    // Text of another model is made anew.
+                    _ if f.derive.is_some() || g.derive.is_some() => f.derive == g.derive,
                     (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b) && f.multi == g.multi && f.media == g.media,
                 };
                 keep.then_some(j)
@@ -463,11 +489,50 @@ impl Db {
             .collect()
     }
 
+    /// Gives derived TEXT field `field` ([`crate::schema::Derive`]) of the
+    /// table named `table` its model. Writes through this `Db` that leave
+    /// the text out get it made, as they get embedded vectors.
+    pub fn set_deriver_in(&self, table: &str, field: &str, d: Arc<dyn Deriver>) -> Result<()> {
+        let schema = self.table(table)?;
+        let f = schema.field(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let Some(spec) = &f.derive else { return Err(Error::Schema(format!("field {field} is not a derived TEXT field"))) };
+        let kind = schema.field(&spec.from).and_then(|m| m.media).expect("checked by the schema");
+        if d.modality() == Modality::Image && kind != crate::media::MediaKind::Image {
+            return Err(Error::Schema(format!("model {} makes text of images, and {} is a MEDIA field of kind {}: declare kind = 'image'", spec.model, spec.from, kind.as_str())));
+        }
+        let mut all = self.derivers.write().unwrap_or_else(|e| e.into_inner());
+        all.retain(|m| !(m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name)));
+        all.push(Deriving { table: schema.table.clone(), field: f.name.clone(), derive: spec.clone(), model: d });
+        Ok(())
+    }
+
+    /// The model of derived field `field` of the table named `table`.
+    pub fn deriver_in(&self, table: &str, field: &str) -> Option<Arc<dyn Deriver>> {
+        let schema = self.storage.table(table)?;
+        let i = schema.field_index(field)?;
+        self.derivers_of(&schema).swap_remove(i)
+    }
+
+    /// The models of the derived fields of the table `schema` describes, by
+    /// field.
+    fn derivers_of(&self, schema: &Schema) -> Vec<Option<Arc<dyn Deriver>>> {
+        let all = self.derivers.read().unwrap_or_else(|e| e.into_inner());
+        schema
+            .fields
+            .iter()
+            .map(|f| {
+                let serves = |m: &&Deriving| m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name) && f.derive.as_ref() == Some(&m.derive);
+                all.iter().find(serves).map(|m| m.model.clone())
+            })
+            .collect()
+    }
+
     /// Opens the model of every embedded field of every table from `models`
-    /// ([`crate::embed::open`]), and of the tables created later
+    /// ([`crate::embed::open`]), and of every derived field
+    /// ([`crate::derive::open`]), and those of the tables created later
     /// ([`Db::create_table`]); returns the fields whose model did not open,
     /// with the reason (named `table.field` outside the first table). Their
-    /// vectors must come with the writes.
+    /// vectors or text must come with the writes.
     pub fn open_embedders(&self, models: &Path) -> Vec<(String, Error)> {
         *self.models.write().unwrap_or_else(|e| e.into_inner()) = Some(models.to_path_buf());
         let first = self.schema().table.clone();
@@ -513,8 +578,12 @@ impl Db {
         let Some(schema) = self.storage.table(table) else { return Vec::new() };
         let mut failed = Vec::new();
         for f in &schema.fields {
-            let Some(spec) = &f.embed else { continue };
-            if let Err(e) = crate::embed::open(&spec.model, models).and_then(|m| self.set_embedder_in(table, &f.name, m)) {
+            let opened = match (&f.embed, &f.derive) {
+                (Some(spec), _) => crate::embed::open(&spec.model, models).and_then(|m| self.set_embedder_in(table, &f.name, m)),
+                (_, Some(spec)) => crate::derive::open(&spec.model, models).and_then(|m| self.set_deriver_in(table, &f.name, m)),
+                _ => continue,
+            };
+            if let Err(e) = opened {
                 failed.push((f.name.clone(), e));
             }
         }
@@ -579,15 +648,17 @@ impl Db {
 
     /// Does for documents of the table named `table` the work a write does
     /// before the writer, so that the rows it logs hold every value: their
-    /// MEDIA values are resolved ([`Db::resolve_media_in`]), then the
-    /// embedded vectors they leave out computed ([`Db::embed_missing_in`]).
-    /// Generated fields must be filled in first. [`Db::load`] and SQL
-    /// writes do this themselves.
+    /// MEDIA values are resolved ([`Db::resolve_media_in`]), the derived
+    /// text they leave out made (and the generated fields that read it
+    /// filled in again), then the embedded vectors they leave out computed
+    /// ([`Db::embed_missing_in`]). Generated fields must be filled in
+    /// first. [`Db::load`] and SQL writes do this themselves.
     pub fn fill_in(&self, table: &str, docs: &mut [Document]) -> Result<()> {
         let schema = self.table(table)?;
         let media = self.media_resolver();
-        let held = resolve_media(&media, &schema, docs)?;
-        embed_with(&self.models_of(&schema), &schema, docs, &Files { resolver: &media, held })
+        let files = Files { resolver: &media, held: resolve_media(&media, &schema, docs)? };
+        derive_known(&self.derivers_of(&schema), &schema, docs, &Derived::new(), &files)?;
+        embed_with(&self.models_of(&schema), &schema, docs, &files)
     }
 
     /// Sets how writes through this `Db` resolve the MEDIA values they give
@@ -831,20 +902,22 @@ impl Db {
             Write::Update { sets, .. } => held = resolve_sets(&media, &schema, sets)?,
             Write::Delete { .. } => {}
         }
-        let known = self.embed_ahead(&schema, &write, &Files { resolver: &media, held })?;
-        Ok(PreparedWrite { schema, write, known })
+        let (known, derived) = self.embed_ahead(&schema, &write, &Files { resolver: &media, held })?;
+        Ok(PreparedWrite { schema, write, known, derived })
     }
 
-    /// The vectors `write` will compute, from the latest version. The rows
-    /// an UPDATE or `ON CONFLICT DO UPDATE` rewrites are read here and
-    /// again under the writer lock, where only the texts that changed in
-    /// between are embedded. An error reading the rows (the table dropped,
-    /// a sum that overflows) is left for the write to report; an image
-    /// that cannot be embedded fails the statement.
-    fn embed_ahead(&self, schema: &Schema, write: &Write, files: &Files) -> Result<Known> {
+    /// The text `write` will derive and the vectors it will compute, from
+    /// the latest version. The rows an UPDATE or `ON CONFLICT DO UPDATE`
+    /// rewrites are read here and again under the writer lock, where only
+    /// the files and texts that changed in between go to a model. An error
+    /// reading the rows (the table dropped, a sum that overflows) is left
+    /// for the write to report; an image that cannot be read fails the
+    /// statement.
+    fn embed_ahead(&self, schema: &Schema, write: &Write, files: &Files) -> Result<(Known, Derived)> {
         let models = self.models_of(schema);
-        if models.iter().all(Option::is_none) {
-            return Ok(Known::new());
+        let derivers = self.derivers_of(schema);
+        if models.iter().all(Option::is_none) && derivers.iter().all(Option::is_none) {
+            return Ok((Known::new(), Derived::new()));
         }
         let docs = || -> Result<Vec<Document>> {
             let Some(snap) = self.snapshot().table(&schema.table) else { return Ok(Vec::new()) };
@@ -856,7 +929,7 @@ impl Db {
                     let pk = pk()?;
                     let (live, mut new): (Vec<Document>, Vec<Document>) = docs.iter().cloned().partition(|d| snap.lookup(&d[pk]).is_some());
                     if !in_place(schema, sets) {
-                        new.extend(plan_sets(schema, &models, self.conflict_rows(&snap, schema, pk, live)?, sets)?.rewrites);
+                        new.extend(plan_sets(schema, &models, &derivers, self.conflict_rows(&snap, schema, pk, live)?, sets)?.rewrites);
                     }
                     new
                 }
@@ -864,12 +937,15 @@ impl Db {
                 Write::Update { sets, .. } if in_place(schema, sets) => Vec::new(),
                 Write::Update { select, sets } => {
                     let rows = self.execute(&snap, select, &self.exec)?.rows;
-                    plan_sets(schema, &models, rows.into_iter().map(|r| (r, Vec::new())).collect(), sets)?.rewrites
+                    plan_sets(schema, &models, &derivers, rows.into_iter().map(|r| (r, Vec::new())).collect(), sets)?.rewrites
                 }
                 Write::Delete { .. } => Vec::new(),
             })
         };
-        docs().map_or_else(|_| Ok(Known::new()), |docs| vectors_of(&models, schema, &docs, files))
+        let Ok(mut docs) = docs() else { return Ok((Known::new(), Derived::new())) };
+        let derived = derived_of(&derivers, schema, &docs, files)?;
+        derive_known(&derivers, schema, &mut docs, &derived, files)?;
+        Ok((vectors_of(&models, schema, &docs, files)?, derived))
     }
 
     /// Runs a write [`Db::prepare_write`] bound, in one transaction, and
@@ -893,8 +969,9 @@ impl Db {
             return Err(Error::Query(format!("table {} was dropped and created again while the statement ran; run it again", schema.table)));
         }
         let models = self.models_of(schema);
-        // Vectors computed ahead cover the rows unless they changed since:
-        // images of those are read here.
+        let derivers = self.derivers_of(schema);
+        // Text and vectors computed ahead cover the rows unless they changed
+        // since: files of those are read here.
         let media = self.media_resolver();
         let files = Files { resolver: &media, held: Held::new() };
         // Read under the writer lock: no other write lands between.
@@ -905,6 +982,7 @@ impl Db {
             Write::Insert { mut docs, conflict } => {
                 match conflict {
                     Conflict::Fail | Conflict::Replace => {
+                        derive_known(&derivers, schema, &mut docs, &p.derived, &files)?;
                         embed_known(&models, schema, &mut docs, &p.known, &files)?;
                         for d in docs {
                             if conflict == Conflict::Replace {
@@ -917,6 +995,7 @@ impl Db {
                     }
                     Conflict::Skip => {
                         let mut docs = not_live(&snap, pk()?, docs);
+                        derive_known(&derivers, schema, &mut docs, &p.derived, &files)?;
                         embed_known(&models, schema, &mut docs, &p.known, &files)?;
                         for d in docs {
                             tt.insert(d)?;
@@ -930,13 +1009,14 @@ impl Db {
                             return Err(Error::Query(format!("ON CONFLICT DO UPDATE: key {:?} comes twice; a statement updates a row once", d[pk])));
                         }
                         let (live, mut new): (Vec<Document>, Vec<Document>) = docs.into_iter().partition(|d| snap.lookup(&d[pk]).is_some());
+                        derive_known(&derivers, schema, &mut new, &p.derived, &files)?;
                         embed_known(&models, schema, &mut new, &p.known, &files)?;
                         for d in new {
                             tt.insert(d)?;
                             n += 1;
                         }
                         let pairs = self.conflict_rows(&snap, schema, pk, live)?;
-                        n += set_rows(&mut tt, schema, &models, pairs, &sets, &p.known, &files)?;
+                        n += set_rows(&mut tt, schema, (&models, &derivers), pairs, &sets, (&p.known, &p.derived), &files)?;
                     }
                 }
             }
@@ -948,7 +1028,7 @@ impl Db {
             }
             Write::Update { select, sets } => {
                 let rows = self.execute(&snap, &select, &self.exec)?.rows;
-                n += set_rows(&mut tt, schema, &models, rows.into_iter().map(|r| (r, Vec::new())).collect(), &sets, &p.known, &files)?;
+                n += set_rows(&mut tt, schema, (&models, &derivers), rows.into_iter().map(|r| (r, Vec::new())).collect(), &sets, (&p.known, &p.derived), &files)?;
             }
         }
         drop(tt);
@@ -1139,10 +1219,10 @@ fn resolve_media(r: &Resolver, schema: &Schema, docs: &mut [Document]) -> Result
             let inputs: Vec<&str> = at.iter().filter_map(|&j| docs[j][f].as_str()).collect();
             r.resolve_all(kind, &inputs)
         };
-        let embedded = embedded_media(schema, f);
+        let read = read_by_model(schema, f);
         for (j, m) in at.into_iter().zip(resolved) {
             let m = m.map_err(|e| media_error(&field.name, e))?;
-            if let Some(data) = m.data.filter(|_| embedded) {
+            if let Some(data) = m.data.filter(|_| read) {
                 held.insert(m.media.sha256.clone(), data);
             }
             docs[j][f] = Value::Str(m.media.to_text());
@@ -1157,7 +1237,7 @@ fn resolve_sets(r: &Resolver, schema: &Schema, sets: &mut [(usize, Assign)]) -> 
     for (f, a) in sets {
         let (Some(kind), Assign::Value(Value::Str(t))) = (schema.fields[*f].media, &*a) else { continue };
         let m = r.resolve(kind, t).map_err(|e| media_error(&schema.fields[*f].name, e))?;
-        if let Some(data) = m.data.filter(|_| embedded_media(schema, *f)) {
+        if let Some(data) = m.data.filter(|_| read_by_model(schema, *f)) {
             held.insert(m.media.sha256.clone(), data);
         }
         *a = Assign::Value(Value::Str(m.media.to_text()));
@@ -1165,9 +1245,10 @@ fn resolve_sets(r: &Resolver, schema: &Schema, sets: &mut [(usize, Assign)]) -> 
     Ok(held)
 }
 
-/// Whether a field embeds MEDIA field `f`.
-fn embedded_media(schema: &Schema, f: usize) -> bool {
-    (0..schema.fields.len()).any(|g| schema.embeds_media(g) == Some(f))
+/// Whether a model reads the files of MEDIA field `f`: a field embeds it,
+/// or is derived from it.
+fn read_by_model(schema: &Schema, f: usize) -> bool {
+    (0..schema.fields.len()).any(|g| schema.embeds_media(g) == Some(f) || schema.derives_from(g) == Some(f))
 }
 
 fn media_error(field: &str, e: Error) -> Error {
@@ -1231,20 +1312,87 @@ fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Doc
 /// that the MEDIA values name, decoded a batch at a time.
 fn embed_sources(e: &dyn Embedder, schema: &Schema, f: usize, sources: &[String], files: &Files) -> Result<Vec<Vec<f32>>> {
     let Some(m) = schema.embeds_media(f) else { return Ok(embed_all(e, sources)) };
-    let field = &schema.fields[m].name;
     let mut out = Vec::with_capacity(sources.len());
     for batch in sources.chunks(16) {
-        let images = batch
-            .iter()
-            .map(|t| {
-                let m = Media::parse(t).map_err(Error::Schema)?;
-                let data = files.bytes(&m)?;
-                crate::media::decode_image(&data).map_err(|e| Error::Schema(format!("{}: {e}", m.uri)))
-            })
-            .collect::<Result<Vec<_>>>()
-            .map_err(|e| media_error(field, e))?;
+        let images = images_of(&schema.fields[m].name, batch, files)?;
         let inputs: Vec<Input> = images.iter().map(Input::Image).collect();
         out.extend(e.embed_inputs(&inputs)?);
+    }
+    Ok(out)
+}
+
+/// The images MEDIA values of field `field` name, decoded.
+fn images_of(field: &str, values: &[String], files: &Files) -> Result<Vec<crate::embed::Image>> {
+    values
+        .iter()
+        .map(|t| {
+            let m = Media::parse(t).map_err(Error::Schema)?;
+            let data = files.bytes(&m)?;
+            crate::media::decode_image(&data).map_err(|e| Error::Schema(format!("{}: {e}", m.uri)))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map_err(|e| media_error(field, e))
+}
+
+/// Makes the derived text `docs` leave out (null) with `derivers` (by
+/// field of `schema`), taking it from `known` where it has the file's, and
+/// fills in again the generated fields of the documents that got text. A
+/// document without a file gets none.
+fn derive_known(derivers: &[Option<Arc<dyn Deriver>>], schema: &Schema, docs: &mut [Document], known: &Derived, files: &Files) -> Result<()> {
+    let mut changed = vec![false; docs.len()];
+    for (f, d) in derivers.iter().enumerate() {
+        let (Some(d), Some(m)) = (d, schema.derives_from(f)) else { continue };
+        let ahead = known.get(&f);
+        let mut todo = Vec::new();
+        let mut values = Vec::new();
+        for (j, doc) in docs.iter_mut().enumerate() {
+            let Value::Str(v) = &doc[m] else { continue };
+            if !matches!(doc[f], Value::Null) {
+                continue;
+            }
+            changed[j] = true;
+            match ahead.and_then(|a| a.get(v)) {
+                Some(t) => doc[f] = Value::Str(t.clone()),
+                None => {
+                    todo.push(j);
+                    values.push(v.clone());
+                }
+            }
+        }
+        for (j, t) in todo.into_iter().zip(derive_sources(d.as_ref(), schema, m, &values, files)?) {
+            docs[j][f] = Value::Str(t);
+        }
+    }
+    if schema.fields.iter().any(|f| !f.generated_from.is_empty()) {
+        docs.iter_mut().zip(changed).filter(|(_, c)| *c).for_each(|(d, _)| schema.fill_generated(d));
+    }
+    Ok(())
+}
+
+/// The text `docs` leave out (null) of their derived fields, each file
+/// read once.
+fn derived_of(derivers: &[Option<Arc<dyn Deriver>>], schema: &Schema, docs: &[Document], files: &Files) -> Result<Derived> {
+    let mut known = Derived::new();
+    for (f, d) in derivers.iter().enumerate() {
+        let (Some(d), Some(m)) = (d, schema.derives_from(f)) else { continue };
+        let mut seen = HashSet::new();
+        let values: Vec<String> = docs.iter().filter(|doc| matches!(doc[f], Value::Null)).filter_map(|doc| doc[m].as_str()).filter(|v| seen.insert(v.to_string())).map(String::from).collect();
+        if !values.is_empty() {
+            let texts = derive_sources(d.as_ref(), schema, m, &values, files)?;
+            known.insert(f, values.into_iter().zip(texts).collect());
+        }
+    }
+    Ok(known)
+}
+
+/// The text `d` makes of the files that `values` of MEDIA field `m` name,
+/// decoded a batch at a time.
+fn derive_sources(d: &dyn Deriver, schema: &Schema, m: usize, values: &[String], files: &Files) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(values.len());
+    for batch in values.chunks(16) {
+        let images = images_of(&schema.fields[m].name, batch, files)?;
+        let inputs: Vec<Input> = images.iter().map(Input::Image).collect();
+        out.extend(d.derive(&inputs)?);
     }
     Ok(out)
 }
@@ -1264,7 +1412,7 @@ struct Planned {
 /// document the INSERT proposed ([`Assign::Excluded`]). Only single-valued
 /// numbers change in place; any other field rewrites the row, which needs
 /// every text field stored or generated.
-fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)]) -> Result<Planned> {
+fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], derivers: &[Option<Arc<dyn Deriver>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)]) -> Result<Planned> {
     let pk = schema.primary_key.ok_or_else(|| Error::Query(format!("UPDATE needs a primary key, and {} has none", schema.table)))?;
     if let Some(f) = sets.iter().map(|(f, _)| &schema.fields[*f]).find(|f| f.semantic_id.is_some()) {
         let from = &f.semantic_id.as_ref().expect("a semantic-ID field").from;
@@ -1279,13 +1427,19 @@ fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(V
             return Err(Error::Query(format!("UPDATE of non-numeric fields rewrites documents, and {} is not stored", f.name)));
         }
     }
-    // A rewrite that changes a source of an embedded field recomputes
-    // its vector, unless it sets the vector itself.
+    // A rewrite that changes the file of a derived field makes its text
+    // again, unless it sets the text itself.
+    let remade: Vec<usize> = (0..schema.fields.len())
+        .filter(|&f| derivers[f].is_some() && !sets.iter().any(|(g, _)| *g == f))
+        .filter(|&f| sets.iter().any(|(g, _)| schema.derives_from(f) == Some(*g)))
+        .collect();
+    // A rewrite that changes a source of an embedded field (or the text
+    // made again) recomputes its vector, unless it sets the vector itself.
     let stale: Vec<usize> = (0..schema.fields.len())
         .filter(|&f| models[f].is_some() && !sets.iter().any(|(g, _)| *g == f))
         .filter(|&f| {
             let from = &schema.fields[f].embed.as_ref().expect("embedded").from;
-            sets.iter().any(|(g, _)| from.iter().any(|s| schema.field_index(s) == Some(*g)) || generated_from_set(schema, from, *g))
+            sets.iter().map(|(g, _)| *g).chain(remade.iter().copied()).any(|g| from.iter().any(|s| schema.field_index(s) == Some(g)) || generated_from_set(schema, from, g))
         })
         .collect();
     // Expressions read generated fields, which need not be stored.
@@ -1345,7 +1499,7 @@ fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(V
             for (f, a) in sets {
                 doc[*f] = new(*f, a)?;
             }
-            for &f in &stale {
+            for &f in stale.iter().chain(&remade) {
                 doc[f] = Value::Null;
             }
             // A semantic ID whose vector changes is derived again (the
@@ -1369,13 +1523,22 @@ fn in_place(schema: &Schema, sets: &[(usize, Assign)]) -> bool {
     sets.iter().all(|(f, _)| matches!(schema.fields[*f].ty, FieldType::Int | FieldType::Float) && !schema.fields[*f].multi)
 }
 
-/// Sets fields of live rows ([`plan_sets`]), embedding the vectors the
-/// rewrites leave out (from `known` where it has their text).
-fn set_rows(tt: &mut TableTxn, schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)], known: &Known, files: &Files) -> Result<u64> {
-    let mut p = plan_sets(schema, models, rows, sets)?;
+/// Sets fields of live rows ([`plan_sets`]), making the text and the
+/// vectors the rewrites leave out (from `known` where it has them).
+fn set_rows(
+    tt: &mut TableTxn,
+    schema: &Schema,
+    (models, derivers): (&[Option<Arc<dyn Embedder>>], &[Option<Arc<dyn Deriver>>]),
+    rows: Vec<(Vec<Value>, Document)>,
+    sets: &[(usize, Assign)],
+    (known, derived): (&Known, &Derived),
+    files: &Files,
+) -> Result<u64> {
+    let mut p = plan_sets(schema, models, derivers, rows, sets)?;
     for (key, f, v) in p.in_place {
         tt.set(&key, &schema.fields[f].name, v)?;
     }
+    derive_known(derivers, schema, &mut p.rewrites, derived, files)?;
     embed_known(models, schema, &mut p.rewrites, known, files)?;
     for doc in p.rewrites {
         tt.upsert(doc)?;

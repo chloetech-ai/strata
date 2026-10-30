@@ -619,6 +619,10 @@ impl<'a> Raise<'a> {
             Expr::Product(factors) => Score::Product(factors.iter().map(|s| self.score(s)).collect::<Result<_>>()?),
             Expr::Ppr(g) if matches!(g.kind, GraphKind::Ppr { .. }) => Score::Ppr { graph: self.graph(g)? },
             Expr::Hops => Score::Hops { graph: self.hops_graph()?, far_first: false },
+            Expr::Ranked { keys } => {
+                let pk = self.schema.primary_key.ok_or_else(|| err(format!("ranked(keys) ranks rows by their primary keys, and {} has none", self.schema.table)))?;
+                Score::Ranked { keys: keys.iter().map(|k| crate::query::sql::coerced(&self.schema.fields[pk], k.clone())).collect::<Result<_>>()? }
+            }
             e => return Err(err(format!("not a score: {e:?}"))),
         })
     }
