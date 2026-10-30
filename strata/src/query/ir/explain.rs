@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use super::{Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, OnConflict, Plan, SortKey};
+use super::{Agg, ArithOp, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Plan, SortKey};
 use crate::query::logical::{AggFn, DecayShape, Direction, Expand, Fuzzy, Opts};
 use crate::query::sql::ident;
 use crate::schema::{FieldType, Logical, Schema};
@@ -60,6 +60,11 @@ impl<'a> Text<'a> {
                 }
                 if !s.order.is_empty() {
                     lines.push(format!("  order: {}", self.keys(&s.order, &names)));
+                }
+                // For one release: `+` between scores meant min-max fusion
+                // before.
+                if s.order.iter().any(|k| k.expr.adds_raw_scores()) {
+                    lines.push("  note: + adds raw scores; minmax() normalises them, as a sum of scores did before ranking expressions".into());
                 }
                 (lines, names)
             }
@@ -289,17 +294,13 @@ impl<'a> Text<'a> {
                 }
                 s + " END"
             }
-            Expr::Call { func, args } => {
-                let name = match func {
-                    Func::Lower => "lower",
-                    Func::Upper => "upper",
-                    Func::Length => "length",
-                    Func::Abs => "abs",
-                    Func::Round => "round",
-                    Func::Coalesce => "coalesce",
-                    Func::Dot => "dot",
+            Expr::Call { func, args } => format!("{}({})", func.name(), args.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
+            Expr::Norm { kind, input } => {
+                let name = match kind {
+                    NormKind::MinMax => "minmax",
+                    NormKind::Rank => "rank",
                 };
-                format!("{name}({})", args.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", "))
+                format!("{name}({})", self.expr(input, names))
             }
             Expr::Match { field: f, query, expand } => format!("MATCH({}, {}{})", field(names, *f), quote(query), expansion(expand)),
             Expr::Graph(g) | Expr::Ppr(g) => self.graph(g, names),
@@ -333,7 +334,13 @@ impl<'a> Text<'a> {
                 format!("decay({}, {origin}, {}, offset => {}, decay => {}, shape => '{shape}')", field(names, *f), decay.scale / unit, decay.offset / unit, decay.decay)
             }
             Expr::Rrf { inputs, k, depth } => format!("rrf({}, k => {k}, depth => {depth})", inputs.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
+            // Min-max fusion, as SQL writes it: each term normalised, unless
+            // a term's score keeps raw values (`norm => 'none'`).
             Expr::Weighted(terms) => {
+                let raw = terms.iter().any(|(_, x)| match x {
+                    Expr::Bm25 { opts, .. } | Expr::Similarity { opts, .. } | Expr::Sparse { opts, .. } | Expr::Decay { opts, .. } => opts.get("norm").and_then(|v| v.as_str()) == Some("none"),
+                    _ => false,
+                });
                 let mut s = String::new();
                 for (i, (w, x)) in terms.iter().enumerate() {
                     // A negative weight after the first term is a minus.
@@ -348,9 +355,13 @@ impl<'a> Text<'a> {
                             *w
                         }
                     };
+                    let x = match raw {
+                        true => self.operand(x, names),
+                        false => format!("minmax({})", self.expr(x, names)),
+                    };
                     s += &match w {
-                        w if w == 1.0 => self.operand(x, names),
-                        w => format!("{w} * {}", self.operand(x, names)),
+                        w if w == 1.0 => x,
+                        w => format!("{w} * {x}"),
                     };
                 }
                 s

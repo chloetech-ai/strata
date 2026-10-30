@@ -65,7 +65,7 @@ fn fused_pages_reach_past_the_depth() {
     let rrf = "SELECT id FROM t ORDER BY rrf(bm25(body, 'apple'), similarity(emb, :q)) DESC";
     assert_eq!(query(&db, &format!("{rrf} LIMIT 10 OFFSET 200")).rows.len(), 10);
     assert_eq!(query(&db, &format!("{rrf} LIMIT 10 OFFSET 295")).rows.len(), 5);
-    let weighted = "SELECT id FROM t ORDER BY 0.5 * bm25(body, 'apple') + 0.5 * similarity(emb, :q) DESC";
+    let weighted = "SELECT id FROM t ORDER BY 0.5 * minmax(bm25(body, 'apple')) + 0.5 * minmax(similarity(emb, :q)) DESC";
     assert_eq!(query(&db, &format!("{weighted} LIMIT 250")).rows.len(), 250);
     let product = "SELECT id FROM t ORDER BY bm25(body, 'apple') * similarity(emb, :q) DESC";
     assert_eq!(query(&db, &format!("{product} LIMIT 20 OFFSET 250")).rows.len(), 20);
@@ -196,7 +196,11 @@ fn typos_and_synonyms_score_like_their_word() {
 #[test]
 fn fused_ties_follow_a_descending_key() {
     let (_d, db) = db_with((1..=50).map(|i| row(i, Some("apple pie"))).collect());
-    for score in ["bm25(body, 'apple') * bm25(body, 'pie')", "0.5 * bm25(body, 'apple') + 0.5 * bm25(body, 'pie')"] {
+    for score in [
+        "bm25(body, 'apple') * bm25(body, 'pie')",
+        "0.5 * minmax(bm25(body, 'apple')) + 0.5 * minmax(bm25(body, 'pie'))",
+        "bm25(body, 'apple') + ln(1 + bm25(body, 'pie'))",
+    ] {
         let r = query(&db, &format!("SELECT id FROM t ORDER BY {score} DESC, id DESC LIMIT 3"));
         assert_eq!(ids(&r), vec![50, 49, 48], "{score}");
         let r = query(&db, &format!("SELECT id FROM t ORDER BY {score} DESC, id LIMIT 3"));

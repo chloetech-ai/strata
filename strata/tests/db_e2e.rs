@@ -154,7 +154,7 @@ fn scifact_end_to_end() {
     assert_eq!(before.as_i64().unwrap() - 1, after.as_i64().unwrap());
     let rs = db
         .query(
-            "SELECT id, score() FROM docs WHERE year >= 2000 ORDER BY 0.3 * bm25(body, 'cancer treatment') + 0.7 * similarity(emb, :q) DESC LIMIT 5",
+            "SELECT id, score() FROM docs WHERE year >= 2000 ORDER BY 0.3 * minmax(bm25(body, 'cancer treatment')) + 0.7 * minmax(similarity(emb, :q)) DESC LIMIT 5",
             &params(Some(0)),
         )
         .unwrap();

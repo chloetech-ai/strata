@@ -30,6 +30,7 @@ use std::sync::Arc;
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::error::{Error, Result};
+use crate::query::ir::{ArithOp, Func, NormKind};
 use crate::query::{ddl, ir};
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::schema::{Field, FieldType, Logical, Schema};
@@ -1071,15 +1072,27 @@ impl<'a> Binder<'a> {
         // `ORDER BY distance(..) ASC` ranks like `similarity DESC`.
         if let Expr::Function(f) = e {
             if fname(f) == "distance" {
-                return Ok(OrderBy::Score { score: self.score(e)?, desc: !desc, nulls_first: false });
+                let (args, opts) = self.args(f)?;
+                return Ok(OrderBy::Score { score: self.similarity(&args, opts, true)?, desc: !desc, nulls_first: false });
             }
         }
         Ok(OrderBy::Score { score: self.score(e)?, desc, nulls_first: false })
     }
 
+    /// A ranking: a score, a column, or an expression of them. `+` adds raw
+    /// values; a sum of `w * minmax(score)` is the min-max fusion that `+`
+    /// meant before ranking expressions, and a product of scores keeps its
+    /// rule (a factor below 0, or missing, counts as 0). Both are written
+    /// to plans in their old form, which older shards read.
     fn score(&self, e: &Expr) -> Result<Score> {
+        Ok(self.rank(e)?.fused_shapes())
+    }
+
+    /// A part of a ranking expression.
+    fn rank(&self, e: &Expr) -> Result<Score> {
+        let bx = |e: &Expr| self.rank(e).map(Box::new);
         match e {
-            Expr::Nested(inner) => self.score(inner),
+            Expr::Nested(inner) => self.rank(inner),
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 let f = self.field_of(e)?;
                 if self.schema.fields[f].multi {
@@ -1090,105 +1103,113 @@ impl<'a> Binder<'a> {
                     _ => Err(err("ORDER BY a column needs a numeric field")),
                 }
             }
-            Expr::BinaryOp { left, op: BinaryOperator::Plus, right } => {
-                Ok(Score::Weighted([self.weighted(left, 1.0)?, self.weighted(right, 1.0)?].concat()))
+            Expr::Value(_) | Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr: _ } if self.number(e).is_some() => match self.number(e) {
+                Some(x) if x.is_finite() => Ok(Score::Num(x)),
+                _ => Err(err(format!("a number in a ranking expression is finite, not {e}"))),
+            },
+            Expr::Value(_) => Err(err(format!("a ranking expression takes numbers, not {e}"))),
+            Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => Ok(Score::Neg(bx(expr)?)),
+            Expr::UnaryOp { op: sql::UnaryOperator::Plus, expr } => self.rank(expr),
+            Expr::BinaryOp { left, op, right } => {
+                let op = match op {
+                    BinaryOperator::Plus => ArithOp::Add,
+                    BinaryOperator::Minus => ArithOp::Sub,
+                    BinaryOperator::Multiply => ArithOp::Mul,
+                    BinaryOperator::Divide => ArithOp::Div,
+                    BinaryOperator::Modulo => ArithOp::Mod,
+                    o => return Err(err(format!("a ranking expression takes + - * / %, not {o}"))),
+                };
+                Ok(Score::Arith { op, left: bx(left)?, right: bx(right)? })
             }
-            Expr::BinaryOp { left, op: BinaryOperator::Minus, right } => {
-                Ok(Score::Weighted([self.weighted(left, 1.0)?, self.weighted(right, -1.0)?].concat()))
-            }
-            Expr::BinaryOp { op: BinaryOperator::Multiply, .. } => {
-                let mut terms = self.weighted(e, 1.0)?;
-                match terms.as_slice() {
-                    [(w, Score::Product(_))] if *w == 1.0 => Ok(terms.pop().unwrap().1),
-                    _ => Ok(Score::Weighted(terms)),
-                }
+            Expr::Case { operand, conditions, else_result, .. } => {
+                let whens = conditions
+                    .iter()
+                    .map(|c| {
+                        // `CASE x WHEN v` tests `x = v`.
+                        let cond = match operand {
+                            Some(x) => Expr::BinaryOp { left: x.clone(), op: BinaryOperator::Eq, right: Box::new(c.condition.clone()) },
+                            None => c.condition.clone(),
+                        };
+                        let p = self.pred(&cond)?.three_valued(&|f| self.schema.fields[f].multi).simplify();
+                        Ok((Score::Cond(Box::new(p)), self.rank(&c.result)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Score::Case { whens, otherwise: else_result.as_deref().map(bx).transpose()? })
             }
             Expr::Function(f) => {
+                let name = fname(f);
                 let (args, opts) = self.args(f)?;
-                match fname(f).as_str() {
+                let one = |what: &str| match args.as_slice() {
+                    [x] => Ok(x),
+                    _ => Err(err(format!("{name}({what}) takes one argument"))),
+                };
+                match name.as_str() {
                     "bm25" => {
                         let [field, text] = args.as_slice() else { return Err(err("bm25(field, text)")) };
                         let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
                         Expand::from_opts(&opts).map_err(err)?;
-                        Ok(Score::Bm25 { field, text, opts })
+                        Ok(Score::Bm25 { field, text, opts: without_norm(opts) })
                     }
-                    "similarity" | "distance" => {
-                        let [field, v] = args.as_slice() else { return Err(err("similarity(field, vector)")) };
-                        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. } | FieldType::Sparse), "VECTOR or SPARSE")?;
-                        if self.schema.fields[field].ty == FieldType::Sparse {
-                            if fname(f) == "distance" {
-                                return Err(err("a SPARSE field takes similarity(...), not distance(...)"));
-                            }
-                            let terms = crate::text::sparse::parse(&self.literal(v)?).map_err(|e| err(format!("similarity({}, ..): {e}", self.schema.fields[field].name)))?;
-                            return Ok(Score::Sparse { field, terms, opts });
-                        }
-                        let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
-                        let vector = self.vector(v)?;
-                        if vector.len() != dim {
-                            return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
-                        }
-                        Ok(Score::Similarity { field, vector, opts })
-                    }
+                    "similarity" => self.similarity(&args, opts, false),
+                    "distance" => Err(err("distance(...) ranks on its own, ORDER BY distance(...) ASC; in an expression, use similarity(...), which ranks larger first")),
                     "maxsim" => self.maxsim(&args, opts),
                     "rrf" => {
                         if args.len() < 2 {
                             return Err(err("rrf needs at least two scores"));
                         }
-                        let inputs = args.iter().map(|a| self.score(a)).collect::<Result<Vec<_>>>()?;
+                        let inputs = args
+                            .iter()
+                            .map(|a| match a {
+                                // A ranking reads hops nearest first.
+                                Expr::Function(g) if fname(g) == "hops" => Ok(Score::Hops { graph: self.hops_graph()?, far_first: false }),
+                                a => match self.rank(a)? {
+                                    s if s.is_leaf() && !matches!(s, Score::SeqNo | Score::Cond(_)) => Ok(s),
+                                    _ => Err(err(format!("rrf fuses the rankings of scores and columns, not of {a}"))),
+                                },
+                            })
+                            .collect::<Result<Vec<_>>>()?;
                         let num = |k: &str, d: f64| opts.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
                         Ok(Score::Rrf { inputs, k: num("k", 60.0), depth: num("depth", 100.0) as usize })
                     }
                     "ppr" => Ok(Score::Ppr { graph: self.graph(f, "ppr")? }),
                     "decay" => self.decay(f),
-                    n => Err(err(format!("unknown score function {n}"))),
+                    // The number of hops, in an expression.
+                    "hops" if args.is_empty() => Ok(Score::Hops { graph: self.hops_graph()?, far_first: true }),
+                    "seq_no" if args.is_empty() => Ok(Score::SeqNo),
+                    "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
+                    "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),
+                    n => match Func::numeric(n) {
+                        Some(func) => {
+                            func.arity(args.len()).map_err(|a| err(format!("{n}() takes {a}")))?;
+                            Ok(Score::Call { func, args: args.iter().map(|a| self.rank(a)).collect::<Result<_>>()? })
+                        }
+                        None => Err(err(format!("unknown score function {n}"))),
+                    },
                 }
             }
             _ => Err(err(format!("unsupported ORDER BY expression: {e}"))),
         }
     }
 
-    /// Terms of a weighted sum, each multiplied by `w`.
-    fn weighted(&self, e: &Expr, w: f64) -> Result<Vec<(f64, Score)>> {
-        match e {
-            Expr::Nested(inner) => self.weighted(inner, w),
-            Expr::BinaryOp { left, op: BinaryOperator::Plus, right } => {
-                Ok([self.weighted(left, w)?, self.weighted(right, w)?].concat())
+    /// `similarity(field, vector)`, or `distance(field, vector)` (which
+    /// ranks the same, ascending, on its own in ORDER BY).
+    fn similarity(&self, args: &[&Expr], opts: Opts, distance: bool) -> Result<Score> {
+        let [field, v] = args else { return Err(err("similarity(field, vector)")) };
+        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. } | FieldType::Sparse), "VECTOR or SPARSE")?;
+        if self.schema.fields[field].ty == FieldType::Sparse {
+            if distance {
+                return Err(err("a SPARSE field takes similarity(...), not distance(...)"));
             }
-            Expr::BinaryOp { left, op: BinaryOperator::Minus, right } => {
-                Ok([self.weighted(left, w)?, self.weighted(right, -w)?].concat())
-            }
-            Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } => {
-                if let Some(c) = self.number(left) {
-                    self.weighted(right, w * c)
-                } else if let Some(c) = self.number(right) {
-                    self.weighted(left, w * c)
-                } else {
-                    Ok(vec![(w, Score::Product(self.factors(e)?))])
-                }
-            }
-            _ => Ok(vec![(w, self.score(e)?)]),
+            let terms = crate::text::sparse::parse(&self.literal(v)?).map_err(|e| err(format!("similarity({}, ..): {e}", self.schema.fields[field].name)))?;
+            return Ok(Score::Sparse { field, terms, opts: without_norm(opts) });
         }
-    }
-
-    /// The factors of a product of scores, `a * b * ...`.
-    fn factors(&self, e: &Expr) -> Result<Vec<Score>> {
-        match e {
-            Expr::Nested(inner) => self.factors(inner),
-            Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } => {
-                if self.number(left).is_some() || self.number(right).is_some() {
-                    return Err(err("a product of scores takes no constant factors (they do not change the order)"));
-                }
-                Ok([self.factors(left)?, self.factors(right)?].concat())
-            }
-            _ => {
-                let s = self.score(e)?;
-                match s {
-                    Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Column { .. } | Score::Decay { .. } | Score::Ppr { .. } | Score::Hops { .. } => Ok(vec![s]),
-                    _ => Err(err("a product multiplies bm25, similarity, ppr, a column or decay, not sums or fusions")),
-                }
-            }
+        let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
+        let vector = self.vector(v)?;
+        if vector.len() != dim {
+            return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
         }
+        Ok(Score::Similarity { field, vector, opts: without_norm(opts) })
     }
 
     /// `maxsim(field, vectors)`: the vectors are a list parameter, a tuple
@@ -1202,7 +1223,7 @@ impl<'a> Binder<'a> {
             v.as_f64().filter(|x| *x >= 1.0 && x.fract() == 0.0).ok_or_else(|| err("max_vectors => a whole number, at least 1"))?;
         }
         if let Some(q) = subquery_of(vs) {
-            return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(self.sub(q, Sub::Vectors)?)), opts });
+            return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(self.sub(q, Sub::Vectors)?)), opts: without_norm(opts) });
         }
         let vectors: Vec<Arc<[f32]>> = match vs {
             Expr::Tuple(items) => items.iter().map(|i| self.vector(i)).collect::<Result<_>>()?,
@@ -1225,7 +1246,7 @@ impl<'a> Binder<'a> {
         if vectors.iter().any(|v| v.iter().any(|x| !x.is_finite())) {
             return Err(err("a vector's components must be finite numbers"));
         }
-        Ok(Score::MaxSim { field, vectors: Vectors::List(vectors), opts })
+        Ok(Score::MaxSim { field, vectors: Vectors::List(vectors), opts: without_norm(opts) })
     }
 
     /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
@@ -1808,6 +1829,14 @@ fn contains_graph(p: &Pred) -> bool {
     }
 }
 
+/// A score's options without `norm`, which chose raw values over min-max
+/// fusion in a sum of scores before ranking expressions: `+` adds raw
+/// values now, and `minmax()` normalises.
+fn without_norm(mut opts: Opts) -> Opts {
+    opts.remove("norm");
+    opts
+}
+
 fn fname(f: &sql::Function) -> String {
     f.name.to_string().to_ascii_lowercase()
 }
@@ -1924,10 +1953,17 @@ mod tests {
         let Some(OrderBy::Score { score: Score::Rrf { inputs, k, depth }, .. }) = &s.order else { panic!() };
         assert_eq!((inputs.len(), *k, *depth), (2, 20.0, 100));
 
-        let s = bind("SELECT id FROM docs ORDER BY 0.3 * bm25(body, :t) + 0.7 * similarity(emb, :q) DESC LIMIT 5", &schema(), &q())
+        // A weighted sum of min-max normalised scores is the old fusion;
+        // `+` alone adds raw values.
+        let s = bind("SELECT id FROM docs ORDER BY 0.3 * minmax(bm25(body, :t)) + 0.7 * minmax(similarity(emb, :q)) DESC LIMIT 5", &schema(), &q())
             .unwrap();
         let Some(OrderBy::Score { score: Score::Weighted(ts), .. }) = &s.order else { panic!() };
         assert_eq!(ts.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![0.3, 0.7]);
+        let s = bind("SELECT id FROM docs ORDER BY 0.3 * bm25(body, :t) + 0.7 * similarity(emb, :q) DESC LIMIT 5", &schema(), &q()).unwrap();
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Arith { op: ArithOp::Add, .. }, .. })), "{:?}", s.order);
+        // distance() ranks on its own, not in an expression.
+        let e = bind("SELECT id FROM docs ORDER BY 1 - distance(emb, :q) DESC", &schema(), &q()).unwrap_err().to_string();
+        assert!(e.contains("use similarity(...)"), "{e}");
     }
 
     #[test]
@@ -1945,13 +1981,17 @@ mod tests {
         // A product of scores (a boost), not a weighted sum.
         let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
         assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true, .. }) if f.len() == 2), "{:?}", s.order);
+        // With a constant among its factors, it is an expression.
+        let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * 2 * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Arith { op: ArithOp::Mul, .. }, .. })), "{:?}", s.order);
 
         for bad in [
             "SELECT id FROM other",
             "SELECT id FROM docs WHERE MATCH(year, 'x')",
             "SELECT id FROM docs WHERE category > 'c01'",
             "SELECT id FROM docs ORDER BY similarity(emb, :missing)",
-            "SELECT id FROM docs ORDER BY bm25(body, :t) * 2 * similarity(emb, :q)",
+            "SELECT id FROM docs ORDER BY bm25(body, :t) >= 2",
+            "SELECT id FROM docs ORDER BY ln(similarity(emb, :q), 2, 3)",
             "SELECT id FROM docs ORDER BY year, rating",
             "DELETE FROM docs",
         ] {

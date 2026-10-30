@@ -60,7 +60,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 3] = [OPERATORS, SEQ_NO, MAXSIM];
+pub const FEATURES: [&str; 4] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, MAXSIM];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -70,6 +70,13 @@ pub const OPERATORS: &str = "operators";
 /// The feature of a plan with a column of rows' sequence numbers
 /// ([`Expr::SeqNo`]).
 pub const SEQ_NO: &str = "seq_no";
+
+/// The feature of a plan whose Search ranks by an expression of scores,
+/// row values and numbers ([`Expr::Arith`], [`Expr::Call`], [`Expr::Case`],
+/// [`Expr::Norm`] and literals around score leaves), rather than by a score
+/// or one of the fused shapes ([`Expr::Rrf`], [`Expr::Weighted`],
+/// [`Expr::Product`]).
+pub const RANK_EXPRESSIONS: &str = "rank_expressions";
 
 /// The feature of a plan that scores with several query vectors
 /// ([`Expr::MaxSim`]), takes a dot product of vectors ([`Func::Dot`]), or
@@ -276,7 +283,9 @@ pub enum ArithOp {
     Mod,
 }
 
-/// A scalar function of values.
+/// A scalar function of values. The functions from [`Func::Ln`] on are
+/// numeric, came with [`RANK_EXPRESSIONS`], and are NULL where the result
+/// is not a finite number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Func {
@@ -289,8 +298,149 @@ pub enum Func {
     Round,
     /// The first argument that is not NULL (nor a list without values).
     Coalesce,
-    /// The dot product of two vectors of one length (feature [`MAXSIM`]).
+    /// The natural logarithm.
+    Ln,
+    /// The base-10 logarithm of `args[0]`, or with two arguments the
+    /// logarithm of `args[1]` to base `args[0]` (as PostgreSQL's `log`).
+    Log,
+    Exp,
+    Sqrt,
+    /// `args[0]` to the power `args[1]`.
+    Pow,
+    /// The smallest argument that is not NULL; NULL if all are.
+    Least,
+    /// The largest argument that is not NULL; NULL if all are.
+    Greatest,
+    /// `1 / (1 + e^-x)`.
+    Sigmoid,
+    /// `args[0]` within `args[1]` and `args[2]`.
+    Clamp,
+    /// The dot product of two vectors of one length (feature [`MAXSIM`]);
+    /// not a ranking expression's function: `similarity` is.
     Dot,
+}
+
+impl Func {
+    /// The function's name in SQL.
+    pub fn name(self) -> &'static str {
+        match self {
+            Func::Lower => "lower",
+            Func::Upper => "upper",
+            Func::Length => "length",
+            Func::Abs => "abs",
+            Func::Round => "round",
+            Func::Coalesce => "coalesce",
+            Func::Ln => "ln",
+            Func::Log => "log",
+            Func::Exp => "exp",
+            Func::Sqrt => "sqrt",
+            Func::Pow => "pow",
+            Func::Least => "least",
+            Func::Greatest => "greatest",
+            Func::Sigmoid => "sigmoid",
+            Func::Clamp => "clamp",
+            Func::Dot => "dot",
+        }
+    }
+
+    /// The numeric function named `name` (as SQL writes it), which a
+    /// ranking expression can use.
+    pub fn numeric(name: &str) -> Option<Func> {
+        Some(match name {
+            "abs" => Func::Abs,
+            "round" => Func::Round,
+            "coalesce" => Func::Coalesce,
+            "ln" => Func::Ln,
+            "log" => Func::Log,
+            "exp" => Func::Exp,
+            "sqrt" => Func::Sqrt,
+            "pow" | "power" => Func::Pow,
+            "least" => Func::Least,
+            "greatest" => Func::Greatest,
+            "sigmoid" => Func::Sigmoid,
+            "clamp" => Func::Clamp,
+            _ => return None,
+        })
+    }
+
+    /// Whether the function takes `n` arguments, or else how many it takes.
+    pub fn arity(self, n: usize) -> std::result::Result<(), &'static str> {
+        let ok = match self {
+            Func::Lower | Func::Upper | Func::Length | Func::Abs | Func::Ln | Func::Exp | Func::Sqrt | Func::Sigmoid => n == 1,
+            Func::Round | Func::Log => n == 1 || n == 2,
+            Func::Pow | Func::Dot => n == 2,
+            Func::Clamp => n == 3,
+            Func::Coalesce | Func::Least | Func::Greatest => n >= 1,
+        };
+        match (ok, self) {
+            (true, _) => Ok(()),
+            (_, Func::Round | Func::Log) => Err("one or two arguments"),
+            (_, Func::Pow | Func::Dot) => Err("two arguments"),
+            (_, Func::Clamp) => Err("three arguments: a value, its least and its greatest"),
+            (_, Func::Coalesce | Func::Least | Func::Greatest) => Err("at least one argument"),
+            _ => Err("one argument"),
+        }
+    }
+
+    /// The numeric function of `args`, NaN standing for NULL: NaN where the
+    /// result has no finite value (`ln(0)`, `sqrt(-1)`, an overflow).
+    /// [`Func::Lower`], [`Func::Upper`] and [`Func::Length`] take text, and
+    /// are NaN here.
+    pub fn eval_f64(self, args: &[f64]) -> f64 {
+        // NULL in, NULL out, except where a function skips it: `pow(1,
+        // NULL)` and `clamp(NULL, 0, 1)` are not 1 and 0, as f64's pow and
+        // max would make them.
+        if !matches!(self, Func::Coalesce | Func::Least | Func::Greatest) && args.iter().any(|a| a.is_nan()) {
+            return f64::NAN;
+        }
+        let x = args.first().copied().unwrap_or(f64::NAN);
+        let r = match self {
+            Func::Lower | Func::Upper | Func::Length | Func::Dot => f64::NAN,
+            Func::Abs => x.abs(),
+            Func::Round => {
+                let d = args.get(1).map_or(0.0, |d| d.clamp(-30.0, 30.0).trunc());
+                let m = 10f64.powi(d as i32);
+                (x * m).round() / m
+            }
+            Func::Coalesce => args.iter().copied().find(|v| !v.is_nan()).unwrap_or(f64::NAN),
+            Func::Ln if x > 0.0 => x.ln(),
+            Func::Log if args.len() == 1 && x > 0.0 => x.log10(),
+            Func::Log => match args.get(1) {
+                Some(&y) if x > 0.0 && x != 1.0 && y > 0.0 => y.ln() / x.ln(),
+                _ => f64::NAN,
+            },
+            Func::Ln => f64::NAN,
+            Func::Exp => x.exp(),
+            Func::Sqrt if x >= 0.0 => x.sqrt(),
+            Func::Sqrt => f64::NAN,
+            Func::Pow => x.powf(args.get(1).copied().unwrap_or(f64::NAN)),
+            Func::Least => args.iter().copied().filter(|v| !v.is_nan()).reduce(f64::min).unwrap_or(f64::NAN),
+            Func::Greatest => args.iter().copied().filter(|v| !v.is_nan()).reduce(f64::max).unwrap_or(f64::NAN),
+            Func::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            Func::Clamp => match (args.get(1), args.get(2)) {
+                (Some(&lo), Some(&hi)) => x.max(lo).min(hi),
+                _ => f64::NAN,
+            },
+        };
+        if r.is_finite() {
+            r
+        } else {
+            f64::NAN
+        }
+    }
+}
+
+/// A set function of [`Expr::Norm`]: a value seen against every candidate
+/// a ranking scores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormKind {
+    /// `minmax(x)`: `(x - min) / (max - min)` over the candidates, 1 where
+    /// they all have one value, and 0 where `x` is NULL.
+    MinMax,
+    /// `rank(x)`: 1 for the largest `x`, plus the number of candidates with
+    /// a larger value; rows where `x` is NULL rank after every other.
+    Rank,
 }
 
 /// A branch of [`Expr::Case`].
@@ -395,6 +545,7 @@ pub enum Expr {
     /// The best similarity of a VECTOR field with any of `vectors`: a list
     /// literal of vectors, or [`Expr::Values`] of a subquery, which runs
     /// first (feature [`MAXSIM`]).
+    #[serde(rename = "maxsim")]
     MaxSim {
         field: u32,
         vectors: Box<Expr>,
@@ -421,6 +572,9 @@ pub enum Expr {
     Weighted(Vec<(f64, Expr)>),
     /// The product of scores.
     Product(Vec<Expr>),
+    /// A set function of a ranking expression, over the rows it ranks
+    /// (feature [`RANK_EXPRESSIONS`]).
+    Norm { kind: NormKind, input: Box<Expr> },
     /// Personalized PageRank from a traversal's seeds.
     Ppr(Box<Graph>),
     /// The rows of a plan (graph seeds from a query of the table, which
@@ -586,6 +740,34 @@ impl Node {
         }
     }
 
+    /// Whether a Search in the plan ranks by an expression that needs
+    /// [`RANK_EXPRESSIONS`].
+    pub fn ranks_by_expression(&self) -> bool {
+        fn within(e: &Expr) -> bool {
+            let mut found = false;
+            e.visit(&mut |x| {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    found |= n.ranks_by_expression();
+                }
+            });
+            found
+        }
+        match self {
+            Node::Search(s) => s.order.first().is_some_and(|k| k.expr.is_rank_expression()) || within(&s.filter),
+            Node::Filter { input, cond } => input.ranks_by_expression() || within(cond),
+            Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input } => input.ranks_by_expression(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.ranks_by_expression() || b.ranks_by_expression(),
+            Node::With { ctes, input } => input.ranks_by_expression() || ctes.iter().any(|c| c.input.ranks_by_expression()),
+            Node::Insert { .. } | Node::Ref { .. } => false,
+        }
+    }
+
     /// Calls `f` on each expression of a leaf's nodes.
     pub(crate) fn leaf_exprs(&self, f: &mut dyn FnMut(&Expr)) {
         match self {
@@ -674,6 +856,50 @@ impl Expr {
     /// Whether the expression holds a subquery that operators run
     /// ([`Expr::Values`], [`Expr::Keys`], [`Expr::Exists`],
     /// [`Expr::Scalar`]).
+    /// Whether the expression, a Search's ranking, needs
+    /// [`RANK_EXPRESSIONS`]: anything but a score, a field, `hops()` and
+    /// the fused shapes of them that came before.
+    pub fn is_rank_expression(&self) -> bool {
+        match self {
+            Expr::Field(_) | Expr::Hops | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::MaxSim { .. } | Expr::Decay { .. } | Expr::Ppr(_) => false,
+            Expr::Rrf { inputs, .. } | Expr::Product(inputs) => inputs.iter().any(Expr::is_rank_expression),
+            Expr::Weighted(terms) => terms.iter().any(|(_, x)| x.is_rank_expression()),
+            _ => true,
+        }
+    }
+
+    /// Whether the expression adds raw relevance scores (`bm25(..) +
+    /// similarity(..)`), which meant min-max fusion before ranking
+    /// expressions: EXPLAIN says so, for one release.
+    pub fn adds_raw_scores(&self) -> bool {
+        // The scores and fields an expression reads raw: not through a set
+        // function or a fused shape.
+        fn raw<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+            match e {
+                Expr::Arith { left, right, .. } => {
+                    raw(left, out);
+                    raw(right, out);
+                }
+                Expr::Neg(x) => raw(x, out),
+                Expr::Call { args, .. } => args.iter().for_each(|a| raw(a, out)),
+                Expr::Case { whens, otherwise, .. } => whens.iter().map(|w| &w.then).chain(otherwise.as_deref()).for_each(|x| raw(x, out)),
+                Expr::Field(_) | Expr::Hops | Expr::SeqNo | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::Decay { .. } | Expr::Ppr(_) => out.push(e),
+                _ => {}
+            }
+        }
+        let relevance = |e: &&Expr| matches!(e, Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::Ppr(_) | Expr::Hops);
+        let mut found = false;
+        self.visit(&mut |e| {
+            if let Expr::Arith { op: ArithOp::Add | ArithOp::Sub, left, right } = e {
+                let (mut l, mut r) = (Vec::new(), Vec::new());
+                raw(left, &mut l);
+                raw(right, &mut r);
+                found |= !l.is_empty() && !r.is_empty() && l != r && (l.iter().any(relevance) || r.iter().any(relevance));
+            }
+        });
+        found
+    }
+
     pub fn has_operators(&self) -> bool {
         let mut found = false;
         self.visit(&mut |e| found |= matches!(e, Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_)));
@@ -694,7 +920,7 @@ impl Expr {
             }
         };
         match self {
-            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => x.visit(f),
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } => x.visit(f),
             Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) => xs.iter().for_each(|x| x.visit(f)),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => {
                 left.visit(f);
@@ -735,7 +961,7 @@ impl Expr {
         f(self)?;
         let mut within: Vec<&mut Expr> = Vec::new();
         match self {
-            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::MaxSim { vectors: x, .. } => within.push(x),
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } | Expr::MaxSim { vectors: x, .. } => within.push(x),
             Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
@@ -796,6 +1022,9 @@ impl Plan {
         }
         if seq_no {
             features.push(SEQ_NO.to_string());
+        }
+        if root.ranks_by_expression() {
+            features.push(RANK_EXPRESSIONS.to_string());
         }
         if root.uses_maxsim() {
             features.push(MAXSIM.to_string());
@@ -859,10 +1088,16 @@ impl Plan {
     /// `features`: an error naming what it lacks if not. A plan in another
     /// form than JSON (a shard's protobuf) is checked with it too.
     pub fn readable(version: u64, features: &[&str]) -> Result<()> {
+        Plan::readable_by(version, features, &FEATURES)
+    }
+
+    /// [`Plan::readable`] by a reader of the plan features `known`: an
+    /// older version of Strata knows fewer.
+    pub fn readable_by(version: u64, features: &[&str], known: &[&str]) -> Result<()> {
         if version == 0 || version > VERSION as u64 {
             return Err(err(format!("plan version {version} is not one this version of Strata reads (it reads version {VERSION}): it may be newer")));
         }
-        match features.iter().find(|f| !FEATURES.contains(f)) {
+        match features.iter().find(|f| !known.contains(f)) {
             Some(name) => Err(err(format!("the plan needs feature {name:?}, which this version of Strata does not have: it may be newer"))),
             None => Ok(()),
         }

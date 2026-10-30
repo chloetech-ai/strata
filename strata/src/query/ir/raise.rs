@@ -3,7 +3,7 @@
 //! made gives back the statement it was made of; a plan from elsewhere is
 //! checked against the schema as the binder checks SQL.
 
-use super::{err, Agg, ArithOp, CmpOp, Expr, Graph, GraphKind, Node, OnConflict, Plan};
+use super::{err, Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, OnConflict, Plan};
 use crate::error::Result;
 use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::query::sql::{self, Assign, Conflict, Write};
@@ -471,8 +471,41 @@ impl<'a> Raise<'a> {
         })
     }
 
+    /// A Search's ranking, its sums of `w * minmax(score)` and products of
+    /// scores in their fused shapes, as SQL binds them.
     fn score(&mut self, e: &Expr) -> Result<Score> {
+        Ok(self.rank(e, false)?.fused_shapes())
+    }
+
+    /// A Search's ranking, or part of one: `in_expr` within arithmetic, a
+    /// function, a set function or CASE (feature
+    /// [`super::RANK_EXPRESSIONS`]), where `hops()` is the number of hops,
+    /// rather than at the top or within RRF, a weighted sum or a product,
+    /// where it ranks nearest first.
+    fn rank(&mut self, e: &Expr, in_expr: bool) -> Result<Score> {
+        let sub = |this: &mut Self, x: &Expr| this.rank(x, true).map(Box::new);
         Ok(match e {
+            Expr::Lit(v) => match v.as_f64() {
+                Some(x) if x.is_finite() && !matches!(v, Value::Str(_)) => Score::Num(x),
+                _ => return Err(err(format!("a number in a ranking expression is finite, not {v:?}"))),
+            },
+            Expr::SeqNo => Score::SeqNo,
+            Expr::Arith { op, left, right } => Score::Arith { op: *op, left: sub(self, left)?, right: sub(self, right)? },
+            Expr::Neg(x) => Score::Neg(sub(self, x)?),
+            Expr::Call { func, args } => {
+                if Func::numeric(func.name()).is_none() {
+                    return Err(err(format!("{}() takes text: a ranking expression is numeric", func.name())));
+                }
+                func.arity(args.len()).map_err(|n| err(format!("{}() takes {n}", func.name())))?;
+                Score::Call { func: *func, args: args.iter().map(|a| self.rank(a, true)).collect::<Result<_>>()? }
+            }
+            Expr::Norm { kind, input } => Score::Norm { kind: *kind, input: sub(self, input)? },
+            Expr::Case { operand: Some(_), .. } => return Err(err("CASE in a ranking expression takes WHEN conditions, not an operand")),
+            Expr::Case { operand: None, whens, otherwise } => Score::Case {
+                whens: whens.iter().map(|w| Ok((Score::Cond(Box::new(self.filter(&w.when)?)), self.rank(&w.then, true)?))).collect::<Result<_>>()?,
+                otherwise: otherwise.as_ref().map(|x| sub(self, x)).transpose()?,
+            },
+            Expr::Hops if in_expr => Score::Hops { graph: self.hops_graph()?, far_first: true },
             Expr::Field(f) => {
                 let f = self.field(*f)?;
                 if !matches!(self.schema.fields[f].ty, FieldType::Int | FieldType::Float) || self.schema.fields[f].multi {

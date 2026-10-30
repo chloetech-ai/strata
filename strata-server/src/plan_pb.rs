@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, OnConflict, Plan, Search, Set, SortKey, When};
+use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Plan, Search, Set, SortKey, When};
 use strata::query::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy};
 use strata::value::Value;
 
@@ -192,6 +192,15 @@ fn expr(e: &Expr) -> E {
                 Func::Abs => pb::Func::Abs,
                 Func::Round => pb::Func::Round,
                 Func::Coalesce => pb::Func::Coalesce,
+                Func::Ln => pb::Func::Ln,
+                Func::Log => pb::Func::Log,
+                Func::Exp => pb::Func::Exp,
+                Func::Sqrt => pb::Func::Sqrt,
+                Func::Pow => pb::Func::Pow,
+                Func::Least => pb::Func::Least,
+                Func::Greatest => pb::Func::Greatest,
+                Func::Sigmoid => pb::Func::Sigmoid,
+                Func::Clamp => pb::Func::Clamp,
                 Func::Dot => pb::Func::Dot,
             } as i32,
             args: args.iter().map(ex).collect(),
@@ -230,6 +239,13 @@ fn expr(e: &Expr) -> E {
         Expr::Rrf { inputs, k, depth } => E::Rrf(pb::Rrf { inputs: inputs.iter().map(ex).collect(), k: *k, depth: *depth }),
         Expr::Weighted(terms) => E::Weighted(pb::Weighted { terms: terms.iter().map(|(w, e)| pb::WeightedTerm { weight: *w, expr: Some(ex(e)) }).collect() }),
         Expr::Product(xs) => E::Product(exprs(xs)),
+        Expr::Norm { kind, input } => E::Norm(Box::new(pb::Norm {
+            kind: match kind {
+                NormKind::MinMax => pb::NormKind::MinMax,
+                NormKind::Rank => pb::NormKind::Rank,
+            } as i32,
+            input: bex(input),
+        })),
         Expr::Ppr(g) => E::Ppr(Box::new(graph(g))),
         Expr::Subquery(n) => E::Subquery(Box::new(node(n))),
         Expr::Values(n) => E::Values(Box::new(node(n))),
@@ -484,6 +500,15 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
                 pb::Func::Abs => Func::Abs,
                 pb::Func::Round => Func::Round,
                 pb::Func::Coalesce => Func::Coalesce,
+                pb::Func::Ln => Func::Ln,
+                pb::Func::Log => Func::Log,
+                pb::Func::Exp => Func::Exp,
+                pb::Func::Sqrt => Func::Sqrt,
+                pb::Func::Pow => Func::Pow,
+                pb::Func::Least => Func::Least,
+                pb::Func::Greatest => Func::Greatest,
+                pb::Func::Sigmoid => Func::Sigmoid,
+                pb::Func::Clamp => Func::Clamp,
                 pb::Func::Dot => Func::Dot,
             };
             Expr::Call { func, args: from_exprs(c.args)? }
@@ -527,6 +552,13 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
         E::Rrf(r) => Expr::Rrf { inputs: from_exprs(r.inputs)?, k: finite(r.k, "k")?, depth: r.depth },
         E::Weighted(w) => Expr::Weighted(w.terms.into_iter().map(|t| Ok((finite(t.weight, "a weight")?, from_ex(t.expr)?))).collect::<Result<_, ApiError>>()?),
         E::Product(xs) => Expr::Product(from_exprs(xs.v)?),
+        E::Norm(n) => {
+            let kind = match en::<pb::NormKind>(n.kind, "set function")? {
+                pb::NormKind::MinMax => NormKind::MinMax,
+                pb::NormKind::Rank => NormKind::Rank,
+            };
+            Expr::Norm { kind, input: Box::new(from_ex(n.input.map(|x| *x))?) }
+        }
         E::Ppr(g) => Expr::Ppr(Box::new(from_graph(*g)?)),
         E::Subquery(n) => Expr::Subquery(Box::new(from_node_in(*n)?)),
         E::Values(n) => Expr::Values(Box::new(from_node_in(*n)?)),

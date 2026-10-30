@@ -362,7 +362,7 @@ fn hybrid_study(args: &Args, sys: &StrataSys, coll: &Collection) -> Result<Json>
         ("rrf".into(), "ORDER BY rrf(bm25(body, '{t}'), similarity(emb, :q), depth => 100) DESC".into()),
     ];
     for a in alphas.iter().filter(|&&a| a > 0.0 && a < 1.0) {
-        methods.push((format!("weighted_{a:.1}"), format!("ORDER BY {a} * bm25(body, '{{t}}') + {:.1} * similarity(emb, :q) DESC", 1.0 - a)));
+        methods.push((format!("weighted_{a:.1}"), format!("ORDER BY {a} * minmax(bm25(body, '{{t}}')) + {:.1} * minmax(similarity(emb, :q)) DESC", 1.0 - a)));
     }
     let mut ndcg: HashMap<String, Vec<f64>> = HashMap::new();
     let mut lat: HashMap<String, Vec<f64>> = HashMap::new();
@@ -563,7 +563,7 @@ const SHOWCASE: &[(&str, &str)] = &[
     ("prefix and conjunction", "SELECT COUNT(*) FROM docs WHERE MATCH(body, 'progr* AND language')"),
     ("ranked text, OR / NOT filter", "SELECT id, score() FROM docs WHERE (category IN ('c01', 'c02') OR rating > 4.5) AND NOT topic = 't03' ORDER BY bm25(body, 'best programming language to learn first') DESC LIMIT 10"),
     ("filtered vector, OR filter", "SELECT id, score() FROM docs WHERE year < 1995 OR category = 'c40' ORDER BY similarity(emb, :q) DESC LIMIT 10"),
-    ("filtered hybrid, weighted", "SELECT id, score() FROM docs WHERE rating >= 3 AND year BETWEEN 2005 AND 2020 ORDER BY 0.2 * bm25(body, :t) + 0.8 * similarity(emb, :q) DESC LIMIT 10"),
+    ("filtered hybrid, weighted", "SELECT id, score() FROM docs WHERE rating >= 3 AND year BETWEEN 2005 AND 2020 ORDER BY 0.2 * minmax(bm25(body, :t)) + 0.8 * minmax(similarity(emb, :q)) DESC LIMIT 10"),
     ("hybrid, RRF on a correlated filter", "SELECT id, score() FROM docs WHERE topic IN ('t05', 't06', 't07') ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10"),
     ("facets over a text match", "SELECT topic, COUNT(*) FROM docs WHERE MATCH(body, 'india') AND year BETWEEN 2000 AND 2010 GROUP BY topic ORDER BY 2 DESC, 1 LIMIT 5"),
     ("text filter, ordered by a column", "SELECT id, rating FROM docs WHERE MATCH(body, 'travel AND visa') ORDER BY rating DESC, id LIMIT 5"),

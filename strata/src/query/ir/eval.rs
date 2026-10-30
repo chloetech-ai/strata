@@ -193,6 +193,7 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
         | Expr::Rrf { .. }
         | Expr::Weighted(_)
         | Expr::Product(_)
+        | Expr::Norm { .. }
         | Expr::Ppr(_)
         | Expr::Subquery(_) => return Err(err("full-text, graph and score expressions are answered by indexes in a Search, not row by row")),
         Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_) => return Err(err("a subquery is run before the rows it is evaluated over")),
@@ -368,6 +369,17 @@ fn call(func: Func, args: &[Value]) -> Result<Value> {
         }
         // A list without values is NULL here, as to IS NULL.
         Func::Coalesce => Ok(args.iter().find(|v| !matches!(v, Value::Null) && !matches!(v, Value::List(xs) if xs.is_empty())).cloned().unwrap_or(Value::Null)),
+        Func::Ln | Func::Log | Func::Exp | Func::Sqrt | Func::Pow | Func::Least | Func::Greatest | Func::Sigmoid | Func::Clamp => {
+            let xs = args
+                .iter()
+                .map(|v| match v {
+                    Value::Null => Ok(f64::NAN),
+                    v => v.as_f64().ok_or_else(|| err(format!("{} takes numbers, not {v:?}", func.name()))),
+                })
+                .collect::<Result<Vec<f64>>>()?;
+            let r = func.eval_f64(&xs);
+            Ok(if r.is_nan() { Value::Null } else { Value::Float(r) })
+        }
         // With the kernel similarity() uses, so the two agree to the bit.
         Func::Dot => match (vector(&one)?, vector(args.get(1).unwrap_or(&Value::Null))?) {
             (Some(a), Some(b)) if a.len() == b.len() => Ok(Some(crate::vector::kernels::dot_f32(&a, &b) as f64).filter(|d| d.is_finite()).map_or(Value::Null, Value::Float)),
