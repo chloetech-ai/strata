@@ -291,3 +291,28 @@ fn a_boost_by_seq_no_ranks_every_match() {
         assert!(got.stats.plan.join("\n").contains("every match scored"));
     }
 }
+
+/// A boost that gives -0 to some rows and 0 to others ties them, as the
+/// evaluator does: `B * coalesce(rating, 0) * -1` is -0 for a rating of 0
+/// and 0 for one of -0, and every other match ranks below; the 67 rows at
+/// 0 alone would fill the page.
+#[test]
+fn minus_zero_ties_with_zero() {
+    let mut docs = data::synthetic(200, DIM, 5);
+    for (i, d) in docs.iter_mut().enumerate() {
+        d[col::TITLE] = Value::Str("apple".into());
+        d[col::RATING] = Value::Float(match i % 3 {
+            0 => 0.0,
+            1 => -0.0,
+            _ => 1.0 + i as f64,
+        });
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "zero.strata", &docs, SEG);
+    let params = Params::new().set("t", Value::Str("apple".into()));
+    let sql = sql("B * coalesce(rating, 0) * -1", ", depth => 100000", "", " LIMIT 50");
+    let want = run(&db, &sql, &params, &ExecOptions { rank_safe: false, ..ExecOptions::default() });
+    let got = run(&db, &sql, &params, &ExecOptions::default());
+    assert!(want.keys.len() == 50 && want.scores.iter().all(|s| s.to_bits() == 0), "{:?}", want.scores);
+    identical(&sql, &want, &got);
+}
