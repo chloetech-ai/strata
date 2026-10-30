@@ -889,7 +889,7 @@ mod tests {
                         let m = 10f64.powi(v.get(1).map_or(Some(0.0), |d| *d)?.clamp(-30.0, 30.0).trunc() as i32);
                         fin((v[0]? * m).round() / m)
                     }
-                    Func::Lower | Func::Upper | Func::Length => None,
+                    Func::Lower | Func::Upper | Func::Length | Func::SidAt => None,
                 }
             }
             Score::Norm { kind: NormKind::MinMax, input } => {
