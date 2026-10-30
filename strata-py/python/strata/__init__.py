@@ -80,6 +80,8 @@ __all__ = [
     "StrataError",
     "open",
     "connect",
+    "from_sqlite",
+    "plan_sqlite",
     "Query",
     "Expr",
     "col",
@@ -127,6 +129,28 @@ def _schema_json(schema: Any) -> str:
     raise TypeError("a schema is a dict, JSON text or the path of a JSON file")
 
 
+def _schemas_json(schemas: Any) -> str | None:
+    """Schemas for a SQLite import: a dict, a list of them, a plan
+    (`plan_sqlite`), JSON text or the path of a JSON file."""
+    if schemas is None:
+        return None
+    if isinstance(schemas, (Mapping, list)):
+        return json.dumps(schemas)
+    if isinstance(schemas, (str, os.PathLike)):
+        text = os.fspath(schemas)
+        if text.lstrip().startswith(("{", "[")):
+            return text
+        with builtins.open(text, encoding="utf-8") as f:
+            return f.read()
+    raise TypeError("schemas are a dict, a list, JSON text or the path of a JSON file")
+
+
+def _names(tables: str | Iterable[str] | None) -> list[str] | None:
+    if tables is None:
+        return None
+    return [tables] if isinstance(tables, str) else list(tables)
+
+
 class Database(Search):
     """A Strata database opened in this process.
 
@@ -138,6 +162,8 @@ class Database(Search):
 
     def __init__(self, inner: Any):
         self._db = inner
+        #: What the last SQLite import into it did (`from_sqlite`, `import_sqlite`).
+        self.last_import: dict | None = None
 
     @classmethod
     def create(cls, path: str | os.PathLike, schema: Any, *, directory: bool = False, models: str | os.PathLike | None = None) -> "Database":
@@ -229,6 +255,30 @@ class Database(Search):
         rows, bulk, skipped = self._db.import_file(os.fspath(path), format, table)
         return {"rows": rows, "bulk": bulk, "skipped_fields": skipped}
 
+    def import_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, schemas: Any = None, blobs_base64: bool = False) -> dict:
+        """Imports the tables of a SQLite database file (all, or `tables`).
+        Each goes into the table of its name: an existing table takes the
+        columns whose names match its fields (rows upserted by key, or
+        bulk-loaded when it is empty); a missing one is created from the
+        SQLite table's declarations and values, or from the schema
+        `schemas` gives for it (see `plan_sqlite`). BLOB columns are left
+        out unless `blobs_base64`. Returns {tables: [{source, table, rows,
+        created, bulk, notes}], skipped: {name: why}}; the notes say what
+        did not carry over."""
+        self.last_import = json.loads(self._db.import_sqlite(os.fspath(path), _names(tables), _schemas_json(schemas), blobs_base64))
+        return self.last_import
+
+    def export_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, fts: bool = True, indexes: bool = True, schemas: bool = True) -> dict:
+        """Writes the tables (all, or `tables`) to a new SQLite file, from
+        one snapshot: rows, keys, references, NOT NULL and DEFAULT, B-tree
+        indexes (`indexes`), an FTS5 index over each table's text fields
+        kept in step by triggers (`fts`), and the Strata schemas in table
+        `_strata_tables` (`schemas`), which an import restores. Vectors are
+        float32 blobs (`F32_BLOB(n)`), lists, edges and sparse weights JSON,
+        timestamps UTC text. Returns {tables: [{table, rows, indexes, fts,
+        notes}]}."""
+        return json.loads(self._db.export_sqlite(os.fspath(path), _names(tables), fts, indexes, schemas))
+
     def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None) -> list[float]:
         """The query vector of `text` by an embedded field's model (of the
         first table, or of `table`), or of `image`, the bytes of an image
@@ -277,6 +327,25 @@ def open(path: str | os.PathLike, schema: Any = None, *, directory: bool = False
     if schema is None:
         raise StrataError(f"{os.fspath(path)} does not exist: pass a schema to create it")
     return Database.create(path, schema, directory=directory, models=models)
+
+
+def from_sqlite(sqlite_path: str | os.PathLike, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, schemas: Any = None, blobs_base64: bool = False, directory: bool = False, models: str | os.PathLike | None = None) -> Database:
+    """Creates a database at `path` from the tables of a SQLite database
+    file (all, or `tables`), with schemas made from the SQLite tables or
+    given in `schemas` (see `plan_sqlite`). What the import did, as
+    `Database.import_sqlite` returns it, is the database's `last_import`."""
+    inner, report = _strata.Database.from_sqlite(os.fspath(sqlite_path), os.fspath(path), _names(tables), _schemas_json(schemas), blobs_base64, directory, None if models is None else os.fspath(models))
+    db = Database(inner)
+    db.last_import = json.loads(report)
+    return db
+
+
+def plan_sqlite(sqlite_path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, schemas: Any = None, blobs_base64: bool = False) -> dict:
+    """What `from_sqlite` would make of a SQLite file, without writing:
+    {tables: [...], skipped: {name: why}}, each table the schema of the
+    Strata table it becomes (with its `source`, `columns` and `notes`). Edit
+    the plan and pass it to `from_sqlite` as `schemas`."""
+    return json.loads(_strata.Database.plan_sqlite(os.fspath(sqlite_path), _names(tables), _schemas_json(schemas), blobs_base64))
 
 
 def connect(url: str = "http://127.0.0.1:7700", *, token: str | None = None, timeout: float = 30.0) -> Client:

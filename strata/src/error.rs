@@ -43,6 +43,13 @@ impl From<std::io::Error> for Error {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "baselines"))]
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Error::Query(format!("sqlite: {e}"))
+    }
+}
+
 /// Shorthand for `Error::Corrupt` from anything printable.
 pub fn corrupt(m: impl fmt::Display) -> Error {
     Error::Corrupt(m.to_string())

@@ -24,6 +24,7 @@ use strata::query::exec::ResultSet;
 use strata::rank_log::{Export, Log};
 use strata::schema::Schema;
 use strata::sid::{Codebook, TrainOptions};
+use strata::sqlite;
 use strata::storage::{DbOptions, Layout, MergePolicy};
 use strata::{FieldType, Value};
 
@@ -206,6 +207,11 @@ impl Database {
 
     fn get(&self) -> PyResult<Arc<Db>> {
         self.db.read().unwrap_or_else(|e| e.into_inner()).clone().ok_or_else(|| StrataError::new_err("the database is closed"))
+    }
+
+    fn sqlite_options(tables: Option<Vec<String>>, schemas: Option<&str>, blobs_base64: bool) -> PyResult<sqlite::ImportOptions> {
+        let schemas = schemas.map(sqlite::schemas_from_json).transpose().map_err(err)?.unwrap_or_default();
+        Ok(sqlite::ImportOptions { tables: tables.unwrap_or_default(), schemas, blobs_base64 })
     }
 
     fn documents(db: &Db, schema: &Schema, rows: &[Json]) -> strata::Result<Vec<strata::Document>> {
@@ -407,6 +413,69 @@ impl Database {
         let format = format.map(|f| Format::parse(f).ok_or_else(|| PyValueError::new_err(format!("unknown format {f:?}: jsonl, json, csv or tsv")))).transpose()?;
         let r = py.detach(|| table_of(&db, table).and_then(|s| ingest::import_file_into(&db, &s.table, &path, format))).map_err(err)?;
         Ok((r.rows, r.bulk, r.unknown))
+    }
+
+    /// Imports the tables of the SQLite file `path` ([`sqlite::import`]);
+    /// returns what it did as JSON.
+    #[pyo3(signature = (path, tables = None, schemas = None, blobs_base64 = false))]
+    fn import_sqlite(&self, py: Python<'_>, path: PathBuf, tables: Option<Vec<String>>, schemas: Option<&str>, blobs_base64: bool) -> PyResult<String> {
+        let db = self.get()?;
+        let opts = Database::sqlite_options(tables, schemas, blobs_base64)?;
+        let r = py.detach(|| sqlite::import(&db, &path, &opts)).map_err(err)?;
+        Ok(r.to_json().to_string())
+    }
+
+    /// Writes the tables to a new SQLite file ([`sqlite::export`]); returns
+    /// what it wrote as JSON.
+    #[pyo3(signature = (path, tables = None, fts = true, indexes = true, schemas = true))]
+    fn export_sqlite(&self, py: Python<'_>, path: PathBuf, tables: Option<Vec<String>>, fts: bool, indexes: bool, schemas: bool) -> PyResult<String> {
+        let db = self.get()?;
+        let opts = sqlite::ExportOptions { tables: tables.unwrap_or_default(), fts, indexes, meta: schemas };
+        let r = py.detach(|| sqlite::export(&db, &path, &opts)).map_err(err)?;
+        Ok(r.to_json().to_string())
+    }
+
+    /// Creates a database at `path` from the tables of the SQLite file
+    /// `sqlite_path`; returns it and what the import did as JSON.
+    #[staticmethod]
+    #[pyo3(signature = (sqlite_path, path, tables = None, schemas = None, blobs_base64 = false, directory = false, models = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_sqlite(
+        py: Python<'_>,
+        sqlite_path: PathBuf,
+        path: PathBuf,
+        tables: Option<Vec<String>>,
+        schemas: Option<&str>,
+        blobs_base64: bool,
+        directory: bool,
+        models: Option<PathBuf>,
+    ) -> PyResult<(Self, String)> {
+        let opts = Database::sqlite_options(tables, schemas, blobs_base64)?;
+        let db_opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, ..DbOptions::default() };
+        let models = models.unwrap_or_else(strata::embed::models_dir);
+        let (db, embed_errors, report) = py
+            .detach(|| -> strata::Result<_> {
+                let src = sqlite::Source::open(&sqlite_path)?;
+                let plan = src.plan(None, &opts)?;
+                let first = plan.tables.first().ok_or_else(|| strata::Error::Schema(format!("{}: no table to import", sqlite_path.display())))?;
+                let db = Db::create_in(&path, first.schema.clone(), db_opts, &models)?;
+                // Before the rows, so that they get their embeddings.
+                let embed_errors: Vec<(String, String)> = db.open_embedders(&models).into_iter().map(|(f, e)| (f, e.to_string())).collect();
+                let r = src.load(&db, &plan)?;
+                Ok((db, embed_errors, r.to_json().to_string()))
+            })
+            .map_err(err)?;
+        Ok((Database { db: RwLock::new(Some(Arc::new(db))), embed_errors }, report))
+    }
+
+    /// What an import of the SQLite file `sqlite_path` into a new database
+    /// would do ([`sqlite::Plan::to_json`]).
+    #[staticmethod]
+    #[pyo3(signature = (sqlite_path, tables = None, schemas = None, blobs_base64 = false))]
+    fn plan_sqlite(py: Python<'_>, sqlite_path: PathBuf, tables: Option<Vec<String>>, schemas: Option<&str>, blobs_base64: bool) -> PyResult<String> {
+        let opts = Database::sqlite_options(tables, schemas, blobs_base64)?;
+        let plan = py.detach(|| sqlite::plan(&sqlite_path, None, &opts)).map_err(err)?;
+        Ok(plan.to_json().to_string())
     }
 
     /// The vector `field`'s model gives `text` as a query, or `image`, the

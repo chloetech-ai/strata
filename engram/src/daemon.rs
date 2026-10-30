@@ -823,9 +823,13 @@ impl Daemon {
         // The two searches are independent (only packing needs both), so
         // they run side by side when a core is free, on one snapshot.
         let store = self.store.pinned();
+        let tail = match &self.cfg.rank.tail {
+            t if t.enabled => Some(recall::Tail::of(&store.tail(sid, t.records)?, t)),
+            _ => None,
+        };
         let (known, searched) = recall::both(
             || if self.cfg.knowledge.enabled { recall::knowledge(&store, &query, &filter, &skip, &self.cfg.knowledge) } else { Ok(Vec::new()) },
-            || recall::search(&store, &query, &filter, &self.cfg.rank),
+            || recall::search_with(&store, &query, tail.as_ref(), &filter, &self.cfg.rank),
         );
         let known = known?;
         let (hits, ev) = searched?;
