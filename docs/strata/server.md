@@ -248,12 +248,14 @@ curl -s localhost:7700/v1/query -d '{"sql": "SELECT id FROM photos ORDER BY simi
   "params": {"q": {"embed": "a dog on a beach", "field": "emb"}}}'
 ```
 
-Through Strata, `siglip-base-patch16-224`'s retrieval matches what its authors report (Karpathy's test splits, five captions an image, exact search; `strata-media-eval`, cloud container with 4 vCPUs):
+Through Strata, `siglip-base-patch16-224` retrieves as well as [open_clip's published results](https://github.com/mlfoundations/open_clip/blob/main/docs/openclip_retrieval_results.csv) for it say (Karpathy's test splits, five captions an image, exact search; `strata-media-eval`, cloud container with 4 vCPUs, [results](https://github.com/rkonow/strata/tree/main/strata/results/media)):
 
-| split | text to image R@1 / R@5 / R@10 | image to text R@1 / R@5 / R@10 | published (open_clip), text to image / image to text R@1 |
-|---|---|---|---|
-| Flickr30K, 1,000 images | 74.7 / 92.3 / 95.7 | 89.2 / 97.9 / 99.3 | 74.7 / 89.1 |
-| COCO, 5,000 images | COCO_T2I | COCO_I2T | 47.8 / 65.7 |
+| split | text to image R@1 / R@5 / R@10 | image to text R@1 / R@5 / R@10 |
+|---|---|---|
+| Flickr30K, 1,000 images | 74.7 / 92.3 / 95.7 | 89.2 / 97.9 / 99.3 |
+| *published* | *74.7 / 92.3 / 95.6* | *89.1 / 98.0 / 99.3* |
+| COCO, 5,000 images | 47.8 / 72.4 / 80.9 | 65.7 / 85.6 / 91.4 |
+| *published* | *47.8 / 72.4 / 81.0* | *65.7 / 85.4 / 91.3* |
 
 ## Semantic IDs
 

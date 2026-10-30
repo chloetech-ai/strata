@@ -532,7 +532,7 @@ mod tests {
             ("CREATE TABLE t (a MEDIA REFERENCES t)", "neither the key, a reference"),
             ("CREATE TABLE t (a MEDIA[])", "only KEYWORD[] and INT[]"),
             ("CREATE TABLE t (a MEDIA, b TEXT OPTIONS(from = 'a'))", "not a source of text"),
-            ("CREATE TABLE t (a MEDIA, e VECTOR OPTIONS(embed = 'a', model = 'hash:8'))", "not a source of text"),
+            ("CREATE TABLE t (a MEDIA, e VECTOR OPTIONS(embed = 'a', model = 'hash:8'))", "is of kind image"),
             ("CREATE TABLE t (id INT PRIMARY KEY, a MEDIA NOT NULL) OPTIONS(shard_by = 'a')", "KEYWORD or INT"),
         ] {
             let e = create(bad, &[]).unwrap_err().to_string();
