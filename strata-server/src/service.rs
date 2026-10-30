@@ -1417,6 +1417,41 @@ impl Service {
         }
     }
 
+    /// The codes that can follow each of `prefixes` in semantic-ID field
+    /// `field`, among the rows `sql` (`SELECT COUNT(*) FROM t WHERE ...`)
+    /// or `plan` filters, seeing the writes `after` names: per prefix, each
+    /// next code and its rows ([`strata::db::Db::sid_next`]), summed over
+    /// the shards on a coordinator. It takes a query slot.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sid_next(self: &Arc<Self>, sql: &str, plan: Option<&Plan>, params: &Params, field: &str, prefixes: &[String], after: &After, timeout_ms: u64) -> Result<Vec<Vec<(String, u64)>>, ApiError> {
+        let t0 = Instant::now();
+        let bound = match plan {
+            Some(p) => p.clone(),
+            None => self.bound(|tables| compound::plan_read(sql, tables, params, &|t, n| self.rank_profile(t, n))).await?,
+        };
+        if bound.root.uses_operators() {
+            return Err(ApiError::bad("query error: the next codes count one table's rows: a condition without subqueries"));
+        }
+        let schema = self.table(bound.table()).await?;
+        let select = bound.to_select(&schema)?;
+        let timeout = self.timeout_of(timeout_ms);
+        let deadline = t0 + timeout;
+        match &self.backend {
+            Backend::Local(db) => {
+                let snap = self.read_snapshot(db, 0, after, deadline).await?;
+                let view = snap.table(&schema.table).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", schema.table)))?;
+                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected("sid_next", t0)) };
+                let db = db.clone();
+                let opts = ExecOptions { deadline: Some(deadline), memory: self.query_memory.clone(), ..db.exec.clone() };
+                let (field, prefixes) = (field.to_string(), prefixes.to_vec());
+                let r = tokio::task::spawn_blocking(move || db.sid_next_with(&view, &select, &field, &prefixes, &opts)).await.map_err(ApiError::internal)?;
+                drop(permit);
+                Ok(r?)
+            }
+            Backend::Cluster(c) => c.sid_next(sql, &schema, plan, params, field, prefixes, after, deadline).await,
+        }
+    }
+
     /// Any statement, on any table: rows for a SELECT, which sees the
     /// writes `after` names; the documents an INSERT, UPDATE or DELETE
     /// wrote; none for `CREATE TABLE`, `DROP TABLE` and the `RANK PROFILE`

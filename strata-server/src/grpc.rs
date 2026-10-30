@@ -90,14 +90,18 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 /// The protocol versions this server speaks (`proto/strata.proto`): 1
 /// takes SQL or a JSON plan, 2 a typed plan, 3 holds a query's snapshot
 /// for the fetch that follows, 4 places keys in slots, 5 reads the writes
-/// a read must see (`min_seq_no`), which a replica waits for, and 6 keeps
-/// stream sources' offsets ([`SOURCES_PROTOCOL`]).
+/// a read must see (`min_seq_no`), which a replica waits for, 6 keeps
+/// stream sources' offsets ([`SOURCES_PROTOCOL`]), and 7 answers the next
+/// codes of semantic-ID prefixes ([`SIDNEXT_PROTOCOL`]).
 pub const MIN_PROTOCOL: u32 = 1;
-pub const PROTOCOL: u32 = 6;
+pub const PROTOCOL: u32 = 7;
 
 /// The protocol whose writes carry stream sources' offsets
 /// ([`crate::service::op_source`]), and that answers `Sources`.
 pub const SOURCES_PROTOCOL: u32 = 6;
+
+/// The protocol of `SidNext`, the next codes of semantic-ID prefixes.
+pub const SIDNEXT_PROTOCOL: u32 = 7;
 
 /// A write's answer ([`crate::service::Written`]).
 pub fn write_response(w: crate::service::Written) -> pb::WriteResponse {
@@ -243,6 +247,22 @@ impl pb::strata_server::Strata for Grpc {
             let after = After::of(r.min_seq_no, r.min_seq_nos)?;
             let (stats, snapshot) = svc.term_stats(&r.sql, plan.as_ref(), &params_from_pb(r.params), &after, r.timeout_ms as u64).await?;
             Ok(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot })
+        })
+        .await
+    }
+
+    async fn sid_next(&self, req: Request<pb::SidNextRequest>) -> Result<Response<pb::SidNextResponse>, Status> {
+        self.serve("SidNext", req, |svc, r| async move {
+            let q = r.query.unwrap_or_default();
+            svc.check_epoch(q.epoch)?;
+            let plan = request_plan(q.protocol, q.plan, &q.plan_json)?;
+            let after = After::of(q.min_seq_no, q.min_seq_nos)?;
+            let next = svc.sid_next(&q.sql, plan.as_ref(), &params_from_pb(q.params), &r.field, &r.prefixes, &after, q.timeout_ms as u64).await?;
+            let next = next.into_iter().map(|cs| {
+                let (codes, counts) = cs.into_iter().unzip();
+                pb::SidChildren { codes, counts }
+            });
+            Ok(pb::SidNextResponse { next: next.collect() })
         })
         .await
     }

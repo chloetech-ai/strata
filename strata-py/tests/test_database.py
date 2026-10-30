@@ -303,6 +303,15 @@ def test_writes_to_any_table(db, tmp_path):
         db.sql("UPDATE events SET usr = 'u2' WHERE id = 1")
 
 
+def test_a_table_ordered_by_a_column_and_kept_for_a_period(db):
+    assert db.sql("CREATE TABLE views (id INT PRIMARY KEY, usr KEYWORD, ts TIMESTAMP) OPTIONS(cluster_by = 'usr', retain = '30 days')") == 0
+    t = db.tables()[1]
+    assert list(t)[:5] == ["table", "key", "cluster_by", "retain", "retain_by"]
+    assert (t["cluster_by"], t["retain"], t["retain_by"]) == ("usr", "30 days", "ts")
+    with pytest.raises(strata.StrataError, match="cluster_by"):
+        db.sql("CREATE TABLE bad (id INT PRIMARY KEY, body TEXT) OPTIONS(cluster_by = 'body')")
+
+
 def test_rank_profiles(db):
     liked = "CREATE RANK PROFILE liked ON books AS SELECT * FROM books ORDER BY bm25(title, :q) * (1 + :w * rating) DESC WITH (w => 0.5)"
     assert db.sql(liked) == 0

@@ -50,14 +50,18 @@
 //!
 //! `OPTIONS(...)` after the columns takes the table's options: `shard_by`,
 //! the column that places its rows on shards instead of their key
-//! ([`crate::schema::Schema::with_shard_by`]):
+//! ([`crate::schema::Schema::with_shard_by`]); `cluster_by`, the column
+//! that orders each segment's rows ([`crate::schema::Schema::with_cluster_by`]);
+//! and `retain`, how long rows are kept after the time in `retain_by`
+//! (default: the table's only TIMESTAMP; [`crate::schema::Schema::with_retain`]):
 //!
 //! ```sql
 //! CREATE TABLE events (
 //!   id INT PRIMARY KEY,
 //!   usr KEYWORD NOT NULL,
-//!   item KEYWORD REFERENCES items
-//! ) OPTIONS(shard_by = 'usr');
+//!   item KEYWORD REFERENCES items,
+//!   ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+//! ) OPTIONS(shard_by = 'usr', cluster_by = 'usr', retain = '400 days');
 //! ```
 //!
 //! Every other clause and column option (`UNIQUE`, `CHECK`, `ON DELETE`,
@@ -76,9 +80,9 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// The forms this module binds, for error messages.
-const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column')]";
+const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column')]";
 /// The options of a table, in `OPTIONS(...)` after its columns.
-const TABLE_OPTIONS: [&str; 1] = ["shard_by"];
+const TABLE_OPTIONS: [&str; 4] = ["shard_by", "cluster_by", "retain", "retain_by"];
 const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES or MEDIA, KEYWORD[] or INT[] for lists, and VECTOR(dimensions)[] for several vectors per row";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
@@ -196,6 +200,7 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
         }
         match option_value(value)? {
             v @ J::String(_) => short[k] = v,
+            _ if k == "retain" => return Err(err("the table's option retain is a period, in quotes: retain = '400 days'")),
             _ => return Err(err(format!("the table's option {k} names a column, in quotes: {k} = 'usr'"))),
         }
     }
