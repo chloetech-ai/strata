@@ -386,6 +386,8 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           pip install maturin pytest numpy confluent-kafka
+          # strata.train.sequence's test: CPU PyTorch (PyPI's macOS wheel is one)
+          if [ "$RUNNER_OS" = Linux ]; then pip install torch --index-url https://download.pytorch.org/whl/cpu; else pip install torch; fi
           maturin develop --release
           pytest tests -v
       - name: Clippy

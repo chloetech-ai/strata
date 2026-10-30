@@ -52,6 +52,7 @@ use crate::error::{Error, Result};
 use crate::query::logical::{AggFn, Decay, Direction, Expand, Opts};
 use crate::query::cross_encoder::CrossEncoder;
 use crate::query::model::Opened;
+use crate::query::sequence::SequenceModel;
 use crate::value::Value;
 
 pub mod eval;
@@ -63,8 +64,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 20] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP];
+pub const FEATURES: [&str; 21] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP, ENCODE];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -152,6 +153,10 @@ pub const GUARD: &str = "guard";
 /// group ([`Node::DistinctOn`] with `per` above 1: `MAX k PER field`). A
 /// Strata from before it would keep one.
 pub const PER_CAP: &str = "per_cap";
+
+/// The feature of a plan that turns a history into a vector with a
+/// sequence model ([`Expr::Encode`]).
+pub const ENCODE: &str = "encode";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -813,6 +818,24 @@ pub enum Expr {
     /// row it does not list: the values a correlated subquery took for the
     /// Search's rows, once it ran (feature [`CORRELATED`]).
     ByKey(Vec<KeyValue>),
+    /// A history's vector by a sequence model
+    /// ([`crate::query::sequence`], feature [`ENCODE`]): `rows` are the
+    /// history's events, newest first, each the item's key, then its
+    /// action and time when the plan has those columns (a TIMESTAMP, or
+    /// microseconds); `now` is the request's time in seconds since the
+    /// Unix epoch (the clock's when absent). It runs before the rows it ranks, as a subquery does, and
+    /// stands for a vector of the item field the model names. `model` and
+    /// `hash` are as [`Expr::Gbdt`]'s.
+    Encode {
+        model: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hash: String,
+        rows: Box<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        now: Option<f64>,
+        #[serde(skip)]
+        open: Opened<SequenceModel>,
+    },
 }
 
 /// A row's primary key and a number for it ([`Expr::ByKey`]); `None` is
@@ -971,7 +994,7 @@ impl Node {
         fn within(e: &Expr) -> bool {
             let mut found = false;
             e.visit(&mut |x| {
-                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } = x {
                     found |= n.has_phases();
                 }
             });
@@ -999,7 +1022,7 @@ impl Node {
     pub fn each_search(&self, f: &mut dyn FnMut(&Search)) {
         fn within(e: &Expr, f: &mut dyn FnMut(&Search)) {
             e.visit(&mut |x| {
-                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } = x {
                     n.each_search(f);
                 }
             });
@@ -1047,7 +1070,7 @@ impl Node {
         fn within(e: &Expr) -> bool {
             let mut found = false;
             e.visit(&mut |x| {
-                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } = x {
                     found |= n.has_features();
                 }
             });
@@ -1113,10 +1136,11 @@ impl Node {
         found
     }
 
-    /// Whether the plan ranks with a model ([`RANK_MODELS`]).
+    /// Whether the plan names a model to open: a ranking model
+    /// ([`RANK_MODELS`]) or a sequence model ([`ENCODE`]).
     pub fn has_models(&self) -> bool {
         let mut found = false;
-        self.visit_exprs(&mut |e| found |= matches!(e, Expr::Gbdt { .. } | Expr::CrossEncoder { .. }));
+        self.visit_exprs(&mut |e| found |= matches!(e, Expr::Gbdt { .. } | Expr::CrossEncoder { .. } | Expr::Encode { .. }));
         found
     }
 
@@ -1127,7 +1151,7 @@ impl Node {
         let mut each = |e: &Expr| {
             e.visit(&mut |x| {
                 f(x);
-                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } = x {
                     n.visit_exprs(f);
                 }
             })
@@ -1199,7 +1223,7 @@ impl Node {
             e.visit_mut(&mut |x| {
                 f(x)?;
                 match x {
-                    Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) => n.visit_exprs_mut(f),
+                    Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } => n.visit_exprs_mut(f),
                     _ => Ok(()),
                 }
             })
@@ -1294,7 +1318,7 @@ impl Node {
         fn within(e: &Expr) -> bool {
             let mut found = false;
             e.visit(&mut |x| {
-                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } = x {
                     found |= n.ranks_by_expression();
                 }
             });
@@ -1456,7 +1480,7 @@ impl Expr {
 
     pub fn has_operators(&self) -> bool {
         let mut found = false;
-        self.visit(&mut |e| found |= matches!(e, Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_)));
+        self.visit(&mut |e| found |= matches!(e, Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_) | Expr::Encode { .. }));
         found
     }
 
@@ -1635,7 +1659,12 @@ impl Plan {
         if root.has_profiles() {
             features.push(RANK_PROFILES.to_string());
         }
-        if root.has_models() {
+        let (mut gbdt, mut encode) = (false, false);
+        root.visit_exprs(&mut |e| {
+            gbdt |= matches!(e, Expr::Gbdt { .. } | Expr::CrossEncoder { .. });
+            encode |= matches!(e, Expr::Encode { .. });
+        });
+        if gbdt {
             features.push(RANK_MODELS.to_string());
         }
         let (mut prefix, mut edits) = (false, false);
@@ -1652,7 +1681,7 @@ impl Plan {
         }
         let (mut distinct_on, mut per_cap) = (root.keeps_firsts(), root.caps_per());
         root.visit_exprs(&mut |e| {
-            if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = e {
+            if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } = e {
                 distinct_on |= n.keeps_firsts();
                 per_cap |= n.caps_per();
             }
@@ -1691,6 +1720,9 @@ impl Plan {
         root.each_search(&mut |s| guarded |= s.guard.is_some());
         if guarded {
             features.push(GUARD.to_string());
+        }
+        if encode {
+            features.push(ENCODE.to_string());
         }
         Plan { version: VERSION, features, root }
     }

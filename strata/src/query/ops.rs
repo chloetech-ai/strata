@@ -52,7 +52,7 @@ pub fn run(plan: &Plan, schema: &Schema, runner: &mut Runner, opts: &ExecOptions
 
 /// [`run`] of a plan whose leaves read any tables of `catalog`.
 pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, plan: Vec::new() };
+    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, plan: Vec::new(), encoded: Vec::new() };
     let rows = ops.node(&plan.root, "query")?;
     let keys = rows.keys.filter(|k| k.iter().all(|k| !matches!(k, Value::Null)));
     Ok(ResultSet {
@@ -103,6 +103,10 @@ struct Ops<'a, 'r> {
     /// and how many it read.
     driver: Option<(*const Node, u64, usize)>,
     plan: Vec<String>,
+    /// The vectors of the `encode(..)`s run so far, with the `WITH`
+    /// results in scope then: a column and the ORDER BY that names it
+    /// run it once.
+    encoded: Vec<(Expr, usize, Option<std::sync::Arc<[f32]>>)>,
 }
 
 impl<'a> Ops<'a, '_> {
@@ -616,6 +620,12 @@ impl<'a> Ops<'a, '_> {
                 }
             }
             Expr::MaxSim { vectors, .. } if matches!(vectors.as_ref(), Expr::Values(_)) => **vectors = Expr::Lit(Value::List(self.vectors(vectors)?)),
+            // No events, no vector: such a ranking scores no row.
+            Expr::MaxSim { field, vectors, .. } if matches!(vectors.as_ref(), Expr::Encode { .. }) => {
+                trained_for(vectors, schema, *field)?;
+                **vectors = Expr::Lit(Value::List(self.encoded(vectors)?.map(Value::Vector).into_iter().collect()))
+            }
+            Expr::Encode { .. } => *e = Expr::Lit(self.encoded(e)?.map_or(Value::Null, Value::Vector)),
             Expr::Values(_) | Expr::Keys(_) => *e = Expr::Lit(Value::List(self.values(e, None, None)?)),
             Expr::Exists(n) => *e = Expr::Lit(Value::Bool(!self.node(n, "subquery")?.rows.is_empty())),
             // Runs for each row, once the rows are known.
@@ -673,6 +683,89 @@ impl<'a> Ops<'a, '_> {
         }
         self.plan.push(format!("subquery: {} query vectors", out.len()));
         Ok(out)
+    }
+
+    /// The vector of [`Expr::Encode`]'s history by its model, `None` when
+    /// none of its events' items has a vector.
+    fn encoded(&mut self, e: &Expr) -> Result<Option<std::sync::Arc<[f32]>>> {
+        if let Some((_, _, v)) = self.encoded.iter().find(|(x, n, _)| x == e && *n == self.ctes.len()) {
+            return Ok(v.clone());
+        }
+        let v = self.encode(e)?;
+        self.encoded.push((e.clone(), self.ctes.len(), v.clone()));
+        Ok(v)
+    }
+
+    fn encode(&mut self, e: &Expr) -> Result<Option<std::sync::Arc<[f32]>>> {
+        let Expr::Encode { model, rows, now, open, .. } = e else { unreachable!("an encode") };
+        let m = open.0.clone().ok_or_else(|| err(format!("sequence model {model} is not open: Db::query and Db::run open the models of a query's plan (Db::open_ranking_models)")))?;
+        let items = self.catalog.iter().find(|s| s.table.eq_ignore_ascii_case(&m.table)).copied().ok_or_else(|| err(format!("sequence model {model} reads the vectors of table {}, which this database has not", m.table)))?;
+        let (pk, field) = (items.primary_key.ok_or_else(|| err(format!("sequence model {model}: table {} has no primary key", m.table)))?, items.field_index(&m.field));
+        match field.map(|f| &items.fields[f].ty) {
+            _ if field.is_some_and(|f| items.fields[f].multi) => return Err(err(format!("sequence model {model} reads one vector an item, and {}.{} holds several", m.table, m.field))),
+            Some(FieldType::Vector { dim, .. }) if *dim == m.dim => {}
+            Some(FieldType::Vector { dim, .. }) => return Err(err(format!("sequence model {model} was trained on {}.{} of {} dimensions; the field has {dim}", m.table, m.field, m.dim))),
+            _ => return Err(err(format!("sequence model {model} reads VECTOR field {}.{}, which is not one", m.table, m.field))),
+        }
+        let field = field.expect("a field");
+        let history = self.node(rows, "encode's history")?;
+        if history.rows.first().is_some_and(|r| r.is_empty() || r.len() > 3) {
+            return Err(err(format!("encode's history returns the item's key, then its action and time (one to three columns), not {}", history.columns.len())));
+        }
+        // The newest events the model reads, then their items' vectors.
+        let events = &history.rows[..history.rows.len().min(m.max_len)];
+        let keys: Vec<Value> = events.iter().map(|r| r[0].clone()).filter(|k| !matches!(k, Value::Null)).collect();
+        let mut vectors: HashMap<Part, std::sync::Arc<[f32]>> = HashMap::new();
+        if !keys.is_empty() {
+            let leaf = Node::Project {
+                input: Box::new(Node::Search(crate::query::ir::Search {
+                    table: items.table.clone(),
+                    filter: Expr::In { expr: Box::new(Expr::Field(pk as u32)), list: keys.into_iter().map(Expr::Lit).collect() },
+                    order: Vec::new(),
+                    phases: Vec::new(),
+                    profile: None,
+                    guard: None,
+                })),
+                columns: vec![crate::query::ir::Column { name: "key".into(), expr: Expr::Field(pk as u32) }, crate::query::ir::Column { name: "vector".into(), expr: Expr::Field(field as u32) }],
+            };
+            for r in self.node(&leaf, "encode's items")?.rows {
+                if let [k, Value::Vector(v)] = &r[..] {
+                    vectors.insert(part(k), v.clone());
+                }
+            }
+        }
+        // Item, action, time; or of two columns, the item and an action
+        // (text) or a time (a TIMESTAMP or number).
+        let at = |r: &[Value]| match r.len() {
+            2 if matches!(r[1], Value::Timestamp(_) | Value::Int(_) | Value::Float(_)) => (None, Some(1)),
+            2 => (Some(1), None),
+            3 => (Some(1), Some(2)),
+            _ => (None, None),
+        };
+        let text: Vec<Option<String>> = events
+            .iter()
+            .map(|r| match at(r).0.map(|i| &r[i]) {
+                Some(Value::Str(a)) => Some(a.clone()),
+                Some(Value::Null) | None => None,
+                Some(Value::Int(n)) => Some(n.to_string()),
+                Some(v) => Some(format!("{v:?}")),
+            })
+            .collect();
+        let mut steps = Vec::with_capacity(events.len());
+        for (r, action) in events.iter().zip(&text).rev() {
+            let Some(item) = vectors.get(&part(&r[0])) else { continue };
+            let time = match at(r).1.map(|i| &r[i]) {
+                // Microseconds, as TIMESTAMPs and the rank log's export.
+                Some(Value::Timestamp(t) | Value::Int(t)) => Some(*t as f64 / 1e6),
+                Some(Value::Float(t)) if t.is_finite() => Some(*t / 1e6),
+                Some(Value::Null) | None => None,
+                Some(v) => return Err(err(format!("encode's history has times (a TIMESTAMP, or microseconds since the Unix epoch) in its last column, not {v:?}"))),
+            };
+            steps.push(crate::query::sequence::Event { item, action: action.as_deref(), time });
+        }
+        let now = now.unwrap_or_else(|| crate::timestamp::now() as f64 / 1e6);
+        self.plan.push(format!("encode: {model} over {} events, {} with vectors", events.len(), steps.len()));
+        Ok(m.encode(&steps, Some(now)).map(Into::into))
     }
 
     /// [`Ops::values`] of a weighted walk's seeds, each with the sum of the
@@ -1014,6 +1107,18 @@ fn equal_value(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Op
         Value::Float(_) if int => Ok(None),
         v => coerce(schema, f, v).map(Some),
     }
+}
+
+/// Refuses an [`Expr::Encode`] against field `f` of `schema`'s table when
+/// its model gives vectors of another table's or field's.
+fn trained_for(e: &Expr, schema: Option<&Schema>, f: u32) -> Result<()> {
+    if let (Expr::Encode { model, open: crate::query::model::Opened(Some(m)), .. }, Some(s)) = (e, schema) {
+        let name = s.fields.get(f as usize).map_or("", |x| &x.name);
+        if !s.table.eq_ignore_ascii_case(&m.table) || !name.eq_ignore_ascii_case(&m.field) {
+            return Err(err(format!("sequence model {model} gives vectors of {}.{}, not of {}.{name}", m.table, m.field, s.table)));
+        }
+    }
+    Ok(())
 }
 
 /// The first table's scan of the joins under a LIMIT, or the scan whose

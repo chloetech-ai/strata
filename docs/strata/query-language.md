@@ -589,6 +589,44 @@ curl -s localhost:7700/v1/rank_log/export -d '{"events": {"table": "events", "us
 - **As of the row's time**, by the events' own times: an event timed before a row is in its history even when it arrived after the row was served, which a query at the time could not have seen. The features are the values served, never recomputed.
 - **A coordinator does not export**: export from each shard's server. Logs placed by context (a hand-made log with `context KEYWORD NOT NULL` and `shard_by = 'context'`) and events placed by user then give each shard every row and event of its contexts.
 
+#### Sequence models: `encode('model', history)`
+
+A sequence model reads what a user did, newest first, and gives a vector in the space of an item field, so that the items it ranks first are the ones the user is likely to want next:
+
+```sql
+-- the next item for a user, from their last 200 events
+SELECT id, score() FROM items
+WHERE NOT id IN (SELECT item FROM events WHERE usr = :u)
+ORDER BY similarity(emb, encode('next', (SELECT item, action, ts FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 200), now => :now)) DESC
+LIMIT 10;
+
+-- as a feature of a ranking, next to the text's
+WITH top AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 200)
+SELECT id, score() FROM top
+ORDER BY bm25(title, :q) + 2 * coalesce(dot(emb, encode('next', (SELECT item, ts FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 200))), 0) DESC
+LIMIT 10;
+```
+
+- **The history** is a subquery of the user's events, newest first: its first column is an item's primary key in the model's table, then optionally what the event was (a text column: `view`, `buy`, a rating) and when (a `TIMESTAMP`, or a number of microseconds since the epoch, as the [rank log's export](#exporting-the-log-for-training) writes them); with two columns, the second is the time when it is a time or a number, else the action. The model reads the newest rows up to the length it was trained on; an item without a vector is left out. `now =>` is the time of the request (a `TIMESTAMP`, microseconds or ISO 8601 text; the clock's by default): the time since the newest event is part of what the model reads.
+- **Where it goes**: `similarity(field, encode(…))` ranks the field's nearest items (the dot product with the model's vector: a search of the field's index, its best scored exactly, as [`maxsim`](#maxsimfield-vectors-several-query-vectors) runs one), `maxsim(field, encode(…))` the same as one query vector, and `dot(field, encode(…))` is a number in any ranking expression. A user with no events has no vector: `similarity` and `maxsim` then return no rows, and `dot` is `NULL`. The history runs once a query, however often `encode` appears in it.
+- **The model** is a small causal transformer (SASRec's): each event is its item's vector, projected, plus a learned vector for its action, for the time until the next event (in powers of two of seconds) and for its position; two layers of attention over the events, each seeing only the ones before it, then the last event's output, projected into the item field's space and normalized. It is the directory `<models>/<model>/` (`config.json` and `model.safetensors`), in the models directory [`gbdt`](#ranking-models-gbdtmodel-features)'s files come from. The config names the table and the vector field the model was trained on and their dimension: a database without that field, or with one of another dimension, refuses the model, and so do `similarity` and `maxsim` over another field.
+- **Training** is `strata.train.sequence` in Python, with PyTorch (`pip install torch`), from a table of events, the rank log's export, or lists of `(item, action, time)`:
+
+  ```python
+  import strata, strata.train
+  db = strata.Database.open("shop.strata")
+  out = strata.train.sequence(db, "next", table="items", field="emb",
+                              events={"table": "events", "user": "usr", "item": "item", "action": "action", "time": "ts"},
+                              learn_items=True)
+  db.upsert([{"id": k, "emb": v} for k, v in out["vectors"].items()])   # with learn_items, the items' learned vectors
+  ```
+
+  It trains next-item prediction over each user's events, with every item in the field (`negatives="all"`) or the other targets of a batch (`"in_batch"`, for many items) as the negatives, and writes the model where `models=` says (the models directory by default). With `learn_items=True` the item vectors are trained too, starting from the field's, and `out["vectors"]` holds them, to write back; otherwise the field's vectors are kept as they are and only the model learns.
+- **Equal to PyTorch's**: Strata's vector is the one the PyTorch module gives for the same history, within 2·10⁻⁵ (`strata/tests/sequence.rs`), and the items a query ranks are the ones PyTorch's vector ranks.
+- **How well it ranks**: on MovieLens-1M and Amazon Beauty, leave-one-out over every item as SASRec is measured, a model of two layers that reads items only has Recall@10 0.278 and 0.066 (NDCG@10 0.159 and 0.041), above published SASRec's 0.250 and 0.061; reading times too, 0.319 and 0.077. Strata's answers equal PyTorch's on every user ([`results/sequence`](https://github.com/rkonow/strata/tree/main/strata/results/sequence), with the protocol and the published numbers).
+- **What it costs**: the model alone, on one thread of a cloud VM's Xeon at 2.80 GHz, takes 0.09 ms for 10 events, 0.28 ms for 50 and 1.5 ms for 200 (p50); the whole query, reading the history and searching the field, 0.6 to 0.7 ms on Beauty's 50 events and 2 to 3 ms on MovieLens's 200. Keep `max_len` as short as the ranking allows.
+- **A plan names the model and the hash of its files** and needs the plan feature `encode`; a database or shard whose files of that name are others refuses it. A coordinator runs `encode` itself, from the history its shards return, so it needs the model; the shards don't.
+
 ### `decay(field, origin, scale, …)`: closeness to a value
 
 A numeric column's closeness to `origin`, as in Elasticsearch's decay functions. With `d = max(0, |x − origin| − offset)`, the score is 1 at `d = 0` and `decay` at `d = scale`:

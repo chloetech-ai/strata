@@ -579,6 +579,9 @@ pub(crate) enum Sub {
     /// A number in a ranking expression: its one value, for each row
     /// ranked when it names the row (a correlated subquery).
     Score,
+    /// A history for `encode(..)`: its rows, one to three columns
+    /// ([`ir::Expr::Encode`]).
+    Rows,
 }
 
 /// Plans a subquery for the binder ([`bind_query_with`]): the expression
@@ -1569,6 +1572,12 @@ impl<'a> Binder<'a> {
         if self.schema.fields[field].multi {
             return Err(err(multi_similarity(&self.schema.fields[field].name)));
         }
+        if let Some(e) = self.encode(v)? {
+            if distance {
+                return Err(err("encode(..) ranks by similarity(field, encode(..)), larger first, not by distance"));
+            }
+            return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(e)), opts: without_norm(opts) });
+        }
         let vector = self.vector(v)?;
         if vector.len() != dim {
             return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
@@ -1590,6 +1599,9 @@ impl<'a> Binder<'a> {
         }
         if let Some(q) = subquery_of(vs) {
             return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(self.sub(q, Sub::Vectors)?)), opts: without_norm(opts) });
+        }
+        if let Some(e) = self.encode(vs)? {
+            return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(e)), opts: without_norm(opts) });
         }
         let vectors: Vec<Arc<[f32]>> = match vs {
             Expr::Tuple(items) => items.iter().map(|i| self.vector(i)).collect::<Result<_>>()?,
@@ -1613,6 +1625,22 @@ impl<'a> Binder<'a> {
             return Err(err("a vector's components must be finite numbers"));
         }
         Ok(Score::MaxSim { field, vectors: Vectors::List(vectors), opts: without_norm(opts) })
+    }
+
+    /// `encode('model', (SELECT item, action, time FROM ... ORDER BY time
+    /// DESC LIMIT 200), now => t)`, if `e` is a call of it: the history's
+    /// vector by a sequence model ([`crate::query::sequence`]), once the
+    /// subquery ran.
+    fn encode(&self, e: &Expr) -> Result<Option<ir::Expr>> {
+        let e = match e {
+            Expr::Nested(x) => x,
+            e => e,
+        };
+        let Expr::Function(f) = e else { return Ok(None) };
+        if fname(f) != "encode" {
+            return Ok(None);
+        }
+        encode_call(f, &|e| self.literal(e), &|q| self.sub(q, Sub::Rows)).map(Some)
     }
 
     /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
@@ -2318,6 +2346,33 @@ fn strip_nested(e: &Expr) -> &Expr {
         Expr::Nested(x) => strip_nested(x),
         e => e,
     }
+}
+
+/// An `encode(..)` call ([`Binder::encode`]), with `literal` for its
+/// model's name and `now`, and `sub` to plan its history.
+pub(crate) fn encode_call(f: &sql::Function, literal: &dyn Fn(&Expr) -> Result<Value>, sub: &dyn Fn(&sql::Query) -> Result<ir::Expr>) -> Result<ir::Expr> {
+    let usage = "encode('model', (SELECT item, action, time FROM ... ORDER BY time DESC LIMIT 200), now => time)";
+    let FunctionArguments::List(list) = &f.args else { return Err(err(usage)) };
+    let (mut pos, mut now) = (Vec::new(), None);
+    for a in &list.args {
+        match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => pos.push(e),
+            FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } if name.value.eq_ignore_ascii_case("now") => now = Some(e),
+            _ => return Err(err(format!("encode takes a model and a history, and now => a time: {usage}"))),
+        }
+    }
+    let [model, rows] = pos[..] else { return Err(err(usage)) };
+    let Value::Str(model) = literal(model)? else { return Err(err(format!("encode's model is its name: {usage}"))) };
+    let q = subquery_of(rows).ok_or_else(|| err(format!("encode's history is a subquery of its events, newest first: {usage}")))?;
+    let ir::Expr::Values(rows) = sub(q)? else { unreachable!("a subquery's rows") };
+    let now = match now.map(literal).transpose()? {
+        None | Some(Value::Null) => None,
+        Some(Value::Timestamp(t) | Value::Int(t)) => Some(t as f64 / 1e6),
+        Some(Value::Float(t)) if t.is_finite() => Some(t / 1e6),
+        Some(Value::Str(t)) => Some(crate::timestamp::parse(&t).ok_or_else(|| err(format!("encode's now is a time, not {t:?}")))? as f64 / 1e6),
+        Some(v) => return Err(err(format!("encode's now is a time (a TIMESTAMP, or microseconds since the Unix epoch), not {v:?}"))),
+    };
+    Ok(ir::Expr::Encode { model, hash: String::new(), rows, now, open: Default::default() })
 }
 
 fn fname(f: &sql::Function) -> String {

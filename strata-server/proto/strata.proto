@@ -560,6 +560,9 @@ message Expr {
     // A column of the outer row inside a correlated subquery; plan
     // feature "correlated".
     uint32 outer = 61;
+    // encode('model', (history)): a history's vector by a sequence
+    // model; plan feature "encode".
+    Encode encode = 62;
     // A ranking given as primary keys, best first (ranked(:keys)); plan
     // feature "ranked". Numbered from 70, the range of the semantic-ID
     // work.
@@ -596,6 +599,17 @@ message Gbdt {
   string model = 1;
   string hash = 2;
   repeated Expr args = 3;
+}
+
+// encode('model', (SELECT item, action, ts ...)): the history's vector by
+// the sequence model of that name, whose files have the hash `hash` (empty:
+// not opened yet); `now` is the request's time in seconds since the Unix
+// epoch (the clock's when absent).
+message Encode {
+  string model = 1;
+  string hash = 2;
+  Node rows = 3;
+  optional double now = 4;
 }
 
 message Norm {
