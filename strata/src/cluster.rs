@@ -227,8 +227,9 @@ fn by_key(a: &Value, b: &Value, desc: bool) -> Ordering {
 }
 
 /// Fuses the candidates of every shard: each input's top `depth` over all
-/// shards (at least the `k` rows the page needs, as each shard took), then
-/// the fused score over those ([`Rank`]), as one database computes it.
+/// shards (at least the `k` rows the page needs, as each shard took), or
+/// every row for a rank-safe boost ([`Rank::driver`]), then the fused score
+/// over those ([`Rank`]), as one database computes it.
 fn fuse(score: &Score, rows: Vec<Row>, k: usize) -> Result<Vec<Row>> {
     let rank = Rank::of(score, ExecOptions::default().fusion_depth).expect("a ranking expression");
     let n_inputs = rank.leaves.len();
@@ -249,7 +250,9 @@ fn fuse(score: &Score, rows: Vec<Row>, k: usize) -> Result<Vec<Row>> {
             l
         })
         .collect();
-    let cands: Vec<usize> = if rank.exact { (0..rows.len()).collect() } else { rank.candidates(&lists) };
+    // A rank-safe boost: each shard sent its exact top rows by the
+    // expression (and its inputs' top `depth`), so every row is one.
+    let cands: Vec<usize> = if rank.exact || rank.driver().is_some() { (0..rows.len()).collect() } else { rank.candidates(&lists) };
     let values: Vec<Vec<f64>> =
         if rank.reads_values() { (0..n_inputs).map(|j| cands.iter().map(|&i| rows[i].inputs[j].unwrap_or(f64::NEG_INFINITY)).collect()).collect() } else { Vec::new() };
     let mut at = vec![usize::MAX; rows.len()];

@@ -521,7 +521,9 @@ GROUP BY category ORDER BY 2 DESC LIMIT 5;
   `minmax(x)`, `rank(x)`), evaluated once by `query::rank` on a database
   and on a coordinator; `+` adds raw values. `NULL` (a missing value, or a
   result that is not finite) makes the expression `NULL`, and the row
-  ranks last.
+  ranks last. An expression of one text score and row values
+  (`bm25(body, :t) * (1 + 0.2 * importance)`) is a rank-safe boost: its
+  top rows are exact, found by the text score's top-k loop.
 * `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`:
   a numeric column's closeness to `origin`, as Elasticsearch's decay
   functions: `d = max(0, |x − origin| − offset)` maps to 1 at `d = 0` and
@@ -826,6 +828,22 @@ only the rows the page can reach (the best `k` and the rows tied with the
 `k`-th), which matters when `exact => 1` makes every row a candidate.
 Ranking expressions extend this expression with arithmetic, functions and
 rerank phases.
+
+**Rank-safe boosts** (`Rank::driver`, `text::bm25::Boost`). When an
+expression has one text score (BM25 or sparse) and its other leaves are
+row values (columns, decays, `CASE` conditions, `seq_no()`), with no set
+function, the text score's top-k loop ranks by the whole expression
+instead of taking its top `depth` rows as candidates. Interval arithmetic
+over the expression, with each column's minimum and maximum (and the
+values updated in place), bounds a row's value for text scores in
+`[0, c]`; the loop turns its threshold θ (the k-th best value so far) into
+the largest text score `c` whose bound is at most θ, by bisection, and
+MaxScore and Block-Max WAND skip what cannot reach `c` as they skip what
+cannot reach θ today. A row's value comes from the same evaluator
+(`Rank::eval_row`), so the top k is exactly what scoring every matching row
+gives. If the bound does not fall with the text score (`rating - bm25`),
+the loop scores every match. Each shard answers with its exact top rows,
+and a coordinator takes every row a shard sends as a candidate.
 
 The vector strategies are chosen by estimated cost against an estimated
 filter selectivity `s`: pre-filter costs `s·n` distance computations; IVF
