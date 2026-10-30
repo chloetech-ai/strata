@@ -78,9 +78,9 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// The forms this module binds, for error messages.
-const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column')]";
+const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column', edges = 'src, dst, w')]";
 /// The options of a table, in `OPTIONS(...)` after its columns.
-const TABLE_OPTIONS: [&str; 4] = ["shard_by", "cluster_by", "retain", "retain_by"];
+const TABLE_OPTIONS: [&str; 5] = ["shard_by", "cluster_by", "retain", "retain_by", "edges"];
 const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES or MEDIA, and KEYWORD[] or INT[] for lists";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
@@ -199,6 +199,7 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
         match option_value(value)? {
             v @ J::String(_) => short[k] = v,
             _ if k == "retain" => return Err(err("the table's option retain is a period, in quotes: retain = '400 days'")),
+            _ if k == "edges" => return Err(err("the table's option edges names its source, target and weight columns, in quotes: edges = 'src, dst, w'")),
             _ => return Err(err(format!("the table's option {k} names a column, in quotes: {k} = 'usr'"))),
         }
     }
@@ -249,7 +250,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let bad = |m: String| err(format!("column {name}: {m}"));
     let (ty, multi, dim) = column_type(ty).map_err(bad)?;
     let allowed: &[&str] = match ty {
-        "text" => &["positions", "stored", "indexed", "from", "analyzer"],
+        "text" => &["positions", "stored", "indexed", "from", "analyzer", "derive", "model"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
         "media" => &["stored", "indexed", "kind"],
         "keyword" if multi => &["stored", "indexed", "semantic_id", "codebook"],
@@ -259,7 +260,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
         return Err(bad("semantic_id and codebook are options of a KEYWORD[] column".into()));
     }
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model", "kind", "semantic_id", "codebook"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model", "kind", "semantic_id", "codebook", "derive"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {
@@ -307,11 +308,15 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     if nlist.is_some() && kind.as_deref() != Some("ivf") {
         return Err(bad("nlist is an option of index = 'ivf'".into()));
     }
-    match (opts.remove("embed"), opts.remove("model")) {
-        (None, None) => {}
-        (Some(from), Some(model)) if model.is_string() => {
+    match (opts.remove("embed"), opts.remove("derive"), opts.remove("model")) {
+        (None, None, None) => {}
+        (Some(from), None, Some(model)) if model.is_string() => {
             f.insert("embed".into(), json!({"from": names(&from).map_err(|m| bad(format!("embed {m}")))?, "model": model}));
         }
+        (None, Some(J::String(from)), Some(model)) if model.is_string() => {
+            f.insert("derive".into(), json!({"from": from, "model": model}));
+        }
+        _ if ty == "text" => return Err(bad("a derived text takes derive = 'media column' and model = 'name'".into())),
         _ => return Err(bad("an embedded vector takes embed = 'fields' and model = 'name'".into())),
     }
     if let Some(from) = opts.remove("from") {
@@ -514,6 +519,32 @@ mod tests {
         assert_eq!(s.fields[1].references.as_deref(), Some("papers"));
         // No key is allowed, as in the JSON form.
         assert_eq!(create("CREATE TABLE log (line TEXT NULL)", &[]).unwrap().0.primary_key, None);
+    }
+
+    #[test]
+    fn derived_text_names_its_file_and_model() {
+        let (s, _) = create("CREATE TABLE photos (id KEYWORD PRIMARY KEY, image MEDIA OPTIONS(kind = 'image'), caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base'), emb VECTOR(8) OPTIONS(embed = 'caption', model = 'hash:8'))", &[]).unwrap();
+        let f = s.field("caption").unwrap();
+        assert_eq!(f.derive, Some(crate::schema::Derive { from: "image".into(), model: "blip-image-captioning-base".into() }));
+        assert!(f.stored && matches!(f.ty, FieldType::Text { .. }));
+        assert_eq!(s.derives_from(2), Some(1));
+        assert_eq!(s.features().collect::<Vec<_>>(), ["media", "derive"]);
+        assert_eq!(s.to_short_json()["fields"][2], serde_json::json!({"name": "caption", "type": "text", "derive": {"from": "image", "model": "blip-image-captioning-base"}}));
+        assert_eq!(Schema::from_json_value(&s.to_short_json()).unwrap(), s);
+        assert_eq!(serde_json::from_str::<Schema>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        for (bad, says) in [
+            ("CREATE TABLE t (a MEDIA, c TEXT OPTIONS(derive = 'a'))", "derive = 'media column' and model"),
+            ("CREATE TABLE t (a MEDIA, c TEXT OPTIONS(model = 'colors'))", "derive = 'media column' and model"),
+            ("CREATE TABLE t (a MEDIA, c KEYWORD OPTIONS(derive = 'a', model = 'colors'))", "not an option of a KEYWORD"),
+            ("CREATE TABLE t (a TEXT, c TEXT OPTIONS(derive = 'a', model = 'colors'))", "not a MEDIA field"),
+            ("CREATE TABLE t (a MEDIA, c TEXT OPTIONS(derive = 'a', model = 'colors', stored = false))", "must be stored"),
+            ("CREATE TABLE t (a MEDIA, b TEXT, c TEXT OPTIONS(derive = 'a', model = 'colors', from = 'b'))", "not generated"),
+            ("CREATE TABLE t (a MEDIA, c TEXT NOT NULL OPTIONS(derive = 'a', model = 'colors'))", "no default or NOT NULL"),
+            ("CREATE TABLE t (a MEDIA, c TEXT DEFAULT 'x' OPTIONS(derive = 'a', model = 'colors'))", "no default or NOT NULL"),
+        ] {
+            let e = create(bad, &[]).unwrap_err().to_string();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
     }
 
     #[test]

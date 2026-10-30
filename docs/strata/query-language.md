@@ -54,7 +54,7 @@ WHERE a.year >= 2020 ORDER BY bm25(a.body, 'mrna vaccine') DESC LIMIT 20;
 
 ```text
 [WITH name AS (SELECT ...), ...]
-SELECT [DISTINCT] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates>
+SELECT [DISTINCT | DISTINCT ON (<expressions>)] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates>
 FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [WHERE <predicate>]
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
@@ -102,7 +102,7 @@ A `KEYWORD[]` field may hold the [semantic ID](server.md#semantic-ids) of a vect
 
 A `SPARSE` value is a JSON object of terms and non-negative weights, `{"tok": 1.25, "##en": 0.4}`, as a learned sparse model (SPLADE, BGE-M3's sparse output, OpenSearch's neural sparse models) writes it. Terms are taken as given, not analysed, and weights are stored in steps of 1/1024.
 
-A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)).
+A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)), and whose captions a `TEXT` field can: `caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')` ([text from media](server.md#text-from-media)).
 
 ## Full text: `MATCH`
 
@@ -164,7 +164,8 @@ The text may weigh a word, require it or exclude it, as a search box does:
 - **`^w`** after a word or a closing quote multiplies its terms' BM25 by `w`, a number of at least 0 (`2`, `0.5`, `.5`). Weights add up, as a word written twice does. A word weighing 0 scores nothing, and a text whose words all weigh 0 ranks no row.
 - **`+`** before a word or a quoted phrase requires it, **`-`** excludes it: a row must contain every required one and none of the excluded ones, and ranks by the others too. An excluded word does not score, and a word the query drops as a stopword is neither required nor excluded. A sign counts only at the start of a word and before a letter, digit or quote: `covid-19`, a `-` alone, `+-x` and `x^` are words. Quotes alone change nothing: `"messenger rna"` scores what `messenger rna` does.
 - With `fuzzy` or `synonyms`, a word's typo neighbours and synonyms take the highest weight the word is written with (writing it twice weighs the word twice, not them), and a required or excluded word counts as present when one of them is, as in `MATCH`.
-- A required or excluded word is a filter on the ranked rows: the top-k loop (all three `algo`s), a [rank-safe boost](#rank-safe-boosts), a [rerank phase](#rerank-phases) (where a row the filter drops scores 0, as one without the words does) and shards all apply it, so the rows and scores are those of the rows the text allows. Weights cost nothing; a filter costs what the same `MATCH` in `WHERE` does.
+- A required or excluded word is a filter on the ranked rows: the top-k loop (all three `algo`s), a [rank-safe boost](#rank-safe-boosts), a [rerank phase](#rerank-phases) (where a row the filter drops scores 0, as one without the words does) and shards all apply it, so the rows and scores are those of the rows the text allows.
+- Weights and signs cost little. With each query's first word weighed 2 (`word^2`) or required (`+word`), or its last word excluded (`-word`), the median query took 0.27, 0.28 and 0.23 ms on Quora's 10,000 queries against 0.25 ms for the plain text, and 0.24, 0.18 and 0.22 ms on FiQA against 0.22 ms; a required word can make a query faster, as the filter drops rows before they are scored. Text written without operators ranks and times as the plain text does on all five collections measured (`strata/results/text/bm25_term_operators.json`, one core of a 4-core cloud VM while another job held the other three). The operators were put on words mechanically to time them, so these queries rank worse than the plain text: an operator helps when it says what the person searching means.
 - **`min => n`** (or `'p%'`) ranks only the rows with at least `n` of the text's optional words and phrases: those without a sign, each counted once however often it is written, whatever its weight (`^0` counts too). Required and excluded words are not counted; a text without optional words ignores `min`. Counts are clamped to between 1 and the number of optional words, and a percentage rounds down, as in `MATCH`'s groups: `bm25(body, 'vaccine mrna trial phase', min => 2)` ranks the rows with two of the four words, by all of them. With `syntax => 'plain'`, each word is an optional word.
 - `min` filters the ranked rows, as a required word does, so its cost depends on how many rows hold one of the words. With `min => 2` the median query took 0.24 ms on Quora's 10,000 queries (0.25 ms plain) and 0.41 ms on FiQA (0.23 ms plain). On TREC-COVID, whose query words appear in most of its documents, it took 1.6 ms (0.5 ms plain), because the filter counts every row that holds one of the words (`strata/results/text/bm25_min_match.json`, one core of a 4-core cloud VM while another job held the other three). `min` is for leaving rows out, not for ranking better. Asking every BEIR query for two of its words, or half of them, left nDCG@10 unchanged on TREC-COVID and lowered it elsewhere, by as much as 0.077 (SciFact, half the words).
 - **`syntax => 'plain'`** reads the text as words alone, as `bm25` did before: for text not written for a search box, such as a user's message passed through, or a benchmark's recorded queries. BEIR's hold `+1`, `-word` or `x^2` here and there, so the evaluations and benchmarks in this repository pass `syntax => 'plain'`, and so does Engram.
@@ -224,6 +225,16 @@ $$
 
 Options: `k => 60`, `depth => 100`. The depth is raised to `LIMIT + OFFSET` when the page asks for more rows, as in weighted sums and products.
 
+### `ranked(keys)`: a ranking from elsewhere
+
+`ranked(:keys)` is a ranking computed outside Strata, given as primary keys, best first: a recommender's candidates, a reranker's order, or the rows a [semantic-ID](server.md#semantic-ids) decoder generated. It is a score like any other, so it fuses with Strata's own rankings:
+
+```sql
+SELECT id FROM items WHERE in_stock ORDER BY rrf(bm25(title, :q), ranked(:keys)) DESC LIMIT 20;
+```
+
+A listed row scores `-(its position)`, from `-1` for the first key; a key listed twice ranks where it is first. A row the list leaves out has `NULL`, so in an expression it ranks last unless `coalesce` gives it a value, and in a weighted sum it takes the input's worst value, as a missing column does. Times another score (`ranked(:keys) * rating`) it multiplies as arithmetic, not as a product of scores, which would count its negative values as 0. A key no live row has is skipped. On its own, `ORDER BY ranked(:keys) DESC` answers the listed rows that `WHERE` keeps, in list order. The keys are a parameter holding a list (an array of keys in the HTTP API), a tuple (`ranked(('a', 'b'))`) or an array (`ranked(ARRAY['a', 'b'])`). Over shards, each shard scores its own rows from the list and the coordinator merges them, so no extra round is needed. A plan that uses it needs the plan feature `ranked`.
+
 ### Weighted sums: `minmax()`
 
 A weighted sum of min-max normalised scores is weighted fusion: `0.2 * minmax(bm25(body, :t)) + 0.8 * minmax(similarity(emb, :q))`. Weights are numeric constants; `+` and `-` combine any number of terms. Candidates are the union of each input's top 100, re-scored exactly by every input and min-max normalised over that union:
@@ -257,7 +268,7 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 | part | meaning |
 |---|---|
 | `+ - * / %`, unary `-` | arithmetic on raw values |
-| `bm25`, `similarity`, `ppr`, `decay`, `rrf`, a numeric column, `hops()`, `seq_no()` | the leaves: a row's value of each |
+| `bm25`, `similarity`, `ppr`, `decay`, `rrf`, `ranked`, a numeric column, `hops()`, `seq_no()` | the leaves: a row's value of each |
 | `ln(x)`, `log(x)` (base 10), `log(b, x)`, `exp(x)`, `sqrt(x)`, `pow(x, y)`, `abs(x)`, `round(x[, digits])`, `sigmoid(x)`, `clamp(x, lo, hi)` | numeric functions |
 | `least(…)`, `greatest(…)`, `coalesce(…)` | over their arguments that are not `NULL` |
 | `minmax(x)` | `x` over the rows ranked, put on [0, 1]: 1 where all are equal, 0 where `x` is `NULL` |
@@ -266,7 +277,7 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 
 `NULL` is a missing value (a `NULL` column, a row without a vector, one a traversal does not reach) or a result that is not a finite number (`ln(0)`, a division by 0, an overflow). Arithmetic and functions of `NULL` are `NULL`, except `coalesce`, `least` and `greatest`, which skip it. A row whose score is `NULL` ranks after every other, and its `score()` is `NULL`.
 
-Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
+Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's, `ranked`), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
 
 #### Rank-safe boosts
 
@@ -471,6 +482,32 @@ Each plans into operators over the single-table queries above ([`EXPLAIN`](#expl
 
 The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-table query that ran, with its rows and its own plan.
 
+## The first row of each group: DISTINCT ON
+
+`SELECT DISTINCT ON (keys) ...` keeps, of the rows with equal keys, the first in the query's order, as PostgreSQL does: a row per group, the groups in the order of their first rows, and `LIMIT` and `OFFSET` count groups. With rows of a long video or document in a table of segments, it answers each video once, by its best segment:
+
+```sql
+-- each video's best clip, the 10 best videos
+SELECT DISTINCT ON (video) video, id, start_ms, score() FROM clips
+WHERE MATCH(transcript, 'penalty kick') ORDER BY bm25(transcript, 'penalty kick') DESC LIMIT 10;
+
+-- each user's latest event
+SELECT DISTINCT ON (usr) usr, item, ts FROM events ORDER BY ts DESC, id;
+
+-- the best page of each PDF, by an image query's similarity
+SELECT DISTINCT ON (doc) doc, page FROM pages ORDER BY similarity(emb, :q) DESC LIMIT 5;
+
+-- over groups: each country's top seller
+SELECT DISTINCT ON (country) country, seller, SUM(price) AS total FROM sales GROUP BY country, seller ORDER BY country, total DESC;
+```
+
+- **Keys** are expressions of the rows (`video`, `lower(lang)`, `year % 10`), or columns of the answer by name or number (`DISTINCT ON (2)`), and need not be selected. Keys are equal when their values are: `NULL` with `NULL`, and a multi-valued column's list with the same list.
+- **The order.** PostgreSQL requires `ORDER BY` to start with the keys; Strata does not, so `ORDER BY` a score gives the best row of each group, the best groups first. When `ORDER BY` does start with the keys, the answer is PostgreSQL's. Without `ORDER BY`, which row of a group is kept is not defined.
+- **Reads.** When the query's order is the scan's (a score, or one numeric column), a `LIMIT` reads the scan in growing slices: four times the rows asked for (at least 32), then four times as many, until that many groups have a row or the scan runs out. A group with many rows near the top costs more reads, never a wrong answer. Ordered by several columns, the rows are sorted in memory, and the scan holds at most 1,000,000 rows.
+- **Shards.** A coordinator keeps the first rows over its shards' merged rows, so three shards give what one database does, whether or not the table is placed by the keys (`shard_by`).
+
+The plan's node is `DistinctOn` (`Distinct on: video` in `EXPLAIN`), and its JSON needs the plan features `operators` and `distinct_on`; a version of Strata from before it refuses the plan by that name.
+
 ## Graphs
 
 Rows with an `EDGES` field are nodes of a graph. Graph predicates and scores take **seeds**: a key (`'p1'`), a parameter, a tuple of keys (`('p1', 'p2')`), or a subquery, whose filters, ranking and `LIMIT` are those of any query. A subquery over the same table seeds with its rows; one over another table returns one column, whose values are the keys to start from, such as the items a user's recent events name: `ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 20))`. With `weighted => 1`, a seed's restart weight is its row's score, summed over the rows that name it: `ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY w DESC), weighted => 1)` starts from each item in proportion to the sum of its events' `w`, and ordering the events by `decay(ts, ...)` instead weighs recent ones more.
@@ -512,6 +549,29 @@ Edges are written as part of their row: a JSON array of target keys, each option
 ```text
 ["p2", ["cites", "p7"], ["extends", "p9", 0.5], {"to": "p11", "label": "refutes"}]
 ```
+
+### Edge tables
+
+An `EDGES` field belongs to its source row, so adding one edge rewrites the row, its text and its vectors. A graph kept up as events arrive, such as items seen together, goes in an **edge table** instead: a table whose rows are edges, declared with `OPTIONS(edges = 'src, dst, w')`. A walk over the table whose keys it holds names the edge table where it would name a field:
+
+```sql
+CREATE TABLE cooc (
+  id KEYWORD PRIMARY KEY,                  -- 'src>dst'
+  src KEYWORD NOT NULL REFERENCES items,
+  dst KEYWORD NOT NULL REFERENCES items,
+  w FLOAT DEFAULT 0
+) OPTIONS(edges = 'src, dst, w');
+
+SELECT id FROM items
+ORDER BY ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 20)) DESC LIMIT 200;
+```
+
+- Each row is an edge from the row whose key is in `src` to the row whose key is in `dst`, weighted by `w`, or by 1 without a weight column (`edges = 'src, dst'`). `src` and `dst` are stored, single-valued `KEYWORD` or `INT` columns of the type of the other table's key, and the weight is a stored `FLOAT` or `INT`. If `src` references a table, walks are over that table.
+- Writing an edge writes its row and nothing else: insert it, delete it, or add to its weight with an `add` operation, whose `doc` creates the row on the edge's first event ([writes](server.md#writes)).
+- Edges are directed, from `src` to `dst`. For a click on item *i* after the user's last items *h*₁ … *h*₅ (*h*₁ the most recent), adding 1/*g* to the edge *h*_g → *i* records what comes after what: `ppr(cooc, :x, dir => 'out')` and `REACHABLE(cooc, :x, dir => 'out')` follow the items that came after *x*, and `dir => 'both'`, `ppr`'s default, reads them as seen together. That is five `add` operations per event.
+- An edge is followed while its weight, as it is now, is above 0. `UPDATE cooc SET w = w * 0.9` decays every weight in place, and an edge whose weight is 0 or `NULL` stays in the table without being followed. `src` and `dst` are never changed in place: an `UPDATE` of a `KEYWORD` one rewrites the row, and `set`, `add` or an `UPDATE` of an `INT` one is refused, as for `shard_by` (delete the row and insert it again).
+- `REACHABLE`, `PATH`, `hops()` and `ppr` take an edge table with every option but `label`, since its edges have none. A walk over `cooc` and a walk over an `EDGES` field holding the same edges and weights find the same rows at the same hops and the same PageRank, up to rounding.
+- Each segment of the edge table indexes its rows by the keys they link, which flushes and merges build, so a walk finds a row's edges with one lookup of its key in each of the edge table's segments ([how, and what it costs](graphs.md#edge-tables)).
 
 ## Running SQL
 
@@ -561,13 +621,14 @@ DROP TABLE IF EXISTS wrote, authors;
 ```
 
 - **Types** are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (or `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`, `DATETIME`; a `DATE` is a `TIMESTAMP` at midnight UTC), `VECTOR(dimensions)`, `SPARSE`, `MEDIA` and `EDGES`; `KEYWORD[]` and `INT[]` hold lists. A `BOOL` or `TIMESTAMP` column holds one value and is neither the primary key nor a reference.
-- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), `kind` of a `MEDIA` field, `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone), and on a `KEYWORD[]` `semantic_id` (the vector field) with `codebook` for a [semantic-ID field](server.md#semantic-ids): `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`. Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
+- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), `kind` of a `MEDIA` field, `derive` (a `MEDIA` field) with `model` for [text made from media](server.md#text-from-media), `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone), and on a `KEYWORD[]` `semantic_id` (the vector field) with `codebook` for a [semantic-ID field](server.md#semantic-ids): `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`. Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
 - **The primary key** is one column: `PRIMARY KEY` on it, or a `PRIMARY KEY (column)` constraint. A table without one only takes plain `INSERT`.
 - **`REFERENCES table`**, or `FOREIGN KEY (column) REFERENCES table`, records that a `KEYWORD` or `INT` column holds primary keys of that table, which must exist (or be the table being created) and have a primary key of the column's type. References are not enforced: a row may name a key that is not there, and an inner join along the reference leaves that row out (`LEFT JOIN` keeps it). Joins along them are [ordinary joins](#subqueries-with-and-joins) (`FROM wrote w JOIN authors a ON w.author = a.id`).
 - **`NOT NULL`** refuses a row without a value in that column, from any write: SQL, JSON, a file or the Rust API. **`DEFAULT value`** is the value a write that leaves the column out gets: a constant of the column's type on a single-valued `TEXT`, `KEYWORD`, `INT`, `FLOAT`, `BOOL` or `TIMESTAMP` column that is not the key, or `CURRENT_TIMESTAMP` (or `now()`) on a `TIMESTAMP`, the time of the statement, the same in all its rows. An `INSERT` that leaves a column out, a JSON row without its key and a CSV file without its column give it the default; a `NULL` that a write gives stays `NULL`, and a column with `NOT NULL` refuses it. In SQL the keyword `DEFAULT` stands for a column's default, in `VALUES` and in `SET`. The Rust API writes a row as it is given; `Schema::defaults` returns a row of the defaults to start from. The JSON schema's options are `"not_null": true` and `"default"` (`"now"` for the time of the write).
 - **`OPTIONS(shard_by = 'column')`** after the columns places the table's rows on [shards](server.md#tables-on-shards) by that column instead of by the primary key, so that a user's events sit on one shard together. The column is a stored, single-valued `KEYWORD` or `INT` with `NOT NULL`, other than the key, and a row keeps it: `UPDATE` does not change it (delete the row and insert it again). In JSON it is `"shard_by": "usr"`. One database places nothing, so the option only matters to a coordinator.
 - **`OPTIONS(cluster_by = 'column')`** stores each segment's rows sorted by that column, rows of one value in the order they were written: a flush sorts the rows it writes, and a merge sorts the rows of the segments it joins. A user's history then sits in one run of each segment instead of scattered across it, so reading it touches a few pages rather than one per row. The column is an indexed, single-valued `KEYWORD`, `INT` or `TIMESTAMP`, and a row keeps it (`UPDATE` does not change it). Queries return the same rows either way; only `ORDER BY` fixes their order. In JSON it is `"cluster_by": "usr"`.
 - **`OPTIONS(retain = '400 days')`** drops rows once their time is older than the period: a flush does not write them, and a merge leaves them out of the segment it writes, or drops a segment whose rows are all past it without rewriting anything; the merger looks for such segments on its own. Until then a query still finds them, so filter on the time where that matters (`WHERE ts > '2025-10-01'`). The time is the table's only `TIMESTAMP` column, or the one `retain_by = 'column'` names (indexed, single-valued, and not changed by `UPDATE`); a row without one is kept. A period is a whole number and a unit: seconds, minutes, hours, days or weeks (`'90 s'`, `'12h'`, `'2 weeks'`). In JSON it is `"retain": "400 days"` with `"retain_by"`.
+- **`OPTIONS(edges = 'src, dst, w')`** makes each row an edge of a graph over another table's rows, which walks over that table follow ([edge tables](#edge-tables)). In JSON it is `"edges": "src, dst, w"`.
 - **`DROP TABLE`** drops tables other than the first. A table that another table references goes with it (`DROP TABLE wrote, authors`) or with `CASCADE`, which removes those references.
 - Every other clause (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, a `DEFAULT` that is an expression, `CREATE TABLE ... AS SELECT`) is an error, and there is no `ALTER TABLE` yet.
 
@@ -639,7 +700,7 @@ Project: id AS "a.id", title AS "b.title"
         Search papers
 ```
 
-`Join` (or `Left join`) matches its two inputs on the keys after `on`, `targets(f)` being the rows an `EDGES` field links to, with any other `ON` condition after `AND`; `With` names its results, which `Ref` reads; `Key order of top` puts rows in the order of the `WITH` result `top`; `Distinct` keeps each row once. A subquery sits in its condition: `IN values of (...)` (its values), `IN keys of (...)` (its rows' keys), `EXISTS (...)` and a scalar `(...)`, each shown on one line with `;` between its operators. `SELECT DISTINCT` of the table alone is a `GROUP BY`, a single-table query.
+`Join` (or `Left join`) matches its two inputs on the keys after `on`, `targets(f)` being the rows an `EDGES` field links to, with any other `ON` condition after `AND`; `With` names its results, which `Ref` reads; `Key order of top` puts rows in the order of the `WITH` result `top`; `Distinct` keeps each row once, and `Distinct on: video` the [first row of each group](#the-first-row-of-each-group-distinct-on). A subquery sits in its condition: `IN values of (...)` (its values), `IN keys of (...)` (its rows' keys), `EXISTS (...)` and a scalar `(...)`, each shown on one line with `;` between its operators. `SELECT DISTINCT` of the table alone is a `GROUP BY`, a single-table query.
 
 Every statement runs as its plan, and a plan in JSON runs on its own: `Db::run` in Rust, `Database.run` in [Python](python.md#querying) and [`POST /v1/plan`](server.md#http-api) over HTTP take one, and check it against the table's schema as the SQL binder checks a statement.
 

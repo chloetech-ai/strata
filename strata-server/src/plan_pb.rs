@@ -104,6 +104,7 @@ fn node(n: &Node) -> pb::Node {
         Node::Ref { name } => N::Ref(name.clone()),
         Node::Distinct { input } => N::Distinct(Box::new(node(input))),
         Node::KeyOrder { input, by } => N::KeyOrder(Box::new(pb::KeyOrder { input: boxed(input), by: boxed(by) })),
+        Node::DistinctOn { input, keys } => N::DistinctOn(Box::new(pb::DistinctOn { input: boxed(input), keys: keys.iter().map(ex).collect() })),
     };
     pb::Node { node: Some(n) }
 }
@@ -128,6 +129,7 @@ fn graph(g: &Graph) -> pb::Graph {
     };
     pb::Graph {
         field: g.field,
+        edges: g.edges.clone(),
         seeds: bex(&g.seeds),
         kind: Some(kind),
         dir: match g.dir {
@@ -255,6 +257,7 @@ fn expr(e: &Expr) -> E {
         })),
         Expr::Gbdt { model, hash, args, .. } => E::Gbdt(pb::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(ex).collect() }),
         Expr::Ppr(g) => E::Ppr(Box::new(graph(g))),
+        Expr::Ranked { keys } => E::Ranked(pb::Ranked { keys: keys.iter().map(to_pb).collect() }),
         Expr::Subquery(n) => E::Subquery(Box::new(node(n))),
         Expr::Values(n) => E::Values(Box::new(node(n))),
         Expr::Keys(n) => E::Keys(Box::new(node(n))),
@@ -415,6 +418,10 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
             let k = *k;
             Node::KeyOrder { input: from_bnode(k.input)?, by: from_bnode(k.by)? }
         }
+        N::DistinctOn(d) => {
+            let d = *d;
+            Node::DistinctOn { input: from_bnode(d.input)?, keys: from_exprs(d.keys)? }
+        }
     })
 }
 
@@ -435,6 +442,7 @@ fn from_graph(g: pb::Graph) -> Result<Graph, ApiError> {
     };
     Ok(Graph {
         field: g.field,
+        edges: g.edges,
         seeds: from_ex(g.seeds.map(|e| *e))?,
         kind,
         dir,
@@ -572,6 +580,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
         }
         E::Gbdt(g) => Expr::Gbdt { model: g.model, hash: g.hash, args: from_exprs(g.args)?, open: Default::default() },
         E::Ppr(g) => Expr::Ppr(Box::new(from_graph(*g)?)),
+        E::Ranked(r) => Expr::Ranked { keys: r.keys.into_iter().map(lit).collect::<Result<_, _>>()? },
         E::Subquery(n) => Expr::Subquery(Box::new(from_node_in(*n)?)),
         E::Values(n) => Expr::Values(Box::new(from_node_in(*n)?)),
         E::Keys(n) => Expr::Keys(Box::new(from_node_in(*n)?)),

@@ -824,6 +824,7 @@ fn leaf_name(s: &Score, schema: &Schema) -> String {
         Score::Ppr { .. } => "ppr()".into(),
         Score::Hops { .. } => "hops()".into(),
         Score::SeqNo => "seq_no()".into(),
+        Score::Ranked { keys } => format!("ranked({} keys)", keys.len()),
         Score::Cond(p) => {
             fn fields(p: &Pred, out: &mut Vec<usize>) {
                 match p {

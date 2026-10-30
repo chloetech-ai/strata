@@ -33,10 +33,11 @@
 //! ([`Plan::explain`]). Every SQL statement runs as its plan, and
 //! [`crate::db::Db::run`] runs a plan made elsewhere.
 //!
-//! A compound query (joins, `WITH`, subqueries, `SELECT DISTINCT`) is a
-//! plan of operators over those shapes, its leaves ([`crate::query::compound`]
-//! makes it): [`Node::Join`], [`Node::With`] and [`Node::Ref`],
-//! [`Node::Distinct`], [`Node::KeyOrder`], the nodes above over rows in
+//! A compound query (joins, `WITH`, subqueries, `SELECT DISTINCT`,
+//! `DISTINCT ON`) is a plan of operators over those shapes, its leaves
+//! ([`crate::query::compound`] makes it): [`Node::Join`], [`Node::With`]
+//! and [`Node::Ref`], [`Node::Distinct`], [`Node::DistinctOn`]
+//! ([`DISTINCT_ON`]), [`Node::KeyOrder`], the nodes above over rows in
 //! memory, and subqueries as expressions ([`Expr::Values`], [`Expr::Keys`],
 //! [`Expr::Exists`], [`Expr::Scalar`]). [`crate::query::ops`] runs it: each
 //! leaf on the executor, the rest in memory. Such a plan needs the feature
@@ -61,7 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 11] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, TEXT_OPERATORS, MIN_MATCH];
+pub const FEATURES: [&str; 14] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, MIN_MATCH];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -86,6 +88,9 @@ pub const MAXSIM: &str = "maxsim";
 /// The feature of a plan that cuts semantic IDs ([`Func::SidAt`]).
 pub const SEMANTIC_ID: &str = "semantic_id";
 
+/// The feature of a plan with a walk over an edge table ([`Graph::edges`]).
+pub const EDGE_TABLE: &str = "edge_table";
+
 /// The feature of a plan whose Search reranks its top rows in phases
 /// ([`Search::phases`]).
 pub const RANK_PHASES: &str = "rank_phases";
@@ -102,6 +107,13 @@ pub const RANK_PROFILES: &str = "rank_profiles";
 
 /// The feature of a plan that ranks with a model ([`Expr::Gbdt`]).
 pub const RANK_MODELS: &str = "rank_models";
+
+/// The feature of a plan that keeps the first row of each group
+/// ([`Node::DistinctOn`]).
+pub const DISTINCT_ON: &str = "distinct_on";
+/// The feature of a plan that ranks by a ranking given as primary keys
+/// ([`Expr::Ranked`], `ranked(:keys)`).
+pub const RANKED: &str = "ranked";
 
 /// The feature of a plan whose text a Strata from before text operators
 /// reads as other words: a `bm25` with a sign or weight (`+word`, `-word`,
@@ -182,6 +194,11 @@ pub enum Node {
     Ref { name: String },
     /// The input's rows, each once.
     Distinct { input: Box<Node> },
+    /// The first of the input's rows with equal `keys`, in the input's
+    /// order (`DISTINCT ON`): a row per group, the groups in the order of
+    /// their first rows. Keys are equal when their values are, NULL equal
+    /// to NULL and a list to the same list. Needs [`DISTINCT_ON`].
+    DistinctOn { input: Box<Node>, keys: Vec<Expr> },
     /// The input's rows (rows of one table) in the order of the rows of
     /// `by` with the same primary key.
     KeyOrder { input: Box<Node>, by: Box<Node> },
@@ -660,6 +677,13 @@ pub enum Expr {
     },
     /// Personalized PageRank from a traversal's seeds.
     Ppr(Box<Graph>),
+    /// A ranking given as primary keys, best first (`ranked(:keys)`):
+    /// `-(position)` from 1 for a listed row, NULL for others. Feature
+    /// [`RANKED`].
+    Ranked {
+        #[serde(with = "lit_list")]
+        keys: Vec<Value>,
+    },
     /// The rows of a plan (graph seeds from a query of the table, which
     /// the executor runs).
     Subquery(Box<Node>),
@@ -675,11 +699,16 @@ pub enum Expr {
     Scalar(Box<Node>),
 }
 
-/// A traversal over an EDGES field, or over a VECTOR field whose `k` most
-/// similar rows count as a row's neighbours.
+/// A traversal over an EDGES field, over an edge table, or over a VECTOR
+/// field whose `k` most similar rows count as a row's neighbours.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
+    /// The EDGES or VECTOR field; with `edges`, the primary key.
     pub field: u32,
+    /// The edge table walked instead of a field, whose rows link this
+    /// table's (feature [`EDGE_TABLE`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges: Option<String>,
     /// Primary keys (a list literal), or a [`Expr::Subquery`].
     pub seeds: Expr,
     /// The weight of each of the keys `seeds` lists, which PageRank
@@ -721,6 +750,30 @@ impl Expr {
 impl Node {
     fn is_write(&self) -> bool {
         matches!(self, Node::Insert { .. } | Node::Update { .. } | Node::Delete { .. })
+    }
+
+    /// The nodes whose rows the node reads.
+    pub fn inputs(&self) -> Vec<&Node> {
+        match self {
+            Node::Search(_) | Node::Insert { .. } | Node::Ref { .. } => Vec::new(),
+            Node::Aggregate { input, .. }
+            | Node::Filter { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => vec![input],
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => vec![a, b],
+            Node::With { ctes, input } => ctes.iter().map(|c| &c.input).chain([&**input]).collect(),
+        }
+    }
+
+    /// Whether the node or one below it (outside subqueries) is a
+    /// [`Node::DistinctOn`].
+    fn keeps_firsts(&self) -> bool {
+        matches!(self, Node::DistinctOn { .. }) || self.inputs().into_iter().any(Node::keeps_firsts)
     }
 
     /// Whether the node has the shape the executor runs: `Project [Limit]
@@ -784,7 +837,8 @@ impl Node {
             | Node::Project { input, .. }
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
-            | Node::Distinct { input } => input.has_phases(),
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.has_phases(),
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_phases() || b.has_phases(),
             Node::With { ctes, input } => input.has_phases() || ctes.iter().any(|c| c.input.has_phases()),
             Node::Insert { .. } | Node::Ref { .. } => false,
@@ -816,7 +870,8 @@ impl Node {
             | Node::Project { input, .. }
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
-            | Node::Distinct { input } => input.each_search(f),
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.each_search(f),
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => {
                 a.each_search(f);
                 b.each_search(f);
@@ -868,11 +923,19 @@ impl Node {
             | Node::Project { input, .. }
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
-            | Node::Distinct { input } => input.has_features(),
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.has_features(),
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_features() || b.has_features(),
             Node::With { ctes, input } => input.has_features() || ctes.iter().any(|c| c.input.has_features()),
             Node::Insert { .. } | Node::Ref { .. } => false,
         }
+    }
+
+    /// Whether a graph in the plan walks an edge table ([`EDGE_TABLE`]).
+    pub fn walks_edge_tables(&self) -> bool {
+        let mut found = false;
+        self.visit_exprs(&mut |e| found |= matches!(e, Expr::Graph(g) | Expr::Ppr(g) if g.edges.is_some()));
+        found
     }
 
     /// Whether a text of the plan has operators ([`TEXT_OPERATORS`]).
@@ -969,6 +1032,10 @@ impl Node {
                 input.visit_exprs(f);
                 by.visit_exprs(f);
             }
+            Node::DistinctOn { input, keys } => {
+                keys.iter().for_each(&mut each);
+                input.visit_exprs(f);
+            }
             Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.visit_exprs(f),
             Node::Ref { .. } => {}
         }
@@ -1053,6 +1120,12 @@ impl Node {
                 input.visit_exprs_mut(f)?;
                 by.visit_exprs_mut(f)
             }
+            Node::DistinctOn { input, keys } => {
+                for k in keys {
+                    each(k)?;
+                }
+                input.visit_exprs_mut(f)
+            }
             Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.visit_exprs_mut(f),
             Node::Ref { .. } => Ok(()),
         }
@@ -1079,7 +1152,8 @@ impl Node {
             | Node::Project { input, .. }
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
-            | Node::Distinct { input } => input.ranks_by_expression(),
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.ranks_by_expression(),
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.ranks_by_expression() || b.ranks_by_expression(),
             Node::With { ctes, input } => input.ranks_by_expression() || ctes.iter().any(|c| c.input.ranks_by_expression()),
             Node::Insert { .. } | Node::Ref { .. } => false,
@@ -1160,7 +1234,7 @@ impl Node {
     pub(crate) fn search(&self) -> Option<&Search> {
         match self {
             Node::Search(s) => Some(s),
-            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } => input.search(),
+            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } | Node::DistinctOn { input, .. } => input.search(),
             _ => None,
         }
     }
@@ -1168,7 +1242,7 @@ impl Node {
     pub(crate) fn search_mut(&mut self) -> Option<&mut Search> {
         match self {
             Node::Search(s) => Some(s),
-            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } => input.search_mut(),
+            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } | Node::DistinctOn { input, .. } => input.search_mut(),
             _ => None,
         }
     }
@@ -1183,7 +1257,7 @@ impl Expr {
     /// the fused shapes of them that came before.
     pub fn is_rank_expression(&self) -> bool {
         match self {
-            Expr::Field(_) | Expr::Hops | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::MaxSim { .. } | Expr::Decay { .. } | Expr::Ppr(_) => false,
+            Expr::Field(_) | Expr::Hops | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::MaxSim { .. } | Expr::Decay { .. } | Expr::Ppr(_) | Expr::Ranked { .. } => false,
             Expr::Rrf { inputs, .. } | Expr::Product(inputs) => inputs.iter().any(Expr::is_rank_expression),
             Expr::Weighted(terms) => terms.iter().any(|(_, x)| x.is_rank_expression()),
             _ => true,
@@ -1368,6 +1442,23 @@ impl Plan {
         if root.has_models() {
             features.push(RANK_MODELS.to_string());
         }
+        let mut distinct_on = root.keeps_firsts();
+        root.visit_exprs(&mut |e| {
+            if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = e {
+                distinct_on |= n.keeps_firsts();
+            }
+        });
+        if distinct_on {
+            features.push(DISTINCT_ON.to_string());
+        }
+        if root.walks_edge_tables() {
+            features.push(EDGE_TABLE.to_string());
+        }
+        let mut ranked = false;
+        root.visit_exprs(&mut |e| ranked |= matches!(e, Expr::Ranked { .. }));
+        if ranked {
+            features.push(RANKED.to_string());
+        }
         if root.has_text_operators() {
             features.push(TEXT_OPERATORS.to_string());
         }
@@ -1390,6 +1481,7 @@ impl Plan {
                 | Node::Limit { input, .. }
                 | Node::Project { input, .. }
                 | Node::Distinct { input }
+                | Node::DistinctOn { input, .. }
                 | Node::KeyOrder { input, .. } => of(input),
                 Node::Join { left, right, .. } => of(left).or_else(|| of(right)),
                 Node::With { ctes, input } => of(input).or_else(|| ctes.iter().find_map(|c| of(&c.input))),
@@ -1510,6 +1602,26 @@ mod lit {
         let v = Lit::deserialize(d)?.value();
         Lit::of(&v).map_err(de::Error::custom)?;
         Ok(v)
+    }
+}
+
+/// A list of literals, each as [`lit`] writes it.
+mod lit_list {
+    use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::lit::Lit;
+    use crate::value::Value;
+
+    pub fn serialize<S: Serializer>(vs: &[Value], s: S) -> std::result::Result<S::Ok, S::Error> {
+        vs.iter().map(Lit::of).collect::<std::result::Result<Vec<_>, String>>().map_err(ser::Error::custom)?.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<Value>, D::Error> {
+        let vs: Vec<Value> = Vec::<Lit>::deserialize(d)?.into_iter().map(Lit::value).collect();
+        for v in &vs {
+            Lit::of(v).map_err(de::Error::custom)?;
+        }
+        Ok(vs)
     }
 }
 

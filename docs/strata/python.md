@@ -64,7 +64,7 @@ db.query("SELECT year, COUNT(*) FROM books WHERE genres = :g GROUP BY year", g="
 db.close()
 ```
 
-`strata.open(path, schema)` opens the database at `path`, or creates it with `schema` if it does not exist. The schema is a dict, JSON text or the path of a JSON file, in the [form the server takes](server.md#schemas). `Database.create(path, schema)` and `Database.open(path)` do one or the other. `models=` says where embedding and [ranking](query-language.md#ranking-models-gbdtmodel-features) models are (default `$STRATA_MODELS`, else `~/.local/share/strata/models`; `strata-server fetch-model NAME` downloads one there), and `directory=True` creates the database as a directory of segment files.
+`strata.open(path, schema)` opens the database at `path`, or creates it with `schema` if it does not exist. The schema is a dict, JSON text or the path of a JSON file, in the [form the server takes](server.md#schemas). `Database.create(path, schema)` and `Database.open(path)` do one or the other. `models=` says where embedding and [ranking](query-language.md#ranking-models-gbdtmodel-features) models, and the captioners of [text made from media](server.md#text-from-media), are (default `$STRATA_MODELS`, else `~/.local/share/strata/models`; `strata-server fetch-model NAME` downloads one there), and `directory=True` creates the database as a directory of segment files.
 
 A database file can be open in one process at a time. Within that process, threads can query at once: every call releases the GIL while it runs. To share a database between processes, serve it with `strata-server` and use the client below. A `with` block, or `close()`, merges the small segments that writes left and closes the file.
 
@@ -140,6 +140,8 @@ for row in q:
 
 db.table().select("genre", count().alias("n"), col("rating").avg().alias("avg")).group_by("genre").having(count() > 10).order_by(col("genre"))
 db.table().order_by(rrf(bm25("title", text), similarity("emb", db.embed(text)))).limit(10)
+# each video's best clip, the 10 best videos
+db.table().select("video", "id", score()).distinct_on("video").order_by(bm25("transcript", text)).limit(10)
 ```
 
 | | |
@@ -149,7 +151,7 @@ db.table().order_by(rrf(bm25("title", text), similarity("emb", db.embed(text))))
 | `&`, `\|`, `~` | and, or, not (Python's `and`, `or`, `not` and chained comparisons such as `1 < col("x") < 5` raise `TypeError`) |
 | `.isin(values)`, `.between(lo, hi)`, `.is_null()`, `.is_not_null()` | as SQL's `IN`, `BETWEEN` (a bound of `None` is open), `IS NULL` |
 | `match(field, query, min=None)` | the full-text condition, in [MATCH's syntax](query-language.md#full-text-match); `min=2` or `min="75%"` asks for that many of its items |
-| `bm25(field, text, syntax=None, min=None)`, `similarity(field, vector)`, `rrf(*scores, k=60, depth=100)` | scores; `bm25` reads [weights, required and excluded words](query-language.md#weights-required-and-excluded-words) (`"+mrna vaccine^2 -animal"`) unless `syntax="plain"`; `similarity` takes a vector (`embed(text)` gives a text's), or `{term: weight}` for a SPARSE field |
+| `bm25(field, text, syntax=None, min=None)`, `similarity(field, vector)`, `rrf(*scores, k=60, depth=100)`, `ranked(keys)` | scores; `bm25` reads [weights, required and excluded words](query-language.md#weights-required-and-excluded-words) (`"+mrna vaccine^2 -animal"`) unless `syntax="plain"`; `similarity` takes a vector (`embed(text)` gives a text's), or `{term: weight}` for a SPARSE field; `ranked` is a [ranking from elsewhere](query-language.md#rankedkeys-a-ranking-from-elsewhere), primary keys best first |
 | `+`, `-`, `*`, `/`, `%`, `**`, `abs()`, `round()`, `ln`, `log`, `exp`, `sqrt`, `sigmoid`, `clamp`, `least`, `greatest`, `coalesce`, `minmax`, `rank`, `case((cond, value), ..., otherwise=None)` | a [ranking expression](query-language.md#ranking-expressions) of scores, fields and numbers: `bm25("body", q) * (1 + 0.2 * coalesce(col("rating"), 0))`. `+` adds raw values; `0.7 * minmax(a) + 0.3 * minmax(b)` is weighted fusion |
 | `gbdt(model, *features)` | a [ranking model](query-language.md#ranking-models-gbdtmodel-features)'s score of a row from its features: `gbdt("docs_ltr", bm25("body", q), col("rating"))`, the LightGBM or XGBoost model `<models>/docs_ltr/gbdt.json` |
 | `reachable(field, seeds, hops=1, ...)`, `path(field, seeds, to, ...)`, `ppr(field, seeds, ...)` | [graph](graphs.md) conditions and PageRank as a score, with the SQL functions' options as keyword arguments |
@@ -158,7 +160,7 @@ db.table().order_by(rrf(bm25("title", text), similarity("emb", db.embed(text))))
 | `count()`, `col(f).count(distinct=True)`, `.sum()`, `.avg()`, `.min()`, `.max()` | aggregates, for `select`, `having` and `order_by` over groups |
 | `.alias(name)`, `.asc()`, `.desc(nulls_first=False)` | a column's name; an `order_by` direction |
 
-`select(...)` names the columns (without it, the stored fields but vectors, as `SELECT *`), `where(...)` keeps rows, `order_by(...)` ranks by a score best first or orders by fields ascending, `rerank(expr, count)` ranks its top `count` rows again ([rerank phases](query-language.md#rerank-phases)), `group_by(...)` and `having(...)` group, and `limit(n)` and `offset(n)` page. A query is a [plan](query-language.md#explain), the same JSON that `plan(sql)` gives: `q.plan()` shows it, and a `Client` runs it on a server the same way.
+`select(...)` names the columns (without it, the stored fields but vectors, as `SELECT *`), `where(...)` keeps rows, `order_by(...)` ranks by a score best first or orders by fields ascending, `rerank(expr, count)` ranks its top `count` rows again ([rerank phases](query-language.md#rerank-phases)), `group_by(...)` and `having(...)` group, `distinct_on(...)` keeps the [first row of each group](query-language.md#the-first-row-of-each-group-distinct-on) in the query's order, and `limit(n)` and `offset(n)` page (groups, after `distinct_on`). A query is a [plan](query-language.md#explain), the same JSON that `plan(sql)` gives: `q.plan()` shows it, and a `Client` runs it on a server the same way.
 
 ## Semantic-ID codebooks
 

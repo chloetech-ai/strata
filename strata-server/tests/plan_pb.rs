@@ -64,6 +64,9 @@ const SELECTS: &[&str] = &[
     "SELECT id FROM papers ORDER BY 0.3 * minmax(bm25(body, 'graph')) + 0.7 * minmax(similarity(emb, :v)) - minmax(rating) DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY ln(1 + bm25(body, 'graph')) * (1 + 0.2 * coalesce(rating, 0)) - 0.1 * rank(similarity(emb, :v)) + CASE WHEN category = 'ml' THEN 0.5 ELSE -seq_no() / 1e9 END DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY bm25(body, 'graph') * decay(year, 2020, 5) DESC LIMIT 5",
+    // A ranking given as keys.
+    "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), ranked(:ids)) DESC LIMIT 5",
+    "SELECT id FROM papers WHERE year > 2000 ORDER BY ranked(('p3', 'p1')) + 0.1 * coalesce(rating, 0) DESC LIMIT 5",
     // Ranking expressions as columns, and features().
     "SELECT id, bm25(body, 'net') AS b, ln(1 + rating) * 2, features() FROM papers ORDER BY bm25(body, 'graph') * decay(year, 2020, 5) + similarity(emb, :v) DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY decay(year, 2020, 5, offset => 1, decay => 0.3, shape => 'gauss') DESC",
@@ -98,6 +101,8 @@ const COMPOUND: &[&str] = &[
     "SELECT DISTINCT a.category, b.year FROM papers a JOIN papers b ON a.cites = b.id ORDER BY b.year LIMIT 4",
     "SELECT id, dot(emb, :v) FROM papers WHERE year > 2000",
     "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), maxsim(emb, (SELECT emb FROM papers WHERE category = 'ml' LIMIT 4))) DESC LIMIT 5",
+    "SELECT DISTINCT ON (category, year % 3) id, category FROM papers WHERE year > 1990 ORDER BY bm25(body, 'graph') DESC LIMIT 3",
+    "SELECT DISTINCT ON (category) category, year, COUNT(*) AS n FROM papers GROUP BY category, year ORDER BY category, n DESC",
 ];
 
 /// Writes of each kind.
@@ -182,6 +187,27 @@ fn every_plan_round_trips() {
     let weighted = Plan::new(Plan::from_json(&j).unwrap().root);
     assert!(weighted.features.iter().any(|f| f == ir::MAXSIM), "{:?}", weighted.features);
     check(weighted);
+    // A walk over an edge table, which names the table; its field is the
+    // key.
+    let sql = "SELECT id FROM papers ORDER BY ppr(cites, 'p1') DESC LIMIT 5";
+    let mut j = Plan::of_select(&schema, &bind(sql, &schema, &params()).unwrap()).to_json().unwrap();
+    fn over_table(j: &mut serde_json::Value) -> bool {
+        match j {
+            serde_json::Value::Object(m) => match m.get_mut("ppr") {
+                Some(serde_json::Value::Object(g)) => {
+                    g.insert("field".into(), serde_json::json!(0));
+                    g.insert("edges".into(), serde_json::json!("cooc")).is_none()
+                }
+                _ => m.values_mut().any(over_table),
+            },
+            serde_json::Value::Array(xs) => xs.iter_mut().any(over_table),
+            _ => false,
+        }
+    }
+    assert!(over_table(&mut j));
+    let walked = Plan::new(Plan::from_json(&j).unwrap().root);
+    assert!(walked.features.iter().any(|f| f == ir::EDGE_TABLE), "{:?}", walked.features);
+    check(walked);
     for sql in WRITES {
         let Command::Write { write, .. } = bind_command(sql, &[&schema], &params()).unwrap_or_else(|e| panic!("{sql}: {e}")) else { panic!("{sql}") };
         check(Plan::of_write(&schema, &write));

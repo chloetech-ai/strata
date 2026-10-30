@@ -299,6 +299,9 @@ message Node {
     // The input's rows, each once.
     Node distinct = 13;
     KeyOrder key_order = 14;
+    // 90 to 99: media, sequences and semantic IDs, lane M.
+    // The first row of each group (DISTINCT ON); plan feature distinct_on.
+    DistinctOn distinct_on = 90;
   }
 }
 
@@ -452,6 +455,12 @@ message KeyOrder {
   Node by = 2;
 }
 
+// The first of the input's rows with equal keys, in the input's order.
+message DistinctOn {
+  Node input = 1;
+  repeated Expr keys = 2;
+}
+
 message Exprs { repeated Expr v = 1; }
 
 // An expression over a row, with SQL's three-valued logic.
@@ -499,6 +508,10 @@ message Expr {
     Norm norm = 36;
     // A ranking model's score of a row; plan feature "rank_models".
     Gbdt gbdt = 37;
+    // A ranking given as primary keys, best first (ranked(:keys)); plan
+    // feature "ranked". Numbered from 70, the range of the semantic-ID
+    // work.
+    Ranked ranked = 70;
     // maxsim(field, vectors); plan feature "maxsim". Numbered from 80, the
     // range of the multi-vector work, so lanes building at once do not
     // collide.
@@ -517,6 +530,10 @@ message Gbdt {
 message Norm {
   NormKind kind = 1;
   Expr input = 2;
+}
+
+message Ranked {
+  repeated Value keys = 1;
 }
 
 enum NormKind {
@@ -709,6 +726,9 @@ message Graph {
   // A weight per key `seeds` lists, which PageRank restarts at in
   // proportion; empty, all 1 (plan feature "maxsim").
   repeated double weights = 12;
+  // The edge table walked instead of `field`, which is then the primary
+  // key (plan feature "edge_table").
+  optional string edges = 13;
 }
 
 message Reachable {
