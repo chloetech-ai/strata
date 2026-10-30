@@ -17,6 +17,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# The macOS jobs run on gh-mac, the organisation's own macOS runner (3
+# cores and 7 GB, as macos-latest), so that they no longer wait for the
+# plan's few concurrent macOS jobs. Their names still say macos-latest.
 jobs:
   test:
     name: ${{ matrix.crate }} on ${{ matrix.os }}
@@ -25,7 +28,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         crate: [strata, engram, strata-server]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -121,7 +124,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -250,7 +253,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
