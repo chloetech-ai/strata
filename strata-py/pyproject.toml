@@ -13,6 +13,8 @@ classifiers = ["Programming Language :: Python :: 3", "Programming Language :: R
 
 [project.optional-dependencies]
 test = ["pytest"]
+# strata.ingest.kafka
+kafka = ["confluent-kafka>=2.3"]
 
 [tool.maturin]
 python-source = "python"

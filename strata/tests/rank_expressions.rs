@@ -85,7 +85,8 @@ fn shards_rank_every_shape_like_one_database() {
     let q = docs[42][col::EMB].clone();
     let title = docs[42][col::TITLE].as_str().unwrap().to_string();
     let text = title.split(' ').take(3).collect::<Vec<_>>().join(" ");
-    let params = Params::new().set("q", q).set("t", Value::Str(text));
+    let qs = Value::List([42, 7, 1234].iter().map(|&i| docs[i][col::EMB].clone()).collect());
+    let params = Params::new().set("q", q).set("t", Value::Str(text)).set("qs", qs);
     let shapes = [
         "bm25(body, :t) + similarity(emb, :q)",
         "0.3 * minmax(bm25(body, :t)) + 0.7 * minmax(similarity(emb, :q))",
@@ -114,6 +115,8 @@ fn shards_rank_every_shape_like_one_database() {
         "minmax(bm25(body, :t) + similarity(emb, :q))",
         "bm25(body, :t) * similarity(emb, :q) * 2",
         "bm25(body, :t) / rating",
+        "maxsim(emb, :qs) * (1 + rating)",
+        "rrf(bm25(body, :t), maxsim(emb, :qs)) + 0.1 * minmax(rating)",
     ];
     let mut queries = Vec::new();
     for s in shapes {

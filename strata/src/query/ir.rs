@@ -60,7 +60,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 7] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, RANK_PROFILES];
+pub const FEATURES: [&str; 8] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -78,6 +78,10 @@ pub const SEQ_NO: &str = "seq_no";
 /// [`Expr::Product`]).
 pub const RANK_EXPRESSIONS: &str = "rank_expressions";
 
+/// The feature of a plan that scores with several query vectors
+/// ([`Expr::MaxSim`]), takes a dot product of vectors ([`Func::Dot`]), or
+/// seeds a walk with weights ([`Graph::weights`]).
+pub const MAXSIM: &str = "maxsim";
 /// The feature of a plan that cuts semantic IDs ([`Func::SidAt`]).
 pub const SEMANTIC_ID: &str = "semantic_id";
 
@@ -360,6 +364,9 @@ pub enum Func {
     Sigmoid,
     /// `args[0]` within `args[1]` and `args[2]`.
     Clamp,
+    /// The dot product of two vectors of one length (feature [`MAXSIM`]);
+    /// not a ranking expression's function: `similarity` is.
+    Dot,
     /// The prefix of `args[1]` levels of a semantic ID `args[0]`
     /// ([`crate::sid::sid_at`]); needs [`SEMANTIC_ID`].
     SidAt,
@@ -384,6 +391,7 @@ impl Func {
             Func::Greatest => "greatest",
             Func::Sigmoid => "sigmoid",
             Func::Clamp => "clamp",
+            Func::Dot => "dot",
             Func::SidAt => "sid_at",
         }
     }
@@ -413,14 +421,14 @@ impl Func {
         let ok = match self {
             Func::Lower | Func::Upper | Func::Length | Func::Abs | Func::Ln | Func::Exp | Func::Sqrt | Func::Sigmoid => n == 1,
             Func::Round | Func::Log => n == 1 || n == 2,
-            Func::Pow | Func::SidAt => n == 2,
+            Func::Pow | Func::Dot | Func::SidAt => n == 2,
             Func::Clamp => n == 3,
             Func::Coalesce | Func::Least | Func::Greatest => n >= 1,
         };
         match (ok, self) {
             (true, _) => Ok(()),
             (_, Func::Round | Func::Log) => Err("one or two arguments"),
-            (_, Func::Pow) => Err("two arguments"),
+            (_, Func::Pow | Func::Dot) => Err("two arguments"),
             (_, Func::SidAt) => Err("two arguments: a semantic ID and a number of levels"),
             (_, Func::Clamp) => Err("three arguments: a value, its least and its greatest"),
             (_, Func::Coalesce | Func::Least | Func::Greatest) => Err("at least one argument"),
@@ -441,7 +449,7 @@ impl Func {
         }
         let x = args.first().copied().unwrap_or(f64::NAN);
         let r = match self {
-            Func::Lower | Func::Upper | Func::Length | Func::SidAt => f64::NAN,
+            Func::Lower | Func::Upper | Func::Length | Func::Dot | Func::SidAt => f64::NAN,
             Func::Abs => x.abs(),
             Func::Round => {
                 let d = args.get(1).map_or(0.0, |d| d.clamp(-30.0, 30.0).trunc());
@@ -588,6 +596,16 @@ pub enum Expr {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "lits")]
         opts: Opts,
     },
+    /// The best similarity of a VECTOR field with any of `vectors`: a list
+    /// literal of vectors, or [`Expr::Values`] of a subquery, which runs
+    /// first (feature [`MAXSIM`]).
+    #[serde(rename = "maxsim")]
+    MaxSim {
+        field: u32,
+        vectors: Box<Expr>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "lits")]
+        opts: Opts,
+    },
     /// Similarity of a SPARSE field with `terms`.
     Sparse {
         field: u32,
@@ -635,6 +653,11 @@ pub struct Graph {
     pub field: u32,
     /// Primary keys (a list literal), or a [`Expr::Subquery`].
     pub seeds: Expr,
+    /// The weight of each of the keys `seeds` lists, which PageRank
+    /// restarts at in proportion (`weighted => 1`); none, all 1 (feature
+    /// [`MAXSIM`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<f64>,
     pub kind: GraphKind,
     pub dir: Direction,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -695,6 +718,20 @@ impl Node {
         }
         let mut found = false;
         self.leaf_exprs(&mut |e| found |= e.has_operators());
+        found
+    }
+
+    /// Whether the plan needs [`MAXSIM`]: an [`Expr::MaxSim`], a
+    /// [`Func::Dot`] or weighted seeds anywhere in it, subqueries too.
+    pub fn uses_maxsim(&self) -> bool {
+        let mut found = false;
+        self.exprs(&mut |e| {
+            found |= match e {
+                Expr::MaxSim { .. } | Expr::Call { func: Func::Dot, .. } => true,
+                Expr::Graph(g) | Expr::Ppr(g) => !g.weights.is_empty(),
+                _ => false,
+            }
+        });
         found
     }
 
@@ -994,7 +1031,7 @@ impl Expr {
     /// the fused shapes of them that came before.
     pub fn is_rank_expression(&self) -> bool {
         match self {
-            Expr::Field(_) | Expr::Hops | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::Decay { .. } | Expr::Ppr(_) => false,
+            Expr::Field(_) | Expr::Hops | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::MaxSim { .. } | Expr::Decay { .. } | Expr::Ppr(_) => false,
             Expr::Rrf { inputs, .. } | Expr::Product(inputs) => inputs.iter().any(Expr::is_rank_expression),
             Expr::Weighted(terms) => terms.iter().any(|(_, x)| x.is_rank_expression()),
             _ => true,
@@ -1080,6 +1117,7 @@ impl Expr {
                 otherwise.iter().for_each(|x| x.visit(f));
             }
             Expr::Call { args, .. } => args.iter().for_each(|x| x.visit(f)),
+            Expr::MaxSim { vectors, .. } => vectors.visit(f),
             Expr::Rrf { inputs, .. } => inputs.iter().for_each(|x| x.visit(f)),
             Expr::Weighted(ts) => ts.iter().for_each(|(_, x)| x.visit(f)),
             Expr::Graph(g) | Expr::Ppr(g) => graph(g, f),
@@ -1093,7 +1131,7 @@ impl Expr {
         f(self)?;
         let mut within: Vec<&mut Expr> = Vec::new();
         match self {
-            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } => within.push(x),
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } | Expr::MaxSim { vectors: x, .. } => within.push(x),
             Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
@@ -1168,6 +1206,9 @@ impl Plan {
         }
         if root.has_features() {
             features.push(RANK_FEATURES.to_string());
+        }
+        if root.uses_maxsim() {
+            features.push(MAXSIM.to_string());
         }
         if root.has_profiles() {
             features.push(RANK_PROFILES.to_string());
