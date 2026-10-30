@@ -4,7 +4,7 @@
 
 mod graph;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -14,11 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, RangeIndex, RangeStrategy};
 use crate::graph::GraphReader;
-use crate::query::fusion::{self, Norm};
 use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
 use crate::query::logical::{Decay, Expand, OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
+use crate::query::rank::Rank;
 use crate::query::stats::{FieldStats, TermStats};
 use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
@@ -431,7 +431,7 @@ pub struct Executor<'a> {
     readers_all: Vec<Arc<SegmentReaders>>,
     /// Shard mode: the fused query's candidates, each input's scores of
     /// them, and whether each is in each input's top `depth`.
-    parts: Option<(Vec<(usize, DocId)>, Vec<Vec<f32>>, Vec<Vec<bool>>)>,
+    parts: Option<(Vec<(usize, DocId)>, Vec<Vec<f64>>, Vec<Vec<bool>>)>,
     /// Expanded searches, worked out once for every segment.
     expanded: Mutex<Expanded>,
     /// What the query holds of [`ExecOptions::memory`].
@@ -581,7 +581,7 @@ impl<'a> Executor<'a> {
             let mut out = FusionParts::default();
             for h in &hits {
                 let i = at[&(h.seg, h.doc)];
-                out.scores.push(scores.iter().map(|s| Some(s[i] as f64).filter(|x| x.is_finite())).collect());
+                out.scores.push(scores.iter().map(|s| Some(s[i]).filter(|x| x.is_finite())).collect());
                 out.ranked.push(ranked.iter().map(|r| r[i]).collect());
             }
             out
@@ -1082,29 +1082,22 @@ impl<'a> Executor<'a> {
     /// The top `k` rows by `score`. A fused score takes at least `k` rows
     /// of each input (its depth is raised to the page asked for).
     fn ranked(&mut self, score: &Score, p: &Pred, k: usize, tb: Option<&Tiebreak>) -> Result<Vec<Hit>> {
-        if self.opts.shard && matches!(score, Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_)) {
-            return self.fusion_candidates(score, p, k);
-        }
-        let mut hits = match score {
-            Score::Rrf { inputs, k: rk, depth } => {
-                let depth = &self.rows_at_most((*depth).max(k));
-                let mut lists = Vec::new();
-                for s in inputs {
-                    lists.push(self.input_top(s, p, *depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>());
-                }
-                self.stats.plan.push(format!("rrf: {} inputs, depth {depth}, k {rk}", inputs.len()));
-                let mut hits: Vec<Hit> = fusion::rrf(&lists, *rk).into_iter().map(|((seg, doc), score)| Hit { seg, doc, score }).collect();
-                // Exact ties (same ranks in different lists) go to the smaller key.
-                self.sort_by_score_then_key(&mut hits, true, false);
-                hits
-            }
-            Score::Weighted(terms) => self.weighted(terms, p, k)?,
-            Score::Product(factors) => self.product(factors, p, k)?,
+        let mut hits = match Rank::of(score, self.opts.fusion_depth) {
+            // In shard mode, every candidate, for the coordinator to fuse.
+            Some(rank) if self.opts.shard => return self.fused(&rank, p, k),
+            Some(rank) => self.fused(&rank, p, k)?,
             // Cut and ordered like a fusion input, so that rows tied on
             // score come in key order on one database and over shards.
-            leaf => self.input_top(leaf, p, k, matches!(tb, Some(Tiebreak::Key { desc: true })))?,
+            None => self.input_top(score, p, k, matches!(tb, Some(Tiebreak::Key { desc: true })))?,
         };
         if let Some(Tiebreak::Key { desc }) = tb {
+            // Hits come best first, so only rows up to the end of the tie at
+            // the cut can reach the page, and only those read their keys.
+            let reach = match k.checked_sub(1).and_then(|l| hits.get(l)) {
+                Some(last) => k + hits[k..].iter().take_while(|h| h.score.total_cmp(&last.score).is_eq()).count(),
+                None => hits.len().min(k),
+            };
+            hits.truncate(reach);
             self.sort_by_score_then_key(&mut hits, true, *desc);
         }
         hits.truncate(k);
@@ -1650,144 +1643,62 @@ impl<'a> Executor<'a> {
         Ok(Some((pass as f64 + 0.5) / (m as f64 + 1.0)))
     }
 
-    /// Weighted fusion: the union of each input's top candidates, re-scored
-    /// exactly by every input, normalised (min-max by default) and summed.
-    /// With `exact => true` on any input, every document passing the filter
-    /// is a candidate.
-    fn weighted(&mut self, terms: &[(f64, Score)], p: &Pred, k: usize) -> Result<Vec<Hit>> {
-        let opt = |key: &str| terms.iter().find_map(|(_, s)| s.opts().and_then(|o| o.get(key)).cloned());
-        let exact = opt("exact").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
-        let depth = self.rows_at_most(opt("depth").and_then(|v| v.as_f64()).map(|d| d as usize).unwrap_or(self.opts.fusion_depth).max(k));
-        let norm = match opt("norm").as_ref().and_then(|v| v.as_str()) {
-            Some("none") => Norm::None,
-            _ => Norm::MinMax,
-        };
-        let mut cands: Vec<(usize, DocId)> = Vec::new();
-        if exact {
+    /// The rows of a fused score ([`Rank`]), best first, rows tied on score
+    /// by key: its candidates, each leaf's exact value of them where the
+    /// score or a coordinator reads it, and the score over those. In shard
+    /// mode these are every candidate, with what the coordinator fuses
+    /// ([`FusionParts`]).
+    fn fused(&mut self, rank: &Rank<'_>, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        let depth = self.rows_at_most(rank.depth.max(k));
+        let shard = self.opts.shard;
+        // Each generating leaf's top rows: the candidates, and the rankings
+        // RRF and a coordinator read.
+        let mut lists: Vec<Vec<(usize, DocId)>> = Vec::with_capacity(rank.leaves.len());
+        for (s, &generates) in rank.leaves.iter().zip(&rank.generates) {
+            lists.push(if generates && (shard || !rank.exact) { self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect() } else { Vec::new() });
+        }
+        let cands: Vec<(usize, DocId)> = if rank.exact {
+            let mut all = Vec::new();
             let segs = self.segs.clone();
             for s in segs.iter() {
                 self.check_deadline()?;
                 let set = self.filter_set(s, p)?;
-                cands.extend(set.iter().map(|d| (s.ord, d)));
+                all.extend(set.iter().map(|d| (s.ord, d)));
             }
+            all
         } else {
-            for (_, s) in terms {
-                cands.extend(self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)));
-            }
-            cands.sort_unstable();
-            cands.dedup();
-        }
-        self.stats.scored += cands.len() as u64;
-        self.stats.plan.push(format!("weighted: {} candidates ({}), {norm:?}", cands.len(), if exact { "exact" } else { "top-depth union" }));
-        let mut scores = Vec::with_capacity(terms.len());
-        for (_, s) in terms {
-            scores.push(self.exact_scores(s, &cands)?);
-        }
-        let weights: Vec<f64> = terms.iter().map(|(w, _)| *w).collect();
-        let mut hits: Vec<Hit> = fusion::weighted(&weights, &scores, norm).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect();
-        // Rows tied on the fused score go to the smaller key, as over shards.
-        self.order_ties_by_key(&mut hits, false);
-        hits.truncate(k);
-        Ok(hits)
-    }
-
-    /// `a * b * ...`: the top `depth` rows of each relevance factor (of
-    /// every factor if none is), scored exactly by every factor.
-    fn product(&mut self, factors: &[Score], p: &Pred, k: usize) -> Result<Vec<Hit>> {
-        let depth = self.rows_at_most(factors.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(self.opts.fusion_depth, |d| d as usize).max(k));
-        let any_relevance = factors.iter().any(Score::is_relevance);
-        let mut cands: Vec<(usize, DocId)> = Vec::new();
-        for f in factors.iter().filter(|f| f.is_relevance() || !any_relevance) {
-            cands.extend(self.input_top(f, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)));
-        }
-        cands.sort_unstable();
-        cands.dedup();
-        self.stats.scored += cands.len() as u64;
-        self.stats.plan.push(format!("product: {} candidates from {} factors, depth {depth}", cands.len(), factors.len()));
-        let mut scores = Vec::with_capacity(factors.len());
-        for f in factors {
-            scores.push(self.exact_scores(f, &cands)?);
-        }
-        let ones = vec![1.0; factors.len()];
-        let mut hits: Vec<Hit> = fusion::weighted(&ones, &scores, Norm::Product).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect();
-        self.sort_by_score_then_key(&mut hits, true, false);
-        hits.truncate(k);
-        Ok(hits)
-    }
-
-    /// Shard mode: every candidate of a fused score with each input's exact
-    /// score, ordered by the fused score over this shard's candidates. The
-    /// coordinator takes each input's top `depth` over all shards and fuses
-    /// those, which is what one database holding every shard would do.
-    fn fusion_candidates(&mut self, score: &Score, p: &Pred, k: usize) -> Result<Vec<Hit>> {
-        let (inputs, depth, exact): (Vec<&Score>, usize, bool) = match score {
-            Score::Rrf { inputs, depth, .. } => (inputs.iter().collect(), *depth, false),
-            Score::Weighted(terms) => {
-                let opt = |key: &str| terms.iter().find_map(|(_, s)| s.opts().and_then(|o| o.get(key)).cloned());
-                let exact = opt("exact").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
-                let depth = opt("depth").and_then(|v| v.as_f64()).map(|d| d as usize).unwrap_or(self.opts.fusion_depth);
-                (terms.iter().map(|(_, s)| s).collect(), depth, exact)
-            }
-            Score::Product(factors) => {
-                let depth = factors.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(self.opts.fusion_depth, |d| d as usize);
-                (factors.iter().collect(), depth, false)
-            }
-            _ => unreachable!("fused scores only"),
+            rank.candidates(&lists)
         };
-        let depth = self.rows_at_most(depth.max(k));
-        // A product's candidates come from its relevance factors only.
-        let generates = |s: &Score| match score {
-            Score::Product(factors) => s.is_relevance() || !factors.iter().any(Score::is_relevance),
-            _ => true,
-        };
-        let mut lists = Vec::with_capacity(inputs.len());
-        for s in &inputs {
-            lists.push(if generates(s) { self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect::<Vec<_>>() } else { Vec::new() });
-        }
-        let mut cands: Vec<(usize, DocId)> = Vec::new();
-        if exact {
-            let segs = self.segs.clone();
-            for s in segs.iter() {
-                self.check_deadline()?;
-                let set = self.filter_set(s, p)?;
-                cands.extend(set.iter().map(|d| (s.ord, d)));
+        let mut values = Vec::new();
+        if shard || rank.reads_values() {
+            for s in &rank.leaves {
+                values.push(self.exact_scores(s, &cands)?.into_iter().map(f64::from).collect::<Vec<f64>>());
             }
+            self.stats.scored += cands.len() as u64;
+        }
+        // Rankings by candidate, where RRF or a coordinator reads them.
+        let ranks: Vec<Vec<usize>> = if shard || !rank.reads_values() {
+            let at: HashMap<(usize, DocId), usize> = cands.iter().enumerate().map(|(i, c)| (*c, i)).collect();
+            lists.iter().map(|l| l.iter().map(|c| at[c]).collect()).collect()
         } else {
-            cands = lists.concat();
-            cands.sort_unstable();
-            cands.dedup();
-        }
-        let mut scores = Vec::with_capacity(inputs.len());
-        for s in &inputs {
-            scores.push(self.exact_scores(s, &cands)?);
-        }
-        let ranked: Vec<Vec<bool>> = lists
-            .iter()
-            .map(|l| {
-                let set: HashSet<&(usize, DocId)> = l.iter().collect();
-                cands.iter().map(|c| set.contains(c)).collect()
-            })
-            .collect();
-        let mut hits: Vec<Hit> = match score {
-            Score::Rrf { k, .. } => fusion::rrf(&lists, *k).into_iter().map(|((seg, doc), score)| Hit { seg, doc, score }).collect(),
-            Score::Weighted(terms) => {
-                let norm = match terms.iter().find_map(|(_, s)| s.opts().and_then(|o| o.get("norm")).cloned()).as_ref().and_then(|v| v.as_str()) {
-                    Some("none") => Norm::None,
-                    _ => Norm::MinMax,
-                };
-                let weights: Vec<f64> = terms.iter().map(|(w, _)| *w).collect();
-                fusion::weighted(&weights, &scores, norm).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect()
-            }
-            Score::Product(_) => {
-                let ones = vec![1.0; inputs.len()];
-                fusion::weighted(&ones, &scores, Norm::Product).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect()
-            }
-            _ => unreachable!(),
+            Vec::new()
         };
-        self.sort_by_score_then_key(&mut hits, true, false);
-        self.stats.scored += cands.len() as u64;
-        self.stats.plan.push(format!("shard fusion: {} candidates from {} inputs, depth {depth}", cands.len(), inputs.len()));
-        self.parts = Some((cands, scores, ranked));
+        let mut hits: Vec<Hit> = rank.eval(cands.len(), &values, &ranks, if shard { cands.len() } else { k }).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect();
+        self.order_sorted_ties(&mut hits);
+        let generating = rank.generates.iter().filter(|g| **g).count();
+        let from = if rank.exact { "every row WHERE keeps".to_string() } else { format!("the top {depth} of {generating} input{}", if generating == 1 { "" } else { "s" }) };
+        self.stats.plan.push(format!("fused {}: {} candidates from {from}", rank.explain(&self.schema), cands.len()));
+        if shard {
+            let ranked = ranks
+                .iter()
+                .map(|r| {
+                    let mut flags = vec![false; cands.len()];
+                    r.iter().for_each(|&i| flags[i] = true);
+                    flags
+                })
+                .collect();
+            self.parts = Some((cands, values, ranked));
+        }
         Ok(hits)
     }
 
@@ -1919,6 +1830,20 @@ impl<'a> Executor<'a> {
         });
         for (h, (k, _)) in hits.iter_mut().zip(keyed) {
             *h = k;
+        }
+    }
+
+    /// [`Self::sort_by_score_then_key`] (best first, the smaller key first)
+    /// of hits already in score order: only rows that tie read their keys,
+    /// and borrow them.
+    fn order_sorted_ties(&self, hits: &mut [Hit]) {
+        let mut i = 0;
+        while i < hits.len() {
+            let j = i + hits[i..].iter().take_while(|h| h.score.total_cmp(&hits[i].score).is_eq()).count();
+            if j - i > 1 {
+                self.order_ties_by_key(&mut hits[i..j], false);
+            }
+            i = j;
         }
     }
 

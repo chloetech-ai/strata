@@ -4,6 +4,8 @@
 //! * [`ddl`]: `CREATE TABLE` and `DROP TABLE`.
 //! * [`tables`]: the tables a query reads.
 //! * [`logical`]: the bound query: projection, predicate tree, score.
+//! * [`rank`]: fused scores (RRF, weighted sums, products) as one expression
+//!   over their leaves, and its evaluator.
 //! * [`ir`]: the plan of a statement, in JSON and in `EXPLAIN`.
 //! * [`agg`]: aggregates and groups.
 //! * [`stats`]: collection statistics exchanged with a coordinator.
@@ -21,6 +23,7 @@ pub mod ops;
 pub mod parse;
 pub mod plan;
 pub mod pool;
+pub mod rank;
 pub mod sql;
 pub mod stats;
 pub mod tables;

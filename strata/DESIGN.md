@@ -808,6 +808,19 @@ candidate stream is long relative to the lists, and probes otherwise.
 | `similarity` | pre-filter exact scan, IVF with in-filter intersection, HNSW in-filter, post-filter with oversampling |
 | fusion | top-k′ from each retriever, union, exact re-scoring of both scores on the union; or exact scan |
 
+**Fused scores** (`query/rank.rs`). RRF, a weighted sum and a product
+compile into one expression over their leaves, which the plan lines print
+with normalisation written out: `0.3 * minmax(bm25(title)) + 0.7 *
+minmax(similarity(emb))`, `bm25(body) * decay(year)`, `rrf(bm25(body),
+similarity(emb), k => 60)`. One evaluator computes it over the candidates,
+on one database, on each shard (which answers every candidate with each
+leaf's value and whether the row is in the leaf's top rows), and at the
+coordinator over the shards' merged candidates. On one database it orders
+only the rows the page can reach (the best `k` and the rows tied with the
+`k`-th), which matters when `exact => 1` makes every row a candidate.
+Ranking expressions extend this expression with arithmetic, functions and
+rerank phases.
+
 The vector strategies are chosen by estimated cost against an estimated
 filter selectivity `s`: pre-filter costs `s·n` distance computations; IVF
 needs about `nprobe/√s` probes' worth of clusters to collect enough matching

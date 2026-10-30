@@ -39,7 +39,17 @@ pub enum Norm {
 }
 
 /// Weighted fusion of exact scores: `scores[i][j]` is input `i`'s score of
-/// candidate `j`. Returns `(candidate index, fused score)`, best first.
+/// candidate `j`. Returns `(candidate index, fused score)`, best first, as
+/// [`combine`] fuses them.
+pub fn weighted(weights: &[f64], scores: &[Vec<f32>], norm: Norm) -> Vec<(usize, f64)> {
+    let scores: Vec<Vec<f64>> = scores.iter().map(|s| s.iter().map(|&x| f64::from(x)).collect()).collect();
+    let mut out: Vec<(usize, f64)> = combine(weights, &scores, norm).into_iter().enumerate().collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// The fused score of each candidate: `scores[i][j]` is input `i`'s score
+/// of candidate `j`.
 ///
 /// A score that is not finite (a missing column value arrives as −∞) is
 /// missing, and a missing value is the input's worst: in a sum it counts as
@@ -48,13 +58,14 @@ pub enum Norm {
 /// so a row without a value never gains from it; in a product it counts as
 /// 0. Product factors below 0 count as 0 too, so that two negative factors
 /// cannot multiply into a high score. Every fused score is finite.
-pub fn weighted(weights: &[f64], scores: &[Vec<f32>], norm: Norm) -> Vec<(usize, f64)> {
+pub fn combine<S: AsRef<[f64]>>(weights: &[f64], scores: &[S], norm: Norm) -> Vec<f64> {
     assert_eq!(weights.len(), scores.len());
-    let n = scores.first().map_or(0, |s| s.len());
+    let n = scores.first().map_or(0, |s| s.as_ref().len());
     let mut fused = vec![if norm == Norm::Product { 1.0 } else { 0.0f64 }; n];
     for (&w, s) in weights.iter().zip(scores) {
+        let s = s.as_ref();
         assert_eq!(s.len(), n);
-        let (lo, hi) = s.iter().filter(|x| x.is_finite()).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| (lo.min(x as f64), hi.max(x as f64)));
+        let (lo, hi) = s.iter().filter(|x| x.is_finite()).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| (lo.min(x), hi.max(x)));
         // The worst value of this input, which missing values take.
         let worst = match norm {
             _ if lo > hi => 0.0,
@@ -65,7 +76,6 @@ pub fn weighted(weights: &[f64], scores: &[Vec<f32>], norm: Norm) -> Vec<(usize,
             Norm::Product => 0.0,
         };
         for (f, &x) in fused.iter_mut().zip(s) {
-            let x = x as f64;
             let v = match norm {
                 _ if !x.is_finite() => worst,
                 Norm::None => x,
@@ -86,9 +96,7 @@ pub fn weighted(weights: &[f64], scores: &[Vec<f32>], norm: Norm) -> Vec<(usize,
             *f = f64::MIN;
         }
     }
-    let mut out: Vec<(usize, f64)> = fused.into_iter().enumerate().collect();
-    out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    out
+    fused
 }
 
 #[cfg(test)]
