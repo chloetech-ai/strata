@@ -1480,7 +1480,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         },
         Expr::Function(f) if fname(f) == "prefix" => {
             let [x, p] = func_args(f)[..] else { return Err(err("PREFIX(text, prefix) takes two arguments")) };
-            ir::Expr::Prefix { expr: bx(x)?, prefix: bx(p)? }
+            ir::Expr::Prefix { expr: bx(x)?, prefix: bx(p)?, edits: 0 }
         }
         Expr::Function(f) => {
             let func = match fname(f).as_str() {

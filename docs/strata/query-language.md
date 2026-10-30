@@ -139,6 +139,9 @@ SELECT id, n FROM queries WHERE PREFIX(id, :typed) ORDER BY n DESC, id LIMIT 10;
 -- a user's own history first: keys of the form '<user>|<query>'
 SELECT id, n FROM user_queries WHERE PREFIX(id, 'u42|how to') ORDER BY n DESC LIMIT 3;
 
+-- with typos: 'hwo to ins' still finds 'how to install'
+SELECT id, n FROM queries WHERE PREFIX(id, :typed, fuzzy => 'auto') ORDER BY n DESC, id LIMIT 10;
+
 SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/ir/%';
 ```
 
@@ -146,9 +149,10 @@ SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/
 - `ESCAPE 'c'` makes the character after `c` literal: `LIKE 'snake!_%' ESCAPE '!'` is the prefix `snake_`. `PREFIX` needs no escaping.
 - `ILIKE` is refused on a table's own field: store the value lowercased (and a display form beside it) and use `LIKE`.
 - `PREFIX(x, p)` also works over joined or derived rows, as a test of each value; `PREFIX(kw, '')` and `LIKE '%'` are `IS NOT NULL`.
+- **`PREFIX(kw, p, fuzzy => 1 | 2 | 'auto')`** also selects the values that start with a prefix within that many edits of `p` whose first letter is `p`'s own, with the edits `MATCH` counts ([typos](#typos-and-synonyms)); `'auto'` goes by `p`'s length, as it does for a word: none up to 2 letters, 1 up to 5, else 2. The dictionary is walked as a trie, one row of the edit-distance table per letter, jumping past every value whose start is already too far from `p` and past the whole run of a start close enough, so the cost follows the values near what was typed rather than the dictionary's size. The values found are a few runs of the dictionary, read as an exact prefix's one is. Typo matches rank by the `ORDER BY` like exact ones; to show exact completions first, run the exact query and fill what is left with the fuzzy one. `LIKE` takes no typos.
 - Counts kept with `UPDATE ... SET n = n + 1` or a write's `add` change in place, so a query log's popularity stays current without rewriting rows.
 
-A plan with a prefix needs the plan feature `prefix`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids).
+A plan with a prefix needs the plan feature `prefix`, and one with typos also `prefix_edits`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids).
 
 **Cluster a completion table by its key.** `ORDER BY n DESC LIMIT 10` reads the count column's blocks best first ([ordering by a column](#a-column)), and with `OPTIONS(cluster_by = 'id')` a prefix's rows sit together in each segment, so the ten most asked queries under a prefix read about ten blocks whatever the prefix's length:
 
@@ -506,7 +510,7 @@ SELECT id, score() FROM papers ORDER BY bm25(body, 'nueral netwrok', fuzzy => 1)
 SELECT id FROM papers WHERE MATCH(body, 'gnn', synonyms => 1) LIMIT 10;
 ```
 
-- **`fuzzy => 1` or `2`** also matches the indexed terms within that many edits of each word, counting an insertion, deletion, substitution or swap of two neighbouring letters as one edit (optimal string alignment). **`fuzzy => 'auto'`** allows no edits for words of 1 or 2 letters, 1 for 3 to 5 letters and 2 for longer ones. In the `MATCH` grammar, `word~` is `'auto'` for one word and `word~1`, `word~2` choose. A ranked query adds the 50 nearest terms of each word, each weighted `1 − edits / length` (at least 0.1), as Lucene's fuzzy queries do. A word and its typo neighbours share one document frequency, the largest among them, so a rare misspelling scores below the word rather than above it; the expansion is found once per query over every segment's dictionary, so all segments, and the plan line `bm25 expanded with N terms`, agree.
+- **`fuzzy => 1` or `2`** also matches the indexed terms within that many edits of each word, counting an insertion, deletion, substitution or swap of two neighbouring letters as one edit (optimal string alignment). **`fuzzy => 'auto'`** allows no edits for words of 1 or 2 letters, 1 for 3 to 5 letters and 2 for longer ones. In the `MATCH` grammar, `word~` is `'auto'` for one word and `word~1`, `word~2` choose. A ranked query adds the 50 nearest terms of each word, each weighted `1 − edits / length` (at least 0.1), as Lucene's fuzzy queries do. A word and its typo neighbours share one document frequency, the largest among them, so a rare misspelling scores below the word rather than above it; the expansion is found once per query over every segment's dictionary, so all segments, and the plan line `bm25 expanded with N terms`, agree. Each dictionary is walked as a trie, skipping every run of terms whose start is already too many edits away, rather than tested term by term: for a word of a typed query looked up in the 797,472 analysed terms of ORCAS's 10.4 million queries, the median lookup takes 2.1 ms with one edit and 16 ms with two, against 79 and 100 ms testing every term (one thread of a 4-core cloud VM, Intel Xeon @ 2.10GHz; [`results/text/fuzzy-orcas.json`](https://github.com/rkonow/strata/tree/main/strata/results/text), `strata-fuzzy-bench`).
 - **`synonyms => 1`** also matches what the server's synonym list says a word or phrase means. The list is in Solr's format: `laptop, notebook, portable computer` makes each find the others, and `tv => television` makes `tv` find `television` but not the reverse. Both sides are analysed like documents, so `laptops` finds `notebook`. A one-word synonym of a word shares that word's document frequency, as Lucene's synonym queries do; the words of a longer synonym score on their own. [strata-server](server.md) loads it from `--synonyms FILE` and edits it at `/v1/synonyms`; from Rust, set `ExecOptions::synonyms`. Without a list, `synonyms => 1` is an error that says so.
 
 ## Aggregates
