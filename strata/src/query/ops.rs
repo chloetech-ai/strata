@@ -57,7 +57,7 @@ pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &Exec
         keys: keys.unwrap_or_default(),
         scores: rows.scores.unwrap_or_default(),
         parts: None,
-        stats: ExecStats { plan: ops.plan, filter_docs: 0, scored: 0 },
+        stats: ExecStats { plan: ops.plan, filter_docs: 0, scored: 0, reranked: 0 },
     })
 }
 
@@ -187,6 +187,20 @@ impl<'a> Ops<'a, '_> {
                 let keep: Vec<usize> = (0..rows.rows.len()).filter(|&i| seen.insert(rows.rows[i].iter().map(|v| format!("{v:?}")).collect::<Vec<_>>())).collect();
                 Ok(rows.pick(&keep))
             }
+            Node::DistinctOn { input, keys } => {
+                let rows = self.node(input, what)?;
+                let keys: Vec<Expr> = keys.iter().map(|k| self.resolved(k)).collect::<Result<_>>()?;
+                let mut seen = HashSet::new();
+                let mut keep = Vec::new();
+                for (i, r) in rows.rows.iter().enumerate() {
+                    self.tick()?;
+                    let group = keys.iter().map(|k| value(k, r).map(|v| format!("{v:?}"))).collect::<Result<Vec<_>>>()?;
+                    if seen.insert(group) {
+                        keep.push(i);
+                    }
+                }
+                Ok(rows.pick(&keep))
+            }
             Node::KeyOrder { input, by } => {
                 let rows = self.node(input, what)?;
                 let by = self.node(by, what)?;
@@ -311,7 +325,14 @@ impl<'a> Ops<'a, '_> {
             }
             Expr::Graph(g) | Expr::Ppr(g) => {
                 let pk = schema.and_then(|s| s.primary_key);
-                let Graph { seeds, kind, .. } = g.as_mut();
+                let Graph { seeds, kind, weights, .. } = g.as_mut();
+                // PageRank weighted by the seeds' scores restarts at each
+                // seed in proportion to the scores of the rows that name it.
+                if matches!(kind, GraphKind::Ppr { weighted: true, .. }) && matches!(seeds, Expr::Values(_) | Expr::Keys(_)) {
+                    let (keys, ws) = self.weighted_values(seeds, schema, pk)?;
+                    *seeds = Expr::Lit(Value::List(keys));
+                    *weights = ws;
+                }
                 for s in std::iter::once(seeds).chain(match kind {
                     GraphKind::Path { to, .. } => Some(to),
                     _ => None,
@@ -321,6 +342,7 @@ impl<'a> Ops<'a, '_> {
                     }
                 }
             }
+            Expr::MaxSim { vectors, .. } if matches!(vectors.as_ref(), Expr::Values(_)) => **vectors = Expr::Lit(Value::List(self.vectors(vectors)?)),
             Expr::Values(_) | Expr::Keys(_) => *e = Expr::Lit(Value::List(self.values(e, None, None)?)),
             Expr::Exists(n) => *e = Expr::Lit(Value::Bool(!self.node(n, "subquery")?.rows.is_empty())),
             Expr::Scalar(n) => *e = Expr::Lit(self.scalar(n, None, None)?),
@@ -357,6 +379,81 @@ impl<'a> Ops<'a, '_> {
         equal_to(schema, f, vals)
     }
 
+    /// The vectors of [`Expr::Values`] for `maxsim`: each row's, in order,
+    /// a list's each, none for NULL.
+    fn vectors(&mut self, e: &Expr) -> Result<Vec<Value>> {
+        let Expr::Values(n) = e else { unreachable!("a subquery") };
+        let rows = self.node(n, "subquery")?;
+        if rows.rows.first().is_some_and(|r| r.len() != 1) {
+            return Err(err(format!("maxsim's subquery returns one column of vectors, not {}", rows.columns.len())));
+        }
+        let mut out = Vec::new();
+        for v in rows.rows.into_iter().filter_map(|r| r.into_iter().next()) {
+            match v {
+                Value::Null => {}
+                v @ Value::Vector(_) => out.push(v),
+                Value::List(xs) if xs.iter().all(|x| matches!(x, Value::Vector(_))) => out.extend(xs),
+                v => return Err(err(format!("maxsim's subquery returns vectors, not {v:?}"))),
+            }
+        }
+        self.plan.push(format!("subquery: {} query vectors", out.len()));
+        Ok(out)
+    }
+
+    /// [`Ops::values`] of a weighted walk's seeds, each with the sum of the
+    /// scores of the rows that name it (1 for a row without a score), in
+    /// the order they first appear.
+    fn weighted_values(&mut self, e: &Expr, schema: Option<&Schema>, f: Option<usize>) -> Result<(Vec<Value>, Vec<f64>)> {
+        let (Expr::Values(n) | Expr::Keys(n)) = e else { unreachable!("a subquery") };
+        let rows = self.node(n, "subquery")?;
+        let scores = rows.scores.clone().unwrap_or_else(|| vec![1.0; rows.rows.len()]);
+        let named: Vec<(Vec<Value>, f64)> = match e {
+            Expr::Keys(_) => {
+                let keys = rows.keys.ok_or_else(|| err("the subquery's rows are not rows of the table, which have keys"))?;
+                keys.into_iter().zip(scores).map(|(k, w)| (vec![k], w)).collect()
+            }
+            _ => {
+                if rows.rows.first().is_some_and(|r| r.len() != 1) {
+                    return Err(err(format!("a subquery of seeds returns one column, not {}", rows.columns.len())));
+                }
+                rows.rows
+                    .into_iter()
+                    .zip(scores)
+                    .map(|(r, w)| {
+                        let vs = match r.into_iter().next() {
+                            Some(Value::List(xs)) => xs,
+                            Some(Value::Null) | None => Vec::new(),
+                            Some(v) => vec![v],
+                        };
+                        (vs, w)
+                    })
+                    .collect()
+            }
+        };
+        let mut at: HashMap<Part, usize> = HashMap::new();
+        let (mut keys, mut weights) = (Vec::new(), Vec::new());
+        for (vs, w) in named {
+            for v in vs {
+                let Some(v) = equal_value(schema, f, v)? else { continue };
+                match at.get(&part(&v)) {
+                    Some(&i) => weights[i] += w,
+                    None => {
+                        at.insert(part(&v), keys.len());
+                        keys.push(v);
+                        weights.push(w);
+                    }
+                }
+            }
+        }
+        // Restart weights are positive: a score of 0 or below counts as
+        // the least, as for a subquery of the scanned table.
+        for w in &mut weights {
+            *w = if w.is_finite() { w.max(1e-9) } else { 1e-9 };
+        }
+        self.plan.push(format!("subquery: {} weighted seeds", keys.len()));
+        Ok((keys, weights))
+    }
+
     /// The value of [`Expr::Scalar`]: NULL without a row.
     fn scalar(&mut self, n: &Node, schema: Option<&Schema>, f: Option<usize>) -> Result<Value> {
         let rows = self.node(n, "subquery")?;
@@ -369,10 +466,12 @@ impl<'a> Ops<'a, '_> {
         }
     }
 
-    /// LIMIT; over joins whose first table's scan is a leaf, that scan reads
-    /// a growing number of rows (twice the rows wanted, at least 32, then
-    /// four times as many) until enough rows join or it runs out: rows keep
-    /// its order through joins, filters and projections.
+    /// LIMIT; over joins whose first table's scan is a leaf, or over the
+    /// first rows of groups (`DISTINCT ON`) of a scan, that scan reads a
+    /// growing number of rows (twice the rows wanted, four times for
+    /// groups, at least 32, then four times as many) until enough rows join
+    /// or groups have a row, or it runs out: rows keep its order through
+    /// joins, filters, projections and the first rows of groups.
     fn limit(&mut self, input: &Node, offset: usize, limit: Option<usize>, what: &str) -> Result<Rows> {
         let cut = |rows: Rows| {
             let idx: Vec<usize> = (offset..rows.rows.len()).take(limit.unwrap_or(usize::MAX)).collect();
@@ -380,7 +479,8 @@ impl<'a> Ops<'a, '_> {
         };
         let (Some(l), Some(scan)) = (limit, driver_of(input)) else { return Ok(cut(self.node(input, what)?)) };
         let want = l.saturating_add(offset);
-        let mut lim = want.saturating_mul(2).clamp(32, MAX_ROWS);
+        let first = if matches!(input, Node::DistinctOn { .. }) { 4 } else { 2 };
+        let mut lim = want.saturating_mul(first).clamp(32, MAX_ROWS);
         let saved = self.driver.take();
         let r = loop {
             self.driver = Some((scan as *const Node, lim as u64, 0));
@@ -502,6 +602,7 @@ impl<'a> Ops<'a, '_> {
             return Ok(Expr::Graph(Box::new(Graph {
                 field: *f,
                 seeds: Expr::Lit(Value::List(vals)),
+                weights: Vec::new(),
                 kind: GraphKind::Reachable { min_hops: 0, max_hops: 1 },
                 dir: Direction::In,
                 labels: Vec::new(),
@@ -588,7 +689,7 @@ impl<'a> Ops<'a, '_> {
                 Expr::Output(j) => self.source(input, j as usize),
                 _ => None,
             },
-            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Distinct { input } | Node::KeyOrder { input, .. } => self.source(input, i),
+            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Distinct { input } | Node::DistinctOn { input, .. } | Node::KeyOrder { input, .. } => self.source(input, i),
             _ => None,
         }
     }
@@ -599,7 +700,13 @@ impl<'a> Ops<'a, '_> {
             Node::Join { left, right, .. } => [self.columns(left), self.columns(right)].concat(),
             Node::Ref { name } => self.ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(name)).map_or_else(Vec::new, |(_, r)| r.columns.clone()),
             Node::Aggregate { keys, aggs, .. } => (0..keys.len() + aggs.len()).map(|i| format!("#{i}")).collect(),
-            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Distinct { input } | Node::KeyOrder { input, .. } | Node::With { input, .. } => self.columns(input),
+            Node::Filter { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. }
+            | Node::KeyOrder { input, .. }
+            | Node::With { input, .. } => self.columns(input),
             _ => Vec::new(),
         }
     }
@@ -620,21 +727,35 @@ fn coerce(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Value> 
 /// Values field `f` is to equal ([`coerce`]d): an INT field holds no
 /// fraction, so a whole FLOAT is its INT and another FLOAT equals no row.
 fn equal_to(schema: Option<&Schema>, f: Option<usize>, vals: Vec<Value>) -> Result<Vec<Value>> {
-    let int = f.and_then(|f| schema?.fields.get(f)).is_some_and(|field| field.ty == FieldType::Int && field.logical.is_none());
-    vals.into_iter()
-        .filter_map(|v| match v {
-            Value::Float(x) if int && x.fract() == 0.0 && x.abs() < 9e18 => Some(Value::Int(x as i64)),
-            Value::Float(_) if int => None,
-            v => Some(v),
-        })
-        .map(|v| coerce(schema, f, v))
-        .collect()
+    vals.into_iter().filter_map(|v| equal_value(schema, f, v).transpose()).collect()
 }
 
-/// The first table's scan of the joins under a LIMIT, through the nodes
-/// that keep its rows' order (Project, Filter): a leaf.
+/// [`equal_to`] of one value: `None` for one no value of the field equals.
+fn equal_value(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Option<Value>> {
+    let int = f.and_then(|f| schema?.fields.get(f)).is_some_and(|field| field.ty == FieldType::Int && field.logical.is_none());
+    match v {
+        Value::Float(x) if int && x.fract() == 0.0 && x.abs() < 9e18 => coerce(schema, f, Value::Int(x as i64)).map(Some),
+        Value::Float(_) if int => Ok(None),
+        v => coerce(schema, f, v).map(Some),
+    }
+}
+
+/// The first table's scan of the joins under a LIMIT, or the scan whose
+/// rows' first of each group a `DISTINCT ON` keeps, through the nodes that
+/// keep its rows' order (Project, Filter, DistinctOn): a leaf.
 fn driver_of(n: &Node) -> Option<&Node> {
     match n {
+        Node::DistinctOn { input, .. } => {
+            let scan = match input.as_ref() {
+                Node::Filter { input, .. } => input,
+                _ => input,
+            };
+            if scan.is_leaf() {
+                Some(scan)
+            } else {
+                driver_of(input)
+            }
+        }
         Node::Project { input, .. } | Node::Filter { input, .. } if !n.is_leaf() => driver_of(input),
         Node::Join { .. } => {
             let mut x = n;

@@ -19,10 +19,11 @@
 //!
 //! Types are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or
 //! `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (microseconds,
-//! UTC; or `TIMESTAMPTZ`, `DATETIME`), `VECTOR(dimensions)`, `SPARSE` and
-//! `EDGES`; `KEYWORD[]` and `INT[]` hold lists. A table with a BOOL or
-//! TIMESTAMP column makes the database format 3
-//! ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
+//! UTC; or `TIMESTAMPTZ`, `DATETIME`), `VECTOR(dimensions)`, `SPARSE`,
+//! `EDGES` and `MEDIA` (a file's reference, [`crate::media`]; `OPTIONS(kind
+//! = 'image')`, `'audio'`, `'video'` or `'pdf'` says what file); `KEYWORD[]`
+//! and `INT[]` hold lists. A table with a BOOL, TIMESTAMP or MEDIA column
+//! makes the database format 3 ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
 //! the schema's short JSON form ([`crate::schema::Schema::from_json`]):
 //! `positions`, `stored` and `indexed` (true or false), `from` (the fields
 //! a generated TEXT field joins), `analyzer` (`'english'`, the default, or
@@ -30,7 +31,10 @@
 //! `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'`
 //! or `'binary'`), `dim`, and `embed` with `model` (the fields a VECTOR
 //! field is the model's embedding of). Field lists are a string, `'title,
-//! abstract'`, or `ARRAY['title', 'abstract']`.
+//! abstract'`, or `ARRAY['title', 'abstract']`. A KEYWORD[] column with
+//! `semantic_id = 'emb'` and `codebook = 'name'` holds the semantic IDs of
+//! VECTOR column `emb`'s vectors ([`crate::sid`]; feature `semantic_id`):
+//! `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`.
 //!
 //! The key is a column's `PRIMARY KEY` or a `PRIMARY KEY (column)`
 //! constraint. `REFERENCES table [(key)]` on a column, or `FOREIGN KEY
@@ -40,9 +44,26 @@
 //! NULL, and `DEFAULT value` (a constant, or `CURRENT_TIMESTAMP` for a
 //! TIMESTAMP) is what a write that leaves the column out stores; either
 //! makes the database format 3 ([`crate::schema::Field::not_null`],
-//! [`crate::schema::Field::default`]). Every other clause and column
-//! option (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, `AS SELECT`,
-//! ...) is an error, never ignored.
+//! [`crate::schema::Field::default`]).
+//!
+//! `OPTIONS(...)` after the columns takes the table's options: `shard_by`,
+//! the column that places its rows on shards instead of their key
+//! ([`crate::schema::Schema::with_shard_by`]); `cluster_by`, the column
+//! that orders each segment's rows ([`crate::schema::Schema::with_cluster_by`]);
+//! and `retain`, how long rows are kept after the time in `retain_by`
+//! (default: the table's only TIMESTAMP; [`crate::schema::Schema::with_retain`]):
+//!
+//! ```sql
+//! CREATE TABLE events (
+//!   id INT PRIMARY KEY,
+//!   usr KEYWORD NOT NULL,
+//!   item KEYWORD REFERENCES items,
+//!   ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+//! ) OPTIONS(shard_by = 'usr', cluster_by = 'usr', retain = '400 days');
+//! ```
+//!
+//! Every other clause and column option (`UNIQUE`, `CHECK`, `ON DELETE`,
+//! constraint names, `AS SELECT`, ...) is an error, never ignored.
 
 use serde_json::{json, Map, Value as J};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
@@ -57,15 +78,25 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// The forms this module binds, for error messages.
-const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table])";
-const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE or EDGES, and KEYWORD[] or INT[] for lists";
+const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column')]";
+/// The options of a table, in `OPTIONS(...)` after its columns.
+const TABLE_OPTIONS: [&str; 4] = ["shard_by", "cluster_by", "retain", "retain_by"];
+const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES or MEDIA, and KEYWORD[] or INT[] for lists";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
 /// EXISTS`. `tables` are the database's tables, which references name.
 pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<(Schema, bool)> {
     // Every clause but the name, columns, constraints and IF NOT EXISTS
     // must be as a plain CREATE TABLE leaves it.
-    let mut plain = CreateTableBuilder::new(ct.name.clone()).columns(ct.columns.clone()).constraints(ct.constraints.clone()).if_not_exists(ct.if_not_exists).build();
+    let table_options = match &ct.table_options {
+        sql::CreateTableOptions::Options(o) => o.clone(),
+        _ => Vec::new(),
+    };
+    let mut plain = CreateTableBuilder::new(ct.name.clone()).columns(ct.columns.clone()).constraints(ct.constraints.clone()).if_not_exists(ct.if_not_exists);
+    if !table_options.is_empty() {
+        plain = plain.table_options(sql::CreateTableOptions::Options(table_options.clone()));
+    }
+    let mut plain = plain.build();
     if let sql::Statement::CreateTable(p) = &mut plain {
         if ct.hive_formats.as_ref().is_none_or(|h| *h == sql::HiveFormat::default()) {
             p.hive_formats = ct.hive_formats.clone();
@@ -155,7 +186,23 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
         }
         f["references"] = json!(table);
     }
-    let schema = Schema::from_json_value(&json!({"table": name, "key": key, "fields": fields}))?;
+    let mut short = json!({"table": name, "key": key, "fields": fields});
+    for o in &table_options {
+        let sql::SqlOption::KeyValue { key, value } = o else { return Err(err(format!("the table's OPTIONS take key = value pairs, not {o}"))) };
+        let k = key.value.to_ascii_lowercase();
+        if !TABLE_OPTIONS.contains(&k.as_str()) {
+            return Err(err(format!("{} is not an option of a table (its options: {})", key.value, TABLE_OPTIONS.join(", "))));
+        }
+        if short.get(&k).is_some() {
+            return Err(err(format!("the table's option {} is given twice", key.value)));
+        }
+        match option_value(value)? {
+            v @ J::String(_) => short[k] = v,
+            _ if k == "retain" => return Err(err("the table's option retain is a period, in quotes: retain = '400 days'")),
+            _ => return Err(err(format!("the table's option {k} names a column, in quotes: {k} = 'usr'"))),
+        }
+    }
+    let schema = Schema::from_json_value(&short)?;
     // A reference names the primary key of its table, if it names a column.
     for (column, table, named) in &refs {
         let Some(named) = named else { continue };
@@ -204,10 +251,15 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let allowed: &[&str] = match ty {
         "text" => &["positions", "stored", "indexed", "from", "analyzer"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
+        "media" => &["stored", "indexed", "kind"],
+        "keyword" if multi => &["stored", "indexed", "semantic_id", "codebook"],
         _ => &["stored", "indexed"],
     };
+    if !allowed.contains(&"semantic_id") && (opts.contains_key("semantic_id") || opts.contains_key("codebook")) {
+        return Err(bad("semantic_id and codebook are options of a KEYWORD[] column".into()));
+    }
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model", "kind", "semantic_id", "codebook"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {
@@ -265,6 +317,13 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     if let Some(from) = opts.remove("from") {
         f.insert("from".into(), json!(names(&from).map_err(|m| bad(format!("from {m}")))?));
     }
+    match (opts.remove("semantic_id"), opts.remove("codebook")) {
+        (None, None) => {}
+        (Some(J::String(from)), Some(J::String(codebook))) => {
+            f.insert("semantic_id".into(), json!({"from": from, "codebook": codebook}));
+        }
+        _ => return Err(bad("a semantic-ID column takes semantic_id = 'vector column' and codebook = 'name'".into())),
+    }
     for (k, v) in opts {
         match k.as_str() {
             "positions" | "stored" | "indexed" if !v.is_boolean() => return Err(bad(format!("{k} is true or false"))),
@@ -296,6 +355,7 @@ fn column_type(t: &DataType) -> std::result::Result<(&'static str, bool, Option<
             ("keyword", []) => Ok(("keyword", false, None)),
             ("sparse", []) => Ok(("sparse", false, None)),
             ("edges", []) => Ok(("edges", false, None)),
+            ("media", []) => Ok(("media", false, None)),
             ("vector", []) => Ok(("vector", false, None)),
             ("vector", [d]) => match d.parse::<u64>() {
                 Ok(d) if d > 0 => Ok(("vector", false, Some(d))),
@@ -403,7 +463,7 @@ pub(crate) fn drop_table(stmt: &sql::Statement) -> Result<(Vec<String>, DropOpti
 mod tests {
     use super::*;
     use crate::query::parse::parse;
-    use crate::schema::{FieldType, VectorCodes, VectorIndexKind};
+    use crate::schema::{FieldType, MediaKind, VectorCodes, VectorIndexKind};
 
     fn create(text: &str, tables: &[&Schema]) -> Result<(Schema, bool)> {
         let stmts = parse(text)?;
@@ -454,6 +514,64 @@ mod tests {
         assert_eq!(s.fields[1].references.as_deref(), Some("papers"));
         // No key is allowed, as in the JSON form.
         assert_eq!(create("CREATE TABLE log (line TEXT NULL)", &[]).unwrap().0.primary_key, None);
+    }
+
+    #[test]
+    fn media_columns_name_their_kind() {
+        let (s, _) = create("CREATE TABLE photos (id KEYWORD PRIMARY KEY, image MEDIA OPTIONS(kind = 'image'), any_file MEDIA, scan MEDIA OPTIONS(kind = 'PDF', indexed = false))", &[]).unwrap();
+        let f = |n: &str| s.field(n).unwrap();
+        assert_eq!((f("image").media, f("any_file").media, f("scan").media), (Some(MediaKind::Image), Some(MediaKind::Any), Some(MediaKind::Pdf)));
+        assert!(f("image").ty == FieldType::Keyword && f("image").stored && f("image").indexed && !f("scan").indexed);
+        assert_eq!(f("image").type_name(), "MEDIA");
+        assert_eq!(s.features().collect::<Vec<_>>(), ["media", "media", "media"]);
+        assert_eq!(s.to_short_json()["fields"][1], serde_json::json!({"name": "image", "type": "media", "kind": "image"}));
+        assert_eq!(s.to_short_json()["fields"][2], serde_json::json!({"name": "any_file", "type": "media"}));
+        assert_eq!(Schema::from_json_value(&s.to_short_json()).unwrap(), s);
+        assert_eq!(serde_json::from_str::<Schema>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        for (bad, says) in [
+            ("CREATE TABLE t (a MEDIA OPTIONS(kind = 'smell'))", "kind is"),
+            ("CREATE TABLE t (a KEYWORD OPTIONS(kind = 'image'))", "not an option of a KEYWORD"),
+            ("CREATE TABLE t (a MEDIA OPTIONS(stored = false))", "is stored"),
+            ("CREATE TABLE t (a MEDIA PRIMARY KEY)", "neither the key"),
+            ("CREATE TABLE t (a MEDIA DEFAULT 'x')", "given a default"),
+            ("CREATE TABLE t (a MEDIA REFERENCES t)", "neither the key, a reference"),
+            ("CREATE TABLE t (a MEDIA[])", "only KEYWORD[] and INT[]"),
+            ("CREATE TABLE t (a MEDIA, b TEXT OPTIONS(from = 'a'))", "not a source of text"),
+            ("CREATE TABLE t (a MEDIA, e VECTOR OPTIONS(embed = 'a', model = 'hash:8'))", "is of kind image"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, a MEDIA NOT NULL) OPTIONS(shard_by = 'a')", "KEYWORD or INT"),
+        ] {
+            let e = create(bad, &[]).unwrap_err().to_string();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_table_is_placed_by_a_column() {
+        let (s, _) = create("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, ts INT) OPTIONS(shard_by = 'USR')", &[]).unwrap();
+        assert_eq!(s.shard_by.as_deref(), Some("usr"));
+        assert_eq!(s.shard_by_field(), Some(1));
+        assert_eq!(s.features().collect::<Vec<_>>(), ["not_null", "shard_by"]);
+        assert_eq!(s.to_short_json()["shard_by"], "usr");
+        assert_eq!(Schema::from_json_value(&s.to_short_json()).unwrap(), s);
+        assert_eq!(serde_json::from_str::<Schema>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        // A table without the option serializes as before it existed.
+        let plain = create("CREATE TABLE t (id INT PRIMARY KEY)", &[]).unwrap().0;
+        assert!(!serde_json::to_string(&plain).unwrap().contains("shard_by") && plain.to_short_json().get("shard_by").is_none());
+        for (bad, says) in [
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD) OPTIONS(shard_by = 'u')", "NOT NULL"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(shard_by = 'v')", "not a field"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(shard_by = 'id')", "by their key already"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u TEXT NOT NULL) OPTIONS(shard_by = 'u')", "KEYWORD or INT"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD[] NOT NULL) OPTIONS(shard_by = 'u')", "single-valued"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u TIMESTAMP NOT NULL) OPTIONS(shard_by = 'u')", "KEYWORD or INT"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(shard_by = 3)", "names a column"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(color = 'u')", "not an option of a table"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(shard_by = 'u', shard_by = 'u')", "given twice"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) WITH (shard_by = 'u')", "not supported"),
+        ] {
+            let e = create(bad, &[]).unwrap_err().to_string();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
     }
 
     #[test]

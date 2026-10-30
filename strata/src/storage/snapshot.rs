@@ -26,6 +26,7 @@ use crate::segment::build::BuildOptions;
 use crate::segment::{DocFilter, DocId, SegmentFile};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
+use crate::storage::manifest::RankProfile;
 use crate::storage::pk::PkIndex;
 use crate::storage::rowseq;
 use crate::storage::state::{SegHandle, State};
@@ -73,6 +74,7 @@ pub(crate) struct SnapInner {
 struct TableView {
     id: u32,
     schema: Arc<Schema>,
+    profiles: Arc<Vec<RankProfile>>,
     segments: Vec<SegmentView>,
     pks: Vec<Option<PkIndex>>,
     n_live: u64,
@@ -140,6 +142,16 @@ impl Snapshot {
     /// The schema of the table this snapshot looks at.
     pub fn schema(&self) -> &Schema {
         &self.view().schema
+    }
+
+    /// The rank profiles of the table this snapshot looks at, by name.
+    pub fn rank_profiles(&self) -> &[RankProfile] {
+        &self.view().profiles
+    }
+
+    /// Its rank profile named `name` (any case).
+    pub fn rank_profile(&self, name: &str) -> Option<&RankProfile> {
+        self.rank_profiles().iter().find(|p| p.name.eq_ignore_ascii_case(name))
     }
 
     /// The same version, looking at the table named `name` (any case).
@@ -301,6 +313,7 @@ pub(crate) struct MemPart {
 pub(crate) struct TableCapture {
     id: u32,
     pub schema: Arc<Schema>,
+    profiles: Arc<Vec<RankProfile>>,
     disk: Vec<(Arc<SegHandle>, Option<Arc<LiveDocs>>, u32, Option<Arc<Updates>>)>,
     pub mem: Vec<MemPart>,
 }
@@ -375,7 +388,7 @@ impl State {
             let seqs = (numbered && seg.is_none()).then(|| (first..first + len).map(|p| table.mem.seqs.get(p).copied().unwrap_or(0)).collect());
             mem.push(MemPart { table: table.id, gen, chunk: k, len, docs, live, n_live: (len - n_deleted) as u32, seg, updates, seqs });
         }
-        TableCapture { id: table.id, schema: table.schema.clone(), disk, mem }
+        TableCapture { id: table.id, schema: table.schema.clone(), profiles: table.profiles.clone(), disk, mem }
     }
 
     /// The cached segment of the first `len` documents of chunk `k` of
@@ -447,7 +460,7 @@ impl Capture {
                 });
             }
             let n_live = segments.iter().map(|s| s.n_live as u64).sum();
-            tables.push(TableView { id: t.id, schema: t.schema, segments, pks, n_live });
+            tables.push(TableView { id: t.id, schema: t.schema, profiles: t.profiles, segments, pks, n_live });
         }
         SnapInner { txn: self.txn, numbered: self.numbered, seq: self.seq, tables, maps, path, _pin: self.pin }
     }

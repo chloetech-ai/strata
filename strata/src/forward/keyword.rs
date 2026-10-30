@@ -22,6 +22,9 @@
 //!   facets go through the postings. INT values are stored as [`int_key`]
 //!   strings, whose byte order is numeric order, so a range is a run of
 //!   codes.
+//!
+//! A MEDIA field ([`Field::media`]) is a keyword column of its values'
+//! `sha256`: the doc store keeps the whole value.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -85,6 +88,8 @@ pub(crate) struct KeywordBuilder {
     /// Provisional id (first-seen order) per document.
     docs: Vec<Option<u32>>,
     multi: bool,
+    /// A MEDIA field ([`Field::media`]), indexed by its values' `sha256`.
+    media: bool,
     /// A multi-valued field's values after each document's first.
     extra: Vec<(DocId, u32)>,
 }
@@ -92,11 +97,16 @@ pub(crate) struct KeywordBuilder {
 impl KeywordBuilder {
     pub fn new(field: &Field, opts: &BuildOptions) -> Result<Self> {
         let rare = super::usize_option(opts, "forward.kw_rare", DEFAULT_RARE)?;
-        Ok(KeywordBuilder { name: field.name.clone(), rare, ids: HashMap::new(), docs: Vec::new(), multi: field.multi, extra: Vec::new() })
+        Ok(KeywordBuilder { name: field.name.clone(), rare, ids: HashMap::new(), docs: Vec::new(), multi: field.multi, media: field.media.is_some(), extra: Vec::new() })
     }
 
     fn id(&mut self, v: &Value) -> Result<u32> {
+        let hash;
         let key = match (v, self.multi) {
+            (Value::Str(s), _) if self.media => {
+                hash = crate::media::hash_of(s).ok_or_else(|| Error::Schema(format!("{}: not a MEDIA value", self.name)))?;
+                Cow::Borrowed(hash.as_str())
+            }
             (Value::Str(_), _) | (Value::Int(_), true) => key_of(v).expect("string or integer"),
             _ => return Err(Error::Schema(format!("{}: not a string", self.name))),
         };
@@ -482,6 +492,15 @@ impl KeywordColumn {
             return b - a;
         }
         self.pyr_codes.binary_search(&code).map_or(0, |i| self.lists.card(i) as usize)
+    }
+
+    /// Number of documents with value `code` among those set in `words`
+    /// (a bitset of the segment's documents).
+    pub fn count_code_in(&self, code: u32, words: &[u64]) -> u64 {
+        match self.list(code) {
+            List::Rare(d) => d.iter().filter(|&&d| words[d as usize / 64] >> (d % 64) & 1 == 1).count() as u64,
+            List::Pyramid(p) => p.and_count_bits(words),
+        }
     }
 
     /// Number of documents with `value`.

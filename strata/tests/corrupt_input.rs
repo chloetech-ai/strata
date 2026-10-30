@@ -72,6 +72,16 @@ fn arbitrary_sql() {
 }
 
 #[test]
+fn damaged_media_and_arbitrary_media_values() {
+    for v in [r#"{"uri":"a.png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}"#, r#"{"data":"AAAA"}"#, r#"{"uri":"file:///etc/passwd"}"#, "https://cdn/a.png", r#"{"uri":"x","data":"!!"}"#] {
+        harness::media(&[[0].as_slice(), v.as_bytes()].concat());
+    }
+    for data in inputs(7, 4000, 60) {
+        harness::media(&data);
+    }
+}
+
+#[test]
 fn arbitrary_text_queries() {
     for q in ["alpha", "\"bravo charlie\" -delta", "(echo OR golf) AND NOT kilo", "lim* india~2", "a'b", ""] {
         harness::text_query(q.as_bytes());

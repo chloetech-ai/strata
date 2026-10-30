@@ -57,6 +57,9 @@ pub struct MergeStats {
     pub docs_merged: u64,
     /// Deleted documents dropped.
     pub docs_dropped: u64,
+    /// Documents past their table's retention dropped
+    /// ([`crate::schema::Schema::with_retain`]).
+    pub docs_expired: u64,
     pub bytes_written: u64,
     pub seconds: f64,
     /// Merges the policy selected that were made smaller, or left for

@@ -44,8 +44,11 @@ use crate::query::ir::eval;
 use crate::query::ir::{self, ArithOp, CmpOp, Func, When};
 use crate::query::ops;
 use crate::query::sql::{Sub, Subs};
+use crate::query::logical::{OrderBy, Phase, Select};
+use crate::query::rank::Rank;
 use crate::query::{AggFn, Params, Projection};
 use crate::schema::{FieldType, Schema};
+use crate::storage::RankProfile;
 use crate::value::Value;
 
 /// Rows one part of a compound query reads at most (a side of a join, a
@@ -57,9 +60,9 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// Functions that only the executor evaluates: they name one side of a join.
-const NATIVE: [&str; 13] = ["match", "bm25", "similarity", "distance", "rrf", "ppr", "decay", "reachable", "path", "hops", "score", "now", "near"];
+const NATIVE: [&str; 14] = ["match", "bm25", "similarity", "distance", "maxsim", "rrf", "ppr", "decay", "reachable", "path", "hops", "score", "now", "near"];
 /// Score functions, which order a side's scan.
-const SCORES: [&str; 7] = ["bm25", "similarity", "distance", "rrf", "ppr", "decay", "hops"];
+const SCORES: [&str; 8] = ["bm25", "similarity", "distance", "maxsim", "rrf", "ppr", "decay", "hops"];
 const AGGREGATES: [&str; 5] = ["count", "sum", "avg", "min", "max"];
 
 fn fname(f: &sql::Function) -> String {
@@ -109,7 +112,7 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
             }
             Expr::Subquery(q) if seeds.contains(&(x as *const Expr)) => found |= needs(q, schema) || !matches!(q.body.as_ref(), sql::SetExpr::Select(_)),
             Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_) => found = true,
-            _ => {}
+            _ => found |= of_rows(x),
         })
     };
     for e in select_exprs(s) {
@@ -125,9 +128,24 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
     found
 }
 
+/// Whether `e` (outside subqueries) computes a value of rows that a scan
+/// does not: a semantic ID's prefix, `sid_at(..)`, or a dot product of
+/// vectors, `dot(..)`, which operators compute over the rows the scan
+/// returns.
+fn of_rows(e: &Expr) -> bool {
+    let mut found = false;
+    walk(e, &mut |x| found |= matches!(x, Expr::Function(f) if matches!(fname(f).as_str(), "sid_at" | "dot")));
+    found
+}
+
+/// Whether a SELECT's columns or ORDER BY compute [`of_rows`] values.
+fn rows_of(q: &sql::Query, s: &sql::Select) -> bool {
+    select_exprs(s).into_iter().any(of_rows) || q.order_by.as_ref().is_some_and(|ob| matches!(&ob.kind, sql::OrderByKind::Expressions(es) if es.iter().any(|e| of_rows(&e.expr))))
+}
+
 /// The expressions of a SELECT outside its FROM and ORDER BY.
 fn select_exprs(s: &sql::Select) -> Vec<&Expr> {
-    let mut out: Vec<&Expr> = Vec::new();
+    let mut out: Vec<&Expr> = distinct_on(s).iter().collect();
     for item in &s.projection {
         match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => out.push(e),
@@ -218,6 +236,38 @@ pub fn plan(sql_text: &str, schema: &Schema, params: &Params) -> Result<ir::Plan
 /// [`plan`] of a query that may read any of the tables of `catalog`.
 pub fn plan_in(sql_text: &str, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
     plan_query(&*parse(sql_text)?, catalog, params)
+}
+
+/// A table's rank profile by name, the table and the name in any case
+/// ([`crate::storage::Database::rank_profiles`]).
+pub type Profiles<'a> = &'a dyn Fn(&str, &str) -> Option<RankProfile>;
+
+/// The plan of a SELECT over the tables of `catalog` (the first table
+/// first), as [`crate::db::Db::query`] binds it: a query of one table that
+/// needs no operators ([`is_compound`]) is one search of the table it
+/// names, and any other a plan of operators ([`plan_in`]). A query that
+/// ranks by a rank profile (`ORDER BY rank_profile(..)`) plans as written
+/// out with the one `profiles` finds ([`super::profile::expand`]), and its
+/// plan names it. A server binds its requests against its database's
+/// tables with it.
+pub fn plan_read(sql_text: &str, catalog: &[&Schema], params: &Params, profiles: Profiles) -> Result<ir::Plan> {
+    plan_read_query(&*super::sql::parse_query(sql_text)?, catalog, params, profiles)
+}
+
+/// [`plan_read`] of a parsed query.
+pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Params, profiles: Profiles) -> Result<ir::Plan> {
+    if let Some((q, r)) = super::profile::expand(q, profiles)? {
+        let table = super::tables::read_by(&q).first().cloned().unwrap_or_default();
+        return Ok(super::profile::mark(plan_read_query(&q, catalog, params, &|_, _| None)?, &table, &r));
+    }
+    let schema = match super::tables::read_by(q).first() {
+        None => *catalog.first().ok_or_else(|| err("the database has no tables"))?,
+        Some(t) => catalog.iter().copied().find(|s| s.table.eq_ignore_ascii_case(t)).ok_or_else(|| err(format!("no such table: {t}")))?,
+    };
+    if needs(q, schema) {
+        return plan_query(q, catalog, params);
+    }
+    Ok(ir::Plan::of_select(schema, &super::sql::bind_query(q, schema, params)?))
 }
 
 /// [`plan_in`] of a parsed query.
@@ -322,6 +372,9 @@ impl<'a> Planner<'a> {
 
     /// [`Planner::query`], its `WITH` results in scope until it returns.
     fn scoped(&self, q: &sql::Query) -> Result<Planned> {
+        if let Some(p) = self.phased(q)? {
+            return Ok(p);
+        }
         let mut defs = Vec::new();
         if let Some(w) = &q.with {
             if w.recursive {
@@ -351,6 +404,148 @@ impl<'a> Planner<'a> {
         })
     }
 
+    /// A `WITH` that ranks a table's rows and cuts them, ranked again by
+    /// the next `WITH` or the query itself, as one Search with rerank
+    /// phases ([`ir::Phase`]): each phase ranks the rows of the one before
+    /// by an expression, best first.
+    ///
+    /// ```sql
+    /// WITH top AS (SELECT * FROM docs WHERE year > 2020 ORDER BY bm25(body, :q) DESC LIMIT 100)
+    /// SELECT id, score() FROM top ORDER BY bm25(body, :q) * (1 + 0.1 * rating) DESC LIMIT 10
+    /// ```
+    ///
+    /// Every row a phase reads goes on, ranked by the phase (one it gives
+    /// no value last, rows tied in the order they had), and an outer
+    /// ranking may read any of the table's columns, as the rows are the
+    /// table's. Each `WITH` after the first, and the query, reads the one
+    /// before alone, with no `WHERE`, grouping or subquery, and ranks by one
+    /// expression `DESC`; each `WITH` keeps the table's columns (`*`) and
+    /// has a `LIMIT`. `None` for any other query, or one that does not
+    /// bind so, which plans as the table restricted to the `WITH` result's
+    /// keys ([`Planner::over_rows`]).
+    fn phased(&self, q: &sql::Query) -> Result<Option<Planned>> {
+        let Some(w) = q.with.as_ref().filter(|w| !w.recursive && w.cte_tables.iter().all(|c| c.alias.columns.is_empty())) else { return Ok(None) };
+        let mut body = q.clone();
+        body.with = None;
+        // The first `WITH`, its table and alias.
+        let first = &w.cte_tables[0].query;
+        let Some((s0, name)) = one_table(first) else { return Ok(None) };
+        let Some(schema) = self.table(&name).filter(|_| self.cte(&name).is_none()) else { return Ok(None) };
+        let simple = |s: &sql::Select| s.distinct.is_none() && s.having.is_none() && matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty());
+        if first.with.is_some() || !simple(s0) {
+            return Ok(None);
+        }
+        // Each later step: what it projects, ranks by and cuts, its
+        // columns named without the `WITH` it reads.
+        let mut steps = Vec::new();
+        let reads: Vec<&sql::Query> = w.cte_tables[1..].iter().map(|c| c.query.as_ref()).chain(std::iter::once(&body)).collect();
+        for (i, r) in reads.iter().enumerate() {
+            let read = &w.cte_tables[i].alias.name.value;
+            let Some((s, from)) = one_table(r) else { return Ok(None) };
+            let alias = match &s.from[0].relation {
+                TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+                _ => None,
+            };
+            let mut subquery = false;
+            let mut exprs = select_exprs(s);
+            if let Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) = &r.order_by {
+                exprs.extend(es.iter().map(|o| &o.expr));
+            }
+            for e in exprs {
+                walk(e, &mut |x| subquery |= matches!(x, Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }));
+            }
+            let order = match &r.order_by {
+                Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) if es.len() == 1 => &es[0],
+                _ => return Ok(None),
+            };
+            let ranks = order.options.asc == Some(false)
+                && order.options.nulls_first.is_none()
+                && !matches!(&order.expr, Expr::Value(_))
+                && !matches!(&order.expr, Expr::Function(f) if matches!(fname(f).as_str(), "hops" | "distance"));
+            if !from.eq_ignore_ascii_case(read) || r.with.is_some() || !simple(s) || s.selection.is_some() || subquery || !ranks {
+                return Ok(None);
+            }
+            let plain = |e: &Expr| {
+                let e = unqualify(e, read);
+                alias.as_deref().map_or(e.clone(), |a| unqualify(&e, a))
+            };
+            let projection = s
+                .projection
+                .iter()
+                .map(|item| match item {
+                    SelectItem::UnnamedExpr(e) => SelectItem::UnnamedExpr(plain(e)),
+                    SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias { expr: plain(expr), alias: alias.clone() },
+                    other => other.clone(),
+                })
+                .collect();
+            let mut o = order.clone();
+            o.expr = plain(&order.expr);
+            steps.push((projection, o, r.limit_clause.clone()));
+        }
+        // Each phase's ranking, first to last, for `features()`.
+        let orders: Vec<Expr> = match &first.order_by {
+            Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) if !es.is_empty() => {
+                std::iter::once(es[0].expr.clone()).chain(steps.iter().map(|(_, o, _)| o.expr.clone())).collect()
+            }
+            _ => return Ok(None),
+        };
+        // Each step binds as the first `WITH` with its own columns, ranking
+        // and cut, so that its graphs and parameters line up; the last with
+        // the rankings before it.
+        let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind, Some(schema));
+        let bind = |projection: Option<Vec<SelectItem>>, order: Option<sql::OrderByExpr>, cut: Option<sql::LimitClause>, earlier: &[Expr]| -> Option<Select> {
+            let mut q = first.as_ref().clone();
+            let sql::SetExpr::Select(s) = q.body.as_mut() else { return None };
+            if let Some(p) = projection {
+                s.projection = p;
+            }
+            if let (Some(o), Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. })) = (order, &mut q.order_by) {
+                *es = vec![o];
+            }
+            q.limit_clause = cut;
+            super::sql::bind_phase_with(&q, schema, self.params, &subs as &Subs, earlier).ok()
+        };
+        let keyed = |s: &Select| {
+            s.group_by.is_empty()
+                && s.projection.iter().all(|(name, p)| match p {
+                    Projection::Field(f) => schema.fields[*f].name.eq_ignore_ascii_case(name),
+                    Projection::Score | Projection::Hops(_) => true,
+                    _ => false,
+                })
+        };
+        let Some(base) = bind(None, None, first.limit_clause.clone(), &[]) else { return Ok(None) };
+        let mut count = match limits(&first.limit_clause, self.params) {
+            Ok((0, Some(n))) if n > 0 && base.order.is_some() && base.tiebreak.is_none() && keyed(&base) => n,
+            _ => return Ok(None),
+        };
+        let mut phases: Vec<Phase> = Vec::new();
+        let last = steps.len() - 1;
+        let mut out = None;
+        for (i, (projection, order, cut)) in steps.into_iter().enumerate() {
+            let earlier = if i == last { &orders[..=i] } else { &[] };
+            let Some(s) = bind(Some(projection), Some(order), cut.clone(), earlier) else { return Ok(None) };
+            let Some(OrderBy::Score { score, desc: true, nulls_first: false }) = s.order.clone() else { return Ok(None) };
+            if s.tiebreak.is_some() || s.graphs != base.graphs || s.projection.iter().any(|(_, p)| *p == Projection::SeqNo) {
+                return Ok(None);
+            }
+            let global = phases.last().is_some_and(|p| p.global) || Rank::is_global(&score);
+            phases.push(Phase { score, count, global });
+            if i < last {
+                count = match limits(&cut, self.params) {
+                    Ok((0, Some(n))) if n > 0 && keyed(&s) => n,
+                    _ => return Ok(None),
+                };
+            } else {
+                out = Some(s);
+            }
+        }
+        let Some(s) = out else { return Ok(None) };
+        let select = Select { order: base.order, phases, ..s };
+        let columns = select.projection.iter().map(|(n, _)| n.clone()).collect();
+        let keyed = keyed(&select).then(|| schema.table.clone());
+        Ok(Some(Planned { node: ir::Plan::of_select(schema, &select).root, columns, keyed }))
+    }
+
     fn body(&self, q: &sql::Query) -> Result<Planned> {
         let sql::SetExpr::Select(s) = q.body.as_ref() else { return Err(err("UNION, INTERSECT and EXCEPT are not supported")) };
         if s.from.len() != 1 {
@@ -363,8 +558,8 @@ impl<'a> Planner<'a> {
             TableFactor::Table { name, .. } if self.cte(&super::sql::table_name(name)).is_some() => {
                 let cte = self.cte(&super::sql::table_name(name)).expect("in scope");
                 match cte.keyed.as_deref().and_then(|t| self.table(t)) {
-                    Some(schema) => self.over_rows(q, s, &cte, schema),
-                    None => self.join(q, s),
+                    Some(schema) if !rows_of(q, s) => self.over_rows(q, s, &cte, schema),
+                    _ => self.join(q, s),
                 }
             }
             TableFactor::Table { name, .. } => match self.table(&super::sql::table_name(name)) {
@@ -380,8 +575,14 @@ impl<'a> Planner<'a> {
     fn single(&self, q: &sql::Query, s: &sql::Select, schema: &Schema) -> Result<Planned> {
         let mut q = q.clone();
         let mut s = s.clone();
-        if s.distinct.is_some() {
-            distinct_to_group(&mut s)?;
+        match &s.distinct {
+            // The first row of each group: the scan's rows, kept by operators.
+            Some(sql::Distinct::On(_)) => return self.join(&q, &s),
+            Some(sql::Distinct::Distinct) => distinct_to_group(&mut s)?,
+            None => {}
+        }
+        if rows_of(&q, &s) {
+            return self.join(&q, &s);
         }
         q.body = Box::new(sql::SetExpr::Select(Box::new(s)));
         self.leaf(&q, "query", schema)
@@ -413,9 +614,10 @@ impl<'a> Planner<'a> {
     }
 
     /// The expression a subquery stands for: its one column's values (`IN`),
-    /// whether it has a row (`EXISTS`), its one value (a comparison), or the
-    /// keys of its rows (seeds; `None` for a subquery of the scanned table
-    /// `scanned`, which the executor runs itself).
+    /// whether it has a row (`EXISTS`), its one value (a comparison), or for
+    /// seeds the keys of its rows when they are rows of the scanned table
+    /// `scanned`, else its one column's values (`None` for a subquery of the
+    /// scanned table that the executor runs itself).
     fn subquery(&self, q: &sql::Query, kind: Sub, scanned: Option<&Schema>) -> Result<Option<ir::Expr>> {
         if kind == Sub::Seeds && scanned.is_some_and(|s| !needs(q, s)) {
             return Ok(None);
@@ -431,12 +633,19 @@ impl<'a> Planner<'a> {
                 one("a subquery in IN")?;
                 ir::Expr::Values(node)
             }
+            Sub::Vectors => {
+                one("a subquery of query vectors")?;
+                ir::Expr::Values(node)
+            }
             Sub::Exists => ir::Expr::Exists(node),
             Sub::Scalar => {
                 one("a scalar subquery")?;
                 ir::Expr::Scalar(node)
             }
-            Sub::Seeds if p.keyed.is_some() => ir::Expr::Keys(node),
+            // Rows of the scanned table seed by their keys. Rows of another
+            // table seed by the values of their one column: `(SELECT item
+            // FROM events ...)` starts from the items, not from the events.
+            Sub::Seeds if p.keyed.as_deref().is_some_and(|t| scanned.is_none_or(|s| s.table.eq_ignore_ascii_case(t))) => ir::Expr::Keys(node),
             Sub::Seeds => {
                 one("a subquery of seeds")?;
                 ir::Expr::Values(node)
@@ -546,7 +755,7 @@ impl<'a> Planner<'a> {
             let at = sides.of(&c)?;
             let left_join_right = |i: usize| srcs[i].join.as_ref().is_some_and(|(k, _)| *k == ir::JoinKind::Left);
             match at.as_slice() {
-                [i] if !in_memory(*i) && !left_join_right(*i) => pushed[*i].push(c),
+                [i] if !in_memory(*i) && !left_join_right(*i) && !of_rows(&c) => pushed[*i].push(c),
                 _ => residual.push(c),
             }
         }
@@ -641,7 +850,7 @@ impl<'a> Planner<'a> {
         // in that order and keep it through the joins, so a cut needs only
         // as many of them as join into enough rows ([`ops`] grows its scan).
         let driver_order = !grouped
-            && s.distinct.is_none()
+            && !matches!(s.distinct, Some(sql::Distinct::Distinct))
             && match order.first() {
                 None => true,
                 Some(_) if mem_order.len() > 1 => false,
@@ -937,6 +1146,18 @@ fn unqualify(e: &Expr, alias: &str) -> Expr {
     e
 }
 
+/// A SELECT of one table or `WITH` result, with no join, and its name.
+pub(crate) fn one_table(q: &sql::Query) -> Option<(&sql::Select, String)> {
+    let sql::SetExpr::Select(s) = q.body.as_ref() else { return None };
+    match s.from.as_slice() {
+        [t] if t.joins.is_empty() => match &t.relation {
+            TableFactor::Table { name, .. } => Some((s, super::sql::table_name(name))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn qualified(alias: &str, column: &str) -> Expr {
     Expr::CompoundIdentifier(vec![sql::Ident::new(alias), sql::Ident::new(column)])
 }
@@ -946,7 +1167,7 @@ fn qualified(alias: &str, column: &str) -> Expr {
 /// (`"order"`, `"doc id"`), and the operand of a sign in parentheses when
 /// it starts with a sign itself (`- -1` would print as `--1`, which
 /// starts a comment).
-fn printable(q: &sql::Query) -> String {
+pub(crate) fn printable(q: &sql::Query) -> String {
     let mut q = q.clone();
     query_mut(&mut q, &mut |e| match e {
         Expr::Identifier(id) => quote(id),
@@ -969,13 +1190,16 @@ fn quote(id: &mut sql::Ident) {
 
 /// Calls `f` on every expression of `q`'s SELECT, its subqueries' too,
 /// each before its subexpressions.
-fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
+pub(crate) fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
     if let Some(w) = &mut q.with {
         for cte in &mut w.cte_tables {
             query_mut(&mut cte.query, f);
         }
     }
     if let sql::SetExpr::Select(s) = q.body.as_mut() {
+        if let Some(sql::Distinct::On(es)) = &mut s.distinct {
+            es.iter_mut().for_each(|e| walk_mut(e, f));
+        }
         for item in &mut s.projection {
             if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
                 walk_mut(e, f);
@@ -1067,6 +1291,14 @@ fn has_aggregate(s: &sql::Select) -> bool {
         }
     }
     found
+}
+
+/// The expressions of `DISTINCT ON (...)`: none for another SELECT.
+fn distinct_on(s: &sql::Select) -> &[Expr] {
+    match &s.distinct {
+        Some(sql::Distinct::On(es)) => es,
+        _ => &[],
+    }
 }
 
 /// `SELECT DISTINCT a, b` as `GROUP BY a, b`.
@@ -1253,13 +1485,18 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                 "abs" => Func::Abs,
                 "round" => Func::Round,
                 "coalesce" => Func::Coalesce,
+                "dot" if func_args(f).len() != 2 => return Err(err("dot(a, b) takes two vectors")),
+                "dot" => Func::Dot,
+                "sid_at" => Func::SidAt,
                 n if NATIVE.contains(&n) => {
                     return Err(err(format!("{}(...) works on one table's scan, in its WHERE or ORDER BY (in a join, on that table's column: a.body), not on values of rows", n.to_uppercase())))
                 }
                 n if AGGREGATES.contains(&n) => return Err(err(format!("{}(...) is an aggregate: it needs GROUP BY or a SELECT of aggregates, not a value of one row", n.to_uppercase()))),
                 n => return Err(err(format!("unknown function {n}"))),
             };
-            ir::Expr::Call { func, args: func_args(f).into_iter().map(go).collect::<Result<_>>()? }
+            let args: Vec<ir::Expr> = func_args(f).into_iter().map(go).collect::<Result<_>>()?;
+            func.arity(args.len()).map_err(|a| err(format!("{}() takes {a}", func.name())))?;
+            ir::Expr::Call { func, args }
         }
         e @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => return Err(err(format!("no such column: {e}"))),
         e => return Err(err(format!("unsupported expression: {e}"))),
@@ -1380,6 +1617,21 @@ impl Planner<'_> {
                 })
                 .collect()
         };
+        // DISTINCT ON: the first row of each group, in the order above.
+        let first_of = |node: ir::Node, items_at: &[ir::Expr], slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<ir::Node> {
+            let on = distinct_on(s);
+            if on.is_empty() {
+                return Ok(node);
+            }
+            let keys = on
+                .iter()
+                .map(|e| match by_alias(e) {
+                    Some(i) => Ok(items_at[i].clone()),
+                    None => compile_with(e, params, slot, multi, Some(&subs)),
+                })
+                .collect::<Result<_>>()?;
+            Ok(ir::Node::DistinctOn { input: Box::new(node), keys })
+        };
         let mut node = input;
         let items_at: Vec<ir::Expr> = if grouped {
             // The Aggregate's rows: its group values, its aggregates, and
@@ -1417,6 +1669,7 @@ impl Planner<'_> {
                     .collect(),
             };
             node = ir::Node::Sort { input: Box::new(node), keys };
+            node = first_of(node, &items_at, &group_slot, &[])?;
             items_at
         } else {
             let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_row(e, cols, multi, params, &subs)).collect::<Result<_>>()?;
@@ -1424,6 +1677,7 @@ impl Planner<'_> {
                 let keys = sort_keys(&items_at, &|e| at(slot(e, cols)), multi)?;
                 node = ir::Node::Sort { input: Box::new(node), keys };
             }
+            node = first_of(node, &items_at, &|e| at(slot(e, cols)), multi)?;
             items_at
         };
         let columns: Vec<String> = items.into_iter().map(|i| i.0).collect();
@@ -1435,9 +1689,9 @@ impl Planner<'_> {
             (0, None) => node,
             (o, l) => ir::Node::Limit { input: Box::new(node), offset: o as u64, limit: l.map(|l| l as u64) },
         };
-        let node = match s.distinct.is_some() {
-            true => cut(ir::Node::Distinct { input: Box::new(project(node)) }),
-            false => project(cut(node)),
+        let node = match s.distinct {
+            Some(sql::Distinct::Distinct) => cut(ir::Node::Distinct { input: Box::new(project(node)) }),
+            _ => project(cut(node)),
         };
         Ok(Planned { node, columns, keyed: None })
     }

@@ -131,7 +131,7 @@ fn queries() -> Vec<(&'static str, Json)> {
         ("SELECT id, score() FROM products ORDER BY similarity(emb, :q) DESC LIMIT 10", like.clone()),
         ("SELECT id, score() FROM products WHERE rating >= 4 ORDER BY similarity(emb, :q) DESC LIMIT 10", like.clone()),
         ("SELECT id, score() FROM products ORDER BY rrf(bm25(body, 'espresso'), similarity(emb, :q)) DESC LIMIT 10", like.clone()),
-        ("SELECT id, score() FROM products WHERE year >= 2020 ORDER BY 0.4 * bm25(body, 'recycled') + 0.6 * similarity(emb, :q) DESC LIMIT 15", like.clone()),
+        ("SELECT id, score() FROM products WHERE year >= 2020 ORDER BY 0.4 * minmax(bm25(body, 'recycled')) + 0.6 * minmax(similarity(emb, :q)) DESC LIMIT 15", like.clone()),
         ("SELECT id, price FROM products WHERE tags = 'bestseller' ORDER BY price ASC, id LIMIT 12", none.clone()),
         ("SELECT id, tags FROM products WHERE tags IN ('sale', 'new') AND MATCH(body, '\"cast iron\"') ORDER BY sold DESC, id LIMIT 10", none.clone()),
         ("SELECT brand, COUNT(*) FROM products WHERE MATCH(body, 'waterproof') GROUP BY brand ORDER BY 2 DESC, 1 LIMIT 8", none.clone()),
@@ -140,6 +140,10 @@ fn queries() -> Vec<(&'static str, Json)> {
         ("SELECT id, year, score() FROM products ORDER BY bm25(body, 'waterproof jacket') * decay(year, 2026, 2) DESC LIMIT 10", none.clone()),
         ("SELECT id, price, score() FROM products WHERE category = 'kitchen' ORDER BY decay(price, 50, 20, shape => 'gauss') DESC LIMIT 10", none.clone()),
         ("SELECT id, score() FROM products ORDER BY similarity(emb, :q) * decay(rating, 5, 1) DESC LIMIT 10", like.clone()),
+        // Ranking expressions: BM25 scored with the whole collection's
+        // statistics, and a rank-safe boost.
+        ("SELECT id, score() FROM products ORDER BY ln(1 + bm25(body, 'waterproof hiking')) + 0.1 * coalesce(rating, 0) DESC LIMIT 10", none.clone()),
+        ("SELECT id, score() FROM products WHERE price < 200 ORDER BY bm25(body, 'leather boots') * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 8", none.clone()),
     ]
 }
 
@@ -510,11 +514,22 @@ async fn coordinator_answers_like_one_database() {
     for sql in [
         "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE a.year >= - -2022 AND b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
         "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > - -100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
+        // Rerank phases: a second phase each shard scores, a global one.
+        "WITH top AS (SELECT * FROM products ORDER BY bm25(body, 'waterproof hiking') DESC LIMIT 60) SELECT id, score() FROM top ORDER BY bm25(body, 'boots') + coalesce(rating, 0) DESC LIMIT 10",
+        "WITH a AS (SELECT * FROM products WHERE price < 300 ORDER BY bm25(body, 'leather') DESC LIMIT 80), b AS (SELECT * FROM a ORDER BY rating DESC LIMIT 30) SELECT id, price, score() FROM b ORDER BY minmax(bm25(body, 'jacket')) - 0.5 * minmax(price) DESC LIMIT 8 OFFSET 2",
+        // Features: the fetch round scores BM25 with the query's
+        // statistics, and so does one round.
+        "SELECT id, title, features() FROM products ORDER BY bm25(body, 'waterproof hiking') * (1 + 0.1 * coalesce(rating, 0)) DESC LIMIT 10",
+        "SELECT id, bm25(body, 'boots') AS b, ln(1 + bm25(body, 'leather')) - 0.01 * price AS x FROM products ORDER BY price DESC LIMIT 12",
+        "WITH top AS (SELECT * FROM products ORDER BY bm25(body, 'waterproof hiking') DESC LIMIT 60) SELECT id, score(), features() FROM top ORDER BY bm25(body, 'boots') + coalesce(rating, 0) DESC LIMIT 10",
     ] {
         let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
         assert!(!want["rows"].as_array().unwrap().is_empty(), "{sql}");
         let got = coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
         same(sql, &want, &js::result(&got.rs, 0.0));
+        if sql.contains("features()") {
+            assert!(got.rs.stats.plan.iter().any(|l| l.starts_with("fetch: ")), "{sql}: {:?}", got.rs.stats.plan);
+        }
     }
     let h = coord.health().await;
     assert_eq!((h["status"].as_str(), h["docs"].as_u64()), (Some("ok"), Some(N as u64)), "{h}");
@@ -525,6 +540,7 @@ async fn coordinator_answers_like_one_database() {
         "SELECT id, price FROM products WHERE year >= 2020 ORDER BY price DESC, id LIMIT 7",
         "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > 100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
         "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
+        "WITH top AS (SELECT * FROM products ORDER BY bm25(body, 'waterproof hiking') DESC LIMIT 60) SELECT id, score() FROM top ORDER BY bm25(body, 'boots') + coalesce(rating, 0) DESC LIMIT 10",
     ] {
         let plan = match strata::query::compound::is_compound(sql, &coord.schema) {
             true => strata::query::compound::plan(sql, &coord.schema, &Params::new()).unwrap(),
@@ -594,7 +610,7 @@ impl pb::strata_server::Strata for Stuck {
         std::future::pending().await
     }
     async fn schema(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::SchemaResponse>, tonic::Status> {
-        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone() }))
+        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone(), ..Default::default() }))
     }
     async fn health(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
         std::future::pending().await
@@ -617,6 +633,16 @@ impl pb::strata_server::Strata for Stuck {
     async fn verify(&self, _: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
     }
+    type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
+    async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn sources(&self, _: tonic::Request<pb::SourcesRequest>) -> Result<tonic::Response<pb::SourcesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn sid_next(&self, _: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no semantic IDs here"))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -634,7 +660,7 @@ impl pb::strata_server::Strata for Overloaded {
         Err(tonic::Status::unimplemented("read only"))
     }
     async fn schema(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::SchemaResponse>, tonic::Status> {
-        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone() }))
+        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone(), ..Default::default() }))
     }
     async fn health(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::HealthResponse { status: "ok".into(), ..Default::default() }))
@@ -656,6 +682,16 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn verify(&self, _: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
+    }
+    type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
+    async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn sources(&self, _: tonic::Request<pb::SourcesRequest>) -> Result<tonic::Response<pb::SourcesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn sid_next(&self, _: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no semantic IDs here"))
     }
 }
 
@@ -901,6 +937,18 @@ impl pb::strata_server::Strata for Recording {
         self.up()?;
         self.inner.restore(r).await
     }
+    type WriteStreamStream = <strata_server::grpc::Grpc as pb::strata_server::Strata>::WriteStreamStream;
+    async fn write_stream(&self, r: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
+        self.up()?;
+        self.inner.write_stream(r).await
+    }
+    async fn sources(&self, r: tonic::Request<pb::SourcesRequest>) -> Result<tonic::Response<pb::SourcesResponse>, tonic::Status> {
+        self.up()?;
+        match self.version.load(Ordering::Relaxed) {
+            6.. => self.inner.sources(r).await,
+            _ => Err(tonic::Status::unimplemented("unknown method Sources")),
+        }
+    }
     async fn verify(&self, r: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         self.up()?;
         let delay = *self.delay.lock().unwrap();
@@ -909,6 +957,10 @@ impl pb::strata_server::Strata for Recording {
             true => self.inner.verify(r).await,
             false => Err(tonic::Status::unimplemented("unknown method Verify")),
         }
+    }
+    async fn sid_next(&self, r: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.sid_next(r).await
     }
 }
 
@@ -1118,8 +1170,13 @@ async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
     replica.shipped.lock().unwrap().clear();
     replica.down.store(false, Ordering::Relaxed);
     let last = pdb.storage().seq_no().unwrap().seq;
+    // The replica applies the last batch before its answer reaches the
+    // primary, which counts it in sync (and so compares it) only then.
     for _ in 0..200 {
-        if rdb.storage().seq_no().unwrap().seq == last && r.health().await["replication"]["serves_reads"] == true {
+        if rdb.storage().seq_no().unwrap().seq == last
+            && r.health().await["replication"]["serves_reads"] == true
+            && p.health().await["replication"]["replicas"][0]["in_sync"] == true
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1332,7 +1389,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
     let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 5, strata::query::ir::VERSION, 0));
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 7, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1358,9 +1415,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 6, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: 8, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 6"), "{}", e.message());
+    assert!(e.message().contains("protocol 8"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
@@ -1712,7 +1769,7 @@ fn imports_files_from_the_command_line() {
     std::fs::write(&rows, "{\"id\": \"a\", \"title\": \"first\"}\n{\"id\": \"b\", \"title\": \"second\", \"price\": 2}\n").unwrap();
     std::fs::write(&more, "id\ttitle\tprice\nb\tsecond again\t3\nc\tthird\t\n").unwrap();
     let db = dir.path().join("items.strata");
-    server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows.clone(), more], Default::default()).unwrap();
+    server::import_files(&db, Some(&schema), None, dir.path(), None, false, &[rows.clone(), more], Default::default()).unwrap();
     let opened = Db::open(&db, DbOptions::default()).unwrap();
     let r = opened.query("SELECT id, title, price FROM items", &Params::new()).unwrap();
     let mut got: Vec<String> = r.rows.iter().map(|r| format!("{:?}", r)).collect();
@@ -1721,7 +1778,7 @@ fn imports_files_from_the_command_line() {
     assert!(got[1].contains("second again") && got[1].contains("3.0"), "{got:?}");
     drop(opened);
     // An existing database takes no schema.
-    assert!(server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows], Default::default()).unwrap_err().contains("exists"));
+    assert!(server::import_files(&db, Some(&schema), None, dir.path(), None, false, &[rows], Default::default()).unwrap_err().contains("exists"));
 }
 
 #[test]
@@ -1731,7 +1788,7 @@ fn sqlite_files_from_and_to_the_command_line() {
     std::fs::write(&schema, ITEMS).unwrap();
     std::fs::write(&rows, "{\"id\": \"a\", \"title\": \"first\"}\n{\"id\": \"b\", \"title\": \"second\", \"price\": 2}\n").unwrap();
     let db = dir.path().join("items.strata");
-    server::import_files(&db, Some(&schema), dir.path(), None, false, std::slice::from_ref(&rows), Default::default()).unwrap();
+    server::import_files(&db, Some(&schema), None, dir.path(), None, false, std::slice::from_ref(&rows), Default::default()).unwrap();
     let out = dir.path().join("items.sqlite");
     server::export_sqlite(&db, &out, &Default::default()).unwrap();
     assert!(strata::sqlite::is_sqlite_file(&out));
@@ -1739,11 +1796,11 @@ fn sqlite_files_from_and_to_the_command_line() {
     // --plan writes nothing, and is for SQLite files.
     let back = dir.path().join("back.strata");
     let plan = || server::SqliteImport { plan: true, ..Default::default() };
-    server::import_files(&back, None, dir.path(), None, false, std::slice::from_ref(&out), plan()).unwrap();
+    server::import_files(&back, None, None, dir.path(), None, false, std::slice::from_ref(&out), plan()).unwrap();
     assert!(!back.exists());
-    assert!(server::import_files(&back, None, dir.path(), None, false, std::slice::from_ref(&rows), plan()).unwrap_err().contains("--plan"));
+    assert!(server::import_files(&back, None, None, dir.path(), None, false, std::slice::from_ref(&rows), plan()).unwrap_err().contains("--plan"));
     // A new database from the SQLite file: the schema it kept, and the rows.
-    server::import_files(&back, None, dir.path(), None, false, &[out], Default::default()).unwrap();
+    server::import_files(&back, None, None, dir.path(), None, false, &[out], Default::default()).unwrap();
     let (a, b) = (Db::open(&db, DbOptions::default()).unwrap(), Db::open(&back, DbOptions::default()).unwrap());
     assert_eq!(a.schema().to_short_json(), b.schema().to_short_json());
     assert_eq!(b.snapshot().n_live_docs(), 2);
@@ -2167,6 +2224,22 @@ async fn explain_gives_the_plan_ir() {
         "{r}"
     );
     assert!(r["plan"].as_array().is_some_and(|p| !p.is_empty()), "{r}");
+    assert!(r.get("hits").is_none(), "{r}");
+    // `hits`: the top rows with the values they were ranked by.
+    let boosted = "SELECT id, price FROM products ORDER BY bm25(body, 'quiet kettle') * (1 + 0.1 * coalesce(rating, 0)) DESC LIMIT 5";
+    let (status, h) = post(&c, &format!("{base}/v1/explain"), json!({ "sql": boosted, "hits": 3 })).await;
+    assert_eq!(status, 200, "{h}");
+    let hits = h["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3, "{h}");
+    let (_, want) = post(&c, &format!("{base}/v1/query"), json!({ "sql": boosted })).await;
+    for (i, hit) in hits.iter().enumerate() {
+        assert_eq!(hit["id"], want["rows"][i][0], "{h}");
+        let (score, bm25, rating) = (hit["score()"].as_f64().unwrap(), hit["bm25(body, 'quiet kettle')"].as_f64().unwrap(), hit["rating"].as_f64().unwrap_or(0.0));
+        assert!((score - bm25 * (1.0 + 0.1 * rating)).abs() < 1e-9 * score.max(1.0), "{hit}");
+        assert_eq!(hit["bm25(body, 'quiet kettle') * (1 + 0.1 * coalesce(rating, 0))"], hit["score()"], "{hit}");
+    }
+    let (status, e) = post(&c, &format!("{base}/v1/explain"), json!({ "sql": "SELECT id FROM products LIMIT 3", "hits": 3 })).await;
+    assert!(status == 400 && e["error"].as_str().unwrap().contains("ORDER BY"), "{e}");
     // POST /v1/plan runs that plan as /v1/query runs the SQL, and a write
     // plan as /v1/sql runs the statement.
     let (status, want) = post(&c, &format!("{base}/v1/query"), json!({ "sql": sql })).await;
@@ -2513,4 +2586,102 @@ async fn a_coordinator_writes_to_the_promoted_primary() {
 
 fn last_of(db: &Db) -> u64 {
     db.storage().numbering().unwrap().seq
+}
+
+/// The next codes of semantic-ID prefixes over HTTP, and from a
+/// coordinator, which sums its shards': as the embedded database answers.
+/// A shard of an older protocol is named in the error.
+#[tokio::test(flavor = "multi_thread")]
+async fn next_semantic_id_codes_over_http_and_shards() {
+    use std::collections::BTreeMap;
+    use strata::schema::{Field, FieldType, Schema};
+    use strata::sid::Codebook;
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    // A vector near (10a + 1-or-minus-1, 10b + ...) has code a.b of a 2 x 4
+    // grid codebook in two dimensions.
+    let l0: Vec<f32> = [[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]].concat();
+    let l1: Vec<f32> = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]].concat();
+    Codebook::new(2, 4, vec![l0.clone(), l1.clone()]).unwrap().save("grid", &models).unwrap();
+    let schema = Schema::new(
+        "items",
+        vec![
+            Field::new("id", FieldType::Keyword),
+            Field::new("tag", FieldType::Keyword),
+            Field::new("emb", FieldType::Vector { dim: 2, index: strata::VectorIndexKind::Flat }),
+            Field::semantic_id("sid", "emb", "grid"),
+        ],
+        Some("id"),
+    )
+    .unwrap();
+    let rows: Vec<Vec<Value>> = (0..400)
+        .map(|i| {
+            let (a, b) = ((i * 5 + i / 7) % 4, (i * 3 + i / 11) % 4);
+            let v = vec![l0[2 * a] + l1[2 * b] + 0.01 * (i % 5) as f32, l0[2 * a + 1] + l1[2 * b + 1]];
+            vec![Value::Str(format!("i{i:04}")), Value::Str(["red", "blue"][i % 2].into()), Value::Vector(v.into()), Value::Null]
+        })
+        .collect();
+    let make = |name: &str, keep: &dyn Fn(&Value) -> bool| {
+        let db = Db::create_in(&dir.path().join(name), schema.clone(), DbOptions::default(), &models).unwrap();
+        db.load(rows.iter().filter(|r| keep(&r[0])).cloned()).unwrap();
+        db
+    };
+    let whole = make("whole.strata", &|_| true);
+    let prefixes: Vec<String> = ["", "0", "1", "2.3", "3.1", "1.2.4", "7"].map(String::from).to_vec();
+    let want = |filter: Option<&str>| whole.sid_next("items", "sid", &prefixes, filter, &Params::new()).unwrap();
+    assert!(want(None)[0].len() == 4 && want(None)[2].len() == 4, "{:?}", want(None));
+    let as_json = |next: Vec<Vec<(String, u64)>>| -> Json {
+        prefixes.iter().zip(next).map(|(p, cs)| json!({"prefix": p, "next": cs.into_iter().map(|(code, count)| json!({"code": code, "count": count})).collect::<Vec<_>>()})).collect()
+    };
+
+    // Over HTTP.
+    let url = http(service(make("http.strata", &|_| true), "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let (status, got) = post(&c, &format!("{url}/v1/sid/next"), json!({"field": "sid", "prefixes": prefixes, "where": "tag = :t", "params": {"t": "red"}})).await;
+    assert_eq!(status, 200, "{got}");
+    assert_eq!(got["next"], as_json(want(Some("tag = 'red'"))));
+    let (status, got) = post(&c, &format!("{url}/v1/sid/next"), json!({"table": "items", "field": "sid", "prefixes": prefixes})).await;
+    assert_eq!((status, &got["next"]), (200, &as_json(want(None))));
+    for (body, says) in [
+        (json!({"field": "sid"}), "prefixes"),
+        (json!({"field": "tag", "prefixes": [""]}), "not a semantic-ID field"),
+        (json!({"field": "sid", "prefixes": ["1..2"]}), "not a prefix"),
+        (json!({"field": "sid", "prefixes": [""], "where": "id IN (SELECT id FROM items)"}), "subqueries"),
+    ] {
+        let (status, got) = post(&c, &format!("{url}/v1/sid/next"), body.clone()).await;
+        assert_eq!(status, 400, "{body}: {got}");
+        assert!(got["error"].as_str().unwrap().contains(says), "{body}: {got}");
+    }
+
+    // A coordinator sums its shards'. Each shard numbers its own ties, so
+    // the levels' counts are the whole table's and a tie's are the sum of
+    // the shards' with that tie.
+    let mut urls = Vec::new();
+    let mut shards = Vec::new();
+    for s in 0..3 {
+        let db = make(&format!("s{s}.strata"), &|k| shard_of(k, 3) == s);
+        shards.push(make(&format!("c{s}.strata"), &|k| shard_of(k, 3) == s));
+        urls.push(recording(db, strata_server::grpc::PROTOCOL).await.0);
+    }
+    let coord = cluster(Coordinator::connect(urls.clone()).await.unwrap());
+    for filter in [None, Some("tag = 'blue'"), Some("sid = '2'")] {
+        let mut sums: Vec<BTreeMap<u32, (String, u64)>> = vec![BTreeMap::new(); prefixes.len()];
+        for db in &shards {
+            for (sum, next) in sums.iter_mut().zip(db.sid_next("items", "sid", &prefixes, filter, &Params::new()).unwrap()) {
+                for (code, k) in next {
+                    sum.entry(code.rsplit('.').next().unwrap().parse().unwrap()).or_insert((code, 0)).1 += k;
+                }
+            }
+        }
+        let summed: Vec<Vec<(String, u64)>> = sums.into_iter().map(|m| m.into_values().collect()).collect();
+        assert_eq!(summed[..3], want(filter)[..3], "{filter:?}");
+        let sql = format!("SELECT COUNT(*) FROM items{}", filter.map(|f| format!(" WHERE {f}")).unwrap_or_default());
+        let got = coord.sid_next(&sql, None, &Params::new(), "sid", &prefixes, &After::Any, 0).await.unwrap_or_else(|e| panic!("{filter:?}: {}", e.message));
+        assert_eq!(got, summed, "{filter:?}");
+    }
+    // One shard from before SidNext.
+    let (old, _) = recording(make("old.strata", &|k| shard_of(k, 3) == 2), 5).await;
+    let coord = cluster(Coordinator::connect(vec![urls[0].clone(), urls[1].clone(), old]).await.unwrap());
+    let e = coord.sid_next("SELECT COUNT(*) FROM items", None, &Params::new(), "sid", &prefixes, &After::Any, 0).await.unwrap_err();
+    assert!(e.message.contains("protocol 5") && e.message.contains("needs 7"), "{}", e.message);
 }

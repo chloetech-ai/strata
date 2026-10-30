@@ -9,11 +9,12 @@ use strata::query::exec::ResultSet;
 use strata::query::ir::{self, Plan};
 use strata::query::Params;
 use strata::value::Value;
+use futures::StreamExt;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
-use crate::service::{After, QueryReq, Service};
+use crate::service::{After, QueryReq, Service, Stream};
 use crate::{obs, plan_pb, ApiError};
 
 pub fn to_pb(v: &Value) -> pb::Value {
@@ -88,10 +89,24 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 
 /// The protocol versions this server speaks (`proto/strata.proto`): 1
 /// takes SQL or a JSON plan, 2 a typed plan, 3 holds a query's snapshot
-/// for the fetch that follows, 4 places keys in slots, and 5 reads the
-/// writes a read must see (`min_seq_no`), which a replica waits for.
+/// for the fetch that follows, 4 places keys in slots, 5 reads the writes
+/// a read must see (`min_seq_no`), which a replica waits for, 6 keeps
+/// stream sources' offsets ([`SOURCES_PROTOCOL`]), and 7 answers the next
+/// codes of semantic-ID prefixes ([`SIDNEXT_PROTOCOL`]).
 pub const MIN_PROTOCOL: u32 = 1;
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 7;
+
+/// The protocol whose writes carry stream sources' offsets
+/// ([`crate::service::op_source`]), and that answers `Sources`.
+pub const SOURCES_PROTOCOL: u32 = 6;
+
+/// The protocol of `SidNext`, the next codes of semantic-ID prefixes.
+pub const SIDNEXT_PROTOCOL: u32 = 7;
+
+/// A write's answer ([`crate::service::Written`]).
+pub fn write_response(w: crate::service::Written) -> pb::WriteResponse {
+    pb::WriteResponse { written: w.rows, seq_no: w.seq_no, seq_nos: w.seq_nos, skipped: w.skipped, ..Default::default() }
+}
 
 /// What [`pb::strata_server::Strata::hello`] answers, but what is the
 /// server's own: its slot map's epoch, role, term and last number.
@@ -236,6 +251,22 @@ impl pb::strata_server::Strata for Grpc {
         .await
     }
 
+    async fn sid_next(&self, req: Request<pb::SidNextRequest>) -> Result<Response<pb::SidNextResponse>, Status> {
+        self.serve("SidNext", req, |svc, r| async move {
+            let q = r.query.unwrap_or_default();
+            svc.check_epoch(q.epoch)?;
+            let plan = request_plan(q.protocol, q.plan, &q.plan_json)?;
+            let after = After::of(q.min_seq_no, q.min_seq_nos)?;
+            let next = svc.sid_next(&q.sql, plan.as_ref(), &params_from_pb(q.params), &r.field, &r.prefixes, &after, q.timeout_ms as u64).await?;
+            let next = next.into_iter().map(|cs| {
+                let (codes, counts) = cs.into_iter().unzip();
+                pb::SidChildren { codes, counts }
+            });
+            Ok(pb::SidNextResponse { next: next.collect() })
+        })
+        .await
+    }
+
     async fn write(&self, req: Request<pb::WriteRequest>) -> Result<Response<pb::WriteResponse>, Status> {
         self.serve("Write", req, |svc, r| async move {
             svc.check_epoch(r.epoch)?;
@@ -249,13 +280,81 @@ impl pb::strata_server::Strata for Grpc {
                     crate::service::SqlAnswer::Rows(_) => return Err(ApiError::bad("Write takes INSERT, UPDATE or DELETE; use Query")),
                 }
             };
-            Ok(pb::WriteResponse { written: w.rows, seq_no: w.seq_no, seq_nos: w.seq_nos })
+            Ok(write_response(w))
+        })
+        .await
+    }
+
+    type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, Status>> + Send>>;
+
+    /// Applies each batch once the one before has committed, and answers
+    /// it; the first that fails ends the stream with its error, so that no
+    /// batch after it is applied ([`Service::stream_write`]).
+    async fn write_stream(&self, req: Request<tonic::Streaming<pb::WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
+        let id = obs::request_id(req.metadata().get(obs::HEADER).and_then(|v| v.to_str().ok()));
+        let mut input = req.into_inner();
+        let svc = self.0.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let span = tracing::info_span!("request", id = %id, method = "WriteStream");
+        let run = async move {
+            let t0 = Instant::now();
+            let mut s = Stream::default();
+            let mut code = "Ok";
+            while let Some(m) = input.next().await {
+                let r = async {
+                    let m = m.map_err(|e| ApiError::bad(format!("reading the stream: {}", e.message())))?;
+                    svc.check_epoch(m.epoch)?;
+                    if m.ops_json.is_empty() || !m.sql.is_empty() {
+                        return Err(ApiError::bad("a WriteStream message carries write operations (ops_json), not SQL"));
+                    }
+                    if !m.idempotency_key.is_empty() {
+                        return Err(ApiError::bad("WriteStream takes no idempotency keys: give the events sources, whose offsets make a replay skip what was written"));
+                    }
+                    let ops: Vec<serde_json::Value> = from_json(&m.ops_json, "write operations")?;
+                    s.admit(&ops)?;
+                    svc.stream_write(&mut s, ops).await
+                }
+                .await;
+                match r {
+                    Ok(w) => {
+                        let r = pb::WriteResponse { offsets: s.offsets().into_iter().collect(), ..write_response(w) };
+                        if tx.send(Ok(r)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if e.status >= 500 {
+                            obs::server_error(e.status, &e.message);
+                        }
+                        let st = Status::from(e);
+                        code = code_name(st.code());
+                        let _ = tx.send(Err(st)).await;
+                        break;
+                    }
+                }
+            }
+            tracing::debug!(batches = s.batches, written = s.written, skipped = s.skipped, "stream ended");
+            svc.metrics.grpc("WriteStream", code, t0.elapsed().as_secs_f64());
+        };
+        tokio::spawn(run.instrument(span));
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
+    }
+
+    async fn sources(&self, req: Request<pb::SourcesRequest>) -> Result<Response<pb::SourcesResponse>, Status> {
+        self.serve("Sources", req, |svc, _| async move {
+            let sources = svc.sources().await?;
+            Ok(pb::SourcesResponse { sources: sources.into_iter().map(|s| pb::Source { name: s.name, offset: s.offset, updated_micros: s.updated.unwrap_or(0) }).collect() })
         })
         .await
     }
 
     async fn schema(&self, req: Request<pb::Empty>) -> Result<Response<pb::SchemaResponse>, Status> {
-        self.serve("Schema", req, |svc, _| async move { Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&svc.schema).unwrap_or_default() }) }).await
+        self.serve("Schema", req, |svc, _| async move {
+            let tables = svc.catalog().iter().map(|t| serde_json::to_string(&**t).unwrap_or_default()).collect();
+            let profiles = svc.rank_profiles().iter().map(|(t, p)| crate::coord::profile_json(t, p)).collect();
+            Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&svc.schema).unwrap_or_default(), tables_json: tables, profiles_json: profiles })
+        })
+        .await
     }
 
     async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {

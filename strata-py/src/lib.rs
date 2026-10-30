@@ -22,6 +22,7 @@ use strata::query::sql::{ident, quoted};
 use strata::query::Params;
 use strata::query::exec::ResultSet;
 use strata::schema::Schema;
+use strata::sid::{Codebook, TrainOptions};
 use strata::sqlite;
 use strata::storage::{DbOptions, Layout, MergePolicy};
 use strata::{FieldType, Value};
@@ -110,8 +111,10 @@ fn result_py<'py>(py: Python<'py>, rs: &ResultSet) -> PyResult<Bound<'py, PyDict
 
 /// A query parameter, as the HTTP API reads one: a number, string, None,
 /// a list of numbers (a vector), a list, a dict of term weights (SPARSE),
-/// `{"embed": text, "field": f}` (the text's vector by `f`'s model) or
-/// `{"vector_of": key, "field": f}` (a stored row's vector).
+/// `{"embed": text, "field": f}` (the text's vector by `f`'s model, or an
+/// image file's for `{"embed": {"image": "<base64>"}}`) or
+/// `{"vector_of": key, "field": f}` (a stored row's vector), each with
+/// `"table"` for a field of another table than the first.
 fn param(db: &Db, j: &Json) -> strata::Result<Value> {
     let bad = |m: String| strata::Error::Query(m);
     Ok(match j {
@@ -127,16 +130,24 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
         Json::Array(xs) if !xs.is_empty() && xs.iter().all(|x| x.is_i64()) => Value::List(xs.iter().map(|x| Value::Int(x.as_i64().unwrap_or(0))).collect()),
         Json::Array(xs) if !xs.is_empty() && xs.iter().all(|x| x.is_number()) => Value::Vector(xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect::<Vec<_>>().into()),
         Json::Array(xs) => Value::List(xs.iter().map(|x| param(db, x)).collect::<strata::Result<_>>()?),
-        Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string()) && o.keys().all(|k| k == "embed" || k == "field") => {
+        Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some()) && o.keys().all(|k| k == "embed" || k == "field" || k == "table") => {
+            let s = table_of(db, o.get("table").and_then(|t| t.as_str()))?;
             let field = match o.get("field").and_then(|f| f.as_str()) {
                 Some(f) => f.to_string(),
-                None => db.schema().fields.iter().find(|f| db.embedder(&f.name).is_some()).map(|f| f.name.clone()).ok_or_else(|| bad("no embedded field has its model open".into()))?,
+                None => s.fields.iter().find(|f| db.embedder_in(&s.table, &f.name).is_some()).map(|f| f.name.clone()).ok_or_else(|| bad("no embedded field has its model open".into()))?,
             };
-            let e = db.embedder(&field).ok_or_else(|| bad(format!("{field} has no embedding model open (see Database.open's models)")))?;
-            Value::Vector(e.embed_query(o["embed"].as_str().unwrap_or_default()).into())
+            let e = db.embedder_in(&s.table, &field).ok_or_else(|| bad(format!("{field} has no embedding model open (see Database.open's models)")))?;
+            match &o["embed"] {
+                Json::String(t) => Value::Vector(e.embed_query(t).into()),
+                Json::Object(i) if i.len() == 1 && i["image"].is_string() => {
+                    let data = strata::media::base64_bytes(i["image"].as_str().unwrap_or_default()).map_err(|m| bad(format!("{{\"embed\": {{\"image\": ...}}}} is an image file in base64: {m}")))?;
+                    Value::Vector(strata::embed::embed_image_file(e.as_ref(), &data)?.into())
+                }
+                _ => return Err(bad("\"embed\" is a text or {\"image\": \"<base64>\"}".into())),
+            }
         }
-        Json::Object(o) if o.contains_key("vector_of") && o.keys().all(|k| k == "vector_of" || k == "field") => {
-            let s = db.schema();
+        Json::Object(o) if o.contains_key("vector_of") && o.keys().all(|k| k == "vector_of" || k == "field" || k == "table") => {
+            let s = &*table_of(db, o.get("table").and_then(|t| t.as_str()))?;
             let pk = s.primary_key.ok_or_else(|| bad("vector_of needs a primary key".into()))?;
             let field = match o.get("field").and_then(|f| f.as_str()) {
                 Some(f) => f.to_string(),
@@ -202,11 +213,19 @@ impl Database {
         Ok(sqlite::ImportOptions { tables: tables.unwrap_or_default(), schemas, blobs_base64 })
     }
 
-    fn documents(db: &Db, rows: &[Json]) -> strata::Result<Vec<strata::Document>> {
+    fn documents(db: &Db, schema: &Schema, rows: &[Json]) -> strata::Result<Vec<strata::Document>> {
         let now = strata::timestamp::now();
-        let mut docs = rows.iter().enumerate().map(|(i, j)| ingest::document_at(db.schema(), j, now).map_err(|e| strata::Error::Schema(format!("row {}: {e}", i + 1)))).collect::<strata::Result<Vec<_>>>()?;
-        db.embed_missing(&mut docs);
+        let mut docs = rows.iter().enumerate().map(|(i, j)| ingest::document_at(schema, j, now).map_err(|e| strata::Error::Schema(format!("row {}: {e}", i + 1)))).collect::<strata::Result<Vec<_>>>()?;
+        db.fill_in(&schema.table, &mut docs)?;
         Ok(docs)
+    }
+}
+
+/// The schema of the table named `table` (any case), or of the first.
+fn table_of(db: &Db, table: Option<&str>) -> strata::Result<Arc<Schema>> {
+    match table {
+        None => Ok(db.catalog().swap_remove(0)),
+        Some(t) => db.storage().table(t).ok_or_else(|| strata::Error::Query(format!("no such table: {t}"))),
     }
 }
 
@@ -218,8 +237,9 @@ impl Database {
     fn create(py: Python<'_>, path: PathBuf, schema: &str, directory: bool, models: Option<PathBuf>) -> PyResult<Self> {
         let schema = Schema::from_json(schema).map_err(err)?;
         let opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, ..DbOptions::default() };
-        let db = py.detach(|| Db::create(&path, schema, opts)).map_err(err)?;
-        Ok(Database::new(db, models))
+        let models = models.unwrap_or_else(strata::embed::models_dir);
+        let db = py.detach(|| Db::create_in(&path, schema, opts, &models)).map_err(err)?;
+        Ok(Database::new(db, Some(models)))
     }
 
     /// Opens the database at `path`.
@@ -230,9 +250,15 @@ impl Database {
         Ok(Database::new(db, models))
     }
 
-    /// The schema in its short JSON form.
-    fn schema_json(&self) -> PyResult<String> {
-        Ok(self.get()?.schema().to_short_json().to_string())
+    /// The schema of the first table, or of `table`, in its short JSON form.
+    #[pyo3(signature = (table = None))]
+    fn schema_json(&self, table: Option<&str>) -> PyResult<String> {
+        Ok(table_of(&*self.get()?, table).map_err(err)?.to_short_json().to_string())
+    }
+
+    /// Every table's schema in its short JSON form, the first first.
+    fn tables_json(&self) -> PyResult<Vec<String>> {
+        Ok(self.get()?.catalog().iter().map(|s| s.to_short_json().to_string()).collect())
     }
 
     /// Live rows.
@@ -280,19 +306,23 @@ impl Database {
         }
     }
 
-    /// Inserts rows (keys must be new); all or none are written.
-    fn insert(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<u64> {
+    /// Inserts rows (keys must be new) into the first table or `table`;
+    /// all or none are written.
+    #[pyo3(signature = (rows, table = None))]
+    fn insert(&self, py: Python<'_>, rows: &Bound<'_, PyAny>, table: Option<&str>) -> PyResult<u64> {
         let db = self.get()?;
         let rows = rows_json(rows)?;
         py.detach(|| -> strata::Result<u64> {
-            let docs = Database::documents(&db, &rows)?;
+            let schema = table_of(&db, table)?;
+            let docs = Database::documents(&db, &schema, &rows)?;
             let n = docs.len() as u64;
             if docs.len() >= BULK_INSERT {
-                db.load(docs)?;
+                db.load_into(&schema.table, docs)?;
             } else {
                 let mut t = db.storage().begin()?;
+                let mut tt = t.table(&schema.table)?;
                 for d in docs {
-                    t.insert(d)?;
+                    tt.insert(d)?;
                 }
                 t.commit()?;
             }
@@ -301,18 +331,21 @@ impl Database {
         .map_err(err)
     }
 
-    /// Inserts rows or replaces the rows with their keys, in transactions
-    /// of 10,000 rows.
-    fn upsert(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<u64> {
+    /// Inserts rows or replaces the rows with their keys, in the first
+    /// table or `table`, in transactions of 10,000 rows.
+    #[pyo3(signature = (rows, table = None))]
+    fn upsert(&self, py: Python<'_>, rows: &Bound<'_, PyAny>, table: Option<&str>) -> PyResult<u64> {
         let db = self.get()?;
         let rows = rows_json(rows)?;
         py.detach(|| -> strata::Result<u64> {
+            let schema = table_of(&db, table)?;
             let mut n = 0;
             for chunk in rows.chunks(BATCH) {
-                let docs = Database::documents(&db, chunk)?;
+                let docs = Database::documents(&db, &schema, chunk)?;
                 let mut t = db.storage().begin()?;
+                let mut tt = t.table(&schema.table)?;
                 for d in docs {
-                    t.upsert(d)?;
+                    tt.upsert(d)?;
                 }
                 t.commit()?;
                 n += chunk.len() as u64;
@@ -322,17 +355,20 @@ impl Database {
         .map_err(err)
     }
 
-    /// Deletes the rows with these keys; returns how many there were.
-    fn delete(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<u64> {
+    /// Deletes the rows with these keys from the first table or `table`;
+    /// returns how many there were.
+    #[pyo3(signature = (keys, table = None))]
+    fn delete(&self, py: Python<'_>, keys: &Bound<'_, PyAny>, table: Option<&str>) -> PyResult<u64> {
         let db = self.get()?;
         let keys = if keys.cast::<PyString>().is_ok() || keys.cast::<PyInt>().is_ok() { vec![to_json(keys)?] } else { rows_json(keys)? };
         py.detach(|| -> strata::Result<u64> {
-            let s = db.schema();
+            let s = table_of(&db, table)?;
             let pk = s.primary_key.ok_or_else(|| strata::Error::Query("deleting by key needs a primary key".into()))?;
             let mut t = db.storage().begin()?;
+            let mut tt = t.table(&s.table)?;
             let mut n = 0;
             for k in &keys {
-                n += t.delete(&ingest::value(s, pk, k)?)? as u64;
+                n += tt.delete(&ingest::value(&s, pk, k)?)? as u64;
             }
             t.commit()?;
             Ok(n)
@@ -342,11 +378,11 @@ impl Database {
 
     /// Loads a JSON Lines, JSON, CSV or TSV file; returns (rows, bulk,
     /// skipped fields).
-    #[pyo3(signature = (path, format = None))]
-    fn import_file(&self, py: Python<'_>, path: PathBuf, format: Option<&str>) -> PyResult<(u64, bool, Vec<String>)> {
+    #[pyo3(signature = (path, format = None, table = None))]
+    fn import_file(&self, py: Python<'_>, path: PathBuf, format: Option<&str>, table: Option<&str>) -> PyResult<(u64, bool, Vec<String>)> {
         let db = self.get()?;
         let format = format.map(|f| Format::parse(f).ok_or_else(|| PyValueError::new_err(format!("unknown format {f:?}: jsonl, json, csv or tsv")))).transpose()?;
-        let r = py.detach(|| ingest::import_file(&db, &path, format)).map_err(err)?;
+        let r = py.detach(|| table_of(&db, table).and_then(|s| ingest::import_file_into(&db, &s.table, &path, format))).map_err(err)?;
         Ok((r.rows, r.bulk, r.unknown))
     }
 
@@ -393,7 +429,7 @@ impl Database {
                 let src = sqlite::Source::open(&sqlite_path)?;
                 let plan = src.plan(None, &opts)?;
                 let first = plan.tables.first().ok_or_else(|| strata::Error::Schema(format!("{}: no table to import", sqlite_path.display())))?;
-                let db = Db::create(&path, first.schema.clone(), db_opts)?;
+                let db = Db::create_in(&path, first.schema.clone(), db_opts, &models)?;
                 // Before the rows, so that they get their embeddings.
                 let embed_errors: Vec<(String, String)> = db.open_embedders(&models).into_iter().map(|(f, e)| (f, e.to_string())).collect();
                 let r = src.load(&db, &plan)?;
@@ -413,19 +449,57 @@ impl Database {
         Ok(plan.to_json().to_string())
     }
 
-    /// The vector `field`'s model gives `text` as a query.
-    #[pyo3(signature = (text, field = None))]
-    fn embed(&self, py: Python<'_>, text: &str, field: Option<&str>) -> PyResult<Vec<f32>> {
+    /// The vector `field`'s model gives `text` as a query, or `image`, the
+    /// bytes of an image file, for a model of images.
+    #[pyo3(signature = (text = None, field = None, table = None, image = None))]
+    fn embed(&self, py: Python<'_>, text: Option<&str>, field: Option<&str>, table: Option<&str>, image: Option<Vec<u8>>) -> PyResult<Vec<f32>> {
         let db = self.get()?;
+        if let Some(data) = image {
+            let s = table_of(&db, table).map_err(err)?;
+            let field = match field {
+                Some(f) => f.to_string(),
+                None => s.fields.iter().find(|f| db.embedder_in(&s.table, &f.name).is_some_and(|e| e.modalities().contains(&strata::embed::Modality::Image))).map(|f| f.name.clone()).ok_or_else(|| PyValueError::new_err("no embedded field has a model of images open"))?,
+            };
+            let e = db.embedder_in(&s.table, &field).ok_or_else(|| PyValueError::new_err(format!("{field} has no embedding model open (see Database.open's models)")))?;
+            return py.detach(|| strata::embed::embed_image_file(e.as_ref(), &data)).map_err(err);
+        }
+        let text = text.ok_or_else(|| PyValueError::new_err("embed takes a text or an image"))?;
         let mut o = Map::new();
         o.insert("embed".into(), Json::String(text.into()));
         if let Some(f) = field {
             o.insert("field".into(), Json::String(f.into()));
         }
+        if let Some(t) = table {
+            o.insert("table".into(), Json::String(t.into()));
+        }
         match py.detach(|| param(&db, &Json::Object(o))).map_err(err)? {
             Value::Vector(v) => Ok(v.to_vec()),
             _ => unreachable!("an embedding is a vector"),
         }
+    }
+
+    /// The codes that can follow each of `prefixes` in semantic-ID field
+    /// `field` of `table` (the first by default) among the rows SQL
+    /// condition `filter` matches, with their rows ([`Db::sid_next`]).
+    #[pyo3(signature = (field, prefixes, filter = None, params = None, table = None))]
+    fn sid_next(&self, py: Python<'_>, field: &str, prefixes: Vec<String>, filter: Option<String>, params: Option<&Bound<'_, PyDict>>, table: Option<&str>) -> PyResult<Vec<Vec<(String, u64)>>> {
+        let db = self.get()?;
+        let p = params_json(params)?;
+        let table = table_of(&db, table).map_err(err)?.table.clone();
+        py.detach(|| self::params(&db, &p).and_then(|p| db.sid_next(&table, field, &prefixes, filter.as_deref(), &p))).map_err(err)
+    }
+
+    /// Trains a semantic-ID codebook on the vectors of `field` of `table`
+    /// (the first table by default), saves it as `name` under `models`, and
+    /// returns its SHA-256.
+    #[pyo3(signature = (field, name, table = None, models = None, levels = 3, k = 256, iterations = 25, sample = None, seed = 0))]
+    #[allow(clippy::too_many_arguments)]
+    fn train_codebook(&self, py: Python<'_>, field: &str, name: &str, table: Option<String>, models: Option<PathBuf>, levels: usize, k: usize, iterations: usize, sample: Option<usize>, seed: u64) -> PyResult<String> {
+        let db = self.get()?;
+        let table = table.unwrap_or_else(|| db.schema().table.clone());
+        let models = models.unwrap_or_else(strata::embed::models_dir);
+        let opts = train_options(levels, k, iterations, sample, seed);
+        py.detach(|| db.train_codebook(&table, field, name, &models, &opts)).map_err(err)
     }
 
     /// Merges small segments, as a server does in the background.
@@ -449,9 +523,42 @@ impl Database {
     }
 }
 
+fn train_options(levels: usize, k: usize, iters: usize, sample: Option<usize>, seed: u64) -> TrainOptions {
+    TrainOptions { levels, k, iters, sample: sample.unwrap_or(TrainOptions::default().sample), seed }
+}
+
+/// Trains a semantic-ID codebook on `vectors` (a list of vectors, or
+/// anything with `tolist()`), saves it as `name` under `models`, and
+/// returns its SHA-256.
+#[pyfunction]
+#[pyo3(signature = (vectors, name, models = None, levels = 3, k = 256, iterations = 25, sample = None, seed = 0))]
+#[allow(clippy::too_many_arguments)]
+fn train_codebook(py: Python<'_>, vectors: &Bound<'_, PyAny>, name: &str, models: Option<PathBuf>, levels: usize, k: usize, iterations: usize, sample: Option<usize>, seed: u64) -> PyResult<String> {
+    let Json::Array(rows) = to_json(vectors)? else { return Err(PyValueError::new_err("vectors are a list of lists of numbers")) };
+    let dim = match rows.first() {
+        Some(Json::Array(v)) => v.len(),
+        _ => return Err(PyValueError::new_err("vectors are a list of lists of numbers, at least one")),
+    };
+    let mut flat = Vec::with_capacity(rows.len() * dim);
+    for (i, r) in rows.iter().enumerate() {
+        match r {
+            Json::Array(v) if v.len() == dim => {
+                for x in v {
+                    flat.push(x.as_f64().ok_or_else(|| PyValueError::new_err(format!("vector {}: {x} is not a number", i + 1)))? as f32);
+                }
+            }
+            _ => return Err(PyValueError::new_err(format!("vector {} does not have {dim} numbers, as the first does", i + 1))),
+        }
+    }
+    let models = models.unwrap_or_else(strata::embed::models_dir);
+    let opts = train_options(levels, k, iterations, sample, seed);
+    py.detach(|| Codebook::train(&flat, dim, &opts)?.save(name, &models)).map_err(err)
+}
+
 #[pymodule]
 fn _strata(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
+    m.add_function(wrap_pyfunction!(train_codebook, m)?)?;
     m.add("StrataError", m.py().get_type::<StrataError>())?;
     Ok(())
 }

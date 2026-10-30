@@ -30,8 +30,10 @@ use std::sync::Arc;
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::error::{Error, Result};
+use crate::query::ir::{ArithOp, Func, NormKind};
 use crate::query::{ddl, ir};
-use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::rank::Rank;
+use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::schema::{Field, FieldType, Logical, Schema};
 use crate::storage::DropOptions;
 use crate::value::Value;
@@ -116,6 +118,10 @@ pub enum Command {
     CreateTable { schema: Schema, if_not_exists: bool },
     /// `DROP TABLE [IF EXISTS] a, b [CASCADE | RESTRICT]`.
     DropTable { tables: Vec<String>, opts: DropOptions },
+    /// `CREATE [OR REPLACE] RANK PROFILE` ([`crate::query::profile`]).
+    CreateRankProfile { table: String, profile: crate::storage::RankProfile, replace: bool },
+    /// `DROP RANK PROFILE [IF EXISTS] name [ON table]`.
+    DropRankProfile { table: Option<String>, name: String, if_exists: bool },
     /// `EXPLAIN [FORMAT JSON] <statement>`: the statement's plan
     /// ([`crate::query::ir`]), as lines of text or as JSON, made when it
     /// runs ([`crate::db::Db::explain`]).
@@ -151,8 +157,16 @@ pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Op
 
 /// Parses and binds one statement of a database whose tables are `tables`:
 /// a SELECT (bound when it runs), an INSERT, UPDATE or DELETE of one of
-/// them, `CREATE TABLE` or `DROP TABLE`.
+/// them, `CREATE TABLE` or `DROP TABLE`, or `CREATE RANK PROFILE` or
+/// `DROP RANK PROFILE` ([`crate::query::profile`]).
 pub fn bind_command(sql_text: &str, tables: &[&Schema], params: &Params) -> Result<Command> {
+    if let Some(p) = super::profile::parse_statement(sql_text)? {
+        let table = |name: &str| tables.iter().find(|t| t.table.eq_ignore_ascii_case(name)).map(|t| t.table.clone()).ok_or_else(|| err(format!("no such table: {name}")));
+        return Ok(match p {
+            super::profile::Statement::Create { table: t, profile, replace } => Command::CreateRankProfile { table: table(&t)?, profile, replace },
+            super::profile::Statement::Drop { table: t, name, if_exists } => Command::DropRankProfile { table: t.as_deref().map(table).transpose()?, name, if_exists },
+        });
+    }
     bind_statement(&parse_one(sql_text)?, tables, params)
 }
 
@@ -239,7 +253,7 @@ pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: 
             let (tables, opts) = ddl::drop_table(stmt)?;
             Command::DropTable { tables, opts }
         }
-        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE and EXPLAIN are supported")),
+        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE RANK PROFILE, DROP RANK PROFILE and EXPLAIN are supported")),
     })
 }
 
@@ -424,7 +438,7 @@ pub(crate) fn keyed_rows(schema: &Schema, keys: Vec<Value>) -> Result<Select> {
     let projection = every_field(schema);
     let types = projection_types(schema, &projection);
     let filter = if keys.is_empty() { Pred::False } else { Pred::In { field: pk, values: keys } };
-    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, limit: None, offset: 0, graphs: Vec::new(), types })
+    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, phases: Vec::new(), limit: None, offset: 0, graphs: Vec::new(), types })
 }
 
 fn every_field(schema: &Schema) -> Vec<(String, Projection)> {
@@ -467,6 +481,12 @@ pub(crate) fn coerced(field: &Field, v: Value) -> Result<Value> {
     coerce(field, v)
 }
 
+/// What a write gives MEDIA field `field` as text: a URI, or a JSON
+/// object's text ([`crate::media::input_text`]), resolved before the writer.
+fn media_input(field: &Field, text: String) -> Result<Value> {
+    crate::media::input_text(&serde_json::Value::String(text)).map(Value::Str).map_err(|e| err(format!("{}: {e}", field.name)))
+}
+
 /// The value an expression gives `field` in `SET` ([`Assign::Expr`]), in
 /// the form its column holds: [`coerce`]d, a whole FLOAT as an INT, and
 /// one value as a multi-valued field's list of it.
@@ -485,6 +505,8 @@ pub(crate) fn assigned(field: &Field, v: Value) -> Result<Value> {
     Ok(match (&field.ty, v) {
         (_, Value::Null) => Value::Null,
         (FieldType::Vector { .. }, v @ Value::Vector(_)) => v,
+        (_, Value::Str(t)) if field.media.is_some() => media_input(field, t)?,
+        (_, v) if field.media.is_some() => return Err(err(format!("{} is a MEDIA field: SET gives it a URI or a JSON object's text, not {v:?}", field.name))),
         (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
         (FieldType::Sparse, v @ Value::Str(_)) => {
             crate::text::sparse::parse(&v)?;
@@ -536,8 +558,11 @@ pub(crate) enum Sub {
     Exists,
     /// `x < (SELECT ...)`, or a bound of `BETWEEN`: its one value.
     Scalar,
-    /// A traversal's seeds: its rows' keys.
+    /// A traversal's seeds: its rows' keys, or its one column's values when
+    /// it reads another table.
     Seeds,
+    /// `maxsim`'s query vectors: its one column's values, in order.
+    Vectors,
 }
 
 /// Plans a subquery for the binder ([`bind_query_with`]): the expression
@@ -549,6 +574,31 @@ pub(crate) type Subs<'s> = dyn Fn(&sql::Query, Sub) -> Result<Option<ir::Expr>> 
 /// [`Seeds::Plan`], which its plan runs first.
 pub(crate) fn bind_query_with(q: &sql::Query, schema: &Schema, params: &Params, subs: &Subs) -> Result<Select> {
     Binder { subs: Some(subs), ..Binder::new(schema, params) }.query(q)
+}
+
+/// [`bind_query_with`] for the last step of rerank phases: `earlier` are the
+/// ORDER BY expressions of the phases before it, first to last, which
+/// `features()` lists with its own.
+pub(crate) fn bind_phase_with(q: &sql::Query, schema: &Schema, params: &Params, subs: &Subs, earlier: &[Expr]) -> Result<Select> {
+    Binder { subs: Some(subs), earlier, ..Binder::new(schema, params) }.query(q)
+}
+
+/// `sql_text`, one SELECT that ranks rows (a table's, or rerank phases'),
+/// with `score()` and `features()` added to its columns: the values each
+/// row was ranked by, which `/v1/explain` shows for the top rows.
+pub fn with_features(sql_text: &str) -> Result<String> {
+    let one = || err("hits explain the rows of one SELECT ranked by an ORDER BY");
+    let mut stmts = super::parse::parse(sql_text)?;
+    let [sql::Statement::Query(q)] = stmts.as_mut_slice() else { return Err(one()) };
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(one()) };
+    if q.order_by.is_none() {
+        return Err(one());
+    }
+    let mut extra = super::parse::parse("SELECT score(), features()")?;
+    let Some(sql::Statement::Query(x)) = extra.pop() else { return Err(one()) };
+    let sql::SetExpr::Select(x) = *x.body else { return Err(one()) };
+    s.projection.extend(x.projection);
+    Ok(q.to_string())
 }
 
 /// The query of `(SELECT ...)`, in parentheses or not.
@@ -570,11 +620,14 @@ struct Binder<'a> {
     /// The statement's time, in microseconds since the epoch: `now()` in
     /// `decay` and the `"now"` default of a TIMESTAMP.
     now: i64,
+    /// The ORDER BY expressions of the rerank phases before this query's
+    /// ([`bind_phase_with`]).
+    earlier: &'a [Expr],
 }
 
 impl<'a> Binder<'a> {
     fn new(schema: &'a Schema, params: &'a Params) -> Self {
-        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now() }
+        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now(), earlier: &[] }
     }
 
     /// The expression a compound query's subquery stands for.
@@ -619,8 +672,27 @@ impl<'a> Binder<'a> {
             _ => return Err(err("GROUP BY ALL is not supported")),
         };
         let mut projection = Vec::new();
+        let mut features = false;
         for item in &s.projection {
             let (e, alias) = match item {
+                sql::SelectItem::UnnamedExpr(Expr::Function(f)) if fname(f) == "features" => {
+                    if !self.args_raw(f).is_ok_and(|(a, n)| a.is_empty() && n.is_empty()) {
+                        return Err(err("features() takes no arguments"));
+                    }
+                    let own = match &q.order_by {
+                        Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) if !es.is_empty() => Some(self.ordered_expr(&es[0].expr, &s.projection)?),
+                        _ => None,
+                    };
+                    let orders: Vec<&Expr> = self.earlier.iter().chain(own).collect();
+                    if orders.is_empty() {
+                        return Err(err("features() lists the inputs of the query's ranking, and it has no ORDER BY"));
+                    }
+                    for e in self.feature_items(&orders)? {
+                        projection.push((name_of(&e), self.projection(&e)?));
+                    }
+                    features = true;
+                    continue;
+                }
                 sql::SelectItem::UnnamedExpr(e) => (e, None),
                 sql::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
                 sql::SelectItem::Wildcard(_) => {
@@ -638,8 +710,12 @@ impl<'a> Binder<'a> {
         }
         let aggregated = !group_by.is_empty() || projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
         if aggregated {
+            if features {
+                return Err(err("features() lists the inputs of a ranking of rows, not of groups"));
+            }
             for (name, p) in &projection {
                 match p {
+                    Projection::Feature(_) => return Err(err(format!("{name}: a ranking expression scores rows, not groups"))),
                     Projection::Field(f) if !group_by.contains(f) => {
                         return Err(err(format!("{name} must be in GROUP BY or inside an aggregate (COUNT, SUM, AVG, MIN, MAX)")))
                     }
@@ -692,7 +768,7 @@ impl<'a> Binder<'a> {
         };
         let graphs = self.graphs.take();
         let types = projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs, types })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases: Vec::new(), limit, offset, graphs, types })
     }
 
     /// The graph predicate `hops()` refers to: the first REACHABLE or PATH.
@@ -805,7 +881,12 @@ impl<'a> Binder<'a> {
             k: count("k", 10.0)?.max(1) as usize,
             min_sim: num("min_sim", f64::NEG_INFINITY)?,
         };
+        // The same computation named twice (in SELECT and ORDER BY) runs
+        // once.
         let mut gs = self.graphs.borrow_mut();
+        if let Some(i) = gs.iter().position(|x| *x == g) {
+            return Ok(i);
+        }
         gs.push(g);
         Ok(gs.len() - 1)
     }
@@ -903,10 +984,84 @@ impl<'a> Binder<'a> {
                 "hops" => Ok(Projection::Hops(self.hops_graph()?)),
                 "seq_no" => Ok(Projection::SeqNo),
                 "count" | "sum" | "avg" | "min" | "max" => self.aggregate(f),
-                n => Err(err(format!("unsupported function in SELECT: {n}"))),
+                "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
+                _ => self.feature(e),
             },
+            Expr::Nested(_) | Expr::UnaryOp { .. } | Expr::BinaryOp { .. } | Expr::Case { .. } => self.feature(e),
             _ => Err(err(format!("unsupported select expression: {e}"))),
         }
+    }
+
+    /// A ranking expression in SELECT: one that scores each row by itself.
+    fn feature(&self, e: &Expr) -> Result<Projection> {
+        let s = self.score(e)?;
+        if Rank::of(&s, 0).is_some_and(|r| !r.is_row_local()) {
+            return Err(err(format!("{e}: a set function (minmax, rank), rrf or a weighted fusion ranks rows against each other, so it is not a column; select score()")));
+        }
+        Ok(Projection::Feature(s))
+    }
+
+    /// The expression an ORDER BY key stands for: the selected column it
+    /// names by position, or itself.
+    fn ordered_expr<'e>(&self, e: &'e Expr, items: &'e [sql::SelectItem]) -> Result<&'e Expr> {
+        let Some(n) = literal_usize(e) else { return Ok(e) };
+        match items.get(n.wrapping_sub(1)) {
+            Some(sql::SelectItem::UnnamedExpr(Expr::Function(f))) if fname(f) == "features" => Err(err(format!("ORDER BY {n}: features() is not one column"))),
+            Some(sql::SelectItem::UnnamedExpr(x) | sql::SelectItem::ExprWithAlias { expr: x, .. }) => Ok(x),
+            _ => Err(err(format!("ORDER BY {n}: no such column"))),
+        }
+    }
+
+    /// What `features()` stands for in a query ranked by `orders` (the
+    /// ORDER BY of each rerank phase, first to last): each leaf of the
+    /// ranking (a column, or a score such as `bm25(body, :q)`), then each
+    /// phase's expression that is not a leaf and scores a row by itself,
+    /// each once, named by its SQL text. A ranking by `distance(..)`
+    /// reads its `similarity(..)`.
+    fn feature_items(&self, orders: &[&Expr]) -> Result<Vec<Expr>> {
+        // Functions of other scores, and the rows they read.
+        let inner = |f: &sql::Function| matches!(fname(f).as_str(), "rrf" | "minmax" | "rank" | "gbdt") || Func::numeric(&fname(f)).is_some();
+        let leaf = |e: &Expr| !matches!(e, Expr::Nested(_) | Expr::UnaryOp { .. } | Expr::BinaryOp { .. } | Expr::Case { .. } | Expr::Value(_)) && !matches!(e, Expr::Function(f) if inner(f));
+        fn leaves(b: &Binder, e: &Expr, leaf: &dyn Fn(&Expr) -> bool, out: &mut Vec<Expr>) -> Result<()> {
+            match e {
+                Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } => leaves(b, x, leaf, out)?,
+                Expr::BinaryOp { left, right, .. } => {
+                    leaves(b, left, leaf, out)?;
+                    leaves(b, right, leaf, out)?;
+                }
+                Expr::Case { conditions, else_result, .. } => {
+                    for x in conditions.iter().map(|c| &c.result).chain(else_result.as_deref()) {
+                        leaves(b, x, leaf, out)?;
+                    }
+                }
+                Expr::Value(_) => {}
+                Expr::Function(f) if !leaf(e) => {
+                    for a in b.args_raw(f)?.0 {
+                        leaves(b, a, leaf, out)?;
+                    }
+                }
+                Expr::Function(f) if fname(f) == "distance" => {
+                    let mut g = f.clone();
+                    g.name = sql::ObjectName::from(vec![sql::Ident::new("similarity")]);
+                    out.push(Expr::Function(g));
+                }
+                e => out.push(e.clone()),
+            }
+            Ok(())
+        }
+        let mut items = Vec::new();
+        for e in orders {
+            leaves(self, e, &leaf, &mut items)?;
+        }
+        for e in orders {
+            let e = strip_nested(e);
+            if !leaf(e) && Rank::of(&self.score(e)?, 0).is_none_or(|r| r.is_row_local()) {
+                items.push(e.clone());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        items.retain(|e| seen.insert(name_of(e)));
+        Ok(items)
     }
 
     /// `COUNT(*)`, `COUNT([DISTINCT] f)`, `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`.
@@ -1056,6 +1211,7 @@ impl<'a> Binder<'a> {
                 Projection::Score => Err(err("ORDER BY score(): order by the score expression itself")),
                 Projection::SeqNo => Err(err("ORDER BY seq_no(): a query cannot order by it")),
                 Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true, nulls_first: false }),
+                Projection::Feature(s) => Ok(OrderBy::Score { score: s.clone(), desc, nulls_first: false }),
                 Projection::Count | Projection::Agg { .. } => Err(err("ORDER BY an aggregate needs GROUP BY")),
             };
         }
@@ -1068,15 +1224,27 @@ impl<'a> Binder<'a> {
         // `ORDER BY distance(..) ASC` ranks like `similarity DESC`.
         if let Expr::Function(f) = e {
             if fname(f) == "distance" {
-                return Ok(OrderBy::Score { score: self.score(e)?, desc: !desc, nulls_first: false });
+                let (args, opts) = self.args(f)?;
+                return Ok(OrderBy::Score { score: self.similarity(&args, opts, true)?, desc: !desc, nulls_first: false });
             }
         }
         Ok(OrderBy::Score { score: self.score(e)?, desc, nulls_first: false })
     }
 
+    /// A ranking: a score, a column, or an expression of them. `+` adds raw
+    /// values; a sum of `w * minmax(score)` is the min-max fusion that `+`
+    /// meant before ranking expressions, and a product of scores keeps its
+    /// rule (a factor below 0, or missing, counts as 0). Both are written
+    /// to plans in their old form, which older shards read.
     fn score(&self, e: &Expr) -> Result<Score> {
+        Ok(self.rank(e)?.fused_shapes())
+    }
+
+    /// A part of a ranking expression.
+    fn rank(&self, e: &Expr) -> Result<Score> {
+        let bx = |e: &Expr| self.rank(e).map(Box::new);
         match e {
-            Expr::Nested(inner) => self.score(inner),
+            Expr::Nested(inner) => self.rank(inner),
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 let f = self.field_of(e)?;
                 if self.schema.fields[f].multi {
@@ -1087,104 +1255,160 @@ impl<'a> Binder<'a> {
                     _ => Err(err("ORDER BY a column needs a numeric field")),
                 }
             }
-            Expr::BinaryOp { left, op: BinaryOperator::Plus, right } => {
-                Ok(Score::Weighted([self.weighted(left, 1.0)?, self.weighted(right, 1.0)?].concat()))
+            Expr::Value(_) | Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr: _ } if self.number(e).is_some() => match self.number(e) {
+                Some(x) if x.is_finite() => Ok(Score::Num(x)),
+                _ => Err(err(format!("a number in a ranking expression is finite, not {e}"))),
+            },
+            Expr::Value(_) => Err(err(format!("a ranking expression takes numbers, not {e}"))),
+            Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => Ok(Score::Neg(bx(expr)?)),
+            Expr::UnaryOp { op: sql::UnaryOperator::Plus, expr } => self.rank(expr),
+            Expr::BinaryOp { left, op, right } => {
+                let op = match op {
+                    BinaryOperator::Plus => ArithOp::Add,
+                    BinaryOperator::Minus => ArithOp::Sub,
+                    BinaryOperator::Multiply => ArithOp::Mul,
+                    BinaryOperator::Divide => ArithOp::Div,
+                    BinaryOperator::Modulo => ArithOp::Mod,
+                    o => return Err(err(format!("a ranking expression takes + - * / %, not {o}"))),
+                };
+                Ok(Score::Arith { op, left: bx(left)?, right: bx(right)? })
             }
-            Expr::BinaryOp { left, op: BinaryOperator::Minus, right } => {
-                Ok(Score::Weighted([self.weighted(left, 1.0)?, self.weighted(right, -1.0)?].concat()))
-            }
-            Expr::BinaryOp { op: BinaryOperator::Multiply, .. } => {
-                let mut terms = self.weighted(e, 1.0)?;
-                match terms.as_slice() {
-                    [(w, Score::Product(_))] if *w == 1.0 => Ok(terms.pop().unwrap().1),
-                    _ => Ok(Score::Weighted(terms)),
-                }
+            Expr::Case { operand, conditions, else_result, .. } => {
+                let whens = conditions
+                    .iter()
+                    .map(|c| {
+                        // `CASE x WHEN v` tests `x = v`.
+                        let cond = match operand {
+                            Some(x) => Expr::BinaryOp { left: x.clone(), op: BinaryOperator::Eq, right: Box::new(c.condition.clone()) },
+                            None => c.condition.clone(),
+                        };
+                        let p = self.pred(&cond)?.three_valued(&|f| self.schema.fields[f].multi).simplify();
+                        Ok((Score::Cond(Box::new(p)), self.rank(&c.result)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Score::Case { whens, otherwise: else_result.as_deref().map(bx).transpose()? })
             }
             Expr::Function(f) => {
+                let name = fname(f);
                 let (args, opts) = self.args(f)?;
-                match fname(f).as_str() {
+                let one = |what: &str| match args.as_slice() {
+                    [x] => Ok(x),
+                    _ => Err(err(format!("{name}({what}) takes one argument"))),
+                };
+                match name.as_str() {
                     "bm25" => {
                         let [field, text] = args.as_slice() else { return Err(err("bm25(field, text)")) };
                         let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
                         Expand::from_opts(&opts).map_err(err)?;
-                        Ok(Score::Bm25 { field, text, opts })
+                        Ok(Score::Bm25 { field, text, opts: without_norm(opts) })
                     }
-                    "similarity" | "distance" => {
-                        let [field, v] = args.as_slice() else { return Err(err("similarity(field, vector)")) };
-                        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. } | FieldType::Sparse), "VECTOR or SPARSE")?;
-                        if self.schema.fields[field].ty == FieldType::Sparse {
-                            if fname(f) == "distance" {
-                                return Err(err("a SPARSE field takes similarity(...), not distance(...)"));
-                            }
-                            let terms = crate::text::sparse::parse(&self.literal(v)?).map_err(|e| err(format!("similarity({}, ..): {e}", self.schema.fields[field].name)))?;
-                            return Ok(Score::Sparse { field, terms, opts });
-                        }
-                        let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
-                        let vector = self.vector(v)?;
-                        if vector.len() != dim {
-                            return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
-                        }
-                        Ok(Score::Similarity { field, vector, opts })
-                    }
+                    "similarity" => self.similarity(&args, opts, false),
+                    "distance" => Err(err("distance(...) ranks on its own, ORDER BY distance(...) ASC; in an expression, use similarity(...), which ranks larger first")),
+                    "maxsim" => self.maxsim(&args, opts),
                     "rrf" => {
                         if args.len() < 2 {
                             return Err(err("rrf needs at least two scores"));
                         }
-                        let inputs = args.iter().map(|a| self.score(a)).collect::<Result<Vec<_>>>()?;
+                        let inputs = args
+                            .iter()
+                            .map(|a| match a {
+                                // A ranking reads hops nearest first.
+                                Expr::Function(g) if fname(g) == "hops" => Ok(Score::Hops { graph: self.hops_graph()?, far_first: false }),
+                                a => match self.rank(a)? {
+                                    s if s.is_leaf() && !matches!(s, Score::SeqNo | Score::Cond(_)) => Ok(s),
+                                    _ => Err(err(format!("rrf fuses the rankings of scores and columns, not of {a}"))),
+                                },
+                            })
+                            .collect::<Result<Vec<_>>>()?;
                         let num = |k: &str, d: f64| opts.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
                         Ok(Score::Rrf { inputs, k: num("k", 60.0), depth: num("depth", 100.0) as usize })
                     }
                     "ppr" => Ok(Score::Ppr { graph: self.graph(f, "ppr")? }),
                     "decay" => self.decay(f),
-                    n => Err(err(format!("unknown score function {n}"))),
+                    // The number of hops, in an expression.
+                    "hops" if args.is_empty() => Ok(Score::Hops { graph: self.hops_graph()?, far_first: true }),
+                    "seq_no" if args.is_empty() => Ok(Score::SeqNo),
+                    "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
+                    "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
+                    "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),
+                    "gbdt" => {
+                        let usage = "gbdt('model', feature, ...) takes a model's name and the features it reads, in order";
+                        let [model, features @ ..] = args.as_slice() else { return Err(err(usage)) };
+                        let model = self.literal(model).ok().and_then(|v| v.as_str().map(str::to_string)).ok_or_else(|| err(usage))?;
+                        if features.is_empty() || !opts.is_empty() {
+                            return Err(err(usage));
+                        }
+                        Ok(Score::Gbdt { model, hash: String::new(), args: features.iter().map(|a| self.rank(a)).collect::<Result<_>>()?, open: Default::default() })
+                    }
+                    n => match Func::numeric(n) {
+                        Some(func) => {
+                            func.arity(args.len()).map_err(|a| err(format!("{n}() takes {a}")))?;
+                            Ok(Score::Call { func, args: args.iter().map(|a| self.rank(a)).collect::<Result<_>>()? })
+                        }
+                        None => Err(err(format!("unknown score function {n}"))),
+                    },
                 }
             }
             _ => Err(err(format!("unsupported ORDER BY expression: {e}"))),
         }
     }
 
-    /// Terms of a weighted sum, each multiplied by `w`.
-    fn weighted(&self, e: &Expr, w: f64) -> Result<Vec<(f64, Score)>> {
-        match e {
-            Expr::Nested(inner) => self.weighted(inner, w),
-            Expr::BinaryOp { left, op: BinaryOperator::Plus, right } => {
-                Ok([self.weighted(left, w)?, self.weighted(right, w)?].concat())
+    /// `similarity(field, vector)`, or `distance(field, vector)` (which
+    /// ranks the same, ascending, on its own in ORDER BY).
+    fn similarity(&self, args: &[&Expr], opts: Opts, distance: bool) -> Result<Score> {
+        let [field, v] = args else { return Err(err("similarity(field, vector)")) };
+        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. } | FieldType::Sparse), "VECTOR or SPARSE")?;
+        if self.schema.fields[field].ty == FieldType::Sparse {
+            if distance {
+                return Err(err("a SPARSE field takes similarity(...), not distance(...)"));
             }
-            Expr::BinaryOp { left, op: BinaryOperator::Minus, right } => {
-                Ok([self.weighted(left, w)?, self.weighted(right, -w)?].concat())
-            }
-            Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } => {
-                if let Some(c) = self.number(left) {
-                    self.weighted(right, w * c)
-                } else if let Some(c) = self.number(right) {
-                    self.weighted(left, w * c)
-                } else {
-                    Ok(vec![(w, Score::Product(self.factors(e)?))])
-                }
-            }
-            _ => Ok(vec![(w, self.score(e)?)]),
+            let terms = crate::text::sparse::parse(&self.literal(v)?).map_err(|e| err(format!("similarity({}, ..): {e}", self.schema.fields[field].name)))?;
+            return Ok(Score::Sparse { field, terms, opts: without_norm(opts) });
         }
+        let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
+        let vector = self.vector(v)?;
+        if vector.len() != dim {
+            return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
+        }
+        Ok(Score::Similarity { field, vector, opts: without_norm(opts) })
     }
 
-    /// The factors of a product of scores, `a * b * ...`.
-    fn factors(&self, e: &Expr) -> Result<Vec<Score>> {
-        match e {
-            Expr::Nested(inner) => self.factors(inner),
-            Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } => {
-                if self.number(left).is_some() || self.number(right).is_some() {
-                    return Err(err("a product of scores takes no constant factors (they do not change the order)"));
-                }
-                Ok([self.factors(left)?, self.factors(right)?].concat())
-            }
-            _ => {
-                let s = self.score(e)?;
-                match s {
-                    Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Column { .. } | Score::Decay { .. } | Score::Ppr { .. } | Score::Hops { .. } => Ok(vec![s]),
-                    _ => Err(err("a product multiplies bm25, similarity, ppr, a column or decay, not sums or fusions")),
-                }
-            }
+    /// `maxsim(field, vectors)`: the vectors are a list parameter, a tuple
+    /// or array of vectors, a JSON array of them, or a subquery of one
+    /// column of vectors (in a compound query, which runs it first).
+    fn maxsim(&self, args: &[&Expr], opts: Opts) -> Result<Score> {
+        let [field, vs] = args else { return Err(err("maxsim(field, vectors)")) };
+        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. }), "VECTOR")?;
+        let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!("a VECTOR field") };
+        if let Some(v) = opts.get("max_vectors") {
+            v.as_f64().filter(|x| *x >= 1.0 && x.fract() == 0.0).ok_or_else(|| err("max_vectors => a whole number, at least 1"))?;
         }
+        if let Some(q) = subquery_of(vs) {
+            return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(self.sub(q, Sub::Vectors)?)), opts: without_norm(opts) });
+        }
+        let vectors: Vec<Arc<[f32]>> = match vs {
+            Expr::Tuple(items) => items.iter().map(|i| self.vector(i)).collect::<Result<_>>()?,
+            Expr::Array(a) => a.elem.iter().map(|i| self.vector(i)).collect::<Result<_>>()?,
+            Expr::Nested(inner) => vec![self.vector(inner)?],
+            _ => match self.literal(vs)? {
+                // A JSON array of vectors.
+                Value::Str(s) => {
+                    let vs: Vec<Vec<f32>> = serde_json::from_str(&s).map_err(|_| err("maxsim's vectors as text are a JSON array of arrays of numbers"))?;
+                    vs.into_iter().map(Arc::from).collect()
+                }
+                Value::List(xs) if xs.iter().all(|x| matches!(x, Value::Int(_) | Value::Float(_))) => vec![self.vector_value(Value::List(xs))?],
+                Value::List(xs) => xs.into_iter().map(|x| self.vector_value(x)).collect::<Result<_>>()?,
+                v => vec![self.vector_value(v)?],
+            },
+        };
+        if let Some(v) = vectors.iter().find(|v| v.len() != dim) {
+            return Err(err(format!("a query vector has {} dimensions, field has {dim}", v.len())));
+        }
+        if vectors.iter().any(|v| v.iter().any(|x| !x.is_finite())) {
+            return Err(err("a vector's components must be finite numbers"));
+        }
+        Ok(Score::MaxSim { field, vectors: Vectors::List(vectors), opts: without_norm(opts) })
     }
 
     /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
@@ -1577,6 +1801,8 @@ impl<'a> Binder<'a> {
         Ok(match (&field.ty, v) {
             (_, Value::Null) => Value::Null,
             (FieldType::Vector { .. }, _) => Value::Vector(self.vector(e)?),
+            (_, Value::Str(t)) if field.media.is_some() => media_input(field, t)?,
+            (_, v) if field.media.is_some() => return Err(err(format!("{} is a MEDIA field: give it a URI or a JSON object's text, not {v:?}", field.name))),
             (_, v @ Value::List(_)) if field.multi => v,
             (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
             (FieldType::Sparse, v @ Value::Str(_)) => {
@@ -1673,7 +1899,13 @@ impl<'a> Binder<'a> {
     }
 
     fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {
-        let v: Arc<[f32]> = match self.literal(e)? {
+        self.vector_value(self.literal(e)?)
+    }
+
+    /// A value as a vector: a vector, a JSON array as text, or a list of
+    /// numbers.
+    fn vector_value(&self, v: Value) -> Result<Arc<[f32]>> {
+        let v: Arc<[f32]> = match v {
             Value::Vector(v) => v,
             Value::Str(s) => {
                 let v: Vec<f32> = serde_json::from_str(&s).map_err(|_| err("vector literal must be a JSON array"))?;
@@ -1758,6 +1990,22 @@ fn contains_graph(p: &Pred) -> bool {
         Pred::And(ps) | Pred::Or(ps) => ps.iter().any(contains_graph),
         Pred::Not(q) => contains_graph(q),
         _ => false,
+    }
+}
+
+/// A score's options without `norm`, which chose raw values over min-max
+/// fusion in a sum of scores before ranking expressions: `+` adds raw
+/// values now, and `minmax()` normalises.
+fn without_norm(mut opts: Opts) -> Opts {
+    opts.remove("norm");
+    opts
+}
+
+/// `e` without the parentheses around it.
+fn strip_nested(e: &Expr) -> &Expr {
+    match e {
+        Expr::Nested(x) => strip_nested(x),
+        e => e,
     }
 }
 
@@ -1877,10 +2125,17 @@ mod tests {
         let Some(OrderBy::Score { score: Score::Rrf { inputs, k, depth }, .. }) = &s.order else { panic!() };
         assert_eq!((inputs.len(), *k, *depth), (2, 20.0, 100));
 
-        let s = bind("SELECT id FROM docs ORDER BY 0.3 * bm25(body, :t) + 0.7 * similarity(emb, :q) DESC LIMIT 5", &schema(), &q())
+        // A weighted sum of min-max normalised scores is the old fusion;
+        // `+` alone adds raw values.
+        let s = bind("SELECT id FROM docs ORDER BY 0.3 * minmax(bm25(body, :t)) + 0.7 * minmax(similarity(emb, :q)) DESC LIMIT 5", &schema(), &q())
             .unwrap();
         let Some(OrderBy::Score { score: Score::Weighted(ts), .. }) = &s.order else { panic!() };
         assert_eq!(ts.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![0.3, 0.7]);
+        let s = bind("SELECT id FROM docs ORDER BY 0.3 * bm25(body, :t) + 0.7 * similarity(emb, :q) DESC LIMIT 5", &schema(), &q()).unwrap();
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Arith { op: ArithOp::Add, .. }, .. })), "{:?}", s.order);
+        // distance() ranks on its own, not in an expression.
+        let e = bind("SELECT id FROM docs ORDER BY 1 - distance(emb, :q) DESC", &schema(), &q()).unwrap_err().to_string();
+        assert!(e.contains("use similarity(...)"), "{e}");
     }
 
     #[test]
@@ -1898,13 +2153,17 @@ mod tests {
         // A product of scores (a boost), not a weighted sum.
         let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
         assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true, .. }) if f.len() == 2), "{:?}", s.order);
+        // With a constant among its factors, it is an expression.
+        let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * 2 * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Arith { op: ArithOp::Mul, .. }, .. })), "{:?}", s.order);
 
         for bad in [
             "SELECT id FROM other",
             "SELECT id FROM docs WHERE MATCH(year, 'x')",
             "SELECT id FROM docs WHERE category > 'c01'",
             "SELECT id FROM docs ORDER BY similarity(emb, :missing)",
-            "SELECT id FROM docs ORDER BY bm25(body, :t) * 2 * similarity(emb, :q)",
+            "SELECT id FROM docs ORDER BY bm25(body, :t) >= 2",
+            "SELECT id FROM docs ORDER BY ln(similarity(emb, :q), 2, 3)",
             "SELECT id FROM docs ORDER BY year, rating",
             "DELETE FROM docs",
         ] {

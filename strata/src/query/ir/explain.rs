@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use super::{Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, OnConflict, Plan, SortKey};
+use super::{Agg, ArithOp, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Plan, SortKey};
 use crate::query::logical::{AggFn, DecayShape, Direction, Expand, Fuzzy, Opts};
 use crate::query::sql::ident;
 use crate::schema::{FieldType, Logical, Schema};
@@ -15,10 +15,23 @@ const ROWS_SHOWN: usize = 5;
 
 impl Plan {
     /// The plan as lines of text, the root first and each node's input
-    /// indented under it. `schemas` name the fields of the tables the plan
-    /// reads (a field of another table shows as `#id`).
+    /// indented under it, then the file of each ranking model it names.
+    /// `schemas` name the fields of the tables the plan reads (a field of
+    /// another table shows as `#id`).
     pub fn explain(&self, schemas: &[&Schema]) -> Vec<String> {
-        Text { schemas, refs: RefCell::default() }.node(&self.root).0
+        let mut lines = Text { schemas, refs: RefCell::default() }.node(&self.root).0;
+        self.root.visit_exprs(&mut |e| {
+            if let Expr::Gbdt { model, hash, .. } = e {
+                let line = match hash.as_str() {
+                    "" => format!("ranking model: {model}"),
+                    h => format!("ranking model: {model} (hash {h})"),
+                };
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
+        });
+        lines
     }
 }
 
@@ -60,6 +73,20 @@ impl<'a> Text<'a> {
                 }
                 if !s.order.is_empty() {
                     lines.push(format!("  order: {}", self.keys(&s.order, &names)));
+                }
+                // Where each phase runs: a second phase on each shard's
+                // rows, a global one once over every row.
+                for p in &s.phases {
+                    let at = if p.global { "a global phase: scored once over every row" } else { "a second phase: each shard scores its rows" };
+                    lines.push(format!("  rerank: {} DESC over the top {} ({at})", self.expr(&p.expr, &names), p.count));
+                }
+                if let Some(r) = &s.profile {
+                    lines.push(format!("  rank profile: {} (hash {})", ident(&r.name), r.hash));
+                }
+                // For one release: `+` between scores meant min-max fusion
+                // before.
+                if s.order.iter().map(|k| &k.expr).chain(s.phases.iter().map(|p| &p.expr)).any(|e| e.adds_raw_scores()) {
+                    lines.push("  note: + adds raw scores; minmax() normalises them, as a sum of scores did before ranking expressions".into());
                 }
                 (lines, names)
             }
@@ -129,6 +156,7 @@ impl<'a> Text<'a> {
                 (vec![format!("Ref {}", ident(name))], Names { schema: None, outputs: names.outputs })
             }
             Node::Distinct { input } => over(input, &|_| "Distinct".into()),
+            Node::DistinctOn { input, keys } => over(input, &|names| format!("Distinct on: {}", keys.iter().map(|k| self.expr(k, names)).collect::<Vec<_>>().join(", "))),
             Node::KeyOrder { input, by } => {
                 let (il, names) = self.node(input);
                 let lines = match &**by {
@@ -289,21 +317,27 @@ impl<'a> Text<'a> {
                 }
                 s + " END"
             }
-            Expr::Call { func, args } => {
-                let name = match func {
-                    Func::Lower => "lower",
-                    Func::Upper => "upper",
-                    Func::Length => "length",
-                    Func::Abs => "abs",
-                    Func::Round => "round",
-                    Func::Coalesce => "coalesce",
+            Expr::Call { func, args } => format!("{}({})", func.name(), args.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
+            Expr::Gbdt { model, args, .. } => format!("gbdt({})", std::iter::once(quote(model)).chain(args.iter().map(|x| self.expr(x, names))).collect::<Vec<_>>().join(", ")),
+            Expr::Norm { kind, input } => {
+                let name = match kind {
+                    NormKind::MinMax => "minmax",
+                    NormKind::Rank => "rank",
                 };
-                format!("{name}({})", args.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", "))
+                format!("{name}({})", self.expr(input, names))
             }
             Expr::Match { field: f, query, expand } => format!("MATCH({}, {}{})", field(names, *f), quote(query), expansion(expand)),
             Expr::Graph(g) | Expr::Ppr(g) => self.graph(g, names),
             Expr::Bm25 { field: f, text, opts } => format!("bm25({}, {}{})", field(names, *f), quote(text), options(opts)),
             Expr::Similarity { field: f, vector, opts } => format!("similarity({}, {}{})", field(names, *f), lit(&Value::Vector(vector.clone())), options(opts)),
+            Expr::MaxSim { field: f, vectors, opts } => {
+                let vectors = match vectors.as_ref() {
+                    // A few vectors, and how many there are.
+                    Expr::Lit(Value::List(vs)) if vs.len() > 2 => format!("ARRAY[{}, … ({} vectors)]", vs.iter().take(2).map(lit).collect::<Vec<_>>().join(", "), vs.len()),
+                    e => self.expr(e, names),
+                };
+                format!("maxsim({}, {vectors}{})", field(names, *f), options(opts))
+            }
             Expr::Sparse { field: f, terms, opts } => {
                 let terms: serde_json::Map<String, serde_json::Value> = terms.iter().map(|(t, w)| (t.clone(), serde_json::json!(w))).collect();
                 format!("similarity({}, {}{})", field(names, *f), quote(&serde_json::Value::Object(terms).to_string()), options(opts))
@@ -324,7 +358,13 @@ impl<'a> Text<'a> {
                 format!("decay({}, {origin}, {}, offset => {}, decay => {}, shape => '{shape}')", field(names, *f), decay.scale / unit, decay.offset / unit, decay.decay)
             }
             Expr::Rrf { inputs, k, depth } => format!("rrf({}, k => {k}, depth => {depth})", inputs.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
+            // Min-max fusion, as SQL writes it: each term normalised, unless
+            // a term's score keeps raw values (`norm => 'none'`).
             Expr::Weighted(terms) => {
+                let raw = terms.iter().any(|(_, x)| match x {
+                    Expr::Bm25 { opts, .. } | Expr::Similarity { opts, .. } | Expr::Sparse { opts, .. } | Expr::Decay { opts, .. } => opts.get("norm").and_then(|v| v.as_str()) == Some("none"),
+                    _ => false,
+                });
                 let mut s = String::new();
                 for (i, (w, x)) in terms.iter().enumerate() {
                     // A negative weight after the first term is a minus.
@@ -339,9 +379,13 @@ impl<'a> Text<'a> {
                             *w
                         }
                     };
+                    let x = match raw {
+                        true => self.operand(x, names),
+                        false => format!("minmax({})", self.expr(x, names)),
+                    };
                     s += &match w {
-                        w if w == 1.0 => self.operand(x, names),
-                        w => format!("{w} * {}", self.operand(x, names)),
+                        w if w == 1.0 => x,
+                        w => format!("{w} * {x}"),
                     };
                 }
                 s
@@ -370,6 +414,12 @@ impl<'a> Text<'a> {
                 format!("ppr({f}, {seeds}, alpha => {alpha}, eps => {eps}, max_pushes => {max_pushes}, weighted => {}, dir => '{dir}'", *weighted as u8)
             }
         };
+        if !g.weights.is_empty() {
+            // A few weights, and how many there are.
+            let shown: Vec<String> = g.weights.iter().take(8).map(|w| format!("{w:?}")).collect();
+            let more = if g.weights.len() > 8 { format!(", … ({} weights)", g.weights.len()) } else { String::new() };
+            s += &format!(", weights => ({}{more})", shown.join(", "));
+        }
         if !g.labels.is_empty() {
             s += &format!(", labels => {}", quote(&g.labels.join(",")));
         }

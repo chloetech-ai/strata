@@ -11,11 +11,12 @@ from .result import Result
 
 
 def ordered_schema(s: dict) -> dict:
-    """The short schema form in reading order: table, key, fields, and each
-    field's name and type first."""
+    """The short schema form in reading order: table, key, the table's
+    options, fields, and each field's name and type first."""
     out = {"table": s["table"]}
-    if s.get("key") is not None:
-        out["key"] = s["key"]
+    for k in ("key", "shard_by", "cluster_by", "retain", "retain_by"):
+        if s.get(k) is not None:
+            out[k] = s[k]
     out["fields"] = [{"name": f["name"], "type": f["type"], **f} for f in s["fields"]]
     return out
 
@@ -38,12 +39,15 @@ class Search:
     open), `embed`, `query` and `run`."""
 
     def table(self, name: str | None = None) -> Query:
-        """A query of the table, built from Python values (`strata.build`):
+        """A query of the first table or the one named, built from Python
+        values (`strata.build`):
         `db.table().where(col("year") >= 2019).order_by(bm25("body",
         q)).limit(10)`."""
         s = self.schema
         if name is not None and name.lower() != s["table"].lower():
-            raise StrataError(f"no table {name}: this serves {s['table']}")
+            s = next((t for t in self.tables() if t["table"].lower() == name.lower()), None)
+            if s is None:
+                raise StrataError(f"no table {name}")
         return Query(self, s)
 
     def search(

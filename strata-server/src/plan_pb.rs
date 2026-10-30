@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, OnConflict, Plan, Search, Set, SortKey, When};
+use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Phase, Plan, ProfileRef, Search, Set, SortKey, When};
 use strata::query::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy};
 use strata::value::Value;
 
@@ -62,7 +62,13 @@ fn opts(o: &BTreeMap<String, Value>) -> HashMap<String, pb::Value> {
 
 fn node(n: &Node) -> pb::Node {
     let n = match n {
-        Node::Search(s) => N::Search(Box::new(pb::Search { table: s.table.clone(), filter: bex(&s.filter), order: s.order.iter().map(sort_key).collect() })),
+        Node::Search(s) => N::Search(Box::new(pb::Search {
+            table: s.table.clone(),
+            filter: bex(&s.filter),
+            order: s.order.iter().map(sort_key).collect(),
+            phases: s.phases.iter().map(|p| pb::Phase { count: p.count, expr: Some(ex(&p.expr)), global: p.global }).collect(),
+            profile: s.profile.as_ref().map(|r| pb::RankProfileRef { name: r.name.clone(), hash: r.hash.clone() }),
+        })),
         Node::Aggregate { input, keys, aggs } => N::Aggregate(Box::new(pb::Aggregate {
             input: boxed(input),
             keys: keys.iter().map(ex).collect(),
@@ -98,6 +104,7 @@ fn node(n: &Node) -> pb::Node {
         Node::Ref { name } => N::Ref(name.clone()),
         Node::Distinct { input } => N::Distinct(Box::new(node(input))),
         Node::KeyOrder { input, by } => N::KeyOrder(Box::new(pb::KeyOrder { input: boxed(input), by: boxed(by) })),
+        Node::DistinctOn { input, keys } => N::DistinctOn(Box::new(pb::DistinctOn { input: boxed(input), keys: keys.iter().map(ex).collect() })),
     };
     pb::Node { node: Some(n) }
 }
@@ -134,6 +141,7 @@ fn graph(g: &Graph) -> pb::Graph {
         max_nodes: g.max_nodes,
         k: g.k,
         min_sim: g.min_sim,
+        weights: g.weights.clone(),
     }
 }
 
@@ -191,6 +199,17 @@ fn expr(e: &Expr) -> E {
                 Func::Abs => pb::Func::Abs,
                 Func::Round => pb::Func::Round,
                 Func::Coalesce => pb::Func::Coalesce,
+                Func::Ln => pb::Func::Ln,
+                Func::Log => pb::Func::Log,
+                Func::Exp => pb::Func::Exp,
+                Func::Sqrt => pb::Func::Sqrt,
+                Func::Pow => pb::Func::Pow,
+                Func::Least => pb::Func::Least,
+                Func::Greatest => pb::Func::Greatest,
+                Func::Sigmoid => pb::Func::Sigmoid,
+                Func::Clamp => pb::Func::Clamp,
+                Func::Dot => pb::Func::Dot,
+                Func::SidAt => pb::Func::SidAt,
             } as i32,
             args: args.iter().map(ex).collect(),
         }),
@@ -208,6 +227,7 @@ fn expr(e: &Expr) -> E {
         Expr::Graph(g) => E::Graph(Box::new(graph(g))),
         Expr::Bm25 { field, text, opts: o } => E::Bm25(pb::Bm25 { field: *field, text: text.clone(), opts: opts(o) }),
         Expr::Similarity { field, vector, opts: o } => E::Similarity(pb::Similarity { field: *field, vector: Some(pb::Floats { v: vector.to_vec() }), opts: opts(o) }),
+        Expr::MaxSim { field, vectors, opts: o } => E::Maxsim(Box::new(pb::MaxSim { field: *field, vectors: bex(vectors), opts: opts(o) })),
         Expr::Sparse { field, terms, opts: o } => E::Sparse(pb::SparseScore { field: *field, terms: terms.iter().map(|(t, w)| pb::SparseTerm { term: t.clone(), weight: *w }).collect(), opts: opts(o) }),
         Expr::Decay { field, decay, opts: o } => E::Decay(pb::DecayScore {
             field: *field,
@@ -227,6 +247,14 @@ fn expr(e: &Expr) -> E {
         Expr::Rrf { inputs, k, depth } => E::Rrf(pb::Rrf { inputs: inputs.iter().map(ex).collect(), k: *k, depth: *depth }),
         Expr::Weighted(terms) => E::Weighted(pb::Weighted { terms: terms.iter().map(|(w, e)| pb::WeightedTerm { weight: *w, expr: Some(ex(e)) }).collect() }),
         Expr::Product(xs) => E::Product(exprs(xs)),
+        Expr::Norm { kind, input } => E::Norm(Box::new(pb::Norm {
+            kind: match kind {
+                NormKind::MinMax => pb::NormKind::MinMax,
+                NormKind::Rank => pb::NormKind::Rank,
+            } as i32,
+            input: bex(input),
+        })),
+        Expr::Gbdt { model, hash, args, .. } => E::Gbdt(pb::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(ex).collect() }),
         Expr::Ppr(g) => E::Ppr(Box::new(graph(g))),
         Expr::Subquery(n) => E::Subquery(Box::new(node(n))),
         Expr::Values(n) => E::Values(Box::new(node(n))),
@@ -314,7 +342,9 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
                 Some(f) => from_ex(Some(*f))?,
                 None => Expr::Lit(Value::Bool(true)),
             };
-            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()? })
+            let phases = s.phases.into_iter().map(|p| Ok(Phase { count: p.count, expr: from_ex(p.expr)?, global: p.global })).collect::<Result<_, ApiError>>()?;
+            let profile = s.profile.map(|r| ProfileRef { name: r.name, hash: r.hash });
+            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()?, phases, profile })
         }
         N::Aggregate(a) => {
             let a = *a;
@@ -386,6 +416,10 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
             let k = *k;
             Node::KeyOrder { input: from_bnode(k.input)?, by: from_bnode(k.by)? }
         }
+        N::DistinctOn(d) => {
+            let d = *d;
+            Node::DistinctOn { input: from_bnode(d.input)?, keys: from_exprs(d.keys)? }
+        }
     })
 }
 
@@ -414,6 +448,7 @@ fn from_graph(g: pb::Graph) -> Result<Graph, ApiError> {
         max_nodes: g.max_nodes,
         k: g.k,
         min_sim: g.min_sim.map(|x| finite(x, "min_sim")).transpose()?,
+        weights: g.weights.into_iter().map(|w| finite(w, "a seed's weight")).collect::<Result<_, ApiError>>()?,
     })
 }
 
@@ -480,6 +515,17 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
                 pb::Func::Abs => Func::Abs,
                 pb::Func::Round => Func::Round,
                 pb::Func::Coalesce => Func::Coalesce,
+                pb::Func::Ln => Func::Ln,
+                pb::Func::Log => Func::Log,
+                pb::Func::Exp => Func::Exp,
+                pb::Func::Sqrt => Func::Sqrt,
+                pb::Func::Pow => Func::Pow,
+                pb::Func::Least => Func::Least,
+                pb::Func::Greatest => Func::Greatest,
+                pb::Func::Sigmoid => Func::Sigmoid,
+                pb::Func::Clamp => Func::Clamp,
+                pb::Func::Dot => Func::Dot,
+                pb::Func::SidAt => Func::SidAt,
             };
             Expr::Call { func, args: from_exprs(c.args)? }
         }
@@ -501,6 +547,10 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
             }
             Expr::Similarity { field: s.field, vector: v.into(), opts: from_opts(s.opts)? }
         }
+        E::Maxsim(m) => {
+            let m = *m;
+            Expr::MaxSim { field: m.field, vectors: Box::new(from_ex(m.vectors.map(|e| *e))?), opts: from_opts(m.opts)? }
+        }
         E::Sparse(s) => {
             let terms = s.terms.into_iter().map(|t| Ok((t.term, finite(t.weight as f64, "a term's weight")? as f32))).collect::<Result<_, ApiError>>()?;
             Expr::Sparse { field: s.field, terms, opts: from_opts(s.opts)? }
@@ -518,6 +568,14 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
         E::Rrf(r) => Expr::Rrf { inputs: from_exprs(r.inputs)?, k: finite(r.k, "k")?, depth: r.depth },
         E::Weighted(w) => Expr::Weighted(w.terms.into_iter().map(|t| Ok((finite(t.weight, "a weight")?, from_ex(t.expr)?))).collect::<Result<_, ApiError>>()?),
         E::Product(xs) => Expr::Product(from_exprs(xs.v)?),
+        E::Norm(n) => {
+            let kind = match en::<pb::NormKind>(n.kind, "set function")? {
+                pb::NormKind::MinMax => NormKind::MinMax,
+                pb::NormKind::Rank => NormKind::Rank,
+            };
+            Expr::Norm { kind, input: Box::new(from_ex(n.input.map(|x| *x))?) }
+        }
+        E::Gbdt(g) => Expr::Gbdt { model: g.model, hash: g.hash, args: from_exprs(g.args)?, open: Default::default() },
         E::Ppr(g) => Expr::Ppr(Box::new(from_graph(*g)?)),
         E::Subquery(n) => Expr::Subquery(Box::new(from_node_in(*n)?)),
         E::Values(n) => Expr::Values(Box::new(from_node_in(*n)?)),

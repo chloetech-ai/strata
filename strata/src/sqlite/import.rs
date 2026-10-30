@@ -347,7 +347,7 @@ fn write(db: &Db, table: &str, keyed: bool, docs: &mut dyn Iterator<Item = Resul
             return Ok(n);
         }
         let mut batch = batch;
-        db.embed_missing_in(table, &mut batch)?;
+        db.fill_in(table, &mut batch)?;
         n += batch.len() as u64;
         let mut txn = db.storage().begin()?;
         let mut t = txn.table(table)?;
@@ -1082,7 +1082,7 @@ fn into_schema(t: &Table, stats: &[Stats], schema: &Schema, exists: bool, meta: 
             notes.push(format!("column {:?} left out: another column fills field {}", c.name, field.name));
             continue;
         }
-        let read = if st.blobs > 0 && opts.blobs_base64 && matches!(field.ty, FieldType::Keyword | FieldType::Text { .. }) { Read::Base64 } else { Read::Plain { time_unit: st.time_unit() } };
+        let read = if st.blobs > 0 && opts.blobs_base64 && matches!(field.ty, FieldType::Keyword | FieldType::Text { .. }) && field.media.is_none() { Read::Base64 } else { Read::Plain { time_unit: st.time_unit() } };
         columns.push((c.name.clone(), f));
         reads.push(read);
     }
@@ -1211,8 +1211,8 @@ fn value(schema: &Schema, f: usize, v: ValueRef<'_>, read: Read) -> Result<Value
             Value::Vector(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>().into())
         }
         (_, ValueRef::Blob(b)) => return Err(bad(format!("a BLOB of {} bytes", b.len()))),
-        (FieldType::Text { .. } | FieldType::Keyword, ValueRef::Integer(i)) if field.logical.is_none() => Value::Str(i.to_string()),
-        (FieldType::Text { .. } | FieldType::Keyword, ValueRef::Real(r)) if field.logical.is_none() => Value::Str(r.to_string()),
+        (FieldType::Text { .. } | FieldType::Keyword, ValueRef::Integer(i)) if field.logical.is_none() && field.media.is_none() => Value::Str(i.to_string()),
+        (FieldType::Text { .. } | FieldType::Keyword, ValueRef::Real(r)) if field.logical.is_none() && field.media.is_none() => Value::Str(r.to_string()),
         (FieldType::Int, ValueRef::Real(r)) if field.logical.is_none() => {
             if r.fract() != 0.0 || r.abs() >= 9.2e18 {
                 return Err(bad(format!("{r} is not an integer")));
@@ -1240,15 +1240,8 @@ fn value(schema: &Schema, f: usize, v: ValueRef<'_>, read: Read) -> Result<Value
 
 /// Standard base64, with padding.
 fn base64(b: &[u8]) -> String {
-    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
-    for c in b.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            out.push(if i <= c.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
-        }
-    }
-    out
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(b)
 }
 
 #[cfg(test)]

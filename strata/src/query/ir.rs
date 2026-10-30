@@ -33,10 +33,11 @@
 //! ([`Plan::explain`]). Every SQL statement runs as its plan, and
 //! [`crate::db::Db::run`] runs a plan made elsewhere.
 //!
-//! A compound query (joins, `WITH`, subqueries, `SELECT DISTINCT`) is a
-//! plan of operators over those shapes, its leaves ([`crate::query::compound`]
-//! makes it): [`Node::Join`], [`Node::With`] and [`Node::Ref`],
-//! [`Node::Distinct`], [`Node::KeyOrder`], the nodes above over rows in
+//! A compound query (joins, `WITH`, subqueries, `SELECT DISTINCT`,
+//! `DISTINCT ON`) is a plan of operators over those shapes, its leaves
+//! ([`crate::query::compound`] makes it): [`Node::Join`], [`Node::With`]
+//! and [`Node::Ref`], [`Node::Distinct`], [`Node::DistinctOn`]
+//! ([`DISTINCT_ON`]), [`Node::KeyOrder`], the nodes above over rows in
 //! memory, and subqueries as expressions ([`Expr::Values`], [`Expr::Keys`],
 //! [`Expr::Exists`], [`Expr::Scalar`]). [`crate::query::ops`] runs it: each
 //! leaf on the executor, the rest in memory. Such a plan needs the feature
@@ -49,6 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::query::logical::{AggFn, Decay, Direction, Expand, Opts};
+use crate::query::model::Opened;
 use crate::value::Value;
 
 pub mod eval;
@@ -60,7 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 2] = [OPERATORS, SEQ_NO];
+pub const FEATURES: [&str; 10] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -70,6 +73,41 @@ pub const OPERATORS: &str = "operators";
 /// The feature of a plan with a column of rows' sequence numbers
 /// ([`Expr::SeqNo`]).
 pub const SEQ_NO: &str = "seq_no";
+
+/// The feature of a plan whose Search ranks by an expression of scores,
+/// row values and numbers ([`Expr::Arith`], [`Expr::Call`], [`Expr::Case`],
+/// [`Expr::Norm`] and literals around score leaves), rather than by a score
+/// or one of the fused shapes ([`Expr::Rrf`], [`Expr::Weighted`],
+/// [`Expr::Product`]).
+pub const RANK_EXPRESSIONS: &str = "rank_expressions";
+
+/// The feature of a plan that scores with several query vectors
+/// ([`Expr::MaxSim`]), takes a dot product of vectors ([`Func::Dot`]), or
+/// seeds a walk with weights ([`Graph::weights`]).
+pub const MAXSIM: &str = "maxsim";
+/// The feature of a plan that cuts semantic IDs ([`Func::SidAt`]).
+pub const SEMANTIC_ID: &str = "semantic_id";
+
+/// The feature of a plan whose Search reranks its top rows in phases
+/// ([`Search::phases`]).
+pub const RANK_PHASES: &str = "rank_phases";
+
+/// The feature of a plan with a column of a Search that is a ranking
+/// expression scoring each row by itself (`bm25(title, :q)`, what SQL's
+/// `features()` lists), rather than a field, `score()`, `hops()` or
+/// `seq_no()`.
+pub const RANK_FEATURES: &str = "rank_features";
+
+/// The feature of a plan whose Search ranks as a rank profile does
+/// ([`Search::profile`]).
+pub const RANK_PROFILES: &str = "rank_profiles";
+
+/// The feature of a plan that ranks with a model ([`Expr::Gbdt`]).
+pub const RANK_MODELS: &str = "rank_models";
+
+/// The feature of a plan that keeps the first row of each group
+/// ([`Node::DistinctOn`]).
+pub const DISTINCT_ON: &str = "distinct_on";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -139,6 +177,11 @@ pub enum Node {
     Ref { name: String },
     /// The input's rows, each once.
     Distinct { input: Box<Node> },
+    /// The first of the input's rows with equal `keys`, in the input's
+    /// order (`DISTINCT ON`): a row per group, the groups in the order of
+    /// their first rows. Keys are equal when their values are, NULL equal
+    /// to NULL and a list to the same list. Needs [`DISTINCT_ON`].
+    DistinctOn { input: Box<Node>, keys: Vec<Expr> },
     /// The input's rows (rows of one table) in the order of the rows of
     /// `by` with the same primary key.
     KeyOrder { input: Box<Node>, by: Box<Node> },
@@ -191,6 +234,39 @@ pub struct Search {
     /// ties.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<SortKey>,
+    /// Rerank phases after `order`, in turn (feature [`RANK_PHASES`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<Phase>,
+    /// The rank profile `order` and `phases` were written out from
+    /// (feature [`RANK_PROFILES`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileRef>,
+}
+
+/// A rank profile a Search ranks as ([`crate::query::profile`]): its name
+/// and the hash of its definition
+/// ([`crate::storage::manifest::RankProfile::hash`]). A database whose
+/// table has no profile of that name, or one with another hash, refuses
+/// the plan rather than rank otherwise than the plan was made to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileRef {
+    pub name: String,
+    pub hash: String,
+}
+
+/// A rerank phase of a [`Search`]: the top `count` rows of the phase
+/// before it (the first phase is the Search's `order`) ranked again by
+/// `expr`, best first, rows tied on it in the order they had; only those
+/// rows go on. A phase that is not `global` is row-local, and each shard
+/// scores its own rows; a global one runs once over every row it reranks
+/// (on the coordinator over shards), so it may hold set functions
+/// (`minmax`, `rank`, `rrf`). A phase after a global one is global.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Phase {
+    pub count: u64,
+    pub expr: Expr,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub global: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -271,7 +347,9 @@ pub enum ArithOp {
     Mod,
 }
 
-/// A scalar function of values.
+/// A scalar function of values. The functions from [`Func::Ln`] on are
+/// numeric, came with [`RANK_EXPRESSIONS`], and are NULL where the result
+/// is not a finite number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Func {
@@ -284,6 +362,154 @@ pub enum Func {
     Round,
     /// The first argument that is not NULL (nor a list without values).
     Coalesce,
+    /// The natural logarithm.
+    Ln,
+    /// The base-10 logarithm of `args[0]`, or with two arguments the
+    /// logarithm of `args[1]` to base `args[0]` (as PostgreSQL's `log`).
+    Log,
+    Exp,
+    Sqrt,
+    /// `args[0]` to the power `args[1]`.
+    Pow,
+    /// The smallest argument that is not NULL; NULL if all are.
+    Least,
+    /// The largest argument that is not NULL; NULL if all are.
+    Greatest,
+    /// `1 / (1 + e^-x)`.
+    Sigmoid,
+    /// `args[0]` within `args[1]` and `args[2]`.
+    Clamp,
+    /// The dot product of two vectors of one length (feature [`MAXSIM`]);
+    /// not a ranking expression's function: `similarity` is.
+    Dot,
+    /// The prefix of `args[1]` levels of a semantic ID `args[0]`
+    /// ([`crate::sid::sid_at`]); needs [`SEMANTIC_ID`].
+    SidAt,
+}
+
+impl Func {
+    /// The function's name in SQL.
+    pub fn name(self) -> &'static str {
+        match self {
+            Func::Lower => "lower",
+            Func::Upper => "upper",
+            Func::Length => "length",
+            Func::Abs => "abs",
+            Func::Round => "round",
+            Func::Coalesce => "coalesce",
+            Func::Ln => "ln",
+            Func::Log => "log",
+            Func::Exp => "exp",
+            Func::Sqrt => "sqrt",
+            Func::Pow => "pow",
+            Func::Least => "least",
+            Func::Greatest => "greatest",
+            Func::Sigmoid => "sigmoid",
+            Func::Clamp => "clamp",
+            Func::Dot => "dot",
+            Func::SidAt => "sid_at",
+        }
+    }
+
+    /// The numeric function named `name` (as SQL writes it), which a
+    /// ranking expression can use.
+    pub fn numeric(name: &str) -> Option<Func> {
+        Some(match name {
+            "abs" => Func::Abs,
+            "round" => Func::Round,
+            "coalesce" => Func::Coalesce,
+            "ln" => Func::Ln,
+            "log" => Func::Log,
+            "exp" => Func::Exp,
+            "sqrt" => Func::Sqrt,
+            "pow" | "power" => Func::Pow,
+            "least" => Func::Least,
+            "greatest" => Func::Greatest,
+            "sigmoid" => Func::Sigmoid,
+            "clamp" => Func::Clamp,
+            _ => return None,
+        })
+    }
+
+    /// Whether the function takes `n` arguments, or else how many it takes.
+    pub fn arity(self, n: usize) -> std::result::Result<(), &'static str> {
+        let ok = match self {
+            Func::Lower | Func::Upper | Func::Length | Func::Abs | Func::Ln | Func::Exp | Func::Sqrt | Func::Sigmoid => n == 1,
+            Func::Round | Func::Log => n == 1 || n == 2,
+            Func::Pow | Func::Dot | Func::SidAt => n == 2,
+            Func::Clamp => n == 3,
+            Func::Coalesce | Func::Least | Func::Greatest => n >= 1,
+        };
+        match (ok, self) {
+            (true, _) => Ok(()),
+            (_, Func::Round | Func::Log) => Err("one or two arguments"),
+            (_, Func::Pow | Func::Dot) => Err("two arguments"),
+            (_, Func::SidAt) => Err("two arguments: a semantic ID and a number of levels"),
+            (_, Func::Clamp) => Err("three arguments: a value, its least and its greatest"),
+            (_, Func::Coalesce | Func::Least | Func::Greatest) => Err("at least one argument"),
+            _ => Err("one argument"),
+        }
+    }
+
+    /// The numeric function of `args`, NaN standing for NULL: NaN where the
+    /// result has no finite value (`ln(0)`, `sqrt(-1)`, an overflow).
+    /// [`Func::Lower`], [`Func::Upper`], [`Func::Length`] and
+    /// [`Func::SidAt`] take text, and are NaN here.
+    pub fn eval_f64(self, args: &[f64]) -> f64 {
+        // NULL in, NULL out, except where a function skips it: `pow(1,
+        // NULL)` and `clamp(NULL, 0, 1)` are not 1 and 0, as f64's pow and
+        // max would make them.
+        if !matches!(self, Func::Coalesce | Func::Least | Func::Greatest) && args.iter().any(|a| a.is_nan()) {
+            return f64::NAN;
+        }
+        let x = args.first().copied().unwrap_or(f64::NAN);
+        let r = match self {
+            Func::Lower | Func::Upper | Func::Length | Func::Dot | Func::SidAt => f64::NAN,
+            Func::Abs => x.abs(),
+            Func::Round => {
+                let d = args.get(1).map_or(0.0, |d| d.clamp(-30.0, 30.0).trunc());
+                let m = 10f64.powi(d as i32);
+                (x * m).round() / m
+            }
+            Func::Coalesce => args.iter().copied().find(|v| !v.is_nan()).unwrap_or(f64::NAN),
+            Func::Ln if x > 0.0 => x.ln(),
+            Func::Log if args.len() == 1 && x > 0.0 => x.log10(),
+            Func::Log => match args.get(1) {
+                Some(&y) if x > 0.0 && x != 1.0 && y > 0.0 => y.ln() / x.ln(),
+                _ => f64::NAN,
+            },
+            Func::Ln => f64::NAN,
+            Func::Exp => x.exp(),
+            Func::Sqrt if x >= 0.0 => x.sqrt(),
+            Func::Sqrt => f64::NAN,
+            Func::Pow => x.powf(args.get(1).copied().unwrap_or(f64::NAN)),
+            Func::Least => args.iter().copied().filter(|v| !v.is_nan()).reduce(f64::min).unwrap_or(f64::NAN),
+            Func::Greatest => args.iter().copied().filter(|v| !v.is_nan()).reduce(f64::max).unwrap_or(f64::NAN),
+            Func::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            Func::Clamp => match (args.get(1), args.get(2)) {
+                (Some(&lo), Some(&hi)) => x.max(lo).min(hi),
+                _ => f64::NAN,
+            },
+        };
+        if r.is_finite() {
+            r
+        } else {
+            f64::NAN
+        }
+    }
+}
+
+/// A set function of [`Expr::Norm`]: a value seen against every candidate
+/// a ranking scores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormKind {
+    /// `minmax(x)`: `(x - min) / (max - min)` over the candidates, 1 where
+    /// they all have one value, and 0 where `x` is NULL.
+    MinMax,
+    /// `rank(x)`: 1 for the largest `x`, plus the number of candidates with
+    /// a larger value; rows where `x` is NULL rank after every other.
+    Rank,
 }
 
 /// A branch of [`Expr::Case`].
@@ -385,6 +611,16 @@ pub enum Expr {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "lits")]
         opts: Opts,
     },
+    /// The best similarity of a VECTOR field with any of `vectors`: a list
+    /// literal of vectors, or [`Expr::Values`] of a subquery, which runs
+    /// first (feature [`MAXSIM`]).
+    #[serde(rename = "maxsim")]
+    MaxSim {
+        field: u32,
+        vectors: Box<Expr>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "lits")]
+        opts: Opts,
+    },
     /// Similarity of a SPARSE field with `terms`.
     Sparse {
         field: u32,
@@ -405,6 +641,23 @@ pub enum Expr {
     Weighted(Vec<(f64, Expr)>),
     /// The product of scores.
     Product(Vec<Expr>),
+    /// A set function of a ranking expression, over the rows it ranks
+    /// (feature [`RANK_EXPRESSIONS`]).
+    Norm { kind: NormKind, input: Box<Expr> },
+    /// A ranking model's score of a row from its features `args`, ranking
+    /// expressions of the row ([`crate::query::model`], feature
+    /// [`RANK_MODELS`]). `model` names it in the models directory, and
+    /// `hash` is the hash of its file that the plan was made with: empty
+    /// until a database or coordinator opens it, which then runs the plan
+    /// only with a model of that hash.
+    Gbdt {
+        model: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hash: String,
+        args: Vec<Expr>,
+        #[serde(skip)]
+        open: Opened,
+    },
     /// Personalized PageRank from a traversal's seeds.
     Ppr(Box<Graph>),
     /// The rows of a plan (graph seeds from a query of the table, which
@@ -429,6 +682,11 @@ pub struct Graph {
     pub field: u32,
     /// Primary keys (a list literal), or a [`Expr::Subquery`].
     pub seeds: Expr,
+    /// The weight of each of the keys `seeds` lists, which PageRank
+    /// restarts at in proportion (`weighted => 1`); none, all 1 (feature
+    /// [`MAXSIM`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<f64>,
     pub kind: GraphKind,
     pub dir: Direction,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -465,6 +723,30 @@ impl Node {
         matches!(self, Node::Insert { .. } | Node::Update { .. } | Node::Delete { .. })
     }
 
+    /// The nodes whose rows the node reads.
+    pub fn inputs(&self) -> Vec<&Node> {
+        match self {
+            Node::Search(_) | Node::Insert { .. } | Node::Ref { .. } => Vec::new(),
+            Node::Aggregate { input, .. }
+            | Node::Filter { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => vec![input],
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => vec![a, b],
+            Node::With { ctes, input } => ctes.iter().map(|c| &c.input).chain([&**input]).collect(),
+        }
+    }
+
+    /// Whether the node or one below it (outside subqueries) is a
+    /// [`Node::DistinctOn`].
+    fn keeps_firsts(&self) -> bool {
+        matches!(self, Node::DistinctOn { .. }) || self.inputs().into_iter().any(Node::keeps_firsts)
+    }
+
     /// Whether the node has the shape the executor runs: `Project [Limit]
     /// [Sort] [Filter] [Aggregate] Search` ([`Plan::to_select`] says
     /// whether it is one it takes). Its subqueries ([`Expr::Values`] and
@@ -492,6 +774,330 @@ impl Node {
         found
     }
 
+    /// Whether the plan needs [`MAXSIM`]: an [`Expr::MaxSim`], a
+    /// [`Func::Dot`] or weighted seeds anywhere in it, subqueries too.
+    pub fn uses_maxsim(&self) -> bool {
+        let mut found = false;
+        self.visit_exprs(&mut |e| {
+            found |= match e {
+                Expr::MaxSim { .. } | Expr::Call { func: Func::Dot, .. } => true,
+                Expr::Graph(g) | Expr::Ppr(g) => !g.weights.is_empty(),
+                _ => false,
+            }
+        });
+        found
+    }
+
+    /// Whether a Search in the plan reranks in phases ([`RANK_PHASES`]).
+    pub fn has_phases(&self) -> bool {
+        fn within(e: &Expr) -> bool {
+            let mut found = false;
+            e.visit(&mut |x| {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    found |= n.has_phases();
+                }
+            });
+            found
+        }
+        match self {
+            Node::Search(s) => !s.phases.is_empty() || within(&s.filter),
+            Node::Filter { input, cond } => input.has_phases() || within(cond),
+            Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.has_phases(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_phases() || b.has_phases(),
+            Node::With { ctes, input } => input.has_phases() || ctes.iter().any(|c| c.input.has_phases()),
+            Node::Insert { .. } | Node::Ref { .. } => false,
+        }
+    }
+
+    /// Calls `f` on each Search of the node, those of subqueries in its
+    /// expressions too.
+    pub fn each_search(&self, f: &mut dyn FnMut(&Search)) {
+        fn within(e: &Expr, f: &mut dyn FnMut(&Search)) {
+            e.visit(&mut |x| {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    n.each_search(f);
+                }
+            });
+        }
+        match self {
+            Node::Search(s) => {
+                f(s);
+                within(&s.filter, f);
+            }
+            Node::Filter { input, cond } => {
+                input.each_search(f);
+                within(cond, f);
+            }
+            Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.each_search(f),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => {
+                a.each_search(f);
+                b.each_search(f);
+            }
+            Node::With { ctes, input } => {
+                ctes.iter().for_each(|c| c.input.each_search(f));
+                input.each_search(f);
+            }
+            Node::Insert { .. } | Node::Ref { .. } => {}
+        }
+    }
+
+    /// Whether a Search in the plan ranks as a rank profile
+    /// ([`RANK_PROFILES`]).
+    pub fn has_profiles(&self) -> bool {
+        let mut found = false;
+        self.each_search(&mut |s| found |= s.profile.is_some());
+        found
+    }
+
+    /// Whether a Search's columns in the plan hold a ranking expression
+    /// ([`RANK_FEATURES`]).
+    pub fn has_features(&self) -> bool {
+        fn within(e: &Expr) -> bool {
+            let mut found = false;
+            e.visit(&mut |x| {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    found |= n.has_features();
+                }
+            });
+            found
+        }
+        // The columns of `Project [Limit] Search`.
+        fn over_search(n: &Node) -> bool {
+            match n {
+                Node::Limit { input, .. } => over_search(input),
+                n => matches!(n, Node::Search(_)),
+            }
+        }
+        match self {
+            Node::Search(s) => within(&s.filter),
+            Node::Project { input, columns } if over_search(input) => {
+                columns.iter().any(|c| !matches!(c.expr, Expr::Field(_) | Expr::Score | Expr::Hops | Expr::SeqNo)) || input.has_features()
+            }
+            Node::Filter { input, cond } => input.has_features() || within(cond),
+            Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.has_features(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_features() || b.has_features(),
+            Node::With { ctes, input } => input.has_features() || ctes.iter().any(|c| c.input.has_features()),
+            Node::Insert { .. } | Node::Ref { .. } => false,
+        }
+    }
+
+    /// Whether the plan ranks with a model ([`RANK_MODELS`]).
+    pub fn has_models(&self) -> bool {
+        let mut found = false;
+        self.visit_exprs(&mut |e| found |= matches!(e, Expr::Gbdt { .. }));
+        found
+    }
+
+    /// Calls `f` on every expression of the node and of the nodes under
+    /// it, and of the plans of subqueries in them, each expression before
+    /// those within it.
+    pub fn visit_exprs(&self, f: &mut dyn FnMut(&Expr)) {
+        let mut each = |e: &Expr| {
+            e.visit(&mut |x| {
+                f(x);
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    n.visit_exprs(f);
+                }
+            })
+        };
+        match self {
+            Node::Search(s) => {
+                each(&s.filter);
+                s.order.iter().for_each(|k| each(&k.expr));
+                s.phases.iter().for_each(|p| each(&p.expr));
+            }
+            Node::Aggregate { input, keys, aggs } => {
+                keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut each);
+                input.visit_exprs(f);
+            }
+            Node::Filter { input, cond } => {
+                each(cond);
+                input.visit_exprs(f);
+            }
+            Node::Sort { input, keys } => {
+                keys.iter().for_each(|k| each(&k.expr));
+                input.visit_exprs(f);
+            }
+            Node::Project { input, columns } => {
+                columns.iter().for_each(|c| each(&c.expr));
+                input.visit_exprs(f);
+            }
+            Node::Insert { rows, on_conflict, .. } => {
+                rows.iter().flatten().for_each(&mut each);
+                if let OnConflict::Update(sets) = on_conflict {
+                    sets.iter().for_each(|s| each(&s.value));
+                }
+            }
+            Node::Update { input, sets, .. } => {
+                sets.iter().for_each(|s| each(&s.value));
+                input.visit_exprs(f);
+            }
+            Node::Join { left, right, keys, on, .. } => {
+                keys.iter().for_each(|k| {
+                    each(&k.left);
+                    each(&k.right);
+                });
+                on.iter().for_each(&mut each);
+                left.visit_exprs(f);
+                right.visit_exprs(f);
+            }
+            Node::With { ctes, input } => {
+                ctes.iter().for_each(|c| c.input.visit_exprs(f));
+                input.visit_exprs(f);
+            }
+            Node::KeyOrder { input, by } => {
+                input.visit_exprs(f);
+                by.visit_exprs(f);
+            }
+            Node::DistinctOn { input, keys } => {
+                keys.iter().for_each(&mut each);
+                input.visit_exprs(f);
+            }
+            Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.visit_exprs(f),
+            Node::Ref { .. } => {}
+        }
+    }
+
+    /// [`Node::visit_exprs`], changing the expressions.
+    pub fn visit_exprs_mut(&mut self, f: &mut dyn FnMut(&mut Expr) -> Result<()>) -> Result<()> {
+        let mut each = |e: &mut Expr| {
+            e.visit_mut(&mut |x| {
+                f(x)?;
+                match x {
+                    Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) => n.visit_exprs_mut(f),
+                    _ => Ok(()),
+                }
+            })
+        };
+        match self {
+            Node::Search(s) => {
+                each(&mut s.filter)?;
+                for e in s.order.iter_mut().map(|k| &mut k.expr).chain(s.phases.iter_mut().map(|p| &mut p.expr)) {
+                    each(e)?;
+                }
+                Ok(())
+            }
+            Node::Aggregate { input, keys, aggs } => {
+                for e in keys.iter_mut().chain(aggs.iter_mut().filter_map(|a| a.arg.as_mut())) {
+                    each(e)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Filter { input, cond } => {
+                each(cond)?;
+                input.visit_exprs_mut(f)
+            }
+            Node::Sort { input, keys } => {
+                for k in keys {
+                    each(&mut k.expr)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Project { input, columns } => {
+                for c in columns {
+                    each(&mut c.expr)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Insert { rows, on_conflict, .. } => {
+                for e in rows.iter_mut().flatten() {
+                    each(e)?;
+                }
+                if let OnConflict::Update(sets) = on_conflict {
+                    for s in sets {
+                        each(&mut s.value)?;
+                    }
+                }
+                Ok(())
+            }
+            Node::Update { input, sets, .. } => {
+                for s in sets {
+                    each(&mut s.value)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Join { left, right, keys, on, .. } => {
+                for k in keys {
+                    each(&mut k.left)?;
+                    each(&mut k.right)?;
+                }
+                if let Some(on) = on {
+                    each(on)?;
+                }
+                left.visit_exprs_mut(f)?;
+                right.visit_exprs_mut(f)
+            }
+            Node::With { ctes, input } => {
+                for c in ctes {
+                    c.input.visit_exprs_mut(f)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::KeyOrder { input, by } => {
+                input.visit_exprs_mut(f)?;
+                by.visit_exprs_mut(f)
+            }
+            Node::DistinctOn { input, keys } => {
+                for k in keys {
+                    each(k)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.visit_exprs_mut(f),
+            Node::Ref { .. } => Ok(()),
+        }
+    }
+
+    /// Whether a Search in the plan ranks by an expression that needs
+    /// [`RANK_EXPRESSIONS`].
+    pub fn ranks_by_expression(&self) -> bool {
+        fn within(e: &Expr) -> bool {
+            let mut found = false;
+            e.visit(&mut |x| {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    found |= n.ranks_by_expression();
+                }
+            });
+            found
+        }
+        match self {
+            Node::Search(s) => s.order.first().is_some_and(|k| k.expr.is_rank_expression()) || s.phases.iter().any(|p| p.expr.is_rank_expression()) || within(&s.filter),
+            Node::Filter { input, cond } => input.ranks_by_expression() || within(cond),
+            Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.ranks_by_expression(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.ranks_by_expression() || b.ranks_by_expression(),
+            Node::With { ctes, input } => input.ranks_by_expression() || ctes.iter().any(|c| c.input.ranks_by_expression()),
+            Node::Insert { .. } | Node::Ref { .. } => false,
+        }
+    }
+
     /// Calls `f` on each expression of a leaf's nodes.
     pub(crate) fn leaf_exprs(&self, f: &mut dyn FnMut(&Expr)) {
         match self {
@@ -515,6 +1121,7 @@ impl Node {
             Node::Search(s) => {
                 f(&s.filter);
                 s.order.iter().for_each(|k| f(&k.expr));
+                s.phases.iter().for_each(|p| f(&p.expr));
             }
             _ => {}
         }
@@ -551,6 +1158,9 @@ impl Node {
                 for k in &mut s.order {
                     f(&mut k.expr)?;
                 }
+                for p in &mut s.phases {
+                    f(&mut p.expr)?;
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -562,7 +1172,7 @@ impl Node {
     pub(crate) fn search(&self) -> Option<&Search> {
         match self {
             Node::Search(s) => Some(s),
-            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } => input.search(),
+            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } | Node::DistinctOn { input, .. } => input.search(),
             _ => None,
         }
     }
@@ -570,7 +1180,7 @@ impl Node {
     pub(crate) fn search_mut(&mut self) -> Option<&mut Search> {
         match self {
             Node::Search(s) => Some(s),
-            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } => input.search_mut(),
+            Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } | Node::DistinctOn { input, .. } => input.search_mut(),
             _ => None,
         }
     }
@@ -580,6 +1190,50 @@ impl Expr {
     /// Whether the expression holds a subquery that operators run
     /// ([`Expr::Values`], [`Expr::Keys`], [`Expr::Exists`],
     /// [`Expr::Scalar`]).
+    /// Whether the expression, a Search's ranking, needs
+    /// [`RANK_EXPRESSIONS`]: anything but a score, a field, `hops()` and
+    /// the fused shapes of them that came before.
+    pub fn is_rank_expression(&self) -> bool {
+        match self {
+            Expr::Field(_) | Expr::Hops | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::MaxSim { .. } | Expr::Decay { .. } | Expr::Ppr(_) => false,
+            Expr::Rrf { inputs, .. } | Expr::Product(inputs) => inputs.iter().any(Expr::is_rank_expression),
+            Expr::Weighted(terms) => terms.iter().any(|(_, x)| x.is_rank_expression()),
+            _ => true,
+        }
+    }
+
+    /// Whether the expression adds raw relevance scores (`bm25(..) +
+    /// similarity(..)`), which meant min-max fusion before ranking
+    /// expressions: EXPLAIN says so, for one release.
+    pub fn adds_raw_scores(&self) -> bool {
+        // The scores and fields an expression reads raw: not through a set
+        // function or a fused shape.
+        fn raw<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+            match e {
+                Expr::Arith { left, right, .. } => {
+                    raw(left, out);
+                    raw(right, out);
+                }
+                Expr::Neg(x) => raw(x, out),
+                Expr::Call { args, .. } => args.iter().for_each(|a| raw(a, out)),
+                Expr::Case { whens, otherwise, .. } => whens.iter().map(|w| &w.then).chain(otherwise.as_deref()).for_each(|x| raw(x, out)),
+                Expr::Field(_) | Expr::Hops | Expr::SeqNo | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::Decay { .. } | Expr::Ppr(_) => out.push(e),
+                _ => {}
+            }
+        }
+        let relevance = |e: &&Expr| matches!(e, Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::Ppr(_) | Expr::Hops);
+        let mut found = false;
+        self.visit(&mut |e| {
+            if let Expr::Arith { op: ArithOp::Add | ArithOp::Sub, left, right } = e {
+                let (mut l, mut r) = (Vec::new(), Vec::new());
+                raw(left, &mut l);
+                raw(right, &mut r);
+                found |= !l.is_empty() && !r.is_empty() && l != r && (l.iter().any(relevance) || r.iter().any(relevance));
+            }
+        });
+        found
+    }
+
     pub fn has_operators(&self) -> bool {
         let mut found = false;
         self.visit(&mut |e| found |= matches!(e, Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_)));
@@ -600,7 +1254,7 @@ impl Expr {
             }
         };
         match self {
-            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => x.visit(f),
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } => x.visit(f),
             Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) => xs.iter().for_each(|x| x.visit(f)),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => {
                 left.visit(f);
@@ -626,7 +1280,8 @@ impl Expr {
                 }
                 otherwise.iter().for_each(|x| x.visit(f));
             }
-            Expr::Call { args, .. } => args.iter().for_each(|x| x.visit(f)),
+            Expr::Call { args, .. } | Expr::Gbdt { args, .. } => args.iter().for_each(|x| x.visit(f)),
+            Expr::MaxSim { vectors, .. } => vectors.visit(f),
             Expr::Rrf { inputs, .. } => inputs.iter().for_each(|x| x.visit(f)),
             Expr::Weighted(ts) => ts.iter().for_each(|(_, x)| x.visit(f)),
             Expr::Graph(g) | Expr::Ppr(g) => graph(g, f),
@@ -640,8 +1295,8 @@ impl Expr {
         f(self)?;
         let mut within: Vec<&mut Expr> = Vec::new();
         match self {
-            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => within.push(x),
-            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } | Expr::MaxSim { vectors: x, .. } => within.push(x),
+            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Gbdt { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
                 within.push(expr);
@@ -702,6 +1357,38 @@ impl Plan {
         if seq_no {
             features.push(SEQ_NO.to_string());
         }
+        if root.ranks_by_expression() {
+            features.push(RANK_EXPRESSIONS.to_string());
+        }
+        let mut sid_at = false;
+        root.visit_exprs(&mut |e| sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. }));
+        if sid_at {
+            features.push(SEMANTIC_ID.to_string());
+        }
+        if root.has_phases() {
+            features.push(RANK_PHASES.to_string());
+        }
+        if root.has_features() {
+            features.push(RANK_FEATURES.to_string());
+        }
+        if root.uses_maxsim() {
+            features.push(MAXSIM.to_string());
+        }
+        if root.has_profiles() {
+            features.push(RANK_PROFILES.to_string());
+        }
+        if root.has_models() {
+            features.push(RANK_MODELS.to_string());
+        }
+        let mut distinct_on = root.keeps_firsts();
+        root.visit_exprs(&mut |e| {
+            if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = e {
+                distinct_on |= n.keeps_firsts();
+            }
+        });
+        if distinct_on {
+            features.push(DISTINCT_ON.to_string());
+        }
         Plan { version: VERSION, features, root }
     }
 
@@ -718,6 +1405,7 @@ impl Plan {
                 | Node::Limit { input, .. }
                 | Node::Project { input, .. }
                 | Node::Distinct { input }
+                | Node::DistinctOn { input, .. }
                 | Node::KeyOrder { input, .. } => of(input),
                 Node::Join { left, right, .. } => of(left).or_else(|| of(right)),
                 Node::With { ctes, input } => of(input).or_else(|| ctes.iter().find_map(|c| of(&c.input))),
@@ -761,10 +1449,16 @@ impl Plan {
     /// `features`: an error naming what it lacks if not. A plan in another
     /// form than JSON (a shard's protobuf) is checked with it too.
     pub fn readable(version: u64, features: &[&str]) -> Result<()> {
+        Plan::readable_by(version, features, &FEATURES)
+    }
+
+    /// [`Plan::readable`] by a reader of the plan features `known`: an
+    /// older version of Strata knows fewer.
+    pub fn readable_by(version: u64, features: &[&str], known: &[&str]) -> Result<()> {
         if version == 0 || version > VERSION as u64 {
             return Err(err(format!("plan version {version} is not one this version of Strata reads (it reads version {VERSION}): it may be newer")));
         }
-        match features.iter().find(|f| !FEATURES.contains(f)) {
+        match features.iter().find(|f| !known.contains(f)) {
             Some(name) => Err(err(format!("the plan needs feature {name:?}, which this version of Strata does not have: it may be newer"))),
             None => Ok(()),
         }

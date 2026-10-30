@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::query::ir::{ArithOp, Func, NormKind};
+use crate::query::model::Opened;
 use crate::value::Value;
 
 /// A row predicate over schema fields (indices into `Schema::fields`).
@@ -118,6 +120,9 @@ pub enum Direction {
 pub enum Seeds {
     /// Primary keys.
     Keys(Vec<Value>),
+    /// Primary keys, each with its weight: the scores of the subquery rows
+    /// that named it, summed, which `ppr(..., weighted => 1)` restarts at.
+    Weighted(Vec<(Value, f64)>),
     /// The rows of a subquery over the same table (with their scores, which
     /// `ppr(..., weighted => 1)` uses as restart weights).
     Query(Box<Select>),
@@ -253,10 +258,15 @@ pub enum Score {
     /// Dot product of a SPARSE field's term weights with `terms`' (also
     /// `similarity(...)` in SQL).
     Sparse { field: usize, terms: Vec<(String, f32)>, opts: Opts },
+    /// `maxsim(field, vectors)`: a row's best similarity to any of several
+    /// query vectors.
+    MaxSim { field: usize, vectors: Vectors, opts: Opts },
     /// Reciprocal rank fusion: `Σ 1 / (k + rank_i)` over the inputs' rankings
     /// of their top `depth` rows.
     Rrf { inputs: Vec<Score>, k: f64, depth: usize },
-    /// A weighted sum of scores (`0.3 * bm25(..) + 0.7 * similarity(..)`).
+    /// A weighted sum of min-max normalised scores (`0.3 *
+    /// minmax(bm25(..)) + 0.7 * minmax(similarity(..))`): a missing value
+    /// counts as the worst of its term.
     Weighted(Vec<(f64, Score)>),
     /// A numeric column's value.
     Column { field: usize },
@@ -271,22 +281,83 @@ pub enum Score {
     /// The product of scores (`bm25(..) * decay(..)`): candidates are the
     /// top `depth` rows of each relevance factor (BM25, similarity, graph;
     /// of every factor when there is none), scored exactly by every factor.
+    /// A factor below 0, or missing, counts as 0.
     Product(Vec<Score>),
+    /// The sequence number of the write that last changed the row
+    /// (`seq_no()`), in a ranking expression.
+    SeqNo,
+    /// 1 for a row the predicate holds for, as `WHERE` would keep it, and
+    /// 0 for others: the test of a [`Score::Case`] branch.
+    Cond(Box<Pred>),
+    // A ranking expression (`bm25(body, :q) * (1 + 0.2 * importance)`)
+    // is these over the scores above ([`crate::query::rank`]). NULL in
+    // arithmetic makes the expression NULL, and the row ranks last.
+    /// A number: a literal or a parameter.
+    Num(f64),
+    Arith { op: ArithOp, left: Box<Score>, right: Box<Score> },
+    Neg(Box<Score>),
+    /// A numeric function ([`Func::numeric`]).
+    Call { func: Func, args: Vec<Score> },
+    /// A set function of a ranking expression over the rows it ranks
+    /// (`minmax(x)`, `rank(x)`).
+    Norm { kind: NormKind, input: Box<Score> },
+    /// A ranking model's score of a row from its features
+    /// ([`crate::query::model`]): the model named `model`, of the file
+    /// whose hash is `hash`, once opened ([`super::ir::Expr::Gbdt`]).
+    Gbdt { model: String, hash: String, args: Vec<Score>, open: Opened },
+    /// `CASE WHEN c THEN x ... ELSE y END`, each `c` a [`Score::Cond`]; NULL
+    /// without an `ELSE`.
+    Case { whens: Vec<(Score, Score)>, otherwise: Option<Box<Score>> },
 }
 
 impl Score {
-    /// Every leaf (BM25, similarity or column) of the expression.
+    /// Calls `f` on the expression and each within it.
+    pub fn visit(&self, f: &mut dyn FnMut(&Score)) {
+        f(self);
+        match self {
+            Score::Rrf { inputs: xs, .. } | Score::Product(xs) | Score::Call { args: xs, .. } | Score::Gbdt { args: xs, .. } => xs.iter().for_each(|x| x.visit(f)),
+            Score::Weighted(ts) => ts.iter().for_each(|(_, x)| x.visit(f)),
+            Score::Arith { left, right, .. } => {
+                left.visit(f);
+                right.visit(f);
+            }
+            Score::Neg(x) | Score::Norm { input: x, .. } => x.visit(f),
+            Score::Case { whens, otherwise } => {
+                for (c, x) in whens {
+                    c.visit(f);
+                    x.visit(f);
+                }
+                otherwise.iter().for_each(|x| x.visit(f));
+            }
+            _ => {}
+        }
+    }
+
+    /// Every leaf (BM25, similarity, a column...) of the expression.
     pub fn leaves(&self) -> Vec<&Score> {
         match self {
-            Score::Rrf { inputs, .. } | Score::Product(inputs) => inputs.iter().flat_map(|s| s.leaves()).collect(),
+            Score::Rrf { inputs, .. } | Score::Product(inputs) | Score::Call { args: inputs, .. } | Score::Gbdt { args: inputs, .. } => inputs.iter().flat_map(|s| s.leaves()).collect(),
             Score::Weighted(ts) => ts.iter().flat_map(|(_, s)| s.leaves()).collect(),
+            Score::Arith { left, right, .. } => [left.leaves(), right.leaves()].concat(),
+            Score::Neg(x) | Score::Norm { input: x, .. } => x.leaves(),
+            Score::Case { whens, otherwise } => whens.iter().flat_map(|(c, x)| [c.leaves(), x.leaves()].concat()).chain(otherwise.iter().flat_map(|x| x.leaves())).collect(),
+            Score::Num(_) => Vec::new(),
             s => vec![s],
         }
     }
 
+    /// Whether the score is a leaf: a score of one row by itself, which
+    /// the executor reads directly.
+    pub fn is_leaf(&self) -> bool {
+        matches!(
+            self,
+            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Cond(_)
+        )
+    }
+
     pub fn opts(&self) -> Option<&Opts> {
         match self {
-            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } | Score::Sparse { opts, .. } | Score::Decay { opts, .. } => Some(opts),
+            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } | Score::Sparse { opts, .. } | Score::MaxSim { opts, .. } | Score::Decay { opts, .. } => Some(opts),
             _ => None,
         }
     }
@@ -295,9 +366,99 @@ impl Score {
     /// similarity, sparse, graph), as opposed to a row's own values (a column, a
     /// decay), which only boost rows found by relevance.
     pub fn is_relevance(&self) -> bool {
-        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Ppr { .. } | Score::Hops { .. })
+        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Ppr { .. } | Score::Hops { .. })
+    }
+
+    /// Whether the score can be a term of the fused shapes
+    /// ([`Score::Weighted`], [`Score::Product`]) that came before ranking
+    /// expressions: `hops()`, the number of hops in an expression, ranks
+    /// nearest first in them.
+    pub fn is_fusable(&self) -> bool {
+        self.is_leaf() && !matches!(self, Score::Hops { .. } | Score::SeqNo | Score::Cond(_))
+    }
+
+    /// The expression with its sums of `w * minmax(score)` as
+    /// [`Score::Weighted`] and its products of scores as [`Score::Product`],
+    /// whatever wrote it (SQL or a plan): they keep the rules from before
+    /// ranking expressions, and plans write them as before, which older
+    /// shards read.
+    pub fn fused_shapes(self) -> Score {
+        // The terms of a sum of `[±][c *] minmax(score) [* c]`, each with
+        // its weight.
+        fn terms(e: &Score, w: f64, out: &mut Vec<(f64, Score)>) -> bool {
+            match e {
+                Score::Arith { op: ArithOp::Add, left, right } => terms(left, w, out) && terms(right, w, out),
+                Score::Arith { op: ArithOp::Sub, left, right } => terms(left, w, out) && terms(right, -w, out),
+                Score::Neg(x) => terms(x, -w, out),
+                Score::Arith { op: ArithOp::Mul, left, right } => match (&**left, &**right) {
+                    (Score::Num(c), x) | (x, Score::Num(c)) => terms(x, w * c, out),
+                    _ => false,
+                },
+                Score::Norm { kind: NormKind::MinMax, input } if input.is_fusable() => {
+                    out.push((w, (**input).clone()));
+                    true
+                }
+                _ => false,
+            }
+        }
+        // The factors of a chain of `*`.
+        fn factors(e: Score, out: &mut Vec<Score>) {
+            match e {
+                Score::Arith { op: ArithOp::Mul, left, right } => {
+                    factors(*left, out);
+                    factors(*right, out);
+                }
+                e => out.push(e),
+            }
+        }
+        let shapes = |x: Box<Score>| Box::new(x.fused_shapes());
+        match self {
+            Score::Arith { op: ArithOp::Add | ArithOp::Sub, .. } => {
+                let mut t = Vec::new();
+                if terms(&self, 1.0, &mut t) && t.len() > 1 {
+                    return Score::Weighted(t);
+                }
+                let Score::Arith { op, left, right } = self else { unreachable!() };
+                Score::Arith { op, left: shapes(left), right: shapes(right) }
+            }
+            Score::Arith { op: ArithOp::Mul, .. } => {
+                let mut fs = Vec::new();
+                factors(self.clone(), &mut fs);
+                let (scores, rest): (Vec<Score>, Vec<Score>) = fs.into_iter().partition(Score::is_fusable);
+                if scores.len() > 1 && rest.iter().all(|f| matches!(f, Score::Num(_))) {
+                    // Constant factors scale the product of scores.
+                    let c: f64 = rest.iter().map(|f| if let Score::Num(c) = f { *c } else { 1.0 }).product();
+                    let product = Score::Product(scores);
+                    return match rest.is_empty() {
+                        true => product,
+                        false => Score::Arith { op: ArithOp::Mul, left: Box::new(Score::Num(c)), right: Box::new(product) },
+                    };
+                }
+                let Score::Arith { op, left, right } = self else { unreachable!() };
+                Score::Arith { op, left: shapes(left), right: shapes(right) }
+            }
+            Score::Arith { op, left, right } => Score::Arith { op, left: shapes(left), right: shapes(right) },
+            Score::Neg(x) => Score::Neg(shapes(x)),
+            Score::Call { func, args } => Score::Call { func, args: args.into_iter().map(Score::fused_shapes).collect() },
+            Score::Norm { kind, input } => Score::Norm { kind, input: shapes(input) },
+            Score::Gbdt { model, hash, args, open } => Score::Gbdt { model, hash, args: args.into_iter().map(Score::fused_shapes).collect(), open },
+            Score::Case { whens, otherwise } => Score::Case { whens: whens.into_iter().map(|(c, x)| (c, x.fused_shapes())).collect(), otherwise: otherwise.map(shapes) },
+            e => e,
+        }
     }
 }
+
+/// The query vectors of [`Score::MaxSim`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Vectors {
+    List(Vec<Arc<[f32]>>),
+    /// The vectors of a compound subquery's plan ([`crate::query::ir::Expr::Values`]),
+    /// which runs first: like [`Seeds::Plan`], never the executor's.
+    Plan(Box<crate::query::ir::Expr>),
+}
+
+/// The query vectors `maxsim` takes by default, at most.
+pub const MAX_QUERY_VECTORS: usize = 64;
 
 /// How a decay function falls off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +515,21 @@ pub enum OrderBy {
     Agg { what: Projection, desc: bool },
 }
 
+/// A rerank phase ([`Select::phases`]): the top `count` rows of the phase
+/// before it (the first phase is the query's `ORDER BY`), ranked again by
+/// `score`, best first. Rows tied on it keep the order they had, and only
+/// those `count` rows go on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Phase {
+    pub score: Score,
+    pub count: usize,
+    /// Scored once over every row the phase reranks, on the coordinator
+    /// over shards: a set function (`minmax`, `rank`, `rrf`) reads them
+    /// all. A phase that is not global is row-local, and each shard scores
+    /// its own rows.
+    pub global: bool,
+}
+
 /// An aggregate function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -394,6 +570,11 @@ pub enum Projection {
     /// `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`, `COUNT(f)`, `COUNT(DISTINCT
     /// f)`: of the whole result, or per group.
     Agg { func: AggFn, field: usize },
+    /// A ranking expression that scores each row by itself (`bm25(title,
+    /// :q)`, `ln(1 + rating)`; no set function, RRF or fusion): the value
+    /// the query's ranking gives it ([`crate::query::rank`]), NULL where the
+    /// row has none. `features()` stands for those of the query's ranking.
+    Feature(Score),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -409,6 +590,9 @@ pub struct Select {
     pub having: Option<Having>,
     /// Secondary order for rows that tie on the primary one.
     pub tiebreak: Option<Tiebreak>,
+    /// Rerank phases after `order`, in turn; LIMIT and OFFSET cut the
+    /// last one's rows.
+    pub phases: Vec<Phase>,
     pub limit: Option<usize>,
     pub offset: usize,
     /// Graph computations that `Pred::Graph`, `Score::Ppr`, `Score::Hops`
@@ -422,6 +606,29 @@ pub struct Select {
 }
 
 impl Select {
+    /// A ranking model the query ranks with that is not open
+    /// ([`crate::query::model::Models::open`]): the executor refuses the
+    /// query rather than rank by NULL.
+    pub fn unopened_model(&self) -> Option<String> {
+        let order = self.order.iter().filter_map(|o| match o {
+            OrderBy::Score { score, .. } => Some(score),
+            _ => None,
+        });
+        let features = self.projection.iter().filter_map(|(_, p)| match p {
+            Projection::Feature(s) => Some(s),
+            _ => None,
+        });
+        let mut found = None;
+        for s in order.chain(self.phases.iter().map(|p| &p.score)).chain(features) {
+            s.visit(&mut |x| {
+                if let Score::Gbdt { model, open: Opened(None), .. } = x {
+                    found.get_or_insert_with(|| model.clone());
+                }
+            });
+        }
+        found
+    }
+
     /// `rows` with the values of BOOL and TIMESTAMP columns as
     /// [`Value::Bool`](crate::value::Value::Bool) and
     /// [`Value::Timestamp`](crate::value::Value::Timestamp)

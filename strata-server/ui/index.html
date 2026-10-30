@@ -770,7 +770,7 @@ function builderQuery() {
     order = `${textScore || vecScore ? (textScore || vecScore) + " * " : ""}${boost} DESC`;
   } else if (textScore && vecScore) {
     if (B.fuse === "rrf") order = `rrf(${textScore}, ${vecScore}) DESC`;
-    else { const w = $("bWeight").value / 100; $("bWeightVal").textContent = `${(1 - w).toFixed(2)} / ${w.toFixed(2)}`; order = `${(1 - w).toFixed(2)} * ${textScore} + ${w.toFixed(2)} * ${vecScore} DESC`; }
+    else { const w = $("bWeight").value / 100; $("bWeightVal").textContent = `${(1 - w).toFixed(2)} / ${w.toFixed(2)}`; order = `${(1 - w).toFixed(2)} * minmax(${textScore}) + ${w.toFixed(2)} * minmax(${vecScore}) DESC`; }
   } else if (textScore || vecScore) order = `${textScore || vecScore} DESC`;
   else if ($("bSort").value) order = `${A}${ident($("bSort").value)} ${$("bDir").value}`;
   const cols = S.fields.filter((f) => B.cols.has(f.name)).map((f) => A + ident(f.name));
@@ -1296,9 +1296,11 @@ function helpSections(x) {
   const vx = [];
   if (V && k0 != null) {
     vx.push({ t: "Rows like a row", d: `{"vector_of": key} is that row's vector.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY similarity(${V}, :q) DESC\nLIMIT 10`, params: { q: { vector_of: k0 } } });
-    if (tf) vx.push({ t: "Hybrid: text and vectors", d: `rrf() fuses the two rankings; 0.5 * a + 0.5 * b weighs them instead.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY rrf(bm25(${tf}, '${w1} ${w2}'), similarity(${V}, :q)) DESC\nLIMIT 10`, params: { q: embeddingOf(vF.name)?.loaded ? { embed: `${w1} ${w2}`, field: vF.name } : { vector_of: k0 } } });
+    if (tf) vx.push({ t: "Hybrid: text and vectors", d: `rrf() fuses the two rankings; 0.5 * minmax(a) + 0.5 * minmax(b) weighs them instead.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY rrf(bm25(${tf}, '${w1} ${w2}'), similarity(${V}, :q)) DESC\nLIMIT 10`, params: { q: embeddingOf(vF.name)?.loaded ? { embed: `${w1} ${w2}`, field: vF.name } : { vector_of: k0 } } });
   }
   if (tf && num) vx.push({ t: "Boost by a number", d: `decay(field, origin, scale) is 1 at the origin and 0.5 a scale away; multiply a score by it.`, sql: `SELECT ${show}, ${num}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1}') * decay(${num}, ${x.max}, ${Math.max(1, round2((x.max - x.min) / 4))}) DESC\nLIMIT 10` });
+  if (tf && num) vx.push({ t: "Rerank the top rows", d: `A WITH that ranks and cuts, ranked again: the 100 best matches for ${w1}, reordered by their ${numF.name} on top of the text score.`, sql: `WITH top AS (\n  SELECT * FROM ${T} ORDER BY bm25(${tf}, '${w1}') DESC LIMIT 100\n)\nSELECT ${show}, ${num}, score() FROM top\nORDER BY ln(1 + bm25(${tf}, '${w1}')) + 0.1 * coalesce(${num}, 0) DESC\nLIMIT 10` });
+  if (tf && num) vx.push({ t: "See what a ranking read", d: `features() adds a column per input of the ranking (each score and column, then the expression), the values it ranked by; any expression that scores a row by itself can be a column too.`, sql: `SELECT ${show}, score(), features() FROM ${T}\nORDER BY bm25(${tf}, '${w1}') * (1 + 0.1 * coalesce(${num}, 0)) DESC\nLIMIT 10` });
   if (vx.length) sec.push({ id: "ranking", title: "Similarity, hybrid and boosts", intro: "", ex: vx });
   return sec;
 }
@@ -1454,7 +1456,7 @@ async function refreshHealth() {
   } catch (e) { $("dot").className = "dot bad"; $("counts").textContent = e.message; }
 }
 // ---- schema and import ----------------------------------------------------------
-const TYPES = ["text", "keyword", "int", "float", "bool", "timestamp", "vector", "sparse", "edges"];
+const TYPES = ["text", "keyword", "int", "float", "bool", "timestamp", "vector", "sparse", "media", "edges"];
 const MODELS = { "potion-retrieval-32M": 512, "potion-base-8M": 256, "bge-small-en-v1.5": 384, "snowflake-arctic-embed-m-v1.5": 768 };
 const modelDim = (m) => !m ? null : m.startsWith("hash:") ? Number(m.slice(5)) || null : (MODELS[m] || null);
 const FORMATS = { jsonl: "jsonl", ndjson: "jsonl", json: "json", csv: "csv", tsv: "tsv", tab: "tsv" };
@@ -1527,6 +1529,7 @@ function designJson() {
     const o = { name: f.name, type: f.type }, vec = f.type === "vector", gen = !!(f.from && f.from.length);
     if (f.type === "text" && f.positions === false) o.positions = false;
     if (f.type === "text" && f.analyzer && f.analyzer !== "english") o.analyzer = f.analyzer;
+    if (f.type === "media" && f.kind && f.kind !== "any") o.kind = f.kind;
     if (gen) o.from = f.from;
     if (f.multi) o.multi = true;
     if (f.stored != null && f.stored !== (!vec && !gen)) o.stored = f.stored;
@@ -1578,7 +1581,7 @@ function fieldRow(f) {
   const type = el("select", {}, ...TYPES.map((t) => el("option", { value: t, text: t })));
   type.value = f.type;
   type.onchange = () => {
-    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored", "default", "analyzer"]) delete f[k];
+    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored", "default", "analyzer", "kind"]) delete f[k];
     f.type = type.value;
     if (f.type === "vector") { const from = textFields(); f.embed = from.length ? { from, model: "potion-retrieval-32M" } : undefined; if (!f.embed) f.dim = 384; }
     designChanged(true);
@@ -1619,6 +1622,12 @@ function fieldRow(f) {
     codes.onchange = () => { f.codes = codes.value; designChanged(false); };
     opts.append(el("label", { title: "How nearest rows are found" }, "index", index), el("label", { title: "How the vectors are compressed for search; the full vectors rescore the best" }, "codes", codes));
   }
+  if (f.type === "media") {
+    const kind = el("select", {}, ...["any", "image", "audio", "video", "pdf"].map((k) => el("option", { value: k, text: k })));
+    kind.value = f.kind || "any";
+    kind.onchange = () => { f.kind = kind.value === "any" ? undefined : kind.value; designChanged(false); };
+    opts.append(el("label", { title: "The files this field takes: a row holds a file's URI, hash, type and size, and writes give a URI or the bytes (base64)" }, "files", kind));
+  }
   if (f.type === "keyword" || f.type === "int") opts.append(check("list", !!f.multi, (on) => { f.multi = on || undefined; if (on) delete f.stored; }, "Each row holds several values"));
   if (f.type === "text") {
     opts.append(check("phrases", f.positions !== false, (on) => { f.positions = on ? undefined : false; }, "Keep word positions, for \"exact phrase\" searches"));
@@ -1642,8 +1651,8 @@ function fieldRow(f) {
     opts.append(el("label", { title: "What a row that leaves this field out holds (now: the time it is written)" }, "default", def));
   }
   const storedDefault = !vec && !gen;
-  opts.append(check("indexed", f.indexed !== false, (on) => { f.indexed = on ? undefined : false; }, "Searchable and filterable"),
-    check("stored", f.stored == null ? storedDefault : f.stored, (on) => { f.stored = on === storedDefault ? undefined : on; }, vec ? "Keep the full vectors to return them (search needs only the index)" : "Returned in results"));
+  opts.append(check("indexed", f.indexed !== false, (on) => { f.indexed = on ? undefined : false; }, "Searchable and filterable"));
+  if (f.type !== "media") opts.append(check("stored", f.stored == null ? storedDefault : f.stored, (on) => { f.stored = on === storedDefault ? undefined : on; }, vec ? "Keep the full vectors to return them (search needs only the index)" : "Returned in results"));
   const del = el("button", { class: "btn small", title: "Remove this field", text: "×" });
   del.onclick = () => {
     D.fields = D.fields.filter((g) => g !== f);

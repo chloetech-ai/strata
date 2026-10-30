@@ -13,7 +13,7 @@ use crate::segment::{DocId, SegmentFile};
 use crate::storage::db::Reserved;
 use crate::storage::freelist::FreeList;
 use crate::storage::live::{words_for, LiveDocs};
-use crate::storage::manifest::{Manifest, SegmentMeta};
+use crate::storage::manifest::{Manifest, RankProfile, SegmentMeta};
 use crate::storage::pager::{Extent, Meta};
 use crate::storage::pk::PkIndex;
 use crate::storage::rowseq;
@@ -280,11 +280,18 @@ pub(crate) struct TableState {
     pub mem_live: Vec<Option<(usize, usize, Arc<LiveDocs>)>>,
     /// The latest segment built for each memtable chunk (emptied by a flush).
     pub memsegs: Vec<Option<MemSeg>>,
+    /// Its rank profiles, sorted by name: those of the manifest and those
+    /// logged since, which the next version writes
+    /// ([`crate::storage::manifest::TableMeta::profiles`]).
+    pub profiles: Arc<Vec<RankProfile>>,
+    /// The ties its semantic-ID fields have given ([`crate::sid::Ties`]),
+    /// once a write needed them; kept up to date by every insert.
+    pub ties: Option<crate::sid::Ties>,
 }
 
 impl TableState {
     pub fn new(id: u32, schema: Arc<Schema>, handles: Vec<Arc<SegHandle>>, chunk: usize, gen: u64) -> TableState {
-        TableState { id, schema, handles, mem: Memtable::new(chunk, gen), mem_live: Vec::new(), memsegs: Vec::new() }
+        TableState { id, schema, handles, mem: Memtable::new(chunk, gen), mem_live: Vec::new(), memsegs: Vec::new(), profiles: Arc::default(), ties: None }
     }
 
     /// Empties the memtable (after a flush).
@@ -444,6 +451,9 @@ impl State {
         match op {
             Op::Insert(doc) => {
                 let table = &mut self.tables[t];
+                if let Some(ties) = &mut table.ties {
+                    ties.saw_doc(&table.schema, &doc);
+                }
                 let key = table.schema.primary_key.and_then(|pk| Key::of(&doc[pk]));
                 // The transaction owned the only reference.
                 let i = table.mem.push(Arc::try_unwrap(doc).unwrap_or_else(|d| (*d).clone()), seq);
@@ -463,6 +473,14 @@ impl State {
                 }
                 None => {}
             },
+            Op::Profile { name, def } => {
+                let profiles = Arc::make_mut(&mut self.tables[t].profiles);
+                profiles.retain(|p| !p.name.eq_ignore_ascii_case(&name));
+                if let Some(p) = def {
+                    profiles.push(Arc::unwrap_or_clone(p));
+                    profiles.sort_by_key(|p| p.name.to_ascii_lowercase());
+                }
+            }
             Op::Set { key, field, value } => match self.find_live(t, &key) {
                 Some(Loc::Mem(i)) => {
                     let u = &mut self.tables[t].mem.updates;

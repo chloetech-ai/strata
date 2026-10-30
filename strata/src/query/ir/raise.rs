@@ -3,9 +3,10 @@
 //! made gives back the statement it was made of; a plan from elsewhere is
 //! checked against the schema as the binder checks SQL.
 
-use super::{err, Agg, ArithOp, CmpOp, Expr, Graph, GraphKind, Node, OnConflict, Plan};
+use super::{err, Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, OnConflict, Plan};
 use crate::error::Result;
-use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
+use crate::query::rank::Rank;
 use crate::query::sql::{self, Assign, Conflict, Write};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
@@ -72,6 +73,7 @@ fn name(n: &Node) -> &'static str {
         Node::With { .. } => "With",
         Node::Ref { .. } => "Ref",
         Node::Distinct { .. } => "Distinct",
+        Node::DistinctOn { .. } => "DistinctOn",
         Node::KeyOrder { .. } => "KeyOrder",
     }
 }
@@ -158,6 +160,7 @@ impl<'a> Raise<'a> {
         self.table(&search.table)?;
         let filter = self.filter(&search.filter)?;
         let pk = self.schema.primary_key;
+        let mut phases = Vec::new();
         let (projection, group_by, having, order, tiebreak) = match aggregate {
             None => {
                 if let Some(n) = sort.map(|_| "Sort").or(having.map(|_| "Filter")) {
@@ -173,7 +176,17 @@ impl<'a> Raise<'a> {
                                 Expr::Score => Projection::Score,
                                 Expr::Hops => Projection::Hops(self.hops_graph()?),
                                 Expr::SeqNo => Projection::SeqNo,
-                                e => return Err(err(format!("a column of a Search is a field, score(), hops() or seq_no(), not {e:?}"))),
+                                // A ranking expression (feature
+                                // RANK_FEATURES), which scores each row by
+                                // itself.
+                                e => match self.rank(e, true).map(Score::fused_shapes) {
+                                    Ok(s) if Rank::is_global(&s) => {
+                                        return Err(err(format!("a column of a Search scores each row by itself: minmax(), rank(), rrf() and weighted sums rank rows against each other, not {e:?}")))
+                                    }
+                                    Ok(s) => Projection::Feature(s),
+                                    Err(crate::error::Error::Query(x)) => return Err(err(format!("a column of a Search is a field, score(), hops(), seq_no() or a ranking expression: {x}"))),
+                                    Err(x) => return Err(x),
+                                },
                             },
                         ))
                     })
@@ -188,10 +201,11 @@ impl<'a> Raise<'a> {
                     [_, k] if pk.is_some() && k.expr == Expr::Field(pk.unwrap() as u32) => Some(Tiebreak::Key { desc: k.desc }),
                     _ => return Err(err("a Search orders by a score, then possibly by the primary key")),
                 };
+                phases = self.phases(&search.phases, order.is_some())?;
                 (projection, Vec::new(), None, order, tiebreak)
             }
             Some((keys, aggs)) => {
-                if !search.order.is_empty() {
+                if !search.order.is_empty() || !search.phases.is_empty() {
                     return Err(err("a Search under an Aggregate is not ordered"));
                 }
                 let group_by: Vec<usize> = keys.iter().map(|k| self.field_of(k)).collect::<Result<_>>()?;
@@ -230,7 +244,7 @@ impl<'a> Raise<'a> {
             }
         };
         let types = sql::projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs: self.graphs, types })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types })
     }
 
     /// The graph `hops()` refers to: the first REACHABLE or PATH.
@@ -427,7 +441,11 @@ impl<'a> Raise<'a> {
         if !matches!(self.schema.fields[field].ty, FieldType::Edges | FieldType::Vector { .. }) {
             return Err(err(format!("a traversal needs an EDGES or VECTOR field, not {}", self.schema.fields[field].name)));
         }
-        let seeds = self.seeds(&g.seeds)?;
+        let seeds = match (self.seeds(&g.seeds)?, g.weights.as_slice()) {
+            (s, []) => s,
+            (Seeds::Keys(keys), ws) if keys.len() == ws.len() && ws.iter().all(|w| w.is_finite()) => Seeds::Weighted(keys.into_iter().zip(ws.iter().copied()).collect()),
+            _ => return Err(err("a traversal's weights are finite numbers, one per key of its seeds")),
+        };
         let kind = match &g.kind {
             GraphKind::Reachable { min_hops, max_hops } => logical::GraphKind::Reach { min_hops: *min_hops, max_hops: *max_hops },
             GraphKind::Path { to, max_hops } => logical::GraphKind::Path { to: self.seeds(to)?, max_hops: *max_hops },
@@ -444,7 +462,7 @@ impl<'a> Raise<'a> {
                 Some(p)
             }
         };
-        self.graphs.push(GraphQuery {
+        let g = GraphQuery {
             field,
             seeds,
             kind,
@@ -454,7 +472,13 @@ impl<'a> Raise<'a> {
             max_nodes: g.max_nodes as usize,
             k: g.k as usize,
             min_sim: g.min_sim.unwrap_or(f64::NEG_INFINITY),
-        });
+        };
+        // The same computation named twice (in a column and the order)
+        // runs once, as SQL binds it.
+        if let Some(i) = self.graphs.iter().position(|x| *x == g) {
+            return Ok(i);
+        }
+        self.graphs.push(g);
         Ok(self.graphs.len() - 1)
     }
 
@@ -467,8 +491,76 @@ impl<'a> Raise<'a> {
         })
     }
 
+    /// A Search's rerank phases, after its order: each reranks at least one
+    /// row, and one is global where it holds a set function (`minmax`,
+    /// `rank`, `rrf`, a weighted sum) or follows a global one.
+    fn phases(&mut self, phases: &[super::Phase], ordered: bool) -> Result<Vec<logical::Phase>> {
+        if !phases.is_empty() && !ordered {
+            return Err(err("rerank phases follow a Search's order: give it one"));
+        }
+        let mut after_global = false;
+        let mut out = Vec::with_capacity(phases.len());
+        for p in phases {
+            if p.count == 0 {
+                return Err(err("a rerank phase reranks at least one row"));
+            }
+            let score = self.score(&p.expr)?;
+            if !p.global && after_global {
+                return Err(err("a rerank phase after a global one is global"));
+            }
+            if !p.global && Rank::is_global(&score) {
+                return Err(err("a rerank phase with minmax(), rank(), rrf() or a weighted sum reads every row it reranks: it is global"));
+            }
+            after_global |= p.global;
+            out.push(logical::Phase { score, count: usize::try_from(p.count).unwrap_or(usize::MAX), global: p.global });
+        }
+        Ok(out)
+    }
+
+    /// A Search's ranking, its sums of `w * minmax(score)` and products of
+    /// scores in their fused shapes, as SQL binds them.
     fn score(&mut self, e: &Expr) -> Result<Score> {
+        Ok(self.rank(e, false)?.fused_shapes())
+    }
+
+    /// A Search's ranking, or part of one: `in_expr` within arithmetic, a
+    /// function, a set function or CASE (feature
+    /// [`super::RANK_EXPRESSIONS`]), where `hops()` is the number of hops,
+    /// rather than at the top or within RRF, a weighted sum or a product,
+    /// where it ranks nearest first.
+    fn rank(&mut self, e: &Expr, in_expr: bool) -> Result<Score> {
+        let sub = |this: &mut Self, x: &Expr| this.rank(x, true).map(Box::new);
         Ok(match e {
+            Expr::Lit(v) => match v.as_f64() {
+                Some(x) if x.is_finite() && !matches!(v, Value::Str(_)) => Score::Num(x),
+                _ => return Err(err(format!("a number in a ranking expression is finite, not {v:?}"))),
+            },
+            Expr::SeqNo => Score::SeqNo,
+            Expr::Arith { op, left, right } => Score::Arith { op: *op, left: sub(self, left)?, right: sub(self, right)? },
+            Expr::Neg(x) => Score::Neg(sub(self, x)?),
+            Expr::Call { func, args } => {
+                if Func::numeric(func.name()).is_none() {
+                    return Err(err(format!("{}() takes text: a ranking expression is numeric", func.name())));
+                }
+                func.arity(args.len()).map_err(|n| err(format!("{}() takes {n}", func.name())))?;
+                Score::Call { func: *func, args: args.iter().map(|a| self.rank(a, true)).collect::<Result<_>>()? }
+            }
+            Expr::Norm { kind, input } => Score::Norm { kind: *kind, input: sub(self, input)? },
+            Expr::Gbdt { model, hash, args, open } => {
+                let Some(m) = &open.0 else {
+                    return Err(err(format!("ranking model {model} is not open: a database or coordinator opens a plan's models before it runs it (Db::run)")));
+                };
+                if args.len() != m.features {
+                    return Err(err(format!("ranking model {model} reads {} features, not {}", m.features, args.len())));
+                }
+                Score::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(|a| self.rank(a, true)).collect::<Result<_>>()?, open: open.clone() }
+            }
+            Expr::Case { operand: Some(_), .. } => return Err(err("CASE in a ranking expression takes WHEN conditions, not an operand")),
+            Expr::Case { operand: None, whens, otherwise } => Score::Case {
+                whens: whens.iter().map(|w| Ok((Score::Cond(Box::new(self.filter(&w.when)?)), self.rank(&w.then, true)?))).collect::<Result<_>>()?,
+                otherwise: otherwise.as_ref().map(|x| sub(self, x)).transpose()?,
+            },
+            Expr::Hops if in_expr => Score::Hops { graph: self.hops_graph()?, far_first: true },
             Expr::Field(f) => {
                 let f = self.field(*f)?;
                 if !matches!(self.schema.fields[f].ty, FieldType::Int | FieldType::Float) || self.schema.fields[f].multi {
@@ -485,6 +577,20 @@ impl<'a> Raise<'a> {
                     }
                 }
                 Score::Similarity { field: f, vector: vector.clone(), opts: opts.clone() }
+            }
+            Expr::MaxSim { field, vectors, opts } => {
+                let f = self.typed(*field, |t| matches!(t, FieldType::Vector { .. }), "maxsim", "VECTOR")?;
+                let FieldType::Vector { dim, .. } = self.schema.fields[f].ty else { unreachable!("a VECTOR field") };
+                let Expr::Lit(Value::List(vs)) = vectors.as_ref() else { return Err(err("maxsim's query vectors are a list of vectors, once its subquery ran")) };
+                let vectors = vs
+                    .iter()
+                    .map(|v| match v {
+                        Value::Vector(v) if v.len() == dim => Ok(v.clone()),
+                        Value::Vector(v) => Err(err(format!("a query vector has {} dimensions, field has {dim}", v.len()))),
+                        v => Err(err(format!("maxsim's query vectors are vectors, not {v:?}"))),
+                    })
+                    .collect::<Result<_>>()?;
+                Score::MaxSim { field: f, vectors: Vectors::List(vectors), opts: opts.clone() }
             }
             Expr::Sparse { field, terms, opts } => Score::Sparse { field: self.typed(*field, |t| *t == FieldType::Sparse, "similarity", "SPARSE")?, terms: terms.clone(), opts: opts.clone() },
             Expr::Decay { field, decay, opts } => Score::Decay { field: self.typed(*field, |t| matches!(t, FieldType::Int | FieldType::Float), "decay", "INT or FLOAT")?, decay: *decay, opts: opts.clone() },

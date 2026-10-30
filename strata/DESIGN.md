@@ -235,7 +235,8 @@ need no table.
   `TIMESTAMP` field is `"bool"` or `"timestamp"`, a `NOT NULL` field
   `"not_null"`, a default `"default"`, a TEXT field's analyzer other than
   `english` `"analyzer:<name>:<version>"`; a database that numbers its
-  writes `"seq_no"`, for good), and falls back to 2 or 1,
+  writes `"seq_no"`, for good; a table with a rank profile
+  `"rank_profiles"`), and falls back to 2 or 1,
   in both meta slots, when the last one goes. A reader refuses a manifest
   that requires a feature it does not know, naming the feature, and ignores
   an `optional` list and other keys it does not know. Format 3 is the last
@@ -512,10 +513,27 @@ GROUP BY category ORDER BY 2 DESC LIMIT 5;
   JSON object of query term weights (`algo => ..` as for `bm25`).
 * `rrf(s1, s2, ...)`: reciprocal rank fusion, `Σ 1/(60 + rank_i)`, where each
   ranking is over the rows passing `WHERE` (`k => ..`, `depth => ..`).
-  Arithmetic on scores gives weighted fusion: candidates are the union of
-  each input's top 100, re-scored exactly by every input and min-max
-  normalised (`norm => 'none'` keeps raw scores, `exact => 1` scores every
-  row passing `WHERE`).
+  A weighted sum of `minmax()` of scores is weighted fusion: candidates are
+  the union of each input's top 100, re-scored exactly by every input and
+  min-max normalised (`exact => 1` scores every row passing `WHERE`).
+* Ranking expressions: `ORDER BY` takes any expression of scores, columns
+  and numbers (`+ - * / %`, `ln`, `log`, `exp`, `sqrt`, `pow`, `abs`,
+  `round`, `sigmoid`, `clamp`, `least`, `greatest`, `coalesce`, `CASE`,
+  `minmax(x)`, `rank(x)`), evaluated once by `query::rank` on a database
+  and on a coordinator; `+` adds raw values. `NULL` (a missing value, or a
+  result that is not finite) makes the expression `NULL`, and the row
+  ranks last. An expression of one text score and row values
+  (`bm25(body, :t) * (1 + 0.2 * importance)`) is a rank-safe boost: its
+  top rows are exact, found by the text score's top-k loop.
+* Rerank phases: a `WITH` that ranks a table and cuts it, ranked again by
+  the next `WITH` or the query (`WITH top AS (... ORDER BY bm25(body, :t)
+  DESC LIMIT 100) SELECT ... FROM top ORDER BY <expression> DESC`), plans
+  as one Search with phases; each ranks the top `count` rows of the one
+  before, rows tied keeping their order.
+* Features: a ranking expression that scores a row by itself is a column
+  (`SELECT bm25(title, :t) AS t`), and `features()` stands for the
+  ranking's inputs (its leaves, then each phase's row-local expression),
+  each named by its SQL text.
 * `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`:
   a numeric column's closeness to `origin`, as Elasticsearch's decay
   functions: `d = max(0, |x − origin| − offset)` maps to 1 at `d = 0` and
@@ -834,6 +852,113 @@ only the rows the page can reach (the best `k` and the rows tied with the
 `k`-th), which matters when `exact => 1` makes every row a candidate.
 Ranking expressions extend this expression with arithmetic, functions and
 rerank phases.
+
+**Rank-safe boosts** (`Rank::driver`, `text::bm25::Boost`). When an
+expression has one text score (BM25 or sparse) and its other leaves are
+row values (columns, decays, `CASE` conditions, `seq_no()`), with no set
+function, the text score's top-k loop ranks by the whole expression
+instead of taking its top `depth` rows as candidates. Interval arithmetic
+over the expression, with each column's minimum and maximum (and the
+values updated in place), bounds a row's value for text scores in
+`[0, c]`; the loop turns its threshold θ (the k-th best value so far) into
+the largest text score `c` whose bound is at most θ, by bisection, and
+MaxScore and Block-Max WAND skip what cannot reach `c` as they skip what
+cannot reach θ today. A row's value comes from the same evaluator
+(`Rank::eval_row`), so the top k is exactly what scoring every matching row
+gives. If the bound does not fall with the text score (`rating - bm25`),
+the loop scores every match. Each shard answers with its exact top rows,
+and a coordinator takes every row a shard sends as a candidate.
+
+**Rerank phases** (`Select::phases`, `ir::Phase`). A Search's ranking
+goes on in phases: each takes the top `count` rows of the phase before
+(the first is `ORDER BY`), scores them exactly by its expression
+(`exact_scores` of its leaves, `Rank::rerank`) and ranks them, rows tied
+keeping the order they had; `LIMIT` and `OFFSET` cut the last. A
+row-local phase is a second phase and a phase with a set function a
+global one, as is any phase after a global one; the plan says which, and
+raising a plan checks it. Over shards the answer stays one database's in
+one round. A row in the collection's top `count` by the first phase has
+fewer than `count` rows above it anywhere, so it is in its own shard's
+top `count`: each shard answers its top `count` by the first phase (every
+candidate, for a first phase with a set function), each row with its
+score in every second phase and its leaves' values for every global one
+(`RankParts::phases`). The coordinator ranks them by the first phase,
+keeps the top `count`, and reranks: a second phase by the shards' scores
+(`Rank::by_scores`), a global one by evaluating its expression over the
+rows it reranks. The cost is a second phase on up to shards × `count`
+rows instead of `count`, which is why costly models will go in the
+global phase. SQL writes phases with `WITH` (`compound::Planner::phased`),
+which needs no new syntax; the plan, not the SQL, is the contract.
+
+**Features** (`Projection::Feature`, plan feature `rank_features`). A
+column of a Search may be a ranking expression that scores each row by
+itself (no set function, RRF or fusion). The executor computes it for the
+rows it returns, after ranking, with the evaluator the ranking used
+(`exact_scores` of its leaves, `Rank::eval_row`), so a column equals the
+value the row was ranked by. `features()` is expanded by the SQL binder,
+on the syntax tree, into the ranking's leaves and each phase's row-local
+expression, named by their SQL text (a vector parameter stays `:q`, not
+its 768 numbers); the plan holds plain columns. Over shards, the BM25
+statistics a coordinator sums cover the columns' terms too, and query then
+fetch computes the columns in the fetch round, for the page alone, with
+those statistics.
+
+**Rank profiles** (`query::profile`, plan feature `rank_profiles`). A
+table keeps rankings under names (`TableMeta::profiles`: the ranking's
+canonical SQL and its parameters' defaults), and `ORDER BY
+rank_profile('name', ...)` is expanded on the syntax tree, before
+planning, into the query written out: the profile's parameters
+substituted, the query's `WHERE` moved into the first phase, its columns
+and `LIMIT` kept on the last. So phases, rank-safe boosts and features
+work through a profile unchanged, and the plan is the written-out query's
+with the profile's name and hash (FNV-1a of its JSON) on its Search. A
+database refuses a plan whose profile it holds with another hash, so a
+coordinator that planned with an old definition, or a shard that missed
+a change, fails rather than ranks otherwise. A profile change is a
+logged operation of its own (WAL record kind 6: the name, then the
+profile as JSON or `NULL` for a drop), in a transaction that changes no
+row, so it is numbered, replayed and shipped to replicas in order with
+writes. The log names `rank_profiles` in its header from its first
+profile record (logged into a log restarted with the name, after a flush
+and a version, `Database::allow_profiles`) until it is next emptied; the
+manifest requires the feature while a table has a profile, and a flush
+writes a version when only profiles changed. A copy (`checkpoint`,
+`install_copy`) carries the profiles held in memory, logged or not.
+Profiles are kept apart from the schema: tables are compared by schema
+across shards and replicas, and a profile change must not make a table
+look different there.
+
+**Ranking models** (`query::model`, plan feature `rank_models`).
+`gbdt('name', features...)` is `Expr::Gbdt` in a plan: the model's name,
+the hash of its file (FNV-1a, empty until opened) and its features, any
+row-local ranking expressions. A model is a LightGBM `dump_model()` or
+an XGBoost `save_model` JSON in `<models>/<name>/gbdt.json`, parsed into
+flat trees and evaluated as the library does (LightGBM in `f64` in tree
+order, XGBoost with `f32` features, comparisons and sums from its base
+margin), so a score equals the library's bit for bit
+(`tests/models/make.py` writes the reference). Plans are opened before
+they run (`Models::open`, by `Db::run`, `Db::query` and the server): each
+call gets the model of that name, the plan's hash is checked against the
+file's (a plan made with another file is refused) or set from it, and
+the model rides in the plan as an `Arc` that serialisation leaves out;
+raising a plan with a model not opened is an error, and so is executing
+or merging a `Select` that holds one. A coordinator opens the models
+from its own directory, since it evaluates ranking expressions over the
+shards' rows, and sends shards the plan with the hashes. In the
+evaluator a model is a row-local function of its arguments; its
+interval is the hull of the leaves each tree can reach from its
+arguments' intervals (plus the rounding of the sum), which is what makes
+`gbdt(bm25(..), columns...)` a rank-safe boost. A node is 24 bytes and a
+leaf is a node whose children are itself, so a walk is a loop of
+branch-free steps; a phase scores its rows one tree at a time
+(`Gbdt::predict_columns`), so the tree stays in cache, which on the
+benchmark's 300-tree model is faster than LightGBM's own predictor
+(0.66 against 0.86 ms per 100 rows, one thread of the cloud VM). Bounds skip a subtree
+whose least and greatest leaf lie within what they found. The top-k
+loop takes a bound as narrowing when it falls below its top at half the
+text score's maximum or at 0, since a model's is flat above its last
+split on the text score; even so a model's bound, summed over hundreds
+of trees, skips few rows, so the docs steer models to rerank phases.
 
 The vector strategies are chosen by estimated cost against an estimated
 filter selectivity `s`: pre-filter costs `s·n` distance computations; IVF

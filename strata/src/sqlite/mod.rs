@@ -45,7 +45,7 @@
 //! | `BOOL` | `BOOLEAN`, 0 or 1 |
 //! | `TIMESTAMP` | `TIMESTAMP`, UTC text as SQLite writes it (`2026-10-01 12:30:05.250`) |
 //! | `VECTOR(n)` | `F32_BLOB(n)`: little-endian float32, as libSQL and sqlite-vec read them |
-//! | multi-valued `KEYWORD` or `INT`, `EDGES`, `SPARSE` | `JSON` text |
+//! | multi-valued `KEYWORD` or `INT`, `EDGES`, `SPARSE`, `MEDIA` | `JSON` text |
 //!
 //! References become `REFERENCES` clauses, `NOT NULL` and `DEFAULT`
 //! carry over, single-valued indexed fields get B-tree indexes, and the

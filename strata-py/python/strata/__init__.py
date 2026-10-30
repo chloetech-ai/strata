@@ -35,9 +35,39 @@ import json
 import os
 from typing import Any, Iterable, Mapping
 
-from . import _strata
+from . import _strata, train
 from ._search import Search, ordered_schema, params as _params
-from .build import Expr, Query, bm25, col, count, hops, lit, match, path, ppr, reachable, rrf, score, similarity
+from .build import (
+    Expr,
+    Query,
+    bm25,
+    case,
+    clamp,
+    coalesce,
+    col,
+    count,
+    exp,
+    features,
+    gbdt,
+    greatest,
+    hops,
+    least,
+    lit,
+    ln,
+    log,
+    match,
+    maxsim,
+    minmax,
+    path,
+    ppr,
+    rank,
+    reachable,
+    rrf,
+    score,
+    sigmoid,
+    similarity,
+    sqrt,
+)
 from ._strata import StrataError
 from .client import Client
 from .result import Result
@@ -58,13 +88,29 @@ __all__ = [
     "match",
     "bm25",
     "similarity",
+    "maxsim",
     "rrf",
+    "minmax",
+    "rank",
+    "gbdt",
+    "ln",
+    "log",
+    "exp",
+    "sqrt",
+    "sigmoid",
+    "clamp",
+    "least",
+    "greatest",
+    "coalesce",
+    "case",
     "score",
     "hops",
+    "features",
     "count",
     "reachable",
     "path",
     "ppr",
+    "train",
 ]
 
 
@@ -134,8 +180,12 @@ class Database(Search):
 
     @property
     def schema(self) -> dict:
-        """The schema in its short form: {table, key, fields}."""
+        """The first table's schema in its short form: {table, key, fields}."""
         return ordered_schema(json.loads(self._db.schema_json()))
+
+    def tables(self) -> list[dict]:
+        """Every table's schema in its short form, the first first."""
+        return [ordered_schema(json.loads(t)) for t in self._db.tables_json()]
 
     @property
     def embed_errors(self) -> dict[str, str]:
@@ -173,27 +223,28 @@ class Database(Search):
         r = self._db.run(json.dumps(plan))
         return r if isinstance(r, int) else Result._of(r)
 
-    def insert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]]) -> int:
-        """Inserts a row or rows, whose keys must be new; all or none are
-        written. Returns how many."""
-        return self._db.insert(rows)
+    def insert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]], *, table: str | None = None) -> int:
+        """Inserts a row or rows, whose keys must be new, into the first
+        table or `table`; all or none are written. Returns how many."""
+        return self._db.insert(rows, table)
 
-    def upsert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]]) -> int:
+    def upsert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]], *, table: str | None = None) -> int:
         """Inserts a row or rows, replacing the rows that have their keys,
         in transactions of 10,000 rows. Returns how many."""
-        return self._db.upsert(rows)
+        return self._db.upsert(rows, table)
 
-    def delete(self, keys: Any) -> int:
+    def delete(self, keys: Any, *, table: str | None = None) -> int:
         """Deletes the rows with this key or these keys; returns how many
         there were."""
-        return self._db.delete(keys)
+        return self._db.delete(keys, table)
 
-    def import_file(self, path: str | os.PathLike, format: str | None = None) -> dict:
+    def import_file(self, path: str | os.PathLike, format: str | None = None, *, table: str | None = None) -> dict:
         """Loads a JSON Lines, JSON (an array), CSV or TSV file, in `format`
-        or the one its extension names. Into an empty table the rows are
-        bulk-loaded in one commit; otherwise they are upserted. Returns
-        {rows, bulk, skipped_fields}: the columns the schema lacks."""
-        rows, bulk, skipped = self._db.import_file(os.fspath(path), format)
+        or the one its extension names, into the first table or `table`.
+        Into an empty table the rows are bulk-loaded in one commit;
+        otherwise they are upserted. Returns {rows, bulk, skipped_fields}:
+        the columns the schema lacks."""
+        rows, bulk, skipped = self._db.import_file(os.fspath(path), format, table)
         return {"rows": rows, "bulk": bulk, "skipped_fields": skipped}
 
     def import_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, schemas: Any = None, blobs_base64: bool = False) -> dict:
@@ -220,9 +271,21 @@ class Database(Search):
         notes}]}."""
         return json.loads(self._db.export_sqlite(os.fspath(path), _names(tables), fts, indexes, schemas))
 
-    def embed(self, text: str, field: str | None = None) -> list[float]:
-        """The query vector of `text` by an embedded field's model."""
-        return self._db.embed(text, field)
+    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None) -> list[float]:
+        """The query vector of `text` by an embedded field's model (of the
+        first table, or of `table`), or of `image`, the bytes of an image
+        file, by a model of images."""
+        return self._db.embed(text, field, table, None if image is None else bytes(image))
+
+    def sid_next(self, prefixes: Iterable[str], *, field: str, where: str | None = None, params: Mapping[str, Any] | None = None, table: str | None = None, **kw: Any) -> dict[str, dict[str, int]]:
+        """The codes that can follow each prefix of semantic-ID field
+        `field` (``""`` for the first number) among the rows SQL condition
+        `where` matches, or all rows: {prefix: {code: rows}}, the codes of
+        each prefix in the order of their last numbers. At most 64
+        prefixes."""
+        prefixes = builtins.list(prefixes)
+        got = self._db.sid_next(field, prefixes, where, _params(params, kw), table)
+        return {p: dict(cs) for p, cs in zip(prefixes, got)}
 
     def optimize(self) -> None:
         """Merges small segments (many small writes leave many)."""

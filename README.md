@@ -19,7 +19,7 @@ Around the library:
 SELECT id, title, score() FROM docs
 WHERE MATCH(body, 'vaccine AND (mrna OR "messenger rna") -animal')
   AND year BETWEEN 2019 AND 2021 AND category IN ('c01', 'c02')
-ORDER BY 0.2 * bm25(body, :text) + 0.8 * similarity(emb, :q) DESC
+ORDER BY 0.2 * minmax(bm25(body, :text)) + 0.8 * minmax(similarity(emb, :q)) DESC
 LIMIT 10;
 ```
 

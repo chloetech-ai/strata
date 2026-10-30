@@ -116,7 +116,12 @@ fn write(db: &Db, snap: &Snapshot, tables: &[&Schema], path: &Path, opts: &Expor
                     continue;
                 }
                 let index = distinct(format!("{}_{}_idx", s.table, f.name), &mut used);
-                conn.execute_batch(&format!("CREATE INDEX {} ON {} ({});", quote(&index), quote(&s.table), quote(&f.name)))?;
+                // A MEDIA field is indexed by its file's hash, as in Strata.
+                let on = match f.media {
+                    Some(_) => format!("json_extract({}, '$.sha256')", quote(&f.name)),
+                    None => quote(&f.name),
+                };
+                conn.execute_batch(&format!("CREATE INDEX {} ON {} ({on});", quote(&index), quote(&s.table)))?;
                 t.indexes.push(index);
             }
         }
@@ -152,6 +157,7 @@ fn notes(s: &Schema) -> Vec<String> {
             }
             FieldType::Edges => out.push(format!("{}: edges as JSON arrays of keys, without the graph index", f.name)),
             FieldType::Sparse => out.push(format!("{}: term weights as JSON objects, without their index", f.name)),
+            _ if f.media.is_some() => out.push(format!("{}: each file's description as a JSON object (uri, sha256, mime and what else Strata read), indexed by sha256; the files stay where the URIs say", f.name)),
             _ if f.multi => out.push(format!("{}: values as JSON arrays", f.name)),
             _ => {}
         }
@@ -166,7 +172,7 @@ fn notes(s: &Schema) -> Vec<String> {
 
 /// The SQLite type of a field's column.
 fn declared(f: &Field) -> String {
-    if f.multi {
+    if f.multi || f.media.is_some() {
         return "JSON".into();
     }
     match (f.logical, &f.ty) {

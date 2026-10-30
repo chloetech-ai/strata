@@ -38,6 +38,7 @@ use serde::Serialize;
 
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};
+use crate::sid::{Codebook, Ties};
 use crate::segment::build::{build_segment, build_threads, BuildOptions, GraphStart, SegmentBuild};
 use crate::segment::{DocId, SegmentFile, SegmentWriter};
 use crate::storage::freelist::FreeList;
@@ -45,11 +46,11 @@ use crate::storage::io;
 use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
-use crate::storage::manifest::{Manifest, Numbering, SegmentMeta, SeqNo, TableMeta};
+use crate::storage::manifest::{sources_schema, Manifest, Numbering, RankProfile, SegmentMeta, SeqNo, TableMeta, SOURCES, SOURCES_ID};
 use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MERGE_BATCH_BYTES, MERGE_BATCH_DOCS, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
-use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
+use crate::storage::snapshot::{build_memseg, Pins, SegmentView, Snapshot};
 use crate::storage::rowseq::{self, Seqs};
 use crate::storage::state::{mem_seq, Check, Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::{Updates, SEQ};
@@ -262,6 +263,10 @@ pub struct Database {
     published: RwLock<Option<Snapshot>>,
     /// The merges running, with what a crash interrupted ([`Merging`]).
     merging: Mutex<Merging>,
+    /// Expired rows per segment ([`Database::expired_in`]): the segment's
+    /// live count, the minute they were counted at and whether all were
+    /// expired, and the count.
+    expired: Mutex<HashMap<u64, ((u32, i64, bool), u32)>>,
     /// Where `merging.record` is kept.
     merge_record_path: PathBuf,
     /// Set by [`Database::spawn_merger`].
@@ -294,6 +299,17 @@ pub struct Database {
     /// Told the term and number of each numbered transaction once it is
     /// committed ([`Database::on_commit`]).
     commit_hook: RwLock<Option<CommitHook>>,
+    /// The codebooks of semantic-ID fields ([`Database::set_codebook`]).
+    codebooks: RwLock<Vec<Coded>>,
+}
+
+/// The codebook of semantic-ID field `field` of the table with id `table`,
+/// the one whose file has hash `hash`.
+struct Coded {
+    table: u32,
+    field: usize,
+    hash: String,
+    codebook: Arc<Codebook>,
 }
 
 type CommitHook = Arc<dyn Fn(SeqNo) + Send + Sync>;
@@ -359,6 +375,9 @@ struct MergeClaim<'a> {
     ids: Vec<u64>,
     /// Selected larger and cut to fit its memory budget.
     cut: bool,
+    /// The table's retention field and the time before which its rows
+    /// expire, when the merge was claimed ([`Schema::retention`]).
+    retention: Option<(usize, i64)>,
 }
 
 impl Drop for MergeClaim<'_> {
@@ -457,6 +476,70 @@ impl Merger {
     fn close(&self) {
         lock(&self.wake).closed = true;
         self.cv.notify_all();
+    }
+}
+
+/// A table's rows as a flush or a bulk load writes them to segments:
+/// without those past `retention` ([`Schema::retention`]), and sorted by
+/// its cluster_by field, rows of one value in the order written
+/// ([`Schema::with_cluster_by`]). `with` holds a value for each row (its
+/// sequence number), which goes along.
+fn arrange<T>(schema: &Schema, mut live: Vec<Document>, mut with: Vec<T>, retention: Option<(usize, i64)>) -> (Vec<Document>, Vec<T>) {
+    if live.iter().any(|d| expired(retention, d)) {
+        (live, with) = live.into_iter().zip(with).filter(|(d, _)| !expired(retention, d)).unzip();
+    }
+    if let Some(f) = schema.cluster_by_field() {
+        let keys: Vec<ClusterKey> = live.iter().map(|d| ClusterKey::of(&d[f])).collect();
+        let mut by: Vec<u32> = (0..live.len() as u32).collect();
+        by.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
+        let mut rows: Vec<Option<(Document, T)>> = live.into_iter().zip(with).map(Some).collect();
+        (live, with) = by.into_iter().map(|i| rows[i as usize].take().expect("each row once")).unzip();
+    }
+    (live, with)
+}
+
+/// Whether row `d` is past `retention`, its table's ([`Schema::retention`]).
+fn expired(retention: Option<(usize, i64)>, d: &Document) -> bool {
+    retention.is_some_and(|(f, cutoff)| matches!(d[f], Value::Timestamp(t) | Value::Int(t) if t < cutoff))
+}
+
+/// A row's place in a segment ordered by its cluster_by field: rows
+/// without a value first.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum ClusterKey<'a> {
+    Null,
+    Int(i64),
+    Str(&'a str),
+}
+
+impl<'a> ClusterKey<'a> {
+    fn of(v: &'a Value) -> ClusterKey<'a> {
+        match v {
+            Value::Int(x) | Value::Timestamp(x) => ClusterKey::Int(*x),
+            Value::Str(s) => ClusterKey::Str(s),
+            _ => ClusterKey::Null,
+        }
+    }
+}
+
+/// The sort keys of a merge's documents (`order`, as (input, docID)) by
+/// cluster_by field `f`, read from the inputs' columns: a keyword's is its
+/// rank among every input's values, so that keys compare as the values do.
+fn cluster_keys(schema: &Schema, f: usize, views: &[&SegmentView], order: &[(u32, DocId)]) -> Result<Vec<Option<i64>>> {
+    let name = &schema.fields[f].name;
+    match schema.fields[f].ty {
+        FieldType::Keyword => {
+            let cols = views.iter().map(|v| crate::forward::KeywordColumn::open(&v.file, name)).collect::<Result<Vec<_>>>()?;
+            let mut all: Vec<&str> = cols.iter().flat_map(|c| (0..c.n_values() as u32).map(|code| c.value(code))).collect();
+            all.sort_unstable();
+            all.dedup();
+            let ranks: Vec<Vec<i64>> = cols.iter().map(|c| (0..c.n_values() as u32).map(|code| all.partition_point(|&x| x < c.value(code)) as i64).collect()).collect();
+            Ok(order.iter().map(|&(k, d)| cols[k as usize].code_of_doc(d).map(|code| ranks[k as usize][code as usize])).collect())
+        }
+        _ => {
+            let cols = views.iter().map(|v| crate::forward::NumericColumn::open(&v.file, name)).collect::<Result<Vec<_>>>()?;
+            Ok(order.iter().map(|&(k, d)| cols[k as usize].get_i64(d)).collect())
+        }
     }
 }
 
@@ -856,7 +939,11 @@ impl Database {
             .tables
             .iter()
             .zip(handles)
-            .map(|(t, h)| TableState::new(t.id, Arc::new(t.schema.clone()), h, opts.memtable_chunk_docs, 0))
+            .map(|(t, h)| {
+                let mut ts = TableState::new(t.id, Arc::new(t.schema.clone()), h, opts.memtable_chunk_docs, 0);
+                ts.profiles = Arc::new(t.profiles.clone());
+                ts
+            })
             .collect();
         let schema = tables[0].schema.clone();
         let seq = manifest.seq_no.as_ref().map_or(0, |n| n.seq);
@@ -936,6 +1023,7 @@ impl Database {
             build_lock: Mutex::new(()),
             published: RwLock::new(None),
             merging: Mutex::new(Merging { record, ..Merging::default() }),
+            expired: Mutex::new(HashMap::new()),
             merge_record_path,
             merger: OnceLock::new(),
             merger_threads: Mutex::new(Vec::new()),
@@ -951,6 +1039,7 @@ impl Database {
             background_waiting: AtomicUsize::new(0),
             background_holding: AtomicUsize::new(0),
             commit_hook: RwLock::new(None),
+            codebooks: RwLock::new(Vec::new()),
         };
         db.republish();
         Ok(db)
@@ -962,9 +1051,11 @@ impl Database {
     }
 
     /// The schemas of the database's tables, in creation order (the first
-    /// is the table the database was created with).
+    /// is the table the database was created with). The system table
+    /// [`SOURCES`] is not among them: [`Self::table`] and SQL read it by
+    /// name.
     pub fn tables(&self) -> Vec<Arc<Schema>> {
-        lock(&self.state).tables.iter().map(|t| t.schema.clone()).collect()
+        lock(&self.state).tables.iter().filter(|t| t.id != SOURCES_ID).map(|t| t.schema.clone()).collect()
     }
 
     /// The schema of the table named `name` (any case).
@@ -987,6 +1078,9 @@ impl Database {
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         check_table_name(&schema.table)?;
+        if schema.table.eq_ignore_ascii_case(SOURCES) {
+            return Err(Error::Schema(format!("{SOURCES} is a system table, which streams make and write (Database::ensure_sources)")));
+        }
         if self.table(&schema.table).is_some() {
             return Err(Error::Schema(format!("table {} already exists", schema.table)));
         }
@@ -1013,8 +1107,101 @@ impl Database {
         let mut vw = VersionWriter::begin(self);
         let id = vw.manifest.next_table_id;
         vw.manifest.next_table_id += 1;
-        vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new() });
+        vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new(), profiles: Vec::new() });
         let c = vw.commit(&mut wal)?;
+        self.publish(c, |_| {})
+    }
+
+    /// Gives table `table` (any case) the rank profile `profile`, in place
+    /// of one of the same name (any case) only when `replace`. It is
+    /// logged as a write is, in a transaction of its own, so it is
+    /// numbered, replayed and shipped to replicas as writes are, and it
+    /// changes no row. The database then requires feature `rank_profiles`
+    /// (format 3) while a table has a profile, and its log names the
+    /// feature from the first profile record until it is next emptied
+    /// ([`Wal::allow_profiles`]: that first record flushes the memtables).
+    ///
+    /// Strata keeps a profile as written; [`crate::query::profile`] reads
+    /// it when a query ranks by it.
+    pub fn set_rank_profile(&self, table: &str, profile: RankProfile, replace: bool) -> Result<()> {
+        check_name("rank profile", &profile.name)?;
+        let mut txn = self.begin()?;
+        let t = self.table_ref(Some(table))?;
+        if t.id == SOURCES_ID {
+            return Err(Error::Schema(format!("{SOURCES} is a system table, which takes no rank profile")));
+        }
+        let exists = lock(&self.state).tables[t.pos].profiles.iter().any(|p| p.name.eq_ignore_ascii_case(&profile.name));
+        if exists && !replace {
+            return Err(Error::Schema(format!("{} has a rank profile named {} already; CREATE OR REPLACE RANK PROFILE replaces it", t.schema.table, profile.name)));
+        }
+        txn.ops.push((t.id, Op::Profile { name: profile.name.clone(), def: Some(Arc::new(profile)) }));
+        txn.commit()
+    }
+
+    /// Drops table `table`'s rank profile named `name` (any case), logged
+    /// as [`Database::set_rank_profile`] logs one. Returns whether there
+    /// was one.
+    pub fn drop_rank_profile(&self, table: &str, name: &str) -> Result<bool> {
+        let mut txn = self.begin()?;
+        let t = self.table_ref(Some(table))?;
+        let Some(name) = lock(&self.state).tables[t.pos].profiles.iter().find(|p| p.name.eq_ignore_ascii_case(name)).map(|p| p.name.clone()) else { return Ok(false) };
+        txn.ops.push((t.id, Op::Profile { name, def: None }));
+        txn.commit()?;
+        Ok(true)
+    }
+
+    /// The rank profiles of table `table` (any case), by name.
+    pub fn rank_profiles(&self, table: &str) -> Result<Vec<RankProfile>> {
+        let st = lock(&self.state);
+        let t = st.tables.iter().find(|t| t.schema.table.eq_ignore_ascii_case(table)).ok_or_else(|| Error::Schema(format!("no table {table}")))?;
+        Ok(t.profiles.to_vec())
+    }
+
+    /// Starts the log again naming `rank_profiles`, before the first
+    /// profile record goes into it: what it holds is in a version first
+    /// (the memtables flushed, then a commit that records the last
+    /// transaction), so emptying it drops nothing.
+    fn allow_profiles(&self, wal: &mut Wal) -> Result<()> {
+        self.flush_locked(wal)?;
+        if !wal.is_empty() {
+            // Transactions that left nothing to flush.
+            let txn = lock(&self.state).txn;
+            let mut vw = VersionWriter::begin(self);
+            vw.manifest.wal_txn = txn;
+            let c = vw.commit(wal)?;
+            self.publish(c, |_| {})?;
+        }
+        wal.allow_profiles(self.opts.sync).map_err(|e| self.poison(e))
+    }
+
+    /// Adds the system table [`SOURCES`] if the database lacks it, in one
+    /// commit: streams keep there, per source, the offset of the last
+    /// event they wrote, in the transaction that wrote it. Every copy of a
+    /// database gives it the same id ([`SOURCES_ID`]), so a replica makes
+    /// its own when its primary's first offset arrives
+    /// ([`Database::apply_shipped`]). The database then needs feature
+    /// `sources`, so versions of Strata before it refuse to open it.
+    pub fn ensure_sources(&self) -> Result<()> {
+        if self.has_sources() {
+            return Ok(());
+        }
+        let mut wal = self.try_writer()?;
+        self.check_poisoned()?;
+        self.add_sources(&mut wal)
+    }
+
+    fn has_sources(&self) -> bool {
+        lock(&self.state).tables.iter().any(|t| t.id == SOURCES_ID)
+    }
+
+    /// [`Database::ensure_sources`], under the writer lock.
+    fn add_sources(&self, wal: &mut Wal) -> Result<()> {
+        if self.has_sources() {
+            return Ok(());
+        }
+        let mut vw = VersionWriter::begin(self);
+        vw.manifest.tables.push(TableMeta { id: SOURCES_ID, schema: sources_schema(), segments: Vec::new(), profiles: Vec::new() });
+        let c = vw.commit(wal)?;
         self.publish(c, |_| {})
     }
 
@@ -1144,7 +1331,12 @@ impl Database {
             return Ok(Applied::Mismatch { seq: last.seq, term: last.term });
         }
         let Some(WriteTxn { mut wal, .. }) = held else { return Ok(Applied::At(prev)) };
-        let schemas: Vec<(u32, Arc<Schema>)> = lock(&self.state).tables.iter().map(|t| (t.id, t.schema.clone())).collect();
+        let mut schemas: Vec<(u32, Arc<Schema>)> = lock(&self.state).tables.iter().map(|t| (t.id, t.schema.clone())).collect();
+        // The primary's sources' offsets, before this copy has a table for
+        // them: it makes its own, as the primary did.
+        if !schemas.iter().any(|(id, _)| *id == SOURCES_ID) {
+            schemas.push((SOURCES_ID, Arc::new(sources_schema())));
+        }
         let fits = |table: u32, op: &Op| schemas.iter().find(|(id, _)| *id == table).is_some_and(|(_, s)| op_fits(s, op));
         let mut shipped = Vec::with_capacity(txns.len());
         let mut at = now.last();
@@ -1165,6 +1357,9 @@ impl Database {
             at = s;
             shipped.push((s, t.ops));
         }
+        if shipped.iter().any(|(_, ops)| ops.iter().any(|(id, _)| *id == SOURCES_ID)) {
+            self.add_sources(&mut wal)?;
+        }
         let mut at = now.last();
         let mut failed = None;
         for (s, ops) in shipped {
@@ -1174,7 +1369,7 @@ impl Database {
                     break;
                 }
             }
-            let mut txn = WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new() };
+            let mut txn = WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new() };
             let replayed = txn.replay(ops);
             let WriteTxn { wal: w, ops, .. } = txn;
             wal = w;
@@ -1252,27 +1447,41 @@ impl Database {
             let st = lock(&copy.state);
             let n = st.manifest.seq_no.clone().ok_or_else(|| Error::Schema("the copy does not number its writes".into()))?;
             let mut tables = Vec::new();
+            let mut sources = None;
             for t in &st.manifest.tables {
                 let segs = t.segments.iter().map(|m| Ok((m.n_docs, st.handle(m.id).cloned().ok_or_else(|| corrupt(format!("segment {} is in the manifest but not open", m.id)))?))).collect::<Result<Vec<_>>>()?;
-                tables.push((t.schema.clone(), segs));
+                match t.id == SOURCES_ID {
+                    true => sources = Some(segs),
+                    false => {
+                        // Logged since its last version, maybe.
+                        let profiles = st.tables.iter().find(|ts| ts.id == t.id).map_or_else(Vec::new, |ts| ts.profiles.to_vec());
+                        tables.push((t.schema.clone(), segs, profiles));
+                    }
+                }
             }
-            (Numbering { seq: st.seq, ..n }, tables)
+            (Numbering { seq: st.seq, ..n }, (tables, sources))
         };
+        let (tables, sources) = tables;
         // No background flush may seal the log in between.
         let _one = lock(&self.background);
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         let ours = self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?;
         {
+            // Sources aside, which either may have made first.
             let st = lock(&self.state);
+            let mine: Vec<&Schema> = st.manifest.tables.iter().filter(|t| t.id != SOURCES_ID).map(|t| &t.schema).collect();
             let names = |ts: &mut dyn Iterator<Item = &Schema>| ts.map(|s| s.table.clone()).collect::<Vec<_>>().join(", ");
-            if st.manifest.tables.len() != tables.len() || st.manifest.tables.iter().zip(&tables).any(|(t, (s, _))| t.schema != *s) {
+            if mine.len() != tables.len() || mine.iter().zip(&tables).any(|(t, (s, _, _))| **t != *s) {
                 return Err(Error::Schema(format!(
                     "the copy's tables ({}) are not this database's ({}), or their schemas differ",
                     names(&mut tables.iter().map(|t| &t.0)),
-                    names(&mut st.manifest.tables.iter().map(|t| &t.schema))
+                    names(&mut mine.into_iter())
                 )));
             }
+        }
+        if sources.is_some() {
+            self.add_sources(&mut wal)?;
         }
         if theirs.term < ours.term {
             return Err(Error::Schema(format!("the copy is of term {}, older than this database's ({}): it is a copy of a replaced primary", theirs.term, ours.term)));
@@ -1286,14 +1495,19 @@ impl Database {
             wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
         }
         let mut vw = VersionWriter::begin(self);
-        let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).collect();
+        let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).filter(|&id| id != SOURCES_ID).collect();
         for id in vw.manifest.tables.iter().flat_map(|t| &t.segments).map(|s| s.id).collect::<Vec<_>>() {
             vw.remove_segment(id);
         }
-        for ((_, segs), &to) in tables.iter().zip(&ids) {
+        let mut into: Vec<_> = ids.into_iter().zip(tables.iter().map(|(_, segs, profiles)| (segs, profiles.clone()))).collect();
+        if let Some(segs) = &sources {
+            into.push((SOURCES_ID, (segs, Vec::new())));
+        }
+        for (to, (segs, profiles)) in into {
             for (n_docs, h) in segs {
                 vw.add_segment(to, None, h.file.image(), *n_docs, h.base.as_deref(), h.updates.as_deref())?;
             }
+            vw.table_mut(to).profiles = profiles;
         }
         vw.manifest.seq_no = Some(theirs.clone());
         // The commit keeps the last number given here when it is higher: the
@@ -1311,6 +1525,9 @@ impl Database {
             st.live_cache.clear();
             st.updates_cache.clear();
             st.ship = ShipLog::new(max);
+            for t in &mut st.tables {
+                t.ties = None;
+            }
         })?;
         Ok(theirs.last())
     }
@@ -1350,6 +1567,8 @@ impl Database {
                     None if opts.if_exists => {}
                     None => return Err(Error::Schema(format!("no table {name}"))),
                     Some(t) if t.id == 0 => return Err(Error::Schema(format!("{} is the database's first table, which cannot be dropped", t.schema.table))),
+                    // A replica's would come back with its primary's next offset.
+                    Some(t) if t.id == SOURCES_ID => return Err(Error::Schema(format!("{SOURCES} is a system table, which cannot be dropped: delete its rows to forget sources"))),
                     Some(t) if ids.contains(&t.id) => {}
                     Some(t) => {
                         ids.push(t.id);
@@ -1418,7 +1637,7 @@ impl Database {
         self.wait_for_flusher();
         let wal = self.try_writer()?;
         self.check_poisoned()?;
-        Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new() })
+        Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new() })
     }
 
     /// The current version. Never waits for a writer; the first snapshot
@@ -1516,7 +1735,9 @@ impl Database {
         self.check_poisoned()?;
         let (mems, pending, pending_updates, txn, numbered) = {
             let st = lock(&self.state);
-            if st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
+            // Rank profiles changed since the last version go into one too.
+            let profiles_kept = st.tables.iter().all(|t| st.manifest.table(t.id).is_some_and(|m| m.profiles == *t.profiles));
+            if st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() && profiles_kept {
                 return Ok(());
             }
             let mems: Vec<_> = st
@@ -1530,6 +1751,19 @@ impl Database {
         let mut vw = VersionWriter::begin(self);
         vw.manifest.wal_txn = txn;
         for (table, schema, chunks, deleted, mem_updates, mem_seqs) in mems {
+            // The codes of the deleted and expired documents, which the
+            // segments drop.
+            let now = crate::timestamp::now();
+            let retention = schema.retention(now);
+            let mut gone = Vec::new();
+            if !crate::sid::fields(&schema).is_empty() {
+                let (mut dropped, mut kept) = (Ties::default(), Ties::default());
+                for (i, d) in chunks.iter().flat_map(|c| c.iter()).enumerate() {
+                    let t = if deleted[i / 64] >> (i % 64) & 1 == 1 || expired(retention, d) { &mut dropped } else { &mut kept };
+                    t.saw_doc(&schema, d);
+                }
+                gone = crate::sid::gone_sections(&schema, &dropped, &kept);
+            }
             let (live, seqs): (Vec<Document>, Vec<u64>) = chunks
                 .iter()
                 .flat_map(|c| c.iter())
@@ -1542,9 +1776,15 @@ impl Database {
                 })
                 .unzip();
             drop(chunks);
+            let (live, seqs) = arrange(&schema, live, seqs, retention);
             let max = self.opts.segment_max_docs.max(1);
+            if live.is_empty() && !gone.is_empty() {
+                // A segment without documents keeps what they were given.
+                let image = rowseq::build_with(&schema, &[], numbered.then_some(&[]), &self.opts.build, std::mem::take(&mut gone))?;
+                vw.add_segment(table, None, &image, 0, None, None)?;
+            }
             for (chunk, seqs) in live.chunks(max).zip(seqs.chunks(max)) {
-                let image = rowseq::build(&schema, chunk, numbered.then_some(seqs), &self.opts.build)?;
+                let image = rowseq::build_with(&schema, chunk, numbered.then_some(seqs), &self.opts.build, std::mem::take(&mut gone))?;
                 vw.add_segment(table, None, &image, chunk.len() as u32, None, None)?;
             }
         }
@@ -1586,6 +1826,22 @@ impl Database {
     fn flush_due(&self) -> bool {
         let st = lock(&self.state);
         st.mem_len() + st.n_pending > self.opts.memtable_max_docs
+    }
+
+    /// Whether writes fell behind the flusher: past twice
+    /// `memtable_max_docs` while the flusher flushes (or is about to), a
+    /// commit waits for its flush ([`Self::spawn_flusher`]). A server stops
+    /// reading a stream meanwhile and refuses plain writes (429). Not while
+    /// the flusher is idle, as after a reopen replays a long log: then the
+    /// next commit flushes, or wakes it; nor while flushes fail, which
+    /// commits report.
+    pub fn backlogged(&self) -> bool {
+        let Some(sig) = self.flush_signal.get() else { return false };
+        if !self.over_twice() || self.flush_error().is_some() {
+            return false;
+        }
+        let w = lock(&sig.state);
+        (w.running || w.due) && !w.closed
     }
 
     /// Whether the memtables and pending deletes are past twice
@@ -1798,9 +2054,11 @@ impl Database {
         let mut seen = HashSet::new();
         let mut chunk = Vec::new();
         let max = self.opts.segment_max_docs.max(1);
+        let mut ties = Ties::default();
         for doc in docs {
             let mut doc = doc?;
             conform(schema, &mut doc)?;
+            self.fill_sids(&t, &mut doc, &mut ties, &[])?;
             if let Some(pk) = pk {
                 let dup = !seen.insert(Key::of(&doc[pk]).expect("validated key"))
                     || (check_existing && lock(&self.state).find_live(t.pos, &doc[pk]).is_some());
@@ -1810,20 +2068,30 @@ impl Database {
             }
             chunk.push(doc);
             if chunk.len() == max {
-                let image = build_segment(schema, &chunk, &self.opts.build)?;
-                vw.add_segment(t.id, None, &image, chunk.len() as u32, None, None)?;
-                chunk.clear();
+                self.add_loaded(&mut vw, &t, std::mem::take(&mut chunk))?;
             }
         }
         if !chunk.is_empty() {
-            let image = build_segment(schema, &chunk, &self.opts.build)?;
-            vw.add_segment(t.id, None, &image, chunk.len() as u32, None, None)?;
+            self.add_loaded(&mut vw, &t, chunk)?;
         }
         if vw.segments_added == 0 {
             return Ok(());
         }
         let c = vw.commit(&mut wal)?;
-        self.publish(c, |_| {})
+        self.publish(c, |st| {
+            if let Some(known) = st.table_index(t.id).and_then(|i| st.tables[i].ties.as_mut()) {
+                known.absorb(&ties);
+            }
+        })
+    }
+
+    /// Adds a segment of bulk-loaded rows, ordered by the table's
+    /// cluster_by field. Rows past its retention stay until a merge.
+    fn add_loaded(&self, vw: &mut VersionWriter, t: &TableRef, chunk: Vec<Document>) -> Result<()> {
+        let n = chunk.len();
+        let (chunk, _) = arrange(&t.schema, chunk, vec![(); n], None);
+        let image = build_segment(&t.schema, &chunk, &self.opts.build)?;
+        vw.add_segment(t.id, None, &image, n as u32, None, None)
     }
 
     /// Writes segment `id`'s image to `dest` (a new file), for another
@@ -1892,7 +2160,8 @@ impl Database {
             return Ok(ids);
         }
         let c = vw.commit(&mut wal)?;
-        self.publish(c, |_| {})?;
+        // Their semantic IDs are counted again when a write needs them.
+        self.publish(c, |st| st.tables[0].ties = None)?;
         Ok(ids)
     }
 
@@ -2008,10 +2277,16 @@ impl Database {
         let mut m = lock(&self.merging);
         let snap = self.snapshot_inner(false).table_by_id(table)?;
         let bytes: HashMap<u64, u64> = lock(&self.state).handles().map(|h| (h.meta.id, h.meta.extent.len)).collect();
+        // Rows past the table's retention count as deleted: a segment of
+        // them only is dropped, and one with many is rewritten without them.
+        let retention = snap.schema().retention(crate::timestamp::now());
         let infos: Vec<SegmentInfo> = snap
             .segments()
             .iter()
-            .map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live, bytes: bytes.get(&v.id).copied().unwrap_or(0) })
+            .map(|v| {
+                let expired = retention.map_or(0, |(f, cutoff)| self.expired_in(v, &snap.schema().fields[f].name, cutoff));
+                SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live.saturating_sub(expired), bytes: bytes.get(&v.id).copied().unwrap_or(0) }
+            })
             .collect();
         let cap = |g: &[u64]| match (m.record.cap(g), budget) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -2029,7 +2304,37 @@ impl Database {
         m.record.running.push(MergeEntry { segments: group.clone(), memory, times: 0 });
         m.limited += cut as u64;
         let _ = m.record.store(&self.merge_record_path);
-        Some(MergeClaim { db: self, table, snap, ids: group, cut })
+        Some(MergeClaim { db: self, table, snap, ids: group, cut, retention })
+    }
+
+    /// The live rows of segment `v` whose TIMESTAMP `field` is before
+    /// `cutoff` ([`Schema::with_retain`]). The merger asks every few
+    /// seconds, so a segment whose rows are partly past it is counted once
+    /// per delete set and minute; one whose rows all are, or none, is told
+    /// by its column's least and greatest times at once.
+    fn expired_in(&self, v: &SegmentView, field: &str, cutoff: i64) -> u32 {
+        // A column that cannot be read counts nothing: the merge reads it
+        // again, and fails there.
+        let Ok(c) = crate::forward::NumericColumn::open(&v.file, field) else { return 0 };
+        let (Some(lo), Some(hi)) = (c.min(), c.max()) else { return 0 };
+        if lo as i64 >= cutoff {
+            return 0;
+        }
+        let key = (v.n_live, cutoff.div_euclid(60_000_000), (hi as i64) < cutoff);
+        let mut cache = lock(&self.expired);
+        if let Some(&(k, n)) = cache.get(&v.id) {
+            if k == key {
+                return n;
+            }
+        }
+        let docs = c.scan_keys(c.int_key_range(i64::MIN, cutoff - 1));
+        let n = docs.iter().filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).count() as u32;
+        if cache.len() >= 4096 {
+            // Mostly segments merged away since.
+            cache.clear();
+        }
+        cache.insert(v.id, (key, n));
+        n
     }
 
     /// Runs a merge a merger thread claimed.
@@ -2051,63 +2356,104 @@ impl Database {
             let h = lock(&self.state).handle(id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
             h.verify(self.dir.as_deref())?;
             let n = v.file.n_docs() as DocId;
-            let live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
+            let mut live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
             stats.docs_dropped += (n as usize - live.len()) as u64;
+            // Rows past the table's retention are dropped as deleted ones
+            // are (their time is not changed in place).
+            if let Some((f, cutoff)) = claim.retention {
+                let times = crate::forward::NumericColumn::open(&v.file, &schema.fields[f].name)?;
+                let before = live.len();
+                live.retain(|&d| times.get_i64(d).is_none_or(|t| t >= cutoff));
+                stats.docs_expired += (before - live.len()) as u64;
+            }
             views.push(v);
             inputs.push((id, live));
         }
-        let n_new = inputs.iter().map(|(_, l)| l.len()).sum::<usize>();
-        // The inputs' live documents in batches of about MERGE_BATCH_BYTES
-        // of their images (a batch can span inputs), each decoded while the
-        // segment builds from the one before, and the image streamed to its
-        // reserved space: the merge never holds every document decoded, nor
-        // the whole image.
-        let mut batches: Vec<Vec<(usize, &[DocId])>> = Vec::new();
-        let (mut batch, mut docs, mut bytes) = (Vec::new(), 0usize, 0usize);
-        for (k, (_, live)) in inputs.iter().enumerate() {
-            let per_doc = (views[k].file.image().len() / views[k].file.n_docs().max(1)).max(1);
-            let mut rest = &live[..];
-            while !rest.is_empty() {
-                // Documents until the batch is full.
-                let room = (MERGE_BATCH_DOCS.end - docs).min(MERGE_BATCH_BYTES.saturating_sub(bytes).div_ceil(per_doc).max(MERGE_BATCH_DOCS.start.saturating_sub(docs)));
-                let (piece, after) = rest.split_at(room.clamp(1, rest.len()));
-                batch.push((k, piece));
-                (docs, bytes, rest) = (docs + piece.len(), bytes + piece.len() * per_doc, after);
-                if docs >= MERGE_BATCH_DOCS.end || (docs >= MERGE_BATCH_DOCS.start && bytes >= MERGE_BATCH_BYTES) {
-                    batches.push(std::mem::take(&mut batch));
-                    (docs, bytes) = (0, 0);
-                }
+        // The merged segment's documents in order, as (input, docID): the
+        // inputs concatenated, oldest first, or sorted by the table's
+        // cluster_by field, rows of one value in that order.
+        let mut order: Vec<(u32, DocId)> = inputs.iter().enumerate().flat_map(|(k, (_, live))| live.iter().map(move |&d| (k as u32, d))).collect();
+        let clustered = match schema.cluster_by_field() {
+            None => false,
+            Some(f) => {
+                let keys = cluster_keys(schema, f, &views, &order)?;
+                let mut by: Vec<u32> = (0..order.len() as u32).collect();
+                by.sort_by_key(|&i| keys[i as usize]);
+                order = by.into_iter().map(|i| order[i as usize]).collect();
+                true
+            }
+        };
+        let n_new = order.len();
+        // Batches of about MERGE_BATCH_BYTES of the inputs' images, each
+        // decoded while the segment builds from the one before, and the
+        // image streamed to its reserved space: the merge never holds every
+        // document decoded, nor the whole image.
+        let per_doc: Vec<usize> = views.iter().map(|v| (v.file.image().len() / v.file.n_docs().max(1)).max(1)).collect();
+        let mut batches: Vec<&[(u32, DocId)]> = Vec::new();
+        let (mut from, mut docs, mut bytes) = (0usize, 0usize, 0usize);
+        for (i, &(k, _)) in order.iter().enumerate() {
+            (docs, bytes) = (docs + 1, bytes + per_doc[k as usize]);
+            if docs >= MERGE_BATCH_DOCS.end || (docs >= MERGE_BATCH_DOCS.start && bytes >= MERGE_BATCH_BYTES) {
+                batches.push(&order[from..=i]);
+                (from, docs, bytes) = (i + 1, 0, 0);
             }
         }
-        if !batch.is_empty() {
-            batches.push(batch);
+        if from < order.len() {
+            batches.push(&order[from..]);
         }
-        let decode = |batch: &[(usize, &[DocId])]| -> Result<Vec<Document>> {
-            let mut all = Vec::with_capacity(batch.iter().map(|(_, l)| l.len()).sum());
-            for &(k, live) in batch {
+        // Semantic-ID codes the merge drops (its inputs' deleted and expired
+        // documents' and those they had dropped) stay in a section of the merged
+        // segment, unless a document it keeps has a higher one.
+        let sids = !crate::sid::fields(schema).is_empty();
+        let mut dropped = Ties::default();
+        if sids {
+            for v in &views {
+                dropped.scan(schema, &v.file)?;
+            }
+        }
+        let kept = Mutex::new(Ties::default());
+        let decode = |batch: &[(u32, DocId)]| -> Result<Vec<Document>> {
+            // Each input's documents of the batch, read in docID order.
+            let mut wanted: Vec<Vec<(DocId, usize)>> = vec![Vec::new(); views.len()];
+            for (i, &(k, d)) in batch.iter().enumerate() {
+                wanted[k as usize].push((d, i));
+            }
+            let mut out: Vec<Document> = vec![Vec::new(); batch.len()];
+            for (k, mut want) in wanted.into_iter().enumerate() {
+                if want.is_empty() {
+                    continue;
+                }
+                want.sort_unstable();
                 let v = views[k];
-                let mut got = source.documents(schema, &v.file, live)?;
+                let live: Vec<DocId> = want.iter().map(|w| w.0).collect();
+                let got = source.documents(schema, &v.file, &live)?;
                 if got.len() != live.len() {
                     return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
                 }
-                // The merged segment holds the values written in place.
-                if let Some(u) = &v.updates {
-                    for (doc, &d) in got.iter_mut().zip(live) {
-                        u.apply(d, doc);
+                for (mut doc, (d, i)) in got.into_iter().zip(want) {
+                    // The merged segment holds the values written in place.
+                    if let Some(u) = &v.updates {
+                        u.apply(d, &mut doc);
                     }
+                    out[i] = doc;
                 }
-                all.append(&mut got);
             }
-            Ok(all)
+            if sids {
+                let mut k = lock(&kept);
+                for d in &out {
+                    k.saw_doc(schema, d);
+                }
+            }
+            Ok(out)
         };
         // The merged vector graphs start from the largest input's, if it
-        // lost no documents.
+        // lost no documents and keeps its order.
         let mut starts = Vec::new();
         let mut base = 0u32;
         let mut largest: Option<(usize, &SegmentFile, u32)> = None;
         for (k, (_, live)) in inputs.iter().enumerate() {
             let v = views[k];
-            if live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
+            if !clustered && live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
                 largest = Some((live.len(), &v.file, base));
             }
             base += live.len() as u32;
@@ -2124,29 +2470,48 @@ impl Database {
         let seqs = match lock(&self.state).manifest.seq_no.is_some() {
             false => None,
             true => {
-                let mut out = Vec::with_capacity(n_new);
-                for (k, (_, live)) in inputs.iter().enumerate() {
-                    let (v, built) = (views[k], Seqs::of(&views[k].file)?);
-                    for &d in live {
-                        out.push(match v.updates.as_ref().and_then(|u| u.get(SEQ, d)) {
-                            Some(x) => x.as_i64().unwrap_or(0) as u64,
-                            None => built.as_ref().map_or(0, |b| b.get(d)),
-                        });
-                    }
-                }
-                Some(out)
+                let built = views.iter().map(|v| Seqs::of(&v.file)).collect::<Result<Vec<_>>>()?;
+                let seq = |&(k, d): &(u32, DocId)| match views[k as usize].updates.as_ref().and_then(|u| u.get(SEQ, d)) {
+                    Some(x) => x.as_i64().unwrap_or(0) as u64,
+                    None => built[k as usize].as_ref().map_or(0, |b| b.get(d)),
+                };
+                Some(order.iter().map(seq).collect::<Vec<u64>>())
             }
         };
+        // Where each input's live documents went, when not concatenated.
+        let slots: Option<Vec<Vec<u32>>> = clustered.then(|| {
+            let mut slots: Vec<Vec<u32>> = inputs.iter().map(|(_, live)| vec![0; live.len()]).collect();
+            for (at, &(k, d)) in order.iter().enumerate() {
+                let live = &inputs[k as usize].1;
+                slots[k as usize][live.binary_search(&d).expect("an input's live document")] = at as u32;
+            }
+            slots
+        });
         // Written before the writer lock is taken, into space reserved for
         // it: commits go on meanwhile.
+        let gone = |sections: &mut SegmentWriter| {
+            for (name, bytes) in crate::sid::gone_sections(schema, &dropped, &lock(&kept)) {
+                sections.put(name, bytes);
+            }
+        };
         let written = match batches.len() {
+            // Every document was deleted; a segment without documents keeps
+            // the codes they were given.
+            0 if sids && !crate::sid::gone_sections(schema, &dropped, &Ties::default()).is_empty() => {
+                let mut sections = SegmentBuild::new(schema, &self.opts.build, 0)?.finish(&[])?;
+                if seqs.is_some() {
+                    sections.put(rowseq::SECTION, rowseq::encode(&[]));
+                }
+                gone(&mut sections);
+                Some(self.write_reserved(sections, pacer)?)
+            }
             0 => None,
             n => {
                 let mut build = SegmentBuild::with_starts(schema, &self.opts.build, n_new, &starts)?;
                 let mut sections = std::thread::scope(|s| {
-                    let mut next = decode(&batches[0]);
+                    let mut next = decode(batches[0]);
                     for i in 1..n {
-                        let (decode, batch) = (&decode, &batches[i]);
+                        let (decode, batch) = (&decode, batches[i]);
                         let ahead = s.spawn(move || decode(batch));
                         let added = next.and_then(|docs| build.add(&docs));
                         next = ahead.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
@@ -2157,13 +2522,14 @@ impl Database {
                 if let Some(seqs) = &seqs {
                     sections.put(rowseq::SECTION, rowseq::encode(seqs));
                 }
+                gone(&mut sections);
                 Some(self.write_reserved(sections, pacer)?)
             }
         };
         let n_new = n_new as u32;
         let go = between();
         let mut wal = self.background_writer();
-        let r = if go { self.install_merge(&mut wal, claim, written.as_ref(), &inputs, n_new, stats) } else { Ok(false) };
+        let r = if go { self.install_merge(&mut wal, claim, written.as_ref(), &inputs, slots.as_deref(), n_new, stats) } else { Ok(false) };
         // A commit that failed before it could reach the disk leaves
         // nothing naming the image; one that may have reached it poisons
         // the database, and then the image stays (opening removes it if no
@@ -2180,7 +2546,8 @@ impl Database {
     /// `n_new` documents; none when every input document was deleted) in
     /// one commit. Returns whether it did: not when the table was dropped
     /// meanwhile.
-    fn install_merge(&self, wal: &mut Wal, claim: &MergeClaim, written: Option<&(Reserved, u32)>, inputs: &[(u64, Vec<DocId>)], n_new: u32, stats: &mut MergeStats) -> Result<bool> {
+    #[allow(clippy::too_many_arguments)]
+    fn install_merge(&self, wal: &mut Wal, claim: &MergeClaim, written: Option<&(Reserved, u32)>, inputs: &[(u64, Vec<DocId>)], slots: Option<&[Vec<u32>]>, n_new: u32, stats: &mut MergeStats) -> Result<bool> {
         let (table, snap, ids) = (claim.table, &claim.snap, &claim.ids[..]);
         self.check_poisoned()?;
         {
@@ -2192,22 +2559,23 @@ impl Database {
             }
         }
         // Documents of the inputs deleted after the snapshot, as docIDs of
-        // the merged segment (inputs are concatenated in order), and values
-        // written in place after it.
+        // the merged segment (the inputs concatenated in order, or where
+        // `slots` puts them), and values written in place after it.
         let mut deleted = Vec::new();
         let mut updated = Updates::default();
         {
             let mut st = lock(&self.state);
             let mut base = 0u32;
-            for (id, live) in inputs {
+            for (k, (id, live)) in inputs.iter().enumerate() {
+                let slot = |j: usize| slots.map_or(base + j as u32, |s| s[k][j]);
                 let h = st.handle(*id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
-                deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| base + j as u32));
+                deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| slot(j)));
                 let then = snap.segments().iter().find(|v| v.id == *id).and_then(|v| v.updates.clone());
                 if let Some(now) = st.updates_of(&h) {
                     for (f, d, v) in now.iter() {
                         if then.as_ref().and_then(|t| t.get(f, d)) != Some(v) {
                             if let Ok(j) = live.binary_search(&d) {
-                                updated.set(f, base + j as u32, v.clone());
+                                updated.set(f, slot(j), v.clone());
                             }
                         }
                     }
@@ -2371,6 +2739,12 @@ impl Database {
             if let Some(n) = &mut manifest.seq_no {
                 n.seq = st.seq;
             }
+            // Profiles logged since the last version are in no segment.
+            for t in manifest.tables.iter_mut() {
+                if let Some(ts) = st.tables.iter().find(|ts| ts.id == t.id) {
+                    t.profiles = ts.profiles.to_vec();
+                }
+            }
             (snap, manifest, st.handles().cloned().collect::<Vec<_>>())
         };
         let name = dest.file_name().ok_or_else(|| Error::Schema(format!("{} names no file", dest.display())))?.to_string_lossy();
@@ -2400,7 +2774,10 @@ impl Database {
         let o = DbOptions { layout, sync: true, publish_snapshots: false, doc_source: None, ..DbOptions::default() };
         let out = Database::create(tmp, manifest.tables[0].schema.clone(), o)?;
         for t in &manifest.tables[1..] {
-            out.create_table(t.schema.clone())?;
+            match t.id == SOURCES_ID {
+                true => out.ensure_sources()?,
+                false => out.create_table(t.schema.clone())?,
+            }
         }
         let mut stats = CheckpointStats { tables: manifest.tables.len(), ..CheckpointStats::default() };
         {
@@ -2416,6 +2793,7 @@ impl Database {
             // may differ (dropped tables leave gaps in the source's).
             let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).collect();
             for (t, &to) in manifest.tables.iter().zip(&ids) {
+                vw.table_mut(to).profiles = t.profiles.clone();
                 for m in &t.segments {
                     let h = handles.iter().find(|h| h.meta.id == m.id).ok_or_else(|| corrupt(format!("segment {} is in the manifest but not open", m.id)))?;
                     vw.manifest.next_segment_id = m.id;
@@ -2738,9 +3116,18 @@ impl Database {
                             debug_assert!(t.id != 0, "the first table's schema changed");
                             o.schema = Arc::new(t.schema.clone());
                         }
+                        // The version took them from here, unless it
+                        // installs others (a copy's).
+                        if *o.profiles != t.profiles {
+                            o.profiles = Arc::new(t.profiles.clone());
+                        }
                         o
                     }
-                    None => TableState::new(t.id, Arc::new(t.schema.clone()), h, self.opts.memtable_chunk_docs, 0),
+                    None => {
+                        let mut ts = TableState::new(t.id, Arc::new(t.schema.clone()), h, self.opts.memtable_chunk_docs, 0);
+                        ts.profiles = Arc::new(t.profiles.clone());
+                        ts
+                    }
                 })
                 .collect();
             st.txn = c.meta.txn;
@@ -2783,15 +3170,128 @@ impl Database {
         TableRef { id: 0, pos: 0, schema: self.schema.clone() }
     }
 
+    /// Gives semantic-ID field `field` of the table named `table` its
+    /// codebook, whose file has hash `hash` ([`crate::sid::Codebook::open`]):
+    /// writes then fill the field from the row's vector. It must be the
+    /// codebook the field records.
+    pub fn set_codebook(&self, table: &str, field: &str, codebook: Arc<Codebook>, hash: &str) -> Result<()> {
+        let t = self.table_ref(Some(table))?;
+        let f = t.schema.field_index(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let Some(sid) = &t.schema.fields[f].semantic_id else { return Err(Error::Schema(format!("field {field} is not a semantic-ID field"))) };
+        if sid.hash != hash {
+            return Err(Error::Schema(format!("field {field} records codebook {} with hash {}, not {hash}", sid.codebook, sid.hash)));
+        }
+        let dim = t.schema.field(&sid.from).and_then(|v| if let FieldType::Vector { dim, .. } = v.ty { Some(dim) } else { None });
+        if dim != Some(codebook.dim) {
+            return Err(Error::Schema(format!("codebook {} codes {}-dimension vectors; {} holds {}", sid.codebook, codebook.dim, sid.from, dim.unwrap_or(0))));
+        }
+        let mut all = self.codebooks.write().unwrap_or_else(|e| e.into_inner());
+        all.retain(|c| !(c.table == t.id && c.field == f));
+        all.push(Coded { table: t.id, field: f, hash: hash.to_string(), codebook });
+        Ok(())
+    }
+
+    /// The codebook of semantic-ID field `field` of the table named `table`,
+    /// if it has one ([`Database::set_codebook`]).
+    pub fn codebook(&self, table: &str, field: &str) -> Option<Arc<Codebook>> {
+        let t = self.table_ref(Some(table)).ok()?;
+        self.codebook_of(&t, t.schema.field_index(field)?)
+    }
+
+    fn codebook_of(&self, t: &TableRef, f: usize) -> Option<Arc<Codebook>> {
+        let hash = &t.schema.fields.get(f)?.semantic_id.as_ref()?.hash;
+        let all = self.codebooks.read().unwrap_or_else(|e| e.into_inner());
+        all.iter().find(|c| c.table == t.id && c.field == f && c.hash == *hash).map(|c| c.codebook.clone())
+    }
+
+    /// Fills the semantic-ID fields of `doc`, a row of table `t` that a
+    /// write under the writer lock gives ([`crate::sid`]): a code given in
+    /// full is kept, one of the levels alone gets its tie, and a row with a
+    /// vector and no code gets one from the codebook. `live` holds the
+    /// fields' values in the row an upsert replaces, whose code the row
+    /// keeps when its levels are the same; `local` the ties the write gave
+    /// so far.
+    fn fill_sids(&self, t: &TableRef, doc: &mut Document, local: &mut Ties, live: &[(usize, Value)]) -> Result<()> {
+        for (f, vf) in crate::sid::fields(&t.schema) {
+            let field = &t.schema.fields[f];
+            let cb = self.codebook_of(t, f);
+            let levels = match &doc[f] {
+                Value::Null => match (&doc[vf], &cb) {
+                    (Value::Vector(v), Some(cb)) => cb.code(v),
+                    (Value::Vector(_), None) => {
+                        let sid = field.semantic_id.as_ref().expect("a semantic-ID field");
+                        return Err(Error::Schema(format!("field {}: its codebook {} is not open here, so rows cannot get codes (Db::open_codebooks)", field.name, sid.codebook)));
+                    }
+                    _ => continue,
+                },
+                v => {
+                    let code = crate::sid::code_of(v).filter(|c| c.len() >= 2).ok_or_else(|| Error::Schema(format!("bad value for {}: {v:?} (a semantic ID is every prefix of a code such as 12.7.201.0)", field.name)))?;
+                    match &cb {
+                        Some(cb) if code.len() == cb.n_levels() && code.iter().all(|&x| (x as usize) < cb.k) => code,
+                        Some(cb) if code.len() == cb.n_levels() + 1 && code[..cb.n_levels()].iter().all(|&x| (x as usize) < cb.k) => {
+                            local.saw(f, &code);
+                            continue;
+                        }
+                        Some(cb) => return Err(Error::Schema(format!("bad value for {}: {v:?} (codes have {} levels below {}, and a tie)", field.name, cb.n_levels(), cb.k))),
+                        // Without the codebook, a code is taken as given.
+                        None if code[..code.len() - 1].iter().all(|&x| x < 256) && code.len() <= crate::sid::MAX_LEVELS + 1 => {
+                            local.saw(f, &code);
+                            continue;
+                        }
+                        None => return Err(Error::Schema(format!("bad value for {}: {v:?}", field.name))),
+                    }
+                }
+            };
+            let kept = live.iter().find(|(g, _)| *g == f).and_then(|(_, v)| crate::sid::code_of(v).filter(|c| c.len() == levels.len() + 1 && c[..levels.len()] == levels[..]));
+            let code = match kept {
+                Some(c) => c,
+                None => {
+                    let p = crate::sid::pack(&levels);
+                    let tie = self.committed_tie(t, f, p)?.max(local.get(f, p));
+                    levels.iter().copied().chain([tie]).collect()
+                }
+            };
+            local.saw(f, &code);
+            doc[f] = crate::sid::value(&code[..code.len() - 1], code[code.len() - 1]);
+        }
+        Ok(())
+    }
+
+    /// The next tie of semantic-ID field `f` of table `t` under prefix `p`
+    /// that committed writes leave, counting the table's ties first if no
+    /// write has needed them since it opened. Under the writer lock, which
+    /// keeps its segments and memtable as they are.
+    fn committed_tie(&self, t: &TableRef, f: usize, p: u32) -> Result<u32> {
+        let (files, chunks) = {
+            let st = lock(&self.state);
+            let table = &st.tables[t.pos];
+            if let Some(ties) = &table.ties {
+                return Ok(ties.get(f, p));
+            }
+            (table.handles.iter().map(|h| h.file.clone()).collect::<Vec<_>>(), table.mem.chunks.clone())
+        };
+        let mut ties = Ties::default();
+        for file in &files {
+            ties.scan(&t.schema, file)?;
+        }
+        // Deleted memtable rows too: their numbers are not given again.
+        for doc in chunks.iter().flat_map(|c| c.iter()) {
+            ties.saw_doc(&t.schema, doc);
+        }
+        let next = ties.get(f, p);
+        lock(&self.state).tables[t.pos].ties = Some(ties);
+        Ok(next)
+    }
+
     /// INT field `f` of the live document of table `t` with primary key
     /// `key`: the value written in place if any, else the document's.
     fn live_int(&self, t: &TableRef, key: &Value, f: usize) -> Result<Option<i64>> {
         Ok(self.live_value(t, key, f)?.as_i64())
     }
 
-    /// Numeric field `f` of the live document of table `t` with primary
-    /// key `key` (NULL without one): the value written in place if any,
-    /// else the document's.
+    /// Field `f` of the live document of table `t` with primary key `key`
+    /// (NULL without one): a number's value written in place if any, else
+    /// the document's (a field not numeric must be stored).
     fn live_value(&self, t: &TableRef, key: &Value, f: usize) -> Result<Value> {
         let st = lock(&self.state);
         let (h, d) = match st.find_live(t.pos, key) {
@@ -2811,7 +3311,7 @@ impl Database {
         }
         drop(st);
         let field = &t.schema.fields[f];
-        Ok(if field.indexed {
+        Ok(if field.indexed && matches!(field.ty, FieldType::Int | FieldType::Float) {
             crate::forward::NumericColumn::open(&h.file, &field.name)?.get(d)
         } else {
             crate::forward::DocStore::open(&h.file, &t.schema)?.get_fields(d, &[f]).pop().unwrap_or(Value::Null)
@@ -2830,6 +3330,9 @@ impl Database {
             return Ok(None);
         }
         self.check_poisoned()?;
+        if !wal.allows_profiles() && ops.iter().any(|(_, op)| matches!(op, Op::Profile { .. })) {
+            self.allow_profiles(wal)?;
+        }
         // While flushes fail or the flusher falls behind, the memtable
         // grows; past twice its limit, writes wait for a flush to succeed,
         // refused before they are logged.
@@ -2909,6 +3412,8 @@ pub struct WriteTxn<'a> {
     ops: Vec<(u32, Op)>,
     /// What the transaction did to each table it wrote, by table id.
     keys: Vec<(u32, TxnKeys)>,
+    /// The semantic-ID ties the transaction gave, by table id.
+    ties: Vec<(u32, Ties)>,
 }
 
 /// What a transaction did to one table's keys.
@@ -2935,6 +3440,23 @@ struct TableRef {
 impl TableRef {
     fn primary_key(&self) -> Result<usize> {
         self.schema.primary_key.ok_or_else(|| Error::Schema(format!("table {} has no primary key", self.schema.table)))
+    }
+
+    /// Refuses to change field `i` in place when it places the table's
+    /// rows on shards ([`crate::schema::Schema::with_shard_by`]): the row
+    /// would stay on the shard of its old value. Nor when it orders the
+    /// segments' rows or keeps them ([`crate::schema::Schema::with_cluster_by`],
+    /// [`crate::schema::Schema::with_retain`]), which merges read from the
+    /// segments' columns.
+    fn check_not_placing(&self, i: usize) -> Result<()> {
+        let s = &self.schema;
+        let why = match () {
+            _ if s.shard_by_field() == Some(i) => "places the rows on shards (shard_by)",
+            _ if s.cluster_by_field() == Some(i) => "orders the rows (cluster_by)",
+            _ if s.retention(0).is_some_and(|(f, _)| f == i) => "keeps the rows (retain_by)",
+            _ => return Ok(()),
+        };
+        Err(Error::Schema(format!("{} {why} of {}, so it is not changed in place: delete the row and write it again", s.fields[i].name, s.table)))
     }
 
     /// Checks that `key` has the primary key's type.
@@ -2989,6 +3511,13 @@ impl TableTxn<'_, '_> {
         self.txn.add_in(&self.t, key, field, delta)
     }
 
+    /// Field `field` of the live row with this key, as this transaction
+    /// finds it, its own writes included; `None` when no row with the key
+    /// is live.
+    pub fn value(&mut self, key: &Value, field: &str) -> Result<Option<Value>> {
+        self.txn.value_in(&self.t, key, field)
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.t.schema
     }
@@ -2999,6 +3528,28 @@ impl<'a> WriteTxn<'a> {
     pub fn table(&mut self, name: &str) -> Result<TableTxn<'_, 'a>> {
         let t = self.db.table_ref(Some(name))?;
         Ok(TableTxn { txn: self, t })
+    }
+
+    /// The offset of the last event written from stream source `name`, as
+    /// this transaction finds it ([`SOURCES`]); `None` for a source not
+    /// written yet.
+    pub fn source_offset(&mut self, name: &str) -> Result<Option<i64>> {
+        if !self.db.has_sources() {
+            return Ok(None);
+        }
+        let v = self.table(SOURCES)?.value(&Value::Str(name.to_string()), "last_offset")?;
+        Ok(v.and_then(|v| v.as_i64()))
+    }
+
+    /// Records `offset` as the last event written from source `name`, at
+    /// `now` (microseconds since the epoch), in this transaction: committed
+    /// with the rows the events wrote, or not at all. The database needs
+    /// the table first ([`Database::ensure_sources`]).
+    pub fn set_source(&mut self, name: &str, offset: i64, now: i64) -> Result<()> {
+        if !self.db.has_sources() {
+            return Err(Error::Schema(format!("the database has no {SOURCES} table yet: Database::ensure_sources makes it")));
+        }
+        self.table(SOURCES)?.upsert(vec![Value::Str(name.to_string()), Value::Int(offset), Value::Timestamp(now)])
     }
 
     /// Inserts a document; its primary key must not be live.
@@ -3074,6 +3625,7 @@ impl<'a> WriteTxn<'a> {
 
     fn insert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
         conform(&t.schema, &mut doc)?;
+        self.fill_sids(t, &mut doc, false)?;
         if let Some(pk) = t.schema.primary_key {
             let key = Key::of(&doc[pk]).expect("validated key");
             if self.is_live(t, &key, &doc[pk]) {
@@ -3093,6 +3645,7 @@ impl<'a> WriteTxn<'a> {
     fn upsert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
         conform(&t.schema, &mut doc)?;
         let pk = t.primary_key()?;
+        self.fill_sids(t, &mut doc, true)?;
         self.delete_in(t, &doc[pk].clone())?;
         let key = Key::of(&doc[pk]).expect("validated key");
         let doc = Arc::new(doc);
@@ -3143,6 +3696,7 @@ impl<'a> WriteTxn<'a> {
     fn set_in(&mut self, t: &TableRef, key: &Value, field: &str, value: Value) -> Result<bool> {
         let k = t.key_of(key)?;
         let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        t.check_not_placing(i)?;
         let f = &t.schema.fields[i];
         let value = match (&f.ty, f.store(value)?) {
             _ if f.multi || Some(i) == t.schema.primary_key => {
@@ -3173,20 +3727,11 @@ impl<'a> WriteTxn<'a> {
     fn add_in(&mut self, t: &TableRef, key: &Value, field: &str, delta: &Value) -> Result<bool> {
         let k = t.key_of(key)?;
         let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        t.check_not_placing(i)?;
         if let Some(l) = t.schema.fields[i].logical {
             return Err(Error::Schema(format!("{field} is a {}: set it rather than add to it", l.type_name())));
         }
-        if !self.is_live(t, &k, key) {
-            return Ok(false);
-        }
-        let keys = self.keys(t.id);
-        let base = match (keys.touched.get(&k), keys.written.get(&k)) {
-            (Some(true), Some(d)) => d[i].clone(),
-            _ => match keys.sets.get(&(k.clone(), i)) {
-                Some(v) => v.clone(),
-                None => self.db.live_value(t, key, i)?,
-            },
-        };
+        let Some(base) = self.value_of(t, &k, key, i)? else { return Ok(false) };
         let overflow = || Error::Schema(format!("{field} + {delta:?} overflows"));
         let sum = match (&t.schema.fields[i].ty, delta) {
             (FieldType::Int, Value::Int(x)) => Value::Int(base.as_i64().unwrap_or(0).checked_add(*x).ok_or_else(overflow)?),
@@ -3202,6 +3747,30 @@ impl<'a> WriteTxn<'a> {
             _ => return Err(Error::Schema(format!("{field} is not a numeric field"))),
         };
         self.set_in(t, key, field, sum)
+    }
+
+    /// Field `field` of the live row with this key, as this transaction
+    /// finds it, its own writes included; `None` when no row with the key is
+    /// live.
+    fn value_in(&mut self, t: &TableRef, key: &Value, field: &str) -> Result<Option<Value>> {
+        let k = t.key_of(key)?;
+        let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        self.value_of(t, &k, key, i)
+    }
+
+    fn value_of(&mut self, t: &TableRef, k: &Key, key: &Value, i: usize) -> Result<Option<Value>> {
+        if !self.is_live(t, k, key) {
+            return Ok(None);
+        }
+        let keys = self.keys(t.id);
+        let v = match (keys.touched.get(k), keys.written.get(k)) {
+            (Some(true), Some(d)) => d[i].clone(),
+            _ => match keys.sets.get(&(k.clone(), i)) {
+                Some(v) => v.clone(),
+                None => self.db.live_value(t, key, i)?,
+            },
+        };
+        Ok(Some(v))
     }
 
     /// Operations buffered so far.
@@ -3251,9 +3820,41 @@ impl<'a> WriteTxn<'a> {
                         return Err(differs(format!("sets {name} of {key:?}, which no row here has")));
                     }
                 }
+                op @ Op::Profile { .. } => self.ops.push((t.id, op)),
             }
         }
         Ok(())
+    }
+
+    /// Fills the semantic-ID fields `doc` leaves out ([`crate::sid`]); an
+    /// upsert keeps the code of the row it replaces when the new vector has
+    /// the same levels.
+    fn fill_sids(&mut self, t: &TableRef, doc: &mut Document, upsert: bool) -> Result<()> {
+        let fields = crate::sid::fields(&t.schema);
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let mut live = Vec::new();
+        if let (true, Some(pk)) = (upsert, t.schema.primary_key) {
+            let key = Key::of(&doc[pk]).expect("validated key");
+            for &(f, _) in &fields {
+                let k = self.keys(t.id);
+                let v = match (k.touched.get(&key), k.written.get(&key)) {
+                    (Some(true), Some(d)) => d[f].clone(),
+                    (Some(false), _) => Value::Null,
+                    _ => self.db.live_value(t, &doc[pk], f)?,
+                };
+                live.push((f, v));
+            }
+        }
+        let i = match self.ties.iter().position(|(id, _)| *id == t.id) {
+            Some(i) => i,
+            None => {
+                self.ties.push((t.id, Ties::default()));
+                self.ties.len() - 1
+            }
+        };
+        self.db.fill_sids(t, doc, &mut self.ties[i].1, &live)
     }
 
     fn keys(&mut self, table: u32) -> &mut TxnKeys {
@@ -3322,6 +3923,13 @@ impl<'a> VersionWriter<'a> {
         let mut manifest = st.manifest.clone();
         // Past the ids reserved for merges.
         manifest.next_segment_id = manifest.next_segment_id.max(st.next_segment_id);
+        // Profiles logged since the last version. The writer lock, which
+        // every version is written under, keeps them until the commit.
+        for t in manifest.tables.iter_mut() {
+            if let Some(ts) = st.tables.iter().find(|ts| ts.id == t.id) {
+                t.profiles = ts.profiles.to_vec();
+            }
+        }
         VersionWriter {
             db,
             txn: st.txn + 1,
@@ -3705,12 +4313,18 @@ pub struct DropOptions {
 
 /// Table names are plain identifiers, so SQL can name them unquoted.
 fn check_table_name(name: &str) -> Result<()> {
+    check_name("table", name)
+}
+
+/// A table's or a rank profile's name: letters, digits and underscores,
+/// not starting with a digit.
+fn check_name(what: &str, name: &str) -> Result<()> {
     let mut chars = name.chars();
     let ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
     if ok {
         Ok(())
     } else {
-        Err(Error::Schema(format!("bad table name {name:?}: use letters, digits and underscores, not starting with a digit")))
+        Err(Error::Schema(format!("bad {what} name {name:?}: use letters, digits and underscores, not starting with a digit")))
     }
 }
 
@@ -3750,6 +4364,7 @@ fn op_fits(schema: &Schema, op: &Op) -> bool {
     match op {
         Op::Insert(doc) => validate(schema, doc).is_ok(),
         Op::Delete(k) => is_key(k),
+        Op::Profile { name, def } => check_name("rank profile", name).is_ok() && def.as_ref().is_none_or(|p| p.name == *name),
         Op::Set { key, field, value } => {
             let i = *field as usize;
             is_key(key)

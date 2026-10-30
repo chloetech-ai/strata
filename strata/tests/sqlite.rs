@@ -259,6 +259,8 @@ fn a_value_that_does_not_fit_names_its_row() {
     assert!(e.contains("not a SQLite database"), "{e}");
 }
 
+const COVER: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
 /// Every kind of field, in two tables that reference each other's keys.
 fn library(path: &Path) -> Db {
     let mut authors = vec![
@@ -288,6 +290,7 @@ fn library(path: &Path) -> Db {
             Field::timestamp("published"),
             Field::boolean("in_print"),
             Field::new("shelf", FieldType::Keyword).default(json!("new")),
+            Field::media("cover", strata::schema::MediaKind::Image),
         ],
         Some("isbn"),
     )
@@ -320,6 +323,7 @@ fn library(path: &Path) -> Db {
             Value::Timestamp(strata::timestamp::parse(published).unwrap()),
             Value::Bool(in_print),
             Value::Str("fiction".into()),
+            Value::Str(strata::media::input_text(&json!({"uri": format!("https://example.com/{isbn}.png"), "sha256": COVER, "mime": "image/png", "bytes": 1234, "width": 600, "height": 900})).unwrap()),
         ]
     };
     b.insert(row("isbn-1", "A Wizard of Earthsea", 1, &["fantasy", "classic"], "[]", [1.0, 0.0, 0.0], "1968-11-01", true)).unwrap();
@@ -349,6 +353,7 @@ fn strata_to_sqlite_and_back() {
     assert_eq!(done.tables[0].fts.as_deref(), Some("authors_fts"));
     assert_eq!(done.tables[1].fts.as_deref(), Some("books_fts"));
     assert!(done.tables[1].indexes.contains(&"books_author_idx".to_string()));
+    assert!(done.tables[1].indexes.contains(&"books_cover_idx".to_string()));
     assert!(done.tables[1].notes.iter().any(|n| n.starts_with("emb: vectors as F32_BLOB(3)")), "{:?}", done.tables[1].notes);
     assert!(sqlite::export(&db, &out, &ExportOptions::default()).unwrap_err().to_string().contains("exists"));
 
@@ -363,7 +368,7 @@ fn strata_to_sqlite_and_back() {
         types,
         [
             "isbn TEXT", "title TEXT", "blurb TEXT", "body TEXT", "author INTEGER", "price REAL", "pages INTEGER", "tags JSON", "years JSON", "cites JSON", "terms JSON", "emb F32_BLOB(3)", "published TIMESTAMP",
-            "in_print BOOLEAN", "shelf TEXT"
+            "in_print BOOLEAN", "shelf TEXT", "cover JSON"
         ]
     );
     let one = |sql: &str| -> rusqlite::types::Value { c.query_row(sql, [], |r| r.get(0)).unwrap_or_else(|e| panic!("{sql}: {e}")) };
@@ -377,6 +382,8 @@ fn strata_to_sqlite_and_back() {
     assert_eq!(one("SELECT emb FROM books WHERE isbn = 'isbn-2'"), S::Blob([0.0f32, 1.0, 0.0].iter().flat_map(|x| x.to_le_bytes()).collect()));
     assert_eq!(one("SELECT isbn FROM books_fts JOIN books ON books.rowid = books_fts.rowid WHERE books_fts MATCH 'wizards'"), S::Text("isbn-1".into()), "porter stems");
     assert_eq!(one("SELECT a.name FROM books b JOIN authors a ON a.id = b.author WHERE b.isbn = 'isbn-3'"), S::Text("Borges".into()));
+    assert_eq!(one(&format!("SELECT count(*) FROM books WHERE json_extract(cover, '$.sha256') = '{COVER}'")), S::Integer(2));
+    assert_eq!(one("SELECT json_extract(cover, '$.uri') FROM books WHERE isbn = 'isbn-2'"), S::Text("https://example.com/isbn-2.png".into()));
     // Defaults and NOT NULL hold in SQLite too, and the triggers index new rows.
     c.execute("INSERT INTO books (isbn, title, pages) VALUES ('isbn-4', 'The Dispossessed', 400)", []).unwrap();
     assert_eq!(one("SELECT price || ' ' || shelf FROM books WHERE isbn = 'isbn-4'"), S::Text("9.99 new".into()));

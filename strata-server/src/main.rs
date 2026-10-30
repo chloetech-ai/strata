@@ -204,6 +204,23 @@ struct Args {
     /// taken while it serves) written by `POST /v1/admin/checkpoint`.
     #[arg(long)]
     backup_dir: Option<PathBuf>,
+    /// What writes may fetch for MEDIA fields, comma-separated: directories
+    /// (`file:/data/media`) and hosts fetched over HTTPS
+    /// (`cdn.example.com`, `*.example.com`; `http://host:port` only spelled
+    /// out). Nothing by default: writes then give the bytes or the whole
+    /// value.
+    #[arg(long, value_delimiter = ',')]
+    media_fetch: Vec<String>,
+    /// The largest media file a write fetches or gives, in bytes.
+    #[arg(long, default_value_t = strata::media::DEFAULT_MAX_BYTES)]
+    media_max_bytes: u64,
+    /// Where the bytes a write gives a MEDIA field without a URI are kept,
+    /// as DIR/<sha256> (the value's uri is then media:<sha256>).
+    #[arg(long)]
+    media_store: Option<PathBuf>,
+    /// How long a media fetch may take, in seconds.
+    #[arg(long, default_value_t = 30)]
+    media_timeout_s: u64,
     /// Merges that may run at once (default: half the cores, 1 to 4).
     #[arg(long)]
     merge_threads: Option<usize>,
@@ -277,6 +294,10 @@ enum Command {
         /// SQLite's: one, an array, or the output of --plan, edited.
         #[arg(long)]
         schema: Option<PathBuf>,
+        /// The table the rows go to (default: the first). A SQLite file's
+        /// tables go to the tables of their names.
+        #[arg(long)]
+        table: Option<String>,
         /// The files' format: jsonl, json, csv, tsv or sqlite (default:
         /// SQLite for a SQLite database, else from each file's extension).
         #[arg(long)]
@@ -357,10 +378,11 @@ async fn main() {
             }
             return;
         }
-        Some(Command::Import { db, schema, format, models, directory, files, tables, blobs_base64, plan }) => {
+        Some(Command::Import { db, schema, table, format, models, directory, files, tables, blobs_base64, plan }) => {
+            let sqlite = server::SqliteImport { format: format.as_deref().is_some_and(|f| f.eq_ignore_ascii_case("sqlite")), tables: tables.clone(), blobs_base64: *blobs_base64, plan: *plan };
+            let format = format.as_deref().filter(|_| !sqlite.format).map(|f| strata::ingest::Format::parse(f).unwrap_or_else(|| fail(&format!("unknown --format {f}: jsonl, json, csv, tsv or sqlite"))));
             let models = models.clone().unwrap_or_else(strata::embed::models_dir);
-            let sqlite = server::SqliteImport { tables: tables.clone(), blobs_base64: *blobs_base64, plan: *plan };
-            if let Err(e) = server::import_files(db, schema.as_deref(), &models, format.as_deref(), *directory, files, sqlite) {
+            if let Err(e) = server::import_files(db, schema.as_deref(), table.as_deref(), &models, format, *directory, files, sqlite) {
                 fail(&e);
             }
             return;
@@ -434,6 +456,11 @@ async fn main() {
         models: a.models.unwrap_or_else(strata::embed::models_dir),
         synonyms: a.synonyms,
         backup_dir: a.backup_dir,
+        media_fetch: a.media_fetch,
+        // The default needs no resolver of its own: a database's has it.
+        media_max_bytes: if a.media_max_bytes == strata::media::DEFAULT_MAX_BYTES { 0 } else { a.media_max_bytes },
+        media_store: a.media_store,
+        media_timeout_s: a.media_timeout_s,
         slow_ms: a.slow_ms,
         merger: {
             let d = strata::storage::MergerOptions::default();

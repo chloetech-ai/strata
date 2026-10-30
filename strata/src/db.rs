@@ -13,18 +13,20 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crate::embed::Embedder;
+use crate::embed::{Embedder, Input, Modality};
 use crate::error::{Error, Result};
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
+use crate::media::{Media, Resolver};
 use crate::query::agg::Part;
 use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentReaders};
 use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::Plan;
+use crate::query::model::Models;
 use crate::query::stats::TermStats;
-use crate::query::{bind_command, compound, ops, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
+use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
 use crate::schema::{Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
-use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn};
+use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn, SOURCES};
 use crate::value::{Document, Value};
 use crate::vector::VectorReader;
 
@@ -57,10 +59,35 @@ impl PreparedWrite {
             _ => Vec::new(),
         }
     }
+
+    /// The values that place the documents an INSERT writes on shards:
+    /// their keys ([`Self::inserted_keys`]), or for a table placed by a
+    /// column ([`Schema::with_shard_by`]) that column's values.
+    pub fn inserted_places(&self) -> Vec<&Value> {
+        match (&self.write, self.schema.shard_by_field()) {
+            (Write::Insert { docs, .. }, Some(f)) => docs.iter().map(|d| &d[f]).collect(),
+            _ => self.inserted_keys(),
+        }
+    }
+
+    /// The table it writes.
+    pub fn table(&self) -> &Schema {
+        &self.schema
+    }
 }
 
 /// Vectors computed ahead of a write, by embedded field and source text.
 type Known = HashMap<usize, HashMap<String, Arc<[f32]>>>;
+
+/// A stream's source, as the system table [`SOURCES`] keeps it: the
+/// offset of the last event written from it, and when that was written
+/// (microseconds since the epoch).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub name: String,
+    pub offset: i64,
+    pub updated: Option<i64>,
+}
 
 pub struct Db {
     storage: Arc<Database>,
@@ -73,8 +100,12 @@ pub struct Db {
     /// Models of embedded VECTOR fields ([`Db::set_embedder_in`]).
     embedders: RwLock<Vec<Model>>,
     /// Where [`Db::open_embedders`] found models, for the tables created
-    /// after it.
+    /// after it, and where ranking models are ([`Db::open_ranking_models`]).
     models: RwLock<Option<PathBuf>>,
+    /// The ranking models queries have used.
+    ranking: Models,
+    /// How writes resolve MEDIA values ([`Db::set_media_resolver`]).
+    media: RwLock<Arc<Resolver>>,
 }
 
 /// The model of an embedded VECTOR field, and the field it was set for: it
@@ -90,16 +121,40 @@ struct Model {
 }
 
 impl Db {
+    /// A new database of one table. Its semantic-ID fields' codebooks
+    /// come from the default models directory ([`Db::create_in`]).
     pub fn create(path: &Path, schema: Schema, opts: DbOptions) -> Result<Db> {
-        Ok(Db::wrap(Database::create(path, schema, with_source(opts))?))
+        Db::create_in(path, schema, opts, &crate::embed::models_dir())
     }
 
+    /// [`Db::create`], with the codebooks of semantic-ID fields from
+    /// `models`: the table records each one's hash ([`crate::sid::resolve`]),
+    /// and writes get codes from it.
+    pub fn create_in(path: &Path, mut schema: Schema, opts: DbOptions, models: &Path) -> Result<Db> {
+        crate::sid::resolve(&mut schema, models)?;
+        let db = Db::wrap(Database::create(path, schema, with_source(opts))?);
+        db.open_codebooks(models);
+        Ok(db)
+    }
+
+    /// Opens a database; the codebooks of its semantic-ID fields come from
+    /// the default models directory, or from [`Db::open_embedders`]'s.
     pub fn open(path: &Path, opts: DbOptions) -> Result<Db> {
-        Ok(Db::wrap(Database::open(path, with_source(opts))?))
+        let db = Db::wrap(Database::open(path, with_source(opts))?);
+        db.open_codebooks(&crate::embed::models_dir());
+        Ok(db)
     }
 
     fn wrap(storage: Database) -> Db {
-        Db { storage: Arc::new(storage), readers: RwLock::new(HashMap::new()), exec: ExecOptions::default(), embedders: RwLock::new(Vec::new()), models: RwLock::new(None) }
+        Db {
+            storage: Arc::new(storage),
+            readers: RwLock::new(HashMap::new()),
+            exec: ExecOptions::default(),
+            embedders: RwLock::new(Vec::new()),
+            models: RwLock::new(None),
+            media: RwLock::new(Arc::new(Resolver::default())),
+            ranking: Models::default(),
+        }
     }
 
     pub fn storage(&self) -> &Database {
@@ -128,6 +183,37 @@ impl Db {
         self.storage.tables()
     }
 
+    /// The stream sources written from ([`Database::ensure_sources`]), by
+    /// name, with the offset of the last event each wrote; none before
+    /// the first.
+    pub fn sources(&self) -> Result<Vec<Source>> {
+        let snap = self.snapshot();
+        if snap.table(SOURCES).is_none() {
+            return Ok(Vec::new());
+        }
+        let sql = format!("SELECT name, last_offset, updated FROM {SOURCES} LIMIT {}", u32::MAX);
+        let rs = self.query_at(&snap, &sql, &Params::new(), &ExecOptions { max_rows: None, ..self.exec.clone() })?;
+        let mut sources: Vec<Source> = rs
+            .rows
+            .into_iter()
+            .filter_map(|r| {
+                let mut r = r.into_iter();
+                let name = match r.next()? {
+                    Value::Str(s) => s,
+                    _ => return None,
+                };
+                let offset = r.next()?.as_i64()?;
+                let updated = r.next().and_then(|v| match v {
+                    Value::Timestamp(t) | Value::Int(t) => Some(t),
+                    _ => None,
+                });
+                Some(Source { name, offset, updated })
+            })
+            .collect();
+        sources.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(sources)
+    }
+
     /// The schema of the table named `table` (any case).
     fn table(&self, table: &str) -> Result<Arc<Schema>> {
         self.storage.table(table).ok_or_else(|| Error::Schema(format!("no table {table}")))
@@ -138,13 +224,16 @@ impl Db {
     /// [`crate::storage::WriteTxn::table`] and [`Snapshot::table`]. After
     /// [`Db::open_embedders`], its embedded fields get their models from the
     /// same place (a model it cannot open leaves the vectors to the writes).
-    pub fn create_table(&self, schema: Schema) -> Result<()> {
+    pub fn create_table(&self, mut schema: Schema) -> Result<()> {
         let name = schema.table.clone();
-        self.storage.create_table(schema)?;
         let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let models = dir.clone().unwrap_or_else(crate::embed::models_dir);
+        crate::sid::resolve(&mut schema, &models)?;
+        self.storage.create_table(schema)?;
         if let Some(dir) = dir {
             self.open_embedders_of(&name, &dir);
         }
+        self.open_codebooks_of(&name, &models);
         Ok(())
     }
 
@@ -188,8 +277,9 @@ impl Db {
     pub fn try_load_into(&self, table: &str, docs: impl IntoIterator<Item = Result<Document>>) -> Result<()> {
         let schema = self.table(table)?;
         let models = self.models_of(&schema);
+        let media = self.media_resolver();
         let mut docs = docs.into_iter();
-        if models.iter().all(Option::is_none) {
+        if models.iter().all(Option::is_none) && !schema.fields.iter().any(|f| f.media.is_some()) {
             return self.storage.try_bulk_load_into(table, docs.map(move |d| {
                 d.map(|mut d| {
                     schema.fill_generated(&mut d);
@@ -197,7 +287,10 @@ impl Db {
                 })
             }));
         }
-        // Embedded in batches, so that a model sees many texts at once.
+        // Resolved and embedded in batches, so that fetches run together
+        // and a model sees many texts at once; fewer rows of images, whose
+        // bytes are held until they are embedded.
+        let batch_size = if (0..schema.fields.len()).any(|f| schema.embeds_media(f).is_some()) { MEDIA_BATCH } else { EMBED_BATCH };
         let mut ready: std::vec::IntoIter<Result<Document>> = Vec::new().into_iter();
         self.storage.try_bulk_load_into(
             table,
@@ -206,7 +299,7 @@ impl Db {
                     return Some(d);
                 }
                 let mut batch = Vec::new();
-                for d in docs.by_ref().take(EMBED_BATCH) {
+                for d in docs.by_ref().take(batch_size) {
                     match d {
                         Ok(d) => batch.push(d),
                         Err(e) => {
@@ -219,7 +312,10 @@ impl Db {
                     return None;
                 }
                 batch.iter_mut().for_each(|d| schema.fill_generated(d));
-                embed_with(&models, &schema, &mut batch);
+                let embedded = resolve_media(&media, &schema, &mut batch).and_then(|held| embed_with(&models, &schema, &mut batch, &Files { resolver: &media, held }));
+                if let Err(e) = embedded {
+                    return Some(Err(e));
+                }
                 ready = batch.into_iter().map(Ok).collect::<Vec<_>>().into_iter();
             }),
         )
@@ -266,8 +362,10 @@ impl Db {
     /// database with the new schema and load the old one into it. A VECTOR
     /// field is copied when the old field has the same dimensions and
     /// embedding ([`crate::schema::Embed`]); otherwise this database embeds
-    /// it anew (given the model, [`Db::set_embedder`]). Returns the rows
-    /// loaded.
+    /// it anew (given the model, [`Db::set_embedder`]). A semantic-ID field
+    /// is copied when the old field has the same codebook, and derived anew
+    /// otherwise: a new codebook means a new field, filled this way.
+    /// Returns the rows loaded.
     pub fn load_from(&self, other: &Db) -> Result<u64> {
         let (old, new) = (other.schema(), self.schema());
         if let Some(f) = old.unrebuildable() {
@@ -281,7 +379,9 @@ impl Db {
                 let g = &old.fields[j];
                 let keep = match (&f.ty, &g.ty) {
                     (FieldType::Vector { dim: a, .. }, FieldType::Vector { dim: b, .. }) => a == b && f.embed == g.embed,
-                    (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b) && f.multi == g.multi,
+                    // Codes of another codebook are derived anew.
+                    _ if f.semantic_id.is_some() || g.semantic_id.is_some() => f.semantic_id == g.semantic_id,
+                    (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b) && f.multi == g.multi && f.media == g.media,
                 };
                 keep.then_some(j)
             })
@@ -325,6 +425,9 @@ impl Db {
         };
         if e.dim() != *dim {
             return Err(Error::Schema(format!("model {} makes {}-dimension vectors; field {field} holds {dim}", spec.model, e.dim())));
+        }
+        if let Some(m) = schema.embeds_media(i).filter(|_| !e.modalities().contains(&Modality::Image)) {
+            return Err(Error::Schema(format!("model {} does not embed images, and field {field} is the embedding of the images of {}", spec.model, schema.fields[m].name)));
         }
         let mut all = self.embedders.write().unwrap_or_else(|e| e.into_inner());
         all.retain(|m| !(m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name)));
@@ -374,6 +477,35 @@ impl Db {
                 failed.push((if t.table == first { f } else { format!("{}.{f}", t.table) }, e));
             }
         }
+        failed.extend(self.open_codebooks(models));
+        failed
+    }
+
+    /// Opens the codebook of every semantic-ID field from `models`
+    /// ([`crate::sid::Codebook::open`]), checked against the hash the field
+    /// records; returns the fields whose codebook did not open, as
+    /// [`Db::open_embedders`] does. Writes that need codes from those fail.
+    pub fn open_codebooks(&self, models: &Path) -> Vec<(String, Error)> {
+        let first = self.schema().table.clone();
+        let mut failed = Vec::new();
+        for t in self.catalog() {
+            for (f, e) in self.open_codebooks_of(&t.table, models) {
+                failed.push((if t.table == first { f } else { format!("{}.{f}", t.table) }, e));
+            }
+        }
+        failed
+    }
+
+    fn open_codebooks_of(&self, table: &str, models: &Path) -> Vec<(String, Error)> {
+        let Some(schema) = self.storage.table(table) else { return Vec::new() };
+        let mut failed = Vec::new();
+        for f in &schema.fields {
+            let Some(sid) = &f.semantic_id else { continue };
+            let opened = crate::sid::Codebook::open(&sid.codebook, models).and_then(|(cb, hash)| self.storage.set_codebook(table, &f.name, cb, &hash));
+            if let Err(e) = opened {
+                failed.push((f.name.clone(), e));
+            }
+        }
         failed
     }
 
@@ -389,20 +521,97 @@ impl Db {
         failed
     }
 
+    /// Opens the ranking models a plan's `gbdt()` calls name
+    /// ([`crate::query::model`]) from the models directory: the one
+    /// [`Db::open_embedders`] was given, else
+    /// [`crate::embed::models_dir`]. A plan that names the hash of another
+    /// file of a model is refused; one without gets the hashes of the files
+    /// opened. [`Db::run`] and [`Db::query`] open a plan's models
+    /// themselves.
+    pub fn open_ranking_models(&self, plan: &mut Plan) -> Result<()> {
+        if !plan.root.has_models() {
+            return Ok(());
+        }
+        let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(crate::embed::models_dir);
+        self.ranking.open(&dir, plan)
+    }
+
+    /// Trains a semantic-ID codebook ([`crate::sid::Codebook::train`]) on the
+    /// vectors of VECTOR field `field` of the table named `table`, and saves
+    /// it as `name` under `models`, for semantic-ID fields to name. Returns
+    /// the SHA-256 of its file.
+    pub fn train_codebook(&self, table: &str, field: &str, name: &str, models: &Path, opts: &crate::sid::TrainOptions) -> Result<String> {
+        let snap = self.snapshot().table(table).ok_or_else(|| Error::Schema(format!("no table {table}")))?;
+        let schema = snap.schema();
+        let f = schema.field(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let FieldType::Vector { dim, .. } = f.ty else { return Err(Error::Schema(format!("field {field} is not a VECTOR field"))) };
+        let mut vectors = Vec::new();
+        for v in snap.segments() {
+            let r = VectorReader::open(&v.file, &f.name)?;
+            for d in 0..v.file.n_docs() as DocId {
+                if v.live.as_ref().is_none_or(|l| l.contains(d)) && r.has_vector(d) {
+                    vectors.extend_from_slice(r.vector(d));
+                }
+            }
+        }
+        if vectors.is_empty() {
+            return Err(Error::Schema(format!("{table}.{field} holds no vectors to train a codebook on")));
+        }
+        crate::sid::Codebook::train(&vectors, dim, opts)?.save(name, models)
+    }
+
     /// Computes the embedded vectors that documents of the first table
     /// leave out (null) from their sources, one batch per field split
     /// across the cores. A document whose sources are all empty gets no
     /// vector. Generated fields must be filled in first.
-    pub fn embed_missing(&self, docs: &mut [Document]) {
-        let schema = self.schema();
-        embed_with(&self.models_of(schema), schema, docs);
+    pub fn embed_missing(&self, docs: &mut [Document]) -> Result<()> {
+        let first = self.schema().table.clone();
+        self.embed_missing_in(&first, docs)
     }
 
     /// [`Db::embed_missing`] for documents of the table named `table`.
+    /// The images of a MEDIA field are read from where their values say
+    /// ([`crate::media::Resolver::bytes_of`]).
     pub fn embed_missing_in(&self, table: &str, docs: &mut [Document]) -> Result<()> {
         let schema = self.table(table)?;
-        embed_with(&self.models_of(&schema), &schema, docs);
-        Ok(())
+        embed_with(&self.models_of(&schema), &schema, docs, &Files { resolver: &self.media_resolver(), held: HashMap::new() })
+    }
+
+    /// Does for documents of the table named `table` the work a write does
+    /// before the writer, so that the rows it logs hold every value: their
+    /// MEDIA values are resolved ([`Db::resolve_media_in`]), then the
+    /// embedded vectors they leave out computed ([`Db::embed_missing_in`]).
+    /// Generated fields must be filled in first. [`Db::load`] and SQL
+    /// writes do this themselves.
+    pub fn fill_in(&self, table: &str, docs: &mut [Document]) -> Result<()> {
+        let schema = self.table(table)?;
+        let media = self.media_resolver();
+        let held = resolve_media(&media, &schema, docs)?;
+        embed_with(&self.models_of(&schema), &schema, docs, &Files { resolver: &media, held })
+    }
+
+    /// Sets how writes through this `Db` resolve the MEDIA values they give
+    /// ([`crate::media::Resolver`]: the sources it may fetch, its size cap
+    /// and its media store). The default fetches nothing and keeps
+    /// nothing: it takes complete values, and bytes given with a URI.
+    pub fn set_media_resolver(&self, r: Resolver) {
+        *self.media.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(r);
+    }
+
+    /// How writes resolve MEDIA values ([`Db::set_media_resolver`]).
+    pub fn media_resolver(&self) -> Arc<Resolver> {
+        self.media.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Turns the MEDIA values of documents of the table named `table`, as
+    /// writes give them ([`crate::media::input_text`]), into the values
+    /// they store ([`crate::media::Resolver::resolve`]): files fetched,
+    /// hashed and described here rather than in the writer, so that the
+    /// rows a primary logs hold them and replicas never fetch. The first
+    /// value that fails fails them all.
+    pub fn resolve_media_in(&self, table: &str, docs: &mut [Document]) -> Result<()> {
+        let schema = self.table(table)?;
+        resolve_media(&self.media_resolver(), &schema, docs).map(drop)
     }
 
     pub fn query(&self, sql: &str, params: &Params) -> Result<ResultSet> {
@@ -434,6 +643,17 @@ impl Db {
     /// reads its own table and may hold up to
     /// [`crate::query::compound::MAX_ROWS`] rows.
     fn run_on(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
+        profile::check_plan(plan, &|t, name| snap.table(t).and_then(|v| v.rank_profile(name).map(|p| p.hash())))?;
+        let opened;
+        let plan = match plan.root.has_models() {
+            true => {
+                let mut p = plan.clone();
+                self.open_ranking_models(&mut p)?;
+                opened = p;
+                &opened
+            }
+            false => plan,
+        };
         let view_of = |table: &str| snap.table(table).ok_or_else(|| Error::Query(format!("no such table: {table}")));
         if !plan.root.uses_operators() {
             let view = view_of(plan.table())?;
@@ -481,7 +701,7 @@ impl Db {
         }
         let schema = self.table(plan.table())?;
         let write = plan.to_write(&schema)?;
-        Ok(self.prepare(schema, write))
+        self.prepare(schema, write)
     }
 
     /// Runs any statement, on any table: a SELECT returns its rows; an
@@ -519,10 +739,39 @@ impl Db {
                 self.drop_tables(&names, opts)?;
                 Ok(SqlResult::Written(0))
             }
+            Command::CreateRankProfile { table, profile, replace } => {
+                self.storage.set_rank_profile(&table, profile, replace)?;
+                Ok(SqlResult::Written(0))
+            }
+            Command::DropRankProfile { table, name, if_exists } => {
+                let table = match table {
+                    Some(t) => Some(t),
+                    None => {
+                        let mut with: Vec<String> = Vec::new();
+                        for t in &catalog {
+                            if self.storage.rank_profiles(&t.table)?.iter().any(|p| p.name.eq_ignore_ascii_case(&name)) {
+                                with.push(t.table.clone());
+                            }
+                        }
+                        if with.len() > 1 {
+                            return Err(Error::Query(format!("{} have a rank profile named {name}: DROP RANK PROFILE {name} ON table", with.join(" and "))));
+                        }
+                        with.pop()
+                    }
+                };
+                let dropped = match &table {
+                    Some(t) => self.storage.drop_rank_profile(t, &name)?,
+                    None => false,
+                };
+                if !dropped && !if_exists {
+                    return Err(Error::Query(format!("no rank profile named {name}{}", table.map_or(String::new(), |t| format!(" on {t}")))));
+                }
+                Ok(SqlResult::Written(0))
+            }
             Command::Write { table, write } => {
                 let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
                 let write = Plan::of_write(schema, &write).to_write(schema)?;
-                self.write_prepared(&self.prepare(schema.clone(), write)).map(SqlResult::Written)
+                self.write_prepared(&self.prepare(schema.clone(), write)?).map(SqlResult::Written)
             }
         }
     }
@@ -538,7 +787,10 @@ impl Db {
 
     fn explain_statement(&self, stmt: &sqlparser::ast::Statement, params: &Params) -> Result<Plan> {
         if let sqlparser::ast::Statement::Query(q) = stmt {
-            return plan_of(&self.snapshot(), q, params);
+            // The plan names the files of its ranking models.
+            let mut plan = plan_of(&self.snapshot(), q, params)?;
+            self.open_ranking_models(&mut plan)?;
+            return Ok(plan);
         }
         let catalog = self.catalog();
         let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
@@ -562,26 +814,37 @@ impl Db {
         let Command::Write { table, write } = bind_command(sql, &tables, params)? else { return Ok(None) };
         let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
         let write = Plan::of_write(schema, &write).to_write(schema)?;
-        Ok(Some(self.prepare(schema.clone(), write)))
+        Ok(Some(self.prepare(schema.clone(), write)?))
     }
 
-    fn prepare(&self, schema: Arc<Schema>, mut write: Write) -> PreparedWrite {
-        if let Write::Insert { docs, .. } = &mut write {
-            docs.iter_mut().for_each(|d| schema.fill_generated(d));
+    fn prepare(&self, schema: Arc<Schema>, mut write: Write) -> Result<PreparedWrite> {
+        let media = self.media_resolver();
+        let mut held = Held::new();
+        match &mut write {
+            Write::Insert { docs, conflict } => {
+                docs.iter_mut().for_each(|d| schema.fill_generated(d));
+                held = resolve_media(&media, &schema, docs)?;
+                if let Conflict::Update(sets) = conflict {
+                    held.extend(resolve_sets(&media, &schema, sets)?);
+                }
+            }
+            Write::Update { sets, .. } => held = resolve_sets(&media, &schema, sets)?,
+            Write::Delete { .. } => {}
         }
-        let known = self.embed_ahead(&schema, &write);
-        PreparedWrite { schema, write, known }
+        let known = self.embed_ahead(&schema, &write, &Files { resolver: &media, held })?;
+        Ok(PreparedWrite { schema, write, known })
     }
 
     /// The vectors `write` will compute, from the latest version. The rows
     /// an UPDATE or `ON CONFLICT DO UPDATE` rewrites are read here and
     /// again under the writer lock, where only the texts that changed in
-    /// between are embedded. An error here (the table dropped, a sum that
-    /// overflows) is left for the write to report.
-    fn embed_ahead(&self, schema: &Schema, write: &Write) -> Known {
+    /// between are embedded. An error reading the rows (the table dropped,
+    /// a sum that overflows) is left for the write to report; an image
+    /// that cannot be embedded fails the statement.
+    fn embed_ahead(&self, schema: &Schema, write: &Write, files: &Files) -> Result<Known> {
         let models = self.models_of(schema);
         if models.iter().all(Option::is_none) {
-            return Known::new();
+            return Ok(Known::new());
         }
         let docs = || -> Result<Vec<Document>> {
             let Some(snap) = self.snapshot().table(&schema.table) else { return Ok(Vec::new()) };
@@ -606,7 +869,7 @@ impl Db {
                 Write::Delete { .. } => Vec::new(),
             })
         };
-        docs().map_or_else(|_| Known::new(), |docs| vectors_of(&models, schema, &docs))
+        docs().map_or_else(|_| Ok(Known::new()), |docs| vectors_of(&models, schema, &docs, files))
     }
 
     /// Runs a write [`Db::prepare_write`] bound, in one transaction, and
@@ -630,6 +893,10 @@ impl Db {
             return Err(Error::Query(format!("table {} was dropped and created again while the statement ran; run it again", schema.table)));
         }
         let models = self.models_of(schema);
+        // Vectors computed ahead cover the rows unless they changed since:
+        // images of those are read here.
+        let media = self.media_resolver();
+        let files = Files { resolver: &media, held: Held::new() };
         // Read under the writer lock: no other write lands between.
         let snap = self.snapshot().table(&schema.table).expect("the writer lock keeps the table");
         let pk = || schema.primary_key.ok_or_else(|| Error::Query(format!("{} has no primary key", schema.table)));
@@ -638,7 +905,7 @@ impl Db {
             Write::Insert { mut docs, conflict } => {
                 match conflict {
                     Conflict::Fail | Conflict::Replace => {
-                        embed_known(&models, schema, &mut docs, &p.known);
+                        embed_known(&models, schema, &mut docs, &p.known, &files)?;
                         for d in docs {
                             if conflict == Conflict::Replace {
                                 tt.upsert(d)?;
@@ -650,7 +917,7 @@ impl Db {
                     }
                     Conflict::Skip => {
                         let mut docs = not_live(&snap, pk()?, docs);
-                        embed_known(&models, schema, &mut docs, &p.known);
+                        embed_known(&models, schema, &mut docs, &p.known, &files)?;
                         for d in docs {
                             tt.insert(d)?;
                             n += 1;
@@ -663,13 +930,13 @@ impl Db {
                             return Err(Error::Query(format!("ON CONFLICT DO UPDATE: key {:?} comes twice; a statement updates a row once", d[pk])));
                         }
                         let (live, mut new): (Vec<Document>, Vec<Document>) = docs.into_iter().partition(|d| snap.lookup(&d[pk]).is_some());
-                        embed_known(&models, schema, &mut new, &p.known);
+                        embed_known(&models, schema, &mut new, &p.known, &files)?;
                         for d in new {
                             tt.insert(d)?;
                             n += 1;
                         }
                         let pairs = self.conflict_rows(&snap, schema, pk, live)?;
-                        n += set_rows(&mut tt, schema, &models, pairs, &sets, &p.known)?;
+                        n += set_rows(&mut tt, schema, &models, pairs, &sets, &p.known, &files)?;
                     }
                 }
             }
@@ -681,7 +948,7 @@ impl Db {
             }
             Write::Update { select, sets } => {
                 let rows = self.execute(&snap, &select, &self.exec)?.rows;
-                n += set_rows(&mut tt, schema, &models, rows.into_iter().map(|r| (r, Vec::new())).collect(), &sets, &p.known)?;
+                n += set_rows(&mut tt, schema, &models, rows.into_iter().map(|r| (r, Vec::new())).collect(), &sets, &p.known, &files)?;
             }
         }
         drop(tt);
@@ -717,6 +984,37 @@ impl Db {
     pub fn term_stats_with(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions) -> Result<TermStats> {
         let readers = self.readers(snap)?;
         Executor::new(snap, &readers, opts).term_stats(select)
+    }
+
+    /// The codes that can follow each of `prefixes` in semantic-ID field
+    /// `field` of table `table`, among the rows that SQL condition `filter`
+    /// (with `params`) matches, or all rows: per prefix, each code one
+    /// number longer that such rows have, with how many rows have it, in
+    /// the order of their last numbers. The prefix `""` asks for the first
+    /// numbers. At most [`crate::sid::MAX_PREFIXES`] prefixes.
+    pub fn sid_next(&self, table: &str, field: &str, prefixes: &[String], filter: Option<&str>, params: &Params) -> Result<Vec<Vec<(String, u64)>>> {
+        let snap = self.snapshot().table(table).ok_or_else(|| Error::Query(format!("no such table: {table}")))?;
+        let sql = format!("SELECT COUNT(*) FROM {}{}", qsql::ident(&snap.schema().table), filter.map(|c| format!(" WHERE {c}")).unwrap_or_default());
+        let select = qsql::bind(&sql, snap.schema(), params)?;
+        self.sid_next_with(&snap, &select, field, prefixes, &self.exec)
+    }
+
+    /// [`Db::sid_next`] on snapshot `snap`, among the rows `select`'s
+    /// filter matches (the rest of it is not used), with options.
+    pub fn sid_next_with(&self, snap: &Snapshot, select: &Select, field: &str, prefixes: &[String], opts: &ExecOptions) -> Result<Vec<Vec<(String, u64)>>> {
+        let schema = snap.schema();
+        let f = schema.field_index(field).ok_or_else(|| Error::Query(format!("no field {field} in {}", schema.table)))?;
+        if schema.fields[f].semantic_id.is_none() {
+            return Err(Error::Query(format!("{field} is not a semantic-ID field")));
+        }
+        if prefixes.is_empty() || prefixes.len() > crate::sid::MAX_PREFIXES {
+            return Err(Error::Query(format!("ask for the next codes of 1 to {} prefixes, not {}", crate::sid::MAX_PREFIXES, prefixes.len())));
+        }
+        if let Some(p) = prefixes.iter().find(|p| !p.is_empty() && crate::sid::parse(p).is_none_or(|c| c.len() > crate::sid::MAX_LEVELS)) {
+            return Err(Error::Query(format!("{p:?} is not a prefix of a semantic ID: numbers joined by dots, such as 12.7, or \"\" for the first")));
+        }
+        let readers = self.readers(snap)?;
+        Executor::new(snap, &readers, opts).sid_next(select, f, prefixes)
     }
 
     /// Builds a segment image of `docs` for this schema into `dest` (a new
@@ -801,20 +1099,94 @@ impl Db {
 /// Documents [`Db::load`] embeds at a time.
 const EMBED_BATCH: usize = 4096;
 
+/// Documents [`Db::load`] embeds at a time into a table with a field of
+/// images' vectors: their files are held until they are embedded.
+const MEDIA_BATCH: usize = 64;
+
+/// The bytes of the files a write's MEDIA values named, by hash: read
+/// once when the values were resolved, for the vectors embedded from them.
+type Held = HashMap<String, Arc<[u8]>>;
+
+/// Where the images an embedded field embeds come from: the bytes a write
+/// held, else where the value says ([`Resolver::bytes_of`]).
+struct Files<'a> {
+    resolver: &'a Resolver,
+    held: Held,
+}
+
+impl Files<'_> {
+    fn bytes(&self, m: &Media) -> Result<Arc<[u8]>> {
+        match self.held.get(&m.sha256) {
+            Some(b) => Ok(b.clone()),
+            None => Ok(self.resolver.bytes_of(m)?.into()),
+        }
+    }
+}
+
 /// Whether field `g` is a source of a generated field among `from`.
 fn generated_from_set(schema: &Schema, from: &[String], g: usize) -> bool {
     from.iter().filter_map(|s| schema.field(s)).any(|f| f.generated_from.iter().any(|x| schema.field_index(x) == Some(g)))
 }
 
+/// [`Db::resolve_media_in`] with resolver `r`, for documents of `schema`.
+/// Returns the bytes read of the files a field embeds.
+fn resolve_media(r: &Resolver, schema: &Schema, docs: &mut [Document]) -> Result<Held> {
+    let mut held = Held::new();
+    for (f, field) in schema.fields.iter().enumerate() {
+        let Some(kind) = field.media else { continue };
+        let at: Vec<usize> = (0..docs.len()).filter(|&j| matches!(docs[j][f], Value::Str(_))).collect();
+        let resolved = {
+            let inputs: Vec<&str> = at.iter().filter_map(|&j| docs[j][f].as_str()).collect();
+            r.resolve_all(kind, &inputs)
+        };
+        let embedded = embedded_media(schema, f);
+        for (j, m) in at.into_iter().zip(resolved) {
+            let m = m.map_err(|e| media_error(&field.name, e))?;
+            if let Some(data) = m.data.filter(|_| embedded) {
+                held.insert(m.media.sha256.clone(), data);
+            }
+            docs[j][f] = Value::Str(m.media.to_text());
+        }
+    }
+    Ok(held)
+}
+
+/// Resolves the MEDIA values an UPDATE's `SET` gives as constants.
+fn resolve_sets(r: &Resolver, schema: &Schema, sets: &mut [(usize, Assign)]) -> Result<Held> {
+    let mut held = Held::new();
+    for (f, a) in sets {
+        let (Some(kind), Assign::Value(Value::Str(t))) = (schema.fields[*f].media, &*a) else { continue };
+        let m = r.resolve(kind, t).map_err(|e| media_error(&schema.fields[*f].name, e))?;
+        if let Some(data) = m.data.filter(|_| embedded_media(schema, *f)) {
+            held.insert(m.media.sha256.clone(), data);
+        }
+        *a = Assign::Value(Value::Str(m.media.to_text()));
+    }
+    Ok(held)
+}
+
+/// Whether a field embeds MEDIA field `f`.
+fn embedded_media(schema: &Schema, f: usize) -> bool {
+    (0..schema.fields.len()).any(|g| schema.embeds_media(g) == Some(f))
+}
+
+fn media_error(field: &str, e: Error) -> Error {
+    match e {
+        Error::Schema(m) => Error::Schema(format!("field {field}: {m}")),
+        Error::Timeout(m) => Error::Timeout(format!("field {field}: {m}")),
+        e => e,
+    }
+}
+
 /// Computes the embedded vectors `docs` leave out (null) with `models`
 /// (by field of `schema`), one batch per field split across the cores. A
 /// document whose sources are all empty gets no vector.
-fn embed_with(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut [Document]) {
-    embed_known(models, schema, docs, &Known::new());
+fn embed_with(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut [Document], files: &Files) -> Result<()> {
+    embed_known(models, schema, docs, &Known::new(), files)
 }
 
 /// [`embed_with`], taking the vectors of the texts `known` has from it.
-fn embed_known(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut [Document], known: &Known) {
+fn embed_known(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut [Document], known: &Known, files: &Files) -> Result<()> {
     for (f, e) in models.iter().enumerate() {
         let Some(e) = e else { continue };
         let ahead = known.get(&f);
@@ -831,26 +1203,50 @@ fn embed_known(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut
                 }
             }
         }
-        for (j, v) in todo.into_iter().zip(embed_all(e.as_ref(), &texts)) {
+        for (j, v) in todo.into_iter().zip(embed_sources(e.as_ref(), schema, f, &texts, files)?) {
             docs[j][f] = Value::Vector(v.into());
         }
     }
+    Ok(())
 }
 
 /// The vectors `docs` leave out (null) of their embedded fields, each text
 /// embedded once.
-fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Document]) -> Known {
+fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Document], files: &Files) -> Result<Known> {
     let mut known = Known::new();
     for (f, e) in models.iter().enumerate() {
         let Some(e) = e else { continue };
         let mut seen = HashSet::new();
         let texts: Vec<String> = docs.iter().filter(|d| matches!(d[f], Value::Null)).map(|d| schema.embed_text(f, d)).filter(|t| !t.is_empty() && seen.insert(t.clone())).collect();
         if !texts.is_empty() {
-            let vectors = embed_all(e.as_ref(), &texts);
+            let vectors = embed_sources(e.as_ref(), schema, f, &texts, files)?;
             known.insert(f, texts.into_iter().zip(vectors).map(|(t, v)| (t, v.into())).collect());
         }
     }
-    known
+    Ok(known)
+}
+
+/// The vectors of field `f` of `schema` for `sources` (as
+/// [`Schema::embed_text`] gives them): of the texts, or of the images
+/// that the MEDIA values name, decoded a batch at a time.
+fn embed_sources(e: &dyn Embedder, schema: &Schema, f: usize, sources: &[String], files: &Files) -> Result<Vec<Vec<f32>>> {
+    let Some(m) = schema.embeds_media(f) else { return Ok(embed_all(e, sources)) };
+    let field = &schema.fields[m].name;
+    let mut out = Vec::with_capacity(sources.len());
+    for batch in sources.chunks(16) {
+        let images = batch
+            .iter()
+            .map(|t| {
+                let m = Media::parse(t).map_err(Error::Schema)?;
+                let data = files.bytes(&m)?;
+                crate::media::decode_image(&data).map_err(|e| Error::Schema(format!("{}: {e}", m.uri)))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(|e| media_error(field, e))?;
+        let inputs: Vec<Input> = images.iter().map(Input::Image).collect();
+        out.extend(e.embed_inputs(&inputs)?);
+    }
+    Ok(out)
 }
 
 /// What setting fields of live rows writes ([`plan_sets`]).
@@ -870,6 +1266,13 @@ struct Planned {
 /// every text field stored or generated.
 fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)]) -> Result<Planned> {
     let pk = schema.primary_key.ok_or_else(|| Error::Query(format!("UPDATE needs a primary key, and {} has none", schema.table)))?;
+    if let Some(f) = sets.iter().map(|(f, _)| &schema.fields[*f]).find(|f| f.semantic_id.is_some()) {
+        let from = &f.semantic_id.as_ref().expect("a semantic-ID field").from;
+        return Err(Error::Query(format!("{} is a semantic ID: the writer derives it from {from}; set {from} instead", f.name)));
+    }
+    if let Some(f) = schema.shard_by_field().filter(|f| sets.iter().any(|(g, _)| g == f)) {
+        return Err(Error::Query(format!("{} places {}'s rows on shards (shard_by), so UPDATE does not change it: delete the row and insert it again", schema.fields[f].name, schema.table)));
+    }
     let rewrite = !in_place(schema, sets);
     if rewrite {
         if let Some(f) = schema.fields.iter().find(|f| matches!(f.ty, FieldType::Text { .. }) && !f.stored && f.generated_from.is_empty()) {
@@ -945,6 +1348,13 @@ fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(V
             for &f in &stale {
                 doc[f] = Value::Null;
             }
+            // A semantic ID whose vector changes is derived again (the
+            // writer keeps it if the levels stay the same).
+            for (f, vf) in crate::sid::fields(schema) {
+                if stale.contains(&vf) || sets.iter().any(|(g, _)| *g == vf) {
+                    doc[f] = Value::Null;
+                }
+            }
             schema.fill_generated(&mut doc);
             rewrites.push(doc);
         }
@@ -961,12 +1371,12 @@ fn in_place(schema: &Schema, sets: &[(usize, Assign)]) -> bool {
 
 /// Sets fields of live rows ([`plan_sets`]), embedding the vectors the
 /// rewrites leave out (from `known` where it has their text).
-fn set_rows(tt: &mut TableTxn, schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)], known: &Known) -> Result<u64> {
+fn set_rows(tt: &mut TableTxn, schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)], known: &Known, files: &Files) -> Result<u64> {
     let mut p = plan_sets(schema, models, rows, sets)?;
     for (key, f, v) in p.in_place {
         tt.set(&key, &schema.fields[f].name, v)?;
     }
-    embed_known(models, schema, &mut p.rewrites, known);
+    embed_known(models, schema, &mut p.rewrites, known, files)?;
     for doc in p.rewrites {
         tt.upsert(doc)?;
     }
@@ -1060,15 +1470,9 @@ impl DocumentSource for StoredSource {
 }
 
 /// The plan of a SELECT over `snap`'s tables: the executor's query of one
-/// table, or a compound one's operators ([`compound::needs`]) over any.
+/// table, or a compound one's operators ([`compound::needs`]) over any
+/// ([`compound::plan_read`]).
 fn plan_of(snap: &Snapshot, q: &sqlparser::ast::Query, params: &Params) -> Result<Plan> {
-    let view = match tables::read_by(q).first() {
-        None => snap.clone(),
-        Some(t) => snap.table(t).ok_or_else(|| Error::Query(format!("no such table: {t}")))?,
-    };
-    if compound::needs(q, view.schema()) {
-        let catalog: Vec<&Schema> = snap.schemas().collect();
-        return compound::plan_query(q, &catalog, params);
-    }
-    Ok(Plan::of_select(view.schema(), &qsql::bind_query(q, view.schema(), params)?))
+    let catalog: Vec<&Schema> = snap.schemas().collect();
+    compound::plan_read_query(q, &catalog, params, &|t, name| snap.table(t).and_then(|v| v.rank_profile(name).cloned()))
 }

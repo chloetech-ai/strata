@@ -164,7 +164,7 @@ fn shards_fusions_and_products_with_sparse_scores() {
             "SELECT id, score() FROM docs ORDER BY similarity(splade, :q) DESC LIMIT 10",
             "SELECT id, score() FROM docs WHERE year < 2010 ORDER BY similarity(splade, :q) DESC LIMIT 10 OFFSET 3",
             "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(splade, :q)) DESC LIMIT 10",
-            "SELECT id, score() FROM docs ORDER BY 0.5 * bm25(body, :t) + 0.5 * similarity(splade, :q) DESC LIMIT 10",
+            "SELECT id, score() FROM docs ORDER BY 0.5 * minmax(bm25(body, :t)) + 0.5 * minmax(similarity(splade, :q)) DESC LIMIT 10",
             "SELECT id, score() FROM docs ORDER BY similarity(splade, :q) * decay(year, 2019, 5) DESC LIMIT 10",
         ] {
             let want = whole.query(sql, &p).unwrap();
@@ -204,4 +204,34 @@ fn sparse_values_through_sql_writes_and_errors() {
     }
     let bad = vec![Value::Str("x".into()), Value::Int(1), Value::Null, Value::Str(r#"{"a": "b"}"#.into())];
     assert!(db.load([bad]).is_err());
+}
+
+/// A sparse score boosted by a row's values ranks by its exact top k, the
+/// sparse index's bounds driving the expression (rank-safe boosts): the
+/// same rows, bit for bit, as scoring every matching row.
+#[test]
+fn a_boosted_sparse_score_ranks_every_match() {
+    let (d, _) = docs(5);
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "b.strata", &d);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(6);
+    let run = |sql: &str, params: &Params, opts: &ExecOptions| {
+        let snap = db.snapshot();
+        let select = bind(sql, snap.schema(), params).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        db.execute(&snap, &select, opts).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    };
+    let reference = ExecOptions { rank_safe: false, ..ExecOptions::default() };
+    for i in 0..60 {
+        let params = Params::new().set("w", json(&query(&mut rng)));
+        let s = format!("similarity(splade, :w{}, depth => 100000)", ["", ", algo => 'maxscore'", ", algo => 'bmw'"][i % 3]);
+        let expr = [format!("{s} * (1 + (year - 2000) / 10)"), format!("{s} + 0.05 * (year - 2000)"), format!("ln(1 + {s}) * CASE WHEN year > 2010 THEN 2 ELSE 1 END")][i / 3 % 3].clone();
+        let filter = ["", "WHERE year < 2015"][i % 2];
+        let sql = format!("SELECT id, score() FROM docs {filter} ORDER BY {expr} DESC LIMIT {}", [1, 10, 100][i % 3]);
+        let want = run(&sql, &params, &reference);
+        let got = run(&sql, &params, &ExecOptions::default());
+        assert_eq!(keys(&got), keys(&want), "{sql}");
+        assert_eq!(got.scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>(), want.scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>(), "{sql}");
+        let plan = got.stats.plan.join("\n");
+        assert!(plan.contains("sparse") && plan.contains("ranks by the expression") && plan.contains("rank-safe"), "{sql}:\n{plan}");
+    }
 }

@@ -24,7 +24,7 @@ strata-server import --db shop.strata --plan shop.sqlite > plan.json   # what it
 strata-server import --db shop.strata --schema plan.json shop.sqlite   # with the plan, edited
 ```
 
-A SQLite file is recognised by its first bytes (or `--format sqlite`), and can be mixed with JSON and CSV files in one command. A database that does not exist is created from the first SQLite file's tables. Each SQLite table goes into the Strata table of its name, spelled as a Strata identifier (`Order Details` becomes `Order_Details`, and column names likewise):
+A SQLite file is recognised by its first bytes (or `--format sqlite`), and can be mixed with JSON and CSV files in one command (`--table` names the table of those files' rows). A database that does not exist is created from the first SQLite file's tables. Each SQLite table goes into the Strata table of its name, spelled as a Strata identifier (`Order Details` becomes `Order_Details`, and column names likewise):
 
 - **A table Strata has** keeps its schema: each column fills the field of its name, the others are left out and listed. The rows are upserted by key (inserted, in a table without one), 10,000 a transaction, or bulk-loaded when the table is empty.
 - **A table Strata lacks** is created, with the schema `--schema` gives for it, or the one an [export](#export) kept for it, or else one made from the SQLite table, and its rows are bulk-loaded in one commit: a value that does not fit is reported with its table and row, and nothing of that table is written.
@@ -47,7 +47,7 @@ SQLite has five storage classes and lets any column hold any of them, so the imp
 | `F32_BLOB(n)`, `FLOAT32(n)` or `VECTOR(n)` holding little-endian float32 blobs (as libSQL and sqlite-vec write them) or JSON arrays | `VECTOR(n)` |
 | `JSON` holding arrays of strings or integers | a multi-valued `KEYWORD` or `INT` |
 | no declared type | from the values: `INT`, `FLOAT`, or text as above |
-| other `BLOB` | left out (Strata has no binary type), or base64 text in a stored, unindexed `KEYWORD` with `--blobs-base64` |
+| other `BLOB` | left out (Strata keeps no bytes), or base64 text in a stored, unindexed `KEYWORD` with `--blobs-base64` |
 
 A column whose values break its declared type, such as `'n/a'` in an `INTEGER` column, becomes text, its numbers with it. Integers in a date column are Unix time in seconds, milliseconds or microseconds, chosen by the largest one (up to 10^11 seconds, the year 5138; up to 10^14 milliseconds); reals under 10^7 are Julian days.
 
@@ -105,13 +105,14 @@ In Python, `db.export_sqlite("shop.sqlite")`; in Rust, `strata::sqlite::export`.
 | `TIMESTAMP` | `TIMESTAMP`, UTC text the way SQLite's date functions write it: `2026-10-01 12:30:05.250` |
 | `VECTOR(n)` | `F32_BLOB(n)`: n little-endian float32 values, which libSQL's vector functions and sqlite-vec read as they are |
 | multi-valued `KEYWORD` or `INT` | `JSON`, an array (`json_each` lists its values) |
+| `MEDIA` | `JSON`, the file's description (`uri`, `sha256`, `mime`, ...); the files stay where their URIs point |
 | `EDGES` | `JSON`, an array of keys |
 | `SPARSE` | `JSON`, an object of term weights |
 
 With them:
 
 - **References** become `REFERENCES` clauses, and `NOT NULL` and `DEFAULT` carry over (`"now"` is `CURRENT_TIMESTAMP`). Strata does not enforce references, so a row may name a key that is gone; SQLite checks foreign keys only when a connection turns them on (`PRAGMA foreign_keys = ON`), and then only on later writes.
-- **B-tree indexes** on each indexed single-valued `KEYWORD`, `INT`, `FLOAT`, `BOOL` and `TIMESTAMP` field other than the key, named `<table>_<field>_idx` (`--no-indexes` leaves them out).
+- **B-tree indexes** on each indexed single-valued `KEYWORD`, `INT`, `FLOAT`, `BOOL` and `TIMESTAMP` field other than the key, named `<table>_<field>_idx`, and on a `MEDIA` field's `json_extract(field, '$.sha256')`, as Strata indexes it (`--no-indexes` leaves them out).
 - **An FTS5 index** over each table's `TEXT` fields, `<table>_fts`, with its text in the table itself (`content=`) and triggers that keep it in step with inserts, updates and deletes (`--no-fts` leaves it out). Search it as FTS5 is searched: `SELECT t.* FROM t_fts JOIN t ON t.rowid = t_fts.rowid WHERE t_fts MATCH 'wizard' ORDER BY rank`.
 - **The Strata schemas** in a table `_strata_tables` (`name`, `position`, `schema` in the short JSON form), which an import of the file reads to restore them (`--no-schemas` leaves it out; an import then makes schemas from the SQLite tables).
 

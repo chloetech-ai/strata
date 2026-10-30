@@ -63,7 +63,12 @@ const SELECTS: &[&str] = &[
     "SELECT id FROM papers ORDER BY similarity(emb, :v) DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY distance(emb, '[0.1, 0.2, 0.3, 0.4]') ASC LIMIT 5",
     "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), similarity(emb, :v), k => 10, depth => 50) DESC LIMIT 5",
-    "SELECT id FROM papers ORDER BY 0.3 * bm25(body, 'graph') + 0.7 * similarity(emb, :v) - rating DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY 0.3 * minmax(bm25(body, 'graph')) + 0.7 * minmax(similarity(emb, :v)) - minmax(rating) DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY bm25(body, 'graph') + 0.5 * similarity(emb, :v) - 0.1 * coalesce(rating, 0) DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY ln(1 + bm25(body, 'graph')) / (1 + abs(rating)) + CASE WHEN category = 'ml' THEN 1 WHEN year > 2000 THEN 0.5 END DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY rank(similarity(emb, :v)) * -1 + sigmoid(clamp(year - 2000, -5, 5)) + least(rating, 3) - greatest(rating, 1) DESC LIMIT 5",
+    "SELECT id FROM papers WHERE REACHABLE(cites, 'p1', hops => 3) ORDER BY pow(2, -hops()) + sqrt(exp(0)) + log(10, 100) + year % 7 DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY seq_no() / 1e9 - rating DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY bm25(body, 'graph') * decay(published, now(), 2592000) DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY decay(year, 2020, 5, offset => 1, decay => 0.3, shape => 'gauss') DESC",
     "SELECT id FROM papers ORDER BY similarity(terms, '{\"graph\": 1.5, \"net\": 0.5}') DESC LIMIT 3",
@@ -246,14 +251,16 @@ fn db_runs_plans() {
     fill(&a);
     fill(&b);
     // The same rows, or the same error (a synonym list the database lacks).
-    let mut answered = 0;
+    let mut refused = Vec::new();
     for sql in SELECTS.iter().filter(|s| !s.contains("now()")) {
         let plan = through_json(&a.explain(sql, &params()).unwrap());
         let want = a.sql(sql, &params()).map(rows).map_err(|e| e.to_string());
-        answered += want.is_ok() as usize;
+        if let Err(e) = &want {
+            refused.push(format!("{sql}: {e}"));
+        }
         assert_eq!(a.run(&plan).map(rows).map_err(|e| e.to_string()), want, "{sql}");
     }
-    assert!(answered + 2 >= SELECTS.len(), "{answered}");
+    assert!(refused.len() <= 2, "{refused:#?}");
     let all = |db: &Db| {
         let mut r = rows(run(db, "SELECT * FROM papers"));
         r.sort_by_key(|r| r[0].as_str().unwrap().to_string());
@@ -404,8 +411,13 @@ fn explain_shows_the_plan() {
     // Weights keep their signs, and a TIMESTAMP decays from a time over
     // seconds, as SQL gives them.
     assert_eq!(
+        lines(&db, "EXPLAIN SELECT id FROM papers ORDER BY 0.7 * minmax(bm25(body, 'graph')) - 0.3 * minmax(similarity(emb, :v)) DESC LIMIT 3")[3],
+        "      order: 0.7 * minmax(bm25(body, 'graph')) - 0.3 * minmax(similarity(emb, [0.1, 0.2, 0.3, 0.4])) DESC"
+    );
+    // `+` and `-` take raw values.
+    assert_eq!(
         lines(&db, "EXPLAIN SELECT id FROM papers ORDER BY 0.7 * bm25(body, 'graph') - 0.3 * similarity(emb, :v) DESC LIMIT 3")[3],
-        "      order: 0.7 * bm25(body, 'graph') - 0.3 * similarity(emb, [0.1, 0.2, 0.3, 0.4]) DESC"
+        "      order: (0.7 * bm25(body, 'graph')) - (0.3 * similarity(emb, [0.1, 0.2, 0.3, 0.4])) DESC"
     );
     assert_eq!(
         lines(&db, "EXPLAIN SELECT id FROM papers ORDER BY decay(published, '2026-10-01', 86400, offset => 3600) DESC LIMIT 3")[3],

@@ -6,7 +6,7 @@ mod text_common;
 
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use strata::segment::{DocFilter, DocId, DocSet};
-use strata::text::{analyze, Bm25Params, CollectionStats, FilterStrategy, TextFieldReader, TopKAlgo};
+use strata::text::{analyze, Bm25Params, Boost, CollectionStats, FilterStrategy, TextFieldReader, TopKAlgo};
 use text_common::*;
 
 const ALGOS: [TopKAlgo; 3] = [TopKAlgo::Exhaustive, TopKAlgo::MaxScore, TopKAlgo::BlockMaxWand];
@@ -192,4 +192,106 @@ fn edge_cases() {
         assert!(r.top_k(&q, &stats, Bm25Params::default(), 10, Some(&empty), algo).is_empty());
     }
     assert_eq!(r.score(&q, &stats, Bm25Params::default(), &[1, 3, 0])[..2], [0.0, 0.0]);
+}
+
+/// A boost of a document's BM25 `t` by a value of its own `v[d]` (NaN for
+/// none): `f(t, v)`, bounded by `b(t, lo, hi)` over the values' range.
+struct Hand<'v> {
+    v: &'v [f64],
+    lo: f64,
+    hi: f64,
+    f: fn(f64, f64) -> f64,
+    b: fn(f64, f64, f64) -> f64,
+}
+
+impl Boost for Hand<'_> {
+    fn score(&mut self, d: DocId, t: f32) -> f64 {
+        (self.f)(t as f64, self.v[d as usize])
+    }
+    fn bound(&mut self, t: f32) -> f64 {
+        (self.b)(t as f64, self.lo, self.hi)
+    }
+}
+
+/// `(name, value, bound, narrows)`: whether the bound falls with BM25, so
+/// that the algorithm asked for runs (else every match is scored), where
+/// it is known.
+type HandBoost = (&'static str, fn(f64, f64) -> f64, fn(f64, f64, f64) -> f64, Option<bool>);
+
+const BOOSTS: [HandBoost; 8] = [
+    ("t * (1 + 0.2 v)", |t, v| t * (1.0 + 0.2 * v), |t, _, hi| t * (1.0 + 0.2 * hi), Some(true)),
+    ("t + 3 v", |t, v| t + 3.0 * v, |t, _, hi| t + 3.0 * hi, Some(true)),
+    ("ln(1 + t) * v", |t, v| (1.0 + t).ln() * v, |t, _, hi| (1.0 + t).ln() * hi, Some(true)),
+    ("t / v", |t, v| t / v, |t, lo, _| t / lo, Some(true)),
+    ("t * (1 + 0.2 coalesce(v, 0))", |t, v| t * (1.0 + 0.2 * if v.is_nan() { 0.0 } else { v }), |t, _, hi| t * (1.0 + 0.2 * hi), Some(true)),
+    // Flat above BM25 2, as a model's above its last split on BM25.
+    ("min(t, 2) * (1 + 0.2 v)", |t, v| t.min(2.0) * (1.0 + 0.2 * v), |t, _, hi| t.min(2.0) * (1.0 + 0.2 * hi), Some(true)),
+    // A bound that is not monotone: none below 1.
+    ("t * (1 + 0.2 v), bound from 1", |t, v| t * (1.0 + 0.2 * v), |t, _, hi| if t < 1.0 { f64::INFINITY } else { t * (1.0 + 0.2 * hi) }, None),
+    // Falls as BM25 rises: no threshold skips anything.
+    ("v - t", |t, v| v - t, |_, _, hi| hi, Some(false)),
+];
+
+/// A boosted top k holds exactly the documents that scoring every match
+/// ranks at or above the `k`-th (ties kept), with every algorithm and
+/// filter; a bound that is too low loses some.
+#[test]
+fn boosts_rank_like_scoring_every_match() {
+    let mut rng = StdRng::seed_from_u64(17);
+    for texts in [synthetic(53, 4000), (0..3000).map(|_| (0..rng.gen_range(1..5)).map(|_| format!("t{}", rng.gen_range(0..12))).collect::<Vec<_>>().join(" ")).collect()] {
+        let naive = Naive::new(&texts);
+        let n = texts.len() as u32;
+        // Values in [0.5, 5] in steps of 0.5 (ties), NULL in every tenth.
+        let v: Vec<f64> = (0..n).map(|_| if rng.gen_bool(0.1) { f64::NAN } else { rng.gen_range(1..=10) as f64 * 0.5 }).collect();
+        let filters: Vec<DocSet> = [0.002, 0.05, 0.5].iter().map(|&p| DocSet::from_sorted((0..n).filter(|_| rng.gen_bool(p)).collect(), n)).collect();
+        let every = Every(4);
+        let mut fs: Vec<Option<&dyn DocFilter>> = vec![None, Some(&every)];
+        fs.extend(filters.iter().map(|f| Some(f as &dyn DocFilter)));
+        let seg = build(&texts, strata::text::PostingsFormat::Loom, 32, false);
+        let r = TextFieldReader::open(&seg, "body").unwrap();
+        let (mut checked, mut lost) = (0, 0);
+        for (qi, q) in queries(&texts, &naive, 40, 3).iter().enumerate() {
+            let stats = r.stats(q);
+            let p = Bm25Params::default();
+            let terms: Vec<(String, f32)> = q.iter().map(|t| (t.clone(), 1.0)).collect();
+            let k = [1, 10, 100][qi % 3];
+            for filter in &fs {
+                let matches = r.top_k(q, &stats, p, n as usize, *filter, TopKAlgo::Exhaustive);
+                for &(name, f, b, narrows) in &BOOSTS {
+                    // Every match scored: those at or above the k-th.
+                    let mut all: Vec<(u32, f64)> = matches.iter().map(|&(d, t)| (d, f(t as f64, v[d as usize]))).map(|(d, x)| (d, if x.is_nan() { f64::NEG_INFINITY } else { x })).collect();
+                    all.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let mut want: Vec<(u32, u64)> = match all.get(k - 1) {
+                        Some(&(_, cut)) => all.iter().filter(|x| x.1 >= cut).map(|&(d, x)| (d, x.to_bits())).collect(),
+                        None => all.iter().map(|&(d, x)| (d, x.to_bits())).collect(),
+                    };
+                    want.sort();
+                    for algo in ALGOS {
+                        let what = format!("{name} {algo:?} k={k} {q:?} filter {}", filter.map_or(0, |f| f.cardinality()));
+                        let mut boost = Hand { v: &v, lo: 0.5, hi: 5.0, f, b };
+                        let (got, ran) = r.top_k_boosted(&terms, &stats, p, k, *filter, algo, &mut boost);
+                        if let Some(narrows) = narrows {
+                            assert_eq!(ran, if narrows { algo } else { TopKAlgo::Exhaustive }, "{what}");
+                        }
+                        assert!(got.windows(2).all(|w| w[0].1 >= w[1].1), "{what}: not by decreasing score");
+                        let mut got: Vec<(u32, u64)> = got.iter().map(|&(d, x)| (d, x.to_bits())).collect();
+                        got.sort();
+                        assert_eq!(got, want, "{what}");
+                        checked += 1;
+                        // The same with a bound 30% too low.
+                        if algo != TopKAlgo::Exhaustive {
+                            let mut low = Hand { v: &v, lo: 0.5, hi: 5.0, f, b: |t, lo, hi| 0.7 * BOOSTS[0].2(t, lo, hi) };
+                            if name == BOOSTS[0].0 {
+                                let mut got: Vec<(u32, u64)> = r.top_k_boosted(&terms, &stats, p, k, *filter, algo, &mut low).0.iter().map(|&(d, x)| (d, x.to_bits())).collect();
+                                got.sort();
+                                lost += (got != want) as usize;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "{checked}");
+        assert!(lost > 10, "a bound 30% too low lost rows in only {lost} queries");
+    }
 }

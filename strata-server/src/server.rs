@@ -91,11 +91,36 @@ pub struct Options {
     pub synonyms: Option<PathBuf>,
     /// Where `POST /v1/admin/checkpoint` writes checkpoints.
     pub backup_dir: Option<PathBuf>,
+    /// What writes may fetch for MEDIA fields: `file:` roots and hosts
+    /// ([`strata::media::Allowlist::parse`]).
+    pub media_fetch: Vec<String>,
+    /// The largest media file a write fetches or gives, in bytes (0:
+    /// [`strata::media::DEFAULT_MAX_BYTES`]).
+    pub media_max_bytes: u64,
+    /// Where bytes that writes give a MEDIA field without a URI are kept.
+    pub media_store: Option<PathBuf>,
+    /// How long a media fetch may take, in seconds (0:
+    /// [`crate::media::DEFAULT_TIMEOUT`]).
+    pub media_timeout_s: u64,
     /// The background merger ([`strata::storage::Database::spawn_merger`]).
     pub merger: MergerOptions,
     /// Log queries and writes that take this many milliseconds or more
     /// (0: none).
     pub slow_ms: u64,
+}
+
+/// How writes resolve MEDIA values, from `--media-fetch`,
+/// `--media-max-bytes`, `--media-store` and `--media-timeout-s`.
+fn media_resolver(o: &Options) -> Result<strata::media::Resolver, String> {
+    let allow = strata::media::Allowlist::parse(&o.media_fetch).map_err(|e| e.to_string())?;
+    if let Some(dir) = &o.media_store {
+        std::fs::create_dir_all(dir).map_err(|e| format!("--media-store {}: {e}", dir.display()))?;
+    }
+    let timeout = if o.media_timeout_s > 0 { Duration::from_secs(o.media_timeout_s) } else { crate::media::DEFAULT_TIMEOUT };
+    let max_bytes = if o.media_max_bytes > 0 { o.media_max_bytes } else { strata::media::DEFAULT_MAX_BYTES };
+    let http = crate::media::HttpFetcher::new(allow.clone(), timeout)?;
+    tracing::info!(fetch = %allow.entries().join(", "), max_bytes, store = ?o.media_store, timeout_s = timeout.as_secs(), "media fields: what writes may fetch");
+    Ok(strata::media::Resolver { allow, max_bytes, store: o.media_store.clone(), http: Some(std::sync::Arc::new(http)) })
 }
 
 /// Segment builds (flushes, merges, imports): vector indexes on every core.
@@ -177,15 +202,18 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             db
         } else if let Some(n) = o.demo {
             fill = Some(Fill::Demo(n));
-            Db::create(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
+            Db::create_in(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| e.to_string())?
         } else if let Some(s) = &o.schema {
             let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
             let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
             fill = o.copy_from.clone().map(Fill::Copy);
-            Db::create(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
+            Db::create_in(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| e.to_string())?
         } else {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
+        for (field, why) in db.open_codebooks(&o.models) {
+            tracing::warn!(field = %field, error = %why, "cannot give this field semantic IDs: writes must carry them");
+        }
         if o.seq_no {
             db.storage().start_seq_no().map_err(|e| format!("--seq-no on {}: {e}", path.display()))?;
         }
@@ -229,10 +257,10 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         svc.max_body = o.max_body_mb.saturating_mul(1 << 20);
     }
     svc.open_models(&o.models);
-    for m in &svc.models {
+    for m in svc.models().iter() {
         match &m.model {
-            Ok(e) => tracing::info!(field = %m.field, model = %e.name(), from = %m.spec.from.join(" + "), "embedded field"),
-            Err(why) => tracing::warn!(field = %m.field, model = %m.spec.model, from = %m.spec.from.join(" + "), error = %why, "cannot run this embedded field's model: writes must supply its vectors"),
+            Ok(e) => tracing::info!(table = %m.table, field = %m.field, model = %e.name(), from = %m.spec.from.join(" + "), "embedded field"),
+            Err(why) => tracing::warn!(table = %m.table, field = %m.field, model = %m.spec.model, from = %m.spec.from.join(" + "), error = %why, "cannot run this embedded field's model: writes must supply its vectors"),
         }
     }
     if let (Some(fill), Backend::Local(db)) = (fill, &svc.backend) {
@@ -258,6 +286,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     if let Some(dir) = &o.backup_dir {
         svc.set_backup_dir(dir).map_err(|e| e.message)?;
+    }
+    if !o.media_fetch.is_empty() || o.media_store.is_some() || o.media_max_bytes > 0 {
+        svc.set_media(media_resolver(o)?).map_err(|e| e.message)?;
     }
     // Once loaded: bulk loads are not shipped, so every copy loads the same.
     if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
@@ -329,6 +360,9 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
 /// What `strata-server import` does with SQLite files.
 #[derive(Default)]
 pub struct SqliteImport {
+    /// Every file is a SQLite database (`--format sqlite`); otherwise a
+    /// file is one when its first bytes say so.
+    pub format: bool,
     /// Only these tables.
     pub tables: Vec<String>,
     /// BLOB columns as base64 text ([`strata::sqlite::ImportOptions::blobs_base64`]).
@@ -339,35 +373,36 @@ pub struct SqliteImport {
 
 /// `strata-server import`: loads `files` into the database at `path`, rows
 /// from JSON Lines, JSON, CSV or TSV files (`format`, or each file's
-/// extension) and the tables of SQLite files (`format` `sqlite`, or a file
-/// that is a SQLite database), and says what each wrote. A database that
-/// does not exist is created with `schema`, or from the first SQLite
-/// file's tables; with SQLite files, `schema` holds
+/// extension) into its table `table` (the first if `None`), and the tables
+/// of SQLite files into the tables of their names, and says what each
+/// wrote. A database that does not exist is created with `schema`, or from
+/// the first SQLite file's tables; with SQLite files, `schema` holds
 /// schemas for the tables they create ([`strata::sqlite::schemas_from_json`]).
-pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: Option<&str>, directory: bool, files: &[PathBuf], sqlite: SqliteImport) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+pub fn import_files(path: &Path, schema: Option<&Path>, table: Option<&str>, models: &Path, format: Option<Format>, directory: bool, files: &[PathBuf], sqlite: SqliteImport) -> Result<(), String> {
     let opts = || DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, build: build_options(), ..DbOptions::default() };
-    let sqlite_format = format.is_some_and(|f| f.eq_ignore_ascii_case("sqlite"));
-    let rows_format = match format {
-        Some(f) if !sqlite_format => Some(Format::parse(f).ok_or_else(|| format!("unknown --format {f}: jsonl, json, csv, tsv or sqlite"))?),
-        _ => None,
-    };
-    let is_sqlite = |f: &Path| sqlite_format || (format.is_none() && strata::sqlite::is_sqlite_file(f));
+    let is_sqlite = |f: &Path| sqlite.format || (format.is_none() && strata::sqlite::is_sqlite_file(f));
     let any_sqlite = files.iter().any(|f| is_sqlite(f));
+    if let Some(f) = files.iter().find(|f| table.is_some() && is_sqlite(f)) {
+        return Err(format!("{}: --table is for rows; a SQLite file's tables go to the tables of their names (--tables picks them)", f.display()));
+    }
     let text = schema.map(|s| std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))).transpose()?;
     let given = match (&text, schema, any_sqlite) {
         (Some(t), Some(s), true) => strata::sqlite::schemas_from_json(t).map_err(|e| format!("{}: {e}", s.display()))?,
         _ => Vec::new(),
     };
     let sq = strata::sqlite::ImportOptions { tables: sqlite.tables, schemas: given, blobs_base64: sqlite.blobs_base64 };
+    let created = |db: Db| {
+        for (field, why) in db.open_embedders(models) {
+            tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
+        }
+        db
+    };
     let mut db = if path.exists() {
         if schema.is_some() && !any_sqlite {
             return Err(format!("{} exists: --schema is only for a new database", path.display()));
         }
-        let db = Db::open(path, opts()).map_err(|e| format!("open {}: {e}", path.display()))?;
-        for (field, why) in db.open_embedders(models) {
-            tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
-        }
-        Some(db)
+        Some(created(Db::open(path, opts()).map_err(|e| format!("open {}: {e}", path.display()))?))
     } else {
         None
     };
@@ -383,12 +418,6 @@ pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: O
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return Ok(());
     }
-    let created = |db: Db| {
-        for (field, why) in db.open_embedders(models) {
-            tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
-        }
-        db
-    };
     for file in files {
         let t0 = std::time::Instant::now();
         if is_sqlite(file) {
@@ -399,7 +428,7 @@ pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: O
                 Some(d) => d,
                 None => {
                     let first = plan.tables.first().ok_or_else(|| format!("{}: no table to import", file.display()))?;
-                    created(Db::create(path, first.schema.clone(), opts()).map_err(|e| format!("create {}: {e}", path.display()))?)
+                    created(Db::create_in(path, first.schema.clone(), opts(), models).map_err(|e| format!("create {}: {e}", path.display()))?)
                 }
             };
             let r = src.load(&d, &plan);
@@ -423,10 +452,11 @@ pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: O
             None => {
                 let (s, text) = schema.zip(text.as_deref()).ok_or_else(|| format!("{} does not exist: pass --schema FILE to create it", path.display()))?;
                 let schema = Schema::from_json(text).map_err(|e| format!("{}: {e}", s.display()))?;
-                created(Db::create(path, schema, opts()).map_err(|e| format!("create {}: {e}", path.display()))?)
+                created(Db::create_in(path, schema, opts(), models).map_err(|e| format!("create {}: {e}", path.display()))?)
             }
         };
-        let r = strata::ingest::import_file(&d, file, rows_format).map_err(|e| format!("{}: {e}", file.display()));
+        let into = table.map_or_else(|| d.schema().table.clone(), String::from);
+        let r = strata::ingest::import_file_into(&d, &into, file, format).map_err(|e| format!("{}: {e}", file.display()));
         db = Some(d);
         let r = r?;
         let how = if r.bulk { "loaded" } else { "upserted" };

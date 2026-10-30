@@ -14,16 +14,39 @@ use strata::query::{OrderBy, Projection, Score, Select};
 /// Upper bounds of the latency buckets, in seconds.
 const BUCKETS: [f64; 14] = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
 
-#[derive(Default)]
+/// Upper bounds of the stream lag buckets, in seconds: a stream catching
+/// up may be hours behind.
+const LAG_BUCKETS: [f64; 18] = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0];
+
 struct Histogram {
-    counts: [u64; BUCKETS.len()],
+    bounds: &'static [f64],
+    counts: Vec<u64>,
     sum: f64,
     n: u64,
 }
 
+impl Default for Histogram {
+    fn default() -> Histogram {
+        Histogram::with(&BUCKETS)
+    }
+}
+
+/// The stream lag histogram, in [`LAG_BUCKETS`].
+struct Lag(Histogram);
+
+impl Default for Lag {
+    fn default() -> Lag {
+        Lag(Histogram::with(&LAG_BUCKETS))
+    }
+}
+
 impl Histogram {
+    fn with(bounds: &'static [f64]) -> Histogram {
+        Histogram { bounds, counts: vec![0; bounds.len()], sum: 0.0, n: 0 }
+    }
+
     fn observe(&mut self, secs: f64) {
-        if let Some(i) = BUCKETS.iter().position(|&b| secs <= b) {
+        if let Some(i) = self.bounds.iter().position(|&b| secs <= b) {
             self.counts[i] += 1;
         }
         self.sum += secs;
@@ -35,7 +58,7 @@ impl Histogram {
     fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
         let mut cum = 0;
-        for (b, c) in BUCKETS.iter().zip(self.counts) {
+        for (b, c) in self.bounds.iter().zip(&self.counts) {
             cum += c;
             let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"{b}\"}} {cum}");
         }
@@ -64,6 +87,7 @@ struct Inner {
     /// HTTP status → failed writes.
     write_errors: BTreeMap<u16, u64>,
     write_seconds: Histogram,
+    lag_seconds: Lag,
     replays: u64,
     /// "query" or "write" → requests slower than the slow log's threshold.
     slow: BTreeMap<&'static str, u64>,
@@ -110,16 +134,20 @@ pub fn kind(q: &Select) -> &'static str {
     if q.projection.iter().all(|(_, p)| matches!(p, Projection::Count)) {
         return "count";
     }
+    if !q.phases.is_empty() {
+        return "reranked";
+    }
     match &q.order {
         Some(OrderBy::Score { score, .. }) => match score {
             Score::Bm25 { .. } => "bm25",
-            Score::Similarity { .. } => "vector",
+            Score::Similarity { .. } | Score::MaxSim { .. } => "vector",
             Score::Sparse { .. } => "sparse",
             Score::Rrf { .. } | Score::Weighted(_) => "hybrid",
             Score::Column { .. } => "column",
             Score::Decay { .. } => "decay",
             Score::Product(_) => "boosted",
             Score::Ppr { .. } | Score::Hops { .. } => "graph",
+            _ => "expression",
         },
         _ => "filter",
     }
@@ -174,6 +202,12 @@ impl Metrics {
         m.writes += 1;
         m.written_docs += docs;
         m.write_seconds.observe(secs);
+    }
+
+    /// A row a stream wrote became visible `secs` after its event's time
+    /// (`source.ts`).
+    pub fn lag(&self, secs: f64) {
+        self.inner().lag_seconds.0.observe(secs.max(0.0));
     }
 
     pub fn write_error(&self, status: u16) {
@@ -244,7 +278,7 @@ impl Metrics {
             h.render(o, "strata_grpc_request_duration_seconds", &format!("method=\"{method}\""));
         }
 
-        head(o, "strata_queries_total", "counter", "Queries by kind (bm25, vector, sparse, hybrid, boosted, decay, graph, column, facet, aggregate, count, filter, compound, invalid) and outcome (ok, partial, error, timeout, rejected).");
+        head(o, "strata_queries_total", "counter", "Queries by kind (bm25, vector, sparse, hybrid, boosted, expression, reranked, decay, graph, column, facet, aggregate, count, filter, compound, invalid) and outcome (ok, partial, error, timeout, rejected).");
         for (&(k, outcome), n) in &m.queries {
             let _ = writeln!(o, "strata_queries_total{{kind=\"{k}\",outcome=\"{outcome}\"}} {n}");
         }
@@ -267,6 +301,8 @@ impl Metrics {
         }
         head(o, "strata_write_duration_seconds", "histogram", "Time from a write request to its commit, embedding and waiting for the writer included.");
         m.write_seconds.render(o, "strata_write_duration_seconds", "");
+        head(o, "strata_stream_lag_seconds", "histogram", "Time from an event (its source.ts) to the moment the rows written for it were visible.");
+        m.lag_seconds.0.render(o, "strata_stream_lag_seconds", "");
         head(o, "strata_idempotent_replays_total", "counter", "Writes answered from their idempotency key instead of being applied again.");
         let _ = writeln!(o, "strata_idempotent_replays_total {}", m.replays);
         head(o, "strata_slow_requests_total", "counter", "Queries and writes the slow log wrote down (--slow-ms).");

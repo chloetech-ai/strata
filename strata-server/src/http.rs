@@ -4,16 +4,18 @@
 //! |---|---|---|
 //! | `GET /` | | the UI |
 //! | `GET /livez`, `/readyz` | | `{status}`: 503 when a restart is needed |
-//! | `GET /v1/health`, `/v1/stats`, `/v1/schema`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
+//! | `GET /v1/health`, `/v1/stats`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
+//! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
+//! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and rank profiles, the first first |
 //! | `GET /metrics` | | Prometheus text |
 //! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?}` | rows |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows, or `{written, seq_no?, seq_nos?}` |
-//! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`) | `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}` (a plan as `/v1/explain` gives it) | rows, or `{written, seq_no?, seq_nos?}` |
-//! | `POST /v1/import?format=jsonl` | rows as JSON Lines, JSON, CSV or TSV | `{written, skipped_fields}` |
+//! | `POST /v1/import?format=jsonl&table=name` | rows as JSON Lines, JSON, CSV or TSV (of the first table without `table`) | `{written, skipped_fields}` |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
-//! | `POST /v1/explain` | `{sql, params?}` | the bound query, its plan IR and the executor's plan |
-//! | `POST /v1/embed` | `{text, field?}` | `{field, vector}`: the text's vector by an embedded field's model |
+//! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
+//! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
@@ -33,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
+use futures::StreamExt;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -47,7 +50,7 @@ use strata::storage::Layout;
 
 use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
-use crate::service::{After, QueryReq, Service, SqlAnswer, Written};
+use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
 use crate::{agent, json as js, obs, ApiError};
 
 const UI: &str = include_str!("../ui/index.html");
@@ -61,6 +64,10 @@ impl IntoResponse for ApiError {
         let code = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let failure = (self.status >= 500).then(|| Failure(self.message.as_str().into()));
         let mut r = (code, AxJson(json!({"error": self.message}))).into_response();
+        // Refused for the server's load: when to try again.
+        if self.status == 429 {
+            r.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from(crate::service::RETRY_AFTER.as_secs()));
+        }
         if let Some(f) = failure {
             r.extensions_mut().insert(f);
         }
@@ -84,6 +91,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
     let api = Router::new()
         .route("/v1/stats", get(stats))
         .route("/v1/schema", get(schema))
+        .route("/v1/tables", get(tables))
         .route("/v1/config", get(config))
         .route("/metrics", get(metrics))
         .route("/v1/query", post(query))
@@ -91,11 +99,16 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/write", post(write).layer(rows.clone()))
         .route("/v1/plan", post(run_plan).layer(rows.clone()))
         .route("/v1/import", post(import).layer(rows))
+        // A stream's body has no end set.
+        .route("/v1/stream", post(stream).layer(DefaultBodyLimit::disable()))
+        .route("/v1/sources", get(sources))
+        .route("/v1/sources/*name", get(source))
         .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
         .route("/v1/embed", post(embed))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
+        .route("/v1/sid/next", post(sid_next))
         .route("/v1/snapshot", post(snapshot))
         .route("/v1/admin/checkpoint", post(admin_checkpoint))
         .route("/v1/admin/check", post(admin_check))
@@ -211,19 +224,37 @@ async fn stats(State(app): State<App>) -> AxJson<Json> {
     AxJson(app.svc.stats().await)
 }
 
-async fn schema(State(app): State<App>) -> AxJson<Json> {
-    let s = &app.svc.schema;
-    AxJson(json!({
+/// A table's schema: `?table=`, else the first table's.
+async fn schema(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Res {
+    let s = match q.get("table") {
+        Some(t) => app.svc.table(t).await?,
+        None => Arc::new(app.svc.schema.clone()),
+    };
+    Ok(AxJson(table_json(&app.svc, &s)))
+}
+
+/// Every table's schema, the first first.
+async fn tables(State(app): State<App>) -> AxJson<Json> {
+    let tables: Vec<Json> = app.svc.catalog().iter().map(|s| table_json(&app.svc, s)).collect();
+    AxJson(json!({"tables": tables}))
+}
+
+fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json {
+    json!({
+        "table": s.table,
         "schema": s,
         "short": s.to_short_json(),
         "primary_key": s.primary_key.map(|k| s.fields[k].name.clone()),
+        "shard_by": s.shard_by,
+        // Its rank profiles, by name.
+        "profiles": svc.rank_profiles().into_iter().filter(|(t, _)| t.eq_ignore_ascii_case(&s.table)).map(|(_, p)| p).collect::<Vec<_>>(),
         // Each embedded VECTOR field: its sources, model, and whether this
         // server can embed text for it.
-        "embeddings": app.svc.models.iter().map(|m| json!({
+        "embeddings": svc.models().iter().filter(|m| m.table.eq_ignore_ascii_case(&s.table)).map(|m| json!({
             "field": m.field, "from": m.spec.from, "model": m.spec.model,
             "loaded": m.model.is_ok(), "error": m.model.as_ref().err(),
         })).collect::<Vec<_>>(),
-    }))
+    })
 }
 
 async fn config(State(app): State<App>) -> AxJson<Json> {
@@ -279,6 +310,9 @@ async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 /// coordinator each shard's ([`Written`]).
 fn written(w: Written, took_ms: f64) -> Json {
     let mut j = json!({"written": w.rows, "took_ms": took_ms});
+    if w.skipped > 0 {
+        j["skipped"] = json!(w.skipped);
+    }
     if let Some(s) = w.seq_no {
         j["seq_no"] = json!(s);
     }
@@ -344,8 +378,190 @@ async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMa
     };
     let format = format.ok_or_else(|| ApiError::bad("name the rows' format: ?format=jsonl, json, csv or tsv"))?;
     let t0 = std::time::Instant::now();
-    let (n, skipped) = app.svc.import(body, format).await?;
+    let (n, skipped) = app.svc.import(q.get("table").map(String::as_str), body, format).await?;
     Ok(AxJson(json!({"written": n, "skipped_fields": skipped, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
+}
+
+/// Write operations as NDJSON: one a line, or one event's several as
+/// `{"ops": [...], "source": {...}}` (the source going to each operation
+/// that names none), which a batch never splits. They are written in
+/// batches as they arrive ([`Service::stream_write`]), and each batch is
+/// answered by a line once it commits: `{"batch": n, "ops": .., "written":
+/// .., "skipped": .., "lines": ..}`, `lines` counting the lines committed
+/// so far. The answer ends with `{"done": true, ...}`, or with `{"error":
+/// ..., "status": .., "lines": ..}` at the first failure, nothing after
+/// the lines it counts applied.
+async fn stream(State(app): State<App>, headers: HeaderMap, body: axum::body::Body) -> Result<Response, ApiError> {
+    if auth::simple_content_type(header_str(&headers, header::CONTENT_TYPE)) {
+        return Err(ApiError { status: 415, message: "send the operations as application/x-ndjson, not text/plain or a form".into() });
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Json>();
+    tokio::spawn(ndjson(app.svc.clone(), body, tx).instrument(tracing::Span::current()));
+    let lines = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|j| Ok::<_, std::convert::Infallible>(Bytes::from(format!("{j}\n"))));
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], axum::body::Body::from_stream(lines)).into_response())
+}
+
+/// Lines a stream reads ahead of its writes ([`read_lines`]).
+const STREAM_LINES: usize = 4096;
+
+/// Writes a stream's lines ([`stream`]), answering on `tx`. The body is
+/// read in a task of its own, ahead of the writes, so each batch takes the
+/// lines that arrived while the one before it committed: one line at a
+/// time while the client trickles, up to [`STREAM_OPS`] operations when
+/// it sends faster than one commit takes. The client may send
+/// acknowledged batches' successors before the answers arrive: answers
+/// wait in memory, so that a client that reads them only once it has
+/// sent everything does not stall the stream.
+async fn ndjson(svc: Arc<Service>, body: axum::body::Body, tx: tokio::sync::mpsc::UnboundedSender<Json>) {
+    let (ahead, mut lines) = tokio::sync::mpsc::channel(STREAM_LINES);
+    tokio::spawn(read_lines(body, svc.max_body, ahead).in_current_span());
+    let mut s = Stream::default();
+    let mut batch: Vec<Json> = Vec::new();
+    // Lines read, and lines committed.
+    let (mut read, mut done) = (0u64, 0u64);
+    while let Some(first) = lines.recv().await {
+        let mut next = Some(first);
+        while let Some(line) = next.take() {
+            let ops = match line {
+                Ok(ops) => s.admit(&ops).map(|_| ops).map_err(|e| ApiError { message: format!("line {}: {}", read + 1, e.message), ..e }),
+                Err(e) => Err(e),
+            };
+            let ops = match ops {
+                Ok(ops) => ops,
+                Err(e) => {
+                    // The lines before it are good.
+                    if flush(&svc, &mut s, &mut batch, read, &mut done, &tx).await {
+                        let _ = tx.send(json!({"error": e.message, "status": e.status, "lines": done}));
+                    }
+                    return;
+                }
+            };
+            read += 1;
+            batch.extend(ops);
+            if batch.len() < STREAM_OPS {
+                next = lines.try_recv().ok();
+            }
+        }
+        if !flush(&svc, &mut s, &mut batch, read, &mut done, &tx).await {
+            return;
+        }
+    }
+    if flush(&svc, &mut s, &mut batch, read, &mut done, &tx).await {
+        let _ = tx.send(json!({"done": true, "batches": s.batches, "lines": done, "written": s.written, "skipped": s.skipped}));
+    }
+}
+
+/// Reads a stream's body into its lines' operations ([`line_ops`]) for
+/// [`ndjson`] to write. Once [`STREAM_LINES`] lines wait it stops reading,
+/// so that flow control slows a producer faster than the writes. A line
+/// that is not operations is the last it sends.
+async fn read_lines(body: axum::body::Body, max: usize, lines: tokio::sync::mpsc::Sender<Result<Vec<Json>, ApiError>>) {
+    let at_line = |n: u64| move |e: ApiError| ApiError { message: format!("line {n}: {}", e.message), ..e };
+    let mut chunks = body.into_data_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut n = 0u64;
+    while let Some(next) = chunks.next().await {
+        let bytes = match next {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = lines.send(Err(ApiError::bad(format!("reading the body: {e}")))).await;
+                return;
+            }
+        };
+        buf.extend_from_slice(&bytes);
+        let mut at = 0;
+        while let Some(nl) = buf[at..].iter().position(|&b| b == b'\n') {
+            n += 1;
+            let ops = line_ops(&buf[at..at + nl]).map_err(at_line(n));
+            at += nl + 1;
+            let bad = ops.is_err();
+            if lines.send(ops).await.is_err() || bad {
+                return;
+            }
+        }
+        buf.drain(..at);
+        if buf.len() > max {
+            let _ = lines.send(Err(ApiError { status: 413, message: format!("line {}: longer than the server takes ({max} bytes)", n + 1) })).await;
+            return;
+        }
+    }
+    // A last line without its newline.
+    if !buf.is_empty() {
+        let _ = lines.send(line_ops(&buf).map_err(at_line(n + 1))).await;
+    }
+}
+
+/// Writes the stream's batch, if any, and answers it; false when it
+/// failed, which the answer says.
+async fn flush(svc: &Arc<Service>, s: &mut Stream, batch: &mut Vec<Json>, read: u64, done: &mut u64, tx: &tokio::sync::mpsc::UnboundedSender<Json>) -> bool {
+    if batch.is_empty() {
+        *done = read;
+        return true;
+    }
+    let ops = std::mem::take(batch);
+    let n = ops.len();
+    match svc.stream_write(s, ops).await {
+        Ok(w) => {
+            *done = read;
+            let mut j = json!({"batch": s.batches, "ops": n, "written": w.rows, "skipped": w.skipped, "lines": read});
+            if let Some(q) = w.seq_no {
+                j["seq_no"] = json!(q);
+            }
+            if !w.seq_nos.is_empty() {
+                j["seq_nos"] = json!(w.seq_nos);
+            }
+            let offsets = s.offsets();
+            if !offsets.is_empty() {
+                j["offsets"] = Json::Object(offsets.into_iter().map(|(n, o)| (n, json!(o))).collect());
+            }
+            let _ = tx.send(j);
+            true
+        }
+        Err(e) => {
+            let _ = tx.send(json!({"error": e.message, "status": e.status, "lines": *done}));
+            false
+        }
+    }
+}
+
+/// A line of a stream: an operation, `{"ops": [...]}`, or blank.
+fn line_ops(line: &[u8]) -> Result<Vec<Json>, ApiError> {
+    let text = std::str::from_utf8(line).map_err(|_| ApiError::bad("not UTF-8 text"))?.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut j: Json = serde_json::from_str(text).map_err(|e| ApiError::bad(format!("not JSON: {e}")))?;
+    match j.get_mut("ops").map(Json::take) {
+        Some(Json::Array(mut ops)) => {
+            if let Some(src) = j.get("source").filter(|s| !s.is_null()) {
+                for op in ops.iter_mut().filter(|op| op.is_object() && !has_source(op)) {
+                    op["source"] = src.clone();
+                }
+            }
+            Ok(ops)
+        }
+        Some(_) => Err(ApiError::bad("\"ops\" is an array of operations")),
+        None if j.is_object() => Ok(vec![j]),
+        None => Err(ApiError::bad("a line is an operation (a JSON object), or one event's operations as {\"ops\": [...]}")),
+    }
+}
+
+/// Every stream source written from, with the offset of the last event
+/// each wrote ([`Service::sources`]).
+async fn sources(State(app): State<App>) -> Res {
+    let sources: Vec<Json> = app.svc.sources().await?.into_iter().map(source_json).collect();
+    Ok(AxJson(json!({"sources": sources})))
+}
+
+/// One source's offset, null for one not written from (start from the
+/// beginning).
+async fn source(State(app): State<App>, axum::extract::Path(name): axum::extract::Path<String>) -> Res {
+    let found = app.svc.sources().await?.into_iter().find(|s| s.name == name);
+    Ok(AxJson(found.map_or_else(|| json!({"name": name, "offset": null, "updated": null}), source_json)))
+}
+
+fn source_json(s: strata::db::Source) -> Json {
+    json!({"name": s.name, "offset": s.offset, "updated": s.updated.map(strata::timestamp::format)})
 }
 
 /// A schema validated, in both JSON forms.
@@ -354,35 +570,57 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
     Ok(AxJson(json!({"schema": s, "short": s.to_short_json()})))
 }
 
-/// The vector of a text, as `{"embed": text}` gives a query's parameter:
-/// for a plan, whose vectors are values.
+/// The vector of a text, or of an image file (`"image"`, base64), as
+/// `{"embed": ...}` gives a query's parameter: for a plan, whose vectors
+/// are values.
 async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
-    let text = body_str(&b, "text")?;
-    let field = match b.get("field") {
-        None | Some(Json::Null) => None,
-        Some(f) => Some(f.as_str().ok_or_else(|| ApiError::bad("field is a field's name"))?),
+    let what = match b.get("image") {
+        Some(i) => json!({ "image": i.as_str().ok_or_else(|| ApiError::bad("image is an image file in base64"))? }),
+        None => json!(body_str(&b, "text")?),
     };
-    let field = app.svc.model(field)?.0.to_string();
-    let p = app.svc.params(Some(&json!({ "v": { "embed": text, "field": field } }))).await?;
+    let name = |k: &str| match b.get(k) {
+        None | Some(Json::Null) => Ok(None),
+        Some(f) => f.as_str().map(Some).ok_or_else(|| ApiError::bad(format!("{k} is a name"))),
+    };
+    let (table, field, _) = app.svc.model(name("table")?, name("field")?)?;
+    let p = app.svc.params(Some(&json!({ "v": { "embed": what, "field": field, "table": table } }))).await?;
     let Some(strata::value::Value::Vector(v)) = p.0.get("v") else { return Err(ApiError::internal("the text has no vector")) };
-    Ok(AxJson(json!({ "field": field, "vector": &v[..] })))
+    Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] })))
 }
 
 async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let sql = body_str(&b, "sql")?;
     let params = app.svc.params(b.get("params")).await?;
+    let catalog = app.svc.catalog();
+    let tables: Vec<&strata::schema::Schema> = catalog.iter().map(|t| &**t).collect();
     // A compound query is operators over single-table queries; what each
     // of those ran is in "plan".
-    let (logical, plan) = match strata::query::compound::is_compound(sql, &app.svc.schema) {
-        true => ("a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(), strata::query::compound::plan(sql, &app.svc.schema, &params)?),
+    let profiles = |t: &str, n: &str| app.svc.rank_profile(t, n);
+    // The plan names the files of its ranking models.
+    let plan = app.svc.open_ranking_models(std::sync::Arc::new(strata::query::compound::plan_read(sql, &tables, &params, &profiles)?))?;
+    let logical = match plan.root.uses_operators() {
+        true => "a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(),
         false => {
-            let select = strata::query::bind(sql, &app.svc.schema, &params)?;
-            (format!("{select:#?}"), strata::query::ir::Plan::of_select(&app.svc.schema, &select))
+            let schema = tables.iter().find(|t| t.table.eq_ignore_ascii_case(plan.table())).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", plan.table())))?;
+            // A query by a rank profile binds as written out.
+            format!("{:#?}", strata::query::bind(&strata::query::profile::written_out(sql, &profiles)?, schema, &params)?)
         }
     };
-    let (ir, tree) = (plan.to_json()?, json!(plan.explain(&[&app.svc.schema])));
+    let (ir, tree) = (plan.to_json()?, json!(plan.explain(&tables)));
+    // `hits`: the top rows with the values they were ranked by.
+    let hits = match body_u64(&b, "hits") {
+        0 => None,
+        n => {
+            let sql = strata::query::sql::with_features(sql)?;
+            let h = app.svc.query(QueryReq { sql, params: params.clone(), timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await?;
+            let j = js::result(&h.rs, h.took_ms);
+            let names = j["columns"].as_array().cloned().unwrap_or_default();
+            let rows = j["rows"].as_array().cloned().unwrap_or_default();
+            Some(rows.iter().take(n as usize).map(|r| names.iter().zip(r.as_array().into_iter().flatten()).map(|(c, v)| (c.as_str().unwrap_or("").to_string(), v.clone())).collect::<serde_json::Map<_, _>>()).collect::<Vec<_>>())
+        }
+    };
     let a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await?;
-    Ok(AxJson(json!({
+    let mut out = json!({
         "kind": a.kind,
         "logical": logical,
         "ir": ir,
@@ -392,7 +630,11 @@ async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         "scored": a.rs.stats.scored,
         "rows": a.rs.rows.len(),
         "took_ms": a.took_ms,
-    })))
+    });
+    if let Some(h) = hits {
+        out["hits"] = json!(h);
+    }
+    Ok(AxJson(out))
 }
 
 async fn synonyms(State(app): State<App>) -> AxJson<Json> {
@@ -407,6 +649,37 @@ async fn synonyms(State(app): State<App>) -> AxJson<Json> {
 async fn put_synonyms(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let rules = app.svc.put_synonyms(body_str(&b, "text")?)?;
     Ok(AxJson(json!({"rules": rules, "file": app.svc.synonyms_file().map(|p| p.display().to_string())})))
+}
+
+/// `{"field": "sid", "prefixes": ["12", "12.7"], "where": "tag = :t",
+/// "params": {...}, "table": ..., "min_seq_no": ..., "timeout_ms": ...}`:
+/// the codes that can follow each prefix among the rows `where` matches
+/// (all rows without it), with how many rows have each
+/// ([`strata::db::Db::sid_next`]). `table` defaults to the first.
+async fn sid_next(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let t0 = Instant::now();
+    let table = match b.get("table") {
+        None | Some(Json::Null) => app.svc.schema.table.clone(),
+        Some(_) => body_str(&b, "table")?.to_string(),
+    };
+    let field = body_str(&b, "field")?;
+    let prefixes: Vec<String> = match b.get("prefixes") {
+        Some(Json::Array(ps)) => ps.iter().map(|p| p.as_str().map(String::from).ok_or_else(|| ApiError::bad("prefixes are strings, such as \"12.7\", or \"\" for the first numbers"))).collect::<Result<_, _>>()?,
+        _ => return Err(ApiError::bad("the body needs \"prefixes\", a list of codes such as [\"12\", \"12.7\"] (\"\" for the first numbers)")),
+    };
+    let filter = match b.get("where") {
+        None | Some(Json::Null) => String::new(),
+        Some(_) => format!(" WHERE {}", body_str(&b, "where")?),
+    };
+    let sql = format!("SELECT COUNT(*) FROM {}{filter}", strata::query::sql::ident(&table));
+    let params = app.svc.params(b.get("params")).await?;
+    let next = app.svc.sid_next(&sql, None, &params, field, &prefixes, &after(&b)?, body_u64(&b, "timeout_ms")).await?;
+    let next: Vec<Json> = prefixes
+        .iter()
+        .zip(next)
+        .map(|(p, cs)| json!({"prefix": p, "next": cs.into_iter().map(|(code, count)| json!({"code": code, "count": count})).collect::<Vec<_>>()}))
+        .collect();
+    Ok(AxJson(json!({"next": next, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
 }
 
 async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {

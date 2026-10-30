@@ -1,8 +1,8 @@
 //! Plans of bound statements: [`Plan::bind`], [`Plan::of_select`] and
 //! [`Plan::of_write`].
 
-use super::{Agg, Column, Expr, Graph, GraphKind, Node, OnConflict, Plan, Search, Set, SortKey};
-use crate::query::logical::{self, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use super::{Agg, Column, Expr, Graph, GraphKind, Node, OnConflict, Phase, Plan, Search, Set, SortKey};
+use crate::query::logical::{self, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::query::sql::{Assign, Conflict, Write};
 use crate::schema::Schema;
 use crate::value::Value;
@@ -63,7 +63,9 @@ impl Outputs {
     fn of(&mut self, p: &Projection) -> Expr {
         let agg = match p {
             Projection::Field(f) => return self.keys.iter().position(|k| k == f).map_or(Expr::Field(*f as u32), |i| Expr::Output(i as u32)),
-            Projection::Score => return Expr::Score,
+            // A ranking expression scores rows, not groups: binding and
+            // the executor refuse it here.
+            Projection::Score | Projection::Feature(_) => return Expr::Score,
             Projection::Hops(_) => return Expr::Hops,
             Projection::SeqNo => return Expr::SeqNo,
             Projection::Count => Agg { func: logical::AggFn::Count, arg: None },
@@ -123,7 +125,7 @@ impl Lower<'_> {
                 Some(Tiebreak::GroupValue { desc }) => keys.push(key(Expr::Output(0), desc)),
                 Some(Tiebreak::Key { desc }) => keys.push(key(pk(), desc)),
             }
-            let search = Node::Search(Search { table, filter, order: Vec::new() });
+            let search = Node::Search(Search { table, filter, order: Vec::new(), phases: Vec::new(), profile: None });
             let mut node = Node::Aggregate { input: Box::new(search), keys: out.keys.iter().map(|&f| Expr::Field(f as u32)).collect(), aggs: out.aggs };
             if let Some(cond) = having {
                 node = Node::Filter { input: Box::new(node), cond };
@@ -152,11 +154,13 @@ impl Lower<'_> {
                         Projection::Field(f) => Expr::Field(*f as u32),
                         Projection::Hops(_) => Expr::Hops,
                         Projection::SeqNo => Expr::SeqNo,
+                        Projection::Feature(s) => self.score(s),
                         _ => Expr::Score,
                     },
                 })
                 .collect();
-            (Node::Search(Search { table, filter, order }), columns)
+            let phases = s.phases.iter().map(|p| Phase { count: p.count as u64, expr: self.score(&p.score), global: p.global }).collect();
+            (Node::Search(Search { table, filter, order, phases, profile: None }), columns)
         };
         let (mut node, columns) = node;
         if s.limit.is_some() || s.offset > 0 {
@@ -201,9 +205,14 @@ impl Lower<'_> {
     }
 
     fn graph(&self, g: &GraphQuery) -> Graph {
+        let (seeds, weights) = match &g.seeds {
+            Seeds::Weighted(ws) => (Expr::Lit(Value::List(ws.iter().map(|(k, _)| k.clone()).collect())), ws.iter().map(|(_, w)| *w).collect()),
+            s => (self.seeds(s), Vec::new()),
+        };
         Graph {
             field: g.field as u32,
-            seeds: self.seeds(&g.seeds),
+            seeds,
+            weights,
             kind: match &g.kind {
                 logical::GraphKind::Reach { min_hops, max_hops } => GraphKind::Reachable { min_hops: *min_hops, max_hops: *max_hops },
                 logical::GraphKind::Path { to, max_hops } => GraphKind::Path { to: self.seeds(to), max_hops: *max_hops },
@@ -221,6 +230,7 @@ impl Lower<'_> {
     fn seeds(&self, s: &Seeds) -> Expr {
         match s {
             Seeds::Keys(keys) => Expr::Lit(Value::List(keys.clone())),
+            Seeds::Weighted(ws) => Expr::Lit(Value::List(ws.iter().map(|(k, _)| k.clone()).collect())),
             Seeds::Query(q) => Expr::Subquery(Box::new(Lower { schema: self.schema, graphs: &q.graphs }.select(q))),
             Seeds::Plan(e) => (**e).clone(),
         }
@@ -230,6 +240,14 @@ impl Lower<'_> {
         match s {
             Score::Bm25 { field, text, opts } => Expr::Bm25 { field: *field as u32, text: text.clone(), opts: opts.clone() },
             Score::Similarity { field, vector, opts } => Expr::Similarity { field: *field as u32, vector: vector.clone(), opts: opts.clone() },
+            Score::MaxSim { field, vectors, opts } => Expr::MaxSim {
+                field: *field as u32,
+                vectors: Box::new(match vectors {
+                    Vectors::List(vs) => Expr::Lit(Value::List(vs.iter().map(|v| Value::Vector(v.clone())).collect())),
+                    Vectors::Plan(e) => (**e).clone(),
+                }),
+                opts: opts.clone(),
+            },
             Score::Sparse { field, terms, opts } => Expr::Sparse { field: *field as u32, terms: terms.clone(), opts: opts.clone() },
             Score::Decay { field, decay, opts } => Expr::Decay { field: *field as u32, decay: *decay, opts: opts.clone() },
             Score::Rrf { inputs, k, depth } => Expr::Rrf { inputs: inputs.iter().map(|s| self.score(s)).collect(), k: *k, depth: *depth as u64 },
@@ -237,7 +255,22 @@ impl Lower<'_> {
             Score::Product(factors) => Expr::Product(factors.iter().map(|s| self.score(s)).collect()),
             Score::Column { field } => Expr::Field(*field as u32),
             Score::Ppr { graph } => Expr::Ppr(Box::new(self.graph(&self.graphs[*graph]))),
+            // `hops()` ranks nearest first in the fused shapes, and is the
+            // number of hops in an expression ([`super::raise`]).
             Score::Hops { .. } => Expr::Hops,
+            Score::SeqNo => Expr::SeqNo,
+            Score::Cond(p) => self.pred(p),
+            Score::Num(x) => Expr::Lit(Value::Float(*x)),
+            Score::Arith { op, left, right } => Expr::Arith { op: *op, left: Box::new(self.score(left)), right: Box::new(self.score(right)) },
+            Score::Neg(x) => Expr::Neg(Box::new(self.score(x))),
+            Score::Call { func, args } => Expr::Call { func: *func, args: args.iter().map(|a| self.score(a)).collect() },
+            Score::Norm { kind, input } => Expr::Norm { kind: *kind, input: Box::new(self.score(input)) },
+            Score::Gbdt { model, hash, args, open } => Expr::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(|a| self.score(a)).collect(), open: open.clone() },
+            Score::Case { whens, otherwise } => Expr::Case {
+                operand: None,
+                whens: whens.iter().map(|(c, x)| super::When { when: self.score(c), then: self.score(x) }).collect(),
+                otherwise: otherwise.as_ref().map(|x| Box::new(self.score(x))),
+            },
         }
     }
 
