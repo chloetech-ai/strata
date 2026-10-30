@@ -339,7 +339,7 @@ The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-ta
 
 ## Graphs
 
-Rows with an `EDGES` field are nodes of a graph. Graph predicates and scores take **seeds**: a key (`'p1'`), a parameter, a tuple of keys (`('p1', 'p2')`), or a subquery over the same table, whose filters, ranking and `LIMIT` are those of any query.
+Rows with an `EDGES` field are nodes of a graph. Graph predicates and scores take **seeds**: a key (`'p1'`), a parameter, a tuple of keys (`('p1', 'p2')`), or a subquery, whose filters, ranking and `LIMIT` are those of any query. A subquery over the same table seeds with its rows; one over another table returns one column, whose values are the keys to start from, such as the items a user's recent events name: `ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 20))`.
 
 ```sql
 -- papers within two citations of p1, either way, nearest first
