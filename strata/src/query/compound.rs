@@ -145,7 +145,7 @@ fn rows_of(q: &sql::Query, s: &sql::Select) -> bool {
 
 /// The expressions of a SELECT outside its FROM and ORDER BY.
 fn select_exprs(s: &sql::Select) -> Vec<&Expr> {
-    let mut out: Vec<&Expr> = Vec::new();
+    let mut out: Vec<&Expr> = distinct_on(s).iter().collect();
     for item in &s.projection {
         match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => out.push(e),
@@ -575,8 +575,11 @@ impl<'a> Planner<'a> {
     fn single(&self, q: &sql::Query, s: &sql::Select, schema: &Schema) -> Result<Planned> {
         let mut q = q.clone();
         let mut s = s.clone();
-        if s.distinct.is_some() {
-            distinct_to_group(&mut s)?;
+        match &s.distinct {
+            // The first row of each group: the scan's rows, kept by operators.
+            Some(sql::Distinct::On(_)) => return self.join(&q, &s),
+            Some(sql::Distinct::Distinct) => distinct_to_group(&mut s)?,
+            None => {}
         }
         if rows_of(&q, &s) {
             return self.join(&q, &s);
@@ -847,7 +850,7 @@ impl<'a> Planner<'a> {
         // in that order and keep it through the joins, so a cut needs only
         // as many of them as join into enough rows ([`ops`] grows its scan).
         let driver_order = !grouped
-            && s.distinct.is_none()
+            && !matches!(s.distinct, Some(sql::Distinct::Distinct))
             && match order.first() {
                 None => true,
                 Some(_) if mem_order.len() > 1 => false,
@@ -1194,6 +1197,9 @@ pub(crate) fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
         }
     }
     if let sql::SetExpr::Select(s) = q.body.as_mut() {
+        if let Some(sql::Distinct::On(es)) = &mut s.distinct {
+            es.iter_mut().for_each(|e| walk_mut(e, f));
+        }
         for item in &mut s.projection {
             if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
                 walk_mut(e, f);
@@ -1285,6 +1291,14 @@ fn has_aggregate(s: &sql::Select) -> bool {
         }
     }
     found
+}
+
+/// The expressions of `DISTINCT ON (...)`: none for another SELECT.
+fn distinct_on(s: &sql::Select) -> &[Expr] {
+    match &s.distinct {
+        Some(sql::Distinct::On(es)) => es,
+        _ => &[],
+    }
 }
 
 /// `SELECT DISTINCT a, b` as `GROUP BY a, b`.
@@ -1603,6 +1617,21 @@ impl Planner<'_> {
                 })
                 .collect()
         };
+        // DISTINCT ON: the first row of each group, in the order above.
+        let first_of = |node: ir::Node, items_at: &[ir::Expr], slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<ir::Node> {
+            let on = distinct_on(s);
+            if on.is_empty() {
+                return Ok(node);
+            }
+            let keys = on
+                .iter()
+                .map(|e| match by_alias(e) {
+                    Some(i) => Ok(items_at[i].clone()),
+                    None => compile_with(e, params, slot, multi, Some(&subs)),
+                })
+                .collect::<Result<_>>()?;
+            Ok(ir::Node::DistinctOn { input: Box::new(node), keys })
+        };
         let mut node = input;
         let items_at: Vec<ir::Expr> = if grouped {
             // The Aggregate's rows: its group values, its aggregates, and
@@ -1640,6 +1669,7 @@ impl Planner<'_> {
                     .collect(),
             };
             node = ir::Node::Sort { input: Box::new(node), keys };
+            node = first_of(node, &items_at, &group_slot, &[])?;
             items_at
         } else {
             let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_row(e, cols, multi, params, &subs)).collect::<Result<_>>()?;
@@ -1647,6 +1677,7 @@ impl Planner<'_> {
                 let keys = sort_keys(&items_at, &|e| at(slot(e, cols)), multi)?;
                 node = ir::Node::Sort { input: Box::new(node), keys };
             }
+            node = first_of(node, &items_at, &|e| at(slot(e, cols)), multi)?;
             items_at
         };
         let columns: Vec<String> = items.into_iter().map(|i| i.0).collect();
@@ -1658,9 +1689,9 @@ impl Planner<'_> {
             (0, None) => node,
             (o, l) => ir::Node::Limit { input: Box::new(node), offset: o as u64, limit: l.map(|l| l as u64) },
         };
-        let node = match s.distinct.is_some() {
-            true => cut(ir::Node::Distinct { input: Box::new(project(node)) }),
-            false => project(cut(node)),
+        let node = match s.distinct {
+            Some(sql::Distinct::Distinct) => cut(ir::Node::Distinct { input: Box::new(project(node)) }),
+            _ => project(cut(node)),
         };
         Ok(Planned { node, columns, keyed: None })
     }
