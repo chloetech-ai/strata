@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
-use strata::db::{Db, PreparedWrite};
+use strata::db::{Db, PreparedWrite, Source};
 use strata::embed::Embedder;
 use strata::ingest::{Format, Rows};
 use strata::query::exec::{ExecOptions, ResultSet};
@@ -742,7 +742,7 @@ impl Service {
             match &job {
                 WriteJob::Ops(ops) => {
                     let catalog = self.catalog();
-                    let places = ops.iter().map(|op| op_schema(&catalog, op).and_then(|t| Ok((place_name(t), op_place(t, op)?)))).collect::<Result<Vec<_>, _>>()?;
+                    let places = ops.iter().filter(|op| !is_mark(op)).map(|op| op_schema(&catalog, op).and_then(|t| Ok((place_name(t), op_place(t, op)?)))).collect::<Result<Vec<_>, _>>()?;
                     self.check_keys(places.iter().map(|(w, v)| (*w, v)))?
                 }
                 WriteJob::Sql(p) => {
@@ -1401,6 +1401,7 @@ impl Service {
         F: FnOnce(&Db) -> strata::Result<Option<PreparedWrite>> + Send + 'static,
     {
         self.writable()?;
+        self.backpressure(db).await?;
         let q = self.enqueue()?;
         let core = match self.embeds() {
             true => Some(self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?),
@@ -1428,9 +1429,13 @@ impl Service {
         let t0 = Instant::now();
         let n = match &self.backend {
             Backend::Local(db) => {
-                // Before any work: a replica, or a full queue, refuses the
-                // request.
-                let queued = match self.takes_writes().and_then(|_| self.enqueue()) {
+                // Before any work: a replica, a database behind on its
+                // flushes, or a full queue refuses the request.
+                let admitted = match self.takes_writes() {
+                    Ok(()) => self.backpressure(db).await.and_then(|_| self.enqueue()),
+                    Err(e) => Err(e),
+                };
+                let queued = match admitted {
                     Ok(q) => q,
                     Err(e) => return self.wrote(Err(e), t0, None),
                 };
@@ -1463,7 +1468,13 @@ impl Service {
                         .map_err(ApiError::internal)??;
                     }
                     // The deadline bounds the wait for the writer, not the embedding.
-                    self.write(WriteJob::Ops(ops), Instant::now() + self.timeout, key.clone(), queued).await
+                    let w = self.write(WriteJob::Ops(ops), Instant::now() + self.timeout, key.clone(), queued).await?;
+                    // Visible now: how long after its event each row is.
+                    let now = strata::timestamp::now();
+                    for &ts in &w.stamps {
+                        self.metrics.lag(now.saturating_sub(ts) as f64 / 1e6);
+                    }
+                    Ok(w)
                 }
                 .await;
                 if let (Err(_), Some(k)) = (&r, &key) {
@@ -1480,6 +1491,67 @@ impl Service {
             Backend::Cluster(c) => c.write_ops(ops, key).await,
         };
         self.wrote(n, t0, None)
+    }
+
+    /// Writes one batch of a stream ([`Self::write_ops`]), which `s` took
+    /// ([`Stream::admit`]). A local database's stream waits while the
+    /// database is behind on its flushes or the writer's queue is full,
+    /// rather than being refused, and reads nothing more from its client
+    /// meanwhile. A coordinator's sends a batch a shard refused for its
+    /// load (429) again a second later, under the batch's idempotency key,
+    /// so that the shards that took it do not apply it twice.
+    pub async fn stream_write(self: &Arc<Self>, s: &mut Stream, ops: Vec<Json>) -> Result<Written, ApiError> {
+        let give_up = Instant::now() + self.max_timeout;
+        let n = s.batches;
+        s.batches += 1;
+        let w = match &self.backend {
+            Backend::Local(db) => {
+                let busy = || db.storage().backlogged() || self.writer_state.queued.load(Ordering::Relaxed) >= self.max_queued_writes;
+                while busy() && Instant::now() < give_up {
+                    tokio::time::sleep(STREAM_POLL).await;
+                }
+                self.write_ops(ops, None).await?
+            }
+            Backend::Cluster(_) => {
+                let key = Some(format!("stream-{:016x}-{n}", s.id));
+                loop {
+                    match self.write_ops(ops.clone(), key.clone()).await {
+                        Err(e) if e.status == 429 && Instant::now() + RETRY_AFTER < give_up => tokio::time::sleep(RETRY_AFTER).await,
+                        r => break r?,
+                    }
+                }
+            }
+        };
+        s.written += w.rows;
+        s.skipped += w.skipped;
+        Ok(w)
+    }
+
+    /// Waits up to [`BACKLOG_WAIT`] while `db` is behind on its flushes
+    /// ([`strata::storage::Database::backlogged`]); then refuses the write
+    /// (429), so that clients slow down rather than queue.
+    async fn backpressure(&self, db: &Db) -> Result<(), ApiError> {
+        let until = Instant::now() + BACKLOG_WAIT;
+        while db.storage().backlogged() {
+            if Instant::now() >= until {
+                return Err(ApiError { status: 429, message: "the database is behind on flushing writes to disk; try again in a second".into() });
+            }
+            tokio::time::sleep(STREAM_POLL).await;
+        }
+        Ok(())
+    }
+
+    /// The stream sources written from, with the offset of the last event
+    /// each wrote: a coordinator's are the least over its shards, where a
+    /// stream resumes ([`Coordinator::sources`]).
+    pub async fn sources(&self) -> Result<Vec<Source>, ApiError> {
+        match &self.backend {
+            Backend::Local(db) => {
+                let db = db.clone();
+                tokio::task::spawn_blocking(move || db.sources()).await.map_err(ApiError::internal)?.map_err(Into::into)
+            }
+            Backend::Cluster(c) => c.sources().await,
+        }
     }
 
     /// Counts a write's outcome (the request logs a failure on the
@@ -1676,10 +1748,30 @@ pub struct Written {
     pub rows: u64,
     pub seq_no: Option<u64>,
     pub seq_nos: Vec<u64>,
+    /// Operations not applied because their source offset was written
+    /// already ([`op_source`]): a replay's.
+    pub skipped: u64,
+    /// When the events the write applied happened (their `source.ts`, in
+    /// microseconds), for the lag metric; not part of the answer.
+    pub stamps: Vec<i64>,
 }
 
 /// Rows one write request of an import carries.
 pub const IMPORT_OPS: usize = 1000;
+
+/// Operations a batch of a stream (`/v1/stream`) takes at most; fewer when
+/// the client has sent no more yet.
+pub const STREAM_OPS: usize = 4096;
+
+/// How often a stream, or a write held back by a backlog, looks again.
+const STREAM_POLL: Duration = Duration::from_millis(5);
+
+/// How long a write waits for a backlog of flushes to clear before 429.
+const BACKLOG_WAIT: Duration = Duration::from_secs(1);
+
+/// When a client should send a write refused for the server's load (429)
+/// again, as `Retry-After` says.
+pub const RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// The largest body a route other than `/v1/write` and `/v1/import` takes:
 /// a query, its parameters (vectors among them) or a synonym list.
@@ -1981,9 +2073,9 @@ fn apply_group(db: &Db, group: Vec<Queued>) {
     }
     let requests: Vec<&[Json]> = group.iter().map(|q| q.ops()).collect();
     match wait_for_writer(deadline, || apply_requests(db, &requests)) {
-        Ok((counts, seq_no)) => {
-            for (q, rows) in group.into_iter().zip(counts) {
-                q.answer(Ok(Written { rows, seq_no, ..Default::default() }));
+        Ok((applied, seq_no)) => {
+            for (q, a) in group.into_iter().zip(applied) {
+                q.answer(Ok(a.written(seq_no)));
             }
         }
         Err(e) if group.len() == 1 => {
@@ -2030,22 +2122,156 @@ pub(crate) fn wait_for_writer<T>(deadline: Instant, mut write: impl FnMut() -> R
 
 /// Applies `ops` to `db` in one transaction.
 pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<Written, ApiError> {
-    let (counts, seq_no) = apply_requests(db, &[ops])?;
-    Ok(Written { rows: counts[0], seq_no, ..Default::default() })
+    let (mut applied, seq_no) = apply_requests(db, &[ops])?;
+    Ok(applied.remove(0).written(seq_no))
 }
 
-/// Applies several requests' operations in one transaction; returns the
-/// rows each wrote, and the transaction's sequence number in a database
-/// that numbers its writes.
-fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<(Vec<u64>, Option<u64>), ApiError> {
+/// What one request's operations did in a transaction ([`apply_into`]).
+#[derive(Default)]
+struct Applied {
+    rows: u64,
+    skipped: u64,
+    stamps: Vec<i64>,
+}
+
+impl Applied {
+    fn written(self, seq_no: Option<u64>) -> Written {
+        Written { rows: self.rows, seq_no, skipped: self.skipped, stamps: self.stamps, ..Default::default() }
+    }
+}
+
+/// Applies several requests' operations in one transaction; returns what
+/// each did, and the transaction's sequence number in a database that
+/// numbers its writes.
+fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<(Vec<Applied>, Option<u64>), ApiError> {
     let catalog = db.catalog();
+    // Made outside the transaction, which holds the writer.
+    if requests.iter().flat_map(|ops| ops.iter()).any(has_source) {
+        db.storage().ensure_sources()?;
+    }
     let mut t = db.storage().begin()?;
-    let mut counts = Vec::with_capacity(requests.len());
+    let mut applied = Vec::with_capacity(requests.len());
     for ops in requests {
-        counts.push(apply_into(&catalog, &mut t, ops)?);
+        applied.push(apply_into(&catalog, &mut t, ops)?);
     }
     let seq_no = t.commit_seq()?;
-    Ok((counts, seq_no))
+    Ok((applied, seq_no))
+}
+
+/// Where an operation's event came from (its `"source"`): a stream's
+/// source, the event's offset in it, and when the event happened
+/// (microseconds since the epoch), if the operation says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mark {
+    pub name: String,
+    pub offset: i64,
+    pub ts: Option<i64>,
+}
+
+/// The longest source name, in bytes.
+const SOURCE_NAME: usize = 256;
+
+pub fn has_source(op: &Json) -> bool {
+    op.get("source").is_some_and(|s| !s.is_null())
+}
+
+/// Whether an operation only marks a source's offset (`"op": "source"`),
+/// writing no row.
+pub fn is_mark(op: &Json) -> bool {
+    op.get("op").and_then(|o| o.as_str()) == Some("source")
+}
+
+/// An operation's `"source": {"name": ..., "offset": n, "ts": ...}`, if it
+/// has one; `ts` is ISO 8601 text, or milliseconds since the epoch.
+pub fn op_source(op: &Json) -> Result<Option<Mark>, ApiError> {
+    let s = match op.get("source") {
+        None | Some(Json::Null) => return Ok(None),
+        Some(s) => s,
+    };
+    let name = s
+        .get("name")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty() && n.len() <= SOURCE_NAME)
+        .ok_or_else(|| ApiError::bad(format!("an operation's source has a \"name\" of 1 to {SOURCE_NAME} bytes")))?;
+    let offset = s.get("offset").and_then(|o| o.as_i64()).ok_or_else(|| ApiError::bad(format!("source {name}: the \"offset\" is a whole number")))?;
+    let ts = match s.get("ts") {
+        None | Some(Json::Null) => None,
+        Some(Json::String(t)) => Some(strata::timestamp::parse(t).ok_or_else(|| ApiError::bad(format!("source {name}: ts {t:?} is not ISO 8601 text")))?),
+        Some(v) => Some(v.as_i64().ok_or_else(|| ApiError::bad(format!("source {name}: ts is ISO 8601 text or whole milliseconds since the epoch")))?.saturating_mul(1000)),
+    };
+    Ok(Some(Mark { name: name.to_string(), offset, ts }))
+}
+
+/// A stream's state from one batch to the next ([`Service::stream_write`]).
+pub struct Stream {
+    /// Each source's highest offset so far, which the next must pass.
+    last: HashMap<String, i64>,
+    /// The sources admitted since [`Stream::offsets`] last took them.
+    fresh: Vec<String>,
+    /// Names the stream's batches in their idempotency keys.
+    id: u64,
+    pub batches: u64,
+    pub written: u64,
+    pub skipped: u64,
+}
+
+impl Default for Stream {
+    fn default() -> Stream {
+        Stream { last: HashMap::new(), fresh: Vec::new(), id: rand_id(), batches: 0, written: 0, skipped: 0 }
+    }
+}
+
+impl Stream {
+    /// Takes the operations of one event or of several (a line of
+    /// `/v1/stream`, a message of gRPC `WriteStream`), which a batch never
+    /// splits: each source's offsets must pass those before them in the
+    /// stream, since an offset written already marks a replay and is
+    /// skipped.
+    pub fn admit(&mut self, ops: &[Json]) -> Result<(), ApiError> {
+        let mut top: Vec<(String, i64)> = Vec::new();
+        for op in ops {
+            let Some(m) = op_source(op)? else {
+                if is_mark(op) {
+                    return Err(ApiError::bad("a \"source\" operation needs a source: {\"op\": \"source\", \"source\": {\"name\": ..., \"offset\": n}}"));
+                }
+                continue;
+            };
+            if let Some(&last) = self.last.get(&m.name) {
+                if m.offset <= last {
+                    return Err(ApiError::bad(format!(
+                        "source {}: offset {} comes after {last} in this stream: offsets increase along a stream, and one event's operations go together (one line, as {{\"ops\": [...]}}, or one message)",
+                        m.name, m.offset
+                    )));
+                }
+            }
+            match top.iter_mut().find(|(n, _)| *n == m.name) {
+                Some((_, t)) => *t = (*t).max(m.offset),
+                None => top.push((m.name, m.offset)),
+            }
+        }
+        for (name, offset) in top {
+            if !self.fresh.contains(&name) {
+                self.fresh.push(name.clone());
+            }
+            self.last.insert(name, offset);
+        }
+        Ok(())
+    }
+
+    /// The last offset of each source admitted since the last call: once
+    /// a batch has committed, where each of its sources stands, which a
+    /// consumer may commit to its log.
+    pub fn offsets(&mut self) -> Vec<(String, i64)> {
+        let fresh = std::mem::take(&mut self.fresh);
+        fresh.into_iter().map(|n| { let o = self.last[&n]; (n, o) }).collect()
+    }
+}
+
+fn rand_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.finish()
 }
 
 /// Refuses an operation with `if_seq_no` unless the row with `key` is
@@ -2081,10 +2307,46 @@ fn key_text(key: &Value) -> String {
 
 /// Applies one request's `ops`, each to the table it names ([`op_table`]);
 /// a TIMESTAMP defaulting to `"now"` takes the same time in all of them.
-fn apply_into(catalog: &[Arc<Schema>], txn: &mut WriteTxn<'_>, ops: &[Json]) -> Result<u64, ApiError> {
-    let mut n = 0u64;
+///
+/// An operation with a source ([`op_source`]) whose offset the source has
+/// reached already, as the transaction finds it when the request starts,
+/// is a replay's and is skipped; afterwards each source's highest offset
+/// is kept, in the same transaction ([`WriteTxn::set_source`]). So a
+/// stream resumed from its sources' offsets applies each event once.
+fn apply_into(catalog: &[Arc<Schema>], txn: &mut WriteTxn<'_>, ops: &[Json]) -> Result<Applied, ApiError> {
+    let mut a = Applied::default();
     let now = strata::timestamp::now();
+    // Each source's offset when the request started, and its highest here.
+    let mut sources: Vec<(String, Option<i64>, i64)> = Vec::new();
+    // The event last stamped: its operations follow one another.
+    let mut stamped = None;
     for op in ops {
+        if let Some(m) = op_source(op)? {
+            let i = match sources.iter().position(|(n, ..)| *n == m.name) {
+                Some(i) => i,
+                None => {
+                    let stored = txn.source_offset(&m.name)?;
+                    sources.push((m.name.clone(), stored, i64::MIN));
+                    sources.len() - 1
+                }
+            };
+            let (_, stored, top) = &mut sources[i];
+            if stored.is_some_and(|s| m.offset <= s) {
+                a.skipped += !is_mark(op) as u64;
+                continue;
+            }
+            *top = (*top).max(m.offset);
+            if m.ts.is_some() && stamped != Some((i, m.offset)) {
+                a.stamps.extend(m.ts);
+                stamped = Some((i, m.offset));
+            }
+        }
+        if is_mark(op) {
+            if !has_source(op) {
+                return Err(ApiError::bad("a \"source\" operation needs a source: {\"op\": \"source\", \"source\": {\"name\": ..., \"offset\": n}}"));
+            }
+            continue;
+        }
         let schema = &**op_schema(catalog, op)?;
         let mut tt = txn.table(&schema.table)?;
         let t = &mut tt;
@@ -2133,9 +2395,14 @@ fn apply_into(catalog: &[Arc<Schema>], txn: &mut WriteTxn<'_>, ops: &[Json]) -> 
             }
             other => return Err(ApiError::bad(format!("unknown write op {other:?}"))),
         };
-        n += wrote as u64;
+        a.rows += wrote as u64;
     }
-    Ok(n)
+    for (name, stored, top) in sources {
+        if top > i64::MIN && stored.is_none_or(|s| top > s) {
+            txn.set_source(&name, top, now)?;
+        }
+    }
+    Ok(a)
 }
 
 
