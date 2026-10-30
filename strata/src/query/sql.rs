@@ -1020,7 +1020,7 @@ impl<'a> Binder<'a> {
     /// reads its `similarity(..)`.
     fn feature_items(&self, orders: &[&Expr]) -> Result<Vec<Expr>> {
         // Functions of other scores, and the rows they read.
-        let inner = |f: &sql::Function| matches!(fname(f).as_str(), "rrf" | "minmax" | "rank") || Func::numeric(&fname(f)).is_some();
+        let inner = |f: &sql::Function| matches!(fname(f).as_str(), "rrf" | "minmax" | "rank" | "gbdt") || Func::numeric(&fname(f)).is_some();
         let leaf = |e: &Expr| !matches!(e, Expr::Nested(_) | Expr::UnaryOp { .. } | Expr::BinaryOp { .. } | Expr::Case { .. } | Expr::Value(_)) && !matches!(e, Expr::Function(f) if inner(f));
         fn leaves(b: &Binder, e: &Expr, leaf: &dyn Fn(&Expr) -> bool, out: &mut Vec<Expr>) -> Result<()> {
             match e {
@@ -1332,6 +1332,15 @@ impl<'a> Binder<'a> {
                     "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
                     "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
                     "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),
+                    "gbdt" => {
+                        let usage = "gbdt('model', feature, ...) takes a model's name and the features it reads, in order";
+                        let [model, features @ ..] = args.as_slice() else { return Err(err(usage)) };
+                        let model = self.literal(model).ok().and_then(|v| v.as_str().map(str::to_string)).ok_or_else(|| err(usage))?;
+                        if features.is_empty() || !opts.is_empty() {
+                            return Err(err(usage));
+                        }
+                        Ok(Score::Gbdt { model, hash: String::new(), args: features.iter().map(|a| self.rank(a)).collect::<Result<_>>()?, open: Default::default() })
+                    }
                     n => match Func::numeric(n) {
                         Some(func) => {
                             func.arity(args.len()).map_err(|a| err(format!("{n}() takes {a}")))?;

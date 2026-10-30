@@ -265,6 +265,7 @@ impl Lower<'_> {
             Score::Neg(x) => Expr::Neg(Box::new(self.score(x))),
             Score::Call { func, args } => Expr::Call { func: *func, args: args.iter().map(|a| self.score(a)).collect() },
             Score::Norm { kind, input } => Expr::Norm { kind: *kind, input: Box::new(self.score(input)) },
+            Score::Gbdt { model, hash, args, open } => Expr::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(|a| self.score(a)).collect(), open: open.clone() },
             Score::Case { whens, otherwise } => Expr::Case {
                 operand: None,
                 whens: whens.iter().map(|(c, x)| super::When { when: self.score(c), then: self.score(x) }).collect(),

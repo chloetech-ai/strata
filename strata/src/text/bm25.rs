@@ -363,10 +363,12 @@ impl<'b, B: Boost> Boosted<'b, B> {
 
     /// Whether a bound narrows as the text score falls, so that a
     /// threshold can skip documents: else every matching document is
-    /// scored.
+    /// scored. A bound may be flat over the higher text scores and fall
+    /// only below them, as a model's is above its highest split on the
+    /// text score.
     fn narrows(&mut self) -> bool {
         let top = self.boost.bound(self.max);
-        top < f64::INFINITY && self.boost.bound(self.max * 0.5) < top
+        top < f64::INFINITY && (self.boost.bound(self.max * 0.5) < top || self.boost.bound(0.0) < top)
     }
 
     /// The largest text score whose bound is at most `theta`, found by
