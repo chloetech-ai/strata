@@ -23,14 +23,22 @@ env:
 # 26, 3 cores, 7 GB): the three macOS test jobs run on gh-mac, fault
 # injection and the Python package on gh-mac2. Job names still say
 # ubuntu-latest and macos-latest, which keeps the check names.
+#
+# macOS jobs are the scarcest (the account runs few at once), so a pull
+# request runs only Strata's tests on macOS, where its NEON kernels and
+# syncs differ from Linux; a push to main runs every macOS job.
 jobs:
   test:
     name: ${{ matrix.crate }} on ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
         crate: [strata, engram, strata-server]
+        # On a pull request, a job of its own; on main, already in the matrix.
+        include:
+          - os: macos-latest
+            crate: strata
     runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
@@ -158,7 +166,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac2' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
@@ -287,7 +295,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac2' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
