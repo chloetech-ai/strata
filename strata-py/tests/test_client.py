@@ -155,3 +155,19 @@ def test_client_gbdt(tmp_path, serve):
     model_dir(tmp_path, "xgb_rank")
     with pytest.raises(strata.StrataError, match="is not the one the plan was made with"):
         client.run(plan["ir"])
+
+
+def test_client_cross_encoder(tmp_path, serve):
+    path = tmp_path / "ce.strata"
+    with strata.Database.create(path, BOOKS) as db:
+        db.insert([book(i) for i in range(200)])
+    client = strata.connect(serve(path, "--max-rerank", "20"))
+    top = "WITH top AS (SELECT * FROM books ORDER BY bm25(description, :q) DESC LIMIT 20)"
+    sql = f"{top} SELECT id, score() FROM top ORDER BY cross_encoder('builtin:overlap', title, description, :q) DESC LIMIT 5"
+    r = client.query(sql, q="dragon ship winter")
+    assert len(r) == 5 and r.scores[0] > 0
+    q = client.table().select("id", strata.score()).order_by(strata.bm25("description", "dragon ship winter"))
+    got = client.run(q.rerank(strata.cross_encoder("builtin:overlap", ["title", "description"], "dragon ship winter"), 20).limit(5))
+    assert (got.keys, got.scores) == (r.keys, r.scores)
+    with pytest.raises(strata.StrataError, match="at most 20 rows"):
+        client.query(sql.replace("LIMIT 20", "LIMIT 21"), q="dragon ship winter")

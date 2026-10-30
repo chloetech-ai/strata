@@ -398,7 +398,7 @@ async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     // of those ran is in "plan".
     let profiles = |t: &str, n: &str| app.svc.rank_profile(t, n);
     // The plan names the files of its ranking models.
-    let plan = app.svc.open_ranking_models(std::sync::Arc::new(strata::query::compound::plan_read(sql, &tables, &params, &profiles)?))?;
+    let plan = app.svc.open_ranking_models(std::sync::Arc::new(strata::query::compound::plan_read(sql, &tables, &params, &profiles)?), false)?;
     let logical = match plan.root.uses_operators() {
         true => "a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(),
         false => {

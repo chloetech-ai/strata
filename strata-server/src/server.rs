@@ -74,6 +74,9 @@ pub struct Options {
     pub max_result_window: usize,
     /// The most groups a query may make (0: no limit).
     pub max_groups: usize,
+    /// The most rows a cross-encoder's rerank phase may score (0: no
+    /// limit).
+    pub max_rerank: usize,
     /// Memory the running queries may hold together, in MiB (`None`: a
     /// third of [`strata::storage::memory_limit`]; 0: no limit).
     pub query_memory_mb: Option<u64>,
@@ -219,6 +222,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     svc.slow = (o.slow_ms > 0).then(|| Duration::from_millis(o.slow_ms));
     svc.max_rows = (o.max_result_window > 0).then_some(o.max_result_window);
     svc.max_groups = (o.max_groups > 0).then_some(o.max_groups);
+    svc.max_rerank = (o.max_rerank > 0).then_some(o.max_rerank);
     let query_memory = match o.query_memory_mb {
         Some(mb) => (mb > 0).then(|| mb.saturating_mul(1 << 20)),
         None => strata::storage::memory_limit().map(|l| l / 3),
@@ -301,15 +305,18 @@ pub async fn promote(url: &str, replicas: &[String], write_acks: &str, force: bo
     }
 }
 
-/// Downloads model `name` ([`strata::embed::KNOWN_MODELS`], or a Hugging
-/// Face repository `owner/name`) into `dir`; returns its directory.
+/// Downloads model `name` ([`strata::embed::KNOWN_MODELS`], a
+/// cross-encoder of [`cross_encoder::KNOWN_MODELS`], or a Hugging Face
+/// repository `owner/name`) into `dir`; returns its directory.
 pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
-    let (local, repo) = match strata::embed::KNOWN_MODELS.iter().find(|m| m.0.eq_ignore_ascii_case(name)) {
+    use strata::query::cross_encoder;
+    let known = || strata::embed::KNOWN_MODELS.iter().chain(cross_encoder::KNOWN_MODELS);
+    let (local, repo) = match known().find(|m| m.0.eq_ignore_ascii_case(name)) {
         Some(m) => (m.0.to_string(), m.1.to_string()),
         None if name.contains('/') => (name.rsplit('/').next().unwrap_or(name).to_string(), name.to_string()),
         None => {
-            let known: Vec<&str> = strata::embed::KNOWN_MODELS.iter().map(|m| m.0).collect();
-            return Err(format!("unknown model {name}: one of {}, or a Hugging Face repository owner/name", known.join(", ")));
+            let names: Vec<&str> = known().map(|m| m.0).collect();
+            return Err(format!("unknown model {name}: one of {}, or a Hugging Face repository owner/name", names.join(", ")));
         }
     };
     let out = dir.join(&local);
@@ -325,7 +332,14 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
         std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, out.join(file))).map_err(|e| format!("{}: {e}", out.join(file).display()))?;
         tracing::info!(file, bytes = bytes.len(), "downloaded");
     }
-    strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
+    if !cross_encoder::is_cross_encoder(&out) {
+        strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
+    } else if let Err(e) = cross_encoder::CrossEncoder::open(&local, &out) {
+        match cfg!(feature = "bert") {
+            true => return Err(e.to_string()),
+            false => tracing::warn!(error = %e, "downloaded a cross-encoder this build cannot run"),
+        }
+    }
     Ok(out)
 }
 

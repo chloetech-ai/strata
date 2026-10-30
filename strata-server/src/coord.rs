@@ -922,8 +922,14 @@ impl Coordinator {
         let partial = req.partial.unwrap_or(self.opts.partial);
         let protocol = self.protocol();
         let n = self.replicas.len();
+        // A cross-encoder scores here, over the text of its phase's rows,
+        // which the fetch round reads.
+        let model = select.model_phase().is_some();
+        if model && protocol < 3 {
+            return Err(ApiError::bad("a cross-encoder over shards needs shards that fetch rows (protocol 3)"));
+        }
         // Query then fetch: the query round answers the keys alone.
-        let ids = match protocol >= 3 && self.opts.fetch && n > 1 && strata::cluster::fetches(select, schema) && self.fetch_pays(select) {
+        let ids = match model || (protocol >= 3 && self.opts.fetch && n > 1 && strata::cluster::fetches(select, schema) && self.fetch_pays(select)) {
             true => Some(strata::cluster::ids(select, schema)?),
             false => None,
         };
@@ -1019,7 +1025,23 @@ impl Coordinator {
                     let i = owner.get(&Part::of(k)).ok_or_else(|| ApiError::internal("a merged key no shard answered"))?;
                     keys[*i].push(k.clone());
                 }
-                self.fetch(&req.sql, schema, select, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &stats_json, &mut failed).await?
+                match model {
+                    false => self.fetch(&req.sql, schema, select, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &stats_json, &mut failed).await?,
+                    // The model phase's rows with their text, then the
+                    // model, off the async threads.
+                    true => {
+                        let with = strata::cluster::with_texts(select);
+                        let rows = self.fetch(&req.sql, schema, &with, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &stats_json, &mut failed).await?;
+                        let select = select.clone();
+                        let check = move || match Instant::now() < deadline {
+                            true => Ok(()),
+                            false => Err(strata::Error::Timeout("the query ran past its deadline".into())),
+                        };
+                        tokio::task::spawn_blocking(move || strata::cluster::rerank_models(&select, rows, &mut { check }))
+                            .await
+                            .map_err(|e| ApiError::internal(format!("cross-encoder: {e}")))??
+                    }
+                }
             }
         };
         let missing = failed.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| self.shards[i].clone()).collect();

@@ -313,6 +313,28 @@ SELECT id, score() FROM top ORDER BY sigmoid(gbdt('clicks', bm25(title, :t), bm2
 - **A plan names the model and the hash of its file** (`EXPLAIN` shows `ranking model: docs_ltr (hash …)`) and needs the plan feature `rank_models`. A database or shard whose file of that name is another refuses the plan rather than rank with another model; a plan without a hash runs with the file there. A coordinator scores the shards' rows with the model too, so it needs the same file in its own models directory.
 - `features()` lists a model's inputs' leaves and then the model's score, and from Python `gbdt("docs_ltr", bm25("title", t), col("rating"))` builds the same ranking.
 
+#### Cross-encoders: `cross_encoder('model', fields…, query)`
+
+A cross-encoder reads the query and a row's text together and scores how well the text answers it: far better than BM25 at ordering the best hundred rows, and far slower, so it reranks the top rows of a cheaper ranking, in a rerank phase of its own:
+
+```sql
+WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q) DESC LIMIT 100)
+SELECT id, title, score() FROM top
+ORDER BY cross_encoder('ms-marco-MiniLM-L-6-v2', title, body, :q) DESC LIMIT 10;
+
+-- mixed with other scores of the row, and a phase after it
+WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q) DESC LIMIT 100),
+     ce AS (SELECT * FROM top ORDER BY cross_encoder('bge-reranker-base', body, :q) + 0.1 * coalesce(rating, 0) DESC LIMIT 20)
+SELECT id, score() FROM ce ORDER BY bm25(title, :q) + decay(published, now(), 2592000) DESC LIMIT 10;
+```
+
+- **The model** is a Hugging Face directory `<models>/<model>` holding `config.json`, `tokenizer.json` and `model.safetensors`: a `BertForSequenceClassification` (such as `cross-encoder/ms-marco-MiniLM-L-6-v2`) or an `XLMRobertaForSequenceClassification` (such as `BAAI/bge-reranker-base`), with one label. It runs through candle in `f32` on the CPU, in a server or Python package built with `--features bert` (`accelerate` on a Mac), as BERT embedding models do; without it, a query by such a model is refused. A model is read when a query first uses it and again when one of its files changes. `builtin:overlap` needs no files: the share of the query's distinct words the text holds, for tests and demos.
+- **The text** is the values of the fields named, stored TEXT or KEYWORD fields, joined by a space (`NULL`s left out, each value of a list), and the query is the last argument, a string or a parameter. Query and text together are cut to the model's length (512 tokens at most), the longer of the two first, as Hugging Face's tokenizers cut a pair.
+- **The score is the label's logit**, what sentence-transformers' `CrossEncoder.predict` gives with an identity activation (`sigmoid()` of it is the probability for a model trained with one), equal to PyTorch's within 1e-5. A phase may mix it with other scores of the row (`cross_encoder(…) + 0.1 * rating`), and phases after it rerank the rows it kept.
+- **It runs once per query, in a global phase**: on a database over the rows the phase before it kept, and through a coordinator once on the coordinator, which reads the text of the rows its shards ranked best in the fetch round of query then fetch and scores them; shards need no model. A cross-encoder is refused as the first ranking (rerank a cheaper ranking's top rows), as a column, and among `features()`.
+- **Its cost is per row and per token**: `--max-rerank` on a server (default 1000) refuses a phase that would score more rows, and the query's deadline is checked between batches of 16 rows.
+- **A plan names the model and the hash of its files** (FNV-1a of the three; `EXPLAIN` shows `ranking model: … (hash …)`), with the plan feature `rank_models`, as for [`gbdt`](#ranking-models-gbdtmodel-features). From Python, `.order_by(bm25("body", q)).rerank(cross_encoder("ms-marco-MiniLM-L-6-v2", ["title", "body"], q), 100)` builds the same query.
+
 ### `decay(field, origin, scale, …)`: closeness to a value
 
 A numeric column's closeness to `origin`, as in Elasticsearch's decay functions. With `d = max(0, |x − origin| − offset)`, the score is 1 at `d = 0` and `decay` at `d = scale`:

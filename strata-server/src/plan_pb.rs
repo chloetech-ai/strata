@@ -251,6 +251,7 @@ fn expr(e: &Expr) -> E {
             input: bex(input),
         })),
         Expr::Gbdt { model, hash, args, .. } => E::Gbdt(pb::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(ex).collect() }),
+        Expr::CrossEncoder { model, hash, fields, query, .. } => E::CrossEncoder(pb::CrossEncoder { model: model.clone(), hash: hash.clone(), fields: fields.clone(), query: query.clone() }),
         Expr::Ppr(g) => E::Ppr(Box::new(graph(g))),
         Expr::Subquery(n) => E::Subquery(Box::new(node(n))),
         Expr::Values(n) => E::Values(Box::new(node(n))),
@@ -562,6 +563,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
             Expr::Norm { kind, input: Box::new(from_ex(n.input.map(|x| *x))?) }
         }
         E::Gbdt(g) => Expr::Gbdt { model: g.model, hash: g.hash, args: from_exprs(g.args)?, open: Default::default() },
+        E::CrossEncoder(c) => Expr::CrossEncoder { model: c.model, hash: c.hash, fields: c.fields, query: c.query, open: Default::default() },
         E::Ppr(g) => Expr::Ppr(Box::new(from_graph(*g)?)),
         E::Subquery(n) => Expr::Subquery(Box::new(from_node_in(*n)?)),
         E::Values(n) => Expr::Values(Box::new(from_node_in(*n)?)),

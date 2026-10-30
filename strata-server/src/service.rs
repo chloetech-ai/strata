@@ -168,6 +168,9 @@ pub struct Service {
     pub max_rows: Option<usize>,
     /// The most groups a query may make ([`ExecOptions::max_groups`]).
     pub max_groups: Option<usize>,
+    /// The most rows a cross-encoder's rerank phase may score
+    /// (`--max-rerank`; `None`: no limit).
+    pub max_rerank: Option<usize>,
     /// The memory queries may hold at once ([`ExecOptions::memory`];
     /// `None`: not counted).
     pub query_memory: Option<Arc<MemoryBudget>>,
@@ -250,6 +253,7 @@ impl Service {
             max_timeout: timeout.max(Duration::from_secs(60)),
             slow: None,
             max_rows: None,
+            max_rerank: None,
             max_groups: None,
             query_memory: None,
             max_queued_writes: usize::MAX,
@@ -517,15 +521,33 @@ impl Service {
     /// a database's from its models directory, and a coordinator's from
     /// its own, since it scores the shards' rows with them too. The plan
     /// then names each model's hash, which every shard checks against its
-    /// own file.
-    pub fn open_ranking_models(&self, plan: Arc<Plan>) -> Result<Arc<Plan>, ApiError> {
+    /// own file. A `shard` leaves cross-encoders to its coordinator, which
+    /// refuses a phase that would score more rows with one than
+    /// `--max-rerank` lets it ([`Service::max_rerank`]), as a database
+    /// does.
+    pub fn open_ranking_models(&self, plan: Arc<Plan>, shard: bool) -> Result<Arc<Plan>, ApiError> {
         if !plan.root.has_models() {
             return Ok(plan);
         }
+        if let Some(max) = self.max_rerank.filter(|_| !shard) {
+            let mut over = None;
+            plan.root.each_search(&mut |s| {
+                for p in &s.phases {
+                    let mut cross = false;
+                    p.expr.visit(&mut |x| cross |= matches!(x, strata::query::ir::Expr::CrossEncoder { .. }));
+                    if cross && p.count > max as u64 {
+                        over.get_or_insert(p.count);
+                    }
+                }
+            });
+            if let Some(n) = over {
+                return Err(ApiError::bad(format!("a cross-encoder scores at most {max} rows of a query here (--max-rerank), not {n}: rerank fewer rows by it")));
+            }
+        }
         let mut p = (*plan).clone();
         match &self.backend {
-            Backend::Local(db) => db.open_ranking_models(&mut p)?,
-            Backend::Cluster(_) => self.ranking.open(&self.models_dir.clone().unwrap_or_else(strata::embed::models_dir), &mut p)?,
+            Backend::Local(db) => db.open_ranking_models(&mut p, shard)?,
+            Backend::Cluster(_) => self.ranking.open(&self.models_dir.clone().unwrap_or_else(strata::embed::models_dir), &mut p, true)?,
         }
         Ok(Arc::new(p))
     }
@@ -1064,7 +1086,7 @@ impl Service {
             (Ok(p), Backend::Local(_)) if p.root.has_profiles() => profile::check_plan(&p, &|t, n| self.rank_profile(t, n).map(|p| p.hash())).map(|_| p).map_err(ApiError::from),
             (p, _) => p,
         };
-        let plan = plan.and_then(|p| self.open_ranking_models(p));
+        let plan = plan.and_then(|p| self.open_ranking_models(p, req.shard));
         let bound = match plan {
             Ok(plan) if plan.root.uses_operators() => {
                 // A compound query runs as its plan; a coordinator sends the
@@ -1346,7 +1368,9 @@ impl Service {
             Some(p) => p.clone(),
             None => self.bound(|tables| compound::plan_read(sql, tables, params, &|t, n| self.rank_profile(t, n))).await?,
         };
-        let bound = Arc::unwrap_or_clone(self.open_ranking_models(Arc::new(bound))?);
+        // Statistics are a shard's: its coordinator scores with the
+        // cross-encoders.
+        let bound = Arc::unwrap_or_clone(self.open_ranking_models(Arc::new(bound), true)?);
         if bound.root.uses_operators() {
             return Err(ApiError::bad("term statistics are a single-table query's"));
         }

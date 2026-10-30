@@ -479,7 +479,19 @@ message Expr {
     Norm norm = 36;
     // A ranking model's score of a row; plan feature "rank_models".
     Gbdt gbdt = 37;
+    // A cross-encoder's score of a row's text; plan feature "rank_models".
+    CrossEncoder cross_encoder = 38;
   }
+}
+
+// cross_encoder('model', fields..., query): the model of that name in the
+// models directory, whose files have the hash `hash` (empty: not opened
+// yet), scoring the text of `fields` (joined by a space) for `query`.
+message CrossEncoder {
+  string model = 1;
+  string hash = 2;
+  repeated uint32 fields = 3;
+  string query = 4;
 }
 
 // gbdt('model', features...): the model of that name in the models

@@ -21,6 +21,12 @@
 //! those rows alone, and [`fill`] puts them in the merged order. Stored
 //! fields are read for the page, not for every shard's top rows.
 //!
+//! A query that reranks by a cross-encoder ([`Select::model_phase`]) runs
+//! it once, on the coordinator: shards leave it NULL, the merge ranks up to
+//! its phase and keeps that phase's rows, the fetch round reads their text
+//! with the query's columns ([`with_texts`]), and [`rerank_models`] scores
+//! them and ranks the phases from there on.
+//!
 //! Shards answer with BOOL and TIMESTAMP values as the integers stored,
 //! which the merged answer gives as such ([`Select::typed`]).
 //!
@@ -38,7 +44,7 @@
 use std::cmp::Ordering;
 
 use crate::error::{Error, Result};
-use crate::query::exec::{cmp_values, ExecOptions, ExecStats, ResultSet, DEFAULT_K};
+use crate::query::exec::{cmp_values, ExecOptions, ExecStats, RankParts, ResultSet, DEFAULT_K};
 use crate::query::agg;
 use crate::query::logical::{OrderBy, Pred, Projection, Score, Select, Tiebreak};
 use crate::query::rank::Rank;
@@ -53,7 +59,7 @@ fn err(m: impl Into<String>) -> Error {
 /// the whole collection.
 pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     // The coordinator scores rows with the models too.
-    if let Some(m) = q.unopened_model() {
+    if let Some(m) = q.unopened_model(false) {
         return Err(Error::Query(format!("ranking model {m} is not open on the coordinator: it opens a plan's models from its models directory")));
     }
     let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
@@ -121,13 +127,32 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     if matches!(&q.order, Some(OrderBy::Score { score, .. }) if Rank::of(score, 0).is_some()) {
         rows.sort_by(|a, b| by_score(a.score, b.score, true).then_with(|| by_key(&a.key, &b.key, key_desc)));
     }
-    let want = match first {
-        Some(count) => {
+    let want = match (first, q.model_phase()) {
+        // The rows of a cross-encoder's phase, which the coordinator
+        // scores over their text ([`rerank_models`]).
+        (Some(count), Some(m)) => {
             rows.truncate(count);
-            rows = rerank(q, rows, &mut stats);
+            rows = rerank(q, rows, 0..m, &mut stats);
+            rows.truncate(q.phases[m].count);
+            stats.plan.push(format!("phase {}: {} rows for the cross-encoder, their text fetched", m + 1, rows.len()));
+            let mut out = empty(Vec::with_capacity(rows.len()), stats);
+            let mut phases = Vec::with_capacity(rows.len());
+            for r in rows {
+                out.keys.push(r.key);
+                out.scores.push(r.score);
+                out.rows.push(r.values);
+                phases.push(r.phases);
+            }
+            out.parts = Some(RankParts { phases, ..RankParts::default() });
+            q.typed(&mut out.rows);
+            return Ok(out);
+        }
+        (Some(count), None) => {
+            rows.truncate(count);
+            rows = rerank(q, rows, 0..q.phases.len(), &mut stats);
             q.limit
         }
-        None => want,
+        (None, _) => want,
     };
     let end = want.map_or(rows.len(), |w| w.saturating_add(q.offset).min(rows.len()));
     let rows: Vec<Row> = rows.into_iter().take(end).skip(q.offset).collect();
@@ -200,9 +225,11 @@ pub fn fetch(q: &Select, schema: &Schema, keys: Vec<Value>) -> Result<Select> {
 
 /// The answer to `q`: the rows of `ranked` (the merge of the shards'
 /// answers to [`ids`]) in its order, their columns from `fetched` (the
-/// shards' answers to [`fetch`]) and their scores from `ranked`. A row
-/// that none fetched (it changed between the phases, read from another
-/// version) is left out; the count of those comes back too.
+/// shards' answers to [`fetch`]) and their scores from `ranked`, and what
+/// they rerank by in the phases left ([`RankParts::phases`], for
+/// [`rerank_models`]). A row that none fetched (it changed between the
+/// phases, read from another version) is left out; the count of those
+/// comes back too.
 pub fn fill(q: &Select, ranked: ResultSet, fetched: Vec<ResultSet>) -> Result<(ResultSet, usize)> {
     let mut rows: std::collections::HashMap<agg::Part, Vec<Value>> = std::collections::HashMap::new();
     let mut stats = ranked.stats;
@@ -215,12 +242,17 @@ pub fn fill(q: &Select, ranked: ResultSet, fetched: Vec<ResultSet>) -> Result<(R
     }
     let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
     let mut out = ResultSet { columns, rows: Vec::with_capacity(ranked.keys.len()), keys: Vec::new(), scores: Vec::new(), parts: None, stats };
+    let mut phases = ranked.parts.map(|p| p.phases.into_iter());
     let mut lost = 0;
     for (key, score) in ranked.keys.into_iter().zip(ranked.scores) {
+        let these = phases.as_mut().and_then(|p| p.next());
         let Some(mut row) = rows.remove(&agg::Part::of(&key)) else {
             lost += 1;
             continue;
         };
+        if let Some(p) = these {
+            out.parts.get_or_insert_with(RankParts::default).phases.push(p);
+        }
         for (v, (_, p)) in row.iter_mut().zip(&q.projection) {
             if *p == Projection::Score {
                 // Rows without the ordering column's value score ±inf.
@@ -233,6 +265,92 @@ pub fn fill(q: &Select, ranked: ResultSet, fetched: Vec<ResultSet>) -> Result<(R
     }
     q.typed(&mut out.rows);
     Ok((out, lost))
+}
+
+/// The fields whose text the cross-encoders of `q`'s phases read, each
+/// once, in order: the columns [`with_texts`] adds.
+fn model_fields(q: &Select) -> Vec<usize> {
+    let mut out = Vec::new();
+    for p in &q.phases {
+        p.score.visit(&mut |s| {
+            if let Score::CrossEncoder { fields, .. } = s {
+                for f in fields {
+                    if !out.contains(f) {
+                        out.push(*f);
+                    }
+                }
+            }
+        });
+    }
+    out
+}
+
+/// `q` with a column of each field its cross-encoders read
+/// ([`model_fields`]) after its own: what the fetch round of a query with
+/// a model phase reads, for [`rerank_models`].
+pub fn with_texts(q: &Select) -> Select {
+    let mut out = q.clone();
+    for f in model_fields(q) {
+        out.projection.push((format!("\0text {f}"), Projection::Field(f)));
+        out.types.push(None);
+    }
+    out
+}
+
+/// The answer to `q`, a query with a model phase ([`Select::model_phase`]),
+/// from `rs`: that phase's rows, in order, with the columns of
+/// [`with_texts`] and what each phase reranks them by ([`fill`] of the
+/// merge of [`ids`]). Each phase from the model phase on, its
+/// cross-encoders scoring the rows' text here, once over every shard's
+/// rows, then the page. `check` runs between the model's batches (the
+/// query's deadline).
+pub fn rerank_models(q: &Select, rs: ResultSet, check: &mut dyn FnMut() -> Result<()>) -> Result<ResultSet> {
+    let m = q.model_phase().ok_or_else(|| err("the query ranks with no cross-encoder"))?;
+    let fields = model_fields(q);
+    let own = q.projection.len();
+    let ResultSet { columns, rows: values, keys, scores, parts, mut stats } = rs;
+    let phases = parts.map(|p| p.phases).unwrap_or_default();
+    if phases.len() != values.len() || values.iter().any(|v| v.len() != own + fields.len()) || phases.iter().any(|p| p.len() != q.phases.len()) {
+        return Err(err("the rows of a model phase came without their text or what their phases rerank by"));
+    }
+    let mut rows: Vec<Row> = values
+        .into_iter()
+        .zip(keys)
+        .zip(scores)
+        .zip(phases)
+        .map(|(((values, key), score), phases)| Row { values, key, score, inputs: Vec::new(), ranked: Vec::new(), phases })
+        .collect();
+    for (j, p) in q.phases.iter().enumerate().skip(m) {
+        rows.truncate(p.count);
+        let rank = Rank::of_phase(&p.score);
+        for (l, leaf) in rank.leaves.iter().enumerate() {
+            let Score::CrossEncoder { model, fields: read, query, open, .. } = leaf else { continue };
+            let model = open.0.as_ref().ok_or_else(|| err(format!("cross-encoder {model} is not open on the coordinator: it opens a plan's models from its models directory")))?;
+            let texts: Vec<String> = rows
+                .iter()
+                .map(|r| crate::query::cross_encoder::text_of(read.iter().map(|f| fields.iter().position(|x| x == f).map_or(Value::Null, |i| r.values[own + i].clone()))))
+                .collect();
+            let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+            for (r, s) in rows.iter_mut().zip(model.score(query, &texts, check)?) {
+                r.phases[j][l] = Some(s).filter(|x| x.is_finite());
+            }
+            stats.plan.push(format!("cross-encoder {}: scored {} rows", model.name, rows.len()));
+        }
+        rows = rerank(q, rows, j..j + 1, &mut stats);
+    }
+    let end = q.limit.map_or(rows.len(), |l| l.saturating_add(q.offset).min(rows.len()));
+    let score_cols: Vec<usize> = q.projection.iter().enumerate().filter(|(_, (_, p))| *p == Projection::Score).map(|(i, _)| i).collect();
+    let mut out = ResultSet { columns: columns.into_iter().take(own).collect(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats };
+    for mut r in rows.into_iter().take(end).skip(q.offset) {
+        r.values.truncate(own);
+        for &c in &score_cols {
+            r.values[c] = if r.score.is_finite() { Value::Float(r.score) } else { Value::Null };
+        }
+        out.keys.push(r.key);
+        out.scores.push(r.score);
+        out.rows.push(r.values);
+    }
+    Ok(out)
 }
 
 /// One row of a shard's answer.
@@ -250,14 +368,14 @@ struct Row {
     phases: Vec<Vec<Option<f64>>>,
 }
 
-/// The rerank phases of `q` over `rows`, the top `count` of its first
-/// phase in order: each phase's rows, cut to its `count`, ranked by it as
-/// one database ranks them, rows tied keeping their order. A second phase
+/// The rerank phases `which` of `q` over `rows`, in the order of the phase
+/// before: each phase's rows, cut to its `count`, ranked by it as one
+/// database ranks them, rows tied keeping their order. A second phase
 /// ranks by the scores the shards sent; a global one is scored here, over
 /// every row it reranks, from its leaves' values.
-fn rerank(q: &Select, mut rows: Vec<Row>, stats: &mut ExecStats) -> Vec<Row> {
+fn rerank(q: &Select, mut rows: Vec<Row>, which: std::ops::Range<usize>, stats: &mut ExecStats) -> Vec<Row> {
     let nan = |x: Option<f64>| x.unwrap_or(f64::NAN);
-    for (j, p) in q.phases.iter().enumerate() {
+    for (j, p) in q.phases.iter().enumerate().skip(which.start).take(which.len()) {
         rows.truncate(p.count);
         let order = match p.global {
             false => Rank::by_scores(rows.iter().map(|r| nan(r.phases[j].first().copied().flatten())).collect()),

@@ -25,6 +25,9 @@
 //! file) goes into the plans that use it, so that a database or
 //! coordinator whose model of that name is another file refuses such a
 //! plan rather than rank with another model ([`Models::open`]).
+//!
+//! Cross-encoders (`cross_encoder()`, [`crate::query::cross_encoder`]) are
+//! opened from the same directory the same way.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +37,7 @@ use std::time::SystemTime;
 use serde_json::Value as Json;
 
 use crate::error::{Error, Result};
+use crate::query::cross_encoder::{self, CrossEncoder};
 use crate::query::ir::{Expr, Plan};
 
 /// The file of a GBDT model in its directory.
@@ -482,19 +486,26 @@ fn fnv(bytes: &[u8]) -> u64 {
 }
 
 /// The ranking models of a models directory, opened on first use and
-/// again when their file changes.
+/// again when their files change.
 #[derive(Default)]
 pub struct Models {
     open: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<Gbdt>)>>,
+    cross: Mutex<HashMap<PathBuf, (Vec<(SystemTime, u64)>, Arc<CrossEncoder>)>>,
+}
+
+/// Refuses a model name that is not a directory's own name.
+fn check_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.starts_with('.') || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c)) {
+        return Err(Error::Query(format!("a ranking model's name is letters, digits, _, - and ., not {name:?}")));
+    }
+    Ok(())
 }
 
 impl Models {
     /// The GBDT model `name` of the directory `dir`: its file
     /// `<dir>/<name>/gbdt.json`, read again if it changed since.
     pub fn gbdt(&self, dir: &Path, name: &str) -> Result<Arc<Gbdt>> {
-        if name.is_empty() || name.starts_with('.') || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c)) {
-            return Err(Error::Query(format!("a ranking model's name is letters, digits, _, - and ., not {name:?}")));
-        }
+        check_name(name)?;
         let path = dir.join(name).join(GBDT_FILE);
         let meta = std::fs::metadata(&path).map_err(|_| Error::Query(format!("no ranking model named {name}: no file {}", path.display())))?;
         let stamp = (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len());
@@ -508,39 +519,92 @@ impl Models {
         open.insert(path, (stamp.0, stamp.1, m.clone()));
         Ok(m)
     }
+
+    /// The cross-encoder `name` of the directory `dir` (its files under
+    /// `<dir>/<name>`, opened again if one changed since), or the built-in
+    /// one ([`cross_encoder::OVERLAP`]).
+    pub fn cross_encoder(&self, dir: &Path, name: &str) -> Result<Arc<CrossEncoder>> {
+        if name == cross_encoder::OVERLAP {
+            return Ok(Arc::new(CrossEncoder::open(name, dir)?));
+        }
+        check_name(name)?;
+        let path = dir.join(name);
+        let stamp: Vec<(SystemTime, u64)> = cross_encoder::FILES
+            .iter()
+            .map(|f| std::fs::metadata(path.join(f)).map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len())).unwrap_or((SystemTime::UNIX_EPOCH, 0)))
+            .collect();
+        // Opened outside the lock: hashing a large model takes seconds.
+        if let Some((t, m)) = self.cross.lock().unwrap_or_else(|e| e.into_inner()).get(&path) {
+            if *t == stamp {
+                return Ok(m.clone());
+            }
+        }
+        let m = Arc::new(CrossEncoder::open(name, &path)?);
+        self.cross.lock().unwrap_or_else(|e| e.into_inner()).insert(path, (stamp, m.clone()));
+        Ok(m)
+    }
 }
 
 impl Models {
     /// Opens the models that the plan's `gbdt()` calls name, from `dir`,
-    /// for its Searches to rank with. A call whose plan names a hash runs
-    /// only with the model of that hash, and a plan with another one is
-    /// refused ([`stale`]); a call without one (a plan just bound from
-    /// SQL) gets the hash of the model opened, which the plan then names
-    /// to the shards that run it.
-    pub fn open(&self, dir: &Path, plan: &mut Plan) -> Result<()> {
+    /// for its Searches to rank with, and its cross-encoders unless
+    /// `cross` is false (a shard, whose coordinator scores with them). A
+    /// call whose plan names a hash runs only with the model of that hash,
+    /// and a plan with another one is refused ([`stale`]); a call without
+    /// one (a plan just bound from SQL) gets the hash of the model opened,
+    /// which the plan then names to the shards that run it.
+    pub fn open(&self, dir: &Path, plan: &mut Plan, cross: bool) -> Result<()> {
         plan.root.visit_exprs_mut(&mut |e| {
-            if let Expr::Gbdt { model, hash, open, .. } = e {
-                let m = self.gbdt(dir, model)?;
-                if !hash.is_empty() && *hash != m.hash {
-                    return Err(stale(model, &m.hash, hash));
+            match e {
+                Expr::Gbdt { model, hash, open, .. } => {
+                    let m = self.gbdt(dir, model)?;
+                    if !hash.is_empty() && *hash != m.hash {
+                        return Err(stale(model, &m.hash, hash));
+                    }
+                    hash.clone_from(&m.hash);
+                    *open = Opened(Some(m));
                 }
-                hash.clone_from(&m.hash);
-                *open = Opened(Some(m));
+                Expr::CrossEncoder { model, hash, open, .. } if cross => {
+                    let m = self.cross_encoder(dir, model)?;
+                    if !hash.is_empty() && *hash != m.hash {
+                        return Err(stale(model, &m.hash, hash));
+                    }
+                    hash.clone_from(&m.hash);
+                    *open = Opened(Some(m));
+                }
+                _ => {}
             }
             Ok(())
         })
     }
 }
 
-/// The model a `gbdt()` call of a plan runs with, once a database or
-/// coordinator opened it ([`Models::open`]). A plan's JSON and protobuf
-/// leave it out (they name the model and its hash), and it equals any
-/// other.
-#[derive(Clone, Debug, Default)]
-pub struct Opened(pub Option<Arc<Gbdt>>);
+/// The model a `gbdt()` or `cross_encoder()` call of a plan runs with,
+/// once a database or coordinator opened it ([`Models::open`]). A plan's
+/// JSON and protobuf leave it out (they name the model and its hash), and
+/// it equals any other.
+pub struct Opened<T = Gbdt>(pub Option<Arc<T>>);
 
-impl PartialEq for Opened {
-    fn eq(&self, _: &Opened) -> bool {
+impl<T> Clone for Opened<T> {
+    fn clone(&self) -> Self {
+        Opened(self.0.clone())
+    }
+}
+
+impl<T> Default for Opened<T> {
+    fn default() -> Self {
+        Opened(None)
+    }
+}
+
+impl<T> std::fmt::Debug for Opened<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Opened" } else { "NotOpened" })
+    }
+}
+
+impl<T> PartialEq for Opened<T> {
+    fn eq(&self, _: &Opened<T>) -> bool {
         true
     }
 }

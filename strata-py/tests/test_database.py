@@ -6,7 +6,7 @@ import threading
 import pytest
 
 import strata
-from strata import bm25, col, gbdt, score
+from strata import bm25, col, cross_encoder, gbdt, score
 from conftest import BOOKS, book
 
 
@@ -352,3 +352,28 @@ def test_gbdt(tmp_path):
             db.query("SELECT id FROM books ORDER BY gbdt('m', rating, year) DESC LIMIT 5")
         with pytest.raises(strata.StrataError, match="no ranking model named nope"):
             db.query("SELECT id FROM books ORDER BY gbdt('nope', rating, year, year) DESC LIMIT 5")
+
+
+def test_cross_encoder(tmp_path):
+    with strata.Database.create(tmp_path / "books.strata", BOOKS) as db:
+        db.insert([book(i) for i in range(200)])
+        ce = "cross_encoder('builtin:overlap', title, description, :q)"
+        top = "WITH top AS (SELECT * FROM books ORDER BY bm25(description, :q) DESC LIMIT 30)"
+        sql = f"{top} SELECT id, score(), features() FROM top ORDER BY {ce} DESC LIMIT 5"
+        r = db.query(sql, q="dragon ship winter")
+        assert len(r) == 5 and r.scores == sorted(r.scores, reverse=True) and r.scores[0] > 0
+        # The model is no feature: features() lists the first ranking's.
+        assert r.columns == ["id", "score()", "bm25(description, :q)"]
+        # The builder ranks as the SQL does, in a global phase.
+        q = db.table().select("id", score()).order_by(bm25("description", "dragon ship winter"))
+        q = q.rerank(cross_encoder("builtin:overlap", ["title", "description"], "dragon ship winter"), 30).limit(5)
+        assert q.plan()["root"]["input"]["input"]["phases"][0]["global"] is True
+        got = db.run(q)
+        assert (got.keys, got.scores) == (r.keys, r.scores)
+        plan = db.plan(sql, q="dragon ship winter")
+        assert "rank_models" in plan["features"] and '"cross_encoder":{"model":"builtin:overlap","hash":"builtin"' in json.dumps(plan, separators=(",", ":"))
+        assert db.run(plan).keys == r.keys
+        with pytest.raises(strata.StrataError, match="a cross-encoder reranks the top rows of a cheaper ranking"):
+            db.query(f"SELECT id FROM books ORDER BY {ce} DESC LIMIT 5", q="dragon")
+        with pytest.raises(strata.StrataError, match="no cross-encoder named nope"):
+            db.query(f"{top} SELECT id FROM top ORDER BY cross_encoder('nope', title, :q) DESC LIMIT 5", q="dragon")

@@ -1007,7 +1007,8 @@ impl<'a> Binder<'a> {
     /// ranking (a column, or a score such as `bm25(body, :q)`), then each
     /// phase's expression that is not a leaf and scores a row by itself,
     /// each once, named by its SQL text. A ranking by `distance(..)`
-    /// reads its `similarity(..)`.
+    /// reads its `similarity(..)`. A cross-encoder, which scores only in a
+    /// global phase, is not one.
     fn feature_items(&self, orders: &[&Expr]) -> Result<Vec<Expr>> {
         // Functions of other scores, and the rows they read.
         let inner = |f: &sql::Function| matches!(fname(f).as_str(), "rrf" | "minmax" | "rank" | "gbdt") || Func::numeric(&fname(f)).is_some();
@@ -1030,6 +1031,8 @@ impl<'a> Binder<'a> {
                         leaves(b, a, leaf, out)?;
                     }
                 }
+                // A cross-encoder scores in a global phase alone.
+                Expr::Function(f) if fname(f) == "cross_encoder" => {}
                 Expr::Function(f) if fname(f) == "distance" => {
                     let mut g = f.clone();
                     g.name = sql::ObjectName::from(vec![sql::Ident::new("similarity")]);
@@ -1045,7 +1048,8 @@ impl<'a> Binder<'a> {
         }
         for e in orders {
             let e = strip_nested(e);
-            if !leaf(e) && Rank::of(&self.score(e)?, 0).is_none_or(|r| r.is_row_local()) {
+            let score = self.score(e)?;
+            if !leaf(e) && !score.has_cross_encoder() && Rank::of(&score, 0).is_none_or(|r| r.is_row_local()) {
                 items.push(e.clone());
             }
         }
@@ -1329,6 +1333,26 @@ impl<'a> Binder<'a> {
                             return Err(err(usage));
                         }
                         Ok(Score::Gbdt { model, hash: String::new(), args: features.iter().map(|a| self.rank(a)).collect::<Result<_>>()?, open: Default::default() })
+                    }
+                    "cross_encoder" => {
+                        let usage = "cross_encoder('model', field, ..., query) takes a model's name, the fields whose text it reads and the query";
+                        let [model, fields @ .., query] = args.as_slice() else { return Err(err(usage)) };
+                        let model = self.literal(model).ok().and_then(|v| v.as_str().map(str::to_string)).ok_or_else(|| err(usage))?;
+                        let query = self.literal(query).ok().and_then(|v| v.as_str().map(str::to_string)).ok_or_else(|| err(usage))?;
+                        if fields.is_empty() || !opts.is_empty() {
+                            return Err(err(usage));
+                        }
+                        let fields = fields
+                            .iter()
+                            .map(|f| {
+                                let f = self.typed_field(f, |t| matches!(t, FieldType::Text { .. } | FieldType::Keyword), "TEXT or KEYWORD")?;
+                                match self.schema.fields[f].stored {
+                                    true => Ok(f),
+                                    false => Err(err(format!("cross_encoder reads a stored field's text, and {} is not stored", self.schema.fields[f].name))),
+                                }
+                            })
+                            .collect::<Result<_>>()?;
+                        Ok(Score::CrossEncoder { model, hash: String::new(), fields, query, open: Default::default() })
                     }
                     n => match Func::numeric(n) {
                         Some(func) => {

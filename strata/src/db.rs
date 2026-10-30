@@ -459,19 +459,20 @@ impl Db {
         failed
     }
 
-    /// Opens the ranking models a plan's `gbdt()` calls name
-    /// ([`crate::query::model`]) from the models directory: the one
-    /// [`Db::open_embedders`] was given, else
-    /// [`crate::embed::models_dir`]. A plan that names the hash of another
-    /// file of a model is refused; one without gets the hashes of the files
-    /// opened. [`Db::run`] and [`Db::query`] open a plan's models
-    /// themselves.
-    pub fn open_ranking_models(&self, plan: &mut Plan) -> Result<()> {
+    /// Opens the ranking models a plan's `gbdt()` and `cross_encoder()`
+    /// calls name ([`crate::query::model`]) from the models directory: the
+    /// one [`Db::open_embedders`] was given, else
+    /// [`crate::embed::models_dir`]. A `shard`
+    /// ([`crate::query::exec::ExecOptions::shard`]) leaves cross-encoders
+    /// to its coordinator. A plan that names the hash of another file of a
+    /// model is refused; one without gets the hashes of the files opened.
+    /// [`Db::run`] and [`Db::query`] open a plan's models themselves.
+    pub fn open_ranking_models(&self, plan: &mut Plan, shard: bool) -> Result<()> {
         if !plan.root.has_models() {
             return Ok(());
         }
         let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(crate::embed::models_dir);
-        self.ranking.open(&dir, plan)
+        self.ranking.open(&dir, plan, !shard)
     }
 
     /// Trains a semantic-ID codebook ([`crate::sid::Codebook::train`]) on the
@@ -548,7 +549,7 @@ impl Db {
         let plan = match plan.root.has_models() {
             true => {
                 let mut p = plan.clone();
-                self.open_ranking_models(&mut p)?;
+                self.open_ranking_models(&mut p, false)?;
                 opened = p;
                 &opened
             }
@@ -689,7 +690,7 @@ impl Db {
         if let sqlparser::ast::Statement::Query(q) = stmt {
             // The plan names the files of its ranking models.
             let mut plan = plan_of(&self.snapshot(), q, params)?;
-            self.open_ranking_models(&mut plan)?;
+            self.open_ranking_models(&mut plan, false)?;
             return Ok(plan);
         }
         let catalog = self.catalog();

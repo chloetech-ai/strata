@@ -16,7 +16,7 @@ use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, Ran
 use crate::graph::GraphReader;
 use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
-use crate::query::logical::{Decay, Expand, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak};
+use crate::query::logical::{Decay, Expand, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak, CROSS_ENCODER_FIRST};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
@@ -554,8 +554,14 @@ impl<'a> Executor<'a> {
     }
 
     pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
-        if let Some(m) = q.unopened_model() {
+        if let Some(m) = q.unopened_model(self.opts.shard) {
             return Err(err(format!("ranking model {m} is not open: Db::query and Db::run open the models of a query's plan (Db::open_ranking_models)")));
+        }
+        if matches!(&q.order, Some(OrderBy::Score { score, .. }) if score.has_cross_encoder()) {
+            return Err(err(CROSS_ENCODER_FIRST));
+        }
+        if q.projection.iter().any(|(_, p)| matches!(p, Projection::Feature(s) if s.has_cross_encoder())) {
+            return Err(err("a cross-encoder ranks in a rerank phase, not in a column: rank by it and select score()"));
         }
         let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
         if self.opts.shard && has_graphs(q) {
@@ -2012,7 +2018,38 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+            // A shard leaves it to its coordinator, which scores the rows
+            // of every shard at once ([`crate::cluster::rerank_models`]).
+            Score::CrossEncoder { .. } if self.opts.shard => out.fill(f64::NAN),
+            Score::CrossEncoder { model, fields, query, open, .. } => {
+                let m = open.0.as_ref().ok_or_else(|| err(format!("cross-encoder {model} is not open")))?;
+                let texts = self.texts(fields, cands)?;
+                let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+                out = m.score(query, &texts, &mut || self.check_deadline())?;
+            }
             _ => return Err(err("a ranking expression's leaves are bm25, similarity, ppr, hops, decay, seq_no() or a column")),
+        }
+        Ok(out)
+    }
+
+    /// The text a cross-encoder reads of each candidate: its values of
+    /// `fields` ([`crate::query::cross_encoder::text_of`]).
+    fn texts(&self, fields: &[usize], cands: &[(usize, DocId)]) -> Result<Vec<String>> {
+        let mut out = vec![String::new(); cands.len()];
+        for (seg, range) in group_by_seg(cands) {
+            self.check_deadline()?;
+            let s = &self.seg_by_ord(seg);
+            let store = s.r.store()?;
+            for i in range {
+                let d = cands[i].1;
+                let mut stored = store.map(|st| st.get_fields(d, fields)).unwrap_or_default();
+                stored.resize(fields.len(), Value::Null);
+                let values = fields.iter().zip(stored).map(|(&f, v)| match self.updates(s, f).and_then(|u| u.get(f, d)) {
+                    Some(u) => u.clone(),
+                    None => v,
+                });
+                out[i] = crate::query::cross_encoder::text_of(values);
+            }
         }
         Ok(out)
     }

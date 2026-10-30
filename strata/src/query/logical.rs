@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::query::ir::{ArithOp, Func, NormKind};
+use crate::query::cross_encoder::CrossEncoder;
 use crate::query::model::Opened;
 use crate::value::Value;
 
@@ -299,10 +300,20 @@ pub enum Score {
     /// ([`crate::query::model`]): the model named `model`, of the file
     /// whose hash is `hash`, once opened ([`super::ir::Expr::Gbdt`]).
     Gbdt { model: String, hash: String, args: Vec<Score>, open: Opened },
+    /// A cross-encoder's score of the row's text (`fields`' values joined
+    /// by a space) for `query` ([`crate::query::cross_encoder`],
+    /// [`super::ir::Expr::CrossEncoder`]): a leaf that only a global
+    /// rerank phase ranks by. A shard leaves it NULL, for its coordinator
+    /// to score ([`crate::cluster::rerank_models`]).
+    CrossEncoder { model: String, hash: String, fields: Vec<usize>, query: String, open: Opened<CrossEncoder> },
     /// `CASE WHEN c THEN x ... ELSE y END`, each `c` a [`Score::Cond`]; NULL
     /// without an `ELSE`.
     Case { whens: Vec<(Score, Score)>, otherwise: Option<Box<Score>> },
 }
+
+/// The error of a query that ranks by a cross-encoder first, rather than
+/// in a rerank phase.
+pub const CROSS_ENCODER_FIRST: &str = "a cross-encoder reranks the top rows of a cheaper ranking, in a rerank phase: WITH top AS (SELECT * FROM t ORDER BY bm25(body, :q) DESC LIMIT 100) SELECT ... FROM top ORDER BY cross_encoder('model', body, :q) DESC";
 
 impl Score {
     /// Calls `f` on the expression and each within it.
@@ -345,8 +356,25 @@ impl Score {
     pub fn is_leaf(&self) -> bool {
         matches!(
             self,
-            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Cond(_)
+            Score::Bm25 { .. }
+                | Score::Similarity { .. }
+                | Score::Sparse { .. }
+                | Score::Column { .. }
+                | Score::Ppr { .. }
+                | Score::Hops { .. }
+                | Score::Decay { .. }
+                | Score::SeqNo
+                | Score::Cond(_)
+                | Score::CrossEncoder { .. }
         )
+    }
+
+    /// Whether a cross-encoder scores within the expression, which only a
+    /// global rerank phase ranks by.
+    pub fn has_cross_encoder(&self) -> bool {
+        let mut found = false;
+        self.visit(&mut |x| found |= matches!(x, Score::CrossEncoder { .. }));
+        found
     }
 
     pub fn opts(&self) -> Option<&Opts> {
@@ -507,8 +535,8 @@ pub struct Phase {
     pub count: usize,
     /// Scored once over every row the phase reranks, on the coordinator
     /// over shards: a set function (`minmax`, `rank`, `rrf`) reads them
-    /// all. A phase that is not global is row-local, and each shard scores
-    /// its own rows.
+    /// all, and a cross-encoder runs once per query. A phase that is not
+    /// global is row-local, and each shard scores its own rows.
     pub global: bool,
 }
 
@@ -590,8 +618,9 @@ pub struct Select {
 impl Select {
     /// A ranking model the query ranks with that is not open
     /// ([`crate::query::model::Models::open`]): the executor refuses the
-    /// query rather than rank by NULL.
-    pub fn unopened_model(&self) -> Option<String> {
+    /// query rather than rank by NULL. A `shard` scores no cross-encoder,
+    /// which its coordinator opens.
+    pub fn unopened_model(&self, shard: bool) -> Option<String> {
         let order = self.order.iter().filter_map(|o| match o {
             OrderBy::Score { score, .. } => Some(score),
             _ => None,
@@ -603,12 +632,25 @@ impl Select {
         let mut found = None;
         for s in order.chain(self.phases.iter().map(|p| &p.score)).chain(features) {
             s.visit(&mut |x| {
-                if let Score::Gbdt { model, open: Opened(None), .. } = x {
-                    found.get_or_insert_with(|| model.clone());
+                match x {
+                    Score::Gbdt { model, open: Opened(None), .. } => {
+                        found.get_or_insert_with(|| model.clone());
+                    }
+                    Score::CrossEncoder { model, open: Opened(None), .. } if !shard => {
+                        found.get_or_insert_with(|| model.clone());
+                    }
+                    _ => {}
                 }
             });
         }
         found
+    }
+
+    /// The first rerank phase that a cross-encoder scores in, which a
+    /// coordinator runs itself over the text the shards fetch
+    /// ([`crate::cluster::rerank_models`]).
+    pub fn model_phase(&self) -> Option<usize> {
+        self.phases.iter().position(|p| p.score.has_cross_encoder())
     }
 
     /// `rows` with the values of BOOL and TIMESTAMP columns as

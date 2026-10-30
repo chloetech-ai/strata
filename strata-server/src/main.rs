@@ -174,6 +174,11 @@ struct Args {
     /// limit).
     #[arg(long, default_value_t = 65_536)]
     max_groups: usize,
+    /// The most rows a cross-encoder's rerank phase may score, on a
+    /// database or a coordinator: a query whose phase asks for more fails
+    /// (0: no limit).
+    #[arg(long, default_value_t = 1000)]
+    max_rerank: usize,
     /// Memory the running queries may hold together, in MiB: their groups,
     /// candidate rows, answers and joins; a query that needs more fails
     /// with 429 (default: a third of the cgroup memory limit, or of RAM;
@@ -377,6 +382,7 @@ async fn main() {
         max_concurrent: a.max_concurrent,
         max_result_window: a.max_result_window,
         max_groups: a.max_groups,
+        max_rerank: a.max_rerank,
         query_memory_mb: a.query_memory_mb,
         max_queued_writes: a.max_queued_writes,
         max_body_mb: a.max_body_mb,

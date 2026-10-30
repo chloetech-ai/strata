@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::query::logical::{AggFn, Decay, Direction, Expand, Opts};
+use crate::query::cross_encoder::CrossEncoder;
 use crate::query::model::Opened;
 use crate::value::Value;
 
@@ -96,7 +97,8 @@ pub const RANK_FEATURES: &str = "rank_features";
 /// ([`Search::profile`]).
 pub const RANK_PROFILES: &str = "rank_profiles";
 
-/// The feature of a plan that ranks with a model ([`Expr::Gbdt`]).
+/// The feature of a plan that ranks with a model ([`Expr::Gbdt`],
+/// [`Expr::CrossEncoder`]).
 pub const RANK_MODELS: &str = "rank_models";
 
 /// A statement as a tree of operators ([module docs](self)).
@@ -629,6 +631,20 @@ pub enum Expr {
         #[serde(skip)]
         open: Opened,
     },
+    /// A cross-encoder's score of the row's text for `query`: `fields`'
+    /// values joined by a space ([`crate::query::cross_encoder`], feature
+    /// [`RANK_MODELS`]); `model` and `hash` as a [`Expr::Gbdt`]'s. Only a
+    /// global rerank phase ranks by one, on the database or coordinator:
+    /// a shard leaves it to its coordinator, which fetches the text.
+    CrossEncoder {
+        model: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hash: String,
+        fields: Vec<u32>,
+        query: String,
+        #[serde(skip)]
+        open: Opened<CrossEncoder>,
+    },
     /// Personalized PageRank from a traversal's seeds.
     Ppr(Box<Graph>),
     /// The rows of a plan (graph seeds from a query of the table, which
@@ -830,7 +846,7 @@ impl Node {
     /// Whether the plan ranks with a model ([`RANK_MODELS`]).
     pub fn has_models(&self) -> bool {
         let mut found = false;
-        self.visit_exprs(&mut |e| found |= matches!(e, Expr::Gbdt { .. }));
+        self.visit_exprs(&mut |e| found |= matches!(e, Expr::Gbdt { .. } | Expr::CrossEncoder { .. }));
         found
     }
 

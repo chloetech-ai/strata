@@ -1886,6 +1886,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "csv",
+ "gemm",
  "libc",
  "lz4_flex 0.11.6",
  "memmap2",
