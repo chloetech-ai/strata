@@ -343,17 +343,18 @@ async fn replicas_hold_their_primarys_offsets() {
     for i in 0..200 {
         p.write_ops(sourced(i), None).await.unwrap();
     }
+    // A replica's number reaches its primary's when it has applied the
+    // last transaction, and its snapshot shows it a moment later.
     let seq = |db: &Db| db.storage().seq_no().unwrap().seq;
-    until("the replica holds the primary's last", || seq(&shipped) == seq(&pdb)).await;
+    until("the replica holds the primary's last", || seq(&shipped) == seq(&pdb) && offset_of(&shipped, SOURCE) == Some(199)).await;
     assert_eq!(shipped.sources().unwrap(), pdb.sources().unwrap());
-    assert_eq!(offset_of(&shipped, SOURCE), Some(199));
 
     let copied = numbered(&dir.path().join("r2.strata"), 64 << 20);
     let mut svc = service(copied.clone());
     svc.set_replication(Replication::Replica(Arc::new(Follow::open(copied.clone(), None).unwrap())));
     tokio::spawn(server::serve_grpc(Arc::new(svc), TcpListener::bind(copied_at).await.unwrap(), Access::default()));
     let t0 = Instant::now();
-    while seq(&copied) != seq(&pdb) {
+    while seq(&copied) != seq(&pdb) || offset_of(&copied, SOURCE) != Some(199) {
         if t0.elapsed() > Duration::from_secs(20) {
             panic!("the late replica: {}", p.health().await["replication"]);
         }
