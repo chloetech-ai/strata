@@ -114,8 +114,8 @@ fn split_collection_answers_like_the_whole() {
         "SELECT id, score() FROM docs ORDER BY bm25(body, :t) DESC LIMIT 5 OFFSET 7".into(),
         "SELECT id, score() FROM docs ORDER BY similarity(emb, :q) DESC LIMIT 10".into(),
         "SELECT id, score() FROM docs WHERE rating > 2.5 ORDER BY similarity(emb, :q) DESC LIMIT 10".into(),
-        "SELECT id, score() FROM docs ORDER BY 0.3 * bm25(body, :t) + 0.7 * similarity(emb, :q) DESC LIMIT 10".into(),
-        "SELECT id, score() FROM docs WHERE year < 2015 ORDER BY 0.5 * bm25(body, :t, depth => 40) + 0.5 * similarity(emb, :q) DESC LIMIT 15".into(),
+        "SELECT id, score() FROM docs ORDER BY 0.3 * minmax(bm25(body, :t)) + 0.7 * minmax(similarity(emb, :q)) DESC LIMIT 10".into(),
+        "SELECT id, score() FROM docs WHERE year < 2015 ORDER BY 0.5 * minmax(bm25(body, :t, depth => 40)) + 0.5 * minmax(similarity(emb, :q)) DESC LIMIT 15".into(),
         "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10".into(),
         "SELECT id, rating FROM docs WHERE category = 'c03' ORDER BY rating DESC, id LIMIT 12 OFFSET 3".into(),
         "SELECT id, year FROM docs WHERE MATCH(body, :t) ORDER BY year, id LIMIT 25".into(),
@@ -209,7 +209,7 @@ fn tied_scores_cut_and_rank_alike() {
         "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10",
         "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q), depth => 7) DESC LIMIT 10",
         "SELECT id, score() FROM docs ORDER BY bm25(body, :t, depth => 7) * decay(year, 2020, 5) DESC LIMIT 10",
-        "SELECT id, score() FROM docs ORDER BY 0.5 * bm25(body, :t, depth => 7) + 0.5 * similarity(emb, :q) DESC LIMIT 10",
+        "SELECT id, score() FROM docs ORDER BY 0.5 * minmax(bm25(body, :t, depth => 7)) + 0.5 * minmax(similarity(emb, :q)) DESC LIMIT 10",
     ];
     for sql in queries {
         let want = whole.query(sql, &params).unwrap();
@@ -236,7 +236,7 @@ fn pages_past_the_depth_split_alike() {
     let params = Params::new().set("q", docs[42][data::col::EMB].clone()).set("t", Value::Str(text));
     let queries = [
         ("SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q), depth => 7) DESC LIMIT 10 OFFSET 20", 10),
-        ("SELECT id, score() FROM docs ORDER BY 0.5 * bm25(body, :t, depth => 5) + 0.5 * similarity(emb, :q) DESC LIMIT 30", 30),
+        ("SELECT id, score() FROM docs ORDER BY 0.5 * minmax(bm25(body, :t, depth => 5)) + 0.5 * minmax(similarity(emb, :q)) DESC LIMIT 30", 30),
         ("SELECT id, score() FROM docs ORDER BY bm25(body, :t, depth => 7) * decay(year, 2020, 5) DESC LIMIT 10 OFFSET 15", 10),
         ("SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC OFFSET 10", 100),
         ("SELECT id, score() FROM docs ORDER BY bm25(body, :t) DESC OFFSET 30", 100),

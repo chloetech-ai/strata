@@ -630,6 +630,7 @@ impl<'a> Executor<'a> {
                 let k = if q.limit.is_some() { want.unwrap_or(0) } else { DEFAULT_K.saturating_add(q.offset).min(self.n_live()) };
                 self.ranked(score, &q.filter, k, q.tiebreak.as_ref())?
             }
+            Some(OrderBy::Score { score, .. }) if Rank::of(score, 0).is_some() => return Err(err("a ranking expression is ordered DESC (negate it to rank the smallest first)")),
             Some(OrderBy::Score { .. }) => return Err(err("relevance scores can only be ordered DESC")),
             Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
         })
@@ -1654,8 +1655,9 @@ impl<'a> Executor<'a> {
         // Each generating leaf's top rows: the candidates, and the rankings
         // RRF and a coordinator read.
         let mut lists: Vec<Vec<(usize, DocId)>> = Vec::with_capacity(rank.leaves.len());
+        let rankings = rank.reads_rankings();
         for (s, &generates) in rank.leaves.iter().zip(&rank.generates) {
-            lists.push(if generates && (shard || !rank.exact) { self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect() } else { Vec::new() });
+            lists.push(if generates && (shard || rankings || !rank.exact) { self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect() } else { Vec::new() });
         }
         let cands: Vec<(usize, DocId)> = if rank.exact {
             let mut all = Vec::new();
@@ -1672,12 +1674,12 @@ impl<'a> Executor<'a> {
         let mut values = Vec::new();
         if shard || rank.reads_values() {
             for s in &rank.leaves {
-                values.push(self.exact_scores(s, &cands)?.into_iter().map(f64::from).collect::<Vec<f64>>());
+                values.push(self.exact_scores(s, &cands)?);
             }
             self.stats.scored += cands.len() as u64;
         }
         // Rankings by candidate, where RRF or a coordinator reads them.
-        let ranks: Vec<Vec<usize>> = if shard || !rank.reads_values() {
+        let ranks: Vec<Vec<usize>> = if shard || rankings {
             let at: HashMap<(usize, DocId), usize> = cands.iter().enumerate().map(|(i, c)| (*c, i)).collect();
             lists.iter().map(|l| l.iter().map(|c| at[c]).collect()).collect()
         } else {
@@ -1687,7 +1689,9 @@ impl<'a> Executor<'a> {
         self.order_sorted_ties(&mut hits);
         let generating = rank.generates.iter().filter(|g| **g).count();
         let from = if rank.exact { "every row WHERE keeps".to_string() } else { format!("the top {depth} of {generating} input{}", if generating == 1 { "" } else { "s" }) };
-        self.stats.plan.push(format!("fused {}: {} candidates from {from}", rank.explain(&self.schema), cands.len()));
+        // For one release: `+` between scores meant min-max fusion before.
+        let raw = if rank.adds_raw_scores() { " (+ adds raw scores; minmax() normalises them, as a sum of scores did before ranking expressions)" } else { "" };
+        self.stats.plan.push(format!("fused {}: {} candidates from {from}{raw}", rank.explain(&self.schema), cands.len()));
         if shard {
             let ranked = ranks
                 .iter()
@@ -1702,9 +1706,10 @@ impl<'a> Executor<'a> {
         Ok(hits)
     }
 
-    /// Exact scores of `cands` (sorted by segment, then docID) for one input.
-    fn exact_scores(&self, score: &Score, cands: &[(usize, DocId)]) -> Result<Vec<f32>> {
-        let mut out = vec![0f32; cands.len()];
+    /// Exact values of `cands` (sorted by segment, then docID) for one leaf;
+    /// NaN where a row has none.
+    fn exact_scores(&self, score: &Score, cands: &[(usize, DocId)]) -> Result<Vec<f64>> {
+        let mut out = vec![0f64; cands.len()];
         let by_seg = group_by_seg(cands);
         match score {
             Score::Bm25 { field, text: q, opts } => {
@@ -1716,7 +1721,7 @@ impl<'a> Executor<'a> {
                     let s = &self.seg_by_ord(seg);
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
                     let sc = self.text(s, *field)?.score_weighted(&terms, &stats, params, &docs);
-                    out[range].copy_from_slice(&sc);
+                    out[range].iter_mut().zip(sc).for_each(|(o, x)| *o = x.into());
                 }
             }
             Score::Sparse { field, terms, .. } => {
@@ -1724,7 +1729,7 @@ impl<'a> Executor<'a> {
                     self.check_deadline()?;
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
                     let sc = self.text(&self.seg_by_ord(seg), *field)?.score_dot(terms, &docs);
-                    out[range].copy_from_slice(&sc);
+                    out[range].iter_mut().zip(sc).for_each(|(o, x)| *o = x.into());
                 }
             }
             Score::Similarity { field, vector, .. } => {
@@ -1733,7 +1738,8 @@ impl<'a> Executor<'a> {
                     let s = &self.seg_by_ord(seg);
                     let vr = self.vector(s, *field)?;
                     for i in range {
-                        out[i] = vr.similarity(cands[i].1, vector);
+                        let d = cands[i].1;
+                        out[i] = if vr.has_vector(d) { vr.similarity(d, vector).into() } else { f64::NAN };
                     }
                 }
             }
@@ -1743,7 +1749,7 @@ impl<'a> Executor<'a> {
                     let s = &self.seg_by_ord(seg);
                     let col = self.numeric(s, *field)?.col();
                     for i in range {
-                        out[i] = self.num_value(s, *field, col, cands[i].1).unwrap_or(f64::NEG_INFINITY) as f32;
+                        out[i] = self.num_value(s, *field, col, cands[i].1).unwrap_or(f64::NAN);
                     }
                 }
             }
@@ -1753,16 +1759,43 @@ impl<'a> Executor<'a> {
                     let s = &self.seg_by_ord(seg);
                     let col = self.numeric(s, *field)?.col();
                     for i in range {
-                        out[i] = self.num_value(s, *field, col, cands[i].1).map_or(0.0, |v| decay.eval(v)) as f32;
+                        out[i] = self.num_value(s, *field, col, cands[i].1).map_or(0.0, |v| decay.eval(v));
                     }
                 }
             }
-            Score::Ppr { .. } | Score::Hops { .. } => {
+            Score::Ppr { .. } => {
                 for (i, c) in cands.iter().enumerate() {
-                    out[i] = self.graph_score(score, c.0, c.1) as f32;
+                    out[i] = self.graph_score(score, c.0, c.1);
                 }
             }
-            _ => return Err(err("weighted inputs must be bm25, similarity, ppr, hops, decay or a column")),
+            // NULL for a row the traversal does not reach.
+            Score::Hops { graph, far_first } => {
+                for (i, c) in cands.iter().enumerate() {
+                    out[i] = self.hops_of(*graph, c.0, c.1).map_or(f64::NAN, |h| if *far_first { h as f64 } else { -(h as f64) });
+                }
+            }
+            Score::SeqNo => {
+                if !self.snap.numbers_writes() {
+                    return Err(Error::Query("seq_no(): the database does not number its writes (Database::start_seq_no)".into()));
+                }
+                for (seg, range) in by_seg {
+                    self.check_deadline()?;
+                    let s = &self.seg_by_ord(seg);
+                    for i in range {
+                        out[i] = rowseq::of_view(s.view, cands[i].1)? as f64;
+                    }
+                }
+            }
+            Score::Cond(p) => {
+                for (seg, range) in by_seg {
+                    self.check_deadline()?;
+                    let set = self.materialize(&self.seg_by_ord(seg), p)?;
+                    for i in range {
+                        out[i] = if set.contains(cands[i].1) { 1.0 } else { 0.0 };
+                    }
+                }
+            }
+            _ => return Err(err("a ranking expression's leaves are bm25, similarity, ppr, hops, decay, seq_no() or a column")),
         }
         Ok(out)
     }
@@ -1916,7 +1949,7 @@ fn merge_top(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
 }
 
 /// The BM25 inputs of a query and of the subqueries that seed its graphs.
-fn bm25_leaves<'q>(q: &'q Select, out: &mut Vec<(usize, &'q str, &'q Opts)>) {
+pub(crate) fn bm25_leaves<'q>(q: &'q Select, out: &mut Vec<(usize, &'q str, &'q Opts)>) {
     if let Some(OrderBy::Score { score, .. }) = &q.order {
         for l in score.leaves() {
             if let Score::Bm25 { field, text, opts } = l {

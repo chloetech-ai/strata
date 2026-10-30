@@ -286,7 +286,7 @@ fn seeds_from_subqueries_vectors_and_semantic_edges() {
     assert!(n.rows[0][0].as_i64().unwrap() as usize >= want.len() - both_seeds_reached);
     let rs = db.query(&format!("SELECT id FROM papers ORDER BY rrf(similarity(emb, :q), ppr(cites, '{a}')) DESC LIMIT 10"), &params).unwrap();
     assert_eq!(rs.rows.len(), 10);
-    let rs = db.query(&format!("SELECT id FROM papers ORDER BY 0.5 * similarity(emb, :q) + 0.5 * ppr(cites, '{a}') DESC LIMIT 10"), &params).unwrap();
+    let rs = db.query(&format!("SELECT id FROM papers ORDER BY 0.5 * minmax(similarity(emb, :q)) + 0.5 * minmax(ppr(cites, '{a}')) DESC LIMIT 10"), &params).unwrap();
     assert_eq!(rs.rows.len(), 10);
 
     // Semantic edges: a row's k most similar rows, then theirs.

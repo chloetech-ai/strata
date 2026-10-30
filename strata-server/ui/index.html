@@ -770,7 +770,7 @@ function builderQuery() {
     order = `${textScore || vecScore ? (textScore || vecScore) + " * " : ""}${boost} DESC`;
   } else if (textScore && vecScore) {
     if (B.fuse === "rrf") order = `rrf(${textScore}, ${vecScore}) DESC`;
-    else { const w = $("bWeight").value / 100; $("bWeightVal").textContent = `${(1 - w).toFixed(2)} / ${w.toFixed(2)}`; order = `${(1 - w).toFixed(2)} * ${textScore} + ${w.toFixed(2)} * ${vecScore} DESC`; }
+    else { const w = $("bWeight").value / 100; $("bWeightVal").textContent = `${(1 - w).toFixed(2)} / ${w.toFixed(2)}`; order = `${(1 - w).toFixed(2)} * minmax(${textScore}) + ${w.toFixed(2)} * minmax(${vecScore}) DESC`; }
   } else if (textScore || vecScore) order = `${textScore || vecScore} DESC`;
   else if ($("bSort").value) order = `${A}${ident($("bSort").value)} ${$("bDir").value}`;
   const cols = S.fields.filter((f) => B.cols.has(f.name)).map((f) => A + ident(f.name));
@@ -1296,7 +1296,7 @@ function helpSections(x) {
   const vx = [];
   if (V && k0 != null) {
     vx.push({ t: "Rows like a row", d: `{"vector_of": key} is that row's vector.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY similarity(${V}, :q) DESC\nLIMIT 10`, params: { q: { vector_of: k0 } } });
-    if (tf) vx.push({ t: "Hybrid: text and vectors", d: `rrf() fuses the two rankings; 0.5 * a + 0.5 * b weighs them instead.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY rrf(bm25(${tf}, '${w1} ${w2}'), similarity(${V}, :q)) DESC\nLIMIT 10`, params: { q: embeddingOf(vF.name)?.loaded ? { embed: `${w1} ${w2}`, field: vF.name } : { vector_of: k0 } } });
+    if (tf) vx.push({ t: "Hybrid: text and vectors", d: `rrf() fuses the two rankings; 0.5 * minmax(a) + 0.5 * minmax(b) weighs them instead.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY rrf(bm25(${tf}, '${w1} ${w2}'), similarity(${V}, :q)) DESC\nLIMIT 10`, params: { q: embeddingOf(vF.name)?.loaded ? { embed: `${w1} ${w2}`, field: vF.name } : { vector_of: k0 } } });
   }
   if (tf && num) vx.push({ t: "Boost by a number", d: `decay(field, origin, scale) is 1 at the origin and 0.5 a scale away; multiply a score by it.`, sql: `SELECT ${show}, ${num}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1}') * decay(${num}, ${x.max}, ${Math.max(1, round2((x.max - x.min) / 4))}) DESC\nLIMIT 10` });
   if (vx.length) sec.push({ id: "ranking", title: "Similarity, hybrid and boosts", intro: "", ex: vx });

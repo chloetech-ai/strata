@@ -511,7 +511,7 @@ fn sql(kind: &str, q: &Q, i: usize) -> String {
         "vector_filtered" => format!("{s} WHERE {f} ORDER BY similarity(emb, :q) DESC LIMIT 10"),
         "vector_filtered_exact" => format!("{s} WHERE {f} ORDER BY similarity(emb, :q, strategy => 'prefilter', rerank => 100) DESC LIMIT 10"),
         "hybrid_rrf" => format!("{s} ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 10"),
-        "hybrid_weighted" => format!("{s} ORDER BY 0.3 * bm25(body, :t) + 0.7 * similarity(emb, :q) DESC LIMIT 10"),
+        "hybrid_weighted" => format!("{s} ORDER BY 0.3 * minmax(bm25(body, :t)) + 0.7 * minmax(similarity(emb, :q)) DESC LIMIT 10"),
         "bm25_top100" => format!("{s} ORDER BY bm25(body, :t) DESC LIMIT 100"),
         "vector_top100" => format!("{s} ORDER BY similarity(emb, :q) DESC LIMIT 100"),
         other => panic!("unknown kind {other}"),

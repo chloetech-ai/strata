@@ -18,6 +18,11 @@ and values keep their types, so nothing is quoted or escaped:
 Conditions combine with `&`, `|` and `~` (not `and`, `or` and `not`).
 Scores rank best first; fields and aggregates rank ascending unless given
 with `.desc()`.
+
+A ranking is any expression of scores, fields and numbers, as in SQL:
+`bm25("body", q) * (1 + 0.2 * coalesce(col("rating"), 0))`. `+` adds raw
+values; `0.7 * minmax(bm25(...)) + 0.3 * minmax(similarity(...))` puts
+each score on [0, 1] first, the weighted fusion of the two.
 """
 
 from __future__ import annotations
@@ -38,6 +43,18 @@ __all__ = [
     "bm25",
     "similarity",
     "rrf",
+    "minmax",
+    "rank",
+    "ln",
+    "log",
+    "exp",
+    "sqrt",
+    "sigmoid",
+    "clamp",
+    "least",
+    "greatest",
+    "coalesce",
+    "case",
     "score",
     "hops",
     "count",
@@ -181,22 +198,55 @@ class Expr:
         """Descending, as an `order_by` key."""
         return _Key(self, True, nulls_first)
 
-    # A weighted sum of scores: 0.7 * bm25(...) + 0.3 * similarity(...).
-    def __mul__(self, w: Any) -> Expr:
-        if not isinstance(w, (int, float)) or isinstance(w, bool):
-            return NotImplemented
-        return _Weighted([(float(w) * x, e) for x, e in _terms(self)])
+    # Arithmetic, for a ranking: `+` adds raw values (minmax() normalises
+    # a score first). abs(), round() and ** work as on numbers.
+    def __add__(self, other: Any) -> Expr:
+        return _Arith("add", self, other)
 
-    __rmul__ = __mul__
+    def __radd__(self, other: Any) -> Expr:
+        return _Arith("add", other, self)
 
-    def __add__(self, other: Expr) -> Expr:
-        return _Weighted(_terms(self) + _terms(_expr(other)))
+    def __sub__(self, other: Any) -> Expr:
+        return _Arith("sub", self, other)
 
-    def __sub__(self, other: Expr) -> Expr:
-        return _Weighted(_terms(self) + [(-w, e) for w, e in _terms(_expr(other))])
+    def __rsub__(self, other: Any) -> Expr:
+        return _Arith("sub", other, self)
+
+    def __mul__(self, other: Any) -> Expr:
+        return _Arith("mul", self, other)
+
+    def __rmul__(self, other: Any) -> Expr:
+        return _Arith("mul", other, self)
+
+    def __truediv__(self, other: Any) -> Expr:
+        return _Arith("div", self, other)
+
+    def __rtruediv__(self, other: Any) -> Expr:
+        return _Arith("div", other, self)
+
+    def __mod__(self, other: Any) -> Expr:
+        return _Arith("mod", self, other)
+
+    def __rmod__(self, other: Any) -> Expr:
+        return _Arith("mod", other, self)
 
     def __neg__(self) -> Expr:
-        return _Weighted([(-w, e) for w, e in _terms(self)])
+        return _Ranked("neg", [self], lambda ctx, a: {"neg": a[0]}, f"-{self!r}")
+
+    def __pos__(self) -> Expr:
+        return self
+
+    def __abs__(self) -> Expr:
+        return _call("abs", self)
+
+    def __round__(self, digits: int | None = None) -> Expr:  # type: ignore[override]
+        return _call("round", self) if digits is None else _call("round", self, digits)
+
+    def __pow__(self, other: Any) -> Expr:
+        return _call("pow", self, other)
+
+    def __rpow__(self, other: Any) -> Expr:
+        return _call("pow", other, self)
 
     # Aggregates of a field, for `select` and `having` over groups.
     def count(self, distinct: bool = False) -> Expr:
@@ -229,8 +279,13 @@ def _expr(x: Any) -> Expr:
     raise TypeError(f"{x!r} is not a query condition: build one with col(...) and the functions of strata")
 
 
-def _terms(e: Expr) -> list[tuple[float, Expr]]:
-    return list(e.terms) if isinstance(e, _Weighted) else [(1.0, e)]
+def _num(x: Any) -> Expr:
+    """An operand of arithmetic: an expression, or a number."""
+    if isinstance(x, Expr):
+        return x
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        return _Lit(float(x))
+    raise TypeError(f"arithmetic takes expressions and numbers, not {x!r}")
 
 
 def _operand(x: Any, ctx: _Ctx, field: Mapping[str, Any] | None) -> Any:
@@ -395,8 +450,8 @@ class _Named(Expr):
 
 
 class _Fn(Expr):
-    """A function of the row: a score (BM25, a similarity, RRF, a weighted
-    sum) or a condition (MATCH, a traversal)."""
+    """A function of the row: a score (BM25, a similarity, RRF) or a
+    condition (MATCH, a traversal)."""
 
     def __init__(self, build, text: str, score: bool = True):
         self.build, self.text, self.score = build, text, score
@@ -411,10 +466,33 @@ class _Fn(Expr):
         return self.text
 
 
-class _Weighted(_Fn):
-    def __init__(self, terms: list[tuple[float, Expr]]):
-        self.terms = terms
-        super().__init__(lambda ctx: {"weighted": [[w, e._ir(ctx)] for w, e in self.terms]}, " + ".join(f"{w} * {e!r}" for w, e in terms))
+class _Ranked(Expr):
+    """Part of a ranking expression: arithmetic, a function, minmax(),
+    rank() or a case. It ranks best first, as a score does, unless it
+    is over aggregates, which order groups."""
+
+    def __init__(self, what: str, parts: list[Any], build, text: str):
+        self.what, self.parts, self.build, self.text = what, parts, build, text
+
+    def _ir(self, ctx: _Ctx) -> Any:
+        return self.build(ctx, [p._ir(ctx) for p in self.parts])
+
+    def _is_score(self) -> bool:
+        return not any(isinstance(_bare(p), _Agg) for p in self.parts)
+
+    def __repr__(self) -> str:
+        return self.text
+
+
+def _Arith(op: str, left: Any, right: Any) -> Expr:
+    left, right = _num(left), _num(right)
+    sym = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "%"}[op]
+    return _Ranked(op, [left, right], lambda ctx, a: {"arith": {"op": op, "left": a[0], "right": a[1]}}, f"({left!r} {sym} {right!r})")
+
+
+def _call(func: str, *args: Any) -> Expr:
+    parts = [_num(a) for a in args]
+    return _Ranked(func, parts, lambda ctx, a: {"call": {"func": func, "args": a}}, f"{func}({', '.join(map(repr, parts))})")
 
 
 class _Agg(Expr):
@@ -517,6 +595,86 @@ def rrf(*scores: Expr, k: float = 60, depth: int = 100) -> Expr:
     if not scores:
         raise StrataError("rrf takes rankings")
     return _Fn(lambda ctx: {"rrf": {"inputs": [s._ir(ctx) for s in scores], "k": float(k), "depth": int(depth)}}, f"rrf({', '.join(map(repr, scores))})")
+
+
+def minmax(x: Expr) -> Expr:
+    """`x` put on [0, 1] over the rows it ranks: (x - min) / (max - min),
+    1 where all are equal and 0 where `x` is NULL. A weighted sum of
+    minmax() of scores is their weighted fusion."""
+    x = _num(x)
+    return _Ranked("minmax", [x], lambda ctx, a: {"norm": {"kind": "min_max", "input": a[0]}}, f"minmax({x!r})")
+
+
+def rank(x: Expr) -> Expr:
+    """A row's place in `x`'s ranking of the rows it ranks: 1 plus the
+    rows with a greater value; NULL places after every other."""
+    x = _num(x)
+    return _Ranked("rank", [x], lambda ctx, a: {"norm": {"kind": "rank", "input": a[0]}}, f"rank({x!r})")
+
+
+def ln(x: Any) -> Expr:
+    """The natural logarithm; NULL for x <= 0."""
+    return _call("ln", x)
+
+
+def log(base: Any, x: Any = None) -> Expr:
+    """`log(x)` is the base 10 logarithm, `log(base, x)` the base `base`
+    one."""
+    return _call("log", base) if x is None else _call("log", base, x)
+
+
+def exp(x: Any) -> Expr:
+    return _call("exp", x)
+
+
+def sqrt(x: Any) -> Expr:
+    """The square root; NULL for x < 0."""
+    return _call("sqrt", x)
+
+
+def sigmoid(x: Any) -> Expr:
+    """1 / (1 + e^-x)."""
+    return _call("sigmoid", x)
+
+
+def clamp(x: Any, lo: Any, hi: Any) -> Expr:
+    """`x` within [lo, hi]."""
+    return _call("clamp", x, lo, hi)
+
+
+def least(*xs: Any) -> Expr:
+    """The smallest of `xs` that is not NULL."""
+    return _call("least", *xs)
+
+
+def greatest(*xs: Any) -> Expr:
+    """The largest of `xs` that is not NULL."""
+    return _call("greatest", *xs)
+
+
+def coalesce(*xs: Any) -> Expr:
+    """The first of `xs` that is not NULL."""
+    return _call("coalesce", *xs)
+
+
+def case(*whens: tuple[Expr, Any], otherwise: Any = None) -> Expr:
+    """The value of the first `(condition, value)` whose condition holds,
+    else `otherwise`, else NULL: `case((col("year") > 2020, 1), otherwise=0)`."""
+    if not whens:
+        raise StrataError("case takes (condition, value) pairs")
+    conds = [_expr(c) for c, _ in whens]
+    values = [_num(v) for _, v in whens]
+    rest = [] if otherwise is None else [_num(otherwise)]
+    n = len(whens)
+
+    def build(ctx: _Ctx, a: list) -> Any:
+        c: dict[str, Any] = {"whens": [{"when": a[i], "then": a[n + i]} for i in range(n)]}
+        if rest:
+            c["otherwise"] = a[2 * n]
+        return {"case": c}
+
+    text = " ".join(f"WHEN {c!r} THEN {v!r}" for c, v in zip(conds, values))
+    return _Ranked("case", conds + values + rest, build, f"CASE {text}{f' ELSE {rest[0]!r}' if rest else ''} END")
 
 
 def _graph(field: str, seeds: Any, kind: dict, dir: str, labels: Iterable[str], through: Expr | None, max_nodes: int, k: int, min_sim: float | None):
