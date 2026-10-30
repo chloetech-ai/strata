@@ -400,3 +400,36 @@ def test_cross_encoder(tmp_path):
             db.query(f"SELECT id FROM books ORDER BY {ce} DESC LIMIT 5", q="dragon")
         with pytest.raises(strata.StrataError, match="no cross-encoder named nope"):
             db.query(f"{top} SELECT id FROM top ORDER BY cross_encoder('nope', title, :q) DESC LIMIT 5", q="dragon")
+
+
+def test_the_rank_log(db):
+    import datetime as dt
+
+    db.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD, action KEYWORD, ts TIMESTAMP)")
+    t0 = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+    sql = "SELECT id, title FROM books ORDER BY bm25(title, :q) * (1 + 0.1 * rating) DESC LIMIT 5"
+    served = db.query("SELECT id, score(), features() FROM books ORDER BY bm25(title, :q) * (1 + 0.1 * rating) DESC LIMIT 8", q="dragon")
+    r = db.query_logged(sql, {"q": "dragon"}, context="u1", variant="a", candidates=8, ts=t0)
+    assert r.columns == ["id", "title"] and r.keys == served.keys[:5] and len(r.request) == 32
+    db.insert([
+        {"id": 1, "usr": "u1", "item": "b0002", "action": "view", "ts": t0 - dt.timedelta(minutes=5)},
+        {"id": 2, "usr": "u1", "item": r.keys[0], "action": "buy", "ts": t0 + dt.timedelta(minutes=1)},
+    ], table="events")
+    # The ratings change after: the export keeps what was served.
+    db.sql("UPDATE books SET rating = 5.0 WHERE year > 0")
+    db.sql("UPDATE rank_log SET label = 2 WHERE request = :r AND row_key = :k", r=r.request, k=r.keys[1])
+    records = db.export_rank_log(
+        events={"table": "events", "user": "usr", "item": "item", "time": "ts", "action": "action"},
+        history=5, window="10 minutes", grades={"buy": 3},
+    )
+    assert [x["row_key"] for x in records] == served.keys
+    assert [x["shown"] for x in records] == [True] * 5 + [False] * 3
+    want = [dict(zip(served.columns[2:], row[2:])) for row in served.rows]
+    assert [x["features"] for x in records] == want
+    assert [x["score"] for x in records] == served.scores
+    assert [x["label"] for x in records] == [3, 2] + [0] * 6
+    assert records[0]["history_items"] == ["b0002"] and records[0]["history_actions"] == ["view"]
+    assert records[0]["context"] == "u1" and records[0]["variant"] == "a"
+    assert len(db.export_rank_log(since=t0 + dt.timedelta(seconds=1))) == 0
+    with pytest.raises(strata.StrataError, match="ORDER BY"):
+        db.query_logged("SELECT id FROM books WHERE year > 2000")

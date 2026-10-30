@@ -593,18 +593,27 @@ pub(crate) fn bind_phase_with(q: &sql::Query, schema: &Schema, tables: &[&Schema
 /// with `score()` and `features()` added to its columns: the values each
 /// row was ranked by, which `/v1/explain` shows for the top rows.
 pub fn with_features(sql_text: &str) -> Result<String> {
-    let one = || err("hits explain the rows of one SELECT ranked by an ORDER BY");
-    let mut stmts = super::parse::parse(sql_text)?;
-    let [sql::Statement::Query(q)] = stmts.as_mut_slice() else { return Err(one()) };
-    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(one()) };
-    if q.order_by.is_none() {
-        return Err(one());
-    }
-    let mut extra = super::parse::parse("SELECT score(), features()")?;
-    let Some(sql::Statement::Query(x)) = extra.pop() else { return Err(one()) };
-    let sql::SetExpr::Select(x) = *x.body else { return Err(one()) };
-    s.projection.extend(x.projection);
+    let mut q = ranked_query(sql_text).ok_or_else(|| err("hits explain the rows of one SELECT ranked by an ORDER BY"))?;
+    add_features(&mut q)?;
     Ok(q.to_string())
+}
+
+/// `sql_text` when it is one SELECT ranked by an ORDER BY.
+pub(crate) fn ranked_query(sql_text: &str) -> Option<sql::Query> {
+    let mut stmts = super::parse::parse(sql_text).ok()?;
+    let [sql::Statement::Query(q)] = stmts.as_mut_slice() else { return None };
+    (matches!(q.body.as_ref(), sql::SetExpr::Select(_)) && q.order_by.is_some()).then(|| (**q).clone())
+}
+
+/// Adds `score()` and `features()` to the columns of a query from
+/// [`ranked_query`].
+pub(crate) fn add_features(q: &mut sql::Query) -> Result<()> {
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(err("not a SELECT")) };
+    let mut extra = super::parse::parse("SELECT score(), features()")?;
+    let Some(sql::Statement::Query(x)) = extra.pop() else { unreachable!("a SELECT") };
+    let sql::SetExpr::Select(x) = *x.body else { unreachable!("a SELECT") };
+    s.projection.extend(x.projection);
+    Ok(())
 }
 
 /// The query of `(SELECT ...)`, in parentheses or not.

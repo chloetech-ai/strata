@@ -188,6 +188,12 @@ class Database(Search):
         r = self._db.sql(sql, _params(params, kw))
         return r if isinstance(r, int) else Result._of(r)
 
+    def _query_logged(self, sql: str, params: Mapping[str, Any] | None, log: dict) -> Result:
+        return Result._of(self._db.query_logged(sql, _params(params, {}), json.dumps(log)))
+
+    def _export_rank_log(self, opts: dict) -> list[dict]:
+        return json.loads(self._db.export_rank_log(json.dumps(opts)))
+
     def plan(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> dict:
         """The plan of a SELECT, INSERT, UPDATE or DELETE, without running
         it: the plan IR as JSON, which `run` takes."""
