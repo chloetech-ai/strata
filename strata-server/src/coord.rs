@@ -82,7 +82,7 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::auth::Secret;
-use crate::grpc::{params_to_pb, result_from_pb, MIN_PROTOCOL, PROTOCOL, SOURCES_PROTOCOL};
+use crate::grpc::{params_to_pb, result_from_pb, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
 use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{is_mark, op_place, op_schema, op_source, After, QueryReq, Written};
@@ -862,6 +862,42 @@ impl Coordinator {
             leases.push(lease);
         }
         Ok((sum, leases))
+    }
+
+    /// The next codes of `prefixes` in semantic-ID field `field` among the
+    /// rows `sql` or `plan` filters, on every shard ([`SIDNEXT_PROTOCOL`]),
+    /// their rows summed: per prefix, in the order of the codes' last
+    /// numbers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sid_next(&self, sql: &str, schema: &Schema, plan: Option<&Plan>, params: &Params, field: &str, prefixes: &[String], after: &After, deadline: Instant) -> Result<Vec<Vec<(String, u64)>>, ApiError> {
+        let start = self.turn.fetch_add(1, Ordering::Relaxed);
+        let protocol = self.protocol();
+        let read = &Read::new(sql, params, plan, protocol, self.epoch(), || Plan::bind(sql, schema, params))?.after(self.after(after)?);
+        let calls = (0..self.replicas.len()).map(|i| async move {
+            self.call(i, start, None, deadline, |r, mut c| async move {
+                let p = self.speak(i, r, &mut c, PROTOCOL).await?;
+                if p < SIDNEXT_PROTOCOL {
+                    return Err(tonic::Status::unimplemented(format!("it speaks protocol {p}, and /v1/sid/next needs {SIDNEXT_PROTOCOL}: upgrade it")));
+                }
+                self.reads_after(i, r, read.min(i))?;
+                c.sid_next(pb::SidNextRequest { query: Some(pb::QueryRequest { timeout_ms: ms_left(deadline), ..read.request(p, i) }), field: field.to_string(), prefixes: prefixes.to_vec() }).await
+            })
+            .await
+        });
+        let mut sums: Vec<BTreeMap<u32, (String, u64)>> = vec![BTreeMap::new(); prefixes.len()];
+        for a in join_all(calls).await {
+            let (_, a) = a?;
+            if a.next.len() != prefixes.len() {
+                return Err(ApiError::internal(format!("a shard answered {} prefixes of {}", a.next.len(), prefixes.len())));
+            }
+            for (sum, next) in sums.iter_mut().zip(a.next) {
+                for (code, count) in next.codes.into_iter().zip(next.counts) {
+                    let last = code.rsplit('.').next().and_then(|x| x.parse::<u32>().ok()).ok_or_else(|| ApiError::internal(format!("a shard answered code {code:?}")))?;
+                    sum.entry(last).or_insert_with(|| (code, 0)).1 += count;
+                }
+            }
+        }
+        Ok(sums.into_iter().map(|m| m.into_values().collect()).collect())
     }
 
     /// Runs `select`, a query of table `schema`, on every shard and merges

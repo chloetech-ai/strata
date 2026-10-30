@@ -15,7 +15,9 @@
 // offsets: a write operation may carry its event's "source", and an
 // operation "source" marks one alone, which a server before 6 would not
 // know to skip on a replay, so a coordinator sends them only to shards of
-// 6 or newer, and asks them their offsets with `Sources`. A caller asks a server's versions with
+// 6 or newer, and asks them their offsets with `Sources`; 7 answers the
+// next codes of semantic-ID prefixes (`SidNext`), which a coordinator asks
+// only of shards of 7 or newer. A caller asks a server's versions with
 // `Hello` (a server that answers Unimplemented speaks 1) and speaks the
 // newest both know; a coordinator speaks the oldest of those among its
 // shards' replicas.
@@ -55,6 +57,10 @@ service Strata {
   // Protocol 6: the stream sources this server's writes came from, with
   // the offset of the last event written from each.
   rpc Sources(SourcesRequest) returns (SourcesResponse);
+  // Protocol 7: the codes that can follow each prefix in a semantic-ID
+  // field among the rows a query filters, with how many rows have each,
+  // which a coordinator sums over its shards (HTTP /v1/sid/next).
+  rpc SidNext(SidNextRequest) returns (SidNextResponse);
   // The tables' schemas as JSON.
   rpc Schema(Empty) returns (SchemaResponse);
   rpc Health(Empty) returns (HealthResponse);
@@ -710,6 +716,27 @@ message QueryResponse {
 message TermStatsResponse {
   bytes stats_json = 1;
   uint64 snapshot = 2;
+}
+
+// A query whose filter picks the rows (`SELECT COUNT(*) FROM t WHERE
+// ...`), the semantic-ID field, and up to 64 prefixes ("" for the first
+// numbers).
+message SidNextRequest {
+  QueryRequest query = 1;
+  string field = 2;
+  repeated string prefixes = 3;
+}
+
+// One SidChildren per prefix, in the request's order.
+message SidNextResponse {
+  repeated SidChildren next = 1;
+}
+
+// The codes one number longer than a prefix, in the order of their last
+// numbers, and the rows of each.
+message SidChildren {
+  repeated string codes = 1;
+  repeated uint64 counts = 2;
 }
 
 message WriteRequest {

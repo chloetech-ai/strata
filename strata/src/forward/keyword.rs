@@ -494,6 +494,15 @@ impl KeywordColumn {
         self.pyr_codes.binary_search(&code).map_or(0, |i| self.lists.card(i) as usize)
     }
 
+    /// Number of documents with value `code` among those set in `words`
+    /// (a bitset of the segment's documents).
+    pub fn count_code_in(&self, code: u32, words: &[u64]) -> u64 {
+        match self.list(code) {
+            List::Rare(d) => d.iter().filter(|&&d| words[d as usize / 64] >> (d % 64) & 1 == 1).count() as u64,
+            List::Pyramid(p) => p.and_count_bits(words),
+        }
+    }
+
     /// Number of documents with `value`.
     pub fn count(&self, value: &str) -> usize {
         self.code(value).map_or(0, |c| self.count_code(c))

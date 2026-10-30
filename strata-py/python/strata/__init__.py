@@ -223,6 +223,16 @@ class Database(Search):
         file, by a model of images."""
         return self._db.embed(text, field, table, None if image is None else bytes(image))
 
+    def sid_next(self, prefixes: Iterable[str], *, field: str, where: str | None = None, params: Mapping[str, Any] | None = None, table: str | None = None, **kw: Any) -> dict[str, dict[str, int]]:
+        """The codes that can follow each prefix of semantic-ID field
+        `field` (``""`` for the first number) among the rows SQL condition
+        `where` matches, or all rows: {prefix: {code: rows}}, the codes of
+        each prefix in the order of their last numbers. At most 64
+        prefixes."""
+        prefixes = builtins.list(prefixes)
+        got = self._db.sid_next(field, prefixes, where, _params(params, kw), table)
+        return {p: dict(cs) for p, cs in zip(prefixes, got)}
+
     def optimize(self) -> None:
         """Merges small segments (many small writes leave many)."""
         self._db.optimize()
