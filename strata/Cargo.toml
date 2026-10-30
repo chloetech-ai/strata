@@ -28,7 +28,8 @@ clap = { version = "4", features = ["derive"] }
 rust-stemmers = "1.2"
 # MEDIA values (`media`): bytes given as base64.
 base64 = "0.22"
-# Baselines (feature `baselines`): SQLite with FTS5, and Tantivy.
+# SQLite (bundled, with FTS5): importing and exporting SQLite databases
+# (feature `sqlite`, `strata::sqlite`) and the SQLite baseline (`baselines`).
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
 tantivy = { version = "0.26", optional = true }
 # Embedding models for VECTOR fields declared with `embed` (`embed`):
@@ -55,6 +56,9 @@ vision = ["bert", "dep:image"]
 audio = ["bert", "dep:symphonia"]
 # `bert` with matrix products in Apple's Accelerate framework (macOS only).
 accelerate = ["bert", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+# Importing SQLite databases into Strata and exporting Strata to SQLite
+# (`strata::sqlite`).
+sqlite = ["dep:rusqlite"]
 # SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
 baselines = ["dep:rusqlite", "dep:tantivy"]
 # Power losses, full disks and failing syncs for tests (`storage::io`).

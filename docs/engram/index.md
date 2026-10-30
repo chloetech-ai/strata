@@ -202,6 +202,8 @@ $$
 
 Answers that admitted not knowing and repeats of the same question are excluded, because they would only replay a failure. Packing is greedy by *S*: at most twelve records, at most eight per user turn. Every injected line carries its provenance (kind, session, turn, relative time and id), and up to five further candidates follow as one line each for the model to open with `memory_timeline`.
 
+**Session context (off by default).** With `ENGRAM_SESSION_CONTEXT=1` the prompt's search also uses what the session was just doing. Its last 20 records give a BM25 query (the files they name and the first line of their errors, at most 24 words) and the vectors of the newest four prompts, answers, tool calls and errors, which rank records by `maxsim`. A record's best normalised score in those two lists is added to *rel* with weight 0.5, and records about one of the session's files score 15% more. The gate still reads the prompt's own evidence, so the session reorders what is injected but not whether anything is. On the memory bench it made no measurable difference (198 of 208 runs against 199) and it adds 5.8 ms to a prompt's searches at a million records ([results](results.md#the-session-tail)), so it stays off.
+
 ### The gate
 
 Min-max scores cannot gate, since the best candidate always scores 1. The gate uses absolute evidence about the best candidates: the highest cosine and term coverage among the top five, how far the best BM25 and cosine scores stand above the tenth, whether BM25 and vectors agree on the top record, and whether the prompt refers back ("earlier", "we decided", "last time", …):
@@ -305,6 +307,7 @@ engram stats | briefing | stop
 | `ENGRAM_DEEP_MODEL`, `ENGRAM_DEEP_PLANNER_MODEL`, `ENGRAM_DEEP_RANKER_MODEL`, `ENGRAM_DEEP_HARD_MODEL` | the query engine's models (default `haiku`; the hard model is unset) |
 | `ENGRAM_DEEP_PLAN`, `ENGRAM_DEEP_RANK` | `none` skips the planner; `local` ranks without a model call (defaults: `model`, `model`) |
 | `ENGRAM_CONSOLIDATE=0` | turns consolidation off |
+| `ENGRAM_SESSION_CONTEXT=1` | recall also searches with the session's last records ([session context](#ranking); or `"rank": {"tail": {"enabled": true}}` in the store's `config.json`) |
 | `ENGRAM_EMBEDDER` | `static` (default), `bert`, or `hash:<dim>` for a model-free hash embedder |
 
 The full design, including the evaluation plan, is in [`engram/DESIGN.md`](https://github.com/rkonow/strata/blob/main/engram/DESIGN.md).

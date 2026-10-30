@@ -1642,6 +1642,36 @@ impl<'a> Binder<'a> {
                 crate::text::query::parse_match_with(&query, self.schema.fields[field].text_analyzer())?;
                 Pred::Match { field, query, expand }
             }
+            Expr::Like { negated, any: false, expr, pattern, escape_char } => {
+                let f = self.prefix_field(expr)?;
+                let escape = match escape_char {
+                    None => None,
+                    Some(sql::Value::SingleQuotedString(c)) if c.chars().count() == 1 => c.chars().next(),
+                    Some(c) => return Err(err(format!("LIKE's ESCAPE takes one character, not {c}"))),
+                };
+                let pattern = self.literal(pattern)?;
+                let pattern = pattern.as_str().ok_or_else(|| err("LIKE's pattern must be text"))?;
+                let p = match like_prefix(pattern, escape)? {
+                    LikePrefix::Exact(v) => Pred::In { field: f, values: vec![Value::Str(v)] },
+                    LikePrefix::Prefix(p) if p.is_empty() => Pred::Present { field: f },
+                    LikePrefix::Prefix(p) => Pred::Prefix { field: f, prefix: p },
+                };
+                if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
+            Expr::ILike { .. } => return Err(err("ILIKE cannot use a KEYWORD field's index: store the value lowercased and use LIKE")),
+            Expr::Function(func) if fname(func) == "prefix" => {
+                let (args, opts) = self.args(func)?;
+                let [field, p] = args.as_slice() else { return Err(err("PREFIX(field, prefix)")) };
+                if let Some(k) = opts.keys().next() {
+                    return Err(err(format!("unknown option {k} for PREFIX")));
+                }
+                let f = self.prefix_field(field)?;
+                match self.literal(p)? {
+                    Value::Str(p) if p.is_empty() => Pred::Present { field: f },
+                    Value::Str(p) => Pred::Prefix { field: f, prefix: p },
+                    v => return Err(err(format!("PREFIX takes text, not {v:?}"))),
+                }
+            }
             Expr::Function(func) if matches!(fname(func).as_str(), "reachable" | "path") => Pred::Graph { id: self.graph(func, &fname(func))? },
             Expr::Value(v) if matches!(v.value, sql::Value::Boolean(_)) => {
                 if matches!(v.value, sql::Value::Boolean(true)) { Pred::True } else { Pred::False }
@@ -1794,6 +1824,15 @@ impl<'a> Binder<'a> {
     fn typed_field(&self, e: &Expr, ok: impl Fn(&FieldType) -> bool, what: &str) -> Result<usize> {
         let f = self.field_of(e)?;
         if ok(&self.schema.fields[f].ty) { Ok(f) } else { Err(err(format!("{} is not a {what} field", self.schema.fields[f].name))) }
+    }
+
+    /// The field of `LIKE` and `PREFIX()`: an indexed KEYWORD field.
+    fn prefix_field(&self, e: &Expr) -> Result<usize> {
+        let f = self.typed_field(e, |t| *t == FieldType::Keyword, "KEYWORD")?;
+        if !self.schema.fields[f].indexed {
+            return Err(err(format!("{} is not indexed", self.schema.fields[f].name)));
+        }
+        Ok(f)
     }
 
     fn numeric_field(&self, e: &Expr) -> Result<usize> {
@@ -2195,6 +2234,35 @@ fn as_list(v: Value) -> std::result::Result<Vec<Value>, Value> {
         Value::Vector(xs) if xs.iter().all(|x| x.fract() == 0.0 && x.abs() < 16_777_216.0) => Ok(xs.iter().map(|&x| Value::Int(x as i64)).collect()),
         v => Err(v),
     }
+}
+
+/// A `LIKE` pattern a KEYWORD field's index answers.
+#[derive(Debug, PartialEq)]
+enum LikePrefix {
+    /// No wildcard: equality with the value.
+    Exact(String),
+    /// Text, then `%` (one or more) at the end: a prefix.
+    Prefix(String),
+}
+
+/// `pattern` as an exact value or a prefix, with `escape` (if any) making
+/// the character after it literal; `_`, or `%` before the end, is refused.
+fn like_prefix(pattern: &str, escape: Option<char>) -> Result<LikePrefix> {
+    let mut out = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if Some(c) == escape => out.push(chars.next().ok_or_else(|| err("LIKE pattern ends with its escape character"))?),
+            '%' if chars.all(|c| c == '%') => return Ok(LikePrefix::Prefix(out)),
+            '%' | '_' => {
+                return Err(err(format!(
+                    "LIKE on a table's KEYWORD field takes a value or a prefix ('abc%'), not {pattern:?}: '_', or '%' before the end, is not indexed"
+                )))
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(LikePrefix::Exact(out))
 }
 
 #[cfg(test)]

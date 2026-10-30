@@ -19,18 +19,31 @@ env:
 
 # The jobs run on the organisation's own runners rather than GitHub's shared
 # ones, so that they no longer wait for the plan's few concurrent jobs:
-# gh-linux (Ubuntu 24.04, 4 cores, 16 GB) and gh-mac (macOS 26, 3 cores,
-# 7 GB). Job names still say ubuntu-latest and macos-latest, which keeps the
-# check names.
+# gh-linux (Ubuntu 24.04, 4 cores, 16 GB), and gh-mac and gh-mac2 (macOS
+# 26, 3 cores, 7 GB): the three macOS test jobs run on gh-mac, fault
+# injection and the Python package on gh-mac2. The short Linux jobs (engram,
+# the server smoke test, generic kernels, relevance gate, fault injection
+# and sound) run on GitHub's shared ubuntu-latest, a pool of its own, so
+# that they don't wait for gh-linux, which runs only about 12 jobs at once.
+# Job names still say ubuntu-latest and macos-latest, which keeps the check
+# names.
+#
+# macOS jobs are the scarcest (the account runs few at once), so a pull
+# request runs only Strata's tests on macOS, where its NEON kernels and
+# syncs differ from Linux; a push to main runs every macOS job.
 jobs:
   test:
     name: ${{ matrix.crate }} on ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
         crate: [strata, engram, strata-server]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
+        # On a pull request, a job of its own; on main, already in the matrix.
+        include:
+          - os: macos-latest
+            crate: strata
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || (matrix.crate == 'engram' && 'ubuntu-latest' || 'gh-linux') }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -53,14 +66,17 @@ jobs:
       # The ci profile is release without link-time optimisation and with
       # 16 codegen units (each crate's Cargo.toml): with release's, building
       # Strata's test binaries took 37 of the 40 minutes of its tests.
+      # Strata's SQLite import and export (feature `sqlite`) are tested and
+      # linted in the strata job; strata-server and the Python package turn
+      # the feature on.
       - name: Tests
         working-directory: ${{ matrix.crate }}
-        run: cargo test --profile ci
+        run: cargo test --profile ci ${{ matrix.crate == 'strata' && '--features sqlite' || '' }}
       # Compiler warnings and clippy's correctness and suspicious lints fail
       # the build; style, complexity and performance lints are advice.
       - name: Clippy
         working-directory: ${{ matrix.crate }}
-        run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+        run: cargo clippy --release --all-targets ${{ matrix.crate == 'strata' && '--features sqlite' || '' }} -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
 
   # strata-server, engram and the Python package build for a generic CPU,
   # where Strata chooses its SIMD kernels at run time: test the kernels in
@@ -68,7 +84,7 @@ jobs:
   # that it runs beside the strata tests rather than after them.
   kernels:
     name: strata kernels on a generic build
-    runs-on: gh-linux
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       RUSTFLAGS: -C target-cpu=x86-64
@@ -125,7 +141,7 @@ jobs:
   # clippy over the feature's code in Strata and the server.
   audio:
     name: sound (feature audio)
-    runs-on: gh-linux
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -159,8 +175,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac2' || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -182,7 +198,7 @@ jobs:
   # with its new numbers.
   relevance-gate:
     name: relevance gate (BEIR)
-    runs-on: gh-linux
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -279,7 +295,7 @@ jobs:
 
   server-smoke:
     name: strata-server smoke test
-    runs-on: gh-linux
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -316,14 +332,23 @@ jobs:
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:7702/v1/health && break; sleep 1; done
           printf 'id,title\nc,third row\n' | curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=csv' -H 'content-type: text/csv' --data-binary @- | grep -q '"written":1'
           curl -sf http://127.0.0.1:7702/v1/health | grep -q '"docs":3'
+          # A SQLite database's tables into a new database, and back out.
+          python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.executescript(\"CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, at DATETIME); INSERT INTO notes VALUES (1, 'a first note about rivers and mountains', '2026-10-01 12:00:00');\"); c.commit()" "$RUNNER_TEMP/s.sqlite"
+          ./target/release/strata-server import --db "$RUNNER_TEMP/s.strata" "$RUNNER_TEMP/s.sqlite"
+          ./target/release/strata-server export --db "$RUNNER_TEMP/s.strata" "$RUNNER_TEMP/s2.sqlite"
+          python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); assert c.execute(\"SELECT notes.rowid, at FROM notes_fts JOIN notes ON notes.rowid = notes_fts.rowid WHERE notes_fts MATCH 'river'\").fetchall() == [(1, '2026-10-01 12:00:00')]" "$RUNNER_TEMP/s2.sqlite"
+          # And over HTTP: the SQLite file into the running server, a new table, and the database back out.
+          curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=sqlite' -H 'content-type: application/vnd.sqlite3' --data-binary @"$RUNNER_TEMP/s.sqlite" | grep -q '"written":1'
+          curl -sf http://127.0.0.1:7702/v1/export -o "$RUNNER_TEMP/s3.sqlite"
+          python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); assert c.execute('SELECT count(*) FROM t').fetchone() == (3,); assert c.execute('SELECT body FROM notes').fetchall() == [('a first note about rivers and mountains',)]" "$RUNNER_TEMP/s3.sqlite"
 
   python:
     name: Python package on ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac2' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

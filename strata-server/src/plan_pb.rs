@@ -187,6 +187,7 @@ fn expr(e: &Expr) -> E {
         Expr::Neg(x) => E::Neg(Box::new(ex(x))),
         Expr::Concat(xs) => E::Concat(exprs(xs)),
         Expr::Like { expr, pattern, case_insensitive } => E::Like(Box::new(pb::Like { expr: bex(expr), pattern: bex(pattern), case_insensitive: *case_insensitive })),
+        Expr::Prefix { expr, prefix } => E::Prefix(Box::new(pb::Prefix { expr: bex(expr), prefix: bex(prefix) })),
         Expr::Case { operand, whens, otherwise } => E::Case(Box::new(pb::Case {
             operand: operand.as_deref().and_then(bex),
             whens: whens.iter().map(|w| pb::When { when: Some(ex(&w.when)), then: Some(ex(&w.then)) }).collect(),
@@ -505,6 +506,10 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
         E::Like(l) => {
             let l = *l;
             Expr::Like { expr: from_bex(l.expr)?, pattern: from_bex(l.pattern)?, case_insensitive: l.case_insensitive }
+        }
+        E::Prefix(p) => {
+            let p = *p;
+            Expr::Prefix { expr: from_bex(p.expr)?, prefix: from_bex(p.prefix)? }
         }
         E::Case(c) => {
             let c = *c;

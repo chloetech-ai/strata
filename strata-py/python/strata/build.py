@@ -187,6 +187,14 @@ class Expr:
         """`lo <= expr <= hi`; a bound of None is open."""
         return _Between(self, lo, hi)
 
+    def startswith(self, prefix: str) -> Expr:
+        """The text starts with `prefix` (a multi-valued field: one of its
+        values does); on a KEYWORD field, one run of its index, as SQL's
+        `LIKE 'p%'` and `PREFIX(field, 'p')` are."""
+        if not isinstance(prefix, str):
+            raise TypeError("startswith takes a str")
+        return _Prefix(self, prefix)
+
     def is_null(self) -> Expr:
         """The expression has no value (a multi-valued field: holds none)."""
         return _IsNull(self)
@@ -386,6 +394,14 @@ class _IsNull(Expr):
 
     def _ir(self, ctx: _Ctx) -> Any:
         return {"is_null": self.e._ir(ctx)}
+
+
+class _Prefix(Expr):
+    def __init__(self, e: Expr, prefix: str):
+        self.e, self.prefix = e, prefix
+
+    def _ir(self, ctx: _Ctx) -> Any:
+        return {"prefix": {"expr": self.e._ir(ctx), "prefix": _operand(self.prefix, ctx, _field_of(self.e, ctx))}}
 
 
 class _In(Expr):

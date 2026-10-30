@@ -585,6 +585,46 @@ impl NumericColumn {
         let (min, max) = self.blocks.zone(b);
         cut(min, max, r)
     }
+
+    /// Number of blocks of [`BLOCK`](super::BLOCK) documents.
+    pub fn n_blocks(&self) -> usize {
+        self.blocks.n_blocks()
+    }
+
+    /// Smallest and largest key of block `b`'s values (`None` if it has
+    /// none), from its zone map.
+    pub fn block_keys(&self, b: usize) -> Option<(i64, i64)> {
+        Some(self.blocks.zone(b)).filter(|(lo, hi)| lo <= hi)
+    }
+
+    /// Smallest and largest key of superblock `s` (blocks `s * SUPER` to
+    /// `(s + 1) * SUPER - 1`; `None` if they have no values).
+    pub fn super_keys(&self, s: usize) -> Option<(i64, i64)> {
+        Some(self.blocks.super_zone(s)).filter(|(lo, hi)| lo <= hi)
+    }
+
+    /// Writes the keys of block `b`'s documents to `out` (`out[j]` for
+    /// document `BLOCK * b + j`) and returns the mask of those with a value
+    /// (bit `j % 64` of word `j / 64`); slots without one hold any key.
+    pub fn block_keys_of(&self, b: usize, out: &mut [i64; super::BLOCK]) -> [u64; 2] {
+        let mut deltas = [0u32; super::BLOCK];
+        let mask = self.blocks.present_mask(b);
+        match self.blocks.decode_block_u32(b, &mut deltas) {
+            Some(min) => {
+                for (o, &x) in out.iter_mut().zip(&deltas) {
+                    *o = min.wrapping_add(x as i64);
+                }
+            }
+            None => {
+                for (j, o) in out.iter_mut().enumerate() {
+                    if mask[j / 64] >> (j % 64) & 1 == 1 {
+                        *o = self.blocks.raw((b * super::BLOCK + j) as u32);
+                    }
+                }
+            }
+        }
+        mask
+    }
 }
 
 /// Whether `r` overlaps a zone `[min, max]` without containing it.
@@ -608,6 +648,10 @@ impl DocFilter for ColumnRangeFilter {
 
     fn cardinality(&self) -> usize {
         self.estimate
+    }
+
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        self.range.is_some_and(|r| self.blocks.may_have(docs, r))
     }
 }
 
