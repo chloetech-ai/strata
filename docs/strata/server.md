@@ -153,7 +153,7 @@ A `VECTOR` field can say what its vectors are: a model's embedding of other fiel
 {"name": "emb_both", "type": "vector", "embed": {"from": ["title", "description"], "model": "potion-retrieval-32M"}}
 ```
 
-The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text embedded is their non-empty values joined by newlines, as for a generated field. The declaration is kept in the database, returned by `/v1/schema` and shown by the UI ("emb_title ← title") and the agent. When the server starts it opens each field's model from `--models` and logs what each field is. With the model open:
+The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text embedded is their non-empty values joined by newlines, as for a generated field; or one [`media` field](#media-fields) of kind `image`, whose images a model of images and text embeds ([vectors of images](#vectors-of-images)). The declaration is kept in the database, returned by `/v1/schema` and shown by the UI ("emb_title ← title") and the agent. When the server starts it opens each field's model from `--models` and logs what each field is. With the model open:
 
 - writes that leave the vector out get it computed: `/v1/write` documents and SQL `INSERT`, and an `UPDATE` that changes a source recomputes it, all before the write queues for the writer (on as many writes at once as there are cores), so the writer never waits for a model (with bge-small on 4 cores, an in-place `UPDATE` beside two clients inserting rows went from 4.7 to 500 a second, and four inserting clients from 10 to 23 rows a second: [results](https://github.com/rkonow/strata/tree/main/strata-server/results/sql-writes)); a vector a write supplies is kept as given;
 - an `UPDATE` that changes a source recomputes the vector; merges do not (they keep the stored vectors);
@@ -169,6 +169,7 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 | `potion-base-8M` | Model2Vec, 256 dimensions | smallest |
 | `bge-small-en-v1.5` | BERT encoder, 384 dimensions | build with `--features bert`; milliseconds a row |
 | `snowflake-arctic-embed-m-v1.5` | BERT encoder, 768 dimensions | build with `--features bert`; slower, better |
+| `siglip-base-patch16-224` | SigLIP base: images and text in one space, 768 dimensions | build with `--features vision`; about 0.5 s an image and 80 ms a text on a 4-vCPU cloud VM |
 | `hash:N` | hashed bag of words, *N* dimensions | no files; tests and the demo |
 
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
@@ -229,6 +230,33 @@ This happens before the write queues for the writer, for `/v1/write`, SQL `INSER
 
 Queries return the value as JSON text. The field's index is of hashes, so `WHERE image = :sha256`, `IN` and `GROUP BY image` find and count the rows of a file. `kind` refuses files of another type, by their bytes' headers. A coordinator does not fetch: start each shard with the `--media-*` options. A database with a `media` field is written in [file format 3](index.md#wal-memtable-and-snapshots).
 
+### Vectors of images
+
+An [embedded vector field](#embedded-vector-fields) can be the embedding of a `media` field of kind `image`, by a model of images and text (`siglip-base-patch16-224`, built with `--features vision`):
+
+```json
+{"name": "image", "type": "media", "kind": "image"},
+{"name": "emb", "type": "vector", "embed": {"from": ["image"], "model": "siglip-base-patch16-224"}}
+```
+
+A write's images are decoded (JPEG, PNG, WebP, GIF, BMP) and embedded with the value's other work, before the write queues for the writer, from the bytes the write gave or fetched; a value written whole is read from where its URI says (the media store, or a place `--media-fetch` lists), and must still hash to its `sha256`. An image that cannot be read or decoded fails the request, as a value that cannot be resolved does. The vectors are logged with the row, so replicas get them and run no model. An embedded field embeds one `media` field or text fields, not both; a second field can embed the text beside it.
+
+A query embeds an image file with the model's image tower, `{"embed": {"image": "<base64>"}, "field": "emb"}`, and a text with its text tower, `{"embed": "a dog on a beach", "field": "emb"}`; the image's vector and the caption's are in one space, so either finds images:
+
+```sh
+curl -s localhost:7700/v1/query -d '{"sql": "SELECT id FROM photos ORDER BY similarity(emb, :q) DESC LIMIT 10",
+  "params": {"q": {"embed": "a dog on a beach", "field": "emb"}}}'
+```
+
+Through Strata, `siglip-base-patch16-224` retrieves as well as [open_clip's published results](https://github.com/mlfoundations/open_clip/blob/main/docs/openclip_retrieval_results.csv) for it say (Karpathy's test splits, five captions an image, exact search; `strata-media-eval`, cloud container with 4 vCPUs, [results](https://github.com/rkonow/strata/tree/main/strata/results/media)):
+
+| split | text to image R@1 / R@5 / R@10 | image to text R@1 / R@5 / R@10 |
+|---|---|---|
+| Flickr30K, 1,000 images | 74.7 / 92.3 / 95.7 | 89.2 / 97.9 / 99.3 |
+| *published* | *74.7 / 92.3 / 95.6* | *89.1 / 98.0 / 99.3* |
+| COCO, 5,000 images | 47.8 / 72.4 / 80.9 | 65.7 / 85.6 / 91.4 |
+| *published* | *47.8 / 72.4 / 81.0* | *65.7 / 85.4 / 91.3* |
+
 ## Semantic IDs
 
 A semantic ID is a short code for a row's vector, such as `12.7.201.0`, that nearby vectors share a start of: rows whose codes start with `12` are alike, those that start with `12.7` more so. Generative recommenders predict an item's code a number at a time; a filter on a prefix finds every row under it.
@@ -250,18 +278,20 @@ A database with a semantic-ID field needs the manifest feature `semantic_id`, an
 
 ## HTTP API
 
-Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model; both take `"table"` for a field of another table than the first.
+Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model (`{"embed": {"image": "<base64>"}, ...}` for an image file's, by a [model of images](#vectors-of-images)); both take `"table"` for a field of another table than the first.
 
 | route | body | answer |
 |---|---|---|
 | `POST /v1/query` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{columns, rows, keys, scores, stats, took_ms}`; `min_seq_no` and `min_seq_nos` name a write the read must see ([reads that see a write](#reads-that-see-a-write)) |
 | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows for a `SELECT`; `{written, seq_no?, seq_nos?}` for `INSERT`, `UPDATE`, `DELETE` |
-| `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written, seq_no?, seq_nos?}` ([conditional writes](#conditional-writes); `seq_nos` from a coordinator) |
+| `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written, skipped?, seq_no?, seq_nos?}` ([conditional writes](#conditional-writes); `skipped` for [stream events](#streams) written already; `seq_nos` from a coordinator) |
+| `POST /v1/stream` | operations as NDJSON, one a line, or one event's several as `{ops, source}` ([streams](#streams)) | NDJSON: a line per batch once it commits, `{batch, ops, written, skipped, lines}`, then `{done, batches, lines, written, skipped}`, or `{error, status, lines}` at the first failure |
+| `GET /v1/sources`, `GET /v1/sources/NAME` | | `{sources: [{name, offset, updated}]}`: each stream source's last offset written ([streams](#streams)); for one, `{name, offset, updated}`, `offset` null for a source not written from |
 | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}`: a [plan](query-language.md#explain) in JSON, as `/v1/explain` gives it in `ir` | rows for a read, a compound query's plan included, `{written}` for a write; a coordinator runs reads, and refuses a write plan (400) until its shards take write plans |
 | `POST /v1/import?format=F&table=T` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?, hits?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the bound query (`logical`) and counts; with `hits: n`, a ranked query's top `n` rows as objects with their `score()` and [`features()`](query-language.md#features-the-values-a-ranking-read), the values each was ranked by |
-| `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
+| `POST /v1/embed` | `{text or image, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image file (`image`, base64, for a model of images), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
 | `POST /v1/snapshot` | | a snapshot lease for 60 s: `{snapshot, txn, ttl_s}` (at most 10,000 are held at once; more get 429) |
 | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the queries it ran |
@@ -323,6 +353,29 @@ An operation with `"if_seq_no": n` applies only while its row's number is n, so 
 
 Every operation but `insert`, which fails if the row exists, takes it. When the row has another number, has no row, or was written by an earlier operation of the same request, the request writes nothing and gets 409 (`FailedPrecondition` over gRPC), naming the key and its number. Of several requests writing a row with the same `if_seq_no`, exactly one applies. Without `--seq-no`, `if_seq_no` and `seq_no()` are refused.
 
+### Streams
+
+A stream is a long write: `POST /v1/stream` takes operations as NDJSON (`application/x-ndjson`) for as long as the client sends them, and writes them in batches as they arrive: the server reads ahead while a batch commits, and the next batch takes the lines that came meanwhile, up to 4,096 operations (one line at a time while the client trickles, so a slow stream waits for no batch to fill). Each batch is one transaction; the next is applied once it has committed, and every batch is answered by a line of the answer, which streams back as NDJSON too; the line's `offsets` give the last offset of each source in the batch, which a consumer may commit to its log once the line arrives. The first batch that fails ends the stream with an `{"error": ..., "status": ..., "lines": n}` line, nothing after its `lines` lines applied. gRPC `WriteStream` does the same with a message per batch: the first that fails ends the stream with its error.
+
+An operation from an event stream (Kafka, Kinesis, a log) names its event's place in it: `"source": {"name": "clicks/0", "offset": 81234, "ts": "2026-10-30T06:00:01.250Z"}`, `ts` being when the event happened (ISO 8601 text, or milliseconds since the epoch, as Kafka gives them). A server keeps each source's last offset in a system table, `_sources`, in the same transaction as the rows: committed with them, or not at all. An operation whose offset its source has reached already is a replay's, and is skipped (and counted in `skipped`). So a consumer that resumes from `GET /v1/sources/<name>` plus one, or from anywhere before it, applies each event once, every operation it makes included: an `add` to a counter counts once, and an `insert` does not fail as a duplicate. The same holds for `/v1/write`, whose operations may carry sources too. Name a source per partition (`clicks/0`, `clicks/1`), since offsets are per partition.
+
+```sh
+printf '%s\n' \
+  '{"source": {"name": "clicks/0", "offset": 0, "ts": 1761804001250}, "ops": [{"op": "insert", "table": "events", "doc": {"id": 1, "usr": "u3", "item": "p1"}}, {"op": "add", "table": "users", "key": "u3", "field": "n_events", "value": 1}]}' \
+  '{"source": {"name": "clicks/0", "offset": 1, "ts": 1761804001300}, "op": "insert", "table": "events", "doc": {"id": 2, "usr": "u4", "item": "p2"}}' |
+curl -s localhost:7700/v1/stream -H 'content-type: application/x-ndjson' --data-binary @-
+# {"batch":1,"ops":3,"written":3,"skipped":0,"lines":2,"offsets":{"clicks/0":1}}
+# {"done":true,"batches":1,"lines":2,"written":3,"skipped":0}
+curl -s localhost:7700/v1/sources/clicks/0
+# {"name":"clicks/0","offset":1,"updated":"2026-10-30T06:00:01.412Z"}
+```
+
+A line is an operation, or one event's operations as `{"ops": [...], "source": {...}}` (the source going to each operation that names none), which a batch never splits: since an offset reached marks a replay, an event's operations must commit together. Along a stream a source's offsets increase from line to line; a line whose offset does not pass the one before it ends the stream (400), as it would otherwise be skipped. An `{"op": "source", "source": {...}}` operation moves a source's offset without writing a row (for events a consumer filters out).
+
+Through a coordinator, each batch goes to the shards its rows are on, and every shard keeps the batch's offsets, whether or not the batch gave it rows. `GET /v1/sources` there answers the least offset over the shards, where a stream resumes: each shard skips the events it applied already. A source some shard does not have is not listed (its first batch never reached that shard), so a stream of it starts over. Shards must speak protocol 6 ([gRPC](#grpc)) for writes with sources; an older one is refused by name. Replicas keep their primary's offsets ([replication](#replication-a-primary-and-its-replicas)), and a replica promoted to primary resumes the stream where the old primary stopped.
+
+A stream does not wait in the writer's queue: while the database is behind on flushing its memtable to disk (past twice `memtable_max_docs`, while the flusher flushes), or the queue is full, it reads nothing more from its client until it catches up, so TCP or HTTP/2 flow control slows the producer. A plain write then waits up to a second, and is refused with 429 and `Retry-After: 1`. A coordinator's stream sends a batch a shard refused with 429 again a second later. `strata_stream_lag_seconds` is a histogram of the time from each event's `ts` to the moment its rows were visible.
+
 ### Backups
 
 Copying the database's files while the server runs is not a backup: a commit reuses pages an older version freed, and the directory layout deletes files a version stops naming, so a copy (`cp`, rsync, a disk snapshot, Time Machine) can pair one version's manifest with another's pages. A checkpoint is the safe copy. `POST /v1/admin/checkpoint` flushes the memtable, pins the version that holds every committed write and copies it into `--backup-dir/<name>` while queries and writes go on (they wait only for the flush). The checkpoint is itself a database, checked against its checksums before it gets its name: restore by stopping the server and serving the checkpoint (`--db`), or by moving it into place.
@@ -359,9 +412,9 @@ Not yet: point-in-time recovery between checkpoints, which needs the write-ahead
 
 ## gRPC
 
-`proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `Schema` and `Health`, mirroring the HTTP routes, and `Hello`, `Release`, `Slots`, and `Replicate`, `Restore` and `Verify` (a primary's calls to its [replicas](#replication-a-primary-and-its-replicas)). Values are typed (`int`, `float`, `str`, `vector`, `list`, `boolean`, `timestamp`); statistics and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
+`proto/strata.proto` defines the service: `Query`, `TermStats`, `Write`, `WriteStream`, `Sources`, `Schema` and `Health`, mirroring the HTTP routes, and `Hello`, `Release`, `Slots`, and `Replicate`, `Restore` and `Verify` (a primary's calls to its [replicas](#replication-a-primary-and-its-replicas)). Values are typed (`int`, `float`, `str`, `vector`, `list`, `boolean`, `timestamp`); statistics and fusion parts travel as JSON bytes, since they are Strata's own serde types. The server compiles the proto at build time with a pure-Rust compiler, so building needs no `protoc`.
 
-A query travels as SQL with its parameters or, from protocol 2, as a typed plan (`QueryRequest.plan`, with `protocol` 2 or newer): the tree of operators [`EXPLAIN`](query-language.md#explain) shows, its fields named by position in the schema and its values typed, with no SQL to parse. `sql` then only names the query in the shard's logs. Protocol 3 adds snapshot leases for a fetch that follows a query: a query with `hold` keeps the snapshot it read, its own lease or a new one lasting as a `TermStats` lease does, and names it in its answer (`QueryResponse.snapshot`); a query with `release` ends its lease once answered, and `Release` ends leases no fetch needs. Protocol 4 places keys in [slots](#slots): `Slots` gives a shard its slot map and its place in it, and queries, statistics calls and writes carry the map's `epoch`. Protocol 5 adds [reads that see a write](#reads-that-see-a-write): `QueryRequest.min_seq_no` on a server, `min_seq_nos` on a coordinator, and `WriteResponse.seq_nos` from a coordinator. `Hello` answers the protocol versions a server speaks (1 to 5), the plan version it reads, the plan features it has, the epoch of the slot map it holds, and its role in replication (`STANDALONE`, `PRIMARY` or `REPLICA`) with its term and last sequence number, and on a primary that another replaced, the newer term (`replaced_by_term`). A server refuses a protocol newer than its own, and a plan of a newer version or one that needs a feature it lacks, by name (`InvalidArgument`). Protocol 1, the servers before `Hello`, takes SQL, or a JSON plan (`plan_json`) for a compound query's leaf.
+A query travels as SQL with its parameters or, from protocol 2, as a typed plan (`QueryRequest.plan`, with `protocol` 2 or newer): the tree of operators [`EXPLAIN`](query-language.md#explain) shows, its fields named by position in the schema and its values typed, with no SQL to parse. `sql` then only names the query in the shard's logs. Protocol 3 adds snapshot leases for a fetch that follows a query: a query with `hold` keeps the snapshot it read, its own lease or a new one lasting as a `TermStats` lease does, and names it in its answer (`QueryResponse.snapshot`); a query with `release` ends its lease once answered, and `Release` ends leases no fetch needs. Protocol 4 places keys in [slots](#slots): `Slots` gives a shard its slot map and its place in it, and queries, statistics calls and writes carry the map's `epoch`. Protocol 5 adds [reads that see a write](#reads-that-see-a-write): `QueryRequest.min_seq_no` on a server, `min_seq_nos` on a coordinator, and `WriteResponse.seq_nos` from a coordinator. Protocol 6 keeps [stream sources' offsets](#streams): write operations may carry a `source`, `WriteResponse.skipped` counts those skipped as replays, and `Sources` answers a server's offsets; a coordinator writes sources only to shards of 6 or newer. `WriteStream` (any server, from a client) streams batches of operations, each answered once committed. `Hello` answers the protocol versions a server speaks (1 to 6), the plan version it reads, the plan features it has, the epoch of the slot map it holds, and its role in replication (`STANDALONE`, `PRIMARY` or `REPLICA`) with its term and last sequence number, and on a primary that another replaced, the newer term (`replaced_by_term`). A server refuses a protocol newer than its own, and a plan of a newer version or one that needs a feature it lacks, by name (`InvalidArgument`). Protocol 1, the servers before `Hello`, takes SQL, or a JSON plan (`plan_json`) for a compound query's leaf.
 
 ## Sharding: one coordinator, many shards
 

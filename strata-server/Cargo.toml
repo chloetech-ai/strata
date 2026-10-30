@@ -13,7 +13,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 axum = "0.7"
 tonic = { version = "0.12", features = ["tls", "tls-webpki-roots"] }
 prost = "0.13"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# "stream": request bodies sent as they are made (strata-stream-bench, tests/stream.rs).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["net"] }
 # TLS for the HTTP listener (tonic serves gRPC's), with ring as tonic does.
@@ -33,6 +34,8 @@ twox-hash = { version = "2", default-features = false, features = ["xxhash3_64"]
 bert = ["strata/bert"]
 # `bert` with matrix products in Apple's Accelerate framework (macOS only).
 accelerate = ["strata/accelerate"]
+# Images: decoded, and embedded by SigLIP (siglip-base-patch16-224).
+vision = ["strata/vision"]
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -41,6 +44,8 @@ protox = "0.7"
 [dev-dependencies]
 tempfile = "3"
 base64 = "0.22"
+# PNGs written by the tests of `vision`.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # CI's tests (cargo test --profile ci). The same as release, which keeps
 # cargo's defaults here; every crate's CI runs the ci profile.
