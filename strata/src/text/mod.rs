@@ -38,7 +38,7 @@ pub mod sparse;
 pub mod synonyms;
 
 pub use analyzer::{analyze, analyze_query, analyze_query_with, analyze_with_positions, query_term_seq, Analyzer, QUERY_STOPWORDS};
-pub use bm25::{Bm25Params, CollectionStats, FilterStrategy, TopKAlgo};
+pub use bm25::{Bm25Params, Boost, CollectionStats, FilterStrategy, TopKAlgo};
 pub use builder::TextFieldBuilder;
 pub use cursor::{PostingCursor, END};
 pub use postings::PostingsFormat;

@@ -217,7 +217,18 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 
 `NULL` is a missing value (a `NULL` column, a row without a vector, one a traversal does not reach) or a result that is not a finite number (`ln(0)`, a division by 0, an overflow). Arithmetic and functions of `NULL` are `NULL`, except `coalesce`, `least` and `greatest`, which skip it. A row whose score is `NULL` ranks after every other, and its `score()` is `NULL`.
 
-Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
+Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
+
+#### Rank-safe boosts
+
+An expression with one text score (`bm25`, or `similarity` on a `SPARSE` field) whose other parts are numeric columns, `decay`, `CASE` conditions, numbers and `seq_no()` finds its exact top rows: the rows that scoring every row the text matches would rank first, not only the best of the text's top 100. `minmax()`, `rank()`, `rrf` and `exact => 1` take the candidates above instead.
+
+```sql
+-- the 10 best by BM25 boosted by importance, even a row 5,000th by BM25 alone
+SELECT id FROM docs ORDER BY bm25(body, :t) * (1 + 0.2 * importance) DESC LIMIT 10;
+```
+
+The text score's top-k loop (MaxScore, Block-Max WAND or exhaustive, as `algo` says) ranks by the whole expression. From the k-th best value so far and each column's smallest and largest value, it works out the lowest text score a row needs, and skips the rows below it. A row the text does not match is not a candidate. When the expression does not rise with the text score (`rating - bm25(body, :t)`), no text score can be ruled out: the loop scores every matching row, and the plan line says `every match scored`. Over shards, each shard returns its own exact top rows, so a split collection ranks like the whole one.
 
 A plan that ranks by an expression needs the plan feature `rank_expressions`; a version of Strata from before it refuses the plan by that name. Weighted sums of `minmax()`, products of scores and `rrf` are written as before, so older shards still run them.
 
@@ -245,7 +256,7 @@ SELECT id FROM news ORDER BY bm25(body, :t) * decay(published, now(), 2592000) D
 SELECT id FROM products ORDER BY similarity(emb, :q) * rating DESC LIMIT 10;
 ```
 
-A product's factors are scores (`bm25`, `similarity`, `ppr`, `decay`) and numeric columns. Candidates are the top `depth` (100) rows of each relevance factor (`bm25`, `similarity`, graph scores; of every factor when there is none), scored exactly by every factor. A factor below 0 (a negative similarity) or missing (a `NULL` column) counts as 0, so the product of two negatives cannot rank high. Over shards, each shard returns its factors' raw scores and the coordinator multiplies them, so a split collection ranks like the whole one.
+A product's factors are scores (`bm25`, `similarity`, `ppr`, `decay`) and numeric columns. Candidates are the top `depth` (100) rows of each relevance factor (`bm25`, `similarity`, graph scores; of every factor when there is none), scored exactly by every factor; a product of one text score and row values (`bm25(..) * decay(..)`, `bm25(..) * rating`) is a [rank-safe boost](#rank-safe-boosts) and ranks every row the text matches. A factor below 0 (a negative similarity) or missing (a `NULL` column) counts as 0, so the product of two negatives cannot rank high. Over shards, each shard returns its factors' raw scores and the coordinator multiplies them, so a split collection ranks like the whole one.
 
 ### A column
 

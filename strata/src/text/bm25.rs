@@ -19,6 +19,12 @@
 //! All three algorithms visit documents in docID order and keep the first of
 //! equal-scored documents, so they return the same top-k up to float
 //! rounding (sums are taken in different orders).
+//!
+//! The same loops can rank by an expression of the text score and each
+//! document's own values ([`Boost`], `bm25(..) * (1 + 0.2 * importance)`):
+//! the expression's bound turns the threshold into a text score that a
+//! document must exceed ([`Final::cut`]), so that lists and blocks are
+//! skipped as for the text score alone, and the top k stays exact.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -178,35 +184,63 @@ impl TermScorer<'_> {
     }
 }
 
+/// A score a top-k keeps: a text score (f32), or an expression of one
+/// (f64).
+trait Key: Copy + PartialOrd {
+    const NEG_INFINITY: Self;
+    fn total_cmp(&self, o: &Self) -> Ordering;
+    fn next_down(self) -> Self;
+}
+
+impl Key for f32 {
+    const NEG_INFINITY: f32 = f32::NEG_INFINITY;
+    fn total_cmp(&self, o: &f32) -> Ordering {
+        f32::total_cmp(self, o)
+    }
+    fn next_down(self) -> f32 {
+        f32::next_down(self)
+    }
+}
+
+impl Key for f64 {
+    const NEG_INFINITY: f64 = f64::NEG_INFINITY;
+    fn total_cmp(&self, o: &f64) -> Ordering {
+        f64::total_cmp(self, o)
+    }
+    fn next_down(self) -> f64 {
+        f64::next_down(self)
+    }
+}
+
 /// The best `k` (score, doc) pairs; ties keep the earlier document, or,
 /// with `ties`, every document tied with the `k`-th stays as well.
-struct TopK {
+struct TopK<S = f32> {
     k: usize,
-    heap: BinaryHeap<Entry>,
+    heap: BinaryHeap<Entry<S>>,
     /// Pairs left out of the heap with the score of its worst, when kept.
-    ties: Option<Vec<Entry>>,
+    ties: Option<Vec<Entry<S>>>,
 }
 
 /// Heap order: the greatest entry is the worst (lowest score, then highest
 /// docID), so `peek` is the threshold.
 #[derive(PartialEq)]
-struct Entry(f32, DocId);
+struct Entry<S>(S, DocId);
 
-impl Eq for Entry {}
+impl<S: Key> Eq for Entry<S> {}
 
-impl Ord for Entry {
+impl<S: Key> Ord for Entry<S> {
     fn cmp(&self, o: &Self) -> Ordering {
         o.0.total_cmp(&self.0).then(self.1.cmp(&o.1))
     }
 }
 
-impl PartialOrd for Entry {
+impl<S: Key> PartialOrd for Entry<S> {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
         Some(self.cmp(o))
     }
 }
 
-impl TopK {
+impl<S: Key> TopK<S> {
     fn new(k: usize) -> Self {
         TopK { k, heap: BinaryHeap::with_capacity(k.saturating_add(1).min(HEAP_RESERVE)), ties: None }
     }
@@ -217,18 +251,18 @@ impl TopK {
 
     /// Scores must exceed this to enter (to be kept, with ties).
     #[inline]
-    fn threshold(&self) -> f32 {
+    fn threshold(&self) -> S {
         if self.heap.len() < self.k {
-            return f32::NEG_INFINITY;
+            return S::NEG_INFINITY;
         }
-        let worst = self.heap.peek().map_or(f32::NEG_INFINITY, |e| e.0);
+        let worst = self.heap.peek().map_or(S::NEG_INFINITY, |e| e.0);
         // A score equal to the worst is kept with ties, so only lower
         // bounds may be skipped.
         if self.ties.is_some() { worst.next_down() } else { worst }
     }
 
     #[inline]
-    fn insert(&mut self, doc: DocId, score: f32) {
+    fn insert(&mut self, doc: DocId, score: S) {
         if self.heap.len() < self.k {
             self.heap.push(Entry(score, doc));
             return;
@@ -252,10 +286,134 @@ impl TopK {
     }
 
     /// By decreasing score, the kept ties last.
-    fn into_sorted(self) -> Vec<(DocId, f32)> {
+    fn into_sorted(self) -> Vec<(DocId, S)> {
         let mut v = self.heap.into_sorted_vec();
         v.extend(self.ties.unwrap_or_default());
         v.into_iter().map(|e| (e.1, e.0)).collect()
+    }
+}
+
+/// What a top-k ranks documents by, given each one's text score: the text
+/// score itself ([`Text`]) or an expression of it ([`Boosted`]).
+trait Final {
+    type S: Key;
+    /// Whether a document whose bound fell to the threshold midway is
+    /// still offered with the part of its text score summed so far (which
+    /// cannot enter). An expression is offered only whole scores.
+    const PARTIAL: bool;
+    /// The score of document `d` whose text score is `text`.
+    fn value(&mut self, d: DocId, text: f32) -> Self::S;
+    /// A text score at or below which no document scores above `theta`:
+    /// the threshold the loops compare text bounds with.
+    fn cut(&mut self, theta: Self::S) -> f32;
+}
+
+/// Ranks by the text score.
+struct Text;
+
+impl Final for Text {
+    type S = f32;
+    const PARTIAL: bool = true;
+    #[inline]
+    fn value(&mut self, _: DocId, text: f32) -> f32 {
+        text
+    }
+    #[inline]
+    fn cut(&mut self, theta: f32) -> f32 {
+        theta
+    }
+}
+
+/// The value a top-k ranks a document by, from its text score (BM25 or a
+/// sparse dot product) and the document's own values, with an upper bound
+/// that lets the top-k skip what cannot reach its `k`-th value: a rank-safe
+/// boost such as `bm25(body, :q) * (1 + 0.2 * importance)`
+/// ([`crate::query::rank::Rank::driver`]).
+pub trait Boost {
+    /// Document `d`'s value when its text score is `text`; NaN for NULL,
+    /// which ranks below every number.
+    fn score(&mut self, d: DocId, text: f32) -> f64;
+    /// An upper bound of the values of the segment's documents whose text
+    /// score is at most `text` (`f64::MIN` where each is NULL).
+    fn bound(&mut self, text: f32) -> f64;
+}
+
+/// A cut is lowered by this fraction of itself, so that the float rounding
+/// of a text bound (a sum of list or block bounds) never prunes a document
+/// above it.
+const CUT_SLACK: f32 = 1e-4;
+
+/// Ranks by a [`Boost`] of the text score.
+struct Boosted<'b, B> {
+    boost: &'b mut B,
+    /// The largest text score of the segment: its lists' bounds summed.
+    max: f32,
+    /// The last threshold asked for and its cut.
+    theta: f64,
+    cut: f32,
+    /// The largest text score found whose bound is at most an earlier
+    /// threshold (thresholds only rise), or -1.
+    ok: f32,
+}
+
+impl<'b, B: Boost> Boosted<'b, B> {
+    fn new(boost: &'b mut B, max: f32) -> Self {
+        Boosted { boost, max, theta: f64::NEG_INFINITY, cut: f32::NEG_INFINITY, ok: -1.0 }
+    }
+
+    /// Whether a bound narrows as the text score falls, so that a
+    /// threshold can skip documents: else every matching document is
+    /// scored.
+    fn narrows(&mut self) -> bool {
+        let top = self.boost.bound(self.max);
+        top < f64::INFINITY && self.boost.bound(self.max * 0.5) < top
+    }
+
+    /// The largest text score whose bound is at most `theta`, found by
+    /// bisection from the last one (a bound need not be monotone, so only
+    /// scores whose bound was computed are taken).
+    fn search(&mut self, theta: f64) -> f32 {
+        if self.boost.bound(self.max) <= theta {
+            return self.max;
+        }
+        let mut lo = self.ok;
+        if lo < 0.0 && self.boost.bound(0.0) <= theta {
+            lo = 0.0;
+        }
+        if lo < 0.0 {
+            return lo;
+        }
+        let mut hi = self.max;
+        while hi - lo > hi * CUT_SLACK {
+            let mid = lo + (hi - lo) * 0.5;
+            if self.boost.bound(mid) <= theta {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+impl<B: Boost> Final for Boosted<'_, B> {
+    type S = f64;
+    const PARTIAL: bool = false;
+    #[inline]
+    fn value(&mut self, d: DocId, text: f32) -> f64 {
+        let v = self.boost.score(d, text);
+        if v.is_nan() { f64::NEG_INFINITY } else { v }
+    }
+    #[inline]
+    fn cut(&mut self, theta: f64) -> f32 {
+        if theta != self.theta {
+            self.theta = theta;
+            if theta > f64::NEG_INFINITY {
+                self.ok = self.search(theta);
+                self.cut = if self.ok < 0.0 { f32::NEG_INFINITY } else { self.ok - self.ok * CUT_SLACK };
+            }
+        }
+        self.cut
     }
 }
 
@@ -367,7 +525,7 @@ impl TextFieldReader {
         algo: TopKAlgo,
         strategy: FilterStrategy,
     ) -> Vec<(DocId, f32)> {
-        self.run(self.query(terms, stats, params), TopK::new(k), filter, algo, strategy)
+        self.run(self.query(terms, stats, params), TopK::new(k), &mut Text, filter, algo, strategy)
     }
 
     /// [`top_k`](Self::top_k), plus every document whose score equals the
@@ -382,7 +540,7 @@ impl TextFieldReader {
         filter: Option<&dyn DocFilter>,
         algo: TopKAlgo,
     ) -> Vec<(DocId, f32)> {
-        self.run(self.query(terms, stats, params), TopK::with_ties(k), filter, algo, FilterStrategy::Auto)
+        self.run(self.query(terms, stats, params), TopK::with_ties(k), &mut Text, filter, algo, FilterStrategy::Auto)
     }
 
     /// Top-`k` (with `ties`, plus every document tied with the `k`-th) by
@@ -400,7 +558,48 @@ impl TextFieldReader {
     ) -> Vec<(DocId, f32)> {
         let w: Vec<(&str, f32)> = terms.iter().map(|(t, w)| (t.as_str(), *w)).collect();
         let top = if ties { TopK::with_ties(k) } else { TopK::new(k) };
-        self.run(self.query_weighted(&w, stats, params), top, filter, algo, FilterStrategy::Auto)
+        self.run(self.query_weighted(&w, stats, params), top, &mut Text, filter, algo, FilterStrategy::Auto)
+    }
+
+    /// The top `k` documents, and every document tied with the `k`-th, by
+    /// `boost` of their weighted BM25 ([`top_k_weighted`](Self::top_k_weighted)),
+    /// best first, and the algorithm that ran: `algo` where the boost's
+    /// bound narrows with BM25, else every matching document is scored
+    /// ([`TopKAlgo::Exhaustive`]). Exact: no document left out scores above
+    /// the `k`-th.
+    #[allow(clippy::too_many_arguments)]
+    pub fn top_k_boosted<B: Boost>(
+        &self,
+        terms: &[(String, f32)],
+        stats: &CollectionStats,
+        params: Bm25Params,
+        k: usize,
+        filter: Option<&dyn DocFilter>,
+        algo: TopKAlgo,
+        boost: &mut B,
+    ) -> (Vec<(DocId, f64)>, TopKAlgo) {
+        let w: Vec<(&str, f32)> = terms.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        self.run_boosted(self.query_weighted(&w, stats, params), k, filter, algo, boost)
+    }
+
+    /// [`top_k_boosted`](Self::top_k_boosted) of a sparse field's dot
+    /// product with `terms` ([`top_k_dot`](Self::top_k_dot)).
+    pub fn top_k_dot_boosted<B: Boost>(
+        &self,
+        terms: &[(String, f32)],
+        k: usize,
+        filter: Option<&dyn DocFilter>,
+        algo: TopKAlgo,
+        boost: &mut B,
+    ) -> (Vec<(DocId, f64)>, TopKAlgo) {
+        self.run_boosted(self.query_dot(terms), k, filter, algo, boost)
+    }
+
+    fn run_boosted<B: Boost>(&self, q: Query<'_>, k: usize, filter: Option<&dyn DocFilter>, algo: TopKAlgo, boost: &mut B) -> (Vec<(DocId, f64)>, TopKAlgo) {
+        let max = q.scorers.iter().map(|s| s.max).sum::<f32>();
+        let mut f = Boosted::new(boost, max);
+        let algo = if f.narrows() { algo } else { TopKAlgo::Exhaustive };
+        (self.run(q, TopK::with_ties(k), &mut f, filter, algo, FilterStrategy::Auto), algo)
     }
 
     /// Exact weighted BM25 of `docs` (see [`top_k_weighted`](Self::top_k_weighted)).
@@ -413,7 +612,7 @@ impl TextFieldReader {
     /// term weights with `terms`' (see [`crate::text::sparse`]); filters as
     /// in [`top_k_with`](Self::top_k_with).
     pub fn top_k_dot(&self, terms: &[(String, f32)], k: usize, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
-        self.run(self.query_dot(terms), TopK::new(k), filter, algo, strategy)
+        self.run(self.query_dot(terms), TopK::new(k), &mut Text, filter, algo, strategy)
     }
 
     /// Exact dot product of a sparse field's documents `docs` with `terms`.
@@ -421,30 +620,30 @@ impl TextFieldReader {
         self.score_with(self.query_dot(terms), docs)
     }
 
-    fn run(&self, mut q: Query<'_>, mut top: TopK, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, f32)> {
+    fn run<F: Final>(&self, mut q: Query<'_>, mut top: TopK<F::S>, f: &mut F, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, F::S)> {
         if top.k == 0 || q.scorers.is_empty() {
             return Vec::new();
         }
-        if let Some(f) = filter {
+        if let Some(filt) = filter {
             let drive = match strategy {
                 FilterStrategy::Drive => true,
                 FilterStrategy::Probe => false,
                 FilterStrategy::Auto => {
                     let postings: f64 = q.scorers.iter().map(|s| s.cur.len() as f64).sum();
-                    f.cardinality() as f64 * q.scorers.len() as f64 * drive_cost(algo) < postings
+                    filt.cardinality() as f64 * q.scorers.len() as f64 * drive_cost(algo) < postings
                 }
             };
             if drive {
-                if let Some(members) = f.members() {
-                    q.drive(members, &mut top);
+                if let Some(members) = filt.members() {
+                    q.drive(members, &mut top, f);
                     return top.into_sorted();
                 }
             }
         }
         match algo {
-            TopKAlgo::Exhaustive => q.exhaustive(&mut top, filter),
-            TopKAlgo::MaxScore => q.max_score(&mut top, filter),
-            TopKAlgo::BlockMaxWand => q.block_max_wand(&mut top, filter),
+            TopKAlgo::Exhaustive => q.exhaustive(&mut top, f, filter),
+            TopKAlgo::MaxScore => q.max_score(&mut top, f, filter),
+            TopKAlgo::BlockMaxWand => q.block_max_wand(&mut top, f, filter),
         }
         top.into_sorted()
     }
@@ -488,11 +687,11 @@ impl Query<'_> {
         (s as f32, any, live)
     }
 
-    fn drive(&mut self, members: impl Iterator<Item = DocId>, top: &mut TopK) {
+    fn drive<F: Final>(&mut self, members: impl Iterator<Item = DocId>, top: &mut TopK<F::S>, f: &mut F) {
         for d in members {
             let (s, any, live) = self.score_doc(d);
             if any {
-                top.insert(d, s);
+                top.insert(d, f.value(d, s));
             }
             if !live {
                 break;
@@ -500,7 +699,7 @@ impl Query<'_> {
         }
     }
 
-    fn exhaustive(&mut self, top: &mut TopK, filter: Option<&dyn DocFilter>) {
+    fn exhaustive<F: Final>(&mut self, top: &mut TopK<F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
         let sc = &mut self.scorers;
         // Current docIDs, dense, so that finding the next candidate does not
         // touch the (large) cursors.
@@ -519,7 +718,7 @@ impl Query<'_> {
                         *x = sc[i].cur.next();
                     }
                 }
-                top.insert(d, s as f32);
+                top.insert(d, f.value(d, s as f32));
             } else {
                 for (i, x) in docs.iter_mut().enumerate() {
                     if *x == d {
@@ -530,7 +729,7 @@ impl Query<'_> {
         }
     }
 
-    fn max_score(&mut self, top: &mut TopK, filter: Option<&dyn DocFilter>) {
+    fn max_score<F: Final>(&mut self, top: &mut TopK<F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
         let sc = &mut self.scorers;
         sc.sort_by(|a, b| a.max.total_cmp(&b.max));
         let n = sc.len();
@@ -546,7 +745,7 @@ impl Query<'_> {
         // Lists [0, ne) are non-essential.
         let mut ne = 0;
         loop {
-            let theta = top.threshold();
+            let theta = f.cut(top.threshold());
             while ne < n && ub[ne] <= theta {
                 ne += 1;
             }
@@ -587,19 +786,19 @@ impl Query<'_> {
                 }
             }
             if alive {
-                top.insert(d, s as f32);
+                top.insert(d, f.value(d, s as f32));
             }
         }
     }
 
-    fn block_max_wand(&mut self, top: &mut TopK, filter: Option<&dyn DocFilter>) {
+    fn block_max_wand<F: Final>(&mut self, top: &mut TopK<F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
         let sc = &mut self.scorers;
         let n = sc.len();
         let mut docs: Vec<DocId> = sc.iter().map(|s| s.cur.doc()).collect();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&i| docs[i]);
         loop {
-            let theta = top.threshold();
+            let theta = f.cut(top.threshold());
             // Pivot: the first list at which the bounds so far exceed theta.
             let mut upper = 0.0f32;
             let mut pivot = n;
@@ -631,16 +830,19 @@ impl Query<'_> {
                     // replacing block bounds by scores while it can qualify.
                     if filter.is_none_or(|f| f.contains(pivot_doc)) {
                         let norm = self.norms[pivot_doc as usize];
-                        let (mut s, mut bound) = (0.0f64, block_upper);
+                        let (mut s, mut bound, mut whole) = (0.0f64, block_upper, true);
                         for &i in &order[..=pivot] {
                             let x = sc[i].score(&self.k, norm);
                             s += x as f64;
                             bound -= sc[i].block_max - x;
                             if bound <= theta {
+                                whole = false;
                                 break;
                             }
                         }
-                        top.insert(pivot_doc, s as f32);
+                        if whole || F::PARTIAL {
+                            top.insert(pivot_doc, f.value(pivot_doc, s as f32));
+                        }
                     }
                     for &i in &order[..=pivot] {
                         docs[i] = sc[i].cur.next();
