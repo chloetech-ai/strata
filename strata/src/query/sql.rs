@@ -953,6 +953,21 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// The keys of `ranked(keys)`: a tuple or array of keys, or a
+    /// parameter holding a list of them (or one key).
+    fn ranked_keys(&self, e: &Expr) -> Result<Vec<Value>> {
+        let pk = self.schema.primary_key.ok_or_else(|| err("ranked(keys) ranks rows by their primary keys, and the table has none"))?;
+        match e {
+            Expr::Nested(inner) => self.ranked_keys(inner),
+            Expr::Tuple(items) => items.iter().map(|i| self.field_value(pk, i)).collect(),
+            Expr::Array(a) => a.elem.iter().map(|i| self.field_value(pk, i)).collect(),
+            _ => match as_list(self.literal(e)?) {
+                Ok(xs) => xs.into_iter().map(|x| self.coerce(pk, x)).collect(),
+                Err(v) => Ok(vec![self.coerce(pk, v)?]),
+            },
+        }
+    }
+
     /// A literal as a primary-key value.
     fn key_value(&self, e: &Expr) -> Result<Value> {
         let pk = self.schema.primary_key.ok_or_else(|| err("graph queries need a primary key"))?;
@@ -1369,6 +1384,10 @@ impl<'a> Binder<'a> {
                     // The number of hops, in an expression.
                     "hops" if args.is_empty() => Ok(Score::Hops { graph: self.hops_graph()?, far_first: true }),
                     "seq_no" if args.is_empty() => Ok(Score::SeqNo),
+                    "ranked" => match args.as_slice() {
+                        [keys] => Ok(Score::Ranked { keys: self.ranked_keys(keys)? }),
+                        _ => Err(err("ranked(keys) takes one argument: a list of primary keys, best first")),
+                    },
                     "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
                     "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
                     "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),

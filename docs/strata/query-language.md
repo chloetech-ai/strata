@@ -219,6 +219,16 @@ $$
 
 Options: `k => 60`, `depth => 100`. The depth is raised to `LIMIT + OFFSET` when the page asks for more rows, as in weighted sums and products.
 
+### `ranked(keys)`: a ranking from elsewhere
+
+`ranked(:keys)` is a ranking computed outside Strata, given as primary keys, best first: a recommender's candidates, a reranker's order, or the rows a [semantic-ID](server.md#semantic-ids) decoder generated. It is a score like any other, so it fuses with Strata's own rankings:
+
+```sql
+SELECT id FROM items WHERE in_stock ORDER BY rrf(bm25(title, :q), ranked(:keys)) DESC LIMIT 20;
+```
+
+A listed row scores `-(its position)`, from `-1` for the first key; a key listed twice ranks where it is first. A row the list leaves out has `NULL`, so in an expression it ranks last unless `coalesce` gives it a value, and in a weighted sum it takes the input's worst value, as a missing column does. Times another score (`ranked(:keys) * rating`) it multiplies as arithmetic, not as a product of scores, which would count its negative values as 0. A key no live row has is skipped. On its own, `ORDER BY ranked(:keys) DESC` answers the listed rows that `WHERE` keeps, in list order. The keys are a parameter holding a list (an array of keys in the HTTP API), a tuple (`ranked(('a', 'b'))`) or an array (`ranked(ARRAY['a', 'b'])`). Over shards, each shard scores its own rows from the list and the coordinator merges them, so no extra round is needed. A plan that uses it needs the plan feature `ranked`.
+
 ### Weighted sums: `minmax()`
 
 A weighted sum of min-max normalised scores is weighted fusion: `0.2 * minmax(bm25(body, :t)) + 0.8 * minmax(similarity(emb, :q))`. Weights are numeric constants; `+` and `-` combine any number of terms. Candidates are the union of each input's top 100, re-scored exactly by every input and min-max normalised over that union:
@@ -252,7 +262,7 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 | part | meaning |
 |---|---|
 | `+ - * / %`, unary `-` | arithmetic on raw values |
-| `bm25`, `similarity`, `ppr`, `decay`, `rrf`, a numeric column, `hops()`, `seq_no()` | the leaves: a row's value of each |
+| `bm25`, `similarity`, `ppr`, `decay`, `rrf`, `ranked`, a numeric column, `hops()`, `seq_no()` | the leaves: a row's value of each |
 | `ln(x)`, `log(x)` (base 10), `log(b, x)`, `exp(x)`, `sqrt(x)`, `pow(x, y)`, `abs(x)`, `round(x[, digits])`, `sigmoid(x)`, `clamp(x, lo, hi)` | numeric functions |
 | `least(…)`, `greatest(…)`, `coalesce(…)` | over their arguments that are not `NULL` |
 | `minmax(x)` | `x` over the rows ranked, put on [0, 1]: 1 where all are equal, 0 where `x` is `NULL` |
@@ -261,7 +271,7 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 
 `NULL` is a missing value (a `NULL` column, a row without a vector, one a traversal does not reach) or a result that is not a finite number (`ln(0)`, a division by 0, an overflow). Arithmetic and functions of `NULL` are `NULL`, except `coalesce`, `least` and `greatest`, which skip it. A row whose score is `NULL` ranks after every other, and its `score()` is `NULL`.
 
-Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
+Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's, `ranked`), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
 
 #### Rank-safe boosts
 

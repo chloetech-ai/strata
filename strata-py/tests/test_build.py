@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, rrf, score, similarity, sigmoid, sqrt
+from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, ranked, rrf, score, similarity, sigmoid, sqrt
 from conftest import BOOKS, book
 
 
@@ -50,6 +50,17 @@ def test_bm25_weighs_requires_and_excludes_words(db):
     assert plain.rows != r.rows
     with pytest.raises(strata.StrataError, match="'query' or 'plain'"):
         db.run(t.select("id").order_by(bm25("description", q, syntax="lucene")).limit(5))
+
+
+def test_a_ranking_given_by_keys_runs_as_its_sql(db):
+    t = db.table()
+    keys = ["b0007", "b0003", "none", "b0011", "b0003"]
+    r = same(db, t.select("id", score()).order_by(ranked(keys)).limit(10),
+             "SELECT id, score() FROM books ORDER BY ranked(:keys) DESC LIMIT 10", keys=keys)
+    assert r.rows == [["b0007", -1.0], ["b0003", -2.0], ["b0011", -4.0]]
+    same(db, t.select("id").where(col("year") >= 1950).order_by(rrf(bm25("description", "dragon"), ranked(keys))).limit(5),
+         "SELECT id FROM books WHERE year >= 1950 ORDER BY rrf(bm25(description, 'dragon'), ranked(:keys)) DESC LIMIT 5", keys=keys)
+
 
 def test_ranking_expressions_run_as_their_sql(db):
     """Arithmetic, functions, minmax(), rank() and case() rank as SQL's

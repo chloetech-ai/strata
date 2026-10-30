@@ -48,6 +48,7 @@ __all__ = [
     "similarity",
     "maxsim",
     "rrf",
+    "ranked",
     "minmax",
     "rank",
     "gbdt",
@@ -655,6 +656,21 @@ def rrf(*scores: Expr, k: float = 60, depth: int = 100) -> Expr:
     if not scores:
         raise StrataError("rrf takes rankings")
     return _Fn(lambda ctx: {"rrf": {"inputs": [s._ir(ctx) for s in scores], "k": float(k), "depth": int(depth)}}, f"rrf({', '.join(map(repr, scores))})", inputs=list(scores))
+
+
+def ranked(keys: Iterable[Any]) -> Expr:
+    """A ranking computed outside Strata, as a score: the rows of `keys`
+    (primary keys, best first), each scoring -(its position) from 1, and
+    rows not listed none. An input of `rrf`, or of an expression."""
+    keys = [keys] if isinstance(keys, (str, int)) else list(keys)
+
+    def build(ctx: _Ctx) -> Any:
+        if not ctx.key:
+            raise StrataError(f"ranked() ranks rows by their primary keys, and {ctx.table} has none")
+        key = ctx.field(ctx.key)[1]
+        return {"ranked": {"keys": [_value(k, key) for k in keys]}}
+
+    return _Fn(build, f"ranked({keys!r})")
 
 
 def minmax(x: Expr) -> Expr:

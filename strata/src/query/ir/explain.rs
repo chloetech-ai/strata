@@ -357,6 +357,7 @@ impl<'a> Text<'a> {
                 };
                 format!("decay({}, {origin}, {}, offset => {}, decay => {}, shape => '{shape}')", field(names, *f), decay.scale / unit, decay.offset / unit, decay.decay)
             }
+            Expr::Ranked { keys } => format!("ranked({})", lit(&Value::List(keys.clone()))),
             Expr::Rrf { inputs, k, depth } => format!("rrf({}, k => {k}, depth => {depth})", inputs.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
             // Min-max fusion, as SQL writes it: each term normalised, unless
             // a term's score keeps raw values (`norm => 'none'`).
