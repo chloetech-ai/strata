@@ -140,6 +140,10 @@ fn queries() -> Vec<(&'static str, Json)> {
         ("SELECT id, year, score() FROM products ORDER BY bm25(body, 'waterproof jacket') * decay(year, 2026, 2) DESC LIMIT 10", none.clone()),
         ("SELECT id, price, score() FROM products WHERE category = 'kitchen' ORDER BY decay(price, 50, 20, shape => 'gauss') DESC LIMIT 10", none.clone()),
         ("SELECT id, score() FROM products ORDER BY similarity(emb, :q) * decay(rating, 5, 1) DESC LIMIT 10", like.clone()),
+        // Ranking expressions: BM25 scored with the whole collection's
+        // statistics, and a rank-safe boost.
+        ("SELECT id, score() FROM products ORDER BY ln(1 + bm25(body, 'waterproof hiking')) + 0.1 * coalesce(rating, 0) DESC LIMIT 10", none.clone()),
+        ("SELECT id, score() FROM products WHERE price < 200 ORDER BY bm25(body, 'leather boots') * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 8", none.clone()),
     ]
 }
 
