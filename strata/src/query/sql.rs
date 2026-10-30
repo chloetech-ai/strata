@@ -1362,6 +1362,7 @@ impl<'a> Binder<'a> {
                         let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
                         Expand::from_opts(&opts).map_err(err)?;
+                        crate::query::exec::plain_syntax(&opts)?;
                         Ok(Score::Bm25 { field, text, opts: without_norm(opts) })
                     }
                     "similarity" => self.similarity(&args, opts, false),

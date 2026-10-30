@@ -24,7 +24,13 @@
 //! model in `--models` trained on a training split: `gbdt` its exact top
 //! 10 (rank-safe, from the model's bounds), `gbdt_top100` its top 10 of
 //! BM25's top 100 with rank-safe off, and `gbdt_rerank100` BM25's top 100
-//! reranked by it in a second phase. `--features DIR` makes their training
+//! reranked by it in a second phase. The term-operator variants rank the
+//! query's words (signs, quotes and carets dropped) with the default
+//! syntax: `words` as they are, `weight_first` with its first word that is
+//! not a stopword weighing 2, `require_first` with that word required
+//! (`+word`) and `exclude_last` with its last such word excluded
+//! (`-word`): what weights and the filters they make cost against
+//! `words`. `--features DIR` makes the `gbdt` models' training
 //! data instead of timing anything: each query's BM25 top 100 with
 //! `features()` and its grades, in `<DIR>/<collection>.jsonl`, which
 //! `scripts/train_ltr.py` trains the models on. `ce_rerank<N>` ranks
@@ -37,6 +43,9 @@
 //! `<out>/bm25_<tag>.json` (default `results/text/`). Tune on `--split dev` (or `train` where a collection
 //! has no dev split) and report `test`; `tests/relevance_gate.rs` holds the
 //! test numbers.
+//!
+//! Every `bm25` reads a query as plain words (`syntax => 'plain'`): BEIR's
+//! queries are text, and a few hold `+1` or `-word`.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -50,6 +59,7 @@ use strata::query::exec::ExecOptions;
 use strata::query::Params;
 use strata::schema::{Field, FieldType, Schema};
 use strata::storage::DbOptions;
+use strata::text::Analyzer;
 use strata::value::Value;
 
 #[derive(Parser)]
@@ -96,26 +106,51 @@ struct Args {
 fn query(variant: &str, coll: &str, cross_encoder: &str) -> (String, bool) {
     let top10 = |rank: &str| format!("SELECT id FROM docs ORDER BY {rank} DESC LIMIT 10");
     // A rerank phase over BM25's top `n`.
-    let rerank_n = |rank: &str, n: usize| format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q) DESC LIMIT {n}) SELECT id FROM top ORDER BY {rank} DESC LIMIT 10");
+    let rerank_n = |rank: &str, n: usize| format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT {n}) SELECT id FROM top ORDER BY {rank} DESC LIMIT 10");
     let rerank = |rank: &str| rerank_n(rank, 100);
-    let model = format!("gbdt('ltr_{coll}', bm25(body, :q), importance)");
+    let model = format!("gbdt('ltr_{coll}', bm25(body, :q, syntax => 'plain'), importance)");
     if let Some(n) = variant.strip_prefix("ce_rerank").and_then(|n| n.parse().ok()) {
         return (rerank_n(&format!("cross_encoder('{cross_encoder}', body, :q)"), n), true);
     }
     match variant {
-        "plain" => (top10("bm25(body, :q)"), true),
-        "fuzzy" => (top10("bm25(body, :q, fuzzy => 'auto')"), true),
-        "boost" => (top10("bm25(body, :q) * (1 + 0.2 * importance)"), true),
-        "boost_top100" => (top10("bm25(body, :q) * (1 + 0.2 * importance)"), false),
-        "boost_rerank100" => (rerank("bm25(body, :q) * (1 + 0.2 * importance)"), true),
-        "minmax_rerank100" => (rerank("0.8 * minmax(bm25(body, :q)) + 0.2 * minmax(importance)"), true),
-        "strong_boost" => (top10("bm25(body, :q) * (1 + importance)"), true),
-        "strong_boost_top100" => (top10("bm25(body, :q) * (1 + importance)"), false),
+        "plain" => (top10("bm25(body, :q, syntax => 'plain')"), true),
+        "fuzzy" => (top10("bm25(body, :q, syntax => 'plain', fuzzy => 'auto')"), true),
+        "boost" => (top10("bm25(body, :q, syntax => 'plain') * (1 + 0.2 * importance)"), true),
+        "boost_top100" => (top10("bm25(body, :q, syntax => 'plain') * (1 + 0.2 * importance)"), false),
+        "boost_rerank100" => (rerank("bm25(body, :q, syntax => 'plain') * (1 + 0.2 * importance)"), true),
+        "minmax_rerank100" => (rerank("0.8 * minmax(bm25(body, :q, syntax => 'plain')) + 0.2 * minmax(importance)"), true),
+        "strong_boost" => (top10("bm25(body, :q, syntax => 'plain') * (1 + importance)"), true),
+        "strong_boost_top100" => (top10("bm25(body, :q, syntax => 'plain') * (1 + importance)"), false),
         "gbdt" => (top10(&model), true),
         "gbdt_top100" => (top10(&model), false),
         "gbdt_rerank100" => (rerank(&model), true),
-        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100 or ce_rerank<N>"),
+        "words" | "weight_first" | "require_first" | "exclude_last" => (top10("bm25(body, :q)"), true),
+        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, ce_rerank<N>, words, weight_first, require_first or exclude_last"),
     }
+}
+
+/// The text a variant searches for: a term-operator variant's words of
+/// `text`, with the operator it measures on its first or last word that is
+/// not a stopword; `text` itself for the others.
+fn text_of(variant: &str, text: &str) -> String {
+    if !matches!(variant, "words" | "weight_first" | "require_first" | "exclude_last") {
+        return text.to_string();
+    }
+    let words: Vec<&str> =
+        text.split(|c: char| c.is_whitespace() || c == '"' || c == '^').map(|w| w.trim_start_matches(['+', '-'])).filter(|w| !w.is_empty()).collect();
+    let content = |w: &&str| !Analyzer::English.query_term_seq(w, true).is_empty();
+    let at = match variant {
+        "words" => None,
+        "exclude_last" => words.iter().rposition(content),
+        _ => words.iter().position(content),
+    };
+    let word = |(i, w): (usize, &&str)| match variant {
+        _ if Some(i) != at => w.to_string(),
+        "weight_first" => format!("{w}^2"),
+        "require_first" => format!("+{w}"),
+        _ => format!("-{w}"),
+    };
+    words.iter().enumerate().map(word).collect::<Vec<_>>().join(" ")
 }
 
 /// Row `i`'s importance: uniform in [0, 5) by a hash of `i`, to 0.01.
@@ -134,7 +169,7 @@ fn log_features(db: &Db, coll: &beir::RawCollection, file: &std::path::Path) {
     use std::io::Write;
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     let mut out = std::io::BufWriter::new(std::fs::File::create(file).unwrap());
-    let sql = "WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q) DESC LIMIT 100) SELECT id, features() FROM top ORDER BY importance DESC LIMIT 100";
+    let sql = "WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT 100) SELECT id, features() FROM top ORDER BY importance DESC LIMIT 100";
     for (qid, text) in &coll.queries {
         let r = db.query(sql, &Params::new().set("q", Value::Str(text.clone()))).unwrap_or_else(|e| panic!("{qid}: {e}"));
         let grades = &coll.qrels[qid];
@@ -213,8 +248,9 @@ fn main() {
                 let (sql, safe) = query(v, name, &args.cross_encoder);
                 let opts = ExecOptions { rank_safe: safe, ..ExecOptions::default() };
                 for (q, (_, text)) in coll.queries.iter().enumerate() {
+                    let text = text_of(v, text);
                     let t = Instant::now();
-                    let got: Vec<String> = match db.query_with(&sql, &Params::new().set("q", Value::Str(text.clone())), &opts) {
+                    let got: Vec<String> = match db.query_with(&sql, &Params::new().set("q", Value::Str(text)), &opts) {
                         Ok(r) => r.keys.iter().filter_map(|k| k.as_str().map(str::to_string)).collect(),
                         Err(e) => {
                             if failed[j] == 0 && rep == 0 {
