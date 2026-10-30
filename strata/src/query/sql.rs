@@ -1058,8 +1058,11 @@ impl<'a> Binder<'a> {
         }
         for e in orders {
             let e = strip_nested(e);
+            if leaf(e) {
+                continue;
+            }
             let score = self.score(e)?;
-            if !leaf(e) && !score.has_cross_encoder() && Rank::of(&score, 0).is_none_or(|r| r.is_row_local()) {
+            if !score.has_cross_encoder() && Rank::of(&score, 0).is_none_or(|r| r.is_row_local()) {
                 items.push(e.clone());
             }
         }
