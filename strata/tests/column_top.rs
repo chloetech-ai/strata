@@ -101,7 +101,8 @@ fn top_rows_by_column_from_blocks() {
     let mut docs: Vec<Document> = (0..N).map(doc).collect();
     db.load(docs.iter().cloned()).unwrap();
     assert!(db.snapshot().segments().len() >= 4);
-    assert!(check(&db) > 100);
+    let on = check(&db);
+    assert!(on > 50, "{on} on blocks");
 
     // The best rows from a scan of the documents.
     let r = db.query("SELECT id FROM t ORDER BY n DESC, id LIMIT 10", &Params::new()).unwrap();
@@ -138,12 +139,36 @@ fn top_rows_by_column_from_blocks() {
         docs[i][2] = x;
     }
     t.commit().unwrap();
-    assert!(check(&db) > 100);
+    let on = check(&db);
+    assert!(on > 50, "{on} on blocks");
     let r = db.query("SELECT id, n FROM t ORDER BY n DESC, id LIMIT 3", &Params::new()).unwrap();
     assert!(r.rows.iter().all(|r| r[1].as_i64().unwrap() >= 1 << 60 || r[1].as_i64().unwrap() > 2_000_000), "{:?}", r.rows);
 
     db.storage().flush().unwrap();
-    assert!(check(&db) > 100);
+    let on = check(&db);
+    assert!(on > 50, "{on} on blocks");
     while db.storage().merge(&MergePolicy::default()).unwrap().merges > 0 {}
-    assert!(check(&db) > 100);
+    let on = check(&db);
+    assert!(on > 50, "{on} on blocks");
+}
+
+/// Clustered by its key, a table keeps each prefix's rows together, so a
+/// prefix's top rows read only blocks of its run.
+#[test]
+fn a_clustered_prefix_reads_its_own_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = schema().with_cluster_by("id").unwrap();
+    let db = Db::create(&dir.path().join("c.strata"), schema, DbOptions { segment_max_docs: 7000, sync: false, ..DbOptions::default() }).unwrap();
+    db.load((0..N).map(doc)).unwrap();
+    let on = check(&db);
+    assert!(on > 50, "{on} on blocks");
+    // `q1` is a ninth of the rows, a run of each segment: the blocks read
+    // are some of its 26.
+    let (read, total) = blocks_read(&db, "SELECT id, n, x FROM t WHERE PREFIX(id, 'q1') ORDER BY n DESC, id LIMIT 10");
+    assert!(read <= 26 + 8 && total > 200, "{read} of {total}");
+    while db.storage().merge(&MergePolicy::default()).unwrap().merges > 0 {}
+    let on = check(&db);
+    assert!(on > 50, "{on} on blocks");
+    let (read, total) = blocks_read(&db, "SELECT id, n, x FROM t WHERE PREFIX(id, 'q1') ORDER BY n DESC, id LIMIT 10");
+    assert!(read <= 26 + 8 && total > 200, "{read} of {total}");
 }

@@ -913,4 +913,8 @@ impl DocFilter for CodeRangeFilter {
     fn cardinality(&self) -> usize {
         self.card
     }
+
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        self.lo < self.hi && self.codes.may_have(docs, super::KeyRange { lo: self.lo, hi: self.hi - 1 })
+    }
 }

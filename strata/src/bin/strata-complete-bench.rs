@@ -64,6 +64,10 @@ struct Args {
     /// Where the database is built (removed at the end).
     #[arg(long)]
     dir: Option<std::path::PathBuf>,
+    /// Keep each segment's rows sorted by query (`cluster_by = 'id'`), so
+    /// that a prefix's rows sit together.
+    #[arg(long)]
+    cluster: bool,
 }
 
 const SQL: &str = "SELECT id, n FROM queries WHERE PREFIX(id, :p) ORDER BY n DESC, id LIMIT 10";
@@ -88,7 +92,10 @@ fn main() {
 
     let dir = a.dir.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("strata-complete-bench-{}", std::process::id())));
     std::fs::create_dir_all(&dir).unwrap();
-    let schema = Schema::new("queries", vec![Field::new("id", FieldType::Keyword), Field::new("n", FieldType::Int)], Some("id")).unwrap();
+    let mut schema = Schema::new("queries", vec![Field::new("id", FieldType::Keyword), Field::new("n", FieldType::Int)], Some("id")).unwrap();
+    if a.cluster {
+        schema = schema.with_cluster_by("id").unwrap();
+    }
     let t = Instant::now();
     let db = Db::create(&dir.join("q.strata"), schema, DbOptions { sync: false, ..DbOptions::default() }).unwrap();
     db.load(log.iter().map(|(q, n)| vec![Value::Str(q.clone()), Value::Int(*n)])).unwrap();
@@ -126,7 +133,7 @@ fn main() {
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
     let report = json!({
         "data": {"name": a.name, "queries": log.len(), "clicks": clicks},
-        "params": {"sql": SQL, "samples": a.samples, "threads_query": 1, "load_s": load_s},
+        "params": {"sql": SQL, "samples": a.samples, "threads_query": 1, "load_s": load_s, "cluster_by": a.cluster.then_some("id")},
         "machine": {"cpu": machine, "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)},
         "states": states,
     });

@@ -416,6 +416,16 @@ impl ProbeNode {
             ProbeNode::Not(c) => !c.contains(d),
         }
     }
+
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        match self {
+            ProbeNode::Const(b) => *b,
+            ProbeNode::Leaf(f) => f.may_have(docs),
+            ProbeNode::And(cs) => cs.iter().all(|c| c.may_have(docs.clone())),
+            ProbeNode::Or(cs) => cs.iter().any(|c| c.may_have(docs.clone())),
+            ProbeNode::Not(_) => true,
+        }
+    }
 }
 
 impl DocFilter for ProbeFilter {
@@ -424,6 +434,9 @@ impl DocFilter for ProbeFilter {
     }
     fn cardinality(&self) -> usize {
         self.card
+    }
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        self.root.may_have(docs)
     }
 }
 
@@ -526,21 +539,30 @@ impl Ord for Place {
 }
 
 /// A unit of a column [`Executor::top_blocks`] reads, by the best place a
-/// row of it can have: superblock `s` or block `b` of segment `seg`.
+/// row of it can have: superblock `i` of segment `seg` (`list` is
+/// `usize::MAX`), or block `i`, entry `pos` of the superblock's list of
+/// blocks still to read.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Unit {
     best: Place,
     seg: usize,
-    block: bool,
     i: usize,
+    list: usize,
+    pos: usize,
 }
 
-/// What a row read for [`Executor::top_blocks`] costs, in the planner's
-/// nanoseconds: a block's keys decoded and checked (a few hundred
-/// documents per microsecond) and one row of a scan of the matches (its
-/// value read twice and kept).
-const BLOCK_NS: f64 = 150.0;
+/// What [`Executor::top_blocks`] costs per block it reads, in the
+/// planner's nanoseconds (its keys decoded and the rows that can make the
+/// cut probed, a few cache misses each in a column of ten million rows),
+/// and what a scan of the matches costs per row (its value read twice and
+/// kept).
+const BLOCK_NS: f64 = 2000.0;
 const ROW_NS: f64 = 30.0;
+/// The share of the rows its zone maps admit that a filter must match for
+/// [`Executor::top_blocks`] to read blocks: a rarer match leaves the
+/// k-th best value low, under the best of most blocks, and they would
+/// all be read.
+const TOP_BLOCKS_SHARE: f64 = 1.0 / 64.0;
 
 impl<'a> Executor<'a> {
     /// `readers[i]` must belong to `snap.segments()[i]`.
@@ -1282,142 +1304,90 @@ impl<'a> Executor<'a> {
 
     /// The rows [`Self::by_column`] keeps for its best `k` and their ties,
     /// found by reading the column's blocks of [`forward::BLOCK`] rows best
-    /// first, by their zone maps (superblocks first), until the next
-    /// block's best value is worse than the `k`-th row found: `ORDER BY
-    /// clicks DESC LIMIT 10` over a million matches reads a few hundred
-    /// blocks. A row's filter is checked only when its value can still
-    /// make the cut. Values written in place are read first and skipped in
-    /// their blocks, whose zone maps do not know them.
+    /// first, by their zone maps, until the next block's best value is
+    /// worse than the `k`-th row found. A superblock is opened when it is
+    /// the best unit left, and its blocks that can reach the `k`-th join
+    /// one at a time, best first. Units the filter's zone maps exclude are
+    /// never read (a prefix of a table clustered by its key, a time range
+    /// of one clustered by time), and a row's filter is checked only when
+    /// its value can still make the cut. Values written in place are read
+    /// first and skipped in their blocks, whose zone maps do not know them.
+    /// The ten most clicked of half a million queries starting with `a`
+    /// read about 150 blocks of 81,000; clustered by query, about 10.
     ///
-    /// `None` when the blocks cannot answer alone: once they cost more
-    /// than reading every match would (a filter that rejects the best
-    /// values, or matches few rows), or when rows without a value
+    /// `None` when the scan of the matches is the better plan: when they
+    /// are few, or under [`TOP_BLOCKS_SHARE`] of the rows the zone maps
+    /// admit, or once the blocks have cost half of what the scan would (a
+    /// filter that rejects the best values); and when rows without a value
     /// (`with_nulls`, sorted last) may be needed to fill the `k`.
     fn top_blocks(&mut self, field: usize, desc: bool, with_nulls: bool, p: &Pred, k: usize, int: bool) -> Result<Option<Vec<(Hit, i64)>>> {
+        use forward::{BLOCK, SUPER};
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let segs = self.segs.clone();
-        // What reading every match costs, which the blocks may spend.
-        let mut budget = 0.0;
+        // What reading every match costs.
+        let (mut scan, mut matches) = (0.0, 0.0);
         for s in segs.iter() {
             let est = SegEst { ex: self, s, params: None, local_sel: None };
             let e = self.planner(&est).estimate(p);
-            budget += if *p == Pred::True { 0.0 } else { e.mat_cost } + e.card * ROW_NS;
+            scan += if *p == Pred::True { 0.0 } else { e.mat_cost } + e.card * ROW_NS;
+            matches += e.card;
         }
-        // Fewer matches than about a block per row of the LIMIT: the scan
-        // reads less than ordering the blocks would.
-        if budget < (64 * k) as f64 * BLOCK_NS {
+        // So few matches that a scan costs what a few blocks per row of the
+        // LIMIT would.
+        if scan < 4.0 * k as f64 * BLOCK_NS {
             return Ok(None);
         }
         // A key's value, exact integer (as `int_value` reads it) and place.
         let value = |kind: forward::NumericKind, key: i64| {
+            let v = kind.decode(key);
             let exact = match (int, kind) {
                 (false, _) => 0,
                 (true, forward::NumericKind::Int) => key,
-                (true, kind) => kind.decode(key) as i64,
+                (true, _) => v as i64,
             };
-            (kind.decode(key), exact, Place::new(kind.decode(key), exact, desc))
+            (v, exact, Place::new(v, exact, desc))
         };
+        let block_docs = |b: usize, n: usize| (b * BLOCK) as DocId..((b + 1) * BLOCK).min(n) as DocId;
         let null_score = if desc { f64::NEG_INFINITY } else { f64::INFINITY };
         let null_place = Place::new(null_score, 0, desc);
         let mut units = BinaryHeap::new();
-        // Each segment's filter and what probing a row of it costs, made
-        // when a block of the segment is first read.
-        let mut filters: Vec<Option<(SegFilter, f64)>> = (0..segs.len()).map(|_| None).collect();
+        // The blocks of each opened superblock that could reach the k-th
+        // when it was opened, best first.
+        let mut lists: Vec<Vec<(Place, usize)>> = Vec::new();
+        let mut filters: Vec<SegFilter> = Vec::with_capacity(segs.len());
         // Each segment's documents with a value written in place, by docID.
         let mut written: Vec<Vec<DocId>> = vec![Vec::new(); segs.len()];
         let mut cands: Vec<(Hit, i64)> = Vec::new();
         // The best `k` places found, worst on top.
         let mut top: BinaryHeap<Reverse<Place>> = BinaryHeap::new();
-        let mut spent = 0.0;
-        let (mut read, mut total) = (0usize, 0usize);
+        // Blocks, and rows in the superblocks the filter's zone maps admit.
+        let (mut total, mut admitted) = (0usize, 0usize);
         for (i, s) in segs.iter().enumerate() {
             let col = self.numeric(s, field)?.col();
             total += col.n_blocks();
-            for u in 0..col.n_blocks().div_ceil(forward::SUPER) {
-                if let Some((lo, hi)) = col.super_keys(u) {
-                    units.push(Unit { best: value(col.kind(), if desc { hi } else { lo }).2, seg: i, block: false, i: u });
+            let f = self.top_filter(s, p, k)?;
+            for u in 0..col.n_blocks().div_ceil(SUPER) {
+                let Some((lo, hi)) = col.super_keys(u) else { continue };
+                let docs = (u * SUPER * BLOCK) as DocId..((u + 1) * SUPER * BLOCK).min(col.len()) as DocId;
+                if f.as_dyn().is_none_or(|f| f.may_have(docs.clone())) {
+                    admitted += docs.len();
+                    units.push(Unit { best: value(col.kind(), if desc { hi } else { lo }).2, seg: i, i: u, list: usize::MAX, pos: 0 });
                 }
             }
-            let Some(upd) = self.updates(s, field) else { continue };
-            let (f, probe) = self.top_filter(s, p, k)?;
-            for (d, v) in upd.field(field) {
-                written[i].push(d);
-                let (score, exact, pl) = match v.as_f64() {
-                    Some(x) => {
-                        let exact = if int { v.as_i64().unwrap_or(0) } else { 0 };
-                        (x, exact, Place::new(x, exact, desc))
-                    }
-                    None if with_nulls => (null_score, 0, null_place),
-                    None => continue,
-                };
-                if f.as_dyn().is_some_and(|f| !f.contains(d)) {
-                    continue;
-                }
-                self.charge.room(&mut cands)?;
-                cands.push((Hit { seg: s.ord, doc: d, score }, exact));
-                self.stats.scored += 1;
-                top.push(Reverse(pl));
-                if top.len() > k {
-                    top.pop();
-                }
-            }
-            filters[i] = Some((f, probe));
-        }
-        let mut cut_at = (2 * k).max(4096);
-        let mut keys = [0i64; forward::BLOCK];
-        let mut tick = Ticker::new(self.opts, 64);
-        while let Some(u) = units.pop() {
-            tick.tick()?;
-            let bar = (top.len() == k).then(|| top.peek().unwrap().0);
-            if bar.is_some_and(|bar| u.best < bar) {
-                break;
-            }
-            let s = &segs[u.seg];
-            let col = self.numeric(s, field)?.col();
-            if !u.block {
-                let end = ((u.i + 1) * forward::SUPER).min(col.n_blocks());
-                for b in u.i * forward::SUPER..end {
-                    if let Some((lo, hi)) = col.block_keys(b) {
-                        let best = value(col.kind(), if desc { hi } else { lo }).2;
-                        if bar.is_none_or(|bar| best >= bar) {
-                            units.push(Unit { best, seg: u.seg, block: true, i: b });
+            if let Some(upd) = self.updates(s, field) {
+                for (d, v) in upd.field(field) {
+                    written[i].push(d);
+                    let (score, exact, pl) = match v.as_f64() {
+                        Some(x) => {
+                            let exact = if int { v.as_i64().unwrap_or(0) } else { 0 };
+                            (x, exact, Place::new(x, exact, desc))
                         }
-                    }
-                }
-                continue;
-            }
-            read += 1;
-            spent += BLOCK_NS;
-            if spent > budget {
-                self.stats.plan.push(format!("top {k} by {}: {read} blocks cost more than a scan of the matches", self.schema.fields[field].name));
-                return Ok(None);
-            }
-            if filters[u.seg].is_none() {
-                filters[u.seg] = Some(self.top_filter(s, p, k)?);
-            }
-            let (f, probe) = filters[u.seg].as_ref().map(|(f, c)| (f.as_dyn(), *c)).unwrap();
-            let mut mask = col.block_keys_of(u.i, &mut keys);
-            let first = (u.i * forward::BLOCK) as DocId;
-            let w = &written[u.seg];
-            for &d in &w[w.partition_point(|&d| d < first)..w.partition_point(|&d| d < first + forward::BLOCK as DocId)] {
-                let j = (d - first) as usize;
-                mask[j / 64] &= !(1 << (j % 64));
-            }
-            for (wi, mut m) in mask.into_iter().enumerate() {
-                while m != 0 {
-                    let j = wi * 64 + m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    let (score, exact, pl) = value(col.kind(), keys[j]);
-                    if top.len() == k && pl < top.peek().unwrap().0 {
+                        None if with_nulls => (null_score, 0, null_place),
+                        None => continue,
+                    };
+                    if f.as_dyn().is_some_and(|f| !f.contains(d)) {
                         continue;
-                    }
-                    let d = first + j as DocId;
-                    if let Some(f) = f {
-                        spent += probe;
-                        if !f.contains(d) {
-                            continue;
-                        }
                     }
                     self.charge.room(&mut cands)?;
                     cands.push((Hit { seg: s.ord, doc: d, score }, exact));
@@ -1428,6 +1398,45 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+            filters.push(f);
+        }
+        if matches < admitted as f64 * TOP_BLOCKS_SHARE {
+            return Ok(None);
+        }
+        let mut cut_at = (2 * k).max(4096);
+        let mut tick = Ticker::new(self.opts, 64);
+        let name = &self.schema.fields[field].name;
+        let mut read = 0;
+        while let Some(u) = units.pop() {
+            tick.tick()?;
+            let bar = (top.len() == k).then(|| top.peek().unwrap().0);
+            if bar.is_some_and(|bar| u.best < bar) {
+                break;
+            }
+            let s = &segs[u.seg];
+            let col = self.numeric(s, field)?.col();
+            let f = filters[u.seg].as_dyn();
+            if u.list == usize::MAX {
+                let mut blocks: Vec<(Place, usize)> = (u.i * SUPER..((u.i + 1) * SUPER).min(col.n_blocks()))
+                    .filter_map(|b| col.block_keys(b).map(|(lo, hi)| (value(col.kind(), if desc { hi } else { lo }).2, b)))
+                    .filter(|&(best, b)| bar.is_none_or(|bar| best >= bar) && f.is_none_or(|f| f.may_have(block_docs(b, col.len()))))
+                    .collect();
+                blocks.sort_unstable_by(|a, b| b.cmp(a));
+                if let Some(&(best, b)) = blocks.first() {
+                    units.push(Unit { best, seg: u.seg, i: b, list: lists.len(), pos: 0 });
+                    lists.push(blocks);
+                }
+                continue;
+            }
+            if let Some(&(best, b)) = lists[u.list].get(u.pos + 1) {
+                units.push(Unit { best, seg: u.seg, i: b, list: u.list, pos: u.pos + 1 });
+            }
+            read += 1;
+            if read as f64 * BLOCK_NS > scan / 2.0 {
+                self.stats.plan.push(format!("top {k} by {name}: {read} blocks cost more than a scan of the matches"));
+                return Ok(None);
+            }
+            self.block_rows(s, col, f, u.i, &written[u.seg], k, &value, &mut top, &mut cands)?;
             if cands.len() >= cut_at {
                 let bar = top.peek().unwrap().0;
                 cands.retain(|(h, x)| Place::new(h.score, *x, desc) >= bar);
@@ -1439,23 +1448,69 @@ impl<'a> Executor<'a> {
         if with_nulls && top.peek().is_none_or(|bar| top.len() < k || bar.0 <= null_place) {
             return Ok(None);
         }
-        self.stats.plan.push(format!("top {k} by {}: {read} of {total} blocks read, best first", self.schema.fields[field].name));
+        self.stats.plan.push(format!("top {k} by {name}: {read} of {total} blocks read, best first"));
         Ok(Some(cands))
     }
 
-    /// The filter [`Self::top_blocks`] checks rows against, probed when that
-    /// is cheaper than materialising it for the rows a LIMIT of `k` reads,
-    /// and what checking a row costs.
-    fn top_filter(&mut self, s: &Seg<'a>, p: &Pred, k: usize) -> Result<(SegFilter, f64)> {
-        let (mode, probe) = {
+    /// Reads block `b` of segment `s`'s column for [`Self::top_blocks`]:
+    /// each row not written in place whose value can still make the best
+    /// `k` and that passes `f` joins `cands`, and its place `top`.
+    #[allow(clippy::too_many_arguments)]
+    fn block_rows(
+        &mut self,
+        s: &Seg<'a>,
+        col: &NumericColumn,
+        f: Option<&dyn DocFilter>,
+        b: usize,
+        written: &[DocId],
+        k: usize,
+        value: &impl Fn(forward::NumericKind, i64) -> (f64, i64, Place),
+        top: &mut std::collections::BinaryHeap<std::cmp::Reverse<Place>>,
+        cands: &mut Vec<(Hit, i64)>,
+    ) -> Result<()> {
+        let mut keys = [0i64; forward::BLOCK];
+        let mut mask = col.block_keys_of(b, &mut keys);
+        let first = (b * forward::BLOCK) as DocId;
+        for &d in &written[written.partition_point(|&d| d < first)..written.partition_point(|&d| d < first + forward::BLOCK as DocId)] {
+            let j = (d - first) as usize;
+            mask[j / 64] &= !(1 << (j % 64));
+        }
+        for (wi, mut m) in mask.into_iter().enumerate() {
+            while m != 0 {
+                let j = wi * 64 + m.trailing_zeros() as usize;
+                m &= m - 1;
+                let (score, exact, pl) = value(col.kind(), keys[j]);
+                if top.len() == k && pl < top.peek().unwrap().0 {
+                    continue;
+                }
+                let d = first + j as DocId;
+                if f.is_some_and(|f| !f.contains(d)) {
+                    continue;
+                }
+                self.charge.room(cands)?;
+                cands.push((Hit { seg: s.ord, doc: d, score }, exact));
+                self.stats.scored += 1;
+                top.push(std::cmp::Reverse(pl));
+                if top.len() > k {
+                    top.pop();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The filter [`Self::top_blocks`] checks rows against: probed when that
+    /// is cheaper than materialising it for the rows a LIMIT of `k` reads.
+    fn top_filter(&mut self, s: &Seg<'a>, p: &Pred, k: usize) -> Result<SegFilter> {
+        let mode = {
             let est = SegEst { ex: self, s, params: None, local_sel: None };
             let planner = self.planner(&est);
             let n = est.n_docs().max(1.0);
-            let e = planner.estimate(p);
-            (planner.filter_mode(p, (4.0 * k as f64 * n / e.card.max(1.0)).min(n)), e.probe_cost)
+            let card = planner.estimate(p).card.max(1.0);
+            planner.filter_mode(p, (4.0 * k as f64 * n / card).min(n))
         };
         let mode = self.opts.filter_mode.filter(|m| *m != FilterMode::None).unwrap_or(mode);
-        Ok((self.seg_filter(s, p, mode)?, probe))
+        self.seg_filter(s, p, mode)
     }
 
     /// The `k` rows of the filter with the largest decay of `field` (rows
@@ -2771,6 +2826,13 @@ impl Estimator for SegEst<'_, '_> {
     }
     fn prefix_count(&self, field: usize, prefix: &str) -> f64 {
         self.s.r.keyword(field).ok().flatten().map_or(0.0, |kw| kw.count_prefix(prefix) as f64)
+    }
+    fn prefix_cost(&self, field: usize, prefix: &str) -> Option<f64> {
+        // A long run of a single-valued field scans the code column.
+        let kw = self.s.r.keyword(field).ok().flatten()?;
+        let c = &self.ex.opts.costs;
+        (!self.ex.schema.fields[field].multi && kw.prefix_codes(prefix).len() > forward::PREFIX_LISTS)
+            .then(|| self.n_docs() * c.column_scan + kw.count_prefix(prefix) as f64 * c.emit)
     }
     fn in_count(&self, field: usize, values: &[Value]) -> f64 {
         if let Some(kw) = self.s.r.keyword(field).ok().flatten() {

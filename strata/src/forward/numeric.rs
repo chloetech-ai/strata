@@ -649,6 +649,10 @@ impl DocFilter for ColumnRangeFilter {
     fn cardinality(&self) -> usize {
         self.estimate
     }
+
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        self.range.is_some_and(|r| self.blocks.may_have(docs, r))
+    }
 }
 
 #[cfg(test)]
