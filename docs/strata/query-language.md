@@ -171,6 +171,8 @@ Over ORCAS's 10.4 million queries, loaded in no particular order and merged by t
 
 The full runs, with medians and the 105 segments straight after the load, are [`results/text/complete-orcas.json` and `complete-orcas-clustered.json`](https://github.com/rkonow/strata/tree/main/strata/results/text) (`strata-complete-bench`).
 
+Typos cost the walk of each segment's dictionary. On the same clustered table, the median top 10 with `fuzzy => 'auto'` takes 1.9 ms at 3 letters and 2.7 ms at 4, where it allows one edit, and 7.9 to 10.7 ms from 6 letters, where it allows two (p99 up to 21 ms); with `fuzzy => 1` it takes 3.1 to 3.6 ms from 6 letters (p99 up to 6.9 ms). Up to 2 letters `'auto'` allows none, so it costs what an exact prefix does. Straight after a load, with 105 segments, the same queries take 2.5 to 4 times as long. Results: `complete-orcas-clustered-fuzzy.json` and `complete-orcas-clustered-fuzzy1.json`.
+
 ## Scores
 
 ### `bm25(field, text)`
