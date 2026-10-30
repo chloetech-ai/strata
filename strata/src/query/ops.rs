@@ -187,6 +187,20 @@ impl<'a> Ops<'a, '_> {
                 let keep: Vec<usize> = (0..rows.rows.len()).filter(|&i| seen.insert(rows.rows[i].iter().map(|v| format!("{v:?}")).collect::<Vec<_>>())).collect();
                 Ok(rows.pick(&keep))
             }
+            Node::DistinctOn { input, keys } => {
+                let rows = self.node(input, what)?;
+                let keys: Vec<Expr> = keys.iter().map(|k| self.resolved(k)).collect::<Result<_>>()?;
+                let mut seen = HashSet::new();
+                let mut keep = Vec::new();
+                for (i, r) in rows.rows.iter().enumerate() {
+                    self.tick()?;
+                    let group = keys.iter().map(|k| value(k, r).map(|v| format!("{v:?}"))).collect::<Result<Vec<_>>>()?;
+                    if seen.insert(group) {
+                        keep.push(i);
+                    }
+                }
+                Ok(rows.pick(&keep))
+            }
             Node::KeyOrder { input, by } => {
                 let rows = self.node(input, what)?;
                 let by = self.node(by, what)?;
@@ -369,10 +383,12 @@ impl<'a> Ops<'a, '_> {
         }
     }
 
-    /// LIMIT; over joins whose first table's scan is a leaf, that scan reads
-    /// a growing number of rows (twice the rows wanted, at least 32, then
-    /// four times as many) until enough rows join or it runs out: rows keep
-    /// its order through joins, filters and projections.
+    /// LIMIT; over joins whose first table's scan is a leaf, or over the
+    /// first rows of groups (`DISTINCT ON`) of a scan, that scan reads a
+    /// growing number of rows (twice the rows wanted, four times for
+    /// groups, at least 32, then four times as many) until enough rows join
+    /// or groups have a row, or it runs out: rows keep its order through
+    /// joins, filters, projections and the first rows of groups.
     fn limit(&mut self, input: &Node, offset: usize, limit: Option<usize>, what: &str) -> Result<Rows> {
         let cut = |rows: Rows| {
             let idx: Vec<usize> = (offset..rows.rows.len()).take(limit.unwrap_or(usize::MAX)).collect();
@@ -380,7 +396,8 @@ impl<'a> Ops<'a, '_> {
         };
         let (Some(l), Some(scan)) = (limit, driver_of(input)) else { return Ok(cut(self.node(input, what)?)) };
         let want = l.saturating_add(offset);
-        let mut lim = want.saturating_mul(2).clamp(32, MAX_ROWS);
+        let first = if matches!(input, Node::DistinctOn { .. }) { 4 } else { 2 };
+        let mut lim = want.saturating_mul(first).clamp(32, MAX_ROWS);
         let saved = self.driver.take();
         let r = loop {
             self.driver = Some((scan as *const Node, lim as u64, 0));
@@ -588,7 +605,7 @@ impl<'a> Ops<'a, '_> {
                 Expr::Output(j) => self.source(input, j as usize),
                 _ => None,
             },
-            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Distinct { input } | Node::KeyOrder { input, .. } => self.source(input, i),
+            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Distinct { input } | Node::DistinctOn { input, .. } | Node::KeyOrder { input, .. } => self.source(input, i),
             _ => None,
         }
     }
@@ -599,7 +616,13 @@ impl<'a> Ops<'a, '_> {
             Node::Join { left, right, .. } => [self.columns(left), self.columns(right)].concat(),
             Node::Ref { name } => self.ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(name)).map_or_else(Vec::new, |(_, r)| r.columns.clone()),
             Node::Aggregate { keys, aggs, .. } => (0..keys.len() + aggs.len()).map(|i| format!("#{i}")).collect(),
-            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Distinct { input } | Node::KeyOrder { input, .. } | Node::With { input, .. } => self.columns(input),
+            Node::Filter { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. }
+            | Node::KeyOrder { input, .. }
+            | Node::With { input, .. } => self.columns(input),
             _ => Vec::new(),
         }
     }
@@ -631,10 +654,22 @@ fn equal_to(schema: Option<&Schema>, f: Option<usize>, vals: Vec<Value>) -> Resu
         .collect()
 }
 
-/// The first table's scan of the joins under a LIMIT, through the nodes
-/// that keep its rows' order (Project, Filter): a leaf.
+/// The first table's scan of the joins under a LIMIT, or the scan whose
+/// rows' first of each group a `DISTINCT ON` keeps, through the nodes that
+/// keep its rows' order (Project, Filter, DistinctOn): a leaf.
 fn driver_of(n: &Node) -> Option<&Node> {
     match n {
+        Node::DistinctOn { input, .. } => {
+            let scan = match input.as_ref() {
+                Node::Filter { input, .. } => input,
+                _ => input,
+            };
+            if scan.is_leaf() {
+                Some(scan)
+            } else {
+                driver_of(input)
+            }
+        }
         Node::Project { input, .. } | Node::Filter { input, .. } if !n.is_leaf() => driver_of(input),
         Node::Join { .. } => {
             let mut x = n;

@@ -279,6 +279,9 @@ message Node {
     // The input's rows, each once.
     Node distinct = 13;
     KeyOrder key_order = 14;
+    // 90 to 99: media, sequences and semantic IDs, lane M.
+    // The first row of each group (DISTINCT ON); plan feature distinct_on.
+    DistinctOn distinct_on = 90;
   }
 }
 
@@ -421,6 +424,12 @@ message Cte {
 message KeyOrder {
   Node input = 1;
   Node by = 2;
+}
+
+// The first of the input's rows with equal keys, in the input's order.
+message DistinctOn {
+  Node input = 1;
+  repeated Expr keys = 2;
 }
 
 message Exprs { repeated Expr v = 1; }

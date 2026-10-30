@@ -94,6 +94,8 @@ const COMPOUND: &[&str] = &[
     "SELECT d.id FROM (SELECT id, year FROM papers WHERE year > 2000) AS d ORDER BY d.year LIMIT 3",
     "SELECT a.category, COUNT(*) FROM papers a JOIN papers b ON a.cites = b.id GROUP BY a.category HAVING COUNT(*) > 1",
     "SELECT DISTINCT a.category, b.year FROM papers a JOIN papers b ON a.cites = b.id ORDER BY b.year LIMIT 4",
+    "SELECT DISTINCT ON (category, year % 3) id, category FROM papers WHERE year > 1990 ORDER BY bm25(body, 'graph') DESC LIMIT 3",
+    "SELECT DISTINCT ON (category) category, year, COUNT(*) AS n FROM papers GROUP BY category, year ORDER BY category, n DESC",
 ];
 
 /// Writes of each kind.
