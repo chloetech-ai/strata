@@ -26,12 +26,16 @@ ORDER BY bm25(body, 'mrna vaccine efficacy') DESC LIMIT 10;
 SELECT id FROM papers WHERE rating >= 4
 ORDER BY similarity(emb, :q) DESC LIMIT 10;
 
--- hybrid: reciprocal rank fusion, or a weighted sum of scores
+-- hybrid: reciprocal rank fusion, or a weighted sum of normalised scores
 SELECT id FROM papers WHERE year >= 2015
 ORDER BY rrf(bm25(body, :text), similarity(emb, :q)) DESC LIMIT 10;
 
 SELECT id FROM papers WHERE year >= 2015
-ORDER BY 0.2 * bm25(body, :text) + 0.8 * similarity(emb, :q) DESC LIMIT 10;
+ORDER BY 0.2 * minmax(bm25(body, :text)) + 0.8 * minmax(similarity(emb, :q)) DESC LIMIT 10;
+
+-- any expression of scores and columns
+SELECT id FROM papers
+ORDER BY ln(1 + bm25(body, :text)) * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 10;
 
 -- facets and aggregates over any result
 SELECT category, COUNT(*), AVG(rating), MAX(year) FROM papers WHERE MATCH(body, 'vaccine')
@@ -171,17 +175,51 @@ $$
 
 Options: `k => 60`, `depth => 100`. The depth is raised to `LIMIT + OFFSET` when the page asks for more rows, as in weighted sums and products.
 
-### Weighted sums
+### Weighted sums: `minmax()`
 
-Arithmetic on scores gives weighted fusion: `0.2 * bm25(body, :t) + 0.8 * similarity(emb, :q)`. Weights must be numeric constants; `+` and `-` combine any number of scores. Candidates are the union of each input's top 100, re-scored exactly by every input and min-max normalised over that union:
+A weighted sum of min-max normalised scores is weighted fusion: `0.2 * minmax(bm25(body, :t)) + 0.8 * minmax(similarity(emb, :q))`. Weights are numeric constants; `+` and `-` combine any number of terms. Candidates are the union of each input's top 100, re-scored exactly by every input and min-max normalised over that union:
 
 $$
 \mathrm{fused}(d) = \sum_i w_i\,\frac{s_i(d) - \min_{C} s_i}{\max_{C} s_i - \min_{C} s_i}
 $$
 
-Options, given on any input: `depth => 100` (candidates per input), `norm => 'none'` (keep raw scores), `exact => 1` (score every row that passes `WHERE` instead of the top-100 union). The top-100 shortcut recovers 89–95% of the exact fused top 10 ([results](results.md#hybrid-ranking)).
+Options, given on any input: `depth => 100` (candidates per input), `exact => 1` (score every row that passes `WHERE` instead of the top-100 union). The top-100 shortcut recovers 89–95% of the exact fused top 10 ([results](results.md#hybrid-ranking)).
 
-A row without a value of a column input (`0.7 * bm25(body, :t) + 0.3 * rating` for a row whose `rating` is `NULL`) takes that input's worst value among the candidates: its lowest when the weight is positive and its highest when the weight is negative (0 and 1 after min-max), so a missing value never lifts a row.
+A row without a value of a column input (`0.7 * minmax(bm25(body, :t)) + 0.3 * minmax(rating)` for a row whose `rating` is `NULL`) takes that input's worst value among the candidates: its lowest when the weight is positive and its highest when the weight is negative (0 and 1 after min-max), so a missing value never lifts a row.
+
+**Changed:** a sum of bare scores, `0.2 * bm25(body, :t) + 0.8 * similarity(emb, :q)`, was this fusion before ranking expressions; `+` now adds raw values, as in any expression below. Write `minmax()` around each term for the fusion. For one release, `EXPLAIN` and a query's plan lines add a note when an expression adds raw relevance scores. `norm => 'none'`, which kept raw scores in a sum, is accepted and changes nothing.
+
+### Ranking expressions
+
+`ORDER BY` takes any expression of scores, numeric columns and numbers, ranked best first (`DESC`; negate it to rank the smallest first):
+
+```sql
+-- relevance boosted by a rating, which may be missing
+SELECT id FROM products ORDER BY ln(1 + bm25(body, :t)) * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 10;
+
+-- a business rule on top of similarity
+SELECT id FROM products
+ORDER BY similarity(emb, :q) + CASE WHEN in_stock THEN 0.1 WHEN category = 'outlet' THEN -0.2 ELSE 0 END DESC LIMIT 10;
+
+-- Borda-style fusion of two rankings
+SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q)) DESC LIMIT 10;
+```
+
+| part | meaning |
+|---|---|
+| `+ - * / %`, unary `-` | arithmetic on raw values |
+| `bm25`, `similarity`, `ppr`, `decay`, `rrf`, a numeric column, `hops()`, `seq_no()` | the leaves: a row's value of each |
+| `ln(x)`, `log(x)` (base 10), `log(b, x)`, `exp(x)`, `sqrt(x)`, `pow(x, y)`, `abs(x)`, `round(x[, digits])`, `sigmoid(x)`, `clamp(x, lo, hi)` | numeric functions |
+| `least(…)`, `greatest(…)`, `coalesce(…)` | over their arguments that are not `NULL` |
+| `minmax(x)` | `x` over the rows ranked, put on [0, 1]: 1 where all are equal, 0 where `x` is `NULL` |
+| `rank(x)` | 1 plus the number of rows ranked with a greater `x`; `NULL` places after every other |
+| `CASE WHEN c THEN x … ELSE y END` | the first branch whose condition holds (any `WHERE` condition), else `y`, else `NULL` |
+
+`NULL` is a missing value (a `NULL` column, a row without a vector, one a traversal does not reach) or a result that is not a finite number (`ln(0)`, a division by 0, an overflow). Arithmetic and functions of `NULL` are `NULL`, except `coalesce`, `least` and `greatest`, which skip it. A row whose score is `NULL` ranks after every other, and its `score()` is `NULL`.
+
+Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
+
+A plan that ranks by an expression needs the plan feature `rank_expressions`; a version of Strata from before it refuses the plan by that name. Weighted sums of `minmax()`, products of scores and `rrf` are written as before, so older shards still run them.
 
 ### `decay(field, origin, scale, …)`: closeness to a value
 

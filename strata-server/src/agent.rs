@@ -120,20 +120,21 @@ Table `{table}`, {docs} rows. Fields:
 {fields}
 
 Strata SQL (read-only here):
-SELECT <fields | * | score() | aggregates> FROM {table} [WHERE <predicate>] [GROUP BY <fields> [HAVING ...]] [ORDER BY <one score, numeric field or aggregate> [ASC|DESC]] [LIMIT n [OFFSET m]]
+SELECT <fields | * | score() | aggregates> FROM {table} [WHERE <predicate>] [GROUP BY <fields> [HAVING ...]] [ORDER BY <a score, numeric field, expression of them, or aggregate> [ASC|DESC]] [LIMIT n [OFFSET m]]
 - MATCH(text_field, 'query') is a boolean full-text filter: terms, "phrases", AND, OR, NOT, -term, prefix*, word~ (allows a typo), parentheses; words side by side mean AND.
 - MATCH and bm25 take fuzzy => 'auto' (tolerate typos in every word){synonym_help}.
 - bm25(text_field, 'words') ranks by text relevance (a row scores if it has any of the words). Put the user's key words here.
 - Comparisons (=, <, <=, >, >=, !=), BETWEEN, IN (...), AND, OR, NOT on KEYWORD, INT and FLOAT fields.
 {vector_help}{sparse_help}{graph_help}
-- rrf(score1, score2) fuses two rankings by rank; 0.7 * bm25(...) + 0.3 * similarity(...) is a weighted sum of normalised scores.
+- rrf(score1, score2) fuses two rankings by rank; 0.7 * minmax(bm25(...)) + 0.3 * minmax(similarity(...)) is a weighted sum of normalised scores (+ alone adds raw values).
+- ORDER BY takes arithmetic of scores, numeric fields and numbers: + - * /, ln, log, exp, sqrt, pow, abs, least, greatest, sigmoid, clamp, coalesce, CASE WHEN, minmax(x), rank(x). Example: ORDER BY bm25(body, 'boots') * (1 + 0.2 * coalesce(rating, 0)) DESC. A NULL field makes the expression NULL and the row ranks last.
 - decay(numeric_field, origin, scale) is 1 at the origin and 0.5 at origin ± scale (options: offset => d, decay => 0.5, shape => 'exp' | 'gauss' | 'linear'; origin may be now() for Unix-second timestamps). Multiply to boost relevance: ORDER BY bm25(body, 'boots') * decay(year, 2026, 2) DESC.
 - ORDER BY a numeric field sorts by it (ORDER BY price ASC). score() returns the ranking score.
 - Facets: SELECT f, COUNT(*) FROM {table} WHERE ... GROUP BY f ORDER BY 2 DESC LIMIT 10, where f is a KEYWORD field (or a multi-valued INT field). COUNT(*) alone counts rows.
 - Aggregates: COUNT(*), COUNT(f), COUNT(DISTINCT f), SUM, AVG, MIN, MAX, grouped by one or more KEYWORD, INT or FLOAT fields or over all rows, with HAVING (SELECT f, COUNT(*) AS n, AVG(x) FROM {table} GROUP BY f HAVING n > 5 ORDER BY AVG(x) DESC).
 - Subqueries and WITH: f IN (SELECT f FROM {table} WHERE ...), x > (SELECT AVG(x) FROM {table}), WITH top AS (SELECT ... LIMIT 50) SELECT ... FROM top.
 - Joins of the table with itself (name the sides a and b): JOIN or LEFT JOIN ... ON a.f = b.f; text and score functions name one side, MATCH(a.body, '...').
-- Not supported: UNION, window functions, joins with other tables, ORDER BY two scores.
+- Not supported: UNION, window functions, joins with other tables, ORDER BY two scores (combine them in one expression).
 
 How to work:
 - Query before you answer, and base every claim on rows you saw. Never invent rows or values.

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::query::ir::{ArithOp, Func, NormKind};
 use crate::value::Value;
 
 /// A row predicate over schema fields (indices into `Schema::fields`).
@@ -256,7 +257,9 @@ pub enum Score {
     /// Reciprocal rank fusion: `Σ 1 / (k + rank_i)` over the inputs' rankings
     /// of their top `depth` rows.
     Rrf { inputs: Vec<Score>, k: f64, depth: usize },
-    /// A weighted sum of scores (`0.3 * bm25(..) + 0.7 * similarity(..)`).
+    /// A weighted sum of min-max normalised scores (`0.3 *
+    /// minmax(bm25(..)) + 0.7 * minmax(similarity(..))`): a missing value
+    /// counts as the worst of its term.
     Weighted(Vec<(f64, Score)>),
     /// A numeric column's value.
     Column { field: usize },
@@ -271,17 +274,52 @@ pub enum Score {
     /// The product of scores (`bm25(..) * decay(..)`): candidates are the
     /// top `depth` rows of each relevance factor (BM25, similarity, graph;
     /// of every factor when there is none), scored exactly by every factor.
+    /// A factor below 0, or missing, counts as 0.
     Product(Vec<Score>),
+    /// The sequence number of the write that last changed the row
+    /// (`seq_no()`), in a ranking expression.
+    SeqNo,
+    /// 1 for a row the predicate holds for, as `WHERE` would keep it, and
+    /// 0 for others: the test of a [`Score::Case`] branch.
+    Cond(Box<Pred>),
+    // A ranking expression (`bm25(body, :q) * (1 + 0.2 * importance)`)
+    // is these over the scores above ([`crate::query::rank`]). NULL in
+    // arithmetic makes the expression NULL, and the row ranks last.
+    /// A number: a literal or a parameter.
+    Num(f64),
+    Arith { op: ArithOp, left: Box<Score>, right: Box<Score> },
+    Neg(Box<Score>),
+    /// A numeric function ([`Func::numeric`]).
+    Call { func: Func, args: Vec<Score> },
+    /// A set function of a ranking expression over the rows it ranks
+    /// (`minmax(x)`, `rank(x)`).
+    Norm { kind: NormKind, input: Box<Score> },
+    /// `CASE WHEN c THEN x ... ELSE y END`, each `c` a [`Score::Cond`]; NULL
+    /// without an `ELSE`.
+    Case { whens: Vec<(Score, Score)>, otherwise: Option<Box<Score>> },
 }
 
 impl Score {
-    /// Every leaf (BM25, similarity or column) of the expression.
+    /// Every leaf (BM25, similarity, a column...) of the expression.
     pub fn leaves(&self) -> Vec<&Score> {
         match self {
-            Score::Rrf { inputs, .. } | Score::Product(inputs) => inputs.iter().flat_map(|s| s.leaves()).collect(),
+            Score::Rrf { inputs, .. } | Score::Product(inputs) | Score::Call { args: inputs, .. } => inputs.iter().flat_map(|s| s.leaves()).collect(),
             Score::Weighted(ts) => ts.iter().flat_map(|(_, s)| s.leaves()).collect(),
+            Score::Arith { left, right, .. } => [left.leaves(), right.leaves()].concat(),
+            Score::Neg(x) | Score::Norm { input: x, .. } => x.leaves(),
+            Score::Case { whens, otherwise } => whens.iter().flat_map(|(c, x)| [c.leaves(), x.leaves()].concat()).chain(otherwise.iter().flat_map(|x| x.leaves())).collect(),
+            Score::Num(_) => Vec::new(),
             s => vec![s],
         }
+    }
+
+    /// Whether the score is a leaf: a score of one row by itself, which
+    /// the executor reads directly.
+    pub fn is_leaf(&self) -> bool {
+        matches!(
+            self,
+            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Cond(_)
+        )
     }
 
     pub fn opts(&self) -> Option<&Opts> {
@@ -296,6 +334,83 @@ impl Score {
     /// decay), which only boost rows found by relevance.
     pub fn is_relevance(&self) -> bool {
         matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Ppr { .. } | Score::Hops { .. })
+    }
+
+    /// Whether the score can be a term of the fused shapes
+    /// ([`Score::Weighted`], [`Score::Product`]) that came before ranking
+    /// expressions: `hops()`, the number of hops in an expression, ranks
+    /// nearest first in them.
+    pub fn is_fusable(&self) -> bool {
+        self.is_leaf() && !matches!(self, Score::Hops { .. } | Score::SeqNo | Score::Cond(_))
+    }
+
+    /// The expression with its sums of `w * minmax(score)` as
+    /// [`Score::Weighted`] and its products of scores as [`Score::Product`],
+    /// whatever wrote it (SQL or a plan): they keep the rules from before
+    /// ranking expressions, and plans write them as before, which older
+    /// shards read.
+    pub fn fused_shapes(self) -> Score {
+        // The terms of a sum of `[±][c *] minmax(score) [* c]`, each with
+        // its weight.
+        fn terms(e: &Score, w: f64, out: &mut Vec<(f64, Score)>) -> bool {
+            match e {
+                Score::Arith { op: ArithOp::Add, left, right } => terms(left, w, out) && terms(right, w, out),
+                Score::Arith { op: ArithOp::Sub, left, right } => terms(left, w, out) && terms(right, -w, out),
+                Score::Neg(x) => terms(x, -w, out),
+                Score::Arith { op: ArithOp::Mul, left, right } => match (&**left, &**right) {
+                    (Score::Num(c), x) | (x, Score::Num(c)) => terms(x, w * c, out),
+                    _ => false,
+                },
+                Score::Norm { kind: NormKind::MinMax, input } if input.is_fusable() => {
+                    out.push((w, (**input).clone()));
+                    true
+                }
+                _ => false,
+            }
+        }
+        // The factors of a chain of `*`.
+        fn factors(e: Score, out: &mut Vec<Score>) {
+            match e {
+                Score::Arith { op: ArithOp::Mul, left, right } => {
+                    factors(*left, out);
+                    factors(*right, out);
+                }
+                e => out.push(e),
+            }
+        }
+        let shapes = |x: Box<Score>| Box::new(x.fused_shapes());
+        match self {
+            Score::Arith { op: ArithOp::Add | ArithOp::Sub, .. } => {
+                let mut t = Vec::new();
+                if terms(&self, 1.0, &mut t) && t.len() > 1 {
+                    return Score::Weighted(t);
+                }
+                let Score::Arith { op, left, right } = self else { unreachable!() };
+                Score::Arith { op, left: shapes(left), right: shapes(right) }
+            }
+            Score::Arith { op: ArithOp::Mul, .. } => {
+                let mut fs = Vec::new();
+                factors(self.clone(), &mut fs);
+                let (scores, rest): (Vec<Score>, Vec<Score>) = fs.into_iter().partition(Score::is_fusable);
+                if scores.len() > 1 && rest.iter().all(|f| matches!(f, Score::Num(_))) {
+                    // Constant factors scale the product of scores.
+                    let c: f64 = rest.iter().map(|f| if let Score::Num(c) = f { *c } else { 1.0 }).product();
+                    let product = Score::Product(scores);
+                    return match rest.is_empty() {
+                        true => product,
+                        false => Score::Arith { op: ArithOp::Mul, left: Box::new(Score::Num(c)), right: Box::new(product) },
+                    };
+                }
+                let Score::Arith { op, left, right } = self else { unreachable!() };
+                Score::Arith { op, left: shapes(left), right: shapes(right) }
+            }
+            Score::Arith { op, left, right } => Score::Arith { op, left: shapes(left), right: shapes(right) },
+            Score::Neg(x) => Score::Neg(shapes(x)),
+            Score::Call { func, args } => Score::Call { func, args: args.into_iter().map(Score::fused_shapes).collect() },
+            Score::Norm { kind, input } => Score::Norm { kind, input: shapes(input) },
+            Score::Case { whens, otherwise } => Score::Case { whens: whens.into_iter().map(|(c, x)| (c, x.fused_shapes())).collect(), otherwise: otherwise.map(shapes) },
+            e => e,
+        }
     }
 }
 

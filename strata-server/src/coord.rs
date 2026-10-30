@@ -876,7 +876,7 @@ impl Coordinator {
         };
         let read = &Read::new(&req.sql, params, given, protocol, self.epoch(), || Ok(Plan::of_select(schema, select)))?.after(self.after(&req.after)?);
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
-        let ranked_text = matches!(crate::metrics::kind(select), "bm25" | "hybrid" | "boosted");
+        let ranked_text = strata::cluster::scores_bm25(select);
         // Per shard: the replica holding a lease for this query, and the lease.
         let mut leased: Vec<Option<(usize, u64)>> = vec![None; n];
         let mut failed: Vec<Option<ApiError>> = (0..n).map(|_| None).collect();
@@ -969,11 +969,11 @@ impl Coordinator {
 
     /// Whether query then fetch pays for its second round: when one round
     /// would send at least [`FETCH_FROM`] times the page's rows, every shard
-    /// its top `LIMIT + OFFSET`, as it does for a fused score, whose shards
-    /// send each input's candidates to its depth.
+    /// its top `LIMIT + OFFSET`, as it does for a fused score or a ranking
+    /// expression, whose shards send each input's candidates to its depth.
     fn fetch_pays(&self, select: &Select) -> bool {
         let page = select.limit.unwrap_or(0);
-        matches!(crate::metrics::kind(select), "hybrid" | "boosted") || self.replicas.len() * (page + select.offset) >= FETCH_FROM * page
+        matches!(crate::metrics::kind(select), "hybrid" | "boosted" | "expression") || self.replicas.len() * (page + select.offset) >= FETCH_FROM * page
     }
 
     /// Leaves shard `i` out of a partial answer (and the next second's)

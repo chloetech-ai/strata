@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import bm25, col, count, lit, match, rrf, score, similarity
+from strata import bm25, case, clamp, coalesce, col, count, exp, greatest, least, lit, ln, log, match, minmax, rank, rrf, score, similarity, sigmoid, sqrt
 from conftest import BOOKS, book
 
 
@@ -33,10 +33,37 @@ def test_builder_runs_as_its_sql(db):
          "SELECT id FROM books WHERE year < 1910 OR year > 2015 ORDER BY year DESC LIMIT 4 OFFSET 2")
     same(db, t.select("id").order_by(rrf(bm25("title", "dragon"), bm25("description", "dragon"), k=30)).limit(5),
          "SELECT id FROM books ORDER BY rrf(bm25(title, 'dragon'), bm25(description, 'dragon'), k => 30) DESC LIMIT 5")
-    same(db, t.select("id").order_by(0.7 * bm25("title", "river") + 0.3 * bm25("description", "river")).limit(5),
-         "SELECT id FROM books ORDER BY 0.7 * bm25(title, 'river') + 0.3 * bm25(description, 'river') DESC LIMIT 5")
+    same(db, t.select("id").order_by(0.7 * minmax(bm25("title", "river")) + 0.3 * minmax(bm25("description", "river"))).limit(5),
+         "SELECT id FROM books ORDER BY 0.7 * minmax(bm25(title, 'river')) + 0.3 * minmax(bm25(description, 'river')) DESC LIMIT 5")
     # Without select: the stored fields but vectors, as SELECT * gives.
     same(db, t.where(col("id") == "b0007"), "SELECT * FROM books WHERE id = 'b0007'")
+
+
+def test_ranking_expressions_run_as_their_sql(db):
+    """Arithmetic, functions, minmax(), rank() and case() rank as SQL's
+    expressions do: `+` adds raw values, and NULL ranks last."""
+    t = db.table()
+    for q, sql in [
+        (0.5 * minmax(bm25("title", "river")) - 0.5 * minmax(col("rating")),
+         "0.5 * minmax(bm25(title, 'river')) - 0.5 * minmax(rating)"),
+        (bm25("title", "river") + bm25("description", "river"),
+         "bm25(title, 'river') + bm25(description, 'river')"),
+        (bm25("description", "dragon") * (1 + 0.2 * coalesce(col("rating"), 0)),
+         "bm25(description, 'dragon') * (1 + 0.2 * coalesce(rating, 0))"),
+        (ln(1 + bm25("description", "dragon")) - 0.1 * col("rating"),
+         "ln(1 + bm25(description, 'dragon')) - 0.1 * rating"),
+        (case((col("year") > 2000, 1), (col("year") > 1950, 0.5), otherwise=0) + minmax(bm25("description", "ship")),
+         "CASE WHEN year > 2000 THEN 1 WHEN year > 1950 THEN 0.5 ELSE 0 END + minmax(bm25(description, 'ship'))"),
+        (-rank(bm25("title", "dragon")) - rank(bm25("description", "dragon")),
+         "-rank(bm25(title, 'dragon')) - rank(bm25(description, 'dragon'))"),
+        (round(abs(col("rating") - 3), 1) + sqrt(col("year") / 1000) + clamp(col("rating"), 1, 4) ** 2,
+         "round(abs(rating - 3), 1) + sqrt(year / 1000) + pow(clamp(rating, 1, 4), 2)"),
+        (greatest(sigmoid(col("rating")), least(log(col("year")), exp(1))) % 2,
+         "greatest(sigmoid(rating), least(log(year), exp(1))) % 2"),
+    ]:
+        same(db, t.select("id", score()).order_by(q).limit(8), f"SELECT id, score() FROM books ORDER BY {sql} DESC LIMIT 8")
+    with pytest.raises(TypeError):
+        col("rating") + "x"
 
 
 def test_groups(db):

@@ -1,9 +1,13 @@
 name: CI
 
+# A change to the documentation site or to Markdown files alone builds and
+# tests nothing.
 on:
   push:
     branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
   pull_request:
+    paths-ignore: ["docs/**", "**.md"]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -41,26 +45,41 @@ jobs:
         with:
           workspaces: ${{ matrix.crate }}
           key: ${{ matrix.crate }}-${{ steps.cpu.outputs.model }}
+      # The ci profile is release without link-time optimisation and with
+      # 16 codegen units (each crate's Cargo.toml): with release's, building
+      # Strata's test binaries took 37 of the 40 minutes of its tests.
       - name: Tests
         working-directory: ${{ matrix.crate }}
-        run: cargo test --release
-      # strata-server, engram and the Python package build for a generic
-      # CPU, where Strata chooses its SIMD kernels at run time: test the
-      # kernels in such a build, then with every SIMD path turned off.
-      - name: Kernels on a generic build
-        if: matrix.crate == 'strata' && runner.os == 'Linux'
-        working-directory: strata
-        env:
-          RUSTFLAGS: -C target-cpu=x86-64
-          CARGO_TARGET_DIR: target-generic
-        run: |
-          cargo test --release --lib -- vector:: postings:: forward:: simd
-          STRATA_SIMD=portable cargo test --release --lib -- vector:: postings:: forward::
+        run: cargo test --profile ci
       # Compiler warnings and clippy's correctness and suspicious lints fail
       # the build; style, complexity and performance lints are advice.
       - name: Clippy
         working-directory: ${{ matrix.crate }}
         run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+
+  # strata-server, engram and the Python package build for a generic CPU,
+  # where Strata chooses its SIMD kernels at run time: test the kernels in
+  # such a build, then with every SIMD path turned off. A job of its own, so
+  # that it runs beside the strata tests rather than after them.
+  kernels:
+    name: strata kernels on a generic build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # A generic build runs on any x86-64 runner: no CPU model in the key.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata
+          key: strata-generic
+      - name: Kernels
+        working-directory: strata
+        run: |
+          cargo test --profile ci --lib -- vector:: postings:: forward:: simd
+          STRATA_SIMD=portable cargo test --profile ci --lib -- vector:: postings:: forward::
 
   # Power losses, full disks and failing syncs at every write of a storage
   # workload (storage::io, tests/storage_faults.rs). A job of its own: after
@@ -86,7 +105,7 @@ jobs:
           key: strata-faults-${{ steps.cpu.outputs.model }}
       - name: Fault injection
         working-directory: strata
-        run: cargo test --release --features fault-injection --test storage_faults
+        run: cargo test --profile ci --features fault-injection --test storage_faults
 
   # BM25 through SQL on three BEIR collections against the committed
   # baseline (strata/tests/relevance_gate.rs): a ranking change must come
@@ -113,7 +132,7 @@ jobs:
         run: strata/tests/fixtures/beir/fetch.sh "$HOME/beir"
       - name: Gate
         working-directory: strata
-        run: STRATA_BEIR_DIR="$HOME/beir" STRATA_RELEVANCE_GATE=required cargo test --release --test relevance_gate -- --nocapture
+        run: STRATA_BEIR_DIR="$HOME/beir" STRATA_RELEVANCE_GATE=required cargo test --profile ci --test relevance_gate -- --nocapture
 
   # Miri runs the tests of Strata's zero-copy byte views (postings::bytes)
   # and of the structures read through them, checking every access for

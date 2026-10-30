@@ -95,7 +95,7 @@ fn decay_and_products_rank_like_brute_force() {
     assert!(s.windows(2).all(|w| w[0] >= w[1] - 1e-6), "{s:?}");
 
     // In a weighted sum and in RRF.
-    let r = db.query("SELECT id FROM docs ORDER BY 0.7 * bm25(body, :t) + 0.3 * decay(year, 2012, 4) DESC LIMIT 10", &p).unwrap();
+    let r = db.query("SELECT id FROM docs ORDER BY 0.7 * minmax(bm25(body, :t)) + 0.3 * minmax(decay(year, 2012, 4)) DESC LIMIT 10", &p).unwrap();
     assert_eq!(r.rows.len(), 10);
     let r = db.query("SELECT id FROM docs ORDER BY rrf(bm25(body, :t), decay(year, now(), 3650)) DESC LIMIT 10", &p).unwrap();
     assert_eq!(r.rows.len(), 10);
@@ -126,7 +126,7 @@ fn shards_merge_decay_and_products_like_one_database() {
         "SELECT id, score() FROM docs WHERE rating > 2 ORDER BY bm25(body, :t) * decay(year, 2010, 5, shape => 'linear') DESC LIMIT 12",
         "SELECT id, score() FROM docs ORDER BY similarity(emb, :q) * decay(rating, 5, 1) DESC LIMIT 10",
         "SELECT id, score() FROM docs ORDER BY bm25(body, :t, depth => 40) * similarity(emb, :q) * decay(year, 2000, 10) DESC LIMIT 10 OFFSET 2",
-        "SELECT id, score() FROM docs ORDER BY 0.6 * bm25(body, :t) + 0.4 * decay(year, 2015, 3) DESC LIMIT 10",
+        "SELECT id, score() FROM docs ORDER BY 0.6 * minmax(bm25(body, :t)) + 0.4 * minmax(decay(year, 2015, 3)) DESC LIMIT 10",
     ] {
         let want = whole.query(sql, &p).unwrap();
         let got = sharded(&[&a, &b], sql, &p);
@@ -149,10 +149,24 @@ fn bad_decays_and_products_are_refused() {
         ("SELECT id FROM docs ORDER BY decay(year, 2000, 5, shape => 'cubic') DESC", "shape"),
         ("SELECT id FROM docs ORDER BY decay(year, 'soon', 5) DESC", "origin"),
         ("SELECT id FROM docs ORDER BY decay(year, 2000) DESC", "decay(field, origin, scale"),
-        ("SELECT id FROM docs ORDER BY bm25(body, 'x') * 2 * decay(year, 2000, 5) DESC", "constant"),
-        ("SELECT id FROM docs ORDER BY rrf(bm25(body, 'x'), year) * decay(year, 2000, 5) DESC", "not sums or fusions"),
+        ("SELECT id FROM docs ORDER BY rrf(bm25(body, 'x') * 2, year) DESC", "rrf fuses the rankings of scores and columns"),
+        ("SELECT id FROM docs ORDER BY ln(year, 2) DESC", "ln() takes one argument"),
+        ("SELECT id FROM docs ORDER BY clamp(year, 1) DESC", "clamp() takes three arguments"),
+        ("SELECT id FROM docs ORDER BY bm25(body, 'x') > 2 DESC", "takes + - * / %"),
+        ("SELECT id FROM docs ORDER BY 2 * distance(emb, :v) DESC", "use similarity(...)"),
+        ("SELECT id FROM docs ORDER BY upper(category) DESC", "unknown score function upper"),
+        ("SELECT id FROM docs ORDER BY bm25(body, 'x') + 1 ASC", "ordered DESC"),
     ] {
-        let e = db.query(sql, &Params::new()).err().unwrap_or_else(|| panic!("{sql} was accepted")).to_string();
+        let p = Params::new().set("v", Value::Vector(vec![0.5; DIM].into()));
+        let e = db.query(sql, &p).err().unwrap_or_else(|| panic!("{sql} was accepted")).to_string();
         assert!(e.contains(msg), "{sql}: {e}");
+    }
+    // A product of a score, a constant and a decay, and one of a fusion and
+    // a decay, are ranking expressions.
+    for sql in [
+        "SELECT id FROM docs ORDER BY bm25(body, 'x') * 2 * decay(year, 2000, 5) DESC",
+        "SELECT id FROM docs ORDER BY rrf(bm25(body, 'x'), year) * decay(year, 2000, 5) DESC",
+    ] {
+        db.query(sql, &Params::new()).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }

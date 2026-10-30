@@ -453,7 +453,20 @@ message Expr {
     Node scalar = 34;
     // A row's sequence number (seq_no()); plan feature "seq_no".
     Empty seq_no = 35;
+    // minmax(x) or rank(x) over the rows a Search ranks; plan feature
+    // "rank_expressions".
+    Norm norm = 36;
   }
+}
+
+message Norm {
+  NormKind kind = 1;
+  Expr input = 2;
+}
+
+enum NormKind {
+  NORM_KIND_MIN_MAX = 0;
+  NORM_KIND_RANK = 1;
 }
 
 message Cmp {
@@ -526,6 +539,17 @@ enum Func {
   FUNC_ABS = 3;
   FUNC_ROUND = 4;
   FUNC_COALESCE = 5;
+  // Numeric functions of ranking expressions (plan feature
+  // "rank_expressions").
+  FUNC_LN = 6;
+  FUNC_LOG = 7;
+  FUNC_EXP = 8;
+  FUNC_SQRT = 9;
+  FUNC_POW = 10;
+  FUNC_LEAST = 11;
+  FUNC_GREATEST = 12;
+  FUNC_SIGMOID = 13;
+  FUNC_CLAMP = 14;
 }
 
 message Match {

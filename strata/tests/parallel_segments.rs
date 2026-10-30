@@ -31,7 +31,7 @@ fn threads_do_not_change_answers() {
         "SELECT id, score() FROM docs ORDER BY similarity(emb, :q) DESC LIMIT 20",
         "SELECT id, score() FROM docs WHERE category IN ('c00', 'c05') ORDER BY similarity(emb, :q) DESC LIMIT 20",
         "SELECT id, score() FROM docs WHERE rating < 1 ORDER BY similarity(emb, :q, strategy => 'postfilter') DESC LIMIT 20",
-        "SELECT id, score() FROM docs ORDER BY 0.4 * bm25(body, :t) + 0.6 * similarity(emb, :q) DESC LIMIT 20",
+        "SELECT id, score() FROM docs ORDER BY 0.4 * minmax(bm25(body, :t)) + 0.6 * minmax(similarity(emb, :q)) DESC LIMIT 20",
         "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 20",
     ];
     for sql in queries {

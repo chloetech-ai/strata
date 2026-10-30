@@ -131,7 +131,7 @@ fn queries() -> Vec<(&'static str, Json)> {
         ("SELECT id, score() FROM products ORDER BY similarity(emb, :q) DESC LIMIT 10", like.clone()),
         ("SELECT id, score() FROM products WHERE rating >= 4 ORDER BY similarity(emb, :q) DESC LIMIT 10", like.clone()),
         ("SELECT id, score() FROM products ORDER BY rrf(bm25(body, 'espresso'), similarity(emb, :q)) DESC LIMIT 10", like.clone()),
-        ("SELECT id, score() FROM products WHERE year >= 2020 ORDER BY 0.4 * bm25(body, 'recycled') + 0.6 * similarity(emb, :q) DESC LIMIT 15", like.clone()),
+        ("SELECT id, score() FROM products WHERE year >= 2020 ORDER BY 0.4 * minmax(bm25(body, 'recycled')) + 0.6 * minmax(similarity(emb, :q)) DESC LIMIT 15", like.clone()),
         ("SELECT id, price FROM products WHERE tags = 'bestseller' ORDER BY price ASC, id LIMIT 12", none.clone()),
         ("SELECT id, tags FROM products WHERE tags IN ('sale', 'new') AND MATCH(body, '\"cast iron\"') ORDER BY sold DESC, id LIMIT 10", none.clone()),
         ("SELECT brand, COUNT(*) FROM products WHERE MATCH(body, 'waterproof') GROUP BY brand ORDER BY 2 DESC, 1 LIMIT 8", none.clone()),
@@ -140,6 +140,10 @@ fn queries() -> Vec<(&'static str, Json)> {
         ("SELECT id, year, score() FROM products ORDER BY bm25(body, 'waterproof jacket') * decay(year, 2026, 2) DESC LIMIT 10", none.clone()),
         ("SELECT id, price, score() FROM products WHERE category = 'kitchen' ORDER BY decay(price, 50, 20, shape => 'gauss') DESC LIMIT 10", none.clone()),
         ("SELECT id, score() FROM products ORDER BY similarity(emb, :q) * decay(rating, 5, 1) DESC LIMIT 10", like.clone()),
+        // Ranking expressions: BM25 scored with the whole collection's
+        // statistics, and a rank-safe boost.
+        ("SELECT id, score() FROM products ORDER BY ln(1 + bm25(body, 'waterproof hiking')) + 0.1 * coalesce(rating, 0) DESC LIMIT 10", none.clone()),
+        ("SELECT id, score() FROM products WHERE price < 200 ORDER BY bm25(body, 'leather boots') * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 8", none.clone()),
     ]
 }
 
@@ -1118,8 +1122,13 @@ async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
     replica.shipped.lock().unwrap().clear();
     replica.down.store(false, Ordering::Relaxed);
     let last = pdb.storage().seq_no().unwrap().seq;
+    // The replica applies the last batch before its answer reaches the
+    // primary, which counts it in sync (and so compares it) only then.
     for _ in 0..200 {
-        if rdb.storage().seq_no().unwrap().seq == last && r.health().await["replication"]["serves_reads"] == true {
+        if rdb.storage().seq_no().unwrap().seq == last
+            && r.health().await["replication"]["serves_reads"] == true
+            && p.health().await["replication"]["replicas"][0]["in_sync"] == true
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

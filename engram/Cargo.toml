@@ -29,3 +29,11 @@ debug = "line-tables-only"
 
 [profile.test]
 opt-level = 2
+
+# CI's tests (cargo test --profile ci): release's optimisation without its
+# link-time optimisation and single codegen unit, which take most of the
+# time of building the test binaries.
+[profile.ci]
+inherits = "release"
+codegen-units = 16
+lto = false

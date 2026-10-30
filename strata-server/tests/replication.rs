@@ -574,7 +574,9 @@ async fn a_replica_the_log_does_not_reach_is_sent_a_copy() {
     let r = restore(fu, 1, &id, size, &image).await.unwrap();
     assert!(r.matched && r.replica_term == 1, "{r:?}");
     assert_eq!(rows(&fdb), rows(&pdb));
-    assert!(copies_in(dir.path()).is_empty(), "{:?}", copies_in(dir.path()));
+    // The primary still sends `other` a copy every 300 ms, which `other`
+    // refuses, so one may be on its way; a copy left behind stays.
+    until("no copy is left beside the databases", || async { copies_in(dir.path()).is_empty() }).await;
 }
 
 /// Waits until a replica in `dir` holds all of the copy its primary sends

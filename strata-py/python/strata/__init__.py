@@ -37,7 +37,34 @@ from typing import Any, Iterable, Mapping
 
 from . import _strata
 from ._search import Search, ordered_schema, params as _params
-from .build import Expr, Query, bm25, col, count, hops, lit, match, path, ppr, reachable, rrf, score, similarity
+from .build import (
+    Expr,
+    Query,
+    bm25,
+    case,
+    clamp,
+    coalesce,
+    col,
+    count,
+    exp,
+    greatest,
+    hops,
+    least,
+    lit,
+    ln,
+    log,
+    match,
+    minmax,
+    path,
+    ppr,
+    rank,
+    reachable,
+    rrf,
+    score,
+    sigmoid,
+    similarity,
+    sqrt,
+)
 from ._strata import StrataError
 from .client import Client
 from .result import Result
@@ -57,6 +84,18 @@ __all__ = [
     "bm25",
     "similarity",
     "rrf",
+    "minmax",
+    "rank",
+    "ln",
+    "log",
+    "exp",
+    "sqrt",
+    "sigmoid",
+    "clamp",
+    "least",
+    "greatest",
+    "coalesce",
+    "case",
     "score",
     "hops",
     "count",

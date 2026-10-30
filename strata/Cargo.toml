@@ -63,3 +63,11 @@ debug = "line-tables-only"
 
 [profile.test]
 opt-level = 2
+
+# CI's tests (cargo test --profile ci): release's optimisation without its
+# link-time optimisation and single codegen unit, which made linking the
+# hundred test binaries, each with all of Strata in it, most of CI's time.
+[profile.ci]
+inherits = "release"
+codegen-units = 16
+lto = false

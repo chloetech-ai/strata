@@ -91,7 +91,7 @@ fn non_finite_floats_are_refused() {
 #[test]
 fn null_inputs_of_a_weighted_sum_rank_as_their_worst() {
     let (_d, db) = sample();
-    let r = db.query("SELECT id, score() FROM t ORDER BY 0.7 * bm25(body, 'apple') + 0.3 * rating DESC LIMIT 10", &Params::new()).unwrap();
+    let r = db.query("SELECT id, score() FROM t ORDER BY 0.7 * minmax(bm25(body, 'apple')) + 0.3 * minmax(rating) DESC LIMIT 10", &Params::new()).unwrap();
     assert!(r.scores.iter().all(|s| s.is_finite()), "{:?}", r.scores);
     // Row 1 has the top BM25 of the short texts but no rating: it scores
     // as the lowest rating, 0 after min-max, so row 4 (more apples, a
@@ -99,13 +99,16 @@ fn null_inputs_of_a_weighted_sum_rank_as_their_worst() {
     assert_eq!(ids(&r)[0], 4, "{:?}", r.rows);
     assert!(ids(&r).contains(&1));
     // A negative weight: the row without a value gains nothing from it.
-    let r = db.query("SELECT id, score() FROM t ORDER BY bm25(body, 'apple') - 0.1 * rating DESC LIMIT 10", &Params::new()).unwrap();
+    let r = db.query("SELECT id, score() FROM t ORDER BY minmax(bm25(body, 'apple')) - 0.1 * minmax(rating) DESC LIMIT 10", &Params::new()).unwrap();
     assert!(r.scores.iter().all(|s| s.is_finite()), "{:?}", r.scores);
     let worst_of_rated = r.scores[ids(&r).iter().position(|&i| i == 3).unwrap()];
     assert!(worst_of_rated.is_finite());
-    // Raw scores: a NULL counts as the worst rating, never as +∞.
-    let r = db.query("SELECT id, score() FROM t ORDER BY bm25(body, 'apple', norm => 'none') - 0.1 * rating DESC LIMIT 10", &Params::new()).unwrap();
-    assert!(r.scores.iter().all(|s| s.is_finite() && *s < 1e6), "{:?}", r.scores);
+    // Raw arithmetic: a NULL makes the score NULL, never +∞, and the row
+    // ranks last.
+    let r = db.query("SELECT id, score() FROM t ORDER BY bm25(body, 'apple') - 0.1 * rating DESC LIMIT 10", &Params::new()).unwrap();
+    assert_eq!(ids(&r).last(), Some(&1), "{:?}", r.rows);
+    assert_eq!(r.rows.last().unwrap()[1], Value::Null);
+    assert!(r.scores[..r.scores.len() - 1].iter().all(|s| s.is_finite() && *s < 1e6), "{:?}", r.scores);
 }
 
 // Bug 8 over shards: the coordinator fuses the same way.
@@ -122,8 +125,9 @@ fn null_inputs_fuse_alike_over_shards() {
     let (_d2, b) = db_with(rows[100..].to_vec());
     let params = Params::new().set("q", Value::Vector(vec![1.0, 0.0].into()));
     for sql in [
-        "SELECT id, score() FROM t ORDER BY 0.7 * bm25(body, 'apple tart') + 0.3 * rating DESC LIMIT 20",
-        "SELECT id, score() FROM t ORDER BY bm25(body, 'apple tart', norm => 'none') - 0.5 * rating DESC LIMIT 20",
+        "SELECT id, score() FROM t ORDER BY 0.7 * minmax(bm25(body, 'apple tart')) + 0.3 * minmax(rating) DESC LIMIT 20",
+        "SELECT id, score() FROM t ORDER BY minmax(bm25(body, 'apple tart')) - 0.5 * minmax(rating) DESC LIMIT 20",
+        "SELECT id, score() FROM t ORDER BY bm25(body, 'apple tart') - 0.5 * rating DESC LIMIT 20",
         "SELECT id, score() FROM t ORDER BY similarity(emb, :q) * rating DESC LIMIT 20",
     ] {
         let want = whole.query(sql, &params).unwrap();
@@ -216,7 +220,7 @@ fn huge_limits_and_depths_answer_with_what_there_is() {
         ("SELECT id FROM t ORDER BY similarity(emb, :q) DESC LIMIT 1000000000000", 4),
         ("SELECT id FROM t ORDER BY similarity(emb, :q, ef => 1e15, rerank => 1e15) DESC LIMIT 2", 2),
         ("SELECT id FROM t ORDER BY rrf(bm25(body, 'apple'), similarity(emb, :q), depth => 1e15) DESC LIMIT 1000000000000", 4),
-        ("SELECT id FROM t ORDER BY 0.5 * bm25(body, 'apple', depth => 1e15) + 0.5 * similarity(emb, :q) DESC LIMIT 1000000000000", 4),
+        ("SELECT id FROM t ORDER BY 0.5 * minmax(bm25(body, 'apple', depth => 1e15)) + 0.5 * minmax(similarity(emb, :q)) DESC LIMIT 1000000000000", 4),
         ("SELECT id FROM t ORDER BY bm25(body, 'apple', depth => 1e15) * similarity(emb, :q) DESC LIMIT 1000000000000", 4),
         ("SELECT id FROM t ORDER BY decay(rating, 2, 1) DESC LIMIT 1000000000000", 4),
     ] {
