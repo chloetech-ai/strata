@@ -908,8 +908,14 @@ async fn ship(p: Weak<Primary>, k: usize) {
                         tracing::info!(replica = %f.url, seq_no = r.seq, "a replica installed a copy of the primary");
                     }
                     next = Some(r.seq + 1);
-                    // It holds what was committed when the batch was read
-                    // (the copy, taken after that, holds more).
+                    // It holds what was committed when the batch was read.
+                    // A copy is taken after that, and writes go on while
+                    // it is sent and installed: it is in sync if it holds
+                    // what is committed now.
+                    let last = match end {
+                        Some(_) => last,
+                        None => p.db.storage().numbering().map_or(last, |n| n.seq),
+                    };
                     if r.seq >= last {
                         f.caught_up();
                         // Shipped up to the last, and not just copied: what

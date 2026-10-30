@@ -9,7 +9,10 @@
 //! cell is null, a vector or a list is a JSON array (a list may also be
 //! values separated by `|`), and a SPARSE value a JSON object. A BOOL is
 //! `true`, `false`, 1 or 0 (in CSV also `t` and `f`), a TIMESTAMP ISO
-//! 8601 text ([`crate::timestamp`]).
+//! 8601 text ([`crate::timestamp`]). A MEDIA value is an object of
+//! [`crate::media::KEYS`] or a URI (in CSV the object's JSON text or the
+//! URI), which [`Db::fill_in`] resolves before it is written
+//! ([`crate::media`]).
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read};
@@ -44,6 +47,9 @@ pub fn field_value(field: &Field, key: bool, j: &Json) -> Result<Value> {
             _ => return Err(Error::Schema(format!("bad value for {}: {} ({})", field.name, short(j), l.expects()))),
         };
         return field.store(v);
+    }
+    if field.media.is_some() {
+        return crate::media::input_text(j).map(Value::Str).map_err(|e| Error::Schema(format!("bad value for {}: {e}", field.name)));
     }
     if field.multi {
         let items = match j {
@@ -148,6 +154,9 @@ pub fn cell(schema: &Schema, f: usize, s: &str) -> Result<Value> {
     }
     if field.logical.is_some() {
         return field.store(Value::Str(t.to_string()));
+    }
+    if field.media.is_some() {
+        return value(schema, f, &Json::String(t.to_string()));
     }
     Ok(match &field.ty {
         FieldType::Int => Value::Int(t.parse().map_err(|_| bad())?),
@@ -340,7 +349,7 @@ pub fn import_into(db: &Db, table: &str, mut rows: Rows<'_>) -> Result<Imported>
             if batch.is_empty() {
                 break;
             }
-            db.embed_missing_in(table, &mut batch)?;
+            db.fill_in(table, &mut batch)?;
             let n = batch.len() as u64;
             let mut t = db.storage().begin()?;
             let mut tt = t.table(table)?;
