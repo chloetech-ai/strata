@@ -1302,6 +1302,7 @@ impl<'a> Binder<'a> {
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
                         Expand::from_opts(&opts).map_err(err)?;
                         crate::query::exec::plain_syntax(&opts)?;
+                        crate::query::exec::min_need(&opts)?;
                         Ok(Score::Bm25 { field, text, opts: without_norm(opts) })
                     }
                     "similarity" => self.similarity(&args, opts, false),
@@ -1521,17 +1522,21 @@ impl<'a> Binder<'a> {
             }
             Expr::Function(func) if fname(func) == "match" => {
                 let (args, opts) = self.args(func)?;
-                let [field, q] = args.as_slice() else { return Err(err("MATCH(field, query, synonyms => 0 | 1, fuzzy => 0 | 1 | 2 | 'auto')")) };
+                let [field, q] = args.as_slice() else { return Err(err("MATCH(field, query, synonyms => 0 | 1, fuzzy => 0 | 1 | 2 | 'auto', min => n | 'p%')")) };
                 let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                 if !self.schema.fields[field].indexed {
                     return Err(err(format!("{} is not indexed", self.schema.fields[field].name)));
                 }
-                if let Some(k) = opts.keys().find(|k| !matches!(k.as_str(), "synonyms" | "fuzzy")) {
-                    return Err(err(format!("unknown option {k} for MATCH: synonyms, fuzzy")));
+                if let Some(k) = opts.keys().find(|k| !matches!(k.as_str(), "synonyms" | "fuzzy" | "min")) {
+                    return Err(err(format!("unknown option {k} for MATCH: synonyms, fuzzy, min")));
                 }
                 let expand = Expand::from_opts(&opts).map_err(err)?;
-                let query = self.literal(q)?.as_str().ok_or_else(|| err("MATCH query must be a string"))?.to_string();
+                let mut query = self.literal(q)?.as_str().ok_or_else(|| err("MATCH query must be a string"))?.to_string();
                 crate::text::query::parse_match_with(&query, self.schema.fields[field].text_analyzer())?;
+                // `min => n`: the query as one group a row needs n of.
+                if let Some(need) = crate::query::exec::min_need(&opts)? {
+                    query = format!("({query})@{need}");
+                }
                 Pred::Match { field, query, expand }
             }
             Expr::Function(func) if matches!(fname(func).as_str(), "reachable" | "path") => Pred::Graph { id: self.graph(func, &fname(func))? },

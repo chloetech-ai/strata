@@ -61,7 +61,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 10] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, TEXT_OPERATORS];
+pub const FEATURES: [&str; 11] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, TEXT_OPERATORS, MIN_MATCH];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -108,6 +108,11 @@ pub const RANK_MODELS: &str = "rank_models";
 /// `word^2`; [`crate::text::query::has_operators`]), or a `MATCH` with a
 /// weight.
 pub const TEXT_OPERATORS: &str = "text_operators";
+
+/// The feature of a plan whose text a row must match some of: a `MATCH`
+/// group `(a b c)@2`, or `bm25`'s `min` option. A Strata from before them
+/// reads `)@2` as a word and ignores `min`, and so returns other rows.
+pub const MIN_MATCH: &str = "min_match";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -876,7 +881,20 @@ impl Node {
         self.visit_exprs(&mut |e| {
             found |= match e {
                 Expr::Bm25 { text, opts, .. } => !crate::query::exec::plain_syntax(opts).unwrap_or(false) && crate::text::query::has_operators(text),
-                Expr::Match { query, .. } => crate::text::query::match_has_weights(query),
+                Expr::Match { query, .. } => crate::text::query::match_features(query).weights,
+                _ => false,
+            }
+        });
+        found
+    }
+
+    /// Whether a text of the plan needs some of its items ([`MIN_MATCH`]).
+    pub fn has_min_match(&self) -> bool {
+        let mut found = false;
+        self.visit_exprs(&mut |e| {
+            found |= match e {
+                Expr::Bm25 { opts, .. } => opts.contains_key("min"),
+                Expr::Match { query, .. } => crate::text::query::match_features(query).at_least,
                 _ => false,
             }
         });
@@ -1352,6 +1370,9 @@ impl Plan {
         }
         if root.has_text_operators() {
             features.push(TEXT_OPERATORS.to_string());
+        }
+        if root.has_min_match() {
+            features.push(MIN_MATCH.to_string());
         }
         Plan { version: VERSION, features, root }
     }

@@ -301,7 +301,7 @@ impl TextFieldReader {
             BoolQuery::Phrase(ts) => ts.len() as f64 * ts.iter().map(|t| self.doc_freq(t) as f64).fold(f64::INFINITY, f64::min),
             BoolQuery::Prefix(p) => self.prefix_infos(p).iter().map(|i| i.df as f64).sum(),
             BoolQuery::Fuzzy { term, edits } => self.fuzzy_infos(term, *edits).iter().map(|i| i.df as f64).sum(),
-            BoolQuery::Or(cs) => cs.iter().map(|c| self.eval_cost(c)).sum(),
+            BoolQuery::Or(cs) | BoolQuery::AtLeast { items: cs, .. } => cs.iter().map(|c| self.eval_cost(c)).sum(),
             BoolQuery::And(cs) => {
                 let (neg, pos): (Vec<&BoolQuery>, Vec<&BoolQuery>) = cs.iter().partition(|c| matches!(c, BoolQuery::Not(_)));
                 let min = pos.iter().map(|c| self.eval_cost(c)).fold(f64::INFINITY, f64::min);
@@ -364,6 +364,16 @@ impl TextFieldReader {
                 acc
             }
             BoolQuery::Not(c) => self.eval_set(c).complement(),
+            // Counts, for each document, the items that hold.
+            BoolQuery::AtLeast { n: need, items } => {
+                let mut count = vec![0u32; n as usize];
+                for c in items {
+                    for d in self.eval_set(c).iter() {
+                        count[d as usize] += 1;
+                    }
+                }
+                DocSet::from_sorted((0..n).filter(|&d| count[d as usize] as usize >= *need).collect(), n)
+            }
         }
     }
 
@@ -471,6 +481,20 @@ impl TextFieldReader {
             }
             BoolQuery::Or(cs) => n * (1.0 - cs.iter().map(|c| 1.0 - self.estimate(c) / n).product::<f64>()),
             BoolQuery::Not(c) => n - self.estimate(c),
+            // Independent items: the chance that at least `need` hold.
+            BoolQuery::AtLeast { n: need, items } => {
+                let mut exactly = vec![1.0];
+                for c in items {
+                    let p = (self.estimate(c) / n).clamp(0.0, 1.0);
+                    let mut next = vec![0.0; exactly.len() + 1];
+                    for (j, x) in exactly.iter().enumerate() {
+                        next[j] += x * (1.0 - p);
+                        next[j + 1] += x * p;
+                    }
+                    exactly = next;
+                }
+                n * exactly.iter().skip(*need).sum::<f64>()
+            }
         }
     }
 
@@ -504,6 +528,7 @@ impl TextFieldReader {
             BoolQuery::And(cs) => Matcher::All(cs.iter().map(|c| self.matcher(c)).collect()),
             BoolQuery::Or(cs) => Matcher::Any(cs.iter().map(|c| self.matcher(c)).collect()),
             BoolQuery::Not(c) => Matcher::Not(Box::new(self.matcher(c))),
+            BoolQuery::AtLeast { n, items } => Matcher::AtLeast(*n, items.iter().map(|c| self.matcher(c)).collect()),
         }
     }
 }
@@ -576,6 +601,8 @@ enum Matcher<'a> {
     Set(DocSet),
     All(Vec<Matcher<'a>>),
     Any(Vec<Matcher<'a>>),
+    /// At least this many of the matchers.
+    AtLeast(usize, Vec<Matcher<'a>>),
     Not(Box<Matcher<'a>>),
     Never,
 }
@@ -599,6 +626,8 @@ impl Matcher<'_> {
             Matcher::Set(s) => s.contains(d),
             Matcher::All(ms) => ms.iter_mut().all(|m| m.matches(d)),
             Matcher::Any(ms) => ms.iter_mut().any(|m| m.matches(d)),
+            // Matchers only move forward, so one left behind catches up.
+            Matcher::AtLeast(n, ms) => ms.iter_mut().filter_map(|m| m.matches(d).then_some(())).take(*n).count() >= *n,
             Matcher::Not(m) => !m.matches(d),
             Matcher::Never => false,
         }

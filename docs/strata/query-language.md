@@ -112,7 +112,7 @@ A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256"
 query   := and ("OR" and)*
 and     := unary (["AND"] unary)*          juxtaposition is AND
 unary   := ("NOT" | "-") unary | primary    "a NOT b" is "a AND NOT b"
-primary := "(" query ")" | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
+primary := "(" query ")" ["@" n | "@" p "%"] | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
 ```
 
 | query | matches |
@@ -124,8 +124,11 @@ primary := "(" query ")" | ("\"phrase\"" | word | word* | word~ | word~N) ["^" w
 | `vacc*` | every indexed term with that prefix |
 | `vacine~`, `vacine~1` | the word and the indexed terms an edit or two from it ([typos](#typos-and-synonyms)) |
 | `vaccine AND (mrna OR "messenger rna") -animal` | any combination, with parentheses |
+| `(mrna vaccine trial phase)@2`, `(…)@50%` | at least 2 of the group's items, or half of them |
 
 Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it. A weight (`vaccine^2`, `"messenger rna"^0.5`) is read and ignored, since `MATCH` only says whether a row matches: `vaccine^2 mrna` matches what `vaccine mrna` does, so one text can go to both `MATCH` and [`bm25`](#weights-required-and-excluded-words).
+
+A group with `@n` matches a row with at least `n` of its items: its operands, whether juxtaposed, joined by `AND` or by `OR`, each a word, a phrase, a prefix, a typo-tolerant word or a parenthesised query (`vaccine AND (mrna "messenger rna" trial~ (phase OR stage))@2`). A negated item (`-animal`) is not counted: the row must not have it. A stopword is not an item, and a word's synonyms and typo neighbours count as it does. `@p%` asks for p percent of the items, rounded down; either count is clamped to between 1 and the number of items, as Lucene's `minimum_should_match` is, so `@1` is any of them and a count past the end is all of them. `MATCH(body, 'a b c d', min => 2)` (or `min => '75%'`) treats the whole query as one group. A group nests anywhere a parenthesised query does. A group reads each item's matches once, so it costs about what an `OR` of its items does.
 
 ## Scores
 
@@ -141,6 +144,7 @@ BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains
 | `fuzzy` | 0 | `1`, `2` or `'auto'`: also score the indexed terms that many edits from each word ([typos](#typos-and-synonyms)) |
 | `synonyms` | 0 | `1`: also score each word's synonyms |
 | `syntax` | `'query'` | `'plain'` reads `+`, `-`, quotes and `^` as punctuation: the text is words alone |
+| `min` | none | `n` or `'p%'`: rank only the rows with at least that many of the text's optional words and phrases |
 
 Keeping function words is better for short questions: on Quora it gains 0.055 nDCG@10, while on TREC-COVID, whose queries are full questions, dropping them gains the same amount.
 
@@ -161,10 +165,11 @@ The text may weigh a word, require it or exclude it, as a search box does:
 - **`+`** before a word or a quoted phrase requires it, **`-`** excludes it: a row must contain every required one and none of the excluded ones, and ranks by the others too. An excluded word does not score, and a word the query drops as a stopword is neither required nor excluded. A sign counts only at the start of a word and before a letter, digit or quote: `covid-19`, a `-` alone, `+-x` and `x^` are words. Quotes alone change nothing: `"messenger rna"` scores what `messenger rna` does.
 - With `fuzzy` or `synonyms`, a word's typo neighbours and synonyms take the highest weight the word is written with (writing it twice weighs the word twice, not them), and a required or excluded word counts as present when one of them is, as in `MATCH`.
 - A required or excluded word is a filter on the ranked rows: the top-k loop (all three `algo`s), a [rank-safe boost](#rank-safe-boosts), a [rerank phase](#rerank-phases) (where a row the filter drops scores 0, as one without the words does) and shards all apply it, so the rows and scores are those of the rows the text allows. Weights cost nothing; a filter costs what the same `MATCH` in `WHERE` does.
+- **`min => n`** (or `'p%'`) ranks only the rows with at least `n` of the text's optional words and phrases: those without a sign, each counted once however often it is written, whatever its weight (`^0` counts too). Required and excluded words are not counted; a text without optional words ignores `min`. Counts are clamped to between 1 and the number of optional words, and a percentage rounds down, as in `MATCH`'s groups: `bm25(body, 'vaccine mrna trial phase', min => 2)` ranks the rows with two of the four words, by all of them. With `syntax => 'plain'`, each word is an optional word.
 - **`syntax => 'plain'`** reads the text as words alone, as `bm25` did before: for text not written for a search box, such as a user's message passed through, or a benchmark's recorded queries. BEIR's hold `+1`, `-word` or `x^2` here and there, so the evaluations and benchmarks in this repository pass `syntax => 'plain'`, and so does Engram.
-- A plan that ranks with weights, signs, or a `MATCH` with weights needs the plan feature `text_operators`. From Python, `bm25("body", "+mrna vaccine^2")` reads them, and `bm25("body", text, syntax="plain")` does not.
+- A plan that ranks with weights, signs, or a `MATCH` with weights needs the plan feature `text_operators`, and one with `min` or a `MATCH` group `(…)@n` needs `min_match`. From Python, `bm25("body", "+mrna vaccine^2")` reads them, `bm25("body", text, syntax="plain")` does not, and `bm25("body", text, min=2)` and `match("body", text, min="75%")` ask for some of the words.
 
-**Changed:** `bm25` read `+`, `-`, `"` and `^` as punctuation before; text with them now ranks as above, and `syntax => 'plain'` keeps the old reading. In `MATCH`, `^` separated words: `vaccine^2` matched `vaccine` and `2`, and now matches `vaccine`.
+**Changed:** `bm25` read `+`, `-`, `"` and `^` as punctuation before; text with them now ranks as above, and `syntax => 'plain'` keeps the old reading. In `MATCH`, `^` separated words: `vaccine^2` matched `vaccine` and `2`, and now matches `vaccine`; and `)@2` closes a group a row needs 2 of, where `@2` was a word before.
 
 ### `similarity(field, vector)` and `distance(field, vector)`
 

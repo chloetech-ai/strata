@@ -136,6 +136,10 @@ impl Naive {
                 let s = self.eval(c);
                 (0..self.n).filter(|d| !s.contains(d)).collect()
             }
+            BoolQuery::AtLeast { n, items } => {
+                let sets: Vec<BTreeSet<u32>> = items.iter().map(|c| self.eval(c)).collect();
+                (0..self.n).filter(|d| sets.iter().filter(|s| s.contains(d)).count() >= *n).collect()
+            }
         }
     }
 

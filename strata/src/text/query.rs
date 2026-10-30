@@ -4,8 +4,16 @@
 //! query   := and ("OR" and)*
 //! and     := unary (["AND"] unary)*        juxtaposition is AND
 //! unary   := ("NOT" | "-") unary | primary  "a NOT b" is "a AND NOT b"
-//! primary := "(" query ")" | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
+//! primary := "(" query ")" ["@" n | "@" p "%"] | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
 //! ```
+//!
+//! `(a b c d)@2` matches a row with at least 2 of the group's items: its
+//! operands, joined by `AND`, by juxtaposition or by `OR`, each a word, a
+//! phrase, a prefix, a typo-tolerant word or a parenthesised query. A
+//! negated item (`-a`) is not counted: the row must not have it. `@p%`
+//! asks for p percent of the items, rounded down; either is clamped to
+//! between 1 and the number of items, as Lucene's `minimum_should_match`
+//! is ([`Need`]).
 //!
 //! A weight (`vaccine^2`, `"mrna vaccine"^0.5`) changes nothing about
 //! which rows match: it is there so that the same text read by `bm25`
@@ -40,6 +48,9 @@ pub enum BoolQuery {
     /// Any of (an empty `Or` matches nothing).
     Or(Vec<BoolQuery>),
     Not(Box<BoolQuery>),
+    /// At least `n` of `items`, with 1 < `n` < `items.len()` (the parser
+    /// writes the other counts as `Or` and `And`; see [`at_least`]).
+    AtLeast { n: usize, items: Vec<BoolQuery> },
 }
 
 impl BoolQuery {
@@ -56,16 +67,71 @@ impl BoolQuery {
             BoolQuery::Term(t) => out.push(t),
             BoolQuery::Phrase(ts) => out.extend(ts.iter().map(|t| t.as_str())),
             BoolQuery::Prefix(_) | BoolQuery::Fuzzy { .. } => {}
-            BoolQuery::And(cs) | BoolQuery::Or(cs) => cs.iter().for_each(|c| c.collect_terms(out)),
+            BoolQuery::And(cs) | BoolQuery::Or(cs) | BoolQuery::AtLeast { items: cs, .. } => cs.iter().for_each(|c| c.collect_terms(out)),
             BoolQuery::Not(c) => c.collect_terms(out),
         }
     }
+}
+
+/// How many of a group's items a row needs (`@n`, `@p%`, `min => ..`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    Count(usize),
+    /// A percentage of the items, rounded down.
+    Percent(u32),
+}
+
+impl Need {
+    /// The count out of `y` items: clamped to between 1 and `y`.
+    pub fn of(self, y: usize) -> usize {
+        let n = match self {
+            Need::Count(n) => n,
+            Need::Percent(p) => (y as u64 * p as u64 / 100) as usize,
+        };
+        n.clamp(1, y.max(1))
+    }
+
+    /// `n` or `p%` (`p` at most 100), as `@` and `min =>` write it.
+    pub fn parse(s: &str) -> Option<Need> {
+        let digits = |d: &str| (!d.is_empty() && d.len() <= 9 && d.bytes().all(|b| b.is_ascii_digit())).then(|| d.parse::<u32>().ok()).flatten();
+        match s.strip_suffix('%') {
+            Some(p) => digits(p).filter(|&p| p <= 100).map(Need::Percent),
+            None => digits(s).map(|n| Need::Count(n as usize)),
+        }
+    }
+}
+
+impl std::fmt::Display for Need {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Need::Count(n) => write!(f, "{n}"),
+            Need::Percent(p) => write!(f, "{p}%"),
+        }
+    }
+}
+
+/// A group of `items` a row needs `need` of: the negated items are
+/// required to be absent and not counted; with `n` of the `y` others,
+/// `Or` for 1, `And` for all, else [`BoolQuery::AtLeast`].
+pub fn at_least(need: Need, items: Vec<BoolQuery>) -> Option<BoolQuery> {
+    let (not, pos): (Vec<BoolQuery>, Vec<BoolQuery>) = items.into_iter().partition(|c| matches!(c, BoolQuery::Not(_)));
+    let n = need.of(pos.len());
+    let counted = match pos.len() {
+        0 => None,
+        1 => pos.into_iter().next(),
+        y if n == y => Some(BoolQuery::And(pos)),
+        _ if n == 1 => Some(BoolQuery::Or(pos)),
+        _ => Some(BoolQuery::AtLeast { n, items: pos }),
+    };
+    combine(std::iter::once(counted).chain(not.into_iter().map(Some)).collect(), BoolQuery::And)
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
     LParen,
     RParen,
+    /// `)@n` or `)@p%`: the group closes, and a row needs that many of it.
+    RParenAtLeast(Need),
     And,
     Or,
     Not,
@@ -73,10 +139,21 @@ enum Tok {
     Word(String),
 }
 
-/// The tokens of `q`, and whether a word or phrase of it has a weight.
-fn lex(q: &str) -> Result<(Vec<Tok>, bool)> {
+/// What a `MATCH` query uses that a Strata from before it reads as other
+/// words ([`match_features`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatchFeatures {
+    /// A word or phrase with a weight (`word^2`).
+    pub weights: bool,
+    /// A group a row needs some of (`(a b c)@2`).
+    pub at_least: bool,
+}
+
+/// The tokens of `q`, and what of [`MatchFeatures`] it uses.
+fn lex(q: &str) -> Result<(Vec<Tok>, MatchFeatures)> {
     let mut out = Vec::new();
     let mut weighted = false;
+    let mut at_least = false;
     let mut it = q.char_indices().peekable();
     while let Some(&(i, c)) = it.peek() {
         match c {
@@ -89,7 +166,20 @@ fn lex(q: &str) -> Result<(Vec<Tok>, bool)> {
             }
             ')' => {
                 it.next();
-                out.push(Tok::RParen);
+                // `@n` or `@p%` right after it.
+                let rest = &q[i + 1..];
+                let len = rest.find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"')).unwrap_or(rest.len());
+                match rest.strip_prefix('@') {
+                    Some(_) => {
+                        let need = Need::parse(&rest[1..len]).ok_or_else(|| Error::Query(format!("`)@` takes a count or a percentage (`)@2`, `)@50%`) in MATCH query {q:?}")))?;
+                        at_least = true;
+                        out.push(Tok::RParenAtLeast(need));
+                        while it.peek().is_some_and(|&(j, _)| j < i + 1 + len) {
+                            it.next();
+                        }
+                    }
+                    None => out.push(Tok::RParen),
+                }
             }
             '"' => {
                 it.next();
@@ -141,13 +231,13 @@ fn lex(q: &str) -> Result<(Vec<Tok>, bool)> {
             }
         }
     }
-    Ok((out, weighted))
+    Ok((out, MatchFeatures { weights: weighted, at_least }))
 }
 
-/// Whether a `MATCH` query weighs a word or phrase (`word^2`), which a
-/// Strata from before weights reads as other words.
-pub fn match_has_weights(q: &str) -> bool {
-    lex(q).is_ok_and(|(_, w)| w)
+/// What a `MATCH` query uses of weights and groups a row needs some of
+/// (nothing if it does not parse).
+pub fn match_features(q: &str) -> MatchFeatures {
+    lex(q).map(|(_, f)| f).unwrap_or_default()
 }
 
 /// A weight: digits with an optional fraction (`2`, `0.5`, `.5`), finite.
@@ -300,7 +390,7 @@ impl Parser {
         let mut parts = vec![self.unary()?];
         loop {
             match self.peek() {
-                None | Some(Tok::Or) | Some(Tok::RParen) => break,
+                None | Some(Tok::Or) | Some(Tok::RParen) | Some(Tok::RParenAtLeast(_)) => break,
                 Some(Tok::And) => self.pos += 1,
                 _ => {}
             }
@@ -333,18 +423,24 @@ impl Parser {
         self.pos += 1;
         Ok(match tok {
             Tok::LParen => {
-                if self.peek() == Some(&Tok::RParen) {
+                if matches!(self.peek(), Some(Tok::RParen | Tok::RParenAtLeast(_))) {
                     self.pos += 1;
                     return Ok(None);
                 }
                 self.enter()?;
                 let e = self.or()?;
                 self.depth -= 1;
-                if self.peek() != Some(&Tok::RParen) {
-                    return Err(Error::Query("unbalanced parentheses in MATCH query".into()));
-                }
+                let close = self.peek().cloned();
                 self.pos += 1;
-                e
+                match close {
+                    Some(Tok::RParen) => e,
+                    // The group's items are its top-level operands.
+                    Some(Tok::RParenAtLeast(need)) => match e {
+                        Some(BoolQuery::And(cs) | BoolQuery::Or(cs)) => at_least(need, cs),
+                        e => e.and_then(|e| at_least(need, vec![e])),
+                    },
+                    _ => return Err(Error::Query("unbalanced parentheses in MATCH query".into())),
+                }
             }
             Tok::Phrase(s) => terms_query(self.analyzer.analyze(&s)),
             Tok::Word(w) => match (w.strip_suffix('*'), fuzzy_suffix(&w)) {
@@ -443,6 +539,7 @@ pub fn expand(q: BoolQuery, synonyms: Option<&super::synonyms::SynonymMap>, edit
         }
         BoolQuery::And(cs) => BoolQuery::And(cs.into_iter().map(|c| expand(c, synonyms, edits)).collect()),
         BoolQuery::Or(cs) => BoolQuery::Or(cs.into_iter().map(|c| expand(c, synonyms, edits)).collect()),
+        BoolQuery::AtLeast { n, items } => BoolQuery::AtLeast { n, items: items.into_iter().map(|c| expand(c, synonyms, edits)).collect() },
         // Excluded words stay exact.
         q => q,
     }
@@ -461,6 +558,7 @@ pub fn resolve_fuzzy(q: BoolQuery, near: &mut dyn FnMut(&str, u8) -> Vec<String>
         }
         BoolQuery::And(cs) => BoolQuery::And(cs.into_iter().map(|c| resolve_fuzzy(c, near)).collect()),
         BoolQuery::Or(cs) => BoolQuery::Or(cs.into_iter().map(|c| resolve_fuzzy(c, near)).collect()),
+        BoolQuery::AtLeast { n, items } => BoolQuery::AtLeast { n, items: items.into_iter().map(|c| resolve_fuzzy(c, near)).collect() },
         BoolQuery::Not(c) => BoolQuery::Not(Box::new(resolve_fuzzy(*c, near))),
         q => q,
     }
@@ -518,5 +616,45 @@ mod tests {
         for bad in ["(cat", "cat)", "\"cat", "cat OR", "AND cat", "NOT"] {
             assert!(parse_match(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn groups_a_row_needs_some_of() {
+        let (cat, dog, fox, owl) = (t("cat"), t("dog"), t("fox"), t("owl"));
+        let at = |n, items: Vec<BoolQuery>| AtLeast { n, items };
+        assert_eq!(parse_match("(cat dog fox owl)@2").unwrap(), at(2, vec![cat.clone(), dog.clone(), fox.clone(), owl.clone()]));
+        assert_eq!(parse_match("(cat OR dog OR fox)@2").unwrap(), at(2, vec![cat.clone(), dog.clone(), fox.clone()]));
+        // One of them is OR, all of them AND; counts are clamped to 1..=y.
+        assert_eq!(parse_match("(cat dog fox)@1").unwrap(), Or(vec![cat.clone(), dog.clone(), fox.clone()]));
+        assert_eq!(parse_match("(cat dog fox)@0").unwrap(), Or(vec![cat.clone(), dog.clone(), fox.clone()]));
+        assert_eq!(parse_match("(cat dog fox)@3").unwrap(), And(vec![cat.clone(), dog.clone(), fox.clone()]));
+        assert_eq!(parse_match("(cat dog fox)@9").unwrap(), And(vec![cat.clone(), dog.clone(), fox.clone()]));
+        // Percentages round down: 75% of 4 is 3, of 3 is 2; 10% of 3 is 1.
+        assert_eq!(parse_match("(cat dog fox owl)@75%").unwrap(), at(3, vec![cat.clone(), dog.clone(), fox.clone(), owl.clone()]));
+        assert_eq!(parse_match("(cat dog fox)@75%").unwrap(), at(2, vec![cat.clone(), dog.clone(), fox.clone()]));
+        assert_eq!(parse_match("(cat dog fox)@10%").unwrap(), Or(vec![cat.clone(), dog.clone(), fox.clone()]));
+        // Items are words, phrases, prefixes, typo words and groups; a
+        // negated item is not counted, and a stopword is not an item.
+        assert_eq!(
+            parse_match("(cat \"red fox\" ow* dgo~1 (owl OR dog) -bat the)@3").unwrap(),
+            And(vec![
+                at(3, vec![cat.clone(), Phrase(vec!["red".into(), "fox".into()]), Prefix("ow".into()), Fuzzy { term: "dgo".into(), edits: 1 }, Or(vec![owl.clone(), dog.clone()])]),
+                Not(Box::new(t("bat"))),
+            ])
+        );
+        // Nested, beside other operands, and alone.
+        assert_eq!(parse_match("owl AND ((cat dog fox)@2 OR bat)").unwrap(), And(vec![owl.clone(), Or(vec![at(2, vec![cat.clone(), dog.clone(), fox.clone()]), t("bat")])]));
+        assert_eq!(parse_match("(cat)@2").unwrap(), cat);
+        assert_eq!(parse_match("()@2").unwrap(), Or(vec![]));
+        assert_eq!(parse_match("(the a)@2").unwrap(), Or(vec![]));
+        assert_eq!(parse_match("user@host").unwrap(), Phrase(vec!["user".into(), "host".into()]));
+        for bad in ["(cat dog)@", "(cat dog)@x", "(cat dog)@2x", "(cat dog)@101%", "(cat dog)@-1", "cat)@2", "(cat dog)@ 2"] {
+            assert!(parse_match(bad).is_err(), "{bad}");
+        }
+        assert!(match_features("(cat dog)@2").at_least && !match_features("(cat dog)@2").weights);
+        assert!(match_features("cat^2 dog").weights && !match_features("cat^2 dog").at_least);
+        assert_eq!(match_features("user@host (cat)"), MatchFeatures::default());
+        assert_eq!((Need::Count(3).of(2), Need::Count(0).of(5), Need::Percent(50).of(5), Need::Percent(100).of(5), Need::Percent(0).of(5)), (2, 1, 2, 5, 1));
+        assert_eq!((Need::parse("2"), Need::parse("75%"), Need::parse("1.5"), Need::parse("%"), Need::parse("")), (Some(Need::Count(2)), Some(Need::Percent(75)), None, None, None));
     }
 }

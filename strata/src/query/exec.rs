@@ -2436,43 +2436,77 @@ pub(crate) fn plain_syntax(opts: &Opts) -> Result<bool> {
     }
 }
 
+/// The `min` option of `MATCH` and `bm25`: how many of the text's items
+/// a row needs, a count (`2`) or a percentage (`'75%'`).
+pub(crate) fn min_need(opts: &Opts) -> Result<Option<text::query::Need>> {
+    let Some(v) = opts.get("min") else { return Ok(None) };
+    let need = match v {
+        Value::Str(s) => text::query::Need::parse(s.trim()),
+        v => v.as_f64().filter(|x| x.fract() == 0.0 && (0.0..1e9).contains(x)).map(|x| text::query::Need::Count(x as usize)),
+    };
+    need.map(Some).ok_or_else(|| err(format!("min => a count (2) or a percentage ('75%'), not {v:?}")))
+}
+
 /// The scored terms of a `bm25` query in order, each with the weight of
 /// the word or phrase it comes from (repeats included), and the `MATCH`
-/// query of its required (`+`) and excluded (`-`) words, as the field's
-/// `analyzer` analyses them ([`text::query::ranked_items`]; `syntax =>
-/// 'plain'`: every word, weighing 1, none required). `stopwords => 0`
-/// keeps query stopwords and `stopwords => 1` drops them (by default only
-/// an `english` field does); a word or phrase they leave no term of is
-/// not one. A weight of 0 scores nothing, but a required word still
-/// filters.
+/// query of the rows it may rank beyond having one of them: its required
+/// (`+`) and excluded (`-`) words, and with `min => n`, a group of its
+/// optional words and phrases a row needs n of (each once, however often
+/// written). Words are analysed as the field's `analyzer` analyses them
+/// ([`text::query::ranked_items`]; `syntax => 'plain'`: every word,
+/// weighing 1, none required). `stopwords => 0` keeps query stopwords and
+/// `stopwords => 1` drops them (by default only an `english` field does);
+/// a word or phrase they leave no term of is not one. A weight of 0
+/// scores nothing, but a required word still filters, and an optional one
+/// still counts toward `min`.
 fn ranked_terms(q: &str, opts: &Opts, analyzer: text::Analyzer) -> Result<(Vec<(String, f32)>, Option<String>)> {
     let drop = opts.get("stopwords").and_then(|v| v.as_f64()).map_or(analyzer.drops_query_stopwords(), |x| x != 0.0);
-    if plain_syntax(opts)? {
-        return Ok((analyzer.query_term_seq(q, drop).into_iter().map(|t| (t, 1.0)).collect(), None));
-    }
+    let min = min_need(opts)?;
+    // As a MATCH phrase: the words, quotes left out.
+    let phrase = |text: &str| format!("\"{}\"", text.replace('"', " "));
     let (mut terms, mut must, mut not) = (Vec::new(), Vec::new(), Vec::new());
-    for item in text::query::ranked_items(q) {
-        let seq = analyzer.query_term_seq(item.text, drop);
-        if seq.is_empty() {
-            continue;
+    // The optional items, each once, for `min`.
+    let mut should: Vec<(Vec<String>, String)> = Vec::new();
+    let mut optional = |seq: &Vec<String>, text: &str| {
+        if min.is_some() && !should.iter().any(|(s, _)| s == seq) {
+            should.push((seq.clone(), phrase(text)));
         }
-        // As a MATCH phrase: the words, quotes left out.
-        let phrase = format!("\"{}\"", item.text.replace('"', " "));
-        match item.occur {
-            text::query::Occur::MustNot => {
-                not.push(format!("NOT {phrase}"));
+    };
+    if plain_syntax(opts)? {
+        terms = analyzer.query_term_seq(q, drop).into_iter().map(|t| (t, 1.0)).collect();
+        for word in q.split_whitespace() {
+            let seq = analyzer.query_term_seq(word, drop);
+            if !seq.is_empty() {
+                optional(&seq, word);
+            }
+        }
+    } else {
+        for item in text::query::ranked_items(q) {
+            let seq = analyzer.query_term_seq(item.text, drop);
+            if seq.is_empty() {
                 continue;
             }
-            text::query::Occur::Must => must.push(phrase),
-            text::query::Occur::Should => {}
-        }
-        let w = item.weight.unwrap_or(1.0);
-        if w > 0.0 {
-            terms.extend(seq.into_iter().map(|t| (t, w)));
+            match item.occur {
+                text::query::Occur::MustNot => {
+                    not.push(format!("NOT {}", phrase(item.text)));
+                    continue;
+                }
+                text::query::Occur::Must => must.push(phrase(item.text)),
+                text::query::Occur::Should => optional(&seq, item.text),
+            }
+            let w = item.weight.unwrap_or(1.0);
+            if w > 0.0 {
+                terms.extend(seq.into_iter().map(|t| (t, w)));
+            }
         }
     }
-    must.extend(not);
-    Ok((terms, (!must.is_empty()).then(|| must.join(" "))))
+    let mut filter = Vec::new();
+    if let (Some(need), false) = (min, should.is_empty()) {
+        filter.push(format!("({})@{need}", should.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>().join(" ")));
+    }
+    filter.extend(must);
+    filter.extend(not);
+    Ok((terms, (!filter.is_empty()).then(|| filter.join(" "))))
 }
 
 /// The weighted terms of a `bm25` query ([`Executor::bm25_query`]).
