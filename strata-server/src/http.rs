@@ -108,6 +108,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/embed", post(embed))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
+        .route("/v1/sid/next", post(sid_next))
         .route("/v1/snapshot", post(snapshot))
         .route("/v1/admin/checkpoint", post(admin_checkpoint))
         .route("/v1/admin/check", post(admin_check))
@@ -648,6 +649,37 @@ async fn synonyms(State(app): State<App>) -> AxJson<Json> {
 async fn put_synonyms(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let rules = app.svc.put_synonyms(body_str(&b, "text")?)?;
     Ok(AxJson(json!({"rules": rules, "file": app.svc.synonyms_file().map(|p| p.display().to_string())})))
+}
+
+/// `{"field": "sid", "prefixes": ["12", "12.7"], "where": "tag = :t",
+/// "params": {...}, "table": ..., "min_seq_no": ..., "timeout_ms": ...}`:
+/// the codes that can follow each prefix among the rows `where` matches
+/// (all rows without it), with how many rows have each
+/// ([`strata::db::Db::sid_next`]). `table` defaults to the first.
+async fn sid_next(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let t0 = Instant::now();
+    let table = match b.get("table") {
+        None | Some(Json::Null) => app.svc.schema.table.clone(),
+        Some(_) => body_str(&b, "table")?.to_string(),
+    };
+    let field = body_str(&b, "field")?;
+    let prefixes: Vec<String> = match b.get("prefixes") {
+        Some(Json::Array(ps)) => ps.iter().map(|p| p.as_str().map(String::from).ok_or_else(|| ApiError::bad("prefixes are strings, such as \"12.7\", or \"\" for the first numbers"))).collect::<Result<_, _>>()?,
+        _ => return Err(ApiError::bad("the body needs \"prefixes\", a list of codes such as [\"12\", \"12.7\"] (\"\" for the first numbers)")),
+    };
+    let filter = match b.get("where") {
+        None | Some(Json::Null) => String::new(),
+        Some(_) => format!(" WHERE {}", body_str(&b, "where")?),
+    };
+    let sql = format!("SELECT COUNT(*) FROM {}{filter}", strata::query::sql::ident(&table));
+    let params = app.svc.params(b.get("params")).await?;
+    let next = app.svc.sid_next(&sql, None, &params, field, &prefixes, &after(&b)?, body_u64(&b, "timeout_ms")).await?;
+    let next: Vec<Json> = prefixes
+        .iter()
+        .zip(next)
+        .map(|(p, cs)| json!({"prefix": p, "next": cs.into_iter().map(|(code, count)| json!({"code": code, "count": count})).collect::<Vec<_>>()}))
+        .collect();
+    Ok(AxJson(json!({"next": next, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
 }
 
 async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {

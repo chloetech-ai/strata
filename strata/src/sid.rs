@@ -25,6 +25,11 @@
 //! ([`gone_section`]), so that the ties of a table can be counted again
 //! when it opens.
 //!
+//! [`Db::sid_next`](crate::db::Db::sid_next) answers which codes can
+//! follow a prefix among the rows a filter matches, and how many rows each
+//! has: the children of the prefix in the field's dictionary (every
+//! prefix is a value of it), each counted against the filter.
+//!
 //! A codebook is a model: `<models>/<name>/codebook.safetensors`, F32
 //! tensors `level.0` .. `level.<levels - 1>` of shape `[k, dim]`, the
 //! format an RQ-VAE trained in PyTorch can export
@@ -384,6 +389,10 @@ pub fn value(levels: &[u32], tie: u32) -> Value {
     }
     Value::List(out)
 }
+
+/// The prefixes [`Db::sid_next`](crate::db::Db::sid_next) takes at most
+/// in one call.
+pub const MAX_PREFIXES: usize = 64;
 
 /// The numbers of a code written `12.7.201.0`.
 pub fn parse(code: &str) -> Option<Vec<u32>> {
