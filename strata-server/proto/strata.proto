@@ -571,6 +571,9 @@ enum Func {
   FUNC_GREATEST = 12;
   FUNC_SIGMOID = 13;
   FUNC_CLAMP = 14;
+  // A semantic ID's prefix (plan feature "semantic_id"); 15 is left for the
+  // ranking thread's dot().
+  FUNC_SID_AT = 16;
 }
 
 message Match {

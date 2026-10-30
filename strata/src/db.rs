@@ -105,12 +105,28 @@ struct Model {
 }
 
 impl Db {
+    /// A new database of one table. Its semantic-ID fields' codebooks
+    /// come from the default models directory ([`Db::create_in`]).
     pub fn create(path: &Path, schema: Schema, opts: DbOptions) -> Result<Db> {
-        Ok(Db::wrap(Database::create(path, schema, with_source(opts))?))
+        Db::create_in(path, schema, opts, &crate::embed::models_dir())
     }
 
+    /// [`Db::create`], with the codebooks of semantic-ID fields from
+    /// `models`: the table records each one's hash ([`crate::sid::resolve`]),
+    /// and writes get codes from it.
+    pub fn create_in(path: &Path, mut schema: Schema, opts: DbOptions, models: &Path) -> Result<Db> {
+        crate::sid::resolve(&mut schema, models)?;
+        let db = Db::wrap(Database::create(path, schema, with_source(opts))?);
+        db.open_codebooks(models);
+        Ok(db)
+    }
+
+    /// Opens a database; the codebooks of its semantic-ID fields come from
+    /// the default models directory, or from [`Db::open_embedders`]'s.
     pub fn open(path: &Path, opts: DbOptions) -> Result<Db> {
-        Ok(Db::wrap(Database::open(path, with_source(opts))?))
+        let db = Db::wrap(Database::open(path, with_source(opts))?);
+        db.open_codebooks(&crate::embed::models_dir());
+        Ok(db)
     }
 
     fn wrap(storage: Database) -> Db {
@@ -153,13 +169,16 @@ impl Db {
     /// [`crate::storage::WriteTxn::table`] and [`Snapshot::table`]. After
     /// [`Db::open_embedders`], its embedded fields get their models from the
     /// same place (a model it cannot open leaves the vectors to the writes).
-    pub fn create_table(&self, schema: Schema) -> Result<()> {
+    pub fn create_table(&self, mut schema: Schema) -> Result<()> {
         let name = schema.table.clone();
-        self.storage.create_table(schema)?;
         let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let models = dir.clone().unwrap_or_else(crate::embed::models_dir);
+        crate::sid::resolve(&mut schema, &models)?;
+        self.storage.create_table(schema)?;
         if let Some(dir) = dir {
             self.open_embedders_of(&name, &dir);
         }
+        self.open_codebooks_of(&name, &models);
         Ok(())
     }
 
@@ -281,8 +300,10 @@ impl Db {
     /// database with the new schema and load the old one into it. A VECTOR
     /// field is copied when the old field has the same dimensions and
     /// embedding ([`crate::schema::Embed`]); otherwise this database embeds
-    /// it anew (given the model, [`Db::set_embedder`]). Returns the rows
-    /// loaded.
+    /// it anew (given the model, [`Db::set_embedder`]). A semantic-ID field
+    /// is copied when the old field has the same codebook, and derived anew
+    /// otherwise: a new codebook means a new field, filled this way.
+    /// Returns the rows loaded.
     pub fn load_from(&self, other: &Db) -> Result<u64> {
         let (old, new) = (other.schema(), self.schema());
         if let Some(f) = old.unrebuildable() {
@@ -296,6 +317,8 @@ impl Db {
                 let g = &old.fields[j];
                 let keep = match (&f.ty, &g.ty) {
                     (FieldType::Vector { dim: a, .. }, FieldType::Vector { dim: b, .. }) => a == b && f.embed == g.embed,
+                    // Codes of another codebook are derived anew.
+                    _ if f.semantic_id.is_some() || g.semantic_id.is_some() => f.semantic_id == g.semantic_id,
                     (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b) && f.multi == g.multi,
                 };
                 keep.then_some(j)
@@ -389,6 +412,35 @@ impl Db {
                 failed.push((if t.table == first { f } else { format!("{}.{f}", t.table) }, e));
             }
         }
+        failed.extend(self.open_codebooks(models));
+        failed
+    }
+
+    /// Opens the codebook of every semantic-ID field from `models`
+    /// ([`crate::sid::Codebook::open`]), checked against the hash the field
+    /// records; returns the fields whose codebook did not open, as
+    /// [`Db::open_embedders`] does. Writes that need codes from those fail.
+    pub fn open_codebooks(&self, models: &Path) -> Vec<(String, Error)> {
+        let first = self.schema().table.clone();
+        let mut failed = Vec::new();
+        for t in self.catalog() {
+            for (f, e) in self.open_codebooks_of(&t.table, models) {
+                failed.push((if t.table == first { f } else { format!("{}.{f}", t.table) }, e));
+            }
+        }
+        failed
+    }
+
+    fn open_codebooks_of(&self, table: &str, models: &Path) -> Vec<(String, Error)> {
+        let Some(schema) = self.storage.table(table) else { return Vec::new() };
+        let mut failed = Vec::new();
+        for f in &schema.fields {
+            let Some(sid) = &f.semantic_id else { continue };
+            let opened = crate::sid::Codebook::open(&sid.codebook, models).and_then(|(cb, hash)| self.storage.set_codebook(table, &f.name, cb, &hash));
+            if let Err(e) = opened {
+                failed.push((f.name.clone(), e));
+            }
+        }
         failed
     }
 
@@ -402,6 +454,30 @@ impl Db {
             }
         }
         failed
+    }
+
+    /// Trains a semantic-ID codebook ([`crate::sid::Codebook::train`]) on the
+    /// vectors of VECTOR field `field` of the table named `table`, and saves
+    /// it as `name` under `models`, for semantic-ID fields to name. Returns
+    /// the SHA-256 of its file.
+    pub fn train_codebook(&self, table: &str, field: &str, name: &str, models: &Path, opts: &crate::sid::TrainOptions) -> Result<String> {
+        let snap = self.snapshot().table(table).ok_or_else(|| Error::Schema(format!("no table {table}")))?;
+        let schema = snap.schema();
+        let f = schema.field(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let FieldType::Vector { dim, .. } = f.ty else { return Err(Error::Schema(format!("field {field} is not a VECTOR field"))) };
+        let mut vectors = Vec::new();
+        for v in snap.segments() {
+            let r = VectorReader::open(&v.file, &f.name)?;
+            for d in 0..v.file.n_docs() as DocId {
+                if v.live.as_ref().is_none_or(|l| l.contains(d)) && r.has_vector(d) {
+                    vectors.extend_from_slice(r.vector(d));
+                }
+            }
+        }
+        if vectors.is_empty() {
+            return Err(Error::Schema(format!("{table}.{field} holds no vectors to train a codebook on")));
+        }
+        crate::sid::Codebook::train(&vectors, dim, opts)?.save(name, models)
     }
 
     /// Computes the embedded vectors that documents of the first table
@@ -915,6 +991,10 @@ struct Planned {
 /// every text field stored or generated.
 fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)]) -> Result<Planned> {
     let pk = schema.primary_key.ok_or_else(|| Error::Query(format!("UPDATE needs a primary key, and {} has none", schema.table)))?;
+    if let Some(f) = sets.iter().map(|(f, _)| &schema.fields[*f]).find(|f| f.semantic_id.is_some()) {
+        let from = &f.semantic_id.as_ref().expect("a semantic-ID field").from;
+        return Err(Error::Query(format!("{} is a semantic ID: the writer derives it from {from}; set {from} instead", f.name)));
+    }
     if let Some(f) = schema.shard_by_field().filter(|f| sets.iter().any(|(g, _)| g == f)) {
         return Err(Error::Query(format!("{} places {}'s rows on shards (shard_by), so UPDATE does not change it: delete the row and insert it again", schema.fields[f].name, schema.table)));
     }
@@ -992,6 +1072,13 @@ fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(V
             }
             for &f in &stale {
                 doc[f] = Value::Null;
+            }
+            // A semantic ID whose vector changes is derived again (the
+            // writer keeps it if the levels stay the same).
+            for (f, vf) in crate::sid::fields(schema) {
+                if stale.contains(&vf) || sets.iter().any(|(g, _)| *g == vf) {
+                    doc[f] = Value::Null;
+                }
             }
             schema.fill_generated(&mut doc);
             rewrites.push(doc);

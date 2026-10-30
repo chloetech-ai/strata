@@ -12,6 +12,8 @@ serde_json = "1"
 csv = "1"
 sqlparser = "0.59"
 crc32fast = "1"
+# SHA-256 of codebook files (semantic IDs, `sid`).
+sha2 = "0.10"
 libc = "0.2"
 # Log events (flush and merge failures, a database that stops writing);
 # silent unless the program installs a subscriber, as strata-server does.
