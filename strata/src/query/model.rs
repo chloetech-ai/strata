@@ -53,35 +53,41 @@ pub struct Gbdt {
     trees: Vec<Tree>,
 }
 
-/// A tree's nodes, the root first.
-struct Tree(Vec<Node>);
-
-enum Node {
-    Leaf(f64),
-    Split { feature: usize, test: Test, default_left: bool, left: u32, right: u32 },
+/// A tree's nodes, the root first, and the category sets of its
+/// categorical splits.
+struct Tree {
+    nodes: Vec<Node>,
+    cats: Vec<Vec<u32>>,
+    /// The least and greatest leaf under each node, which bounds skip
+    /// subtrees by ([`Tree::reach`]).
+    range: Vec<(f64, f64)>,
 }
 
-/// Which way a split sends a row.
-enum Test {
-    /// LightGBM's numerical split: left when `x <= threshold`.
-    Le(f64, Missing),
-    /// LightGBM's categorical split: left when `x`, as an integer, is one
-    /// of the categories (sorted).
-    In(Vec<u32>),
-    /// XGBoost's split: left when `x as f32 < threshold`, missing values
-    /// to the default side.
-    Lt(f32),
+/// A split, or a leaf: a node whose children are both itself, so that a
+/// walk can take a step from it as from a split, and ends where a step
+/// stays put. 24 bytes, so that a tree of 31 leaves fits in 1.5 KB.
+#[derive(Clone, Copy)]
+struct Node {
+    /// A numerical split's threshold (XGBoost's an `f32`), a categorical
+    /// split's index in [`Tree::cats`], or a leaf's value.
+    value: f64,
+    feature: u32,
+    left: u32,
+    right: u32,
+    /// [`DEFAULT_LEFT`], [`MISSING_NAN`], [`MISSING_ZERO`], [`CATEGORICAL`].
+    flags: u8,
 }
 
-/// What LightGBM counts as missing at a numerical split.
-#[derive(Clone, Copy, PartialEq)]
-enum Missing {
-    /// Nothing: NaN is 0.
-    None,
-    /// 0 (within LightGBM's `kZeroThreshold`) and NaN, which is 0.
-    Zero,
-    NaN,
-}
+/// Missing values go left.
+const DEFAULT_LEFT: u8 = 1;
+/// NaN is missing (LightGBM's `missing_type` NaN, and every XGBoost split);
+/// otherwise LightGBM reads it as 0.
+const MISSING_NAN: u8 = 2;
+/// 0 and NaN are missing (LightGBM's `missing_type` Zero).
+const MISSING_ZERO: u8 = 4;
+/// LightGBM's categorical split: left when the value, as an integer, is
+/// one of the categories (sorted); NaN and negatives go right.
+const CATEGORICAL: u8 = 8;
 
 /// LightGBM's `kZeroThreshold`.
 const ZERO: f64 = 1e-35_f32 as f64;
@@ -120,8 +126,22 @@ impl Gbdt {
             return Err(bad(name, "neither a LightGBM dump (dump_model) nor an XGBoost model (save_model to .json)"));
         };
         m.hash = hash;
-        for (t, tree) in m.trees.iter().enumerate() {
+        if m.features == 0 {
+            return Err(bad(name, "the model reads no features"));
+        }
+        for (t, tree) in m.trees.iter_mut().enumerate() {
             tree.check(name, t, m.features)?;
+            tree.range = vec![(0.0, 0.0); tree.nodes.len()];
+            // Children come after their parent.
+            for (i, n) in tree.nodes.iter().enumerate().rev() {
+                tree.range[i] = match n.left as usize == i {
+                    true => (n.value, n.value),
+                    false => {
+                        let (l, r) = (tree.range[n.left as usize], tree.range[n.right as usize]);
+                        (l.0.min(r.0), l.1.max(r.1))
+                    }
+                };
+            }
         }
         Ok(m)
     }
@@ -132,11 +152,44 @@ impl Gbdt {
             // As XGBoost: f32 features, comparisons and sum.
             let mut s = self.base;
             for t in &self.trees {
-                s += t.leaf(x) as f32;
+                s += t.leaf::<true>(x) as f32;
             }
             s as f64
         } else {
-            self.trees.iter().fold(0.0, |s, t| s + t.leaf(x))
+            self.trees.iter().fold(0.0, |s, t| s + t.leaf::<false>(x))
+        }
+    }
+
+    /// [`predict`](Self::predict) of `n` rows, feature `f` of row `i`
+    /// being `columns[f][i]`, equal to it bit for bit (each row's sum is
+    /// taken in the same order). Faster over many rows: it walks every
+    /// row through one tree before the next, so the tree stays in cache
+    /// and the processor overlaps the rows' walks.
+    pub fn predict_columns(&self, columns: &[&[f64]], n: usize) -> Vec<f64> {
+        assert!(columns.len() == self.features && columns.iter().all(|c| c.len() >= n), "a column per feature, of every row");
+        match self.xgboost {
+            true => self.walk::<true>(columns, n),
+            false => self.walk::<false>(columns, n),
+        }
+    }
+
+    fn walk<const XGB: bool>(&self, columns: &[&[f64]], n: usize) -> Vec<f64> {
+        let (mut wide, mut narrow) = (vec![0.0f64; n], vec![self.base; n]);
+        let nf = self.features;
+        let rows: Vec<f64> = (0..n).flat_map(|r| columns.iter().map(move |c| c[r])).collect();
+        for t in &self.trees {
+            for (r, x) in rows.chunks_exact(nf).enumerate() {
+                let v = t.leaf::<XGB>(x);
+                if XGB {
+                    narrow[r] += v as f32;
+                } else {
+                    wide[r] += v;
+                }
+            }
+        }
+        match XGB {
+            true => narrow.into_iter().map(f64::from).collect(),
+            false => wide,
         }
     }
 
@@ -148,7 +201,9 @@ impl Gbdt {
     pub fn bounds(&self, inputs: &[(f64, f64, bool)]) -> (f64, f64) {
         let (mut lo, mut hi, mut size) = (0.0, 0.0, 0.0);
         for t in &self.trees {
-            let (a, b) = t.bounds(0, inputs, self.xgboost);
+            let mut found = (f64::INFINITY, f64::NEG_INFINITY);
+            t.reach(0, inputs, self.xgboost, &mut found);
+            let (a, b) = found;
             if a > b {
                 return (f64::INFINITY, f64::NEG_INFINITY);
             }
@@ -169,116 +224,115 @@ impl Gbdt {
 }
 
 impl Tree {
-    fn leaf(&self, x: &[f64]) -> f64 {
+    /// The leaf value row `x` reaches.
+    fn leaf<const XGB: bool>(&self, x: &[f64]) -> f64 {
         let mut i = 0;
         loop {
-            match &self.0[i] {
-                Node::Leaf(v) => return *v,
-                Node::Split { feature, test, default_left, left, right } => {
-                    let v = x[*feature];
-                    let go_left = match test {
-                        Test::Le(t, missing) => {
-                            let v = if v.is_nan() && *missing != Missing::NaN { 0.0 } else { v };
-                            if (*missing == Missing::Zero && is_zero(v)) || (*missing == Missing::NaN && v.is_nan()) {
-                                *default_left
-                            } else {
-                                v <= *t
-                            }
-                        }
-                        // The integer part (-0.5 is 0); NaN and below 0 to the right.
-                        Test::In(cats) => !v.is_nan() && v > -1.0 && v < u32::MAX as f64 && cats.binary_search(&(v as u32)).is_ok(),
-                        Test::Lt(t) => match v.is_nan() {
-                            true => *default_left,
-                            false => (v as f32) < *t,
-                        },
-                    };
-                    i = if go_left { *left } else { *right } as usize;
-                }
+            let node = &self.nodes[i as usize];
+            let next = self.step::<XGB>(node, x[node.feature as usize]);
+            if next == i {
+                return node.value;
             }
+            i = next;
         }
     }
 
-    /// The least and greatest leaf the rows in `inputs` reach from node
-    /// `i`.
-    fn bounds(&self, i: usize, inputs: &[(f64, f64, bool)], xgboost: bool) -> (f64, f64) {
-        match &self.0[i] {
-            Node::Leaf(v) => {
-                let v = if xgboost { *v as f32 as f64 } else { *v };
-                (v, v)
+    /// The child of `node` that a row whose feature there is `v` goes to
+    /// (a leaf's is itself). Numerical splits choose without a branch.
+    #[inline(always)]
+    fn step<const XGB: bool>(&self, node: &Node, v: f64) -> u32 {
+        let f = node.flags;
+        let nan = v.is_nan();
+        let left = if f & CATEGORICAL != 0 {
+            // The integer part (-0.5 is 0); NaN and below 0 to the right.
+            !nan && v > -1.0 && v < u32::MAX as f64 && self.cats[node.value as usize].binary_search(&(v as u32)).is_ok()
+        } else {
+            // LightGBM reads NaN as 0 where it is not missing.
+            let v0 = if nan { 0.0 } else { v };
+            let missing = (nan & (f & MISSING_NAN != 0)) | (is_zero(v0) & (f & MISSING_ZERO != 0));
+            let below = if XGB { (v as f32) < node.value as f32 } else { v0 <= node.value };
+            (missing & (f & DEFAULT_LEFT != 0)) | (!missing & below)
+        };
+        if left { node.left } else { node.right }
+    }
+
+    /// Widens `found` to the least and greatest leaf the rows in `inputs`
+    /// reach from node `i`, skipping a subtree whose leaves all lie within
+    /// it.
+    fn reach(&self, i: usize, inputs: &[(f64, f64, bool)], xgboost: bool, found: &mut (f64, f64)) {
+        let (a, b) = self.range[i];
+        if a >= found.0 && b <= found.1 {
+            return;
+        }
+        let node = &self.nodes[i];
+        if node.left as usize == i {
+            *found = (found.0.min(node.value), found.1.max(node.value));
+            return;
+        }
+        let (f, t) = (node.flags, node.value);
+        let default_left = f & DEFAULT_LEFT != 0;
+        let (lo, hi, null) = inputs[node.feature as usize];
+        let some = lo <= hi;
+        let (mut l, mut r) = (false, false);
+        let mut side = |go_left: bool| if go_left { l = true } else { r = true };
+        if f & CATEGORICAL != 0 {
+            // A value is its integer part: -0.5 is category 0.
+            side(false);
+            if some && self.cats[t as usize].iter().any(|&c| lo < c as f64 + 1.0 && hi > c as f64 - 1.0) {
+                side(true);
             }
-            Node::Split { feature, test, default_left, left, right } => {
-                let (lo, hi, null) = inputs[*feature];
-                let some = lo <= hi;
-                let (mut l, mut r) = (false, false);
-                let mut side = |go_left: bool| if go_left { l = true } else { r = true };
-                match test {
-                    Test::Le(t, missing) => {
-                        if null {
-                            match missing {
-                                Missing::NaN | Missing::Zero => side(*default_left),
-                                Missing::None => side(0.0 <= *t),
-                            }
-                        }
-                        if some {
-                            if *missing == Missing::Zero && lo <= ZERO && hi > -ZERO {
-                                side(*default_left);
-                            }
-                            if lo <= *t {
-                                side(true);
-                            }
-                            if hi > *t {
-                                side(false);
-                            }
-                        }
-                    }
-                    Test::In(cats) => {
-                        // A value is its integer part: -0.5 is category 0.
-                        side(false);
-                        if some && cats.iter().any(|&c| lo < c as f64 + 1.0 && hi > c as f64 - 1.0) {
-                            side(true);
-                        }
-                    }
-                    Test::Lt(t) => {
-                        if null {
-                            side(*default_left);
-                        }
-                        if some {
-                            if (lo as f32) < *t {
-                                side(true);
-                            }
-                            if (hi as f32) >= *t {
-                                side(false);
-                            }
-                        }
-                    }
+        } else if xgboost {
+            if null {
+                side(default_left);
+            }
+            if some {
+                if (lo as f32) < t as f32 {
+                    side(true);
                 }
-                let reach = |n: u32| self.bounds(n as usize, inputs, xgboost);
-                match (l, r) {
-                    (true, true) => {
-                        let (a, b) = (reach(*left), reach(*right));
-                        (a.0.min(b.0), a.1.max(b.1))
-                    }
-                    (true, false) => reach(*left),
-                    (false, true) => reach(*right),
-                    // No row reaches the node: nothing to bound.
-                    (false, false) => (f64::INFINITY, f64::NEG_INFINITY),
+                if (hi as f32) >= t as f32 {
+                    side(false);
+                }
+            }
+        } else {
+            if null {
+                match f & (MISSING_NAN | MISSING_ZERO) != 0 {
+                    true => side(default_left),
+                    false => side(0.0 <= t),
+                }
+            }
+            if some {
+                if f & MISSING_ZERO != 0 && lo <= ZERO && hi > -ZERO {
+                    side(default_left);
+                }
+                if lo <= t {
+                    side(true);
+                }
+                if hi > t {
+                    side(false);
                 }
             }
         }
+        if l {
+            self.reach(node.left as usize, inputs, xgboost, found);
+        }
+        if r {
+            self.reach(node.right as usize, inputs, xgboost, found);
+        }
     }
 
-    /// Every child index is a later node, and every feature one of the
-    /// model's: the walks above end, within bounds.
+    /// Every split's children are later nodes, every leaf's are itself,
+    /// and every feature is one of the model's: the walks above end,
+    /// within bounds.
     fn check(&self, name: &str, t: usize, features: usize) -> Result<()> {
-        if self.0.is_empty() {
+        if self.nodes.is_empty() {
             return Err(bad(name, format!("tree {t} has no nodes")));
         }
-        for (i, n) in self.0.iter().enumerate() {
-            if let Node::Split { feature, left, right, .. } = n {
-                let ok = |c: u32| (c as usize) > i && (c as usize) < self.0.len();
-                if !ok(*left) || !ok(*right) || *feature >= features {
-                    return Err(bad(name, format!("tree {t}, node {i}: a split out of range")));
-                }
+        for (i, n) in self.nodes.iter().enumerate() {
+            let later = |c: u32| (c as usize) > i && (c as usize) < self.nodes.len();
+            let leaf = n.left as usize == i && n.right as usize == i;
+            let cats = n.flags & CATEGORICAL == 0 || (n.value as usize) < self.cats.len();
+            if !(leaf || later(n.left) && later(n.right) && cats) || n.feature as usize >= features {
+                return Err(bad(name, format!("tree {t}, node {i}: a split out of range")));
             }
         }
         Ok(())
@@ -295,50 +349,56 @@ fn lightgbm(name: &str, j: &Json) -> Result<Gbdt> {
     let trees = j["tree_info"].as_array().ok_or_else(|| bad(name, "tree_info is not a list"))?;
     let mut out = Vec::with_capacity(trees.len());
     for (t, info) in trees.iter().enumerate() {
-        let mut nodes = Vec::new();
-        lightgbm_node(name, &info["tree_structure"], &mut nodes).map_err(|e| bad(name, format!("tree {t}: {e}")))?;
-        out.push(Tree(nodes));
+        let mut tree = Tree { nodes: Vec::new(), cats: Vec::new(), range: Vec::new() };
+        lightgbm_node(&info["tree_structure"], &mut tree).map_err(|e| bad(name, format!("tree {t}: {e}")))?;
+        out.push(tree);
     }
     Ok(Gbdt { name: name.to_string(), hash: String::new(), features, xgboost: false, base: 0.0, trees: out })
 }
 
-/// Appends the subtree at `n` to `nodes`, preorder; its index.
-fn lightgbm_node(name: &str, n: &Json, nodes: &mut Vec<Node>) -> std::result::Result<u32, String> {
-    let i = nodes.len() as u32;
+/// A leaf of value `v` at index `i`.
+fn leaf(i: u32, v: f64) -> Node {
+    Node { value: v, feature: 0, left: i, right: i, flags: 0 }
+}
+
+/// Appends the subtree at `n` to `tree`, preorder; its index.
+fn lightgbm_node(n: &Json, tree: &mut Tree) -> std::result::Result<u32, String> {
+    let i = tree.nodes.len() as u32;
     if let Some(v) = n.get("leaf_value") {
         if n.get("leaf_coeff").is_some() {
             return Err("linear trees are not supported".into());
         }
-        nodes.push(Node::Leaf(v.as_f64().ok_or("a leaf_value is not a number")?));
+        tree.nodes.push(leaf(i, v.as_f64().ok_or("a leaf_value is not a number")?));
         return Ok(i);
     }
-    let feature = n["split_feature"].as_u64().ok_or("a split without split_feature")? as usize;
-    let default_left = n["default_left"].as_bool().unwrap_or(false);
-    let test = match n["decision_type"].as_str() {
+    let feature = n["split_feature"].as_u64().ok_or("a split without split_feature")?;
+    let feature = u32::try_from(feature).map_err(|_| format!("feature {feature}"))?;
+    let mut flags = if n["default_left"].as_bool().unwrap_or(false) { DEFAULT_LEFT } else { 0 };
+    let value = match n["decision_type"].as_str() {
         Some("<=") => {
-            let t = n["threshold"].as_f64().ok_or("a numerical threshold is not a number")?;
-            let missing = match n["missing_type"].as_str() {
-                Some("None") | None => Missing::None,
-                Some("Zero") => Missing::Zero,
-                Some("NaN") => Missing::NaN,
+            flags |= match n["missing_type"].as_str() {
+                Some("None") | None => 0,
+                Some("Zero") => MISSING_ZERO,
+                Some("NaN") => MISSING_NAN,
                 Some(o) => return Err(format!("missing_type {o}")),
             };
-            Test::Le(t, missing)
+            n["threshold"].as_f64().ok_or("a numerical threshold is not a number")?
         }
         Some("==") => {
             let t = n["threshold"].as_str().ok_or("a categorical threshold is not a string")?;
             let mut cats = t.split("||").map(|c| c.parse::<u32>().map_err(|_| format!("category {c}"))).collect::<std::result::Result<Vec<u32>, String>>()?;
             cats.sort_unstable();
-            Test::In(cats)
+            tree.cats.push(cats);
+            flags |= CATEGORICAL;
+            (tree.cats.len() - 1) as f64
         }
         o => return Err(format!("decision_type {o:?}")),
     };
-    nodes.push(Node::Split { feature, test, default_left, left: 0, right: 0 });
-    let left = lightgbm_node(name, &n["left_child"], nodes)?;
-    let right = lightgbm_node(name, &n["right_child"], nodes)?;
-    if let Node::Split { left: l, right: r, .. } = &mut nodes[i as usize] {
-        (*l, *r) = (left, right);
-    }
+    tree.nodes.push(Node { value, feature, left: 0, right: 0, flags });
+    let left = lightgbm_node(&n["left_child"], tree)?;
+    let right = lightgbm_node(&n["right_child"], tree)?;
+    let node = &mut tree.nodes[i as usize];
+    (node.left, node.right) = (left, right);
     Ok(i)
 }
 
@@ -399,14 +459,21 @@ fn xgboost_tree(t: &Json) -> std::result::Result<Tree, String> {
         return Err("categorical splits are not supported".into());
     }
     // Children come after their parent in XGBoost's numbering, as the
-    // walk needs ([`Tree::check`]).
+    // walk needs ([`Tree::check`]); values are f32s.
+    let index = |x: i64| u32::try_from(x).map_err(|_| format!("index {x}"));
     let nodes = (0..n)
         .map(|i| match left[i] {
-            -1 => Node::Leaf(cond[i] as f32 as f64),
-            l => Node::Split { feature: feature[i] as usize, test: Test::Lt(cond[i] as f32), default_left: default_left[i] != 0, left: l as u32, right: right[i] as u32 },
+            -1 => Ok(leaf(i as u32, cond[i] as f32 as f64)),
+            l => Ok(Node {
+                value: cond[i] as f32 as f64,
+                feature: index(feature[i])?,
+                left: index(l)?,
+                right: index(right[i])?,
+                flags: MISSING_NAN | if default_left[i] != 0 { DEFAULT_LEFT } else { 0 },
+            }),
         })
-        .collect();
-    Ok(Tree(nodes))
+        .collect::<std::result::Result<_, String>>()?;
+    Ok(Tree { nodes, cats: Vec::new(), range: Vec::new() })
 }
 
 /// 64-bit FNV-1a of bytes.
@@ -547,6 +614,10 @@ mod tests {
                 boxes.push((lo, hi, a.is_nan() || b.is_nan() || next() < 0.3));
             }
             let (lo, hi) = m.bounds(&boxes);
+            // Skipping subtrees changes nothing.
+            let mut every = lgb(&format!("{}, {}", t("None", "7"), t("Zero", "-3")));
+            every.trees.iter_mut().for_each(|t| t.range.fill((f64::NEG_INFINITY, f64::INFINITY)));
+            assert_eq!(every.bounds(&boxes), (lo, hi), "{boxes:?}");
             let values = |&(l, h, null): &(f64, f64, bool)| {
                 let mut v: Vec<f64> = points.iter().copied().filter(|x| *x >= l && *x <= h).chain([l, h].into_iter().filter(|_| l <= h)).collect();
                 if null {

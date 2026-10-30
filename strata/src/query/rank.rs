@@ -377,17 +377,11 @@ impl<'s> Rank<'s> {
             }
             Expr::Gbdt { model, args, .. } => {
                 let args: Vec<Cow<[f64]>> = args.iter().map(|a| self.values(a, n, values, lists)).collect();
-                let mut row = vec![0.0; args.len()];
-                Cow::Owned(
-                    (0..n)
-                        .map(|i| {
-                            for (r, a) in row.iter_mut().zip(&args) {
-                                *r = a[i];
-                            }
-                            model.as_ref().map_or(f64::NAN, |m| finite(m.predict(&row)))
-                        })
-                        .collect(),
-                )
+                let columns: Vec<&[f64]> = args.iter().map(|a| a.as_ref()).collect();
+                Cow::Owned(match model {
+                    Some(m) => m.predict_columns(&columns, n).into_iter().map(finite).collect(),
+                    None => vec![f64::NAN; n],
+                })
             }
             Expr::Case { whens, otherwise } => {
                 let branches: Vec<(Cow<[f64]>, Cow<[f64]>)> = whens.iter().map(|(c, x)| (self.values(c, n, values, lists), self.values(x, n, values, lists))).collect();
