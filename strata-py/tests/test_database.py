@@ -116,6 +116,19 @@ def test_vector_of_any_field_name(tmp_path):
         assert near == ["n3"]
 
 
+
+def test_multi_vector_field(tmp_path):
+    # A row holds several vectors; maxsim sums each query vector's best match.
+    schema = {"table": "pages", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "patches", "type": "vector", "dim": 3, "multi": True, "index": "flat", "keep_f32": True}]}
+    with strata.open(tmp_path / "m.strata", schema) as db:
+        db.insert([{"id": "a", "patches": [[1, 0, 0], [0, 1, 0]]}, {"id": "b", "patches": [[0, 0, 1]]}, {"id": "c", "patches": [0.5, 0.5, 0]}, {"id": "d"}])
+        r = db.query("SELECT id, patches FROM pages ORDER BY maxsim(patches, :qs) DESC LIMIT 5", qs=[[1, 0, 0], [0, 1, 0]])
+        assert r.keys == ["a", "c", "b"] and r.scores == [2.0, 1.0, 0.0]
+        assert r.rows[0][1] == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        assert db.query("SELECT patches FROM pages WHERE id = 'd'").scalar() is None
+        with pytest.raises(strata.StrataError, match="maxsim"):
+            db.query("SELECT id FROM pages ORDER BY similarity(patches, :q) DESC LIMIT 1", q=[1, 0, 0])
+
 def test_numpy_values(db):
     np = pytest.importorskip("numpy")
     v = np.array(db.embed("winter star"), dtype=np.float32)

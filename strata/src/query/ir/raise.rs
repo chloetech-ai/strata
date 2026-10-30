@@ -448,6 +448,9 @@ impl<'a> Raise<'a> {
             }
             None => {}
         }
+        if self.schema.fields[field].is_multi_vector() {
+            return Err(err(format!("a traversal follows one vector per row: {} is a multi-vector field", self.schema.fields[field].name)));
+        }
         let seeds = match (self.seeds(&g.seeds)?, g.weights.as_slice()) {
             (s, []) => s,
             (Seeds::Keys(keys), ws) if keys.len() == ws.len() && ws.iter().all(|w| w.is_finite()) => Seeds::Weighted(keys.into_iter().zip(ws.iter().copied()).collect()),
@@ -579,6 +582,9 @@ impl<'a> Raise<'a> {
             Expr::Bm25 { field, text, opts } => Score::Bm25 { field: self.typed(*field, |t| matches!(t, FieldType::Text { .. }), "bm25", "TEXT")?, text: text.clone(), opts: opts.clone() },
             Expr::Similarity { field, vector, opts } => {
                 let f = self.typed(*field, |t| matches!(t, FieldType::Vector { .. }), "similarity", "VECTOR")?;
+                if self.schema.fields[f].multi {
+                    return Err(err(crate::query::sql::multi_similarity(&self.schema.fields[f].name)));
+                }
                 if let FieldType::Vector { dim, .. } = self.schema.fields[f].ty {
                     if vector.len() != dim {
                         return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));

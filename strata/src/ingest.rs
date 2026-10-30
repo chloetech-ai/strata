@@ -51,6 +51,24 @@ pub fn field_value(field: &Field, key: bool, j: &Json) -> Result<Value> {
     if field.media.is_some() {
         return crate::media::input_text(j).map(Value::Str).map_err(|e| Error::Schema(format!("bad value for {}: {e}", field.name)));
     }
+    if field.is_multi_vector() {
+        // An array of vectors (arrays of numbers), or JSON text of one.
+        let v = match j {
+            Json::String(s) => Value::Str(s.clone()),
+            Json::Array(rows) => Value::List(
+                rows.iter()
+                    .map(|r| match r {
+                        Json::Array(xs) => xs.iter().map(|x| x.as_f64().map(|v| v as f32)).collect::<Option<Vec<f32>>>().map(|v| Value::Vector(v.into())),
+                        Json::Number(n) => n.as_f64().map(Value::Float),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<Value>>>()
+                    .ok_or_else(bad)?,
+            ),
+            _ => return Err(bad()),
+        };
+        return crate::vector::multi::normalize(field, v);
+    }
     if field.multi {
         let items = match j {
             Json::Array(xs) => xs.clone(),
