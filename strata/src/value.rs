@@ -99,6 +99,10 @@ pub type Document = Vec<Value>;
 pub fn conform(schema: &Schema, doc: &mut Document) -> Result<()> {
     let typed = |v: &Value| matches!(v, Value::Bool(_) | Value::Timestamp(_));
     for (f, v) in schema.fields.iter().zip(doc.iter_mut()) {
+        if f.is_multi_vector() {
+            *v = crate::vector::multi::normalize(f, std::mem::replace(v, Value::Null))?;
+            continue;
+        }
         if f.logical.is_some() || typed(v) || matches!(v, Value::List(xs) if xs.iter().any(typed)) {
             *v = f.store(std::mem::replace(v, Value::Null))?;
         }
@@ -117,7 +121,11 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
             return Err(Error::Schema(format!("{} is NOT NULL: give it a value", f.name)));
         }
         if f.multi {
-            let ok = v.items().iter().all(|x| matches!((&f.ty, x), (FieldType::Keyword, Value::Str(_)) | (FieldType::Int, Value::Int(_))));
+            let ok = v.items().iter().all(|x| match (&f.ty, x) {
+                (FieldType::Keyword, Value::Str(_)) | (FieldType::Int, Value::Int(_)) => true,
+                (FieldType::Vector { dim, .. }, Value::Vector(x)) => x.len() == *dim && x.iter().all(|c| c.is_finite()),
+                _ => false,
+            });
             if !ok {
                 return Err(Error::Schema(format!("bad value for multi-valued field {}: {:?}", f.name, short(v))));
             }
