@@ -172,6 +172,57 @@ class Client(Search):
             n += self.write([{"op": "delete", **named, "key": k} for k in keys[i : i + WRITE_BATCH]])
         return n
 
+    def stream(self, events: Iterable[Mapping[str, Any]]) -> dict:
+        """Writes `events` through /v1/stream as they come, in batches the
+        server makes: each an operation, or one event's operations as
+        {"ops": [...], "source": {"name": ..., "offset": n, "ts": ...}},
+        which a batch never splits. A source's offsets increase along the
+        stream; one the server has reached already (a replay's) is skipped,
+        so resuming from `source(name) + 1`, or from before it, applies
+        each event once. Returns the last answer, {"done": True, "lines",
+        "written", "skipped", "batches"}; a failure raises StrataError,
+        whose `answer["lines"]` counts the events written before it."""
+
+        def lines() -> Iterable[bytes]:
+            chunk: list[str] = []
+            for e in events:
+                chunk.append(json.dumps(e, default=_default))
+                if len(chunk) >= 256:
+                    yield ("\n".join(chunk) + "\n").encode()
+                    chunk = []
+            if chunk:
+                yield ("\n".join(chunk) + "\n").encode()
+
+        h = {"content-type": "application/x-ndjson"}
+        if self.token:
+            h["authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(self.url + "/v1/stream", data=lines(), method="POST", headers=h)
+        last: dict = {}
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                for raw in r:
+                    if raw.strip():
+                        last = json.loads(raw)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            err = StrataError(f"{raw.decode(errors='replace')} (HTTP {e.code})")
+            err.status, err.answer = e.code, None
+            raise err from None
+        if "error" in last or not last.get("done"):
+            err = StrataError(f"{last.get('error', 'the stream ended early')} (HTTP {last.get('status', 500)})")
+            err.status, err.answer = last.get("status", 500), last
+            raise err
+        return last
+
+    def source(self, name: str) -> int | None:
+        """The offset of the last event written from stream source `name`,
+        or None for a source not written from: resume from the next."""
+        return self._call("GET", "/v1/sources/" + urllib.parse.quote(name, safe="/"))["offset"]
+
+    def sources(self) -> list[dict]:
+        """Every stream source written from: [{name, offset, updated}]."""
+        return self._call("GET", "/v1/sources")["sources"]
+
     def import_file(self, path: str | os.PathLike, format: str | None = None, *, table: str | None = None) -> dict:
         """Uploads a JSON Lines, JSON (an array), CSV or TSV file (up to the
         server's 256 MB), in `format` or the one its extension names, into

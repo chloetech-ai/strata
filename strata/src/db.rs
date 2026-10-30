@@ -24,7 +24,7 @@ use crate::query::stats::TermStats;
 use crate::query::{bind_command, compound, ops, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
 use crate::schema::{Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
-use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn};
+use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn, SOURCES};
 use crate::value::{Document, Value};
 use crate::vector::VectorReader;
 
@@ -76,6 +76,16 @@ impl PreparedWrite {
 
 /// Vectors computed ahead of a write, by embedded field and source text.
 type Known = HashMap<usize, HashMap<String, Arc<[f32]>>>;
+
+/// A stream's source, as the system table [`SOURCES`] keeps it: the
+/// offset of the last event written from it, and when that was written
+/// (microseconds since the epoch).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub name: String,
+    pub offset: i64,
+    pub updated: Option<i64>,
+}
 
 pub struct Db {
     storage: Arc<Database>,
@@ -141,6 +151,37 @@ impl Db {
     /// ([`Database::tables`]).
     pub fn catalog(&self) -> Vec<Arc<Schema>> {
         self.storage.tables()
+    }
+
+    /// The stream sources written from ([`Database::ensure_sources`]), by
+    /// name, with the offset of the last event each wrote; none before
+    /// the first.
+    pub fn sources(&self) -> Result<Vec<Source>> {
+        let snap = self.snapshot();
+        if snap.table(SOURCES).is_none() {
+            return Ok(Vec::new());
+        }
+        let sql = format!("SELECT name, last_offset, updated FROM {SOURCES} LIMIT {}", u32::MAX);
+        let rs = self.query_at(&snap, &sql, &Params::new(), &ExecOptions { max_rows: None, ..self.exec.clone() })?;
+        let mut sources: Vec<Source> = rs
+            .rows
+            .into_iter()
+            .filter_map(|r| {
+                let mut r = r.into_iter();
+                let name = match r.next()? {
+                    Value::Str(s) => s,
+                    _ => return None,
+                };
+                let offset = r.next()?.as_i64()?;
+                let updated = r.next().and_then(|v| match v {
+                    Value::Timestamp(t) | Value::Int(t) => Some(t),
+                    _ => None,
+                });
+                Some(Source { name, offset, updated })
+            })
+            .collect();
+        sources.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(sources)
     }
 
     /// The schema of the table named `table` (any case).

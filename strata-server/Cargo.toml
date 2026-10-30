@@ -13,7 +13,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 axum = "0.7"
 tonic = { version = "0.12", features = ["tls", "tls-webpki-roots"] }
 prost = "0.13"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# "stream": request bodies sent as they are made (strata-stream-bench, tests/stream.rs).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["net"] }
 # TLS for the HTTP listener (tonic serves gRPC's), with ring as tonic does.

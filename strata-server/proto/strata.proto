@@ -11,7 +11,11 @@
 // every request (`epoch`), and a shard refuses an older epoch and keys of
 // other shards' slots; 5 reads the writes a read must see (`min_seq_no`),
 // which a replica waits for, so that a coordinator sends such a read to a
-// replica of 5 or newer, or to the primary. A caller asks a server's versions with
+// replica of 5 or newer, or to the primary; 6 keeps stream sources'
+// offsets: a write operation may carry its event's "source", and an
+// operation "source" marks one alone, which a server before 6 would not
+// know to skip on a replay, so a coordinator sends them only to shards of
+// 6 or newer, and asks them their offsets with `Sources`. A caller asks a server's versions with
 // `Hello` (a server that answers Unimplemented speaks 1) and speaks the
 // newest both know; a coordinator speaks the oldest of those among its
 // shards' replicas.
@@ -41,6 +45,16 @@ service Strata {
   rpc TermStats(QueryRequest) returns (TermStatsResponse);
   // Runs an INSERT, UPDATE or DELETE, or a batch of write operations.
   rpc Write(WriteRequest) returns (WriteResponse);
+  // A stream of batches of write operations (ops_json), each applied
+  // after the one before commits and answered in turn. The first that
+  // fails ends the stream with its error, unanswered batches after it
+  // unapplied; a client resumes from its sources' offsets (Sources). Any
+  // server takes it from a client; a coordinator writes each batch to its
+  // shards with Write.
+  rpc WriteStream(stream WriteRequest) returns (stream WriteResponse);
+  // Protocol 6: the stream sources this server's writes came from, with
+  // the offset of the last event written from each.
+  rpc Sources(SourcesRequest) returns (SourcesResponse);
   // The tables' schemas as JSON.
   rpc Schema(Empty) returns (SchemaResponse);
   rpc Health(Empty) returns (HealthResponse);
@@ -690,7 +704,12 @@ message WriteRequest {
   // [{"op": "insert" | "upsert", "doc": {...}},
   //  {"op": "upsert_if_newer", "doc": {...}, "version": "field"},
   //  {"op": "delete", "key": ...},
-  //  {"op": "set" | "add", "key": ..., "field": "...", "value": ...}].
+  //  {"op": "set" | "add", "key": ..., "field": "...", "value": ...},
+  //  {"op": "source", "source": {...}}].
+  // Protocol 6: an operation may carry the event it applies, as
+  // "source": {"name": "clicks/0", "offset": 81234, "ts": ...}; one whose
+  // offset the source reached already is skipped, and the source's highest
+  // offset is kept in the same transaction as the rows (_sources).
   // Any but insert may carry "if_seq_no": n, and then applies only while
   // the row's sequence number is n (FailedPrecondition otherwise). Each
   // writes the first table unless it names another ("table": "events");
@@ -714,6 +733,26 @@ message WriteResponse {
   // shard numbers its writes. A read that passes them as min_seq_nos sees
   // the write.
   repeated uint64 seq_nos = 3;
+  // Protocol 6: operations skipped because their source offset was written
+  // already.
+  uint64 skipped = 4;
+  // Protocol 6, WriteStream: the last offset of each source in this
+  // message, committed with its rows.
+  map<string, int64> offsets = 5;
+}
+
+message SourcesRequest {}
+
+message SourcesResponse {
+  repeated Source sources = 1;
+}
+
+message Source {
+  string name = 1;
+  // The offset of the last event written from the source.
+  int64 offset = 2;
+  // When that was written, in microseconds since the epoch; 0 for unknown.
+  int64 updated_micros = 3;
 }
 
 message SchemaResponse {

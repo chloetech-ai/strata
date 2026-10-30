@@ -621,6 +621,13 @@ impl pb::strata_server::Strata for Stuck {
     async fn verify(&self, _: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
     }
+    type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
+    async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn sources(&self, _: tonic::Request<pb::SourcesRequest>) -> Result<tonic::Response<pb::SourcesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -660,6 +667,13 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn verify(&self, _: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
+    }
+    type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
+    async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn sources(&self, _: tonic::Request<pb::SourcesRequest>) -> Result<tonic::Response<pb::SourcesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
     }
 }
 
@@ -904,6 +918,18 @@ impl pb::strata_server::Strata for Recording {
     async fn restore(&self, r: tonic::Request<tonic::Streaming<pb::RestoreChunk>>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
         self.up()?;
         self.inner.restore(r).await
+    }
+    type WriteStreamStream = <strata_server::grpc::Grpc as pb::strata_server::Strata>::WriteStreamStream;
+    async fn write_stream(&self, r: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
+        self.up()?;
+        self.inner.write_stream(r).await
+    }
+    async fn sources(&self, r: tonic::Request<pb::SourcesRequest>) -> Result<tonic::Response<pb::SourcesResponse>, tonic::Status> {
+        self.up()?;
+        match self.version.load(Ordering::Relaxed) {
+            6.. => self.inner.sources(r).await,
+            _ => Err(tonic::Status::unimplemented("unknown method Sources")),
+        }
     }
     async fn verify(&self, r: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         self.up()?;
@@ -1341,7 +1367,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
     let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 5, strata::query::ir::VERSION, 0));
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 6, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1367,9 +1393,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 6, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: 7, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 6"), "{}", e.message());
+    assert!(e.message().contains("protocol 7"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);

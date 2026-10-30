@@ -69,6 +69,7 @@ use std::time::{Duration, Instant};
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value as Json};
+use strata::db::Source;
 use strata::query::agg::Part;
 use strata::query::exec::ResultSet;
 use strata::query::ir::Plan;
@@ -81,10 +82,10 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::auth::Secret;
-use crate::grpc::{params_to_pb, result_from_pb, MIN_PROTOCOL, PROTOCOL};
+use crate::grpc::{params_to_pb, result_from_pb, MIN_PROTOCOL, PROTOCOL, SOURCES_PROTOCOL};
 use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
-use crate::service::{op_place, op_schema, After, QueryReq, Written};
+use crate::service::{is_mark, op_place, op_schema, op_source, After, QueryReq, Written};
 use crate::slots::{hash_shard_of, SlotMap};
 use crate::{json as js, plan_pb, ApiError};
 
@@ -457,6 +458,15 @@ fn try_elsewhere(s: &tonic::Status) -> bool {
             | Code::Unimplemented
             | Code::ResourceExhausted
     )
+}
+
+/// What one shard answered a write ([`Coordinator::write`]): the rows it
+/// wrote and skipped, and its transaction's number (0 for none).
+#[derive(Clone, Copy, Default)]
+struct Wrote {
+    rows: u64,
+    seq_no: u64,
+    skipped: u64,
 }
 
 impl Coordinator {
@@ -1108,27 +1118,28 @@ impl Coordinator {
     /// A primary that refuses the write as a replaced one does, or does not
     /// answer, is passed over for the copy that took its place, if any
     /// (once).
-    async fn write(&self, i: usize, r: pb::WriteRequest) -> Result<(u64, u64), ApiError> {
+    async fn write(&self, i: usize, r: pb::WriteRequest, need: u32) -> Result<Wrote, ApiError> {
         let to: Vec<usize> = match self.primary(i).await? {
             Some(k) => vec![k],
             None => (0..self.replicas[i].len()).collect(),
         };
         let named = |(k, s): (usize, tonic::Status)| self.named(&self.replicas[i][k].url, s);
         if let (&[k], true) = (&to[..], self.replicas[i].len() > 1) {
-            return match self.write_to(i, vec![k], r.clone()).await {
+            return match self.write_to(i, vec![k], r.clone(), need).await {
                 Err((_, s)) if matches!(s.code(), Code::FailedPrecondition | Code::Unavailable) => match self.moved(i, k, s.code()).await {
-                    Some(m) => self.write_to(i, vec![m], r).await.map_err(named),
+                    Some(m) => self.write_to(i, vec![m], r, need).await.map_err(named),
                     None => Err(named((k, s))),
                 },
                 a => a.map_err(named),
             };
         }
-        self.write_to(i, to, r).await.map_err(named)
+        self.write_to(i, to, r, need).await.map_err(named)
     }
 
-    /// [`Self::write`] to replicas `to` of shard `i`; an error names the
-    /// replica that answered it.
-    async fn write_to(&self, i: usize, to: Vec<usize>, r: pb::WriteRequest) -> Result<(u64, u64), (usize, tonic::Status)> {
+    /// [`Self::write`] to replicas `to` of shard `i`, each of which must
+    /// speak protocol `need` or newer; an error names the replica that
+    /// answered it.
+    async fn write_to(&self, i: usize, to: Vec<usize>, r: pb::WriteRequest, need: u32) -> Result<Wrote, (usize, tonic::Status)> {
         let one = to.len() == 1;
         let calls = to.into_iter().map(|k| {
             let rep = &self.replicas[i][k];
@@ -1136,7 +1147,10 @@ impl Coordinator {
             async move {
                 // A replica not asked yet (it was down at connect), or one
                 // that failed, is asked again and given the slot map first.
-                self.speak(i, k, &mut c, PROTOCOL).await.map_err(|s| (k, s))?;
+                let p = self.speak(i, k, &mut c, PROTOCOL).await.map_err(|s| (k, s))?;
+                if p < need {
+                    return Err((k, tonic::Status::unimplemented(format!("it speaks protocol {p}, and source offsets need {need}: upgrade it"))));
+                }
                 let a = c.write(r).await;
                 if a.as_ref().is_err_and(try_elsewhere) {
                     rep.protocol.store(0, Ordering::Relaxed);
@@ -1147,24 +1161,26 @@ impl Coordinator {
         let mut written = None;
         for a in join_all(calls).await {
             let a = a?.into_inner();
-            written.get_or_insert((a.written, a.seq_no.filter(|_| one).unwrap_or(0)));
+            written.get_or_insert(Wrote { rows: a.written, seq_no: a.seq_no.filter(|_| one).unwrap_or(0), skipped: a.skipped });
         }
-        Ok(written.unwrap_or((0, 0)))
+        Ok(written.unwrap_or_default())
     }
 
     /// One answer of the writes to shards `shards` ([`Self::write`]): the
-    /// rows written, and each shard's number (none while every one is 0).
-    fn written(&self, shards: Vec<(usize, (u64, u64))>) -> Written {
+    /// rows written and skipped, and each shard's number (none while every
+    /// one is 0).
+    fn written(&self, shards: Vec<(usize, Wrote)>) -> Written {
         let mut seq_nos = vec![0; self.replicas.len()];
-        let mut rows = 0;
-        for (i, (n, seq)) in shards {
-            rows += n;
-            seq_nos[i] = seq;
+        let (mut rows, mut skipped) = (0, 0);
+        for (i, w) in shards {
+            rows += w.rows;
+            skipped += w.skipped;
+            seq_nos[i] = w.seq_no;
         }
         if seq_nos.iter().all(|&s| s == 0) {
             seq_nos.clear();
         }
-        Written { rows, seq_no: None, seq_nos }
+        Written { rows, seq_nos, skipped, ..Default::default() }
     }
 
     /// An INSERT goes to the shards of its documents' keys (or their
@@ -1211,7 +1227,7 @@ impl Coordinator {
                 let r = pb::WriteRequest { sql: sql.into(), params: params_to_pb(params), epoch: self.epoch(), ..Default::default() };
                 let calls = (0..self.replicas.len()).map(|i| {
                     let r = r.clone();
-                    async move { self.write(i, r).await.map(|w| (i, w)) }
+                    async move { self.write(i, r, MIN_PROTOCOL).await.map(|w| (i, w)) }
                 });
                 Ok(self.written(join_all(calls).await.into_iter().collect::<Result<Vec<_>, _>>()?))
             }
@@ -1227,7 +1243,7 @@ impl Coordinator {
         let r = pb::WriteRequest { sql: sql.into(), params: params_to_pb(params), epoch: self.epoch(), ..Default::default() };
         let calls = (0..self.replicas.len()).map(|i| {
             let r = r.clone();
-            async move { self.write(i, r).await }
+            async move { self.write(i, r, MIN_PROTOCOL).await }
         });
         let answers = join_all(calls).await;
         self.refresh(true).await;
@@ -1247,19 +1263,70 @@ impl Coordinator {
             catalog = self.catalog();
         }
         let mut by_shard: BTreeMap<usize, Vec<Json>> = BTreeMap::new();
+        // Each source's highest offset, which every shard keeps.
+        let mut marks: BTreeMap<String, i64> = BTreeMap::new();
         for op in ops {
+            if let Some(m) = op_source(&op)? {
+                let top = marks.entry(m.name).or_insert(m.offset);
+                *top = (*top).max(m.offset);
+            }
+            if is_mark(&op) {
+                continue;
+            }
             let s = self.shard_of(&op_place(op_schema(&catalog, &op)?, &op)?);
             if op.get("if_seq_no").is_some() && !self.numbered_alike(s) {
                 return Err(ApiError::bad(ONE_REPLICA));
             }
             by_shard.entry(s).or_default().push(op);
         }
+        // A shard the request gives no rows still keeps the offsets, so
+        // that the least over the shards is where a stream resumes
+        // ([`Self::sources`]): each shard skips what it applied already.
+        let need = if marks.is_empty() { MIN_PROTOCOL } else { SOURCES_PROTOCOL };
+        if !marks.is_empty() {
+            for i in 0..self.replicas.len() {
+                let ops = by_shard.entry(i).or_default();
+                ops.extend(marks.iter().map(|(name, offset)| json!({"op": "source", "source": {"name": name, "offset": offset}})));
+            }
+        }
         let calls = by_shard.into_iter().map(|(i, ops)| {
             let idempotency_key = key.as_ref().map(|k| format!("{k}/{i}")).unwrap_or_default();
             let r = pb::WriteRequest { ops_json: serde_json::to_vec(&ops).unwrap_or_default(), idempotency_key, epoch: self.epoch(), ..Default::default() };
-            async move { self.write(i, r).await.map(|w| (i, w)) }
+            async move { self.write(i, r, need).await.map(|w| (i, w)) }
         });
         Ok(self.written(join_all(calls).await.into_iter().collect::<Result<Vec<_>, _>>()?))
+    }
+
+    /// The stream sources written from through the shards, each at the
+    /// least offset over them, which is where a stream resumes: a shard
+    /// skips the events it applied already. A source some shard does not
+    /// have is left out (its first batch did not reach that shard), so a
+    /// stream of it starts over. Any replica may answer: one behind its
+    /// primary has an older offset, which only means more to skip.
+    pub async fn sources(&self) -> Result<Vec<Source>, ApiError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let calls = (0..self.replicas.len()).map(|i| {
+            self.call(i, 0, None, deadline, move |r, mut c| async move {
+                let p = self.speak(i, r, &mut c, PROTOCOL).await?;
+                if p < SOURCES_PROTOCOL {
+                    return Err(tonic::Status::unimplemented(format!("it speaks protocol {p}, and source offsets need {SOURCES_PROTOCOL}: upgrade it")));
+                }
+                c.sources(pb::SourcesRequest {}).await
+            })
+        });
+        let mut least: BTreeMap<String, (i64, i64, usize)> = BTreeMap::new();
+        let n = self.replicas.len();
+        for a in join_all(calls).await {
+            let (_, a) = a?;
+            for s in a.sources {
+                let e = least.entry(s.name).or_insert((s.offset, s.updated_micros, 0));
+                if s.offset < e.0 {
+                    (e.0, e.1) = (s.offset, s.updated_micros);
+                }
+                e.2 += 1;
+            }
+        }
+        Ok(least.into_iter().filter(|(_, (.., k))| *k == n).map(|(name, (offset, updated, _))| Source { name, offset, updated: (updated != 0).then_some(updated) }).collect())
     }
 
     /// "ok" when every replica answers, "degraded" when every shard still
