@@ -960,7 +960,7 @@ impl Coordinator {
                     let i = owner.get(&Part::of(k)).ok_or_else(|| ApiError::internal("a merged key no shard answered"))?;
                     keys[*i].push(k.clone());
                 }
-                self.fetch(&req.sql, schema, select, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &mut failed).await?
+                self.fetch(&req.sql, schema, select, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &stats_json, &mut failed).await?
             }
         };
         let missing = failed.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| self.shards[i].clone()).collect();
@@ -970,10 +970,11 @@ impl Coordinator {
     /// Whether query then fetch pays for its second round: when one round
     /// would send at least [`FETCH_FROM`] times the page's rows, every shard
     /// its top `LIMIT + OFFSET`, as it does for a fused score or a ranking
-    /// expression, whose shards send each input's candidates to its depth.
+    /// expression, whose shards send each input's candidates to its depth,
+    /// and for rerank phases, whose shards send the first phase's top count.
     fn fetch_pays(&self, select: &Select) -> bool {
         let page = select.limit.unwrap_or(0);
-        matches!(crate::metrics::kind(select), "hybrid" | "boosted" | "expression") || self.replicas.len() * (page + select.offset) >= FETCH_FROM * page
+        matches!(crate::metrics::kind(select), "hybrid" | "boosted" | "expression" | "reranked") || self.replicas.len() * (page + select.offset) >= FETCH_FROM * page
     }
 
     /// Leaves shard `i` out of a partial answer (and the next second's)
@@ -991,8 +992,9 @@ impl Coordinator {
     /// The fetch round of query then fetch: the columns of the page
     /// `ranked`, `keys[i]` from shard `i`, read from the snapshot its
     /// query round held (`held`: shard, replica, lease), whose lease the
-    /// fetch ends. The leases of shards holding none of the page's rows
-    /// are ended alongside, without waiting.
+    /// fetch ends, a ranking expression among them scored with the query
+    /// round's BM25 statistics (`stats_json`). The leases of shards holding
+    /// none of the page's rows are ended alongside, without waiting.
     async fn fetch(
         &self,
         sql: &str,
@@ -1003,6 +1005,7 @@ impl Coordinator {
         mut keys: Vec<Vec<Value>>,
         (start, deadline, protocol, partial): (usize, Instant, u32, bool),
         after: &[u64],
+        stats_json: &[u8],
         failed: &mut [Option<ApiError>],
     ) -> Result<ResultSet, ApiError> {
         self.fetches.fetch_add(1, Ordering::Relaxed);
@@ -1026,7 +1029,8 @@ impl Coordinator {
                     async move {
                         let p = self.speak(i, r, &mut c, protocol).await?;
                         self.reads_after(i, r, read.min(i))?;
-                        c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, snapshot, release: snapshot != 0, ..read.request(p, i) }).await
+                        let stats_json = stats_json.to_vec();
+                        c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, release: snapshot != 0, ..read.request(p, i) }).await
                     }
                 });
                 (i, a.await)

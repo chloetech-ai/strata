@@ -16,7 +16,7 @@ use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, Ran
 use crate::graph::GraphReader;
 use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
-use crate::query::logical::{Decay, Expand, OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS};
+use crate::query::logical::{Decay, Expand, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
@@ -197,7 +197,7 @@ pub struct ExecOptions {
     /// Answer as one shard of a larger collection, for a coordinator to
     /// merge ([`crate::cluster::merge`]): OFFSET is folded into LIMIT,
     /// facets and counts return every group, and fused scores return every
-    /// candidate with each input's raw score ([`FusionParts`]).
+    /// candidate with each input's raw score ([`RankParts`]).
     pub shard: bool,
     /// Threads a query may use to search its segments in parallel (1: the
     /// calling thread only): the calling thread and up to `threads - 1` of
@@ -310,6 +310,10 @@ pub struct ExecStats {
     pub filter_docs: u64,
     /// Candidates scored by ranking operators.
     pub scored: u64,
+    /// Rows scored by rerank phases ([`Select::phases`]), each time a
+    /// phase scored one.
+    #[serde(default)]
+    pub reranked: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -322,23 +326,30 @@ pub struct ResultSet {
     /// The score each row was ordered by (0 for unordered rows); empty for
     /// facet and count queries.
     pub scores: Vec<f64>,
-    /// With [`ExecOptions::shard`] and a fused score: every input's score
-    /// of every row, for the coordinator to fuse.
-    pub parts: Option<FusionParts>,
+    /// With [`ExecOptions::shard`], a fused score or rerank phases: what the
+    /// coordinator ranks every row by.
+    pub parts: Option<RankParts>,
     pub stats: ExecStats,
 }
 
-/// The inputs of a fused score (RRF or weighted sum), row by row, so that a
-/// coordinator can fuse candidates from several shards once
-/// ([`crate::cluster::merge`]).
+/// What a coordinator ranks a shard's rows by, row by row, so that it ranks
+/// the rows of several shards once ([`crate::cluster::merge`]): the inputs
+/// of a fused score (a ranking expression, RRF, a weighted sum), and the
+/// values of its rerank phases.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct FusionParts {
+pub struct RankParts {
     /// `scores[row][input]`: the input's exact score of the row (`None`
-    /// where it has none, e.g. a missing column value).
+    /// where it has none, e.g. a missing column value); empty where the
+    /// query ranks by a leaf.
     pub scores: Vec<Vec<Option<f64>>>,
     /// `ranked[row][input]`: whether the row is among the input's top
     /// `depth` rows in this shard.
     pub ranked: Vec<Vec<bool>>,
+    /// `phases[row][phase]`: what the coordinator reranks the row by in
+    /// each rerank phase: the phase's score, which the shard computes, or
+    /// for a global phase each of its leaves' values (`None` for NULL).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<Vec<Vec<Option<f64>>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -549,6 +560,10 @@ impl<'a> Executor<'a> {
         }
         self.run_graphs(&q.graphs)?;
         let empty = |columns, rows, stats| ResultSet { columns, rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
+        let grouped = !q.group_by.is_empty() || q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
+        if grouped && q.projection.iter().any(|(_, p)| matches!(p, Projection::Feature(_))) {
+            return Err(err("a ranking expression in SELECT scores rows, not groups"));
+        }
         if !q.group_by.is_empty() || agg::is_general(q, |f| self.facet_field(f)) {
             let needed = agg::needed(q);
             let groups = if agg::is_general(q, |f| self.facet_field(f)) { self.aggregate(q, &needed)? } else { self.facets(q, q.group_by[0], &needed)? };
@@ -583,9 +598,9 @@ impl<'a> Executor<'a> {
         }
         let keys = hits.iter().map(|h| self.key(h)).collect();
         let scores = hits.iter().map(|h| h.score).collect();
-        let parts = self.parts.take().map(|(cands, scores, ranked)| {
+        let mut parts = self.parts.take().map(|(cands, scores, ranked)| {
             let at: HashMap<(usize, DocId), usize> = cands.iter().enumerate().map(|(i, c)| (*c, i)).collect();
-            let mut out = FusionParts::default();
+            let mut out = RankParts::default();
             for h in &hits {
                 let i = at[&(h.seg, h.doc)];
                 out.scores.push(scores.iter().map(|s| Some(s[i]).filter(|x| x.is_finite())).collect());
@@ -593,6 +608,11 @@ impl<'a> Executor<'a> {
             }
             out
         });
+        // A shard leaves its rows in the first phase's order, with what
+        // each phase reranks them by.
+        if self.opts.shard && !q.phases.is_empty() {
+            parts.get_or_insert_with(RankParts::default).phases = self.phase_parts(&q.phases, &hits)?;
+        }
         Ok(ResultSet { columns, rows, keys, scores, parts, stats: self.stats })
     }
 
@@ -614,6 +634,9 @@ impl<'a> Executor<'a> {
         if let Some(max) = max.filter(|&m| reach > m) {
             return Err(err(format!("LIMIT and OFFSET reach row {reach}; a query returns at most {max} rows")));
         }
+        if !q.phases.is_empty() {
+            return self.phased(q, max);
+        }
         // No query returns more rows than are live, so a larger LIMIT asks
         // for nothing more (and sizes nothing by itself). Without a LIMIT,
         // one row past `max` shows that the query matches too many.
@@ -623,6 +646,87 @@ impl<'a> Executor<'a> {
             return Err(err(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
         }
         Ok(hits)
+    }
+
+    /// The rows of a query with rerank phases ([`Select::phases`]): the top
+    /// `count` of the first phase (the query's ORDER BY, as a query with
+    /// that LIMIT ranks them), then each phase's, cut to its `count` and
+    /// ranked by it, rows tied keeping their order; OFFSET included. A shard
+    /// answers the first phase's rows, which the coordinator reranks
+    /// ([`RankParts::phases`]).
+    fn phased(&mut self, q: &Select, max: Option<usize>) -> Result<Vec<Hit>> {
+        if !matches!(q.order, Some(OrderBy::Score { .. })) || !q.group_by.is_empty() {
+            return Err(err("rerank phases follow an ORDER BY of rows"));
+        }
+        let count = q.phases[0].count;
+        if let Some(max) = max.filter(|&m| count > m) {
+            return Err(err(format!("the first rerank phase takes the top {count} rows; a query reaches at most {max}")));
+        }
+        let k = count.min(self.n_live());
+        let first = Select { limit: Some(k), offset: 0, phases: Vec::new(), ..q.clone() };
+        let mut hits = self.ordered_hits_to(&first, Some(k))?;
+        if self.opts.shard {
+            return Ok(hits);
+        }
+        hits.truncate(k);
+        for p in &q.phases {
+            self.check_deadline()?;
+            hits.truncate(p.count);
+            let rank = Rank::of_phase(&p.score);
+            let values = self.row_values(&rank, &hits)?;
+            hits = rank.rerank(hits.len(), &values).into_iter().map(|(i, score)| Hit { score, ..hits[i] }).collect();
+            self.stats.reranked += hits.len() as u64;
+            self.stats.plan.push(format!("rerank {} rows by {}", hits.len(), rank.explain(&self.schema)));
+        }
+        if let Some(l) = q.limit {
+            hits.truncate(l.saturating_add(q.offset));
+        }
+        Ok(hits)
+    }
+
+    /// Each of `rank`'s leaves' values of `hits` (NaN where a row has none),
+    /// in the order of `hits`.
+    fn row_values(&self, rank: &Rank<'_>, hits: &[Hit]) -> Result<Vec<Vec<f64>>> {
+        let mut order: Vec<usize> = (0..hits.len()).collect();
+        order.sort_unstable_by_key(|&i| (hits[i].seg, hits[i].doc));
+        let cands: Vec<(usize, DocId)> = order.iter().map(|&i| (hits[i].seg, hits[i].doc)).collect();
+        rank.leaves
+            .iter()
+            .map(|l| {
+                let sorted = self.exact_scores(l, &cands)?;
+                let mut out = vec![0.0; hits.len()];
+                for (&i, v) in order.iter().zip(sorted) {
+                    out[i] = v;
+                }
+                Ok(out)
+            })
+            .collect()
+    }
+
+    /// What a shard's coordinator reranks its rows `hits` by in each phase
+    /// ([`RankParts::phases`]): a second phase's score, which each row has
+    /// on its own, or a global phase's leaves' values.
+    fn phase_parts(&mut self, phases: &[Phase], hits: &[Hit]) -> Result<Vec<Vec<Vec<Option<f64>>>>> {
+        let value = |x: f64| Some(x).filter(|x| x.is_finite());
+        let mut out: Vec<Vec<Vec<Option<f64>>>> = vec![Vec::with_capacity(phases.len()); hits.len()];
+        for p in phases {
+            self.check_deadline()?;
+            let rank = Rank::of_phase(&p.score);
+            let values = self.row_values(&rank, hits)?;
+            if p.global {
+                for (i, row) in out.iter_mut().enumerate() {
+                    row.push(values.iter().map(|v| value(v[i])).collect());
+                }
+            } else {
+                for (i, score) in rank.rerank(hits.len(), &values) {
+                    out[i].push(vec![value(score)]);
+                }
+                self.stats.reranked += hits.len() as u64;
+            }
+            let kind = if p.global { "values for a global phase" } else { "a second phase" };
+            self.stats.plan.push(format!("{kind}: {} of {} rows", rank.explain(&self.schema), hits.len()));
+        }
+        Ok(out)
     }
 
     fn ordered_hits_to(&mut self, q: &Select, want: Option<usize>) -> Result<Vec<Hit>> {
@@ -1700,7 +1804,7 @@ impl<'a> Executor<'a> {
     /// by key: its candidates, each leaf's exact value of them where the
     /// score or a coordinator reads it, and the score over those. In shard
     /// mode these are every candidate, with what the coordinator fuses
-    /// ([`FusionParts`]).
+    /// ([`RankParts`]).
     fn fused(&mut self, rank: &Rank<'_>, p: &Pred, k: usize) -> Result<Vec<Hit>> {
         let depth = self.rows_at_most(rank.depth.max(k));
         let shard = self.opts.shard;
@@ -2058,16 +2162,29 @@ impl<'a> Executor<'a> {
                 _ => None,
             })
             .collect();
+        // Each ranking expression's value of every row, column by column.
+        let features: Vec<Option<Vec<f64>>> = q
+            .projection
+            .iter()
+            .map(|(_, p)| match p {
+                Projection::Feature(score) => self.feature_values(score, hits).map(Some),
+                _ => Ok(None),
+            })
+            .collect::<Result<_>>()?;
         let mut rows = Vec::with_capacity(hits.len());
-        for h in hits {
+        for (r, h) in hits.iter().enumerate() {
             let s = &self.seg_by_ord(h.seg);
             let fetched = match (s.r.store()?, stored.is_empty()) {
                 (Some(store), false) => store.get_fields(h.doc, &stored),
                 _ => Vec::new(),
             };
             let mut row = Vec::with_capacity(q.projection.len());
-            for (_, p) in &q.projection {
+            for (c, (_, p)) in q.projection.iter().enumerate() {
                 row.push(match p {
+                    Projection::Feature(_) => match features[c].as_ref().map(|v| v[r]) {
+                        Some(x) if x.is_finite() => Value::Float(x),
+                        _ => Value::Null,
+                    },
                     // A row without the ordering column's value scores ±inf.
                     Projection::Score if h.score.is_finite() => Value::Float(h.score),
                     Projection::Score => Value::Null,
@@ -2088,6 +2205,23 @@ impl<'a> Executor<'a> {
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    /// The value of the ranking expression `score`, which scores each row
+    /// by itself, for each of `hits` (NaN where a row has none): what the
+    /// query's ranking computes for the row.
+    fn feature_values(&self, score: &Score, hits: &[Hit]) -> Result<Vec<f64>> {
+        let rank = Rank::of_phase(score);
+        let values = self.row_values(&rank, hits)?;
+        let mut leaves = vec![0.0; values.len()];
+        Ok((0..hits.len())
+            .map(|i| {
+                for (l, v) in leaves.iter_mut().zip(&values) {
+                    *l = v[i];
+                }
+                rank.eval_row(&leaves)
+            })
+            .collect())
     }
 
     fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {
@@ -2189,9 +2323,18 @@ fn merge_top(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
     hits
 }
 
-/// The BM25 inputs of a query and of the subqueries that seed its graphs.
+/// The BM25 inputs of a query (its ranking, its phases' and its columns')
+/// and of the subqueries that seed its graphs.
 pub(crate) fn bm25_leaves<'q>(q: &'q Select, out: &mut Vec<(usize, &'q str, &'q Opts)>) {
-    if let Some(OrderBy::Score { score, .. }) = &q.order {
+    let order = match &q.order {
+        Some(OrderBy::Score { score, .. }) => Some(score),
+        _ => None,
+    };
+    let columns = q.projection.iter().filter_map(|(_, p)| match p {
+        Projection::Feature(s) => Some(s),
+        _ => None,
+    });
+    for score in order.into_iter().chain(q.phases.iter().map(|p| &p.score)).chain(columns) {
         for l in score.leaves() {
             if let Score::Bm25 { field, text, opts } = l {
                 out.push((*field, text, opts));

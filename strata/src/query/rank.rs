@@ -17,7 +17,7 @@
 //!    ([`Rank::eval`]).
 //!
 //! A shard answers every candidate with each leaf's value and whether the row
-//! is in the leaf's top `depth` ([`crate::query::exec::FusionParts`]). The
+//! is in the leaf's top `depth` ([`crate::query::exec::RankParts`]). The
 //! coordinator takes each leaf's top `depth` over all shards and runs steps 1
 //! and 3 over those rows with the same code ([`crate::cluster`]), so a split
 //! collection ranks like the whole one.
@@ -159,6 +159,51 @@ impl<'s> Rank<'s> {
         // Without a leaf to take candidates from, every row is one.
         let exact = c.exact || !c.generates.contains(&true);
         Some(Rank { depth: c.rrf_depth.or(c.depth).unwrap_or(default_depth), exact, expr, leaves: c.leaves, generates: c.generates })
+    }
+
+    /// The ranking of a rerank phase ([`crate::query::logical::Phase`]):
+    /// `score`'s expression, or the leaf alone, every row it reranks a
+    /// candidate.
+    pub fn of_phase(score: &'s Score) -> Rank<'s> {
+        match Rank::of(score, usize::MAX) {
+            Some(r) => Rank { exact: true, ..r },
+            None => Rank { leaves: vec![score], generates: vec![score.is_relevance()], depth: usize::MAX, exact: true, expr: Expr::Leaf(0) },
+        }
+    }
+
+    /// The score of each of `n` rows that a phase reranks, best first:
+    /// `values[j]` is leaf `j`'s value of each row (NaN where it has none),
+    /// rows in the previous phase's order. Rows tied on score keep that
+    /// order (under RRF, the order they first appear in a ranking); RRF
+    /// ranks the rows by each of its inputs, a row without a value out of
+    /// that ranking.
+    pub fn rerank(&self, n: usize, values: &[Vec<f64>]) -> Vec<(usize, f64)> {
+        let lists: Vec<Vec<usize>> = (0..self.leaves.len())
+            .map(|j| match self.generates[j] && self.reads_rankings() {
+                true => {
+                    let mut l: Vec<usize> = (0..n).filter(|&i| !values[j][i].is_nan()).collect();
+                    l.sort_by(|&a, &b| values[j][b].total_cmp(&values[j][a]));
+                    l.truncate(self.depth);
+                    l
+                }
+                false => Vec::new(),
+            })
+            .collect();
+        self.eval(n, values, &lists, n)
+    }
+
+    /// Whether a rerank phase by `score` reads every row it reranks (a set
+    /// function, RRF or a weighted sum), so that it runs once over all of
+    /// them: a global phase ([`crate::query::logical::Phase::global`]).
+    pub fn is_global(score: &Score) -> bool {
+        Rank::of(score, 0).is_some_and(|r| !r.is_row_local())
+    }
+
+    /// [`Rank::rerank`] of rows whose phase scores a shard computed:
+    /// `scores` (NaN for NULL), best first, rows tied keeping their order.
+    pub fn by_scores(scores: Vec<f64>) -> Vec<(usize, f64)> {
+        let n = scores.len();
+        Rank { leaves: Vec::new(), generates: Vec::new(), depth: n, exact: true, expr: Expr::Leaf(0) }.eval(n, &[scores], &[], n)
     }
 
     /// Whether the expression reads the leaves' values; RRF reads only

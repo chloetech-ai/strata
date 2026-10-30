@@ -110,6 +110,9 @@ pub fn kind(q: &Select) -> &'static str {
     if q.projection.iter().all(|(_, p)| matches!(p, Projection::Count)) {
         return "count";
     }
+    if !q.phases.is_empty() {
+        return "reranked";
+    }
     match &q.order {
         Some(OrderBy::Score { score, .. }) => match score {
             Score::Bm25 { .. } => "bm25",
@@ -245,7 +248,7 @@ impl Metrics {
             h.render(o, "strata_grpc_request_duration_seconds", &format!("method=\"{method}\""));
         }
 
-        head(o, "strata_queries_total", "counter", "Queries by kind (bm25, vector, sparse, hybrid, boosted, expression, decay, graph, column, facet, aggregate, count, filter, compound, invalid) and outcome (ok, partial, error, timeout, rejected).");
+        head(o, "strata_queries_total", "counter", "Queries by kind (bm25, vector, sparse, hybrid, boosted, expression, reranked, decay, graph, column, facet, aggregate, count, filter, compound, invalid) and outcome (ok, partial, error, timeout, rejected).");
         for (&(k, outcome), n) in &m.queries {
             let _ = writeln!(o, "strata_queries_total{{kind=\"{k}\",outcome=\"{outcome}\"}} {n}");
         }

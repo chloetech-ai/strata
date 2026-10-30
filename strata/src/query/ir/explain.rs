@@ -61,9 +61,15 @@ impl<'a> Text<'a> {
                 if !s.order.is_empty() {
                     lines.push(format!("  order: {}", self.keys(&s.order, &names)));
                 }
+                // Where each phase runs: a second phase on each shard's
+                // rows, a global one once over every row.
+                for p in &s.phases {
+                    let at = if p.global { "a global phase: scored once over every row" } else { "a second phase: each shard scores its rows" };
+                    lines.push(format!("  rerank: {} DESC over the top {} ({at})", self.expr(&p.expr, &names), p.count));
+                }
                 // For one release: `+` between scores meant min-max fusion
                 // before.
-                if s.order.iter().any(|k| k.expr.adds_raw_scores()) {
+                if s.order.iter().map(|k| &k.expr).chain(s.phases.iter().map(|p| &p.expr)).any(|e| e.adds_raw_scores()) {
                     lines.push("  note: + adds raw scores; minmax() normalises them, as a sum of scores did before ranking expressions".into());
                 }
                 (lines, names)

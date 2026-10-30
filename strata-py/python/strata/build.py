@@ -58,6 +58,7 @@ __all__ = [
     "case",
     "score",
     "hops",
+    "features",
     "count",
     "reachable",
     "path",
@@ -268,7 +269,7 @@ class Expr:
 
     def _name(self) -> str:
         """The column's name when it has no alias."""
-        raise StrataError(f"{self!r} is not a column: select fields, score(), hops() or aggregates")
+        raise StrataError(f"{self!r} is not a column: select fields, score(), hops(), features(), aggregates or ranking expressions")
 
     def _is_score(self) -> bool:
         return False
@@ -452,16 +453,21 @@ class _Named(Expr):
 
 class _Fn(Expr):
     """A function of the row: a score (BM25, a similarity, RRF) or a
-    condition (MATCH, a traversal)."""
+    condition (MATCH, a traversal). `inputs` are the scores RRF fuses."""
 
-    def __init__(self, build, text: str, score: bool = True):
-        self.build, self.text, self.score = build, text, score
+    def __init__(self, build, text: str, score: bool = True, inputs: list[Expr] | None = None):
+        self.build, self.text, self.score, self.inputs = build, text, score, inputs
 
     def _ir(self, ctx: _Ctx) -> Any:
         return self.build(ctx)
 
     def _is_score(self) -> bool:
         return self.score
+
+    def _name(self) -> str:
+        if not self.score:
+            return super()._name()
+        return self.text
 
     def __repr__(self) -> str:
         return self.text
@@ -470,16 +476,21 @@ class _Fn(Expr):
 class _Ranked(Expr):
     """Part of a ranking expression: arithmetic, a function, minmax(),
     rank() or a case. It ranks best first, as a score does, unless it
-    is over aggregates, which order groups."""
+    is over aggregates, which order groups. `inputs` are the parts whose
+    values it reads (a case's values, not its conditions)."""
 
-    def __init__(self, what: str, parts: list[Any], build, text: str):
+    def __init__(self, what: str, parts: list[Any], build, text: str, inputs: list[Any] | None = None):
         self.what, self.parts, self.build, self.text = what, parts, build, text
+        self.inputs = parts if inputs is None else inputs
 
     def _ir(self, ctx: _Ctx) -> Any:
         return self.build(ctx, [p._ir(ctx) for p in self.parts])
 
     def _is_score(self) -> bool:
         return not any(isinstance(_bare(p), _Agg) for p in self.parts)
+
+    def _name(self) -> str:
+        return self.text
 
     def __repr__(self) -> str:
         return self.text
@@ -560,6 +571,22 @@ def count() -> Expr:
     return _Agg("count", None)
 
 
+def features() -> Expr:
+    """In `select`, a column for each input of the query's ranking: each
+    score and field it reads, then each ranking (`order_by`, `rerank`) that
+    scores a row by itself, each once, named as Python writes it; the
+    values the query ranked by, to train a model on."""
+    return _Features()
+
+
+class _Features(Expr):
+    def _ir(self, ctx: _Ctx) -> Any:
+        raise StrataError("features() stands for several columns: select it by itself")
+
+    def __repr__(self) -> str:
+        return "features()"
+
+
 def match(field: str, query: str) -> Expr:
     """`field` (an indexed TEXT field) matches the full-text `query`, in
     MATCH's syntax (`a b` both words, `a | b` either, `"a b"` the phrase,
@@ -613,7 +640,7 @@ def rrf(*scores: Expr, k: float = 60, depth: int = 100) -> Expr:
     its rank), over each ranking's best `depth` rows."""
     if not scores:
         raise StrataError("rrf takes rankings")
-    return _Fn(lambda ctx: {"rrf": {"inputs": [s._ir(ctx) for s in scores], "k": float(k), "depth": int(depth)}}, f"rrf({', '.join(map(repr, scores))})")
+    return _Fn(lambda ctx: {"rrf": {"inputs": [s._ir(ctx) for s in scores], "k": float(k), "depth": int(depth)}}, f"rrf({', '.join(map(repr, scores))})", inputs=list(scores))
 
 
 def minmax(x: Expr) -> Expr:
@@ -693,7 +720,7 @@ def case(*whens: tuple[Expr, Any], otherwise: Any = None) -> Expr:
         return {"case": c}
 
     text = " ".join(f"WHEN {c!r} THEN {v!r}" for c, v in zip(conds, values))
-    return _Ranked("case", conds + values + rest, build, f"CASE {text}{f' ELSE {rest[0]!r}' if rest else ''} END")
+    return _Ranked("case", conds + values + rest, build, f"CASE {text}{f' ELSE {rest[0]!r}' if rest else ''} END", inputs=values + rest)
 
 
 def _graph(field: str, seeds: Any, kind: dict, dir: str, labels: Iterable[str], through: Expr | None, max_nodes: int, k: int, min_sim: float | None):
@@ -754,6 +781,7 @@ class Query:
         self._order: list[_Key] = []
         self._group: list[Expr] = []
         self._having: list[Expr] = []
+        self._phases: list[tuple[Expr, int]] = []
         self._limit: int | None = None
         self._offset = 0
 
@@ -788,6 +816,17 @@ class Query:
                 out.append(_Key(e, e._is_score(), False))
         return self._copy(order=out)
 
+    def rerank(self, expr: Expr, count: int) -> Query:
+        """Ranks the top `count` rows of the ranking before (`order_by`, or
+        the last `rerank`) again by `expr`, best first, rows tied keeping
+        their order; `limit` and `offset` cut the last one. A phase with
+        `minmax`, `rank` or `rrf`, and any after it, runs once over every
+        row it reranks (a global phase); any other on each shard over its
+        own rows."""
+        if int(count) < 1:
+            raise StrataError("a rerank phase reranks at least one row")
+        return self._copy(phases=self._phases + [(_expr(expr), int(count))])
+
     def group_by(self, *fields: str | Expr) -> Query:
         """Groups the rows by the values of fields (each value of a
         multi-valued field its own group)."""
@@ -815,13 +854,28 @@ class Query:
             stored = [f for f in ctx.fields if f.get("stored", f["type"] != "vector" and not f.get("from")) and f["type"] != "vector"]
             columns = [col(f["name"]) for f in stored]
         grouped = bool(self._group) or any(isinstance(_bare(c), _Agg) for c in columns)
+        if any(isinstance(c, _Features) for c in columns):
+            if grouped:
+                raise StrataError("features() lists the inputs of a ranking of rows, not of groups")
+            columns = [x for c in columns for x in (self._features(ctx) if isinstance(c, _Features) else [c])]
         node: dict[str, Any] = search
         if not grouped:
             if self._having:
                 raise StrataError("having keeps groups: group the rows with group_by")
             if self._order:
                 search["order"] = [k._ir(ctx) for k in self._order]
+            if self._phases:
+                if len(self._order) != 1:
+                    raise StrataError("rerank phases follow an order_by of one key")
+                phases, after = [], False
+                for e, n in self._phases:
+                    expr = e._ir(ctx)
+                    after = after or _reads_every_row(expr)
+                    phases.append({"count": n, "expr": expr, **({"global": True} if after else {})})
+                search["phases"] = phases
         else:
+            if self._phases:
+                raise StrataError("rerank phases rank rows, not groups")
             if self._order and any(k.e._is_score() for k in self._order):
                 raise StrataError("groups are ordered by a group key or an aggregate, not a score")
             keys = [ctx.field(_arg_field(g))[0] for g in self._group]
@@ -849,6 +903,38 @@ class Query:
         root = {"node": "project", "input": node, "columns": [{"name": c._name(), "expr": c._ir(ctx)} for c in columns]}
         return {"version": VERSION, "root": root}
 
+    def _features(self, ctx: _Ctx) -> list[Expr]:
+        """What `features()` stands for: the leaves of every ranking, then
+        each ranking that scores a row by itself and is not a leaf."""
+        ranks = [k.e for k in self._order[:1]] + [e for e, _ in self._phases]
+        if not ranks:
+            raise StrataError("features() lists the inputs of the query's ranking, and it has no order_by")
+
+        def leaves(e: Any, out: list[Expr]) -> None:
+            e = _bare(e)
+            if isinstance(e, _Lit):
+                return
+            if isinstance(e, _Ranked) or (isinstance(e, _Fn) and e.inputs is not None):
+                for x in e.inputs:
+                    leaves(x, out)
+            else:
+                out.append(e)
+
+        items: list[Expr] = []
+        for e in ranks:
+            leaves(e, items)
+        for e in ranks:
+            b = _bare(e)
+            inner = isinstance(b, _Ranked) or (isinstance(b, _Fn) and b.inputs is not None)
+            if inner and not _reads_every_row(b._ir(ctx)):
+                items.append(b)
+        out, seen = [], set()
+        for e in items:
+            if e._name() not in seen:
+                seen.add(e._name())
+                out.append(e)
+        return out
+
     def run(self) -> Any:
         """Runs the query: its `Result`."""
         return self._source.run(self.plan())
@@ -858,6 +944,16 @@ class Query:
 
     def __repr__(self) -> str:
         return f"<Query of {self._schema['table']}>"
+
+
+def _reads_every_row(ir: Any) -> bool:
+    """Whether a ranking's plan holds a set function (`minmax`, `rank`),
+    RRF or a weighted sum, which read every row ranked."""
+    if isinstance(ir, dict):
+        return any(k in ("norm", "rrf", "weighted") or _reads_every_row(v) for k, v in ir.items())
+    if isinstance(ir, list):
+        return any(_reads_every_row(v) for v in ir)
+    return False
 
 
 def _bare(e: Expr) -> Expr:
