@@ -793,6 +793,9 @@ struct Recording {
     /// How long each `Replicate` call waits first, as on a slow link; a
     /// `Verify` waits five times that, as when hashing many rows.
     delay: std::sync::Mutex<Duration>,
+    /// `Hello` and `Write` calls, answered or not.
+    hellos: AtomicUsize,
+    writes: AtomicUsize,
 }
 
 impl Recording {
@@ -852,6 +855,7 @@ impl pb::strata_server::Strata for Recording {
         self.inner.term_stats(self.read(r)?).await
     }
     async fn write(&self, r: tonic::Request<pb::WriteRequest>) -> Result<tonic::Response<pb::WriteResponse>, tonic::Status> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
         self.up()?;
         self.inner.write(r).await
     }
@@ -863,6 +867,7 @@ impl pb::strata_server::Strata for Recording {
         self.inner.health(r).await
     }
     async fn hello(&self, r: tonic::Request<pb::HelloRequest>) -> Result<tonic::Response<pb::HelloResponse>, tonic::Status> {
+        self.hellos.fetch_add(1, Ordering::Relaxed);
         self.up()?;
         match self.version.load(Ordering::Relaxed) {
             1 => Err(tonic::Status::unimplemented("unknown method Hello")),
@@ -924,6 +929,8 @@ async fn recording_of(svc: Arc<Service>, version: u32) -> (String, Arc<Recording
         shipped: Default::default(),
         verifies: AtomicBool::new(true),
         delay: std::sync::Mutex::new(Duration::ZERO),
+        hellos: AtomicUsize::new(0),
+        writes: AtomicUsize::new(0),
     });
     let svc = pb::strata_server::StrataServer::from_arc(shard.clone()).max_decoding_message_size(256 << 20);
     tokio::spawn(tonic::transport::Server::builder().add_service(svc).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
@@ -1047,11 +1054,11 @@ async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
     };
     let (rdb, pdb) = (numbered("r.strata"), numbered("p.strata"));
     let follow = Arc::new(Follow::open(rdb.clone(), None).unwrap());
-    let r = service_with(rdb.clone(), |s| s.replication = Replication::Replica(follow));
+    let r = service_with(rdb.clone(), |s| s.set_replication(Replication::Replica(follow)));
     let (ru, replica) = recording_of(r.clone(), 4).await;
     // A transaction a batch, for the catch-up below.
     let opts = PrimaryOptions { replicas: vec![ru.clone()], acks: Acks::All, heartbeat: Duration::from_millis(100), retry_max: Duration::from_millis(200), batch_bytes: 1, ..Default::default() };
-    let p = service_with(pdb.clone(), |s| s.replication = Replication::Primary(Primary::start(pdb.clone(), None, opts).unwrap()));
+    let p = service_with(pdb.clone(), |s| s.set_replication(Replication::Primary(Primary::start(pdb.clone(), None, opts).unwrap())));
     let pu = grpc(p.clone()).await;
     for _ in 0..200 {
         if r.health().await["replication"]["serves_reads"] == true {
@@ -1163,7 +1170,7 @@ async fn a_replica_behind_is_compared_under_a_steady_writer() {
     set(&rdb, 0);
     let strata::storage::LogRead::Txns(t) = pdb.storage().log_from(1, usize::MAX) else { panic!("the log holds it") };
     let follow = Arc::new(Follow::open(rdb.clone(), None).unwrap());
-    let r = service_with(rdb.clone(), |s| s.replication = Replication::Replica(follow));
+    let r = service_with(rdb.clone(), |s| s.set_replication(Replication::Replica(follow)));
     let (ru, replica) = recording_of(r.clone(), 5).await;
     let opts = PrimaryOptions {
         replicas: vec![ru.clone()],
@@ -1174,7 +1181,7 @@ async fn a_replica_behind_is_compared_under_a_steady_writer() {
         verify_every: Duration::from_millis(50),
         ..Default::default()
     };
-    let p = service_with(pdb.clone(), |s| s.replication = Replication::Primary(Primary::start(pdb.clone(), None, opts).unwrap()));
+    let p = service_with(pdb.clone(), |s| s.set_replication(Replication::Primary(Primary::start(pdb.clone(), None, opts).unwrap())));
     for _ in 0..200 {
         if p.health().await["replication"]["replicas"][0]["verifications"].as_u64().unwrap() > 0 {
             break;
@@ -2397,4 +2404,86 @@ async fn conditional_writes_through_a_coordinator() {
     assert!(svc.local_db().unwrap().storage().seq_no().is_none());
     let e = server::service(&server::Options { shards: urls, seq_no: true, ..Default::default() }).await.err().unwrap();
     assert!(e.contains("start each shard server with it"), "{e}");
+}
+
+/// Once a replica is promoted, a coordinator sends the shard's writes to
+/// it. A write the old primary refuses as replaced, or that finds it down,
+/// goes once to the copy that took its place; a conditional write's
+/// refusal is not retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coordinator_writes_to_the_promoted_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let numbered = |name: &str| {
+        let opts = DbOptions { publish_snapshots: true, ship_log_bytes: 64 << 20, ..DbOptions::default() };
+        let db = Db::create(&dir.path().join(name), demo::schema(N), opts).unwrap();
+        db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
+        db.load((0..300).map(|i| demo::product(i, 7))).unwrap();
+        db.storage().start_seq_no().unwrap();
+        Arc::new(db)
+    };
+    let fast = |replicas: Vec<String>| PrimaryOptions { replicas, acks: Acks::All, heartbeat: Duration::from_millis(100), retry_max: Duration::from_millis(200), ..Default::default() };
+    let sold = |db: &Db| db.query("SELECT sold, seq_no() FROM products WHERE id = 'p0000003'", &Params::new()).unwrap().rows[0].clone();
+    let set = |v: i64| vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": v})];
+
+    // The old primary is up, and learns it was replaced when it next ships.
+    let (pdb, rdb) = (numbered("p.strata"), numbered("r.strata"));
+    let r = service_with(rdb.clone(), |s| s.set_replication(Replication::Replica(Arc::new(Follow::open(rdb.clone(), None).unwrap()))));
+    let ru = grpc(r.clone()).await;
+    let p = service_with(pdb.clone(), |s| s.set_replication(Replication::Primary(Primary::start(pdb.clone(), None, fast(vec![ru.clone()])).unwrap())));
+    let (pu, old) = recording_of(p.clone(), 5).await;
+    let coord = cluster(Coordinator::connect_with(vec![format!("{pu}|{ru}")], CoordOptions { hedge: Duration::from_secs(60), ..Default::default() }).await.unwrap());
+    assert_eq!(coord.write_ops(set(1), None).await.unwrap().seq_nos, vec![1]);
+    let a = r.promote(vec![pu.clone()], Acks::All, false).await.unwrap();
+    assert_eq!(a["replicas"][0]["role"], "primary", "{a}");
+    for _ in 0..200 {
+        if p.replaced_by() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(p.replaced_by(), 2);
+    // A conditional write the new primary refuses is refused once.
+    let e = coord.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": 9, "if_seq_no": 7})], None).await.err().unwrap();
+    assert_eq!(e.status, 409, "{}", e.message);
+    let w = coord.write_ops(set(2), None).await.unwrap();
+    assert_eq!(w.seq_nos, vec![2]);
+    assert_eq!(sold(&rdb), vec![Value::Int(2), Value::Int(2)]);
+    assert_eq!(rdb.storage().numbering().unwrap().term_at(2), 2);
+    let h = coord.health().await;
+    assert_eq!((&h["shards"][0]["replicas"][0]["role"], &h["shards"][0]["replicas"][1]["role"]), (&json!("primary"), &json!("primary")), "{h}");
+    // And the next write goes there at once; a conditional write the new
+    // primary refuses asks it again, and no other copy.
+    let (hellos, writes) = (old.hellos.load(Ordering::Relaxed), old.writes.load(Ordering::Relaxed));
+    assert_eq!(coord.write_ops(set(3), None).await.unwrap().seq_nos, vec![3]);
+    let e = coord.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": 9, "if_seq_no": 1})], None).await.err().unwrap();
+    assert_eq!(e.status, 409, "{}", e.message);
+    assert_eq!((old.hellos.load(Ordering::Relaxed), old.writes.load(Ordering::Relaxed)), (hellos, writes), "the old primary was not asked");
+    assert_eq!(last_of(&pdb), 1, "the old primary took none of them");
+
+    // The old primary is down, listed before the replica or after it.
+    for old_first in [true, false] {
+        let (pdb, rdb) = (numbered(&format!("p-{old_first}.strata")), numbered(&format!("r-{old_first}.strata")));
+        let r = service_with(rdb.clone(), |s| s.set_replication(Replication::Replica(Arc::new(Follow::open(rdb.clone(), None).unwrap()))));
+        let ru = grpc(r.clone()).await;
+        let p = service_with(pdb.clone(), |s| s.set_replication(Replication::Primary(Primary::start(pdb.clone(), None, fast(vec![ru.clone()])).unwrap())));
+        let (pu, old) = recording_of(p.clone(), 5).await;
+        let copies = if old_first { format!("{pu}|{ru}") } else { format!("{ru}|{pu}") };
+        let coord = cluster(Coordinator::connect_with(vec![copies], CoordOptions { hedge: Duration::from_secs(60), ..Default::default() }).await.unwrap());
+        assert_eq!(coord.write_ops(set(1), None).await.unwrap().seq_nos, vec![1]);
+        old.down.store(true, Ordering::Relaxed);
+        r.promote(Vec::new(), Acks::All, false).await.unwrap();
+        let w = coord.write_ops(set(2), None).await.unwrap();
+        assert_eq!(w.seq_nos, vec![2]);
+        assert_eq!(sold(&rdb), vec![Value::Int(2), Value::Int(2)]);
+        // The next goes to the new primary, of the newer term, at once:
+        // both say they are primaries, and the old one is not asked.
+        let (hellos, writes) = (old.hellos.load(Ordering::Relaxed), old.writes.load(Ordering::Relaxed));
+        assert_eq!(coord.write_ops(set(3), None).await.unwrap().seq_nos, vec![3]);
+        assert_eq!((old.hellos.load(Ordering::Relaxed), old.writes.load(Ordering::Relaxed)), (hellos, writes), "the old primary was not asked");
+        assert_eq!(last_of(&pdb), 1);
+    }
+}
+
+fn last_of(db: &Db) -> u64 {
+    db.storage().numbering().unwrap().seq
 }
