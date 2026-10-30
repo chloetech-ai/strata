@@ -14,7 +14,7 @@ def ordered_schema(s: dict) -> dict:
     """The short schema form in reading order: table, key, the table's
     options, fields, and each field's name and type first."""
     out = {"table": s["table"]}
-    for k in ("key", "shard_by", "cluster_by", "retain", "retain_by"):
+    for k in ("key", "shard_by", "cluster_by", "retain", "retain_by", "edges"):
         if s.get(k) is not None:
             out[k] = s[k]
     out["fields"] = [{"name": f["name"], "type": f["type"], **f} for f in s["fields"]]
