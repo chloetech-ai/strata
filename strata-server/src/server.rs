@@ -333,12 +333,15 @@ pub async fn promote(url: &str, replicas: &[String], write_acks: &str, force: bo
     }
 }
 
-/// Downloads model `name` ([`strata::embed::KNOWN_MODELS`], a
-/// cross-encoder of [`cross_encoder::KNOWN_MODELS`], or a Hugging Face
-/// repository `owner/name`) into `dir`; returns its directory.
+/// Downloads model `name` ([`strata::embed::KNOWN_MODELS`],
+/// [`strata::derive::KNOWN_MODELS`], a cross-encoder of
+/// [`cross_encoder::KNOWN_MODELS`], or a Hugging Face repository
+/// `owner/name` of an embedding model or a cross-encoder) into `dir`;
+/// returns its directory.
 pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
     use strata::query::cross_encoder;
-    let known = || strata::embed::KNOWN_MODELS.iter().chain(cross_encoder::KNOWN_MODELS);
+    let derives = strata::derive::KNOWN_MODELS.iter().any(|m| m.0.eq_ignore_ascii_case(name));
+    let known = || strata::embed::KNOWN_MODELS.iter().chain(strata::derive::KNOWN_MODELS).chain(cross_encoder::KNOWN_MODELS);
     let (local, repo) = match known().find(|m| m.0.eq_ignore_ascii_case(name)) {
         Some(m) => (m.0.to_string(), m.1.to_string()),
         None if name.contains('/') => (name.rsplit('/').next().unwrap_or(name).to_string(), name.to_string()),
@@ -350,7 +353,8 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     let out = dir.join(&local);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let client = reqwest::Client::new();
-    for file in strata::embed::MODEL_FILES {
+    let files = if derives { strata::derive::MODEL_FILES } else { strata::embed::MODEL_FILES };
+    for file in files {
         let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
         let r = client.get(&url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("{url}: {e}"))?;
         let bytes = r.bytes().await.map_err(|e| format!("{url}: {e}"))?;
@@ -360,7 +364,9 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
         std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, out.join(file))).map_err(|e| format!("{}: {e}", out.join(file).display()))?;
         tracing::info!(file, bytes = bytes.len(), "downloaded");
     }
-    if !cross_encoder::is_cross_encoder(&out) {
+    if derives {
+        strata::derive::open(&local, dir).map_err(|e| e.to_string())?;
+    } else if !cross_encoder::is_cross_encoder(&out) {
         strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
     } else if let Err(e) = cross_encoder::CrossEncoder::open(&local, &out) {
         match cfg!(feature = "bert") {

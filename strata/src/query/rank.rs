@@ -826,6 +826,7 @@ fn leaf_name(s: &Score, schema: &Schema) -> String {
         Score::Hops { .. } => "hops()".into(),
         Score::SeqNo => "seq_no()".into(),
         Score::CrossEncoder { model, fields, .. } => format!("cross_encoder('{model}', {})", fields.iter().map(name).collect::<Vec<_>>().join(", ")),
+        Score::Ranked { keys } => format!("ranked({} keys)", keys.len()),
         Score::Cond(p) => {
             fn fields(p: &Pred, out: &mut Vec<usize>) {
                 match p {

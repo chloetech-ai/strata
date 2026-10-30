@@ -211,6 +211,7 @@ impl Lower<'_> {
         };
         Graph {
             field: g.field as u32,
+            edges: g.edges.clone(),
             seeds,
             weights,
             kind: match &g.kind {
@@ -259,6 +260,7 @@ impl Lower<'_> {
             // number of hops in an expression ([`super::raise`]).
             Score::Hops { .. } => Expr::Hops,
             Score::SeqNo => Expr::SeqNo,
+            Score::Ranked { keys } => Expr::Ranked { keys: keys.clone() },
             Score::Cond(p) => self.pred(p),
             Score::Num(x) => Expr::Lit(Value::Float(*x)),
             Score::Arith { op, left, right } => Expr::Arith { op: *op, left: Box::new(self.score(left)), right: Box::new(self.score(right)) },

@@ -129,6 +129,7 @@ fn graph(g: &Graph) -> pb::Graph {
     };
     pb::Graph {
         field: g.field,
+        edges: g.edges.clone(),
         seeds: bex(&g.seeds),
         kind: Some(kind),
         dir: match g.dir {
@@ -257,6 +258,7 @@ fn expr(e: &Expr) -> E {
         Expr::Gbdt { model, hash, args, .. } => E::Gbdt(pb::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(ex).collect() }),
         Expr::CrossEncoder { model, hash, fields, query, .. } => E::CrossEncoder(pb::CrossEncoder { model: model.clone(), hash: hash.clone(), fields: fields.clone(), query: query.clone() }),
         Expr::Ppr(g) => E::Ppr(Box::new(graph(g))),
+        Expr::Ranked { keys } => E::Ranked(pb::Ranked { keys: keys.iter().map(to_pb).collect() }),
         Expr::Subquery(n) => E::Subquery(Box::new(node(n))),
         Expr::Values(n) => E::Values(Box::new(node(n))),
         Expr::Keys(n) => E::Keys(Box::new(node(n))),
@@ -441,6 +443,7 @@ fn from_graph(g: pb::Graph) -> Result<Graph, ApiError> {
     };
     Ok(Graph {
         field: g.field,
+        edges: g.edges,
         seeds: from_ex(g.seeds.map(|e| *e))?,
         kind,
         dir,
@@ -579,6 +582,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
         E::Gbdt(g) => Expr::Gbdt { model: g.model, hash: g.hash, args: from_exprs(g.args)?, open: Default::default() },
         E::CrossEncoder(c) => Expr::CrossEncoder { model: c.model, hash: c.hash, fields: c.fields, query: c.query, open: Default::default() },
         E::Ppr(g) => Expr::Ppr(Box::new(from_graph(*g)?)),
+        E::Ranked(r) => Expr::Ranked { keys: r.keys.into_iter().map(lit).collect::<Result<_, _>>()? },
         E::Subquery(n) => Expr::Subquery(Box::new(from_node_in(*n)?)),
         E::Values(n) => Expr::Values(Box::new(from_node_in(*n)?)),
         E::Keys(n) => Expr::Keys(Box::new(from_node_in(*n)?)),

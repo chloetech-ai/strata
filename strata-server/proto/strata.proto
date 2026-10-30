@@ -510,6 +510,10 @@ message Expr {
     Gbdt gbdt = 37;
     // A cross-encoder's score of a row's text; plan feature "rank_models".
     CrossEncoder cross_encoder = 38;
+    // A ranking given as primary keys, best first (ranked(:keys)); plan
+    // feature "ranked". Numbered from 70, the range of the semantic-ID
+    // work.
+    Ranked ranked = 70;
     // maxsim(field, vectors); plan feature "maxsim". Numbered from 80, the
     // range of the multi-vector work, so lanes building at once do not
     // collide.
@@ -538,6 +542,10 @@ message Gbdt {
 message Norm {
   NormKind kind = 1;
   Expr input = 2;
+}
+
+message Ranked {
+  repeated Value keys = 1;
 }
 
 enum NormKind {
@@ -730,6 +738,9 @@ message Graph {
   // A weight per key `seeds` lists, which PageRank restarts at in
   // proportion; empty, all 1 (plan feature "maxsim").
   repeated double weights = 12;
+  // The edge table walked instead of `field`, which is then the primary
+  // key (plan feature "edge_table").
+  optional string edges = 13;
 }
 
 message Reachable {
