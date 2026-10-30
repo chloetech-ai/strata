@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, rrf, score, similarity, sigmoid, sqrt
+from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, ranked, rrf, score, similarity, sigmoid, sqrt
 from conftest import BOOKS, book
 
 
@@ -37,6 +37,16 @@ def test_builder_runs_as_its_sql(db):
          "SELECT id FROM books ORDER BY 0.7 * minmax(bm25(title, 'river')) + 0.3 * minmax(bm25(description, 'river')) DESC LIMIT 5")
     # Without select: the stored fields but vectors, as SELECT * gives.
     same(db, t.where(col("id") == "b0007"), "SELECT * FROM books WHERE id = 'b0007'")
+
+
+def test_a_ranking_given_by_keys_runs_as_its_sql(db):
+    t = db.table()
+    keys = ["b0007", "b0003", "none", "b0011", "b0003"]
+    r = same(db, t.select("id", score()).order_by(ranked(keys)).limit(10),
+             "SELECT id, score() FROM books ORDER BY ranked(:keys) DESC LIMIT 10", keys=keys)
+    assert r.rows == [["b0007", -1.0], ["b0003", -2.0], ["b0011", -4.0]]
+    same(db, t.select("id").where(col("year") >= 1950).order_by(rrf(bm25("description", "dragon"), ranked(keys))).limit(5),
+         "SELECT id FROM books WHERE year >= 1950 ORDER BY rrf(bm25(description, 'dragon'), ranked(:keys)) DESC LIMIT 5", keys=keys)
 
 
 def test_ranking_expressions_run_as_their_sql(db):

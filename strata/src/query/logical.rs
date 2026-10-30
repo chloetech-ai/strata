@@ -286,6 +286,11 @@ pub enum Score {
     /// The sequence number of the write that last changed the row
     /// (`seq_no()`), in a ranking expression.
     SeqNo,
+    /// A ranking computed outside Strata (`ranked(:keys)`): the rows of
+    /// `keys`, primary keys best first, in their order. Its value is
+    /// `-(position)` from 1, and NULL for a row whose key is not listed;
+    /// a key listed twice ranks where it is first.
+    Ranked { keys: Vec<Value> },
     /// 1 for a row the predicate holds for, as `WHERE` would keep it, and
     /// 0 for others: the test of a [`Score::Case`] branch.
     Cond(Box<Pred>),
@@ -351,7 +356,7 @@ impl Score {
     pub fn is_leaf(&self) -> bool {
         matches!(
             self,
-            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Cond(_)
+            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Ranked { .. } | Score::Cond(_)
         )
     }
 
@@ -363,10 +368,11 @@ impl Score {
     }
 
     /// Whether the score ranks by relevance to the query (BM25,
-    /// similarity, sparse, graph), as opposed to a row's own values (a column, a
-    /// decay), which only boost rows found by relevance.
+    /// similarity, sparse, graph, a ranking given by key), as opposed to a
+    /// row's own values (a column, a decay), which only boost rows found by
+    /// relevance.
     pub fn is_relevance(&self) -> bool {
-        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Ppr { .. } | Score::Hops { .. })
+        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Ranked { .. })
     }
 
     /// Whether the score can be a term of the fused shapes
