@@ -60,7 +60,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 4] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, RANK_PHASES];
+pub const FEATURES: [&str; 5] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -77,6 +77,9 @@ pub const SEQ_NO: &str = "seq_no";
 /// or one of the fused shapes ([`Expr::Rrf`], [`Expr::Weighted`],
 /// [`Expr::Product`]).
 pub const RANK_EXPRESSIONS: &str = "rank_expressions";
+
+/// The feature of a plan that cuts semantic IDs ([`Func::SidAt`]).
+pub const SEMANTIC_ID: &str = "semantic_id";
 
 /// The feature of a plan whose Search reranks its top rows in phases
 /// ([`Search::phases`]).
@@ -332,6 +335,9 @@ pub enum Func {
     Sigmoid,
     /// `args[0]` within `args[1]` and `args[2]`.
     Clamp,
+    /// The prefix of `args[1]` levels of a semantic ID `args[0]`
+    /// ([`crate::sid::sid_at`]); needs [`SEMANTIC_ID`].
+    SidAt,
 }
 
 impl Func {
@@ -353,6 +359,7 @@ impl Func {
             Func::Greatest => "greatest",
             Func::Sigmoid => "sigmoid",
             Func::Clamp => "clamp",
+            Func::SidAt => "sid_at",
         }
     }
 
@@ -381,7 +388,7 @@ impl Func {
         let ok = match self {
             Func::Lower | Func::Upper | Func::Length | Func::Abs | Func::Ln | Func::Exp | Func::Sqrt | Func::Sigmoid => n == 1,
             Func::Round | Func::Log => n == 1 || n == 2,
-            Func::Pow => n == 2,
+            Func::Pow | Func::SidAt => n == 2,
             Func::Clamp => n == 3,
             Func::Coalesce | Func::Least | Func::Greatest => n >= 1,
         };
@@ -389,6 +396,7 @@ impl Func {
             (true, _) => Ok(()),
             (_, Func::Round | Func::Log) => Err("one or two arguments"),
             (_, Func::Pow) => Err("two arguments"),
+            (_, Func::SidAt) => Err("two arguments: a semantic ID and a number of levels"),
             (_, Func::Clamp) => Err("three arguments: a value, its least and its greatest"),
             (_, Func::Coalesce | Func::Least | Func::Greatest) => Err("at least one argument"),
             _ => Err("one argument"),
@@ -397,8 +405,8 @@ impl Func {
 
     /// The numeric function of `args`, NaN standing for NULL: NaN where the
     /// result has no finite value (`ln(0)`, `sqrt(-1)`, an overflow).
-    /// [`Func::Lower`], [`Func::Upper`] and [`Func::Length`] take text, and
-    /// are NaN here.
+    /// [`Func::Lower`], [`Func::Upper`], [`Func::Length`] and
+    /// [`Func::SidAt`] take text, and are NaN here.
     pub fn eval_f64(self, args: &[f64]) -> f64 {
         // NULL in, NULL out, except where a function skips it: `pow(1,
         // NULL)` and `clamp(NULL, 0, 1)` are not 1 and 0, as f64's pow and
@@ -408,7 +416,7 @@ impl Func {
         }
         let x = args.first().copied().unwrap_or(f64::NAN);
         let r = match self {
-            Func::Lower | Func::Upper | Func::Length => f64::NAN,
+            Func::Lower | Func::Upper | Func::Length | Func::SidAt => f64::NAN,
             Func::Abs => x.abs(),
             Func::Round => {
                 let d = args.get(1).map_or(0.0, |d| d.clamp(-30.0, 30.0).trunc());
@@ -720,6 +728,66 @@ impl Node {
         }
     }
 
+    /// Calls `f` on every expression of the plan and each within it, in
+    /// the plans of subqueries too.
+    pub(crate) fn exprs(&self, f: &mut dyn FnMut(&Expr)) {
+        let mut each = |e: &Expr| {
+            e.visit(&mut |x| {
+                f(x);
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    n.exprs(f);
+                }
+            })
+        };
+        match self {
+            Node::Search(s) => {
+                each(&s.filter);
+                s.order.iter().for_each(|k| each(&k.expr));
+                s.phases.iter().for_each(|p| each(&p.expr));
+            }
+            Node::Aggregate { input, keys, aggs } => {
+                keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut each);
+                input.exprs(f);
+            }
+            Node::Filter { input, cond } => {
+                each(cond);
+                input.exprs(f);
+            }
+            Node::Sort { input, keys } => {
+                keys.iter().for_each(|k| each(&k.expr));
+                input.exprs(f);
+            }
+            Node::Project { input, columns } => {
+                columns.iter().for_each(|c| each(&c.expr));
+                input.exprs(f);
+            }
+            Node::Insert { rows, .. } => rows.iter().flatten().for_each(each),
+            Node::Update { input, sets, .. } => {
+                sets.iter().for_each(|s| each(&s.value));
+                input.exprs(f);
+            }
+            Node::Join { left, right, keys, on, .. } => {
+                keys.iter().for_each(|k| {
+                    each(&k.left);
+                    each(&k.right);
+                });
+                on.iter().for_each(&mut each);
+                left.exprs(f);
+                right.exprs(f);
+            }
+            Node::With { ctes, input } => {
+                ctes.iter().for_each(|c| c.input.exprs(f));
+                input.exprs(f);
+            }
+            Node::KeyOrder { input, by } => {
+                input.exprs(f);
+                by.exprs(f);
+            }
+            Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.exprs(f),
+            Node::Ref { .. } => {}
+        }
+    }
+
     /// Calls `f` on each expression of a leaf's nodes.
     pub(crate) fn leaf_exprs(&self, f: &mut dyn FnMut(&Expr)) {
         match self {
@@ -980,6 +1048,11 @@ impl Plan {
         }
         if root.ranks_by_expression() {
             features.push(RANK_EXPRESSIONS.to_string());
+        }
+        let mut sid_at = false;
+        root.exprs(&mut |e| sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. }));
+        if sid_at {
+            features.push(SEMANTIC_ID.to_string());
         }
         if root.has_phases() {
             features.push(RANK_PHASES.to_string());

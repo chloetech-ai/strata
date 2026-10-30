@@ -111,7 +111,7 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
             }
             Expr::Subquery(q) if seeds.contains(&(x as *const Expr)) => found |= needs(q, schema) || !matches!(q.body.as_ref(), sql::SetExpr::Select(_)),
             Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_) => found = true,
-            _ => {}
+            _ => found |= of_rows(x),
         })
     };
     for e in select_exprs(s) {
@@ -124,6 +124,15 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
             }
         }
     }
+    found
+}
+
+/// Whether `e` (outside subqueries) computes a value of rows that a scan
+/// does not: a semantic ID's prefix, `sid_at(..)`, which operators compute
+/// over the rows the scan returns.
+fn of_rows(e: &Expr) -> bool {
+    let mut found = false;
+    walk(e, &mut |x| found |= matches!(x, Expr::Function(f) if fname(f) == "sid_at"));
     found
 }
 
@@ -542,6 +551,10 @@ impl<'a> Planner<'a> {
         if s.distinct.is_some() {
             distinct_to_group(&mut s)?;
         }
+        let rows = select_exprs(&s).into_iter().any(of_rows) || q.order_by.as_ref().is_some_and(|ob| matches!(&ob.kind, sql::OrderByKind::Expressions(es) if es.iter().any(|e| of_rows(&e.expr))));
+        if rows {
+            return self.join(&q, &s);
+        }
         q.body = Box::new(sql::SetExpr::Select(Box::new(s)));
         self.leaf(&q, "query", schema)
     }
@@ -709,7 +722,7 @@ impl<'a> Planner<'a> {
             let at = sides.of(&c)?;
             let left_join_right = |i: usize| srcs[i].join.as_ref().is_some_and(|(k, _)| *k == ir::JoinKind::Left);
             match at.as_slice() {
-                [i] if !in_memory(*i) && !left_join_right(*i) => pushed[*i].push(c),
+                [i] if !in_memory(*i) && !left_join_right(*i) && !of_rows(&c) => pushed[*i].push(c),
                 _ => residual.push(c),
             }
         }
@@ -1428,13 +1441,16 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                 "abs" => Func::Abs,
                 "round" => Func::Round,
                 "coalesce" => Func::Coalesce,
+                "sid_at" => Func::SidAt,
                 n if NATIVE.contains(&n) => {
                     return Err(err(format!("{}(...) works on one table's scan, in its WHERE or ORDER BY (in a join, on that table's column: a.body), not on values of rows", n.to_uppercase())))
                 }
                 n if AGGREGATES.contains(&n) => return Err(err(format!("{}(...) is an aggregate: it needs GROUP BY or a SELECT of aggregates, not a value of one row", n.to_uppercase()))),
                 n => return Err(err(format!("unknown function {n}"))),
             };
-            ir::Expr::Call { func, args: func_args(f).into_iter().map(go).collect::<Result<_>>()? }
+            let args: Vec<ir::Expr> = func_args(f).into_iter().map(go).collect::<Result<_>>()?;
+            func.arity(args.len()).map_err(|a| err(format!("{}() takes {a}", func.name())))?;
+            ir::Expr::Call { func, args }
         }
         e @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => return Err(err(format!("no such column: {e}"))),
         e => return Err(err(format!("unsupported expression: {e}"))),

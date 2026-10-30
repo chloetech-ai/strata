@@ -95,9 +95,21 @@ pub fn of_view(v: &SegmentView, d: DocId) -> Result<u64> {
 /// The image of a segment of `docs`, with their numbers when the
 /// database numbers its writes (`seqs`, one per document).
 pub fn build(schema: &Schema, docs: &[Document], seqs: Option<&[u64]>, opts: &BuildOptions) -> Result<Vec<u8>> {
-    let Some(seqs) = seqs else { return build_segment(schema, docs, opts) };
+    build_with(schema, docs, seqs, opts, Vec::new())
+}
+
+/// [`build`], with more sections (by name).
+pub fn build_with(schema: &Schema, docs: &[Document], seqs: Option<&[u64]>, opts: &BuildOptions, sections: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>> {
+    if seqs.is_none() && sections.is_empty() {
+        return build_segment(schema, docs, opts);
+    }
     let mut w = SegmentBuild::new(schema, opts, docs.len())?.finish(docs)?;
-    w.put(SECTION, encode(seqs));
+    if let Some(seqs) = seqs {
+        w.put(SECTION, encode(seqs));
+    }
+    for (name, bytes) in sections {
+        w.put(name, bytes);
+    }
     Ok(w.finish())
 }
 
