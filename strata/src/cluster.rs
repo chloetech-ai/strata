@@ -52,6 +52,10 @@ fn err(m: impl Into<String>) -> Error {
 /// Merges the shard-mode answers of every shard to `q` into the answer of
 /// the whole collection.
 pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
+    // The coordinator scores rows with the models too.
+    if let Some(m) = q.unopened_model() {
+        return Err(Error::Query(format!("ranking model {m} is not open on the coordinator: it opens a plan's models from its models directory")));
+    }
     let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
     let mut stats = ExecStats::default();
     for (i, s) in shards.iter().enumerate() {

@@ -40,6 +40,19 @@ def test_client_reads_and_writes(client):
     assert e.value.status == 400
 
 
+def test_client_rank_profiles(client):
+    assert client.sql("CREATE RANK PROFILE liked ON books AS SELECT * FROM books ORDER BY bm25(title, :q) * (1 + :w * rating) DESC WITH (w => 0.5)") == 0
+    sql = "SELECT id, score() FROM books ORDER BY rank_profile('liked', q => :q) LIMIT 5"
+    r = client.query(sql, q="dragon")
+    want = client.query("SELECT id, score() FROM books ORDER BY bm25(title, :q) * (1 + 0.5 * rating) DESC LIMIT 5", q="dragon")
+    assert len(r) == 5 and (r.keys, r.scores) == (want.keys, want.scores)
+    plan = client.explain(sql, q="dragon")["ir"]
+    assert "rank_profiles" in plan["features"] and client.run(plan).keys == r.keys
+    assert client.sql("CREATE OR REPLACE RANK PROFILE liked ON books AS SELECT * FROM books ORDER BY rating DESC") == 0
+    with pytest.raises(strata.StrataError, match="is not the one the plan was made with"):
+        client.run(plan)
+    assert client.sql("DROP RANK PROFILE liked ON books") == 0
+
 def test_client_writes_to_any_table(client, tmp_path):
     assert client.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, book KEYWORD REFERENCES books, ts INT) OPTIONS(shard_by = 'usr')") == 0
     assert [t["table"] for t in client.tables()] == ["books", "events"]
@@ -121,6 +134,27 @@ def test_client_bool_and_timestamp(tmp_path, serve):
     assert client.query("SELECT id FROM tasks WHERE done = :d", d=False).keys == ["b"]
     with pytest.raises(strata.StrataError, match="HTTP 400"):
         client.insert({"id": "x", "done": 2})
+
+
+def test_client_gbdt(tmp_path, serve):
+    from test_database import model_dir
+    models = model_dir(tmp_path)
+    path = tmp_path / "models.strata"
+    with strata.Database.create(path, BOOKS) as db:
+        db.insert([book(i) for i in range(200)])
+    client = strata.connect(serve(path, "--models", str(models)))
+    sql = "SELECT id, score() FROM books ORDER BY gbdt('m', bm25(description, :q), rating, year % 6) DESC LIMIT 5"
+    r = client.query(sql, q="dragon ship")
+    assert len(r) == 5
+    q = client.table().select("id", strata.score()).order_by(strata.gbdt("m", strata.bm25("description", "dragon ship"), strata.col("rating"), strata.col("year") % 6)).limit(5)
+    got = client.run(q)
+    assert (got.keys, got.scores) == (r.keys, r.scores)
+    plan = client.explain(sql, q="dragon ship")
+    assert "rank_models" in plan["ir"]["features"] and any(line.startswith("ranking model: m (hash ") for line in plan["tree"])
+    assert client.run(plan["ir"]).keys == r.keys
+    model_dir(tmp_path, "xgb_rank")
+    with pytest.raises(strata.StrataError, match="is not the one the plan was made with"):
+        client.run(plan["ir"])
 
 
 def test_client_streams_events_once(client):

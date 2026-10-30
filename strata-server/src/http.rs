@@ -6,7 +6,7 @@
 //! | `GET /livez`, `/readyz` | | `{status}`: 503 when a restart is needed |
 //! | `GET /v1/health`, `/v1/stats`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
 //! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
-//! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema, the first first |
+//! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and rank profiles, the first first |
 //! | `GET /metrics` | | Prometheus text |
 //! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?}` | rows |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows, or `{written, seq_no?, seq_nos?}` |
@@ -245,6 +245,8 @@ fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json
         "short": s.to_short_json(),
         "primary_key": s.primary_key.map(|k| s.fields[k].name.clone()),
         "shard_by": s.shard_by,
+        // Its rank profiles, by name.
+        "profiles": svc.rank_profiles().into_iter().filter(|(t, _)| t.eq_ignore_ascii_case(&s.table)).map(|(_, p)| p).collect::<Vec<_>>(),
         // Each embedded VECTOR field: its sources, model, and whether this
         // server can embed text for it.
         "embeddings": svc.models().iter().filter(|m| m.table.eq_ignore_ascii_case(&s.table)).map(|m| json!({
@@ -592,12 +594,15 @@ async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let tables: Vec<&strata::schema::Schema> = catalog.iter().map(|t| &**t).collect();
     // A compound query is operators over single-table queries; what each
     // of those ran is in "plan".
-    let plan = strata::query::compound::plan_read(sql, &tables, &params)?;
+    let profiles = |t: &str, n: &str| app.svc.rank_profile(t, n);
+    // The plan names the files of its ranking models.
+    let plan = app.svc.open_ranking_models(std::sync::Arc::new(strata::query::compound::plan_read(sql, &tables, &params, &profiles)?))?;
     let logical = match plan.root.uses_operators() {
         true => "a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(),
         false => {
             let schema = tables.iter().find(|t| t.table.eq_ignore_ascii_case(plan.table())).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", plan.table())))?;
-            format!("{:#?}", strata::query::bind(sql, schema, &params)?)
+            // A query by a rank profile binds as written out.
+            format!("{:#?}", strata::query::bind(&strata::query::profile::written_out(sql, &profiles)?, schema, &params)?)
         }
     };
     let (ir, tree) = (plan.to_json()?, json!(plan.explain(&tables)));

@@ -33,10 +33,12 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::query::fusion::{self, Norm};
 use crate::query::ir::{ArithOp, Func, NormKind};
 use crate::query::logical::{Pred, Score};
+use crate::query::model::Gbdt;
 use crate::schema::Schema;
 
 /// A ranking expression, ready to run.
@@ -79,6 +81,10 @@ pub enum Expr {
     /// The value of the first branch whose test is a number other than 0,
     /// else `otherwise`, else NULL.
     Case { whens: Vec<(Expr, Expr)>, otherwise: Option<Box<Expr>> },
+    /// A ranking model's score of the row from its features `args`; NULL
+    /// until the model is opened ([`crate::query::model::Models::open`]),
+    /// which a plan is before it runs.
+    Gbdt { name: String, model: Option<Arc<Gbdt>>, args: Vec<Expr> },
 }
 
 /// Builds a [`Rank`] from a [`Score`].
@@ -137,6 +143,7 @@ impl<'s> Compile<'s> {
             Score::Neg(x) => Expr::Neg(Box::new(self.expr(x))),
             Score::Call { func, args } => Expr::Call { func: *func, args: args.iter().map(|a| self.expr(a)).collect() },
             Score::Norm { kind, input } => Expr::Norm { kind: *kind, input: Box::new(self.expr(input)) },
+            Score::Gbdt { model, args, open, .. } => Expr::Gbdt { name: model.clone(), model: open.0.clone(), args: args.iter().map(|a| self.expr(a)).collect() },
             Score::Case { whens, otherwise } => Expr::Case {
                 whens: whens.iter().map(|(c, x)| (self.expr(c), self.expr(x))).collect(),
                 otherwise: otherwise.as_ref().map(|x| Box::new(self.expr(x))),
@@ -368,6 +375,14 @@ impl<'s> Rank<'s> {
                 }
                 Cow::Owned(out)
             }
+            Expr::Gbdt { model, args, .. } => {
+                let args: Vec<Cow<[f64]>> = args.iter().map(|a| self.values(a, n, values, lists)).collect();
+                let columns: Vec<&[f64]> = args.iter().map(|a| a.as_ref()).collect();
+                Cow::Owned(match model {
+                    Some(m) => m.predict_columns(&columns, n).into_iter().map(finite).collect(),
+                    None => vec![f64::NAN; n],
+                })
+            }
             Expr::Case { whens, otherwise } => {
                 let branches: Vec<(Cow<[f64]>, Cow<[f64]>)> = whens.iter().map(|(c, x)| (self.values(c, n, values, lists), self.values(x, n, values, lists))).collect();
                 let otherwise = otherwise.as_ref().map(|x| self.values(x, n, values, lists));
@@ -478,6 +493,7 @@ impl<'s> Rank<'s> {
             }
             Expr::Neg(x) => format!("-{}", operand(x, 3)),
             Expr::Call { func, args } => format!("{}({})", func.name(), args.iter().map(|a| self.show(a, schema)).collect::<Vec<_>>().join(", ")),
+            Expr::Gbdt { name, args, .. } => format!("gbdt({})", std::iter::once(format!("'{name}'")).chain(args.iter().map(|a| self.show(a, schema))).collect::<Vec<_>>().join(", ")),
             Expr::Norm { kind, input } => format!("{}({})", if *kind == NormKind::MinMax { "minmax" } else { "rank" }, self.show(input, schema)),
             Expr::Case { whens, otherwise } => {
                 let mut s = "CASE".to_string();
@@ -541,6 +557,19 @@ fn row(e: &Expr, v: &[f64]) -> f64 {
                 p * if x.is_finite() { x.max(0.0) } else { 0.0 }
             });
             if p.is_finite() { p } else { f64::MIN }
+        }
+        Expr::Gbdt { model: None, .. } => f64::NAN,
+        Expr::Gbdt { model: Some(m), args, .. } => {
+            let mut buf = [0.0; 16];
+            match args.len() {
+                n if n <= buf.len() => {
+                    for (b, a) in buf.iter_mut().zip(args) {
+                        *b = row(a, v);
+                    }
+                    finite(m.predict(&buf[..n]))
+                }
+                _ => finite(m.predict(&args.iter().map(|a| row(a, v)).collect::<Vec<_>>())),
+            }
         }
         Expr::Case { whens, otherwise } => match whens.iter().find(|(c, _)| {
             let c = row(c, v);
@@ -741,6 +770,13 @@ fn interval(e: &Expr, leaves: &[Interval]) -> Interval {
                 false => Interval::new(f64::MIN, f64::INFINITY, false),
             }
         }
+        // The leaves the features' values reach, tree by tree.
+        Expr::Gbdt { model: None, .. } => Interval::ANY,
+        Expr::Gbdt { model: Some(m), args, .. } => {
+            let a: Vec<(f64, f64, bool)> = args.iter().map(|x| interval(x, leaves)).map(|i| (i.lo, i.hi, i.null)).collect();
+            let (lo, hi) = m.bounds(&a);
+            if lo > hi { Interval::NULL } else { Interval::new(lo, hi, false) }
+        }
         Expr::Case { whens, otherwise } => {
             let mut out = otherwise.as_ref().map_or(Interval::NULL, |x| interval(x, leaves));
             for (_, x) in whens {
@@ -757,7 +793,7 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     match e {
         Expr::Sum { terms, .. } => terms.iter().for_each(|(_, x)| visit(x, f)),
-        Expr::Product(xs) | Expr::Call { args: xs, .. } => xs.iter().for_each(|x| visit(x, f)),
+        Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Gbdt { args: xs, .. } => xs.iter().for_each(|x| visit(x, f)),
         Expr::Arith { left, right, .. } => {
             visit(left, f);
             visit(right, f);

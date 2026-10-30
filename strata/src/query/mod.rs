@@ -10,6 +10,8 @@
 //! * [`agg`]: aggregates and groups.
 //! * [`stats`]: collection statistics exchanged with a coordinator.
 //! * [`memory`]: the memory breaker queries count what they hold against.
+//! * [`model`]: ranking models (`gbdt()`), read from LightGBM and XGBoost
+//!   files.
 
 pub mod agg;
 pub mod compound;
@@ -19,9 +21,11 @@ pub mod fusion;
 pub mod ir;
 pub mod logical;
 pub mod memory;
+pub mod model;
 pub mod ops;
 pub mod parse;
 pub mod plan;
+pub mod profile;
 pub mod pool;
 pub mod rank;
 pub mod sql;

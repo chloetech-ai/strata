@@ -11,13 +11,18 @@
 //!          kind 5 table: id: u32 (the operations up to the next table
 //!                 record or the commit are on this table; before any,
 //!                 on table 0)
+//!          kind 6 profile: name value, then the rank profile as JSON
+//!                 text, or NULL where it is dropped
 //! ```
 //!
-//! A database that numbers its writes
-//! ([`crate::storage::Database::start_seq_no`]) logs in `STRWAL02`, whose
-//! header names the features its records use (`seq_no`: each commit
-//! carries the transaction's term and sequence number); a reader refuses a
-//! log naming one it does not know. Others log in `STRWAL01`, as before.
+//! A log whose records use a feature logs in `STRWAL02`, whose header
+//! names them: `seq_no` in a database that numbers its writes
+//! ([`crate::storage::Database::start_seq_no`]), where each commit carries
+//! the transaction's term and sequence number, and `rank_profiles` in one
+//! whose log may hold profile records (the first is logged into a log
+//! started again with that name, [`Wal::allow_profiles`], and a log that
+//! is emptied starts again without it). A reader refuses a log naming a
+//! feature it does not know. Others log in `STRWAL01`, as before.
 //!
 //! A transaction is its operation records followed by a commit record,
 //! written with one `write` and made durable with one `fdatasync`. Replay
@@ -54,20 +59,22 @@ use std::sync::Arc;
 
 use crate::error::{corrupt, Error, Result};
 use crate::storage::io;
-use crate::storage::manifest::SeqNo;
+use crate::storage::manifest::{RankProfile, SeqNo, RANK_PROFILES};
 use crate::value::{Document, Value};
 
 const MAGIC: &[u8; 8] = b"STRWAL01";
 /// A log whose header names its features.
 const MAGIC_2: &[u8; 8] = b"STRWAL02";
 /// The features a log may name, all of which this version reads.
-const FEATURES: &[&str] = &["seq_no"];
+const FEATURES: &[&str] = &[SEQ_NO, RANK_PROFILES];
+const SEQ_NO: &str = "seq_no";
 
 const INSERT: u8 = 1;
 const DELETE: u8 = 2;
 const COMMIT: u8 = 3;
 const SET: u8 = 4;
 const TABLE: u8 = 5;
+const PROFILE: u8 = 6;
 
 /// One logged operation.
 #[derive(Clone, Debug, PartialEq)]
@@ -77,6 +84,9 @@ pub enum Op {
     /// Sets a numeric field of the live document with this key, in place
     /// ([`crate::storage::updates`]).
     Set { key: Value, field: u16, value: Value },
+    /// Gives the table this rank profile, in place of one of the same name
+    /// (any case); `None` drops the profile named `name`.
+    Profile { name: String, def: Option<Arc<RankProfile>> },
 }
 
 /// A committed transaction read back from the log: its sequence number
@@ -93,8 +103,12 @@ pub struct WalTxn {
 pub struct Wal {
     file: File,
     db_id: u64,
-    /// Whether its transactions carry sequence numbers (`STRWAL02`).
+    /// Whether its transactions carry sequence numbers (`STRWAL02` with
+    /// `seq_no`).
     numbered: bool,
+    /// Whether it may hold profile records (`STRWAL02` with
+    /// `rank_profiles`).
+    profiles: bool,
     /// The header's length.
     header: u64,
     len: u64,
@@ -104,16 +118,17 @@ pub struct Wal {
     unsynced: bool,
 }
 
-/// What a log's header says: whether its transactions are numbered, and
-/// the header's length. `None` for a file that is no log of database
-/// `db_id` (or whose header a crash cut short); an error for a log that
-/// uses a feature this version does not have.
-fn header(buf: &[u8], db_id: u64, path: &Path) -> Result<Option<(bool, u64)>> {
+/// What a log's header says: whether its transactions are numbered,
+/// whether it may hold profile records, and the header's length. `None`
+/// for a file that is no log of database `db_id` (or whose header a crash
+/// cut short); an error for a log that uses a feature this version does
+/// not have.
+fn header(buf: &[u8], db_id: u64, path: &Path) -> Result<Option<(bool, bool, u64)>> {
     if buf.len() < 16 || buf[8..16] != db_id.to_le_bytes() {
         return Ok(None);
     }
     if &buf[..8] == MAGIC {
-        return Ok(Some((false, 16)));
+        return Ok(Some((false, false, 16)));
     }
     if &buf[..8] != MAGIC_2 {
         return Ok(None);
@@ -124,15 +139,18 @@ fn header(buf: &[u8], db_id: u64, path: &Path) -> Result<Option<(bool, u64)>> {
     if let Some(x) = names.split(',').find(|x| !FEATURES.contains(x)) {
         return Err(Error::Schema(format!("the write-ahead log {} uses feature {x:?}, which this version of Strata does not have: open it with a newer one", path.display())));
     }
-    Ok(Some((true, 20 + n as u64)))
+    let has = |f: &str| names.split(',').any(|x| x == f);
+    Ok(Some((has(SEQ_NO), has(RANK_PROFILES), 20 + n as u64)))
 }
 
-/// The header of a log of database `db_id`: numbered or not.
-fn header_bytes(db_id: u64, numbered: bool) -> Vec<u8> {
-    let mut h = if numbered { MAGIC_2.to_vec() } else { MAGIC.to_vec() };
+/// The header of a log of database `db_id`: `STRWAL02` naming the features
+/// its records use (numbered, profiles), else `STRWAL01`.
+fn header_bytes(db_id: u64, numbered: bool, profiles: bool) -> Vec<u8> {
+    let names: Vec<&str> = [(numbered, SEQ_NO), (profiles, RANK_PROFILES)].into_iter().filter(|x| x.0).map(|x| x.1).collect();
+    let mut h = if names.is_empty() { MAGIC.to_vec() } else { MAGIC_2.to_vec() };
     h.extend_from_slice(&db_id.to_le_bytes());
-    if numbered {
-        let names = FEATURES.join(",");
+    if !names.is_empty() {
+        let names = names.join(",");
         h.extend_from_slice(&(names.len() as u32).to_le_bytes());
         h.extend_from_slice(names.as_bytes());
     }
@@ -143,7 +161,7 @@ impl Wal {
     /// Creates (or truncates) the log, numbered (`STRWAL02`) or not.
     pub fn create(path: &Path, db_id: u64, numbered: bool, sync: bool) -> Result<Wal> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
-        let mut wal = Wal { file, db_id, numbered, header: 0, len: 0, dropped: None, unsynced: true };
+        let mut wal = Wal { file, db_id, numbered, profiles: false, header: 0, len: 0, dropped: None, unsynced: true };
         wal.reset(sync)?;
         Ok(wal)
     }
@@ -169,8 +187,8 @@ impl Wal {
         let mut buf = vec![0u8; size as usize];
         file.read_exact_at(&mut buf, 0)?;
         // What an earlier process appended may not be durable yet.
-        let mut wal = Wal { file, db_id, numbered, header: 0, len: size, dropped: None, unsynced: true };
-        let Some((logged, header)) = header(&buf, db_id, path)? else {
+        let mut wal = Wal { file, db_id, numbered, profiles: false, header: 0, len: size, dropped: None, unsynced: true };
+        let Some((logged, profiles, header)) = header(&buf, db_id, path)? else {
             wal.reset(sync)?;
             return Ok((wal, Vec::new()));
         };
@@ -188,6 +206,7 @@ impl Wal {
             return Ok((wal, Vec::new()));
         }
         wal.header = header;
+        wal.profiles = profiles;
         let end = header + end as u64;
         if end < size {
             let later = commits_after(&buf[end as usize..], txns.last().map_or(0, |t| t.txn), numbered);
@@ -230,6 +249,9 @@ impl Wal {
             (false, true) => return Err(Error::Schema("a transaction without a sequence number, in a numbered log".into())),
             _ => {}
         }
+        if !self.profiles && ops.iter().any(|(_, op)| matches!(op, Op::Profile { .. })) {
+            return Err(Error::Schema("a rank profile, in a log that does not name rank_profiles (Wal::allow_profiles)".into()));
+        }
         let buf = encode_txn(txn, seq, ops);
         let res = io::write_at(&self.file, &buf, self.len).and_then(|_| if sync { io::sync(&self.file) } else { Ok(()) });
         if let Err(e) = res {
@@ -254,9 +276,17 @@ impl Wal {
     }
 
     /// Empties the log (after a flush made its contents durable elsewhere).
+    /// It no longer names `rank_profiles`: what its profile records held
+    /// is in a version now.
     pub fn reset(&mut self, sync: bool) -> Result<()> {
+        self.profiles = false;
+        self.start(sync)
+    }
+
+    /// Writes the header of an empty log.
+    fn start(&mut self, sync: bool) -> Result<()> {
         io::set_len(&self.file, 0)?;
-        let h = header_bytes(self.db_id, self.numbered);
+        let h = header_bytes(self.db_id, self.numbered, self.profiles);
         io::write_at(&self.file, &h, 0)?;
         if sync {
             io::sync(&self.file)?;
@@ -279,8 +309,23 @@ impl Wal {
         self.numbered
     }
 
+    /// Empties the log and starts it again naming `rank_profiles`, so that
+    /// it may hold profile records, which a version of Strata from before
+    /// them would take for damage. The caller made the log's transactions
+    /// durable elsewhere first.
+    pub fn allow_profiles(&mut self, sync: bool) -> Result<()> {
+        self.profiles = true;
+        self.start(sync)
+    }
+
+    /// Whether it may hold profile records ([`Wal::allow_profiles`]).
+    pub fn allows_profiles(&self) -> bool {
+        self.profiles
+    }
+
     /// Starts an empty log at `path` in place of this one, which the caller
-    /// made durable ([`Wal::sync_appends`]) and renamed ([`sealed_path`]).
+    /// made durable ([`Wal::sync_appends`]) and renamed ([`sealed_path`]):
+    /// numbered as this one, without `rank_profiles`.
     pub fn restart(&mut self, path: &Path, sync: bool) -> Result<()> {
         let dropped = self.dropped.take();
         *self = Wal::create(path, self.db_id, self.numbered, sync)?;
@@ -327,6 +372,12 @@ pub(crate) fn encode_txn(txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)]) -> Vec
                 put_value(&mut body, key);
                 body.extend_from_slice(&field.to_le_bytes());
                 put_value(&mut body, value);
+            }
+            Op::Profile { name, def } => {
+                body.push(PROFILE);
+                put_value(&mut body, &Value::Str(name.clone()));
+                let def = def.as_ref().map(|p| serde_json::to_string(&**p).expect("a rank profile serialises"));
+                put_value(&mut body, &def.map_or(Value::Null, Value::Str));
             }
         }
         frame(&mut out, &body);
@@ -390,7 +441,7 @@ pub fn sealed_files(path: &Path) -> Result<Vec<(u64, PathBuf)>> {
 /// numbers if it is numbered.
 pub fn read_sealed(path: &Path, db_id: u64, fits: &dyn Fn(u32, &Op) -> bool) -> Result<Option<(Vec<WalTxn>, Option<u64>)>> {
     let buf = std::fs::read(path)?;
-    let Some((numbered, header)) = header(&buf, db_id, path)? else { return Ok(None) };
+    let Some((numbered, _, header)) = header(&buf, db_id, path)? else { return Ok(None) };
     let (txns, end) = decode(&buf[header as usize..], numbered, fits);
     let end = header + end as u64;
     Ok(Some((txns, (end < buf.len() as u64).then_some(end))))
@@ -467,6 +518,14 @@ fn decode(buf: &[u8], numbered: bool, fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<W
                     _ => break,
                 }
             }
+            PROFILE => match (get_value(&mut r), get_value(&mut r)) {
+                (Ok(Value::Str(name)), Ok(Value::Null)) => Ok(Op::Profile { name, def: None }),
+                (Ok(Value::Str(name)), Ok(Value::Str(def))) => match serde_json::from_str::<RankProfile>(&def) {
+                    Ok(p) if p.name == name => Ok(Op::Profile { name, def: Some(Arc::new(p)) }),
+                    _ => break,
+                },
+                _ => break,
+            },
             COMMIT => {
                 let (Ok(txn), Ok(n)) = (r.u64(), r.u32()) else { break };
                 let seq = match numbered {
@@ -808,6 +867,70 @@ mod tests {
         let e = Wal::open(&p, 11, true, false, false, &any).err().unwrap().to_string();
         assert!(e.contains(r#"uses feature "zstd:1""#), "{e}");
         assert!(read_sealed(&p, 11, &any).is_err());
+    }
+
+    fn profile(name: &str, w: f64) -> Op {
+        let defaults = [("w".to_string(), serde_json::json!(w))].into();
+        Op::Profile { name: name.into(), def: Some(Arc::new(RankProfile { name: name.into(), ranking: "SELECT * FROM t ORDER BY n * :w DESC".into(), defaults })) }
+    }
+
+    /// Profile records round-trip, and a torn one is lost with its
+    /// transaction; one whose definition names another profile is damage.
+    /// A log takes them only once it names `rank_profiles`, which it does
+    /// until it is emptied.
+    #[test]
+    fn profile_records() {
+        let txns: Txns = vec![
+            (3, Some(SeqNo { term: 1, seq: 1 }), vec![(0, Op::Insert(doc(1))), (2, profile("a", 0.5))]),
+            (4, Some(SeqNo { term: 1, seq: 2 }), vec![(2, profile("b", -1.0)), (2, Op::Profile { name: "a".into(), def: None })]),
+            (5, Some(SeqNo { term: 1, seq: 3 }), vec![(0, profile("ü", 2.0))]),
+        ];
+        for numbered in [false, true] {
+            let txns: Txns = txns.iter().map(|(t, seq, ops)| (*t, seq.filter(|_| numbered), ops.clone())).collect();
+            let (buf, ends) = encode(&txns);
+            let want = || txns.iter().map(|(txn, seq, ops)| WalTxn { txn: *txn, seq: *seq, ops: ops.clone() }).collect::<Vec<_>>();
+            assert_eq!(decode(&buf, numbered, &any), (want(), buf.len()));
+            for cut in 0..=buf.len() {
+                let committed = ends.iter().filter(|&&e| e <= cut).count();
+                assert_eq!(decode(&buf[..cut], numbered, &any).0, want()[..committed], "cut at {cut}");
+            }
+            let mut other = txns.clone();
+            other[1].2[0].1 = match profile("b", -1.0) {
+                Op::Profile { def, .. } => Op::Profile { name: "c".into(), def },
+                _ => unreachable!(),
+            };
+            let mut first = want();
+            first.truncate(1);
+            assert_eq!(decode(&encode(&other).0, numbered, &any), (first, ends[0]));
+
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("db-wal");
+            let mut wal = Wal::create(&p, 11, numbered, false).unwrap();
+            let e = wal.append(3, txns[0].1, &txns[0].2, false).unwrap_err().to_string();
+            assert!(e.contains("does not name rank_profiles"), "{e}");
+            assert!(!wal.allows_profiles());
+            wal.allow_profiles(false).unwrap();
+            for (t, seq, ops) in &txns {
+                wal.append(*t, *seq, ops, false).unwrap();
+            }
+            drop(wal);
+            let bytes = std::fs::read(&p).unwrap();
+            let names: &[u8] = if numbered { b"\x14\0\0\0seq_no,rank_profiles" } else { b"\x0d\0\0\0rank_profiles" };
+            assert_eq!((&bytes[..8], &bytes[16..16 + names.len()]), (&b"STRWAL02"[..], names));
+            let (mut wal, got) = Wal::open(&p, 11, numbered, false, false, &any).unwrap();
+            assert!(wal.allows_profiles());
+            assert_eq!(got, want());
+            // A log started again for a new seal does not name it.
+            wal.restart(&p, false).unwrap();
+            assert!(!wal.allows_profiles());
+            wal.allow_profiles(false).unwrap();
+            wal.reset(false).unwrap();
+            assert!(!wal.allows_profiles());
+            drop(wal);
+            assert_eq!(&std::fs::read(&p).unwrap()[..8], if numbered { b"STRWAL02" } else { b"STRWAL01" });
+            let (wal, got) = Wal::open(&p, 11, numbered, false, false, &any).unwrap();
+            assert!(!wal.allows_profiles() && got.is_empty());
+        }
     }
 
     /// An operation that does not fit (intact records the schema could

@@ -11,7 +11,7 @@ use strata::db::Db;
 use strata::query::ir::{self, Expr, Node, Plan};
 use strata::query::{bind, bind_command, compound, Command, Params};
 use strata::schema::{Field, FieldType, Schema};
-use strata::storage::DbOptions;
+use strata::storage::{DbOptions, RankProfile};
 use strata::value::Value;
 use strata_server::pb;
 use strata_server::plan_pb::{from_pb_plan, to_pb_plan};
@@ -186,10 +186,46 @@ fn every_plan_round_trips() {
         let Command::Write { write, .. } = bind_command(sql, &[&schema], &params()).unwrap_or_else(|e| panic!("{sql}: {e}")) else { panic!("{sql}") };
         check(Plan::of_write(&schema, &write));
     }
+    // Ranked by a rank profile: the plan names it.
+    let profile = RankProfile {
+        name: "recent".into(),
+        ranking: "WITH a AS (SELECT * FROM papers ORDER BY bm25(body, :t) DESC LIMIT 50) SELECT * FROM a ORDER BY rating * :w DESC".into(),
+        defaults: [("w".to_string(), serde_json::json!(0.5))].into(),
+    };
+    let sql = "SELECT id, score() FROM papers WHERE year > 2000 ORDER BY rank_profile('recent', t => 'graph') LIMIT 5";
+    let plan = compound::plan_read(sql, &[&schema], &params(), &|t, n| (t == "papers" && n == "recent").then(|| profile.clone())).unwrap();
+    assert!(plan.features.iter().any(|f| f == ir::RANK_PROFILES), "{:?}", plan.features);
+    let back = through_pb(&plan);
+    let mut named = Vec::new();
+    back.root.each_search(&mut |s| named.extend(s.profile.clone()));
+    assert_eq!(named, [ir::ProfileRef { name: "recent".into(), hash: profile.hash() }]);
+    seen.extend(kinds(&plan));
+    // Ranked by a model: the plan names it and the hash of its file.
+    let sql = "SELECT id, score(), features() FROM papers ORDER BY gbdt('m', bm25(body, 'graph'), rating, year % 6) DESC LIMIT 5";
+    let mut plan = compound::plan(sql, &schema, &params()).unwrap();
+    assert!(plan.features.iter().any(|f| f == ir::RANK_MODELS), "{:?}", plan.features);
+    plan.root
+        .visit_exprs_mut(&mut |e| {
+            if let Expr::Gbdt { hash, .. } = e {
+                *hash = "0123456789abcdef".into();
+            }
+            Ok(())
+        })
+        .unwrap();
+    let back = through_pb(&plan);
+    let mut models = Vec::new();
+    back.root.visit_exprs(&mut |e| {
+        if let Expr::Gbdt { model, hash, args, .. } = e {
+            models.push((model.clone(), hash.clone(), args.len()));
+        }
+    });
+    // In the ranking, and as a column of features().
+    assert_eq!(models, vec![("m".to_string(), "0123456789abcdef".to_string(), 3); 2]);
+    seen.extend(kinds(&plan));
     // Every kind of node and expression was among them.
     let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order"];
     let exprs = [
-        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "maxsim",
+        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "maxsim",
     ];
     let want: BTreeSet<String> = nodes.iter().map(|n| format!("node {n}")).chain(exprs.iter().map(|e| format!("expr {e}"))).collect();
     let missing: Vec<&String> = want.difference(&seen).collect();
@@ -202,7 +238,7 @@ fn plan(root: Node) -> pb::Plan {
 }
 
 fn search(filter: Expr) -> Node {
-    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new(), phases: Vec::new() })
+    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new(), phases: Vec::new(), profile: None })
 }
 
 fn refused(p: pb::Plan, says: &str) {

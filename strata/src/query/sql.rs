@@ -118,6 +118,10 @@ pub enum Command {
     CreateTable { schema: Schema, if_not_exists: bool },
     /// `DROP TABLE [IF EXISTS] a, b [CASCADE | RESTRICT]`.
     DropTable { tables: Vec<String>, opts: DropOptions },
+    /// `CREATE [OR REPLACE] RANK PROFILE` ([`crate::query::profile`]).
+    CreateRankProfile { table: String, profile: crate::storage::RankProfile, replace: bool },
+    /// `DROP RANK PROFILE [IF EXISTS] name [ON table]`.
+    DropRankProfile { table: Option<String>, name: String, if_exists: bool },
     /// `EXPLAIN [FORMAT JSON] <statement>`: the statement's plan
     /// ([`crate::query::ir`]), as lines of text or as JSON, made when it
     /// runs ([`crate::db::Db::explain`]).
@@ -153,8 +157,16 @@ pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Op
 
 /// Parses and binds one statement of a database whose tables are `tables`:
 /// a SELECT (bound when it runs), an INSERT, UPDATE or DELETE of one of
-/// them, `CREATE TABLE` or `DROP TABLE`.
+/// them, `CREATE TABLE` or `DROP TABLE`, or `CREATE RANK PROFILE` or
+/// `DROP RANK PROFILE` ([`crate::query::profile`]).
 pub fn bind_command(sql_text: &str, tables: &[&Schema], params: &Params) -> Result<Command> {
+    if let Some(p) = super::profile::parse_statement(sql_text)? {
+        let table = |name: &str| tables.iter().find(|t| t.table.eq_ignore_ascii_case(name)).map(|t| t.table.clone()).ok_or_else(|| err(format!("no such table: {name}")));
+        return Ok(match p {
+            super::profile::Statement::Create { table: t, profile, replace } => Command::CreateRankProfile { table: table(&t)?, profile, replace },
+            super::profile::Statement::Drop { table: t, name, if_exists } => Command::DropRankProfile { table: t.as_deref().map(table).transpose()?, name, if_exists },
+        });
+    }
     bind_statement(&parse_one(sql_text)?, tables, params)
 }
 
@@ -241,7 +253,7 @@ pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: 
             let (tables, opts) = ddl::drop_table(stmt)?;
             Command::DropTable { tables, opts }
         }
-        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE and EXPLAIN are supported")),
+        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE RANK PROFILE, DROP RANK PROFILE and EXPLAIN are supported")),
     })
 }
 
@@ -1008,7 +1020,7 @@ impl<'a> Binder<'a> {
     /// reads its `similarity(..)`.
     fn feature_items(&self, orders: &[&Expr]) -> Result<Vec<Expr>> {
         // Functions of other scores, and the rows they read.
-        let inner = |f: &sql::Function| matches!(fname(f).as_str(), "rrf" | "minmax" | "rank") || Func::numeric(&fname(f)).is_some();
+        let inner = |f: &sql::Function| matches!(fname(f).as_str(), "rrf" | "minmax" | "rank" | "gbdt") || Func::numeric(&fname(f)).is_some();
         let leaf = |e: &Expr| !matches!(e, Expr::Nested(_) | Expr::UnaryOp { .. } | Expr::BinaryOp { .. } | Expr::Case { .. } | Expr::Value(_)) && !matches!(e, Expr::Function(f) if inner(f));
         fn leaves(b: &Binder, e: &Expr, leaf: &dyn Fn(&Expr) -> bool, out: &mut Vec<Expr>) -> Result<()> {
             match e {
@@ -1320,6 +1332,15 @@ impl<'a> Binder<'a> {
                     "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
                     "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
                     "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),
+                    "gbdt" => {
+                        let usage = "gbdt('model', feature, ...) takes a model's name and the features it reads, in order";
+                        let [model, features @ ..] = args.as_slice() else { return Err(err(usage)) };
+                        let model = self.literal(model).ok().and_then(|v| v.as_str().map(str::to_string)).ok_or_else(|| err(usage))?;
+                        if features.is_empty() || !opts.is_empty() {
+                            return Err(err(usage));
+                        }
+                        Ok(Score::Gbdt { model, hash: String::new(), args: features.iter().map(|a| self.rank(a)).collect::<Result<_>>()?, open: Default::default() })
+                    }
                     n => match Func::numeric(n) {
                         Some(func) => {
                             func.arity(args.len()).map_err(|a| err(format!("{n}() takes {a}")))?;
