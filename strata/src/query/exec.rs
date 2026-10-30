@@ -2231,7 +2231,7 @@ fn merge_top(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
 }
 
 /// The BM25 inputs of a query and of the subqueries that seed its graphs.
-fn bm25_leaves<'q>(q: &'q Select, out: &mut Vec<(usize, &'q str, &'q Opts)>) {
+pub(crate) fn bm25_leaves<'q>(q: &'q Select, out: &mut Vec<(usize, &'q str, &'q Opts)>) {
     let order = match &q.order {
         Some(OrderBy::Score { score, .. }) => Some(score),
         _ => None,
