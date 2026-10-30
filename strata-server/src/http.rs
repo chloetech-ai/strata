@@ -8,8 +8,9 @@
 //! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
 //! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and rank profiles, the first first |
 //! | `GET /metrics` | | Prometheus text |
-//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?}` | rows |
-//! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows, or `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?, log?}` | rows; with `log` (`true` or `{table?, request?, context?, variant?, candidates?, ts?}`) also `request` and `logged` ([`strata::rank_log`]) |
+//! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows, or `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/rank_log/export` | `{table?, since?, until?, events?, history?, window?, grades?}` | NDJSON: one record per logged row ([`strata::rank_log::export`]) |
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}` (a plan as `/v1/explain` gives it) | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/import?format=jsonl&table=name` | rows as JSON Lines, JSON, CSV or TSV (of the first table without `table`) | `{written, skipped_fields}` |
@@ -109,6 +110,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
         .route("/v1/sid/next", post(sid_next))
+        .route("/v1/rank_log/export", post(export_rank_log))
         .route("/v1/snapshot", post(snapshot))
         .route("/v1/admin/checkpoint", post(admin_checkpoint))
         .route("/v1/admin/check", post(admin_check))
@@ -283,8 +285,56 @@ async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         after: after(&b)?,
         ..Default::default()
     };
+    if let Some(log) = b.get("log") {
+        if req.shard {
+            return Err(ApiError::bad("a shard's query is not logged: log through the coordinator"));
+        }
+        return logged(&app, req, log).await;
+    }
     let a = app.svc.query(req).await?;
     Ok(AxJson(answer(&a)))
+}
+
+/// A query run and logged ([`Service::query_logged`]): its answer, with
+/// the request's id (`"request"`) and the log's write (`"logged"`: the
+/// rows, and the write's sequence numbers as a write's answer gives them).
+async fn logged(app: &App, req: QueryReq, log: &Json) -> Res {
+    let log = strata::rank_log::Log::from_json(log)?;
+    let (a, request, w) = app.svc.query_logged(req, log).await?;
+    let mut j = answer(&a);
+    j["request"] = json!(request);
+    let mut l = json!({"rows": w.rows});
+    if let Some(s) = w.seq_no {
+        l["seq_no"] = json!(s);
+    }
+    if !w.seq_nos.is_empty() {
+        l["seq_nos"] = json!(w.seq_nos);
+    }
+    j["logged"] = l;
+    Ok(AxJson(j))
+}
+
+/// The records of a log table ([`strata::rank_log::export`]) as NDJSON,
+/// read from one snapshot of a local database as they are sent. A failure
+/// after the first record ends the answer with `{"error": ..., "status":
+/// ..}`. A coordinator refuses it: each shard's server exports its own
+/// rows, which hold every row of a context when the log and the events
+/// are placed by it (`shard_by`).
+async fn export_rank_log(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let x = strata::rank_log::Export::from_json(&b)?;
+    let db = app.svc.local_db().cloned().ok_or_else(|| ApiError::bad("a coordinator does not export a rank log: export from each shard's server"))?;
+    // Refused before the answer starts.
+    strata::rank_log::check(&*app.svc.table(&x.table).await?)?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Json>(1024);
+    tokio::task::spawn_blocking(move || {
+        let r = db.export_rank_log(&x, |r| tx.blocking_send(r).map_err(|_| strata::Error::Query("the export's client left".into())));
+        if let Err(e) = r {
+            let e = ApiError::from(e);
+            let _ = tx.blocking_send(json!({"error": e.message, "status": e.status}));
+        }
+    });
+    let lines = tokio_stream::wrappers::ReceiverStream::new(rx).map(|j| Ok::<_, std::convert::Infallible>(Bytes::from(format!("{j}\n"))));
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], axum::body::Body::from_stream(lines)).into_response())
 }
 
 /// A query's answer; one a coordinator gave without some shards says
@@ -299,6 +349,10 @@ fn answer(a: &crate::service::Answer) -> Json {
 
 async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
+    if let Some(log) = b.get("log") {
+        let req = QueryReq { sql: body_str(&b, "sql")?.to_string(), params, timeout_ms: body_u64(&b, "timeout_ms"), after: after(&b)?, ..Default::default() };
+        return logged(&app, req, log).await;
+    }
     match app.svc.sql(body_str(&b, "sql")?, &params, after(&b)?, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
         SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),

@@ -24,6 +24,7 @@ use crate::query::ir::Plan;
 use crate::query::model::Models;
 use crate::query::stats::TermStats;
 use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
+use crate::rank_log::{self, Export, Log, Logged};
 use crate::schema::{Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn, SOURCES};
@@ -636,6 +637,43 @@ impl Db {
         let q = qsql::parse_query(sql)?;
         let plan = plan_of(snap, &q, params)?;
         self.run_on(snap, &plan, opts)
+    }
+
+    /// Runs a query ([`Db::query`]) and logs what it served to a log table
+    /// ([`crate::rank_log`]), made by the first query logged to it: one row
+    /// per row answered, or per candidate ([`Log::candidates`]), with the
+    /// values its ranking read. The answer has the columns the query asked
+    /// for. The query reads one snapshot and the log is written after it in
+    /// one transaction, as [`Db::sql`] writes.
+    pub fn query_logged(&self, sql: &str, params: &Params, log: &Log) -> Result<Logged> {
+        if self.storage.table(&log.table).is_none() {
+            self.sql(&rank_log::create_sql(&log.table)?, &Params::new())?;
+        }
+        let schema = self.table(&log.table)?;
+        rank_log::check(&schema)?;
+        let p = rank_log::prepare(sql, params, log)?;
+        let served = rank_log::serve(self.query(&p.sql, params)?, &p, log)?;
+        let now = crate::timestamp::now();
+        let mut t = self.storage.begin()?;
+        {
+            let mut tt = t.table(&schema.table)?;
+            for e in &served.entries {
+                tt.upsert(crate::ingest::document_at(&schema, &e.to_json(), now)?)?;
+            }
+        }
+        let seq_no = t.commit_seq()?;
+        Ok(Logged { rs: served.rs, request: served.request, seq_no })
+    }
+
+    /// Exports a log table ([`rank_log::export`]) from one snapshot: one
+    /// record per logged row, with its features as served and, from an
+    /// events table, its history and label as of its time. Returns the
+    /// records given to `out`.
+    pub fn export_rank_log(&self, x: &Export, mut out: impl FnMut(serde_json::Value) -> Result<()>) -> Result<u64> {
+        let snap = self.snapshot();
+        let tables: Vec<&Schema> = snap.schemas().collect();
+        let opts = ExecOptions { max_rows: None, ..self.exec.clone() };
+        rank_log::export(&mut |sql, params| self.query_at(&snap, sql, params, &opts), &tables, x, &mut out)
     }
 
     /// Runs a read plan on `snap`'s version: a leaf on the executor, any
