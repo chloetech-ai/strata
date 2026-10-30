@@ -3454,6 +3454,7 @@ impl TableRef {
             _ if s.shard_by_field() == Some(i) => "places the rows on shards (shard_by)",
             _ if s.cluster_by_field() == Some(i) => "orders the rows (cluster_by)",
             _ if s.retention(0).is_some_and(|(f, _)| f == i) => "keeps the rows (retain_by)",
+            _ if s.edge_fields().is_some_and(|(a, b, _)| a == i || b == i) => "links the rows (edges)",
             _ => return Ok(()),
         };
         Err(Error::Schema(format!("{} {why} of {}, so it is not changed in place: delete the row and write it again", s.fields[i].name, s.table)))
@@ -3509,6 +3510,11 @@ impl TableTxn<'_, '_> {
     /// [`WriteTxn::add`] in this table.
     pub fn add(&mut self, key: &Value, field: &str, delta: &Value) -> Result<bool> {
         self.txn.add_in(&self.t, key, field, delta)
+    }
+
+    /// [`WriteTxn::add_or_insert`] in this table.
+    pub fn add_or_insert(&mut self, doc: Document, field: &str, delta: &Value) -> Result<()> {
+        self.txn.add_or_insert_in(&self.t, doc, field, delta)
     }
 
     /// Field `field` of the live row with this key, as this transaction
@@ -3623,6 +3629,15 @@ impl<'a> WriteTxn<'a> {
         self.add_in(&t, key, field, delta)
     }
 
+    /// [`WriteTxn::add`] to the live row with `doc`'s primary key, or, when
+    /// no row has it, inserts `doc` with `delta` added to its `field` (NULL
+    /// counting as 0): a counter, or an edge's weight, that starts with its
+    /// first event.
+    pub fn add_or_insert(&mut self, doc: Document, field: &str, delta: &Value) -> Result<()> {
+        let t = self.db.first_table();
+        self.add_or_insert_in(&t, doc, field, delta)
+    }
+
     fn insert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
         conform(&t.schema, &mut doc)?;
         self.fill_sids(t, &mut doc, false)?;
@@ -3732,21 +3747,22 @@ impl<'a> WriteTxn<'a> {
             return Err(Error::Schema(format!("{field} is a {}: set it rather than add to it", l.type_name())));
         }
         let Some(base) = self.value_of(t, &k, key, i)? else { return Ok(false) };
-        let overflow = || Error::Schema(format!("{field} + {delta:?} overflows"));
-        let sum = match (&t.schema.fields[i].ty, delta) {
-            (FieldType::Int, Value::Int(x)) => Value::Int(base.as_i64().unwrap_or(0).checked_add(*x).ok_or_else(overflow)?),
-            (FieldType::Int, _) => return Err(Error::Schema(format!("{field} is INT: add an integer"))),
-            (FieldType::Float, d @ (Value::Int(_) | Value::Float(_))) => {
-                let y = base.as_f64().unwrap_or(0.0) + d.as_f64().unwrap_or(0.0);
-                if !y.is_finite() {
-                    return Err(overflow());
-                }
-                Value::Float(y)
-            }
-            (FieldType::Float, d) => return Err(Error::Schema(format!("cannot add {d:?} to {field}"))),
-            _ => return Err(Error::Schema(format!("{field} is not a numeric field"))),
-        };
+        let sum = added(&t.schema, i, &base, delta)?;
         self.set_in(t, key, field, sum)
+    }
+
+    /// [`WriteTxn::add`] to the live row with `doc`'s key, or else inserts
+    /// `doc` with `delta` added to its `field` (NULL as 0).
+    fn add_or_insert_in(&mut self, t: &TableRef, mut doc: Document, field: &str, delta: &Value) -> Result<()> {
+        let pk = t.primary_key()?;
+        conform(&t.schema, &mut doc)?;
+        let key = doc[pk].clone();
+        if self.add_in(t, &key, field, delta)? {
+            return Ok(());
+        }
+        let i = t.schema.fields.iter().position(|f| f.name == field).expect("add_in found the field");
+        doc[i] = added(&t.schema, i, &doc[i], delta)?;
+        self.insert_in(t, doc)
     }
 
     /// Field `field` of the live row with this key, as this transaction
@@ -4334,6 +4350,27 @@ fn check_name(what: &str, name: &str) -> Result<()> {
 /// not installed yet is free on disk, as pages a commit freed before any
 /// other (reusable at once), so that a crash before their install leaves
 /// no page that is neither used nor free.
+/// `base + delta` for numeric field `i` ([`WriteTxn::add`]): NULL counts as
+/// 0, an INT takes an integer and refuses a sum that overflows, and a FLOAT
+/// sum must be finite.
+fn added(schema: &Schema, i: usize, base: &Value, delta: &Value) -> Result<Value> {
+    let field = &schema.fields[i].name;
+    let overflow = || Error::Schema(format!("{field} + {delta:?} overflows"));
+    Ok(match (&schema.fields[i].ty, delta) {
+        (FieldType::Int, Value::Int(x)) => Value::Int(base.as_i64().unwrap_or(0).checked_add(*x).ok_or_else(overflow)?),
+        (FieldType::Int, _) => return Err(Error::Schema(format!("{field} is INT: add an integer"))),
+        (FieldType::Float, d @ (Value::Int(_) | Value::Float(_))) => {
+            let y = base.as_f64().unwrap_or(0.0) + d.as_f64().unwrap_or(0.0);
+            if !y.is_finite() {
+                return Err(overflow());
+            }
+            Value::Float(y)
+        }
+        (FieldType::Float, d) => return Err(Error::Schema(format!("cannot add {d:?} to {field}"))),
+        _ => return Err(Error::Schema(format!("{field} is not a numeric field"))),
+    })
+}
+
 fn place_freelist(fl: &mut FreeList, reserved: &[Extent]) -> (Extent, Vec<u8>) {
     let on_disk = |fl: &FreeList| {
         let mut d = fl.clone();

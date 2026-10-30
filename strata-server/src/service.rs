@@ -2524,16 +2524,27 @@ fn apply_into(catalog: &[Arc<Schema>], txn: &mut WriteTxn<'_>, ops: &[Json]) -> 
                 t.set(&key, f, js::field_value(schema, fi, op.get("value").unwrap_or(&Json::Null))?)?
             }
             // The transaction's own writes count, other requests' in the
-            // same group commit included.
+            // same group commit included. With a "doc", a key no row has
+            // inserts it, its field plus the value.
             "add" => {
-                let key = op_key(schema, op)?;
                 let raw = op.get("value").unwrap_or(&Json::Null);
                 let delta = match (raw.as_i64(), raw.as_f64()) {
                     (Some(x), _) => Value::Int(x),
                     (None, Some(x)) => Value::Float(x),
                     _ => return Err(ApiError::bad("add needs a numeric value")),
                 };
-                t.add(&key, field()?, &delta)?
+                match op.get("doc") {
+                    Some(_) => {
+                        let d = doc()?;
+                        let pk = schema.primary_key.ok_or_else(|| ApiError::bad("writes by key need a primary key"))?;
+                        if op.get("key").is_some() && op_key(schema, op)? != d[pk] {
+                            return Err(ApiError::bad("add's key and its doc's key differ: give one"));
+                        }
+                        t.add_or_insert(d, field()?, &delta)?;
+                        true
+                    }
+                    None => t.add(&op_key(schema, op)?, field()?, &delta)?,
+                }
             }
             other => return Err(ApiError::bad(format!("unknown write op {other:?}"))),
         };

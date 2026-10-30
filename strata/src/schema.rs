@@ -433,6 +433,41 @@ pub struct Schema {
     /// How long rows are kept ([`Schema::with_retain`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retain: Option<Retain>,
+    /// The fields that make each row an edge of a graph
+    /// ([`Schema::with_edges`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges: Option<Edges>,
+}
+
+/// An edge table's fields ([`Schema::with_edges`]): each row is an edge
+/// from the row whose key is in `src` to the row whose key is in `dst`,
+/// weighted by `weight` (1 without one).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edges {
+    pub src: String,
+    pub dst: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<String>,
+}
+
+impl Edges {
+    /// `text` as SQL's option spells it: `'src, dst'` or `'src, dst, w'`.
+    pub fn parse(text: &str) -> Result<Edges> {
+        let names: Vec<&str> = text.split(',').map(str::trim).collect();
+        match names[..] {
+            [src, dst] if !src.is_empty() && !dst.is_empty() => Ok(Edges { src: src.into(), dst: dst.into(), weight: None }),
+            [src, dst, w] if !src.is_empty() && !dst.is_empty() && !w.is_empty() => Ok(Edges { src: src.into(), dst: dst.into(), weight: Some(w.into()) }),
+            _ => Err(Error::Schema(format!("edges {text:?}: name the source and target fields and, if edges have weights, the weight's, as 'src, dst, w'"))),
+        }
+    }
+
+    /// The option as [`Edges::parse`] reads it.
+    pub fn text(&self) -> String {
+        match &self.weight {
+            Some(w) => format!("{}, {}, {w}", self.src, self.dst),
+            None => format!("{}, {}", self.src, self.dst),
+        }
+    }
 }
 
 /// A table's retention ([`Schema::with_retain`]): rows whose TIMESTAMP
@@ -472,7 +507,7 @@ impl Retain {
 
 impl Schema {
     pub fn new(table: &str, fields: Vec<Field>, primary_key: Option<&str>) -> Result<Self> {
-        let s = Schema { table: table.to_string(), fields, primary_key: None, shard_by: None, cluster_by: None, retain: None };
+        let s = Schema { table: table.to_string(), fields, primary_key: None, shard_by: None, cluster_by: None, retain: None, edges: None };
         let mut s = s;
         if let Some(pk) = primary_key {
             let i = s.field_index(pk).ok_or_else(|| Error::Schema(format!("no primary key field {pk}")))?;
@@ -708,6 +743,48 @@ impl Schema {
         Ok(())
     }
 
+    /// Makes each row of this table an edge of a graph over the rows of
+    /// the table that `src` and `dst` hold keys of: from the row whose key
+    /// is in `src` to the row whose key is in `dst`, weighted by `weight`.
+    /// A walk over the other table follows it as it follows an EDGES field
+    /// (`ppr(cooc, seeds)` in SQL), so one edge is written, updated in
+    /// place or deleted without rewriting the rows it links. Each segment
+    /// holds a graph section of its rows, which flushes and merges build.
+    /// `src` and `dst` are stored, single-valued KEYWORD or INT fields of
+    /// one type; `weight` a stored, single-valued FLOAT or INT field, which
+    /// may change in place (an edge is followed while its weight is
+    /// positive). It makes the database format 3 (feature `edge_table`).
+    pub fn with_edges(mut self, src: &str, dst: &str, weight: Option<&str>) -> Result<Schema> {
+        let find = |name: &str, what: &str| self.field_index(name).ok_or_else(|| Error::Schema(format!("edges: the {what} {name} is not a field of {}", self.table)));
+        let (s, d) = (find(src, "source")?, find(dst, "target")?);
+        let w = weight.map(|w| find(w, "weight")).transpose()?;
+        let plain = |f: &Field| f.stored && !f.multi && f.media.is_none() && f.logical.is_none();
+        let (fs, fd) = (&self.fields[s], &self.fields[d]);
+        if s == d || !plain(fs) || !plain(fd) || fs.ty != fd.ty || !matches!(fs.ty, FieldType::Keyword | FieldType::Int) {
+            return Err(Error::Schema(format!("edges {src}, {dst}: the source and target are two stored, single-valued KEYWORD or INT fields of one type")));
+        }
+        if let Some(w) = w {
+            let f = &self.fields[w];
+            if w == s || w == d || !plain(f) || !matches!(f.ty, FieldType::Float | FieldType::Int) {
+                return Err(Error::Schema(format!("edges: the weight {} is a stored, single-valued FLOAT or INT field", f.name)));
+            }
+        }
+        let name = |i: usize| self.fields[i].name.clone();
+        self.edges = Some(Edges { src: name(s), dst: name(d), weight: w.map(name) });
+        Ok(self)
+    }
+
+    /// The positions of an edge table's source, target and weight fields
+    /// ([`Schema::with_edges`]).
+    pub fn edge_fields(&self) -> Option<(usize, usize, Option<usize>)> {
+        let e = self.edges.as_ref()?;
+        let w = match &e.weight {
+            Some(w) => Some(self.field_index(w)?),
+            None => None,
+        };
+        Some((self.field_index(&e.src)?, self.field_index(&e.dst)?, w))
+    }
+
     /// An indexed TEXT or SPARSE field that is neither stored nor
     /// generated: nothing can rebuild its index when segments merge.
     /// [`Schema::new`] refuses them; databases created before it did can
@@ -773,15 +850,16 @@ impl Schema {
     /// The format 3 features this table needs, as the manifest names them:
     /// its fields' [`Logical::feature`], `not_null`, `default`,
     /// `semantic_id`, [`Analyzer::feature`], `media` ([`Field::media`]) and
-    /// `derive` ([`Field::derive`]), and its options `shard_by`, `cluster_by`
-    /// and `retain` ([`Schema::with_shard_by`], [`Schema::with_cluster_by`],
-    /// [`Schema::with_retain`]).
+    /// `derive` ([`Field::derive`]), and its options `shard_by`, `cluster_by`,
+    /// `retain` and `edge_table` ([`Schema::with_shard_by`],
+    /// [`Schema::with_cluster_by`], [`Schema::with_retain`],
+    /// [`Schema::with_edges`]).
     pub fn features(&self) -> impl Iterator<Item = String> + '_ {
         let fields = self.fields.iter().flat_map(|f| {
             let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default"), f.semantic_id.as_ref().map(|_| "semantic_id"), f.media.map(|_| "media"), f.derive.as_ref().map(|_| "derive")];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
-        let options = [self.shard_by.as_ref().map(|_| "shard_by"), self.cluster_by.as_ref().map(|_| "cluster_by"), self.retain.as_ref().map(|_| "retain")];
+        let options = [self.shard_by.as_ref().map(|_| "shard_by"), self.cluster_by.as_ref().map(|_| "cluster_by"), self.retain.as_ref().map(|_| "retain"), self.edges.as_ref().map(|_| "edge_table")];
         fields.chain(options.into_iter().flatten().map(String::from))
     }
 
@@ -915,7 +993,8 @@ impl Schema {
     /// each segment's rows by it ([`Schema::with_cluster_by`]), and
     /// `"retain": "400 days"` keeps rows for that long after the time in
     /// `"retain_by"` (default: the table's only TIMESTAMP field;
-    /// [`Schema::with_retain`]).
+    /// [`Schema::with_retain`]). `"edges": "src, dst, w"` makes each row an
+    /// edge ([`Schema::with_edges`]).
     /// A text field may be made from a media field's file by a model,
     /// `"derive": {"from": "image", "model": "blip-image-captioning-base"}`,
     /// which makes the database format 3 ([`Field::derive`]).
@@ -988,6 +1067,18 @@ impl Schema {
                 schema = schema.with_retain(&r.by, r.seconds)?;
             }
             Some(other) => return Err(bad(format!("retain is a period, as \"400 days\", not {other}"))),
+        }
+        match obj.get("edges") {
+            None | Some(J::Null) => {}
+            Some(J::String(text)) => {
+                let e = Edges::parse(text)?;
+                schema = schema.with_edges(&e.src, &e.dst, e.weight.as_deref())?;
+            }
+            Some(e @ J::Object(_)) => {
+                let e: Edges = serde_json::from_value(e.clone()).map_err(|e| bad(format!("edges: {e}")))?;
+                schema = schema.with_edges(&e.src, &e.dst, e.weight.as_deref())?;
+            }
+            Some(other) => return Err(bad(format!("edges names the source, target and weight fields, as \"src, dst, w\", not {other}"))),
         }
         Ok(schema)
     }
@@ -1098,6 +1189,9 @@ impl Schema {
         if let Some(r) = &self.retain {
             out.insert("retain".into(), json!(r.period()));
             out.insert("retain_by".into(), json!(r.by));
+        }
+        if let Some(e) = &self.edges {
+            out.insert("edges".into(), json!(e.text()));
         }
         out.insert("fields".into(), J::Array(fields));
         J::Object(out)
