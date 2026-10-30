@@ -21,7 +21,7 @@ use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentRea
 use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::Plan;
 use crate::query::stats::TermStats;
-use crate::query::{bind_command, compound, ops, profile, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
+use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
 use crate::schema::{Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn};
@@ -56,6 +56,21 @@ impl PreparedWrite {
             (Write::Insert { docs, .. }, Some(pk)) => docs.iter().map(|d| &d[pk]).collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// The values that place the documents an INSERT writes on shards:
+    /// their keys ([`Self::inserted_keys`]), or for a table placed by a
+    /// column ([`Schema::with_shard_by`]) that column's values.
+    pub fn inserted_places(&self) -> Vec<&Value> {
+        match (&self.write, self.schema.shard_by_field()) {
+            (Write::Insert { docs, .. }, Some(f)) => docs.iter().map(|d| &d[f]).collect(),
+            _ => self.inserted_keys(),
+        }
+    }
+
+    /// The table it writes.
+    pub fn table(&self) -> &Schema {
+        &self.schema
     }
 }
 
@@ -900,6 +915,9 @@ struct Planned {
 /// every text field stored or generated.
 fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], rows: Vec<(Vec<Value>, Document)>, sets: &[(usize, Assign)]) -> Result<Planned> {
     let pk = schema.primary_key.ok_or_else(|| Error::Query(format!("UPDATE needs a primary key, and {} has none", schema.table)))?;
+    if let Some(f) = schema.shard_by_field().filter(|f| sets.iter().any(|(g, _)| g == f)) {
+        return Err(Error::Query(format!("{} places {}'s rows on shards (shard_by), so UPDATE does not change it: delete the row and insert it again", schema.fields[f].name, schema.table)));
+    }
     let rewrite = !in_place(schema, sets);
     if rewrite {
         if let Some(f) = schema.fields.iter().find(|f| matches!(f.ty, FieldType::Text { .. }) && !f.stored && f.generated_from.is_empty()) {
@@ -1090,20 +1108,9 @@ impl DocumentSource for StoredSource {
 }
 
 /// The plan of a SELECT over `snap`'s tables: the executor's query of one
-/// table, or a compound one's operators ([`compound::needs`]) over any.
+/// table, or a compound one's operators ([`compound::needs`]) over any
+/// ([`compound::plan_read`]).
 fn plan_of(snap: &Snapshot, q: &sqlparser::ast::Query, params: &Params) -> Result<Plan> {
-    let profile_of = |t: &str, name: &str| snap.table(t).and_then(|v| v.rank_profile(name).cloned());
-    if let Some((q, r)) = profile::expand(q, &profile_of)? {
-        let table = tables::read_by(&q).first().cloned().unwrap_or_default();
-        return Ok(profile::mark(plan_of(snap, &q, params)?, &table, &r));
-    }
-    let view = match tables::read_by(q).first() {
-        None => snap.clone(),
-        Some(t) => snap.table(t).ok_or_else(|| Error::Query(format!("no such table: {t}")))?,
-    };
-    if compound::needs(q, view.schema()) {
-        let catalog: Vec<&Schema> = snap.schemas().collect();
-        return compound::plan_query(q, &catalog, params);
-    }
-    Ok(Plan::of_select(view.schema(), &qsql::bind_query(q, view.schema(), params)?))
+    let catalog: Vec<&Schema> = snap.schemas().collect();
+    compound::plan_read_query(q, &catalog, params, &|t, name| snap.table(t).and_then(|v| v.rank_profile(name).cloned()))
 }

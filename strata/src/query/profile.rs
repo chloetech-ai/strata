@@ -386,6 +386,9 @@ pub fn mark(plan: Plan, table: &str, r: &ProfileRef) -> Plan {
     Plan::new(root)
 }
 
+const STALE: &str = "is not the one the plan was made with";
+const GONE: &str = "which the plan ranks as";
+
 /// Refuses a plan made with a rank profile that a table here does not
 /// have as the plan names it: `hash_of(table, name)` is the hash of a
 /// table's profile of that name, if it has one.
@@ -395,9 +398,16 @@ pub fn check_plan(plan: &Plan, hash_of: &dyn Fn(&str, &str) -> Option<String>) -
         let Some(r) = s.profile.as_ref().filter(|_| bad.is_none()) else { return };
         bad = match hash_of(&s.table, &r.name) {
             Some(h) if h == r.hash => None,
-            Some(h) => Some(format!("rank profile {} of {} is not the one the plan was made with (hash {h} here, {} in the plan): it was replaced since, or the copies differ", r.name, s.table, r.hash)),
-            None => Some(format!("{} has no rank profile {}, which the plan ranks as", s.table, r.name)),
+            Some(h) => Some(format!("rank profile {} of {} {STALE} (hash {h} here, {} in the plan): it was replaced since, or the copies differ", r.name, s.table, r.hash)),
+            None => Some(format!("{} has no rank profile {}, {GONE}", s.table, r.name)),
         };
     });
     bad.map_or(Ok(()), |m| Err(err(m)))
+}
+
+/// Whether an error says what [`check_plan`] says of a plan whose rank
+/// profile has changed or gone: a coordinator that planned with what its
+/// shards held before plans again.
+pub fn is_stale(message: &str) -> bool {
+    message.contains(STALE) || message.contains(GONE)
 }

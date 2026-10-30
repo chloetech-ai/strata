@@ -229,10 +229,10 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         svc.max_body = o.max_body_mb.saturating_mul(1 << 20);
     }
     svc.open_models(&o.models);
-    for m in &svc.models {
+    for m in svc.models().iter() {
         match &m.model {
-            Ok(e) => tracing::info!(field = %m.field, model = %e.name(), from = %m.spec.from.join(" + "), "embedded field"),
-            Err(why) => tracing::warn!(field = %m.field, model = %m.spec.model, from = %m.spec.from.join(" + "), error = %why, "cannot run this embedded field's model: writes must supply its vectors"),
+            Ok(e) => tracing::info!(table = %m.table, field = %m.field, model = %e.name(), from = %m.spec.from.join(" + "), "embedded field"),
+            Err(why) => tracing::warn!(table = %m.table, field = %m.field, model = %m.spec.model, from = %m.spec.from.join(" + "), error = %why, "cannot run this embedded field's model: writes must supply its vectors"),
         }
     }
     if let (Some(fill), Backend::Local(db)) = (fill, &svc.backend) {
@@ -327,8 +327,9 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
 }
 
 /// `strata-server import`: loads `files` into the database at `path`,
-/// created with `schema` if it does not exist, and says what each wrote.
-pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: Option<Format>, directory: bool, files: &[PathBuf]) -> Result<(), String> {
+/// created with `schema` if it does not exist, into its table `table` (the
+/// first if `None`), and says what each wrote.
+pub fn import_files(path: &Path, schema: Option<&Path>, table: Option<&str>, models: &Path, format: Option<Format>, directory: bool, files: &[PathBuf]) -> Result<(), String> {
     let opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, build: build_options(), ..DbOptions::default() };
     let db = if path.exists() {
         if schema.is_some() {
@@ -344,9 +345,10 @@ pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: O
     for (field, why) in db.open_embedders(models) {
         tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
     }
+    let table = table.map_or_else(|| db.schema().table.clone(), String::from);
     for file in files {
         let t0 = std::time::Instant::now();
-        let r = strata::ingest::import_file(&db, file, format).map_err(|e| format!("{}: {e}", file.display()))?;
+        let r = strata::ingest::import_file_into(&db, &table, file, format).map_err(|e| format!("{}: {e}", file.display()))?;
         let how = if r.bulk { "loaded" } else { "upserted" };
         tracing::info!(file = %file.display(), rows = r.rows, how, secs = t0.elapsed().as_secs_f64(), "imported");
         if !r.unknown.is_empty() {

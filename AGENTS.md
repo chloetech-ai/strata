@@ -119,6 +119,11 @@ pip install maturin pytest && maturin develop --release && pytest tests
 CI also runs `cargo clippy --release --all-targets -- -A clippy::style -A
 clippy::complexity -A clippy::perf -D warnings` in each crate.
 
+CI runs the tests with `cargo test --profile ci`: release without link-time
+optimisation and with 16 codegen units (each crate's `Cargo.toml`), which
+builds Strata's hundred test binaries in minutes rather than half an hour.
+Use it locally too when only the tests matter; benchmarks keep `--release`.
+
 Benchmark numbers in `docs/`, the reports and `*/results/` are measured, not
 edited: change them only by re-running the benchmark, and name the machine a
 number came from.

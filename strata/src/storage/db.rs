@@ -3024,6 +3024,16 @@ impl TableRef {
         self.schema.primary_key.ok_or_else(|| Error::Schema(format!("table {} has no primary key", self.schema.table)))
     }
 
+    /// Refuses to change field `i` in place when it places the table's
+    /// rows on shards ([`crate::schema::Schema::with_shard_by`]): the row
+    /// would stay on the shard of its old value.
+    fn check_not_placing(&self, i: usize) -> Result<()> {
+        match self.schema.shard_by_field() == Some(i) {
+            true => Err(Error::Schema(format!("{} places {}'s rows on shards (shard_by), so it is not changed in place: delete the row and write it again", self.schema.fields[i].name, self.schema.table))),
+            false => Ok(()),
+        }
+    }
+
     /// Checks that `key` has the primary key's type.
     fn key_of(&self, key: &Value) -> Result<Key> {
         let pk = self.primary_key()?;
@@ -3230,6 +3240,7 @@ impl<'a> WriteTxn<'a> {
     fn set_in(&mut self, t: &TableRef, key: &Value, field: &str, value: Value) -> Result<bool> {
         let k = t.key_of(key)?;
         let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        t.check_not_placing(i)?;
         let f = &t.schema.fields[i];
         let value = match (&f.ty, f.store(value)?) {
             _ if f.multi || Some(i) == t.schema.primary_key => {
@@ -3260,6 +3271,7 @@ impl<'a> WriteTxn<'a> {
     fn add_in(&mut self, t: &TableRef, key: &Value, field: &str, delta: &Value) -> Result<bool> {
         let k = t.key_of(key)?;
         let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        t.check_not_placing(i)?;
         if let Some(l) = t.schema.fields[i].logical {
             return Err(Error::Schema(format!("{field} is a {}: set it rather than add to it", l.type_name())));
         }

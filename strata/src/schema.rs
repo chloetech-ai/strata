@@ -352,11 +352,15 @@ pub struct Schema {
     pub fields: Vec<Field>,
     /// Index into `fields` of the primary key (a Keyword or Int field).
     pub primary_key: Option<usize>,
+    /// The field whose value places a row on a shard instead of its key
+    /// ([`Schema::with_shard_by`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_by: Option<String>,
 }
 
 impl Schema {
     pub fn new(table: &str, fields: Vec<Field>, primary_key: Option<&str>) -> Result<Self> {
-        let s = Schema { table: table.to_string(), fields, primary_key: None };
+        let s = Schema { table: table.to_string(), fields, primary_key: None, shard_by: None };
         let mut s = s;
         if let Some(pk) = primary_key {
             let i = s.field_index(pk).ok_or_else(|| Error::Schema(format!("no primary key field {pk}")))?;
@@ -454,6 +458,35 @@ impl Schema {
         Ok(s)
     }
 
+    /// Places this table's rows on shards by the value of `field` instead
+    /// of their key: a coordinator writes each row to the shard that holds
+    /// its value's slot, so that rows sharing a value (a user's events)
+    /// live on one shard. `field` is a stored, single-valued KEYWORD or INT
+    /// other than the key, and NOT NULL, so that every row has a place. It
+    /// makes the database format 3 (feature `shard_by`).
+    pub fn with_shard_by(mut self, field: &str) -> Result<Schema> {
+        let i = self.field_index(field).ok_or_else(|| Error::Schema(format!("shard_by names {field}, which is not a field of {}", self.table)))?;
+        let f = &self.fields[i];
+        let bad = |m: &str| Err(Error::Schema(format!("shard_by {}: {m}", f.name)));
+        if self.primary_key == Some(i) {
+            return bad("rows are placed by their key already; leave shard_by out");
+        }
+        if f.multi || f.logical.is_some() || !matches!(f.ty, FieldType::Keyword | FieldType::Int) || !f.stored {
+            return bad("rows are placed by a stored, single-valued KEYWORD or INT field");
+        }
+        if !f.not_null {
+            return bad("every row needs a place: declare the field NOT NULL (\"not_null\": true)");
+        }
+        self.shard_by = Some(f.name.clone());
+        Ok(self)
+    }
+
+    /// The position of the field that places rows on shards
+    /// ([`Schema::with_shard_by`]).
+    pub fn shard_by_field(&self) -> Option<usize> {
+        self.shard_by.as_deref().and_then(|f| self.field_index(f))
+    }
+
     /// An indexed TEXT or SPARSE field that is neither stored nor
     /// generated: nothing can rebuild its index when segments merge.
     /// [`Schema::new`] refuses them; databases created before it did can
@@ -494,14 +527,15 @@ impl Schema {
         Ok(())
     }
 
-    /// The format 3 features this table's fields need, as the manifest
-    /// names them: [`Logical::feature`], `not_null`, `default` and
-    /// [`Analyzer::feature`].
+    /// The format 3 features this table needs, as the manifest names them:
+    /// its fields' [`Logical::feature`], `not_null`, `default` and
+    /// [`Analyzer::feature`], and `shard_by` ([`Schema::with_shard_by`]).
     pub fn features(&self) -> impl Iterator<Item = String> + '_ {
-        self.fields.iter().flat_map(|f| {
+        let fields = self.fields.iter().flat_map(|f| {
             let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default")];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
-        })
+        });
+        fields.chain(self.shard_by.as_ref().map(|_| "shard_by".to_string()))
     }
 
     /// A row that holds each field's default, written at `now`
@@ -610,7 +644,9 @@ impl Schema {
     /// `"not_null": true` refuses rows without a value, and `"default"` is
     /// the value a row that leaves the field out takes (`"now"` for a
     /// TIMESTAMP is the time of the write); either makes the database
-    /// format 3 ([`Field::not_null`], [`Field::default`]).
+    /// format 3 ([`Field::not_null`], [`Field::default`]). `"shard_by":
+    /// "usr"` places the table's rows on shards by that field rather than
+    /// their key ([`Schema::with_shard_by`]).
     ///
     /// The long form is this type's own serialization (what
     /// `GET /v1/schema` returns), with `primary_key` the key field's
@@ -641,7 +677,12 @@ impl Schema {
             }
             Some(other) => return Err(bad(format!("the key is a field name, not {other}"))),
         };
-        Schema::new(table, fields, key.as_deref())
+        let schema = Schema::new(table, fields, key.as_deref())?;
+        match obj.get("shard_by") {
+            None | Some(J::Null) => Ok(schema),
+            Some(J::String(f)) => schema.with_shard_by(f),
+            Some(other) => Err(bad(format!("shard_by is a field name, not {other}"))),
+        }
     }
 
     /// The short JSON form ([`Schema::from_json`]), defaults left out.
@@ -728,6 +769,9 @@ impl Schema {
         out.insert("table".into(), json!(self.table));
         if let Some(k) = self.primary_key {
             out.insert("key".into(), json!(self.fields[k].name));
+        }
+        if let Some(f) = &self.shard_by {
+            out.insert("shard_by".into(), json!(f));
         }
         out.insert("fields".into(), J::Array(fields));
         J::Object(out)

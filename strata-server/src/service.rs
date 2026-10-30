@@ -16,9 +16,9 @@ use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
 use strata::query::sql::{ident, quoted};
-use strata::query::{compound, ops, Params, Select};
+use strata::query::{bind_command, compound, ops, profile, Command, Params, Select};
 use strata::schema::Schema;
-use strata::storage::{CheckpointOptions, CheckpointStats, Layout, Snapshot, WriteTxn};
+use strata::storage::{CheckpointOptions, CheckpointStats, Layout, RankProfile, Snapshot, TableTxn, WriteTxn};
 use strata::text::Synonyms;
 use strata::value::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -123,7 +123,9 @@ pub struct Answer {
 /// An embedded VECTOR field ([`strata::Embed`]) and its model, which
 /// computes the vectors writes leave out and embeds `{"embed": "text"}`
 /// parameters.
+#[derive(Clone)]
 pub struct FieldModel {
+    pub table: String,
     pub field: String,
     pub spec: strata::Embed,
     /// The model, or why it did not open (then writes must supply the
@@ -144,8 +146,12 @@ pub struct Service {
     pub schema: Schema,
     pub metrics: Metrics,
     pub agent: AgentConfig,
-    /// The embedded VECTOR fields' models ([`Service::open_models`]).
-    pub models: Vec<FieldModel>,
+    /// The embedded VECTOR fields' models, of every table
+    /// ([`Service::open_models`], [`Service::models`]).
+    models: RwLock<Arc<Vec<FieldModel>>>,
+    /// Where [`Service::open_models`] opened them, for tables created
+    /// later.
+    models_dir: Option<PathBuf>,
     /// Default query deadline.
     pub timeout: Duration,
     /// The longest deadline a request may ask for (`timeout_ms`).
@@ -233,7 +239,8 @@ impl Service {
             schema,
             metrics: Metrics::default(),
             agent,
-            models: Vec::new(),
+            models: RwLock::new(Arc::new(Vec::new())),
+            models_dir: None,
             timeout,
             max_timeout: timeout.max(Duration::from_secs(60)),
             slow: None,
@@ -430,8 +437,8 @@ impl Service {
             }
         }
         if !held.as_ref().is_some_and(|(m, s)| *s == shard && m.same_slots(&map, shard)) {
-            let (m, schema) = (map.clone(), self.schema.clone());
-            let elsewhere = tokio::task::spawn_blocking(move || rows_elsewhere(&db, &schema, &m, shard)).await.map_err(ApiError::internal)??;
+            let m = map.clone();
+            let elsewhere = tokio::task::spawn_blocking(move || rows_elsewhere(&db, &m, shard)).await.map_err(ApiError::internal)??;
             if let Some((n, key)) = elsewhere {
                 let other = map.shard_of(&key);
                 return Err(conflict(format!(
@@ -468,16 +475,18 @@ impl Service {
         }
     }
 
-    /// Refuses (400) to write a key whose slot another shard holds, when
-    /// this shard has a slot map.
-    fn check_keys<'a>(&self, keys: impl IntoIterator<Item = &'a Value>) -> Result<(), ApiError> {
+    /// Refuses (400) to write a row placed in a slot another shard holds,
+    /// when this shard has a slot map: by its key, or by its table's
+    /// shard_by value ([`op_place`]), each named by `what` (`key`, or the
+    /// shard_by field's name).
+    fn check_keys<'a>(&self, keys: impl IntoIterator<Item = (&'a str, &'a Value)>) -> Result<(), ApiError> {
         let held = self.slots.read().unwrap_or_else(|e| e.into_inner());
         let Some((map, shard)) = &*held else { return Ok(()) };
-        for key in keys {
+        for (what, key) in keys {
             let s = slots::slot(key);
             if map.owner(s) != *shard {
                 return Err(ApiError::bad(format!(
-                    "key {} is in slot {s}, which shard {} holds under slot map epoch {}, not this shard ({shard}): write through the coordinator",
+                    "{what} {} is in slot {s}, which shard {} holds under slot map epoch {}, not this shard ({shard}): write through the coordinator",
                     js::to_json(key),
                     map.owner(s),
                     map.epoch
@@ -487,34 +496,76 @@ impl Service {
         Ok(())
     }
 
-    /// Opens the model of each embedded VECTOR field from `dir`
-    /// ([`strata::embed::open`]); a local database computes the vectors
-    /// its writes leave out with them.
+    /// Opens the model of each embedded VECTOR field, of every table, from
+    /// `dir` ([`strata::embed::open`]); a local database computes the
+    /// vectors its writes leave out with them, and opens those of tables
+    /// created later ([`Db::open_embedders`]).
     pub fn open_models(&mut self, dir: &std::path::Path) {
-        self.models = self
-            .schema
-            .fields
-            .iter()
-            .filter_map(|f| {
-                let spec = f.embed.clone()?;
-                let model = strata::embed::open(&spec.model, dir).and_then(|m| match &self.backend {
-                    Backend::Local(db) => db.set_embedder(&f.name, m.clone()).map(|_| m),
-                    Backend::Cluster(_) => Ok(m),
-                });
-                Some(FieldModel { field: f.name.clone(), spec, model: model.map_err(|e| e.to_string()) })
-            })
-            .collect();
+        self.models_dir = Some(dir.to_path_buf());
+        if let Backend::Local(db) = &self.backend {
+            db.open_embedders(dir);
+        }
+        self.refresh_models();
     }
 
-    /// The model of embedded field `field`, or of the first embedded field
-    /// that has one.
-    pub fn model(&self, field: Option<&str>) -> Result<(&str, &Arc<dyn Embedder>), ApiError> {
+    /// The embedded fields' models ([`Service::open_models`]).
+    pub fn models(&self) -> Arc<Vec<FieldModel>> {
+        self.models.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Lists the model of each embedded field of every table now, keeping
+    /// those already listed: after `CREATE TABLE`, and when a coordinator
+    /// learns of new tables. Nothing before [`Service::open_models`].
+    fn refresh_models(&self) {
+        let Some(dir) = &self.models_dir else { return };
+        let old = self.models();
+        let mut list = Vec::new();
+        for t in self.catalog() {
+            for f in &t.fields {
+                let Some(spec) = f.embed.clone() else { continue };
+                if let Some(m) = old.iter().find(|m| m.table.eq_ignore_ascii_case(&t.table) && m.field == f.name && m.spec == spec) {
+                    list.push(m.clone());
+                    continue;
+                }
+                let model = match &self.backend {
+                    Backend::Local(db) => match db.embedder_in(&t.table, &f.name) {
+                        Some(m) => Ok(m),
+                        None => strata::embed::open(&spec.model, dir).and_then(|m| db.set_embedder_in(&t.table, &f.name, m.clone()).map(|_| m)),
+                    },
+                    Backend::Cluster(_) => strata::embed::open(&spec.model, dir),
+                };
+                list.push(FieldModel { table: t.table.clone(), field: f.name.clone(), spec, model: model.map_err(|e| e.to_string()) });
+            }
+        }
+        *self.models.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(list);
+    }
+
+    /// Whether this server embeds any field's text.
+    fn embeds(&self) -> bool {
+        self.models().iter().any(|m| m.model.is_ok())
+    }
+
+    /// The model of embedded field `field` of `table`, or of the first
+    /// embedded field that has one: of `table` when it is given, else of
+    /// the first table that has such a field, in the database's order.
+    pub fn model(&self, table: Option<&str>, field: Option<&str>) -> Result<(String, String, Arc<dyn Embedder>), ApiError> {
+        let mut models = self.models();
+        // A table created since the models were listed.
+        if table.is_some_and(|t| !models.iter().any(|m| m.table.eq_ignore_ascii_case(t))) {
+            self.refresh_models();
+            models = self.models();
+        }
+        let of_table = |m: &&FieldModel| table.is_none_or(|t| m.table.eq_ignore_ascii_case(t));
+        let named = match table {
+            Some(t) => format!("{t}.{}", field.unwrap_or("")),
+            None => field.unwrap_or("").to_string(),
+        };
         let m = match field {
-            Some(f) => self.models.iter().find(|m| m.field.eq_ignore_ascii_case(f)).ok_or_else(|| ApiError::bad(format!("{f} is not an embedded VECTOR field; pass a vector")))?,
-            None => self.models.iter().find(|m| m.model.is_ok()).ok_or_else(|| ApiError::bad("this table has no field this server can embed text for; pass a vector"))?,
+            Some(f) => models.iter().filter(of_table).find(|m| m.field.eq_ignore_ascii_case(f)).ok_or_else(|| ApiError::bad(format!("{named} is not an embedded VECTOR field; pass a vector")))?,
+            None => models.iter().filter(of_table).find(|m| m.model.is_ok()).ok_or_else(|| ApiError::bad("no table has a field this server can embed text for; pass a vector"))?,
         };
         match &m.model {
-            Ok(e) => Ok((&m.field, e)),
+            Ok(e) => Ok((m.table.clone(), m.field.clone(), e.clone())),
             Err(why) => Err(ApiError::bad(format!("{}'s model {} is not available here ({why}); pass a vector", m.field, m.spec.model))),
         }
     }
@@ -523,33 +574,38 @@ impl Service {
     /// before they queue for the writer, so that models run on many cores
     /// rather than in the writer thread.
     fn embed_ops(&self, db: &Db, ops: &mut [Json]) -> Result<(), ApiError> {
-        let wanted: Vec<usize> = self.models.iter().filter(|m| m.model.is_ok()).filter_map(|m| self.schema.field_index(&m.field)).collect();
-        if wanted.is_empty() {
-            return Ok(());
-        }
+        let models = self.models();
         let writes_doc = |op: &Json| matches!(op.get("op").and_then(|o| o.as_str()), Some("insert" | "upsert" | "upsert_if_newer"));
-        let mut at = Vec::new();
-        let mut docs = Vec::new();
         let now = strata::timestamp::now();
-        for (i, op) in ops.iter().enumerate() {
-            if writes_doc(op) && op.get("doc").is_some_and(|d| d.is_object()) {
-                docs.push(js::document(&self.schema, &op["doc"], now)?);
-                at.push(i);
-            }
-        }
-        let before: Vec<Vec<bool>> = docs.iter().map(|d| wanted.iter().map(|&f| matches!(d[f], Value::Null)).collect()).collect();
         let t0 = Instant::now();
-        db.embed_missing(&mut docs);
-        let n = before.iter().flatten().filter(|&&m| m).count() as u64;
-        if n > 0 {
-            self.metrics.embedded("write", n, t0.elapsed().as_secs_f64());
-        }
-        for ((i, d), missing) in at.into_iter().zip(&docs).zip(before) {
-            for (&f, was_missing) in wanted.iter().zip(missing) {
-                if let (true, Value::Vector(v)) = (was_missing, &d[f]) {
-                    ops[i]["doc"][self.schema.fields[f].name.as_str()] = json!(v.as_ref());
+        let mut n = 0;
+        let first = db.schema().table.clone();
+        for schema in db.catalog() {
+            let wanted: Vec<usize> = models.iter().filter(|m| m.model.is_ok() && m.table.eq_ignore_ascii_case(&schema.table)).filter_map(|m| schema.field_index(&m.field)).collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let mut at = Vec::new();
+            let mut docs = Vec::new();
+            for (i, op) in ops.iter().enumerate() {
+                if writes_doc(op) && op.get("doc").is_some_and(|d| d.is_object()) && op_table(op, &first)?.eq_ignore_ascii_case(&schema.table) {
+                    docs.push(js::document(&schema, &op["doc"], now)?);
+                    at.push(i);
                 }
             }
+            let before: Vec<Vec<bool>> = docs.iter().map(|d| wanted.iter().map(|&f| matches!(d[f], Value::Null)).collect()).collect();
+            db.embed_missing_in(&schema.table, &mut docs)?;
+            n += before.iter().flatten().filter(|&&m| m).count() as u64;
+            for ((i, d), missing) in at.into_iter().zip(&docs).zip(before) {
+                for (&f, was_missing) in wanted.iter().zip(missing) {
+                    if let (true, Value::Vector(v)) = (was_missing, &d[f]) {
+                        ops[i]["doc"][schema.fields[f].name.as_str()] = json!(v.as_ref());
+                    }
+                }
+            }
+        }
+        if n > 0 {
+            self.metrics.embedded("write", n, t0.elapsed().as_secs_f64());
         }
         Ok(())
     }
@@ -653,9 +709,18 @@ impl Service {
     /// writer records `key`'s outcome, even if this future is dropped.
     async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue) -> Result<Written, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
-        match &job {
-            WriteJob::Ops(ops) => self.check_keys(&ops.iter().map(|op| op_key(&self.schema, op)).collect::<Result<Vec<_>, _>>()?)?,
-            WriteJob::Sql(p) => self.check_keys(p.inserted_keys())?,
+        if self.slots().is_some() {
+            match &job {
+                WriteJob::Ops(ops) => {
+                    let catalog = self.catalog();
+                    let places = ops.iter().map(|op| op_schema(&catalog, op).and_then(|t| Ok((place_name(t), op_place(t, op)?)))).collect::<Result<Vec<_>, _>>()?;
+                    self.check_keys(places.iter().map(|(w, v)| (*w, v)))?
+                }
+                WriteJob::Sql(p) => {
+                    let what = place_name(p.table());
+                    self.check_keys(p.inserted_places().into_iter().map(|v| (what, v)))?
+                }
+            }
         }
         let (reply, rx) = tokio::sync::oneshot::channel();
         let keys = self.idempotency.clone();
@@ -672,6 +737,77 @@ impl Service {
         match &self.backend {
             Backend::Local(db) => Some(db),
             Backend::Cluster(_) => None,
+        }
+    }
+
+    /// The database's tables, the first first: a local database's as they
+    /// are now, a coordinator's as its shards last named them
+    /// ([`Coordinator::catalog`]).
+    pub fn catalog(&self) -> Vec<Arc<Schema>> {
+        match &self.backend {
+            Backend::Local(db) => db.catalog(),
+            Backend::Cluster(c) => c.catalog(),
+        }
+    }
+
+    /// The table named `name` (any case). A coordinator that does not know
+    /// it asks its shards again first.
+    pub async fn table(&self, name: &str) -> Result<Arc<Schema>, ApiError> {
+        let find = |c: Vec<Arc<Schema>>| c.into_iter().find(|t| t.table.eq_ignore_ascii_case(name));
+        if let Some(t) = find(self.catalog()) {
+            return Ok(t);
+        }
+        if self.learn_tables(false).await {
+            if let Some(t) = find(self.catalog()) {
+                return Ok(t);
+            }
+        }
+        Err(ApiError::bad(format!("query error: no such table: {name}")))
+    }
+
+    /// A coordinator asks its shards for their tables and rank profiles
+    /// again ([`Coordinator::refresh`]; at most once a second unless
+    /// `now`): whether it learned of a change.
+    async fn learn_tables(&self, now: bool) -> bool {
+        let Backend::Cluster(c) = &self.backend else { return false };
+        let changed = c.refresh(now).await;
+        if changed {
+            self.refresh_models();
+        }
+        changed
+    }
+
+    /// Every table's rank profiles, by table, then name: a local
+    /// database's as they are now, a coordinator's as its shards last held
+    /// them alike ([`Coordinator::rank_profiles`]).
+    pub fn rank_profiles(&self) -> Vec<(String, RankProfile)> {
+        match &self.backend {
+            Backend::Local(db) => db.catalog().into_iter().flat_map(|t| db.storage().rank_profiles(&t.table).unwrap_or_default().into_iter().map(move |p| (t.table.clone(), p))).collect(),
+            Backend::Cluster(c) => c.rank_profiles().to_vec(),
+        }
+    }
+
+    /// Table `table`'s rank profile named `name`, both in any case.
+    pub fn rank_profile(&self, table: &str, name: &str) -> Option<RankProfile> {
+        let named = |p: &RankProfile| p.name.eq_ignore_ascii_case(name);
+        match &self.backend {
+            Backend::Local(db) => db.storage().rank_profiles(table).ok()?.into_iter().find(named),
+            Backend::Cluster(c) => c.rank_profiles().iter().find(|(t, p)| t.eq_ignore_ascii_case(table) && named(p)).map(|(_, p)| p.clone()),
+        }
+    }
+
+    /// Runs `bind` over the database's tables; a coordinator whose tables
+    /// lack one the statement names, or a rank profile it ranks by, asks
+    /// its shards again, then binds once more.
+    async fn bound<T>(&self, bind: impl Fn(&[&Schema]) -> strata::Result<T>) -> Result<T, ApiError> {
+        let run = || {
+            let c = self.catalog();
+            let refs: Vec<&Schema> = c.iter().map(|t| &**t).collect();
+            bind(&refs)
+        };
+        match run() {
+            Err(e) if (e.to_string().contains("no such table") || e.to_string().contains("has no rank profile named")) && self.learn_tables(false).await => Ok(run()?),
+            r => Ok(r?),
         }
     }
 
@@ -800,17 +936,14 @@ impl Service {
         let m = j.as_object().ok_or_else(|| ApiError::bad("params must be an object"))?;
         for (k, v) in m {
             let value = match v {
-                Json::Object(o) if o.contains_key("vector_of") && o.keys().all(|k| k == "vector_of" || k == "field") => {
-                    let field = match o.get("field").and_then(|f| f.as_str()) {
-                        Some(f) => f.to_string(),
-                        None => self.vector_field().ok_or_else(|| ApiError::bad("the table has no VECTOR field"))?,
-                    };
-                    self.vector_of(&o["vector_of"], &field).await?
+                Json::Object(o) if o.contains_key("vector_of") && o.keys().all(|k| ["vector_of", "field", "table"].contains(&k.as_str())) => {
+                    let table = o.get("table").and_then(|f| f.as_str());
+                    let (table, field) = self.vector_field(table, o.get("field").and_then(|f| f.as_str()))?;
+                    self.vector_of(&table, &o["vector_of"], &field).await?
                 }
-                Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string()) && o.keys().all(|k| k == "embed" || k == "field") => {
-                    let (_, e) = self.model(o.get("field").and_then(|f| f.as_str()))?;
+                Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string()) && o.keys().all(|k| ["embed", "field", "table"].contains(&k.as_str())) => {
+                    let (_, _, e) = self.model(o.get("table").and_then(|t| t.as_str()), o.get("field").and_then(|f| f.as_str()))?;
                     let text = o["embed"].as_str().unwrap_or_default().to_string();
-                    let e = e.clone();
                     let t0 = Instant::now();
                     let core = match tokio::time::timeout(self.timeout, self.embedding.clone().acquire_owned()).await {
                         Ok(p) => p.map_err(ApiError::internal)?,
@@ -832,20 +965,44 @@ impl Service {
         Ok(p)
     }
 
-    pub fn vector_field(&self) -> Option<String> {
-        self.schema.fields.iter().find(|f| matches!(f.ty, strata::FieldType::Vector { .. })).map(|f| f.name.clone())
+    /// The table and VECTOR field `{"vector_of": key}` reads: `field` of
+    /// `table`, or of the first table that has a field so named; with no
+    /// `field`, the first VECTOR field of `table` (or of the first table).
+    pub fn vector_field(&self, table: Option<&str>, field: Option<&str>) -> Result<(String, String), ApiError> {
+        let catalog = self.catalog();
+        let tables: Vec<&Arc<Schema>> = match table {
+            Some(t) => vec![catalog.iter().find(|s| s.table.eq_ignore_ascii_case(t)).ok_or_else(|| ApiError::bad(format!("query error: no such table: {t}")))?],
+            None => match field {
+                Some(_) => catalog.iter().collect(),
+                None => catalog.iter().take(1).collect(),
+            },
+        };
+        for t in tables {
+            let found = match field {
+                Some(f) => t.field(f),
+                None => t.fields.iter().find(|f| matches!(f.ty, strata::FieldType::Vector { .. })),
+            };
+            if let Some(f) = found {
+                return Ok((t.table.clone(), f.name.clone()));
+            }
+        }
+        Err(match field {
+            Some(f) => ApiError::bad(format!("no field {f}")),
+            None => ApiError::bad("the table has no VECTOR field"),
+        })
     }
 
-    /// The vector `field` of the document `key`.
-    pub async fn vector_of(self: &Arc<Self>, key: &Json, field: &str) -> Result<Value, ApiError> {
-        let pk = self.schema.primary_key.ok_or_else(|| ApiError::bad("vector_of needs a primary key"))?;
-        let f = self.schema.field_index(field).ok_or_else(|| ApiError::bad(format!("no field {field}")))?;
-        if !matches!(self.schema.fields[f].ty, strata::FieldType::Vector { .. }) {
+    /// The vector `field` of the document `key` of `table`.
+    pub async fn vector_of(self: &Arc<Self>, table: &str, key: &Json, field: &str) -> Result<Value, ApiError> {
+        let schema = self.table(table).await?;
+        let pk = schema.primary_key.ok_or_else(|| ApiError::bad("vector_of needs a primary key"))?;
+        let f = schema.field_index(field).ok_or_else(|| ApiError::bad(format!("no field {field}")))?;
+        if !matches!(schema.fields[f].ty, strata::FieldType::Vector { .. }) {
             return Err(ApiError::bad(format!("{field} is not a VECTOR field")));
         }
         // Quoted: a field may be named like a keyword (`order`).
-        let sql = format!("SELECT {} FROM {} WHERE {} = :k LIMIT 1", quoted(field), ident(&self.schema.table), quoted(&self.schema.fields[pk].name));
-        let params = Params::new().set("k", js::field_value(&self.schema, pk, key)?);
+        let sql = format!("SELECT {} FROM {} WHERE {} = :k LIMIT 1", quoted(field), ident(&schema.table), quoted(&schema.fields[pk].name));
+        let params = Params::new().set("k", js::field_value(&schema, pk, key)?);
         let a = self.query(QueryReq { sql, params, ..Default::default() }).await?;
         match a.rs.rows.into_iter().next().and_then(|r| r.into_iter().next()) {
             Some(v @ Value::Vector(_)) => Ok(v),
@@ -854,35 +1011,64 @@ impl Service {
         }
     }
 
-    pub async fn query(self: &Arc<Self>, mut req: QueryReq) -> Result<Answer, ApiError> {
+    /// Runs a query, or its plan when it has one. A coordinator plans a
+    /// query by a rank profile with the profile its shards held when it
+    /// last asked; when a shard refuses the plan because its profile has
+    /// changed since (through another coordinator, or on that shard), the
+    /// coordinator asks again and plans once more.
+    pub async fn query(self: &Arc<Self>, req: QueryReq) -> Result<Answer, ApiError> {
+        let again = (matches!(self.backend, Backend::Cluster(_)) && req.plan.is_none() && req.sql.to_ascii_lowercase().contains("rank_profile")).then(|| req.clone());
+        match (self.query_once(req).await, again) {
+            (Err(e), Some(req)) if profile::is_stale(&e.message) => {
+                self.learn_tables(true).await;
+                self.query_once(req).await
+            }
+            (r, _) => r,
+        }
+    }
+
+    async fn query_once(self: &Arc<Self>, mut req: QueryReq) -> Result<Answer, ApiError> {
         let t0 = Instant::now();
         let timeout = self.timeout_of(req.timeout_ms);
-        // A compound query runs as its plan; a coordinator sends the shards
-        // the plan's leaves.
-        if req.plan.is_none() && compound::is_compound(&req.sql, &self.schema) {
-            match compound::plan(&req.sql, &self.schema, &req.params) {
-                Ok(p) => req.plan = Some(Arc::new(p)),
-                Err(e) => {
-                    self.metrics.query("invalid", "error", t0.elapsed().as_secs_f64());
-                    return Err(e.into());
-                }
-            }
-        }
-        if let Some(plan) = req.plan.clone().filter(|p| p.root.uses_operators()) {
-            return self.compound(req, plan, t0, timeout).await;
-        }
-        let bound = match &req.plan {
-            Some(plan) => plan.to_select(&self.schema),
-            None => bind(&req.sql, &self.schema, &req.params),
+        // Bound against every table: a query of one table is the
+        // executor's, any other a compound plan.
+        let plan = match &req.plan {
+            Some(p) => Ok(p.clone()),
+            None => self.bound(|tables| compound::plan_read(&req.sql, tables, &req.params, &|t, n| self.rank_profile(t, n))).await.map(Arc::new),
         };
-        let select = match bound {
-            Ok(s) => s,
+        // A plan made with a rank profile runs only on a database whose
+        // profile of that name is the same.
+        let plan = match (plan, &self.backend) {
+            (Ok(p), Backend::Local(_)) if p.root.has_profiles() => profile::check_plan(&p, &|t, n| self.rank_profile(t, n).map(|p| p.hash())).map(|_| p).map_err(ApiError::from),
+            (p, _) => p,
+        };
+        let bound = match plan {
+            Ok(plan) if plan.root.uses_operators() => {
+                // A compound query runs as its plan; a coordinator sends the
+                // shards the plan's leaves.
+                req.plan = Some(plan.clone());
+                return self.compound(req, plan, t0, timeout).await;
+            }
+            Ok(plan) => match self.table(plan.table()).await {
+                Ok(schema) => {
+                    // A coordinator sends the shards a plan by a rank
+                    // profile as is, naming the profile they check.
+                    if plan.root.has_profiles() {
+                        req.plan = Some(plan.clone());
+                    }
+                    plan.to_select(&schema).map(|select| (schema, select)).map_err(ApiError::from)
+                }
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        match bound {
+            Ok((schema, select)) => self.select(req, schema, select, t0, timeout).await,
             Err(e) => {
                 self.metrics.query("invalid", "error", t0.elapsed().as_secs_f64());
-                return Err(e.into());
+                Err(e)
             }
-        };
-        self.select(req, select, t0, timeout).await
+        }
     }
 
     /// Runs a plan ([`strata::query::ir`]): a read answers as
@@ -892,7 +1078,8 @@ impl Service {
     pub async fn run_plan(self: &Arc<Self>, plan: Plan, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
         let t0 = Instant::now();
         // What the slow-query log shows of the plan.
-        let text = plan.explain(&[&self.schema]).join(" / ");
+        let catalog = self.catalog();
+        let text = plan.explain(&catalog.iter().map(|t| &**t).collect::<Vec<_>>()).join(" / ");
         if plan.is_write() {
             if after != After::Any {
                 return Err(ApiError::bad(FOR_READS));
@@ -908,8 +1095,9 @@ impl Service {
         self.query(req).await.map(SqlAnswer::Rows)
     }
 
-    /// Runs a bound single-table query, on the database or over the shards.
-    async fn select(self: &Arc<Self>, mut req: QueryReq, select: Select, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
+    /// Runs a bound query of table `schema`, on the database or over the
+    /// shards.
+    async fn select(self: &Arc<Self>, mut req: QueryReq, schema: Arc<Schema>, select: Select, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = metrics::kind(&select);
         let mut lease = 0;
         let res = match &self.backend {
@@ -921,6 +1109,7 @@ impl Service {
                     let snap = self.read_snapshot(db, req.snapshot, &req.after, t0 + timeout).await?;
                     let permit = self.admit(timeout).await.ok_or_else(too_many)?;
                     lease = self.held(&req, &snap, timeout)?;
+                    let view = snap.table(&schema.table).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", schema.table)))?;
                     let (running, n) = Running::start(&self.running);
                     let cancel = Cancel::default();
                     // Each running query gets its share of the cores for its
@@ -944,7 +1133,7 @@ impl Service {
                     // and stops at its next check if this future is dropped.
                     let r = tokio::task::spawn_blocking(move || {
                         let _held = (permit, running);
-                        db.execute(&snap, &select, &opts)
+                        db.execute(&view, &select, &opts)
                     })
                     .await;
                     drop(cancel);
@@ -961,7 +1150,7 @@ impl Service {
                     let reach = select.limit.unwrap_or(0).saturating_add(select.offset);
                     let r = match self.max_rows.filter(|&m| reach > m) {
                         Some(m) => Err(ApiError::bad(format!("query error: LIMIT and OFFSET reach row {reach}; a query returns at most {m} rows"))),
-                        None => c.query(&req, &select, t0 + timeout).await.map(|m| (m.rs, m.missing)),
+                        None => c.query(&req, &schema, &select, t0 + timeout).await.map(|m| (m.rs, m.missing)),
                     };
                     drop(permit);
                     r
@@ -1009,7 +1198,7 @@ impl Service {
     /// here.
     async fn compound(self: &Arc<Self>, req: QueryReq, plan: Arc<Plan>, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = "compound";
-        let schema = self.schema.clone();
+        let catalog = self.catalog();
         let deadline = t0 + timeout;
         let req_sql = req.sql.clone();
         // Each leaf checks it: the caller may have stopped waiting.
@@ -1035,7 +1224,16 @@ impl Service {
                 let db = db.clone();
                 let r = tokio::task::spawn_blocking(move || {
                     let _held = (permit, running);
-                    ops::run(&plan, &schema, &mut |leaf| db.execute(&snap, &leaf.to_select(snap.schema())?, &opts), &opts)
+                    let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
+                    ops::run_in(
+                        &plan,
+                        &tables,
+                        &mut |leaf| {
+                            let view = snap.table(leaf.table()).ok_or_else(|| strata::Error::Query(format!("no such table: {}", leaf.table())))?;
+                            db.execute(&view, &leaf.to_select(view.schema())?, &opts)
+                        },
+                        &opts,
+                    )
                 })
                 .await;
                 r.map(|r| r.map(|rs| (rs, Vec::new())))
@@ -1053,13 +1251,15 @@ impl Service {
                     // Shards any leaf was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
                     let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, ..ExecOptions::default() };
-                    let rs = ops::run(&plan, &schema, &mut |leaf| {
+                    let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
+                    let rs = ops::run_in(&plan, &tables, &mut |leaf| {
                         checks.check()?;
-                        let select = leaf.to_select(&schema)?;
+                        let schema = catalog.iter().find(|t| t.table.eq_ignore_ascii_case(leaf.table())).ok_or_else(|| strata::Error::Query(format!("no such table: {}", leaf.table())))?;
+                        let select = leaf.to_select(schema)?;
                         // The shards run the leaf's plan; its text names it in their logs.
-                        let sql = leaf.explain(&[&schema]).join(" / ");
+                        let sql = leaf.explain(&tables).join(" / ");
                         let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, after: req.after.clone(), ..Default::default() };
-                        let m = rt.block_on(obs::scope(id.clone(), c.query(&step, &select, deadline))).map_err(|e| strata::Error::Query(e.message))?;
+                        let m = rt.block_on(obs::scope(id.clone(), c.query(&step, schema, &select, deadline))).map_err(|e| strata::Error::Query(e.message))?;
                         for s in m.missing {
                             if !missing.contains(&s) {
                                 missing.push(s);
@@ -1118,44 +1318,101 @@ impl Service {
     /// (`timeout_ms`, or the default) and a second. The snapshot holds the
     /// writes `after` names ([`After`]).
     pub async fn term_stats(self: &Arc<Self>, sql: &str, plan: Option<&Plan>, params: &Params, after: &After, timeout_ms: u64) -> Result<(TermStats, u64), ApiError> {
-        let select = match plan {
-            Some(p) => p.to_select(&self.schema)?,
-            None => bind(sql, &self.schema, params)?,
+        let bound = match plan {
+            Some(p) => p.clone(),
+            None => self.bound(|tables| compound::plan_read(sql, tables, params, &|t, n| self.rank_profile(t, n))).await?,
         };
+        if bound.root.uses_operators() {
+            return Err(ApiError::bad("term statistics are a single-table query's"));
+        }
+        let schema = self.table(bound.table()).await?;
+        let select = bound.to_select(&schema)?;
         let timeout = self.timeout_of(timeout_ms);
         match &self.backend {
             Backend::Local(db) => {
                 let snap = self.read_snapshot(db, 0, after, Instant::now() + timeout).await?;
                 let lease = self.lease_of(snap.clone(), self.lease_ttl.min(timeout + Duration::from_secs(1)))?;
+                let view = snap.table(&schema.table).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", schema.table)))?;
                 let db = db.clone();
                 let opts = ExecOptions { synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()), ..db.exec.clone() };
-                let stats = tokio::task::spawn_blocking(move || db.term_stats_with(&snap, &select, &opts)).await.map_err(ApiError::internal)??;
+                let stats = tokio::task::spawn_blocking(move || db.term_stats_with(&view, &select, &opts)).await.map_err(ApiError::internal)??;
                 Ok((stats, lease))
             }
-            Backend::Cluster(c) => Ok((c.term_stats(sql, plan, params, after, Instant::now() + timeout).await?.0, 0)),
+            Backend::Cluster(c) => {
+                // A query by a rank profile reaches the shards written out.
+                let given = plan.or(bound.root.has_profiles().then_some(&bound));
+                Ok((c.term_stats(sql, &schema, given, params, after, Instant::now() + timeout).await?.0, 0))
+            }
         }
     }
 
-    /// Any statement: rows for a SELECT, which sees the writes `after`
-    /// names, the documents written otherwise.
+    /// Any statement, on any table: rows for a SELECT, which sees the
+    /// writes `after` names; the documents an INSERT, UPDATE or DELETE
+    /// wrote; none for `CREATE TABLE`, `DROP TABLE` and the `RANK PROFILE`
+    /// statements ([`Self::ddl`]).
     pub async fn sql(self: &Arc<Self>, sql: &str, params: &Params, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
-        if strata::query::bind_write(sql, &self.schema, params)?.is_none() {
-            let a = self.query(QueryReq { sql: sql.into(), params: params.clone(), timeout_ms, after, ..Default::default() }).await?;
-            return Ok(SqlAnswer::Rows(a));
-        }
+        let ddl = match self.bound(|tables| bind_command(sql, tables, params)).await? {
+            Command::Query => {
+                let a = self.query(QueryReq { sql: sql.into(), params: params.clone(), timeout_ms, after, ..Default::default() }).await?;
+                return Ok(SqlAnswer::Rows(a));
+            }
+            Command::Explain { .. } => return Err(ApiError::bad("query error: EXPLAIN runs through POST /v1/explain")),
+            Command::CreateTable { .. } | Command::DropTable { .. } => Some(Ddl::Table),
+            Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Some(Ddl::RankProfile),
+            Command::Write { .. } => None,
+        };
         if after != After::Any {
             return Err(ApiError::bad(FOR_READS));
         }
         let t0 = Instant::now();
-        let r = match &self.backend {
-            Backend::Local(db) => {
+        let r = match (&self.backend, ddl) {
+            (_, Some(ddl)) => self.ddl(sql, params, ddl, timeout_ms).await,
+            (Backend::Local(db), None) => {
                 let (text, p) = (sql.to_string(), params.clone());
                 self.write_local(db, move |db| db.prepare_write(&text, &p), timeout_ms).await
             }
-            Backend::Cluster(c) => c.sql(sql, params).await,
+            (Backend::Cluster(c), None) => c.sql(sql, params).await,
         };
         let w = self.wrote(r, t0, Some(sql))?;
         Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
+    }
+
+    /// `CREATE TABLE` or `DROP TABLE`, `CREATE RANK PROFILE` or `DROP RANK
+    /// PROFILE`: on a local database, once no write holds the writer;
+    /// through a coordinator, on every shard ([`Coordinator::ddl`]). A
+    /// replica refuses it, as it refuses every write. A primary refuses a
+    /// table's: the tables a primary has are not shipped to its replicas
+    /// yet, so each copy takes them before replication starts. A rank
+    /// profile is logged as a write is, so a primary ships it, and answers
+    /// once the copies its acks name hold it.
+    async fn ddl(self: &Arc<Self>, sql: &str, params: &Params, ddl: Ddl, timeout_ms: u64) -> Result<Written, ApiError> {
+        let r = match &self.backend {
+            Backend::Local(db) => {
+                self.takes_writes()?;
+                if let (Replication::Primary(_), Ddl::Table) = (self.replication(), ddl) {
+                    return Err(conflict("CREATE TABLE and DROP TABLE do not reach replicas yet: give each copy its tables before it replicates".into()));
+                }
+                let timeout = self.timeout_of(timeout_ms);
+                let (db, sql, params) = (db.clone(), sql.to_string(), params.clone());
+                let w = tokio::task::spawn_blocking(move || {
+                    wait_for_writer(Instant::now() + timeout, || {
+                        db.sql(&sql, &params)?;
+                        // Its number, or a later one.
+                        Ok(Written { seq_no: db.storage().seq_no().map(|n| n.seq).filter(|_| ddl == Ddl::RankProfile), ..Default::default() })
+                    })
+                })
+                .await
+                .map_err(ApiError::internal)?;
+                match w {
+                    Ok(w) => self.replicated(w, timeout).await,
+                    e => e,
+                }
+            }
+            Backend::Cluster(c) => c.ddl(sql, params).await,
+        };
+        // The models of the tables it made.
+        self.refresh_models();
+        r
     }
 
     /// A write `prepare` binds (`None`: not a write), queued for the writer
@@ -1167,7 +1424,7 @@ impl Service {
     {
         self.writable()?;
         let q = self.enqueue()?;
-        let core = match self.models.iter().any(|m| m.model.is_ok()) {
+        let core = match self.embeds() {
             true => Some(self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?),
             false => None,
         };
@@ -1216,7 +1473,7 @@ impl Service {
                     // Not a retry of a write applied: a primary may refuse
                     // it before applying it.
                     self.admit_write()?;
-                    if self.models.iter().any(|m| m.model.is_ok()) {
+                    if self.embeds() {
                         // Queued writes wait for a core to embed on.
                         let core = self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?;
                         let (svc, db) = (self.clone(), db.clone());
@@ -1274,15 +1531,27 @@ impl Service {
     /// written, so that an import holds its body and two requests' rows,
     /// not every row. Returns the rows written and the fields the schema
     /// lacks (skipped).
-    pub async fn import(self: &Arc<Self>, body: axum::body::Bytes, format: Format) -> Result<(u64, Vec<String>), ApiError> {
-        let schema = self.schema.clone();
+    pub async fn import(self: &Arc<Self>, table: Option<&str>, body: axum::body::Bytes, format: Format) -> Result<(u64, Vec<String>), ApiError> {
+        let schema = match table {
+            Some(t) => self.table(t).await?,
+            None => Arc::new(self.schema.clone()),
+        };
+        // Rows of the first table name none, as before there were tables.
+        let named = table.map(|_| schema.table.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<strata::Result<Vec<Json>>>(1);
         let reader = tokio::task::spawn_blocking(move || -> strata::Result<Vec<String>> {
             let mut check = Rows::new(&schema, std::io::Cursor::new(body.clone()), format)?;
             check.by_ref().try_for_each(|d| d.map(drop))?;
             let mut rows = Rows::new(&schema, std::io::Cursor::new(body), format)?;
             loop {
-                let chunk: strata::Result<Vec<Json>> = rows.by_ref().take(IMPORT_OPS).map(|d| d.map(|d| json!({"op": "upsert", "doc": js::document_json(&schema, &d)}))).collect();
+                let op = |d: strata::value::Document| {
+                    let mut op = json!({"op": "upsert", "doc": js::document_json(&schema, &d)});
+                    if let Some(t) = &named {
+                        op["table"] = json!(t);
+                    }
+                    op
+                };
+                let chunk: strata::Result<Vec<Json>> = rows.by_ref().take(IMPORT_OPS).map(|d| d.map(op)).collect();
                 let last = chunk.as_ref().map_or(true, |c| c.len() < IMPORT_OPS);
                 // The writing side stopped: a write failed.
                 if tx.blocking_send(chunk).is_err() || last {
@@ -1418,6 +1687,13 @@ pub enum SqlAnswer {
     Written { w: Written, took_ms: f64 },
 }
 
+/// What a statement that changes the catalog changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ddl {
+    Table,
+    RankProfile,
+}
+
 /// What a write did: the rows it wrote and, in a database that numbers
 /// its writes (`--seq-no`), its transaction's sequence number. Through a
 /// coordinator, whose shards number their own writes, each shard's
@@ -1457,20 +1733,29 @@ fn too_many() -> ApiError {
     ApiError { status: 429, message: "too many queries running; try again".into() }
 }
 
-/// How many rows of `db` have keys outside shard `shard`'s slots under
-/// `map`, and one of those keys; `None` if every row is in them. Reads
-/// every key.
-fn rows_elsewhere(db: &Db, schema: &Schema, map: &SlotMap, shard: usize) -> Result<Option<(usize, Value)>, ApiError> {
-    let Some(pk) = schema.primary_key else { return Ok(None) };
-    let sql = format!("SELECT {} FROM {}", quoted(&schema.fields[pk].name), ident(&schema.table));
-    let select = bind(&sql, schema, &Params::new())?;
+/// How many rows of `db`, of any table, are placed outside shard
+/// `shard`'s slots under `map`, by their key or their table's shard_by
+/// value ([`Schema::with_shard_by`]), and one of those values; `None` if
+/// every row is in them. Reads every row's.
+fn rows_elsewhere(db: &Db, map: &SlotMap, shard: usize) -> Result<Option<(usize, Value)>, ApiError> {
+    let snap = db.snapshot();
     let opts = ExecOptions { max_rows: None, ..db.exec.clone() };
-    let rs = db.execute(&db.snapshot(), &select, &opts)?;
     let mut out: Option<(usize, Value)> = None;
-    for key in rs.keys.into_iter().filter(|k| map.shard_of(k) != shard) {
-        match &mut out {
-            Some((n, _)) => *n += 1,
-            None => out = Some((1, key)),
+    for schema in db.catalog() {
+        let Some(place) = schema.shard_by_field().or(schema.primary_key) else { continue };
+        let view = snap.table(&schema.table).ok_or_else(|| ApiError::internal(format!("no table {} in its own snapshot", schema.table)))?;
+        let sql = format!("SELECT {} FROM {}", quoted(&schema.fields[place].name), ident(&schema.table));
+        let select = bind(&sql, &schema, &Params::new())?;
+        let rs = db.execute(&view, &select, &opts)?;
+        let values: Vec<Value> = match schema.shard_by_field() {
+            Some(_) => rs.rows.into_iter().filter_map(|r| r.into_iter().next()).collect(),
+            None => rs.keys,
+        };
+        for v in values.into_iter().filter(|v| map.shard_of(v) != shard) {
+            match &mut out {
+                Some((n, _)) => *n += 1,
+                None => out = Some((1, v)),
+            }
         }
     }
     Ok(out)
@@ -1496,6 +1781,43 @@ pub(crate) fn save_json(path: &Path, j: &Json) -> std::io::Result<()> {
         Some(dir) => std::fs::File::open(dir)?.sync_all(),
         None => Ok(()),
     }
+}
+
+/// The table an operation writes: its `"table"`, else `first`.
+fn op_table<'a>(op: &'a Json, first: &'a str) -> Result<&'a str, ApiError> {
+    match op.get("table") {
+        None | Some(Json::Null) => Ok(first),
+        Some(Json::String(t)) => Ok(t),
+        Some(_) => Err(ApiError::bad("an operation's \"table\" is a table's name")),
+    }
+}
+
+/// The table of `catalog` (the database's tables, the first first) that an
+/// operation writes ([`op_table`]).
+pub fn op_schema<'a>(catalog: &'a [Arc<Schema>], op: &Json) -> Result<&'a Arc<Schema>, ApiError> {
+    let first = catalog.first().ok_or_else(|| ApiError::internal("a database without tables"))?;
+    let name = op_table(op, &first.table)?;
+    catalog.iter().find(|t| t.table.eq_ignore_ascii_case(name)).ok_or_else(|| ApiError::bad(format!("query error: no such table: {name}")))
+}
+
+/// What places the row an operation writes on a shard: its key, or for a
+/// table placed by a column ([`Schema::with_shard_by`]) that column's
+/// value, from the operation's document or, for an operation by key, its
+/// `"routing"`.
+pub fn op_place(schema: &Schema, op: &Json) -> Result<Value, ApiError> {
+    let Some(f) = schema.shard_by_field() else { return op_key(schema, op) };
+    let name = schema.fields[f].name.as_str();
+    let given = op.get("doc").and_then(|d| d.get(name)).filter(|v| !v.is_null()).or_else(|| op.get("routing").filter(|v| !v.is_null()));
+    match given {
+        Some(v) => js::field_value(schema, f, v),
+        None => Err(ApiError::bad(format!("{} places its rows on shards by {name} (shard_by): the operation needs the row's {name}, in its doc or as \"routing\"", schema.table))),
+    }
+}
+
+/// What places a row of `schema`'s table on a shard, as messages name
+/// it: `key`, or the shard_by field.
+fn place_name(schema: &Schema) -> &str {
+    schema.shard_by.as_deref().unwrap_or("key")
 }
 
 /// The primary key an operation names (`key`, or the document's).
@@ -1745,11 +2067,11 @@ pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<Written, ApiError> {
 /// rows each wrote, and the transaction's sequence number in a database
 /// that numbers its writes.
 fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<(Vec<u64>, Option<u64>), ApiError> {
-    let schema = db.schema().clone();
+    let catalog = db.catalog();
     let mut t = db.storage().begin()?;
     let mut counts = Vec::with_capacity(requests.len());
     for ops in requests {
-        counts.push(apply_into(&schema, &mut t, ops)?);
+        counts.push(apply_into(&catalog, &mut t, ops)?);
     }
     let seq_no = t.commit_seq()?;
     Ok((counts, seq_no))
@@ -1760,7 +2082,7 @@ fn apply_requests(db: &Db, requests: &[&[Json]]) -> Result<(Vec<u64>, Option<u64
 /// earlier operation of the transaction wrote has none yet). Checked
 /// under the writer lock, so no other write comes between it and the
 /// operation.
-fn check_seq_no(t: &WriteTxn<'_>, op: &Json, key: &Value) -> Result<(), ApiError> {
+fn check_seq_no(t: &TableTxn<'_, '_>, op: &Json, key: &Value) -> Result<(), ApiError> {
     let want = match op.get("if_seq_no") {
         None | Some(Json::Null) => return Ok(()),
         Some(v) => v.as_u64().ok_or_else(|| ApiError::bad("if_seq_no is a sequence number: a whole number from 0"))?,
@@ -1786,16 +2108,19 @@ fn key_text(key: &Value) -> String {
     }
 }
 
-/// Applies one request's `ops`; a TIMESTAMP defaulting to `"now"` takes
-/// the same time in all of them.
-fn apply_into(schema: &Schema, t: &mut WriteTxn<'_>, ops: &[Json]) -> Result<u64, ApiError> {
+/// Applies one request's `ops`, each to the table it names ([`op_table`]);
+/// a TIMESTAMP defaulting to `"now"` takes the same time in all of them.
+fn apply_into(catalog: &[Arc<Schema>], txn: &mut WriteTxn<'_>, ops: &[Json]) -> Result<u64, ApiError> {
     let mut n = 0u64;
     let now = strata::timestamp::now();
     for op in ops {
+        let schema = &**op_schema(catalog, op)?;
+        let mut tt = txn.table(&schema.table)?;
+        let t = &mut tt;
         let kind = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
         let doc = || js::document(schema, op.get("doc").unwrap_or(&Json::Null), now);
         let field = || op.get("field").and_then(|f| f.as_str()).ok_or_else(|| ApiError::bad(format!("{kind} needs a field")));
-        let checked = |t: &WriteTxn<'_>| -> Result<(), ApiError> {
+        let checked = |t: &TableTxn<'_, '_>| -> Result<(), ApiError> {
             match op.get("if_seq_no") {
                 None => Ok(()),
                 Some(_) if kind == "insert" => Err(ApiError::bad("insert takes no if_seq_no: it fails if the row exists")),

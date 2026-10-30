@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Phase, Plan, Search, Set, SortKey, When};
+use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Phase, Plan, ProfileRef, Search, Set, SortKey, When};
 use strata::query::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy};
 use strata::value::Value;
 
@@ -67,6 +67,7 @@ fn node(n: &Node) -> pb::Node {
             filter: bex(&s.filter),
             order: s.order.iter().map(sort_key).collect(),
             phases: s.phases.iter().map(|p| pb::Phase { count: p.count, expr: Some(ex(&p.expr)), global: p.global }).collect(),
+            profile: s.profile.as_ref().map(|r| pb::RankProfileRef { name: r.name.clone(), hash: r.hash.clone() }),
         })),
         Node::Aggregate { input, keys, aggs } => N::Aggregate(Box::new(pb::Aggregate {
             input: boxed(input),
@@ -336,7 +337,8 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
                 None => Expr::Lit(Value::Bool(true)),
             };
             let phases = s.phases.into_iter().map(|p| Ok(Phase { count: p.count, expr: from_ex(p.expr)?, global: p.global })).collect::<Result<_, ApiError>>()?;
-            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()?, phases })
+            let profile = s.profile.map(|r| ProfileRef { name: r.name, hash: r.hash });
+            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()?, phases, profile })
         }
         N::Aggregate(a) => {
             let a = *a;
