@@ -1,6 +1,6 @@
-//! The writes behind the fixtures of formats 2 and 3 and of numbered writes
-//! in this directory (README.md): `examples/format_fixtures.rs` writes them
-//! with this module,
+//! The writes behind the fixtures of formats 2 and 3, of numbered writes
+//! and of rank profiles in this directory (README.md):
+//! `examples/format_fixtures.rs` writes them with this module,
 //! and `tests/format_fixtures.rs` writes them again to check that Strata
 //! still writes the same bytes. The writes are deterministic: two runs give
 //! the same manifests, segments, delete sets, updates and WAL records, and
@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use strata::schema::{Analyzer, Field, FieldType, Schema};
-use strata::storage::{Database, DbOptions, Layout};
+use strata::storage::{Database, DbOptions, Layout, RankProfile};
 use strata::value::Value;
 
 /// 2026-10-01T00:00:00Z in microseconds.
@@ -191,10 +191,60 @@ fn seqno(path: &Path, layout: Layout) {
     tx.commit().unwrap();
 }
 
-/// Writes every fixture set into `out`: `format2/`, `format3/` and
-/// `seqno/`, each with `db.strata` (and its WAL) and `db.dir`.
+pub fn profile(name: &str, ranking: &str, defaults: &[(&str, serde_json::Value)]) -> RankProfile {
+    RankProfile { name: name.into(), ranking: ranking.into(), defaults: defaults.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() }
+}
+
+/// Rank profiles (format 3 with `rank_profiles`): format 2's writes, with
+/// two profiles of `t` logged before its deletes and values set in place,
+/// and flushed with them into the manifest; and logged before the
+/// transaction left in the WAL, a profile of `u`, `t`'s first profile
+/// replaced and its second dropped.
+fn profiles(path: &Path, layout: Layout) {
+    let db = create(path, t(), layout);
+    db.create_table(u()).unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..30 {
+        tx.insert(t_doc(i, 0)).unwrap();
+    }
+    for i in 0..10 {
+        tx.table("u").unwrap().insert(u_doc(i)).unwrap();
+    }
+    tx.commit().unwrap();
+    db.flush().unwrap();
+    db.set_rank_profile("t", profile("by_n", "SELECT * FROM t ORDER BY n DESC", &[]), false).unwrap();
+    let phased = "WITH top AS (SELECT * FROM t ORDER BY bm25(body, :q) DESC LIMIT 20) SELECT * FROM top ORDER BY n * :w DESC";
+    db.set_rank_profile("t", profile("phased", phased, &[("q", serde_json::json!("lorem")), ("w", serde_json::json!(0.5))]), false).unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..5 {
+        tx.delete(&key(i)).unwrap();
+    }
+    for i in 5..8 {
+        tx.set(&key(i), "n", Value::Int(7)).unwrap();
+    }
+    tx.table("u").unwrap().delete(&Value::Int(9)).unwrap();
+    tx.commit().unwrap();
+    db.flush().unwrap();
+    // Left in the WAL.
+    db.set_rank_profile("u", profile("notes", "SELECT * FROM u ORDER BY bm25(note, :q) DESC", &[("q", serde_json::json!("cats"))]), false).unwrap();
+    db.set_rank_profile("t", profile("by_n", "SELECT * FROM t ORDER BY n", &[]), true).unwrap();
+    assert!(db.drop_rank_profile("t", "phased").unwrap());
+    let mut tx = db.begin().unwrap();
+    for i in 30..40 {
+        tx.insert(t_doc(i, 1)).unwrap();
+    }
+    tx.delete(&key(10)).unwrap();
+    tx.upsert(t_doc(11, 2)).unwrap();
+    let mut ut = tx.table("u").unwrap();
+    ut.insert(u_doc(10)).unwrap();
+    ut.upsert(u_doc(3)).unwrap();
+    tx.commit().unwrap();
+}
+
+/// Writes every fixture set into `out`: `format2/`, `format3/`, `seqno/`
+/// and `profiles/`, each with `db.strata` (and its WAL) and `db.dir`.
 pub fn write_all(out: &Path) {
-    for (dir, write) in [("format2", format2 as fn(&Path, Layout)), ("format3", format3), ("seqno", seqno)] {
+    for (dir, write) in [("format2", format2 as fn(&Path, Layout)), ("format3", format3), ("seqno", seqno), ("profiles", profiles)] {
         let d = out.join(dir);
         std::fs::create_dir_all(&d).unwrap();
         write(&d.join("db.strata"), Layout::SingleFile);

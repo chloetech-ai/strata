@@ -72,7 +72,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 
 ## Schemas
 
-A database starts with one table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the UI's schema designer, or `strata.Database.create` in [Python](python.md)). [`CREATE TABLE`](query-language.md#tables) and `DROP TABLE` over `POST /v1/sql` add and drop more, and the server serves every table: SQL names its tables, write operations and imports name theirs (`"table"`, `?table=`; the first table when they name none), `GET /v1/tables` lists the schemas and `GET /v1/schema?table=` gives one. A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
+A database starts with one table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the UI's schema designer, or `strata.Database.create` in [Python](python.md)). [`CREATE TABLE`](query-language.md#tables) and `DROP TABLE` over `POST /v1/sql` add and drop more, and the server serves every table: SQL names its tables, write operations and imports name theirs (`"table"`, `?table=`; the first table when they name none), `GET /v1/tables` lists the schemas and `GET /v1/schema?table=` gives one. [`CREATE RANK PROFILE`](query-language.md#rank-profiles-a-ranking-kept-with-its-table) and `DROP RANK PROFILE` keep rankings with a table the same way; unlike tables, a primary takes them and ships them to its replicas as it ships writes, and answers once the copies its acks name hold them. A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
 
 ```json
 {
@@ -304,7 +304,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/admin/promote` | `{replicas?, write_acks?, force?}` | on a replica: makes it the primary of a new term, shipping to `replicas` (gRPC URLs) under `write_acks` (`all`) ([promotion](#replication-a-primary-and-its-replicas)): `{term, seq_no, replicas: [{url, role, term, seq_no} or {url, error}]}`; 409 while a copy named holds a later transaction or a newer term (unless `force`), and on a server that is not a replica |
 | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` for `PUT` | the synonym list: `{text, rules, file}` |
 | `GET /v1/schema?table=T` | | `{table, schema, short, primary_key, shard_by, embeddings}` of the first table, or of `T` |
-| `GET /v1/tables` | | `{tables: [...]}`: every table's schema, the first first |
+| `GET /v1/tables` | | `{tables: [...]}`: every table's schema and [rank profiles](query-language.md#rank-profiles-a-ranking-kept-with-its-table) (`profiles`), the first first |
 | `GET /v1/health` | | `{status, docs, segments, ...}`, with 503 when the status is `down` or `failing` ([health](#health)) |
 | `GET /livez`, `/readyz` | | `{status}`, with 503 when the server must be restarted ([health](#health)) |
 | `GET /v1/stats`, `/v1/config` | | JSON |
@@ -442,7 +442,7 @@ A sharded collection therefore ranks like one database: the tests run every quer
 
 ### Tables on shards
 
-A coordinator serves the tables every shard has alike (the same names and schemas), in the first shard's order. It learns them when it connects, after `CREATE TABLE` or `DROP TABLE` through it, which it runs on every shard and then asks again, and when a request names a table it does not know (asking at most once a second), so a table made on each shard directly is served from then on. A table some shards lack is not served, and a shard from before tables offers only its first.
+A coordinator serves the tables every shard has alike (the same names and schemas), in the first shard's order. It learns them when it connects, after `CREATE TABLE` or `DROP TABLE` through it, which it runs on every shard and then asks again, and when a request names a table it does not know (asking at most once a second), so a table made on each shard directly is served from then on. A table some shards lack is not served, and a shard from before tables offers only its first. It serves the rank profiles every replica holds alike in the same way, `CREATE` and `DROP RANK PROFILE` through it run on every shard's primary, and a query by a profile plans on the coordinator, written out; a shard whose profile of that name differs refuses the plan (the coordinator then asks the shards again and plans once more), and a shard from before profiles refuses it by its plan feature, `rank_profiles`.
 
 Rows are placed by their primary key, or by the field a table names as `shard_by`:
 
