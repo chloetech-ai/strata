@@ -19,9 +19,10 @@ env:
 
 # The jobs run on the organisation's own runners rather than GitHub's shared
 # ones, so that they no longer wait for the plan's few concurrent jobs:
-# gh-linux (Ubuntu 24.04, 4 cores, 16 GB) and gh-mac (macOS 26, 3 cores,
-# 7 GB). Job names still say ubuntu-latest and macos-latest, which keeps the
-# check names.
+# gh-linux (Ubuntu 24.04, 4 cores, 16 GB), and gh-mac and gh-mac2 (macOS
+# 26, 3 cores, 7 GB): the three macOS test jobs run on gh-mac, fault
+# injection and the Python package on gh-mac2. Job names still say
+# ubuntu-latest and macos-latest, which keeps the check names.
 jobs:
   test:
     name: ${{ matrix.crate }} on ${{ matrix.os }}
@@ -158,7 +159,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac2' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -287,7 +288,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac2' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
