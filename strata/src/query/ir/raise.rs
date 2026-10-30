@@ -73,6 +73,7 @@ fn name(n: &Node) -> &'static str {
         Node::With { .. } => "With",
         Node::Ref { .. } => "Ref",
         Node::Distinct { .. } => "Distinct",
+        Node::DistinctOn { .. } => "DistinctOn",
         Node::KeyOrder { .. } => "KeyOrder",
     }
 }
@@ -438,8 +439,15 @@ impl<'a> Raise<'a> {
 
     fn graph(&mut self, g: &Graph) -> Result<usize> {
         let field = self.field(g.field)?;
-        if !matches!(self.schema.fields[field].ty, FieldType::Edges | FieldType::Vector { .. }) {
-            return Err(err(format!("a traversal needs an EDGES or VECTOR field, not {}", self.schema.fields[field].name)));
+        match &g.edges {
+            // The edge table is checked against this one when the walk runs.
+            Some(_) if self.schema.primary_key != Some(field) => return Err(err("a walk over an edge table names the primary key as its field")),
+            Some(_) if !g.labels.is_empty() => return Err(err("the edges of an edge table have no labels")),
+            Some(_) => {}
+            None if !matches!(self.schema.fields[field].ty, FieldType::Edges | FieldType::Vector { .. }) => {
+                return Err(err(format!("a traversal needs an EDGES or VECTOR field, not {}", self.schema.fields[field].name)));
+            }
+            None => {}
         }
         let seeds = match (self.seeds(&g.seeds)?, g.weights.as_slice()) {
             (s, []) => s,
@@ -464,6 +472,7 @@ impl<'a> Raise<'a> {
         };
         let g = GraphQuery {
             field,
+            edges: g.edges.clone(),
             seeds,
             kind,
             dir: g.dir,
@@ -603,6 +612,10 @@ impl<'a> Raise<'a> {
             Expr::Product(factors) => Score::Product(factors.iter().map(|s| self.score(s)).collect::<Result<_>>()?),
             Expr::Ppr(g) if matches!(g.kind, GraphKind::Ppr { .. }) => Score::Ppr { graph: self.graph(g)? },
             Expr::Hops => Score::Hops { graph: self.hops_graph()?, far_first: false },
+            Expr::Ranked { keys } => {
+                let pk = self.schema.primary_key.ok_or_else(|| err(format!("ranked(keys) ranks rows by their primary keys, and {} has none", self.schema.table)))?;
+                Score::Ranked { keys: keys.iter().map(|k| crate::query::sql::coerced(&self.schema.fields[pk], k.clone())).collect::<Result<_>>()? }
+            }
             e => return Err(err(format!("not a score: {e:?}"))),
         })
     }

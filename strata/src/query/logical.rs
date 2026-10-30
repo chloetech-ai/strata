@@ -145,11 +145,15 @@ pub enum GraphKind {
     Ppr { alpha: f64, eps: f64, max_pushes: u64, weighted: bool },
 }
 
-/// A graph computation over one EDGES field, or over a VECTOR field whose
-/// `k` most similar rows count as a row's neighbours.
+/// A graph computation over one EDGES field, over an edge table, or over a
+/// VECTOR field whose `k` most similar rows count as a row's neighbours.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphQuery {
+    /// The EDGES or VECTOR field; with `edges`, the primary key.
     pub field: usize,
+    /// The edge table walked instead of a field
+    /// ([`crate::schema::Schema::with_edges`]).
+    pub edges: Option<String>,
     pub seeds: Seeds,
     pub kind: GraphKind,
     pub dir: Direction,
@@ -315,6 +319,11 @@ pub enum Score {
     /// The sequence number of the write that last changed the row
     /// (`seq_no()`), in a ranking expression.
     SeqNo,
+    /// A ranking computed outside Strata (`ranked(:keys)`): the rows of
+    /// `keys`, primary keys best first, in their order. Its value is
+    /// `-(position)` from 1, and NULL for a row whose key is not listed;
+    /// a key listed twice ranks where it is first.
+    Ranked { keys: Vec<Value> },
     /// 1 for a row the predicate holds for, as `WHERE` would keep it, and
     /// 0 for others: the test of a [`Score::Case`] branch.
     Cond(Box<Pred>),
@@ -380,7 +389,7 @@ impl Score {
     pub fn is_leaf(&self) -> bool {
         matches!(
             self,
-            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Cond(_)
+            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Ranked { .. } | Score::Cond(_)
         )
     }
 
@@ -392,10 +401,11 @@ impl Score {
     }
 
     /// Whether the score ranks by relevance to the query (BM25,
-    /// similarity, sparse, graph), as opposed to a row's own values (a column, a
-    /// decay), which only boost rows found by relevance.
+    /// similarity, sparse, graph, a ranking given by key), as opposed to a
+    /// row's own values (a column, a decay), which only boost rows found by
+    /// relevance.
     pub fn is_relevance(&self) -> bool {
-        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Ppr { .. } | Score::Hops { .. })
+        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Ranked { .. })
     }
 
     /// Whether the score can be a term of the fused shapes
@@ -454,7 +464,10 @@ impl Score {
                 let mut fs = Vec::new();
                 factors(self.clone(), &mut fs);
                 let (scores, rest): (Vec<Score>, Vec<Score>) = fs.into_iter().partition(Score::is_fusable);
-                if scores.len() > 1 && rest.iter().all(|f| matches!(f, Score::Num(_))) {
+                // A product counts a factor below 0 as 0, and `ranked()` is
+                // below 0 for every row: it multiplies as arithmetic.
+                let ranked = scores.iter().any(|f| matches!(f, Score::Ranked { .. }));
+                if scores.len() > 1 && !ranked && rest.iter().all(|f| matches!(f, Score::Num(_))) {
                     // Constant factors scale the product of scores.
                     let c: f64 = rest.iter().map(|f| if let Score::Num(c) = f { *c } else { 1.0 }).product();
                     let product = Score::Product(scores);

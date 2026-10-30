@@ -98,6 +98,24 @@ impl Updates {
         self.layers.iter().rev().find_map(|m| m.get(&key))
     }
 
+    /// The entries of every layer, an entry replaced in a later layer
+    /// counted again: what reading all of them costs.
+    pub fn stored(&self) -> usize {
+        self.layers.iter().map(|m| m.len()).sum()
+    }
+
+    /// Calls `f` with each updated document of `field` and its value,
+    /// layer by layer from the oldest, so a document's last call has its
+    /// newest value.
+    pub fn each_oldest_first(&self, field: usize, mut f: impl FnMut(DocId, &Value)) {
+        let fl = field as u16;
+        for m in &self.layers {
+            for (&(_, d), v) in m.range((fl, 0)..=(fl, DocId::MAX)) {
+                f(d, v);
+            }
+        }
+    }
+
     /// Whether any document's `field` was updated.
     pub fn has(&self, field: usize) -> bool {
         let f = field as u16;

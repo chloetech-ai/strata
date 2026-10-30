@@ -614,10 +614,10 @@ impl Service {
 
     /// Does the work the documents of `ops` leave to the server before
     /// they queue for the writer: resolves their MEDIA values (fetching
-    /// files, [`strata::db::Db::resolve_media_in`]) and computes the
-    /// embedded vectors they leave out, so that models run on many cores
-    /// rather than in the writer thread, and the rows logged (and shipped
-    /// to replicas) hold the results.
+    /// files, [`strata::db::Db::resolve_media_in`]), makes the derived text
+    /// and computes the embedded vectors they leave out, so that models run
+    /// on many cores rather than in the writer thread, and the rows logged
+    /// (and shipped to replicas) hold the results.
     fn embed_ops(&self, db: &Db, ops: &mut [Json]) -> Result<(), ApiError> {
         let models = self.models();
         let writes_doc = |op: &Json| matches!(op.get("op").and_then(|o| o.as_str()), Some("insert" | "upsert" | "upsert_if_newer"));
@@ -628,6 +628,7 @@ impl Service {
         for schema in db.catalog() {
             let wanted: Vec<usize> = models.iter().filter(|m| m.model.is_ok() && m.table.eq_ignore_ascii_case(&schema.table)).filter_map(|m| schema.field_index(&m.field)).collect();
             let media: Vec<usize> = (0..schema.fields.len()).filter(|&f| schema.fields[f].media.is_some()).collect();
+            let derived: Vec<usize> = (0..schema.fields.len()).filter(|&f| schema.fields[f].derive.is_some()).collect();
             if wanted.is_empty() && media.is_empty() {
                 continue;
             }
@@ -640,12 +641,18 @@ impl Service {
                 }
             }
             let before: Vec<Vec<bool>> = docs.iter().map(|d| wanted.iter().map(|&f| matches!(d[f], Value::Null)).collect()).collect();
+            let untold: Vec<Vec<bool>> = docs.iter().map(|d| derived.iter().map(|&f| matches!(d[f], Value::Null)).collect()).collect();
             db.fill_in(&schema.table, &mut docs)?;
             n += before.iter().flatten().filter(|&&m| m).count() as u64;
-            for ((i, d), missing) in at.into_iter().zip(&docs).zip(before) {
+            for (((i, d), missing), untold) in at.into_iter().zip(&docs).zip(before).zip(untold) {
                 for (&f, was_missing) in wanted.iter().zip(missing) {
                     if let (true, Value::Vector(v)) = (was_missing, &d[f]) {
                         ops[i]["doc"][schema.fields[f].name.as_str()] = json!(v.as_ref());
+                    }
+                }
+                for (&f, was_untold) in derived.iter().zip(untold) {
+                    if let (true, Value::Str(t)) = (was_untold, &d[f]) {
+                        ops[i]["doc"][schema.fields[f].name.as_str()] = json!(t);
                     }
                 }
                 for &f in &media {
@@ -2517,16 +2524,27 @@ fn apply_into(catalog: &[Arc<Schema>], txn: &mut WriteTxn<'_>, ops: &[Json]) -> 
                 t.set(&key, f, js::field_value(schema, fi, op.get("value").unwrap_or(&Json::Null))?)?
             }
             // The transaction's own writes count, other requests' in the
-            // same group commit included.
+            // same group commit included. With a "doc", a key no row has
+            // inserts it, its field plus the value.
             "add" => {
-                let key = op_key(schema, op)?;
                 let raw = op.get("value").unwrap_or(&Json::Null);
                 let delta = match (raw.as_i64(), raw.as_f64()) {
                     (Some(x), _) => Value::Int(x),
                     (None, Some(x)) => Value::Float(x),
                     _ => return Err(ApiError::bad("add needs a numeric value")),
                 };
-                t.add(&key, field()?, &delta)?
+                match op.get("doc") {
+                    Some(_) => {
+                        let d = doc()?;
+                        let pk = schema.primary_key.ok_or_else(|| ApiError::bad("writes by key need a primary key"))?;
+                        if op.get("key").is_some() && op_key(schema, op)? != d[pk] {
+                            return Err(ApiError::bad("add's key and its doc's key differ: give one"));
+                        }
+                        t.add_or_insert(d, field()?, &delta)?;
+                        true
+                    }
+                    None => t.add(&op_key(schema, op)?, field()?, &delta)?,
+                }
             }
             other => return Err(ApiError::bad(format!("unknown write op {other:?}"))),
         };

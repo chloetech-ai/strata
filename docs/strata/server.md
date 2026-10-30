@@ -174,7 +174,7 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
 
-`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory.
+`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory; it also downloads the captioner of [text from media](#text-from-media).
 
 **Changing your mind.** Vectors are stored, so changing a field's sources or model means re-embedding. Create a database with the new schema and fill it from the old one:
 
@@ -257,6 +257,35 @@ Through Strata, `siglip-base-patch16-224` retrieves as well as [open_clip's publ
 | COCO, 5,000 images | 47.8 / 72.4 / 80.9 | 65.7 / 85.6 / 91.4 |
 | *published* | *47.8 / 72.4 / 81.0* | *65.7 / 85.4 / 91.3* |
 
+### Text from media
+
+A `text` field can be a model's text of a `media` field's file: a caption of each row's image, made by BLIP's captioner (`blip-image-captioning-base`, built with `--features vision`).
+
+```json
+{"name": "image", "type": "media", "kind": "image"},
+{"name": "caption", "type": "text", "derive": {"from": "image", "model": "blip-image-captioning-base"}}
+```
+
+`caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')` declares it in `CREATE TABLE`. The text is made as [vectors of images](#vectors-of-images) are: before the write queues for the writer, from the bytes the write gave or fetched, for `/v1/write`, SQL `INSERT` and imports; an `UPDATE` that changes the file makes it again, and an image that cannot be read or decoded fails the request. A text a write gives is kept as given, so captions made elsewhere (by a larger model, or by people) go in the same field. The field is stored and logged with the row: merges and replicas never run the model, and a database opened without it still reads and searches the text. From then on it is text like any other: BM25, phrases, synonyms, `MATCH`, a [generated field](query-language.md#columns-and-types) over it, and an embedded vector of it (`"embed": {"from": ["caption"], ...}`) all read it. `/v1/schema` lists each derived field under `derived`, with whether this server has its model open.
+
+| model | what it makes | |
+|---|---|---|
+| `blip-image-captioning-base` | a caption of an image, greedily, at most 20 tokens, as the `transformers` library makes it by default | build with `--features vision`; `strata-server fetch-model blip-image-captioning-base`; about 2 s an image on a 4-vCPU cloud VM |
+| `colors` | the names of an image's main colours | no files; tests and demos |
+
+Strata's captions are the `transformers` library's: on 100 images of Flickr30K's test split (the first by file name), BLIP base through Strata and through `transformers` 4.46.3 wrote the same caption for 97 of them; the other three part at a word that two choices nearly tie for (`a man in a red shirt` against `a man wearing a red shirt`), most likely from small differences in resizing the image and in float arithmetic. Changing the model of a field means a new database filled from the old one (`--copy-from`): text of the same model is copied, and text of another is made again.
+
+For finding images by text, the captions add little to an image model's vectors. With SigLIP's vectors and BM25 over BLIP's captions, fused in SQL (`strata-media-eval`, cloud container with 4 vCPUs, [results](https://github.com/rkonow/strata/tree/main/strata/results/media#captions-made-from-the-images)), R@1:
+
+| ranking | Flickr30K 1K, text to image | image to text | COCO (first 1K of 5K), text to image | image to text |
+|---|---|---|---|---|
+| `similarity(emb, :q)` | 74.7 | 89.2 | 67.6 | 82.8 |
+| `bm25(caption, :t)` | 14.6 | 21.1 | 22.7 | 34.5 |
+| `rrf(similarity(emb, :q), bm25(caption, :t))` | 34.0 | 52.8 | 39.9 | 58.4 |
+| `0.95 * minmax(similarity(emb, :q)) + 0.05 * minmax(bm25(caption, :t))` | 74.7 | 89.0 | 68.0 | 84.3 |
+
+`rrf` weighs a weak list as much as a strong one; a small weight on the captions is level with the vectors on Flickr30K and 0.3 to 1.5 better on COCO, whose training captions BLIP was fine-tuned on. What a caption is for is text the rest of the database reads: `MATCH`, phrases, filters and a row's description.
+
 ## Semantic IDs
 
 A semantic ID is a short code for a row's vector, such as `12.7.201.0`, that nearby vectors share a start of: rows whose codes start with `12` are alike, those that start with `12.7` more so. Generative recommenders predict an item's code a number at a time; a filter on a prefix finds every row under it.
@@ -314,7 +343,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/admin/verify` | `{timeout_ms?}` | on a primary: compares each replica's rows with the primary's now ([replication](#replication-a-primary-and-its-replicas)), waiting up to `timeout_ms` (60 s): `{replicas: [{url, in_sync, compared, seq_no, differing_slots, first_differing_slot?, error?}]}`; 409 elsewhere |
 | `POST /v1/admin/promote` | `{replicas?, write_acks?, force?}` | on a replica: makes it the primary of a new term, shipping to `replicas` (gRPC URLs) under `write_acks` (`all`) ([promotion](#replication-a-primary-and-its-replicas)): `{term, seq_no, replicas: [{url, role, term, seq_no} or {url, error}]}`; 409 while a copy named holds a later transaction or a newer term (unless `force`), and on a server that is not a replica |
 | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` for `PUT` | the synonym list: `{text, rules, file}` |
-| `GET /v1/schema?table=T` | | `{table, schema, short, primary_key, shard_by, embeddings}` of the first table, or of `T` |
+| `GET /v1/schema?table=T` | | `{table, schema, short, primary_key, shard_by, embeddings, derived}` of the first table, or of `T` |
 | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and [rank profiles](query-language.md#rank-profiles-a-ranking-kept-with-its-table) (`profiles`), the first first |
 | `GET /v1/health` | | `{status, docs, segments, ...}`, with 503 when the status is `down` or `failing` ([health](#health)) |
 | `GET /livez`, `/readyz` | | `{status}`, with 503 when the server must be restarted ([health](#health)) |
@@ -349,6 +378,8 @@ An operation writes the first table unless it names another (`"table"`), and one
 A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as its plan: operators over single-table queries, all on one snapshot. On a coordinator the operators run there, and each single-table query goes to the shards as its plan (typed from protocol 2, JSON before; see [gRPC](#grpc)). Its plan lines list the single-table queries that ran. A coordinator has no synonym list of its own: start each shard with `--synonyms FILE`.
 
 `set` and `add` change a numeric field in place, without rewriting the row; `upsert_if_newer` writes the row only if its version field is higher than the stored row's, so a feed replayed out of order keeps the newest. Operations see the ones before them in the batch: an `add` after an `upsert` of the same key adds to the upserted value. An `add` to an `INT` field takes an integer and fails on overflow (exact over the whole 64-bit range); one to a `FLOAT` field must stay finite; a missing value counts as 0.
+
+An `add` with a `"doc"` creates the row when no row has its key: the row is the doc, its field plus the value (a missing value counting as 0), and when the row exists the value is added to it as before. So a counter, or the weight of an edge in an [edge table](query-language.md#edge-tables), starts with its first event and needs no write beforehand: `{"op": "add", "table": "cooc", "field": "w", "value": 1, "doc": {"id": "i1>i7", "src": "i1", "dst": "i7"}}`. The key is the doc's (a `"key"` that differs from it is refused).
 
 An answer of 200 means the batch is durable, and an error that nothing of it was written, so a client can retry on an error. When an answer is lost (a timeout, a dropped connection, a coordinator whose other replica failed), send the retry with the same `idempotency_key` (or an `Idempotency-Key` header), 1 to 256 characters: a server that already applied that batch answers with its first `written` instead of applying it again, so an `add` counts once and an `insert` does not fail as a duplicate of itself. The same key with other operations is refused (422), and while the first attempt still runs a retry gets 409. A server remembers keys for an hour, the latest 100,000, in memory, so a restart forgets them. A coordinator passes the key to each shard as `key/shard`. Over gRPC, `WriteRequest.idempotency_key` does the same.
 

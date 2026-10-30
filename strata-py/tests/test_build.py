@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import at_least, bm25, case, clamp, coalesce, col, count, count_true, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, rrf, score, similarity, sigmoid, sqrt
+from strata import at_least, bm25, case, clamp, coalesce, col, count, count_true, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, ranked, rrf, score, similarity, sigmoid, sqrt
 from conftest import BOOKS, book
 
 
@@ -85,6 +85,16 @@ def test_at_least_and_count_true_run_as_their_sql(db):
         at_least("120%", *conds)
     with pytest.raises(strata.StrataError, match="one or more conditions"):
         count_true()
+
+
+def test_a_ranking_given_by_keys_runs_as_its_sql(db):
+    t = db.table()
+    keys = ["b0007", "b0003", "none", "b0011", "b0003"]
+    r = same(db, t.select("id", score()).order_by(ranked(keys)).limit(10),
+             "SELECT id, score() FROM books ORDER BY ranked(:keys) DESC LIMIT 10", keys=keys)
+    assert r.rows == [["b0007", -1.0], ["b0003", -2.0], ["b0011", -4.0]]
+    same(db, t.select("id").where(col("year") >= 1950).order_by(rrf(bm25("description", "dragon"), ranked(keys))).limit(5),
+         "SELECT id FROM books WHERE year >= 1950 ORDER BY rrf(bm25(description, 'dragon'), ranked(:keys)) DESC LIMIT 5", keys=keys)
 
 
 def test_ranking_expressions_run_as_their_sql(db):
@@ -178,6 +188,25 @@ def test_groups(db):
     assert t.select(count()).run().scalar() == 200
     same(db, t.select(count(), col("year").count(distinct=True)).where(col("rating") >= 4),
          "SELECT COUNT(*), COUNT(DISTINCT year) FROM books WHERE rating >= 4")
+
+
+def test_distinct_on(db):
+    """The first row of each group, in the query's order, as SQL's
+    DISTINCT ON keeps it."""
+    t = db.table()
+    q = t.select("id", "year").distinct_on("rating").order_by(col("year").desc()).limit(5)
+    r = same(db, q, "SELECT DISTINCT ON (rating) id, year FROM books ORDER BY year DESC LIMIT 5")
+    assert len(r) == 5
+    assert q.plan()["features"] == ["operators", "distinct_on"]
+    r = same(db, t.select("id", "year", score()).where(match("description", "dragon")).distinct_on("year").order_by(bm25("description", "dragon")).limit(4).offset(1),
+             "SELECT DISTINCT ON (year) id, year, score() FROM books WHERE MATCH(description, 'dragon') ORDER BY bm25(description, 'dragon') DESC LIMIT 4 OFFSET 1")
+    assert len({row[1] for row in r.rows}) == 4
+    # Two keys, one an expression; without a limit, every group.
+    r = same(db, t.select("id").distinct_on("rating", col("year") % 2).order_by(col("year")),
+             "SELECT DISTINCT ON (rating, year % 2) id FROM books ORDER BY year")
+    assert len(r) == 40  # a rating fixes the parity of the year
+    with pytest.raises(strata.StrataError, match="distinct_on"):
+        t.select("genres", count()).group_by("genres").distinct_on("genres").plan()
 
 
 def test_values_need_no_quoting(tmp_path):

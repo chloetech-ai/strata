@@ -191,6 +191,34 @@ PageRank from the same seeds reaches 0.211 at its best (from one seed), below th
 
 **A graph made of vectors adds nothing.** A `VECTOR` field can be traversed as a graph, each row's 10 most similar rows being its neighbours. On this task it returns what vector search already found when the seeds are kept (recall@20 0.112 against 0.111 at 10 seeds, on all queries), and is worse when they are removed (nDCG@20 0.079). A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows with vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in Strata for exploratory queries, at 0.12 ms per hop of 10 neighbours.
 
+## Edge tables
+
+An [edge table](query-language.md#edge-tables) keeps a graph whose edges change one at a time, such as items seen together, apart from the rows it links: each of its rows is an edge, and adding one, changing its weight or deleting it writes that row alone. Each of its segments indexes its rows by the keys they link, in a section of its own (`edge_table`):
+
+- the distinct keys its rows name, numbered in the order of their hashes, with the same radix directory as the primary-key index;
+- each row's source and target as key numbers, and its weight when the segment was built;
+- for each key, the rows that leave it and the rows that reach it, in row order.
+
+A hop from row *u* looks up *u*'s key in each segment of the edge table, then reads the rows that leave it (or reach it, or both, by direction). For each row it checks that the row is live and reads its weight as it is now, in-place writes included, so a decayed or zeroed weight counts at once. The neighbour is the row's other end, a key number, which the walk resolves to a row of the walked table once per segment. Two shortcuts keep a long walk cheap without costing a short one anything. A segment's key numbers get a dense memo once the walk has resolved a thirty-second of them. A segment whose weights were written in place gets a flat copy of its weights once the walk has read a sixteenth as many as its in-place layers hold.
+
+The section is smaller than an `EDGES` field's graph for the same edges, because a key is stored once per segment rather than once per edge. A hop costs more, because an `EDGES` field's out-edges sit with their row and most targets resolve through a same-segment hint. `strata-edges-bench` (in `strata-server`) measures both:
+
+- **Writes.** It streams 300,000 click events of 10,000 users on 50,000 items (Zipf 1.0) through `/v1/stream`. Each event adds 1 to the weight of the edges between its item and the user's last five items, both ways, with `add` operations whose `doc` creates an edge's row on its first event. That is 9.0 edge operations per event and 1,896,100 edges in the end.
+- **Walks.** `ppr` is seeded with a user's last 20 items, for 1,000 users, over the edge table and over an `EDGES` field of `items` holding the same edges and weights. Each query runs once to warm up, then once timed.
+
+| | edge table | `EDGES` field |
+|---|---|---|
+| bytes per edge (index) | 20.6 | 33.2 |
+| `ppr` p50 ms | 21.9 | 15.3 |
+| `ppr` p90 ms | 30.1 | 26.6 |
+| `ppr` p99 ms | 38.7 | 37.4 |
+
+- **Walks cost about 1.4 times as much at the median, and about the same at p99.** Both rank the same 200 rows in the same order in all 1,000 walks. The edge table had 10 segments here. In a first run whose merges had left it 15, its p50 was 28.5 ms against 17.6, since a hop looks up its key in every segment.
+- **Writes.** The events alone take 14.1 µs each (71,155 per second). With the edges, they take 190.2 µs (5,257 per second): 19.6 µs per edge operation, most of which create a row.
+- **Weights as counts.** 54 of the 1,000 walks found nothing over either graph. `ppr` pushes a row only once its residual reaches `eps` times its weighted degree, and each seed starts with 1/20. At the default `eps` of 10⁻⁴, a seed whose edges' weights add up to more than 500 is never pushed, and every seed of those walks was such a popular item. Pass a smaller `eps`, or keep weights near 1 (normalised or decayed), when they count events.
+
+*Cloud VM: 4 cores of an Intel Xeon at 2.10 GHz, 16.9 GB, Linux 6.18. Source: `strata-server/results/edges/vm.json`.*
+
 ## Limits and next steps
 
 - **One quality task, one embedder.** With a stronger embedder, vector search would score above 0.123 and the relative gain over it would likely shrink. The gains over BM25 (+57%) and hybrid search (+58%) are the more robust numbers.

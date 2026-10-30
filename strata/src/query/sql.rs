@@ -549,6 +549,12 @@ pub(crate) fn bind_query(q: &sql::Query, schema: &Schema, params: &Params) -> Re
     Binder::new(schema, params).query(q)
 }
 
+/// [`bind_query`] in a database of `tables`, whose edge tables its walks
+/// may follow.
+pub(crate) fn bind_query_in(q: &sql::Query, schema: &Schema, tables: &[&Schema], params: &Params) -> Result<Select> {
+    Binder { tables, ..Binder::new(schema, params) }.query(q)
+}
+
 /// Where a subquery sits in a compound query's SELECT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Sub {
@@ -572,15 +578,15 @@ pub(crate) type Subs<'s> = dyn Fn(&sql::Query, Sub) -> Result<Option<ir::Expr>> 
 /// [`bind_query`] of a compound query's SELECT, whose subqueries in
 /// conditions and seeds `subs` plans: they bind as [`Pred::Sub`] and
 /// [`Seeds::Plan`], which its plan runs first.
-pub(crate) fn bind_query_with(q: &sql::Query, schema: &Schema, params: &Params, subs: &Subs) -> Result<Select> {
-    Binder { subs: Some(subs), ..Binder::new(schema, params) }.query(q)
+pub(crate) fn bind_query_with(q: &sql::Query, schema: &Schema, tables: &[&Schema], params: &Params, subs: &Subs) -> Result<Select> {
+    Binder { subs: Some(subs), tables, ..Binder::new(schema, params) }.query(q)
 }
 
 /// [`bind_query_with`] for the last step of rerank phases: `earlier` are the
 /// ORDER BY expressions of the phases before it, first to last, which
 /// `features()` lists with its own.
-pub(crate) fn bind_phase_with(q: &sql::Query, schema: &Schema, params: &Params, subs: &Subs, earlier: &[Expr]) -> Result<Select> {
-    Binder { subs: Some(subs), earlier, ..Binder::new(schema, params) }.query(q)
+pub(crate) fn bind_phase_with(q: &sql::Query, schema: &Schema, tables: &[&Schema], params: &Params, subs: &Subs, earlier: &[Expr]) -> Result<Select> {
+    Binder { subs: Some(subs), earlier, tables, ..Binder::new(schema, params) }.query(q)
 }
 
 /// `sql_text`, one SELECT that ranks rows (a table's, or rerank phases'),
@@ -623,11 +629,14 @@ struct Binder<'a> {
     /// The ORDER BY expressions of the rerank phases before this query's
     /// ([`bind_phase_with`]).
     earlier: &'a [Expr],
+    /// The database's tables, whose edge tables a walk may follow
+    /// (`ppr(cooc, ...)`); empty when the query is bound alone.
+    tables: &'a [&'a Schema],
 }
 
 impl<'a> Binder<'a> {
     fn new(schema: &'a Schema, params: &'a Params) -> Self {
-        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now(), earlier: &[] }
+        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now(), earlier: &[], tables: &[] }
     }
 
     /// The expression a compound query's subquery stands for.
@@ -780,8 +789,30 @@ impl<'a> Binder<'a> {
             .ok_or_else(|| err("hops() needs a REACHABLE or PATH predicate in WHERE"))
     }
 
+    /// The edge table a walk's first argument names, rather than a field
+    /// of this table ([`crate::schema::Schema::with_edges`]).
+    fn edge_table(&self, e: &Expr) -> Result<Option<String>> {
+        let Expr::Identifier(id) = e else { return Ok(None) };
+        if self.schema.field_index(&id.value).is_some() {
+            return Ok(None);
+        }
+        let Some(t) = self.tables.iter().find(|t| t.table.eq_ignore_ascii_case(&id.value)) else { return Ok(None) };
+        let Some((src, ..)) = t.edge_fields() else {
+            return Err(err(format!("table {} is not an edge table: a walk follows an EDGES field or a table with OPTIONS(edges = 'src, dst, w')", t.table)));
+        };
+        let pk = self.schema.primary_key.ok_or_else(|| err(format!("a walk over {} needs {} to have a primary key", t.table, self.schema.table)))?;
+        if let Some(r) = t.fields[src].references.as_ref().filter(|r| !r.eq_ignore_ascii_case(&self.schema.table)) {
+            return Err(err(format!("{} links rows of {r}, not of {}", t.table, self.schema.table)));
+        }
+        if t.fields[src].ty != self.schema.fields[pk].ty {
+            return Err(err(format!("{} links {} keys, and {}'s are {}", t.table, crate::schema::type_name(&t.fields[src].ty), self.schema.table, crate::schema::type_name(&self.schema.fields[pk].ty))));
+        }
+        Ok(Some(t.table.clone()))
+    }
+
     /// Binds `REACHABLE(field, seeds, ...)`, `PATH(field, from, to, ...)` or
     /// `ppr(field, seeds, ...)` and returns its index in `Select::graphs`.
+    /// The field may be an edge table instead ([`Binder::edge_table`]).
     fn graph(&self, f: &sql::Function, name: &str) -> Result<usize> {
         let (args, named) = self.args_raw(f)?;
         let want = if name == "path" { 3 } else { 2 };
@@ -792,9 +823,13 @@ impl<'a> Binder<'a> {
                 _ => "REACHABLE(field, seeds, ...)",
             }));
         }
-        let field = self.typed_field(args[0], |t| matches!(t, FieldType::Edges | FieldType::Vector { .. }), "EDGES or VECTOR")?;
-        let vector = matches!(self.schema.fields[field].ty, FieldType::Vector { .. });
-        if !vector && !self.schema.fields[field].indexed {
+        let edges = self.edge_table(args[0])?;
+        let field = match &edges {
+            Some(_) => self.schema.primary_key.expect("checked by edge_table"),
+            None => self.typed_field(args[0], |t| matches!(t, FieldType::Edges | FieldType::Vector { .. }), "EDGES or VECTOR")?,
+        };
+        let vector = edges.is_none() && matches!(self.schema.fields[field].ty, FieldType::Vector { .. });
+        if edges.is_none() && !vector && !self.schema.fields[field].indexed {
             return Err(err(format!("{} is not indexed", self.schema.fields[field].name)));
         }
         if vector && name == "ppr" {
@@ -851,6 +886,9 @@ impl<'a> Binder<'a> {
             .flat_map(|v| v.as_str().unwrap_or("").split(',').map(|l| l.trim().to_string()).collect::<Vec<_>>())
             .filter(|l| !l.is_empty())
             .collect();
+        if let Some(t) = edges.as_ref().filter(|_| !labels.is_empty()) {
+            return Err(err(format!("the edges of edge table {t} have no labels")));
+        }
         let kind = match name {
             "path" => GraphKind::Path { to: self.seeds(args[2])?, max_hops: count("max_hops", 6.0)?.max(1) },
             "ppr" => {
@@ -872,6 +910,7 @@ impl<'a> Binder<'a> {
         };
         let g = GraphQuery {
             field,
+            edges,
             seeds,
             kind,
             dir,
@@ -898,7 +937,7 @@ impl<'a> Binder<'a> {
                 if let Some(e) = self.subs.map(|subs| subs(q, Sub::Seeds)).transpose()?.flatten() {
                     return Ok(Seeds::Plan(Box::new(e)));
                 }
-                Ok(Seeds::Query(Box::new(Binder { subs: self.subs, ..Binder::new(self.schema, self.params) }.query(q)?)))
+                Ok(Seeds::Query(Box::new(Binder { subs: self.subs, tables: self.tables, ..Binder::new(self.schema, self.params) }.query(q)?)))
             }
             Expr::Nested(inner) => self.seeds(inner),
             Expr::Tuple(items) => Ok(Seeds::Keys(items.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
@@ -910,6 +949,21 @@ impl<'a> Binder<'a> {
                     Ok(Seeds::Keys(xs.into_iter().map(|x| self.coerce(pk, x)).collect::<Result<_>>()?))
                 }
                 _ => Ok(Seeds::Keys(vec![self.key_value(e)?])),
+            },
+        }
+    }
+
+    /// The keys of `ranked(keys)`: a tuple or array of keys, or a
+    /// parameter holding a list of them (or one key).
+    fn ranked_keys(&self, e: &Expr) -> Result<Vec<Value>> {
+        let pk = self.schema.primary_key.ok_or_else(|| err("ranked(keys) ranks rows by their primary keys, and the table has none"))?;
+        match e {
+            Expr::Nested(inner) => self.ranked_keys(inner),
+            Expr::Tuple(items) => items.iter().map(|i| self.field_value(pk, i)).collect(),
+            Expr::Array(a) => a.elem.iter().map(|i| self.field_value(pk, i)).collect(),
+            _ => match as_list(self.literal(e)?) {
+                Ok(xs) => xs.into_iter().map(|x| self.coerce(pk, x)).collect(),
+                Err(v) => Ok(vec![self.coerce(pk, v)?]),
             },
         }
     }
@@ -1331,6 +1385,10 @@ impl<'a> Binder<'a> {
                     // The number of hops, in an expression.
                     "hops" if args.is_empty() => Ok(Score::Hops { graph: self.hops_graph()?, far_first: true }),
                     "seq_no" if args.is_empty() => Ok(Score::SeqNo),
+                    "ranked" => match args.as_slice() {
+                        [keys] => Ok(Score::Ranked { keys: self.ranked_keys(keys)? }),
+                        _ => Err(err("ranked(keys) takes one argument: a list of primary keys, best first")),
+                    },
                     "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
                     "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
                     "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),
