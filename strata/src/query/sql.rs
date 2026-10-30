@@ -33,7 +33,7 @@ use crate::error::{Error, Result};
 use crate::query::ir::{ArithOp, Func, NormKind};
 use crate::query::{ddl, ir};
 use crate::query::rank::Rank;
-use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::schema::{Field, FieldType, Logical, Schema};
 use crate::storage::DropOptions;
 use crate::value::Value;
@@ -549,6 +549,8 @@ pub(crate) enum Sub {
     /// A traversal's seeds: its rows' keys, or its one column's values when
     /// it reads another table.
     Seeds,
+    /// `maxsim`'s query vectors: its one column's values, in order.
+    Vectors,
 }
 
 /// Plans a subquery for the binder ([`bind_query_with`]): the expression
@@ -1291,6 +1293,7 @@ impl<'a> Binder<'a> {
                     }
                     "similarity" => self.similarity(&args, opts, false),
                     "distance" => Err(err("distance(...) ranks on its own, ORDER BY distance(...) ASC; in an expression, use similarity(...), which ranks larger first")),
+                    "maxsim" => self.maxsim(&args, opts),
                     "rrf" => {
                         if args.len() < 2 {
                             return Err(err("rrf needs at least two scores"));
@@ -1348,6 +1351,43 @@ impl<'a> Binder<'a> {
             return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
         }
         Ok(Score::Similarity { field, vector, opts: without_norm(opts) })
+    }
+
+    /// `maxsim(field, vectors)`: the vectors are a list parameter, a tuple
+    /// or array of vectors, a JSON array of them, or a subquery of one
+    /// column of vectors (in a compound query, which runs it first).
+    fn maxsim(&self, args: &[&Expr], opts: Opts) -> Result<Score> {
+        let [field, vs] = args else { return Err(err("maxsim(field, vectors)")) };
+        let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. }), "VECTOR")?;
+        let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!("a VECTOR field") };
+        if let Some(v) = opts.get("max_vectors") {
+            v.as_f64().filter(|x| *x >= 1.0 && x.fract() == 0.0).ok_or_else(|| err("max_vectors => a whole number, at least 1"))?;
+        }
+        if let Some(q) = subquery_of(vs) {
+            return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(self.sub(q, Sub::Vectors)?)), opts: without_norm(opts) });
+        }
+        let vectors: Vec<Arc<[f32]>> = match vs {
+            Expr::Tuple(items) => items.iter().map(|i| self.vector(i)).collect::<Result<_>>()?,
+            Expr::Array(a) => a.elem.iter().map(|i| self.vector(i)).collect::<Result<_>>()?,
+            Expr::Nested(inner) => vec![self.vector(inner)?],
+            _ => match self.literal(vs)? {
+                // A JSON array of vectors.
+                Value::Str(s) => {
+                    let vs: Vec<Vec<f32>> = serde_json::from_str(&s).map_err(|_| err("maxsim's vectors as text are a JSON array of arrays of numbers"))?;
+                    vs.into_iter().map(Arc::from).collect()
+                }
+                Value::List(xs) if xs.iter().all(|x| matches!(x, Value::Int(_) | Value::Float(_))) => vec![self.vector_value(Value::List(xs))?],
+                Value::List(xs) => xs.into_iter().map(|x| self.vector_value(x)).collect::<Result<_>>()?,
+                v => vec![self.vector_value(v)?],
+            },
+        };
+        if let Some(v) = vectors.iter().find(|v| v.len() != dim) {
+            return Err(err(format!("a query vector has {} dimensions, field has {dim}", v.len())));
+        }
+        if vectors.iter().any(|v| v.iter().any(|x| !x.is_finite())) {
+            return Err(err("a vector's components must be finite numbers"));
+        }
+        Ok(Score::MaxSim { field, vectors: Vectors::List(vectors), opts: without_norm(opts) })
     }
 
     /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
@@ -1838,7 +1878,13 @@ impl<'a> Binder<'a> {
     }
 
     fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {
-        let v: Arc<[f32]> = match self.literal(e)? {
+        self.vector_value(self.literal(e)?)
+    }
+
+    /// A value as a vector: a vector, a JSON array as text, or a list of
+    /// numbers.
+    fn vector_value(&self, v: Value) -> Result<Arc<[f32]>> {
+        let v: Arc<[f32]> = match v {
             Value::Vector(v) => v,
             Value::Str(s) => {
                 let v: Vec<f32> = serde_json::from_str(&s).map_err(|_| err("vector literal must be a JSON array"))?;

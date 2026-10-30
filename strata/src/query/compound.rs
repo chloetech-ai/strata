@@ -59,9 +59,9 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// Functions that only the executor evaluates: they name one side of a join.
-const NATIVE: [&str; 13] = ["match", "bm25", "similarity", "distance", "rrf", "ppr", "decay", "reachable", "path", "hops", "score", "now", "near"];
+const NATIVE: [&str; 14] = ["match", "bm25", "similarity", "distance", "maxsim", "rrf", "ppr", "decay", "reachable", "path", "hops", "score", "now", "near"];
 /// Score functions, which order a side's scan.
-const SCORES: [&str; 7] = ["bm25", "similarity", "distance", "rrf", "ppr", "decay", "hops"];
+const SCORES: [&str; 8] = ["bm25", "similarity", "distance", "maxsim", "rrf", "ppr", "decay", "hops"];
 const AGGREGATES: [&str; 5] = ["count", "sum", "avg", "min", "max"];
 
 fn fname(f: &sql::Function) -> String {
@@ -128,12 +128,18 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
 }
 
 /// Whether `e` (outside subqueries) computes a value of rows that a scan
-/// does not: a semantic ID's prefix, `sid_at(..)`, which operators compute
-/// over the rows the scan returns.
+/// does not: a semantic ID's prefix, `sid_at(..)`, or a dot product of
+/// vectors, `dot(..)`, which operators compute over the rows the scan
+/// returns.
 fn of_rows(e: &Expr) -> bool {
     let mut found = false;
-    walk(e, &mut |x| found |= matches!(x, Expr::Function(f) if fname(f) == "sid_at"));
+    walk(e, &mut |x| found |= matches!(x, Expr::Function(f) if matches!(fname(f).as_str(), "sid_at" | "dot")));
     found
+}
+
+/// Whether a SELECT's columns or ORDER BY compute [`of_rows`] values.
+fn rows_of(q: &sql::Query, s: &sql::Select) -> bool {
+    select_exprs(s).into_iter().any(of_rows) || q.order_by.as_ref().is_some_and(|ob| matches!(&ob.kind, sql::OrderByKind::Expressions(es) if es.iter().any(|e| of_rows(&e.expr))))
 }
 
 /// The expressions of a SELECT outside its FROM and ORDER BY.
@@ -540,8 +546,8 @@ impl<'a> Planner<'a> {
             TableFactor::Table { name, .. } if self.cte(&super::sql::table_name(name)).is_some() => {
                 let cte = self.cte(&super::sql::table_name(name)).expect("in scope");
                 match cte.keyed.as_deref().and_then(|t| self.table(t)) {
-                    Some(schema) => self.over_rows(q, s, &cte, schema),
-                    None => self.join(q, s),
+                    Some(schema) if !rows_of(q, s) => self.over_rows(q, s, &cte, schema),
+                    _ => self.join(q, s),
                 }
             }
             TableFactor::Table { name, .. } => match self.table(&super::sql::table_name(name)) {
@@ -560,8 +566,7 @@ impl<'a> Planner<'a> {
         if s.distinct.is_some() {
             distinct_to_group(&mut s)?;
         }
-        let rows = select_exprs(&s).into_iter().any(of_rows) || q.order_by.as_ref().is_some_and(|ob| matches!(&ob.kind, sql::OrderByKind::Expressions(es) if es.iter().any(|e| of_rows(&e.expr))));
-        if rows {
+        if rows_of(&q, &s) {
             return self.join(&q, &s);
         }
         q.body = Box::new(sql::SetExpr::Select(Box::new(s)));
@@ -611,6 +616,10 @@ impl<'a> Planner<'a> {
         Ok(Some(match kind {
             Sub::In => {
                 one("a subquery in IN")?;
+                ir::Expr::Values(node)
+            }
+            Sub::Vectors => {
+                one("a subquery of query vectors")?;
                 ir::Expr::Values(node)
             }
             Sub::Exists => ir::Expr::Exists(node),
@@ -1450,6 +1459,8 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                 "abs" => Func::Abs,
                 "round" => Func::Round,
                 "coalesce" => Func::Coalesce,
+                "dot" if func_args(f).len() != 2 => return Err(err("dot(a, b) takes two vectors")),
+                "dot" => Func::Dot,
                 "sid_at" => Func::SidAt,
                 n if NATIVE.contains(&n) => {
                     return Err(err(format!("{}(...) works on one table's scan, in its WHERE or ORDER BY (in a join, on that table's column: a.body), not on values of rows", n.to_uppercase())))

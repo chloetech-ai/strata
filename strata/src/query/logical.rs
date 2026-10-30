@@ -119,6 +119,9 @@ pub enum Direction {
 pub enum Seeds {
     /// Primary keys.
     Keys(Vec<Value>),
+    /// Primary keys, each with its weight: the scores of the subquery rows
+    /// that named it, summed, which `ppr(..., weighted => 1)` restarts at.
+    Weighted(Vec<(Value, f64)>),
     /// The rows of a subquery over the same table (with their scores, which
     /// `ppr(..., weighted => 1)` uses as restart weights).
     Query(Box<Select>),
@@ -254,6 +257,9 @@ pub enum Score {
     /// Dot product of a SPARSE field's term weights with `terms`' (also
     /// `similarity(...)` in SQL).
     Sparse { field: usize, terms: Vec<(String, f32)>, opts: Opts },
+    /// `maxsim(field, vectors)`: a row's best similarity to any of several
+    /// query vectors.
+    MaxSim { field: usize, vectors: Vectors, opts: Opts },
     /// Reciprocal rank fusion: `Σ 1 / (k + rank_i)` over the inputs' rankings
     /// of their top `depth` rows.
     Rrf { inputs: Vec<Score>, k: f64, depth: usize },
@@ -318,13 +324,13 @@ impl Score {
     pub fn is_leaf(&self) -> bool {
         matches!(
             self,
-            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Cond(_)
+            Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Column { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Decay { .. } | Score::SeqNo | Score::Cond(_)
         )
     }
 
     pub fn opts(&self) -> Option<&Opts> {
         match self {
-            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } | Score::Sparse { opts, .. } | Score::Decay { opts, .. } => Some(opts),
+            Score::Bm25 { opts, .. } | Score::Similarity { opts, .. } | Score::Sparse { opts, .. } | Score::MaxSim { opts, .. } | Score::Decay { opts, .. } => Some(opts),
             _ => None,
         }
     }
@@ -333,7 +339,7 @@ impl Score {
     /// similarity, sparse, graph), as opposed to a row's own values (a column, a
     /// decay), which only boost rows found by relevance.
     pub fn is_relevance(&self) -> bool {
-        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::Ppr { .. } | Score::Hops { .. })
+        matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Ppr { .. } | Score::Hops { .. })
     }
 
     /// Whether the score can be a term of the fused shapes
@@ -413,6 +419,18 @@ impl Score {
         }
     }
 }
+
+/// The query vectors of [`Score::MaxSim`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Vectors {
+    List(Vec<Arc<[f32]>>),
+    /// The vectors of a compound subquery's plan ([`crate::query::ir::Expr::Values`]),
+    /// which runs first: like [`Seeds::Plan`], never the executor's.
+    Plan(Box<crate::query::ir::Expr>),
+}
+
+/// The query vectors `maxsim` takes by default, at most.
+pub const MAX_QUERY_VECTORS: usize = 64;
 
 /// How a decay function falls off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
