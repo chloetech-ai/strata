@@ -1,0 +1,33 @@
+{
+ "tasks": 52,
+ "runs": [
+  208,
+  208
+ ],
+ "solved": {
+  "engram+tail": 198,
+  "engram": 199
+ },
+ "fisher_solved_p": 0.999999999999411,
+ "score_diff": 0.0049679487179487,
+ "perm_score_p": 0.49855014498550143,
+ "solved_diff": -0.004807692307692402,
+ "perm_solved_p": 1.0,
+ "inference": {
+  "engram+tail": 13,
+  "engram": 12,
+  "runs_each": 16
+ },
+ "cost_usd_per_run": {
+  "engram+tail": 0.009261899663461538,
+  "engram": 0.009089076490384616
+ },
+ "memory_cost_usd_per_run": {
+  "engram+tail": 0.003814483653846154,
+  "engram": 0.003815500480769231
+ },
+ "prompt_hook_chars_per_run": {
+  "engram+tail": 4085.875,
+  "engram": 4050.716346153846
+ }
+}

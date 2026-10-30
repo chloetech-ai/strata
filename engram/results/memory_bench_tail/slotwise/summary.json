@@ -1,0 +1,206 @@
+{
+ "scenario": "slotwise",
+ "lanes": {
+  "engram": {
+   "runs": 40,
+   "solved": 39,
+   "solved_rate": 0.975,
+   "score": 0.975,
+   "cost_usd": 0.00847084125,
+   "memory_cost_usd": 0.0035885225,
+   "steps": 6.8,
+   "wall_s": 22.2475,
+   "memory_tool_calls": 0.05,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.052512100000000006,
+    "memory_cost_usd": 0.031964000000000006,
+    "wall_s": 271.6,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "conversation": {
+     "runs": 24,
+     "solved": 23,
+     "score": 0.9583333333333334
+    },
+    "repo": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {}
+  },
+  "engram+tail": {
+   "runs": 40,
+   "solved": 40,
+   "solved_rate": 1.0,
+   "score": 1.0,
+   "cost_usd": 0.00885302475,
+   "memory_cost_usd": 0.0036022825000000002,
+   "steps": 7.45,
+   "wall_s": 23.572499999999998,
+   "memory_tool_calls": 0.075,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.052512100000000006,
+    "memory_cost_usd": 0.031964000000000006,
+    "wall_s": 271.6,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "conversation": {
+     "runs": 24,
+     "solved": 24,
+     "score": 1.0
+    },
+    "repo": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "engram": {
+     "all": {
+      "tasks": 10,
+      "runs": [
+       40,
+       40
+      ],
+      "solved": [
+       40,
+       39
+      ],
+      "fisher_solved_p": 0.9999999999999839,
+      "score_diff": 0.025000000000000022,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.025000000000000022,
+      "perm_solved_p": 1.0
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "conversation": {
+      "tasks": 6,
+      "runs": [
+       24,
+       24
+      ],
+      "solved": [
+       24,
+       23
+      ],
+      "fisher_solved_p": 0.999999999999991,
+      "score_diff": 0.04166666666666663,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.04166666666666663,
+      "perm_solved_p": 1.0
+     },
+     "repo": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  }
+ },
+ "tasks": {
+  "cancellation_fee": {
+   "kind": "conversation",
+   "needs": "the cancellation fee tiers (48h half, 24h full) stated only in conversation",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "fully_booked": {
+   "kind": "conversation",
+   "needs": "the contractual cap of 7 treatments a day, deliberately kept out of book()",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "day_plan": {
+   "kind": "conversation",
+   "needs": "an environment fact said in passing (receipt printer, 42 characters a line)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "series_booking": {
+   "kind": "conversation",
+   "needs": "series rules stated only in conversation (skip a taken week and append one; at most 9 sessions)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "sms_reminder": {
+   "kind": "conversation",
+   "needs": "SMS gateway constraints and the reception number stated only in conversation",
+   "engram": 0.75,
+   "engram+tail": 1.0
+  },
+  "ical_advice": {
+   "kind": "conversation",
+   "needs": "a failed approach and why it failed, stated only in conversation",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "reschedule": {
+   "kind": "repo",
+   "needs": "the BookingError convention and the 10-minute gap, both put into the code during the history",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "free_slots": {
+   "kind": "repo",
+   "needs": "the 10-minute gap between appointments, enforced in book() during the history",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "parse_duration": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "merge_intervals": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  }
+ }
+}
