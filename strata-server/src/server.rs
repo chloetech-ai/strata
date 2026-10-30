@@ -326,35 +326,134 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     Ok(out)
 }
 
-/// `strata-server import`: loads `files` into the database at `path`,
-/// created with `schema` if it does not exist, and says what each wrote.
-pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: Option<Format>, directory: bool, files: &[PathBuf]) -> Result<(), String> {
-    let opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, build: build_options(), ..DbOptions::default() };
-    let db = if path.exists() {
-        if schema.is_some() {
+/// What `strata-server import` does with SQLite files.
+#[derive(Default)]
+pub struct SqliteImport {
+    /// Only these tables.
+    pub tables: Vec<String>,
+    /// BLOB columns as base64 text ([`strata::sqlite::ImportOptions::blobs_base64`]).
+    pub blobs_base64: bool,
+    /// Print the plan as JSON, and write nothing.
+    pub plan: bool,
+}
+
+/// `strata-server import`: loads `files` into the database at `path`, rows
+/// from JSON Lines, JSON, CSV or TSV files (`format`, or each file's
+/// extension) and the tables of SQLite files (`format` `sqlite`, or a file
+/// that is a SQLite database), and says what each wrote. A database that
+/// does not exist is created with `schema`, or from the first SQLite
+/// file's tables; with SQLite files, `schema` holds
+/// schemas for the tables they create ([`strata::sqlite::schemas_from_json`]).
+pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: Option<&str>, directory: bool, files: &[PathBuf], sqlite: SqliteImport) -> Result<(), String> {
+    let opts = || DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, build: build_options(), ..DbOptions::default() };
+    let sqlite_format = format.is_some_and(|f| f.eq_ignore_ascii_case("sqlite"));
+    let rows_format = match format {
+        Some(f) if !sqlite_format => Some(Format::parse(f).ok_or_else(|| format!("unknown --format {f}: jsonl, json, csv, tsv or sqlite"))?),
+        _ => None,
+    };
+    let is_sqlite = |f: &Path| sqlite_format || (format.is_none() && strata::sqlite::is_sqlite_file(f));
+    let any_sqlite = files.iter().any(|f| is_sqlite(f));
+    let text = schema.map(|s| std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))).transpose()?;
+    let given = match (&text, schema, any_sqlite) {
+        (Some(t), Some(s), true) => strata::sqlite::schemas_from_json(t).map_err(|e| format!("{}: {e}", s.display()))?,
+        _ => Vec::new(),
+    };
+    let sq = strata::sqlite::ImportOptions { tables: sqlite.tables, schemas: given, blobs_base64: sqlite.blobs_base64 };
+    let mut db = if path.exists() {
+        if schema.is_some() && !any_sqlite {
             return Err(format!("{} exists: --schema is only for a new database", path.display()));
         }
-        Db::open(path, opts).map_err(|e| format!("open {}: {e}", path.display()))?
+        let db = Db::open(path, opts()).map_err(|e| format!("open {}: {e}", path.display()))?;
+        for (field, why) in db.open_embedders(models) {
+            tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
+        }
+        Some(db)
     } else {
-        let s = schema.ok_or_else(|| format!("{} does not exist: pass --schema FILE to create it", path.display()))?;
-        let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
-        let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
-        Db::create(path, schema, opts).map_err(|e| format!("create {}: {e}", path.display()))?
+        None
     };
-    for (field, why) in db.open_embedders(models) {
-        tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
+    if sqlite.plan {
+        let mut plans = Vec::new();
+        for file in files {
+            if !is_sqlite(file) {
+                return Err(format!("{}: --plan is for SQLite files", file.display()));
+            }
+            plans.push(strata::sqlite::plan(file, db.as_ref(), &sq).map_err(|e| format!("{}: {e}", file.display()))?.to_json());
+        }
+        let out = if plans.len() == 1 { plans.remove(0) } else { serde_json::Value::Array(plans) };
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return Ok(());
     }
+    let created = |db: Db| {
+        for (field, why) in db.open_embedders(models) {
+            tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
+        }
+        db
+    };
     for file in files {
         let t0 = std::time::Instant::now();
-        let r = strata::ingest::import_file(&db, file, format).map_err(|e| format!("{}: {e}", file.display()))?;
+        if is_sqlite(file) {
+            let at = |e: strata::Error| format!("{}: {e}", file.display());
+            let src = strata::sqlite::Source::open(file).map_err(at)?;
+            let plan = src.plan(db.as_ref(), &sq).map_err(at)?;
+            let d = match db.take() {
+                Some(d) => d,
+                None => {
+                    let first = plan.tables.first().ok_or_else(|| format!("{}: no table to import", file.display()))?;
+                    created(Db::create(path, first.schema.clone(), opts()).map_err(|e| format!("create {}: {e}", path.display()))?)
+                }
+            };
+            let r = src.load(&d, &plan);
+            db = Some(d);
+            let r = r.map_err(at)?;
+            for (name, why) in &r.skipped {
+                tracing::info!(file = %file.display(), source = %name, "left out: {why}");
+            }
+            for t in &r.tables {
+                let how = if t.bulk { "loaded" } else { "upserted" };
+                tracing::info!(file = %file.display(), source = %t.source, table = %t.table, created = t.created, rows = t.rows, how, "imported");
+                for n in &t.notes {
+                    tracing::warn!(table = %t.table, "{n}");
+                }
+            }
+            tracing::info!(file = %file.display(), tables = r.tables.len(), secs = t0.elapsed().as_secs_f64(), "imported the SQLite file");
+            continue;
+        }
+        let d = match db.take() {
+            Some(d) => d,
+            None => {
+                let (s, text) = schema.zip(text.as_deref()).ok_or_else(|| format!("{} does not exist: pass --schema FILE to create it", path.display()))?;
+                let schema = Schema::from_json(text).map_err(|e| format!("{}: {e}", s.display()))?;
+                created(Db::create(path, schema, opts()).map_err(|e| format!("create {}: {e}", path.display()))?)
+            }
+        };
+        let r = strata::ingest::import_file(&d, file, rows_format).map_err(|e| format!("{}: {e}", file.display()));
+        db = Some(d);
+        let r = r?;
         let how = if r.bulk { "loaded" } else { "upserted" };
         tracing::info!(file = %file.display(), rows = r.rows, how, secs = t0.elapsed().as_secs_f64(), "imported");
         if !r.unknown.is_empty() {
             tracing::warn!(file = %file.display(), fields = %r.unknown.join(", "), "skipped fields the schema lacks");
         }
     }
+    let db = db.ok_or("no files to import")?;
     db.storage().merge(&MergePolicy::default()).map_err(|e| format!("merge: {e}"))?;
     tracing::info!(db = %path.display(), rows = db.snapshot().n_live_docs(), "imported every file");
+    Ok(())
+}
+
+/// Writes the database at `path` to a new SQLite file `out`
+/// ([`strata::sqlite::export`]).
+pub fn export_sqlite(path: &Path, out: &Path, opts: &strata::sqlite::ExportOptions) -> Result<(), String> {
+    let db = Db::open(path, DbOptions::default()).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let t0 = std::time::Instant::now();
+    let r = strata::sqlite::export(&db, out, opts).map_err(|e| format!("{}: {e}", out.display()))?;
+    for t in &r.tables {
+        tracing::info!(table = %t.table, rows = t.rows, indexes = t.indexes.len(), fts = t.fts.as_deref().unwrap_or("none"), "exported");
+        for n in &t.notes {
+            tracing::info!(table = %t.table, "{n}");
+        }
+    }
+    tracing::info!(out = %out.display(), tables = r.tables.len(), secs = t0.elapsed().as_secs_f64(), "exported to SQLite");
     Ok(())
 }
 

@@ -126,6 +126,13 @@ strata-server import --db books.strata --schema books.json books.jsonl more.csv 
 
 Into an empty table the rows are bulk-loaded straight into segments, in one commit: a bad row is reported with its line or row number, and nothing is written. Into a table that has rows they are upserted, 10,000 rows a transaction. The format comes from each file's extension (`.jsonl`, `.ndjson`, `.json`, `.csv`, `.tsv`) or `--format`.
 
+A SQLite database's tables import the same way, each into the table of its name, created from SQLite's declarations when missing, and `strata-server export` writes a database to a new SQLite file ([SQLite in and out](sqlite.md)):
+
+```sh
+strata-server import --db shop.strata shop.sqlite
+strata-server export --db shop.strata copy.sqlite
+```
+
 To a running server, `POST /v1/import` with the rows as the body and the format as `?format=` (or the content type):
 
 ```sh
