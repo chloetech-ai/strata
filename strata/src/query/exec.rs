@@ -2241,6 +2241,11 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+            Score::ByKey(b) => {
+                for (i, c) in cands.iter().enumerate() {
+                    out[i] = self.snap.key(c.0, c.1).map_or(f64::NAN, |k| b.get(&k));
+                }
+            }
             // NULL for a row whose key is not listed.
             Score::Ranked { keys } => {
                 let at = self.ranked_rows(keys)?;
@@ -2341,11 +2346,14 @@ impl<'a> Executor<'a> {
             .projection
             .iter()
             .filter_map(|(_, p)| match p {
-                // Vectors live in their index, not the doc store.
+                // Vectors live in their index, not the doc store, and a
+                // single-valued KEYWORD's index reads a row's value without
+                // decompressing its stored fields.
                 Projection::Field(i)
                     if self.schema.fields[*i].stored
                         && Some(*i) != self.schema.primary_key
-                        && !matches!(self.schema.fields[*i].ty, FieldType::Vector { .. }) =>
+                        && !matches!(self.schema.fields[*i].ty, FieldType::Vector { .. })
+                        && !self.keyword_column(*i) =>
                 {
                     Some(*i)
                 }
@@ -2412,6 +2420,14 @@ impl<'a> Executor<'a> {
                 rank.eval_row(&leaves)
             })
             .collect())
+    }
+
+    /// Whether the field's values are read from its keyword column: one
+    /// value a row, the value itself (a MEDIA field's column holds its
+    /// `sha256`).
+    fn keyword_column(&self, field: usize) -> bool {
+        let f = &self.schema.fields[field];
+        matches!(f.ty, FieldType::Keyword) && f.indexed && !f.multi && f.media.is_none()
     }
 
     fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {

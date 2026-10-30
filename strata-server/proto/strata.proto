@@ -508,6 +508,13 @@ message Expr {
     Norm norm = 36;
     // A ranking model's score of a row; plan feature "rank_models".
     Gbdt gbdt = 37;
+    // The values a correlated subquery took, by the primary key of each
+    // row it ranks; plan feature "correlated". Numbered from 60, the
+    // range of the ranking-context work.
+    ByKey by_key = 60;
+    // A column of the outer row inside a correlated subquery; plan
+    // feature "correlated".
+    uint32 outer = 61;
     // A ranking given as primary keys, best first (ranked(:keys)); plan
     // feature "ranked". Numbered from 70, the range of the semantic-ID
     // work.
@@ -534,6 +541,16 @@ message Norm {
 
 message Ranked {
   repeated Value keys = 1;
+}
+
+message ByKey {
+  repeated KeyValue v = 1;
+}
+
+// A row's primary key and its value: none for NULL.
+message KeyValue {
+  Value key = 1;
+  optional double value = 2;
 }
 
 enum NormKind {

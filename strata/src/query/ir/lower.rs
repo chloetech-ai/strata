@@ -262,7 +262,11 @@ impl Lower<'_> {
             Score::SeqNo => Expr::SeqNo,
             Score::Ranked { keys } => Expr::Ranked { keys: keys.clone() },
             Score::Cond(p) => self.pred(p),
+            // NaN is NULL: a scalar subquery's value of no row.
+            Score::Num(x) if x.is_nan() => Expr::Lit(Value::Null),
             Score::Num(x) => Expr::Lit(Value::Float(*x)),
+            Score::Sub(e) => (**e).clone(),
+            Score::ByKey(b) => Expr::ByKey(b.values.clone()),
             Score::Arith { op, left, right } => Expr::Arith { op: *op, left: Box::new(self.score(left)), right: Box::new(self.score(right)) },
             Score::Neg(x) => Expr::Neg(Box::new(self.score(x))),
             Score::Call { func, args } => Expr::Call { func: *func, args: args.iter().map(|a| self.score(a)).collect() },
