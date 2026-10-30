@@ -380,6 +380,27 @@ impl Blocks {
         m
     }
 
+    /// Whether a document of `docs` may have a key in `r`, by the zone maps
+    /// of its superblocks (those `docs` covers whole) and blocks.
+    pub fn may_have(&self, docs: std::ops::Range<u32>, r: KeyRange) -> bool {
+        let overlaps = |(min, max): (i64, i64)| min <= max && max >= r.lo && min <= r.hi;
+        let (mut b, end) = (docs.start as usize / BLOCK, (docs.end as usize).div_ceil(BLOCK).min(self.n_blocks()));
+        while b < end {
+            if b % SUPER == 0 && b + SUPER <= end && docs.start as usize <= b * BLOCK {
+                if overlaps(self.super_zone(b / SUPER)) {
+                    return true;
+                }
+                b += SUPER;
+            } else {
+                if overlaps(self.zone(b)) {
+                    return true;
+                }
+                b += 1;
+            }
+        }
+        false
+    }
+
     /// Bitset (`n.div_ceil(64)` words) of the documents with a key in `r`.
     pub fn scan_bits(&self, r: KeyRange) -> Vec<u64> {
         let mut words = vec![0u64; self.n.div_ceil(64)];

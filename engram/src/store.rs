@@ -397,6 +397,35 @@ impl Store {
         Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).collect())
     }
 
+    /// The newest `n` records of `session`, newest first, with their vectors.
+    pub fn tail(&self, session: &str, n: usize) -> Result<Vec<(Record, Option<Vec<f32>>)>> {
+        let sql = format!("SELECT {COLUMNS}, emb FROM memory WHERE session = :session ORDER BY seq DESC LIMIT {n}");
+        let rs = self.query_with(&sql, &Params::new().set("session", Value::Str(session.to_string())))?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let v = match r.last()? {
+                    Value::Vector(v) => Some(v.to_vec()),
+                    _ => None,
+                };
+                Some((row_record(r)?, v))
+            })
+            .collect())
+    }
+
+    /// The top `n` by `maxsim` with `vs`: each record's best cosine
+    /// similarity to any of them.
+    pub fn maxsim_top(&self, vs: &[Vec<f32>], n: usize, filter: &Filter) -> Result<Vec<(Record, f64)>> {
+        if vs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!("SELECT {COLUMNS}, score() FROM memory {} ORDER BY maxsim(emb, :vs) DESC LIMIT {n}", filter.sql());
+        let list = Value::List(vs.iter().map(|v| Value::Vector(v.clone().into())).collect());
+        let rs = self.query_with(&sql, &filter.params().set("vs", list))?;
+        Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).collect())
+    }
+
     /// Inverse document frequency of each analysed query term over `body`,
     /// from the segments' term dictionaries (deleted records still count).
     pub fn idf(&self, terms: &[String]) -> Result<Vec<f64>> {

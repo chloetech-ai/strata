@@ -119,6 +119,31 @@ Agent input counts every token the agent read over its steps, most of it Claude 
 
 **The first build.** Before these four-repeat runs, the query engine as first proposed in the same change ran three repeats of the 50 tasks that existed then: 144 of 150 in the background, 139 in front of each prompt, 137 with it off (`pooled.md`). Running it before the model starts cost 10 seconds a run and solved fewer. On slotwise it lost all three runs of one task: it picked a note the distiller had written from the assistant's own unanswered questions ("these cancellation fee details are still undecided and must be settled before the fee is built"), and the agent asked instead of building. The distill prompt now leaves such questions out ([check](https://github.com/rkonow/strata/tree/main/engram/results/v2/distill_open_questions): 6 of 6 outputs carried one before, 0 of 6 after), and the build above has the fix.
 
+## The session tail
+
+Recall can also search with what the session was just doing (`ENGRAM_SESSION_CONTEXT=1`, [how it works](index.md#ranking)): the files and failures of its last 20 records as a BM25 query, and the vectors of its newest prompts, answers, tool calls and errors through `maxsim`. It is off by default because it made no measurable difference.
+
+**Method.** The memory bench above, on its four projects, with one recorded history per project and two lanes on it: Engram as shipped, and the same with the tail on (`memory_bench.py --variant`), so the lanes differ only in the variable. A tail is empty on a session's first prompt, so every run opened with the same request to run the tests and describe the project, and the task was the session's second prompt. Four runs per task and lane, Haiku everywhere, in the cloud container on 2026-10-30.
+
+| | without the tail | with the tail |
+|---|---|---|
+| runs solved | 199 / 208 | 198 / 208 |
+| bakehouse / kestrel / slotwise / stockroom | 68/72, 52/56, 39/40, 40/40 | 69/72, 50/56, 40/40, 39/40 |
+| tasks that imply a requirement (bakehouse) | 12 / 16 | 13 / 16 |
+| $ per run, agent + memory | 0.0091 | 0.0093 |
+| characters the prompt hook injected | 4,051 | 4,086 |
+
+Fisher's exact test gives p = 1.0 on solved runs, and a permutation test within tasks p = 0.50 on the mean score. Four tasks moved by one or two runs, in both directions, and the gate made as many skipped, brief and full injections in each lane. These tasks name what they need, so a tail would matter more where a prompt is vague ("fix this") and the work in progress says what it is about, which this bench does not test.
+
+**Cost.** The prompt's searches (knowledge and hybrid search side by side, then packing, in one process, one prompt at a time) on stores of LongMemEval turns, alternating without and with the tail, 470 prompts each, in the same container:
+
+| records | p50 without → with | p99 without → with | reading the tail (p50) |
+|---|---|---|---|
+| 100,000 | 2.85 → 3.52 ms | 5.5 → 6.1 ms | 0.30 ms |
+| 1,000,000 | 10.5 → 16.3 ms | 27.7 → 34.1 ms | 0.36 ms |
+
+At a million records the tail adds 5.8 ms at the median, over the 2 ms it was allowed: almost all of it is `maxsim`'s four nearest-neighbour searches, one per vector, on the vector side of the search. LongMemEval turns name no files, so the digest's BM25 query does not run here and would add to that in a real session. Searching from the tail after each turn instead of on the prompt would take it off the hook's path, if the tail ever earns a place. The runs are in [`engram/results/memory_bench_tail/`](https://github.com/rkonow/strata/blob/main/engram/results/memory_bench_tail/README.md) and the timings in `engram/results/tail/tail_static.json` (`engram-bench tail`).
+
 ## This repository's own 26-hour session
 
 The transcript of the session that built Strata and Engram is the most realistic test available: 26.5 hours, 43.6 MB, three projects, and two compactions whose summaries keep 14,202 and 17,998 characters. Replaying it through Engram's capture gives the records the hooks would have stored; questions are asked at the point just before Engram's own work began.

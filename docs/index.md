@@ -21,7 +21,7 @@ This repository holds Strata, the pieces around it, and Engram, an application b
 
 | part | what it is | read more |
 |---|---|---|
-| **Strata** | The embedded, single-file database: ACID transactions, SQL, full text, structured columns, vectors and graph edges over the same rows, and a cost-based planner over all of it. | [Design](strata/index.md) · [SQL](strata/query-language.md) · [Graphs](strata/graphs.md) · [Results](strata/results.md) |
+| **Strata** | The embedded, single-file database: ACID transactions, SQL, full text, structured columns, vectors and graph edges over the same rows, and a cost-based planner over all of it. SQLite databases import into it and it exports to SQLite. | [Design](strata/index.md) · [SQL](strata/query-language.md) · [Graphs](strata/graphs.md) · [SQLite](strata/sqlite.md) · [Results](strata/results.md) |
 | **strata-server** | Strata over HTTP JSON and gRPC, with a query-builder UI and an agent that answers questions with SQL. Shards behind a coordinator answer like one database, and a primary ships its writes to replicas. | [Server](strata/server.md) |
 | **strata-py** | Strata from Python: a database inside the process, the way `sqlite3` runs SQLite, or a client of strata-server with the same methods. | [Python](strata/python.md) |
 | **Strata's posting lists** | A study of compressed posting lists and their intersection and union algorithms, which produced three new formats. Strata's text and keyword indexes use two of them. | [Posting lists](posting-lists.md) |
