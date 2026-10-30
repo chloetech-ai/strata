@@ -1,9 +1,12 @@
 import json
+import os
+import shutil
 import threading
 
 import pytest
 
 import strata
+from strata import bm25, col, gbdt, score
 from conftest import BOOKS, book
 
 
@@ -324,3 +327,41 @@ def test_rank_profiles(db):
     with pytest.raises(strata.StrataError, match="books has no rank profile named liked"):
         db.query(sql, q="dragon")
     assert db.sql("DROP RANK PROFILE IF EXISTS liked ON books") == 0
+
+
+MODELS = os.path.join(os.path.dirname(__file__), "..", "..", "strata", "tests", "models")
+
+
+def model_dir(tmp_path, source="lgb_rank"):
+    """A models directory with strata/tests/models' `source` as model m."""
+    models = tmp_path / "models"
+    (models / "m").mkdir(parents=True, exist_ok=True)
+    shutil.copy(os.path.join(MODELS, source, "gbdt.json"), models / "m" / "gbdt.json")
+    return models
+
+
+def test_gbdt(tmp_path):
+    models = model_dir(tmp_path)
+    with strata.Database.create(tmp_path / "books.strata", BOOKS, models=str(models)) as db:
+        db.insert([book(i) for i in range(200)])
+        by = "gbdt('m', bm25(description, :q), rating, year % 6)"
+        sql = f"SELECT id, score(), features() FROM books ORDER BY {by} DESC LIMIT 5"
+        r = db.query(sql, q="dragon ship")
+        assert len(r) == 5 and r.columns[-4:] == ["bm25(description, :q)", "rating", "year", by]
+        assert [row[by] for row in r] == r.scores and r.scores == sorted(r.scores, reverse=True)
+        # The builder ranks as the SQL does.
+        q = db.table().select("id", score()).order_by(gbdt("m", bm25("description", "dragon ship"), col("rating"), col("year") % 6)).limit(5)
+        got = db.run(q)
+        assert (got.keys, got.scores) == (r.keys, r.scores)
+        # A plan names the model's file; another file of it refuses the plan.
+        plan = db.plan(sql, q="dragon ship")
+        assert "rank_models" in plan["features"] and '"hash":"' in json.dumps(plan, separators=(",", ":"))
+        assert db.run(plan).keys == r.keys
+        model_dir(tmp_path, "xgb_rank")
+        with pytest.raises(strata.StrataError, match="ranking model m here is not the one the plan was made with"):
+            db.run(plan)
+        assert db.query(sql, q="dragon ship").keys != r.keys or db.query(sql, q="dragon ship").scores != r.scores
+        with pytest.raises(strata.StrataError, match="reads 3 features, not 2"):
+            db.query("SELECT id FROM books ORDER BY gbdt('m', rating, year) DESC LIMIT 5")
+        with pytest.raises(strata.StrataError, match="no ranking model named nope"):
+            db.query("SELECT id FROM books ORDER BY gbdt('nope', rating, year, year) DESC LIMIT 5")

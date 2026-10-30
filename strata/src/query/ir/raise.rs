@@ -548,6 +548,15 @@ impl<'a> Raise<'a> {
                 Score::Call { func: *func, args: args.iter().map(|a| self.rank(a, true)).collect::<Result<_>>()? }
             }
             Expr::Norm { kind, input } => Score::Norm { kind: *kind, input: sub(self, input)? },
+            Expr::Gbdt { model, hash, args, open } => {
+                let Some(m) = &open.0 else {
+                    return Err(err(format!("ranking model {model} is not open: a database or coordinator opens a plan's models before it runs it (Db::run)")));
+                };
+                if args.len() != m.features {
+                    return Err(err(format!("ranking model {model} reads {} features, not {}", m.features, args.len())));
+                }
+                Score::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(|a| self.rank(a, true)).collect::<Result<_>>()?, open: open.clone() }
+            }
             Expr::Case { operand: Some(_), .. } => return Err(err("CASE in a ranking expression takes WHEN conditions, not an operand")),
             Expr::Case { operand: None, whens, otherwise } => Score::Case {
                 whens: whens.iter().map(|w| Ok((Score::Cond(Box::new(self.filter(&w.when)?)), self.rank(&w.then, true)?))).collect::<Result<_>>()?,

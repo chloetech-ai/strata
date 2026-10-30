@@ -928,6 +928,38 @@ Profiles are kept apart from the schema: tables are compared by schema
 across shards and replicas, and a profile change must not make a table
 look different there.
 
+**Ranking models** (`query::model`, plan feature `rank_models`).
+`gbdt('name', features...)` is `Expr::Gbdt` in a plan: the model's name,
+the hash of its file (FNV-1a, empty until opened) and its features, any
+row-local ranking expressions. A model is a LightGBM `dump_model()` or
+an XGBoost `save_model` JSON in `<models>/<name>/gbdt.json`, parsed into
+flat trees and evaluated as the library does (LightGBM in `f64` in tree
+order, XGBoost with `f32` features, comparisons and sums from its base
+margin), so a score equals the library's bit for bit
+(`tests/models/make.py` writes the reference). Plans are opened before
+they run (`Models::open`, by `Db::run`, `Db::query` and the server): each
+call gets the model of that name, the plan's hash is checked against the
+file's (a plan made with another file is refused) or set from it, and
+the model rides in the plan as an `Arc` that serialisation leaves out;
+raising a plan with a model not opened is an error, and so is executing
+or merging a `Select` that holds one. A coordinator opens the models
+from its own directory, since it evaluates ranking expressions over the
+shards' rows, and sends shards the plan with the hashes. In the
+evaluator a model is a row-local function of its arguments; its
+interval is the hull of the leaves each tree can reach from its
+arguments' intervals (plus the rounding of the sum), which is what makes
+`gbdt(bm25(..), columns...)` a rank-safe boost. A node is 24 bytes and a
+leaf is a node whose children are itself, so a walk is a loop of
+branch-free steps; a phase scores its rows one tree at a time
+(`Gbdt::predict_columns`), so the tree stays in cache, which on the
+benchmark's 300-tree model is faster than LightGBM's own predictor
+(0.66 against 0.86 ms per 100 rows, one thread of the cloud VM). Bounds skip a subtree
+whose least and greatest leaf lie within what they found. The top-k
+loop takes a bound as narrowing when it falls below its top at half the
+text score's maximum or at 0, since a model's is flat above its last
+split on the text score; even so a model's bound, summed over hundreds
+of trees, skips few rows, so the docs steer models to rerank phases.
+
 The vector strategies are chosen by estimated cost against an estimated
 filter selectivity `s`: pre-filter costs `s·n` distance computations; IVF
 needs about `nprobe/√s` probes' worth of clusters to collect enough matching

@@ -21,6 +21,7 @@ use crate::query::agg::Part;
 use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentReaders};
 use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::Plan;
+use crate::query::model::Models;
 use crate::query::stats::TermStats;
 use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
 use crate::schema::{Embed, FieldType, Schema};
@@ -99,8 +100,10 @@ pub struct Db {
     /// Models of embedded VECTOR fields ([`Db::set_embedder_in`]).
     embedders: RwLock<Vec<Model>>,
     /// Where [`Db::open_embedders`] found models, for the tables created
-    /// after it.
+    /// after it, and where ranking models are ([`Db::open_ranking_models`]).
     models: RwLock<Option<PathBuf>>,
+    /// The ranking models queries have used.
+    ranking: Models,
     /// How writes resolve MEDIA values ([`Db::set_media_resolver`]).
     media: RwLock<Arc<Resolver>>,
 }
@@ -150,6 +153,7 @@ impl Db {
             embedders: RwLock::new(Vec::new()),
             models: RwLock::new(None),
             media: RwLock::new(Arc::new(Resolver::default())),
+            ranking: Models::default(),
         }
     }
 
@@ -517,6 +521,21 @@ impl Db {
         failed
     }
 
+    /// Opens the ranking models a plan's `gbdt()` calls name
+    /// ([`crate::query::model`]) from the models directory: the one
+    /// [`Db::open_embedders`] was given, else
+    /// [`crate::embed::models_dir`]. A plan that names the hash of another
+    /// file of a model is refused; one without gets the hashes of the files
+    /// opened. [`Db::run`] and [`Db::query`] open a plan's models
+    /// themselves.
+    pub fn open_ranking_models(&self, plan: &mut Plan) -> Result<()> {
+        if !plan.root.has_models() {
+            return Ok(());
+        }
+        let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(crate::embed::models_dir);
+        self.ranking.open(&dir, plan)
+    }
+
     /// Trains a semantic-ID codebook ([`crate::sid::Codebook::train`]) on the
     /// vectors of VECTOR field `field` of the table named `table`, and saves
     /// it as `name` under `models`, for semantic-ID fields to name. Returns
@@ -625,6 +644,16 @@ impl Db {
     /// [`crate::query::compound::MAX_ROWS`] rows.
     fn run_on(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
         profile::check_plan(plan, &|t, name| snap.table(t).and_then(|v| v.rank_profile(name).map(|p| p.hash())))?;
+        let opened;
+        let plan = match plan.root.has_models() {
+            true => {
+                let mut p = plan.clone();
+                self.open_ranking_models(&mut p)?;
+                opened = p;
+                &opened
+            }
+            false => plan,
+        };
         let view_of = |table: &str| snap.table(table).ok_or_else(|| Error::Query(format!("no such table: {table}")));
         if !plan.root.uses_operators() {
             let view = view_of(plan.table())?;
@@ -758,7 +787,10 @@ impl Db {
 
     fn explain_statement(&self, stmt: &sqlparser::ast::Statement, params: &Params) -> Result<Plan> {
         if let sqlparser::ast::Statement::Query(q) = stmt {
-            return plan_of(&self.snapshot(), q, params);
+            // The plan names the files of its ranking models.
+            let mut plan = plan_of(&self.snapshot(), q, params)?;
+            self.open_ranking_models(&mut plan)?;
+            return Ok(plan);
         }
         let catalog = self.catalog();
         let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();

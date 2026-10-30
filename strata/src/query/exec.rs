@@ -554,6 +554,9 @@ impl<'a> Executor<'a> {
     }
 
     pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
+        if let Some(m) = q.unopened_model() {
+            return Err(err(format!("ranking model {m} is not open: Db::query and Db::run open the models of a query's plan (Db::open_ranking_models)")));
+        }
         let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
         if self.opts.shard && has_graphs(q) {
             return Err(err("graph queries cannot be split across shards: edges cross them"));

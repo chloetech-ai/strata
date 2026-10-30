@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::query::logical::{AggFn, Decay, Direction, Expand, Opts};
+use crate::query::model::Opened;
 use crate::value::Value;
 
 pub mod eval;
@@ -60,7 +61,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 8] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES];
+pub const FEATURES: [&str; 9] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -98,6 +99,9 @@ pub const RANK_FEATURES: &str = "rank_features";
 /// The feature of a plan whose Search ranks as a rank profile does
 /// ([`Search::profile`]).
 pub const RANK_PROFILES: &str = "rank_profiles";
+
+/// The feature of a plan that ranks with a model ([`Expr::Gbdt`]).
+pub const RANK_MODELS: &str = "rank_models";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -629,6 +633,20 @@ pub enum Expr {
     /// A set function of a ranking expression, over the rows it ranks
     /// (feature [`RANK_EXPRESSIONS`]).
     Norm { kind: NormKind, input: Box<Expr> },
+    /// A ranking model's score of a row from its features `args`, ranking
+    /// expressions of the row ([`crate::query::model`], feature
+    /// [`RANK_MODELS`]). `model` names it in the models directory, and
+    /// `hash` is the hash of its file that the plan was made with: empty
+    /// until a database or coordinator opens it, which then runs the plan
+    /// only with a model of that hash.
+    Gbdt {
+        model: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hash: String,
+        args: Vec<Expr>,
+        #[serde(skip)]
+        open: Opened,
+    },
     /// Personalized PageRank from a traversal's seeds.
     Ppr(Box<Graph>),
     /// The rows of a plan (graph seeds from a query of the table, which
@@ -725,7 +743,7 @@ impl Node {
     /// [`Func::Dot`] or weighted seeds anywhere in it, subqueries too.
     pub fn uses_maxsim(&self) -> bool {
         let mut found = false;
-        self.exprs(&mut |e| {
+        self.visit_exprs(&mut |e| {
             found |= match e {
                 Expr::MaxSim { .. } | Expr::Call { func: Func::Dot, .. } => true,
                 Expr::Graph(g) | Expr::Ppr(g) => !g.weights.is_empty(),
@@ -846,6 +864,163 @@ impl Node {
         }
     }
 
+    /// Whether the plan ranks with a model ([`RANK_MODELS`]).
+    pub fn has_models(&self) -> bool {
+        let mut found = false;
+        self.visit_exprs(&mut |e| found |= matches!(e, Expr::Gbdt { .. }));
+        found
+    }
+
+    /// Calls `f` on every expression of the node and of the nodes under
+    /// it, and of the plans of subqueries in them, each expression before
+    /// those within it.
+    pub fn visit_exprs(&self, f: &mut dyn FnMut(&Expr)) {
+        let mut each = |e: &Expr| {
+            e.visit(&mut |x| {
+                f(x);
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    n.visit_exprs(f);
+                }
+            })
+        };
+        match self {
+            Node::Search(s) => {
+                each(&s.filter);
+                s.order.iter().for_each(|k| each(&k.expr));
+                s.phases.iter().for_each(|p| each(&p.expr));
+            }
+            Node::Aggregate { input, keys, aggs } => {
+                keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut each);
+                input.visit_exprs(f);
+            }
+            Node::Filter { input, cond } => {
+                each(cond);
+                input.visit_exprs(f);
+            }
+            Node::Sort { input, keys } => {
+                keys.iter().for_each(|k| each(&k.expr));
+                input.visit_exprs(f);
+            }
+            Node::Project { input, columns } => {
+                columns.iter().for_each(|c| each(&c.expr));
+                input.visit_exprs(f);
+            }
+            Node::Insert { rows, on_conflict, .. } => {
+                rows.iter().flatten().for_each(&mut each);
+                if let OnConflict::Update(sets) = on_conflict {
+                    sets.iter().for_each(|s| each(&s.value));
+                }
+            }
+            Node::Update { input, sets, .. } => {
+                sets.iter().for_each(|s| each(&s.value));
+                input.visit_exprs(f);
+            }
+            Node::Join { left, right, keys, on, .. } => {
+                keys.iter().for_each(|k| {
+                    each(&k.left);
+                    each(&k.right);
+                });
+                on.iter().for_each(&mut each);
+                left.visit_exprs(f);
+                right.visit_exprs(f);
+            }
+            Node::With { ctes, input } => {
+                ctes.iter().for_each(|c| c.input.visit_exprs(f));
+                input.visit_exprs(f);
+            }
+            Node::KeyOrder { input, by } => {
+                input.visit_exprs(f);
+                by.visit_exprs(f);
+            }
+            Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.visit_exprs(f),
+            Node::Ref { .. } => {}
+        }
+    }
+
+    /// [`Node::visit_exprs`], changing the expressions.
+    pub fn visit_exprs_mut(&mut self, f: &mut dyn FnMut(&mut Expr) -> Result<()>) -> Result<()> {
+        let mut each = |e: &mut Expr| {
+            e.visit_mut(&mut |x| {
+                f(x)?;
+                match x {
+                    Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) => n.visit_exprs_mut(f),
+                    _ => Ok(()),
+                }
+            })
+        };
+        match self {
+            Node::Search(s) => {
+                each(&mut s.filter)?;
+                for e in s.order.iter_mut().map(|k| &mut k.expr).chain(s.phases.iter_mut().map(|p| &mut p.expr)) {
+                    each(e)?;
+                }
+                Ok(())
+            }
+            Node::Aggregate { input, keys, aggs } => {
+                for e in keys.iter_mut().chain(aggs.iter_mut().filter_map(|a| a.arg.as_mut())) {
+                    each(e)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Filter { input, cond } => {
+                each(cond)?;
+                input.visit_exprs_mut(f)
+            }
+            Node::Sort { input, keys } => {
+                for k in keys {
+                    each(&mut k.expr)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Project { input, columns } => {
+                for c in columns {
+                    each(&mut c.expr)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Insert { rows, on_conflict, .. } => {
+                for e in rows.iter_mut().flatten() {
+                    each(e)?;
+                }
+                if let OnConflict::Update(sets) = on_conflict {
+                    for s in sets {
+                        each(&mut s.value)?;
+                    }
+                }
+                Ok(())
+            }
+            Node::Update { input, sets, .. } => {
+                for s in sets {
+                    each(&mut s.value)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::Join { left, right, keys, on, .. } => {
+                for k in keys {
+                    each(&mut k.left)?;
+                    each(&mut k.right)?;
+                }
+                if let Some(on) = on {
+                    each(on)?;
+                }
+                left.visit_exprs_mut(f)?;
+                right.visit_exprs_mut(f)
+            }
+            Node::With { ctes, input } => {
+                for c in ctes {
+                    c.input.visit_exprs_mut(f)?;
+                }
+                input.visit_exprs_mut(f)
+            }
+            Node::KeyOrder { input, by } => {
+                input.visit_exprs_mut(f)?;
+                by.visit_exprs_mut(f)
+            }
+            Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.visit_exprs_mut(f),
+            Node::Ref { .. } => Ok(()),
+        }
+    }
+
     /// Whether a Search in the plan ranks by an expression that needs
     /// [`RANK_EXPRESSIONS`].
     pub fn ranks_by_expression(&self) -> bool {
@@ -871,66 +1046,6 @@ impl Node {
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.ranks_by_expression() || b.ranks_by_expression(),
             Node::With { ctes, input } => input.ranks_by_expression() || ctes.iter().any(|c| c.input.ranks_by_expression()),
             Node::Insert { .. } | Node::Ref { .. } => false,
-        }
-    }
-
-    /// Calls `f` on every expression of the plan and each within it, in
-    /// the plans of subqueries too.
-    pub(crate) fn exprs(&self, f: &mut dyn FnMut(&Expr)) {
-        let mut each = |e: &Expr| {
-            e.visit(&mut |x| {
-                f(x);
-                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
-                    n.exprs(f);
-                }
-            })
-        };
-        match self {
-            Node::Search(s) => {
-                each(&s.filter);
-                s.order.iter().for_each(|k| each(&k.expr));
-                s.phases.iter().for_each(|p| each(&p.expr));
-            }
-            Node::Aggregate { input, keys, aggs } => {
-                keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut each);
-                input.exprs(f);
-            }
-            Node::Filter { input, cond } => {
-                each(cond);
-                input.exprs(f);
-            }
-            Node::Sort { input, keys } => {
-                keys.iter().for_each(|k| each(&k.expr));
-                input.exprs(f);
-            }
-            Node::Project { input, columns } => {
-                columns.iter().for_each(|c| each(&c.expr));
-                input.exprs(f);
-            }
-            Node::Insert { rows, .. } => rows.iter().flatten().for_each(each),
-            Node::Update { input, sets, .. } => {
-                sets.iter().for_each(|s| each(&s.value));
-                input.exprs(f);
-            }
-            Node::Join { left, right, keys, on, .. } => {
-                keys.iter().for_each(|k| {
-                    each(&k.left);
-                    each(&k.right);
-                });
-                on.iter().for_each(&mut each);
-                left.exprs(f);
-                right.exprs(f);
-            }
-            Node::With { ctes, input } => {
-                ctes.iter().for_each(|c| c.input.exprs(f));
-                input.exprs(f);
-            }
-            Node::KeyOrder { input, by } => {
-                input.exprs(f);
-                by.exprs(f);
-            }
-            Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.exprs(f),
-            Node::Ref { .. } => {}
         }
     }
 
@@ -1116,7 +1231,7 @@ impl Expr {
                 }
                 otherwise.iter().for_each(|x| x.visit(f));
             }
-            Expr::Call { args, .. } => args.iter().for_each(|x| x.visit(f)),
+            Expr::Call { args, .. } | Expr::Gbdt { args, .. } => args.iter().for_each(|x| x.visit(f)),
             Expr::MaxSim { vectors, .. } => vectors.visit(f),
             Expr::Rrf { inputs, .. } => inputs.iter().for_each(|x| x.visit(f)),
             Expr::Weighted(ts) => ts.iter().for_each(|(_, x)| x.visit(f)),
@@ -1132,7 +1247,7 @@ impl Expr {
         let mut within: Vec<&mut Expr> = Vec::new();
         match self {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } | Expr::MaxSim { vectors: x, .. } => within.push(x),
-            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
+            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Gbdt { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
                 within.push(expr);
@@ -1197,7 +1312,7 @@ impl Plan {
             features.push(RANK_EXPRESSIONS.to_string());
         }
         let mut sid_at = false;
-        root.exprs(&mut |e| sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. }));
+        root.visit_exprs(&mut |e| sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. }));
         if sid_at {
             features.push(SEMANTIC_ID.to_string());
         }
@@ -1212,6 +1327,9 @@ impl Plan {
         }
         if root.has_profiles() {
             features.push(RANK_PROFILES.to_string());
+        }
+        if root.has_models() {
+            features.push(RANK_MODELS.to_string());
         }
         Plan { version: VERSION, features, root }
     }
