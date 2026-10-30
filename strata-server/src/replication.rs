@@ -36,8 +36,11 @@
 //! commit ([`strata::storage::Database::install_copy`]). It then follows
 //! from the copy's last transaction, which the primary's log holds until
 //! the replica has caught up ([`strata::storage::Database::hold_log`]). A
-//! replica whose history differs from the primary's is not copied: the
-//! error says so.
+//! replica whose history differs from the primary's is not copied, and
+//! the error says so, unless its last transaction is of an older term
+//! than the primary's: it then holds transactions of a primary this one
+//! replaced (a replaced primary started again as a replica), and the copy
+//! drops them.
 //!
 //! A replica serves reads once a call from its primary since it started
 //! reached the primary's last transaction, until a call finds it behind,
@@ -65,7 +68,20 @@
 //! held other values under the same keys before numbering began (loaded
 //! from other rows) is not found by them.
 //!
-//! Not here yet: replacing a primary by one of its replicas.
+//! A replica is made the primary of a new term by hand
+//! ([`Follow::promote`]: `POST /v1/admin/promote`, `strata-server
+//! promote`), or a stopped one with `--promote` ([`PrimaryOptions::promote`]).
+//! It first asks the copies it is to ship to for their last transaction
+//! (`Hello`) and refuses while one holds a later one, which the new
+//! primary would not hold, unless forced. It then begins a term above
+//! every term it knows ([`strata::storage::Database::begin_term`]), so
+//! that the replicas follow it, and an old primary that ships to a copy
+//! of the new term is answered with it and stops taking writes and serving
+//! reads (it is fenced). It keeps that beside its database, and starts
+//! again as a primary only with `--promote`. A primary that a primary of
+//! a newer term ships to is fenced the same way, and one of an older term
+//! is answered with this one's. There is no automatic failover: who is
+//! primary is not agreed by the copies themselves.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -205,6 +221,10 @@ pub struct PrimaryOptions {
     /// How often each replica's rows are compared with the primary's
     /// ([`Digests`]); zero: only when asked ([`Primary::verify`]).
     pub verify_every: Duration,
+    /// Start as the primary of a new term, above every term the database
+    /// knows (`--promote`): needed when it was a replica, or another
+    /// primary replaced it.
+    pub promote: bool,
 }
 
 impl Default for PrimaryOptions {
@@ -221,6 +241,7 @@ impl Default for PrimaryOptions {
             copy_chunk_bytes: 1 << 20,
             copy_retry: Duration::from_secs(30),
             verify_every: Duration::from_secs(600),
+            promote: false,
         }
     }
 }
@@ -238,12 +259,14 @@ struct Kept {
     id: String,
     /// The primary followed, and its term.
     follows: Option<(String, u64)>,
+    /// The newer term of a primary that replaced this one, as a primary.
+    replaced_by: Option<u64>,
 }
 
 impl Kept {
     /// Reads `path`, or makes a new id and keeps it there.
     fn open(path: Option<&Path>) -> Result<Kept, String> {
-        let Some(path) = path else { return Ok(Kept { id: new_id(), follows: None }) };
+        let Some(path) = path else { return Ok(Kept { id: new_id(), ..Kept::default() }) };
         if path.exists() {
             let j: Json = std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())).map_err(|e| format!("{}: {e}", path.display()))?;
             let id = j["id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| format!("{}: no id", path.display()))?.to_string();
@@ -251,11 +274,20 @@ impl Kept {
                 Json::Null => None,
                 f => Some((f["primary"].as_str().unwrap_or_default().to_string(), f["term"].as_u64().ok_or_else(|| format!("{}: no term followed", path.display()))?)),
             };
-            return Ok(Kept { id, follows });
+            let replaced_by = match &j["replaced_by"] {
+                Json::Null => None,
+                t => Some(t.as_u64().ok_or_else(|| format!("{}: replaced_by is not a term", path.display()))?),
+            };
+            return Ok(Kept { id, follows, replaced_by });
         }
-        let k = Kept { id: new_id(), follows: None };
+        let k = Kept { id: new_id(), ..Kept::default() };
         k.save(Some(path)).map_err(|e| format!("keep the replication id in {}: {e}", path.display()))?;
         Ok(k)
+    }
+
+    /// The newest term it knows of, besides the database's `term`.
+    fn newest(&self, term: u64) -> u64 {
+        term.max(self.follows.as_ref().map_or(0, |f| f.1)).max(self.replaced_by.unwrap_or(0))
     }
 
     fn save(&self, path: Option<&Path>) -> std::io::Result<()> {
@@ -263,6 +295,9 @@ impl Kept {
         let mut j = json!({"id": self.id});
         if let Some((primary, term)) = &self.follows {
             j["follows"] = json!({"primary": primary, "term": term});
+        }
+        if let Some(t) = self.replaced_by {
+            j["replaced_by"] = json!(t);
         }
         crate::service::save_json(path, &j)
     }
@@ -424,6 +459,8 @@ impl Follower {
 /// and tells a write when enough copies hold it.
 pub struct Primary {
     db: Arc<Db>,
+    /// Where its id is kept, and the term that replaced it.
+    file: Option<PathBuf>,
     id: String,
     opts: PrimaryOptions,
     followers: Vec<Follower>,
@@ -443,12 +480,33 @@ impl Primary {
     /// the primary's id in `file` (none: a new one each start). Every
     /// replica counts as in sync until it fails, so that the first writes
     /// wait for replicas that are there.
+    ///
+    /// A database that followed a primary as a replica, or whose primary
+    /// another replaced, starts only with [`PrimaryOptions::promote`],
+    /// which begins a term above every term it knows.
     pub fn start(db: Arc<Db>, file: Option<&Path>, opts: PrimaryOptions) -> Result<Arc<Primary>, String> {
+        let numbering = db.storage().numbering().ok_or("a primary numbers its writes: start it with --seq-no")?;
+        let mut kept = Kept::open(file)?;
+        if opts.promote {
+            let term = kept.newest(numbering.term) + 1;
+            db.storage().begin_term(term).map_err(|e| format!("begin term {term}: {e}"))?;
+            kept = Kept { id: kept.id, ..Kept::default() };
+            kept.save(file).map_err(|e| format!("keep the replication id: {e}"))?;
+            tracing::info!(term, "promoted: the primary of a new term");
+        } else if let Some((primary, term)) = &kept.follows {
+            return Err(format!("this database is a replica of primary {primary} in term {term}: start it with --replica, or make it the primary of a new term with --promote"));
+        } else if let Some(term) = kept.replaced_by {
+            return Err(format!("a primary of term {term} replaced this one: start it with --replica, as a replica of that primary, or make it the primary of a newer term with --promote"));
+        }
+        Primary::run(db, file, kept, opts)
+    }
+
+    /// Starts shipping as [`Primary::start`] does, under id `kept.id`.
+    fn run(db: Arc<Db>, file: Option<&Path>, kept: Kept, opts: PrimaryOptions) -> Result<Arc<Primary>, String> {
         let numbering = db.storage().numbering().ok_or("a primary numbers its writes: start it with --seq-no")?;
         if !db.storage().keeps_ship_log() {
             return Err("a primary keeps a log of its transactions to ship (DbOptions::ship_log_bytes)".into());
         }
-        let kept = Kept::open(file)?;
         let followers = opts
             .replicas
             .iter()
@@ -478,7 +536,17 @@ impl Primary {
         db.storage().on_commit(move |n| {
             hook.send_replace(n.seq);
         });
-        let p = Arc::new(Primary { db, id: kept.id, opts, followers, committed, progress: watch::channel(0).0, fenced: AtomicU64::new(0), verify_asked: AtomicU64::new(0) });
+        let p = Arc::new(Primary {
+            db,
+            file: file.map(Path::to_path_buf),
+            id: kept.id,
+            opts,
+            followers,
+            committed,
+            progress: watch::channel(0).0,
+            fenced: AtomicU64::new(0),
+            verify_asked: AtomicU64::new(0),
+        });
         for k in 0..p.followers.len() {
             tokio::spawn(ship(Arc::downgrade(&p), k));
         }
@@ -509,6 +577,65 @@ impl Primary {
         self.progress.send_modify(|n| *n += 1);
     }
 
+    /// The newer term of a primary that replaced this one (0: none).
+    pub fn replaced_by(&self) -> u64 {
+        self.fenced.load(Ordering::Relaxed)
+    }
+
+    /// Takes no more writes and serves no reads: a primary of `term`, newer
+    /// than this one's, replaced it. Kept beside the database, so that it
+    /// does not start again as a primary without `--promote`.
+    fn fence(&self, term: u64) {
+        if self.fenced.fetch_max(term, Ordering::Relaxed) >= term {
+            return;
+        }
+        tracing::error!(term = self.term(), replaced_by = term, "a primary of a newer term replaced this one, which takes no more writes and serves no reads");
+        let kept = Kept { id: self.id.clone(), follows: None, replaced_by: Some(term) };
+        if let Err(e) = kept.save(self.file.as_deref()) {
+            tracing::error!(error = %e, "could not keep that another primary replaced this one");
+        }
+        self.changed();
+    }
+
+    /// Refuses a read once another primary replaced this one (503): it
+    /// may hold writes the new primary does not, and not the new
+    /// primary's.
+    pub fn readable(&self) -> Result<(), ApiError> {
+        match self.replaced_by() {
+            0 => Ok(()),
+            t => Err(ApiError { status: 503, message: format!("a primary of term {t} replaced this one (term {}), which serves no reads: read from another copy", self.term()) }),
+        }
+    }
+
+    /// Answers a primary's call to ship to this one (`Replicate`,
+    /// `Restore`, `Verify`), as a primary of term `term` makes when it
+    /// does not know this one replaced it: answered with this primary's
+    /// term, which fences it, when `term` is older. A newer term fences
+    /// this primary, and the call is refused (409).
+    pub fn shipped_to(&self, primary: &str, term: u64) -> Result<pb::ReplicateResponse, ApiError> {
+        let (mine, last) = (self.term(), self.db.storage().numbering().unwrap_or_default().last());
+        if term < mine {
+            return Ok(pb::ReplicateResponse { matched: false, seq: last.seq, term: last.term, replica_term: mine });
+        }
+        if term > mine {
+            self.fence(term);
+            return Err(conflict(format!(
+                "this server is the primary of term {mine}, and primary {primary} of term {term} ships to it: that one replaced this one, which takes no more writes; start this one with --replica"
+            )));
+        }
+        if primary == self.id {
+            return Err(conflict(format!("this server is primary {primary} of term {term}, not a replica: is its own URL among its replicas?")));
+        }
+        Err(conflict(format!("this server is the primary of term {term}, not a replica, and primary {primary} ships to it in the same term: a shard has one primary in a term")))
+    }
+
+    /// Answers a primary's copy of itself (`Restore`), as
+    /// [`Primary::shipped_to`] answers a call.
+    pub async fn copied_to(&self, mut chunks: tonic::Streaming<pb::RestoreChunk>) -> Result<pb::ReplicateResponse, ApiError> {
+        let first = chunks.message().await.map_err(|s| ApiError::bad(format!("the copy was cut off: {}", s.message())))?.ok_or_else(|| ApiError::bad("the copy is empty"))?;
+        self.shipped_to(&first.primary, first.term)
+    }
+
     /// Whether a write may be applied: not on a primary another replaced
     /// (409), and with `majority`, while a majority of copies is in sync
     /// (503), so that a write the copies cannot acknowledge is not applied.
@@ -516,7 +643,7 @@ impl Primary {
         let fenced = self.fenced.load(Ordering::Relaxed);
         if fenced > 0 {
             return Err(conflict(format!(
-                "a replica holds term {fenced}, newer than this primary's ({}): another primary replaced this one, which takes no more writes",
+                "a copy holds term {fenced}, newer than this primary's ({}): another primary replaced this one, which takes no more writes",
                 self.term()
             )));
         }
@@ -539,6 +666,12 @@ impl Primary {
     pub async fn acknowledged(&self, seq: u64, deadline: Instant) -> Result<(), ApiError> {
         let mut progress = self.progress.subscribe();
         loop {
+            // Its replicas follow the new primary, which may not hold it.
+            if let t @ 1.. = self.replaced_by() {
+                return Err(conflict(format!(
+                    "the write is durable on this primary as sequence number {seq}, but a primary of term {t} replaced this one before it was acknowledged, and the new primary may not hold it: write to the new primary"
+                )));
+            }
             let holding = 1 + self.followers.iter().filter(|f| f.acked() >= seq).count();
             match self.opts.acks {
                 Acks::Primary => return Ok(()),
@@ -745,7 +878,8 @@ async fn ship(p: Weak<Primary>, k: usize) {
                 (answer, n, Some(end), pin)
             }
             None => {
-                // A round that found its rows differ said why already.
+                // A round that found its rows differ, or a replica holding
+                // a replaced primary's transactions, said why already.
                 if !must_copy {
                     f.drop_out(format!("it holds transactions up to {}, and this primary's log no longer reaches them: it is sent a copy of the primary", from - 1));
                 }
@@ -761,8 +895,8 @@ async fn ship(p: Weak<Primary>, k: usize) {
         let failed = match answer {
             Ok(r) => {
                 if r.replica_term > numbering.term {
-                    p.fenced.fetch_max(r.replica_term, Ordering::Relaxed);
-                    tracing::error!(replica = %f.url, term = numbering.term, replica_term = r.replica_term, "a replica holds a newer term: another primary replaced this one, which takes no more writes");
+                    tracing::error!(replica = %f.url, term = numbering.term, replica_term = r.replica_term, "a copy holds a newer term: another primary replaced this one");
+                    p.fence(r.replica_term);
                     Some(format!("it holds term {}, newer than this primary's ({}): another primary replaced this one", r.replica_term, numbering.term))
                 } else if r.matched {
                     debug_assert!(end.is_none_or(|e| e == r.seq));
@@ -800,6 +934,17 @@ async fn ship(p: Weak<Primary>, k: usize) {
                     // follows its last.
                     f.acked.store(r.seq, Ordering::Relaxed);
                     next = Some(r.seq + 1);
+                    continue;
+                } else if end.is_some() && r.term < numbering.term {
+                    // Its last transactions are of a primary this one
+                    // replaced, and not this one's: a copy drops them.
+                    f.drop_out(format!(
+                        "its last transaction, {} of term {}, is not this primary's (its last is {last}): it holds transactions of a replaced primary of an older term, and is sent a copy of this one, which drops them",
+                        r.seq, r.term
+                    ));
+                    p.changed();
+                    must_copy = true;
+                    round = None;
                     continue;
                 } else {
                     Some(format!(
@@ -1054,6 +1199,62 @@ impl Follow {
         self.kept.lock().await.follows.as_ref().map(|(p, _)| p.clone())
     }
 
+    /// Makes this replica the primary of a new term, shipping as `opts`
+    /// says: once the copies in `opts.replicas` that answer hold no
+    /// transaction past this replica's last, nor a newer term (409
+    /// otherwise, unless `force`: the new primary would not hold those
+    /// transactions, and a copy of it drops them), it begins a term above
+    /// every term it knows, under the lock calls from its primary take,
+    /// so that a call of the old primary that follows is answered with
+    /// the new term. Answers the new term, its last transaction and what
+    /// each copy said.
+    pub async fn promote(&self, opts: PrimaryOptions, force: bool) -> Result<(Arc<Primary>, Json), ApiError> {
+        let mine = self.db.storage().numbering().ok_or_else(|| ApiError::internal("the replica does not number its writes"))?;
+        let asks = opts.replicas.iter().map(|url| async {
+            let mut c = coord::client(url, opts.token.as_ref(), opts.ca.as_deref())?;
+            let hello = c.hello(pb::HelloRequest { min_protocol: crate::grpc::MIN_PROTOCOL, max_protocol: crate::grpc::PROTOCOL });
+            match tokio::time::timeout(opts.call_timeout, hello).await {
+                Ok(Ok(h)) => Ok(h.into_inner()),
+                Ok(Err(s)) => Err(ApiError::bad(format!("{}: {}", crate::grpc::code_name(s.code()), s.message()))),
+                Err(_) => Err(ApiError::bad(format!("no answer within {} s", opts.call_timeout.as_secs()))),
+            }
+        });
+        let mut copies = Vec::new();
+        let mut ahead = Vec::new();
+        for (url, a) in opts.replicas.iter().zip(futures::future::join_all(asks).await) {
+            copies.push(match a {
+                Ok(h) => {
+                    if h.seq_no > mine.seq || h.term > mine.term {
+                        ahead.push(format!("{url} holds transactions up to {} (term {})", h.seq_no, h.term));
+                    }
+                    json!({"url": url, "role": h.role().as_str_name().to_lowercase(), "term": h.term, "seq_no": h.seq_no})
+                }
+                Err(e) => json!({"url": url, "error": e.message}),
+            });
+        }
+        if !ahead.is_empty() && !force {
+            return Err(conflict(format!(
+                "{}, past this replica's last ({} of term {}): the new primary would not hold those transactions, and a copy of it would drop them. Promote the copy with the latest transaction, or pass force",
+                ahead.join("; "),
+                mine.seq,
+                mine.last().term
+            )));
+        }
+        let mut kept = self.kept.lock().await;
+        let term = kept.newest(self.db.storage().numbering().map_or(0, |n| n.term)) + 1;
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.storage().begin_term(term).map_err(ApiError::from)))
+            .await
+            .map_err(ApiError::internal)??;
+        let next = Kept { id: kept.id.clone(), ..Kept::default() };
+        next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the replication id: {e}")))?;
+        *kept = next.clone();
+        let at = self.db.storage().numbering().unwrap_or_default();
+        tracing::info!(term, seq_no = at.seq, replicas = %opts.replicas.join(", "), write_acks = opts.acks.name(), "promoted: the primary of a new term");
+        let p = Primary::run(self.db.clone(), self.file.as_deref(), next, opts).map_err(ApiError::internal)?;
+        Ok((p, json!({"term": at.term, "seq_no": at.seq, "replicas": copies})))
+    }
+
     /// Applies a primary's batch (`Replicate`), one batch at a time.
     pub async fn replicate(&self, r: pb::ReplicateRequest) -> Result<pb::ReplicateResponse, ApiError> {
         let mut kept = self.kept.lock().await;
@@ -1136,7 +1337,7 @@ impl Follow {
             }
             Some((_, t)) if *t == term => {}
             _ => {
-                let next = Kept { follows: Some((primary.to_string(), term)), ..kept.clone() };
+                let next = Kept { id: kept.id.clone(), follows: Some((primary.to_string(), term)), replaced_by: None };
                 next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the primary followed: {e}")))?;
                 *kept = next;
             }

@@ -80,6 +80,12 @@ struct Args {
     /// started numbering (the same --demo, or a checkpoint of it).
     #[arg(long)]
     replica: bool,
+    /// Start as the primary of a new term, above every term the database
+    /// knows, shipping to --replicas (if any): needed when the database
+    /// was a replica, or another primary replaced it. A running replica is
+    /// promoted with `strata-server promote` instead.
+    #[arg(long, conflicts_with = "replica")]
+    promote: bool,
     /// With --replicas: the copies that hold a write before it is
     /// answered: all (the primary and every replica in sync), majority (of
     /// all copies), or primary.
@@ -231,6 +237,29 @@ enum Command {
         #[arg(long, env = "STRATA_MODELS")]
         models: Option<PathBuf>,
     },
+    /// Make a running replica the primary of a new term (POST
+    /// /v1/admin/promote): it ships to --replicas from then on. It refuses
+    /// while one of them holds transactions it does not, unless --force.
+    Promote {
+        /// The replica's HTTP URL, as http://host:7700.
+        url: String,
+        /// The copies it is to ship to (comma-separated gRPC URLs): the
+        /// shard's other replicas, and the old primary, which is sent a
+        /// copy once it starts again with --replica.
+        #[arg(long, value_delimiter = ',')]
+        replicas: Vec<String>,
+        /// The copies that hold a write before it is answered, as
+        /// --write-acks: all, majority or primary.
+        #[arg(long, default_value = "all")]
+        write_acks: String,
+        /// Promote it though a copy holds transactions it does not, which
+        /// a copy of the new primary then drops.
+        #[arg(long)]
+        force: bool,
+        /// The replica's --token.
+        #[arg(long, env = "STRATA_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+    },
     /// Load rows from JSON Lines, JSON, CSV or TSV files into a database,
     /// created with --schema if it does not exist. A server must not have
     /// the database open (import through `POST /v1/import` instead).
@@ -277,6 +306,13 @@ async fn main() {
             }
             return;
         }
+        Some(Command::Promote { url, replicas, write_acks, force, token }) => {
+            match server::promote(url, replicas, write_acks, *force, token.as_deref()).await {
+                Ok(j) => println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
+                Err(e) => fail(&e),
+            }
+            return;
+        }
         Some(Command::Import { db, schema, format, models, directory, files }) => {
             let format = format.as_deref().map(|f| strata::ingest::Format::parse(f).unwrap_or_else(|| fail(&format!("unknown --format {f}: jsonl, json, csv or tsv"))));
             let models = models.clone().unwrap_or_else(strata::embed::models_dir);
@@ -316,6 +352,7 @@ async fn main() {
         seq_no: a.seq_no,
         replicas: a.replicas,
         replica: a.replica,
+        promote: a.promote,
         write_acks,
         ship_log_mb: a.ship_log_mb,
         verify_every_s: a.verify_every_s,

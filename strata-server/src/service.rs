@@ -29,7 +29,7 @@ pub const MAX_LEASES: usize = 10_000;
 
 use crate::coord::Coordinator;
 use crate::idem;
-use crate::replication::{Follow, Primary, READ_WAIT};
+use crate::replication::{Acks, Follow, Primary, PrimaryOptions, READ_WAIT};
 use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
 use crate::{json as js, obs, pb, ApiError};
@@ -192,12 +192,18 @@ pub struct Service {
     /// is set while its lock is held).
     slots: RwLock<Option<(SlotMap, usize)>>,
     slots_file: tokio::sync::Mutex<Option<PathBuf>>,
-    /// Its part in replication ([`crate::replication`]).
-    pub replication: Replication,
+    /// Its part in replication ([`crate::replication`]), which a replica's
+    /// promotion changes ([`Self::promote`]).
+    replication: RwLock<Replication>,
+    /// How a replica ships once promoted, but for its replicas and
+    /// `--write-acks` (none: as [`PrimaryOptions::default`]).
+    pub promote_options: Option<PrimaryOptions>,
+    /// Held while a promotion runs.
+    promoting: tokio::sync::Mutex<()>,
 }
 
 /// A server's part in replication.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub enum Replication {
     #[default]
     None,
@@ -251,16 +257,37 @@ impl Service {
             backup_dir: None,
             slots: RwLock::new(None),
             slots_file: tokio::sync::Mutex::new(None),
-            replication: Replication::None,
+            replication: RwLock::new(Replication::None),
+            promote_options: None,
+            promoting: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Its part in replication now.
+    pub fn replication(&self) -> Replication {
+        self.replication.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Sets its part in replication, before it serves.
+    pub fn set_replication(&mut self, r: Replication) {
+        *self.replication.get_mut().unwrap_or_else(|e| e.into_inner()) = r;
     }
 
     /// Its role in replication, as `Hello` says it.
     pub fn role(&self) -> pb::Role {
-        match &self.replication {
+        match &self.replication() {
             Replication::None => pb::Role::Standalone,
             Replication::Primary(_) => pb::Role::Primary,
             Replication::Replica(_) => pb::Role::Replica,
+        }
+    }
+
+    /// The newer term of a primary that replaced this one, as a primary
+    /// (0: none).
+    pub fn replaced_by(&self) -> u64 {
+        match &self.replication() {
+            Replication::Primary(p) => p.replaced_by(),
+            _ => 0,
         }
     }
 
@@ -273,7 +300,7 @@ impl Service {
 
     /// Refuses a client's write on a replica (409).
     fn takes_writes(&self) -> Result<(), ApiError> {
-        match &self.replication {
+        match &self.replication() {
             Replication::Replica(_) => Err(conflict("this server is a replica: it applies its primary's writes and takes none from clients; write to the primary".into())),
             _ => Ok(()),
         }
@@ -281,7 +308,7 @@ impl Service {
 
     /// Refuses a write a primary may not apply now ([`Primary::admit`]).
     fn admit_write(&self) -> Result<(), ApiError> {
-        match &self.replication {
+        match &self.replication() {
             Replication::Primary(p) => p.admit(),
             _ => Ok(()),
         }
@@ -290,7 +317,7 @@ impl Service {
     /// Answers a committed write once the copies `--write-acks` asks for
     /// hold it, waiting up to `timeout` ([`Primary::acknowledged`]).
     async fn replicated(&self, w: Written, timeout: Duration) -> Result<Written, ApiError> {
-        if let (Replication::Primary(p), Some(seq)) = (&self.replication, w.seq_no) {
+        if let (Replication::Primary(p), Some(seq)) = (&self.replication(), w.seq_no) {
             p.acknowledged(seq, Instant::now() + timeout).await?;
         }
         Ok(w)
@@ -298,36 +325,56 @@ impl Service {
 
     /// Applies a batch its primary shipped (`Replicate`), on a replica.
     pub async fn replicate(&self, r: pb::ReplicateRequest) -> Result<pb::ReplicateResponse, ApiError> {
-        match &self.replication {
+        match &self.replication() {
             Replication::Replica(f) => f.replicate(r).await,
-            _ => Err(conflict("this server is not a replica (--replica): it takes no shipped transactions".into())),
+            Replication::Primary(p) => p.shipped_to(&r.primary, r.term),
+            Replication::None => Err(conflict("this server is not a replica (--replica): it takes no shipped transactions".into())),
         }
     }
 
     /// Installs a copy of its primary (`Restore`), on a replica.
     pub async fn restore(&self, chunks: tonic::Streaming<pb::RestoreChunk>) -> Result<pb::ReplicateResponse, ApiError> {
-        match &self.replication {
+        match &self.replication() {
             Replication::Replica(f) => f.restore(chunks).await,
-            _ => Err(conflict("this server is not a replica (--replica): it takes no copy of a primary".into())),
+            Replication::Primary(p) => p.copied_to(chunks).await,
+            Replication::None => Err(conflict("this server is not a replica (--replica): it takes no copy of a primary".into())),
         }
     }
 
     /// A replica's digests of its rows at the version its primary pinned
     /// (`Verify`).
     pub async fn verify_for(&self, r: pb::VerifyRequest) -> Result<pb::VerifyResponse, ApiError> {
-        match &self.replication {
+        match &self.replication() {
             Replication::Replica(f) => f.verify(r).await,
-            _ => Err(conflict("this server is not a replica (--replica): it has no rows of a primary's to compare".into())),
+            Replication::Primary(p) => {
+                p.shipped_to(&r.primary, r.term)?;
+                Err(conflict("this server is a primary: it has no rows of another primary's to compare".into()))
+            }
+            Replication::None => Err(conflict("this server is not a replica (--replica): it has no rows of a primary's to compare".into())),
         }
     }
 
     /// Compares each replica's rows with this primary's now
     /// ([`Primary::verify`]), waiting up to `timeout`.
     pub async fn verify_replicas(&self, timeout: Duration) -> Result<Json, ApiError> {
-        match &self.replication {
+        match &self.replication() {
             Replication::Primary(p) => Ok(p.verify(Instant::now() + timeout).await),
             _ => Err(conflict("this server is not a primary (--replicas): it has no replicas to compare".into())),
         }
+    }
+
+    /// Makes this replica the primary of a new term, shipping to
+    /// `replicas` under `acks` ([`Follow::promote`]); with `force`, even
+    /// when one of them holds transactions this replica does not.
+    pub async fn promote(&self, replicas: Vec<String>, acks: Acks, force: bool) -> Result<Json, ApiError> {
+        let _one = self.promoting.lock().await;
+        let Replication::Replica(f) = self.replication() else {
+            return Err(conflict("this server is not a replica (--replica): only a replica is promoted".into()));
+        };
+        let opts = PrimaryOptions { replicas, acks, ..self.promote_options.clone().unwrap_or_default() };
+        let (p, answer) = f.promote(opts, force).await?;
+        *self.replication.write().unwrap_or_else(|e| e.into_inner()) = Replication::Primary(p);
+        Ok(answer)
     }
 
     /// Keeps the slot map a coordinator gives this shard in `path`, and
@@ -704,8 +751,10 @@ impl Service {
     /// on a replica its primary has not found caught up (503,
     /// [`Follow::readable`]).
     fn latest(&self, db: &Db) -> Result<Snapshot, ApiError> {
-        if let Replication::Replica(f) = &self.replication {
-            f.readable()?;
+        match &self.replication() {
+            Replication::Replica(f) => f.readable()?,
+            Replication::Primary(p) => p.readable()?,
+            Replication::None => {}
         }
         Ok(db.snapshot())
     }
@@ -731,7 +780,7 @@ impl Service {
         if at >= min {
             return Ok(snap);
         }
-        match (&self.replication, lease) {
+        match (&self.replication(), lease) {
             (Replication::Replica(f), 0) => f.holding(min, deadline.min(Instant::now() + READ_WAIT)).await,
             (_, 0) => Err(conflict(format!("this server's last transaction is {at}: transaction {min} was not committed here"))),
             (_, l) => Err(conflict(format!("snapshot lease {l} keeps a version holding transactions up to {at}, before {min}"))),
@@ -1265,7 +1314,7 @@ impl Service {
                 if let Some((m, shard)) = self.slots() {
                     h["slots"] = json!({"epoch": m.epoch, "shard": shard, "of": m.shards()});
                 }
-                match &self.replication {
+                match &self.replication() {
                     Replication::None => {}
                     Replication::Primary(p) => h["replication"] = p.health(),
                     Replication::Replica(f) => h["replication"] = f.health().await,
@@ -1352,7 +1401,7 @@ impl Service {
                     one("strata_merges_interrupted", "gauge", "Groups of segments whose merge a crash interrupted.", m.interrupted as f64),
                     one("strata_merge_failing", "gauge", "1 while merges fail.", m.error.is_some() as u8 as f64),
                 ]);
-                match &self.replication {
+                match &self.replication() {
                     Replication::None => {}
                     Replication::Primary(p) => more.extend(p.metrics()),
                     Replication::Replica(f) => more.extend(f.metrics()),
