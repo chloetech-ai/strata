@@ -1,0 +1,62 @@
+{
+  "batch": 500,
+  "clients": 4,
+  "collection": "quora",
+  "cores": [
+    {
+      "core": "quora_shard1_replica_n2",
+      "index": {
+        "current": true,
+        "deletedDocs": 0,
+        "directory": "NRTCachingDirectory(MMapDirectory@/var/solr/data/quora_shard1_replica_n2/data/index lockFactory=org.apache.lucene.store.NativeFSLockFactory@3d626f30; maxCacheMB=48.0 maxMergeSizeMB=4.0)",
+        "hasDeletions": false,
+        "lastModified": "2026-10-28T03:08:46.979Z",
+        "maxDoc": 261331,
+        "numDocs": 261331,
+        "segmentCount": 1,
+        "segmentsFile": "segments_z",
+        "segmentsFileSizeInBytes": 223,
+        "size": "1.04 GB",
+        "sizeInBytes": 1119864701,
+        "userData": {
+          "commitCommandVer": "1880260704309608448",
+          "commitTimeMSec": "1793156926979"
+        },
+        "version": 600
+      }
+    },
+    {
+      "core": "quora_shard2_replica_n1",
+      "index": {
+        "current": true,
+        "deletedDocs": 0,
+        "directory": "NRTCachingDirectory(MMapDirectory@/var/solr/data/quora_shard2_replica_n1/data/index lockFactory=org.apache.lucene.store.NativeFSLockFactory@363f6432; maxCacheMB=48.0 maxMergeSizeMB=4.0)",
+        "hasDeletions": false,
+        "lastModified": "2026-10-28T03:08:58.481Z",
+        "maxDoc": 261548,
+        "numDocs": 261548,
+        "segmentCount": 1,
+        "segmentsFile": "segments_z",
+        "segmentsFileSizeInBytes": 223,
+        "size": "1.04 GB",
+        "sizeInBytes": 1120683387,
+        "userData": {
+          "commitCommandVer": "1880260704342114304",
+          "commitTimeMSec": "1793156938481"
+        },
+        "version": 596
+      }
+    }
+  ],
+  "docs": 522931,
+  "engine": "solr",
+  "index_bytes": 2240548088,
+  "indexed_docs": 522879,
+  "ingest_s": 484.471160513,
+  "json_bytes": 6791817070,
+  "merge_s": 597.011875731,
+  "refresh_s": 1.417318084,
+  "segments": 2,
+  "setup_s": 3.7170620850000002,
+  "total_s": 1082.902506578
+}

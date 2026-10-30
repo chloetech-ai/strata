@@ -1,0 +1,6 @@
+{"engine": "strata", "tag": "before", "pod": "strata-0", "usage_usec": 38218, "user_usec": 9265, "system_usec": 28953, "nr_periods": 6, "nr_throttled": 0, "throttled_usec": 0, "time": 1793159588}
+{"engine": "strata", "tag": "before", "pod": "strata-1", "usage_usec": 37302, "user_usec": 6582, "system_usec": 30719, "nr_periods": 8, "nr_throttled": 0, "throttled_usec": 0, "time": 1793159588}
+{"engine": "strata", "tag": "before", "pod": "strata-coordinator", "usage_usec": 35204, "user_usec": 9711, "system_usec": 25492, "nr_periods": 5, "nr_throttled": 0, "throttled_usec": 0, "time": 1793159588}
+{"engine": "strata", "tag": "after", "pod": "strata-0", "usage_usec": 127528159, "user_usec": 108411219, "system_usec": 19116940, "nr_periods": 1826, "nr_throttled": 13, "throttled_usec": 69463, "time": 1793159772}
+{"engine": "strata", "tag": "after", "pod": "strata-1", "usage_usec": 128334665, "user_usec": 108629929, "system_usec": 19704736, "nr_periods": 1825, "nr_throttled": 13, "throttled_usec": 76398, "time": 1793159772}
+{"engine": "strata", "tag": "after", "pod": "strata-coordinator", "usage_usec": 78639286, "user_usec": 52267363, "system_usec": 26371922, "nr_periods": 1809, "nr_throttled": 1199, "throttled_usec": 29120489, "time": 1793159772}
