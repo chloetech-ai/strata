@@ -938,7 +938,9 @@ impl Service {
     /// a stored document (field: the first VECTOR field if left out), or
     /// `{"embed": "text", "field": "emb"}`, the vector of the text by the
     /// model of that embedded field (the first one with a model if left
-    /// out), so that the text and the rows are embedded alike.
+    /// out), so that the text and the rows are embedded alike, or
+    /// `{"embed": {"image": "<base64>"}, "field": "emb"}`, the vector of an
+    /// image file by a model of images and text.
     pub async fn params(self: &Arc<Self>, j: Option<&Json>) -> Result<Params, ApiError> {
         let mut p = Params::new();
         let Some(j) = j.filter(|j| !j.is_null()) else { return Ok(p) };
@@ -950,8 +952,19 @@ impl Service {
                     let (table, field) = self.vector_field(table, o.get("field").and_then(|f| f.as_str()))?;
                     self.vector_of(&table, &o["vector_of"], &field).await?
                 }
-                Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string()) && o.keys().all(|k| ["embed", "field", "table"].contains(&k.as_str())) => {
-                    let (_, _, e) = self.model(o.get("table").and_then(|t| t.as_str()), o.get("field").and_then(|f| f.as_str()))?;
+                Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some()) && o.keys().all(|k| ["embed", "field", "table"].contains(&k.as_str())) => {
+                    let (_, field, e) = self.model(o.get("table").and_then(|t| t.as_str()), o.get("field").and_then(|f| f.as_str()))?;
+                    let image = match &o["embed"] {
+                        Json::String(_) => None,
+                        Json::Object(i) if i.len() == 1 => {
+                            let b64 = i["image"].as_str().ok_or_else(|| ApiError::bad("{\"embed\": {\"image\": ...}} is an image file in base64"))?;
+                            Some(strata::media::base64_bytes(b64).map_err(|m| ApiError::bad(format!("{{\"embed\": {{\"image\": ...}}}} is an image file in base64: {m}")))?)
+                        }
+                        _ => return Err(ApiError::bad("\"embed\" is a text or {\"image\": \"<base64>\"}")),
+                    };
+                    if image.is_some() && !e.modalities().contains(&strata::embed::Modality::Image) {
+                        return Err(ApiError::bad(format!("the model of {field} ({}) does not embed images", e.name())));
+                    }
                     let text = o["embed"].as_str().unwrap_or_default().to_string();
                     let t0 = Instant::now();
                     let core = match tokio::time::timeout(self.timeout, self.embedding.clone().acquire_owned()).await {
@@ -960,10 +973,13 @@ impl Service {
                     };
                     let v = tokio::task::spawn_blocking(move || {
                         let _core = core;
-                        e.embed_query(&text)
+                        match image {
+                            Some(data) => strata::embed::embed_image_file(e.as_ref(), &data),
+                            None => Ok(e.embed_query(&text)),
+                        }
                     })
                     .await
-                    .map_err(ApiError::internal)?;
+                    .map_err(ApiError::internal)??;
                     self.metrics.embedded("query", 1, t0.elapsed().as_secs_f64());
                     Value::Vector(v.into())
                 }
