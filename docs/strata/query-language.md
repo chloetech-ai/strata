@@ -54,7 +54,7 @@ WHERE a.year >= 2020 ORDER BY bm25(a.body, 'mrna vaccine') DESC LIMIT 20;
 
 ```text
 [WITH name AS (SELECT ...), ...]
-SELECT [DISTINCT] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates>
+SELECT [DISTINCT | DISTINCT ON (<expressions>)] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates>
 FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [WHERE <predicate>]
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
@@ -450,6 +450,32 @@ Each plans into operators over the single-table queries above ([`EXPLAIN`](#expl
 
 The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-table query that ran, with its rows and its own plan.
 
+## The first row of each group: DISTINCT ON
+
+`SELECT DISTINCT ON (keys) ...` keeps, of the rows with equal keys, the first in the query's order, as PostgreSQL does: a row per group, the groups in the order of their first rows, and `LIMIT` and `OFFSET` count groups. With rows of a long video or document in a table of segments, it answers each video once, by its best segment:
+
+```sql
+-- each video's best clip, the 10 best videos
+SELECT DISTINCT ON (video) video, id, start_ms, score() FROM clips
+WHERE MATCH(transcript, 'penalty kick') ORDER BY bm25(transcript, 'penalty kick') DESC LIMIT 10;
+
+-- each user's latest event
+SELECT DISTINCT ON (usr) usr, item, ts FROM events ORDER BY ts DESC, id;
+
+-- the best page of each PDF, by an image query's similarity
+SELECT DISTINCT ON (doc) doc, page FROM pages ORDER BY similarity(emb, :q) DESC LIMIT 5;
+
+-- over groups: each country's top seller
+SELECT DISTINCT ON (country) country, seller, SUM(price) AS total FROM sales GROUP BY country, seller ORDER BY country, total DESC;
+```
+
+- **Keys** are expressions of the rows (`video`, `lower(lang)`, `year % 10`), or columns of the answer by name or number (`DISTINCT ON (2)`), and need not be selected. Keys are equal when their values are: `NULL` with `NULL`, and a multi-valued column's list with the same list.
+- **The order.** PostgreSQL requires `ORDER BY` to start with the keys; Strata does not, so `ORDER BY` a score gives the best row of each group, the best groups first. When `ORDER BY` does start with the keys, the answer is PostgreSQL's. Without `ORDER BY`, which row of a group is kept is not defined.
+- **Reads.** When the query's order is the scan's (a score, or one numeric column), a `LIMIT` reads the scan in growing slices: four times the rows asked for (at least 32), then four times as many, until that many groups have a row or the scan runs out. A group with many rows near the top costs more reads, never a wrong answer. Ordered by several columns, the rows are sorted in memory, and the scan holds at most 1,000,000 rows.
+- **Shards.** A coordinator keeps the first rows over its shards' merged rows, so three shards give what one database does, whether or not the table is placed by the keys (`shard_by`).
+
+The plan's node is `DistinctOn` (`Distinct on: video` in `EXPLAIN`), and its JSON needs the plan features `operators` and `distinct_on`; a version of Strata from before it refuses the plan by that name.
+
 ## Graphs
 
 Rows with an `EDGES` field are nodes of a graph. Graph predicates and scores take **seeds**: a key (`'p1'`), a parameter, a tuple of keys (`('p1', 'p2')`), or a subquery, whose filters, ranking and `LIMIT` are those of any query. A subquery over the same table seeds with its rows; one over another table returns one column, whose values are the keys to start from, such as the items a user's recent events name: `ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 20))`. With `weighted => 1`, a seed's restart weight is its row's score, summed over the rows that name it: `ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY w DESC), weighted => 1)` starts from each item in proportion to the sum of its events' `w`, and ordering the events by `decay(ts, ...)` instead weighs recent ones more.
@@ -618,7 +644,7 @@ Project: id AS "a.id", title AS "b.title"
         Search papers
 ```
 
-`Join` (or `Left join`) matches its two inputs on the keys after `on`, `targets(f)` being the rows an `EDGES` field links to, with any other `ON` condition after `AND`; `With` names its results, which `Ref` reads; `Key order of top` puts rows in the order of the `WITH` result `top`; `Distinct` keeps each row once. A subquery sits in its condition: `IN values of (...)` (its values), `IN keys of (...)` (its rows' keys), `EXISTS (...)` and a scalar `(...)`, each shown on one line with `;` between its operators. `SELECT DISTINCT` of the table alone is a `GROUP BY`, a single-table query.
+`Join` (or `Left join`) matches its two inputs on the keys after `on`, `targets(f)` being the rows an `EDGES` field links to, with any other `ON` condition after `AND`; `With` names its results, which `Ref` reads; `Key order of top` puts rows in the order of the `WITH` result `top`; `Distinct` keeps each row once, and `Distinct on: video` the [first row of each group](#the-first-row-of-each-group-distinct-on). A subquery sits in its condition: `IN values of (...)` (its values), `IN keys of (...)` (its rows' keys), `EXISTS (...)` and a scalar `(...)`, each shown on one line with `;` between its operators. `SELECT DISTINCT` of the table alone is a `GROUP BY`, a single-table query.
 
 Every statement runs as its plan, and a plan in JSON runs on its own: `Db::run` in Rust, `Database.run` in [Python](python.md#querying) and [`POST /v1/plan`](server.md#http-api) over HTTP take one, and check it against the table's schema as the SQL binder checks a statement.
 
