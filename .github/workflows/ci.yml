@@ -274,12 +274,25 @@ jobs:
       - name: Build strata-server
         working-directory: strata-server
         run: cargo build --release
+      # The Kafka consumer's exactly-once test runs against Redpanda, on
+      # Linux only (macOS runners have no Docker); elsewhere it is skipped.
+      - name: Start Redpanda
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d --name redpanda --network host docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
+            redpanda start --mode dev-container --smp 1 --memory 1G --overprovisioned \
+            --kafka-addr 127.0.0.1:19092 --advertise-kafka-addr 127.0.0.1:19092 \
+            --rpc-addr 127.0.0.1:33145 --advertise-rpc-addr 127.0.0.1:33145 \
+            --pandaproxy-addr 127.0.0.1:18082 --schema-registry-addr 127.0.0.1:18081
+          for i in $(seq 1 60); do docker exec redpanda rpk cluster health 2>/dev/null | grep -q 'Healthy: *true' && break; sleep 1; done
+          docker exec redpanda rpk cluster health
+          echo "STRATA_KAFKA=127.0.0.1:19092" >> "$GITHUB_ENV"
       - name: Build and test
         working-directory: strata-py
         run: |
           python -m venv .venv
           . .venv/bin/activate
-          pip install maturin pytest numpy
+          pip install maturin pytest numpy confluent-kafka
           maturin develop --release
           pytest tests -v
       - name: Clippy

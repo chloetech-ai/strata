@@ -32,4 +32,6 @@ for row in db.table().where(col("year") >= 1990).order_by(bm25("title", "dragon"
 The guide is [docs/strata/python.md](../docs/strata/python.md). Tests:
 `maturin develop --release && pytest tests` in a virtualenv (the client
 tests use `../strata-server/target/release/strata-server`, or
-`$STRATA_SERVER`, and are skipped without it).
+`$STRATA_SERVER`, and are skipped without it; the Kafka consumer's test
+needs a broker at `$STRATA_KAFKA`, such as Redpanda in Docker, and
+`confluent-kafka`).
