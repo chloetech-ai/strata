@@ -40,6 +40,24 @@ def test_client_reads_and_writes(client):
     assert e.value.status == 400
 
 
+def test_client_writes_to_any_table(client, tmp_path):
+    assert client.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, book KEYWORD REFERENCES books, ts INT) OPTIONS(shard_by = 'usr')") == 0
+    assert [t["table"] for t in client.tables()] == ["books", "events"]
+    assert client.tables()[1]["shard_by"] == "usr"
+    assert client.insert([{"id": i, "usr": f"u{i % 3}", "book": book(i)["id"], "ts": i} for i in range(1500)], table="events") == 1500
+    assert client.upsert({"id": 1, "usr": "u1", "book": "b0007", "ts": 9}, table="events") == 1
+    assert client.delete([2, 3], table="events") == 2
+    f = tmp_path / "more.csv"
+    f.write_text("id,usr,ts\n5000,u9,1\n5001,u9,2\n")
+    assert client.import_file(f, table="events") == {"rows": 2, "bulk": False, "skipped_fields": []}
+    assert client.query("SELECT COUNT(*) FROM events").scalar() == 1500
+    assert len(client.table("events").select("id").where(strata.col("usr") == "u9").run()) == 2
+    with pytest.raises(strata.StrataError, match="no such table: nope"):
+        client.insert({"id": 1}, table="nope")
+    assert client.sql("DROP TABLE events") == 0
+    assert [t["table"] for t in client.tables()] == ["books"]
+
+
 def test_client_search_and_import(client, tmp_path):
     assert client.search("dragon", mode="text", limit=4).keys
     assert len(client.search("dragon", limit=4)) == 4  # hybrid: the server embeds the text

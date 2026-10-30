@@ -68,7 +68,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 
 ## Schemas
 
-The server serves a database's first table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the UI's schema designer, or `strata.Database.create` in [Python](python.md)). A database can hold more tables, which [`CREATE TABLE`](query-language.md#tables) adds in-process (`Db::sql` in Rust, `Database.sql` in Python); the server, its APIs and the coordinator do not serve those yet. A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
+A database starts with one table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the UI's schema designer, or `strata.Database.create` in [Python](python.md)). [`CREATE TABLE`](query-language.md#tables) and `DROP TABLE` over `POST /v1/sql` add and drop more, and the server serves every table: SQL names its tables, write operations and imports name theirs (`"table"`, `?table=`; the first table when they name none), `GET /v1/tables` lists the schemas and `GET /v1/schema?table=` gives one. A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
 
 ```json
 {
@@ -112,7 +112,7 @@ The server serves a database's first table, whose schema is set when the databas
 | `not_null` | all but the key | false | a write must give the field a value (`NOT NULL`) |
 | `default` | single-valued `text`, `keyword`, `int`, `float`, `bool`, `timestamp`, not the key or generated | | the value a write that leaves the field out gets; `"now"` on a `timestamp` is the time of the write, one time for all the rows of a request, statement or file |
 
-`key` names the primary key, a `keyword` or `int` field; rows are upserted and deleted by it, and a table without one only takes inserts. `"references": "authors"` on a `keyword` or `int` field records that it holds keys of that table ([references](query-language.md#tables)); a new database's first table can reference only itself. An option a type does not know is an error, so a typo does not pass silently. `GET /v1/schema` returns the schema in this form as `short` (and in the long form Strata stores, as `schema`); `POST /v1/schema/check` validates one and returns both. The long form is accepted wherever a schema is read. The [query language](query-language.md#columns-and-types) page describes the types further.
+`key` names the primary key, a `keyword` or `int` field; rows are upserted and deleted by it, and a table without one only takes inserts. `"shard_by": "usr"` places the table's rows on [shards](#tables-on-shards) by that field instead of by the key. `"references": "authors"` on a `keyword` or `int` field records that it holds keys of that table ([references](query-language.md#tables)); a new database's first table can reference only itself. An option a type does not know is an error, so a typo does not pass silently. `GET /v1/schema` returns the first table's schema (`?table=` another's) in this form as `short` (and in the long form Strata stores, as `schema`); `POST /v1/schema/check` validates one and returns both. The long form is accepted wherever a schema is read. The [query language](query-language.md#columns-and-types) page describes the types further.
 
 ## Loading rows
 
@@ -122,11 +122,12 @@ From the command line, into a database no server has open (an open database is l
 
 ```sh
 strata-server import --db books.strata --schema books.json books.jsonl more.csv   # --schema only creates
+strata-server import --db books.strata --table reviews reviews.csv                  # another table
 ```
 
 Into an empty table the rows are bulk-loaded straight into segments, in one commit: a bad row is reported with its line or row number, and nothing is written. Into a table that has rows they are upserted, 10,000 rows a transaction. The format comes from each file's extension (`.jsonl`, `.ndjson`, `.json`, `.csv`, `.tsv`) or `--format`.
 
-To a running server, `POST /v1/import` with the rows as the body and the format as `?format=` (or the content type):
+To a running server, `POST /v1/import` with the rows as the body, the format as `?format=` (or the content type) and the table as `?table=` (the first table without it):
 
 ```sh
 curl -s -X POST 'localhost:7700/v1/import?format=csv' -H 'content-type: text/csv' --data-binary @more.csv
@@ -200,7 +201,7 @@ cd strata && STRATA_DATA=~/data/beir cargo run --release --bin strata-embed-eval
 
 ## HTTP API
 
-Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model.
+Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model; both take `"table"` for a field of another table than the first.
 
 | route | body | answer |
 |---|---|---|
@@ -208,10 +209,10 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows for a `SELECT`; `{written, seq_no?, seq_nos?}` for `INSERT`, `UPDATE`, `DELETE` |
 | `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written, seq_no?, seq_nos?}` ([conditional writes](#conditional-writes); `seq_nos` from a coordinator) |
 | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}`: a [plan](query-language.md#explain) in JSON, as `/v1/explain` gives it in `ir` | rows for a read, a compound query's plan included, `{written}` for a write; a coordinator runs reads, and refuses a write plan (400) until its shards take write plans |
-| `POST /v1/import?format=F` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
+| `POST /v1/import?format=F&table=T` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the bound query (`logical`) and counts |
-| `POST /v1/embed` | `{text, field?}` | `{field, vector}`: the text's vector by an embedded field's model (the first whose model is open, unless `field` names one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
+| `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
 | `POST /v1/snapshot` | | a snapshot lease for 60 s: `{snapshot, txn, ttl_s}` (at most 10,000 are held at once; more get 429) |
 | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the queries it ran |
@@ -221,7 +222,8 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/admin/verify` | `{timeout_ms?}` | on a primary: compares each replica's rows with the primary's now ([replication](#replication-a-primary-and-its-replicas)), waiting up to `timeout_ms` (60 s): `{replicas: [{url, in_sync, compared, seq_no, differing_slots, first_differing_slot?, error?}]}`; 409 elsewhere |
 | `POST /v1/admin/promote` | `{replicas?, write_acks?, force?}` | on a replica: makes it the primary of a new term, shipping to `replicas` (gRPC URLs) under `write_acks` (`all`) ([promotion](#replication-a-primary-and-its-replicas)): `{term, seq_no, replicas: [{url, role, term, seq_no} or {url, error}]}`; 409 while a copy named holds a later transaction or a newer term (unless `force`), and on a server that is not a replica |
 | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` for `PUT` | the synonym list: `{text, rules, file}` |
-| `GET /v1/schema` | | `{schema, short, primary_key, embeddings}` |
+| `GET /v1/schema?table=T` | | `{table, schema, short, primary_key, shard_by, embeddings}` of the first table, or of `T` |
+| `GET /v1/tables` | | `{tables: [...]}`: every table's schema, the first first |
 | `GET /v1/health` | | `{status, docs, segments, ...}`, with 503 when the status is `down` or `failing` ([health](#health)) |
 | `GET /livez`, `/readyz` | | `{status}`, with 503 when the server must be restarted ([health](#health)) |
 | `GET /v1/stats`, `/v1/config` | | JSON |
@@ -244,9 +246,13 @@ curl -s localhost:7700/v1/query -H 'content-type: application/json' -d '{
   {"op": "upsert_if_newer", "doc": {"id": "p3", "title": "green mug", "version": 7}, "version": "version"},
   {"op": "set", "key": "p1", "field": "price", "value": 11.0},
   {"op": "add", "key": "p1", "field": "sold", "value": 1},
-  {"op": "delete", "key": "p9"}
+  {"op": "delete", "key": "p9"},
+  {"op": "insert", "table": "events", "doc": {"id": 7, "usr": "u3", "item": "p1"}},
+  {"op": "delete", "table": "events", "key": 6, "routing": "u3"}
 ]}
 ```
+
+An operation writes the first table unless it names another (`"table"`), and one batch may write several tables in its transaction. On a coordinator, an operation by key (`delete`, `set`, `add`) on a table placed by a column ([tables on shards](#tables-on-shards)) gives that column's value as `"routing"`, since the key alone does not say which shard holds the row.
 
 A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as its plan: operators over single-table queries, all on one snapshot. On a coordinator the operators run there, and each single-table query goes to the shards as its plan (typed from protocol 2, JSON before; see [gRPC](#grpc)). Its plan lines list the single-table queries that ran. A coordinator has no synonym list of its own: start each shard with `--synonyms FILE`.
 
@@ -327,7 +333,19 @@ Query then fetch (from protocol 3): for a page of rows with stored columns, when
 
 A coordinator asks each replica the protocol versions it speaks (`Hello`) when it connects, again every minute and after the replica fails (it may have restarted on another version), and speaks the oldest any replica speaks, so shards can be upgraded one at a time: while one runs a server from before `Hello`, every shard gets SQL and JSON plans; once all speak protocol 2 they get typed plans, and once all speak 3, pages are fetched. `/v1/health` shows the protocol spoken (`protocol`).
 
-A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key, to the shard holding its [slot](#slots); `UPDATE` and `DELETE` go to every shard. Within a shard, a write goes to every replica, or to its primary alone when it has one ([replication](#replication-a-primary-and-its-replicas)). Start each shard with `--seq-no` for [conditional writes](#conditional-writes): a coordinator passes `if_seq_no` and `seq_no()` on while every shard has one replica, or a primary that its replicas [follow](#replication-a-primary-and-its-replicas) (replicas that each take a shard's writes number them in their own order), and its write answers carry no `seq_no`, since a batch can span shards, but one number per shard (`seq_nos`) for [reads that see a write](#reads-that-see-a-write). A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
+A sharded collection therefore ranks like one database: the tests run every query kind against three shards and one whole database and compare keys and scores. Writes are routed by primary key, to the shard holding its [slot](#slots), or by a table's `shard_by` field ([tables on shards](#tables-on-shards)); `UPDATE` and `DELETE` go to every shard. Within a shard, a write goes to every replica, or to its primary alone when it has one ([replication](#replication-a-primary-and-its-replicas)). Start each shard with `--seq-no` for [conditional writes](#conditional-writes): a coordinator passes `if_seq_no` and `seq_no()` on while every shard has one replica, or a primary that its replicas [follow](#replication-a-primary-and-its-replicas) (replicas that each take a shard's writes number them in their own order), and its write answers carry no `seq_no`, since a batch can span shards, but one number per shard (`seq_nos`) for [reads that see a write](#reads-that-see-a-write). A coordinator refuses, for now, `UPDATE` and `DELETE` with a `LIMIT` (each shard would apply its own) and `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` (`INSERT OR REPLACE` works). Shards can also be built offline: `Db::write_segment` writes a segment file anywhere, and `attach_segments` adds built segments to a running database in one commit.
+
+### Tables on shards
+
+A coordinator serves the tables every shard has alike (the same names and schemas), in the first shard's order. It learns them when it connects, after `CREATE TABLE` or `DROP TABLE` through it, which it runs on every shard and then asks again, and when a request names a table it does not know (asking at most once a second), so a table made on each shard directly is served from then on. A table some shards lack is not served, and a shard from before tables offers only its first.
+
+Rows are placed by their primary key, or by the field a table names as `shard_by`:
+
+```sql
+CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD, ts INT) OPTIONS(shard_by = 'usr')
+```
+
+A user's events then sit on one shard, the one whose [slots](#slots) hold the user (the field's value hashes as a key does), so the events of a user are written, and will be read, in one place. Queries still ask every shard. The field must be stored, single-valued, `KEYWORD` or `INT`, `NOT NULL`, and not the key. A row keeps its place: `UPDATE` of the field, and `set` or `add` on it, are refused, and a row that moves goes by a delete and an insert. An `upsert` that gives the same key another value of the field writes the row on that value's shard and leaves the old one where it was (as Elasticsearch's custom routing does), so change the field by deleting first. Operations by key give the field's value as `"routing"`; SQL `UPDATE` and `DELETE` go to every shard as before. A shard refuses a write whose field value another shard's slots hold, naming the value.
 
 ### Slots
 
@@ -341,7 +359,7 @@ When a coordinator connects, it gives every replica its map and its place in it 
 
 - a request with an older epoch than its map's, so a coordinator still on an old map cannot write where the new map says another shard holds a key; a coordinator that gets a 409 when it connects says so and stops;
 - another map of the same epoch, such as a coordinator listing the shards in another order or fewer of them; a new assignment needs a higher epoch;
-- a map while rows here have keys in other shards' slots under it, saying how many and one of them. Nothing moves rows between shards yet, so a map that moves slots is refused until the shards are loaded again under it.
+- a map while rows here have keys (or `shard_by` values) in other shards' slots under it, saying how many and one of them. Nothing moves rows between shards yet, so a map that moves slots is refused until the shards are loaded again under it.
 
 A shard also refuses (400) a write of a key whose slot another shard holds, so that a client writing to a shard directly cannot place a row where the coordinator will not look for it. `--demo-shard I/N` loads the demo rows of shard I's slots under the default map.
 
@@ -355,7 +373,7 @@ strata-server --demo 20000 --seq-no --db a1.strata --listen 127.0.0.1:7720 --grp
 strata-server --demo 20000 --seq-no --db a2.strata --listen 127.0.0.1:7730 --grpc 127.0.0.1:7731 --replica
 ```
 
-A shard's copies can hold the same rows under the same [sequence numbers](#conditional-writes). One server is the primary, started with `--replicas` naming the others' gRPC addresses; each of the others is a replica, started with `--replica`. Both need `--seq-no`. The primary takes the writes and ships its numbered transactions, as its write-ahead log holds them, to each replica's `Replicate` call, in order and in batches of up to 4 MiB. A replica applies a batch only if it follows the replica's last transaction (`Database::apply_shipped`), under the primary's numbers and term, and refuses writes from clients (409). So every copy starts from the same rows: an empty database of the same schema, the same `--demo`, or a [checkpoint](#backups) of the primary. `--demo` and `--copy-from` load each copy on its own, and are not shipped. A replica that starts too far behind is sent a copy of the primary (below), so it needs only the primary's schema.
+A shard's copies can hold the same rows under the same [sequence numbers](#conditional-writes). One server is the primary, started with `--replicas` naming the others' gRPC addresses; each of the others is a replica, started with `--replica`. Both need `--seq-no`. The primary takes the writes and ships its numbered transactions, as its write-ahead log holds them, to each replica's `Replicate` call, in order and in batches of up to 4 MiB. A replica applies a batch only if it follows the replica's last transaction (`Database::apply_shipped`), under the primary's numbers and term, and refuses writes from clients (409). So every copy starts from the same rows: an empty database of the same schema, the same `--demo`, or a [checkpoint](#backups) of the primary. `--demo` and `--copy-from` load each copy on its own, and are not shipped. A replica that starts too far behind is sent a copy of the primary (below), so it needs only the primary's schema. Tables are not shipped yet: a primary refuses `CREATE TABLE` and `DROP TABLE` (409), as a replica refuses every write, so make a database's tables (on a server started without `--replicas` or `--replica`, or with `Db::sql`) before its copies replicate.
 
 **When a write is answered** (`--write-acks`):
 

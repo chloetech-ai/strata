@@ -384,7 +384,7 @@ target/release/strata db.strata --param t='rapid covid tests' < queries.sql
 | `--plan` | prints the plan lines the executor recorded for each statement |
 | `--repeat n` | runs each statement *n* times and reports the median time |
 
-From Rust, `Db::query` takes a `SELECT` and a `Params` map, and `Db::sql` takes any statement, on any table, writes and `CREATE TABLE` included. Over the network, [strata-server](server.md) serves the same SQL over a database's first table.
+From Rust, `Db::query` takes a `SELECT` and a `Params` map, and `Db::sql` takes any statement, on any table, writes and `CREATE TABLE` included. Over the network, [strata-server](server.md) serves the same SQL over every table of a database.
 
 ## Tables
 
@@ -406,6 +406,12 @@ CREATE TABLE IF NOT EXISTS wrote (
   role KEYWORD NOT NULL DEFAULT 'author',
   added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE events (
+  id INT PRIMARY KEY,
+  usr KEYWORD NOT NULL,
+  item KEYWORD,
+  ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) OPTIONS(shard_by = 'usr');
 DROP TABLE IF EXISTS wrote, authors;
 ```
 
@@ -414,10 +420,11 @@ DROP TABLE IF EXISTS wrote, authors;
 - **The primary key** is one column: `PRIMARY KEY` on it, or a `PRIMARY KEY (column)` constraint. A table without one only takes plain `INSERT`.
 - **`REFERENCES table`**, or `FOREIGN KEY (column) REFERENCES table`, records that a `KEYWORD` or `INT` column holds primary keys of that table, which must exist (or be the table being created) and have a primary key of the column's type. References are not enforced: a row may name a key that is not there, and an inner join along the reference leaves that row out (`LEFT JOIN` keeps it). Joins along them are [ordinary joins](#subqueries-with-and-joins) (`FROM wrote w JOIN authors a ON w.author = a.id`).
 - **`NOT NULL`** refuses a row without a value in that column, from any write: SQL, JSON, a file or the Rust API. **`DEFAULT value`** is the value a write that leaves the column out gets: a constant of the column's type on a single-valued `TEXT`, `KEYWORD`, `INT`, `FLOAT`, `BOOL` or `TIMESTAMP` column that is not the key, or `CURRENT_TIMESTAMP` (or `now()`) on a `TIMESTAMP`, the time of the statement, the same in all its rows. An `INSERT` that leaves a column out, a JSON row without its key and a CSV file without its column give it the default; a `NULL` that a write gives stays `NULL`, and a column with `NOT NULL` refuses it. In SQL the keyword `DEFAULT` stands for a column's default, in `VALUES` and in `SET`. The Rust API writes a row as it is given; `Schema::defaults` returns a row of the defaults to start from. The JSON schema's options are `"not_null": true` and `"default"` (`"now"` for the time of the write).
+- **`OPTIONS(shard_by = 'column')`** after the columns places the table's rows on [shards](server.md#tables-on-shards) by that column instead of by the primary key, so that a user's events sit on one shard together. The column is a stored, single-valued `KEYWORD` or `INT` with `NOT NULL`, other than the key, and a row keeps it: `UPDATE` does not change it (delete the row and insert it again). In JSON it is `"shard_by": "usr"`. One database places nothing, so the option only matters to a coordinator.
 - **`DROP TABLE`** drops tables other than the first. A table that another table references goes with it (`DROP TABLE wrote, authors`) or with `CASCADE`, which removes those references.
 - Every other clause (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, a `DEFAULT` that is an expression, `CREATE TABLE ... AS SELECT`) is an error, and there is no `ALTER TABLE` yet.
 
-`CREATE TABLE` and `DROP TABLE` run through `Db::sql` and Python's in-process [`strata.Database`](python.md). [strata-server](server.md) serves a database's first table for now.
+`CREATE TABLE` and `DROP TABLE` run through `Db::sql`, Python's in-process [`strata.Database`](python.md), and [strata-server](server.md#schemas)'s `POST /v1/sql`, where a coordinator runs them on every shard.
 
 ## Writes
 
