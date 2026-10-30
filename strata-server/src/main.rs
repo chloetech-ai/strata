@@ -176,8 +176,9 @@ struct Args {
     max_groups: usize,
     /// The most rows a cross-encoder's rerank phase may score, on a
     /// database or a coordinator: a query whose phase asks for more fails
-    /// (0: no limit).
-    #[arg(long, default_value_t = 1000)]
+    /// (0: no limit). A hundred abstracts take ms-marco-MiniLM-L-6-v2
+    /// about the default deadline on four cores.
+    #[arg(long, default_value_t = 100)]
     max_rerank: usize,
     /// Memory the running queries may hold together, in MiB: their groups,
     /// candidate rows, answers and joins; a query that needs more fails

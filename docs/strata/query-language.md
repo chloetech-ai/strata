@@ -336,7 +336,7 @@ SELECT id, score() FROM top ORDER BY sigmoid(gbdt('clicks', bm25(title, :t), bm2
 
 #### Cross-encoders: `cross_encoder('model', fields…, query)`
 
-A cross-encoder reads the query and a row's text together and scores how well the text answers it: far better than BM25 at ordering the best hundred rows, and far slower, so it reranks the top rows of a cheaper ranking, in a rerank phase of its own:
+A cross-encoder reads the query and a row's text together and scores how well the text answers it. It costs thousands of times what BM25 does per row, so it reranks the top rows of a cheaper ranking, in a rerank phase of its own:
 
 ```sql
 WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q) DESC LIMIT 100)
@@ -353,7 +353,8 @@ SELECT id, score() FROM ce ORDER BY bm25(title, :q) + decay(published, now(), 25
 - **The text** is the values of the fields named, stored TEXT or KEYWORD fields, joined by a space (`NULL`s left out, each value of a list), and the query is the last argument, a string or a parameter. Query and text together are cut to the model's length (512 tokens at most), the longer of the two first, as Hugging Face's tokenizers cut a pair.
 - **The score is the label's logit**, what sentence-transformers' `CrossEncoder.predict` gives with an identity activation (`sigmoid()` of it is the probability for a model trained with one), equal to PyTorch's within 1e-5. A phase may mix it with other scores of the row (`cross_encoder(…) + 0.1 * rating`), and phases after it rerank the rows it kept.
 - **It runs once per query, in a global phase**: on a database over the rows the phase before it kept, and through a coordinator once on the coordinator, which reads the text of the rows its shards ranked best in the fetch round of query then fetch and scores them; shards need no model. A cross-encoder is refused as the first ranking (rerank a cheaper ranking's top rows), as a column, and among `features()`.
-- **Its cost is per row and per token**: `--max-rerank` on a server (default 1000) refuses a phase that would score more rows, and the query's deadline is checked between batches of 16 rows.
+- **Its cost is per row and per token**: `ms-marco-MiniLM-L-6-v2` takes about 50 ms a row of a few hundred tokens on four cores, so BM25's top 20 takes 0.9 to 1.0 s at the median on SciFact, NFCorpus and ArguAna, and the top 100 4.5 to 5.2 s, where BM25 alone takes 0.04 to 1.1 ms (`strata/results/text/bm25_ce_latency.json`, a 4-core cloud VM). `--max-rerank` on a server (default 100) refuses a phase that would score more rows, and the query's deadline (`--timeout-ms`, 5 s) is checked between batches of 16 rows.
+- **Whether it helps depends on the collection**: reranking BM25's top 100 by `ms-marco-MiniLM-L-6-v2`, a model trained on web questions, raises NFCorpus's nDCG@10 from 0.329 to 0.352 and leaves SciFact's where it was (0.687 against 0.691); see [the results](results.md#cross-encoder-reranking). Measure it on your own queries before paying for it.
 - **A plan names the model and the hash of its files** (FNV-1a of the three; `EXPLAIN` shows `ranking model: … (hash …)`), with the plan feature `rank_models`, as for [`gbdt`](#ranking-models-gbdtmodel-features). From Python, `.order_by(bm25("body", q)).rerank(cross_encoder("ms-marco-MiniLM-L-6-v2", ["title", "body"], q), 100)` builds the same query.
 
 ### `decay(field, origin, scale, …)`: closeness to a value
