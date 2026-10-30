@@ -84,6 +84,9 @@ pub(crate) struct VectorBuilder {
     present: Vec<u64>,
     n: usize,
     missing: usize,
+    /// A multi-vector field's row offsets (`n` counts vectors), and whether
+    /// it keeps its float32 vectors.
+    multi: Option<(Vec<u32>, bool)>,
 }
 
 impl VectorBuilder {
@@ -135,6 +138,7 @@ impl VectorBuilder {
             present: Vec::new(),
             n: 0,
             missing: 0,
+            multi: field.is_multi_vector().then(|| (vec![0], field.keep_f32)),
         })
     }
 }
@@ -161,6 +165,28 @@ fn start_graph(seg: &SegmentFile, field: &str, dim: usize) -> Option<(HnswView, 
 
 impl FieldIndexBuilder for VectorBuilder {
     fn add(&mut self, doc: DocId, value: &Value) -> Result<()> {
+        if let Some((offsets, _)) = &self.multi {
+            if doc as usize + 1 != offsets.len() {
+                return Err(Error::Schema(format!("vector field {}: document {doc} out of order", self.field)));
+            }
+            for v in value.items() {
+                match v {
+                    Value::Vector(v) if v.len() == self.dim => {
+                        if self.n.is_multiple_of(64) {
+                            self.present.push(0);
+                        }
+                        self.rows.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+                        self.rows.resize(self.rows.len() + (self.stride - self.dim) * 4, 0);
+                        self.present[self.n / 64] |= 1 << (self.n % 64);
+                        self.n += 1;
+                    }
+                    _ => return Err(Error::Schema(format!("vector field {}: bad value for document {doc}", self.field))),
+                }
+            }
+            let n = u32::try_from(self.n).map_err(|_| Error::Schema(format!("vector field {}: more than 2^32 vectors in a segment", self.field)))?;
+            self.multi.as_mut().expect("multi").0.push(n);
+            return Ok(());
+        }
         if doc as usize != self.n {
             return Err(Error::Schema(format!("vector field {}: document {doc} out of order", self.field)));
         }
@@ -184,14 +210,18 @@ impl FieldIndexBuilder for VectorBuilder {
     }
 
     fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
-        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, start, rows, present, n, missing } = *self;
+        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, start, rows, present, n, missing, multi } = *self;
         let code_stride = code_kind.stride(dim);
         let is_present = |d: u32| present[d as usize / 64] >> (d % 64) & 1 == 1;
         let ids: Vec<u32> = (0..n as u32).filter(|&d| is_present(d)).collect();
         let kind = match kind {
             Kind::Hnsw { .. } if hnsw_max_docs.is_some_and(|m| ids.len() > m) => Kind::Ivf { nlist: None, iters: 10, sample: 64 },
+            // A multi-vector segment of NULL rows has no vectors to index.
+            _ if multi.is_some() && n == 0 => Kind::Flat,
             k => k,
         };
+        // A merge's graph is a graph of rows, not of a multi-vector field's vectors.
+        let start = if multi.is_some() { None } else { start };
         // SAFETY: f32 has no invalid bit patterns; `align_to` only yields the
         // aligned middle part, and we require it to be everything.
         let (head, data, tail) = unsafe { rows.align_to::<f32>() };
@@ -224,6 +254,8 @@ impl FieldIndexBuilder for VectorBuilder {
             ef_construction: None,
             entry: None,
             max_level: None,
+            rows: multi.as_ref().map(|(o, _)| o.len() - 1),
+            f32: multi.as_ref().is_none_or(|&(_, keep)| keep),
         };
         let mut index_sections: Vec<(String, Vec<u8>)> = Vec::new();
         match kind {
@@ -275,7 +307,34 @@ impl FieldIndexBuilder for VectorBuilder {
             out.put(name, bytes);
         }
         out.put(section(&field, codes_part), codes);
-        out.put(section(&field, "f32"), rows);
+        if let Some((offsets, _)) = &multi {
+            let mut owner = Vec::with_capacity(n * 4);
+            for (r, w) in offsets.windows(2).enumerate() {
+                for _ in w[0]..w[1] {
+                    owner.extend((r as u32).to_le_bytes());
+                }
+            }
+            out.put(section(&field, "rows"), offsets.iter().flat_map(|o| o.to_le_bytes()).collect());
+            out.put(section(&field, "owner"), owner);
+            // Rows are scored exactly with SQ8 codes when binary codes are
+            // searched and the float32 vectors are not kept.
+            if !info.f32 && code_kind == VectorCodes::Binary {
+                let sq = Sq8::fit(dim, (0..n).map(|d| &view.row(d)[..dim]));
+                let s = strides(dim).1;
+                let mut c = vec![0u8; n * s];
+                for d in 0..n {
+                    sq.encode(&view.row(d)[..dim], &mut c[d * s..(d + 1) * s]);
+                }
+                let mut p = ByteWriter::new();
+                p.array(&sq.min);
+                p.array(&sq.scale);
+                out.put(section(&field, "rescore"), c);
+                out.put(section(&field, "rescorep"), p.finish());
+            }
+        }
+        if info.f32 {
+            out.put(section(&field, "f32"), rows);
+        }
         Ok(())
     }
 }

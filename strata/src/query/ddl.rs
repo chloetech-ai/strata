@@ -22,7 +22,9 @@
 //! UTC; or `TIMESTAMPTZ`, `DATETIME`), `VECTOR(dimensions)`, `SPARSE`,
 //! `EDGES` and `MEDIA` (a file's reference, [`crate::media`]; `OPTIONS(kind
 //! = 'image')`, `'audio'`, `'video'` or `'pdf'` says what file); `KEYWORD[]`
-//! and `INT[]` hold lists. A table with a BOOL, TIMESTAMP or MEDIA column
+//! and `INT[]` hold lists, and `VECTOR(dimensions)[]` several vectors per
+//! row (options `keep_f32` and `pool` besides a vector's,
+//! [`crate::vector::multi`]). A table with a BOOL, TIMESTAMP or MEDIA column
 //! makes the database format 3 ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
 //! the schema's short JSON form ([`crate::schema::Schema::from_json`]):
 //! `positions`, `stored` and `indexed` (true or false), `from` (the fields
@@ -77,7 +79,7 @@ fn err(m: impl Into<String>) -> Error {
 const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column')]";
 /// The options of a table, in `OPTIONS(...)` after its columns.
 const TABLE_OPTIONS: [&str; 1] = ["shard_by"];
-const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES or MEDIA, and KEYWORD[] or INT[] for lists";
+const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES or MEDIA, KEYWORD[] or INT[] for lists, and VECTOR(dimensions)[] for several vectors per row";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
 /// EXISTS`. `tables` are the database's tables, which references name.
@@ -245,6 +247,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let (ty, multi, dim) = column_type(ty).map_err(bad)?;
     let allowed: &[&str] = match ty {
         "text" => &["positions", "stored", "indexed", "from", "analyzer"],
+        "vector" if multi => &["indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
         "media" => &["stored", "indexed", "kind"],
         "keyword" if multi => &["stored", "indexed", "semantic_id", "codebook"],
@@ -254,7 +257,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
         return Err(bad("semantic_id and codebook are options of a KEYWORD[] column".into()));
     }
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model", "kind", "semantic_id", "codebook"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "dim", "embed", "model", "kind", "semantic_id", "codebook"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {
@@ -321,7 +324,8 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     }
     for (k, v) in opts {
         match k.as_str() {
-            "positions" | "stored" | "indexed" if !v.is_boolean() => return Err(bad(format!("{k} is true or false"))),
+            "positions" | "stored" | "indexed" | "keep_f32" if !v.is_boolean() => return Err(bad(format!("{k} is true or false"))),
+            "pool" if !v.is_number() => return Err(bad("pool is a cosine similarity, such as 0.9".into())),
             "dim" => {
                 positive(&v).map_err(|m| bad(format!("dim {m}")))?;
             }
@@ -341,7 +345,8 @@ fn column_type(t: &DataType) -> std::result::Result<(&'static str, bool, Option<
         let sql::ArrayElemTypeDef::SquareBracket(inner, None) = a else { return Err(format!("{t} is not a type here: {TYPES}")) };
         return match column_type(inner)? {
             (ty @ ("keyword" | "int"), false, None) => Ok((ty, true, None)),
-            _ => Err(format!("{t}: only KEYWORD[] and INT[] hold lists")),
+            ("vector", false, dim) => Ok(("vector", true, dim)),
+            _ => Err(format!("{t}: only KEYWORD[], INT[] and VECTOR(dimensions)[] hold lists")),
         };
     }
     if let DataType::Custom(name, args) = t {
@@ -411,7 +416,11 @@ fn option_value(e: &Expr) -> Result<J> {
         Expr::Value(v) => match &v.value {
             sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => Ok(json!(s)),
             sql::Value::Boolean(b) => Ok(json!(b)),
-            sql::Value::Number(n, _) => n.parse::<u64>().map(|n| json!(n)).map_err(|_| err(format!("option value {n} is not a whole number"))),
+            sql::Value::Number(n, _) => match (n.parse::<u64>(), n.parse::<f64>()) {
+                (Ok(n), _) => Ok(json!(n)),
+                (_, Ok(x)) if x.is_finite() => Ok(json!(x)),
+                _ => Err(err(format!("option value {n} is not a number"))),
+            },
             _ => Err(err(format!("option value {e} is not a string, number or boolean"))),
         },
         Expr::Array(a) => a.elem.iter().map(option_value).collect::<Result<Vec<_>>>().map(J::Array),
@@ -435,7 +444,7 @@ fn names(v: &J) -> std::result::Result<Vec<String>, String> {
 fn positive(v: &J) -> std::result::Result<J, String> {
     match v.as_u64() {
         Some(n) if n > 0 => Ok(json!(n)),
-        _ => Err("is a positive number".into()),
+        _ => Err("is a positive whole number".into()),
     }
 }
 
@@ -530,7 +539,7 @@ mod tests {
             ("CREATE TABLE t (a MEDIA PRIMARY KEY)", "neither the key"),
             ("CREATE TABLE t (a MEDIA DEFAULT 'x')", "given a default"),
             ("CREATE TABLE t (a MEDIA REFERENCES t)", "neither the key, a reference"),
-            ("CREATE TABLE t (a MEDIA[])", "only KEYWORD[] and INT[]"),
+            ("CREATE TABLE t (a MEDIA[])", "only KEYWORD[], INT[] and VECTOR(dimensions)[]"),
             ("CREATE TABLE t (a MEDIA, b TEXT OPTIONS(from = 'a'))", "not a source of text"),
             ("CREATE TABLE t (a MEDIA, e VECTOR OPTIONS(embed = 'a', model = 'hash:8'))", "is of kind image"),
             ("CREATE TABLE t (id INT PRIMARY KEY, a MEDIA NOT NULL) OPTIONS(shard_by = 'a')", "KEYWORD or INT"),

@@ -97,7 +97,7 @@ A database starts with one table, whose schema is set when the database is creat
 | `int`, `float` | numbers | ranges, sorting, sums, boosts |
 | `bool` | true or false | conditions (`WHERE done`), `GROUP BY` |
 | `timestamp` | a moment in UTC, to the microsecond, as ISO 8601 text (`"2026-10-01T12:30:00Z"`) | ranges, sorting, `MIN`/`MAX`, boosts by age |
-| `vector` | a fixed number of floats | `similarity()`, `distance()` |
+| `vector` | a fixed number of floats; with `multi`, a list of them, `[[...], [...]]` | `similarity()`, `distance()`; `maxsim()` |
 | `sparse` | learned term weights (SPLADE, BGE-M3), `{"term": weight}` | `similarity()` |
 | `media` | an image, audio, video or PDF file by URI, with its hash, type and size ([media fields](#media-fields)) | `=` and `IN` on the hash, `GROUP BY` |
 | `edges` | links to other rows by key, a JSON array | [graph queries](graphs.md) |
@@ -106,7 +106,9 @@ A database starts with one table, whose schema is set when the database is creat
 |---|---|---|---|
 | `stored` | all | true; false for vectors and generated text | the value is kept and returned in results |
 | `indexed` | all | true | the value can be searched and filtered on |
-| `multi` | `keyword`, `int` | false | a list of values per row (stored, not the key) |
+| `multi` | `keyword`, `int`, `vector` | false | a list of values per row (stored, not the key); a list of vectors, ranked by [`maxsim`](query-language.md#maxsimfield-vectors-several-query-vectors) |
+| `keep_f32` | multi `vector` | false | keep the float32 vectors to score with instead of 8-bit codes |
+| `pool` | multi `vector` | | merge a row's vectors at least this similar (cosine, such as `0.9`) into their mean at write |
 | `positions` | `text` | true | keep word positions, for phrase searches |
 | `analyzer` | `text` | `"english"` | how text becomes words to search: `"english"` drops stopwords and stems (`running` finds `run`), `"simple"` keeps every word as written; another than `"english"` makes the database format 3 |
 | `from` | `text` | | generated: the named fields' text joined, such as a `body` of title and description to search at once |

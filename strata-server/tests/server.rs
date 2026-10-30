@@ -1624,6 +1624,37 @@ async fn sparse_and_binary_vector_fields_over_http() {
     assert!(metrics.contains(r#"kind="sparse",outcome="ok"} 1"#), "{metrics}");
 }
 
+/// A multi-vector field over HTTP: rows written as arrays of vectors, ranked
+/// by `maxsim` with an array of query vectors, and read back as arrays.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_vector_fields_over_http() {
+    use strata::{Field, FieldType, Schema, VectorIndexKind};
+    let patches = Field::new("patches", FieldType::Vector { dim: 3, index: VectorIndexKind::Flat }).multi().keep_f32();
+    let schema = Schema::new("pages", vec![Field::new("id", FieldType::Keyword), patches], Some("id")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("m.strata"), schema, DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let base = http(service(db, "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let docs = [
+        json!({"id": "a", "patches": [[1, 0, 0], [0, 1, 0]]}),
+        json!({"id": "b", "patches": [[0.0, 0.0, 1.0]]}),
+        json!({"id": "c", "patches": [0.5, 0.5, 0.0]}),
+        json!({"id": "d"}),
+    ];
+    let ops: Vec<Json> = docs.into_iter().map(|d| json!({"op": "insert", "doc": d})).collect();
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({ "ops": ops })).await;
+    assert_eq!((status, r["written"].clone()), (200, json!(4)), "{r}");
+    let sql = "SELECT id, patches FROM pages ORDER BY maxsim(patches, :qs) DESC LIMIT 5";
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": sql, "params": {"qs": [[1, 0, 0], [0, 1, 0]]}})).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["keys"], json!(["a", "c", "b"]), "{r}");
+    assert_eq!(r["scores"], json!([2.0, 1.0, 0.0]), "{r}");
+    assert_eq!(r["rows"][0][1], json!([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]), "{r}");
+    assert_eq!(r["rows"][1][1], json!([[0.5, 0.5, 0.0]]), "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({"ops": [{"op": "insert", "doc": {"id": "bad", "patches": [[1, 0]]}}]})).await;
+    assert_eq!(status, 400, "{r}");
+}
+
 /// `{"vector_of": key}` reads a row's vector whatever the fields are named:
 /// the SQL it ran did not quote them, so a space broke it.
 #[tokio::test(flavor = "multi_thread")]

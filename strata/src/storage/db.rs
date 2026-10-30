@@ -2245,7 +2245,9 @@ impl Database {
         }
         if let Some((_, seg, base)) = largest {
             for (i, f) in schema.fields.iter().enumerate() {
-                if matches!(f.ty, FieldType::Vector { .. }) {
+                // A multi-vector field numbers its vectors apart from the
+                // rows, so its graph is built anew.
+                if matches!(f.ty, FieldType::Vector { .. }) && !f.multi {
                     starts.push(GraphStart { field: i, segment: seg.clone(), base });
                 }
             }
