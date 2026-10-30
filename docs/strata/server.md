@@ -174,7 +174,7 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
 
-`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory; it also downloads the captioner of [text from media](#text-from-media).
+`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory; it also downloads the captioner and the speech model of [text from media](#text-from-media).
 
 **Changing your mind.** Vectors are stored, so changing a field's sources or model means re-embedding. Create a database with the new schema and fill it from the old one:
 
@@ -259,21 +259,26 @@ Through Strata, `siglip-base-patch16-224` retrieves as well as [open_clip's publ
 
 ### Text from media
 
-A `text` field can be a model's text of a `media` field's file: a caption of each row's image, made by BLIP's captioner (`blip-image-captioning-base`, built with `--features vision`).
+A `text` field can be a model's text of a `media` field's file: a caption of each row's image, made by BLIP's captioner (`blip-image-captioning-base`, built with `--features vision`), or a transcript of each row's recording, made by Whisper (`whisper-small`, built with `--features audio`).
 
 ```json
 {"name": "image", "type": "media", "kind": "image"},
-{"name": "caption", "type": "text", "derive": {"from": "image", "model": "blip-image-captioning-base"}}
+{"name": "caption", "type": "text", "derive": {"from": "image", "model": "blip-image-captioning-base"}},
+{"name": "recording", "type": "media", "kind": "audio"},
+{"name": "transcript", "type": "text", "derive": {"from": "recording", "model": "whisper-small"}}
 ```
 
-`caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')` declares it in `CREATE TABLE`. The text is made as [vectors of images](#vectors-of-images) are: before the write queues for the writer, from the bytes the write gave or fetched, for `/v1/write`, SQL `INSERT` and imports; an `UPDATE` that changes the file makes it again, and an image that cannot be read or decoded fails the request. A text a write gives is kept as given, so captions made elsewhere (by a larger model, or by people) go in the same field. The field is stored and logged with the row: merges and replicas never run the model, and a database opened without it still reads and searches the text. From then on it is text like any other: BM25, phrases, synonyms, `MATCH`, a [generated field](query-language.md#columns-and-types) over it, and an embedded vector of it (`"embed": {"from": ["caption"], ...}`) all read it. `/v1/schema` lists each derived field under `derived`, with whether this server has its model open.
+`caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')` declares it in `CREATE TABLE`. The text is made as [vectors of images](#vectors-of-images) are: before the write queues for the writer, from the bytes the write gave or fetched, for `/v1/write`, SQL `INSERT` and imports; an `UPDATE` that changes the file makes it again, and a file that cannot be read or decoded fails the request. A text a write gives is kept as given, so captions made elsewhere (by a larger model, or by people) go in the same field. The field is stored and logged with the row: merges and replicas never run the model, and a database opened without it still reads and searches the text. From then on it is text like any other: BM25, phrases, synonyms, `MATCH`, a [generated field](query-language.md#columns-and-types) over it, and an embedded vector of it (`"embed": {"from": ["caption"], ...}`) all read it. `/v1/schema` lists each derived field under `derived`, with whether this server has its model open.
 
 | model | what it makes | |
 |---|---|---|
 | `blip-image-captioning-base` | a caption of an image, greedily, at most 20 tokens, as the `transformers` library makes it by default | build with `--features vision`; `strata-server fetch-model blip-image-captioning-base`; about 2 s an image on a 4-vCPU cloud VM |
+| `whisper-small` | a transcript of speech in any of Whisper's 99 languages: each 30 seconds decoded as the `transformers` library does by default (greedily, without timestamps), in the language detected in the file's first 30 seconds, and the windows' texts joined by spaces | build with `--features audio`; `strata-server fetch-model whisper-small`; about 5.4 s for each 30 seconds of sound, or part of it, on a 4-vCPU cloud VM (`transformers` takes 2.9 s) |
 | `colors` | the names of an image's main colours | no files; tests and demos |
 
 Strata's captions are the `transformers` library's: on 100 images of Flickr30K's test split (the first by file name), BLIP base through Strata and through `transformers` 4.46.3 wrote the same caption for 97 of them; the other three part at a word that two choices nearly tie for (`a man in a red shirt` against `a man wearing a red shirt`), most likely from small differences in resizing the image and in float arithmetic. Changing the model of a field means a new database filled from the old one (`--copy-from`): text of the same model is copied, and text of another is made again.
+
+Sound is decoded from WAV, FLAC, MP3, Ogg Vorbis and AAC (in MP4) files, mixed down to one channel and resampled to Whisper's 16 kHz; a recording longer than an hour is refused. A recording is cut every 30 seconds, so a word across a cut can be lost or split: Whisper's long-form mode, which moves its window by the timestamps it predicts, is not implemented. Strata's transcripts are the `transformers` library's: on 200 utterances of LibriSpeech's `test-clean` (every 13th, all 40 speakers), `whisper-small` through Strata and through `transformers` 4.46.3 wrote the same 200 transcripts, with a word error rate of 3.8% (`strata-asr-eval`, [results](https://github.com/rkonow/strata/tree/main/strata/results/media#transcripts-of-speech); words compared without punctuation, a stricter count than Whisper's own normalizer). Searching the utterances by what was said, `ORDER BY bm25(transcript, :t)`, ranked the right one first for 198 of 200.
 
 For finding images by text, the captions add little to an image model's vectors. With SigLIP's vectors and BM25 over BLIP's captions, fused in SQL (`strata-media-eval`, cloud container with 4 vCPUs, [results](https://github.com/rkonow/strata/tree/main/strata/results/media#captions-made-from-the-images)), R@1:
 

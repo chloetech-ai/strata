@@ -27,6 +27,8 @@
 //!   measurement harness; [`baselines`] (feature `baselines`): SQLite and
 //!   Tantivy behind the same interface.
 
+#[cfg(feature = "audio")]
+pub mod audio;
 #[cfg(feature = "baselines")]
 pub mod baselines;
 pub mod beir;

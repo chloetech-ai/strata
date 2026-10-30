@@ -22,6 +22,8 @@ bert = ["strata/bert"]
 accelerate = ["strata/accelerate"]
 # Images (`vision`): decoded, and embedded by SigLIP.
 vision = ["strata/vision"]
+# Sound (`audio`): decoded, and transcribed by Whisper.
+audio = ["strata/audio"]
 
 [profile.release]
 codegen-units = 1

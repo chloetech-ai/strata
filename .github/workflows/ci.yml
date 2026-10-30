@@ -17,6 +17,11 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# The jobs run on the organisation's own runners rather than GitHub's shared
+# ones, so that they no longer wait for the plan's few concurrent jobs:
+# gh-linux (Ubuntu 24.04, 4 cores, 16 GB) and gh-mac (macOS 26, 3 cores,
+# 7 GB). Job names still say ubuntu-latest and macos-latest, which keeps the
+# check names.
 jobs:
   test:
     name: ${{ matrix.crate }} on ${{ matrix.os }}
@@ -25,7 +30,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         crate: [strata, engram, strata-server]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +68,7 @@ jobs:
   # that it runs beside the strata tests rather than after them.
   kernels:
     name: strata kernels on a generic build
-    runs-on: ubuntu-latest
+    runs-on: gh-linux
     timeout-minutes: 30
     env:
       RUSTFLAGS: -C target-cpu=x86-64
@@ -87,7 +92,7 @@ jobs:
   # are not fetched here), and clippy over the feature's code.
   vision:
     name: images (feature vision)
-    runs-on: ubuntu-latest
+    runs-on: gh-linux
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -112,6 +117,38 @@ jobs:
         working-directory: strata-server
         run: cargo test --profile ci --features vision --test media_vectors --test media
 
+  # Sound (feature `audio`: symphonia's decoders and Whisper through
+  # candle): decoding, resampling and mel features, and text derived from
+  # sound with a test model (Whisper's weights are not fetched here), and
+  # clippy over the feature's code in Strata and the server.
+  audio:
+    name: sound (feature audio)
+    runs-on: gh-linux
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: CPU model
+        id: cpu
+        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            strata
+            strata-server
+          key: audio-${{ steps.cpu.outputs.model }}
+      - name: Strata
+        working-directory: strata
+        run: |
+          cargo test --profile ci --features audio --test derived_audio
+          cargo test --profile ci --features audio --lib -- audio::
+          cargo clippy --profile ci --features audio --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+      - name: strata-server
+        working-directory: strata-server
+        run: cargo clippy --profile ci --features audio -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+
   # Power losses, full disks and failing syncs at every write of a storage
   # workload (storage::io, tests/storage_faults.rs). A job of its own: after
   # the strata tests, it took the macOS job past its hour.
@@ -121,7 +158,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -143,7 +180,7 @@ jobs:
   # with its new numbers.
   relevance-gate:
     name: relevance gate (BEIR)
-    runs-on: ubuntu-latest
+    runs-on: gh-linux
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -175,7 +212,7 @@ jobs:
   # pinned to the one the tests were run with.
   miri:
     name: miri (${{ matrix.part }})
-    runs-on: ubuntu-latest
+    runs-on: gh-linux
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -206,7 +243,7 @@ jobs:
 
   server-smoke:
     name: strata-server smoke test
-    runs-on: ubuntu-latest
+    runs-on: gh-linux
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -250,7 +287,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
