@@ -78,9 +78,9 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// The forms this module binds, for error messages.
-const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column')]";
+const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column', edges = 'src, dst, w')]";
 /// The options of a table, in `OPTIONS(...)` after its columns.
-const TABLE_OPTIONS: [&str; 4] = ["shard_by", "cluster_by", "retain", "retain_by"];
+const TABLE_OPTIONS: [&str; 5] = ["shard_by", "cluster_by", "retain", "retain_by", "edges"];
 const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES or MEDIA, and KEYWORD[] or INT[] for lists";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
@@ -199,6 +199,7 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
         match option_value(value)? {
             v @ J::String(_) => short[k] = v,
             _ if k == "retain" => return Err(err("the table's option retain is a period, in quotes: retain = '400 days'")),
+            _ if k == "edges" => return Err(err("the table's option edges names its source, target and weight columns, in quotes: edges = 'src, dst, w'")),
             _ => return Err(err(format!("the table's option {k} names a column, in quotes: {k} = 'usr'"))),
         }
     }

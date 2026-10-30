@@ -267,7 +267,7 @@ pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Para
     if needs(q, schema) {
         return plan_query(q, catalog, params);
     }
-    Ok(ir::Plan::of_select(schema, &super::sql::bind_query(q, schema, params)?))
+    Ok(ir::Plan::of_select(schema, &super::sql::bind_query_in(q, schema, catalog, params)?))
 }
 
 /// [`plan_in`] of a parsed query.
@@ -503,7 +503,7 @@ impl<'a> Planner<'a> {
                 *es = vec![o];
             }
             q.limit_clause = cut;
-            super::sql::bind_phase_with(&q, schema, self.params, &subs as &Subs, earlier).ok()
+            super::sql::bind_phase_with(&q, schema, self.catalog, self.params, &subs as &Subs, earlier).ok()
         };
         let keyed = |s: &Select| {
             s.group_by.is_empty()
@@ -595,7 +595,7 @@ impl<'a> Planner<'a> {
             e => e,
         };
         let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind, Some(schema));
-        let select = super::sql::bind_query_with(q, schema, self.params, &subs as &Subs).map_err(at)?;
+        let select = super::sql::bind_query_with(q, schema, self.catalog, self.params, &subs as &Subs).map_err(at)?;
         if select.projection.iter().any(|(_, p)| *p == Projection::SeqNo) {
             return Err(at(err("seq_no() is a column of a SELECT on one table, not of a compound query")));
         }

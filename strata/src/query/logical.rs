@@ -142,11 +142,15 @@ pub enum GraphKind {
     Ppr { alpha: f64, eps: f64, max_pushes: u64, weighted: bool },
 }
 
-/// A graph computation over one EDGES field, or over a VECTOR field whose
-/// `k` most similar rows count as a row's neighbours.
+/// A graph computation over one EDGES field, over an edge table, or over a
+/// VECTOR field whose `k` most similar rows count as a row's neighbours.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphQuery {
+    /// The EDGES or VECTOR field; with `edges`, the primary key.
     pub field: usize,
+    /// The edge table walked instead of a field
+    /// ([`crate::schema::Schema::with_edges`]).
+    pub edges: Option<String>,
     pub seeds: Seeds,
     pub kind: GraphKind,
     pub dir: Direction,

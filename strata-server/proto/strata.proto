@@ -709,6 +709,9 @@ message Graph {
   // A weight per key `seeds` lists, which PageRank restarts at in
   // proportion; empty, all 1 (plan feature "maxsim").
   repeated double weights = 12;
+  // The edge table walked instead of `field`, which is then the primary
+  // key (plan feature "edge_table").
+  optional string edges = 13;
 }
 
 message Reachable {

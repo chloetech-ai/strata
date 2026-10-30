@@ -584,6 +584,7 @@ impl<'a> Ops<'a, '_> {
             // `min_hops => 0`: a value's own row may link to another value.
             return Ok(Expr::Graph(Box::new(Graph {
                 field: *f,
+                edges: None,
                 seeds: Expr::Lit(Value::List(vals)),
                 weights: Vec::new(),
                 kind: GraphKind::Reachable { min_hops: 0, max_hops: 1 },
