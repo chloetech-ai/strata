@@ -144,6 +144,9 @@ fn queries() -> Vec<(&'static str, Json)> {
         // statistics, and a rank-safe boost.
         ("SELECT id, score() FROM products ORDER BY ln(1 + bm25(body, 'waterproof hiking')) + 0.1 * coalesce(rating, 0) DESC LIMIT 10", none.clone()),
         ("SELECT id, score() FROM products WHERE price < 200 ORDER BY bm25(body, 'leather boots') * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 8", none.clone()),
+        // Autocomplete: a prefix's most rated, and a prefix counted.
+        ("SELECT id, rating FROM products WHERE PREFIX(id, 'p00001') ORDER BY rating DESC, id LIMIT 10", none.clone()),
+        ("SELECT COUNT(*) FROM products WHERE category LIKE 'k%' AND id NOT LIKE 'p0000%'", none.clone()),
     ]
 }
 

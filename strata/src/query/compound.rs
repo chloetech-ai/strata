@@ -1477,6 +1477,10 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
             whens: conditions.iter().map(|c| Ok(When { when: go(&c.condition)?, then: go(&c.result)? })).collect::<Result<_>>()?,
             otherwise: else_result.as_deref().map(bx).transpose()?,
         },
+        Expr::Function(f) if fname(f) == "prefix" => {
+            let [x, p] = func_args(f)[..] else { return Err(err("PREFIX(text, prefix) takes two arguments")) };
+            ir::Expr::Prefix { expr: bx(x)?, prefix: bx(p)? }
+        }
         Expr::Function(f) => {
             let func = match fname(f).as_str() {
                 "lower" => Func::Lower,

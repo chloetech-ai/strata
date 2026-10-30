@@ -77,7 +77,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 | type | indexed as | filters |
 |---|---|---|
 | `INT`, `FLOAT` (finite: no NaN or infinity) | frame-of-reference column with zone maps, range histogram | `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL` |
-| `KEYWORD` | dictionary codes and one docID list per value | `=`, `!=`, `IN`, `NOT IN`, `IS [NOT] NULL`; `GROUP BY` |
+| `KEYWORD` | dictionary codes and one docID list per value | `=`, `!=`, `IN`, `NOT IN`, `IS [NOT] NULL`, [prefixes](#prefixes-and-autocomplete) (`LIKE 'p%'`, `PREFIX`); `GROUP BY` |
 | `BOOL` | an `INT` column of 1 and 0 | the field alone (`WHERE done`, `NOT done`), `=`, `!=`, `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] NULL`; `GROUP BY` |
 | `TIMESTAMP` | an `INT` column of microseconds since 1970-01-01 UTC | as `INT`, with times written as text: `at >= '2026-10-01'` |
 | `TEXT` | inverted index (optionally with positions); may be generated from other text fields | `MATCH` |
@@ -126,6 +126,28 @@ primary := "(" query ")" | "\"phrase\"" | word | word* | word~ | word~N
 | `vaccine AND (mrna OR "messenger rna") -animal` | any combination, with parentheses |
 
 Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it.
+
+## Prefixes and autocomplete
+
+`kw LIKE 'p%'` and `PREFIX(kw, 'p')` select the rows of a `KEYWORD` field whose value starts with `p`, byte for byte (no case folding). A field's values are sorted in its dictionary, so the values with a prefix are one run of it, found by two binary searches per segment: a short run unions its values' lists, and one of more than 1,024 values of a single-valued field scans the code column, as a range of numbers does. A multi-valued field matches a row when one of its values starts with the prefix, and `NOT` when none does.
+
+```sql
+-- autocomplete: the ten most asked queries that start with what was typed
+SELECT id, n FROM queries WHERE PREFIX(id, :typed) ORDER BY n DESC, id LIMIT 10;
+
+-- a user's own history first: keys of the form '<user>|<query>'
+SELECT id, n FROM user_queries WHERE PREFIX(id, 'u42|how to') ORDER BY n DESC LIMIT 3;
+
+SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/ir/%';
+```
+
+- `LIKE` on a table's own `KEYWORD` field takes a value (no wildcard: `=`) or text followed by `%`. `_` anywhere, or `%` before the end, is refused there, since the index cannot answer it; over joined or derived rows, `LIKE` takes any pattern.
+- `ESCAPE 'c'` makes the character after `c` literal: `LIKE 'snake!_%' ESCAPE '!'` is the prefix `snake_`. `PREFIX` needs no escaping.
+- `ILIKE` is refused on a table's own field: store the value lowercased (and a display form beside it) and use `LIKE`.
+- `PREFIX(x, p)` also works over joined or derived rows, as a test of each value; `PREFIX(kw, '')` and `LIKE '%'` are `IS NOT NULL`.
+- Counts kept with `UPDATE ... SET n = n + 1` or a write's `add` change in place, so a query log's popularity stays current without rewriting rows.
+
+A plan with a prefix needs the plan feature `prefix`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids). Latency by prefix length over ORCAS's 10.4 million queries is in [`results/text/complete-orcas.json`](https://github.com/rkonow/strata/tree/main/strata/results/text).
 
 ## Scores
 

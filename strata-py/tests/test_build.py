@@ -35,6 +35,10 @@ def test_builder_runs_as_its_sql(db):
          "SELECT id FROM books ORDER BY rrf(bm25(title, 'dragon'), bm25(description, 'dragon'), k => 30) DESC LIMIT 5")
     same(db, t.select("id").order_by(0.7 * minmax(bm25("title", "river")) + 0.3 * minmax(bm25("description", "river"))).limit(5),
          "SELECT id FROM books ORDER BY 0.7 * minmax(bm25(title, 'river')) + 0.3 * minmax(bm25(description, 'river')) DESC LIMIT 5")
+    # Prefixes of a KEYWORD field and of a multi-valued one.
+    r = same(db, t.select("id").where(col("id").startswith("b000") & ~col("genres").startswith("cl")).order_by(col("year")),
+             "SELECT id FROM books WHERE PREFIX(id, 'b000') AND NOT PREFIX(genres, 'cl') ORDER BY year")
+    assert len(r) > 0
     # Without select: the stored fields but vectors, as SELECT * gives.
     same(db, t.where(col("id") == "b0007"), "SELECT * FROM books WHERE id = 'b0007'")
 

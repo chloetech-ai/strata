@@ -1,0 +1,199 @@
+{
+  "data": {
+    "clicks": 18823591,
+    "name": "orcas",
+    "queries": 10405341
+  },
+  "machine": {
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz"
+  },
+  "params": {
+    "load_s": 33.10243322,
+    "samples": 2000,
+    "sql": "SELECT id, n FROM queries WHERE PREFIX(id, :p) ORDER BY n DESC, id LIMIT 10",
+    "threads_query": 1
+  },
+  "states": [
+    {
+      "runs": [
+        {
+          "chars": 1,
+          "checked": 50,
+          "max_ms": 46.997791,
+          "max_rows": 1015589.0,
+          "mean_ms": 17.785811852499986,
+          "median_rows": 560354.0,
+          "p50_ms": 17.625770999999997,
+          "p90_ms": 26.749087000000003,
+          "p99_ms": 36.171786999999995,
+          "prefixes": 2000
+        },
+        {
+          "chars": 2,
+          "checked": 50,
+          "max_ms": 29.901425,
+          "max_rows": 552520.0,
+          "mean_ms": 5.444068036518255,
+          "median_rows": 64887.0,
+          "p50_ms": 3.393358,
+          "p90_ms": 13.019803999999999,
+          "p99_ms": 20.069958999999997,
+          "prefixes": 1999
+        },
+        {
+          "chars": 3,
+          "checked": 50,
+          "max_ms": 24.836917,
+          "max_rows": 388305.0,
+          "mean_ms": 2.577261100100093,
+          "median_rows": 9461.0,
+          "p50_ms": 1.240656,
+          "p90_ms": 6.713253,
+          "p99_ms": 16.581398,
+          "prefixes": 1998
+        },
+        {
+          "chars": 4,
+          "checked": 50,
+          "max_ms": 24.834871,
+          "max_rows": 386571.0,
+          "mean_ms": 2.1255257782237793,
+          "median_rows": 2418.0,
+          "p50_ms": 0.79676,
+          "p90_ms": 4.338908,
+          "p99_ms": 15.788859999999998,
+          "prefixes": 1993
+        },
+        {
+          "chars": 6,
+          "checked": 50,
+          "max_ms": 18.659098999999998,
+          "max_rows": 222508.0,
+          "mean_ms": 1.1812380966751919,
+          "median_rows": 415.0,
+          "p50_ms": 0.5631120000000001,
+          "p90_ms": 1.729986,
+          "p99_ms": 11.898812999999999,
+          "prefixes": 1955
+        },
+        {
+          "chars": 8,
+          "checked": 50,
+          "max_ms": 23.283422,
+          "max_rows": 203764.0,
+          "mean_ms": 0.9054135285412248,
+          "median_rows": 68.0,
+          "p50_ms": 0.508355,
+          "p90_ms": 1.258368,
+          "p99_ms": 11.694169,
+          "prefixes": 1892
+        },
+        {
+          "chars": 12,
+          "checked": 50,
+          "max_ms": 2.6944600000000003,
+          "max_rows": 32249.0,
+          "mean_ms": 0.4039859516706444,
+          "median_rows": 6.0,
+          "p50_ms": 0.35418,
+          "p90_ms": 0.5471020000000001,
+          "p99_ms": 1.417415,
+          "prefixes": 1676
+        }
+      ],
+      "segments": 105,
+      "state": "loaded"
+    },
+    {
+      "runs": [
+        {
+          "chars": 1,
+          "checked": 50,
+          "max_ms": 51.687669,
+          "max_rows": 1015589.0,
+          "mean_ms": 18.701178004999957,
+          "median_rows": 560354.0,
+          "p50_ms": 18.311511,
+          "p90_ms": 27.580249000000002,
+          "p99_ms": 38.713494000000004,
+          "prefixes": 2000
+        },
+        {
+          "chars": 2,
+          "checked": 50,
+          "max_ms": 35.168716,
+          "max_rows": 552520.0,
+          "mean_ms": 6.9188145517758874,
+          "median_rows": 64887.0,
+          "p50_ms": 6.342137,
+          "p90_ms": 12.645831,
+          "p99_ms": 20.560115,
+          "prefixes": 1999
+        },
+        {
+          "chars": 3,
+          "checked": 50,
+          "max_ms": 24.621715,
+          "max_rows": 388305.0,
+          "mean_ms": 3.4179212667667658,
+          "median_rows": 9461.0,
+          "p50_ms": 2.298713,
+          "p90_ms": 7.77598,
+          "p99_ms": 14.659853,
+          "prefixes": 1998
+        },
+        {
+          "chars": 4,
+          "checked": 50,
+          "max_ms": 23.77131,
+          "max_rows": 386571.0,
+          "mean_ms": 2.502130762669344,
+          "median_rows": 2418.0,
+          "p50_ms": 0.449015,
+          "p90_ms": 7.810275,
+          "p99_ms": 16.906402,
+          "prefixes": 1993
+        },
+        {
+          "chars": 6,
+          "checked": 50,
+          "max_ms": 17.769301000000002,
+          "max_rows": 222508.0,
+          "mean_ms": 1.2792228603580564,
+          "median_rows": 415.0,
+          "p50_ms": 0.268358,
+          "p90_ms": 4.9731380000000005,
+          "p99_ms": 13.28401,
+          "prefixes": 1955
+        },
+        {
+          "chars": 8,
+          "checked": 50,
+          "max_ms": 16.959421,
+          "max_rows": 203764.0,
+          "mean_ms": 0.8729737071881601,
+          "median_rows": 68.0,
+          "p50_ms": 0.210234,
+          "p90_ms": 2.320101,
+          "p99_ms": 11.358902,
+          "prefixes": 1892
+        },
+        {
+          "chars": 12,
+          "checked": 50,
+          "max_ms": 8.907691,
+          "max_rows": 32249.0,
+          "mean_ms": 0.23741397255369928,
+          "median_rows": 6.0,
+          "p50_ms": 0.129392,
+          "p90_ms": 0.299427,
+          "p99_ms": 4.16169,
+          "prefixes": 1676
+        }
+      ],
+      "segments": 11,
+      "state": "merged"
+    }
+  ]
+}

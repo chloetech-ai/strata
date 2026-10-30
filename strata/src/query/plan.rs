@@ -29,6 +29,10 @@ pub trait Estimator {
     fn range_count(&self, field: usize, lo: f64, hi: f64) -> f64;
     /// Documents whose keyword field equals one of `values` (exact).
     fn in_count(&self, field: usize, values: &[Value]) -> f64;
+    /// Documents whose keyword field has a value starting with `prefix`.
+    fn prefix_count(&self, _field: usize, _prefix: &str) -> f64 {
+        self.n_docs()
+    }
     /// Documents with a value of `field`.
     fn present_count(&self, _field: usize) -> f64 {
         self.n_docs()
@@ -158,6 +162,10 @@ impl<E: Estimator> Planner<'_, E> {
                     probe_cost: c.probe_keyword * values.len().min(4) as f64,
                     probeable: true,
                 }
+            }
+            Pred::Prefix { field, prefix } => {
+                let card = self.est.prefix_count(*field, prefix).min(n);
+                PredEstimate { card, mat_cost: c.leaf + card * (c.posting + c.emit), probe_cost: c.probe_keyword, probeable: true }
             }
             Pred::Graph { id } => {
                 // Already computed: materialising is a copy, probing a lookup.

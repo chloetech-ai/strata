@@ -26,6 +26,9 @@ pub enum Pred {
     IntRange { field: usize, lo: i64, hi: i64 },
     /// Keyword (or numeric) equality with any of `values`.
     In { field: usize, values: Vec<Value> },
+    /// KEYWORD values starting with `prefix` (`LIKE 'p%'`, `PREFIX(f, 'p')`):
+    /// one run of the field's sorted dictionary.
+    Prefix { field: usize, prefix: String },
     /// Rows with a value of the field (`IS NOT NULL`; a multi-valued field
     /// needs at least one).
     Present { field: usize },
@@ -191,7 +194,7 @@ impl Pred {
             p if !negated => p,
             Pred::True => Pred::False,
             Pred::False => Pred::True,
-            p @ (Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. }) if !multi(field) => {
+            p @ (Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. } | Pred::Prefix { field, .. }) if !multi(field) => {
                 Pred::And(vec![Pred::Present { field }, Pred::Not(Box::new(p))])
             }
             p => Pred::Not(Box::new(p)),

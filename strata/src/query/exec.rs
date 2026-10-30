@@ -995,6 +995,7 @@ impl<'a> Executor<'a> {
                 _ => self.keyword(s, *field)?.present(),
             },
             Pred::In { field, values } => self.materialize_in(s, *field, values)?,
+            Pred::Prefix { field, prefix } => self.keyword(s, *field)?.docs_prefix(prefix),
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
             Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => self.materialize(s, c)?.complement(),
@@ -1065,6 +1066,8 @@ impl<'a> Executor<'a> {
                 ProbeNode::Leaf(Box::new(self.materialize(s, p)?))
             }
             Pred::Present { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
+            Pred::Prefix { field, .. } if self.schema.fields[*field].multi => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
+            Pred::Prefix { field, prefix } => ProbeNode::Leaf(Box::new(self.keyword(s, *field)?.filter_prefix(prefix))),
             Pred::Range { field, lo, hi } => ProbeNode::Leaf(Box::new(self.numeric(s, *field)?.col().filter(*lo, *hi))),
             Pred::IntRange { field, lo, hi } => {
                 let col = self.numeric(s, *field)?.col();
@@ -2514,6 +2517,9 @@ impl Estimator for SegEst<'_, '_> {
             return kw.n_present() as f64;
         }
         self.s.r.numeric(field).ok().flatten().map_or(self.n_docs(), |n| n.col().n_present() as f64)
+    }
+    fn prefix_count(&self, field: usize, prefix: &str) -> f64 {
+        self.s.r.keyword(field).ok().flatten().map_or(0.0, |kw| kw.count_prefix(prefix) as f64)
     }
     fn in_count(&self, field: usize, values: &[Value]) -> f64 {
         if let Some(kw) = self.s.r.keyword(field).ok().flatten() {

@@ -44,6 +44,11 @@ use crate::value::Value;
 /// Values with fewer documents than this share the rare-value array.
 pub const DEFAULT_RARE: usize = 64;
 
+/// A prefix matching more values than this scans the code column of a
+/// single-valued field instead of unioning the values' lists, and its
+/// count is estimated.
+pub const PREFIX_LISTS: usize = 1024;
+
 const VERSION: u64 = 1;
 
 /// An INT value as a keyword: 16 hex digits of the value with its sign bit
@@ -381,6 +386,55 @@ impl KeywordColumn {
             }
         }
         lo as u32
+    }
+
+    /// Codes of the values starting with `prefix`: one run, since values
+    /// are in byte order.
+    pub fn prefix_codes(&self, prefix: &str) -> std::ops::Range<u32> {
+        let start = self.lower_bound(prefix);
+        let (mut lo, mut hi) = (start as usize, self.n_values());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.value_bytes(mid as u32).starts_with(prefix.as_bytes()) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        start..lo as u32
+    }
+
+    /// Documents with a value starting with `prefix` (multi-valued: at
+    /// least one). A long run of a single-valued field scans the code
+    /// column, as a range of numbers does; a short one unions its lists.
+    pub fn docs_prefix(&self, prefix: &str) -> DocSet {
+        let codes = self.prefix_codes(prefix);
+        if codes.is_empty() {
+            return DocSet::empty(self.n as u32);
+        }
+        if !self.multi && codes.len() > PREFIX_LISTS {
+            let r = super::KeyRange { lo: codes.start as i64, hi: codes.end as i64 - 1 };
+            return DocSet::from_bits(self.codes.scan_bits(r), self.n as u32);
+        }
+        self.docs_codes(&codes.collect::<Vec<u32>>())
+    }
+
+    /// Documents with a value starting with `prefix`: exact for a run of
+    /// up to [`PREFIX_LISTS`] values, else the run's share of the
+    /// documents with a value.
+    pub fn count_prefix(&self, prefix: &str) -> usize {
+        let codes = self.prefix_codes(prefix);
+        if codes.len() <= PREFIX_LISTS {
+            return codes.map(|c| self.count_code(c)).sum();
+        }
+        (self.n_present() as f64 * codes.len() as f64 / self.n_values().max(1) as f64) as usize
+    }
+
+    /// A probe for a prefix against the code column of a single-valued
+    /// field: one code lookup and a range test per document.
+    pub fn filter_prefix(&self, prefix: &str) -> CodeRangeFilter {
+        let codes = self.prefix_codes(prefix);
+        CodeRangeFilter { card: self.count_prefix(prefix), codes: self.codes.clone(), lo: codes.start as i64, hi: codes.end as i64 }
     }
 
     /// Codes of the INT values in `lo..=hi` of a multi-valued INT field.
@@ -834,6 +888,26 @@ impl DocFilter for CodeSetFilter {
     #[inline]
     fn contains(&self, doc: DocId) -> bool {
         self.codes.get(doc).is_some_and(|c| self.set[c as usize / 64] >> (c % 64) & 1 == 1)
+    }
+
+    fn cardinality(&self) -> usize {
+        self.card
+    }
+}
+
+/// Documents whose code is in `lo..hi`: a prefix's run of values
+/// ([`KeywordColumn::filter_prefix`]).
+pub struct CodeRangeFilter {
+    codes: Blocks,
+    lo: i64,
+    hi: i64,
+    card: usize,
+}
+
+impl DocFilter for CodeRangeFilter {
+    #[inline]
+    fn contains(&self, doc: DocId) -> bool {
+        self.codes.get(doc).is_some_and(|c| self.lo <= c && c < self.hi)
     }
 
     fn cardinality(&self) -> usize {
