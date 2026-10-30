@@ -229,6 +229,28 @@ The text score's top-k loop (MaxScore, Block-Max WAND or exhaustive, as `algo` s
 
 A plan that ranks by an expression needs the plan feature `rank_expressions`; a version of Strata from before it refuses the plan by that name. Weighted sums of `minmax()`, products of scores and `rrf` are written as before, so older shards still run them.
 
+#### Rerank phases
+
+A ranking can go on in phases, as a search engine's rank profile does: a cheap first phase over every candidate, then a costlier one over its top rows. SQL writes a phase as a `WITH` that ranks a table and cuts it, ranked again by the next `WITH` or the query itself:
+
+```sql
+-- BM25's top 100, ranked again by a mix of title and body relevance and rating
+WITH top AS (SELECT * FROM docs WHERE year >= 2020 ORDER BY bm25(body, :t) DESC LIMIT 100)
+SELECT id, title, score() FROM top
+ORDER BY bm25(title, :t) + 0.5 * bm25(body, :t) + 0.1 * coalesce(rating, 0) DESC LIMIT 10;
+
+-- three phases: similarity's top 500, its best 50 by a rating, then a fusion of the 50
+WITH a AS (SELECT * FROM products ORDER BY similarity(emb, :q) DESC LIMIT 500),
+     b AS (SELECT * FROM a ORDER BY coalesce(rating, 0) DESC LIMIT 50)
+SELECT id, score() FROM b ORDER BY minmax(bm25(body, :t)) + minmax(similarity(emb, :q)) DESC LIMIT 10;
+```
+
+The planner makes one search of them, with phases. Each phase ranks the rows of the one before by an expression, best first, and may read any of the table's columns, since the rows are the table's. Every row a phase reads goes on: one the expression gives no value ranks last with a `NULL` score (and a row a `bm25` phase's terms miss scores 0), and rows tied keep the order the phase before gave them. `LIMIT` and `OFFSET` on the query cut the last phase, and `score()` is the last phase's score. The first `WITH` may filter (`WHERE`) and rank as any query does; each later step reads the step before alone, with no `WHERE`, grouping or subquery, ranks by one expression `DESC`, and each `WITH` keeps the table's columns (`*`) and has a `LIMIT`. Other `WITH` queries plan as before: the table restricted to the rows of the `WITH`.
+
+A phase whose expression is row-local is a second phase: over shards, each shard scores it on its own top rows by the first phase. A phase with `minmax()`, `rank()`, `rrf` or a weighted sum reads every row it reranks, so it is a global phase: it runs once over the merged rows (on the coordinator over shards), and so does every phase after it. The coordinator keeps the top rows of the whole collection by the first phase before it ranks them by the next, so a split collection answers exactly as the whole one does. `EXPLAIN` shows each phase and which kind it is, and a query's plan lines say how many rows each reranked. The first phase's `LIMIT` counts against the rows a query may reach (`max_rows`), and the phases against its deadline.
+
+From Python, `rerank(expr, count)` adds a phase: `t.select("id", score()).order_by(bm25("body", q)).rerank(col("rating"), 100).limit(10)`. A plan with phases needs the plan feature `rank_phases`.
+
 ### `decay(field, origin, scale, …)`: closeness to a value
 
 A numeric column's closeness to `origin`, as in Elasticsearch's decay functions. With `d = max(0, |x − origin| − offset)`, the score is 1 at `d = 0` and `decay` at `d = scale`:

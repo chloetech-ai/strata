@@ -17,7 +17,7 @@
 //!    ([`Rank::eval`]).
 //!
 //! A shard answers every candidate with each leaf's value and whether the row
-//! is in the leaf's top `depth` ([`crate::query::exec::FusionParts`]). The
+//! is in the leaf's top `depth` ([`crate::query::exec::RankParts`]). The
 //! coordinator takes each leaf's top `depth` over all shards and runs steps 1
 //! and 3 over those rows with the same code ([`crate::cluster`]), so a split
 //! collection ranks like the whole one.

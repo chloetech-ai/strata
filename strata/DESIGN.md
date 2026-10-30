@@ -524,6 +524,11 @@ GROUP BY category ORDER BY 2 DESC LIMIT 5;
   ranks last. An expression of one text score and row values
   (`bm25(body, :t) * (1 + 0.2 * importance)`) is a rank-safe boost: its
   top rows are exact, found by the text score's top-k loop.
+* Rerank phases: a `WITH` that ranks a table and cuts it, ranked again by
+  the next `WITH` or the query (`WITH top AS (... ORDER BY bm25(body, :t)
+  DESC LIMIT 100) SELECT ... FROM top ORDER BY <expression> DESC`), plans
+  as one Search with phases; each ranks the top `count` rows of the one
+  before, rows tied keeping their order.
 * `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`:
   a numeric column's closeness to `origin`, as Elasticsearch's decay
   functions: `d = max(0, |x − origin| − offset)` maps to 1 at `d = 0` and
@@ -858,6 +863,27 @@ cannot reach θ today. A row's value comes from the same evaluator
 gives. If the bound does not fall with the text score (`rating - bm25`),
 the loop scores every match. Each shard answers with its exact top rows,
 and a coordinator takes every row a shard sends as a candidate.
+
+**Rerank phases** (`Select::phases`, `ir::Phase`). A Search's ranking
+goes on in phases: each takes the top `count` rows of the phase before
+(the first is `ORDER BY`), scores them exactly by its expression
+(`exact_scores` of its leaves, `Rank::rerank`) and ranks them, rows tied
+keeping the order they had; `LIMIT` and `OFFSET` cut the last. A
+row-local phase is a second phase and a phase with a set function a
+global one, as is any phase after a global one; the plan says which, and
+raising a plan checks it. Over shards the answer stays one database's in
+one round. A row in the collection's top `count` by the first phase has
+fewer than `count` rows above it anywhere, so it is in its own shard's
+top `count`: each shard answers its top `count` by the first phase (every
+candidate, for a first phase with a set function), each row with its
+score in every second phase and its leaves' values for every global one
+(`RankParts::phases`). The coordinator ranks them by the first phase,
+keeps the top `count`, and reranks: a second phase by the shards' scores
+(`Rank::by_scores`), a global one by evaluating its expression over the
+rows it reranks. The cost is a second phase on up to shards × `count`
+rows instead of `count`, which is why costly models will go in the
+global phase. SQL writes phases with `WITH` (`compound::Planner::phased`),
+which needs no new syntax; the plan, not the SQL, is the contract.
 
 The vector strategies are chosen by estimated cost against an estimated
 filter selectivity `s`: pre-filter costs `s·n` distance computations; IVF

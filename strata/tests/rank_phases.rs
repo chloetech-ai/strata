@@ -221,7 +221,8 @@ fn a_phase_keeps_every_row_and_the_order_of_ties() {
 }
 
 /// A phase scores the rows it reranks and no others: the first phase's
-/// cut, then each phase's.
+/// cut, then each phase's; over shards, a second phase each shard's top
+/// rows by the first.
 #[test]
 fn a_phase_scores_only_the_rows_it_reranks() {
     let docs = docs();
@@ -238,6 +239,15 @@ fn a_phase_scores_only_the_rows_it_reranks() {
     let small = open(dir.path(), "small.strata", &docs[..20]);
     let r = small.query(sql, &params).unwrap();
     assert_eq!(r.stats.reranked, 20 + 20);
+    // Over 2 shards, each scores the second phases on its own top 90 by
+    // the first; a global phase runs once, on the 30 rows it reranks.
+    let halves = [open(dir.path(), "h0.strata", &docs[..N / 2]), open(dir.path(), "h1.strata", &docs[N / 2..])];
+    assert_eq!(sharded(&halves, &select(&db, sql, &params)).stats.reranked, 2 * (90 + 90));
+    let global = sql.replace("ORDER BY bm25(body, :t) + similarity(emb, :q) DESC", "ORDER BY minmax(bm25(body, :t)) + minmax(similarity(emb, :q)) DESC");
+    assert_eq!(db.query(&global, &params).unwrap().stats.reranked, 90 + 30);
+    let r = sharded(&halves, &select(&db, &global, &params));
+    assert_eq!(r.stats.reranked, 2 * 90 + 30);
+    assert!(r.stats.plan.iter().any(|l| l == "global phase 2: scored 30 rows"), "{:?}", r.stats.plan);
 }
 
 /// The first phase's cut counts against the rows a query may reach, and

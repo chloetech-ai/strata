@@ -78,6 +78,8 @@ const SELECTS: &[&str] = &[
 /// Compound queries: operators over single-table queries.
 const COMPOUND: &[&str] = &[
     "SELECT DISTINCT category FROM papers",
+    // Rerank phases: a second phase, then a global one.
+    "WITH a AS (SELECT * FROM papers WHERE year > 2000 ORDER BY bm25(body, 'graph') DESC LIMIT 100), b AS (SELECT * FROM a ORDER BY similarity(emb, :v) DESC LIMIT 30) SELECT id, score() FROM b ORDER BY minmax(bm25(body, 'net')) + rating DESC LIMIT 5 OFFSET 1",
     "SELECT a.id, b.title FROM papers a JOIN papers b ON a.cites = b.id WHERE a.year >= 2019 ORDER BY a.year DESC LIMIT 5",
     "SELECT a.id, b.id FROM papers a LEFT JOIN papers b ON a.category = b.category AND b.year > a.year WHERE a.title LIKE 'gr%' OR b.title ILIKE '%NET' ORDER BY a.id LIMIT 7 OFFSET 1",
     "SELECT a.id || '/' || b.id, CASE WHEN a.year > b.year THEN 'newer' WHEN a.year IS NULL THEN NULL ELSE 'older' END, upper(a.category), length(b.title), abs(a.year - b.year), round(a.rating / 2), coalesce(a.rating, - -1) % 3 FROM papers a JOIN papers b ON a.category = b.category",
@@ -175,7 +177,7 @@ fn plan(root: Node) -> pb::Plan {
 }
 
 fn search(filter: Expr) -> Node {
-    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new() })
+    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new(), phases: Vec::new() })
 }
 
 fn refused(p: pb::Plan, says: &str) {

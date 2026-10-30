@@ -735,6 +735,7 @@ class Query:
         self._order: list[_Key] = []
         self._group: list[Expr] = []
         self._having: list[Expr] = []
+        self._phases: list[tuple[Expr, int]] = []
         self._limit: int | None = None
         self._offset = 0
 
@@ -769,6 +770,17 @@ class Query:
                 out.append(_Key(e, e._is_score(), False))
         return self._copy(order=out)
 
+    def rerank(self, expr: Expr, count: int) -> Query:
+        """Ranks the top `count` rows of the ranking before (`order_by`, or
+        the last `rerank`) again by `expr`, best first, rows tied keeping
+        their order; `limit` and `offset` cut the last one. A phase with
+        `minmax`, `rank` or `rrf`, and any after it, runs once over every
+        row it reranks (a global phase); any other on each shard over its
+        own rows."""
+        if int(count) < 1:
+            raise StrataError("a rerank phase reranks at least one row")
+        return self._copy(phases=self._phases + [(_expr(expr), int(count))])
+
     def group_by(self, *fields: str | Expr) -> Query:
         """Groups the rows by the values of fields (each value of a
         multi-valued field its own group)."""
@@ -802,7 +814,18 @@ class Query:
                 raise StrataError("having keeps groups: group the rows with group_by")
             if self._order:
                 search["order"] = [k._ir(ctx) for k in self._order]
+            if self._phases:
+                if len(self._order) != 1:
+                    raise StrataError("rerank phases follow an order_by of one key")
+                phases, after = [], False
+                for e, n in self._phases:
+                    expr = e._ir(ctx)
+                    after = after or _reads_every_row(expr)
+                    phases.append({"count": n, "expr": expr, **({"global": True} if after else {})})
+                search["phases"] = phases
         else:
+            if self._phases:
+                raise StrataError("rerank phases rank rows, not groups")
             if self._order and any(k.e._is_score() for k in self._order):
                 raise StrataError("groups are ordered by a group key or an aggregate, not a score")
             keys = [ctx.field(_arg_field(g))[0] for g in self._group]
@@ -839,6 +862,16 @@ class Query:
 
     def __repr__(self) -> str:
         return f"<Query of {self._schema['table']}>"
+
+
+def _reads_every_row(ir: Any) -> bool:
+    """Whether a ranking's plan holds a set function (`minmax`, `rank`),
+    RRF or a weighted sum, which read every row ranked."""
+    if isinstance(ir, dict):
+        return any(k in ("norm", "rrf", "weighted") or _reads_every_row(v) for k, v in ir.items())
+    if isinstance(ir, list):
+        return any(_reads_every_row(v) for v in ir)
+    return False
 
 
 def _bare(e: Expr) -> Expr:

@@ -890,10 +890,11 @@ impl Coordinator {
     /// Whether query then fetch pays for its second round: when one round
     /// would send at least [`FETCH_FROM`] times the page's rows, every shard
     /// its top `LIMIT + OFFSET`, as it does for a fused score or a ranking
-    /// expression, whose shards send each input's candidates to its depth.
+    /// expression, whose shards send each input's candidates to its depth,
+    /// and for rerank phases, whose shards send the first phase's top count.
     fn fetch_pays(&self, select: &Select) -> bool {
         let page = select.limit.unwrap_or(0);
-        matches!(crate::metrics::kind(select), "hybrid" | "boosted" | "expression") || self.replicas.len() * (page + select.offset) >= FETCH_FROM * page
+        matches!(crate::metrics::kind(select), "hybrid" | "boosted" | "expression" | "reranked") || self.replicas.len() * (page + select.offset) >= FETCH_FROM * page
     }
 
     /// Leaves shard `i` out of a partial answer (and the next second's)
