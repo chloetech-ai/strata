@@ -431,7 +431,10 @@ impl Score {
                 let mut fs = Vec::new();
                 factors(self.clone(), &mut fs);
                 let (scores, rest): (Vec<Score>, Vec<Score>) = fs.into_iter().partition(Score::is_fusable);
-                if scores.len() > 1 && rest.iter().all(|f| matches!(f, Score::Num(_))) {
+                // A product counts a factor below 0 as 0, and `ranked()` is
+                // below 0 for every row: it multiplies as arithmetic.
+                let ranked = scores.iter().any(|f| matches!(f, Score::Ranked { .. }));
+                if scores.len() > 1 && !ranked && rest.iter().all(|f| matches!(f, Score::Num(_))) {
                     // Constant factors scale the product of scores.
                     let c: f64 = rest.iter().map(|f| if let Score::Num(c) = f { *c } else { 1.0 }).product();
                     let product = Score::Product(scores);

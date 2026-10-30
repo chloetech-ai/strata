@@ -173,6 +173,21 @@ fn rrf_fuses_a_ranking_given_by_key() {
     assert!(!listed.is_empty() && listed.len() < r.keys.len(), "{sql}: {} of {}", listed.len(), r.keys.len());
     assert!(listed.iter().all(|k| keys.contains(k)), "{sql}");
     assert!(keys_of(&r).iter().zip(&r.scores).filter(|(_, s)| **s <= -999.0).all(|(k, _)| !keys.contains(k)), "{sql}");
+
+    // Times a column it multiplies, as arithmetic: a product of scores
+    // would count its values, all below 0, as 0.
+    let rating: HashMap<String, f64> = docs.iter().map(|d| (d[col::ID].as_str().unwrap().to_string(), d[col::RATING].as_f64().unwrap_or(f64::NAN))).collect();
+    let mut pos: HashMap<&str, f64> = HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        pos.entry(k.as_str()).or_insert(-((i + 1) as f64));
+    }
+    let sql = "SELECT id, score() FROM docs ORDER BY ranked(:keys) * rating DESC LIMIT 1000";
+    let r = db.query(sql, &params).unwrap();
+    assert!(r.scores.iter().any(|s| *s < 0.0), "{sql}: {:?}", &r.scores[..5]);
+    for (key, score) in keys_of(&r).iter().zip(&r.scores) {
+        let want = pos[key.as_str()] * rating[key];
+        assert!(if want.is_nan() { *score == f64::NEG_INFINITY } else { close(want, *score) }, "{sql}: {key}: {want} vs {score}");
+    }
 }
 
 #[test]
@@ -193,6 +208,8 @@ fn shards_rank_by_keys_like_one_database() {
         "rrf(similarity(emb, :q), ranked(:keys), k => 10, depth => 40)",
         "0.5 * minmax(bm25(body, :t)) + 0.5 * minmax(ranked(:keys))",
         "ranked(:keys) + 0.01 * coalesce(rating, 0)",
+        "ranked(:keys) * coalesce(rating, 1)",
+        "ranked(:keys) * similarity(emb, :q)",
         "similarity(emb, :q) + coalesce(ranked(:keys), -1000)",
     ];
     for s in shapes {
