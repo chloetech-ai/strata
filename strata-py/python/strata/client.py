@@ -192,9 +192,10 @@ class Client(Search):
         so resuming from `source(name) + 1`, or from before it, applies
         each event once. Returns the last answer, {"done": True, "lines",
         "written", "skipped", "batches"}; a failure raises StrataError,
-        whose `answer["lines"]` counts the events written before it."""
+        whose `answer["lines"]` counts the events written before it.
+        `strata.ingest` reads Kafka into a stream."""
 
-        def lines() -> Iterable[bytes]:
+        def chunks() -> Iterable[bytes]:
             chunk: list[str] = []
             for e in events:
                 chunk.append(json.dumps(e, default=_default))
@@ -204,16 +205,24 @@ class Client(Search):
             if chunk:
                 yield ("\n".join(chunk) + "\n").encode()
 
+        return self._stream(chunks())
+
+    def _stream(self, chunks: Iterable[bytes]) -> dict:
+        # Each chunk is some whole lines, sent as soon as it is made.
         h = {"content-type": "application/x-ndjson"}
         if self.token:
             h["authorization"] = f"Bearer {self.token}"
-        req = urllib.request.Request(self.url + "/v1/stream", data=lines(), method="POST", headers=h)
+        req = urllib.request.Request(self.url + "/v1/stream", data=chunks, method="POST", headers=h)
         last: dict = {}
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 for raw in r:
                     if raw.strip():
-                        last = json.loads(raw)
+                        try:
+                            last = json.loads(raw)
+                        except ValueError:
+                            last = {}  # cut short
+                            break
         except urllib.error.HTTPError as e:
             raw = e.read()
             err = StrataError(f"{raw.decode(errors='replace')} (HTTP {e.code})")

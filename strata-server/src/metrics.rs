@@ -140,7 +140,7 @@ pub fn kind(q: &Select) -> &'static str {
     match &q.order {
         Some(OrderBy::Score { score, .. }) => match score {
             Score::Bm25 { .. } => "bm25",
-            Score::Similarity { .. } => "vector",
+            Score::Similarity { .. } | Score::MaxSim { .. } => "vector",
             Score::Sparse { .. } => "sparse",
             Score::Rrf { .. } | Score::Weighted(_) => "hybrid",
             Score::Column { .. } => "column",

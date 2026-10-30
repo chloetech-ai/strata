@@ -145,6 +145,23 @@ Binary codes hold an eighth of the memory of 8-bit codes (a 32nd of the float32 
 
 The data is synthetic because the container could not download embeddings. How much recall binary codes cost depends on the embedding model, so measure it on the collection before choosing them. [`strata/notes/vector.md`](https://github.com/rkonow/strata/blob/main/strata/notes/vector.md#binary-codes) has every depth and the kernels; the numbers are in `strata/results/vector/`.
 
+## MaxSim
+
+`maxsim(emb, vectors)` runs one vector search per query vector and scores the union of their top 10 exactly against every query vector. Measured on 200,000 synthetic 384-dimension unit vectors (1,000 centres sharing a common direction, as for [compressed vectors](#compressed-vectors)), 100 lists of query vectors, `LIMIT 10`, one query thread, on the 4-core cloud container (Intel Xeon at 2.10 GHz, AVX-512 VNNI), not the M2:
+
+| query vectors | HNSW recall@10 | HNSW mean | HNSW p99 | flat recall@10 | flat mean |
+|---|---|---|---|---|---|
+| `similarity` | 0.994 | 0.19 ms | 0.32 ms | 1.000 | 4.0 ms |
+| 1 | 0.994 | 0.17 ms | 0.29 ms | 1.000 | 4.3 ms |
+| 2 | 1.000 | 0.37 ms | 0.47 ms | 1.000 | 7.1 ms |
+| 4 | 0.999 | 0.87 ms | 1.16 ms | 1.000 | 14.9 ms |
+| 8 | 0.998 | 1.63 ms | 2.05 ms | 1.000 | 29.6 ms |
+| 16 | 0.999 | 3.29 ms | 4.21 ms | 1.000 | 63.5 ms |
+| 32 | 0.998 | 6.52 ms | 8.24 ms | 1.000 | 118.8 ms |
+| 64 | 0.999 | 14.18 ms | 17.46 ms | 1.000 | 247.2 ms |
+
+Recall is against the exact answer, each row's best dot product with the query vectors over every row. Each added query vector costs about one more search: 0.22 ms with HNSW and 3.85 ms with the flat scan of 8-bit codes (the slope of mean latency over the number of vectors), against 0.19 ms and 4.0 ms for one `similarity` search; scoring the union exactly adds little. With one vector `maxsim` is `similarity`. `strata-maxsim-bench` measures it; the numbers are in `strata/results/vector/maxsim-200000x384.json`.
+
 ## Filtered vector search and the planner
 
 Filtered vector search is where one fixed strategy cannot win:
