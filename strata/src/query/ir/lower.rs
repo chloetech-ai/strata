@@ -125,7 +125,7 @@ impl Lower<'_> {
                 Some(Tiebreak::GroupValue { desc }) => keys.push(key(Expr::Output(0), desc)),
                 Some(Tiebreak::Key { desc }) => keys.push(key(pk(), desc)),
             }
-            let search = Node::Search(Search { table, filter, order: Vec::new(), phases: Vec::new() });
+            let search = Node::Search(Search { table, filter, order: Vec::new(), phases: Vec::new(), profile: None });
             let mut node = Node::Aggregate { input: Box::new(search), keys: out.keys.iter().map(|&f| Expr::Field(f as u32)).collect(), aggs: out.aggs };
             if let Some(cond) = having {
                 node = Node::Filter { input: Box::new(node), cond };
@@ -160,7 +160,7 @@ impl Lower<'_> {
                 })
                 .collect();
             let phases = s.phases.iter().map(|p| Phase { count: p.count as u64, expr: self.score(&p.score), global: p.global }).collect();
-            (Node::Search(Search { table, filter, order, phases }), columns)
+            (Node::Search(Search { table, filter, order, phases, profile: None }), columns)
         };
         let (mut node, columns) = node;
         if s.limit.is_some() || s.offset > 0 {
@@ -265,6 +265,7 @@ impl Lower<'_> {
             Score::Neg(x) => Expr::Neg(Box::new(self.score(x))),
             Score::Call { func, args } => Expr::Call { func: *func, args: args.iter().map(|a| self.score(a)).collect() },
             Score::Norm { kind, input } => Expr::Norm { kind: *kind, input: Box::new(self.score(input)) },
+            Score::Gbdt { model, hash, args, open } => Expr::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(|a| self.score(a)).collect(), open: open.clone() },
             Score::Case { whens, otherwise } => Expr::Case {
                 operand: None,
                 whens: whens.iter().map(|(c, x)| super::When { when: self.score(c), then: self.score(x) }).collect(),

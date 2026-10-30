@@ -15,10 +15,11 @@ use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
+use strata::query::model::Models;
 use strata::query::sql::{ident, quoted};
-use strata::query::{bind_command, compound, ops, Command, Params, Select};
+use strata::query::{bind_command, compound, ops, profile, Command, Params, Select};
 use strata::schema::Schema;
-use strata::storage::{CheckpointOptions, CheckpointStats, Layout, Snapshot, TableTxn, WriteTxn};
+use strata::storage::{CheckpointOptions, CheckpointStats, Layout, RankProfile, Snapshot, TableTxn, WriteTxn};
 use strata::text::Synonyms;
 use strata::value::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -150,8 +151,11 @@ pub struct Service {
     /// ([`Service::open_models`], [`Service::models`]).
     models: RwLock<Arc<Vec<FieldModel>>>,
     /// Where [`Service::open_models`] opened them, for tables created
-    /// later.
+    /// later, and where ranking models are.
     models_dir: Option<PathBuf>,
+    /// A coordinator's ranking models ([`Service::open_ranking_models`]);
+    /// a database keeps its own.
+    ranking: Models,
     /// Default query deadline.
     pub timeout: Duration,
     /// The longest deadline a request may ask for (`timeout_ms`).
@@ -241,6 +245,7 @@ impl Service {
             agent,
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
+            ranking: Models::default(),
             timeout,
             max_timeout: timeout.max(Duration::from_secs(60)),
             slow: None,
@@ -506,6 +511,23 @@ impl Service {
             db.open_embedders(dir);
         }
         self.refresh_models();
+    }
+
+    /// `plan` with its ranking models opened ([`strata::query::model`]):
+    /// a database's from its models directory, and a coordinator's from
+    /// its own, since it scores the shards' rows with them too. The plan
+    /// then names each model's hash, which every shard checks against its
+    /// own file.
+    pub fn open_ranking_models(&self, plan: Arc<Plan>) -> Result<Arc<Plan>, ApiError> {
+        if !plan.root.has_models() {
+            return Ok(plan);
+        }
+        let mut p = (*plan).clone();
+        match &self.backend {
+            Backend::Local(db) => db.open_ranking_models(&mut p)?,
+            Backend::Cluster(_) => self.ranking.open(&self.models_dir.clone().unwrap_or_else(strata::embed::models_dir), &mut p)?,
+        }
+        Ok(Arc::new(p))
     }
 
     /// The embedded fields' models ([`Service::open_models`]).
@@ -786,7 +808,7 @@ impl Service {
         if let Some(t) = find(self.catalog()) {
             return Ok(t);
         }
-        if self.learn_tables().await {
+        if self.learn_tables(false).await {
             if let Some(t) = find(self.catalog()) {
                 return Ok(t);
             }
@@ -794,20 +816,40 @@ impl Service {
         Err(ApiError::bad(format!("query error: no such table: {name}")))
     }
 
-    /// A coordinator asks its shards for their tables again
-    /// ([`Coordinator::refresh`]): whether it learned of a change.
-    async fn learn_tables(&self) -> bool {
+    /// A coordinator asks its shards for their tables and rank profiles
+    /// again ([`Coordinator::refresh`]; at most once a second unless
+    /// `now`): whether it learned of a change.
+    async fn learn_tables(&self, now: bool) -> bool {
         let Backend::Cluster(c) = &self.backend else { return false };
-        let changed = c.refresh(false).await;
+        let changed = c.refresh(now).await;
         if changed {
             self.refresh_models();
         }
         changed
     }
 
+    /// Every table's rank profiles, by table, then name: a local
+    /// database's as they are now, a coordinator's as its shards last held
+    /// them alike ([`Coordinator::rank_profiles`]).
+    pub fn rank_profiles(&self) -> Vec<(String, RankProfile)> {
+        match &self.backend {
+            Backend::Local(db) => db.catalog().into_iter().flat_map(|t| db.storage().rank_profiles(&t.table).unwrap_or_default().into_iter().map(move |p| (t.table.clone(), p))).collect(),
+            Backend::Cluster(c) => c.rank_profiles().to_vec(),
+        }
+    }
+
+    /// Table `table`'s rank profile named `name`, both in any case.
+    pub fn rank_profile(&self, table: &str, name: &str) -> Option<RankProfile> {
+        let named = |p: &RankProfile| p.name.eq_ignore_ascii_case(name);
+        match &self.backend {
+            Backend::Local(db) => db.storage().rank_profiles(table).ok()?.into_iter().find(named),
+            Backend::Cluster(c) => c.rank_profiles().iter().find(|(t, p)| t.eq_ignore_ascii_case(table) && named(p)).map(|(_, p)| p.clone()),
+        }
+    }
+
     /// Runs `bind` over the database's tables; a coordinator whose tables
-    /// lack one the statement names asks its shards again, then binds once
-    /// more.
+    /// lack one the statement names, or a rank profile it ranks by, asks
+    /// its shards again, then binds once more.
     async fn bound<T>(&self, bind: impl Fn(&[&Schema]) -> strata::Result<T>) -> Result<T, ApiError> {
         let run = || {
             let c = self.catalog();
@@ -815,7 +857,7 @@ impl Service {
             bind(&refs)
         };
         match run() {
-            Err(e) if e.to_string().contains("no such table") && self.learn_tables().await => Ok(run()?),
+            Err(e) if (e.to_string().contains("no such table") || e.to_string().contains("has no rank profile named")) && self.learn_tables(false).await => Ok(run()?),
             r => Ok(r?),
         }
     }
@@ -1036,15 +1078,38 @@ impl Service {
         }
     }
 
-    pub async fn query(self: &Arc<Self>, mut req: QueryReq) -> Result<Answer, ApiError> {
+    /// Runs a query, or its plan when it has one. A coordinator plans a
+    /// query by a rank profile with the profile its shards held when it
+    /// last asked; when a shard refuses the plan because its profile has
+    /// changed since (through another coordinator, or on that shard), the
+    /// coordinator asks again and plans once more.
+    pub async fn query(self: &Arc<Self>, req: QueryReq) -> Result<Answer, ApiError> {
+        let again = (matches!(self.backend, Backend::Cluster(_)) && req.plan.is_none() && req.sql.to_ascii_lowercase().contains("rank_profile")).then(|| req.clone());
+        match (self.query_once(req).await, again) {
+            (Err(e), Some(req)) if profile::is_stale(&e.message) => {
+                self.learn_tables(true).await;
+                self.query_once(req).await
+            }
+            (r, _) => r,
+        }
+    }
+
+    async fn query_once(self: &Arc<Self>, mut req: QueryReq) -> Result<Answer, ApiError> {
         let t0 = Instant::now();
         let timeout = self.timeout_of(req.timeout_ms);
         // Bound against every table: a query of one table is the
         // executor's, any other a compound plan.
         let plan = match &req.plan {
             Some(p) => Ok(p.clone()),
-            None => self.bound(|tables| compound::plan_read(&req.sql, tables, &req.params)).await.map(Arc::new),
+            None => self.bound(|tables| compound::plan_read(&req.sql, tables, &req.params, &|t, n| self.rank_profile(t, n))).await.map(Arc::new),
         };
+        // A plan made with a rank profile runs only on a database whose
+        // profile of that name is the same.
+        let plan = match (plan, &self.backend) {
+            (Ok(p), Backend::Local(_)) if p.root.has_profiles() => profile::check_plan(&p, &|t, n| self.rank_profile(t, n).map(|p| p.hash())).map(|_| p).map_err(ApiError::from),
+            (p, _) => p,
+        };
+        let plan = plan.and_then(|p| self.open_ranking_models(p));
         let bound = match plan {
             Ok(plan) if plan.root.uses_operators() => {
                 // A compound query runs as its plan; a coordinator sends the
@@ -1053,7 +1118,15 @@ impl Service {
                 return self.compound(req, plan, t0, timeout).await;
             }
             Ok(plan) => match self.table(plan.table()).await {
-                Ok(schema) => plan.to_select(&schema).map(|select| (schema, select)).map_err(ApiError::from),
+                Ok(schema) => {
+                    // A coordinator sends the shards a plan by a rank
+                    // profile or a model as is, naming the profile or the
+                    // model's hash they check.
+                    if plan.root.has_profiles() || plan.root.has_models() {
+                        req.plan = Some(plan.clone());
+                    }
+                    plan.to_select(&schema).map(|select| (schema, select)).map_err(ApiError::from)
+                }
                 Err(e) => Err(e),
             },
             Err(e) => Err(e),
@@ -1316,8 +1389,9 @@ impl Service {
     pub async fn term_stats(self: &Arc<Self>, sql: &str, plan: Option<&Plan>, params: &Params, after: &After, timeout_ms: u64) -> Result<(TermStats, u64), ApiError> {
         let bound = match plan {
             Some(p) => p.clone(),
-            None => self.bound(|tables| compound::plan_read(sql, tables, params)).await?,
+            None => self.bound(|tables| compound::plan_read(sql, tables, params, &|t, n| self.rank_profile(t, n))).await?,
         };
+        let bound = Arc::unwrap_or_clone(self.open_ranking_models(Arc::new(bound))?);
         if bound.root.uses_operators() {
             return Err(ApiError::bad("term statistics are a single-table query's"));
         }
@@ -1334,7 +1408,12 @@ impl Service {
                 let stats = tokio::task::spawn_blocking(move || db.term_stats_with(&view, &select, &opts)).await.map_err(ApiError::internal)??;
                 Ok((stats, lease))
             }
-            Backend::Cluster(c) => Ok((c.term_stats(sql, &schema, plan, params, after, Instant::now() + timeout).await?.0, 0)),
+            Backend::Cluster(c) => {
+                // A query by a rank profile reaches the shards written
+                // out, and one by a model with the model's hash.
+                let given = plan.filter(|_| !bound.root.has_models()).or((bound.root.has_profiles() || bound.root.has_models()).then_some(&bound));
+                Ok((c.term_stats(sql, &schema, given, params, after, Instant::now() + timeout).await?.0, 0))
+            }
         }
     }
 
@@ -1348,7 +1427,7 @@ impl Service {
         let t0 = Instant::now();
         let bound = match plan {
             Some(p) => p.clone(),
-            None => self.bound(|tables| compound::plan_read(sql, tables, params)).await?,
+            None => self.bound(|tables| compound::plan_read(sql, tables, params, &|t, n| self.rank_profile(t, n))).await?,
         };
         if bound.root.uses_operators() {
             return Err(ApiError::bad("query error: the next codes count one table's rows: a condition without subqueries"));
@@ -1375,7 +1454,8 @@ impl Service {
 
     /// Any statement, on any table: rows for a SELECT, which sees the
     /// writes `after` names; the documents an INSERT, UPDATE or DELETE
-    /// wrote; none for `CREATE TABLE` and `DROP TABLE` ([`Self::ddl`]).
+    /// wrote; none for `CREATE TABLE`, `DROP TABLE` and the `RANK PROFILE`
+    /// statements ([`Self::ddl`]).
     pub async fn sql(self: &Arc<Self>, sql: &str, params: &Params, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
         let ddl = match self.bound(|tables| bind_command(sql, tables, params)).await? {
             Command::Query => {
@@ -1383,43 +1463,56 @@ impl Service {
                 return Ok(SqlAnswer::Rows(a));
             }
             Command::Explain { .. } => return Err(ApiError::bad("query error: EXPLAIN runs through POST /v1/explain")),
-            Command::CreateTable { .. } | Command::DropTable { .. } => true,
-            Command::Write { .. } => false,
+            Command::CreateTable { .. } | Command::DropTable { .. } => Some(Ddl::Table),
+            Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Some(Ddl::RankProfile),
+            Command::Write { .. } => None,
         };
         if after != After::Any {
             return Err(ApiError::bad(FOR_READS));
         }
         let t0 = Instant::now();
         let r = match (&self.backend, ddl) {
-            (_, true) => self.ddl(sql, params, timeout_ms).await,
-            (Backend::Local(db), false) => {
+            (_, Some(ddl)) => self.ddl(sql, params, ddl, timeout_ms).await,
+            (Backend::Local(db), None) => {
                 let (text, p) = (sql.to_string(), params.clone());
                 self.write_local(db, move |db| db.prepare_write(&text, &p), timeout_ms).await
             }
-            (Backend::Cluster(c), false) => c.sql(sql, params).await,
+            (Backend::Cluster(c), None) => c.sql(sql, params).await,
         };
         let w = self.wrote(r, t0, Some(sql))?;
         Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
     }
 
-    /// `CREATE TABLE` or `DROP TABLE`: on a local database, once no write
-    /// holds the writer; through a coordinator, on every shard
-    /// ([`Coordinator::ddl`]). A replica refuses it, as it refuses every
-    /// write, and so does a primary: the tables a primary has are not
-    /// shipped to its replicas yet, so each copy takes them before
-    /// replication starts.
-    async fn ddl(self: &Arc<Self>, sql: &str, params: &Params, timeout_ms: u64) -> Result<Written, ApiError> {
+    /// `CREATE TABLE` or `DROP TABLE`, `CREATE RANK PROFILE` or `DROP RANK
+    /// PROFILE`: on a local database, once no write holds the writer;
+    /// through a coordinator, on every shard ([`Coordinator::ddl`]). A
+    /// replica refuses it, as it refuses every write. A primary refuses a
+    /// table's: the tables a primary has are not shipped to its replicas
+    /// yet, so each copy takes them before replication starts. A rank
+    /// profile is logged as a write is, so a primary ships it, and answers
+    /// once the copies its acks name hold it.
+    async fn ddl(self: &Arc<Self>, sql: &str, params: &Params, ddl: Ddl, timeout_ms: u64) -> Result<Written, ApiError> {
         let r = match &self.backend {
             Backend::Local(db) => {
                 self.takes_writes()?;
-                if let Replication::Primary(_) = self.replication() {
+                if let (Replication::Primary(_), Ddl::Table) = (self.replication(), ddl) {
                     return Err(conflict("CREATE TABLE and DROP TABLE do not reach replicas yet: give each copy its tables before it replicates".into()));
                 }
-                let deadline = Instant::now() + self.timeout_of(timeout_ms);
+                let timeout = self.timeout_of(timeout_ms);
                 let (db, sql, params) = (db.clone(), sql.to_string(), params.clone());
-                tokio::task::spawn_blocking(move || wait_for_writer(deadline, || db.sql(&sql, &params).map(|_| Written::default()).map_err(ApiError::from)))
-                    .await
-                    .map_err(ApiError::internal)?
+                let w = tokio::task::spawn_blocking(move || {
+                    wait_for_writer(Instant::now() + timeout, || {
+                        db.sql(&sql, &params)?;
+                        // Its number, or a later one.
+                        Ok(Written { seq_no: db.storage().seq_no().map(|n| n.seq).filter(|_| ddl == Ddl::RankProfile), ..Default::default() })
+                    })
+                })
+                .await
+                .map_err(ApiError::internal)?;
+                match w {
+                    Ok(w) => self.replicated(w, timeout).await,
+                    e => e,
+                }
             }
             Backend::Cluster(c) => c.ddl(sql, params).await,
         };
@@ -1770,6 +1863,13 @@ impl Service {
 pub enum SqlAnswer {
     Rows(Answer),
     Written { w: Written, took_ms: f64 },
+}
+
+/// What a statement that changes the catalog changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ddl {
+    Table,
+    RankProfile,
 }
 
 /// What a write did: the rows it wrote and, in a database that numbers

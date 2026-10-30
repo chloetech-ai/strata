@@ -46,7 +46,7 @@ use crate::storage::io;
 use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
-use crate::storage::manifest::{sources_schema, Manifest, Numbering, SegmentMeta, SeqNo, TableMeta, SOURCES, SOURCES_ID};
+use crate::storage::manifest::{sources_schema, Manifest, Numbering, RankProfile, SegmentMeta, SeqNo, TableMeta, SOURCES, SOURCES_ID};
 use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MERGE_BATCH_BYTES, MERGE_BATCH_DOCS, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
@@ -868,7 +868,11 @@ impl Database {
             .tables
             .iter()
             .zip(handles)
-            .map(|(t, h)| TableState::new(t.id, Arc::new(t.schema.clone()), h, opts.memtable_chunk_docs, 0))
+            .map(|(t, h)| {
+                let mut ts = TableState::new(t.id, Arc::new(t.schema.clone()), h, opts.memtable_chunk_docs, 0);
+                ts.profiles = Arc::new(t.profiles.clone());
+                ts
+            })
             .collect();
         let schema = tables[0].schema.clone();
         let seq = manifest.seq_no.as_ref().map_or(0, |n| n.seq);
@@ -1031,9 +1035,71 @@ impl Database {
         let mut vw = VersionWriter::begin(self);
         let id = vw.manifest.next_table_id;
         vw.manifest.next_table_id += 1;
-        vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new() });
+        vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new(), profiles: Vec::new() });
         let c = vw.commit(&mut wal)?;
         self.publish(c, |_| {})
+    }
+
+    /// Gives table `table` (any case) the rank profile `profile`, in place
+    /// of one of the same name (any case) only when `replace`. It is
+    /// logged as a write is, in a transaction of its own, so it is
+    /// numbered, replayed and shipped to replicas as writes are, and it
+    /// changes no row. The database then requires feature `rank_profiles`
+    /// (format 3) while a table has a profile, and its log names the
+    /// feature from the first profile record until it is next emptied
+    /// ([`Wal::allow_profiles`]: that first record flushes the memtables).
+    ///
+    /// Strata keeps a profile as written; [`crate::query::profile`] reads
+    /// it when a query ranks by it.
+    pub fn set_rank_profile(&self, table: &str, profile: RankProfile, replace: bool) -> Result<()> {
+        check_name("rank profile", &profile.name)?;
+        let mut txn = self.begin()?;
+        let t = self.table_ref(Some(table))?;
+        if t.id == SOURCES_ID {
+            return Err(Error::Schema(format!("{SOURCES} is a system table, which takes no rank profile")));
+        }
+        let exists = lock(&self.state).tables[t.pos].profiles.iter().any(|p| p.name.eq_ignore_ascii_case(&profile.name));
+        if exists && !replace {
+            return Err(Error::Schema(format!("{} has a rank profile named {} already; CREATE OR REPLACE RANK PROFILE replaces it", t.schema.table, profile.name)));
+        }
+        txn.ops.push((t.id, Op::Profile { name: profile.name.clone(), def: Some(Arc::new(profile)) }));
+        txn.commit()
+    }
+
+    /// Drops table `table`'s rank profile named `name` (any case), logged
+    /// as [`Database::set_rank_profile`] logs one. Returns whether there
+    /// was one.
+    pub fn drop_rank_profile(&self, table: &str, name: &str) -> Result<bool> {
+        let mut txn = self.begin()?;
+        let t = self.table_ref(Some(table))?;
+        let Some(name) = lock(&self.state).tables[t.pos].profiles.iter().find(|p| p.name.eq_ignore_ascii_case(name)).map(|p| p.name.clone()) else { return Ok(false) };
+        txn.ops.push((t.id, Op::Profile { name, def: None }));
+        txn.commit()?;
+        Ok(true)
+    }
+
+    /// The rank profiles of table `table` (any case), by name.
+    pub fn rank_profiles(&self, table: &str) -> Result<Vec<RankProfile>> {
+        let st = lock(&self.state);
+        let t = st.tables.iter().find(|t| t.schema.table.eq_ignore_ascii_case(table)).ok_or_else(|| Error::Schema(format!("no table {table}")))?;
+        Ok(t.profiles.to_vec())
+    }
+
+    /// Starts the log again naming `rank_profiles`, before the first
+    /// profile record goes into it: what it holds is in a version first
+    /// (the memtables flushed, then a commit that records the last
+    /// transaction), so emptying it drops nothing.
+    fn allow_profiles(&self, wal: &mut Wal) -> Result<()> {
+        self.flush_locked(wal)?;
+        if !wal.is_empty() {
+            // Transactions that left nothing to flush.
+            let txn = lock(&self.state).txn;
+            let mut vw = VersionWriter::begin(self);
+            vw.manifest.wal_txn = txn;
+            let c = vw.commit(wal)?;
+            self.publish(c, |_| {})?;
+        }
+        wal.allow_profiles(self.opts.sync).map_err(|e| self.poison(e))
     }
 
     /// Adds the system table [`SOURCES`] if the database lacks it, in one
@@ -1062,7 +1128,7 @@ impl Database {
             return Ok(());
         }
         let mut vw = VersionWriter::begin(self);
-        vw.manifest.tables.push(TableMeta { id: SOURCES_ID, schema: sources_schema(), segments: Vec::new() });
+        vw.manifest.tables.push(TableMeta { id: SOURCES_ID, schema: sources_schema(), segments: Vec::new(), profiles: Vec::new() });
         let c = vw.commit(wal)?;
         self.publish(c, |_| {})
     }
@@ -1314,7 +1380,11 @@ impl Database {
                 let segs = t.segments.iter().map(|m| Ok((m.n_docs, st.handle(m.id).cloned().ok_or_else(|| corrupt(format!("segment {} is in the manifest but not open", m.id)))?))).collect::<Result<Vec<_>>>()?;
                 match t.id == SOURCES_ID {
                     true => sources = Some(segs),
-                    false => tables.push((t.schema.clone(), segs)),
+                    false => {
+                        // Logged since its last version, maybe.
+                        let profiles = st.tables.iter().find(|ts| ts.id == t.id).map_or_else(Vec::new, |ts| ts.profiles.to_vec());
+                        tables.push((t.schema.clone(), segs, profiles));
+                    }
                 }
             }
             (Numbering { seq: st.seq, ..n }, (tables, sources))
@@ -1330,7 +1400,7 @@ impl Database {
             let st = lock(&self.state);
             let mine: Vec<&Schema> = st.manifest.tables.iter().filter(|t| t.id != SOURCES_ID).map(|t| &t.schema).collect();
             let names = |ts: &mut dyn Iterator<Item = &Schema>| ts.map(|s| s.table.clone()).collect::<Vec<_>>().join(", ");
-            if mine.len() != tables.len() || mine.iter().zip(&tables).any(|(t, (s, _))| **t != *s) {
+            if mine.len() != tables.len() || mine.iter().zip(&tables).any(|(t, (s, _, _))| **t != *s) {
                 return Err(Error::Schema(format!(
                     "the copy's tables ({}) are not this database's ({}), or their schemas differ",
                     names(&mut tables.iter().map(|t| &t.0)),
@@ -1357,14 +1427,15 @@ impl Database {
         for id in vw.manifest.tables.iter().flat_map(|t| &t.segments).map(|s| s.id).collect::<Vec<_>>() {
             vw.remove_segment(id);
         }
-        let mut into: Vec<_> = ids.into_iter().zip(tables.iter().map(|(_, segs)| segs)).collect();
+        let mut into: Vec<_> = ids.into_iter().zip(tables.iter().map(|(_, segs, profiles)| (segs, profiles.clone()))).collect();
         if let Some(segs) = &sources {
-            into.push((SOURCES_ID, segs));
+            into.push((SOURCES_ID, (segs, Vec::new())));
         }
-        for (to, segs) in into {
+        for (to, (segs, profiles)) in into {
             for (n_docs, h) in segs {
                 vw.add_segment(to, None, h.file.image(), *n_docs, h.base.as_deref(), h.updates.as_deref())?;
             }
+            vw.table_mut(to).profiles = profiles;
         }
         vw.manifest.seq_no = Some(theirs.clone());
         // The commit keeps the last number given here when it is higher: the
@@ -1592,7 +1663,9 @@ impl Database {
         self.check_poisoned()?;
         let (mems, pending, pending_updates, txn, numbered) = {
             let st = lock(&self.state);
-            if st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() {
+            // Rank profiles changed since the last version go into one too.
+            let profiles_kept = st.tables.iter().all(|t| st.manifest.table(t.id).is_some_and(|m| m.profiles == *t.profiles));
+            if st.mem_len() == 0 && st.pending.is_empty() && st.pending_updates.is_empty() && profiles_kept {
                 return Ok(());
             }
             let mems: Vec<_> = st
@@ -2518,6 +2591,12 @@ impl Database {
             if let Some(n) = &mut manifest.seq_no {
                 n.seq = st.seq;
             }
+            // Profiles logged since the last version are in no segment.
+            for t in manifest.tables.iter_mut() {
+                if let Some(ts) = st.tables.iter().find(|ts| ts.id == t.id) {
+                    t.profiles = ts.profiles.to_vec();
+                }
+            }
             (snap, manifest, st.handles().cloned().collect::<Vec<_>>())
         };
         let name = dest.file_name().ok_or_else(|| Error::Schema(format!("{} names no file", dest.display())))?.to_string_lossy();
@@ -2566,6 +2645,7 @@ impl Database {
             // may differ (dropped tables leave gaps in the source's).
             let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).collect();
             for (t, &to) in manifest.tables.iter().zip(&ids) {
+                vw.table_mut(to).profiles = t.profiles.clone();
                 for m in &t.segments {
                     let h = handles.iter().find(|h| h.meta.id == m.id).ok_or_else(|| corrupt(format!("segment {} is in the manifest but not open", m.id)))?;
                     vw.manifest.next_segment_id = m.id;
@@ -2888,9 +2968,18 @@ impl Database {
                             debug_assert!(t.id != 0, "the first table's schema changed");
                             o.schema = Arc::new(t.schema.clone());
                         }
+                        // The version took them from here, unless it
+                        // installs others (a copy's).
+                        if *o.profiles != t.profiles {
+                            o.profiles = Arc::new(t.profiles.clone());
+                        }
                         o
                     }
-                    None => TableState::new(t.id, Arc::new(t.schema.clone()), h, self.opts.memtable_chunk_docs, 0),
+                    None => {
+                        let mut ts = TableState::new(t.id, Arc::new(t.schema.clone()), h, self.opts.memtable_chunk_docs, 0);
+                        ts.profiles = Arc::new(t.profiles.clone());
+                        ts
+                    }
                 })
                 .collect();
             st.txn = c.meta.txn;
@@ -3093,6 +3182,9 @@ impl Database {
             return Ok(None);
         }
         self.check_poisoned()?;
+        if !wal.allows_profiles() && ops.iter().any(|(_, op)| matches!(op, Op::Profile { .. })) {
+            self.allow_profiles(wal)?;
+        }
         // While flushes fail or the flusher falls behind, the memtable
         // grows; past twice its limit, writes wait for a flush to succeed,
         // refused before they are logged.
@@ -3573,6 +3665,7 @@ impl<'a> WriteTxn<'a> {
                         return Err(differs(format!("sets {name} of {key:?}, which no row here has")));
                     }
                 }
+                op @ Op::Profile { .. } => self.ops.push((t.id, op)),
             }
         }
         Ok(())
@@ -3675,6 +3768,13 @@ impl<'a> VersionWriter<'a> {
         let mut manifest = st.manifest.clone();
         // Past the ids reserved for merges.
         manifest.next_segment_id = manifest.next_segment_id.max(st.next_segment_id);
+        // Profiles logged since the last version. The writer lock, which
+        // every version is written under, keeps them until the commit.
+        for t in manifest.tables.iter_mut() {
+            if let Some(ts) = st.tables.iter().find(|ts| ts.id == t.id) {
+                t.profiles = ts.profiles.to_vec();
+            }
+        }
         VersionWriter {
             db,
             txn: st.txn + 1,
@@ -4058,12 +4158,18 @@ pub struct DropOptions {
 
 /// Table names are plain identifiers, so SQL can name them unquoted.
 fn check_table_name(name: &str) -> Result<()> {
+    check_name("table", name)
+}
+
+/// A table's or a rank profile's name: letters, digits and underscores,
+/// not starting with a digit.
+fn check_name(what: &str, name: &str) -> Result<()> {
     let mut chars = name.chars();
     let ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
     if ok {
         Ok(())
     } else {
-        Err(Error::Schema(format!("bad table name {name:?}: use letters, digits and underscores, not starting with a digit")))
+        Err(Error::Schema(format!("bad {what} name {name:?}: use letters, digits and underscores, not starting with a digit")))
     }
 }
 
@@ -4103,6 +4209,7 @@ fn op_fits(schema: &Schema, op: &Op) -> bool {
     match op {
         Op::Insert(doc) => validate(schema, doc).is_ok(),
         Op::Delete(k) => is_key(k),
+        Op::Profile { name, def } => check_name("rank profile", name).is_ok() && def.as_ref().is_none_or(|p| p.name == *name),
         Op::Set { key, field, value } => {
             let i = *field as usize;
             is_key(key)

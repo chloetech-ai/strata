@@ -309,6 +309,15 @@ message Search {
   repeated SortKey order = 3;
   // Rerank phases after `order`, in turn (plan feature rank_phases).
   repeated Phase phases = 4;
+  // The rank profile the query ranked by, written out above: a server
+  // whose profile of that name has another hash refuses the plan (plan
+  // feature rank_profiles).
+  RankProfileRef profile = 5;
+}
+
+message RankProfileRef {
+  string name = 1;
+  string hash = 2;
 }
 
 // A rerank phase: the top `count` rows of the phase before it ranked again
@@ -488,11 +497,21 @@ message Expr {
     // minmax(x) or rank(x) over the rows a Search ranks; plan feature
     // "rank_expressions".
     Norm norm = 36;
+    // A ranking model's score of a row; plan feature "rank_models".
+    Gbdt gbdt = 37;
     // maxsim(field, vectors); plan feature "maxsim". Numbered from 80, the
     // range of the multi-vector work, so lanes building at once do not
     // collide.
     MaxSim maxsim = 80;
   }
+}
+
+// gbdt('model', features...): the model of that name in the models
+// directory, whose file has the hash `hash` (empty: not opened yet).
+message Gbdt {
+  string model = 1;
+  string hash = 2;
+  repeated Expr args = 3;
 }
 
 message Norm {
@@ -819,6 +838,9 @@ message SchemaResponse {
   // Every table's schema, the first first; empty from a server before
   // tables were served (it serves the first alone).
   repeated string tables_json = 2;
+  // Every table's rank profiles, each `{"table": name, "profile": {...}}`,
+  // by table, then name.
+  repeated string profiles_json = 3;
 }
 
 message HealthResponse {

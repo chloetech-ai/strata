@@ -15,10 +15,23 @@ const ROWS_SHOWN: usize = 5;
 
 impl Plan {
     /// The plan as lines of text, the root first and each node's input
-    /// indented under it. `schemas` name the fields of the tables the plan
-    /// reads (a field of another table shows as `#id`).
+    /// indented under it, then the file of each ranking model it names.
+    /// `schemas` name the fields of the tables the plan reads (a field of
+    /// another table shows as `#id`).
     pub fn explain(&self, schemas: &[&Schema]) -> Vec<String> {
-        Text { schemas, refs: RefCell::default() }.node(&self.root).0
+        let mut lines = Text { schemas, refs: RefCell::default() }.node(&self.root).0;
+        self.root.visit_exprs(&mut |e| {
+            if let Expr::Gbdt { model, hash, .. } = e {
+                let line = match hash.as_str() {
+                    "" => format!("ranking model: {model}"),
+                    h => format!("ranking model: {model} (hash {h})"),
+                };
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
+        });
+        lines
     }
 }
 
@@ -66,6 +79,9 @@ impl<'a> Text<'a> {
                 for p in &s.phases {
                     let at = if p.global { "a global phase: scored once over every row" } else { "a second phase: each shard scores its rows" };
                     lines.push(format!("  rerank: {} DESC over the top {} ({at})", self.expr(&p.expr, &names), p.count));
+                }
+                if let Some(r) = &s.profile {
+                    lines.push(format!("  rank profile: {} (hash {})", ident(&r.name), r.hash));
                 }
                 // For one release: `+` between scores meant min-max fusion
                 // before.
@@ -301,6 +317,7 @@ impl<'a> Text<'a> {
                 s + " END"
             }
             Expr::Call { func, args } => format!("{}({})", func.name(), args.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
+            Expr::Gbdt { model, args, .. } => format!("gbdt({})", std::iter::once(quote(model)).chain(args.iter().map(|x| self.expr(x, names))).collect::<Vec<_>>().join(", ")),
             Expr::Norm { kind, input } => {
                 let name = match kind {
                     NormKind::MinMax => "minmax",
