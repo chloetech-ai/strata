@@ -948,7 +948,17 @@ shards' rows, and sends shards the plan with the hashes. In the
 evaluator a model is a row-local function of its arguments; its
 interval is the hull of the leaves each tree can reach from its
 arguments' intervals (plus the rounding of the sum), which is what makes
-`gbdt(bm25(..), columns...)` a rank-safe boost.
+`gbdt(bm25(..), columns...)` a rank-safe boost. A node is 24 bytes and a
+leaf is a node whose children are itself, so a walk is a loop of
+branch-free steps; a phase scores its rows one tree at a time
+(`Gbdt::predict_columns`), so the tree stays in cache, which on the
+benchmark's 300-tree model is faster than LightGBM's own predictor
+(0.66 against 0.86 ms per 100 rows, one thread of the cloud VM). Bounds skip a subtree
+whose least and greatest leaf lie within what they found. The top-k
+loop takes a bound as narrowing when it falls below its top at half the
+text score's maximum or at 0, since a model's is flat above its last
+split on the text score; even so a model's bound, summed over hundreds
+of trees, skips few rows, so the docs steer models to rerank phases.
 
 The vector strategies are chosen by estimated cost against an estimated
 filter selectivity `s`: pre-filter costs `s·n` distance computations; IVF
