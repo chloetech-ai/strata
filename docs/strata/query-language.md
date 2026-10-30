@@ -147,7 +147,24 @@ SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/
 - `PREFIX(x, p)` also works over joined or derived rows, as a test of each value; `PREFIX(kw, '')` and `LIKE '%'` are `IS NOT NULL`.
 - Counts kept with `UPDATE ... SET n = n + 1` or a write's `add` change in place, so a query log's popularity stays current without rewriting rows.
 
-A plan with a prefix needs the plan feature `prefix`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids). Latency by prefix length over ORCAS's 10.4 million queries is in [`results/text/complete-orcas.json`](https://github.com/rkonow/strata/tree/main/strata/results/text).
+A plan with a prefix needs the plan feature `prefix`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids).
+
+**Cluster a completion table by its key.** `ORDER BY n DESC LIMIT 10` reads the count column's blocks best first ([ordering by a column](#a-column)), and with `OPTIONS(cluster_by = 'id')` a prefix's rows sit together in each segment, so the ten most asked queries under a prefix read about ten blocks whatever the prefix's length:
+
+```sql
+CREATE TABLE queries (id KEYWORD PRIMARY KEY, n INT) OPTIONS(cluster_by = 'id');
+```
+
+Over ORCAS's 10.4 million queries, loaded in no particular order and merged by the default policy (11 segments), 2,000 typed queries drawn by clicks, one thread on a 4-core cloud VM (Intel Xeon @ 2.10GHz), p99 in ms:
+
+| characters typed | 1 | 2 | 3 | 4 | 6 | 8 | 12 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rows matching (median) | 560,354 | 64,887 | 9,461 | 2,418 | 415 | 68 | 6 |
+| every match read | 46.7 | 25.4 | 18.2 | 17.1 | 9.9 | 9.1 | 2.6 |
+| blocks best first | 9.5 | 13.0 | 8.8 | 9.7 | 6.3 | 6.5 | 2.6 |
+| blocks, clustered by `id` | 0.27 | 0.53 | 0.48 | 0.38 | 0.35 | 0.33 | 0.28 |
+
+The full runs, with medians and the 105 segments straight after the load, are [`results/text/complete-orcas.json` and `complete-orcas-clustered.json`](https://github.com/rkonow/strata/tree/main/strata/results/text) (`strata-complete-bench`).
 
 ## Scores
 
