@@ -6,6 +6,9 @@
 //!
 //! * [`BlipCaptioner`] (feature `vision`): BLIP's captioner through candle,
 //!   `blip-image-captioning-base`. Seconds an image on a few cores.
+//! * [`WhisperTranscriber`] (feature `audio`): Whisper's transcripts of
+//!   speech through candle, `whisper-small`: about 5 s for each 30
+//!   seconds of sound on 4 cores.
 //! * [`ColorNamer`] (`colors`): names an image's main colours, for tests
 //!   and demos without model files.
 //!
@@ -15,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::embed::{Image, Input, Modality};
+#[cfg(feature = "audio")]
+use crate::embed::Audio;
 use crate::error::{Error, Result};
 
 /// A model that makes text of media.
@@ -32,14 +37,25 @@ fn model_err(what: impl std::fmt::Display) -> Error {
 
 /// Models [`open`] knows how to fetch: name, Hugging Face repository, and
 /// what it is.
-pub const KNOWN_MODELS: &[(&str, &str, &str)] = &[("blip-image-captioning-base", "Salesforce/blip-image-captioning-base", "BLIP, captions of images (feature vision)")];
+pub const KNOWN_MODELS: &[(&str, &str, &str)] = &[
+    ("blip-image-captioning-base", "Salesforce/blip-image-captioning-base", "BLIP, captions of images (feature vision)"),
+    ("whisper-small", "openai/whisper-small", "Whisper, transcripts of speech in 99 languages (feature audio)"),
+];
 
-/// The files a model directory of [`KNOWN_MODELS`] needs: BLIP's
-/// repository ships its weights as a PyTorch file only.
-pub const MODEL_FILES: &[&str] = &["config.json", "tokenizer.json", "pytorch_model.bin"];
+/// The files the model directory of `name` ([`KNOWN_MODELS`]) needs:
+/// BLIP's repository ships its weights as a PyTorch file only; Whisper's
+/// as safetensors, with the generation settings (languages, suppressed
+/// tokens) in a file of their own.
+pub fn model_files(name: &str) -> &'static [&'static str] {
+    match name.starts_with("whisper") {
+        true => &["config.json", "tokenizer.json", "generation_config.json", "model.safetensors"],
+        false => &["config.json", "tokenizer.json", "pytorch_model.bin"],
+    }
+}
 
 /// Opens the model a derived field names: `colors`, or a directory under
-/// `models` (or an absolute path) holding a BLIP captioner.
+/// `models` (or an absolute path) holding a BLIP captioner or a Whisper
+/// model.
 pub fn open(model: &str, models: &Path) -> Result<Arc<dyn Deriver>> {
     if model == "colors" {
         return Ok(Arc::new(ColorNamer));
@@ -54,7 +70,13 @@ pub fn open(model: &str, models: &Path) -> Result<Arc<dyn Deriver>> {
         #[cfg(not(feature = "vision"))]
         return Err(model_err(format!("model {model} is a BLIP captioner: build with the `vision` feature")));
     }
-    Err(model_err(format!("model {model} does not make text of media (a BLIP captioner does)")))
+    if config["model_type"] == "whisper" {
+        #[cfg(feature = "audio")]
+        return Ok(Arc::new(WhisperTranscriber::open(&dir)?));
+        #[cfg(not(feature = "audio"))]
+        return Err(model_err(format!("model {model} is a Whisper model: build with the `audio` feature")));
+    }
+    Err(model_err(format!("model {model} does not make text of media (a BLIP captioner or a Whisper model does)")))
 }
 
 // ---------------------------------------------------------------- colors
@@ -375,6 +397,381 @@ mod blip {
             }
             let x = self.head_norm.forward(&self.head_dense.forward(&x)?.apply(&self.act)?)?;
             self.head.forward(&x)?.squeeze(1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------- whisper
+
+/// Whisper's transcripts of speech (`openai/whisper-small`, Apache-2.0).
+/// The sound is resampled to 16 kHz and read in 30-second windows, each a
+/// log-mel spectrogram as the `transformers` library computes it. The
+/// decoder writes a window's text greedily after `<|startoftranscript|>`,
+/// the language it detects in the file's first window,
+/// `<|transcribe|>` and `<|notimestamps|>`, without the tokens the
+/// model's generation settings suppress, until `<|endoftext|>`: what
+/// `transformers` generates for a window by default. A file's windows'
+/// texts are joined by spaces. The model is Strata's own over the
+/// repository's `model.safetensors`: windows run in batches, and the
+/// decoder keeps each layer's keys and values of the sound and of the
+/// tokens so far.
+#[cfg(feature = "audio")]
+pub struct WhisperTranscriber {
+    model: whisper::Model,
+    tokenizer: tokenizers::Tokenizer,
+    /// `(mel bins, 201)`.
+    filters: candle_core::Tensor,
+    sot: u32,
+    eot: u32,
+    /// The tokens after `<|startoftranscript|>` and the language.
+    task: Vec<u32>,
+    languages: Vec<u32>,
+    /// Added to the logits of every step, and of the first.
+    suppress: candle_core::Tensor,
+    suppress_first: candle_core::Tensor,
+    max_tokens: usize,
+    name: String,
+}
+
+#[cfg(feature = "audio")]
+impl WhisperTranscriber {
+    /// Windows transcribed at once.
+    const BATCH: usize = 4;
+    const RATE: u32 = 16_000;
+    /// Samples a window holds: 30 seconds.
+    const WINDOW: usize = 480_000;
+
+    pub fn open(dir: &Path) -> Result<WhisperTranscriber> {
+        use candle_core::{Device, Tensor};
+        use candle_nn::VarBuilder;
+        let e = |x: String| model_err(format!("{}: {x}", dir.display()));
+        let json = |f: &str| -> Result<serde_json::Value> {
+            let text = std::fs::read_to_string(dir.join(f)).map_err(|x| e(format!("{f}: {x}")))?;
+            serde_json::from_str(&text).map_err(|x| e(format!("{f}: {x}")))
+        };
+        let (config, generation) = (json("config.json")?, json("generation_config.json")?);
+        let cfg: whisper::Config = serde_json::from_value(config).map_err(|x| e(x.to_string()))?;
+        let id = |v: &serde_json::Value, what: &str| v.as_u64().map(|i| i as u32).ok_or_else(|| e(format!("generation_config.json has no {what}")));
+        let (sot, eot) = (id(&generation["decoder_start_token_id"], "decoder_start_token_id")?, id(&generation["eos_token_id"], "eos_token_id")?);
+        let no_timestamps = id(&generation["no_timestamps_token_id"], "no_timestamps_token_id")?;
+        let mut languages: Vec<u32> = generation["lang_to_id"].as_object().map(|m| m.values().filter_map(|v| v.as_u64()).map(|v| v as u32).collect()).unwrap_or_default();
+        languages.sort();
+        // A multilingual model is told the language and the task; an
+        // English one only that there are no timestamps.
+        let task = match languages.is_empty() {
+            true => vec![no_timestamps],
+            false => vec![id(&generation["task_to_id"]["transcribe"], "task_to_id.transcribe")?, no_timestamps],
+        };
+        let ids = |k: &str| generation[k].as_array().map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect::<Vec<_>>()).unwrap_or_default();
+        let dev = Device::Cpu;
+        let mask = |ids: &[usize]| {
+            let mut m = vec![0f32; cfg.vocab_size];
+            for &i in ids.iter().filter(|&&i| i < cfg.vocab_size) {
+                m[i] = f32::NEG_INFINITY;
+            }
+            Tensor::from_vec(m, cfg.vocab_size, &dev)
+        };
+        let suppress = mask(&ids("suppress_tokens")).map_err(|x| e(x.to_string()))?;
+        let suppress_first = mask(&[ids("suppress_tokens"), ids("begin_suppress_tokens")].concat()).map_err(|x| e(x.to_string()))?;
+        let filters = crate::audio::mel_filters(Self::RATE, 400, cfg.num_mel_bins, 0.0, Self::RATE as f64 / 2.0, false, true);
+        let filters = Tensor::from_vec(filters.concat(), (cfg.num_mel_bins, 201), &dev).map_err(|x| e(x.to_string()))?;
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|x| e(x.to_string()))?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], candle_core::DType::F32, &dev) }.map_err(|x| e(x.to_string()))?;
+        let model = whisper::Model::new(&cfg, vb.pp("model")).map_err(|x| e(x.to_string()))?;
+        let name = format!("whisper:{}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        Ok(WhisperTranscriber { model, tokenizer, filters, sot, eot, task, languages, suppress, suppress_first, max_tokens: cfg.max_target_positions, name })
+    }
+
+    /// The log-mel spectrogram of a window of 16 kHz sound, `(mel bins,
+    /// 3000)`: the window padded with silence to 30 seconds, frames 10 ms
+    /// apart, log10 of the mel power, floored 8 below its peak and scaled
+    /// as Whisper's feature extractor does.
+    fn mel(&self, window: &[f32]) -> candle_core::Result<candle_core::Tensor> {
+        let mut x = window.to_vec();
+        x.resize(Self::WINDOW, 0.0);
+        let power = crate::audio::power_spectrogram(&x, 400, 160, self.filters.device())?.narrow(0, 0, Self::WINDOW / 160)?;
+        let mel = self.filters.matmul(&power.t()?)?;
+        let log = (mel.maximum(1e-10)?.log()? / std::f64::consts::LN_10)?;
+        let peak = log.flatten_all()?.max(0)?.to_scalar::<f32>()? as f64;
+        (log.maximum(peak - 8.0)? + 4.0)? / 4.0
+    }
+
+    /// Transcribes a batch of windows (file, samples), each sequence in
+    /// step; one that has ended takes `<|endoftext|>` until all have.
+    /// `language` holds each file's language, found here for a file whose
+    /// first window this is.
+    fn windows(&self, batch: &[(usize, &[f32])], language: &mut [Option<u32>]) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        use candle_core::{Tensor, D};
+        let dev = candle_core::Device::Cpu;
+        let n = batch.len();
+        let mels = batch.iter().map(|(_, w)| self.mel(w)).collect::<candle_core::Result<Vec<_>>>()?;
+        let sound = self.model.encode(&Tensor::stack(&mels, 0)?)?;
+        let mut state = self.model.start(&sound)?;
+        let mut logits = self.model.step(&Tensor::new(vec![self.sot; n], &dev)?, 0, &mut state)?;
+        let mut prompt: Vec<Vec<u32>> = Vec::with_capacity(n);
+        for (j, (file, _)) in batch.iter().enumerate() {
+            if !self.languages.is_empty() && language[*file].is_none() {
+                let row: Vec<f32> = logits.get(j)?.to_vec1()?;
+                language[*file] = self.languages.iter().copied().max_by(|a, b| row[*a as usize].total_cmp(&row[*b as usize]));
+            }
+            prompt.push(language[*file].into_iter().chain(self.task.iter().copied()).collect());
+        }
+        let mut pos = 1;
+        for p in 0..prompt[0].len() {
+            logits = self.model.step(&Tensor::new(prompt.iter().map(|t| t[p]).collect::<Vec<_>>(), &dev)?, pos, &mut state)?;
+            pos += 1;
+        }
+        let mut tokens: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut done = vec![false; n];
+        while pos < self.max_tokens {
+            let mask = if tokens.iter().all(|t| t.is_empty()) { &self.suppress_first } else { &self.suppress };
+            let mut next = logits.broadcast_add(mask)?.argmax(D::Minus1)?.to_vec1::<u32>()?;
+            for j in 0..n {
+                if done[j] || next[j] == self.eot {
+                    done[j] = true;
+                    next[j] = self.eot;
+                } else {
+                    tokens[j].push(next[j]);
+                }
+            }
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            logits = self.model.step(&Tensor::new(next, &dev)?, pos, &mut state)?;
+            pos += 1;
+        }
+        tokens.iter().map(|t| self.tokenizer.decode(t, true).map(|s| clean_up(&s).trim().to_string())).collect()
+    }
+}
+
+/// Takes out the spaces before punctuation and English contractions, as
+/// the `transformers` library does to a decoded text when the tokenizer's
+/// `clean_up_tokenization_spaces` is set, as Whisper's is.
+#[cfg(feature = "audio")]
+fn clean_up(s: &str) -> String {
+    [(" .", "."), (" ?", "?"), (" !", "!"), (" ,", ","), (" ' ", "'"), (" n't", "n't"), (" 'm", "'m"), (" 's", "'s"), (" 've", "'ve"), (" 're", "'re")].iter().fold(s.to_string(), |s, (a, b)| s.replace(a, b))
+}
+
+#[cfg(feature = "audio")]
+impl Deriver for WhisperTranscriber {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn modality(&self) -> Modality {
+        Modality::Audio
+    }
+    fn derive(&self, inputs: &[Input<'_>]) -> Result<Vec<String>> {
+        let sounds: Vec<&Audio> = inputs
+            .iter()
+            .map(|i| match i {
+                Input::Audio(a) => Ok(*a),
+                i => Err(model_err(format!("model {} makes text of audio, not {}s", self.name, i.modality().as_str()))),
+            })
+            .collect::<Result<_>>()?;
+        let pcm: Vec<Vec<f32>> = sounds.iter().map(|a| crate::audio::resample(&a.samples, a.rate, Self::RATE)).collect();
+        // Windows of less than a tenth of a second hold no speech.
+        let windows: Vec<(usize, &[f32])> = pcm.iter().enumerate().flat_map(|(i, x)| x.chunks(Self::WINDOW).filter(|w| w.len() >= 1_600).map(move |w| (i, w))).collect();
+        let mut language = vec![None; sounds.len()];
+        let mut texts: Vec<Vec<String>> = vec![Vec::new(); sounds.len()];
+        for batch in windows.chunks(Self::BATCH) {
+            let out = self.windows(batch, &mut language).map_err(|e| model_err(format!("{}: {e}", self.name)))?;
+            for ((i, _), t) in batch.iter().zip(out) {
+                if !t.is_empty() {
+                    texts[*i].push(t);
+                }
+            }
+        }
+        Ok(texts.into_iter().map(|t| t.join(" ")).collect())
+    }
+}
+
+/// Whisper's encoder and decoder (pre-norm transformers, the decoder with
+/// cross-attention to the encoder's states), the decoder one token of
+/// each sequence at a time.
+#[cfg(feature = "audio")]
+mod whisper {
+    use candle_core::{Module, Result, Tensor, D};
+    use candle_nn::{conv1d, embedding, layer_norm, linear, linear_no_bias, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, VarBuilder};
+
+    /// What of `config.json` the model needs.
+    #[derive(serde::Deserialize)]
+    pub struct Config {
+        pub num_mel_bins: usize,
+        pub d_model: usize,
+        pub encoder_layers: usize,
+        pub encoder_attention_heads: usize,
+        pub decoder_layers: usize,
+        pub decoder_attention_heads: usize,
+        pub encoder_ffn_dim: usize,
+        pub decoder_ffn_dim: usize,
+        pub max_source_positions: usize,
+        pub max_target_positions: usize,
+        pub vocab_size: usize,
+    }
+
+    /// GELU (the exact one, of `erf`) of `x`, its rows split among the
+    /// cores: candle computes it on one.
+    fn gelu(x: &Tensor) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let width = *dims.last().expect("a tensor of rows");
+        let rows = x.elem_count() / width.max(1);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(rows).max(1);
+        if threads == 1 {
+            return x.gelu_erf();
+        }
+        let flat = x.reshape((rows, width))?;
+        let per = rows.div_ceil(threads);
+        let parts = std::thread::scope(|s| {
+            let flat = &flat;
+            let jobs: Vec<_> = (0..rows).step_by(per).map(|at| s.spawn(move || flat.narrow(0, at, per.min(rows - at))?.gelu_erf())).collect();
+            jobs.into_iter().map(|j| j.join().expect("a GELU thread")).collect::<Result<Vec<_>>>()
+        })?;
+        Tensor::cat(&parts, 0)?.reshape(dims)
+    }
+
+    struct Attention {
+        query: Linear,
+        key: Linear,
+        value: Linear,
+        out: Linear,
+        heads: usize,
+    }
+
+    impl Attention {
+        fn new(d: usize, heads: usize, vb: VarBuilder) -> Result<Attention> {
+            Ok(Attention { query: linear(d, d, vb.pp("q_proj"))?, key: linear_no_bias(d, d, vb.pp("k_proj"))?, value: linear(d, d, vb.pp("v_proj"))?, out: linear(d, d, vb.pp("out_proj"))?, heads })
+        }
+
+        /// `(batch, len, d)` as `(batch, heads, len, d / heads)`.
+        fn split(&self, x: &Tensor) -> Result<Tensor> {
+            let (b, n, d) = x.dims3()?;
+            x.reshape((b, n, self.heads, d / self.heads))?.transpose(1, 2)?.contiguous()
+        }
+
+        /// The keys of `x`, transposed, `(batch, heads, d / heads, len)`,
+        /// and its values, `(batch, heads, len, d / heads)`.
+        fn keys(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+            let k = self.key.forward(x)?;
+            let (b, n, d) = k.dims3()?;
+            let k = k.reshape((b, n, self.heads, d / self.heads))?.permute((0, 2, 3, 1))?.contiguous()?;
+            Ok((k, self.split(&self.value.forward(x)?)?))
+        }
+
+        fn attend(&self, x: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+            let q = self.split(&self.query.forward(x)?)?;
+            let q = (&q * (1.0 / (q.dim(D::Minus1)? as f64).sqrt()))?;
+            let w = candle_nn::ops::softmax_last_dim(&q.matmul(k)?)?;
+            let (b, _, n, _) = q.dims4()?;
+            self.out.forward(&w.matmul(v)?.transpose(1, 2)?.reshape((b, n, ()))?)
+        }
+    }
+
+    struct Block {
+        attention: Attention,
+        attention_norm: LayerNorm,
+        cross: Option<(Attention, LayerNorm)>,
+        fc1: Linear,
+        fc2: Linear,
+        mlp_norm: LayerNorm,
+    }
+
+    impl Block {
+        fn new(d: usize, heads: usize, ffn: usize, cross: bool, vb: VarBuilder) -> Result<Block> {
+            let cross = match cross {
+                true => Some((Attention::new(d, heads, vb.pp("encoder_attn"))?, layer_norm(d, 1e-5, vb.pp("encoder_attn_layer_norm"))?)),
+                false => None,
+            };
+            Ok(Block {
+                attention: Attention::new(d, heads, vb.pp("self_attn"))?,
+                attention_norm: layer_norm(d, 1e-5, vb.pp("self_attn_layer_norm"))?,
+                cross,
+                fc1: linear(d, ffn, vb.pp("fc1"))?,
+                fc2: linear(ffn, d, vb.pp("fc2"))?,
+                mlp_norm: layer_norm(d, 1e-5, vb.pp("final_layer_norm"))?,
+            })
+        }
+
+        fn mlp(&self, x: &Tensor) -> Result<Tensor> {
+            x + self.fc2.forward(&gelu(&self.fc1.forward(&self.mlp_norm.forward(x)?)?)?)?
+        }
+    }
+
+    pub struct Model {
+        conv1: Conv1d,
+        conv2: Conv1d,
+        sound_positions: Tensor,
+        encoder: Vec<Block>,
+        encoder_norm: LayerNorm,
+        words: Embedding,
+        word_positions: Tensor,
+        decoder: Vec<Block>,
+        decoder_norm: LayerNorm,
+    }
+
+    /// A batch's keys and values: of the sound, projected once per layer,
+    /// and of the tokens so far.
+    pub struct State {
+        sound: Vec<(Tensor, Tensor)>,
+        tokens: Vec<Option<(Tensor, Tensor)>>,
+    }
+
+    impl Model {
+        pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Model> {
+            let d = cfg.d_model;
+            let (enc, dec) = (vb.pp("encoder"), vb.pp("decoder"));
+            let conv = |stride| Conv1dConfig { padding: 1, stride, ..Default::default() };
+            Ok(Model {
+                conv1: conv1d(cfg.num_mel_bins, d, 3, conv(1), enc.pp("conv1"))?,
+                conv2: conv1d(d, d, 3, conv(2), enc.pp("conv2"))?,
+                sound_positions: enc.get((cfg.max_source_positions, d), "embed_positions.weight")?,
+                encoder: (0..cfg.encoder_layers).map(|i| Block::new(d, cfg.encoder_attention_heads, cfg.encoder_ffn_dim, false, enc.pp("layers").pp(i))).collect::<Result<_>>()?,
+                encoder_norm: layer_norm(d, 1e-5, enc.pp("layer_norm"))?,
+                words: embedding(cfg.vocab_size, d, dec.pp("embed_tokens"))?,
+                word_positions: dec.get((cfg.max_target_positions, d), "embed_positions.weight")?,
+                decoder: (0..cfg.decoder_layers).map(|i| Block::new(d, cfg.decoder_attention_heads, cfg.decoder_ffn_dim, true, dec.pp("layers").pp(i))).collect::<Result<_>>()?,
+                decoder_norm: layer_norm(d, 1e-5, dec.pp("layer_norm"))?,
+            })
+        }
+
+        /// The encoder's states `(batch, frames / 2, d)` of log-mel
+        /// spectrograms `(batch, mel bins, frames)`.
+        pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
+            let x = gelu(&self.conv2.forward(&gelu(&self.conv1.forward(mel)?)?)?)?.transpose(1, 2)?;
+            let mut x = x.broadcast_add(&self.sound_positions.narrow(0, 0, x.dim(1)?)?)?;
+            for b in &self.encoder {
+                let h = b.attention_norm.forward(&x)?;
+                let (k, v) = b.attention.keys(&h)?;
+                x = b.mlp(&(&x + b.attention.attend(&h, &k, &v)?)?)?;
+            }
+            self.encoder_norm.forward(&x)
+        }
+
+        /// The state of a batch whose sound's states are `sound`.
+        pub fn start(&self, sound: &Tensor) -> Result<State> {
+            let sound = self.decoder.iter().map(|b| b.cross.as_ref().expect("a decoder block attends to the sound").0.keys(sound)).collect::<Result<Vec<_>>>()?;
+            Ok(State { sound, tokens: (0..self.decoder.len()).map(|_| None).collect() })
+        }
+
+        /// The next token's logits `(batch, vocabulary)` after `ids`, the
+        /// batch's tokens at position `pos`.
+        pub fn step(&self, ids: &Tensor, pos: usize, state: &mut State) -> Result<Tensor> {
+            let mut x = self.words.forward(&ids.unsqueeze(1)?)?.broadcast_add(&self.word_positions.narrow(0, pos, 1)?)?;
+            for (i, b) in self.decoder.iter().enumerate() {
+                let h = b.attention_norm.forward(&x)?;
+                let (k, v) = b.attention.keys(&h)?;
+                let (k, v) = match state.tokens[i].take() {
+                    Some((pk, pv)) => (Tensor::cat(&[&pk, &k], 3)?, Tensor::cat(&[&pv, &v], 2)?),
+                    None => (k, v),
+                };
+                x = (&x + b.attention.attend(&h, &k, &v)?)?;
+                state.tokens[i] = Some((k, v));
+                let (cross, norm) = b.cross.as_ref().expect("a decoder block attends to the sound");
+                let (sk, sv) = &state.sound[i];
+                x = (&x + cross.attend(&norm.forward(&x)?, sk, sv)?)?;
+                x = b.mlp(&x)?;
+            }
+            let x = self.decoder_norm.forward(&x)?.squeeze(1)?;
+            x.matmul(&self.words.embeddings().t()?)
         }
     }
 }

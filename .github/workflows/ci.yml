@@ -117,6 +117,38 @@ jobs:
         working-directory: strata-server
         run: cargo test --profile ci --features vision --test media_vectors --test media
 
+  # Sound (feature `audio`: symphonia's decoders and Whisper through
+  # candle): decoding, resampling and mel features, and text derived from
+  # sound with a test model (Whisper's weights are not fetched here), and
+  # clippy over the feature's code in Strata and the server.
+  audio:
+    name: sound (feature audio)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: CPU model
+        id: cpu
+        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            strata
+            strata-server
+          key: audio-${{ steps.cpu.outputs.model }}
+      - name: Strata
+        working-directory: strata
+        run: |
+          cargo test --profile ci --features audio --test derived_audio
+          cargo test --profile ci --features audio --lib -- audio::
+          cargo clippy --profile ci --features audio --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+      - name: strata-server
+        working-directory: strata-server
+        run: cargo clippy --profile ci --features audio -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+
   # Power losses, full disks and failing syncs at every write of a storage
   # workload (storage::io, tests/storage_faults.rs). A job of its own: after
   # the strata tests, it took the macOS job past its hour.

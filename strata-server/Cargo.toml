@@ -36,6 +36,9 @@ bert = ["strata/bert"]
 accelerate = ["strata/accelerate"]
 # Images: decoded, and embedded by SigLIP (siglip-base-patch16-224).
 vision = ["strata/vision"]
+# Sound: decoded (WAV, FLAC, MP3, Ogg Vorbis, AAC), and transcribed by
+# Whisper (whisper-small).
+audio = ["strata/audio"]
 
 [build-dependencies]
 tonic-build = "0.12"
