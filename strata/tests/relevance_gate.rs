@@ -219,7 +219,7 @@ fn cross_encoder_relevance_holds() {
     let file = "relevance_gate_cross_encoder.json";
     let baseline: Json = if update { Json::Null } else { serde_json::from_str(&std::fs::read_to_string(baseline_path(file)).unwrap()).unwrap() };
     let tmp = tempfile::tempdir().unwrap();
-    let sql = format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q) DESC LIMIT 20) SELECT id FROM top ORDER BY cross_encoder('{MODEL}', body, :q) DESC LIMIT 10");
+    let sql = format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT 20) SELECT id FROM top ORDER BY cross_encoder('{MODEL}', body, :q) DESC LIMIT 10");
     let mut report = serde_json::Map::new();
     let mut failures = Vec::new();
     for name in COLLECTIONS {
