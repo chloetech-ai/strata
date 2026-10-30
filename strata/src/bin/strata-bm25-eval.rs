@@ -16,7 +16,10 @@
 //! exact top 10); `boost_top100` and `strong_boost_top100` rank by the same
 //! expression over BM25's top 100 rows only, as before rank-safe boosts
 //! ([`ExecOptions::rank_safe`] off), with how many of their top 10 are the
-//! exact ones. `--reps N` runs the
+//! exact ones. `boost_rerank100` ranks BM25's top 100 again by the boost in
+//! a rerank phase (a `WITH`), and `minmax_rerank100` by `0.8 *
+//! minmax(bm25) + 0.2 * minmax(importance)` in a global one: the time a
+//! 100-row phase adds to BM25 alone. `--reps N` runs the
 //! variants N times in turn and keeps each query's median time. Writes
 //! `<out>/bm25_<tag>.json` (default `results/text/`). Tune on `--split dev` (or `train` where a collection
 //! has no dev split) and report `test`; `tests/relevance_gate.rs` holds the
@@ -63,16 +66,21 @@ struct Args {
     reps: usize,
 }
 
-/// A variant's ranking and whether it ranks rank-safe.
-fn ranking(variant: &str) -> (&'static str, bool) {
+/// A variant's query and whether it ranks rank-safe.
+fn query(variant: &str) -> (String, bool) {
+    let top10 = |rank: &str| format!("SELECT id FROM docs ORDER BY {rank} DESC LIMIT 10");
+    // A rerank phase over BM25's top 100.
+    let rerank = |rank: &str| format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q) DESC LIMIT 100) SELECT id FROM top ORDER BY {rank} DESC LIMIT 10");
     match variant {
-        "plain" => ("bm25(body, :q)", true),
-        "fuzzy" => ("bm25(body, :q, fuzzy => 'auto')", true),
-        "boost" => ("bm25(body, :q) * (1 + 0.2 * importance)", true),
-        "boost_top100" => ("bm25(body, :q) * (1 + 0.2 * importance)", false),
-        "strong_boost" => ("bm25(body, :q) * (1 + importance)", true),
-        "strong_boost_top100" => ("bm25(body, :q) * (1 + importance)", false),
-        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, or either boost with _top100"),
+        "plain" => (top10("bm25(body, :q)"), true),
+        "fuzzy" => (top10("bm25(body, :q, fuzzy => 'auto')"), true),
+        "boost" => (top10("bm25(body, :q) * (1 + 0.2 * importance)"), true),
+        "boost_top100" => (top10("bm25(body, :q) * (1 + 0.2 * importance)"), false),
+        "boost_rerank100" => (rerank("bm25(body, :q) * (1 + 0.2 * importance)"), true),
+        "minmax_rerank100" => (rerank("0.8 * minmax(bm25(body, :q)) + 0.2 * minmax(importance)"), true),
+        "strong_boost" => (top10("bm25(body, :q) * (1 + importance)"), true),
+        "strong_boost_top100" => (top10("bm25(body, :q) * (1 + importance)"), false),
+        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100 or minmax_rerank100"),
     }
 }
 
@@ -125,8 +133,7 @@ fn main() {
         let mut failed = vec![0; args.variants.len()];
         for rep in 0..args.reps.max(1) {
             for (j, v) in args.variants.iter().enumerate() {
-                let (rank, safe) = ranking(v);
-                let sql = format!("SELECT id FROM docs ORDER BY {rank} DESC LIMIT 10");
+                let (sql, safe) = query(v);
                 let opts = ExecOptions { rank_safe: safe, ..ExecOptions::default() };
                 for (q, (_, text)) in coll.queries.iter().enumerate() {
                     let t = Instant::now();
@@ -159,7 +166,7 @@ fn main() {
                 percentile(&ms, 99.0)
             );
             // The share of the exact top 10 that BM25's top 100 holds.
-            if let Some(b) = v.strip_suffix("_top100").and_then(|base| args.variants.iter().position(|w| w == base)) {
+            if let Some(b) = v.strip_suffix("_top100").or_else(|| v.strip_suffix("_rerank100")).and_then(|base| args.variants.iter().position(|w| w == base)) {
                 let share: Vec<f64> = ids[j]
                     .iter()
                     .zip(&ids[b])

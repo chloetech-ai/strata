@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Plan, Search, Set, SortKey, When};
+use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Phase, Plan, Search, Set, SortKey, When};
 use strata::query::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy};
 use strata::value::Value;
 
@@ -62,7 +62,12 @@ fn opts(o: &BTreeMap<String, Value>) -> HashMap<String, pb::Value> {
 
 fn node(n: &Node) -> pb::Node {
     let n = match n {
-        Node::Search(s) => N::Search(Box::new(pb::Search { table: s.table.clone(), filter: bex(&s.filter), order: s.order.iter().map(sort_key).collect() })),
+        Node::Search(s) => N::Search(Box::new(pb::Search {
+            table: s.table.clone(),
+            filter: bex(&s.filter),
+            order: s.order.iter().map(sort_key).collect(),
+            phases: s.phases.iter().map(|p| pb::Phase { count: p.count, expr: Some(ex(&p.expr)), global: p.global }).collect(),
+        })),
         Node::Aggregate { input, keys, aggs } => N::Aggregate(Box::new(pb::Aggregate {
             input: boxed(input),
             keys: keys.iter().map(ex).collect(),
@@ -331,7 +336,8 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
                 Some(f) => from_ex(Some(*f))?,
                 None => Expr::Lit(Value::Bool(true)),
             };
-            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()? })
+            let phases = s.phases.into_iter().map(|p| Ok(Phase { count: p.count, expr: from_ex(p.expr)?, global: p.global })).collect::<Result<_, ApiError>>()?;
+            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()?, phases })
         }
         N::Aggregate(a) => {
             let a = *a;

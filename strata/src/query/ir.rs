@@ -60,7 +60,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 4] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID];
+pub const FEATURES: [&str; 5] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -80,6 +80,10 @@ pub const RANK_EXPRESSIONS: &str = "rank_expressions";
 
 /// The feature of a plan that cuts semantic IDs ([`Func::SidAt`]).
 pub const SEMANTIC_ID: &str = "semantic_id";
+
+/// The feature of a plan whose Search reranks its top rows in phases
+/// ([`Search::phases`]).
+pub const RANK_PHASES: &str = "rank_phases";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -201,6 +205,24 @@ pub struct Search {
     /// ties.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<SortKey>,
+    /// Rerank phases after `order`, in turn (feature [`RANK_PHASES`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<Phase>,
+}
+
+/// A rerank phase of a [`Search`]: the top `count` rows of the phase
+/// before it (the first phase is the Search's `order`) ranked again by
+/// `expr`, best first, rows tied on it in the order they had; only those
+/// rows go on. A phase that is not `global` is row-local, and each shard
+/// scores its own rows; a global one runs once over every row it reranks
+/// (on the coordinator over shards), so it may hold set functions
+/// (`minmax`, `rank`, `rrf`). A phase after a global one is global.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Phase {
+    pub count: u64,
+    pub expr: Expr,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub global: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -651,6 +673,33 @@ impl Node {
         found
     }
 
+    /// Whether a Search in the plan reranks in phases ([`RANK_PHASES`]).
+    pub fn has_phases(&self) -> bool {
+        fn within(e: &Expr) -> bool {
+            let mut found = false;
+            e.visit(&mut |x| {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    found |= n.has_phases();
+                }
+            });
+            found
+        }
+        match self {
+            Node::Search(s) => !s.phases.is_empty() || within(&s.filter),
+            Node::Filter { input, cond } => input.has_phases() || within(cond),
+            Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input } => input.has_phases(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_phases() || b.has_phases(),
+            Node::With { ctes, input } => input.has_phases() || ctes.iter().any(|c| c.input.has_phases()),
+            Node::Insert { .. } | Node::Ref { .. } => false,
+        }
+    }
+
     /// Whether a Search in the plan ranks by an expression that needs
     /// [`RANK_EXPRESSIONS`].
     pub fn ranks_by_expression(&self) -> bool {
@@ -664,7 +713,7 @@ impl Node {
             found
         }
         match self {
-            Node::Search(s) => s.order.first().is_some_and(|k| k.expr.is_rank_expression()) || within(&s.filter),
+            Node::Search(s) => s.order.first().is_some_and(|k| k.expr.is_rank_expression()) || s.phases.iter().any(|p| p.expr.is_rank_expression()) || within(&s.filter),
             Node::Filter { input, cond } => input.ranks_by_expression() || within(cond),
             Node::Aggregate { input, .. }
             | Node::Sort { input, .. }
@@ -694,6 +743,7 @@ impl Node {
             Node::Search(s) => {
                 each(&s.filter);
                 s.order.iter().for_each(|k| each(&k.expr));
+                s.phases.iter().for_each(|p| each(&p.expr));
             }
             Node::Aggregate { input, keys, aggs } => {
                 keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut each);
@@ -761,6 +811,7 @@ impl Node {
             Node::Search(s) => {
                 f(&s.filter);
                 s.order.iter().for_each(|k| f(&k.expr));
+                s.phases.iter().for_each(|p| f(&p.expr));
             }
             _ => {}
         }
@@ -796,6 +847,9 @@ impl Node {
                 f(&mut s.filter)?;
                 for k in &mut s.order {
                     f(&mut k.expr)?;
+                }
+                for p in &mut s.phases {
+                    f(&mut p.expr)?;
                 }
                 Ok(())
             }
@@ -999,6 +1053,9 @@ impl Plan {
         root.exprs(&mut |e| sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. }));
         if sid_at {
             features.push(SEMANTIC_ID.to_string());
+        }
+        if root.has_phases() {
+            features.push(RANK_PHASES.to_string());
         }
         Plan { version: VERSION, features, root }
     }

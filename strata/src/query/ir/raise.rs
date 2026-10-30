@@ -6,6 +6,7 @@
 use super::{err, Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, OnConflict, Plan};
 use crate::error::Result;
 use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::rank::Rank;
 use crate::query::sql::{self, Assign, Conflict, Write};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
@@ -158,6 +159,7 @@ impl<'a> Raise<'a> {
         self.table(&search.table)?;
         let filter = self.filter(&search.filter)?;
         let pk = self.schema.primary_key;
+        let mut phases = Vec::new();
         let (projection, group_by, having, order, tiebreak) = match aggregate {
             None => {
                 if let Some(n) = sort.map(|_| "Sort").or(having.map(|_| "Filter")) {
@@ -188,10 +190,11 @@ impl<'a> Raise<'a> {
                     [_, k] if pk.is_some() && k.expr == Expr::Field(pk.unwrap() as u32) => Some(Tiebreak::Key { desc: k.desc }),
                     _ => return Err(err("a Search orders by a score, then possibly by the primary key")),
                 };
+                phases = self.phases(&search.phases, order.is_some())?;
                 (projection, Vec::new(), None, order, tiebreak)
             }
             Some((keys, aggs)) => {
-                if !search.order.is_empty() {
+                if !search.order.is_empty() || !search.phases.is_empty() {
                     return Err(err("a Search under an Aggregate is not ordered"));
                 }
                 let group_by: Vec<usize> = keys.iter().map(|k| self.field_of(k)).collect::<Result<_>>()?;
@@ -230,7 +233,7 @@ impl<'a> Raise<'a> {
             }
         };
         let types = sql::projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs: self.graphs, types })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types })
     }
 
     /// The graph `hops()` refers to: the first REACHABLE or PATH.
@@ -465,6 +468,32 @@ impl<'a> Raise<'a> {
             Expr::Subquery(n) => Seeds::Query(Box::new(Raise::new(self.schema).select(n)?)),
             e => return Err(err(format!("seeds are keys or a subquery, not {e:?}"))),
         })
+    }
+
+    /// A Search's rerank phases, after its order: each reranks at least one
+    /// row, and one is global where it holds a set function (`minmax`,
+    /// `rank`, `rrf`, a weighted sum) or follows a global one.
+    fn phases(&mut self, phases: &[super::Phase], ordered: bool) -> Result<Vec<logical::Phase>> {
+        if !phases.is_empty() && !ordered {
+            return Err(err("rerank phases follow a Search's order: give it one"));
+        }
+        let mut after_global = false;
+        let mut out = Vec::with_capacity(phases.len());
+        for p in phases {
+            if p.count == 0 {
+                return Err(err("a rerank phase reranks at least one row"));
+            }
+            let score = self.score(&p.expr)?;
+            if !p.global && after_global {
+                return Err(err("a rerank phase after a global one is global"));
+            }
+            if !p.global && Rank::is_global(&score) {
+                return Err(err("a rerank phase with minmax(), rank(), rrf() or a weighted sum reads every row it reranks: it is global"));
+            }
+            after_global |= p.global;
+            out.push(logical::Phase { score, count: usize::try_from(p.count).unwrap_or(usize::MAX), global: p.global });
+        }
+        Ok(out)
     }
 
     /// A Search's ranking, its sums of `w * minmax(score)` and products of

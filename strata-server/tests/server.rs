@@ -514,6 +514,9 @@ async fn coordinator_answers_like_one_database() {
     for sql in [
         "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE a.year >= - -2022 AND b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
         "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > - -100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
+        // Rerank phases: a second phase each shard scores, a global one.
+        "WITH top AS (SELECT * FROM products ORDER BY bm25(body, 'waterproof hiking') DESC LIMIT 60) SELECT id, score() FROM top ORDER BY bm25(body, 'boots') + coalesce(rating, 0) DESC LIMIT 10",
+        "WITH a AS (SELECT * FROM products WHERE price < 300 ORDER BY bm25(body, 'leather') DESC LIMIT 80), b AS (SELECT * FROM a ORDER BY rating DESC LIMIT 30) SELECT id, price, score() FROM b ORDER BY minmax(bm25(body, 'jacket')) - 0.5 * minmax(price) DESC LIMIT 8 OFFSET 2",
     ] {
         let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
         assert!(!want["rows"].as_array().unwrap().is_empty(), "{sql}");
@@ -529,6 +532,7 @@ async fn coordinator_answers_like_one_database() {
         "SELECT id, price FROM products WHERE year >= 2020 ORDER BY price DESC, id LIMIT 7",
         "SELECT id, price FROM products WHERE id IN (SELECT id FROM products WHERE price > 100 AND year >= 2020) ORDER BY price DESC LIMIT 10",
         "SELECT a.id, b.id FROM products a JOIN products b ON a.brand = b.brand WHERE b.id = 'p0000042' ORDER BY a.price DESC, a.id LIMIT 5",
+        "WITH top AS (SELECT * FROM products ORDER BY bm25(body, 'waterproof hiking') DESC LIMIT 60) SELECT id, score() FROM top ORDER BY bm25(body, 'boots') + coalesce(rating, 0) DESC LIMIT 10",
     ] {
         let plan = match strata::query::compound::is_compound(sql, &coord.schema) {
             true => strata::query::compound::plan(sql, &coord.schema, &Params::new()).unwrap(),

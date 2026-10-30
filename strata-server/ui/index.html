@@ -1299,6 +1299,7 @@ function helpSections(x) {
     if (tf) vx.push({ t: "Hybrid: text and vectors", d: `rrf() fuses the two rankings; 0.5 * minmax(a) + 0.5 * minmax(b) weighs them instead.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY rrf(bm25(${tf}, '${w1} ${w2}'), similarity(${V}, :q)) DESC\nLIMIT 10`, params: { q: embeddingOf(vF.name)?.loaded ? { embed: `${w1} ${w2}`, field: vF.name } : { vector_of: k0 } } });
   }
   if (tf && num) vx.push({ t: "Boost by a number", d: `decay(field, origin, scale) is 1 at the origin and 0.5 a scale away; multiply a score by it.`, sql: `SELECT ${show}, ${num}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1}') * decay(${num}, ${x.max}, ${Math.max(1, round2((x.max - x.min) / 4))}) DESC\nLIMIT 10` });
+  if (tf && num) vx.push({ t: "Rerank the top rows", d: `A WITH that ranks and cuts, ranked again: the 100 best matches for ${w1}, reordered by their ${numF.name} on top of the text score.`, sql: `WITH top AS (\n  SELECT * FROM ${T} ORDER BY bm25(${tf}, '${w1}') DESC LIMIT 100\n)\nSELECT ${show}, ${num}, score() FROM top\nORDER BY ln(1 + bm25(${tf}, '${w1}')) + 0.1 * coalesce(${num}, 0) DESC\nLIMIT 10` });
   if (vx.length) sec.push({ id: "ranking", title: "Similarity, hybrid and boosts", intro: "", ex: vx });
   return sec;
 }

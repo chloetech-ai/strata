@@ -66,6 +66,28 @@ def test_ranking_expressions_run_as_their_sql(db):
         col("rating") + "x"
 
 
+def test_rerank_phases_run_as_their_sql(db):
+    """`rerank` ranks the top rows again as the SQL WITH form does: a
+    second phase, a global one, and a chain."""
+    t = db.table()
+    first = t.select("id", score()).order_by(bm25("description", "dragon ship river"))
+    for q, sql in [
+        (first.rerank(col("rating"), 40).limit(10),
+         "WITH top AS (SELECT * FROM books ORDER BY bm25(description, 'dragon ship river') DESC LIMIT 40) SELECT id, score() FROM top ORDER BY rating DESC LIMIT 10"),
+        (first.rerank(minmax(bm25("title", "river")) + 0.5 * minmax(col("year")), 30).limit(5).offset(2),
+         "WITH top AS (SELECT * FROM books ORDER BY bm25(description, 'dragon ship river') DESC LIMIT 30) SELECT id, score() FROM top ORDER BY minmax(bm25(title, 'river')) + 0.5 * minmax(year) DESC LIMIT 5 OFFSET 2"),
+        (first.rerank(col("year"), 60).rerank(coalesce(col("rating"), 0) - col("year") / 1000, 20).limit(8),
+         "WITH a AS (SELECT * FROM books ORDER BY bm25(description, 'dragon ship river') DESC LIMIT 60), b AS (SELECT * FROM a ORDER BY year DESC LIMIT 20) SELECT id, score() FROM b ORDER BY coalesce(rating, 0) - year / 1000 DESC LIMIT 8"),
+    ]:
+        same(db, q, sql)
+    phases = first.rerank(col("rating"), 40).rerank(rank(col("year")), 20).rerank(col("rating"), 10).plan()["root"]["input"]["phases"]
+    assert [p.get("global", False) for p in phases] == [False, True, True]
+    with pytest.raises(strata.StrataError, match="at least one row"):
+        first.rerank(col("rating"), 0)
+    with pytest.raises(strata.StrataError, match="follow an order_by"):
+        t.select("id").rerank(col("rating"), 10).plan()
+
+
 def test_groups(db):
     t = db.table()
     r = same(db, t.select("genres", count().alias("n"), col("rating").avg().alias("r")).group_by("genres").having(count() > 50).order_by(col("genres")),
