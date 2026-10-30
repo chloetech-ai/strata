@@ -409,6 +409,17 @@ impl Database {
         }
     }
 
+    /// The codes that can follow each of `prefixes` in semantic-ID field
+    /// `field` of `table` (the first by default) among the rows SQL
+    /// condition `filter` matches, with their rows ([`Db::sid_next`]).
+    #[pyo3(signature = (field, prefixes, filter = None, params = None, table = None))]
+    fn sid_next(&self, py: Python<'_>, field: &str, prefixes: Vec<String>, filter: Option<String>, params: Option<&Bound<'_, PyDict>>, table: Option<&str>) -> PyResult<Vec<Vec<(String, u64)>>> {
+        let db = self.get()?;
+        let p = params_json(params)?;
+        let table = table_of(&db, table).map_err(err)?.table.clone();
+        py.detach(|| self::params(&db, &p).and_then(|p| db.sid_next(&table, field, &prefixes, filter.as_deref(), &p))).map_err(err)
+    }
+
     /// Trains a semantic-ID codebook on the vectors of `field` of `table`
     /// (the first table by default), saves it as `name` under `models`, and
     /// returns its SHA-256.

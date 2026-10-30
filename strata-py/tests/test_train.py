@@ -71,3 +71,38 @@ def test_a_codebook_from_a_tables_vectors(tmp_path):
     # A table cannot name a codebook that is not there.
     with pytest.raises(strata.StrataError, match="train"):
         strata.Database.create(tmp_path / "none.strata", items_schema("missing"), models=models)
+
+
+def brute_next(rows, prefix, keep=lambda r: True):
+    """The children of `prefix` in a trie of the rows' codes, with counts."""
+    depth = 0 if prefix == "" else prefix.count(".") + 1
+    out = {}
+    for r in rows:
+        code = r["sid"][-1].split(".")
+        if keep(r) and len(code) > depth and ".".join(code[:depth]) == prefix:
+            child = ".".join(code[: depth + 1])
+            out[child] = out.get(child, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: int(kv[0].rsplit(".", 1)[-1])))
+
+
+def test_next_codes_in_process_and_over_http(tmp_path, serve):
+    models = tmp_path / "models"
+    strata.train.codebook(grid(400), "grid", models=models, levels=2, k=4)
+    schema = items_schema("grid")
+    schema["fields"].append({"name": "tag", "type": "keyword"})
+    path = tmp_path / "items.strata"
+    db = strata.Database.create(path, schema, models=models)
+    db.upsert([{"id": f"i{i}", "emb": v, "tag": ["red", "blue"][i % 2]} for i, v in enumerate(grid(120))])
+    rows = list(db.query("SELECT id, sid, tag FROM items LIMIT 1000"))
+    prefixes = ["", "0", "1", rows[0]["sid"][1], "9"]
+    want = {p: brute_next(rows, p) for p in prefixes}
+    assert db.sid_next(prefixes, field="sid") == want
+    red = {p: brute_next(rows, p, lambda r: r["tag"] == "red") for p in prefixes}
+    assert db.sid_next(prefixes, field="sid", where="tag = :t", t="red") == red
+    with pytest.raises(strata.StrataError, match="not a prefix"):
+        db.sid_next(["1..2"], field="sid")
+    db.close()
+    url = serve(path, "--models", str(models))
+    c = strata.connect(url)
+    assert c.sid_next(prefixes, field="sid") == want
+    assert c.sid_next(prefixes, field="sid", where="tag = :t", params={"t": "red"}) == red

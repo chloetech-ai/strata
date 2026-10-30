@@ -640,6 +640,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn sources(&self, _: tonic::Request<pb::SourcesRequest>) -> Result<tonic::Response<pb::SourcesResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
     }
+    async fn sid_next(&self, _: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no semantic IDs here"))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -686,6 +689,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn sources(&self, _: tonic::Request<pb::SourcesRequest>) -> Result<tonic::Response<pb::SourcesResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn sid_next(&self, _: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no semantic IDs here"))
     }
 }
 
@@ -951,6 +957,10 @@ impl pb::strata_server::Strata for Recording {
             true => self.inner.verify(r).await,
             false => Err(tonic::Status::unimplemented("unknown method Verify")),
         }
+    }
+    async fn sid_next(&self, r: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.sid_next(r).await
     }
 }
 
@@ -1379,7 +1389,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
     let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 6, strata::query::ir::VERSION, 0));
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 7, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1405,9 +1415,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 7, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: 8, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 7"), "{}", e.message());
+    assert!(e.message().contains("protocol 8"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
@@ -2549,4 +2559,102 @@ async fn a_coordinator_writes_to_the_promoted_primary() {
 
 fn last_of(db: &Db) -> u64 {
     db.storage().numbering().unwrap().seq
+}
+
+/// The next codes of semantic-ID prefixes over HTTP, and from a
+/// coordinator, which sums its shards': as the embedded database answers.
+/// A shard of an older protocol is named in the error.
+#[tokio::test(flavor = "multi_thread")]
+async fn next_semantic_id_codes_over_http_and_shards() {
+    use std::collections::BTreeMap;
+    use strata::schema::{Field, FieldType, Schema};
+    use strata::sid::Codebook;
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    // A vector near (10a + 1-or-minus-1, 10b + ...) has code a.b of a 2 x 4
+    // grid codebook in two dimensions.
+    let l0: Vec<f32> = [[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]].concat();
+    let l1: Vec<f32> = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]].concat();
+    Codebook::new(2, 4, vec![l0.clone(), l1.clone()]).unwrap().save("grid", &models).unwrap();
+    let schema = Schema::new(
+        "items",
+        vec![
+            Field::new("id", FieldType::Keyword),
+            Field::new("tag", FieldType::Keyword),
+            Field::new("emb", FieldType::Vector { dim: 2, index: strata::VectorIndexKind::Flat }),
+            Field::semantic_id("sid", "emb", "grid"),
+        ],
+        Some("id"),
+    )
+    .unwrap();
+    let rows: Vec<Vec<Value>> = (0..400)
+        .map(|i| {
+            let (a, b) = ((i * 5 + i / 7) % 4, (i * 3 + i / 11) % 4);
+            let v = vec![l0[2 * a] + l1[2 * b] + 0.01 * (i % 5) as f32, l0[2 * a + 1] + l1[2 * b + 1]];
+            vec![Value::Str(format!("i{i:04}")), Value::Str(["red", "blue"][i % 2].into()), Value::Vector(v.into()), Value::Null]
+        })
+        .collect();
+    let make = |name: &str, keep: &dyn Fn(&Value) -> bool| {
+        let db = Db::create_in(&dir.path().join(name), schema.clone(), DbOptions::default(), &models).unwrap();
+        db.load(rows.iter().filter(|r| keep(&r[0])).cloned()).unwrap();
+        db
+    };
+    let whole = make("whole.strata", &|_| true);
+    let prefixes: Vec<String> = ["", "0", "1", "2.3", "3.1", "1.2.4", "7"].map(String::from).to_vec();
+    let want = |filter: Option<&str>| whole.sid_next("items", "sid", &prefixes, filter, &Params::new()).unwrap();
+    assert!(want(None)[0].len() == 4 && want(None)[2].len() == 4, "{:?}", want(None));
+    let as_json = |next: Vec<Vec<(String, u64)>>| -> Json {
+        prefixes.iter().zip(next).map(|(p, cs)| json!({"prefix": p, "next": cs.into_iter().map(|(code, count)| json!({"code": code, "count": count})).collect::<Vec<_>>()})).collect()
+    };
+
+    // Over HTTP.
+    let url = http(service(make("http.strata", &|_| true), "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let (status, got) = post(&c, &format!("{url}/v1/sid/next"), json!({"field": "sid", "prefixes": prefixes, "where": "tag = :t", "params": {"t": "red"}})).await;
+    assert_eq!(status, 200, "{got}");
+    assert_eq!(got["next"], as_json(want(Some("tag = 'red'"))));
+    let (status, got) = post(&c, &format!("{url}/v1/sid/next"), json!({"table": "items", "field": "sid", "prefixes": prefixes})).await;
+    assert_eq!((status, &got["next"]), (200, &as_json(want(None))));
+    for (body, says) in [
+        (json!({"field": "sid"}), "prefixes"),
+        (json!({"field": "tag", "prefixes": [""]}), "not a semantic-ID field"),
+        (json!({"field": "sid", "prefixes": ["1..2"]}), "not a prefix"),
+        (json!({"field": "sid", "prefixes": [""], "where": "id IN (SELECT id FROM items)"}), "subqueries"),
+    ] {
+        let (status, got) = post(&c, &format!("{url}/v1/sid/next"), body.clone()).await;
+        assert_eq!(status, 400, "{body}: {got}");
+        assert!(got["error"].as_str().unwrap().contains(says), "{body}: {got}");
+    }
+
+    // A coordinator sums its shards'. Each shard numbers its own ties, so
+    // the levels' counts are the whole table's and a tie's are the sum of
+    // the shards' with that tie.
+    let mut urls = Vec::new();
+    let mut shards = Vec::new();
+    for s in 0..3 {
+        let db = make(&format!("s{s}.strata"), &|k| shard_of(k, 3) == s);
+        shards.push(make(&format!("c{s}.strata"), &|k| shard_of(k, 3) == s));
+        urls.push(recording(db, strata_server::grpc::PROTOCOL).await.0);
+    }
+    let coord = cluster(Coordinator::connect(urls.clone()).await.unwrap());
+    for filter in [None, Some("tag = 'blue'"), Some("sid = '2'")] {
+        let mut sums: Vec<BTreeMap<u32, (String, u64)>> = vec![BTreeMap::new(); prefixes.len()];
+        for db in &shards {
+            for (sum, next) in sums.iter_mut().zip(db.sid_next("items", "sid", &prefixes, filter, &Params::new()).unwrap()) {
+                for (code, k) in next {
+                    sum.entry(code.rsplit('.').next().unwrap().parse().unwrap()).or_insert((code, 0)).1 += k;
+                }
+            }
+        }
+        let summed: Vec<Vec<(String, u64)>> = sums.into_iter().map(|m| m.into_values().collect()).collect();
+        assert_eq!(summed[..3], want(filter)[..3], "{filter:?}");
+        let sql = format!("SELECT COUNT(*) FROM items{}", filter.map(|f| format!(" WHERE {f}")).unwrap_or_default());
+        let got = coord.sid_next(&sql, None, &Params::new(), "sid", &prefixes, &After::Any, 0).await.unwrap_or_else(|e| panic!("{filter:?}: {}", e.message));
+        assert_eq!(got, summed, "{filter:?}");
+    }
+    // One shard from before SidNext.
+    let (old, _) = recording(make("old.strata", &|k| shard_of(k, 3) == 2), 5).await;
+    let coord = cluster(Coordinator::connect(vec![urls[0].clone(), urls[1].clone(), old]).await.unwrap());
+    let e = coord.sid_next("SELECT COUNT(*) FROM items", None, &Params::new(), "sid", &prefixes, &After::Any, 0).await.unwrap_err();
+    assert!(e.message.contains("protocol 5") && e.message.contains("needs 7"), "{}", e.message);
 }

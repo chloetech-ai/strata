@@ -50,7 +50,7 @@ use crate::storage::manifest::{sources_schema, Manifest, Numbering, RankProfile,
 use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MERGE_BATCH_BYTES, MERGE_BATCH_DOCS, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
-use crate::storage::snapshot::{build_memseg, Pins, Snapshot};
+use crate::storage::snapshot::{build_memseg, Pins, SegmentView, Snapshot};
 use crate::storage::rowseq::{self, Seqs};
 use crate::storage::state::{mem_seq, Check, Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::{Updates, SEQ};
@@ -263,6 +263,10 @@ pub struct Database {
     published: RwLock<Option<Snapshot>>,
     /// The merges running, with what a crash interrupted ([`Merging`]).
     merging: Mutex<Merging>,
+    /// Expired rows per segment ([`Database::expired_in`]): the segment's
+    /// live count, the minute they were counted at and whether all were
+    /// expired, and the count.
+    expired: Mutex<HashMap<u64, ((u32, i64, bool), u32)>>,
     /// Where `merging.record` is kept.
     merge_record_path: PathBuf,
     /// Set by [`Database::spawn_merger`].
@@ -371,6 +375,9 @@ struct MergeClaim<'a> {
     ids: Vec<u64>,
     /// Selected larger and cut to fit its memory budget.
     cut: bool,
+    /// The table's retention field and the time before which its rows
+    /// expire, when the merge was claimed ([`Schema::retention`]).
+    retention: Option<(usize, i64)>,
 }
 
 impl Drop for MergeClaim<'_> {
@@ -469,6 +476,70 @@ impl Merger {
     fn close(&self) {
         lock(&self.wake).closed = true;
         self.cv.notify_all();
+    }
+}
+
+/// A table's rows as a flush or a bulk load writes them to segments:
+/// without those past `retention` ([`Schema::retention`]), and sorted by
+/// its cluster_by field, rows of one value in the order written
+/// ([`Schema::with_cluster_by`]). `with` holds a value for each row (its
+/// sequence number), which goes along.
+fn arrange<T>(schema: &Schema, mut live: Vec<Document>, mut with: Vec<T>, retention: Option<(usize, i64)>) -> (Vec<Document>, Vec<T>) {
+    if live.iter().any(|d| expired(retention, d)) {
+        (live, with) = live.into_iter().zip(with).filter(|(d, _)| !expired(retention, d)).unzip();
+    }
+    if let Some(f) = schema.cluster_by_field() {
+        let keys: Vec<ClusterKey> = live.iter().map(|d| ClusterKey::of(&d[f])).collect();
+        let mut by: Vec<u32> = (0..live.len() as u32).collect();
+        by.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
+        let mut rows: Vec<Option<(Document, T)>> = live.into_iter().zip(with).map(Some).collect();
+        (live, with) = by.into_iter().map(|i| rows[i as usize].take().expect("each row once")).unzip();
+    }
+    (live, with)
+}
+
+/// Whether row `d` is past `retention`, its table's ([`Schema::retention`]).
+fn expired(retention: Option<(usize, i64)>, d: &Document) -> bool {
+    retention.is_some_and(|(f, cutoff)| matches!(d[f], Value::Timestamp(t) | Value::Int(t) if t < cutoff))
+}
+
+/// A row's place in a segment ordered by its cluster_by field: rows
+/// without a value first.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum ClusterKey<'a> {
+    Null,
+    Int(i64),
+    Str(&'a str),
+}
+
+impl<'a> ClusterKey<'a> {
+    fn of(v: &'a Value) -> ClusterKey<'a> {
+        match v {
+            Value::Int(x) | Value::Timestamp(x) => ClusterKey::Int(*x),
+            Value::Str(s) => ClusterKey::Str(s),
+            _ => ClusterKey::Null,
+        }
+    }
+}
+
+/// The sort keys of a merge's documents (`order`, as (input, docID)) by
+/// cluster_by field `f`, read from the inputs' columns: a keyword's is its
+/// rank among every input's values, so that keys compare as the values do.
+fn cluster_keys(schema: &Schema, f: usize, views: &[&SegmentView], order: &[(u32, DocId)]) -> Result<Vec<Option<i64>>> {
+    let name = &schema.fields[f].name;
+    match schema.fields[f].ty {
+        FieldType::Keyword => {
+            let cols = views.iter().map(|v| crate::forward::KeywordColumn::open(&v.file, name)).collect::<Result<Vec<_>>>()?;
+            let mut all: Vec<&str> = cols.iter().flat_map(|c| (0..c.n_values() as u32).map(|code| c.value(code))).collect();
+            all.sort_unstable();
+            all.dedup();
+            let ranks: Vec<Vec<i64>> = cols.iter().map(|c| (0..c.n_values() as u32).map(|code| all.partition_point(|&x| x < c.value(code)) as i64).collect()).collect();
+            Ok(order.iter().map(|&(k, d)| cols[k as usize].code_of_doc(d).map(|code| ranks[k as usize][code as usize])).collect())
+        }
+        _ => {
+            let cols = views.iter().map(|v| crate::forward::NumericColumn::open(&v.file, name)).collect::<Result<Vec<_>>>()?;
+            Ok(order.iter().map(|&(k, d)| cols[k as usize].get_i64(d)).collect())
+        }
     }
 }
 
@@ -952,6 +1023,7 @@ impl Database {
             build_lock: Mutex::new(()),
             published: RwLock::new(None),
             merging: Mutex::new(Merging { record, ..Merging::default() }),
+            expired: Mutex::new(HashMap::new()),
             merge_record_path,
             merger: OnceLock::new(),
             merger_threads: Mutex::new(Vec::new()),
@@ -1679,12 +1751,15 @@ impl Database {
         let mut vw = VersionWriter::begin(self);
         vw.manifest.wal_txn = txn;
         for (table, schema, chunks, deleted, mem_updates, mem_seqs) in mems {
-            // The codes of the deleted documents, which the segments drop.
+            // The codes of the deleted and expired documents, which the
+            // segments drop.
+            let now = crate::timestamp::now();
+            let retention = schema.retention(now);
             let mut gone = Vec::new();
             if !crate::sid::fields(&schema).is_empty() {
                 let (mut dropped, mut kept) = (Ties::default(), Ties::default());
                 for (i, d) in chunks.iter().flat_map(|c| c.iter()).enumerate() {
-                    let t = if deleted[i / 64] >> (i % 64) & 1 == 1 { &mut dropped } else { &mut kept };
+                    let t = if deleted[i / 64] >> (i % 64) & 1 == 1 || expired(retention, d) { &mut dropped } else { &mut kept };
                     t.saw_doc(&schema, d);
                 }
                 gone = crate::sid::gone_sections(&schema, &dropped, &kept);
@@ -1701,6 +1776,7 @@ impl Database {
                 })
                 .unzip();
             drop(chunks);
+            let (live, seqs) = arrange(&schema, live, seqs, retention);
             let max = self.opts.segment_max_docs.max(1);
             if live.is_empty() && !gone.is_empty() {
                 // A segment without documents keeps what they were given.
@@ -1992,14 +2068,11 @@ impl Database {
             }
             chunk.push(doc);
             if chunk.len() == max {
-                let image = build_segment(schema, &chunk, &self.opts.build)?;
-                vw.add_segment(t.id, None, &image, chunk.len() as u32, None, None)?;
-                chunk.clear();
+                self.add_loaded(&mut vw, &t, std::mem::take(&mut chunk))?;
             }
         }
         if !chunk.is_empty() {
-            let image = build_segment(schema, &chunk, &self.opts.build)?;
-            vw.add_segment(t.id, None, &image, chunk.len() as u32, None, None)?;
+            self.add_loaded(&mut vw, &t, chunk)?;
         }
         if vw.segments_added == 0 {
             return Ok(());
@@ -2010,6 +2083,15 @@ impl Database {
                 known.absorb(&ties);
             }
         })
+    }
+
+    /// Adds a segment of bulk-loaded rows, ordered by the table's
+    /// cluster_by field. Rows past its retention stay until a merge.
+    fn add_loaded(&self, vw: &mut VersionWriter, t: &TableRef, chunk: Vec<Document>) -> Result<()> {
+        let n = chunk.len();
+        let (chunk, _) = arrange(&t.schema, chunk, vec![(); n], None);
+        let image = build_segment(&t.schema, &chunk, &self.opts.build)?;
+        vw.add_segment(t.id, None, &image, n as u32, None, None)
     }
 
     /// Writes segment `id`'s image to `dest` (a new file), for another
@@ -2195,10 +2277,16 @@ impl Database {
         let mut m = lock(&self.merging);
         let snap = self.snapshot_inner(false).table_by_id(table)?;
         let bytes: HashMap<u64, u64> = lock(&self.state).handles().map(|h| (h.meta.id, h.meta.extent.len)).collect();
+        // Rows past the table's retention count as deleted: a segment of
+        // them only is dropped, and one with many is rewritten without them.
+        let retention = snap.schema().retention(crate::timestamp::now());
         let infos: Vec<SegmentInfo> = snap
             .segments()
             .iter()
-            .map(|v| SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live, bytes: bytes.get(&v.id).copied().unwrap_or(0) })
+            .map(|v| {
+                let expired = retention.map_or(0, |(f, cutoff)| self.expired_in(v, &snap.schema().fields[f].name, cutoff));
+                SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live.saturating_sub(expired), bytes: bytes.get(&v.id).copied().unwrap_or(0) }
+            })
             .collect();
         let cap = |g: &[u64]| match (m.record.cap(g), budget) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -2216,7 +2304,37 @@ impl Database {
         m.record.running.push(MergeEntry { segments: group.clone(), memory, times: 0 });
         m.limited += cut as u64;
         let _ = m.record.store(&self.merge_record_path);
-        Some(MergeClaim { db: self, table, snap, ids: group, cut })
+        Some(MergeClaim { db: self, table, snap, ids: group, cut, retention })
+    }
+
+    /// The live rows of segment `v` whose TIMESTAMP `field` is before
+    /// `cutoff` ([`Schema::with_retain`]). The merger asks every few
+    /// seconds, so a segment whose rows are partly past it is counted once
+    /// per delete set and minute; one whose rows all are, or none, is told
+    /// by its column's least and greatest times at once.
+    fn expired_in(&self, v: &SegmentView, field: &str, cutoff: i64) -> u32 {
+        // A column that cannot be read counts nothing: the merge reads it
+        // again, and fails there.
+        let Ok(c) = crate::forward::NumericColumn::open(&v.file, field) else { return 0 };
+        let (Some(lo), Some(hi)) = (c.min(), c.max()) else { return 0 };
+        if lo as i64 >= cutoff {
+            return 0;
+        }
+        let key = (v.n_live, cutoff.div_euclid(60_000_000), (hi as i64) < cutoff);
+        let mut cache = lock(&self.expired);
+        if let Some(&(k, n)) = cache.get(&v.id) {
+            if k == key {
+                return n;
+            }
+        }
+        let docs = c.scan_keys(c.int_key_range(i64::MIN, cutoff - 1));
+        let n = docs.iter().filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).count() as u32;
+        if cache.len() >= 4096 {
+            // Mostly segments merged away since.
+            cache.clear();
+        }
+        cache.insert(v.id, (key, n));
+        n
     }
 
     /// Runs a merge a merger thread claimed.
@@ -2238,39 +2356,53 @@ impl Database {
             let h = lock(&self.state).handle(id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
             h.verify(self.dir.as_deref())?;
             let n = v.file.n_docs() as DocId;
-            let live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
+            let mut live: Vec<DocId> = (0..n).filter(|&d| v.live.as_ref().is_none_or(|l| l.contains(d))).collect();
             stats.docs_dropped += (n as usize - live.len()) as u64;
+            // Rows past the table's retention are dropped as deleted ones
+            // are (their time is not changed in place).
+            if let Some((f, cutoff)) = claim.retention {
+                let times = crate::forward::NumericColumn::open(&v.file, &schema.fields[f].name)?;
+                let before = live.len();
+                live.retain(|&d| times.get_i64(d).is_none_or(|t| t >= cutoff));
+                stats.docs_expired += (before - live.len()) as u64;
+            }
             views.push(v);
             inputs.push((id, live));
         }
-        let n_new = inputs.iter().map(|(_, l)| l.len()).sum::<usize>();
-        // The inputs' live documents in batches of about MERGE_BATCH_BYTES
-        // of their images (a batch can span inputs), each decoded while the
-        // segment builds from the one before, and the image streamed to its
-        // reserved space: the merge never holds every document decoded, nor
-        // the whole image.
-        let mut batches: Vec<Vec<(usize, &[DocId])>> = Vec::new();
-        let (mut batch, mut docs, mut bytes) = (Vec::new(), 0usize, 0usize);
-        for (k, (_, live)) in inputs.iter().enumerate() {
-            let per_doc = (views[k].file.image().len() / views[k].file.n_docs().max(1)).max(1);
-            let mut rest = &live[..];
-            while !rest.is_empty() {
-                // Documents until the batch is full.
-                let room = (MERGE_BATCH_DOCS.end - docs).min(MERGE_BATCH_BYTES.saturating_sub(bytes).div_ceil(per_doc).max(MERGE_BATCH_DOCS.start.saturating_sub(docs)));
-                let (piece, after) = rest.split_at(room.clamp(1, rest.len()));
-                batch.push((k, piece));
-                (docs, bytes, rest) = (docs + piece.len(), bytes + piece.len() * per_doc, after);
-                if docs >= MERGE_BATCH_DOCS.end || (docs >= MERGE_BATCH_DOCS.start && bytes >= MERGE_BATCH_BYTES) {
-                    batches.push(std::mem::take(&mut batch));
-                    (docs, bytes) = (0, 0);
-                }
+        // The merged segment's documents in order, as (input, docID): the
+        // inputs concatenated, oldest first, or sorted by the table's
+        // cluster_by field, rows of one value in that order.
+        let mut order: Vec<(u32, DocId)> = inputs.iter().enumerate().flat_map(|(k, (_, live))| live.iter().map(move |&d| (k as u32, d))).collect();
+        let clustered = match schema.cluster_by_field() {
+            None => false,
+            Some(f) => {
+                let keys = cluster_keys(schema, f, &views, &order)?;
+                let mut by: Vec<u32> = (0..order.len() as u32).collect();
+                by.sort_by_key(|&i| keys[i as usize]);
+                order = by.into_iter().map(|i| order[i as usize]).collect();
+                true
+            }
+        };
+        let n_new = order.len();
+        // Batches of about MERGE_BATCH_BYTES of the inputs' images, each
+        // decoded while the segment builds from the one before, and the
+        // image streamed to its reserved space: the merge never holds every
+        // document decoded, nor the whole image.
+        let per_doc: Vec<usize> = views.iter().map(|v| (v.file.image().len() / v.file.n_docs().max(1)).max(1)).collect();
+        let mut batches: Vec<&[(u32, DocId)]> = Vec::new();
+        let (mut from, mut docs, mut bytes) = (0usize, 0usize, 0usize);
+        for (i, &(k, _)) in order.iter().enumerate() {
+            (docs, bytes) = (docs + 1, bytes + per_doc[k as usize]);
+            if docs >= MERGE_BATCH_DOCS.end || (docs >= MERGE_BATCH_DOCS.start && bytes >= MERGE_BATCH_BYTES) {
+                batches.push(&order[from..=i]);
+                (from, docs, bytes) = (i + 1, 0, 0);
             }
         }
-        if !batch.is_empty() {
-            batches.push(batch);
+        if from < order.len() {
+            batches.push(&order[from..]);
         }
-        // Semantic-ID codes the merge drops (its inputs' deleted documents'
-        // and those they had dropped) stay in a section of the merged
+        // Semantic-ID codes the merge drops (its inputs' deleted and expired
+        // documents' and those they had dropped) stay in a section of the merged
         // segment, unless a document it keeps has a higher one.
         let sids = !crate::sid::fields(schema).is_empty();
         let mut dropped = Ties::default();
@@ -2280,38 +2412,48 @@ impl Database {
             }
         }
         let kept = Mutex::new(Ties::default());
-        let decode = |batch: &[(usize, &[DocId])]| -> Result<Vec<Document>> {
-            let mut all = Vec::with_capacity(batch.iter().map(|(_, l)| l.len()).sum());
-            for &(k, live) in batch {
+        let decode = |batch: &[(u32, DocId)]| -> Result<Vec<Document>> {
+            // Each input's documents of the batch, read in docID order.
+            let mut wanted: Vec<Vec<(DocId, usize)>> = vec![Vec::new(); views.len()];
+            for (i, &(k, d)) in batch.iter().enumerate() {
+                wanted[k as usize].push((d, i));
+            }
+            let mut out: Vec<Document> = vec![Vec::new(); batch.len()];
+            for (k, mut want) in wanted.into_iter().enumerate() {
+                if want.is_empty() {
+                    continue;
+                }
+                want.sort_unstable();
                 let v = views[k];
-                let mut got = source.documents(schema, &v.file, live)?;
+                let live: Vec<DocId> = want.iter().map(|w| w.0).collect();
+                let got = source.documents(schema, &v.file, &live)?;
                 if got.len() != live.len() {
                     return Err(corrupt(format!("document source returned {} of {} documents", got.len(), live.len())));
                 }
-                // The merged segment holds the values written in place.
-                if let Some(u) = &v.updates {
-                    for (doc, &d) in got.iter_mut().zip(live) {
-                        u.apply(d, doc);
+                for (mut doc, (d, i)) in got.into_iter().zip(want) {
+                    // The merged segment holds the values written in place.
+                    if let Some(u) = &v.updates {
+                        u.apply(d, &mut doc);
                     }
+                    out[i] = doc;
                 }
-                all.append(&mut got);
             }
             if sids {
                 let mut k = lock(&kept);
-                for d in &all {
+                for d in &out {
                     k.saw_doc(schema, d);
                 }
             }
-            Ok(all)
+            Ok(out)
         };
         // The merged vector graphs start from the largest input's, if it
-        // lost no documents.
+        // lost no documents and keeps its order.
         let mut starts = Vec::new();
         let mut base = 0u32;
         let mut largest: Option<(usize, &SegmentFile, u32)> = None;
         for (k, (_, live)) in inputs.iter().enumerate() {
             let v = views[k];
-            if live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
+            if !clustered && live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
                 largest = Some((live.len(), &v.file, base));
             }
             base += live.len() as u32;
@@ -2328,19 +2470,23 @@ impl Database {
         let seqs = match lock(&self.state).manifest.seq_no.is_some() {
             false => None,
             true => {
-                let mut out = Vec::with_capacity(n_new);
-                for (k, (_, live)) in inputs.iter().enumerate() {
-                    let (v, built) = (views[k], Seqs::of(&views[k].file)?);
-                    for &d in live {
-                        out.push(match v.updates.as_ref().and_then(|u| u.get(SEQ, d)) {
-                            Some(x) => x.as_i64().unwrap_or(0) as u64,
-                            None => built.as_ref().map_or(0, |b| b.get(d)),
-                        });
-                    }
-                }
-                Some(out)
+                let built = views.iter().map(|v| Seqs::of(&v.file)).collect::<Result<Vec<_>>>()?;
+                let seq = |&(k, d): &(u32, DocId)| match views[k as usize].updates.as_ref().and_then(|u| u.get(SEQ, d)) {
+                    Some(x) => x.as_i64().unwrap_or(0) as u64,
+                    None => built[k as usize].as_ref().map_or(0, |b| b.get(d)),
+                };
+                Some(order.iter().map(seq).collect::<Vec<u64>>())
             }
         };
+        // Where each input's live documents went, when not concatenated.
+        let slots: Option<Vec<Vec<u32>>> = clustered.then(|| {
+            let mut slots: Vec<Vec<u32>> = inputs.iter().map(|(_, live)| vec![0; live.len()]).collect();
+            for (at, &(k, d)) in order.iter().enumerate() {
+                let live = &inputs[k as usize].1;
+                slots[k as usize][live.binary_search(&d).expect("an input's live document")] = at as u32;
+            }
+            slots
+        });
         // Written before the writer lock is taken, into space reserved for
         // it: commits go on meanwhile.
         let gone = |sections: &mut SegmentWriter| {
@@ -2363,9 +2509,9 @@ impl Database {
             n => {
                 let mut build = SegmentBuild::with_starts(schema, &self.opts.build, n_new, &starts)?;
                 let mut sections = std::thread::scope(|s| {
-                    let mut next = decode(&batches[0]);
+                    let mut next = decode(batches[0]);
                     for i in 1..n {
-                        let (decode, batch) = (&decode, &batches[i]);
+                        let (decode, batch) = (&decode, batches[i]);
                         let ahead = s.spawn(move || decode(batch));
                         let added = next.and_then(|docs| build.add(&docs));
                         next = ahead.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
@@ -2383,7 +2529,7 @@ impl Database {
         let n_new = n_new as u32;
         let go = between();
         let mut wal = self.background_writer();
-        let r = if go { self.install_merge(&mut wal, claim, written.as_ref(), &inputs, n_new, stats) } else { Ok(false) };
+        let r = if go { self.install_merge(&mut wal, claim, written.as_ref(), &inputs, slots.as_deref(), n_new, stats) } else { Ok(false) };
         // A commit that failed before it could reach the disk leaves
         // nothing naming the image; one that may have reached it poisons
         // the database, and then the image stays (opening removes it if no
@@ -2400,7 +2546,8 @@ impl Database {
     /// `n_new` documents; none when every input document was deleted) in
     /// one commit. Returns whether it did: not when the table was dropped
     /// meanwhile.
-    fn install_merge(&self, wal: &mut Wal, claim: &MergeClaim, written: Option<&(Reserved, u32)>, inputs: &[(u64, Vec<DocId>)], n_new: u32, stats: &mut MergeStats) -> Result<bool> {
+    #[allow(clippy::too_many_arguments)]
+    fn install_merge(&self, wal: &mut Wal, claim: &MergeClaim, written: Option<&(Reserved, u32)>, inputs: &[(u64, Vec<DocId>)], slots: Option<&[Vec<u32>]>, n_new: u32, stats: &mut MergeStats) -> Result<bool> {
         let (table, snap, ids) = (claim.table, &claim.snap, &claim.ids[..]);
         self.check_poisoned()?;
         {
@@ -2412,22 +2559,23 @@ impl Database {
             }
         }
         // Documents of the inputs deleted after the snapshot, as docIDs of
-        // the merged segment (inputs are concatenated in order), and values
-        // written in place after it.
+        // the merged segment (the inputs concatenated in order, or where
+        // `slots` puts them), and values written in place after it.
         let mut deleted = Vec::new();
         let mut updated = Updates::default();
         {
             let mut st = lock(&self.state);
             let mut base = 0u32;
-            for (id, live) in inputs {
+            for (k, (id, live)) in inputs.iter().enumerate() {
+                let slot = |j: usize| slots.map_or(base + j as u32, |s| s[k][j]);
                 let h = st.handle(*id).cloned().ok_or_else(|| corrupt("merge input vanished"))?;
-                deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| base + j as u32));
+                deleted.extend(live.iter().enumerate().filter(|&(_, &d)| st.is_deleted(&h, d)).map(|(j, _)| slot(j)));
                 let then = snap.segments().iter().find(|v| v.id == *id).and_then(|v| v.updates.clone());
                 if let Some(now) = st.updates_of(&h) {
                     for (f, d, v) in now.iter() {
                         if then.as_ref().and_then(|t| t.get(f, d)) != Some(v) {
                             if let Ok(j) = live.binary_search(&d) {
-                                updated.set(f, base + j as u32, v.clone());
+                                updated.set(f, slot(j), v.clone());
                             }
                         }
                     }
@@ -3296,12 +3444,19 @@ impl TableRef {
 
     /// Refuses to change field `i` in place when it places the table's
     /// rows on shards ([`crate::schema::Schema::with_shard_by`]): the row
-    /// would stay on the shard of its old value.
+    /// would stay on the shard of its old value. Nor when it orders the
+    /// segments' rows or keeps them ([`crate::schema::Schema::with_cluster_by`],
+    /// [`crate::schema::Schema::with_retain`]), which merges read from the
+    /// segments' columns.
     fn check_not_placing(&self, i: usize) -> Result<()> {
-        match self.schema.shard_by_field() == Some(i) {
-            true => Err(Error::Schema(format!("{} places {}'s rows on shards (shard_by), so it is not changed in place: delete the row and write it again", self.schema.fields[i].name, self.schema.table))),
-            false => Ok(()),
-        }
+        let s = &self.schema;
+        let why = match () {
+            _ if s.shard_by_field() == Some(i) => "places the rows on shards (shard_by)",
+            _ if s.cluster_by_field() == Some(i) => "orders the rows (cluster_by)",
+            _ if s.retention(0).is_some_and(|(f, _)| f == i) => "keeps the rows (retain_by)",
+            _ => return Ok(()),
+        };
+        Err(Error::Schema(format!("{} {why} of {}, so it is not changed in place: delete the row and write it again", s.fields[i].name, s.table)))
     }
 
     /// Checks that `key` has the primary key's type.

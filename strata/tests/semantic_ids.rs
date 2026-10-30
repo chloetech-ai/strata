@@ -371,3 +371,78 @@ fn sid_at_cuts_a_code() {
     let plan = db.explain("SELECT id FROM items WHERE sid = '1' LIMIT 5", &Params::new()).unwrap();
     assert!(plan.features.is_empty(), "{:?}", plan.features);
 }
+
+/// The next codes of a prefix among the rows a filter matches are the
+/// children of the prefix in a trie of those rows' codes, with the rows
+/// under each: across segments, the memtable and deleted rows.
+#[test]
+fn next_codes_are_a_tries_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(dir.path(), DbOptions { memtable_max_docs: 120, ..DbOptions::default() });
+    let mut n = 0;
+    let mut next = || {
+        n += 1;
+        let (a, b) = ((n * 5 + n / 7) % 4, (n * 3 + n / 11) % 4);
+        row(&format!("i{n:04}"), ["red", "blue", "green"][n % 3], at(a, b, (n % 9) as f32 * 0.03))
+    };
+    db.load((0..300).map(|_| next()).collect::<Vec<_>>()).unwrap();
+    for _ in 0..4 {
+        insert(&db, (0..50).map(|_| next()).collect());
+    }
+    let mut t = db.storage().begin().unwrap();
+    for i in (13..=500).step_by(13) {
+        t.delete(&Value::Str(format!("i{i:04}"))).unwrap();
+    }
+    t.commit().unwrap();
+    db.storage().merge(&MergePolicy::default()).unwrap();
+    insert(&db, (0..40).map(|_| next()).collect());
+    let mut t = db.storage().begin().unwrap();
+    t.delete(&Value::Str("i0510".into())).unwrap();
+    t.commit().unwrap();
+
+    let rs = db.query("SELECT id, tag, sid FROM items LIMIT 100000", &Params::new()).unwrap();
+    let rows: Vec<(String, Vec<u32>)> = rs.rows.iter().map(|r| (r[1].as_str().unwrap().to_string(), sid::code_of(&r[2]).unwrap())).collect();
+    assert_eq!(rows.len(), 540 - 38 - 1);
+    assert!(rows.iter().any(|(_, c)| c[2] >= 10), "ties past 9 test the dictionary's order");
+    let mut prefixes = BTreeSet::from([String::new(), "3.3.999".into(), "9".into(), "0.0.0".into(), "2.1.10".into()]);
+    for (_, c) in &rows {
+        for k in 1..=c.len() {
+            prefixes.insert(text(&c[..k]));
+        }
+    }
+    let prefixes: Vec<String> = prefixes.into_iter().collect();
+    let filters: [(Option<&str>, &dyn Fn(&str, &[u32]) -> bool); 5] = [
+        (None, &|_, _| true),
+        (Some("tag = 'red'"), &|t, _| t == "red"),
+        (Some("tag IN ('red', 'green') AND sid != '1'"), &|t, c| t != "blue" && c[0] != 1),
+        (Some("sid = '2.1'"), &|_, c| c[..2] == [2, 1]),
+        (Some("tag = 'nope'"), &|_, _| false),
+    ];
+    for (filter, keep) in filters {
+        for chunk in prefixes.chunks(sid::MAX_PREFIXES) {
+            let got = db.sid_next("items", "sid", chunk, filter, &Params::new()).unwrap();
+            for (p, got) in chunk.iter().zip(got) {
+                let depth = if p.is_empty() { 0 } else { p.split('.').count() };
+                let mut want: BTreeMap<u32, u64> = BTreeMap::new();
+                for (tag, c) in &rows {
+                    if c.len() > depth && text(&c[..depth]) == *p && keep(tag, c) {
+                        *want.entry(c[depth]).or_insert(0) += 1;
+                    }
+                }
+                let want: Vec<(String, u64)> = want.into_iter().map(|(x, k)| (if p.is_empty() { x.to_string() } else { format!("{p}.{x}") }, k)).collect();
+                assert_eq!(got, want, "{p:?} under {filter:?}");
+            }
+        }
+    }
+    // Parameters, and the errors.
+    let p = Params::new().set("t", Value::Str("blue".into()));
+    let blue = db.sid_next("items", "sid", &[String::new()], Some("tag = :t"), &p).unwrap();
+    assert_eq!(blue[0].iter().map(|(_, k)| k).sum::<u64>(), rows.iter().filter(|(t, _)| t == "blue").count() as u64);
+    let e = |prefixes: &[String], field: &str| db.sid_next("items", field, prefixes, None, &Params::new()).unwrap_err().to_string();
+    assert!(e(&vec![String::new(); 65], "sid").contains("1 to 64"));
+    assert!(e(&[], "sid").contains("1 to 64"));
+    assert!(e(&["1..2".into()], "sid").contains("not a prefix"));
+    assert!(e(&["01".into()], "sid").contains("not a prefix"));
+    assert!(e(&[String::new()], "tag").contains("not a semantic-ID field"));
+    assert!(db.sid_next("items", "sid", &[String::new()], Some("nope = 1"), &Params::new()).is_err());
+}

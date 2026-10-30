@@ -987,6 +987,37 @@ impl Db {
         Executor::new(snap, &readers, opts).term_stats(select)
     }
 
+    /// The codes that can follow each of `prefixes` in semantic-ID field
+    /// `field` of table `table`, among the rows that SQL condition `filter`
+    /// (with `params`) matches, or all rows: per prefix, each code one
+    /// number longer that such rows have, with how many rows have it, in
+    /// the order of their last numbers. The prefix `""` asks for the first
+    /// numbers. At most [`crate::sid::MAX_PREFIXES`] prefixes.
+    pub fn sid_next(&self, table: &str, field: &str, prefixes: &[String], filter: Option<&str>, params: &Params) -> Result<Vec<Vec<(String, u64)>>> {
+        let snap = self.snapshot().table(table).ok_or_else(|| Error::Query(format!("no such table: {table}")))?;
+        let sql = format!("SELECT COUNT(*) FROM {}{}", qsql::ident(&snap.schema().table), filter.map(|c| format!(" WHERE {c}")).unwrap_or_default());
+        let select = qsql::bind(&sql, snap.schema(), params)?;
+        self.sid_next_with(&snap, &select, field, prefixes, &self.exec)
+    }
+
+    /// [`Db::sid_next`] on snapshot `snap`, among the rows `select`'s
+    /// filter matches (the rest of it is not used), with options.
+    pub fn sid_next_with(&self, snap: &Snapshot, select: &Select, field: &str, prefixes: &[String], opts: &ExecOptions) -> Result<Vec<Vec<(String, u64)>>> {
+        let schema = snap.schema();
+        let f = schema.field_index(field).ok_or_else(|| Error::Query(format!("no field {field} in {}", schema.table)))?;
+        if schema.fields[f].semantic_id.is_none() {
+            return Err(Error::Query(format!("{field} is not a semantic-ID field")));
+        }
+        if prefixes.is_empty() || prefixes.len() > crate::sid::MAX_PREFIXES {
+            return Err(Error::Query(format!("ask for the next codes of 1 to {} prefixes, not {}", crate::sid::MAX_PREFIXES, prefixes.len())));
+        }
+        if let Some(p) = prefixes.iter().find(|p| !p.is_empty() && crate::sid::parse(p).is_none_or(|c| c.len() > crate::sid::MAX_LEVELS)) {
+            return Err(Error::Query(format!("{p:?} is not a prefix of a semantic ID: numbers joined by dots, such as 12.7, or \"\" for the first")));
+        }
+        let readers = self.readers(snap)?;
+        Executor::new(snap, &readers, opts).sid_next(select, f, prefixes)
+    }
+
     /// Builds a segment image of `docs` for this schema into `dest` (a new
     /// file), to attach to a database elsewhere ([`Db::attach_segments`]).
     pub fn write_segment(schema: &Schema, docs: Vec<Document>, opts: &crate::segment::build::BuildOptions, dest: &Path) -> Result<()> {

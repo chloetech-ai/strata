@@ -132,6 +132,25 @@ def test_groups(db):
          "SELECT COUNT(*), COUNT(DISTINCT year) FROM books WHERE rating >= 4")
 
 
+def test_distinct_on(db):
+    """The first row of each group, in the query's order, as SQL's
+    DISTINCT ON keeps it."""
+    t = db.table()
+    q = t.select("id", "year").distinct_on("rating").order_by(col("year").desc()).limit(5)
+    r = same(db, q, "SELECT DISTINCT ON (rating) id, year FROM books ORDER BY year DESC LIMIT 5")
+    assert len(r) == 5
+    assert q.plan()["features"] == ["operators", "distinct_on"]
+    r = same(db, t.select("id", "year", score()).where(match("description", "dragon")).distinct_on("year").order_by(bm25("description", "dragon")).limit(4).offset(1),
+             "SELECT DISTINCT ON (year) id, year, score() FROM books WHERE MATCH(description, 'dragon') ORDER BY bm25(description, 'dragon') DESC LIMIT 4 OFFSET 1")
+    assert len({row[1] for row in r.rows}) == 4
+    # Two keys, one an expression; without a limit, every group.
+    r = same(db, t.select("id").distinct_on("rating", col("year") % 2).order_by(col("year")),
+             "SELECT DISTINCT ON (rating, year % 2) id FROM books ORDER BY year")
+    assert len(r) == 40  # a rating fixes the parity of the year
+    with pytest.raises(strata.StrataError, match="distinct_on"):
+        t.select("genres", count()).group_by("genres").distinct_on("genres").plan()
+
+
 def test_values_need_no_quoting(tmp_path):
     """Any field name, and any text, with no escaping: a name SQL reserves,
     one with a space or a quote, text with quotes."""

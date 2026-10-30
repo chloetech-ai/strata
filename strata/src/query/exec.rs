@@ -553,6 +553,49 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
+    /// The next numbers below each of `prefixes` that rows matching `q`'s
+    /// filter have in semantic-ID field `field` ([`crate::db::Db::sid_next`]):
+    /// per prefix, each child code and its rows, in the order of their
+    /// last numbers. The filter is worked out once per segment; the
+    /// children of a prefix are found by jumping through the field's
+    /// sorted dictionary, past each child's own children.
+    pub fn sid_next(mut self, q: &Select, field: usize, prefixes: &[String]) -> Result<Vec<Vec<(String, u64)>>> {
+        let mut counts: Vec<std::collections::BTreeMap<u32, u64>> = vec![Default::default(); prefixes.len()];
+        let segs = self.segs.clone();
+        for s in segs.iter() {
+            self.check_deadline()?;
+            let set = self.filter_set(s, &q.filter)?;
+            if set.is_empty() {
+                continue;
+            }
+            let words = set.to_bits();
+            let kw = self.keyword(s, field)?;
+            let n = kw.n_values() as u32;
+            for (p, out) in prefixes.iter().zip(&mut counts) {
+                let under = if p.is_empty() { String::new() } else { format!("{p}.") };
+                let mut c = kw.lower_bound(&under);
+                while c < n {
+                    let Some(rest) = kw.value(c).strip_prefix(under.as_str()) else { break };
+                    let child = rest.split('.').next().unwrap_or("");
+                    if let (true, Ok(x)) = (rest.len() == child.len(), child.parse::<u32>()) {
+                        let k = kw.count_code_in(c, &words);
+                        if k > 0 {
+                            *out.entry(x).or_insert(0) += k;
+                        }
+                    }
+                    // Past the child's own children: `child.` sorts before
+                    // `child/`, and every digit after it.
+                    c = kw.lower_bound(&format!("{under}{child}/")).max(c + 1);
+                }
+            }
+        }
+        Ok(prefixes
+            .iter()
+            .zip(counts)
+            .map(|(p, m)| m.into_iter().map(|(x, k)| (if p.is_empty() { x.to_string() } else { format!("{p}.{x}") }, k)).collect())
+            .collect())
+    }
+
     pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
         if let Some(m) = q.unopened_model(self.opts.shard) {
             return Err(err(format!("ranking model {m} is not open: Db::query and Db::run open the models of a query's plan (Db::open_ranking_models)")));
