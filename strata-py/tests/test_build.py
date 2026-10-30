@@ -70,12 +70,15 @@ def test_min_asks_for_some_of_the_words(db):
 
 def test_at_least_and_count_true_run_as_their_sql(db):
     t = db.table()
-    conds = [match("description", "dragon"), col("year") >= 1990, col("genres").isin(["classic"]), col("rating") < 2]
-    sql = "MATCH(description, 'dragon'), year >= 1990, genres IN ('classic'), rating < 2"
+    conds = [match("description", "dragon"), col("year") >= 1990, col("genres").isin(["classic"]), col("rating") < 3]
+    sql = "MATCH(description, 'dragon'), year >= 1990, genres IN ('classic'), rating < 3"
     for n, text in [(2, "2"), (3, "3"), ("50%", "'50%'"), (9, "9")]:
         r = same(db, t.select("id").where(at_least(n, *conds)).order_by(col("year")).limit(100),
                  f"SELECT id FROM books WHERE AT_LEAST({text}, {sql}) ORDER BY year LIMIT 100")
         assert len(r) > 0, text
+    # A count past the conditions' needs every one of them.
+    every = "MATCH(description, 'dragon') AND year >= 1990 AND genres IN ('classic') AND rating < 3"
+    assert r.keys == db.query(f"SELECT id FROM books WHERE {every} ORDER BY year LIMIT 100").keys
     same(db, t.select("id").where(~at_least(2, *conds)).order_by(col("year")).limit(100),
          f"SELECT id FROM books WHERE NOT AT_LEAST(2, {sql}) ORDER BY year LIMIT 100")
     r = same(db, t.select("id", count_true(*conds).alias("k")).order_by(bm25("description", "river") * (1 + count_true(*conds))).limit(20),
