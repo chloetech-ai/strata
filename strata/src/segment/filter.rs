@@ -22,6 +22,13 @@ pub trait DocFilter: Send + Sync {
     fn members(&self) -> Option<Box<dyn Iterator<Item = DocId> + '_>> {
         self.as_doc_set().map(|s| s.iter())
     }
+    /// Whether a member may lie in `docs`: false only when none can (by a
+    /// column's zone maps, or a materialised set's own members), so that
+    /// a scan can skip those documents.
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        let _ = docs;
+        true
+    }
 }
 
 /// A materialised set of docIDs in `0..n`, sorted array when sparse and
@@ -198,6 +205,21 @@ impl DocFilter for DocSet {
     }
     fn cardinality(&self) -> usize {
         self.len()
+    }
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        match self {
+            DocSet::Sorted { docs: d, .. } => d.get(d.partition_point(|&x| x < docs.start)).is_some_and(|&x| x < docs.end),
+            DocSet::Bits { words, .. } => {
+                let (a, b) = (docs.start as usize, (docs.end as usize).min(64 * words.len()));
+                a < b
+                    && (a / 64..=(b - 1) / 64).any(|w| {
+                        let lo = a.max(64 * w) - 64 * w;
+                        let hi = b.min(64 * w + 64) - 64 * w;
+                        let mask = if hi - lo == 64 { !0 } else { ((1u64 << (hi - lo)) - 1) << lo };
+                        words[w] & mask != 0
+                    })
+            }
+        }
     }
     fn as_doc_set(&self) -> Option<&DocSet> {
         Some(self)

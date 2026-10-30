@@ -163,6 +163,10 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
             }
             _ => Value::Null,
         },
+        Expr::Prefix { expr, prefix } => match (eval(expr, row)?, eval(prefix, row)?) {
+            (Value::Str(s), Value::Str(p)) => Value::Bool(s.starts_with(&p)),
+            _ => Value::Null,
+        },
         Expr::Case { operand, whens, otherwise } => {
             let base = operand.as_ref().map(|o| eval(o, row)).transpose()?;
             for w in whens {

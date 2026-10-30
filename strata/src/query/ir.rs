@@ -62,8 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 13] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS];
+pub const FEATURES: [&str; 14] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -120,6 +120,10 @@ pub const RANKED: &str = "ranked";
 /// `word^2`; [`crate::text::query::has_operators`]), or a `MATCH` with a
 /// weight.
 pub const TEXT_OPERATORS: &str = "text_operators";
+
+/// The feature of a plan that tests whether text starts with a prefix
+/// ([`Expr::Prefix`]).
+pub const PREFIX: &str = "prefix";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -588,6 +592,11 @@ pub enum Expr {
         #[serde(default, skip_serializing_if = "is_false")]
         case_insensitive: bool,
     },
+    /// Whether text `expr` starts with text `prefix` (`PREFIX(x, p)`, and a
+    /// table's `kw LIKE 'p%'`): NULL unless both are text. A Search's
+    /// filter reads it as a run of a KEYWORD field's dictionary (feature
+    /// [`PREFIX`]).
+    Prefix { expr: Box<Expr>, prefix: Box<Expr> },
     /// `CASE [operand] WHEN .. THEN .. [ELSE ..] END`: the first branch
     /// whose `when` is TRUE (or equals the operand), else `otherwise`, else
     /// NULL.
@@ -1312,7 +1321,7 @@ impl Expr {
                 expr.visit(f);
                 list.iter().for_each(|x| x.visit(f));
             }
-            Expr::Like { expr, pattern, .. } => {
+            Expr::Like { expr, pattern, .. } | Expr::Prefix { expr, prefix: pattern } => {
                 expr.visit(f);
                 pattern.visit(f);
             }
@@ -1341,7 +1350,8 @@ impl Expr {
         match self {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } | Expr::MaxSim { vectors: x, .. } => within.push(x),
             Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Gbdt { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
-            Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => within.extend([&mut **left, &mut **right]),
+            Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. }
+            | Expr::Prefix { expr: left, prefix: right } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
                 within.push(expr);
                 within.extend(lo.iter_mut().chain(hi.iter_mut()).map(|x| &mut **x));
@@ -1423,6 +1433,11 @@ impl Plan {
         }
         if root.has_models() {
             features.push(RANK_MODELS.to_string());
+        }
+        let mut prefix = false;
+        root.visit_exprs(&mut |e| prefix |= matches!(e, Expr::Prefix { .. }));
+        if prefix {
+            features.push(PREFIX.to_string());
         }
         let mut distinct_on = root.keeps_firsts();
         root.visit_exprs(&mut |e| {
