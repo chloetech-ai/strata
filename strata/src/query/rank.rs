@@ -277,14 +277,7 @@ impl<'s> Rank<'s> {
             Expr::Num(x) => Cow::Owned(vec![finite(*x); n]),
             Expr::Arith { op, left, right } => {
                 let (a, b) = (self.values(left, n, values, lists), self.values(right, n, values, lists));
-                let f = |x: f64, y: f64| match op {
-                    ArithOp::Add => x + y,
-                    ArithOp::Sub => x - y,
-                    ArithOp::Mul => x * y,
-                    ArithOp::Div => x / y,
-                    ArithOp::Mod => x % y,
-                };
-                Cow::Owned(a.iter().zip(b.iter()).map(|(&x, &y)| finite(f(x, y))).collect())
+                Cow::Owned(a.iter().zip(b.iter()).map(|(&x, &y)| arith(*op, x, y)).collect())
             }
             Expr::Neg(x) => Cow::Owned(each(self.values(x, n, values, lists), &|v| -v)),
             Expr::Call { func, args } => {
@@ -343,6 +336,56 @@ impl<'s> Rank<'s> {
                 )
             }
         }
+    }
+
+    /// Whether each row's value comes from its own leaves alone, with no
+    /// set function, fusion or ranking over the candidates: what
+    /// [`eval_row`](Self::eval_row) and [`upper`](Self::upper) take.
+    pub fn is_row_local(&self) -> bool {
+        let mut local = true;
+        visit(&self.expr, &mut |e| local &= !matches!(e, Expr::Sum { .. } | Expr::Rrf { .. } | Expr::Norm { .. }));
+        local
+    }
+
+    /// The leaf whose top-k loop can rank by the whole expression, so that
+    /// its top k is exact without scoring every row (rank-safe boosts,
+    /// `bm25(body, :q) * (1 + 0.2 * importance)`): the one text score (BM25
+    /// or sparse) of a row-local expression whose other leaves are row
+    /// values (columns, decays, conditions, `seq_no()`), not under
+    /// `exact => 1`, and the only leaf whose top rows are candidates (a
+    /// product of row values alone, `decay(..) * rating`, takes its own).
+    /// The text score's bounds then bound the expression
+    /// ([`upper`](Self::upper)), and a row it does not match is not a
+    /// candidate, as with its top `depth`.
+    pub fn driver(&self) -> Option<usize> {
+        if self.exact || !self.is_row_local() {
+            return None;
+        }
+        let mut text = None;
+        for (j, l) in self.leaves.iter().enumerate() {
+            match l {
+                Score::Bm25 { .. } | Score::Sparse { .. } if text.is_none() => text = Some(j),
+                Score::Column { .. } | Score::Decay { .. } | Score::Cond(_) | Score::SeqNo if !self.generates[j] => {}
+                _ => return None,
+            }
+        }
+        text
+    }
+
+    /// The value of a row-local expression ([`is_row_local`](Self::is_row_local))
+    /// for a row whose leaves have `leaves` (NaN for NULL): the score
+    /// [`eval`](Self::eval) gives it, bit for bit; NaN for NULL.
+    pub fn eval_row(&self, leaves: &[f64]) -> f64 {
+        row(&self.expr, leaves)
+    }
+
+    /// An upper bound of a row-local expression's value over the rows whose
+    /// leaves lie in `leaves`: no such row's [`eval_row`](Self::eval_row) is
+    /// greater (NULL ranks below every number). `f64::MIN` where every such
+    /// row is NULL, and +∞ where nothing bounds it.
+    pub fn upper(&self, leaves: &[Interval]) -> f64 {
+        let i = interval(&self.expr, leaves);
+        if i.is_empty() { f64::MIN } else { i.hi.max(f64::MIN) }
     }
 
     /// The expression as SQL would write it, normalisation explicit and
@@ -411,6 +454,256 @@ fn finite(x: f64) -> f64 {
         x
     } else {
         f64::NAN
+    }
+}
+
+/// `x op y`, NULL where it is not a finite number.
+#[inline]
+fn arith(op: ArithOp, x: f64, y: f64) -> f64 {
+    finite(match op {
+        ArithOp::Add => x + y,
+        ArithOp::Sub => x - y,
+        ArithOp::Mul => x * y,
+        ArithOp::Div => x / y,
+        ArithOp::Mod => x % y,
+    })
+}
+
+/// One row's value of `e`, as [`Rank::values`] computes it for every row.
+fn row(e: &Expr, v: &[f64]) -> f64 {
+    match e {
+        Expr::Leaf(j) => finite(v[*j]),
+        Expr::Num(x) => finite(*x),
+        Expr::Arith { op, left, right } => arith(*op, row(left, v), row(right, v)),
+        Expr::Neg(x) => finite(-row(x, v)),
+        Expr::Call { func, args } => {
+            let mut buf = [0.0; 8];
+            match args.len() {
+                n if n <= buf.len() => {
+                    for (b, a) in buf.iter_mut().zip(args) {
+                        *b = row(a, v);
+                    }
+                    func.eval_f64(&buf[..n])
+                }
+                _ => func.eval_f64(&args.iter().map(|a| row(a, v)).collect::<Vec<_>>()),
+            }
+        }
+        // As fusion::combine multiplies: a factor below 0, or missing,
+        // counts as 0, and an overflow ranks last.
+        Expr::Product(fs) => {
+            let p = fs.iter().fold(1.0, |p, f| {
+                let x = row(f, v);
+                p * if x.is_finite() { x.max(0.0) } else { 0.0 }
+            });
+            if p.is_finite() { p } else { f64::MIN }
+        }
+        Expr::Case { whens, otherwise } => match whens.iter().find(|(c, _)| {
+            let c = row(c, v);
+            !c.is_nan() && c != 0.0
+        }) {
+            Some((_, x)) => row(x, v),
+            None => otherwise.as_ref().map_or(f64::NAN, |x| row(x, v)),
+        },
+        Expr::Sum { .. } | Expr::Rrf { .. } | Expr::Norm { .. } => f64::NAN,
+    }
+}
+
+/// The values an expression takes over a set of rows: each finite value
+/// lies in `[lo, hi]` (none does when `lo > hi`), and NULL is possible when
+/// `null`. A bound may be infinite.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Interval {
+    pub lo: f64,
+    pub hi: f64,
+    pub null: bool,
+}
+
+impl Interval {
+    /// Any value, or NULL.
+    pub const ANY: Interval = Interval { lo: f64::NEG_INFINITY, hi: f64::INFINITY, null: true };
+    /// NULL only.
+    const NULL: Interval = Interval { lo: f64::INFINITY, hi: f64::NEG_INFINITY, null: true };
+
+    pub fn new(lo: f64, hi: f64, null: bool) -> Interval {
+        Interval { lo, hi, null }
+    }
+
+    fn point(x: f64) -> Interval {
+        if x.is_finite() { Interval::new(x, x, false) } else { Interval::NULL }
+    }
+
+    /// No finite value.
+    pub fn is_empty(&self) -> bool {
+        !(self.lo <= self.hi)
+    }
+
+    /// Both sets of values.
+    fn hull(self, o: Interval) -> Interval {
+        Interval { lo: self.lo.min(o.lo), hi: self.hi.max(o.hi), null: self.null || o.null }
+    }
+
+    /// The values of `f`, non-decreasing, over this interval: `f` of its
+    /// ends, widened by a few ulps for a libm function that is not exactly
+    /// monotone; unbounded on a side where `f` of the end is NULL.
+    fn rising(self, f: impl Fn(f64) -> f64) -> Interval {
+        if self.is_empty() {
+            return Interval::NULL;
+        }
+        let (lo, hi) = (f(self.lo), f(self.hi));
+        let wide = |x: f64| x.abs() * 1e-12 + f64::MIN_POSITIVE;
+        Interval {
+            lo: if lo.is_nan() { f64::NEG_INFINITY } else { lo - wide(lo) },
+            hi: if hi.is_nan() { f64::INFINITY } else { hi + wide(hi) },
+            null: self.null || lo.is_nan() || hi.is_nan(),
+        }
+    }
+
+    /// The values of `f`, non-increasing, over this interval.
+    fn falling(self, f: impl Fn(f64) -> f64) -> Interval {
+        let r = self.rising(|x| -f(x));
+        if r.is_empty() { r } else { Interval::new(-r.hi, -r.lo, r.null) }
+    }
+}
+
+/// The values of `e` over rows whose leaves lie in `leaves`: an interval
+/// that holds every row's [`row`] value, wider where a tight one would cost
+/// more than it gives.
+fn interval(e: &Expr, leaves: &[Interval]) -> Interval {
+    let any = |null: bool| Interval { null, ..Interval::ANY };
+    match e {
+        Expr::Leaf(j) => leaves[*j],
+        Expr::Num(x) => Interval::point(*x),
+        Expr::Neg(x) => {
+            let x = interval(x, leaves);
+            if x.is_empty() { x } else { Interval::new(-x.hi, -x.lo, x.null) }
+        }
+        Expr::Arith { op, left, right } => {
+            let (a, b) = (interval(left, leaves), interval(right, leaves));
+            if a.is_empty() || b.is_empty() {
+                return Interval::NULL;
+            }
+            let null = a.null || b.null;
+            // A result off the ends' results is NULL (an overflow).
+            let corners = |f: fn(f64, f64) -> f64| {
+                let c = [f(a.lo, b.lo), f(a.lo, b.hi), f(a.hi, b.lo), f(a.hi, b.hi)];
+                match c.iter().any(|x| x.is_nan()) {
+                    true => any(true),
+                    false => Interval::new(c.iter().copied().fold(f64::INFINITY, f64::min), c.iter().copied().fold(f64::NEG_INFINITY, f64::max), null || c.iter().any(|x| x.is_infinite())),
+                }
+            };
+            match op {
+                ArithOp::Add => {
+                    let (lo, hi) = (a.lo + b.lo, a.hi + b.hi);
+                    if lo.is_nan() || hi.is_nan() { any(true) } else { Interval::new(lo, hi, null || lo.is_infinite() || hi.is_infinite()) }
+                }
+                ArithOp::Sub => {
+                    let (lo, hi) = (a.lo - b.hi, a.hi - b.lo);
+                    if lo.is_nan() || hi.is_nan() { any(true) } else { Interval::new(lo, hi, null || lo.is_infinite() || hi.is_infinite()) }
+                }
+                ArithOp::Mul => corners(|x, y| x * y),
+                // A divisor near 0 makes any quotient.
+                ArithOp::Div if b.lo <= 0.0 && b.hi >= 0.0 => any(true),
+                ArithOp::Div => corners(|x, y| x / y),
+                // |x % y| < |y| and |x % y| <= |x|, with the sign of x.
+                ArithOp::Mod => {
+                    let m = b.lo.abs().max(b.hi.abs());
+                    Interval::new(if a.lo < 0.0 { a.lo.max(-m) } else { 0.0 }, if a.hi > 0.0 { a.hi.min(m) } else { 0.0 }, true)
+                }
+            }
+        }
+        Expr::Call { func, args } => {
+            let a: Vec<Interval> = args.iter().map(|x| interval(x, leaves)).collect();
+            let one = |f: Func| move |x: f64| f.eval_f64(&[x]);
+            match func {
+                Func::Abs => {
+                    let x = a[0];
+                    match () {
+                        _ if x.is_empty() => x,
+                        _ if x.lo >= 0.0 => x,
+                        _ if x.hi <= 0.0 => Interval::new(-x.hi, -x.lo, x.null),
+                        _ => Interval::new(0.0, x.hi.max(-x.lo), x.null),
+                    }
+                }
+                Func::Ln | Func::Exp | Func::Sqrt | Func::Sigmoid => a[0].rising(one(*func)),
+                Func::Log if a.len() == 1 => a[0].rising(one(Func::Log)),
+                Func::Round if a.len() == 1 => a[0].rising(one(Func::Round)),
+                Func::Round => match a[1] {
+                    d if !d.is_empty() && d.lo == d.hi => {
+                        let r = a[0].rising(|x| Func::Round.eval_f64(&[x, d.lo]));
+                        Interval { null: r.null || d.null, ..r }
+                    }
+                    _ => any(true),
+                },
+                // x^c for a constant c and x >= 0, and c^y for a constant
+                // c > 0, are monotone.
+                Func::Pow => match (a[0], a[1]) {
+                    (x, c) if !x.is_empty() && !c.is_empty() && c.lo == c.hi && x.lo >= 0.0 => {
+                        let f = |x: f64| Func::Pow.eval_f64(&[x, c.lo]);
+                        let r = if c.lo >= 0.0 { x.rising(f) } else { x.falling(f) };
+                        Interval { null: r.null || c.null, ..r }
+                    }
+                    (c, y) if !c.is_empty() && !y.is_empty() && c.lo == c.hi && c.lo > 0.0 => {
+                        let f = |y: f64| Func::Pow.eval_f64(&[c.lo, y]);
+                        let r = if c.lo >= 1.0 { y.rising(f) } else { y.falling(f) };
+                        Interval { null: r.null || c.null, ..r }
+                    }
+                    _ => any(true),
+                },
+                // Non-decreasing in each argument.
+                Func::Clamp => {
+                    if a.iter().any(Interval::is_empty) {
+                        return Interval::NULL;
+                    }
+                    let lo = Func::Clamp.eval_f64(&[a[0].lo, a[1].lo, a[2].lo]);
+                    let hi = Func::Clamp.eval_f64(&[a[0].hi, a[1].hi, a[2].hi]);
+                    if lo.is_nan() || hi.is_nan() { any(true) } else { Interval::new(lo, hi, a.iter().any(|x| x.null)) }
+                }
+                // NULL arguments are skipped: the result is one of the
+                // others, or NULL when every one is.
+                Func::Least | Func::Greatest | Func::Coalesce => {
+                    let present: Vec<&Interval> = a.iter().filter(|x| !x.is_empty()).collect();
+                    let null = a.iter().all(|x| x.null);
+                    if present.is_empty() {
+                        return Interval::NULL;
+                    }
+                    let (lo, hi) = (present.iter().map(|x| x.lo).fold(f64::INFINITY, f64::min), present.iter().map(|x| x.hi).fold(f64::NEG_INFINITY, f64::max));
+                    // An argument that is never NULL is always among them.
+                    let sure = a.iter().filter(|x| !x.null && !x.is_empty());
+                    match func {
+                        Func::Least => Interval::new(lo, sure.map(|x| x.hi).fold(hi, f64::min), null),
+                        Func::Greatest => Interval::new(sure.map(|x| x.lo).fold(lo, f64::max), hi, null),
+                        _ => Interval::new(lo, hi, null),
+                    }
+                }
+                _ => any(true),
+            }
+        }
+        // Each factor counts as max(x, 0), 0 when missing; an overflow is
+        // f64::MIN.
+        Expr::Product(fs) => {
+            let (mut lo, mut hi) = (1.0f64, 1.0f64);
+            for f in fs {
+                let x = interval(f, leaves);
+                let (flo, fhi) = match x.is_empty() {
+                    true => (0.0, 0.0),
+                    false => (if x.null { 0.0 } else { x.lo.max(0.0) }, x.hi.max(0.0)),
+                };
+                lo *= flo;
+                hi *= fhi;
+            }
+            match hi.is_finite() && lo.is_finite() {
+                true => Interval::new(lo, hi, false),
+                false => Interval::new(f64::MIN, f64::INFINITY, false),
+            }
+        }
+        Expr::Case { whens, otherwise } => {
+            let mut out = otherwise.as_ref().map_or(Interval::NULL, |x| interval(x, leaves));
+            for (_, x) in whens {
+                out = out.hull(interval(x, leaves));
+            }
+            out
+        }
+        Expr::Sum { .. } | Expr::Rrf { .. } | Expr::Norm { .. } => Interval::ANY,
     }
 }
 
@@ -710,6 +1003,127 @@ mod tests {
             }
         }
         assert!(seen_null > 1000, "{seen_null}");
+    }
+
+    /// A random row-local expression: [`random_score`] without set
+    /// functions, sometimes times a product of columns.
+    fn random_local(rng: &mut u64, depth: u32) -> Score {
+        loop {
+            let s = random_score(rng, depth);
+            let mut r = (*rng).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            *rng = r;
+            r ^= r >> 29;
+            let s = match r % 5 {
+                0 => Score::Arith {
+                    op: ArithOp::Mul,
+                    left: Box::new(s),
+                    right: Box::new(Score::Product(vec![Score::Column { field: (r % 3) as usize }, Score::Column { field: (r / 3 % 3) as usize }])),
+                },
+                _ => s,
+            };
+            if Rank::of(&s, 100).is_some_and(|k| k.is_row_local()) {
+                return s;
+            }
+        }
+    }
+
+    /// Rows of three columns with NULLs, ties, zeros, negatives and 1e300.
+    fn columns(n: usize, seed: u64) -> Vec<Vec<f64>> {
+        let mut rng = seed | 1;
+        let mut col = |nulls: u64| -> Vec<f64> {
+            (0..n)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    match rng % 10 {
+                        x if x < nulls => f64::NAN,
+                        x => [0.0, 1.0, 2.0, -1.5, 0.25, 7.0, 2.0, 1e300, -0.0, 3.5][x as usize] * if rng % 3 == 0 { -1.0 } else { 1.0 },
+                    }
+                })
+                .collect()
+        };
+        vec![col(0), col(2), col(5)]
+    }
+
+    /// The leaves' values of each row, in a Rank's leaf order.
+    fn leaf_values(rank: &Rank, cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        rank.leaves
+            .iter()
+            .map(|l| match l {
+                Score::Column { field } => cols[*field].clone(),
+                l => panic!("{l:?}"),
+            })
+            .collect()
+    }
+
+    /// eval_row gives each row the value the batch evaluator gives it, bit
+    /// for bit, so a top-k loop that scores rows one at a time keeps the
+    /// rows the evaluator ranks first.
+    #[test]
+    fn eval_row_matches_the_batch_evaluator() {
+        let n = 16;
+        let cols = columns(n, 0x2545_f491_4f6c_dd1d);
+        let mut rng = 0x1234_5678_9abc_def1u64;
+        for _ in 0..3000 {
+            let s = random_local(&mut rng, 4);
+            let rank = Rank::of(&s, 100).unwrap();
+            let values = leaf_values(&rank, &cols);
+            let batch = rank.values(&rank.expr, n, &values, &vec![Vec::new(); values.len()]);
+            for i in 0..n {
+                let leaves: Vec<f64> = values.iter().map(|v| v[i]).collect();
+                let one = rank.eval_row(&leaves);
+                assert!(one.to_bits() == batch[i].to_bits() || (one.is_nan() && batch[i].is_nan()), "{s:?} row {i}: {one} vs {}", batch[i]);
+            }
+        }
+    }
+
+    /// No row whose leaves lie in a box scores above the box's upper bound,
+    /// over random expressions, boxes and rows in them.
+    #[test]
+    fn upper_bounds_every_row_in_the_box() {
+        let mut rng = 0x0bad_5eed_1234_5678u64;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let pick = |r: u64| -> f64 { [0.0, 1.0, 2.0, -1.5, 0.25, 7.0, -3.0, 1e300, -0.0, 3.5, 1e-300, 0.5][(r % 12) as usize] };
+        let mut tight = 0;
+        for _ in 0..4000 {
+            let mut r = next(u64::MAX) | 1;
+            let s = random_local(&mut r, 4);
+            let rank = Rank::of(&s, 100).unwrap();
+            // A box per leaf, and rows inside it: its ends, points
+            // between them, and NULL where the box allows it.
+            let boxes: Vec<Interval> = rank
+                .leaves
+                .iter()
+                .map(|_| {
+                    let (a, b) = (pick(next(1 << 20)), pick(next(1 << 20)));
+                    Interval::new(a.min(b), a.max(b), next(3) == 0)
+                })
+                .collect();
+            let upper = rank.upper(&boxes);
+            for _ in 0..24 {
+                let leaves: Vec<f64> = boxes
+                    .iter()
+                    .map(|b| match next(6) {
+                        0 if b.null => f64::NAN,
+                        1 => b.lo,
+                        2 => b.hi,
+                        _ => b.lo + (b.hi - b.lo) * (next(1000) as f64 / 1000.0),
+                    })
+                    .map(|x| if x.is_finite() { x } else { f64::NAN })
+                    .collect();
+                let v = rank.eval_row(&leaves);
+                assert!(v.is_nan() || v <= upper, "{s:?}\nboxes {boxes:?}\nrow {leaves:?}: {v} > {upper}");
+                tight += (v == upper) as usize;
+            }
+        }
+        // The bounds are reached, not only safe.
+        assert!(tight > 1000, "{tight}");
     }
 
     #[test]

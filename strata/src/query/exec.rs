@@ -18,13 +18,13 @@ use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
 use crate::query::logical::{Decay, Expand, OrderBy, Opts, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
-use crate::query::rank::Rank;
+use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
 use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
 use crate::storage::{rowseq, KeyRef, SegmentView, Snapshot, Updates};
-use crate::text::{self, Bm25Params, BoolQuery, CollectionStats, FilterStrategy, Synonyms, TextFieldReader, TopKAlgo};
+use crate::text::{self, Bm25Params, Boost, BoolQuery, CollectionStats, FilterStrategy, Synonyms, TextFieldReader, TopKAlgo};
 use crate::value::Value;
 use crate::vector::{self, SearchParams, VectorReader};
 
@@ -183,6 +183,12 @@ pub struct ExecOptions {
     pub bm25_algo: TopKAlgo,
     /// Candidates per input for fusion (`rrf` uses its own `depth`).
     pub fusion_depth: usize,
+    /// Rank a boosted text score (`bm25(..) * (1 + 0.2 * importance)`: one
+    /// BM25 or sparse score and row values, [`Rank::driver`]) by its exact
+    /// top k, the text index's bounds driving the expression. False takes
+    /// the text score's top `depth` rows as candidates, as other
+    /// expressions do (for comparisons).
+    pub rank_safe: bool,
     /// Collection statistics to score BM25 with instead of this database's
     /// own, so that a shard of a larger collection scores like the whole
     /// of it ([`crate::query::stats`]). Terms missing from it use local
@@ -236,6 +242,7 @@ impl Default for ExecOptions {
             bm25: Bm25Params::default(),
             bm25_algo: TopKAlgo::MaxScore,
             fusion_depth: 100,
+            rank_safe: true,
             stats: None,
             shard: false,
             threads: 1,
@@ -1697,14 +1704,26 @@ impl<'a> Executor<'a> {
     fn fused(&mut self, rank: &Rank<'_>, p: &Pred, k: usize) -> Result<Vec<Hit>> {
         let depth = self.rows_at_most(rank.depth.max(k));
         let shard = self.opts.shard;
+        let driver = rank.driver().filter(|_| self.opts.rank_safe);
         // Each generating leaf's top rows: the candidates, and the rankings
-        // RRF and a coordinator read.
+        // RRF and a coordinator read. A shard answers a driven expression
+        // with them too, for a coordinator from before rank-safe boosts to
+        // fuse as it did.
         let mut lists: Vec<Vec<(usize, DocId)>> = Vec::with_capacity(rank.leaves.len());
         let rankings = rank.reads_rankings();
         for (s, &generates) in rank.leaves.iter().zip(&rank.generates) {
-            lists.push(if generates && (shard || rankings || !rank.exact) { self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect() } else { Vec::new() });
+            let read = generates && (shard || rankings || (!rank.exact && driver.is_none()));
+            lists.push(if read { self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect() } else { Vec::new() });
         }
-        let cands: Vec<(usize, DocId)> = if rank.exact {
+        let cands: Vec<(usize, DocId)> = if let Some(text) = driver {
+            let mut cands = self.driven_top(rank, text, p, self.rows_at_most(k))?;
+            if shard {
+                cands.extend(lists.iter().flatten().copied());
+                cands.sort_unstable();
+                cands.dedup();
+            }
+            cands
+        } else if rank.exact {
             let mut all = Vec::new();
             let segs = self.segs.clone();
             for s in segs.iter() {
@@ -1733,7 +1752,11 @@ impl<'a> Executor<'a> {
         let mut hits: Vec<Hit> = rank.eval(cands.len(), &values, &ranks, if shard { cands.len() } else { k }).into_iter().map(|(i, score)| Hit { seg: cands[i].0, doc: cands[i].1, score }).collect();
         self.order_sorted_ties(&mut hits);
         let generating = rank.generates.iter().filter(|g| **g).count();
-        let from = if rank.exact { "every row WHERE keeps".to_string() } else { format!("the top {depth} of {generating} input{}", if generating == 1 { "" } else { "s" }) };
+        let from = match driver {
+            Some(_) => format!("its own top {} (rank-safe: the text score's bounds drive it)", self.rows_at_most(k)),
+            None if rank.exact => "every row WHERE keeps".to_string(),
+            None => format!("the top {depth} of {generating} input{}", if generating == 1 { "" } else { "s" }),
+        };
         // For one release: `+` between scores meant min-max fusion before.
         let raw = if rank.adds_raw_scores() { " (+ adds raw scores; minmax() normalises them, as a sum of scores did before ranking expressions)" } else { "" };
         self.stats.plan.push(format!("fused {}: {} candidates from {from}{raw}", rank.explain(&self.schema), cands.len()));
@@ -1749,6 +1772,93 @@ impl<'a> Executor<'a> {
             self.parts = Some((cands, values, ranked));
         }
         Ok(hits)
+    }
+
+    /// The rows of a rank-safe boost ([`Rank::driver`]) that rank in its
+    /// top `k`, and every row tied with the `k`-th, by segment and docID.
+    /// Each segment's text top-k loop ranks by the expression, its bound
+    /// skipping what cannot reach the `k`-th value
+    /// ([`TextFieldReader::top_k_boosted`]), so no row left out ranks above
+    /// them.
+    fn driven_top(&mut self, rank: &Rank<'_>, text: usize, p: &Pred, k: usize) -> Result<Vec<(usize, DocId)>> {
+        if rank.leaves.contains(&&Score::SeqNo) && !self.snap.numbers_writes() {
+            return Err(Error::Query("seq_no(): the database does not number its writes (Database::start_seq_no)".into()));
+        }
+        // The text score's terms, statistics and parameters.
+        let (field, terms, bm25, algo) = match rank.leaves[text] {
+            Score::Bm25 { field, text: query, opts } => {
+                let (q, stats) = self.bm25_scoring(*field, query, opts)?;
+                let (params, algo) = self.bm25_params(opts)?;
+                (*field, q.terms, Some((stats, params)), algo)
+            }
+            Score::Sparse { field, terms, opts } => (*field, terms.clone(), None, self.bm25_params(opts)?.1),
+            _ => return Err(err("a rank-safe boost is driven by bm25 or a sparse similarity")),
+        };
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let per = self.per_segment(|ex, s, l| {
+            let t = ex.text(s, field)?;
+            let candidates = terms.iter().map(|(w, _)| t.doc_freq(w) as f64).sum::<f64>() * 0.3;
+            let mode = match ex.opts.filter_mode {
+                Some(m) => m,
+                None => {
+                    let est = SegEst { ex, s, params: None, local_sel: None };
+                    ex.planner(&est).filter_mode(p, candidates)
+                }
+            };
+            let f = ex.seg_filter_l(s, p, mode, l)?;
+            let mut boost = ex.row_boost(s, rank, text)?;
+            let (hits, ran) = match &bm25 {
+                Some((stats, params)) => t.top_k_boosted(&terms, stats, *params, k, f.as_dyn(), algo, &mut boost),
+                None => t.top_k_dot_boosted(&terms, k, f.as_dyn(), algo, &mut boost),
+            };
+            let how = if ran == algo { String::new() } else { " (its bound does not narrow with the text score: every match scored)".to_string() };
+            l.plan.push(format!("seg {}: {} {ran:?} ranks by the expression{how}, filter {mode:?}", s.ord, if bm25.is_some() { "bm25" } else { "sparse" }));
+            Ok(hits.into_iter().map(|(d, _)| (s.ord, d)).collect::<Vec<_>>())
+        })?;
+        let mut cands = per.concat();
+        cands.sort_unstable();
+        Ok(cands)
+    }
+
+    /// A rank-safe boost over segment `s`: the leaves of `rank` other than
+    /// the text score `text`, read from each row, and their intervals over
+    /// the segment.
+    fn row_boost<'e>(&'e self, s: &'e Seg<'a>, rank: &'e Rank<'e>, text: usize) -> Result<RowBoost<'e, 'a>> {
+        let (mut leaves, mut boxes) = (Vec::new(), Vec::new());
+        for (j, leaf) in rank.leaves.iter().enumerate() {
+            let (l, b) = match leaf {
+                _ if j == text => (RowLeaf::Text, Interval::ANY),
+                Score::Column { field } => {
+                    let col = self.numeric(s, *field)?.col();
+                    (RowLeaf::Column { field: *field, col }, self.column_box(s, *field, col))
+                }
+                Score::Decay { field, decay, .. } => {
+                    let col = self.numeric(s, *field)?.col();
+                    (RowLeaf::Decay { field: *field, col, decay }, decay_box(decay, self.column_box(s, *field, col)))
+                }
+                Score::Cond(p) => (RowLeaf::Cond(self.materialize(s, p)?), Interval::new(0.0, 1.0, false)),
+                Score::SeqNo => (RowLeaf::SeqNo, Interval::new(0.0, f64::INFINITY, false)),
+                _ => return Err(err("a rank-safe boost reads columns, decays, conditions and seq_no()")),
+            };
+            leaves.push(l);
+            boxes.push(b);
+        }
+        Ok(RowBoost { ex: self, s, rank, vals: vec![0.0; leaves.len()], leaves, boxes, text })
+    }
+
+    /// The values of numeric `field` over segment `s`: its column's least
+    /// and greatest, and those written in place; NULL possible.
+    fn column_box(&self, s: &Seg<'a>, field: usize, col: &NumericColumn) -> Interval {
+        let mut b = Interval::new(col.min().unwrap_or(f64::INFINITY), col.max().unwrap_or(f64::NEG_INFINITY), true);
+        if let Some(u) = self.updates(s, field) {
+            for x in u.field(field).filter_map(|(_, v)| v.as_f64()) {
+                b.lo = b.lo.min(x);
+                b.hi = b.hi.max(x);
+            }
+        }
+        b
     }
 
     /// Exact values of `cands` (sorted by segment, then docID) for one leaf;
@@ -1999,6 +2109,78 @@ fn query_vectors<'v>(vectors: &'v Vectors, opts: &Opts) -> Result<&'v [Arc<[f32]
         return Err(err(format!("maxsim takes at most {max} query vectors, not {}: keep fewer (a LIMIT on its subquery) or raise max_vectors", qs.len())));
     }
     Ok(qs)
+}
+
+/// A leaf of a rank-safe boost, read for one row of a segment.
+enum RowLeaf<'c> {
+    /// The text score, from the top-k loop.
+    Text,
+    Column { field: usize, col: &'c NumericColumn },
+    Decay { field: usize, col: &'c NumericColumn, decay: &'c Decay },
+    Cond(DocSet),
+    SeqNo,
+}
+
+/// A rank-safe boost over one segment ([`Rank::driver`]): the expression of
+/// a row's text score and its own values, bit for bit the value
+/// [`Rank::eval`] gives the row from its leaves' exact values, and its upper
+/// bound from the leaves' intervals over the segment.
+struct RowBoost<'e, 'a> {
+    ex: &'e Executor<'a>,
+    s: &'e Seg<'a>,
+    rank: &'e Rank<'e>,
+    leaves: Vec<RowLeaf<'e>>,
+    /// Each leaf's interval over the segment; the text score's is set per
+    /// bound.
+    boxes: Vec<Interval>,
+    text: usize,
+    vals: Vec<f64>,
+}
+
+impl Boost for RowBoost<'_, '_> {
+    fn score(&mut self, d: DocId, text: f32) -> f64 {
+        let (ex, s) = (self.ex, self.s);
+        for (v, l) in self.vals.iter_mut().zip(&self.leaves) {
+            // As exact_scores reads each leaf.
+            *v = match l {
+                RowLeaf::Text => text.into(),
+                RowLeaf::Column { field, col } => ex.num_value(s, *field, col, d).unwrap_or(f64::NAN),
+                RowLeaf::Decay { field, col, decay } => ex.num_value(s, *field, col, d).map_or(0.0, |v| decay.eval(v)),
+                RowLeaf::Cond(set) => {
+                    if set.contains(d) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                RowLeaf::SeqNo => rowseq::of_view(s.view, d).map_or(f64::NAN, |x| x as f64),
+            };
+        }
+        self.rank.eval_row(&self.vals)
+    }
+
+    fn bound(&mut self, text: f32) -> f64 {
+        self.boxes[self.text] = Interval::new(0.0, text.into(), false);
+        self.rank.upper(&self.boxes)
+    }
+}
+
+/// The values of `decay` over a column's values `b`: from 0 (a missing
+/// value) to its value nearest the origin, where it is largest for the
+/// parameters SQL accepts; any value for others.
+fn decay_box(decay: &Decay, b: Interval) -> Interval {
+    if !(decay.scale > 0.0 && decay.offset >= 0.0 && decay.decay > 0.0 && decay.decay < 1.0) {
+        return Interval::ANY;
+    }
+    if b.is_empty() {
+        return Interval::new(0.0, 0.0, false);
+    }
+    let top = decay.eval(decay.origin.clamp(b.lo, b.hi));
+    if top.is_nan() {
+        return Interval::ANY;
+    }
+    // Widened for exp, which need not be exactly monotone.
+    Interval::new(0.0, top + top.abs() * 1e-12 + f64::MIN_POSITIVE, false)
 }
 
 fn merge_top(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
