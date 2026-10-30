@@ -181,6 +181,9 @@ impl Manifest {
         if self.seq_no.is_some() {
             used.insert("seq_no".to_string());
         }
+        if self.table(SOURCES_ID).is_some() {
+            used.insert("sources".to_string());
+        }
         used.into_iter().collect()
     }
 
@@ -280,7 +283,31 @@ struct V1 {
 
 /// The features this version of Strata reads, besides its analyzers'
 /// ([`known_feature`]).
-pub const FEATURES: &[&str] = &["bool", "default", "media", "not_null", "semantic_id", "seq_no", "shard_by", "timestamp"];
+pub const FEATURES: &[&str] = &["bool", "default", "media", "not_null", "semantic_id", "seq_no", "shard_by", "sources", "timestamp"];
+
+/// The system table in which streams keep, per source (a Kafka partition,
+/// say), the offset of the last event they wrote, in the transaction that
+/// wrote it ([`crate::storage::Database::ensure_sources`]). The database
+/// then needs feature `sources`.
+pub const SOURCES: &str = "_sources";
+
+/// [`SOURCES`]'s table id, the same in every copy of a database and never
+/// one that `CREATE TABLE` gives, so that a replica applies its primary's
+/// offsets to a `_sources` of its own, made when the first of them
+/// arrives, without the table being shipped.
+pub const SOURCES_ID: u32 = u32::MAX - 1;
+
+/// [`SOURCES`]'s schema: a source's name, the last offset written, and
+/// when.
+pub fn sources_schema() -> Schema {
+    Schema::from_json(
+        r#"{"table": "_sources", "key": "name", "fields": [
+            {"name": "name", "type": "keyword"},
+            {"name": "last_offset", "type": "int", "not_null": true},
+            {"name": "updated", "type": "timestamp"}]}"#,
+    )
+    .expect("the _sources schema is valid")
+}
 
 /// Whether this version of Strata reads a database that requires feature
 /// `x`: one of [`FEATURES`], or a TEXT field's analyzer it has
