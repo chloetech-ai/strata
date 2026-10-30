@@ -290,6 +290,7 @@ impl<'a> Raise<'a> {
                 Pred::And(ps)
             }
             Expr::Or(xs) => Pred::Or(xs.iter().map(|x| self.pred(x)).collect::<Result<_>>()?),
+            Expr::AtLeast { need, conds } => Pred::AtLeast { need: *need as usize, items: conds.iter().map(|x| self.pred(x)).collect::<Result<_>>()? },
             Expr::IsNull(x) => Pred::Not(Box::new(Pred::Present { field: self.present_field(x)? })),
             Expr::Not(x) => match &**x {
                 Expr::IsNull(y) => Pred::Present { field: self.present_field(y)? },
@@ -537,6 +538,10 @@ impl<'a> Raise<'a> {
             Expr::SeqNo => Score::SeqNo,
             Expr::Arith { op, left, right } => Score::Arith { op: *op, left: sub(self, left)?, right: sub(self, right)? },
             Expr::Neg(x) => Score::Neg(sub(self, x)?),
+            // Each condition 1 where it holds, as WHERE would keep the row.
+            Expr::Call { func: Func::CountTrue, args } if !args.is_empty() => {
+                Score::Call { func: Func::CountTrue, args: args.iter().map(|a| Ok(Score::Cond(Box::new(self.filter(a)?)))).collect::<Result<_>>()? }
+            }
             Expr::Call { func, args } => {
                 if Func::numeric(func.name()).is_none() {
                     return Err(err(format!("{}() takes text: a ranking expression is numeric", func.name())));
@@ -688,7 +693,7 @@ impl<'a> Raise<'a> {
             Expr::Excluded(f) => Err(err(format!("excluded.{} is the row an INSERT proposed, in ON CONFLICT DO UPDATE", self.schema.fields[self.field(*f)?].name))),
             Expr::Lit(_) => Ok(()),
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => go(x),
-            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) => all(xs),
+            Expr::And(xs) | Expr::Or(xs) | Expr::AtLeast { conds: xs, .. } | Expr::Concat(xs) => all(xs),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => go(left).and_then(|_| go(right)),
             Expr::Like { expr, pattern, .. } => go(expr).and_then(|_| go(pattern)),
             Expr::Between { expr, lo, hi } => [Some(expr), lo.as_ref(), hi.as_ref()].into_iter().flatten().try_for_each(|x| go(x)),

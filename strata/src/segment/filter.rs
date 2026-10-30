@@ -177,6 +177,87 @@ impl DocSet {
         DocSet::all(self.universe()).difference(self)
     }
 
+    /// The docIDs in `0..n` that at least `need` of `sets` hold. Sparse
+    /// sets are merged and counted; otherwise each set is added into a
+    /// bit-sliced counter, ⌈log2(y + 1)⌉ words for each 64 docIDs that
+    /// hold their counts in binary (a dense set adds 64 docIDs a word
+    /// operation at a time, a sparse one a member at a time), and the
+    /// counts at least `need` come out of a bitwise comparison.
+    pub fn at_least(sets: &[DocSet], need: usize, n: u32) -> DocSet {
+        let y = sets.len();
+        if need == 0 {
+            return DocSet::all(n);
+        }
+        if need > y {
+            return DocSet::empty(n);
+        }
+        let words = (n as usize).div_ceil(64);
+        let total: usize = sets.iter().map(DocSet::len).sum();
+        if total <= words && sets.iter().all(|s| matches!(s, DocSet::Sorted { .. })) {
+            let mut all: Vec<DocId> = Vec::with_capacity(total);
+            for s in sets {
+                if let DocSet::Sorted { docs, .. } = s {
+                    all.extend_from_slice(docs);
+                }
+            }
+            all.sort_unstable();
+            let mut out = Vec::new();
+            for run in all.chunk_by(|a, b| a == b) {
+                if run.len() >= need {
+                    out.push(run[0]);
+                }
+            }
+            return DocSet::from_sorted(out, n);
+        }
+        // Bit b of a docID's count is bit d % 64 of `count[d / 64 * planes
+        // + b]`; adding a set ripples its bits up as carries.
+        let planes = (usize::BITS - y.leading_zeros()) as usize;
+        let mut count = vec![0u64; words * planes];
+        let add = |slot: &mut [u64], mut carry: u64| {
+            for c in slot {
+                let t = *c & carry;
+                *c ^= carry;
+                carry = t;
+                if carry == 0 {
+                    break;
+                }
+            }
+        };
+        for s in sets {
+            match s {
+                DocSet::Bits { words: ws, .. } => {
+                    for (slot, &w) in count.chunks_exact_mut(planes).zip(ws) {
+                        add(slot, w);
+                    }
+                }
+                DocSet::Sorted { docs, .. } => {
+                    for &d in docs {
+                        let w = d as usize / 64;
+                        add(&mut count[w * planes..(w + 1) * planes], 1 << (d % 64));
+                    }
+                }
+            }
+        }
+        // From the highest bit down: greater once a count has a 1 where
+        // `need` has a 0 and they were equal above.
+        let out = count
+            .chunks_exact(planes)
+            .map(|slot| {
+                let (mut gt, mut eq) = (0u64, !0u64);
+                for b in (0..planes).rev() {
+                    if need >> b & 1 == 1 {
+                        eq &= slot[b];
+                    } else {
+                        gt |= eq & slot[b];
+                        eq &= !slot[b];
+                    }
+                }
+                gt | eq
+            })
+            .collect();
+        DocSet::from_bits(out, n)
+    }
+
     fn normalize(self) -> Self {
         let n = self.universe();
         let dense = self.len() > n as usize / 32;
@@ -244,5 +325,32 @@ mod tests {
         assert_eq!(sa.complement().len(), n as usize - a.len());
         assert_eq!(DocSet::all(n).len(), n as usize);
         assert!(sa.contains(999) && !sa.contains(998));
+    }
+
+    #[test]
+    fn at_least_counts_like_a_loop() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for n in [1u32, 63, 64, 65, 200, 3000] {
+            for _ in 0..40 {
+                let y = 1 + next(17) as usize;
+                // Each set dense or sparse, some empty or full.
+                let sets: Vec<DocSet> = (0..y)
+                    .map(|_| {
+                        let p = [0, 1, 2, 30, 50, 90, 100][next(7) as usize];
+                        DocSet::from_sorted((0..n).filter(|_| next(100) < p).collect(), n)
+                    })
+                    .collect();
+                for need in 0..=y + 1 {
+                    let want: Vec<u32> = (0..n).filter(|&d| sets.iter().filter(|s| s.contains(d)).count() >= need).collect();
+                    assert_eq!(DocSet::at_least(&sets, need, n).to_sorted(), want, "n {n}, y {y}, need {need}");
+                }
+            }
+        }
     }
 }

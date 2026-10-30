@@ -86,6 +86,25 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
             }
             known((!unknown).then_some(false))
         }
+        // TRUE once `need` are, FALSE once too few are left to get there,
+        // and UNKNOWN when the UNKNOWN ones could go either way.
+        Expr::AtLeast { need, conds } => {
+            let (need, mut yes, mut maybe) = (*need as usize, 0, 0);
+            for x in conds {
+                match cond(x)? {
+                    Some(true) => yes += 1,
+                    None => maybe += 1,
+                    Some(false) => {}
+                }
+            }
+            known(if yes >= need {
+                Some(true)
+            } else if yes + maybe < need {
+                Some(false)
+            } else {
+                None
+            })
+        }
         Expr::IsNull(x) => Value::Bool(match eval(x, row)? {
             Value::Null => true,
             Value::List(vs) => vs.is_empty(),
@@ -348,6 +367,14 @@ fn call(func: Func, args: &[Value]) -> Result<Value> {
         Func::Upper => text(|s| Value::Str(s.to_uppercase())),
         Func::Length => text(|s| Value::Int(s.chars().count() as i64)),
         Func::SidAt => crate::sid::sid_at(&one, args.get(1).unwrap_or(&Value::Null)),
+        // UNKNOWN is not TRUE.
+        Func::CountTrue => {
+            let mut n = 0;
+            for v in args {
+                n += (truth(v).map_err(|_| err(format!("count_true counts conditions, not {v:?}")))? == Some(true)) as i64;
+            }
+            Ok(Value::Int(n))
+        }
         Func::Abs => Ok(match one {
             Value::Int(x) => x.checked_abs().map_or(Value::Float((x as f64).abs()), Value::Int),
             Value::Float(x) => Value::Float(x.abs()),

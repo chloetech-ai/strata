@@ -1343,6 +1343,14 @@ impl<'a> Binder<'a> {
                         }
                         Ok(Score::Gbdt { model, hash: String::new(), args: features.iter().map(|a| self.rank(a)).collect::<Result<_>>()?, open: Default::default() })
                     }
+                    // Each condition 1 where WHERE would keep the row, else 0.
+                    "count_true" => {
+                        if args.is_empty() || !opts.is_empty() {
+                            return Err(err("count_true(condition, ...) takes one or more conditions"));
+                        }
+                        let cond = |c: &Expr| Ok(Score::Cond(Box::new(self.pred(c)?.three_valued(&|f| self.schema.fields[f].multi).simplify())));
+                        Ok(Score::Call { func: Func::CountTrue, args: args.iter().map(|a| cond(a)).collect::<Result<_>>()? })
+                    }
                     n => match Func::numeric(n) {
                         Some(func) => {
                             func.arity(args.len()).map_err(|a| err(format!("{n}() takes {a}")))?;
@@ -1538,6 +1546,20 @@ impl<'a> Binder<'a> {
                     query = format!("({query})@{need}");
                 }
                 Pred::Match { field, query, expand }
+            }
+            // At least n of the conditions; n may be a share of them.
+            Expr::Function(func) if fname(func) == "at_least" => {
+                let usage = "AT_LEAST(n, condition, ...): n a count (2) or a percentage ('75%') of the conditions";
+                let (args, opts) = self.args(func)?;
+                let [n, conds @ ..] = args.as_slice() else { return Err(err(usage)) };
+                if conds.is_empty() {
+                    return Err(err(usage));
+                }
+                if let Some(k) = opts.keys().next() {
+                    return Err(err(format!("unknown option {k} for AT_LEAST")));
+                }
+                let need = crate::query::exec::need_of(&self.literal(n)?, "AT_LEAST's n is")?.of(conds.len());
+                Pred::AtLeast { need, items: conds.iter().map(|c| self.pred(c)).collect::<Result<_>>()? }
             }
             Expr::Function(func) if matches!(fname(func).as_str(), "reachable" | "path") => Pred::Graph { id: self.graph(func, &fname(func))? },
             Expr::Value(v) if matches!(v.value, sql::Value::Boolean(_)) => {
@@ -1993,7 +2015,7 @@ fn check_select(s: &sql::Select) -> Result<()> {
 fn contains_graph(p: &Pred) -> bool {
     match p {
         Pred::Graph { .. } => true,
-        Pred::And(ps) | Pred::Or(ps) => ps.iter().any(contains_graph),
+        Pred::And(ps) | Pred::Or(ps) | Pred::AtLeast { items: ps, .. } => ps.iter().any(contains_graph),
         Pred::Not(q) => contains_graph(q),
         _ => false,
     }

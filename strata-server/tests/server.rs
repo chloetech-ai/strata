@@ -144,6 +144,9 @@ fn queries() -> Vec<(&'static str, Json)> {
         // statistics, and a rank-safe boost.
         ("SELECT id, score() FROM products ORDER BY ln(1 + bm25(body, 'waterproof hiking')) + 0.1 * coalesce(rating, 0) DESC LIMIT 10", none.clone()),
         ("SELECT id, score() FROM products WHERE price < 200 ORDER BY bm25(body, 'leather boots') * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 8", none.clone()),
+        // Some of the conditions, and a boost by how many hold.
+        ("SELECT id, price FROM products WHERE AT_LEAST(2, MATCH(body, 'waterproof'), price < 200, year >= 2020) ORDER BY price DESC, id LIMIT 10", none.clone()),
+        ("SELECT id, score() FROM products WHERE AT_LEAST('50%', rating >= 4, tags = 'sale', category = 'outdoor') ORDER BY bm25(body, 'leather boots') * (1 + count_true(rating >= 4, year >= 2020)) DESC LIMIT 8", none.clone()),
     ]
 }
 

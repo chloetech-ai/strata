@@ -1463,6 +1463,22 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
             whens: conditions.iter().map(|c| Ok(When { when: go(&c.condition)?, then: go(&c.result)? })).collect::<Result<_>>()?,
             otherwise: else_result.as_deref().map(bx).transpose()?,
         },
+        Expr::Function(f) if fname(f) == "at_least" => {
+            let usage = "AT_LEAST(n, condition, ...): n a count (2) or a percentage ('75%') of the conditions";
+            let args = func_args(f);
+            let [n, conds @ ..] = args.as_slice() else { return Err(err(usage)) };
+            if conds.is_empty() {
+                return Err(err(usage));
+            }
+            if let FunctionArguments::List(l) = &f.args {
+                if let Some(FunctionArg::Named { name, .. }) = l.args.iter().find(|a| matches!(a, FunctionArg::Named { .. })) {
+                    return Err(err(format!("unknown option {name} for AT_LEAST")));
+                }
+            }
+            let ir::Expr::Lit(n) = go(n)? else { return Err(err(usage)) };
+            let need = crate::query::exec::need_of(&n, "AT_LEAST's n is")?.of(conds.len());
+            ir::Expr::AtLeast { need: need as u32, conds: conds.iter().map(|c| go(c)).collect::<Result<_>>()? }
+        }
         Expr::Function(f) => {
             let func = match fname(f).as_str() {
                 "lower" => Func::Lower,
@@ -1474,6 +1490,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                 "dot" if func_args(f).len() != 2 => return Err(err("dot(a, b) takes two vectors")),
                 "dot" => Func::Dot,
                 "sid_at" => Func::SidAt,
+                "count_true" => Func::CountTrue,
                 n if NATIVE.contains(&n) => {
                     return Err(err(format!("{}(...) works on one table's scan, in its WHERE or ORDER BY (in a join, on that table's column: a.body), not on values of rows", n.to_uppercase())))
                 }

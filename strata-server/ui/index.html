@@ -505,8 +505,11 @@ function vecFieldChanged() {
     : e.loaded ? `${f} is ${e.model}'s embedding of ${e.from.join(" + ")}; a description is embedded by the same model.`
     : `${f} is ${e.model}'s embedding of ${e.from.join(" + ")}, which this server cannot run: search by a row.`;
 }
-// Conditions are a tree of groups: all of (AND), any of (OR), none of (NOT).
-const newGroup = (op = "AND") => ({ group: true, op, items: [] });
+// Conditions are a tree of groups: all of (AND), any of (OR), none of (NOT),
+// at least n of (AT_LEAST).
+const newGroup = (op = "AND") => ({ group: true, op, items: [], n: "2" });
+// A group's n as AT_LEAST takes it: a count, or a share such as '75%'.
+const needSql = (g) => /^\d+$/.test(g.n.trim()) ? g.n.trim() : /^\d+%$/.test(g.n.trim()) ? lit(g.n.trim()) : "2";
 const B = { where: newGroup("AND"), fuse: "rrf", cols: null, joinCols: null, groupBy: [], metrics: [] };
 function opt(v, t) { return el("option", { value: v, text: t ?? v }); }
 function setupBuilder() {
@@ -560,10 +563,11 @@ const filterable = () => S.fields.filter((f) => f.kind !== "vector" && f.kind !=
 const changed = () => { renderFilters(); updateSql(); };
 function renderFilters() { $("bFilters").replaceChildren(renderGroup(B.where, null)); }
 function renderGroup(g, parent) {
-  const seg = el("span", { class: "seg" }, [["AND", "all of", "every condition holds (AND)"], ["OR", "any of", "at least one holds (OR)"], ["NOT", "none of", "no condition holds (NOT)"]].map(([v, t, title]) =>
+  const seg = el("span", { class: "seg" }, [["AND", "all of", "every condition holds (AND)"], ["OR", "any of", "at least one holds (OR)"], ["NOT", "none of", "no condition holds (NOT)"], ["ATLEAST", "at least n of", "at least n of the conditions hold (AT_LEAST)"]].map(([v, t, title]) =>
     el("button", { "aria-pressed": String(g.op === v), title, onclick: () => { g.op = v; changed(); } }, t)));
+  const n = g.op !== "ATLEAST" ? null : el("input", { type: "text", value: g.n, style: "width:4.5em", title: "How many of the conditions: a count (2) or a share (75%)", oninput: (e) => { g.n = e.target.value; updateSql(); } });
   const head = el("div", { class: "group-head" },
-    el("span", { class: "small muted", text: parent ? "a group: rows matching" : "Rows matching" }), seg, el("span", { class: "spacer" }),
+    el("span", { class: "small muted", text: parent ? "a group: rows matching" : "Rows matching" }), seg, n ? el("span", { class: "small muted", text: "n =" }) : null, n, el("span", { class: "spacer" }),
     el("button", { class: "btn small", onclick: () => addFilter(filterable()[0].name, null, null, g) }, "+ condition"),
     el("button", { class: "btn small", title: "A nested group, e.g. (a OR b) inside all of", onclick: () => { g.items.push(newGroup(g.op === "OR" ? "AND" : "OR")); changed(); } }, "+ group"),
     el("button", { class: "btn small", title: "Keep rows whose value is among another query's results (IN (SELECT ...))", onclick: () => { g.items.push(newSub()); changed(); } }, "+ in another query's results"),
@@ -616,6 +620,7 @@ function groupSql(g, q) {
   const parts = g.items.map((it) => itemSql(it, q)).filter(Boolean);
   if (!parts.length) return null;
   if (g.op === "NOT") return `NOT (${parts.join(" OR ")})`;
+  if (g.op === "ATLEAST") return `AT_LEAST(${needSql(g)}, ${parts.join(", ")})`;
   return parts.length === 1 ? parts[0] : `(${parts.join(g.op === "OR" ? " OR " : " AND ")})`;
 }
 // The top group's conditions, each its own line when they are ANDed.
@@ -624,6 +629,7 @@ function whereParts(q) {
   if (!parts.length) return [];
   if (g.op === "AND") return parts;
   if (g.op === "OR") return [parts.length > 1 ? `(${parts.join("\n    OR ")})` : parts[0]];
+  if (g.op === "ATLEAST") return [`AT_LEAST(${needSql(g)},\n    ${parts.join(",\n    ")})`];
   return [`NOT (${parts.join(" OR ")})`];
 }
 // Prefixes this table's column names in a condition with `alias.`.
@@ -1264,7 +1270,8 @@ function helpSections(x) {
   if (kw) fl.push({ t: "AND, OR and NOT", d: `Parentheses group conditions; NOT negates one or a group.`, sql: `SELECT ${show}${num ? ", " + num : ""} FROM ${T}\nWHERE (${kw} = ${lit(v1)} OR ${kw} = ${lit(v2)})${num ? `\n  AND NOT ${num} < ${x.avg}` : ""}\nLIMIT 20` });
   if (kw && num) fl.push({ t: "IN and BETWEEN", d: `A list of values, a range, and either negated.`, sql: `SELECT ${show}, ${kw}, ${num} FROM ${T}\nWHERE ${kw} IN (${lit(v1)}, ${lit(v2)}) AND ${num} NOT BETWEEN ${x.min} AND ${x.avg}\nLIMIT 20` });
   if (tf && kw) fl.push({ t: "Text OR a filter", d: `A text match is a condition like any other.`, sql: `SELECT ${show} FROM ${T}\nWHERE MATCH(${tf}, '${w1}') OR ${kw} = ${lit(v1)}\nLIMIT 20` });
-  if (fl.length) sec.push({ id: "filters", title: "Conditions", intro: "WHERE takes =, !=, <, <=, >, >=, IN, BETWEEN, MATCH and the graph predicates, combined with AND, OR, NOT and parentheses.", ex: fl });
+  if (tf && kw && num) fl.push({ t: "At least n of", d: `AT_LEAST(n, ...) keeps rows where n of the conditions hold (or a share: '75%'); count_true(...) counts them, to rank by.`, sql: `SELECT ${show}, score() FROM ${T}\nWHERE AT_LEAST(2, MATCH(${tf}, '${w1}'), ${kw} = ${lit(v1)}, ${num} >= ${x.avg})\nORDER BY bm25(${tf}, '${w1} ${w2}') * (1 + 0.1 * count_true(${kw} = ${lit(v1)}, ${num} >= ${x.avg})) DESC\nLIMIT 10` });
+  if (fl.length) sec.push({ id: "filters", title: "Conditions", intro: "WHERE takes =, !=, <, <=, >, >=, IN, BETWEEN, MATCH and the graph predicates, combined with AND, OR, NOT, AT_LEAST and parentheses.", ex: fl });
   const ag = [];
   if (kw) ag.push({ t: "Count, average, minimum, maximum", d: `GROUP BY KEYWORD, INT or FLOAT fields; COUNT(*), COUNT(f), COUNT(DISTINCT f), SUM, AVG, MIN and MAX per group.`, sql: `SELECT ${kw}, COUNT(*)${num ? `, AVG(${num}), MIN(${num}), MAX(${num})` : ""} FROM ${T}\nGROUP BY ${kw}\nORDER BY COUNT(*) DESC\nLIMIT 10` });
   if (kw && num) ag.push({ t: "HAVING", d: `Keep groups by their aggregates, named by alias or written out, and order by any of them.`, sql: `SELECT ${kw}, COUNT(*) AS n, AVG(${num}) AS avg_${numF.name} FROM ${T}\nGROUP BY ${kw}\nHAVING n >= 5\nORDER BY avg_${numF.name} DESC\nLIMIT 10` });

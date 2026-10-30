@@ -256,11 +256,12 @@ impl<'a> Text<'a> {
             Expr::Lit(v) => lit(v),
             Expr::Not(x) => match &**x {
                 Expr::IsNull(y) => format!("{} IS NOT NULL", self.operand(y, names)),
-                x @ (Expr::Field(_) | Expr::Lit(_) | Expr::Match { .. } | Expr::Graph(_)) => format!("NOT {}", self.expr(x, names)),
+                x @ (Expr::Field(_) | Expr::Lit(_) | Expr::Match { .. } | Expr::Graph(_) | Expr::AtLeast { .. }) => format!("NOT {}", self.expr(x, names)),
                 x => format!("NOT ({})", self.expr(x, names)),
             },
             Expr::And(xs) => xs.iter().map(|x| self.operand(x, names)).collect::<Vec<_>>().join(" AND "),
             Expr::Or(xs) => xs.iter().map(|x| self.operand(x, names)).collect::<Vec<_>>().join(" OR "),
+            Expr::AtLeast { need, conds } => format!("AT_LEAST({need}, {})", conds.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
             Expr::IsNull(x) => format!("{} IS NULL", self.operand(x, names)),
             Expr::Cmp { op, left, right } => {
                 let op = match op {

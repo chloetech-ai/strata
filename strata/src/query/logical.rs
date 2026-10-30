@@ -31,6 +31,9 @@ pub enum Pred {
     Present { field: usize },
     And(Vec<Pred>),
     Or(Vec<Pred>),
+    /// The rows at least `need` of `items` hold for (`AT_LEAST(n, c1,
+    /// ..)`), `need` from 1 to the number of items.
+    AtLeast { need: usize, items: Vec<Pred> },
     /// The rows the inner predicate does not hold: a plain complement.
     /// The binder hands the executor predicates in which NULL is already
     /// accounted for ([`Pred::three_valued`]).
@@ -172,7 +175,10 @@ impl Pred {
     /// and `IS NULL` are never UNKNOWN, and neither is a comparison on a
     /// multi-valued field (`multi`), which holds when some value matches:
     /// its negation holds when none does, also for an empty list, as
-    /// `NOT (x = ANY(list))` does. Apply it once, to a predicate as written.
+    /// `NOT (x = ANY(list))` does. `NOT AT_LEAST(n, ..)` of y conditions
+    /// holds where at least y - n + 1 of them are FALSE, so a row that
+    /// UNKNOWNs could lift to n is left out. Apply it once, to a predicate
+    /// as written.
     pub fn three_valued(self, multi: &dyn Fn(usize) -> bool) -> Pred {
         self.nnf(false, multi)
     }
@@ -187,6 +193,12 @@ impl Pred {
             Pred::Or(ps) => {
                 let ps = ps.into_iter().map(|p| p.nnf(negated, multi)).collect();
                 if negated { Pred::And(ps) } else { Pred::Or(ps) }
+            }
+            // Fewer than n TRUE, and not for want of an answer: at least
+            // y - n + 1 FALSE.
+            Pred::AtLeast { need, items } => {
+                let need = if negated { (items.len() + 1).saturating_sub(need) } else { need };
+                Pred::AtLeast { need, items: items.into_iter().map(|p| p.nnf(negated, multi)).collect() }
             }
             p if !negated => p,
             Pred::True => Pred::False,
@@ -231,6 +243,23 @@ impl Pred {
                     0 => Pred::False,
                     1 => out.pop().unwrap(),
                     _ => Pred::Or(out),
+                }
+            }
+            Pred::AtLeast { mut need, items } => {
+                let mut out = Vec::with_capacity(items.len());
+                for p in items.into_iter().map(Pred::simplify) {
+                    match p {
+                        Pred::True => need = need.saturating_sub(1),
+                        Pred::False => {}
+                        p => out.push(p),
+                    }
+                }
+                match need {
+                    0 => Pred::True,
+                    n if n > out.len() => Pred::False,
+                    1 => Pred::Or(out).simplify(),
+                    n if n == out.len() => Pred::And(out).simplify(),
+                    _ => Pred::AtLeast { need, items: out },
                 }
             }
             Pred::Not(p) => match p.simplify() {

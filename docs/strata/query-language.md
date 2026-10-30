@@ -86,7 +86,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 | `MEDIA` | a file by reference: URI, SHA-256, type, size; a `KEYWORD` index of the hashes | `=`, `IN` on the hash; `GROUP BY` |
 | `EDGES` | out-edge CSR and reverse index per segment | `REACHABLE`, `PATH`, `ppr` |
 
-Predicates combine with `AND`, `OR`, `NOT` and parentheses, across all of these.
+Predicates combine with `AND`, `OR`, `NOT`, [`AT_LEAST`](#some-of-the-conditions-at_least) and parentheses, across all of these.
 
 `INT` values are 64-bit integers and compare exactly: `id = 9007199254740993` finds that row and not 9007199254740992, which a double cannot tell apart. A fraction bounds integers by rounding inward (`n > 2.5` is `n >= 3`, `n = 2.5` matches nothing).
 
@@ -103,6 +103,27 @@ A `KEYWORD[]` field may hold the [semantic ID](server.md#semantic-ids) of a vect
 A `SPARSE` value is a JSON object of terms and non-negative weights, `{"tok": 1.25, "##en": 0.4}`, as a learned sparse model (SPLADE, BGE-M3's sparse output, OpenSearch's neural sparse models) writes it. Terms are taken as given, not analysed, and weights are stored in steps of 1/1024.
 
 A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)).
+
+## Some of the conditions: `AT_LEAST`
+
+`AT_LEAST(n, c1, c2, …)` holds where at least `n` of the conditions do. A condition is anything `WHERE` takes: a comparison, `IN`, `IS NULL`, `MATCH`, a graph predicate, a subquery condition, a group in parentheses, another `AT_LEAST`.
+
+```sql
+-- two of three signals, ranked by the text
+SELECT id, title FROM papers
+WHERE AT_LEAST(2, MATCH(title, 'covid'), year >= 2020, venue IN ('nejm', 'lancet'))
+ORDER BY bm25(body, :q) DESC LIMIT 20;
+
+-- rows meeting more of the conditions rank higher
+SELECT id FROM papers
+ORDER BY bm25(body, :q) * (1 + 0.1 * count_true(year >= 2021, venue IN ('nejm', 'lancet', 'jama'))) DESC LIMIT 20;
+```
+
+- **`n`** is a count, a percentage of the conditions (`'75%'`, rounded down) or a parameter (`:n`). Either is clamped to between 1 and the number of conditions, as [`MATCH`'s groups](#full-text-match) are: `AT_LEAST(1, …)` is the `OR` of the conditions, and a count past the end is their `AND`.
+- **`NULL`.** A condition that is UNKNOWN (a comparison with a `NULL`) is not met. Under `NOT`, `AT_LEAST` follows SQL's three-valued logic: `NOT AT_LEAST(n, …)` holds where fewer than `n` conditions would be TRUE even if every UNKNOWN one were, so it never returns a row whose answer depends on a `NULL`. With `a = 1` and `c` `NULL`, `AT_LEAST(2, a > 0, c = 'x')` leaves the row out, and so does `NOT AT_LEAST(2, a > 0, c = 'x')`.
+- **`count_true(c1, c2, …)`** is how many of the conditions hold, a number for [ranking expressions](#ranking-expressions) and `SELECT`, exactly the sum of `CASE WHEN c THEN 1 ELSE 0 END` over them: a condition on a `NULL` counts 0. In a `SELECT` over rows in memory (a join, a `WITH` result) its conditions cannot use `MATCH` or graph predicates, which only a table's indexes answer.
+- **How it runs.** Each condition becomes the set of rows it holds for, as `WHERE` evaluates it, and a counter adds the sets up 64 rows to a machine word, in ⌈log2(y + 1)⌉ words for each 64 rows; sets with few rows are merged instead. A ranking that checks its candidates one at a time tests their conditions in turn, until the count is reached or out of reach.
+- A plan with `AT_LEAST` or `count_true` needs the plan feature `at_least`. From Python, [`at_least(2, match("title", "covid"), col("year") >= 2020)`](python.md#queries-built-in-python) and `count_true(…)` build them.
 
 ## Full text: `MATCH`
 
@@ -263,6 +284,7 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 | `minmax(x)` | `x` over the rows ranked, put on [0, 1]: 1 where all are equal, 0 where `x` is `NULL` |
 | `rank(x)` | 1 plus the number of rows ranked with a greater `x`; `NULL` places after every other |
 | `CASE WHEN c THEN x … ELSE y END` | the first branch whose condition holds (any `WHERE` condition), else `y`, else `NULL` |
+| `count_true(c, …)` | how many of the conditions hold ([`AT_LEAST`](#some-of-the-conditions-at_least)) |
 
 `NULL` is a missing value (a `NULL` column, a row without a vector, one a traversal does not reach) or a result that is not a finite number (`ln(0)`, a division by 0, an overflow). Arithmetic and functions of `NULL` are `NULL`, except `coalesce`, `least` and `greatest`, which skip it. A row whose score is `NULL` ranks after every other, and its `score()` is `NULL`.
 

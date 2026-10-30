@@ -156,6 +156,7 @@ fn expr(e: &Expr) -> E {
         Expr::Not(x) => E::Not(Box::new(ex(x))),
         Expr::And(xs) => E::And(exprs(xs)),
         Expr::Or(xs) => E::Or(exprs(xs)),
+        Expr::AtLeast { need, conds } => E::AtLeast(pb::AtLeast { need: *need, conds: conds.iter().map(ex).collect() }),
         Expr::IsNull(x) => E::IsNull(Box::new(ex(x))),
         Expr::Cmp { op, left, right } => E::Cmp(Box::new(pb::Cmp {
             op: match op {
@@ -209,6 +210,7 @@ fn expr(e: &Expr) -> E {
                 Func::Clamp => pb::Func::Clamp,
                 Func::Dot => pb::Func::Dot,
                 Func::SidAt => pb::Func::SidAt,
+                Func::CountTrue => pb::Func::CountTrue,
             } as i32,
             args: args.iter().map(ex).collect(),
         }),
@@ -459,6 +461,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
         E::Not(x) => Expr::Not(Box::new(from_ex(Some(*x))?)),
         E::And(xs) => Expr::And(from_exprs(xs.v)?),
         E::Or(xs) => Expr::Or(from_exprs(xs.v)?),
+        E::AtLeast(a) => Expr::AtLeast { need: a.need, conds: from_exprs(a.conds)? },
         E::IsNull(x) => Expr::IsNull(Box::new(from_ex(Some(*x))?)),
         E::Cmp(c) => {
             let c = *c;
@@ -521,6 +524,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
                 pb::Func::Clamp => Func::Clamp,
                 pb::Func::Dot => Func::Dot,
                 pb::Func::SidAt => Func::SidAt,
+                pb::Func::CountTrue => Func::CountTrue,
             };
             Expr::Call { func, args: from_exprs(c.args)? }
         }

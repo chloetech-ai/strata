@@ -40,6 +40,7 @@ __all__ = [
     "col",
     "lit",
     "match",
+    "at_least",
     "bm25",
     "similarity",
     "maxsim",
@@ -57,6 +58,7 @@ __all__ = [
     "greatest",
     "coalesce",
     "case",
+    "count_true",
     "score",
     "hops",
     "features",
@@ -604,6 +606,42 @@ def match(field: str, query: str, *, min: int | str | None = None) -> Expr:
     return _Fn(lambda ctx: {"match": {"field": ctx.field(field)[0], "query": q}}, f"match({field!r}, {q!r})", score=False)
 
 
+def _of(need: int | str, y: int) -> int:
+    """`need` of `y` items: a count, or a percentage (`"75%"`) rounded
+    down, clamped to between 1 and `y`, as SQL's AT_LEAST reads it."""
+    s = str(need).strip() if isinstance(need, (int, str)) and not isinstance(need, bool) else ""
+    p = s[:-1] if s.endswith("%") else None
+    if not (p if p is not None else s).isdigit() or (p is not None and int(p) > 100):
+        raise StrataError(f"at_least takes a count (2) or a percentage ('75%'), not {need!r}")
+    n = y * int(p) // 100 if p is not None else int(s)
+    return max(1, min(n, y))
+
+
+class _AtLeast(Expr):
+    def __init__(self, need: int | str, conds: list[Expr]):
+        self.text, self.conds = need, conds
+        self.need = _of(need, len(conds))
+
+    def _ir(self, ctx: _Ctx) -> Any:
+        return {"at_least": {"need": self.need, "conds": [c._ir(ctx) for c in self.conds]}}
+
+    def __repr__(self) -> str:
+        return f"at_least({self.text!r}, {', '.join(map(repr, self.conds))})"
+
+
+def at_least(n: int | str, *conds: Expr) -> Expr:
+    """At least `n` of the conditions hold, as SQL's `AT_LEAST(n, ...)`:
+    `at_least(2, match("title", "covid"), col("year") >= 2020,
+    col("venue").isin(["nejm", "lancet"]))`. `n` is a count or a
+    percentage (`"75%"`, rounded down), clamped to between 1 and the
+    number of conditions. A condition on a NULL is not met, and
+    `~at_least(...)` keeps only the rows with too few met whatever their
+    NULLs are."""
+    if not conds:
+        raise StrataError("at_least(n, *conds) takes one or more conditions")
+    return _AtLeast(n, [_expr(c) for c in conds])
+
+
 def bm25(field: str, text: str, *, syntax: str | None = None, min: int | str | None = None) -> Expr:
     """BM25 of a TEXT field for `text`, as a score. `text` may weigh a
     word (`word^2`), require one (`+word`, `+"a phrase"`) or exclude one
@@ -765,6 +803,17 @@ def case(*whens: tuple[Expr, Any], otherwise: Any = None) -> Expr:
 
     text = " ".join(f"WHEN {c!r} THEN {v!r}" for c, v in zip(conds, values))
     return _Ranked("case", conds + values + rest, build, f"CASE {text}{f' ELSE {rest[0]!r}' if rest else ''} END", inputs=values + rest)
+
+
+def count_true(*conds: Expr) -> Expr:
+    """How many of the conditions hold, a number to rank by:
+    `bm25("body", q) * (1 + 0.1 * count_true(col("year") >= 2021,
+    col("venue").isin(["nejm", "lancet"])))`. A condition on a NULL counts
+    as not met."""
+    if not conds:
+        raise StrataError("count_true(*conds) takes one or more conditions")
+    parts = [_expr(c) for c in conds]
+    return _Fn(lambda ctx: {"call": {"func": "count_true", "args": [c._ir(ctx) for c in parts]}}, f"count_true({', '.join(map(repr, parts))})")
 
 
 def _graph(field: str, seeds: Any, kind: dict, dir: str, labels: Iterable[str], through: Expr | None, max_nodes: int, k: int, min_sim: float | None):

@@ -397,6 +397,7 @@ enum ProbeNode {
     Leaf(Box<dyn DocFilter>),
     And(Vec<ProbeNode>),
     Or(Vec<ProbeNode>),
+    AtLeast(usize, Vec<ProbeNode>),
     Not(Box<ProbeNode>),
 }
 
@@ -407,6 +408,22 @@ impl ProbeNode {
             ProbeNode::Leaf(f) => f.contains(d),
             ProbeNode::And(cs) => cs.iter().all(|c| c.contains(d)),
             ProbeNode::Or(cs) => cs.iter().any(|c| c.contains(d)),
+            // Done once the count reaches `need`, or the rest cannot lift
+            // it there.
+            ProbeNode::AtLeast(need, cs) => {
+                let mut have = 0;
+                for (i, c) in cs.iter().enumerate() {
+                    if c.contains(d) {
+                        have += 1;
+                        if have >= *need {
+                            return true;
+                        }
+                    } else if have + (cs.len() - i - 1) < *need {
+                        return false;
+                    }
+                }
+                *need == 0
+            }
             ProbeNode::Not(c) => !c.contains(d),
         }
     }
@@ -1005,6 +1022,10 @@ impl<'a> Executor<'a> {
                 }
                 acc
             }
+            Pred::AtLeast { need, items } => {
+                let sets = items.iter().map(|c| self.materialize(s, c)).collect::<Result<Vec<_>>>()?;
+                DocSet::at_least(&sets, *need, n)
+            }
             Pred::And(cs) => {
                 // Most selective first; once the running result is small,
                 // probing a child per survivor beats materialising it.
@@ -1084,6 +1105,7 @@ impl<'a> Executor<'a> {
             Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => ProbeNode::Not(Box::new(self.compile_probe(s, c)?)),
             Pred::Or(cs) => ProbeNode::Or(cs.iter().map(|c| self.compile_probe(s, c)).collect::<Result<_>>()?),
+            Pred::AtLeast { need, items } => ProbeNode::AtLeast(*need, items.iter().map(|c| self.compile_probe(s, c)).collect::<Result<_>>()?),
             Pred::And(cs) => {
                 let est = SegEst { ex: self, s, params: None, local_sel: None };
                 let planner = self.planner(&est);
@@ -2439,12 +2461,17 @@ pub(crate) fn plain_syntax(opts: &Opts) -> Result<bool> {
 /// The `min` option of `MATCH` and `bm25`: how many of the text's items
 /// a row needs, a count (`2`) or a percentage (`'75%'`).
 pub(crate) fn min_need(opts: &Opts) -> Result<Option<text::query::Need>> {
-    let Some(v) = opts.get("min") else { return Ok(None) };
+    opts.get("min").map(|v| need_of(v, "min =>")).transpose()
+}
+
+/// A count (`2`) or a percentage (`'75%'`) of some items, which `what`
+/// (`min =>`) takes.
+pub(crate) fn need_of(v: &Value, what: &str) -> Result<text::query::Need> {
     let need = match v {
         Value::Str(s) => text::query::Need::parse(s.trim()),
         v => v.as_f64().filter(|x| x.fract() == 0.0 && (0.0..1e9).contains(x)).map(|x| text::query::Need::Count(x as usize)),
     };
-    need.map(Some).ok_or_else(|| err(format!("min => a count (2) or a percentage ('75%'), not {v:?}")))
+    need.ok_or_else(|| err(format!("{what} a count (2) or a percentage ('75%'), not {v:?}")))
 }
 
 /// The scored terms of a `bm25` query in order, each with the weight of

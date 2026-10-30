@@ -499,11 +499,19 @@ message Expr {
     Norm norm = 36;
     // A ranking model's score of a row; plan feature "rank_models".
     Gbdt gbdt = 37;
+    // AT_LEAST(need, conds...); plan feature "at_least".
+    AtLeast at_least = 39;
     // maxsim(field, vectors); plan feature "maxsim". Numbered from 80, the
     // range of the multi-vector work, so lanes building at once do not
     // collide.
     MaxSim maxsim = 80;
   }
+}
+
+// Whether at least `need` of `conds` are TRUE.
+message AtLeast {
+  uint32 need = 1;
+  repeated Expr conds = 2;
 }
 
 // gbdt('model', features...): the model of that name in the models
@@ -617,6 +625,8 @@ enum Func {
   FUNC_DOT = 15;
   // A semantic ID's prefix (plan feature "semantic_id").
   FUNC_SID_AT = 16;
+  // The number of TRUE conditions (plan feature "at_least").
+  FUNC_COUNT_TRUE = 17;
 }
 
 message Match {

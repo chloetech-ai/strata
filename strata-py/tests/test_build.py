@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, rrf, score, similarity, sigmoid, sqrt
+from strata import at_least, bm25, case, clamp, coalesce, col, count, count_true, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, rrf, score, similarity, sigmoid, sqrt
 from conftest import BOOKS, book
 
 
@@ -51,6 +51,7 @@ def test_bm25_weighs_requires_and_excludes_words(db):
     with pytest.raises(strata.StrataError, match="'query' or 'plain'"):
         db.run(t.select("id").order_by(bm25("description", q, syntax="lucene")).limit(5))
 
+
 def test_min_asks_for_some_of_the_words(db):
     t = db.table()
     q = "dragon ship river secret"
@@ -65,6 +66,26 @@ def test_min_asks_for_some_of_the_words(db):
          "SELECT id FROM books WHERE MATCH(description, '(dragon ship river)@2 -secret') ORDER BY year LIMIT 100")
     with pytest.raises(strata.StrataError, match="count or a percentage"):
         bm25("description", q, min=1.5)
+
+
+def test_at_least_and_count_true_run_as_their_sql(db):
+    t = db.table()
+    conds = [match("description", "dragon"), col("year") >= 1990, col("genres").isin(["classic"]), col("rating") < 2]
+    sql = "MATCH(description, 'dragon'), year >= 1990, genres IN ('classic'), rating < 2"
+    for n, text in [(2, "2"), (3, "3"), ("50%", "'50%'"), (9, "9")]:
+        r = same(db, t.select("id").where(at_least(n, *conds)).order_by(col("year")).limit(100),
+                 f"SELECT id FROM books WHERE AT_LEAST({text}, {sql}) ORDER BY year LIMIT 100")
+        assert len(r) > 0, text
+    same(db, t.select("id").where(~at_least(2, *conds)).order_by(col("year")).limit(100),
+         f"SELECT id FROM books WHERE NOT AT_LEAST(2, {sql}) ORDER BY year LIMIT 100")
+    r = same(db, t.select("id", count_true(*conds).alias("k")).order_by(bm25("description", "river") * (1 + count_true(*conds))).limit(20),
+             f"SELECT id, count_true({sql}) AS k FROM books ORDER BY bm25(description, 'river') * (1 + count_true({sql})) DESC LIMIT 20")
+    assert len(r) == 20 and all(0 <= k <= 4 for _, k in r.rows) and len({k for _, k in r.rows}) > 1
+    with pytest.raises(strata.StrataError, match="a count .2. or a percentage"):
+        at_least("120%", *conds)
+    with pytest.raises(strata.StrataError, match="one or more conditions"):
+        count_true()
+
 
 def test_ranking_expressions_run_as_their_sql(db):
     """Arithmetic, functions, minmax(), rank() and case() rank as SQL's

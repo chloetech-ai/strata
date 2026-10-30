@@ -61,7 +61,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 11] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, TEXT_OPERATORS, MIN_MATCH];
+pub const FEATURES: [&str; 12] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, TEXT_OPERATORS, MIN_MATCH, AT_LEAST];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -113,6 +113,10 @@ pub const TEXT_OPERATORS: &str = "text_operators";
 /// group `(a b c)@2`, or `bm25`'s `min` option. A Strata from before them
 /// reads `)@2` as a word and ignores `min`, and so returns other rows.
 pub const MIN_MATCH: &str = "min_match";
+
+/// The feature of a plan that counts conditions: `AT_LEAST(n, ..)`
+/// ([`Expr::AtLeast`]) or `count_true(..)` ([`Func::CountTrue`]).
+pub const AT_LEAST: &str = "at_least";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -385,6 +389,9 @@ pub enum Func {
     /// The prefix of `args[1]` levels of a semantic ID `args[0]`
     /// ([`crate::sid::sid_at`]); needs [`SEMANTIC_ID`].
     SidAt,
+    /// How many of its arguments, conditions, are TRUE (UNKNOWN counts
+    /// as not); needs [`AT_LEAST`].
+    CountTrue,
 }
 
 impl Func {
@@ -408,6 +415,7 @@ impl Func {
             Func::Clamp => "clamp",
             Func::Dot => "dot",
             Func::SidAt => "sid_at",
+            Func::CountTrue => "count_true",
         }
     }
 
@@ -438,7 +446,7 @@ impl Func {
             Func::Round | Func::Log => n == 1 || n == 2,
             Func::Pow | Func::Dot | Func::SidAt => n == 2,
             Func::Clamp => n == 3,
-            Func::Coalesce | Func::Least | Func::Greatest => n >= 1,
+            Func::Coalesce | Func::Least | Func::Greatest | Func::CountTrue => n >= 1,
         };
         match (ok, self) {
             (true, _) => Ok(()),
@@ -446,7 +454,7 @@ impl Func {
             (_, Func::Pow | Func::Dot) => Err("two arguments"),
             (_, Func::SidAt) => Err("two arguments: a semantic ID and a number of levels"),
             (_, Func::Clamp) => Err("three arguments: a value, its least and its greatest"),
-            (_, Func::Coalesce | Func::Least | Func::Greatest) => Err("at least one argument"),
+            (_, Func::Coalesce | Func::Least | Func::Greatest | Func::CountTrue) => Err("at least one argument"),
             _ => Err("one argument"),
         }
     }
@@ -459,7 +467,7 @@ impl Func {
         // NULL in, NULL out, except where a function skips it: `pow(1,
         // NULL)` and `clamp(NULL, 0, 1)` are not 1 and 0, as f64's pow and
         // max would make them.
-        if !matches!(self, Func::Coalesce | Func::Least | Func::Greatest) && args.iter().any(|a| a.is_nan()) {
+        if !matches!(self, Func::Coalesce | Func::Least | Func::Greatest | Func::CountTrue) && args.iter().any(|a| a.is_nan()) {
             return f64::NAN;
         }
         let x = args.first().copied().unwrap_or(f64::NAN);
@@ -486,6 +494,8 @@ impl Func {
             Func::Least => args.iter().copied().filter(|v| !v.is_nan()).reduce(f64::min).unwrap_or(f64::NAN),
             Func::Greatest => args.iter().copied().filter(|v| !v.is_nan()).reduce(f64::max).unwrap_or(f64::NAN),
             Func::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            // Conditions as 1 and 0.
+            Func::CountTrue => args.iter().filter(|&&v| v != 0.0 && !v.is_nan()).count() as f64,
             Func::Clamp => match (args.get(1), args.get(2)) {
                 (Some(&lo), Some(&hi)) => x.max(lo).min(hi),
                 _ => f64::NAN,
@@ -547,6 +557,10 @@ pub enum Expr {
     Not(Box<Expr>),
     And(Vec<Expr>),
     Or(Vec<Expr>),
+    /// Whether at least `need` of `conds` are TRUE (`AT_LEAST(n, c1,
+    /// ..)`): FALSE where fewer are TRUE and UNKNOWN, UNKNOWN where the
+    /// UNKNOWN ones decide it (feature [`AT_LEAST`]).
+    AtLeast { need: u32, conds: Vec<Expr> },
     /// The expression has no value (a multi-valued field: holds none).
     IsNull(Box<Expr>),
     Cmp { op: CmpOp, left: Box<Expr>, right: Box<Expr> },
@@ -1243,7 +1257,7 @@ impl Expr {
         };
         match self {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } => x.visit(f),
-            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) => xs.iter().for_each(|x| x.visit(f)),
+            Expr::And(xs) | Expr::Or(xs) | Expr::AtLeast { conds: xs, .. } | Expr::Concat(xs) | Expr::Product(xs) => xs.iter().for_each(|x| x.visit(f)),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => {
                 left.visit(f);
                 right.visit(f);
@@ -1284,7 +1298,14 @@ impl Expr {
         let mut within: Vec<&mut Expr> = Vec::new();
         match self {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } | Expr::MaxSim { vectors: x, .. } => within.push(x),
-            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Gbdt { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
+            Expr::And(xs)
+            | Expr::Or(xs)
+            | Expr::AtLeast { conds: xs, .. }
+            | Expr::Concat(xs)
+            | Expr::Product(xs)
+            | Expr::Call { args: xs, .. }
+            | Expr::Gbdt { args: xs, .. }
+            | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
                 within.push(expr);
@@ -1373,6 +1394,11 @@ impl Plan {
         }
         if root.has_min_match() {
             features.push(MIN_MATCH.to_string());
+        }
+        let mut counts = false;
+        root.visit_exprs(&mut |e| counts |= matches!(e, Expr::AtLeast { .. } | Expr::Call { func: Func::CountTrue, .. }));
+        if counts {
+            features.push(AT_LEAST.to_string());
         }
         Plan { version: VERSION, features, root }
     }
