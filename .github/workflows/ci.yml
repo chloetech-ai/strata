@@ -53,14 +53,17 @@ jobs:
       # The ci profile is release without link-time optimisation and with
       # 16 codegen units (each crate's Cargo.toml): with release's, building
       # Strata's test binaries took 37 of the 40 minutes of its tests.
+      # Strata's SQLite import and export (feature `sqlite`) are tested and
+      # linted in the strata job; strata-server and the Python package turn
+      # the feature on.
       - name: Tests
         working-directory: ${{ matrix.crate }}
-        run: cargo test --profile ci
+        run: cargo test --profile ci ${{ matrix.crate == 'strata' && '--features sqlite' || '' }}
       # Compiler warnings and clippy's correctness and suspicious lints fail
       # the build; style, complexity and performance lints are advice.
       - name: Clippy
         working-directory: ${{ matrix.crate }}
-        run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+        run: cargo clippy --release --all-targets ${{ matrix.crate == 'strata' && '--features sqlite' || '' }} -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
 
   # strata-server, engram and the Python package build for a generic CPU,
   # where Strata chooses its SIMD kernels at run time: test the kernels in
@@ -280,6 +283,15 @@ jobs:
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:7702/v1/health && break; sleep 1; done
           printf 'id,title\nc,third row\n' | curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=csv' -H 'content-type: text/csv' --data-binary @- | grep -q '"written":1'
           curl -sf http://127.0.0.1:7702/v1/health | grep -q '"docs":3'
+          # A SQLite database's tables into a new database, and back out.
+          python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.executescript(\"CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, at DATETIME); INSERT INTO notes VALUES (1, 'a first note about rivers and mountains', '2026-10-01 12:00:00');\"); c.commit()" "$RUNNER_TEMP/s.sqlite"
+          ./target/release/strata-server import --db "$RUNNER_TEMP/s.strata" "$RUNNER_TEMP/s.sqlite"
+          ./target/release/strata-server export --db "$RUNNER_TEMP/s.strata" "$RUNNER_TEMP/s2.sqlite"
+          python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); assert c.execute(\"SELECT notes.rowid, at FROM notes_fts JOIN notes ON notes.rowid = notes_fts.rowid WHERE notes_fts MATCH 'river'\").fetchall() == [(1, '2026-10-01 12:00:00')]" "$RUNNER_TEMP/s2.sqlite"
+          # And over HTTP: the SQLite file into the running server, a new table, and the database back out.
+          curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=sqlite' -H 'content-type: application/vnd.sqlite3' --data-binary @"$RUNNER_TEMP/s.sqlite" | grep -q '"written":1'
+          curl -sf http://127.0.0.1:7702/v1/export -o "$RUNNER_TEMP/s3.sqlite"
+          python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); assert c.execute('SELECT count(*) FROM t').fetchone() == (3,); assert c.execute('SELECT body FROM notes').fetchall() == [('a first note about rivers and mountains',)]" "$RUNNER_TEMP/s3.sqlite"
 
   python:
     name: Python package on ${{ matrix.os }}

@@ -49,12 +49,6 @@ use crate::error::{Error, Result};
 use crate::workload::run::{BuildReport, QueryOutput, System};
 use crate::workload::{self, Kind, Pred, WorkloadQuery, FACET_K, RRF_DEPTH, TOP_K};
 
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        Error::Query(format!("sqlite: {e}"))
-    }
-}
-
 const SCHEMA: &str = "
 CREATE TABLE docs(id TEXT PRIMARY KEY, title TEXT, text TEXT, year INTEGER,
                   category TEXT, rating REAL, topic TEXT, emb BLOB);
