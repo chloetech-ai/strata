@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import bm25, case, clamp, coalesce, col, count, exp, greatest, least, lit, ln, log, match, minmax, rank, rrf, score, similarity, sigmoid, sqrt
+from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, minmax, rank, rrf, score, similarity, sigmoid, sqrt
 from conftest import BOOKS, book
 
 
@@ -86,6 +86,38 @@ def test_rerank_phases_run_as_their_sql(db):
         first.rerank(col("rating"), 0)
     with pytest.raises(strata.StrataError, match="follow an order_by"):
         t.select("id").rerank(col("rating"), 10).plan()
+
+
+def test_features_run_as_their_sql(db):
+    """`features()` and ranking expressions in `select` give the values
+    SQL's do, named as Python writes them."""
+    t = db.table()
+    dragon, river = bm25("description", "dragon"), bm25("title", "river")
+    boost = dragon * (1 + 0.2 * coalesce(col("rating"), 0))
+    later = ln(1 + river) - 0.1 * col("rating")
+    for q, sql, names in [
+        (t.select("id", score(), features()).order_by(boost).limit(10),
+         "SELECT id, score(), features() FROM books ORDER BY bm25(description, 'dragon') * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 10",
+         ["id", "score()", repr(dragon), "rating", repr(boost)]),
+        (t.select("id", features()).order_by(rrf(river, dragon)).limit(8),
+         "SELECT id, features() FROM books ORDER BY rrf(bm25(title, 'river'), bm25(description, 'dragon')) DESC LIMIT 8",
+         ["id", repr(river), repr(dragon)]),
+        (t.select("id", score(), features()).order_by(bm25("description", "dragon ship river")).rerank(later, 30).limit(8),
+         "WITH top AS (SELECT * FROM books ORDER BY bm25(description, 'dragon ship river') DESC LIMIT 30) SELECT id, score(), features() FROM top ORDER BY ln(1 + bm25(title, 'river')) - 0.1 * rating DESC LIMIT 8",
+         ["id", "score()", "bm25('description', 'dragon ship river')", repr(river), "rating", repr(later)]),
+        (t.select("id", river.alias("r"), col("year") / 1000).order_by(col("rating").desc()).limit(10),
+         "SELECT id, bm25(title, 'river') AS r, year / 1000 FROM books ORDER BY rating DESC LIMIT 10",
+         ["id", "r", repr(col("year") / 1000)]),
+    ]:
+        got, want = db.run(q), db.query(sql)
+        assert got.columns == names, sql
+        assert got.rows == want.rows, sql
+    with pytest.raises(strata.StrataError, match="no order_by"):
+        t.select("id", features()).plan()
+    with pytest.raises(strata.StrataError, match="not of groups"):
+        t.select("genres", count(), features()).group_by("genres").plan()
+    with pytest.raises(strata.StrataError, match="against each other"):
+        db.run(t.select("id", minmax(col("rating")).alias("m")).order_by(col("rating").desc()).limit(3))
 
 
 def test_groups(db):

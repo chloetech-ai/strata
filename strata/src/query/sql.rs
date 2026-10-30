@@ -32,6 +32,7 @@ use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArg
 use crate::error::{Error, Result};
 use crate::query::ir::{ArithOp, Func, NormKind};
 use crate::query::{ddl, ir};
+use crate::query::rank::Rank;
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
 use crate::schema::{Field, FieldType, Logical, Schema};
 use crate::storage::DropOptions;
@@ -561,6 +562,31 @@ pub(crate) fn bind_query_with(q: &sql::Query, schema: &Schema, params: &Params, 
     Binder { subs: Some(subs), ..Binder::new(schema, params) }.query(q)
 }
 
+/// [`bind_query_with`] for the last step of rerank phases: `earlier` are the
+/// ORDER BY expressions of the phases before it, first to last, which
+/// `features()` lists with its own.
+pub(crate) fn bind_phase_with(q: &sql::Query, schema: &Schema, params: &Params, subs: &Subs, earlier: &[Expr]) -> Result<Select> {
+    Binder { subs: Some(subs), earlier, ..Binder::new(schema, params) }.query(q)
+}
+
+/// `sql_text`, one SELECT that ranks rows (a table's, or rerank phases'),
+/// with `score()` and `features()` added to its columns: the values each
+/// row was ranked by, which `/v1/explain` shows for the top rows.
+pub fn with_features(sql_text: &str) -> Result<String> {
+    let one = || err("hits explain the rows of one SELECT ranked by an ORDER BY");
+    let mut stmts = super::parse::parse(sql_text)?;
+    let [sql::Statement::Query(q)] = stmts.as_mut_slice() else { return Err(one()) };
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(one()) };
+    if q.order_by.is_none() {
+        return Err(one());
+    }
+    let mut extra = super::parse::parse("SELECT score(), features()")?;
+    let Some(sql::Statement::Query(x)) = extra.pop() else { return Err(one()) };
+    let sql::SetExpr::Select(x) = *x.body else { return Err(one()) };
+    s.projection.extend(x.projection);
+    Ok(q.to_string())
+}
+
 /// The query of `(SELECT ...)`, in parentheses or not.
 fn subquery_of(e: &Expr) -> Option<&sql::Query> {
     match e {
@@ -580,11 +606,14 @@ struct Binder<'a> {
     /// The statement's time, in microseconds since the epoch: `now()` in
     /// `decay` and the `"now"` default of a TIMESTAMP.
     now: i64,
+    /// The ORDER BY expressions of the rerank phases before this query's
+    /// ([`bind_phase_with`]).
+    earlier: &'a [Expr],
 }
 
 impl<'a> Binder<'a> {
     fn new(schema: &'a Schema, params: &'a Params) -> Self {
-        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now() }
+        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now(), earlier: &[] }
     }
 
     /// The expression a compound query's subquery stands for.
@@ -629,8 +658,27 @@ impl<'a> Binder<'a> {
             _ => return Err(err("GROUP BY ALL is not supported")),
         };
         let mut projection = Vec::new();
+        let mut features = false;
         for item in &s.projection {
             let (e, alias) = match item {
+                sql::SelectItem::UnnamedExpr(Expr::Function(f)) if fname(f) == "features" => {
+                    if !self.args_raw(f).is_ok_and(|(a, n)| a.is_empty() && n.is_empty()) {
+                        return Err(err("features() takes no arguments"));
+                    }
+                    let own = match &q.order_by {
+                        Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) if !es.is_empty() => Some(self.ordered_expr(&es[0].expr, &s.projection)?),
+                        _ => None,
+                    };
+                    let orders: Vec<&Expr> = self.earlier.iter().chain(own).collect();
+                    if orders.is_empty() {
+                        return Err(err("features() lists the inputs of the query's ranking, and it has no ORDER BY"));
+                    }
+                    for e in self.feature_items(&orders)? {
+                        projection.push((name_of(&e), self.projection(&e)?));
+                    }
+                    features = true;
+                    continue;
+                }
                 sql::SelectItem::UnnamedExpr(e) => (e, None),
                 sql::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
                 sql::SelectItem::Wildcard(_) => {
@@ -648,8 +696,12 @@ impl<'a> Binder<'a> {
         }
         let aggregated = !group_by.is_empty() || projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
         if aggregated {
+            if features {
+                return Err(err("features() lists the inputs of a ranking of rows, not of groups"));
+            }
             for (name, p) in &projection {
                 match p {
+                    Projection::Feature(_) => return Err(err(format!("{name}: a ranking expression scores rows, not groups"))),
                     Projection::Field(f) if !group_by.contains(f) => {
                         return Err(err(format!("{name} must be in GROUP BY or inside an aggregate (COUNT, SUM, AVG, MIN, MAX)")))
                     }
@@ -815,7 +867,12 @@ impl<'a> Binder<'a> {
             k: count("k", 10.0)?.max(1) as usize,
             min_sim: num("min_sim", f64::NEG_INFINITY)?,
         };
+        // The same computation named twice (in SELECT and ORDER BY) runs
+        // once.
         let mut gs = self.graphs.borrow_mut();
+        if let Some(i) = gs.iter().position(|x| *x == g) {
+            return Ok(i);
+        }
         gs.push(g);
         Ok(gs.len() - 1)
     }
@@ -913,10 +970,84 @@ impl<'a> Binder<'a> {
                 "hops" => Ok(Projection::Hops(self.hops_graph()?)),
                 "seq_no" => Ok(Projection::SeqNo),
                 "count" | "sum" | "avg" | "min" | "max" => self.aggregate(f),
-                n => Err(err(format!("unsupported function in SELECT: {n}"))),
+                "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
+                _ => self.feature(e),
             },
+            Expr::Nested(_) | Expr::UnaryOp { .. } | Expr::BinaryOp { .. } | Expr::Case { .. } => self.feature(e),
             _ => Err(err(format!("unsupported select expression: {e}"))),
         }
+    }
+
+    /// A ranking expression in SELECT: one that scores each row by itself.
+    fn feature(&self, e: &Expr) -> Result<Projection> {
+        let s = self.score(e)?;
+        if Rank::of(&s, 0).is_some_and(|r| !r.is_row_local()) {
+            return Err(err(format!("{e}: a set function (minmax, rank), rrf or a weighted fusion ranks rows against each other, so it is not a column; select score()")));
+        }
+        Ok(Projection::Feature(s))
+    }
+
+    /// The expression an ORDER BY key stands for: the selected column it
+    /// names by position, or itself.
+    fn ordered_expr<'e>(&self, e: &'e Expr, items: &'e [sql::SelectItem]) -> Result<&'e Expr> {
+        let Some(n) = literal_usize(e) else { return Ok(e) };
+        match items.get(n.wrapping_sub(1)) {
+            Some(sql::SelectItem::UnnamedExpr(Expr::Function(f))) if fname(f) == "features" => Err(err(format!("ORDER BY {n}: features() is not one column"))),
+            Some(sql::SelectItem::UnnamedExpr(x) | sql::SelectItem::ExprWithAlias { expr: x, .. }) => Ok(x),
+            _ => Err(err(format!("ORDER BY {n}: no such column"))),
+        }
+    }
+
+    /// What `features()` stands for in a query ranked by `orders` (the
+    /// ORDER BY of each rerank phase, first to last): each leaf of the
+    /// ranking (a column, or a score such as `bm25(body, :q)`), then each
+    /// phase's expression that is not a leaf and scores a row by itself,
+    /// each once, named by its SQL text. A ranking by `distance(..)`
+    /// reads its `similarity(..)`.
+    fn feature_items(&self, orders: &[&Expr]) -> Result<Vec<Expr>> {
+        // Functions of other scores, and the rows they read.
+        let inner = |f: &sql::Function| matches!(fname(f).as_str(), "rrf" | "minmax" | "rank") || Func::numeric(&fname(f)).is_some();
+        let leaf = |e: &Expr| !matches!(e, Expr::Nested(_) | Expr::UnaryOp { .. } | Expr::BinaryOp { .. } | Expr::Case { .. } | Expr::Value(_)) && !matches!(e, Expr::Function(f) if inner(f));
+        fn leaves(b: &Binder, e: &Expr, leaf: &dyn Fn(&Expr) -> bool, out: &mut Vec<Expr>) -> Result<()> {
+            match e {
+                Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } => leaves(b, x, leaf, out)?,
+                Expr::BinaryOp { left, right, .. } => {
+                    leaves(b, left, leaf, out)?;
+                    leaves(b, right, leaf, out)?;
+                }
+                Expr::Case { conditions, else_result, .. } => {
+                    for x in conditions.iter().map(|c| &c.result).chain(else_result.as_deref()) {
+                        leaves(b, x, leaf, out)?;
+                    }
+                }
+                Expr::Value(_) => {}
+                Expr::Function(f) if !leaf(e) => {
+                    for a in b.args_raw(f)?.0 {
+                        leaves(b, a, leaf, out)?;
+                    }
+                }
+                Expr::Function(f) if fname(f) == "distance" => {
+                    let mut g = f.clone();
+                    g.name = sql::ObjectName::from(vec![sql::Ident::new("similarity")]);
+                    out.push(Expr::Function(g));
+                }
+                e => out.push(e.clone()),
+            }
+            Ok(())
+        }
+        let mut items = Vec::new();
+        for e in orders {
+            leaves(self, e, &leaf, &mut items)?;
+        }
+        for e in orders {
+            let e = strip_nested(e);
+            if !leaf(e) && Rank::of(&self.score(e)?, 0).is_none_or(|r| r.is_row_local()) {
+                items.push(e.clone());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        items.retain(|e| seen.insert(name_of(e)));
+        Ok(items)
     }
 
     /// `COUNT(*)`, `COUNT([DISTINCT] f)`, `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`.
@@ -1066,6 +1197,7 @@ impl<'a> Binder<'a> {
                 Projection::Score => Err(err("ORDER BY score(): order by the score expression itself")),
                 Projection::SeqNo => Err(err("ORDER BY seq_no(): a query cannot order by it")),
                 Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true, nulls_first: false }),
+                Projection::Feature(s) => Ok(OrderBy::Score { score: s.clone(), desc, nulls_first: false }),
                 Projection::Count | Projection::Agg { .. } => Err(err("ORDER BY an aggregate needs GROUP BY")),
             };
         }
@@ -1182,6 +1314,7 @@ impl<'a> Binder<'a> {
                     // The number of hops, in an expression.
                     "hops" if args.is_empty() => Ok(Score::Hops { graph: self.hops_graph()?, far_first: true }),
                     "seq_no" if args.is_empty() => Ok(Score::SeqNo),
+                    "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
                     "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
                     "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),
                     n => match Func::numeric(n) {
@@ -1799,6 +1932,14 @@ fn contains_graph(p: &Pred) -> bool {
 fn without_norm(mut opts: Opts) -> Opts {
     opts.remove("norm");
     opts
+}
+
+/// `e` without the parentheses around it.
+fn strip_nested(e: &Expr) -> &Expr {
+    match e {
+        Expr::Nested(x) => strip_nested(x),
+        e => e,
+    }
 }
 
 fn fname(f: &sql::Function) -> String {

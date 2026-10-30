@@ -60,7 +60,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 5] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES];
+pub const FEATURES: [&str; 6] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -84,6 +84,12 @@ pub const SEMANTIC_ID: &str = "semantic_id";
 /// The feature of a plan whose Search reranks its top rows in phases
 /// ([`Search::phases`]).
 pub const RANK_PHASES: &str = "rank_phases";
+
+/// The feature of a plan with a column of a Search that is a ranking
+/// expression scoring each row by itself (`bm25(title, :q)`, what SQL's
+/// `features()` lists), rather than a field, `score()`, `hops()` or
+/// `seq_no()`.
+pub const RANK_FEATURES: &str = "rank_features";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -700,6 +706,44 @@ impl Node {
         }
     }
 
+    /// Whether a Search's columns in the plan hold a ranking expression
+    /// ([`RANK_FEATURES`]).
+    pub fn has_features(&self) -> bool {
+        fn within(e: &Expr) -> bool {
+            let mut found = false;
+            e.visit(&mut |x| {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    found |= n.has_features();
+                }
+            });
+            found
+        }
+        // The columns of `Project [Limit] Search`.
+        fn over_search(n: &Node) -> bool {
+            match n {
+                Node::Limit { input, .. } => over_search(input),
+                n => matches!(n, Node::Search(_)),
+            }
+        }
+        match self {
+            Node::Search(s) => within(&s.filter),
+            Node::Project { input, columns } if over_search(input) => {
+                columns.iter().any(|c| !matches!(c.expr, Expr::Field(_) | Expr::Score | Expr::Hops | Expr::SeqNo)) || input.has_features()
+            }
+            Node::Filter { input, cond } => input.has_features() || within(cond),
+            Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input } => input.has_features(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_features() || b.has_features(),
+            Node::With { ctes, input } => input.has_features() || ctes.iter().any(|c| c.input.has_features()),
+            Node::Insert { .. } | Node::Ref { .. } => false,
+        }
+    }
+
     /// Whether a Search in the plan ranks by an expression that needs
     /// [`RANK_EXPRESSIONS`].
     pub fn ranks_by_expression(&self) -> bool {
@@ -1056,6 +1100,9 @@ impl Plan {
         }
         if root.has_phases() {
             features.push(RANK_PHASES.to_string());
+        }
+        if root.has_features() {
+            features.push(RANK_FEATURES.to_string());
         }
         Plan { version: VERSION, features, root }
     }

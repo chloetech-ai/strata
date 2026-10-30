@@ -560,6 +560,10 @@ impl<'a> Executor<'a> {
         }
         self.run_graphs(&q.graphs)?;
         let empty = |columns, rows, stats| ResultSet { columns, rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
+        let grouped = !q.group_by.is_empty() || q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
+        if grouped && q.projection.iter().any(|(_, p)| matches!(p, Projection::Feature(_))) {
+            return Err(err("a ranking expression in SELECT scores rows, not groups"));
+        }
         if !q.group_by.is_empty() || agg::is_general(q, |f| self.facet_field(f)) {
             let needed = agg::needed(q);
             let groups = if agg::is_general(q, |f| self.facet_field(f)) { self.aggregate(q, &needed)? } else { self.facets(q, q.group_by[0], &needed)? };
@@ -2109,16 +2113,29 @@ impl<'a> Executor<'a> {
                 _ => None,
             })
             .collect();
+        // Each ranking expression's value of every row, column by column.
+        let features: Vec<Option<Vec<f64>>> = q
+            .projection
+            .iter()
+            .map(|(_, p)| match p {
+                Projection::Feature(score) => self.feature_values(score, hits).map(Some),
+                _ => Ok(None),
+            })
+            .collect::<Result<_>>()?;
         let mut rows = Vec::with_capacity(hits.len());
-        for h in hits {
+        for (r, h) in hits.iter().enumerate() {
             let s = &self.seg_by_ord(h.seg);
             let fetched = match (s.r.store()?, stored.is_empty()) {
                 (Some(store), false) => store.get_fields(h.doc, &stored),
                 _ => Vec::new(),
             };
             let mut row = Vec::with_capacity(q.projection.len());
-            for (_, p) in &q.projection {
+            for (c, (_, p)) in q.projection.iter().enumerate() {
                 row.push(match p {
+                    Projection::Feature(_) => match features[c].as_ref().map(|v| v[r]) {
+                        Some(x) if x.is_finite() => Value::Float(x),
+                        _ => Value::Null,
+                    },
                     // A row without the ordering column's value scores ±inf.
                     Projection::Score if h.score.is_finite() => Value::Float(h.score),
                     Projection::Score => Value::Null,
@@ -2139,6 +2156,23 @@ impl<'a> Executor<'a> {
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    /// The value of the ranking expression `score`, which scores each row
+    /// by itself, for each of `hits` (NaN where a row has none): what the
+    /// query's ranking computes for the row.
+    fn feature_values(&self, score: &Score, hits: &[Hit]) -> Result<Vec<f64>> {
+        let rank = Rank::of_phase(score);
+        let values = self.row_values(&rank, hits)?;
+        let mut leaves = vec![0.0; values.len()];
+        Ok((0..hits.len())
+            .map(|i| {
+                for (l, v) in leaves.iter_mut().zip(&values) {
+                    *l = v[i];
+                }
+                rank.eval_row(&leaves)
+            })
+            .collect())
     }
 
     fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {
@@ -2230,13 +2264,18 @@ fn merge_top(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
     hits
 }
 
-/// The BM25 inputs of a query and of the subqueries that seed its graphs.
+/// The BM25 inputs of a query (its ranking, its phases' and its columns')
+/// and of the subqueries that seed its graphs.
 pub(crate) fn bm25_leaves<'q>(q: &'q Select, out: &mut Vec<(usize, &'q str, &'q Opts)>) {
     let order = match &q.order {
         Some(OrderBy::Score { score, .. }) => Some(score),
         _ => None,
     };
-    for score in order.into_iter().chain(q.phases.iter().map(|p| &p.score)) {
+    let columns = q.projection.iter().filter_map(|(_, p)| match p {
+        Projection::Feature(s) => Some(s),
+        _ => None,
+    });
+    for score in order.into_iter().chain(q.phases.iter().map(|p| &p.score)).chain(columns) {
         for l in score.leaves() {
             if let Score::Bm25 { field, text, opts } = l {
                 out.push((*field, text, opts));

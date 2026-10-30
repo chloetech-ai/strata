@@ -517,11 +517,19 @@ async fn coordinator_answers_like_one_database() {
         // Rerank phases: a second phase each shard scores, a global one.
         "WITH top AS (SELECT * FROM products ORDER BY bm25(body, 'waterproof hiking') DESC LIMIT 60) SELECT id, score() FROM top ORDER BY bm25(body, 'boots') + coalesce(rating, 0) DESC LIMIT 10",
         "WITH a AS (SELECT * FROM products WHERE price < 300 ORDER BY bm25(body, 'leather') DESC LIMIT 80), b AS (SELECT * FROM a ORDER BY rating DESC LIMIT 30) SELECT id, price, score() FROM b ORDER BY minmax(bm25(body, 'jacket')) - 0.5 * minmax(price) DESC LIMIT 8 OFFSET 2",
+        // Features: the fetch round scores BM25 with the query's
+        // statistics, and so does one round.
+        "SELECT id, title, features() FROM products ORDER BY bm25(body, 'waterproof hiking') * (1 + 0.1 * coalesce(rating, 0)) DESC LIMIT 10",
+        "SELECT id, bm25(body, 'boots') AS b, ln(1 + bm25(body, 'leather')) - 0.01 * price AS x FROM products ORDER BY price DESC LIMIT 12",
+        "WITH top AS (SELECT * FROM products ORDER BY bm25(body, 'waterproof hiking') DESC LIMIT 60) SELECT id, score(), features() FROM top ORDER BY bm25(body, 'boots') + coalesce(rating, 0) DESC LIMIT 10",
     ] {
         let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
         assert!(!want["rows"].as_array().unwrap().is_empty(), "{sql}");
         let got = coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
         same(sql, &want, &js::result(&got.rs, 0.0));
+        if sql.contains("features()") {
+            assert!(got.rs.stats.plan.iter().any(|l| l.starts_with("fetch: ")), "{sql}: {:?}", got.rs.stats.plan);
+        }
     }
     let h = coord.health().await;
     assert_eq!((h["status"].as_str(), h["docs"].as_u64()), (Some("ok"), Some(N as u64)), "{h}");
@@ -2153,6 +2161,22 @@ async fn explain_gives_the_plan_ir() {
         "{r}"
     );
     assert!(r["plan"].as_array().is_some_and(|p| !p.is_empty()), "{r}");
+    assert!(r.get("hits").is_none(), "{r}");
+    // `hits`: the top rows with the values they were ranked by.
+    let boosted = "SELECT id, price FROM products ORDER BY bm25(body, 'quiet kettle') * (1 + 0.1 * coalesce(rating, 0)) DESC LIMIT 5";
+    let (status, h) = post(&c, &format!("{base}/v1/explain"), json!({ "sql": boosted, "hits": 3 })).await;
+    assert_eq!(status, 200, "{h}");
+    let hits = h["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3, "{h}");
+    let (_, want) = post(&c, &format!("{base}/v1/query"), json!({ "sql": boosted })).await;
+    for (i, hit) in hits.iter().enumerate() {
+        assert_eq!(hit["id"], want["rows"][i][0], "{h}");
+        let (score, bm25, rating) = (hit["score()"].as_f64().unwrap(), hit["bm25(body, 'quiet kettle')"].as_f64().unwrap(), hit["rating"].as_f64().unwrap_or(0.0));
+        assert!((score - bm25 * (1.0 + 0.1 * rating)).abs() < 1e-9 * score.max(1.0), "{hit}");
+        assert_eq!(hit["bm25(body, 'quiet kettle') * (1 + 0.1 * coalesce(rating, 0))"], hit["score()"], "{hit}");
+    }
+    let (status, e) = post(&c, &format!("{base}/v1/explain"), json!({ "sql": "SELECT id FROM products LIMIT 3", "hits": 3 })).await;
+    assert!(status == 400 && e["error"].as_str().unwrap().contains("ORDER BY"), "{e}");
     // POST /v1/plan runs that plan as /v1/query runs the SQL, and a write
     // plan as /v1/sql runs the statement.
     let (status, want) = post(&c, &format!("{base}/v1/query"), json!({ "sql": sql })).await;

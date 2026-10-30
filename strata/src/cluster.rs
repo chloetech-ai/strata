@@ -154,12 +154,16 @@ pub fn scores_bm25(q: &Select) -> bool {
 /// Whether a fetch phase reads less than one round would: `q` returns a
 /// page of rows (not groups or counts, and with a LIMIT, as a query
 /// without one keeps every shard's rows) and selects a column besides the
-/// primary key and the score, which [`ids`] answers by themselves.
+/// primary key and the score, which [`ids`] answers by themselves: a field,
+/// or a ranking expression, which the fetch then computes for the page
+/// alone (with the query's BM25 statistics, [`ExecOptions::stats`]).
 pub fn fetches(q: &Select, schema: &Schema) -> bool {
     let Some(pk) = schema.primary_key else { return false };
     let rows = q.limit.is_some() && q.group_by.is_empty() && !agg::is_general(q, |_| false) && !q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
     // A BOOL or TIMESTAMP key would come back as its stored integer.
-    rows && q.graphs.is_empty() && schema.fields[pk].logical.is_none() && q.projection.iter().any(|(_, p)| matches!(p, Projection::Field(f) if *f != pk))
+    rows && q.graphs.is_empty()
+        && schema.fields[pk].logical.is_none()
+        && q.projection.iter().any(|(_, p)| matches!(p, Projection::Field(f) if *f != pk) || matches!(p, Projection::Feature(_)))
 }
 
 /// `q` answering only its rows' primary keys (with their scores, as every
@@ -170,7 +174,9 @@ pub fn ids(q: &Select, schema: &Schema) -> Result<Select> {
 }
 
 /// `q`'s columns of the rows with primary keys `keys`, in no order: the
-/// fetch phase, which a shard answers from the snapshot it ranked from.
+/// fetch phase, which a shard answers from the snapshot it ranked from,
+/// with the BM25 statistics the query ranked with when a column scores
+/// BM25 ([`scores_bm25`]).
 pub fn fetch(q: &Select, schema: &Schema, keys: Vec<Value>) -> Result<Select> {
     let pk = schema.primary_key.ok_or_else(|| err(format!("{} has no primary key", schema.table)))?;
     Ok(Select {

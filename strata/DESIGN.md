@@ -529,6 +529,10 @@ GROUP BY category ORDER BY 2 DESC LIMIT 5;
   DESC LIMIT 100) SELECT ... FROM top ORDER BY <expression> DESC`), plans
   as one Search with phases; each ranks the top `count` rows of the one
   before, rows tied keeping their order.
+* Features: a ranking expression that scores a row by itself is a column
+  (`SELECT bm25(title, :t) AS t`), and `features()` stands for the
+  ranking's inputs (its leaves, then each phase's row-local expression),
+  each named by its SQL text.
 * `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`:
   a numeric column's closeness to `origin`, as Elasticsearch's decay
   functions: `d = max(0, |x − origin| − offset)` maps to 1 at `d = 0` and
@@ -884,6 +888,19 @@ rows it reranks. The cost is a second phase on up to shards × `count`
 rows instead of `count`, which is why costly models will go in the
 global phase. SQL writes phases with `WITH` (`compound::Planner::phased`),
 which needs no new syntax; the plan, not the SQL, is the contract.
+
+**Features** (`Projection::Feature`, plan feature `rank_features`). A
+column of a Search may be a ranking expression that scores each row by
+itself (no set function, RRF or fusion). The executor computes it for the
+rows it returns, after ranking, with the evaluator the ranking used
+(`exact_scores` of its leaves, `Rank::eval_row`), so a column equals the
+value the row was ranked by. `features()` is expanded by the SQL binder,
+on the syntax tree, into the ranking's leaves and each phase's row-local
+expression, named by their SQL text (a vector parameter stays `:q`, not
+its 768 numbers); the plan holds plain columns. Over shards, the BM25
+statistics a coordinator sums cover the columns' terms too, and query then
+fetch computes the columns in the fetch round, for the page alone, with
+those statistics.
 
 The vector strategies are chosen by estimated cost against an estimated
 filter selectivity `s`: pre-filter costs `s·n` distance computations; IVF
