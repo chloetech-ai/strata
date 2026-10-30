@@ -62,6 +62,18 @@ impl BoolQuery {
         out
     }
 
+    /// Whether testing a document costs a seek per term: no phrase of
+    /// more than one term (positions), prefix or typo (expansions).
+    pub fn seeks_only(&self) -> bool {
+        match self {
+            BoolQuery::Term(_) => true,
+            BoolQuery::Phrase(ts) => ts.len() <= 1,
+            BoolQuery::Prefix(_) | BoolQuery::Fuzzy { .. } => false,
+            BoolQuery::And(cs) | BoolQuery::Or(cs) | BoolQuery::AtLeast { items: cs, .. } => cs.iter().all(|c| c.seeks_only()),
+            BoolQuery::Not(c) => c.seeks_only(),
+        }
+    }
+
     fn collect_terms<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {
             BoolQuery::Term(t) => out.push(t),
@@ -615,6 +627,13 @@ mod tests {
         assert_eq!(parse_match("cat~dog").unwrap(), Phrase(vec!["cat".into(), "dog".into()]));
         for bad in ["(cat", "cat)", "\"cat", "cat OR", "AND cat", "NOT"] {
             assert!(parse_match(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn quoted_single_words_test_by_seeks() {
+        for (q, seeks) in [("cat dog", true), ("(\"cat\" \"dog\" fox)@2 -owl", true), ("\"cat dog\"", false), ("cat*", false), ("(cat dog~1 fox)@2", false)] {
+            assert_eq!(parse_match(q).unwrap().seeks_only(), seeks, "{q}");
         }
     }
 

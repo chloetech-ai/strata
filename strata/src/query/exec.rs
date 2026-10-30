@@ -2607,6 +2607,9 @@ impl Estimator for SegEst<'_, '_> {
             _ => self.n_docs(),
         }
     }
+    fn match_probeable(&self, field: usize, query: &str, expand: &Expand) -> bool {
+        expand.is_none() && self.ex.match_query(field, query, expand).is_ok_and(|q| q.seeks_only())
+    }
     fn range_count(&self, field: usize, lo: f64, hi: f64) -> f64 {
         if self.ex.schema.fields[field].multi {
             return self.s.r.keyword(field).ok().flatten().map_or(self.n_docs(), |kw| kw.int_codes(lo, hi).map(|c| kw.count_code(c) as f64).sum());

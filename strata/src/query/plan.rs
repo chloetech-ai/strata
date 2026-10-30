@@ -25,6 +25,12 @@ pub trait Estimator {
     fn match_count(&self, field: usize, query: &str, expand: &Expand) -> f64;
     /// Total postings read to materialise `MATCH(field, query)`.
     fn match_postings(&self, field: usize, query: &str, expand: &Expand) -> f64;
+    /// Whether `MATCH(field, query)` is cheap to test one document at a
+    /// time: words and quoted single words, with no longer phrase, prefix,
+    /// typo or synonym.
+    fn match_probeable(&self, _field: usize, query: &str, expand: &Expand) -> bool {
+        !query.contains('"') && !query.contains('*') && !query.contains('~') && expand.is_none()
+    }
     /// Documents with `lo <= field <= hi` (histogram estimate).
     fn range_count(&self, field: usize, lo: f64, hi: f64) -> f64;
     /// Documents whose keyword field equals one of `values` (exact).
@@ -136,8 +142,8 @@ impl<E: Estimator> Planner<'_, E> {
             Pred::Match { field, query, expand } => {
                 let card = self.est.match_count(*field, query, expand).min(n);
                 let postings = self.est.match_postings(*field, query, expand);
-                let simple = !query.contains('"') && !query.contains('*') && !query.contains('~') && expand.is_none();
-                PredEstimate { card, mat_cost: c.leaf + postings * c.posting + card * c.emit, probe_cost: c.probe_match, probeable: simple }
+                let probeable = self.est.match_probeable(*field, query, expand);
+                PredEstimate { card, mat_cost: c.leaf + postings * c.posting + card * c.emit, probe_cost: c.probe_match, probeable }
             }
             Pred::Range { field, lo, hi } => {
                 let card = self.est.range_count(*field, *lo, *hi).min(n);

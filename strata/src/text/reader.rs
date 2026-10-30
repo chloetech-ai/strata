@@ -366,13 +366,21 @@ impl TextFieldReader {
             BoolQuery::Not(c) => self.eval_set(c).complement(),
             // Counts, for each document, the items that hold.
             BoolQuery::AtLeast { n: need, items } => {
-                let mut count = vec![0u32; n as usize];
+                // Each row's count of items, and the rows as they reach
+                // `need`: no pass over the rows that match none.
+                let mut count = vec![0u16; n as usize];
+                let mut out = Vec::new();
                 for c in items {
                     for d in self.eval_set(c).iter() {
-                        count[d as usize] += 1;
+                        let k = &mut count[d as usize];
+                        *k = k.saturating_add(1);
+                        if *k as usize == (*need).min(u16::MAX as usize) {
+                            out.push(d);
+                        }
                     }
                 }
-                DocSet::from_sorted((0..n).filter(|&d| count[d as usize] as usize >= *need).collect(), n)
+                out.sort_unstable();
+                DocSet::from_sorted(out, n)
             }
         }
     }
