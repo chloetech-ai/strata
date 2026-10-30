@@ -227,7 +227,7 @@ footer p { max-width: 90ch; }
       <a href="#cost">What it saves</a>
       <a href="#install">Install</a>
       <a href="../">Documentation</a>
-      <a href="https://github.com/rkonow/engram">GitHub</a>
+      <a href="https://github.com/rkonow/strata">GitHub</a>
     </nav>
   </header>
 
@@ -339,7 +339,7 @@ footer p { max-width: 90ch; }
     <div class="head">
       <p class="eyebrow">How it searches</p>
       <h2>Every kind of search, and a planner that picks among them</h2>
-      <p class="lede">Engram runs on Strata, an embedded search database built alongside it. One file per project indexes every record as full text, structured fields, vectors and a graph at once, and one SQL statement can combine them. For each request, Engram decides which searches are worth running and how to run each one.</p>
+      <p class="lede">Engram runs on <a href="../">Strata</a>, the embedded search database it is built on. One file per project indexes every record as full text, structured fields, vectors and a graph at once, and one SQL statement can combine them. For each request, Engram decides which searches are worth running and how to run each one.</p>
     </div>
     <div class="kinds">
       <div class="kind"><span class="k">Full text</span><p>BM25 ranking with Block-Max WAND, plus boolean and phrase queries.</p><small>Finds the exact error message or function name.</small></div>
@@ -495,15 +495,15 @@ footer p { max-width: 90ch; }
     <div class="install">
       <div class="panel">
         <h3>Run it yourself</h3>
-<pre class="code">git clone https://github.com/rkonow/engram
-cd engram &amp;&amp; ./install.sh
+<pre class="code">git clone https://github.com/rkonow/strata
+cd strata &amp;&amp; ./install.sh
 <span class="c"># or only for one project:</span>
 ./install.sh --project ~/code/app</pre>
         <p class="note">It needs macOS or Linux (Windows through WSL 2), Rust, a C compiler, curl and the Claude Code CLI logged in. The first build takes a few minutes. Run it again after <code>git pull</code> to upgrade. <a href="../engram/setup.html">The install guide</a> covers remote machines, dev containers and troubleshooting.</p>
       </div>
       <div class="panel">
         <h3>Or ask Claude Code to do it</h3>
-        <p class="ask" id="ask-text">Clone https://github.com/rkonow/engram and set Engram up for my Claude Code by following its AGENTS.md.</p>
+        <p class="ask" id="ask-text">Clone https://github.com/rkonow/strata and set Engram up for my Claude Code by following its AGENTS.md.</p>
         <button type="button" class="copy" id="copy-ask">Copy the sentence</button>
         <p class="note">Paste it into any session. The agent checks the prerequisites without installing anything unasked, asks whether you want every session or one project, runs the installer and reports anything that failed.</p>
       </div>
@@ -517,7 +517,7 @@ cd engram &amp;&amp; ./install.sh
 
   <footer>
     <p>Measured 2026-10-15 and 2026-10-16 in a cloud container (4 CPUs, 16 GB), except where a number names the M2 MacBook Air. Haiku is the agent, reader and judge throughout. The cost figures in the calculator are estimates; everything else on this page is measured.</p>
-    <p>Sources: <a href="../engram/results.html">results page</a>, <a href="https://github.com/rkonow/engram/blob/main/engram/results/v3/competitors/README.md">Hindsight and mem0 write-up</a>, <a href="https://github.com/rkonow/engram/pull/9">pull request #9</a>, <a href="https://github.com/rkonow/engram">rkonow/engram</a>.</p>
+    <p>Sources: <a href="../engram/results.html">results page</a>, <a href="https://github.com/rkonow/strata/blob/main/engram/results/v3/competitors/README.md">Hindsight and mem0 write-up</a>, <a href="https://github.com/rkonow/strata/pull/9">pull request #9</a>, <a href="https://github.com/rkonow/strata">rkonow/strata</a>.</p>
   </footer>
 </div>
 

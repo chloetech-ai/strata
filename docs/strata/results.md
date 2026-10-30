@@ -143,7 +143,7 @@ A `VECTOR` field can keep 1-bit codes instead of 8-bit ones (`"codes": "binary"`
 
 Binary codes hold an eighth of the memory of 8-bit codes (a 32nd of the float32 vectors, 1,536 MB here, which are read only for the rescored candidates). The flat scan gets 3.5× faster and IVF 2.0× faster for 0.006 of recall; HNSW is level. HNSW searches as wide as the candidates it rescores, so the 1-bit rows walk the graph 320 wide and are compared with 8-bit codes at ef 320; at the default ef of 64, 8-bit HNSW reaches 0.868 on this data. The two 1-bit HNSW figures come from two builds.
 
-The data is synthetic because the container could not download embeddings. How much recall binary codes cost depends on the embedding model, so measure it on the collection before choosing them. [`strata/notes/vector.md`](https://github.com/rkonow/engram/blob/main/strata/notes/vector.md#binary-codes) has every depth and the kernels; the numbers are in `strata/results/vector/`.
+The data is synthetic because the container could not download embeddings. How much recall binary codes cost depends on the embedding model, so measure it on the collection before choosing them. [`strata/notes/vector.md`](https://github.com/rkonow/strata/blob/main/strata/notes/vector.md#binary-codes) has every depth and the kernels; the numbers are in `strata/results/vector/`.
 
 ## Filtered vector search and the planner
 

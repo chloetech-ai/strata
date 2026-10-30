@@ -1,5 +1,5 @@
-title: Engram
-description: Long-term memory for coding agents, built on Strata, an embedded search database with SQL
+title: Strata
+description: "An embedded search database with SQL, and Engram, long-term memory for coding agents built on it"
 remote_theme: just-the-docs/just-the-docs@v0.10.1
 plugins:
   - jekyll-remote-theme
@@ -22,9 +22,9 @@ kramdown:
 
 aux_links:
   "GitHub":
-    - "https://github.com/rkonow/engram"
+    - "https://github.com/rkonow/strata"
 
-footer_content: "Engram and Strata. Benchmarks were run on an Apple M2 MacBook Air; see Reproducing the results for the machine and the method."
+footer_content: "Strata, and Engram built on it. Benchmarks were run on an Apple M2 MacBook Air; see Reproducing the results for the machine and the method."
 
 exclude:
   - "*.py"

@@ -4,7 +4,7 @@
 #
 #   run_baseline.sh ENGRAM_CHECKOUT OUT_DIR [STEPS]
 #
-#   ENGRAM_CHECKOUT  a clone of github.com/rkonow/engram (the directory holding engram/ and strata/)
+#   ENGRAM_CHECKOUT  a clone of github.com/rkonow/strata (the directory holding engram/ and strata/)
 #   OUT_DIR          where every output goes (created; existing reader answers there are reused)
 #   STEPS            comma list, default: build,retrieval,structure,scale,reader,tests,compare
 #                    (the steps of the baseline; `latency` is available but was not run there)
