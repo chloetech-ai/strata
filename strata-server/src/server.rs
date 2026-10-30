@@ -91,11 +91,36 @@ pub struct Options {
     pub synonyms: Option<PathBuf>,
     /// Where `POST /v1/admin/checkpoint` writes checkpoints.
     pub backup_dir: Option<PathBuf>,
+    /// What writes may fetch for MEDIA fields: `file:` roots and hosts
+    /// ([`strata::media::Allowlist::parse`]).
+    pub media_fetch: Vec<String>,
+    /// The largest media file a write fetches or gives, in bytes (0:
+    /// [`strata::media::DEFAULT_MAX_BYTES`]).
+    pub media_max_bytes: u64,
+    /// Where bytes that writes give a MEDIA field without a URI are kept.
+    pub media_store: Option<PathBuf>,
+    /// How long a media fetch may take, in seconds (0:
+    /// [`crate::media::DEFAULT_TIMEOUT`]).
+    pub media_timeout_s: u64,
     /// The background merger ([`strata::storage::Database::spawn_merger`]).
     pub merger: MergerOptions,
     /// Log queries and writes that take this many milliseconds or more
     /// (0: none).
     pub slow_ms: u64,
+}
+
+/// How writes resolve MEDIA values, from `--media-fetch`,
+/// `--media-max-bytes`, `--media-store` and `--media-timeout-s`.
+fn media_resolver(o: &Options) -> Result<strata::media::Resolver, String> {
+    let allow = strata::media::Allowlist::parse(&o.media_fetch).map_err(|e| e.to_string())?;
+    if let Some(dir) = &o.media_store {
+        std::fs::create_dir_all(dir).map_err(|e| format!("--media-store {}: {e}", dir.display()))?;
+    }
+    let timeout = if o.media_timeout_s > 0 { Duration::from_secs(o.media_timeout_s) } else { crate::media::DEFAULT_TIMEOUT };
+    let max_bytes = if o.media_max_bytes > 0 { o.media_max_bytes } else { strata::media::DEFAULT_MAX_BYTES };
+    let http = crate::media::HttpFetcher::new(allow.clone(), timeout)?;
+    tracing::info!(fetch = %allow.entries().join(", "), max_bytes, store = ?o.media_store, timeout_s = timeout.as_secs(), "media fields: what writes may fetch");
+    Ok(strata::media::Resolver { allow, max_bytes, store: o.media_store.clone(), http: Some(std::sync::Arc::new(http)) })
 }
 
 /// Segment builds (flushes, merges, imports): vector indexes on every core.
@@ -258,6 +283,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     if let Some(dir) = &o.backup_dir {
         svc.set_backup_dir(dir).map_err(|e| e.message)?;
+    }
+    if !o.media_fetch.is_empty() || o.media_store.is_some() || o.media_max_bytes > 0 {
+        svc.set_media(media_resolver(o)?).map_err(|e| e.message)?;
     }
     // Once loaded: bulk loads are not shipped, so every copy loads the same.
     if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {

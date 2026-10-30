@@ -60,6 +60,10 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--copy-from PATH` | | fill the new database (`--db` with `--schema`) with this database's rows, re-embedding the vector fields whose embedding changed |
 | `--synonyms FILE` | | the synonym list for `synonyms => 1` searches ([format](query-language.md#typos-and-synonyms)): read at start if it exists, written by `PUT /v1/synonyms` |
 | `--backup-dir DIR` | | where `POST /v1/admin/checkpoint` writes checkpoints ([backups](#backups)); created if missing |
+| `--media-fetch LIST` | nothing | what writes to [`media` fields](#media-fields) may fetch, comma-separated: `file:/srv/images` (a directory), `cdn.example.com` (HTTPS), `*.example.com`, `http://host:port` |
+| `--media-store DIR` | | where files written as bytes are kept, by hash (`media:<sha256>`); created if missing |
+| `--media-max-bytes N` | 52428800 (50 MiB) | the largest file a `media` value may name |
+| `--media-timeout-s N` | 30 | how long one fetch may take |
 | `--log FILTER` | `$STRATA_LOG`, else `info` | what to [log](#logs): a level (`error`, `warn`, `info`, `debug`, `trace`), or levels per module (`info,strata=debug`); `debug` logs every request |
 | `--log-format F` | `$STRATA_LOG_FORMAT`, else `text` | log lines as `text` or `json` (one object per line) |
 | `--slow-ms N` | 1000 | log queries and writes that take this many milliseconds or more, with their SQL (0: none) |
@@ -95,6 +99,7 @@ A database starts with one table, whose schema is set when the database is creat
 | `timestamp` | a moment in UTC, to the microsecond, as ISO 8601 text (`"2026-10-01T12:30:00Z"`) | ranges, sorting, `MIN`/`MAX`, boosts by age |
 | `vector` | a fixed number of floats | `similarity()`, `distance()` |
 | `sparse` | learned term weights (SPLADE, BGE-M3), `{"term": weight}` | `similarity()` |
+| `media` | an image, audio, video or PDF file by URI, with its hash, type and size ([media fields](#media-fields)) | `=` and `IN` on the hash, `GROUP BY` |
 | `edges` | links to other rows by key, a JSON array | [graph queries](graphs.md) |
 
 | option | types | default | what it does |
@@ -108,6 +113,7 @@ A database starts with one table, whose schema is set when the database is creat
 | `dim` | `vector` | the model's, for a known `embed` model | the number of dimensions |
 | `index` | `vector` | `"hnsw"` (m 16, ef_construction 200) | `"flat"` (an exact scan), `{"hnsw": {"m": 32, "ef_construction": 400}}` or `{"ivf": {"nlist": 1024}}` |
 | `codes` | `vector` | `"sq8"` (a byte a dimension) | `"binary"`: a bit a dimension, 1/32 of the vectors, rescored |
+| `kind` | `media` | any | `"image"`, `"audio"`, `"video"` or `"pdf"`: the files the field takes |
 | `embed` | `vector` | | `{"from": [fields], "model": name}`: the vectors are that model's embedding of those fields ([below](#embedded-vector-fields)) |
 | `not_null` | all but the key | false | a write must give the field a value (`NOT NULL`) |
 | `default` | single-valued `text`, `keyword`, `int`, `float`, `bool`, `timestamp`, not the key or generated | | the value a write that leaves the field out gets; `"now"` on a `timestamp` is the time of the write, one time for all the rows of a request, statement or file |
@@ -198,6 +204,30 @@ Title + text is the best single vector, or within 0.005 of it, everywhere but TR
 ```sh
 cd strata && STRATA_DATA=~/data/beir cargo run --release --bin strata-embed-eval -- --dataset scifact --model potion-retrieval-32M
 ```
+
+## Media fields
+
+A `media` field holds a file by reference: its URI, the SHA-256 of its bytes, its type and its size, and for the types Strata reads the headers of, an image's width and height, a recording's duration or a PDF's pages. The bytes are not in the database.
+
+```json
+{"name": "image", "type": "media", "kind": "image"}
+```
+
+```json
+{"uri": "https://cdn.example.com/a.png", "sha256": "9f86d0…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}
+```
+
+A write gives one of
+
+- the whole value, as above: taken as given, nothing is fetched;
+- a URI, `"https://cdn.example.com/a.png"` or `{"uri": "file:/srv/images/a.png"}`: the server fetches the file if `--media-fetch` lists it, and fills in the rest;
+- the bytes, base64, with a URI or without: `{"uri": "a.png", "data": "iVBORw0K…"}` keeps that URI, and `{"data": "iVBORw0K…"}` keeps the file in `--media-store` under its hash, as `media:<sha256>`.
+
+This happens before the write queues for the writer, for `/v1/write`, SQL `INSERT` and `UPDATE`, and imports alike, up to 16 files fetched at once; a value that cannot be resolved fails the whole request (400, or 504 for a fetch that timed out) and nothing of it is written. A `sha256` given with a URI or bytes is checked. What the log, the segments and [replicas](#replication-a-primary-and-its-replicas) get is the resolved value, so a replica never fetches, and a replayed log does not either.
+
+**What may be fetched.** Nothing, until `--media-fetch` names it: a `file:` directory takes the files under it (after symbolic links and `..` are resolved), a host name takes `https://` URLs of it on port 443, `*.example.com` its subdomains, and `http://host:port` plain HTTP there. A fetch follows at most 5 redirects, each to a URL the list has, reads at most `--media-max-bytes` and gives up after `--media-timeout-s`. The list is the server's guard against writes that would make it read its own files or reach hosts on its network: keep it to the places the files are.
+
+Queries return the value as JSON text. The field's index is of hashes, so `WHERE image = :sha256`, `IN` and `GROUP BY image` find and count the rows of a file. `kind` refuses files of another type, by their bytes' headers. A coordinator does not fetch: start each shard with the `--media-*` options. A database with a `media` field is written in [file format 3](index.md#wal-memtable-and-snapshots).
 
 ## HTTP API
 
@@ -305,6 +335,7 @@ Not yet: point-in-time recovery between checkpoints, which needs the write-ahead
 - **A token, or loopback only.** `--token` (or `$STRATA_TOKEN`) guards the HTTP API and every gRPC call, compared in constant time. Without one the server listens only on loopback addresses: an address reachable from elsewhere (`0.0.0.0`, a LAN address) is refused at start unless `--no-token` says to serve it open. The token is not printed in the log; open the UI and give it there (or once as `/?token=…`, which the page then drops from its address).
 - **Browsers on other sites.** A server on your laptop is reachable by every web page you visit, through your browser. It answers only to the host names `localhost`, `127.0.0.1` and `::1` when it listens on loopback (add names with `--allow-host`), so a page that points its own name at 127.0.0.1 (DNS rebinding) gets 403. A request that can change something and carries an `Origin` other than the server's own gets 403, and `/v1/import` refuses the content types a page may send without asking first (`text/plain`, forms, none). The UI and the clients here send their own origin or no origin, and proper content types.
 - **TLS.** `--tls-cert FILE --tls-key FILE` (PEM) serve both HTTP and gRPC over TLS. A coordinator reaches `https://` shards over TLS, trusting the public roots and `--shard-ca FILE`, and sends `--shard-token` (by default its own `--token`) with every call.
+- **Fetches by writes.** A write to a [`media` field](#media-fields) can name a URL or a file for the server to read; only what `--media-fetch` lists is read, redirects included.
 - **What is not there yet**: scoped keys (read, write, admin), mutual TLS, and an audit log.
 
 ## gRPC

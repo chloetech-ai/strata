@@ -201,7 +201,7 @@ impl Database {
     fn documents(db: &Db, schema: &Schema, rows: &[Json]) -> strata::Result<Vec<strata::Document>> {
         let now = strata::timestamp::now();
         let mut docs = rows.iter().enumerate().map(|(i, j)| ingest::document_at(schema, j, now).map_err(|e| strata::Error::Schema(format!("row {}: {e}", i + 1)))).collect::<strata::Result<Vec<_>>>()?;
-        db.embed_missing_in(&schema.table, &mut docs)?;
+        db.fill_in(&schema.table, &mut docs)?;
         Ok(docs)
     }
 }

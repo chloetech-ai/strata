@@ -19,10 +19,11 @@
 //!
 //! Types are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or
 //! `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (microseconds,
-//! UTC; or `TIMESTAMPTZ`, `DATETIME`), `VECTOR(dimensions)`, `SPARSE` and
-//! `EDGES`; `KEYWORD[]` and `INT[]` hold lists. A table with a BOOL or
-//! TIMESTAMP column makes the database format 3
-//! ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
+//! UTC; or `TIMESTAMPTZ`, `DATETIME`), `VECTOR(dimensions)`, `SPARSE`,
+//! `EDGES` and `MEDIA` (a file's reference, [`crate::media`]; `OPTIONS(kind
+//! = 'image')`, `'audio'`, `'video'` or `'pdf'` says what file); `KEYWORD[]`
+//! and `INT[]` hold lists. A table with a BOOL, TIMESTAMP or MEDIA column
+//! makes the database format 3 ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
 //! the schema's short JSON form ([`crate::schema::Schema::from_json`]):
 //! `positions`, `stored` and `indexed` (true or false), `from` (the fields
 //! a generated TEXT field joins), `analyzer` (`'english'`, the default, or
@@ -73,7 +74,7 @@ fn err(m: impl Into<String>) -> Error {
 const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column')]";
 /// The options of a table, in `OPTIONS(...)` after its columns.
 const TABLE_OPTIONS: [&str; 1] = ["shard_by"];
-const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE or EDGES, and KEYWORD[] or INT[] for lists";
+const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES or MEDIA, and KEYWORD[] or INT[] for lists";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
 /// EXISTS`. `tables` are the database's tables, which references name.
@@ -242,10 +243,11 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let allowed: &[&str] = match ty {
         "text" => &["positions", "stored", "indexed", "from", "analyzer"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
+        "media" => &["stored", "indexed", "kind"],
         _ => &["stored", "indexed"],
     };
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model", "kind"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {
@@ -334,6 +336,7 @@ fn column_type(t: &DataType) -> std::result::Result<(&'static str, bool, Option<
             ("keyword", []) => Ok(("keyword", false, None)),
             ("sparse", []) => Ok(("sparse", false, None)),
             ("edges", []) => Ok(("edges", false, None)),
+            ("media", []) => Ok(("media", false, None)),
             ("vector", []) => Ok(("vector", false, None)),
             ("vector", [d]) => match d.parse::<u64>() {
                 Ok(d) if d > 0 => Ok(("vector", false, Some(d))),
@@ -441,7 +444,7 @@ pub(crate) fn drop_table(stmt: &sql::Statement) -> Result<(Vec<String>, DropOpti
 mod tests {
     use super::*;
     use crate::query::parse::parse;
-    use crate::schema::{FieldType, VectorCodes, VectorIndexKind};
+    use crate::schema::{FieldType, MediaKind, VectorCodes, VectorIndexKind};
 
     fn create(text: &str, tables: &[&Schema]) -> Result<(Schema, bool)> {
         let stmts = parse(text)?;
@@ -492,6 +495,35 @@ mod tests {
         assert_eq!(s.fields[1].references.as_deref(), Some("papers"));
         // No key is allowed, as in the JSON form.
         assert_eq!(create("CREATE TABLE log (line TEXT NULL)", &[]).unwrap().0.primary_key, None);
+    }
+
+    #[test]
+    fn media_columns_name_their_kind() {
+        let (s, _) = create("CREATE TABLE photos (id KEYWORD PRIMARY KEY, image MEDIA OPTIONS(kind = 'image'), any_file MEDIA, scan MEDIA OPTIONS(kind = 'PDF', indexed = false))", &[]).unwrap();
+        let f = |n: &str| s.field(n).unwrap();
+        assert_eq!((f("image").media, f("any_file").media, f("scan").media), (Some(MediaKind::Image), Some(MediaKind::Any), Some(MediaKind::Pdf)));
+        assert!(f("image").ty == FieldType::Keyword && f("image").stored && f("image").indexed && !f("scan").indexed);
+        assert_eq!(f("image").type_name(), "MEDIA");
+        assert_eq!(s.features().collect::<Vec<_>>(), ["media", "media", "media"]);
+        assert_eq!(s.to_short_json()["fields"][1], serde_json::json!({"name": "image", "type": "media", "kind": "image"}));
+        assert_eq!(s.to_short_json()["fields"][2], serde_json::json!({"name": "any_file", "type": "media"}));
+        assert_eq!(Schema::from_json_value(&s.to_short_json()).unwrap(), s);
+        assert_eq!(serde_json::from_str::<Schema>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        for (bad, says) in [
+            ("CREATE TABLE t (a MEDIA OPTIONS(kind = 'smell'))", "kind is"),
+            ("CREATE TABLE t (a KEYWORD OPTIONS(kind = 'image'))", "not an option of a KEYWORD"),
+            ("CREATE TABLE t (a MEDIA OPTIONS(stored = false))", "is stored"),
+            ("CREATE TABLE t (a MEDIA PRIMARY KEY)", "neither the key"),
+            ("CREATE TABLE t (a MEDIA DEFAULT 'x')", "given a default"),
+            ("CREATE TABLE t (a MEDIA REFERENCES t)", "neither the key, a reference"),
+            ("CREATE TABLE t (a MEDIA[])", "only KEYWORD[] and INT[]"),
+            ("CREATE TABLE t (a MEDIA, b TEXT OPTIONS(from = 'a'))", "not a source of text"),
+            ("CREATE TABLE t (a MEDIA, e VECTOR OPTIONS(embed = 'a', model = 'hash:8'))", "not a source of text"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, a MEDIA NOT NULL) OPTIONS(shard_by = 'a')", "KEYWORD or INT"),
+        ] {
+            let e = create(bad, &[]).unwrap_err().to_string();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
     }
 
     #[test]

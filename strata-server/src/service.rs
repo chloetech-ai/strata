@@ -570,9 +570,32 @@ impl Service {
         }
     }
 
-    /// Computes the embedded vectors that the documents of `ops` leave out
-    /// before they queue for the writer, so that models run on many cores
-    /// rather than in the writer thread.
+    /// Sets how a local database's writes resolve the MEDIA values they
+    /// give (`--media-fetch`, `--media-max-bytes`, `--media-store`,
+    /// [`strata::db::Db::set_media_resolver`]). A coordinator refuses: its
+    /// shards fetch for the writes they take.
+    pub fn set_media(&self, r: strata::media::Resolver) -> Result<(), ApiError> {
+        match &self.backend {
+            Backend::Local(db) => {
+                db.set_media_resolver(r);
+                Ok(())
+            }
+            Backend::Cluster(_) => Err(ApiError::bad("--media-fetch, --media-max-bytes and --media-store go to each shard server, which fetches the files of the writes it takes")),
+        }
+    }
+
+    /// Whether a table has a MEDIA field, whose values writes resolve
+    /// before the writer ([`Service::embed_ops`]).
+    fn has_media(&self) -> bool {
+        self.catalog().iter().any(|t| t.fields.iter().any(|f| f.media.is_some()))
+    }
+
+    /// Does the work the documents of `ops` leave to the server before
+    /// they queue for the writer: resolves their MEDIA values (fetching
+    /// files, [`strata::db::Db::resolve_media_in`]) and computes the
+    /// embedded vectors they leave out, so that models run on many cores
+    /// rather than in the writer thread, and the rows logged (and shipped
+    /// to replicas) hold the results.
     fn embed_ops(&self, db: &Db, ops: &mut [Json]) -> Result<(), ApiError> {
         let models = self.models();
         let writes_doc = |op: &Json| matches!(op.get("op").and_then(|o| o.as_str()), Some("insert" | "upsert" | "upsert_if_newer"));
@@ -582,7 +605,8 @@ impl Service {
         let first = db.schema().table.clone();
         for schema in db.catalog() {
             let wanted: Vec<usize> = models.iter().filter(|m| m.model.is_ok() && m.table.eq_ignore_ascii_case(&schema.table)).filter_map(|m| schema.field_index(&m.field)).collect();
-            if wanted.is_empty() {
+            let media: Vec<usize> = (0..schema.fields.len()).filter(|&f| schema.fields[f].media.is_some()).collect();
+            if wanted.is_empty() && media.is_empty() {
                 continue;
             }
             let mut at = Vec::new();
@@ -594,12 +618,17 @@ impl Service {
                 }
             }
             let before: Vec<Vec<bool>> = docs.iter().map(|d| wanted.iter().map(|&f| matches!(d[f], Value::Null)).collect()).collect();
-            db.embed_missing_in(&schema.table, &mut docs)?;
+            db.fill_in(&schema.table, &mut docs)?;
             n += before.iter().flatten().filter(|&&m| m).count() as u64;
             for ((i, d), missing) in at.into_iter().zip(&docs).zip(before) {
                 for (&f, was_missing) in wanted.iter().zip(missing) {
                     if let (true, Value::Vector(v)) = (was_missing, &d[f]) {
                         ops[i]["doc"][schema.fields[f].name.as_str()] = json!(v.as_ref());
+                    }
+                }
+                for &f in &media {
+                    if let Value::Str(t) = &d[f] {
+                        ops[i]["doc"][schema.fields[f].name.as_str()] = json!(t);
                     }
                 }
             }
@@ -1406,7 +1435,7 @@ impl Service {
                     // Not a retry of a write applied: a primary may refuse
                     // it before applying it.
                     self.admit_write()?;
-                    if self.embeds() {
+                    if self.embeds() || self.has_media() {
                         // Queued writes wait for a core to embed on.
                         let core = self.embedding.clone().acquire_owned().await.map_err(ApiError::internal)?;
                         let (svc, db) = (self.clone(), db.clone());
