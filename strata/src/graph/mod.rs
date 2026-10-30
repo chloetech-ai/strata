@@ -40,8 +40,15 @@
 //! short scan and one stored-key comparison per group (hash collisions make
 //! separate groups), after which the sources are read sequentially. The
 //! traversals themselves are in [`traverse`].
+//!
+//! An edge table ([`crate::schema::Schema::with_edges`]) holds one edge
+//! per row, between rows of another table; its segments index the rows by
+//! the keys they link, in a section of their own ([`edge_table`]).
 
+pub mod edge_table;
 pub mod traverse;
+
+pub use edge_table::{EdgeTableBuilder, EdgeTableReader};
 
 use std::collections::BTreeMap;
 
