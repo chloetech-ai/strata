@@ -9,7 +9,9 @@
 // coordinator can query then fetch; 4 places keys in slots: a coordinator
 // gives each shard its slot map (`Slots`) and sends the map's epoch with
 // every request (`epoch`), and a shard refuses an older epoch and keys of
-// other shards' slots. A caller asks a server's versions with
+// other shards' slots; 5 reads the writes a read must see (`min_seq_no`),
+// which a replica waits for, so that a coordinator sends such a read to a
+// replica of 5 or newer, or to the primary. A caller asks a server's versions with
 // `Hello` (a server that answers Unimplemented speaks 1) and speaks the
 // newest both know; a coordinator speaks the oldest of those among its
 // shards' replicas.
@@ -84,6 +86,10 @@ message ReplicateRequest {
   // The primary's id. A replica follows one primary per term, and refuses
   // another of the same term.
   string primary = 6;
+  // Whether the primary had committed more than `txns` hold when it sent
+  // them: the replica is catching up, and refuses reads until a call
+  // reaches the primary's last.
+  bool behind = 7;
 }
 
 message ReplicateResponse {
@@ -197,6 +203,16 @@ message QueryRequest {
   bool release = 11;
   // Protocol 4: the epoch of the coordinator's slot map; 0 for none.
   uint64 epoch = 12;
+  // Protocol 5: the sequence number of a write the read must see (0:
+  // none), as a server numbering its writes answered it
+  // (WriteResponse.seq_no). A replica waits until it has applied it, a
+  // second at most, and answers Unavailable then: read from the primary.
+  // A primary, or a server without replicas, answers FailedPrecondition
+  // for a number past its last, as for a snapshot lease from before it.
+  uint64 min_seq_no = 13;
+  // To a coordinator: the numbers its write answered, one per shard
+  // (WriteResponse.seq_nos), instead of min_seq_no.
+  repeated uint64 min_seq_nos = 14;
 }
 
 // A plan (strata::query::ir): a statement as a tree of operators over typed
@@ -631,6 +647,11 @@ message WriteResponse {
   // The transaction's sequence number, from a server that numbers its
   // writes (--seq-no) when the request wrote.
   optional uint64 seq_no = 2;
+  // From a coordinator: each shard's number instead, 0 for a shard not
+  // written or whose replicas each number their own writes; empty when no
+  // shard numbers its writes. A read that passes them as min_seq_nos sees
+  // the write.
+  repeated uint64 seq_nos = 3;
 }
 
 message SchemaResponse { string schema_json = 1; }

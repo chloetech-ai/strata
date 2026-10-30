@@ -29,7 +29,7 @@ pub const MAX_LEASES: usize = 10_000;
 
 use crate::coord::Coordinator;
 use crate::idem;
-use crate::replication::{Follow, Primary};
+use crate::replication::{Follow, Primary, READ_WAIT};
 use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
 use crate::{json as js, obs, pb, ApiError};
@@ -69,6 +69,45 @@ pub struct QueryReq {
     pub hold: bool,
     /// End the lease `snapshot` once answered.
     pub release: bool,
+    /// The writes the query must see ([`After`]).
+    pub after: After,
+}
+
+/// The writes a read must see, so that a client reads its own writes
+/// from any copy: the sequence number a server answered its last write
+/// with (`min_seq_no`), or through a coordinator, the number each shard
+/// answered (`min_seq_nos`, 0 for a shard not written). A replica waits
+/// until it has applied that write, up to [`crate::replication::READ_WAIT`],
+/// and refuses the read otherwise (503), so that a coordinator asks the
+/// shard's primary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum After {
+    #[default]
+    Any,
+    Seq(u64),
+    Shards(Vec<u64>),
+}
+
+impl After {
+    /// From a request's `min_seq_no` and `min_seq_nos` (0 and empty: not
+    /// given), which are not both given.
+    pub fn of(min_seq_no: u64, min_seq_nos: Vec<u64>) -> Result<After, ApiError> {
+        match (min_seq_no, min_seq_nos.is_empty()) {
+            (0, true) => Ok(After::Any),
+            (n, true) => Ok(After::Seq(n)),
+            (0, false) => Ok(After::Shards(min_seq_nos)),
+            _ => Err(ApiError::bad("a read takes min_seq_no (a server's sequence number) or min_seq_nos (a coordinator's, one per shard), not both")),
+        }
+    }
+
+    /// The number a read on a server must see (0: none).
+    fn seq(&self) -> Result<u64, ApiError> {
+        match self {
+            After::Any => Ok(0),
+            After::Seq(n) => Ok(*n),
+            After::Shards(_) => Err(ApiError::bad("min_seq_nos is a coordinator's, one number per shard; a server takes min_seq_no, the number its write answered")),
+        }
+    }
 }
 
 pub struct Answer {
@@ -571,17 +610,18 @@ impl Service {
         }
     }
 
-    /// Pins the current version for `lease_ttl`; returns the lease.
+    /// Pins the current version ([`Self::latest`]) for `lease_ttl`;
+    /// returns the lease and the version's txn.
     pub fn lease(&self) -> Result<(u64, u64), ApiError> {
-        self.lease_for(self.lease_ttl)
+        let db = self.local().ok_or_else(|| ApiError::bad("a coordinator holds no snapshots"))?;
+        let snap = self.latest(db)?;
+        let txn = snap.txn();
+        Ok((self.lease_of(snap, self.lease_ttl)?, txn))
     }
 
-    /// Pins the current version for `ttl`; returns the lease. At most
-    /// [`MAX_LEASES`] are held at once.
-    fn lease_for(&self, ttl: Duration) -> Result<(u64, u64), ApiError> {
-        let db = self.local().ok_or_else(|| ApiError::bad("a coordinator holds no snapshots"))?;
-        let snap = db.snapshot();
-        let txn = snap.txn();
+    /// Keeps `snap` for `ttl`; returns the lease. At most [`MAX_LEASES`]
+    /// are held at once.
+    fn lease_of(&self, snap: Snapshot, ttl: Duration) -> Result<u64, ApiError> {
         let mut l = self.leases.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         l.retain(|_, (_, t)| *t > now);
@@ -590,7 +630,7 @@ impl Service {
         }
         let id = self.next_lease.fetch_add(1, Ordering::Relaxed);
         l.insert(id, (snap, now + ttl));
-        Ok((id, txn))
+        Ok(id)
     }
 
     /// Ends `leases` before they expire, and releases the versions only
@@ -603,10 +643,11 @@ impl Service {
     }
 
     /// The lease a query reads with `hold` ([`QueryReq::hold`]): the one
-    /// it names, or a new one lasting as a [`Service::term_stats`] lease.
-    fn held(&self, req: &QueryReq, timeout: Duration) -> Result<u64, ApiError> {
+    /// it names, or a new one on `snap`, the version it reads, lasting as
+    /// a [`Service::term_stats`] lease.
+    fn held(&self, req: &QueryReq, snap: &Snapshot, timeout: Duration) -> Result<u64, ApiError> {
         match (req.hold, req.snapshot) {
-            (true, 0) => Ok(self.lease_for(self.lease_ttl.min(timeout + Duration::from_secs(1)))?.0),
+            (true, 0) => self.lease_of(snap.clone(), self.lease_ttl.min(timeout + Duration::from_secs(1))),
             (true, l) => Ok(l),
             (false, _) => Ok(0),
         }
@@ -632,16 +673,53 @@ impl Service {
         }
     }
 
-    fn snapshot(&self, db: &Db, lease: u64) -> Result<Snapshot, ApiError> {
-        if lease == 0 {
-            return Ok(db.snapshot());
-        }
+    /// The version lease `lease` keeps.
+    fn leased(&self, lease: u64) -> Result<Snapshot, ApiError> {
         let l = self.leases.lock().unwrap_or_else(|e| e.into_inner());
         match l.get(&lease) {
             Some((s, t)) if *t > Instant::now() => Ok(s.clone()),
             _ => Err(ApiError::bad(format!("snapshot lease {lease} is unknown or expired"))),
         }
     }
+
+    /// The latest version, for a read that does not name a lease: refused
+    /// on a replica its primary has not found caught up (503,
+    /// [`Follow::readable`]).
+    fn latest(&self, db: &Db) -> Result<Snapshot, ApiError> {
+        if let Replication::Replica(f) = &self.replication {
+            f.readable()?;
+        }
+        Ok(db.snapshot())
+    }
+
+    /// The version a read reads: lease `lease`, or the latest
+    /// ([`Self::latest`]), holding the write `after` names. A replica waits
+    /// until it has applied that write, until `deadline` and
+    /// [`READ_WAIT`] at most, and refuses the read then (503: read from
+    /// the primary). A primary, or a server without replicas, holds every
+    /// write it answered, so it refuses a number past its last (409), and
+    /// a lease keeps its version, so one from before the write is refused
+    /// too (409).
+    async fn read_snapshot(&self, db: &Db, lease: u64, after: &After, deadline: Instant) -> Result<Snapshot, ApiError> {
+        let min = after.seq()?;
+        if min > 0 && db.storage().numbering().is_none() {
+            return Err(ApiError::bad("min_seq_no needs a database that numbers its writes: start the server with --seq-no"));
+        }
+        let snap = match lease {
+            0 => self.latest(db)?,
+            l => self.leased(l)?,
+        };
+        let at = snap.seq_no().unwrap_or(0);
+        if at >= min {
+            return Ok(snap);
+        }
+        match (&self.replication, lease) {
+            (Replication::Replica(f), 0) => f.holding(min, deadline.min(Instant::now() + READ_WAIT)).await,
+            (_, 0) => Err(conflict(format!("this server's last transaction is {at}: transaction {min} was not committed here"))),
+            (_, l) => Err(conflict(format!("snapshot lease {l} keeps a version holding transactions up to {at}, before {min}"))),
+        }
+    }
+
 
     /// Parameters from JSON. Besides plain values (see [`js::param`]), a
     /// parameter may be `{"vector_of": key, "field": "emb"}`, the vector of
@@ -743,43 +821,45 @@ impl Service {
     /// Runs a plan ([`strata::query::ir`]): a read answers as
     /// [`Service::query`] does, and a write as [`Service::sql`] does (on any
     /// table). A coordinator takes writes as SQL until its shards take write
-    /// plans.
-    pub async fn run_plan(self: &Arc<Self>, plan: Plan, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+    /// plans. A read sees the writes `after` names.
+    pub async fn run_plan(self: &Arc<Self>, plan: Plan, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
         let t0 = Instant::now();
         // What the slow-query log shows of the plan.
         let text = plan.explain(&[&self.schema]).join(" / ");
         if plan.is_write() {
+            if after != After::Any {
+                return Err(ApiError::bad(FOR_READS));
+            }
             let Backend::Local(db) = &self.backend else {
                 return Err(ApiError::bad("a coordinator takes writes as SQL; its shards do not take write plans yet"));
             };
             let w = self.write_local(db, move |db| db.prepare_plan(&plan).map(Some), timeout_ms).await;
             let w = self.wrote(w, t0, Some(&text))?;
-            return Ok(SqlAnswer::Written { n: w.rows, seq_no: w.seq_no, took_ms: t0.elapsed().as_secs_f64() * 1e3 });
+            return Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 });
         }
-        let req = QueryReq { sql: text, timeout_ms, plan: Some(Arc::new(plan)), ..Default::default() };
+        let req = QueryReq { sql: text, timeout_ms, plan: Some(Arc::new(plan)), after, ..Default::default() };
         self.query(req).await.map(SqlAnswer::Rows)
     }
 
     /// Runs a bound single-table query, on the database or over the shards.
-    async fn select(self: &Arc<Self>, req: QueryReq, select: Select, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
+    async fn select(self: &Arc<Self>, mut req: QueryReq, select: Select, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = metrics::kind(&select);
-        let Some(permit) = self.admit(timeout).await else {
-            self.metrics.query(kind, "rejected", t0.elapsed().as_secs_f64());
-            return Err(ApiError { status: 429, message: "too many queries running; try again".into() });
-        };
         let mut lease = 0;
         let res = match &self.backend {
-            Backend::Local(db) => match self.held(&req, timeout).and_then(|l| {
-                lease = l;
-                self.snapshot(db, req.snapshot.max(l))
-            }) {
-                Ok(snap) => {
+            Backend::Local(db) => {
+                let stats = req.stats.take().map(Arc::new);
+                async {
+                    // A read on a replica may wait for a write it must see,
+                    // before it takes a query slot.
+                    let snap = self.read_snapshot(db, req.snapshot, &req.after, t0 + timeout).await?;
+                    let permit = self.admit(timeout).await.ok_or_else(too_many)?;
+                    lease = self.held(&req, &snap, timeout)?;
                     let (running, n) = Running::start(&self.running);
                     let cancel = Cancel::default();
                     // Each running query gets its share of the cores for its
                     // segments (as engram's recall does).
                     let opts = ExecOptions {
-                        stats: req.stats.map(Arc::new),
+                        stats,
                         shard: req.shard,
                         threads: (self.cores / n).max(1),
                         deadline: Some(t0 + timeout),
@@ -806,17 +886,20 @@ impl Service {
                         Err(e) => Err(ApiError::internal(e)),
                     }
                 }
-                Err(e) => Err(e),
-            },
-            Backend::Cluster(c) => {
-                let reach = select.limit.unwrap_or(0).saturating_add(select.offset);
-                let r = match self.max_rows.filter(|&m| reach > m) {
-                    Some(m) => Err(ApiError::bad(format!("query error: LIMIT and OFFSET reach row {reach}; a query returns at most {m} rows"))),
-                    None => c.query(&req, &select, t0 + timeout).await.map(|m| (m.rs, m.missing)),
-                };
-                drop(permit);
-                r
+                .await
             }
+            Backend::Cluster(c) => match self.admit(timeout).await {
+                None => Err(too_many()),
+                Some(permit) => {
+                    let reach = select.limit.unwrap_or(0).saturating_add(select.offset);
+                    let r = match self.max_rows.filter(|&m| reach > m) {
+                        Some(m) => Err(ApiError::bad(format!("query error: LIMIT and OFFSET reach row {reach}; a query returns at most {m} rows"))),
+                        None => c.query(&req, &select, t0 + timeout).await.map(|m| (m.rs, m.missing)),
+                    };
+                    drop(permit);
+                    r
+                }
+            },
         };
         // A shard's answer to a coordinator is not a client's.
         let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), res);
@@ -859,10 +942,6 @@ impl Service {
     /// here.
     async fn compound(self: &Arc<Self>, req: QueryReq, plan: Arc<Plan>, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = "compound";
-        let Some(permit) = self.admit(timeout).await else {
-            self.metrics.query(kind, "rejected", t0.elapsed().as_secs_f64());
-            return Err(ApiError { status: 429, message: "too many queries running; try again".into() });
-        };
         let schema = self.schema.clone();
         let deadline = t0 + timeout;
         let req_sql = req.sql.clone();
@@ -870,7 +949,10 @@ impl Service {
         let cancel = Cancel::default();
         let r = match &self.backend {
             Backend::Local(db) => {
-                let snap = self.snapshot(db, req.snapshot)?;
+                // A read on a replica may wait for a write it must see,
+                // before it takes a query slot.
+                let snap = self.read_snapshot(db, req.snapshot, &req.after, deadline).await?;
+                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected(kind, t0)) };
                 let (running, n) = Running::start(&self.running);
                 // Leaves hold up to compound::MAX_ROWS rows; the answer is
                 // held to the window below.
@@ -892,6 +974,7 @@ impl Service {
                 r.map(|r| r.map(|rs| (rs, Vec::new())))
             }
             Backend::Cluster(c) => {
+                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected(kind, t0)) };
                 let c = c.clone();
                 let rt = tokio::runtime::Handle::current();
                 let stop = cancel.0.clone();
@@ -908,7 +991,7 @@ impl Service {
                         let select = leaf.to_select(&schema)?;
                         // The shards run the leaf's plan; its text names it in their logs.
                         let sql = leaf.explain(&[&schema]).join(" / ");
-                        let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, ..Default::default() };
+                        let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, after: req.after.clone(), ..Default::default() };
                         let m = rt.block_on(obs::scope(id.clone(), c.query(&step, &select, deadline))).map_err(|e| strata::Error::Query(e.message))?;
                         for s in m.missing {
                             if !missing.contains(&s) {
@@ -932,6 +1015,12 @@ impl Service {
             r => r,
         };
         self.done(&req_sql, kind, t0, self.max_rows, res)
+    }
+
+    /// Counts a query refused for want of a slot, and says so (429).
+    fn rejected(&self, kind: &'static str, t0: Instant) -> ApiError {
+        self.metrics.query(kind, "rejected", t0.elapsed().as_secs_f64());
+        too_many()
     }
 
     /// A query slot, waited for until `timeout`; `None` (counted as
@@ -959,31 +1048,36 @@ impl Service {
     /// The statistics `sql` scores with, and a lease on the snapshot they
     /// came from (0 from a coordinator, which sums its shards'). The lease
     /// lasts for the query round that follows: the request's deadline
-    /// (`timeout_ms`, or the default) and a second.
-    pub async fn term_stats(self: &Arc<Self>, sql: &str, plan: Option<&Plan>, params: &Params, timeout_ms: u64) -> Result<(TermStats, u64), ApiError> {
+    /// (`timeout_ms`, or the default) and a second. The snapshot holds the
+    /// writes `after` names ([`After`]).
+    pub async fn term_stats(self: &Arc<Self>, sql: &str, plan: Option<&Plan>, params: &Params, after: &After, timeout_ms: u64) -> Result<(TermStats, u64), ApiError> {
         let select = match plan {
             Some(p) => p.to_select(&self.schema)?,
             None => bind(sql, &self.schema, params)?,
         };
+        let timeout = self.timeout_of(timeout_ms);
         match &self.backend {
             Backend::Local(db) => {
-                let ttl = self.lease_ttl.min(self.timeout_of(timeout_ms) + Duration::from_secs(1));
-                let (lease, _) = self.lease_for(ttl)?;
-                let snap = self.snapshot(db, lease)?;
+                let snap = self.read_snapshot(db, 0, after, Instant::now() + timeout).await?;
+                let lease = self.lease_of(snap.clone(), self.lease_ttl.min(timeout + Duration::from_secs(1)))?;
                 let db = db.clone();
                 let opts = ExecOptions { synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()), ..db.exec.clone() };
                 let stats = tokio::task::spawn_blocking(move || db.term_stats_with(&snap, &select, &opts)).await.map_err(ApiError::internal)??;
                 Ok((stats, lease))
             }
-            Backend::Cluster(c) => Ok((c.term_stats(sql, plan, params, Instant::now() + self.timeout_of(timeout_ms)).await?.0, 0)),
+            Backend::Cluster(c) => Ok((c.term_stats(sql, plan, params, after, Instant::now() + timeout).await?.0, 0)),
         }
     }
 
-    /// Any statement: rows for a SELECT, the documents written otherwise.
-    pub async fn sql(self: &Arc<Self>, sql: &str, params: &Params, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+    /// Any statement: rows for a SELECT, which sees the writes `after`
+    /// names, the documents written otherwise.
+    pub async fn sql(self: &Arc<Self>, sql: &str, params: &Params, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
         if strata::query::bind_write(sql, &self.schema, params)?.is_none() {
-            let a = self.query(QueryReq { sql: sql.into(), params: params.clone(), timeout_ms, ..Default::default() }).await?;
+            let a = self.query(QueryReq { sql: sql.into(), params: params.clone(), timeout_ms, after, ..Default::default() }).await?;
             return Ok(SqlAnswer::Rows(a));
+        }
+        if after != After::Any {
+            return Err(ApiError::bad(FOR_READS));
         }
         let t0 = Instant::now();
         let r = match &self.backend {
@@ -991,10 +1085,10 @@ impl Service {
                 let (text, p) = (sql.to_string(), params.clone());
                 self.write_local(db, move |db| db.prepare_write(&text, &p), timeout_ms).await
             }
-            Backend::Cluster(c) => c.sql(sql, params).await.map(Written::rows),
+            Backend::Cluster(c) => c.sql(sql, params).await,
         };
         let w = self.wrote(r, t0, Some(sql))?;
-        Ok(SqlAnswer::Written { n: w.rows, seq_no: w.seq_no, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
+        Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
     }
 
     /// A write `prepare` binds (`None`: not a write), queued for the writer
@@ -1081,7 +1175,7 @@ impl Service {
                     e => e,
                 }
             }
-            Backend::Cluster(c) => c.write_ops(ops, key).await.map(Written::rows),
+            Backend::Cluster(c) => c.write_ops(ops, key).await,
         };
         self.wrote(n, t0, None)
     }
@@ -1254,23 +1348,20 @@ impl Service {
 
 pub enum SqlAnswer {
     Rows(Answer),
-    /// `seq_no` as in [`Written`].
-    Written { n: u64, seq_no: Option<u64>, took_ms: f64 },
+    Written { w: Written, took_ms: f64 },
 }
 
 /// What a write did: the rows it wrote and, in a database that numbers
-/// its writes (`--seq-no`), its transaction's sequence number (none
-/// through a coordinator, whose shards number their own writes).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// its writes (`--seq-no`), its transaction's sequence number. Through a
+/// coordinator, whose shards number their own writes, each shard's
+/// instead (`seq_nos`, 0 for a shard not written or whose replicas each
+/// number their own); empty when none is numbered. A read that passes
+/// them on sees the write ([`After`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Written {
     pub rows: u64,
     pub seq_no: Option<u64>,
-}
-
-impl Written {
-    fn rows(rows: u64) -> Written {
-        Written { rows, seq_no: None }
-    }
+    pub seq_nos: Vec<u64>,
 }
 
 /// Rows one write request of an import carries.
@@ -1289,6 +1380,14 @@ pub fn shard_of(key: &Value, n: usize) -> usize {
 
 fn conflict(message: String) -> ApiError {
     ApiError { status: 409, message }
+}
+
+/// Why a write refuses `min_seq_no` and `min_seq_nos`.
+const FOR_READS: &str = "min_seq_no and min_seq_nos are for reads: a write sees every write before it";
+
+/// A query refused for want of a slot ([`Service::admit`]).
+fn too_many() -> ApiError {
+    ApiError { status: 429, message: "too many queries running; try again".into() }
 }
 
 /// How many rows of `db` have keys outside shard `shard`'s slots under
@@ -1366,7 +1465,7 @@ impl Queued {
     /// Records the outcome under the request's key and answers it.
     fn answer(mut self, r: Result<Written, ApiError>) {
         if let Some(k) = &self.key {
-            self.keys.finish(k, r.as_ref().ok().copied());
+            self.keys.finish(k, r.as_ref().ok().cloned());
         }
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(r);
@@ -1516,7 +1615,7 @@ fn apply_group(db: &Db, group: Vec<Queued>) {
     }
     let Some(deadline) = group.iter().map(|q| q.deadline).max() else { return };
     if let [Queued { job: WriteJob::Sql(p), .. }] = &group[..] {
-        let r = wait_for_writer(deadline, || db.write_prepared_seq(p).map(|(rows, seq_no)| Written { rows, seq_no }).map_err(ApiError::from));
+        let r = wait_for_writer(deadline, || db.write_prepared_seq(p).map(|(rows, seq_no)| Written { rows, seq_no, ..Default::default() }).map_err(ApiError::from));
         group.into_iter().next().expect("one").answer(r);
         return;
     }
@@ -1524,7 +1623,7 @@ fn apply_group(db: &Db, group: Vec<Queued>) {
     match wait_for_writer(deadline, || apply_requests(db, &requests)) {
         Ok((counts, seq_no)) => {
             for (q, rows) in group.into_iter().zip(counts) {
-                q.answer(Ok(Written { rows, seq_no }));
+                q.answer(Ok(Written { rows, seq_no, ..Default::default() }));
             }
         }
         Err(e) if group.len() == 1 => {
@@ -1572,7 +1671,7 @@ pub(crate) fn wait_for_writer<T>(deadline: Instant, mut write: impl FnMut() -> R
 /// Applies `ops` to `db` in one transaction.
 pub fn apply_ops(db: &Db, ops: &[Json]) -> Result<Written, ApiError> {
     let (counts, seq_no) = apply_requests(db, &[ops])?;
-    Ok(Written { rows: counts[0], seq_no })
+    Ok(Written { rows: counts[0], seq_no, ..Default::default() })
 }
 
 /// Applies several requests' operations in one transaction; returns the

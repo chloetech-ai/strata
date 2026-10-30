@@ -62,7 +62,7 @@ impl Keys {
         }
         match g.keys.get(key) {
             Some((h, _)) if *h != hash => Begin::Mismatch,
-            Some((_, Some(n))) => Begin::Done(*n),
+            Some((_, Some(n))) => Begin::Done(n.clone()),
             Some((_, None)) => Begin::Busy,
             None => {
                 g.keys.insert(key.to_string(), (hash, None));
@@ -111,9 +111,9 @@ mod tests {
         assert_eq!(k.begin("a", 1), Begin::Busy);
         assert_eq!(k.begin("a", 2), Begin::Mismatch);
         // The answer comes back whole, with its sequence number.
-        let w = Written { rows: 3, seq_no: Some(7) };
-        k.finish("a", Some(w));
-        assert_eq!(k.begin("a", 1), Begin::Done(w));
+        let w = Written { rows: 3, seq_no: Some(7), ..Default::default() };
+        k.finish("a", Some(w.clone()));
+        assert_eq!(k.begin("a", 1), Begin::Done(w.clone()));
         // A request that did not commit can be retried.
         assert_eq!(k.begin("b", 1), Begin::New);
         k.finish("b", None);

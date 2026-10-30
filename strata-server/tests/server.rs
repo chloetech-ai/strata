@@ -14,7 +14,8 @@ use strata::query::Params;
 use strata::storage::{DbOptions, Layout};
 use strata::value::Value;
 use strata_server::auth::{self, Access, Secret, Tls};
-use strata_server::service::{shard_of, AgentConfig, Backend, QueryReq, Service, MAX_LEASES};
+use strata_server::replication::{Acks, Follow, Primary, PrimaryOptions};
+use strata_server::service::{shard_of, After, AgentConfig, Backend, QueryReq, Replication, Service, MAX_LEASES};
 use strata_server::coord::{CoordOptions, Coordinator};
 use strata_server::slots::{self, SlotMap};
 use strata_server::{demo, json as js, pb, server};
@@ -42,6 +43,14 @@ fn vector_42(db: &Db) -> Value {
 fn service(db: Db, base_url: &str) -> Arc<Service> {
     let schema = db.schema().clone();
     Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent_config(base_url), 16, Duration::from_secs(10)))
+}
+
+/// A server of `db`, set up by `f` (its replication).
+fn service_with(db: Arc<Db>, f: impl FnOnce(&mut Service)) -> Arc<Service> {
+    let schema = db.schema().clone();
+    let mut svc = Service::new(Backend::Local(db), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
+    f(&mut svc);
+    Arc::new(svc)
 }
 
 async fn http(svc: Arc<Service>, token: Option<&str>) -> String {
@@ -522,22 +531,22 @@ async fn coordinator_answers_like_one_database() {
             false => strata::query::ir::Plan::bind(sql, &coord.schema, &Params::new()).unwrap(),
         };
         let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
-        let Ok(strata_server::service::SqlAnswer::Rows(got)) = coord.run_plan(plan, 0).await else { panic!("{sql}") };
+        let Ok(strata_server::service::SqlAnswer::Rows(got)) = coord.run_plan(plan, After::Any, 0).await else { panic!("{sql}") };
         same(sql, &want, &js::result(&got.rs, 0.0));
     }
     let strata::query::Command::Write { write, .. } = strata::query::bind_command("DELETE FROM products WHERE id = 'p0000001'", &[&coord.schema], &Params::new()).unwrap() else { panic!() };
-    let e = coord.run_plan(strata::query::ir::Plan::of_write(&coord.schema, &write), 0).await.err().unwrap();
+    let e = coord.run_plan(strata::query::ir::Plan::of_write(&coord.schema, &write), After::Any, 0).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("coordinator"), "{}", e.message);
 
     // Writes: inserts go to their key's shard, UPDATE and DELETE to all.
     let sql = |s: String| {
         let coord = coord.clone();
-        async move { coord.sql(&s, &Params::new(), 0).await.unwrap() }
+        async move { coord.sql(&s, &Params::new(), After::Any, 0).await.unwrap() }
     };
     let ids: Vec<String> = (0..30).map(|i| format!("new{i}")).collect();
     let values: Vec<String> = ids.iter().map(|id| format!("('{id}', 'Tent {id}', 'outdoor', 10.0, 0)")).collect();
     let n = match sql(format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", "))).await {
-        strata_server::service::SqlAnswer::Written { n, .. } => n,
+        strata_server::service::SqlAnswer::Written { w, .. } => w.rows,
         _ => panic!("rows"),
     };
     assert_eq!(n, 30);
@@ -732,7 +741,7 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
     let both = cluster(c);
     let ids: Vec<String> = (0..20).map(|i| format!("rep{i}")).collect();
     let values: Vec<String> = ids.iter().map(|id| format!("('{id}', 'Tent {id}', 'outdoor', 10.0, 0)")).collect();
-    both.sql(&format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), 0).await.unwrap();
+    both.sql(&format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
     let h = both.health().await;
     assert_eq!(h["status"], "ok", "{h}");
     for (s, shard) in h["shards"].as_array().unwrap().iter().enumerate() {
@@ -751,13 +760,15 @@ struct Seen {
     hold: bool,
     release: bool,
     epoch: u64,
+    min_seq_no: u64,
 }
 
 /// A shard server that records each read, as a server of protocol
 /// `version` would take it: one of 1 is from before `Hello` (it answers
 /// Unimplemented, and the fields it does not know, `protocol` and `plan`,
 /// never reach it), one of 2 has no leases for a fetch (`hold`, `release`,
-/// `Release`), and one of 3 no slots (`epoch`, `Slots`). While `down`, it
+/// `Release`), one of 3 no slots (`epoch`, `Slots`), and one of 4 does not
+/// wait for a write (`min_seq_no`). While `down`, it
 /// fails every read, and while
 /// `fail_fetch`, every fetch (a read that ends its lease). `after_hold` is
 /// a write it applies once, after answering a read that held its snapshot.
@@ -768,6 +779,9 @@ struct Recording {
     fail_fetch: AtomicBool,
     after_hold: std::sync::Mutex<Option<String>>,
     seen: std::sync::Mutex<Vec<Seen>>,
+    /// Each `Replicate` call's transactions and whether it said the
+    /// replica is behind.
+    shipped: std::sync::Mutex<Vec<(usize, bool)>>,
 }
 
 impl Recording {
@@ -781,8 +795,11 @@ impl Recording {
     fn read(&self, mut r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Request<pb::QueryRequest>, tonic::Status> {
         self.up()?;
         let q = r.get_mut();
-        self.seen.lock().unwrap().push(Seen { protocol: q.protocol, typed: q.plan.is_some(), hold: q.hold, release: q.release, epoch: q.epoch });
+        self.seen.lock().unwrap().push(Seen { protocol: q.protocol, typed: q.plan.is_some(), hold: q.hold, release: q.release, epoch: q.epoch, min_seq_no: q.min_seq_no });
         let v = self.version.load(Ordering::Relaxed);
+        if v < 5 {
+            q.min_seq_no = 0;
+        }
         if v < 4 {
             q.epoch = 0;
         }
@@ -816,7 +833,7 @@ impl pb::strata_server::Strata for Recording {
         let a = self.inner.query(r).await?;
         let write = self.after_hold.lock().unwrap().take_if(|_| hold);
         if let Some(sql) = write {
-            self.inner.0.sql(&sql, &Params::new(), 0).await.unwrap();
+            self.inner.0.sql(&sql, &Params::new(), After::Any, 0).await.unwrap();
         }
         Ok(a)
     }
@@ -859,6 +876,7 @@ impl pb::strata_server::Strata for Recording {
     }
     async fn replicate(&self, r: tonic::Request<pb::ReplicateRequest>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
         self.up()?;
+        self.shipped.lock().unwrap().push((r.get_ref().txns.len(), r.get_ref().behind));
         self.inner.replicate(r).await
     }
     async fn restore(&self, r: tonic::Request<tonic::Streaming<pb::RestoreChunk>>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
@@ -868,15 +886,20 @@ impl pb::strata_server::Strata for Recording {
 }
 
 async fn recording(db: Db, version: u32) -> (String, Arc<Recording>) {
+    recording_of(service(db, "http://unused"), version).await
+}
+
+async fn recording_of(svc: Arc<Service>, version: u32) -> (String, Arc<Recording>) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let shard = Arc::new(Recording {
-        inner: strata_server::grpc::Grpc(service(db, "http://unused")),
+        inner: strata_server::grpc::Grpc(svc),
         version: AtomicU32::new(version),
         down: AtomicBool::new(false),
         fail_fetch: AtomicBool::new(false),
         after_hold: Default::default(),
         seen: Default::default(),
+        shipped: Default::default(),
     });
     let svc = pb::strata_server::StrataServer::from_arc(shard.clone()).max_decoding_message_size(256 << 20);
     tokio::spawn(tonic::transport::Server::builder().add_service(svc).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
@@ -945,8 +968,8 @@ async fn shards_speak_the_oldest_protocol_among_them() {
             leases_end(&seen).await;
         }
         // Statistics alone, as a coordinator in front of this one asks.
-        let (stats, _) = coord.term_stats("SELECT id FROM products ORDER BY bm25(body, 'waterproof') DESC LIMIT 3", None, &Params::new(), 0).await.unwrap();
-        let (local, _) = service(create(dir.path(), &format!("r{round}w.strata"), |_| true), "http://unused").term_stats("SELECT id FROM products ORDER BY bm25(body, 'waterproof') DESC LIMIT 3", None, &Params::new(), 0).await.unwrap();
+        let (stats, _) = coord.term_stats("SELECT id FROM products ORDER BY bm25(body, 'waterproof') DESC LIMIT 3", None, &Params::new(), &After::Any, 0).await.unwrap();
+        let (local, _) = service(create(dir.path(), &format!("r{round}w.strata"), |_| true), "http://unused").term_stats("SELECT id FROM products ORDER BY bm25(body, 'waterproof') DESC LIMIT 3", None, &Params::new(), &After::Any, 0).await.unwrap();
         assert_eq!(serde_json::to_value(&stats).unwrap(), serde_json::to_value(&local).unwrap());
         // Every read reached every shard in the protocol spoken, typed from
         // 2, and pages were fetched from 3.
@@ -980,6 +1003,100 @@ async fn a_replica_is_asked_its_protocol_again_after_failing() {
     shard.down.store(false, Ordering::Relaxed);
     assert_eq!(count().await.unwrap().rs.rows[0][0], n);
     assert_eq!(shard.last().map(|s| (s.protocol, s.typed)), Some((1, false)));
+}
+
+/// A read that must see a write goes only to a copy that waits for it. A
+/// replica that speaks a protocol before 5 would answer what it holds, so
+/// the coordinator sends such a read to the shard's primary until the
+/// replica is upgraded, and other reads to either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    // Numbered, and a primary's with a log to ship.
+    let numbered = |name: &str| {
+        let opts = DbOptions { publish_snapshots: true, ship_log_bytes: 64 << 20, ..DbOptions::default() };
+        let db = Db::create(&dir.path().join(name), demo::schema(N), opts).unwrap();
+        db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
+        db.load((0..300).map(|i| demo::product(i, 7))).unwrap();
+        db.storage().start_seq_no().unwrap();
+        Arc::new(db)
+    };
+    let (rdb, pdb) = (numbered("r.strata"), numbered("p.strata"));
+    let follow = Arc::new(Follow::open(rdb.clone(), None).unwrap());
+    let r = service_with(rdb.clone(), |s| s.replication = Replication::Replica(follow));
+    let (ru, replica) = recording_of(r.clone(), 4).await;
+    // A transaction a batch, for the catch-up below.
+    let opts = PrimaryOptions { replicas: vec![ru.clone()], acks: Acks::All, heartbeat: Duration::from_millis(100), retry_max: Duration::from_millis(200), batch_bytes: 1, ..Default::default() };
+    let p = service_with(pdb.clone(), |s| s.replication = Replication::Primary(Primary::start(pdb.clone(), None, opts).unwrap()));
+    let pu = grpc(p.clone()).await;
+    for _ in 0..200 {
+        if r.health().await["replication"]["serves_reads"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // No hedges: each read goes to one copy, and to the next on a failure.
+    let c = Coordinator::connect_with(vec![format!("{ru}|{pu}")], CoordOptions { hedge: Duration::from_secs(60), ..Default::default() }).await.unwrap();
+    let coord = cluster(c);
+    let sold = |after: Vec<u64>| {
+        let coord = coord.clone();
+        async move {
+            let q = QueryReq { sql: "SELECT sold FROM products WHERE id = 'p0000003'".into(), after: After::Shards(after), ..Default::default() };
+            coord.query(q).await.unwrap().rs.rows[0][0].as_i64().unwrap()
+        }
+    };
+    let seen = |min: u64| replica.seen.lock().unwrap().iter().filter(|s| s.min_seq_no == min).count();
+    // Each pair of reads starts once at each copy.
+    for v in 1..=4 {
+        let w = coord.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": v})], None).await.unwrap();
+        for after in [w.seq_nos.clone(), w.seq_nos.clone(), Vec::new(), Vec::new()] {
+            assert_eq!(sold(after).await, v);
+        }
+        assert_eq!(seen(w.seq_nos[0]), 0, "a read that must see transaction {} never reaches a replica of protocol 4", w.seq_nos[0]);
+    }
+    assert!(seen(0) >= 4, "other reads do: {}", seen(0));
+    // Passed over, it did not fail: it is not avoided.
+    let h = coord.health().await;
+    assert!(h["shards"][0]["replicas"][0].get("avoided").is_none() && h["retries"].as_u64() >= Some(4), "{h}");
+
+    // Upgraded: it is asked its protocol again after failing a read.
+    replica.down.store(true, Ordering::Relaxed);
+    replica.version.store(5, Ordering::Relaxed);
+    for _ in 0..2 {
+        sold(Vec::new()).await;
+    }
+    replica.down.store(false, Ordering::Relaxed);
+    // Avoided for a while after failing.
+    tokio::time::sleep(CoordOptions::default().cool_off).await;
+    let mut asked = 0;
+    for v in 5..=8 {
+        let w = coord.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": v})], None).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(sold(w.seq_nos.clone()).await, v);
+        }
+        asked += seen(w.seq_nos[0]);
+    }
+    assert!(asked >= 4, "reads that name a write reach it now: {asked}");
+
+    // Each batch says whether it reaches the primary's last: a replica that
+    // catches up is told it is behind until the last batch.
+    replica.down.store(true, Ordering::Relaxed);
+    for v in 9..=14 {
+        coord.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": v})], None).await.unwrap();
+    }
+    replica.shipped.lock().unwrap().clear();
+    replica.down.store(false, Ordering::Relaxed);
+    let last = pdb.storage().seq_no().unwrap().seq;
+    for _ in 0..200 {
+        if rdb.storage().seq_no().unwrap().seq == last && r.health().await["replication"]["serves_reads"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let shipped = replica.shipped.lock().unwrap().clone();
+    let batches: Vec<bool> = shipped.iter().filter(|(n, _)| *n > 0).map(|&(_, behind)| behind).collect();
+    assert!(batches.len() == 6 && batches[..5].iter().all(|&b| b) && !batches[5], "{shipped:?}");
+    assert_eq!(r.health().await["replication"]["serves_reads"], true);
 }
 
 /// A replica down when the coordinator connected gets no slot map then; it
@@ -1088,7 +1205,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
     let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 4, strata::query::ir::VERSION, 0));
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 5, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1114,9 +1231,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 5, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: 6, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 5"), "{}", e.message());
+    assert!(e.message().contains("protocol 6"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
@@ -1158,7 +1275,7 @@ async fn keys_live_in_their_slots() {
     // Writes land on the shard holding their key's slot.
     let ids: Vec<String> = (0..40).map(|i| format!("new{i}")).collect();
     let values: Vec<String> = ids.iter().map(|id| format!("('{id}', 'Tent {id}', 'outdoor', 10.0, 0)")).collect();
-    first.sql(&format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), 0).await.unwrap();
+    first.sql(&format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
     for id in &ids {
         let k = Value::Str(id.clone());
         for (s, svc) in shards.iter().enumerate() {
@@ -1168,7 +1285,7 @@ async fn keys_live_in_their_slots() {
     }
     // A shard refuses a key another holds, however it is written.
     let theirs = (0..).map(|i| format!("x{i}")).find(|id| even.shard_of(&Value::Str(id.clone())) == 1).unwrap();
-    let e = shards[0].sql(&format!("INSERT INTO products (id, title) VALUES ('{theirs}', 'Lamp')"), &Params::new(), 0).await.err().unwrap();
+    let e = shards[0].sql(&format!("INSERT INTO products (id, title) VALUES ('{theirs}', 'Lamp')"), &Params::new(), After::Any, 0).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("which shard 1 holds under slot map epoch 1"), "{}", e.message);
     let e = shards[0].write_ops(vec![json!({"op": "upsert", "doc": {"id": theirs, "title": "Lamp"}})], None).await.err().unwrap();
     assert_eq!(e.status, 400, "{}", e.message);
@@ -1539,7 +1656,7 @@ async fn snapshot_leases_end_with_their_query() {
     let dir = tempfile::tempdir().unwrap();
     let svc = service(create(dir.path(), "db.strata", |_| true), "http://unused");
     let sql = "SELECT id FROM products ORDER BY bm25(body, 'waterproof hiking boots') DESC LIMIT 5";
-    let (_, lease) = svc.term_stats(sql, None, &Params::new(), 200).await.unwrap();
+    let (_, lease) = svc.term_stats(sql, None, &Params::new(), &After::Any, 200).await.unwrap();
     let q = |snapshot| QueryReq { sql: sql.into(), snapshot, ..Default::default() };
     svc.query(q(lease)).await.unwrap();
     assert_eq!(svc.sweep_leases(), 1);
@@ -1760,7 +1877,7 @@ async fn bool_and_timestamp_fields_over_http_and_grpc() {
     assert_eq!(got.rs.rows, want.rows);
     assert!(!want.rows.is_empty());
     // An INSERT through the coordinator reaches its key's shard as written.
-    coord.sql("INSERT INTO tasks (id, done, at, n) VALUES ('y1', TRUE, '2026-10-31T23:59:59.5-03:00', 200)", &Params::new(), 0).await.unwrap();
+    coord.sql("INSERT INTO tasks (id, done, at, n) VALUES ('y1', TRUE, '2026-10-31T23:59:59.5-03:00', 200)", &Params::new(), After::Any, 0).await.unwrap();
     let got = coord.query(QueryReq { sql: "SELECT done, at FROM tasks WHERE id = 'y1'".into(), ..Default::default() }).await.unwrap();
     assert_eq!(js::result(&got.rs, 0.0)["rows"], json!([[true, "2026-11-01T02:59:59.500Z"]]));
 }
@@ -1812,13 +1929,13 @@ async fn defaults_and_not_null_over_http_and_grpc() {
     let coord = Coordinator::connect(urls).await.unwrap();
     let coord = Arc::new(Service::new(Backend::Cluster(Arc::new(coord)), schema.clone(), agent_config("http://unused"), 16, Duration::from_secs(10)));
     let values: Vec<String> = (0..20).map(|i| format!("('k{i}')")).collect();
-    coord.sql(&format!("INSERT INTO events (id) VALUES {}", values.join(", ")), &Params::new(), 0).await.unwrap();
+    coord.sql(&format!("INSERT INTO events (id) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
     let got = coord.query(QueryReq { sql: "SELECT kind, n, COUNT(*), MIN(at), MAX(at) FROM events GROUP BY kind, n".into(), ..Default::default() }).await.unwrap();
     let rows = js::result(&got.rs, 0.0)["rows"].clone();
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!((&rows[0][0], &rows[0][1], &rows[0][2]), (&json!("click"), &json!(1), &json!(20)));
     assert_eq!(rows[0][3], rows[0][4], "one time for the statement: {rows}");
-    assert!(coord.sql("INSERT INTO events (id, kind) VALUES ('y', NULL)", &Params::new(), 0).await.is_err());
+    assert!(coord.sql("INSERT INTO events (id, kind) VALUES ('y', NULL)", &Params::new(), After::Any, 0).await.is_err());
 }
 
 /// A TEXT field's analyzer over HTTP: the schema names it, and searches
@@ -2037,6 +2154,34 @@ async fn conditional_writes_apply_while_the_row_is_unchanged() {
     let e = g.write(pb::WriteRequest { ops_json: ops(0), ..Default::default() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
 
+    // A read may name the write it must see (`min_seq_no`). This server
+    // holds every write it answered, and refuses a number past its last.
+    let sql = "SELECT sold FROM products WHERE id = 'p0000008'";
+    let plan = strata::query::ir::Plan::bind(sql, &svc.schema, &Params::new()).unwrap().to_json().unwrap();
+    for (path, body) in [("query", json!({"sql": sql})), ("sql", json!({"sql": sql})), ("plan", json!({"plan": plan}))] {
+        let url = format!("{base}/v1/{path}");
+        let with = |extra: Json| {
+            let mut b = body.clone();
+            b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            b
+        };
+        let (status, r) = post(&c, &url, with(json!({"min_seq_no": 9}))).await;
+        assert_eq!((status, r["rows"].as_array().map(Vec::len)), (200, Some(1)), "{path}: {r}");
+        let (status, r) = post(&c, &url, with(json!({"min_seq_no": 10}))).await;
+        assert!(status == 409 && r["error"].as_str().unwrap().contains("transaction 10 was not committed here"), "{path}: {r}");
+        for bad in [json!({"min_seq_no": -1}), json!({"min_seq_no": "9"}), json!({"min_seq_nos": 9}), json!({"min_seq_nos": [9, "x"]}), json!({"min_seq_nos": [9]}), json!({"min_seq_no": 9, "min_seq_nos": [9]})] {
+            let (status, r) = post(&c, &url, with(bad.clone())).await;
+            assert_eq!(status, 400, "{path} {bad}: {r}");
+        }
+    }
+    let (status, r) = post(&c, &format!("{base}/v1/sql"), json!({"sql": "UPDATE products SET sold = 1 WHERE id = 'p0000008'", "min_seq_no": 9})).await;
+    assert!(status == 400 && r["error"].as_str().unwrap().contains("are for reads"), "{r}");
+    let read = |min_seq_no: u64| pb::QueryRequest { sql: sql.into(), protocol: 5, min_seq_no, ..Default::default() };
+    assert_eq!(g.query(read(9)).await.unwrap().into_inner().rows.len(), 1);
+    assert_eq!(g.query(read(10)).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    let e = g.query(pb::QueryRequest { min_seq_nos: vec![9], ..read(0) }).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+
     // A database that does not number its writes refuses both, by name,
     // and answers no number.
     let plain = http(service(create(dir.path(), "p.strata", |i| i < 50), "http://unused"), None).await;
@@ -2049,6 +2194,9 @@ async fn conditional_writes_apply_while_the_row_is_unchanged() {
     let (status, r) = post(&c, &format!("{plain}/v1/write"), json!({"ops": [{"op": "add", "key": "p0000003", "field": "sold", "value": 1}]})).await;
     assert_eq!(status, 200);
     assert!(r.get("seq_no").is_none(), "{r}");
+    let (status, r) = post(&c, &format!("{plain}/v1/query"), json!({"sql": sql, "min_seq_no": 1})).await;
+    assert!(status == 400 && r["error"].as_str().unwrap().contains("--seq-no"), "{r}");
+    assert_eq!(post(&c, &format!("{plain}/v1/query"), json!({"sql": sql, "min_seq_no": 0})).await.0, 200);
 }
 
 /// Through a coordinator, `seq_no()` reads each shard's numbers and
@@ -2078,7 +2226,32 @@ async fn conditional_writes_through_a_coordinator() {
     assert_eq!(seq_of("p0000003").await, 0);
     let w = coord.write_ops(set("p0000003", 0), None).await.unwrap();
     assert_eq!((w.rows, w.seq_no), (1, None), "a coordinator answers no number: each shard numbers its own");
+    let s3 = shard_of(&key(3), 2);
+    assert_eq!(w.seq_nos, [(s3 == 0) as u64, (s3 == 1) as u64], "but one per shard: 0 where it wrote nothing");
     assert_eq!(seq_of("p0000003").await, 1);
+    // Over HTTP and gRPC, a read through it names the write it must see
+    // with each shard's number, as the write answered them.
+    let base = http(coord.clone(), None).await;
+    let c = reqwest::Client::new();
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({"ops": [{"op": "set", "key": "p0000004", "field": "sold", "value": 6}]})).await;
+    assert_eq!(status, 200, "{r}");
+    let nos = r["seq_nos"].clone();
+    assert!(r.get("seq_no").is_none() && nos.as_array().is_some_and(|a| a.len() == 2), "{r}");
+    let sql = "SELECT sold FROM products WHERE id = 'p0000004'";
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": sql, "min_seq_nos": nos})).await;
+    assert_eq!((status, r["rows"][0][0].clone()), (200, json!(6)), "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": sql, "min_seq_no": 1})).await;
+    assert!(status == 400 && r["error"].as_str().unwrap().contains("a coordinator takes min_seq_nos"), "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": sql, "min_seq_nos": [0, 0, 0]})).await;
+    assert_eq!(status, 400, "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": sql, "min_seq_nos": [1000, 1000]})).await;
+    assert!(status == 409 && r["error"].as_str().unwrap().contains("was not committed here"), "{r}");
+    let mut g = pb::strata_client::StrataClient::connect(grpc(coord.clone()).await).await.unwrap();
+    let ops = serde_json::to_vec(&json!([{"op": "set", "key": "p0000004", "field": "sold", "value": 7}])).unwrap();
+    let w = g.write(pb::WriteRequest { ops_json: ops, ..Default::default() }).await.unwrap().into_inner();
+    assert!(w.seq_no.is_none() && w.seq_nos.len() == 2, "{w:?}");
+    let a = g.query(pb::QueryRequest { sql: sql.into(), protocol: 5, min_seq_nos: w.seq_nos, ..Default::default() }).await.unwrap().into_inner();
+    assert_eq!(a.rows.len(), 1);
     let e = coord.write_ops(set("p0000003", 0), None).await.unwrap_err();
     assert_eq!(e.status, 409, "{}", e.message);
 
@@ -2087,6 +2260,14 @@ async fn conditional_writes_through_a_coordinator() {
     assert!(e.status == 400 && e.message.contains("one replica per shard"), "{}", e.message);
     let e = replicated.query(QueryReq { sql: "SELECT id, seq_no() FROM products LIMIT 3".into(), ..Default::default() }).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("one replica per shard"), "{}", e.message);
+    // Each copy numbers what it takes, so a write answers no number, and
+    // a read cannot name one.
+    let w = replicated.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": 8})], None).await.unwrap();
+    assert!(w.seq_no.is_none() && w.seq_nos.is_empty(), "{w:?}");
+    let read = |after: Vec<u64>| QueryReq { sql: "SELECT sold FROM products WHERE id = 'p0000003'".into(), after: After::Shards(after), ..Default::default() };
+    let e = replicated.query(read(vec![0, 1])).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("whose replicas each number their own writes"), "{}", e.message);
+    assert!(replicated.query(read(vec![0, 0])).await.is_ok());
 
     // --seq-no.
     let numbered = |name: &str, seq_no: bool| server::Options { db: Some(dir.path().join(name)), demo: Some(20), seq_no, ..Default::default() };

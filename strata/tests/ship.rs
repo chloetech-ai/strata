@@ -60,6 +60,7 @@ fn ship(primary: &Db, replica: &Db, max: usize) -> usize {
         let bytes: Vec<&[u8]> = got.iter().map(|t| &*t.bytes).collect();
         assert_eq!(replica.storage().apply_shipped(prev(primary, at.seq), &bytes).unwrap(), Applied::At(end));
         assert_eq!(last(replica), end, "the replica's last number is the last applied");
+        assert_eq!(replica.snapshot().seq_no(), Some(end.seq), "and its snapshots hold it");
         n += got.len();
     }
 }
@@ -459,6 +460,7 @@ fn a_replica_takes_a_copy_of_its_primary() {
             })
             .unwrap();
         assert_eq!(installed, Some(last(&primary)), "seed {seed}: a merge built, and the copy was installed meanwhile");
+        assert_eq!(replica.snapshot().seq_no(), Some(last(&primary).seq), "seed {seed}: its snapshots hold the copy's last");
         same(&primary, &replica, &format!("seed {seed}: copied"));
         assert_eq!(replica.documents(&before).map(|d| d.unwrap()).collect::<Vec<_>>(), read_before, "a snapshot from before reads what it read");
         let at = last(&replica).seq;

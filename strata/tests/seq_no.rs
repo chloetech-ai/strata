@@ -176,6 +176,52 @@ fn writes_are_numbered_once_started() {
     }
 }
 
+/// A snapshot says the number of the last transaction it holds, and keeps
+/// it as later writes, flushes and merges go on, published by the writer
+/// or built by the reader.
+#[test]
+fn a_snapshot_says_the_last_transaction_it_holds() {
+    for publish_snapshots in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_for(dir.path(), "db", Layout::SingleFile);
+        let opts = || DbOptions { publish_snapshots, ..options(Layout::SingleFile) };
+        let mut model = Rows::new();
+        let db = Db::create(&path, schema(), opts()).unwrap();
+        upsert(&db, &mut model, 0, 0);
+        assert_eq!(db.snapshot().seq_no(), None, "not numbered");
+        db.storage().start_seq_no().unwrap();
+        assert_eq!(db.snapshot().seq_no(), Some(0));
+        for i in 1..=3 {
+            upsert(&db, &mut model, i, i as i64);
+            assert_eq!(db.snapshot().seq_no(), Some(i));
+        }
+        let old = db.snapshot();
+        let at_3 = model.clone();
+        for i in 4..=6 {
+            upsert(&db, &mut model, i % 3, i as i64);
+        }
+        db.storage().flush().unwrap();
+        upsert(&db, &mut model, 9, 9);
+        db.storage().flush().unwrap();
+        db.storage().merge(&MergePolicy { merge_factor: 2, floor_docs: 1_000, ..MergePolicy::default() }).unwrap();
+        // Values set in place and deletes are transactions too.
+        let mut tx = db.storage().begin().unwrap();
+        tx.set(&Value::Str(key(1)), "n", Value::Int(41)).unwrap();
+        model.insert(key(1), 41);
+        tx.commit_seq().unwrap();
+        let mut tx = db.storage().begin().unwrap();
+        assert!(tx.delete(&Value::Str(key(2))).unwrap());
+        model.remove(&key(2));
+        assert_eq!(tx.commit_seq().unwrap(), Some(9));
+        assert_eq!((db.snapshot().seq_no(), rows(&db)), (Some(9), model.clone()));
+        let in_old: Rows = db.documents(&old).map(|d| d.unwrap()).map(|d| (d[0].as_str().unwrap().to_string(), d[1].as_i64().unwrap())).collect();
+        assert_eq!((old.seq_no(), in_old), (Some(3), at_3), "an older snapshot keeps its number and rows");
+        drop((old, db));
+        let db = Db::open(&path, opts()).unwrap();
+        assert_eq!(db.snapshot().seq_no(), Some(9));
+    }
+}
+
 /// The log of a crash holds the numbers of the transactions it holds,
 /// sealed by a background flush or not; reopened, the database goes on
 /// from the last.

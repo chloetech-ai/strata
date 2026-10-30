@@ -39,6 +39,17 @@
 //! replica whose history differs from the primary's is not copied: the
 //! error says so.
 //!
+//! A replica serves reads once a call from its primary since it started
+//! reached the primary's last transaction, until a call finds it behind,
+//! it fails to apply one or it installs a copy: while it catches up,
+//! reads are refused (503), and a coordinator asks another copy. A read
+//! that must see a write passes the write's sequence number
+//! ([`crate::service::After`]): a replica waits until it has applied it,
+//! up to [`READ_WAIT`], and refuses the read otherwise, so that a
+//! coordinator asks the primary, which holds every write it answered. A
+//! replica its primary cannot reach does not know it fell behind, and
+//! goes on serving what it holds.
+//!
 //! Not here yet: replacing a primary by one of its replicas.
 
 use std::path::{Path, PathBuf};
@@ -48,7 +59,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
 use strata::db::Db;
-use strata::storage::{Applied, CheckpointOptions, Database, DbOptions, Layout, LogRead, SeqNo};
+use strata::storage::{Applied, CheckpointOptions, Database, DbOptions, Layout, LogRead, SeqNo, Snapshot};
 use tokio::sync::watch;
 
 use crate::auth::Secret;
@@ -505,6 +516,7 @@ async fn ship(p: Weak<Primary>, k: usize) {
                     txns: txns.iter().map(|t| t.bytes.to_vec()).collect(),
                     global_checkpoint: p.global_checkpoint(),
                     primary: p.id.clone(),
+                    behind: end < last,
                 };
                 drop(txns);
                 let mut c = f.client.clone();
@@ -641,6 +653,12 @@ async fn send_copy(p: &Primary, f: &Follower, term: u64) -> Result<pb::Replicate
 /// checkpoint may hold, before refusing a batch (503).
 const WRITER_WAIT: Duration = Duration::from_secs(5);
 
+/// How long a read on a replica waits for a write it must see
+/// ([`crate::service::After`]) before it is refused (503), within its
+/// deadline. An in-sync replica applies a write within milliseconds of
+/// its primary; one a second behind is better skipped for the primary.
+pub const READ_WAIT: Duration = Duration::from_secs(1);
+
 /// A replica: applies what its primary ships.
 pub struct Follow {
     db: Arc<Db>,
@@ -653,6 +671,14 @@ pub struct Follow {
     applied: AtomicU64,
     restores: AtomicU64,
     called_at: Mutex<Option<Instant>>,
+    /// Whether it serves reads ([`Follow::readable`]).
+    serves_reads: AtomicBool,
+    /// The last number committed, as the database's commit hook says, for
+    /// reads waiting for a write ([`Follow::holding`]).
+    committed: Arc<watch::Sender<u64>>,
+    /// Reads that waited for a write, and reads refused.
+    read_waits: AtomicU64,
+    reads_refused: AtomicU64,
 }
 
 impl Follow {
@@ -663,7 +689,69 @@ impl Follow {
             return Err("a replica numbers its writes as its primary does: start it with --seq-no".into());
         }
         let kept = Kept::open(file)?;
-        Ok(Follow { db, file: file.map(Path::to_path_buf), kept: tokio::sync::Mutex::new(kept), global_checkpoint: AtomicU64::new(0), applied: AtomicU64::new(0), restores: AtomicU64::new(0), called_at: Mutex::new(None) })
+        let committed = Arc::new(watch::channel(db.storage().numbering().map_or(0, |n| n.seq)).0);
+        let hook = committed.clone();
+        db.storage().on_commit(move |n| {
+            hook.send_replace(n.seq);
+        });
+        Ok(Follow {
+            db,
+            file: file.map(Path::to_path_buf),
+            kept: tokio::sync::Mutex::new(kept),
+            global_checkpoint: AtomicU64::new(0),
+            applied: AtomicU64::new(0),
+            restores: AtomicU64::new(0),
+            called_at: Mutex::new(None),
+            serves_reads: AtomicBool::new(false),
+            committed,
+            read_waits: AtomicU64::new(0),
+            reads_refused: AtomicU64::new(0),
+        })
+    }
+
+    /// Whether a read may take a new snapshot here: once a call from its
+    /// primary since this server started reached the primary's last
+    /// transaction, until a call finds it behind, it fails to apply one or
+    /// it installs a copy. Refused otherwise (503), as it is catching up.
+    pub fn readable(&self) -> Result<(), ApiError> {
+        if self.serves_reads.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.reads_refused.fetch_add(1, Ordering::Relaxed);
+        let why = match *self.called_at.lock().unwrap_or_else(|e| e.into_inner()) {
+            None => "its primary has not called since it started",
+            Some(_) => "it is catching up with its primary",
+        };
+        Err(ApiError { status: 503, message: format!("this replica serves no reads while {why}: read from another copy or the primary") })
+    }
+
+    /// The latest version, once it holds transaction `seq`, waiting for it
+    /// until `until`: refused then (503), as the primary holds it.
+    pub async fn holding(&self, seq: u64, until: Instant) -> Result<Snapshot, ApiError> {
+        let mut committed = self.committed.subscribe();
+        let mut waited = false;
+        loop {
+            let snap = self.db.snapshot();
+            let at = snap.seq_no().unwrap_or(0);
+            if at >= seq {
+                return Ok(snap);
+            }
+            if !waited {
+                waited = true;
+                self.read_waits.fetch_add(1, Ordering::Relaxed);
+            }
+            let now = Instant::now();
+            if now >= until {
+                self.reads_refused.fetch_add(1, Ordering::Relaxed);
+                return Err(ApiError {
+                    status: 503,
+                    message: format!("this replica holds transactions up to {at}, and the read must see transaction {seq}, which it has not applied in time: read from the primary"),
+                });
+            }
+            // A copy installed tells no hook: look again every few
+            // milliseconds too.
+            let _ = tokio::time::timeout((until - now).min(Duration::from_millis(10)), committed.changed()).await;
+        }
     }
 
     /// The primary it follows, if one has called.
@@ -689,9 +777,12 @@ impl Follow {
             crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.storage().apply_shipped(prev, &txns).map_err(ApiError::from))
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(ApiError::internal)
+        .and_then(|r| r);
         let replica_term = self.db.storage().numbering().map_or(0, |n| n.term).max(r.term);
-        Ok(match applied {
+        // It serves reads while what it holds reaches the primary's last.
+        self.serves_reads.store(matches!(applied, Ok(Applied::At(_))) && !r.behind, Ordering::Relaxed);
+        Ok(match applied? {
             Applied::At(at) => {
                 self.applied.fetch_add(n, Ordering::Relaxed);
                 self.global_checkpoint.store(r.global_checkpoint.min(at.seq), Ordering::Relaxed);
@@ -779,6 +870,9 @@ impl Follow {
         .await
         .map_err(ApiError::internal)??;
         self.restores.fetch_add(1, Ordering::Relaxed);
+        // The primary wrote on while it sent the copy: its next call says
+        // whether this replica reaches its last.
+        self.serves_reads.store(false, Ordering::Relaxed);
         tracing::info!(primary = %first.primary, seq_no = at.seq, "installed a copy of the primary");
         let replica_term = self.db.storage().numbering().map_or(0, |n| n.term).max(first.term);
         Ok(pb::ReplicateResponse { matched: true, seq: at.seq, term: at.term, replica_term })
@@ -790,7 +884,8 @@ impl Follow {
         let n = self.db.storage().numbering().unwrap_or_default();
         let mut h = json!({
             "role": "replica", "id": kept.id, "term": n.term, "seq_no": n.seq, "global_checkpoint": self.global_checkpoint.load(Ordering::Relaxed),
-            "restores": self.restores.load(Ordering::Relaxed),
+            "restores": self.restores.load(Ordering::Relaxed), "serves_reads": self.serves_reads.load(Ordering::Relaxed),
+            "read_waits": self.read_waits.load(Ordering::Relaxed), "reads_refused": self.reads_refused.load(Ordering::Relaxed),
         });
         if let Some((primary, term)) = kept.follows {
             h["follows"] = json!({"primary": primary, "term": term});
@@ -807,6 +902,9 @@ impl Follow {
             Family::one("strata_global_checkpoint", "gauge", "The highest sequence number every in-sync replica holds, as the primary last said.", self.global_checkpoint.load(Ordering::Relaxed) as f64),
             Family::one("strata_replica_applied_total", "counter", "Transactions this replica applied from its primary.", self.applied.load(Ordering::Relaxed) as f64),
             Family::one("strata_replica_restores_total", "counter", "Copies of its primary this replica installed.", self.restores.load(Ordering::Relaxed) as f64),
+            Family::one("strata_replica_serves_reads", "gauge", "1 while this replica serves reads: its primary's last call reached the primary's last transaction.", self.serves_reads.load(Ordering::Relaxed) as u8 as f64),
+            Family::one("strata_replica_read_waits_total", "counter", "Reads that waited for this replica to apply a write they must see (min_seq_no).", self.read_waits.load(Ordering::Relaxed) as f64),
+            Family::one("strata_replica_reads_refused_total", "counter", "Reads refused while this replica caught up, or because it had not applied a write they must see in time.", self.reads_refused.load(Ordering::Relaxed) as f64),
         ]
     }
 }

@@ -60,6 +60,8 @@ pub(crate) struct SnapInner {
     txn: u64,
     /// Whether the database numbers its writes (`seq_no()`).
     numbered: bool,
+    /// The number of the last transaction it holds (0 unnumbered).
+    seq: u64,
     tables: Vec<TableView>,
     /// Mappings the on-disk segments point into.
     maps: Vec<OwnedBytes>,
@@ -94,6 +96,12 @@ impl Snapshot {
     /// The txn this snapshot reflects.
     pub fn txn(&self) -> u64 {
         self.inner.txn
+    }
+
+    /// The sequence number of the last transaction this snapshot holds,
+    /// in a database that numbers its writes (0 before the first).
+    pub fn seq_no(&self) -> Option<u64> {
+        self.inner.numbered.then_some(self.inner.seq)
     }
 
     /// The schema of the table this snapshot looks at.
@@ -269,6 +277,7 @@ pub(crate) struct Capture {
     pub version: u64,
     txn: u64,
     numbered: bool,
+    seq: u64,
     pin: Pin,
     pub tables: Vec<TableCapture>,
 }
@@ -282,7 +291,7 @@ impl State {
         for t in 0..self.tables.len() {
             tables.push(self.capture_table(t, with_mem, numbered));
         }
-        Capture { version: self.version, txn: self.txn, numbered, pin: pins.pin(self.txn), tables }
+        Capture { version: self.version, txn: self.txn, numbered, seq: self.seq, pin: pins.pin(self.txn), tables }
     }
 
     fn capture_table(&mut self, t: usize, with_mem: bool, numbered: bool) -> TableCapture {
@@ -407,7 +416,7 @@ impl Capture {
             let n_live = segments.iter().map(|s| s.n_live as u64).sum();
             tables.push(TableView { id: t.id, schema: t.schema, segments, pks, n_live });
         }
-        SnapInner { txn: self.txn, numbered: self.numbered, tables, maps, path, _pin: self.pin }
+        SnapInner { txn: self.txn, numbered: self.numbered, seq: self.seq, tables, maps, path, _pin: self.pin }
     }
 }
 

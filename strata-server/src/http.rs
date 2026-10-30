@@ -6,16 +6,16 @@
 //! | `GET /livez`, `/readyz` | | `{status}`: 503 when a restart is needed |
 //! | `GET /v1/health`, `/v1/stats`, `/v1/schema`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
 //! | `GET /metrics` | | Prometheus text |
-//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?}` | rows |
-//! | `POST /v1/sql` | `{sql, params?, timeout_ms?}` | rows, or `{written}` |
-//! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`) | `{written}` |
-//! | `POST /v1/plan` | `{plan, timeout_ms?}` (a plan as `/v1/explain` gives it) | rows, or `{written}` |
+//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?}` | rows |
+//! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows, or `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`) | `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}` (a plan as `/v1/explain` gives it) | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/import?format=jsonl` | rows as JSON Lines, JSON, CSV or TSV | `{written, skipped_fields}` |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?}` | the bound query, its plan IR and the executor's plan |
 //! | `POST /v1/embed` | `{text, field?}` | `{field, vector}`: the text's vector by an embedded field's model |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
-//! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?}` | `{stats, snapshot}` |
+//! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
 //! | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the steps taken |
 //!
@@ -46,7 +46,7 @@ use strata::ingest::Format;
 use strata::storage::Layout;
 
 use crate::auth::{self, Access, Secret};
-use crate::service::{QueryReq, Service, SqlAnswer, Written};
+use crate::service::{After, QueryReq, Service, SqlAnswer, Written};
 use crate::{agent, json as js, obs, ApiError};
 
 const UI: &str = include_str!("../ui/index.html");
@@ -170,6 +170,23 @@ fn body_u64(b: &Json, k: &str) -> u64 {
     b.get(k).and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
+/// The writes a read must see ([`After`]): the body's `min_seq_no`, the
+/// sequence number a server's write answered, or `min_seq_nos`, the
+/// numbers a coordinator's answered, one per shard.
+fn after(b: &Json) -> Result<After, ApiError> {
+    let seq = |v: &Json, what: &str| v.as_u64().ok_or_else(|| ApiError::bad(format!("{what} is a sequence number: a whole number from 0")));
+    let min = match b.get("min_seq_no") {
+        None | Some(Json::Null) => 0,
+        Some(v) => seq(v, "min_seq_no")?,
+    };
+    let mins = match b.get("min_seq_nos") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::Array(a)) => a.iter().map(|v| seq(v, "each of min_seq_nos")).collect::<Result<_, _>>()?,
+        Some(_) => return Err(ApiError::bad("min_seq_nos is a list of sequence numbers, one per shard, as a coordinator's write answers seq_nos")),
+    };
+    After::of(min, mins)
+}
+
 async fn health(State(app): State<App>) -> Response {
     let h = app.svc.health().await;
     let code = if matches!(h["status"].as_str(), Some("down" | "failing")) { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
@@ -229,6 +246,7 @@ async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         stats,
         snapshot: body_u64(&b, "snapshot"),
         partial: b.get("partial").and_then(|v| v.as_bool()),
+        after: after(&b)?,
         ..Default::default()
     };
     let a = app.svc.query(req).await?;
@@ -247,18 +265,22 @@ fn answer(a: &crate::service::Answer) -> Json {
 
 async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
-    match app.svc.sql(body_str(&b, "sql")?, &params, body_u64(&b, "timeout_ms")).await? {
+    match app.svc.sql(body_str(&b, "sql")?, &params, after(&b)?, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
-        SqlAnswer::Written { n, seq_no, took_ms } => Ok(AxJson(written(Written { rows: n, seq_no }, took_ms))),
+        SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),
     }
 }
 
 /// A write's answer: the rows written, and the transaction's sequence
-/// number in a database that numbers its writes.
+/// number in a database that numbers its writes, or through a
+/// coordinator each shard's ([`Written`]).
 fn written(w: Written, took_ms: f64) -> Json {
     let mut j = json!({"written": w.rows, "took_ms": took_ms});
     if let Some(s) = w.seq_no {
         j["seq_no"] = json!(s);
+    }
+    if !w.seq_nos.is_empty() {
+        j["seq_nos"] = json!(w.seq_nos);
     }
     j
 }
@@ -266,9 +288,9 @@ fn written(w: Written, took_ms: f64) -> Json {
 /// Runs a plan ([`strata::query::ir`]) as `/v1/sql` runs a statement.
 async fn run_plan(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let plan = strata::query::ir::Plan::from_json(b.get("plan").ok_or_else(|| ApiError::bad("the body needs a \"plan\""))?)?;
-    match app.svc.run_plan(plan, body_u64(&b, "timeout_ms")).await? {
+    match app.svc.run_plan(plan, after(&b)?, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
-        SqlAnswer::Written { n, seq_no, took_ms } => Ok(AxJson(written(Written { rows: n, seq_no }, took_ms))),
+        SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),
     }
 }
 
@@ -386,7 +408,7 @@ async fn put_synonyms(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 
 async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
-    let (stats, snapshot) = app.svc.term_stats(body_str(&b, "sql")?, None, &params, body_u64(&b, "timeout_ms")).await?;
+    let (stats, snapshot) = app.svc.term_stats(body_str(&b, "sql")?, None, &params, &after(&b)?, body_u64(&b, "timeout_ms")).await?;
     Ok(AxJson(json!({"stats": stats, "snapshot": snapshot})))
 }
 
