@@ -165,7 +165,13 @@ impl<'a> Text<'a> {
                 (vec![format!("Ref {}", ident(name))], Names { schema: None, outputs: names.outputs })
             }
             Node::Distinct { input } => over(input, &|_| "Distinct".into()),
-            Node::DistinctOn { input, keys } => over(input, &|names| format!("Distinct on: {}", keys.iter().map(|k| self.expr(k, names)).collect::<Vec<_>>().join(", "))),
+            Node::DistinctOn { input, keys, per } => over(input, &|names| {
+                let keys = keys.iter().map(|k| self.expr(k, names)).collect::<Vec<_>>().join(", ");
+                match *per {
+                    1 => format!("Distinct on: {keys}"),
+                    k => format!("At most {k} per: {keys}"),
+                }
+            }),
             Node::KeyOrder { input, by } => {
                 let (il, names) = self.node(input);
                 let lines = match &**by {

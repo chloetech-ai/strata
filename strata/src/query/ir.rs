@@ -62,8 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 16] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, MIN_MATCH, AT_LEAST, GUARD];
+pub const FEATURES: [&str; 17] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -134,6 +134,11 @@ pub const AT_LEAST: &str = "at_least";
 /// `min_rows`, `max_rows`).
 pub const GUARD: &str = "guard";
 
+/// The feature of a plan that keeps more than the first row of each
+/// group ([`Node::DistinctOn`] with `per` above 1: `MAX k PER field`). A
+/// Strata from before it would keep one.
+pub const PER_CAP: &str = "per_cap";
+
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
@@ -202,11 +207,18 @@ pub enum Node {
     Ref { name: String },
     /// The input's rows, each once.
     Distinct { input: Box<Node> },
-    /// The first of the input's rows with equal `keys`, in the input's
-    /// order (`DISTINCT ON`): a row per group, the groups in the order of
-    /// their first rows. Keys are equal when their values are, NULL equal
-    /// to NULL and a list to the same list. Needs [`DISTINCT_ON`].
-    DistinctOn { input: Box<Node>, keys: Vec<Expr> },
+    /// The first `per` of the input's rows with equal `keys`, in the
+    /// input's order (`DISTINCT ON`, and `MAX k PER field` for `per` k):
+    /// the other rows of a group are dropped, the rows kept stay in their
+    /// order. Keys are equal when their values are, NULL equal to NULL and
+    /// a list to the same list. Needs [`DISTINCT_ON`], and [`PER_CAP`]
+    /// with `per` above 1.
+    DistinctOn {
+        input: Box<Node>,
+        keys: Vec<Expr>,
+        #[serde(default = "one", skip_serializing_if = "is_one")]
+        per: u64,
+    },
     /// The input's rows (rows of one table) in the order of the rows of
     /// `by` with the same primary key.
     KeyOrder { input: Box<Node>, by: Box<Node> },
@@ -829,6 +841,12 @@ impl Node {
         matches!(self, Node::DistinctOn { .. }) || self.inputs().into_iter().any(Node::keeps_firsts)
     }
 
+    /// Whether the node or one below it (outside subqueries) keeps more
+    /// than the first row of a group ([`PER_CAP`]).
+    fn caps_per(&self) -> bool {
+        matches!(self, Node::DistinctOn { per, .. } if *per > 1) || self.inputs().into_iter().any(Node::caps_per)
+    }
+
     /// Whether the node has the shape the executor runs: `Project [Limit]
     /// [Sort] [Filter] [Aggregate] Search` ([`Plan::to_select`] says
     /// whether it is one it takes). Its subqueries ([`Expr::Values`] and
@@ -1088,7 +1106,7 @@ impl Node {
                 input.visit_exprs(f);
                 by.visit_exprs(f);
             }
-            Node::DistinctOn { input, keys } => {
+            Node::DistinctOn { input, keys, .. } => {
                 keys.iter().for_each(&mut each);
                 input.visit_exprs(f);
             }
@@ -1181,7 +1199,7 @@ impl Node {
                 input.visit_exprs_mut(f)?;
                 by.visit_exprs_mut(f)
             }
-            Node::DistinctOn { input, keys } => {
+            Node::DistinctOn { input, keys, .. } => {
                 for k in keys {
                     each(k)?;
                 }
@@ -1465,6 +1483,14 @@ fn is_zero(x: &u64) -> bool {
     *x == 0
 }
 
+fn one() -> u64 {
+    1
+}
+
+fn is_one(x: &u64) -> bool {
+    *x == 1
+}
+
 fn is_false(x: &bool) -> bool {
     !*x
 }
@@ -1510,14 +1536,18 @@ impl Plan {
         if root.has_models() {
             features.push(RANK_MODELS.to_string());
         }
-        let mut distinct_on = root.keeps_firsts();
+        let (mut distinct_on, mut per_cap) = (root.keeps_firsts(), root.caps_per());
         root.visit_exprs(&mut |e| {
             if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = e {
                 distinct_on |= n.keeps_firsts();
+                per_cap |= n.caps_per();
             }
         });
         if distinct_on {
             features.push(DISTINCT_ON.to_string());
+        }
+        if per_cap {
+            features.push(PER_CAP.to_string());
         }
         if root.walks_edge_tables() {
             features.push(EDGE_TABLE.to_string());

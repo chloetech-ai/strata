@@ -187,15 +187,17 @@ impl<'a> Ops<'a, '_> {
                 let keep: Vec<usize> = (0..rows.rows.len()).filter(|&i| seen.insert(rows.rows[i].iter().map(|v| format!("{v:?}")).collect::<Vec<_>>())).collect();
                 Ok(rows.pick(&keep))
             }
-            Node::DistinctOn { input, keys } => {
+            Node::DistinctOn { input, keys, per } => {
                 let rows = self.node(input, what)?;
                 let keys: Vec<Expr> = keys.iter().map(|k| self.resolved(k)).collect::<Result<_>>()?;
-                let mut seen = HashSet::new();
+                let mut seen: HashMap<Vec<String>, u64> = HashMap::new();
                 let mut keep = Vec::new();
                 for (i, r) in rows.rows.iter().enumerate() {
                     self.tick()?;
                     let group = keys.iter().map(|k| value(k, r).map(|v| format!("{v:?}"))).collect::<Result<Vec<_>>>()?;
-                    if seen.insert(group) {
+                    let n = seen.entry(group).or_default();
+                    if *n < *per {
+                        *n += 1;
                         keep.push(i);
                     }
                 }
@@ -467,7 +469,7 @@ impl<'a> Ops<'a, '_> {
     }
 
     /// LIMIT; over joins whose first table's scan is a leaf, or over the
-    /// first rows of groups (`DISTINCT ON`) of a scan, that scan reads a
+    /// first rows of groups (`DISTINCT ON`, `MAX k PER`) of a scan, that scan reads a
     /// growing number of rows (twice the rows wanted, four times for
     /// groups, at least 32, then four times as many) until enough rows join
     /// or groups have a row, or it runs out: rows keep its order through

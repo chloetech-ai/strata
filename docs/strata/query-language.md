@@ -58,7 +58,7 @@ SELECT [DISTINCT | DISTINCT ON (<expressions>)] <columns | * | score() | hops() 
 FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [WHERE <predicate>]
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
-[ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]]]
+[ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]] [MAX k PER <field>]]
 [LIMIT n [OFFSET m]]
 ```
 
@@ -68,7 +68,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 - **Clauses Strata does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `WINDOW`, `QUALIFY`, `GROUP BY ... WITH ROLLUP` and the like.
 - **`SELECT *`** returns every stored, non-vector column.
 - **`score()`** is the value of the `ORDER BY` score for each row; **`hops()`** is a row's distance in a graph traversal ([below](#graphs)); **`seq_no()`** is the sequence number of the write that last changed the row, in a database that numbers its writes, for [conditional writes](server.md#conditional-writes). It is a column of a query on one table, and cannot be aggregated or ordered by. A [ranking expression](#features-the-values-a-ranking-read) that scores each row by itself is a column too (`bm25(title, :q) AS t`), and **`features()`** stands for the inputs of the query's ranking.
-- **`ORDER BY`** takes one key, plus an optional tie-break that must be the primary key (or, in a facet query, the group column). Ranking by a score is always best first; `ORDER BY distance(…) ASC` ranks like `similarity(…) DESC`.
+- **`ORDER BY`** takes one key, plus an optional tie-break that must be the primary key (or, in a facet query, the group column). Ranking by a score is always best first; `ORDER BY distance(…) ASC` ranks like `similarity(…) DESC`. `MAX k PER field` at its end keeps at most k rows of each value ([below](#at-most-k-rows-of-a-value-max-k-per)).
 - **Parameters** are `:name` placeholders, bound from the API or from the shell's `--param name=value`. A vector parameter is a JSON array.
 - **Limits.** An expression nests at most 1,000 levels, counting parentheses and the operators of a chain such as `a OR b OR …` (SQLite has the same default); a long list of values belongs in `IN (…)`, which has no such limit. A `LIMIT` larger than the table returns every row that qualifies. A query ranked by a score without a `LIMIT` returns 100 rows, counted after its `OFFSET`, on one database and through a coordinator alike.
 
@@ -551,6 +551,36 @@ SELECT DISTINCT ON (country) country, seller, SUM(price) AS total FROM sales GRO
 - **Shards.** A coordinator keeps the first rows over its shards' merged rows, so three shards give what one database does, whether or not the table is placed by the keys (`shard_by`).
 
 The plan's node is `DistinctOn` (`Distinct on: video` in `EXPLAIN`), and its JSON needs the plan features `operators` and `distinct_on`; a version of Strata from before it refuses the plan by that name.
+
+## At most k rows of a value: `MAX k PER`
+
+`ORDER BY ... MAX k PER field` keeps, of the rows with equal values of `field`, the first `k` in the query's order, and the rows kept stay in that order: a ranking with at most two clips of a video, three products of a brand or two arguments of a debate. `LIMIT` and `OFFSET` count the rows kept.
+
+```sql
+-- the 20 best clips, at most two of a video
+SELECT id, video, score() FROM clips ORDER BY bm25(transcript, :q) DESC MAX 2 PER video LIMIT 20;
+
+-- the newest products in stock, at most three of a brand
+SELECT id, brand, title FROM products WHERE in_stock ORDER BY added DESC, id MAX 3 PER brand LIMIT 30;
+
+-- in a subquery: of each video's two most viewed clips, those about a dog
+SELECT id FROM clips WHERE MATCH(transcript, 'dog')
+  AND id IN (SELECT id FROM clips ORDER BY views DESC, id MAX 2 PER video LIMIT 1000);
+```
+
+- **It ends `ORDER BY`**, and needs one: the rows a value keeps are its first in that order. `k` is a whole number, 1 or more, and `MAX 1 PER x` is `DISTINCT ON (x)`, with the same plan.
+- **A field of one value.** `field` is a field of the rows (`video`, `t.brand` in a join), and `NULL` is one value of its own. A multi-valued field is refused, since a row with several values would be in several groups.
+- **Not with `DISTINCT`** or `DISTINCT ON`, which already keep one row of each.
+- **Reads** are those of [`DISTINCT ON`](#the-first-row-of-each-group-distinct-on): growing slices of the scan until `LIMIT` rows are kept or the scan runs out. A field whose values cannot fill the `LIMIT`, such as one row of each of 15 topics for a `LIMIT` of 20, reads every row that matches.
+- **Shards.** A coordinator keeps each value's first rows over its shards' merged rows, so three shards give what one database does.
+
+The plan's node is `DistinctOn` with `per` (`At most 2 per: video` in `EXPLAIN`). With `k` above 1 its JSON needs the plan feature `per_cap`, so a version of Strata from before it refuses the plan rather than keeping one row of each value. Python's builder writes it `.max_per(2, "video")`.
+
+On ArguAna (BEIR's 8,674 arguments from 592 debates on 15 topics; a document's debate and topic are in its id), every one of the 1,406 queries ranked by `bm25(body, :q)`, its own argument left out as BEIR scores it, top 20. Times are the median over queries of each query's median of 3 runs, one thread on a 4-core cloud VM (Intel Xeon @ 2.10GHz):
+
+PER_CAP_TABLE
+
+Caps trade relevance for spread. ArguAna's answer to a query is the argument against it, in the query's own debate, so a cap on debates also caps how many of the right debate's arguments the ranking can show: nDCG@10 falls from UNCAPPED to K1_DEBATE with one per debate. The run is `strata-per-cap-bench` ([`results/text/per_cap.json`](https://github.com/rkonow/strata/blob/main/strata/results/text/per_cap.json)).
 
 ## Graphs
 

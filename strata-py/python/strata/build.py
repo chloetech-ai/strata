@@ -942,6 +942,8 @@ class Query:
         self._limit: int | None = None
         self._offset = 0
         self._distinct_on: list[Expr] = []
+        self._per = 1
+        self._per_field: str | None = None
 
     def _copy(self, **kw: Any) -> Query:
         q = Query.__new__(Query)
@@ -996,7 +998,19 @@ class Query:
         `SELECT DISTINCT ON (...)`: `.distinct_on("video")` with
         `.order_by(score)` gives each video's best row, the best videos
         first, and `limit` counts groups."""
-        return self._copy(distinct_on=[col(k) if isinstance(k, str) else _expr(k) for k in keys])
+        return self._copy(distinct_on=[col(k) if isinstance(k, str) else _expr(k) for k in keys], per=1, per_field=None)
+
+    def max_per(self, k: int, field: str) -> Query:
+        """Keeps at most `k` rows of each value of `field`, the first `k`
+        in the query's order, as SQL's `MAX k PER field`:
+        `.order_by(score).max_per(2, "venue").limit(20)` gives the best 20
+        rows with no more than 2 of a venue. NULL is one value; a
+        multi-valued field is refused."""
+        if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+            raise StrataError(f"max_per keeps a whole number of rows, 1 or more ({k!r})")
+        if not isinstance(field, str):
+            raise StrataError("max_per takes a field's name")
+        return self._copy(distinct_on=[col(field)], per=k, per_field=field)
 
     def having(self, *conditions: Expr) -> Query:
         """Keeps the groups every condition on their aggregates holds for."""
@@ -1080,6 +1094,11 @@ class Query:
         if self._distinct_on:
             if grouped:
                 raise StrataError("distinct_on keeps rows of the table: not with group_by or aggregates")
+            if self._per_field is not None:
+                if not self._order:
+                    raise StrataError("max_per needs an order_by: it keeps each value's first rows in its order")
+                if ctx.field(self._per_field)[1].get("multi"):
+                    raise StrataError(f"max_per: {self._per_field} is multi-valued, and a row with several values is in several groups")
             # The scan's rows with the answer's columns and the fields of
             # the keys, which are computed over them, the first row of each
             # group kept in their order. A LIMIT reads the scan in growing
@@ -1098,6 +1117,9 @@ class Query:
             node = {"node": "distinct_on", "input": leaf, "keys": [k._ir(ctx) for k in self._distinct_on]}
             ctx.outputs = None
             features = ["operators", "distinct_on"]
+            if self._per > 1:
+                node["per"] = self._per
+                features.append("per_cap")
         if self._limit is not None or self._offset:
             node = {"node": "limit", "input": node}
             if self._offset:

@@ -95,7 +95,7 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
         return true;
     }
     let sql::SetExpr::Select(s) = q.body.as_ref() else { return true };
-    if s.from.len() != 1 || !s.from[0].joins.is_empty() || s.distinct.is_some() {
+    if s.from.len() != 1 || !s.from[0].joins.is_empty() || s.distinct.is_some() || per_capped(q) {
         return true;
     }
     match &s.from[0].relation {
@@ -576,8 +576,9 @@ impl<'a> Planner<'a> {
         let mut q = q.clone();
         let mut s = s.clone();
         match &s.distinct {
-            // The first row of each group: the scan's rows, kept by operators.
+            // The first rows of each group: the scan's rows, kept by operators.
             Some(sql::Distinct::On(_)) => return self.join(&q, &s),
+            _ if per_capped(&q) => return self.join(&q, &s),
             Some(sql::Distinct::Distinct) => distinct_to_group(&mut s)?,
             None => {}
         }
@@ -710,7 +711,7 @@ impl<'a> Planner<'a> {
 
     /// Joins (and any SELECT over rows held in memory).
     fn join(&self, q: &sql::Query, s: &sql::Select) -> Result<Planned> {
-        let order: Vec<sql::OrderByExpr> = match &q.order_by {
+        let mut order: Vec<sql::OrderByExpr> = match &q.order_by {
             None => Vec::new(),
             Some(ob) => match &ob.kind {
                 sql::OrderByKind::Expressions(es) => es.clone(),
@@ -718,6 +719,18 @@ impl<'a> Planner<'a> {
             },
         };
         let (offset, limit) = limits(&q.limit_clause, self.params)?;
+        // MAX k PER field: DISTINCT ON (field), k rows a value.
+        let cap = take_per_cap(&mut order)?;
+        let capped;
+        let s = match &cap {
+            None => s,
+            Some(_) if s.distinct.is_some() => return Err(err("MAX k PER field keeps rows, as DISTINCT ON does (MAX 1 PER): not with DISTINCT")),
+            Some((_, field)) => {
+                capped = sql::Select { distinct: Some(sql::Distinct::On(vec![field.clone()])), ..s.clone() };
+                &capped
+            }
+        };
+        let per = cap.as_ref().map_or(1, |(k, _)| *k);
 
         // The tables.
         let twj = &s.from[0];
@@ -864,6 +877,11 @@ impl<'a> Planner<'a> {
             scan_order[0] = Some(mem_order[0].clone());
         }
         let needed = sides.needed(s, &order, &srcs)?;
+        if let Some((i, c)) = cap.as_ref().map(|(_, field)| sides.column(field)).transpose()?.flatten() {
+            if table(i).and_then(|t| t.field(&c)).is_some_and(|f| f.multi) {
+                return Err(err(format!("MAX k PER {c}: {c} is multi-valued, and a row with several values is in several groups; cap a field of one value")));
+            }
+        }
 
         // The scans, joined left to right: rows of `cols` (alias, column),
         // multi-valued where `multi` says.
@@ -905,7 +923,7 @@ impl<'a> Planner<'a> {
         if let Some(cond) = and(compile_all(&residual, &cols, &multi, self.params, &subs)?) {
             node = ir::Node::Filter { input: Box::new(node), cond };
         }
-        self.evaluate(s, node, &cols, &multi, &mem_order, offset, limit, srcs.len() > 1, driver_order)
+        self.evaluate(s, node, &cols, &multi, &mem_order, offset, limit, srcs.len() > 1, driver_order, per)
     }
 
     /// One side of a join: a leaf with its own conditions and ranking,
@@ -1178,7 +1196,7 @@ pub(crate) fn printable(q: &sql::Query) -> String {
         }
         _ => {}
     });
-    q.to_string()
+    super::parse::unparse_per_caps(&q.to_string())
 }
 
 fn quote(id: &mut sql::Ident) {
@@ -1291,6 +1309,36 @@ fn has_aggregate(s: &sql::Select) -> bool {
         }
     }
     found
+}
+
+/// Whether `e` is `MAX k PER field` ([`super::parse::PER_CAP`]).
+fn is_per_cap(e: &Expr) -> bool {
+    matches!(e, Expr::Function(f) if fname(f) == super::parse::PER_CAP)
+}
+
+/// Whether `q` ends its ORDER BY with `MAX k PER field`.
+fn per_capped(q: &sql::Query) -> bool {
+    matches!(&q.order_by, Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) if es.iter().any(|o| is_per_cap(&o.expr)))
+}
+
+/// `MAX k PER field` out of an ORDER BY, as (k, field): the rows a
+/// value keeps, and the field.
+fn take_per_cap(order: &mut Vec<sql::OrderByExpr>) -> Result<Option<(u64, Expr)>> {
+    let Some(i) = order.iter().position(|o| is_per_cap(&o.expr)) else { return Ok(None) };
+    let o = order.remove(i);
+    if i != order.len() {
+        return Err(err("MAX k PER field ends ORDER BY"));
+    }
+    let Expr::Function(f) = &o.expr else { unreachable!("a call") };
+    let (k, field) = match func_args(f).as_slice() {
+        [Expr::Value(v), field] => (v.value.to_string().parse::<u64>().ok().filter(|&k| k > 0), (*field).clone()),
+        _ => (None, o.expr.clone()),
+    };
+    let k = k.ok_or_else(|| err("MAX k PER field takes a whole number of rows, 1 or more"))?;
+    if order.is_empty() {
+        return Err(err("MAX k PER field needs an ORDER BY: it keeps each value's k first rows in its order"));
+    }
+    Ok(Some((k, field)))
 }
 
 /// The expressions of `DISTINCT ON (...)`: none for another SELECT.
@@ -1561,7 +1609,8 @@ impl Planner<'_> {
     /// and the projection, as operators over rows in memory. With `driver`
     /// the rows come in the order asked for (the first table's scan's).
     #[allow(clippy::too_many_arguments)]
-    fn evaluate(&self, s: &sql::Select, input: ir::Node, cols: &[(String, String)], multi: &[bool], order: &[OrderKey], offset: usize, limit: Option<usize>, joined: bool, driver: bool) -> Result<Planned> {
+    /// `per`: the rows a group of `DISTINCT ON` keeps (`MAX k PER`).
+    fn evaluate(&self, s: &sql::Select, input: ir::Node, cols: &[(String, String)], multi: &[bool], order: &[OrderKey], offset: usize, limit: Option<usize>, joined: bool, driver: bool, per: u64) -> Result<Planned> {
         let params = self.params;
         let subs = |q: &sql::Query, kind: Sub| self.in_memory(q, kind);
         // The output columns.
@@ -1634,7 +1683,8 @@ impl Planner<'_> {
                 })
                 .collect()
         };
-        // DISTINCT ON: the first row of each group, in the order above.
+        // DISTINCT ON: the first row of each group (`per` rows with MAX k
+        // PER), in the order above.
         let first_of = |node: ir::Node, items_at: &[ir::Expr], slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<ir::Node> {
             let on = distinct_on(s);
             if on.is_empty() {
@@ -1647,7 +1697,7 @@ impl Planner<'_> {
                     None => compile_with(e, params, slot, multi, Some(&subs)),
                 })
                 .collect::<Result<_>>()?;
-            Ok(ir::Node::DistinctOn { input: Box::new(node), keys })
+            Ok(ir::Node::DistinctOn { input: Box::new(node), keys, per })
         };
         let mut node = input;
         let items_at: Vec<ir::Expr> = if grouped {

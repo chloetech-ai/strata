@@ -240,6 +240,25 @@ def test_distinct_on(db):
         t.select("genres", count()).group_by("genres").distinct_on("genres").plan()
 
 
+def test_max_per(db):
+    """At most k rows of each value, the first k in the query's order, as
+    SQL's MAX k PER keeps them."""
+    t = db.table()
+    # Five books have each rating: two of each of the three best.
+    q = t.select("id", "rating").order_by(col("rating").desc()).max_per(2, "rating").limit(6)
+    r = same(db, q, "SELECT id, rating FROM books ORDER BY rating DESC MAX 2 PER rating LIMIT 6")
+    assert [row[1] for row in r.rows] == [4.9, 4.9, 4.8, 4.8, 4.7, 4.7]
+    assert q.plan()["features"] == ["operators", "distinct_on", "per_cap"]
+    same(db, t.select("id", "year", score()).where(match("description", "dragon")).order_by(bm25("description", "dragon")).max_per(3, "year").limit(6).offset(1),
+         "SELECT id, year, score() FROM books WHERE MATCH(description, 'dragon') ORDER BY bm25(description, 'dragon') DESC MAX 3 PER year LIMIT 6 OFFSET 1")
+    # One a value is DISTINCT ON, which needs no per_cap.
+    assert t.select("id").order_by(col("year")).max_per(1, "rating").limit(3).plan()["features"] == ["operators", "distinct_on"]
+    for bad, msg in [(lambda: t.select("id").max_per(2, "rating").limit(3), "order_by"), (lambda: t.select("id").order_by(col("year")).max_per(2, "genres"), "multi-valued"),
+                     (lambda: t.select("id").order_by(col("year")).max_per(0, "rating"), "1 or more")]:
+        with pytest.raises(strata.StrataError, match=msg):
+            bad().plan()
+
+
 def test_values_need_no_quoting(tmp_path):
     """Any field name, and any text, with no escaping: a name SQL reserves,
     one with a space or a quote, text with quotes."""

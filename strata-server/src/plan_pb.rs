@@ -137,7 +137,7 @@ fn node(n: &Node) -> pb::Node {
         Node::Ref { name } => N::Ref(name.clone()),
         Node::Distinct { input } => N::Distinct(Box::new(node(input))),
         Node::KeyOrder { input, by } => N::KeyOrder(Box::new(pb::KeyOrder { input: boxed(input), by: boxed(by) })),
-        Node::DistinctOn { input, keys } => N::DistinctOn(Box::new(pb::DistinctOn { input: boxed(input), keys: keys.iter().map(ex).collect() })),
+        Node::DistinctOn { input, keys, per } => N::DistinctOn(Box::new(pb::DistinctOn { input: boxed(input), keys: keys.iter().map(ex).collect(), per: *per })),
     };
     pb::Node { node: Some(n) }
 }
@@ -473,7 +473,7 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
         }
         N::DistinctOn(d) => {
             let d = *d;
-            Node::DistinctOn { input: from_bnode(d.input)?, keys: from_exprs(d.keys)? }
+            Node::DistinctOn { input: from_bnode(d.input)?, keys: from_exprs(d.keys)?, per: d.per.max(1) }
         }
     })
 }

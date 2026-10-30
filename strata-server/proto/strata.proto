@@ -494,10 +494,12 @@ message KeyOrder {
   Node by = 2;
 }
 
-// The first of the input's rows with equal keys, in the input's order.
+// The first `per` of the input's rows with equal keys, in the input's
+// order (DISTINCT ON, and MAX k PER field for per k; 0 is 1).
 message DistinctOn {
   Node input = 1;
   repeated Expr keys = 2;
+  uint64 per = 3;
 }
 
 message Exprs { repeated Expr v = 1; }

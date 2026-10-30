@@ -105,6 +105,7 @@ const COMPOUND: &[&str] = &[
     "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), maxsim(emb, (SELECT emb FROM papers WHERE category = 'ml' LIMIT 4))) DESC LIMIT 5",
     "SELECT DISTINCT ON (category, year % 3) id, category FROM papers WHERE year > 1990 ORDER BY bm25(body, 'graph') DESC LIMIT 3",
     "SELECT DISTINCT ON (category) category, year, COUNT(*) AS n FROM papers GROUP BY category, year ORDER BY category, n DESC",
+    "SELECT id, category FROM papers WHERE year > 1990 ORDER BY bm25(body, 'graph') DESC MAX 2 PER category LIMIT 5",
 ];
 
 /// Writes of each kind.
