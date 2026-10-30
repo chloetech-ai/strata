@@ -40,9 +40,22 @@
 //! NULL, and `DEFAULT value` (a constant, or `CURRENT_TIMESTAMP` for a
 //! TIMESTAMP) is what a write that leaves the column out stores; either
 //! makes the database format 3 ([`crate::schema::Field::not_null`],
-//! [`crate::schema::Field::default`]). Every other clause and column
-//! option (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, `AS SELECT`,
-//! ...) is an error, never ignored.
+//! [`crate::schema::Field::default`]).
+//!
+//! `OPTIONS(...)` after the columns takes the table's options: `shard_by`,
+//! the column that places its rows on shards instead of their key
+//! ([`crate::schema::Schema::with_shard_by`]):
+//!
+//! ```sql
+//! CREATE TABLE events (
+//!   id INT PRIMARY KEY,
+//!   usr KEYWORD NOT NULL,
+//!   item KEYWORD REFERENCES items
+//! ) OPTIONS(shard_by = 'usr');
+//! ```
+//!
+//! Every other clause and column option (`UNIQUE`, `CHECK`, `ON DELETE`,
+//! constraint names, `AS SELECT`, ...) is an error, never ignored.
 
 use serde_json::{json, Map, Value as J};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
@@ -57,7 +70,9 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// The forms this module binds, for error messages.
-const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table])";
+const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column')]";
+/// The options of a table, in `OPTIONS(...)` after its columns.
+const TABLE_OPTIONS: [&str; 1] = ["shard_by"];
 const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE or EDGES, and KEYWORD[] or INT[] for lists";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
@@ -65,7 +80,15 @@ const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensio
 pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<(Schema, bool)> {
     // Every clause but the name, columns, constraints and IF NOT EXISTS
     // must be as a plain CREATE TABLE leaves it.
-    let mut plain = CreateTableBuilder::new(ct.name.clone()).columns(ct.columns.clone()).constraints(ct.constraints.clone()).if_not_exists(ct.if_not_exists).build();
+    let table_options = match &ct.table_options {
+        sql::CreateTableOptions::Options(o) => o.clone(),
+        _ => Vec::new(),
+    };
+    let mut plain = CreateTableBuilder::new(ct.name.clone()).columns(ct.columns.clone()).constraints(ct.constraints.clone()).if_not_exists(ct.if_not_exists);
+    if !table_options.is_empty() {
+        plain = plain.table_options(sql::CreateTableOptions::Options(table_options.clone()));
+    }
+    let mut plain = plain.build();
     if let sql::Statement::CreateTable(p) = &mut plain {
         if ct.hive_formats.as_ref().is_none_or(|h| *h == sql::HiveFormat::default()) {
             p.hive_formats = ct.hive_formats.clone();
@@ -155,7 +178,22 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
         }
         f["references"] = json!(table);
     }
-    let schema = Schema::from_json_value(&json!({"table": name, "key": key, "fields": fields}))?;
+    let mut short = json!({"table": name, "key": key, "fields": fields});
+    for o in &table_options {
+        let sql::SqlOption::KeyValue { key, value } = o else { return Err(err(format!("the table's OPTIONS take key = value pairs, not {o}"))) };
+        let k = key.value.to_ascii_lowercase();
+        if !TABLE_OPTIONS.contains(&k.as_str()) {
+            return Err(err(format!("{} is not an option of a table (its options: {})", key.value, TABLE_OPTIONS.join(", "))));
+        }
+        if short.get(&k).is_some() {
+            return Err(err(format!("the table's option {} is given twice", key.value)));
+        }
+        match option_value(value)? {
+            v @ J::String(_) => short[k] = v,
+            _ => return Err(err(format!("the table's option {k} names a column, in quotes: {k} = 'usr'"))),
+        }
+    }
+    let schema = Schema::from_json_value(&short)?;
     // A reference names the primary key of its table, if it names a column.
     for (column, table, named) in &refs {
         let Some(named) = named else { continue };
@@ -454,6 +492,35 @@ mod tests {
         assert_eq!(s.fields[1].references.as_deref(), Some("papers"));
         // No key is allowed, as in the JSON form.
         assert_eq!(create("CREATE TABLE log (line TEXT NULL)", &[]).unwrap().0.primary_key, None);
+    }
+
+    #[test]
+    fn a_table_is_placed_by_a_column() {
+        let (s, _) = create("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, ts INT) OPTIONS(shard_by = 'USR')", &[]).unwrap();
+        assert_eq!(s.shard_by.as_deref(), Some("usr"));
+        assert_eq!(s.shard_by_field(), Some(1));
+        assert_eq!(s.features().collect::<Vec<_>>(), ["not_null", "shard_by"]);
+        assert_eq!(s.to_short_json()["shard_by"], "usr");
+        assert_eq!(Schema::from_json_value(&s.to_short_json()).unwrap(), s);
+        assert_eq!(serde_json::from_str::<Schema>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        // A table without the option serializes as before it existed.
+        let plain = create("CREATE TABLE t (id INT PRIMARY KEY)", &[]).unwrap().0;
+        assert!(!serde_json::to_string(&plain).unwrap().contains("shard_by") && plain.to_short_json().get("shard_by").is_none());
+        for (bad, says) in [
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD) OPTIONS(shard_by = 'u')", "NOT NULL"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(shard_by = 'v')", "not a field"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(shard_by = 'id')", "by their key already"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u TEXT NOT NULL) OPTIONS(shard_by = 'u')", "KEYWORD or INT"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD[] NOT NULL) OPTIONS(shard_by = 'u')", "single-valued"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u TIMESTAMP NOT NULL) OPTIONS(shard_by = 'u')", "KEYWORD or INT"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(shard_by = 3)", "names a column"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(color = 'u')", "not an option of a table"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) OPTIONS(shard_by = 'u', shard_by = 'u')", "given twice"),
+            ("CREATE TABLE t (id INT PRIMARY KEY, u KEYWORD NOT NULL) WITH (shard_by = 'u')", "not supported"),
+        ] {
+            let e = create(bad, &[]).unwrap_err().to_string();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
     }
 
     #[test]

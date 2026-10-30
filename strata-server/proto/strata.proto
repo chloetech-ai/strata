@@ -22,6 +22,12 @@
 // replica's rows with its own with `Verify`, which a server from before
 // them answers Unimplemented; `Hello` names a server's role, which an
 // older one leaves out (STANDALONE).
+//
+// Tables take no protocol version either: a server names every table it
+// serves in `Schema` (`tables_json`), which a server from before tables
+// leaves out, and a coordinator serves the tables that every replica of
+// every shard names alike. Plans and SQL name their tables, and a write
+// operation names its own ("table").
 syntax = "proto3";
 
 package strata.v1;
@@ -35,7 +41,7 @@ service Strata {
   rpc TermStats(QueryRequest) returns (TermStatsResponse);
   // Runs an INSERT, UPDATE or DELETE, or a batch of write operations.
   rpc Write(WriteRequest) returns (WriteResponse);
-  // The table's schema as JSON.
+  // The tables' schemas as JSON.
   rpc Schema(Empty) returns (SchemaResponse);
   rpc Health(Empty) returns (HealthResponse);
   // The protocol versions the server speaks, and the plans it reads.
@@ -662,7 +668,10 @@ message WriteRequest {
   //  {"op": "delete", "key": ...},
   //  {"op": "set" | "add", "key": ..., "field": "...", "value": ...}].
   // Any but insert may carry "if_seq_no": n, and then applies only while
-  // the row's sequence number is n (FailedPrecondition otherwise).
+  // the row's sequence number is n (FailedPrecondition otherwise). Each
+  // writes the first table unless it names another ("table": "events");
+  // one by key on a table placed by a column (shard_by) names that
+  // column's value as "routing", so that a coordinator finds its shard.
   bytes ops_json = 3;
   // With ops_json: a retry of a request with the same key (and the same
   // operations) returns the first answer instead of writing again.
@@ -683,7 +692,13 @@ message WriteResponse {
   repeated uint64 seq_nos = 3;
 }
 
-message SchemaResponse { string schema_json = 1; }
+message SchemaResponse {
+  // The first table's schema.
+  string schema_json = 1;
+  // Every table's schema, the first first; empty from a server before
+  // tables were served (it serves the first alone).
+  repeated string tables_json = 2;
+}
 
 message HealthResponse {
   string status = 1;

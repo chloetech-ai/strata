@@ -255,7 +255,11 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn schema(&self, req: Request<pb::Empty>) -> Result<Response<pb::SchemaResponse>, Status> {
-        self.serve("Schema", req, |svc, _| async move { Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&svc.schema).unwrap_or_default() }) }).await
+        self.serve("Schema", req, |svc, _| async move {
+            let tables = svc.catalog().iter().map(|t| serde_json::to_string(&**t).unwrap_or_default()).collect();
+            Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&svc.schema).unwrap_or_default(), tables_json: tables })
+        })
+        .await
     }
 
     async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {

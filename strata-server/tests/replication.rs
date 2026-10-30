@@ -204,7 +204,7 @@ async fn replicas_hold_what_their_primary_wrote() {
     let seq3 = pdb.storage().seq_of(None, &Value::Str("p0000003".into())).unwrap().unwrap();
     let w = p.write_ops(vec![json!({"op": "add", "key": "p0000003", "field": "sold", "value": 1, "if_seq_no": seq3})], None).await.unwrap();
     holds(w.seq_no.unwrap());
-    let (n, _) = p.import(axum::body::Bytes::from("id,title,price\nc1,Copper kettle,12.5\nc2,Iron pan,30\n"), strata::ingest::Format::Csv).await.unwrap();
+    let (n, _) = p.import(None, axum::body::Bytes::from("id,title,price\nc1,Copper kettle,12.5\nc2,Iron pan,30\n"), strata::ingest::Format::Csv).await.unwrap();
     assert_eq!(n, 2);
     holds(last(&pdb));
     // Writers at once, which the writer groups into shared transactions. Each
@@ -264,7 +264,7 @@ async fn replicas_hold_what_their_primary_wrote() {
     assert!(e.status == 409 && e.message.contains("this server is a replica"), "{}", e.message);
     let e = r1.sql("UPDATE products SET sold = 0", &Params::new(), After::Any, 0).await.err().unwrap();
     assert_eq!(e.status, 409, "{}", e.message);
-    let e = r1.import(axum::body::Bytes::from("id,title\nc3,x\n"), strata::ingest::Format::Csv).await.unwrap_err();
+    let e = r1.import(None, axum::body::Bytes::from("id,title\nc3,x\n"), strata::ingest::Format::Csv).await.unwrap_err();
     assert_eq!(e.status, 409, "{}", e.message);
     assert_eq!(last(&r1db), end);
     let e = p.replicate(pb::ReplicateRequest { term: 1, primary: "another".into(), ..Default::default() }).await.unwrap_err();

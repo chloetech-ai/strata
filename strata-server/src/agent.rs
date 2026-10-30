@@ -82,7 +82,7 @@ fn system_prompt(svc: &Service, docs: u64) -> String {
         .map(|f| {
             let v = &f.name;
             let like = format!("{{\"vector_of\": \"<key>\", \"field\": \"{v}\"}} (that row's vector, for \"more like this\")");
-            match svc.models.iter().find(|m| &m.field == v) {
+            match svc.models().iter().find(|m| m.table == s.table && &m.field == v) {
                 Some(m) if m.model.is_ok() => format!(
                     "- similarity({v}, :p) ranks by meaning: {v} is the embedding of {} by {}. Bind :p in `params` as {like} or {{\"embed\": \"some text\", \"field\": \"{v}\"}} (the text embedded by the same model).",
                     m.spec.from.join(" + "),

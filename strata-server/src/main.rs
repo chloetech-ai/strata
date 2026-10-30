@@ -270,6 +270,9 @@ enum Command {
         /// Schema of a new database, as JSON.
         #[arg(long)]
         schema: Option<PathBuf>,
+        /// The table the rows go to (default: the first).
+        #[arg(long)]
+        table: Option<String>,
         /// The files' format: jsonl, json, csv or tsv (default: from each
         /// file's extension).
         #[arg(long)]
@@ -313,10 +316,10 @@ async fn main() {
             }
             return;
         }
-        Some(Command::Import { db, schema, format, models, directory, files }) => {
+        Some(Command::Import { db, schema, table, format, models, directory, files }) => {
             let format = format.as_deref().map(|f| strata::ingest::Format::parse(f).unwrap_or_else(|| fail(&format!("unknown --format {f}: jsonl, json, csv or tsv"))));
             let models = models.clone().unwrap_or_else(strata::embed::models_dir);
-            if let Err(e) = server::import_files(db, schema.as_deref(), &models, format, *directory, files) {
+            if let Err(e) = server::import_files(db, schema.as_deref(), table.as_deref(), &models, format, *directory, files) {
                 fail(&e);
             }
             return;

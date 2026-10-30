@@ -261,3 +261,27 @@ def test_joins_across_tables(db):
     assert [tuple(row.values()) for row in r] == want
     r = db.query("SELECT COUNT(*) AS n FROM books WHERE genres IN (SELECT name FROM genres WHERE shelf >= :s)", {"s": 3})
     assert r[0]["n"] == sum(1 for i in range(200) if "classic" in book(i)["genres"])
+
+
+def test_writes_to_any_table(db, tmp_path):
+    assert db.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, book KEYWORD REFERENCES books, ts INT) OPTIONS(shard_by = 'usr')") == 0
+    assert [t["table"] for t in db.tables()] == ["books", "events"]
+    assert db.tables()[1]["shard_by"] == "usr" and list(db.tables()[1])[:3] == ["table", "key", "shard_by"]
+    assert db.schema["table"] == "books"
+    assert db.insert([{"id": i, "usr": f"u{i % 3}", "book": book(i)["id"], "ts": i} for i in range(1500)], table="events") == 1500
+    assert db.upsert({"id": 1, "usr": "u1", "book": "b0007", "ts": 9}, table="EVENTS") == 1
+    assert db.delete([2, 3, 99999], table="events") == 2
+    f = tmp_path / "more.csv"
+    f.write_text("id,usr,ts\n5000,u9,1\n5001,u9,2\n")
+    assert db.import_file(f, table="events") == {"rows": 2, "bulk": False, "skipped_fields": []}
+    assert db.query("SELECT COUNT(*) FROM events").scalar() == 1500
+    assert len(db) == 200
+    r = db.table("events").select("book").where(strata.col("usr") == "u9").order_by(strata.col("ts")).run()
+    assert r.column("book") == [None, None]
+    assert db.query("SELECT book FROM events WHERE id = 1").scalar() == "b0007"
+    with pytest.raises(strata.StrataError, match="no such table: nope"):
+        db.insert({"id": 1}, table="nope")
+    with pytest.raises(strata.StrataError, match="no table nope"):
+        db.table("nope")
+    with pytest.raises(strata.StrataError, match="shard_by"):
+        db.sql("UPDATE events SET usr = 'u2' WHERE id = 1")
