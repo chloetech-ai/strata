@@ -2,6 +2,10 @@
 //! rows, the traversal runs over the snapshot (edges resolved through the
 //! primary-key indexes), and the result becomes, per segment, a materialised
 //! document set with exact cardinality, plus hop distances and scores.
+//!
+//! A walk over an edge table finds a row's edges by its key in each of the
+//! edge table's segments, at the same version ([`crate::graph::edge_table`]),
+//! and reads each edge's weight as it is now, in-place writes included.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,12 +15,13 @@ use super::{err, Executor, Hit, ProbeNode, Seg, Ticker};
 use crate::query::memory::Charge;
 use crate::error::Result;
 use crate::graph::traverse::{self, node, split, Adjacency, Node, NodeMap};
-use crate::graph::GraphReader;
+use crate::graph::edge_table::weight_of;
+use crate::graph::{EdgeTableReader, GraphReader};
 use crate::query::logical::{Direction, GraphKind, GraphQuery, Pred, Score, Seeds};
 use crate::query::plan::{FilterMode, VectorStrategy};
 use crate::schema::FieldType;
 use crate::segment::{DocFilter, DocId, DocSet};
-use crate::storage::{key_hash, Snapshot};
+use crate::storage::{key_hash, Snapshot, Updates};
 use crate::vector::{SearchParams, VectorReader};
 
 /// The result of one graph computation.
@@ -38,9 +43,77 @@ struct SegRef<'x> {
     through: Option<ProbeNode>,
 }
 
+/// One segment of an edge table.
+struct EdgeSeg {
+    reader: EdgeTableReader,
+    live: Option<Arc<dyn DocFilter>>,
+    weights: Weights,
+    /// The row each key number resolved to: 0 not yet, 1 none, else the
+    /// node plus 2. Empty until the walk has resolved a thirty-second of the
+    /// segment's keys through the key memo, so a short walk allocates none.
+    ends: Vec<u64>,
+    resolved: usize,
+}
+
+/// A segment's weights as they are now: written in place or as built.
+struct Weights {
+    /// The weight field.
+    field: usize,
+    /// The values written in place, if a weight was.
+    updates: Option<Arc<Updates>>,
+    /// The weights copied out of `updates`, once the walk has read enough
+    /// of them that one pass over its layers costs less than the reads.
+    flat: Option<Vec<f32>>,
+    reads: usize,
+    /// The reads through `updates` before copying them out: a sixteenth of
+    /// their entries, each read being a lookup in every layer.
+    budget: usize,
+}
+
+impl Weights {
+    fn new(field: Option<usize>, updates: Option<&Arc<Updates>>) -> Weights {
+        let (field, updates) = match (field, updates) {
+            (Some(f), Some(u)) if u.has(f) => (f, Some(u.clone())),
+            _ => (0, None),
+        };
+        let budget = updates.as_ref().map_or(0, |u| u.stored() / 16 + 64);
+        Weights { field, updates, flat: None, reads: 0, budget }
+    }
+
+    /// Row `d`'s weight; `copied` counts the bytes of a copy it makes.
+    #[inline]
+    fn get(&mut self, r: &EdgeTableReader, d: DocId, copied: &mut u64) -> f32 {
+        if let Some(f) = &self.flat {
+            return f[d as usize];
+        }
+        let Some(u) = &self.updates else { return r.weight(d) };
+        self.reads += 1;
+        if self.reads <= self.budget {
+            return u.get(self.field, d).map_or_else(|| r.weight(d), weight_of);
+        }
+        let mut f = r.weights();
+        u.each_oldest_first(self.field, |d, v| {
+            if let Some(w) = f.get_mut(d as usize) {
+                *w = weight_of(v);
+            }
+        });
+        *copied += 4 * f.len() as u64;
+        let w = f[d as usize];
+        self.flat = Some(f);
+        w
+    }
+}
+
+/// An edge table, as a walk over the table its keys name reads it.
+struct EdgeTable {
+    segs: Vec<EdgeSeg>,
+}
+
 struct GraphAdj<'x> {
     snap: &'x Snapshot,
     segs: Vec<Option<SegRef<'x>>>,
+    /// The edge table walked instead of a field.
+    edges: Option<EdgeTable>,
     dir: Direction,
     has_through: bool,
     /// VECTOR fields: neighbours are the `k` most similar rows.
@@ -56,7 +129,65 @@ struct GraphAdj<'x> {
     held: u64,
 }
 
-impl GraphAdj<'_> {
+impl<'x> GraphAdj<'x> {
+    /// The neighbours of row `d` of segment `s` along the rows of edge table
+    /// `et`: the targets of the rows whose source is its key, the sources of
+    /// those whose target is (by direction), with positive weights.
+    fn edge_table_neighbors(&mut self, et: &mut EdgeTable, s: usize, d: DocId, reverse: bool, out: &mut Vec<(Node, f32)>) -> Result<()> {
+        let snap = self.snap;
+        let (Some(_), Some(pk)) = (&self.segs[s], snap.pk(s)) else { return Ok(()) };
+        let key = pk.key_ref(d);
+        let h = key_hash(key);
+        let (fwd, back) = match (self.dir, reverse) {
+            (Direction::Both, _) => (true, true),
+            (Direction::Out, false) | (Direction::In, true) => (true, false),
+            _ => (false, true),
+        };
+        let mut copied = 0;
+        for seg in et.segs.iter_mut() {
+            let Some(k) = seg.reader.find(key, h) else { continue };
+            for leaving in [true, false] {
+                let rows = match leaving {
+                    true if fwd => seg.reader.leaving(k),
+                    false if back => seg.reader.reaching(k),
+                    _ => continue,
+                };
+                for &row in rows {
+                    // A row of the segment (a damaged section lists others).
+                    let Some(other) = (if leaving { seg.reader.target(row) } else { seg.reader.source(row) }) else { continue };
+                    if seg.live.as_ref().is_some_and(|l| !l.contains(row)) {
+                        continue;
+                    }
+                    let w = seg.weights.get(&seg.reader, row, &mut copied);
+                    // Zero, negative and NaN weights are not followed.
+                    if !(w > 0.0) {
+                        continue;
+                    }
+                    let n2 = match seg.ends.get_mut(other as usize) {
+                        Some(end) => {
+                            if *end == 0 {
+                                *end = seg.reader.key(other).and_then(|k| self.resolve(k)).map_or(1, |n2| n2 + 2);
+                            }
+                            (*end > 1).then(|| *end - 2)
+                        }
+                        None => {
+                            seg.resolved += 1;
+                            if seg.ends.is_empty() && seg.resolved > seg.reader.n_keys() / 32 {
+                                seg.ends = vec![0; seg.reader.n_keys()];
+                                copied += 8 * seg.ends.len() as u64;
+                            }
+                            seg.reader.key(other).and_then(|k| self.resolve(k))
+                        }
+                    };
+                    if let Some(n2) = n2 {
+                        out.push((n2, w));
+                    }
+                }
+            }
+        }
+        self.hold(copied)
+    }
+
     /// The live row with primary key `key`.
     fn resolve(&mut self, key: crate::storage::KeyRef) -> Option<Node> {
         let h = key_hash(key);
@@ -104,6 +235,11 @@ impl Adjacency for GraphAdj<'_> {
     fn neighbors(&mut self, n: Node, reverse: bool, out: &mut Vec<(Node, f32)>) -> Result<()> {
         self.tick.tick()?;
         let (s, d) = split(n);
+        if let Some(mut et) = self.edges.take() {
+            let r = self.edge_table_neighbors(&mut et, s, d, reverse, out);
+            self.edges = Some(et);
+            return r;
+        }
         if let Some((k, min_sim, params)) = &self.knn {
             let Some(v) = self.segs[s].as_ref().and_then(|r| r.vectors).filter(|v| v.has_vector(d)).map(|v| v.vector(d).to_vec()) else {
                 return Ok(());
@@ -212,7 +348,8 @@ impl<'a> Executor<'a> {
             _ => Vec::new(),
         };
         let from = self.segs.clone();
-        let mut adj = self.adjacency(g, &from)?;
+        let edges = g.edges.as_deref().map(|t| self.edge_table(t)).transpose()?;
+        let mut adj = self.adjacency(g, &from, edges)?;
         let mut nodes: NodeMap<(u32, f64)> = traverse::node_map();
         let (what, edges, extra) = match &g.kind {
             GraphKind::Reach { min_hops, max_hops } => {
@@ -257,7 +394,7 @@ impl<'a> Executor<'a> {
         }
         self.stats.plan.push(format!(
             "graph {id}: {what} over {}, {} seeds, {} rows, {edges} edges followed{extra}, {:.2} ms",
-            self.schema.fields[g.field].name,
+            g.edges.as_deref().unwrap_or(&self.schema.fields[g.field].name),
             seed_nodes.len(),
             nodes.len(),
             t0.elapsed().as_secs_f64() * 1e3
@@ -300,14 +437,36 @@ impl<'a> Executor<'a> {
         })
     }
 
+    /// Edge table `name` at this snapshot's version, checked against this
+    /// table: its source and target hold this table's keys.
+    fn edge_table(&self, name: &str) -> Result<EdgeTable> {
+        let snap = self.snap.table(name).ok_or_else(|| err(format!("no such table: {name}")))?;
+        let schema = snap.schema();
+        let Some((src, _, weight)) = schema.edge_fields() else {
+            return Err(err(format!("table {} is not an edge table: a walk follows an EDGES field or a table with OPTIONS(edges = 'src, dst, w')", schema.table)));
+        };
+        let pk = self.schema.primary_key.ok_or_else(|| err(format!("a walk over {} needs {} to have a primary key", schema.table, self.schema.table)))?;
+        if schema.fields[src].ty != self.schema.fields[pk].ty {
+            return Err(err(format!("{} links keys of another type than {}'s", schema.table, self.schema.table)));
+        }
+        let mut segs = Vec::with_capacity(snap.segments().len());
+        for v in snap.segments() {
+            if let Some(reader) = EdgeTableReader::open(&v.file)? {
+                segs.push(EdgeSeg { reader, live: v.live.clone(), weights: Weights::new(weight, v.updates.as_ref()), ends: Vec::new(), resolved: 0 });
+            }
+        }
+        Ok(EdgeTable { segs })
+    }
+
     /// The traversal's view of `from`, the executor's segments (a copy of
-    /// [`Executor::segs`] the caller keeps while it traverses).
-    fn adjacency<'s>(&self, g: &GraphQuery, from: &'s [Seg<'a>]) -> Result<GraphAdj<'s>> {
+    /// [`Executor::segs`] the caller keeps while it traverses), and of the
+    /// edge table it walks instead of a field.
+    fn adjacency<'s>(&self, g: &GraphQuery, from: &'s [Seg<'a>], edges: Option<EdgeTable>) -> Result<GraphAdj<'s>> {
         let field = &self.schema.fields[g.field];
-        let vector = matches!(field.ty, FieldType::Vector { .. });
+        let vector = edges.is_none() && matches!(field.ty, FieldType::Vector { .. });
         let mut segs: Vec<Option<SegRef<'s>>> = (0..self.snap.segments().len()).map(|_| None).collect();
         for s in from {
-            let graph = if vector { None } else { s.r.graph(g.field)? };
+            let graph = if vector || edges.is_some() { None } else { s.r.graph(g.field)? };
             let vectors = if vector { s.r.vector(g.field)? } else { None };
             let labels = match (graph, g.labels.is_empty()) {
                 (Some(gr), false) => Some(g.labels.iter().filter_map(|l| gr.label_code(l)).collect()),
@@ -324,7 +483,7 @@ impl<'a> Executor<'a> {
         // A row's neighbours by similarity take a vector search each.
         let tick = Ticker::new(self.opts, if vector { 16 } else { Ticker::DOCS });
         let charge = self.charge.clone();
-        Ok(GraphAdj { snap: self.snap, segs, dir: g.dir, has_through: g.through.is_some(), knn, memo: traverse::node_map(), int_keys, tick, charge, held: 0 })
+        Ok(GraphAdj { snap: self.snap, segs, edges, dir: g.dir, has_through: g.through.is_some(), knn, memo: traverse::node_map(), int_keys, tick, charge, held: 0 })
     }
 
     /// Top rows by PageRank or hop distance, among those passing `p`.

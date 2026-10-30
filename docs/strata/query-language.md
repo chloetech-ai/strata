@@ -510,6 +510,29 @@ Edges are written as part of their row: a JSON array of target keys, each option
 ["p2", ["cites", "p7"], ["extends", "p9", 0.5], {"to": "p11", "label": "refutes"}]
 ```
 
+### Edge tables
+
+An `EDGES` field belongs to its source row, so adding one edge rewrites the row, its text and its vectors. A graph kept up as events arrive, such as items seen together, goes in an **edge table** instead: a table whose rows are edges, declared with `OPTIONS(edges = 'src, dst, w')`. A walk over the table whose keys it holds names the edge table where it would name a field:
+
+```sql
+CREATE TABLE cooc (
+  id KEYWORD PRIMARY KEY,                  -- 'src>dst'
+  src KEYWORD NOT NULL REFERENCES items,
+  dst KEYWORD NOT NULL REFERENCES items,
+  w FLOAT DEFAULT 0
+) OPTIONS(edges = 'src, dst, w');
+
+SELECT id FROM items
+ORDER BY ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 20)) DESC LIMIT 200;
+```
+
+- Each row is an edge from the row whose key is in `src` to the row whose key is in `dst`, weighted by `w`, or by 1 without a weight column (`edges = 'src, dst'`). `src` and `dst` are stored, single-valued `KEYWORD` or `INT` columns of the type of the other table's key, and the weight is a stored `FLOAT` or `INT`. If `src` references a table, walks are over that table.
+- Writing an edge writes its row and nothing else: insert it, delete it, or add to its weight with an `add` operation, whose `doc` creates the row on the edge's first event ([writes](server.md#writes)).
+- Edges are directed, from `src` to `dst`. For a click on item *i* after the user's last items *h*₁ … *h*₅ (*h*₁ the most recent), adding 1/*g* to the edge *h*_g → *i* records what comes after what: `ppr(cooc, :x, dir => 'out')` and `REACHABLE(cooc, :x, dir => 'out')` follow the items that came after *x*, and `dir => 'both'`, `ppr`'s default, reads them as seen together. That is five `add` operations per event.
+- An edge is followed while its weight, as it is now, is above 0. `UPDATE cooc SET w = w * 0.9` decays every weight in place, and an edge whose weight is 0 or `NULL` stays in the table without being followed. `src` and `dst` are never changed in place: an `UPDATE` of a `KEYWORD` one rewrites the row, and `set`, `add` or an `UPDATE` of an `INT` one is refused, as for `shard_by` (delete the row and insert it again).
+- `REACHABLE`, `PATH`, `hops()` and `ppr` take an edge table with every option but `label`, since its edges have none. A walk over `cooc` and a walk over an `EDGES` field holding the same edges and weights find the same rows at the same hops and the same PageRank, up to rounding.
+- Each segment of the edge table indexes its rows by the keys they link, which flushes and merges build, so a walk finds a row's edges with one lookup of its key in each of the edge table's segments ([how, and what it costs](graphs.md#edge-tables)).
+
 ## Running SQL
 
 The `strata` shell runs one statement, or reads statements from standard input:
@@ -565,6 +588,7 @@ DROP TABLE IF EXISTS wrote, authors;
 - **`OPTIONS(shard_by = 'column')`** after the columns places the table's rows on [shards](server.md#tables-on-shards) by that column instead of by the primary key, so that a user's events sit on one shard together. The column is a stored, single-valued `KEYWORD` or `INT` with `NOT NULL`, other than the key, and a row keeps it: `UPDATE` does not change it (delete the row and insert it again). In JSON it is `"shard_by": "usr"`. One database places nothing, so the option only matters to a coordinator.
 - **`OPTIONS(cluster_by = 'column')`** stores each segment's rows sorted by that column, rows of one value in the order they were written: a flush sorts the rows it writes, and a merge sorts the rows of the segments it joins. A user's history then sits in one run of each segment instead of scattered across it, so reading it touches a few pages rather than one per row. The column is an indexed, single-valued `KEYWORD`, `INT` or `TIMESTAMP`, and a row keeps it (`UPDATE` does not change it). Queries return the same rows either way; only `ORDER BY` fixes their order. In JSON it is `"cluster_by": "usr"`.
 - **`OPTIONS(retain = '400 days')`** drops rows once their time is older than the period: a flush does not write them, and a merge leaves them out of the segment it writes, or drops a segment whose rows are all past it without rewriting anything; the merger looks for such segments on its own. Until then a query still finds them, so filter on the time where that matters (`WHERE ts > '2025-10-01'`). The time is the table's only `TIMESTAMP` column, or the one `retain_by = 'column'` names (indexed, single-valued, and not changed by `UPDATE`); a row without one is kept. A period is a whole number and a unit: seconds, minutes, hours, days or weeks (`'90 s'`, `'12h'`, `'2 weeks'`). In JSON it is `"retain": "400 days"` with `"retain_by"`.
+- **`OPTIONS(edges = 'src, dst, w')`** makes each row an edge of a graph over another table's rows, which walks over that table follow ([edge tables](#edge-tables)). In JSON it is `"edges": "src, dst, w"`.
 - **`DROP TABLE`** drops tables other than the first. A table that another table references goes with it (`DROP TABLE wrote, authors`) or with `CASCADE`, which removes those references.
 - Every other clause (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, a `DEFAULT` that is an expression, `CREATE TABLE ... AS SELECT`) is an error, and there is no `ALTER TABLE` yet.
 
