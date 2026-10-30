@@ -109,3 +109,58 @@ STRATA_MACHINE="..." ./target/release/strata-media-eval --models ~/models \
     --captioner blip-image-captioning-base --limit 1000 --captions-out coco1k-blip-captions.json \
     --out results/media/coco1k-siglip-blip.json
 ```
+
+## Transcripts of speech
+
+`strata-asr-eval` (`strata/src/bin/strata-asr-eval.rs`, feature `audio`)
+loads LibriSpeech utterances into a table whose `transcript` is a `TEXT`
+field the database makes from the `MEDIA` field of each FLAC file as the rows
+load (`"derive": {"from": "audio", "model": "whisper-small"}`), reads the
+transcripts back through SQL and scores them against what was said. Then it
+searches for each utterance by what was said (`ORDER BY bm25(transcript, :t)
+DESC LIMIT 10`) among the others.
+
+Model: `whisper-small` (`openai/whisper-small`, 244M parameters), in candle:
+each 30 seconds of a file (these utterances are all shorter) decoded greedily
+without timestamps, in the language Whisper detects, as the `transformers`
+library generates by default. Split: 200 utterances of LibriSpeech's
+`test-clean`, every 13th by ID, so that all 40 of its speakers are in (25
+minutes of speech). Words are compared lower case and without punctuation
+(apostrophes inside words kept), which counts `St.` against `saint` and `10`
+against `ten` as errors: Whisper's own English normalizer spells those out,
+so the 3.4% its authors report for `whisper-small` on all of `test-clean` is
+not comparable with the numbers here.
+
+| transcripts | word error rate | utterances with every word right |
+|---|---|---|
+| Strata | 3.81% | 120 of 200 |
+| `transformers` 4.46.3 | 3.81% | 120 of 200 |
+
+The two wrote the same 200 transcripts, character for character.
+`whisper_reference.py` writes the `transformers` ones (`python
+whisper_reference.py MODEL_DIR SPLIT_DIR 200 OUT.json`), cutting each file as
+Strata does. The transcripts are `librispeech200-whisper-small-transcripts.json`
+and `librispeech200-transformers-transcripts.json` here.
+
+Found by what was said, `bm25(transcript, :t)`: R@1 99.0, R@5 99.5, R@10
+99.5. The two that miss are made of stopwords, which the `english` analyzer
+drops: "why should he not be as other men" is second, and "ham to be or not
+to be" (transcribed "Him to be or not to be.") is not in the first ten.
+
+Time: 1,077 s for the 200 (1,503 s of speech), 5.4 s an utterance, against
+583 s, 2.9 s an utterance, through `transformers` with PyTorch 2.5.1 on the
+same machine, both with nothing else running. Each utterance is one window,
+and the encoder reads all 30 seconds of a window however short the speech in
+it. The encoder takes most of the time (about 3.7 s a window, in batches of
+four), and attention 60% of that: candle writes each layer's 1500 by 1500
+attention scores to memory, takes their softmax and reads them back, where
+`transformers` calls PyTorch's fused `scaled_dot_product_attention`.
+
+```text
+cargo build --release --features audio --bin strata-asr-eval
+STRATA_MACHINE="..." ./target/release/strata-asr-eval --models ~/models \
+    --librispeech ~/data/LibriSpeech/test-clean --limit 200 \
+    --reference librispeech200-transformers-transcripts.json \
+    --transcripts-out librispeech200-whisper-small-transcripts.json \
+    --out results/media/librispeech200-whisper-small.json
+```

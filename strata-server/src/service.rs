@@ -18,6 +18,7 @@ use strata::query::ir::Plan;
 use strata::query::model::Models;
 use strata::query::sql::{ident, quoted};
 use strata::query::{bind_command, compound, ops, profile, Command, Params, Select};
+use strata::rank_log::{self, Log};
 use strata::schema::Schema;
 use strata::storage::{CheckpointOptions, CheckpointStats, Layout, RankProfile, Snapshot, TableTxn, WriteTxn};
 use strata::text::Synonyms;
@@ -782,7 +783,7 @@ impl Service {
         }
         let (reply, rx) = tokio::sync::oneshot::channel();
         let keys = self.idempotency.clone();
-        tx.send(Queued { job, deadline, reply: Some(reply), key, keys, _queued: queued }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
+        tx.send(Queued { job, deadline, reply: Some(reply), key, keys, queued: Some(queued) }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
         rx.await.map_err(|_| ApiError::internal("the writer thread stopped"))?
     }
 
@@ -1145,6 +1146,36 @@ impl Service {
                 Err(e)
             }
         }
+    }
+
+    /// Runs a query and logs what it served ([`strata::rank_log`]): the
+    /// answer has the query's columns, and the log's rows are written as
+    /// [`Self::write_ops`] writes them, through a coordinator to the shards
+    /// their keys place them on. The first query logged to a table makes
+    /// it, on every shard through a coordinator. A replica refuses it, the
+    /// log being a write. Returns the request's id and the log's write.
+    pub async fn query_logged(self: &Arc<Self>, mut req: QueryReq, log: Log) -> Result<(Answer, String, Written), ApiError> {
+        self.takes_writes()?;
+        let schema = match self.table(&log.table).await {
+            Ok(s) => s,
+            Err(_) => {
+                self.sql(&rank_log::create_sql(&log.table)?, &Params::new(), After::Any, req.timeout_ms).await?;
+                self.table(&log.table).await?
+            }
+        };
+        rank_log::check(&schema)?;
+        let p = rank_log::prepare(&req.sql, &req.params, &log)?;
+        req.sql = p.sql.clone();
+        let mut a = self.query(req).await?;
+        let rs = std::mem::replace(&mut a.rs, ResultSet { columns: Vec::new(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() });
+        let served = rank_log::serve(rs, &p, &log)?;
+        a.rs = served.rs;
+        let ops: Vec<Json> = served.entries.iter().map(|e| json!({"op": "upsert", "table": log.table, "doc": e.to_json()})).collect();
+        let w = match ops.is_empty() {
+            true => Written { rows: 0, seq_no: None, seq_nos: Vec::new(), skipped: 0, stamps: Vec::new() },
+            false => self.write_ops(ops, None).await?,
+        };
+        Ok((a, served.request, w))
     }
 
     /// Runs a plan ([`strata::query::ir`]): a read answers as
@@ -2051,8 +2082,8 @@ struct Queued {
     /// The request's idempotency key, whose outcome the writer records.
     key: Option<String>,
     keys: Arc<idem::Keys>,
-    /// Counts the request as queued until it is answered.
-    _queued: InQueue,
+    /// Counts the request as queued until it is answered (`None` then).
+    queued: Option<InQueue>,
 }
 
 impl Queued {
@@ -2061,6 +2092,9 @@ impl Queued {
         if let Some(k) = &self.key {
             self.keys.finish(k, r.as_ref().ok().cloned());
         }
+        // Uncounted before the answer, which its caller may follow with a
+        // look at the metrics.
+        self.queued = None;
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(r);
         }
@@ -2572,7 +2606,7 @@ mod tests {
         assert_eq!(keys.begin("k", 1), idem::Begin::New);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let state = WriterState::default();
-        let q = Queued { job: WriteJob::Ops(Vec::new()), deadline: Instant::now(), reply: Some(tx), key: Some("k".into()), keys: keys.clone(), _queued: InQueue::start(&state, 1).unwrap() };
+        let q = Queued { job: WriteJob::Ops(Vec::new()), deadline: Instant::now(), reply: Some(tx), key: Some("k".into()), keys: keys.clone(), queued: InQueue::start(&state, 1) };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _held = q;
             panic!("a bug while applying a write");
