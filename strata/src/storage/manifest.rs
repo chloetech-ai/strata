@@ -280,7 +280,7 @@ struct V1 {
 
 /// The features this version of Strata reads, besides its analyzers'
 /// ([`known_feature`]).
-pub const FEATURES: &[&str] = &["bool", "default", "not_null", "seq_no", "timestamp"];
+pub const FEATURES: &[&str] = &["bool", "default", "not_null", "seq_no", "shard_by", "timestamp"];
 
 /// Whether this version of Strata reads a database that requires feature
 /// `x`: one of [`FEATURES`], or a TEXT field's analyzer it has

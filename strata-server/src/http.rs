@@ -4,16 +4,18 @@
 //! |---|---|---|
 //! | `GET /` | | the UI |
 //! | `GET /livez`, `/readyz` | | `{status}`: 503 when a restart is needed |
-//! | `GET /v1/health`, `/v1/stats`, `/v1/schema`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
+//! | `GET /v1/health`, `/v1/stats`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
+//! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
+//! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema, the first first |
 //! | `GET /metrics` | | Prometheus text |
 //! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?}` | rows |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows, or `{written, seq_no?, seq_nos?}` |
-//! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`) | `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}` (a plan as `/v1/explain` gives it) | rows, or `{written, seq_no?, seq_nos?}` |
-//! | `POST /v1/import?format=jsonl` | rows as JSON Lines, JSON, CSV or TSV | `{written, skipped_fields}` |
+//! | `POST /v1/import?format=jsonl&table=name` | rows as JSON Lines, JSON, CSV or TSV (of the first table without `table`) | `{written, skipped_fields}` |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
-//! | `POST /v1/embed` | `{text, field?}` | `{field, vector}`: the text's vector by an embedded field's model |
+//! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
@@ -84,6 +86,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
     let api = Router::new()
         .route("/v1/stats", get(stats))
         .route("/v1/schema", get(schema))
+        .route("/v1/tables", get(tables))
         .route("/v1/config", get(config))
         .route("/metrics", get(metrics))
         .route("/v1/query", post(query))
@@ -211,19 +214,35 @@ async fn stats(State(app): State<App>) -> AxJson<Json> {
     AxJson(app.svc.stats().await)
 }
 
-async fn schema(State(app): State<App>) -> AxJson<Json> {
-    let s = &app.svc.schema;
-    AxJson(json!({
+/// A table's schema: `?table=`, else the first table's.
+async fn schema(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Res {
+    let s = match q.get("table") {
+        Some(t) => app.svc.table(t).await?,
+        None => Arc::new(app.svc.schema.clone()),
+    };
+    Ok(AxJson(table_json(&app.svc, &s)))
+}
+
+/// Every table's schema, the first first.
+async fn tables(State(app): State<App>) -> AxJson<Json> {
+    let tables: Vec<Json> = app.svc.catalog().iter().map(|s| table_json(&app.svc, s)).collect();
+    AxJson(json!({"tables": tables}))
+}
+
+fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json {
+    json!({
+        "table": s.table,
         "schema": s,
         "short": s.to_short_json(),
         "primary_key": s.primary_key.map(|k| s.fields[k].name.clone()),
+        "shard_by": s.shard_by,
         // Each embedded VECTOR field: its sources, model, and whether this
         // server can embed text for it.
-        "embeddings": app.svc.models.iter().map(|m| json!({
+        "embeddings": svc.models().iter().filter(|m| m.table.eq_ignore_ascii_case(&s.table)).map(|m| json!({
             "field": m.field, "from": m.spec.from, "model": m.spec.model,
             "loaded": m.model.is_ok(), "error": m.model.as_ref().err(),
         })).collect::<Vec<_>>(),
-    }))
+    })
 }
 
 async fn config(State(app): State<App>) -> AxJson<Json> {
@@ -344,7 +363,7 @@ async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMa
     };
     let format = format.ok_or_else(|| ApiError::bad("name the rows' format: ?format=jsonl, json, csv or tsv"))?;
     let t0 = std::time::Instant::now();
-    let (n, skipped) = app.svc.import(body, format).await?;
+    let (n, skipped) = app.svc.import(q.get("table").map(String::as_str), body, format).await?;
     Ok(AxJson(json!({"written": n, "skipped_fields": skipped, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
 }
 
@@ -358,29 +377,32 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
 /// for a plan, whose vectors are values.
 async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let text = body_str(&b, "text")?;
-    let field = match b.get("field") {
-        None | Some(Json::Null) => None,
-        Some(f) => Some(f.as_str().ok_or_else(|| ApiError::bad("field is a field's name"))?),
+    let name = |k: &str| match b.get(k) {
+        None | Some(Json::Null) => Ok(None),
+        Some(f) => f.as_str().map(Some).ok_or_else(|| ApiError::bad(format!("{k} is a name"))),
     };
-    let field = app.svc.model(field)?.0.to_string();
-    let p = app.svc.params(Some(&json!({ "v": { "embed": text, "field": field } }))).await?;
+    let (table, field, _) = app.svc.model(name("table")?, name("field")?)?;
+    let p = app.svc.params(Some(&json!({ "v": { "embed": text, "field": field, "table": table } }))).await?;
     let Some(strata::value::Value::Vector(v)) = p.0.get("v") else { return Err(ApiError::internal("the text has no vector")) };
-    Ok(AxJson(json!({ "field": field, "vector": &v[..] })))
+    Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] })))
 }
 
 async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let sql = body_str(&b, "sql")?;
     let params = app.svc.params(b.get("params")).await?;
+    let catalog = app.svc.catalog();
+    let tables: Vec<&strata::schema::Schema> = catalog.iter().map(|t| &**t).collect();
     // A compound query is operators over single-table queries; what each
     // of those ran is in "plan".
-    let (logical, plan) = match strata::query::compound::is_compound(sql, &app.svc.schema) {
-        true => ("a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(), strata::query::compound::plan(sql, &app.svc.schema, &params)?),
+    let plan = strata::query::compound::plan_read(sql, &tables, &params)?;
+    let logical = match plan.root.uses_operators() {
+        true => "a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(),
         false => {
-            let select = strata::query::bind(sql, &app.svc.schema, &params)?;
-            (format!("{select:#?}"), strata::query::ir::Plan::of_select(&app.svc.schema, &select))
+            let schema = tables.iter().find(|t| t.table.eq_ignore_ascii_case(plan.table())).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", plan.table())))?;
+            format!("{:#?}", strata::query::bind(sql, schema, &params)?)
         }
     };
-    let (ir, tree) = (plan.to_json()?, json!(plan.explain(&[&app.svc.schema])));
+    let (ir, tree) = (plan.to_json()?, json!(plan.explain(&tables)));
     // `hits`: the top rows with the values they were ranked by.
     let hits = match body_u64(&b, "hits") {
         0 => None,
