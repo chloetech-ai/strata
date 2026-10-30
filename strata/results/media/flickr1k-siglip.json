@@ -1,0 +1,21 @@
+{
+  "captions": 5000,
+  "captions_load_seconds": 395.441086793,
+  "dimensions": 768,
+  "image_to_text": {
+    "R@1": 0.892,
+    "R@10": 0.993,
+    "R@5": 0.979
+  },
+  "images": 1000,
+  "images_load_seconds": 486.057501096,
+  "machine": "cloud container, 4 vCPU Xeon 2.10 GHz, 15 GB",
+  "model": "siglip-base-patch16-224",
+  "search_seconds": 0.479330732,
+  "split": "test_1k_flickr.csv",
+  "text_to_image": {
+    "R@1": 0.7466,
+    "R@10": 0.9566,
+    "R@5": 0.923
+  }
+}

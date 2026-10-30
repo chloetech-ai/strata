@@ -12,7 +12,7 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 csv = "1"
 sqlparser = "0.59"
 crc32fast = "1"
-# SHA-256 of codebook files (semantic IDs, `sid`).
+# SHA-256 of codebook files (semantic IDs, `sid`) and of MEDIA files.
 sha2 = "0.10"
 libc = "0.2"
 # Log events (flush and merge failures, a database that stops writing);
@@ -26,6 +26,8 @@ rand_distr = "0.4"
 roaring = "0.11.5"
 clap = { version = "4", features = ["derive"] }
 rust-stemmers = "1.2"
+# MEDIA values (`media`): bytes given as base64.
+base64 = "0.22"
 # Baselines (feature `baselines`): SQLite with FTS5, and Tantivy.
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
 tantivy = { version = "0.26", optional = true }
@@ -35,11 +37,15 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
+# Images decoded for SigLIP (`vision`).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"], optional = true }
 
 [features]
 default = ["embed"]
 embed = ["dep:tokenizers"]
 bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+# Images: decoded with the `image` crate, embedded by SigLIP.
+vision = ["bert", "dep:image"]
 # `bert` with matrix products in Apple's Accelerate framework (macOS only).
 accelerate = ["bert", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 # SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
@@ -52,8 +58,15 @@ name = "strata-baselines"
 path = "src/bin/strata-baselines.rs"
 required-features = ["baselines"]
 
+[[bin]]
+name = "strata-media-eval"
+path = "src/bin/strata-media-eval.rs"
+required-features = ["vision"]
+
 [dev-dependencies]
 tempfile = "3"
+# PNGs written by the tests of `vision`.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 codegen-units = 1

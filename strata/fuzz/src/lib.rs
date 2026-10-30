@@ -7,7 +7,7 @@
 //! ones rather than noise that fails the first check. Every target must
 //! return without undefined behaviour, a hang or a runaway allocation.
 //! Beyond that:
-//! - `loom`, `wal`, `manifest`, `sql` and `text_query` must not panic: a damaged input is
+//! - `loom`, `wal`, `manifest`, `sql`, `text_query` and `media` must not panic: a damaged input is
 //!   an error, and a list that passes [`Loom::validate`] decodes, seeks and
 //!   combines like its docIDs.
 //! - `segment` must open without panicking (a damaged segment is an error)
@@ -420,6 +420,42 @@ pub fn text_query(data: &[u8]) {
     ] {
         let _ = db.query(&sql, &params());
     }
+}
+
+/// Files of every kind [`strata::media::describe`] reads the headers of.
+fn media_seeds() -> Vec<Vec<u8>> {
+    let png = [&b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\x02\x80\0\0\x01\xe0"[..], &[8, 6, 0, 0, 0][..]].concat();
+    let jpeg = [&[0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 17, 8, 1, 0xe0, 2, 0x80][..], &[3, 1, 0x22, 0][..]].concat();
+    let wav = [&b"RIFF\x24\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data\x00\x7d\0\0"[..], &[0; 16][..]].concat();
+    let webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0\x7f\x02\0\xdf\x01\0".to_vec();
+    let flac = [&b"fLaC\0\0\0\x22\x10\0\x10\0\0\0\0\0\0\0"[..], &[0x0a, 0xc4, 0x42, 0xf0, 0, 0x0a, 0xc4, 0x40][..]].concat();
+    let mut mp4 = b"\0\0\0\x14ftypisom\0\0\x02\0isom\0\0\0\x24moov\0\0\0\x1cmvhd".to_vec();
+    mp4.extend([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x5f, 0x90, 0, 6, 0x2e, 0x08]);
+    let pdf = b"%PDF-1.4\n2 0 obj << /Type /Pages /Count 3 >>\n3 0 obj << /Type /Page >>".to_vec();
+    vec![png, jpeg, wav, webp, flac, mp4, pdf, b"GIF89a\x20\x01\x10\0".to_vec(), b"BM\0\0\0\0\0\0\0\0\0\0\0\0\x28\0\0\0\x10\0\0\0\xf0\xff\xff\xff".to_vec()]
+}
+
+/// A damaged media file described, and any text as a stored MEDIA value,
+/// a URI, and what a write gives (resolved without fetching). Must not
+/// panic.
+pub fn media(data: &[u8]) {
+    use strata::media::{describe, hash_of, input_text, Media, MediaKind, Resolver, Source};
+    let Some((&which, rest)) = data.split_first() else { return };
+    let seeds = media_seeds();
+    let file = damage(&seeds[which as usize % seeds.len()], rest, &[]);
+    assert_eq!(describe(&file).bytes, file.len() as u64);
+    describe(data);
+    let text = String::from_utf8_lossy(data).into_owned();
+    let _ = (Media::parse(&text), Source::parse(&text), hash_of(&text));
+    let none = Resolver::default();
+    if let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Ok(t) = input_text(&j) {
+            if let Ok(r) = none.resolve(MediaKind::Any, &t) {
+                assert!(Media::parse(&r.media.to_text()).is_ok());
+            }
+        }
+    }
+    let _ = input_text(&serde_json::Value::String(text));
 }
 
 thread_local!(static QUIET: Cell<bool> = const { Cell::new(false) });

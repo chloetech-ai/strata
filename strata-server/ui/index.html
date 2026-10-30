@@ -1456,7 +1456,7 @@ async function refreshHealth() {
   } catch (e) { $("dot").className = "dot bad"; $("counts").textContent = e.message; }
 }
 // ---- schema and import ----------------------------------------------------------
-const TYPES = ["text", "keyword", "int", "float", "bool", "timestamp", "vector", "sparse", "edges"];
+const TYPES = ["text", "keyword", "int", "float", "bool", "timestamp", "vector", "sparse", "media", "edges"];
 const MODELS = { "potion-retrieval-32M": 512, "potion-base-8M": 256, "bge-small-en-v1.5": 384, "snowflake-arctic-embed-m-v1.5": 768 };
 const modelDim = (m) => !m ? null : m.startsWith("hash:") ? Number(m.slice(5)) || null : (MODELS[m] || null);
 const FORMATS = { jsonl: "jsonl", ndjson: "jsonl", json: "json", csv: "csv", tsv: "tsv", tab: "tsv" };
@@ -1529,6 +1529,7 @@ function designJson() {
     const o = { name: f.name, type: f.type }, vec = f.type === "vector", gen = !!(f.from && f.from.length);
     if (f.type === "text" && f.positions === false) o.positions = false;
     if (f.type === "text" && f.analyzer && f.analyzer !== "english") o.analyzer = f.analyzer;
+    if (f.type === "media" && f.kind && f.kind !== "any") o.kind = f.kind;
     if (gen) o.from = f.from;
     if (f.multi) o.multi = true;
     if (f.stored != null && f.stored !== (!vec && !gen)) o.stored = f.stored;
@@ -1580,7 +1581,7 @@ function fieldRow(f) {
   const type = el("select", {}, ...TYPES.map((t) => el("option", { value: t, text: t })));
   type.value = f.type;
   type.onchange = () => {
-    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored", "default", "analyzer"]) delete f[k];
+    for (const k of ["multi", "dim", "embed", "index", "codes", "positions", "stored", "default", "analyzer", "kind"]) delete f[k];
     f.type = type.value;
     if (f.type === "vector") { const from = textFields(); f.embed = from.length ? { from, model: "potion-retrieval-32M" } : undefined; if (!f.embed) f.dim = 384; }
     designChanged(true);
@@ -1621,6 +1622,12 @@ function fieldRow(f) {
     codes.onchange = () => { f.codes = codes.value; designChanged(false); };
     opts.append(el("label", { title: "How nearest rows are found" }, "index", index), el("label", { title: "How the vectors are compressed for search; the full vectors rescore the best" }, "codes", codes));
   }
+  if (f.type === "media") {
+    const kind = el("select", {}, ...["any", "image", "audio", "video", "pdf"].map((k) => el("option", { value: k, text: k })));
+    kind.value = f.kind || "any";
+    kind.onchange = () => { f.kind = kind.value === "any" ? undefined : kind.value; designChanged(false); };
+    opts.append(el("label", { title: "The files this field takes: a row holds a file's URI, hash, type and size, and writes give a URI or the bytes (base64)" }, "files", kind));
+  }
   if (f.type === "keyword" || f.type === "int") opts.append(check("list", !!f.multi, (on) => { f.multi = on || undefined; if (on) delete f.stored; }, "Each row holds several values"));
   if (f.type === "text") {
     opts.append(check("phrases", f.positions !== false, (on) => { f.positions = on ? undefined : false; }, "Keep word positions, for \"exact phrase\" searches"));
@@ -1644,8 +1651,8 @@ function fieldRow(f) {
     opts.append(el("label", { title: "What a row that leaves this field out holds (now: the time it is written)" }, "default", def));
   }
   const storedDefault = !vec && !gen;
-  opts.append(check("indexed", f.indexed !== false, (on) => { f.indexed = on ? undefined : false; }, "Searchable and filterable"),
-    check("stored", f.stored == null ? storedDefault : f.stored, (on) => { f.stored = on === storedDefault ? undefined : on; }, vec ? "Keep the full vectors to return them (search needs only the index)" : "Returned in results"));
+  opts.append(check("indexed", f.indexed !== false, (on) => { f.indexed = on ? undefined : false; }, "Searchable and filterable"));
+  if (f.type !== "media") opts.append(check("stored", f.stored == null ? storedDefault : f.stored, (on) => { f.stored = on === storedDefault ? undefined : on; }, vec ? "Keep the full vectors to return them (search needs only the index)" : "Returned in results"));
   const del = el("button", { class: "btn small", title: "Remove this field", text: "×" });
   del.onclick = () => {
     D.fields = D.fields.filter((g) => g !== f);

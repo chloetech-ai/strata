@@ -1,0 +1,21 @@
+{
+  "captions": 25010,
+  "captions_load_seconds": 2974.184126395,
+  "dimensions": 768,
+  "image_to_text": {
+    "R@1": 0.6572,
+    "R@10": 0.9144,
+    "R@5": 0.8558
+  },
+  "images": 5000,
+  "images_load_seconds": 3453.991741241,
+  "machine": "cloud container, 4 vCPU Xeon 2.10 GHz, 15 GB",
+  "model": "siglip-base-patch16-224",
+  "search_seconds": 12.234250291,
+  "split": "test_5k_mscoco_2014.csv",
+  "text_to_image": {
+    "R@1": 0.4784886045581767,
+    "R@10": 0.8091963214714114,
+    "R@5": 0.7238704518192723
+  }
+}

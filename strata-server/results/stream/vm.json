@@ -1,0 +1,103 @@
+{
+  "coordinator": {
+    "run": {
+      "batches": 490,
+      "events": 1000000,
+      "events_per_batch": 2040.8163265306123,
+      "events_per_s": 46858.322204265096,
+      "operations_per_s": 93716.64440853019,
+      "seconds": 21.340926285,
+      "streams": 1
+    },
+    "shards": 3
+  },
+  "events_per_run": 1000000,
+  "lag": [
+    {
+      "achieved_events_per_s": 995.6371708850791,
+      "batches": 4954,
+      "events": 10000,
+      "lag_ms": {
+        "max": 98.281705,
+        "p50": 3.7910980000000003,
+        "p90": 6.227545999999999,
+        "p99": 36.946576,
+        "p999": 88.281705
+      },
+      "rate": 1000
+    },
+    {
+      "achieved_events_per_s": 9950.92840660936,
+      "batches": 4266,
+      "events": 100000,
+      "lag_ms": {
+        "max": 50.073392,
+        "p50": 4.573370000000001,
+        "p90": 6.804361,
+        "p99": 14.931662,
+        "p999": 25.132916
+      },
+      "rate": 10000
+    },
+    {
+      "achieved_events_per_s": 49645.133768940526,
+      "batches": 444,
+      "events": 500000,
+      "lag_ms": {
+        "max": 421.411747,
+        "p50": 116.67578,
+        "p90": 327.574902,
+        "p99": 384.35174700000005,
+        "p999": 411.831747
+      },
+      "rate": 50000
+    },
+    {
+      "achieved_events_per_s": 46617.3279713716,
+      "batches": 495,
+      "events": 1000000,
+      "lag_ms": {
+        "max": 11452.241326,
+        "p50": 5587.125236000001,
+        "p90": 10787.983475,
+        "p99": 11378.084832,
+        "p999": 11446.057581
+      },
+      "rate": 100000
+    }
+  ],
+  "machine": {
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "host": "vm",
+    "memory_gb": 16.9,
+    "os": "Linux 6.18.44-fc-v185"
+  },
+  "server_lag_histogram": {
+    "events": 3610000.0,
+    "p50_at_most_s": "2",
+    "p99_at_most_s": "30"
+  },
+  "throughput": [
+    {
+      "batches": 491,
+      "events": 1000000,
+      "events_per_batch": 2036.6598778004072,
+      "events_per_s": 52881.0294312475,
+      "operations_per_s": 105762.058862495,
+      "seconds": 18.910373167,
+      "streams": 1
+    },
+    {
+      "batches": 500,
+      "events": 1000000,
+      "events_per_batch": 2000.0,
+      "events_per_s": 51152.480600681076,
+      "operations_per_s": 102304.96120136215,
+      "seconds": 19.549394052,
+      "streams": 4
+    }
+  ],
+  "users": 10000
+}

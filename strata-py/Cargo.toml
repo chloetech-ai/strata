@@ -20,6 +20,8 @@ serde_json = "1"
 # (`accelerate`); Model2Vec models need neither.
 bert = ["strata/bert"]
 accelerate = ["strata/accelerate"]
+# Images (`vision`): decoded, and embedded by SigLIP.
+vision = ["strata/vision"]
 
 [profile.release]
 codegen-units = 1

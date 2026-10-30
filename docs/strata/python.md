@@ -70,7 +70,7 @@ A database file can be open in one process at a time. Within that process, threa
 
 ## Writing
 
-Rows are dicts of field name to value: `str`, `int`, `float`, `None`, `bool` for a `bool` field, a `datetime` or `date` (or ISO 8601 text) for a `timestamp` field, a list for a `multi` field, a list of floats or a numpy array for a vector, a dict of term weights for a `sparse` field. A naive `datetime` is taken as UTC. A field the schema does not have is an error. Results give a `bool` field's values as `bool` and a `timestamp` field's as ISO 8601 text in UTC (`"2026-10-01T12:30:00Z"`), in-process and from the client alike; `datetime.fromisoformat` reads them.
+Rows are dicts of field name to value: `str`, `int`, `float`, `None`, `bool` for a `bool` field, a `datetime` or `date` (or ISO 8601 text) for a `timestamp` field, a list for a `multi` field, a list of floats or a numpy array for a vector, a dict of term weights for a `sparse` field, a URI or a dict for a `media` field (in-process, the whole value or `{"uri": …, "data": <base64>}`: nothing is fetched, see [media fields](server.md#media-fields)). A naive `datetime` is taken as UTC. A field the schema does not have is an error. Results give a `bool` field's values as `bool` and a `timestamp` field's as ISO 8601 text in UTC (`"2026-10-01T12:30:00Z"`), in-process and from the client alike; `datetime.fromisoformat` reads them.
 
 | method | what it does |
 |---|---|
@@ -114,7 +114,7 @@ db.search("dragon", where=col("year") >= 1990, columns=["id", "title"])
 db.search("dragon", where="year >= :y", params={"y": 1990})
 ```
 
-`embed(text, field=None)` returns the query vector of a text, and `len(db)` the number of rows.
+`embed(text, field=None)` returns the query vector of a text (`embed(image=data, field="emb")` of an image file's bytes, by a [model of images](server.md#vectors-of-images), with the package built with `--features vision`), and `len(db)` the number of rows.
 
 `plan(sql, params)` returns a statement's [plan](query-language.md#explain) as a dict without running it, and `run(plan)` runs a plan: a read's `Result`, or the number of rows a write wrote.
 
@@ -185,7 +185,7 @@ It returns the SHA-256 of the file, which the table records. The options are `le
 
 ## A server from Python
 
-`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `tables`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `run(plan)` (a plan from `explain(...)["ir"]` or a `table()` query, run by [`/v1/plan`](server.md#http-api)), `table()` ([queries built in Python](#queries-built-in-python)), `embed(text, field=None)` (a text's vector by the server's model, from [`/v1/embed`](server.md#http-api)), `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
+`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `tables`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `run(plan)` (a plan from `explain(...)["ir"]` or a `table()` query, run by [`/v1/plan`](server.md#http-api)), `table()` ([queries built in Python](#queries-built-in-python)), `embed(text, field=None)` (a text's vector by the server's model, from [`/v1/embed`](server.md#http-api), or `embed(image=data)` an image's), `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
 
 ```python
 client = strata.connect("http://127.0.0.1:7700")   # token= or $STRATA_TOKEN for a server with --token
@@ -194,3 +194,26 @@ client.search("letters", limit=3).dicts()
 ```
 
 The server embeds `{"embed": text}` parameters and the rows it is sent with its own models. Errors the server reports raise `strata.StrataError`, with the HTTP status as `.status`; a server that cannot be reached raises `urllib.error.URLError`.
+
+### Streams and Kafka
+
+`client.stream(events)` writes an iterable of [stream lines](server.md#streams) through `/v1/stream` as it is read, each an operation or one event's operations as `{"ops": [...], "source": {"name", "offset", "ts"}}`, and returns the stream's last answer (`lines`, `written`, `skipped`). `client.source(name)` is the offset of the last event a source wrote (None for none), and `client.sources()` lists them all. A server skips the operations of an offset it has reached, so a stream resumed from `source(name) + 1`, or from anywhere before it, writes each event once.
+
+`strata.ingest.kafka` is a Kafka (or Redpanda) consumer built on it, which needs `confluent-kafka` (`pip install confluent-kafka`, or `pip install "./strata-py[kafka]"`). Each partition is a source named `<topic>/<partition>` (after `prefix=`), and a partition given to the consumer is read from after the offset the server has, not from what the consumer group committed to Kafka, so each event is written once across consumer restarts, server restarts and rebalances. Within a partition the events are written in order.
+
+```python
+import json
+import strata
+from strata import ingest
+
+def click(e):                                   # an ingest.Event: topic, partition, offset, timestamp, key, value
+    c = json.loads(e.value)
+    return [
+        {"op": "insert", "table": "events", "doc": {"id": c["id"], "usr": c["usr"], "item": c["item"]}},
+        {"op": "add", "table": "users", "key": c["usr"], "field": "n_events", "value": 1},
+    ]
+
+ingest.kafka(strata.connect("http://127.0.0.1:7700"), "clicks", click, brokers="127.0.0.1:9092", group="strata")
+```
+
+The function gives an event's operations, which commit together with its offset; None writes the offset alone (for events to leave out). Without one, each value is JSON: an operation, or `{"ops": [...]}`. The consumer runs until interrupted, or until `max_events=` events were read or none came for `idle=` seconds, and returns counts (`events`, `written`, `skipped`, `streams`, `retries`). It keeps a stream open for `seconds_per_stream=` (1 by default), then commits the stream's offsets to Kafka for Kafka's own lag tools and opens the next. When the server cannot be reached, or answers 429 or 5xx, it waits and reads every partition again from the server's offsets, for up to `retry_for=` seconds (60). An event the function fails on stops it after the events before it are written, so a restart begins with that event. `config=` adds librdkafka settings, and consumers of one `group` share the partitions. `ingest.consume(client, log, to_ops)` runs the same loop over another log, through the small `ingest.Log` interface.

@@ -211,6 +211,12 @@ fn profiles_are_kept_with_their_table() {
         refused(&db, text, &none, says);
     }
     assert!(db.storage().rank_profiles("docs").unwrap().is_empty());
+    // Nor does the streams' system table take one.
+    db.storage().ensure_sources().unwrap();
+    refused(&db, "CREATE RANK PROFILE p ON _sources AS SELECT * FROM _sources ORDER BY last_offset DESC", &none, "no such table: _sources");
+    let p = RankProfile { name: "p".into(), ranking: "SELECT * FROM _sources ORDER BY last_offset DESC".into(), defaults: Default::default() };
+    let e = db.storage().set_rank_profile("_sources", p, false).unwrap_err().to_string();
+    assert!(e.contains("_sources is a system table, which takes no rank profile"), "{e}");
 
     // How a query may rank by one.
     sql(&db, PROFILES[0]);

@@ -56,6 +56,7 @@ from .build import (
     ln,
     log,
     match,
+    maxsim,
     minmax,
     path,
     ppr,
@@ -85,6 +86,7 @@ __all__ = [
     "match",
     "bm25",
     "similarity",
+    "maxsim",
     "rrf",
     "minmax",
     "rank",
@@ -219,10 +221,11 @@ class Database(Search):
         rows, bulk, skipped = self._db.import_file(os.fspath(path), format, table)
         return {"rows": rows, "bulk": bulk, "skipped_fields": skipped}
 
-    def embed(self, text: str, field: str | None = None, *, table: str | None = None) -> list[float]:
+    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None) -> list[float]:
         """The query vector of `text` by an embedded field's model (of the
-        first table, or of `table`)."""
-        return self._db.embed(text, field, table)
+        first table, or of `table`), or of `image`, the bytes of an image
+        file, by a model of images."""
+        return self._db.embed(text, field, table, None if image is None else bytes(image))
 
     def optimize(self) -> None:
         """Merges small segments (many small writes leave many)."""

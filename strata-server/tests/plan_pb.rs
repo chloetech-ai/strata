@@ -41,7 +41,8 @@ fn papers(dir: &std::path::Path) -> Schema {
 }
 
 fn params() -> Params {
-    Params::new().set("v", Value::Vector(vec![0.1, 0.2, 0.3, 0.4].into())).set("ids", Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]))
+    let vs = Value::List(vec![Value::Vector(vec![0.1, 0.2, 0.3, 0.4].into()), Value::Vector(vec![0.4, 0.3, 0.2, 0.1].into())]);
+    Params::new().set("v", Value::Vector(vec![0.1, 0.2, 0.3, 0.4].into())).set("ids", Value::List(vec![Value::Str("a".into()), Value::Str("b".into())])).set("vs", vs)
 }
 
 /// SELECTs of one table.
@@ -73,6 +74,7 @@ const SELECTS: &[&str] = &[
     "SELECT id FROM papers WHERE PATH(cites, 'p1', ('p5', 'p6'), max_hops => 4) ORDER BY hops() DESC",
     "SELECT id FROM papers WHERE NOT REACHABLE(cites, ('p1', 'p2'), hops => 0, min_hops => 0) AND REACHABLE(emb, 'p1', k => 5, min_sim => 0.5)",
     "SELECT id FROM papers ORDER BY ppr(cites, (SELECT id FROM papers WHERE MATCH(body, 'graph') ORDER BY bm25(body, 'graph') DESC LIMIT 3), alpha => 0.2, weighted => 1) DESC LIMIT 10",
+    "SELECT id FROM papers WHERE year > 2000 ORDER BY maxsim(emb, :vs, rerank => 50, max_vectors => 8) * (1 + coalesce(rating, 0)) DESC LIMIT 5",
     "SELECT category, COUNT(*) AS n, AVG(rating), MAX(published), MIN(year), SUM(rating) FROM papers WHERE year > 2000 GROUP BY category HAVING COUNT(*) >= 2 AND AVG(rating) < 3 ORDER BY n DESC LIMIT 5",
     "SELECT COUNT(*), COUNT(DISTINCT category), COUNT(rating) FROM papers WHERE MATCH(body, 'graph')",
 ];
@@ -94,6 +96,8 @@ const COMPOUND: &[&str] = &[
     "SELECT d.id FROM (SELECT id, year FROM papers WHERE year > 2000) AS d ORDER BY d.year LIMIT 3",
     "SELECT a.category, COUNT(*) FROM papers a JOIN papers b ON a.cites = b.id GROUP BY a.category HAVING COUNT(*) > 1",
     "SELECT DISTINCT a.category, b.year FROM papers a JOIN papers b ON a.cites = b.id ORDER BY b.year LIMIT 4",
+    "SELECT id, dot(emb, :v) FROM papers WHERE year > 2000",
+    "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), maxsim(emb, (SELECT emb FROM papers WHERE category = 'ml' LIMIT 4))) DESC LIMIT 5",
 ];
 
 /// Writes of each kind.
@@ -160,6 +164,24 @@ fn every_plan_round_trips() {
         assert!(compound::is_compound(sql, &schema), "{sql}");
         check(compound::plan(sql, &schema, &params()).unwrap_or_else(|e| panic!("{sql}: {e}")));
     }
+    // Seeds with weights, which operators fill in from a subquery's scores
+    // before a plan reaches a shard.
+    let sql = "SELECT id FROM papers ORDER BY ppr(cites, ('p1', 'p2'), weighted => 1) DESC LIMIT 5";
+    let mut j = Plan::of_select(&schema, &bind(sql, &schema, &params()).unwrap()).to_json().unwrap();
+    fn weigh(j: &mut serde_json::Value) -> bool {
+        match j {
+            serde_json::Value::Object(m) => match m.get_mut("ppr") {
+                Some(serde_json::Value::Object(g)) => g.insert("weights".into(), serde_json::json!([0.25, 3.5])).is_none(),
+                _ => m.values_mut().any(weigh),
+            },
+            serde_json::Value::Array(xs) => xs.iter_mut().any(weigh),
+            _ => false,
+        }
+    }
+    assert!(weigh(&mut j));
+    let weighted = Plan::new(Plan::from_json(&j).unwrap().root);
+    assert!(weighted.features.iter().any(|f| f == ir::MAXSIM), "{:?}", weighted.features);
+    check(weighted);
     for sql in WRITES {
         let Command::Write { write, .. } = bind_command(sql, &[&schema], &params()).unwrap_or_else(|e| panic!("{sql}: {e}")) else { panic!("{sql}") };
         check(Plan::of_write(&schema, &write));
@@ -203,7 +225,7 @@ fn every_plan_round_trips() {
     // Every kind of node and expression was among them.
     let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order"];
     let exprs = [
-        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt",
+        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "maxsim",
     ];
     let want: BTreeSet<String> = nodes.iter().map(|n| format!("node {n}")).chain(exprs.iter().map(|e| format!("expr {e}"))).collect();
     let missing: Vec<&String> = want.difference(&seen).collect();

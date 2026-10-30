@@ -41,6 +41,10 @@ pub struct AgentReq {
 fn field_line(svc: &Service, f: &strata::Field, i: usize) -> String {
     let ty = match &f.ty {
         FieldType::Text { .. } => "TEXT".to_string(),
+        FieldType::Keyword if f.media.is_some() => {
+            let kind = f.media.filter(|k| *k != strata::media::MediaKind::Any).map_or(String::new(), |k| format!("{} ", k.as_str()));
+            format!("MEDIA (a {kind}file's reference: JSON with uri, sha256, mime, bytes and what its headers say; = '<sha256>' finds a file)")
+        }
         FieldType::Keyword => "KEYWORD".to_string(),
         FieldType::Int => "INT".to_string(),
         FieldType::Float => "FLOAT".to_string(),
