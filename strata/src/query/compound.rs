@@ -413,9 +413,10 @@ impl<'a> Planner<'a> {
     }
 
     /// The expression a subquery stands for: its one column's values (`IN`),
-    /// whether it has a row (`EXISTS`), its one value (a comparison), or the
-    /// keys of its rows (seeds; `None` for a subquery of the scanned table
-    /// `scanned`, which the executor runs itself).
+    /// whether it has a row (`EXISTS`), its one value (a comparison), or for
+    /// seeds the keys of its rows when they are rows of the scanned table
+    /// `scanned`, else its one column's values (`None` for a subquery of the
+    /// scanned table that the executor runs itself).
     fn subquery(&self, q: &sql::Query, kind: Sub, scanned: Option<&Schema>) -> Result<Option<ir::Expr>> {
         if kind == Sub::Seeds && scanned.is_some_and(|s| !needs(q, s)) {
             return Ok(None);
@@ -436,7 +437,10 @@ impl<'a> Planner<'a> {
                 one("a scalar subquery")?;
                 ir::Expr::Scalar(node)
             }
-            Sub::Seeds if p.keyed.is_some() => ir::Expr::Keys(node),
+            // Rows of the scanned table seed by their keys. Rows of another
+            // table seed by the values of their one column: `(SELECT item
+            // FROM events ...)` starts from the items, not from the events.
+            Sub::Seeds if p.keyed.as_deref().is_some_and(|t| scanned.is_none_or(|s| s.table.eq_ignore_ascii_case(t))) => ir::Expr::Keys(node),
             Sub::Seeds => {
                 one("a subquery of seeds")?;
                 ir::Expr::Values(node)
