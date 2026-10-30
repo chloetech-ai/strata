@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 
@@ -194,6 +195,40 @@ def test_client_streams_events_once(client):
         client.stream(twice)
     assert e.value.answer["lines"] == 1
     assert client.source("views/0") == 4000
+
+
+def test_client_sqlite_in_and_out(client, tmp_path):
+    src = tmp_path / "shop.sqlite"
+    c = sqlite3.connect(src)
+    c.executescript(
+        """
+        CREATE TABLE reviews (id INTEGER PRIMARY KEY, book TEXT NOT NULL REFERENCES books (id), stars INTEGER, said TEXT, at DATETIME);
+        INSERT INTO reviews VALUES (1, 'b0001', 5, 'a river runs through every page of it', '2026-10-01 12:00:00'),
+                                   (2, 'b0002', 3, 'slow in the middle but the ending is worth the wait', '2026-10-02 08:30:00');
+        CREATE TABLE books (id TEXT PRIMARY KEY, title TEXT, year INTEGER);
+        INSERT INTO books VALUES ('b0001', 'River of stars', 1999);
+        """
+    )
+    c.commit()
+    c.close()
+    plan = client.plan_sqlite(src)
+    assert [(t["table"], t["exists"]) for t in plan["tables"]] == [("books", True), ("reviews", False)]
+    assert [t["table"] for t in client.tables()] == ["books"]
+    r = client.import_sqlite(src)
+    assert r["written"] == 3
+    assert [(t["table"], t["rows"], t["created"]) for t in r["tables"]] == [("books", 1, False), ("reviews", 2, True)]
+    assert client.query("SELECT title FROM books WHERE id = 'b0001'").scalar() == "River of stars"
+    assert client.query("SELECT r.stars FROM reviews r JOIN books b ON r.book = b.id WHERE MATCH(r.said, 'ending')").scalar() == 3
+    with pytest.raises(strata.StrataError, match="no table nope"):
+        client.import_sqlite(src, tables="nope")
+
+    out = tmp_path / "out.sqlite"
+    assert client.export_sqlite(out, tables=["reviews"], fts=False) == ["reviews"]
+    with pytest.raises(FileExistsError):
+        client.export_sqlite(out)
+    c = sqlite3.connect(out)
+    assert c.execute("SELECT id, book, stars, at FROM reviews ORDER BY id").fetchall() == [(1, "b0001", 5, "2026-10-01 12:00:00"), (2, "b0002", 3, "2026-10-02 08:30:00")]
+    c.close()
 
 
 def test_client_rank_log(client):

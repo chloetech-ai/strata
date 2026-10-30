@@ -7,7 +7,7 @@
 //!
 //! * [`schema`], [`value`]: tables, field types, documents; [`ingest`]:
 //!   rows from JSON, CSV and files; [`timestamp`]: TIMESTAMP values as
-//!   text.
+//!   text; `sqlite` (feature `sqlite`): SQLite databases in and out.
 //! * [`embed`]: the models that fill VECTOR fields declared with `embed`;
 //!   [`media`]: MEDIA values, and the files they name.
 //! * [`segment`]: the immutable unit of storage, a directory of aligned,
@@ -53,6 +53,8 @@ pub mod schema;
 pub mod segment;
 pub mod sid;
 pub mod simd;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod storage;
 pub mod text;
 pub mod timestamp;

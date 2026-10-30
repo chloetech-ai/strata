@@ -135,6 +135,13 @@ strata-server import --db books.strata --table reviews reviews.csv              
 
 Into an empty table the rows are bulk-loaded straight into segments, in one commit: a bad row is reported with its line or row number, and nothing is written. Into a table that has rows they are upserted, 10,000 rows a transaction. The format comes from each file's extension (`.jsonl`, `.ndjson`, `.json`, `.csv`, `.tsv`) or `--format`.
 
+A SQLite database's tables import the same way, each into the table of its name, created from SQLite's declarations when missing, and `strata-server export` writes a database to a new SQLite file ([SQLite in and out](sqlite.md)):
+
+```sh
+strata-server import --db shop.strata shop.sqlite
+strata-server export --db shop.strata copy.sqlite
+```
+
 To a running server, `POST /v1/import` with the rows as the body, the format as `?format=` (or the content type) and the table as `?table=` (the first table without it):
 
 ```sh
@@ -143,6 +150,14 @@ curl -s -X POST 'localhost:7700/v1/import?format=csv' -H 'content-type: text/csv
 ```
 
 The content type must not be `text/plain`, a form or missing (a web page on another site can send those without asking; see [security](#security)): `text/csv`, `text/tab-separated-values`, `application/x-ndjson`, `application/json` or `application/octet-stream` all work. The server reads every row once before it writes any, so a bad row writes nothing, then reads them again 1,000 at a time and upserts each thousand through its writer while it reads the next (a coordinator routes them to the shards), so an import holds its body and two thousand rows, not every row. A request may be up to `--max-body-mb` (256 MiB). The UI's **Schema and import** tab uploads a file this way, and [Python](python.md) has `import_file` both in-process and as a client.
+
+A SQLite file goes the same way, as `?format=sqlite` (or the content type `application/vnd.sqlite3`, or no format at all: the server knows the file by its first bytes), and `GET /v1/export` sends the database back as a SQLite file ([over HTTP](sqlite.md#over-http-and-in-the-ui)):
+
+```sh
+curl -s -X POST 'localhost:7700/v1/import?format=sqlite&plan=true' -H 'content-type: application/vnd.sqlite3' --data-binary @shop.sqlite   # the plan
+curl -s -X POST 'localhost:7700/v1/import?format=sqlite' -H 'content-type: application/vnd.sqlite3' --data-binary @shop.sqlite
+curl -s 'localhost:7700/v1/export' -o copy.sqlite
+```
 
 The server flushes the memtable into segments on a thread of its own: a write that fills it (10,000 rows and deletes not yet flushed) returns without waiting for the segments to build, and writes go on meanwhile. Once the memtable holds twice that, writes wait for the flush under way. Segments build their vector indexes on every core.
 
@@ -359,6 +374,8 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `GET /v1/sources`, `GET /v1/sources/NAME` | | `{sources: [{name, offset, updated}]}`: each stream source's last offset written ([streams](#streams)); for one, `{name, offset, updated}`, `offset` null for a source not written from |
 | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}`: a [plan](query-language.md#explain) in JSON, as `/v1/explain` gives it in `ir` | rows for a read, a compound query's plan included, `{written}` for a write; a coordinator runs reads, and refuses a write plan (400) until its shards take write plans |
 | `POST /v1/import?format=F&table=T` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
+| `POST /v1/import?format=sqlite&tables=A,B&plan=true&blobs_base64=true` | a SQLite database file ([SQLite in and out](sqlite.md#over-http-and-in-the-ui)) | `{tables: [{source, table, rows, created, notes}], skipped, written, took_ms}`; with `plan`, what it would do, writing nothing |
+| `GET /v1/export?tables=A,B&fts=false&indexes=false&schemas=false` | | the database (or those tables) as a new SQLite file, `application/vnd.sqlite3`; `x-strata-tables` names the tables |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?, hits?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the bound query (`logical`) and counts; with `hits: n`, a ranked query's top `n` rows as objects with their `score()` and [`features()`](query-language.md#features-the-values-a-ranking-read), the values each was ranked by |
 | `POST /v1/embed` | `{text, image or audio, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image or sound file (`image` or `audio`, base64, for a model of images or of sound), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
