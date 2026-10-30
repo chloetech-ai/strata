@@ -57,7 +57,7 @@ pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &Exec
         keys: keys.unwrap_or_default(),
         scores: rows.scores.unwrap_or_default(),
         parts: None,
-        stats: ExecStats { plan: ops.plan, filter_docs: 0, scored: 0 },
+        stats: ExecStats { plan: ops.plan, filter_docs: 0, scored: 0, reranked: 0 },
     })
 }
 

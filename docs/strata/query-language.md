@@ -54,7 +54,7 @@ WHERE a.year >= 2020 ORDER BY bm25(a.body, 'mrna vaccine') DESC LIMIT 20;
 
 ```text
 [WITH name AS (SELECT ...), ...]
-SELECT [DISTINCT] <columns | * | score() | hops() | seq_no() | aggregates>
+SELECT [DISTINCT] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates>
 FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [WHERE <predicate>]
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
@@ -67,7 +67,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 - **Strings** are single-quoted, `'sale'`. Where a value goes, a double-quoted `"sale"` is a string too, as SQLite and MySQL read it, and a bare name is an error rather than a string: `WHERE tag = sale` says `no such column: sale`.
 - **Clauses Strata does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `WINDOW`, `QUALIFY`, `GROUP BY ... WITH ROLLUP` and the like.
 - **`SELECT *`** returns every stored, non-vector column.
-- **`score()`** is the value of the `ORDER BY` score for each row; **`hops()`** is a row's distance in a graph traversal ([below](#graphs)); **`seq_no()`** is the sequence number of the write that last changed the row, in a database that numbers its writes, for [conditional writes](server.md#conditional-writes). It is a column of a query on one table, and cannot be aggregated or ordered by.
+- **`score()`** is the value of the `ORDER BY` score for each row; **`hops()`** is a row's distance in a graph traversal ([below](#graphs)); **`seq_no()`** is the sequence number of the write that last changed the row, in a database that numbers its writes, for [conditional writes](server.md#conditional-writes). It is a column of a query on one table, and cannot be aggregated or ordered by. A [ranking expression](#features-the-values-a-ranking-read) that scores each row by itself is a column too (`bm25(title, :q) AS t`), and **`features()`** stands for the inputs of the query's ranking.
 - **`ORDER BY`** takes one key, plus an optional tie-break that must be the primary key (or, in a facet query, the group column). Ranking by a score is always best first; `ORDER BY distance(…) ASC` ranks like `similarity(…) DESC`.
 - **Parameters** are `:name` placeholders, bound from the API or from the shell's `--param name=value`. A vector parameter is a JSON array.
 - **Limits.** An expression nests at most 1,000 levels, counting parentheses and the operators of a chain such as `a OR b OR …` (SQLite has the same default); a long list of values belongs in `IN (…)`, which has no such limit. A `LIMIT` larger than the table returns every row that qualifies. A query ranked by a score without a `LIMIT` returns 100 rows, counted after its `OFFSET`, on one database and through a coordinator alike.
@@ -233,6 +233,46 @@ SELECT id FROM docs ORDER BY bm25(body, :t) * (1 + 0.2 * importance) DESC LIMIT 
 The text score's top-k loop (MaxScore, Block-Max WAND or exhaustive, as `algo` says) ranks by the whole expression. From the k-th best value so far and each column's smallest and largest value, it works out the lowest text score a row needs, and skips the rows below it. A row the text does not match is not a candidate. When the expression does not rise with the text score (`rating - bm25(body, :t)`), no text score can be ruled out: the loop scores every matching row, and the plan line says `every match scored`. Over shards, each shard returns its own exact top rows, so a split collection ranks like the whole one.
 
 A plan that ranks by an expression needs the plan feature `rank_expressions`; a version of Strata from before it refuses the plan by that name. Weighted sums of `minmax()`, products of scores and `rrf` are written as before, so older shards still run them.
+
+#### Rerank phases
+
+A ranking can go on in phases, as a search engine's rank profile does: a cheap first phase over every candidate, then a costlier one over its top rows. SQL writes a phase as a `WITH` that ranks a table and cuts it, ranked again by the next `WITH` or the query itself:
+
+```sql
+-- BM25's top 100, ranked again by a mix of title and body relevance and rating
+WITH top AS (SELECT * FROM docs WHERE year >= 2020 ORDER BY bm25(body, :t) DESC LIMIT 100)
+SELECT id, title, score() FROM top
+ORDER BY bm25(title, :t) + 0.5 * bm25(body, :t) + 0.1 * coalesce(rating, 0) DESC LIMIT 10;
+
+-- three phases: similarity's top 500, its best 50 by a rating, then a fusion of the 50
+WITH a AS (SELECT * FROM products ORDER BY similarity(emb, :q) DESC LIMIT 500),
+     b AS (SELECT * FROM a ORDER BY coalesce(rating, 0) DESC LIMIT 50)
+SELECT id, score() FROM b ORDER BY minmax(bm25(body, :t)) + minmax(similarity(emb, :q)) DESC LIMIT 10;
+```
+
+The planner makes one search of them, with phases. Each phase ranks the rows of the one before by an expression, best first, and may read any of the table's columns, since the rows are the table's. Every row a phase reads goes on: one the expression gives no value ranks last with a `NULL` score (and a row a `bm25` phase's terms miss scores 0), and rows tied keep the order the phase before gave them. `LIMIT` and `OFFSET` on the query cut the last phase, and `score()` is the last phase's score. The first `WITH` may filter (`WHERE`) and rank as any query does; each later step reads the step before alone, with no `WHERE`, grouping or subquery, ranks by one expression `DESC`, and each `WITH` keeps the table's columns (`*`) and has a `LIMIT`. Other `WITH` queries plan as before: the table restricted to the rows of the `WITH`.
+
+A phase whose expression is row-local is a second phase: over shards, each shard scores it on its own top rows by the first phase. A phase with `minmax()`, `rank()`, `rrf` or a weighted sum reads every row it reranks, so it is a global phase: it runs once over the merged rows (on the coordinator over shards), and so does every phase after it. The coordinator keeps the top rows of the whole collection by the first phase before it ranks them by the next, so a split collection answers exactly as the whole one does. `EXPLAIN` shows each phase and which kind it is, and a query's plan lines say how many rows each reranked. The first phase's `LIMIT` counts against the rows a query may reach (`max_rows`), and the phases against its deadline.
+
+From Python, `rerank(expr, count)` adds a phase: `t.select("id", score()).order_by(bm25("body", q)).rerank(col("rating"), 100).limit(10)`. A plan with phases needs the plan feature `rank_phases`.
+
+#### Features: the values a ranking read
+
+A ranking expression that scores each row by itself is a column, with the value the ranking computes for the row, and `features()` lists the inputs of the query's ranking, to log beside what users chose and train a model on (Vespa's match-features):
+
+```sql
+SELECT id, score(), features() FROM docs
+ORDER BY bm25(body, :t) * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 10;
+-- columns: id, score(), bm25(body, :t), rating, bm25(body, :t) * (1 + 0.2 * coalesce(rating, 0))
+
+SELECT id, bm25(title, :t) AS title_bm25, ln(1 + rating) AS r, year / 1000 FROM docs
+ORDER BY similarity(emb, :q) DESC LIMIT 10;
+```
+
+- **`features()`** stands for one column per input, each once, named by its SQL text: every leaf of the ranking (a score such as `bm25(body, :t)` or `similarity(emb, :q)`, a column, `decay(..)`, `hops()`), the first phase's first, then each phase's expression that scores a row by itself and is not a leaf. With [rerank phases](#rerank-phases) it lists every phase's. An expression with `minmax()`, `rank()`, `rrf` or a weighted sum ranks rows against each other, so it is not a column: its inputs are, and `score()` is its value. A ranking by `distance(..)` lists the `similarity(..)` it ranks by. `features()` takes no alias and needs an `ORDER BY`.
+- **A selected expression** may use anything a ranking expression does but the set functions: `bm25`, `similarity`, `decay`, columns, numbers, arithmetic, `ln` and the other functions, `CASE`. Its value is the ranking's, bit for bit: a row a `bm25`'s terms miss scores 0, and one without a value is `NULL`. `ORDER BY 2` ranks by the second column when it is one.
+- **Over shards** a feature is one database's value: a coordinator sums the shards' BM25 statistics of the terms any column scores, and its fetch round computes the columns for the page alone, with those statistics.
+- A plan with such a column needs the plan feature `rank_features`. From Python, `features()` goes in `select`, and so does any expression of scores (`select("id", bm25("title", q).alias("t"))`); Python names a feature as it writes the expression.
 
 ### `decay(field, origin, scale, …)`: closeness to a value
 

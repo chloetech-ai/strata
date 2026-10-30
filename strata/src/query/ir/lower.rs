@@ -1,7 +1,7 @@
 //! Plans of bound statements: [`Plan::bind`], [`Plan::of_select`] and
 //! [`Plan::of_write`].
 
-use super::{Agg, Column, Expr, Graph, GraphKind, Node, OnConflict, Plan, Search, Set, SortKey};
+use super::{Agg, Column, Expr, Graph, GraphKind, Node, OnConflict, Phase, Plan, Search, Set, SortKey};
 use crate::query::logical::{self, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
 use crate::query::sql::{Assign, Conflict, Write};
 use crate::schema::Schema;
@@ -63,7 +63,9 @@ impl Outputs {
     fn of(&mut self, p: &Projection) -> Expr {
         let agg = match p {
             Projection::Field(f) => return self.keys.iter().position(|k| k == f).map_or(Expr::Field(*f as u32), |i| Expr::Output(i as u32)),
-            Projection::Score => return Expr::Score,
+            // A ranking expression scores rows, not groups: binding and
+            // the executor refuse it here.
+            Projection::Score | Projection::Feature(_) => return Expr::Score,
             Projection::Hops(_) => return Expr::Hops,
             Projection::SeqNo => return Expr::SeqNo,
             Projection::Count => Agg { func: logical::AggFn::Count, arg: None },
@@ -123,7 +125,7 @@ impl Lower<'_> {
                 Some(Tiebreak::GroupValue { desc }) => keys.push(key(Expr::Output(0), desc)),
                 Some(Tiebreak::Key { desc }) => keys.push(key(pk(), desc)),
             }
-            let search = Node::Search(Search { table, filter, order: Vec::new() });
+            let search = Node::Search(Search { table, filter, order: Vec::new(), phases: Vec::new() });
             let mut node = Node::Aggregate { input: Box::new(search), keys: out.keys.iter().map(|&f| Expr::Field(f as u32)).collect(), aggs: out.aggs };
             if let Some(cond) = having {
                 node = Node::Filter { input: Box::new(node), cond };
@@ -152,11 +154,13 @@ impl Lower<'_> {
                         Projection::Field(f) => Expr::Field(*f as u32),
                         Projection::Hops(_) => Expr::Hops,
                         Projection::SeqNo => Expr::SeqNo,
+                        Projection::Feature(s) => self.score(s),
                         _ => Expr::Score,
                     },
                 })
                 .collect();
-            (Node::Search(Search { table, filter, order }), columns)
+            let phases = s.phases.iter().map(|p| Phase { count: p.count as u64, expr: self.score(&p.score), global: p.global }).collect();
+            (Node::Search(Search { table, filter, order, phases }), columns)
         };
         let (mut node, columns) = node;
         if s.limit.is_some() || s.offset > 0 {
