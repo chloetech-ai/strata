@@ -1505,6 +1505,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "csv",
+ "gemm",
  "libc",
  "lz4_flex",
  "memmap2",
