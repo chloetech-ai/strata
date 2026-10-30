@@ -19,18 +19,31 @@ env:
 
 # The jobs run on the organisation's own runners rather than GitHub's shared
 # ones, so that they no longer wait for the plan's few concurrent jobs:
-# gh-linux (Ubuntu 24.04, 4 cores, 16 GB) and gh-mac (macOS 26, 3 cores,
-# 7 GB). Job names still say ubuntu-latest and macos-latest, which keeps the
-# check names.
+# gh-linux (Ubuntu 24.04, 4 cores, 16 GB), and gh-mac and gh-mac2 (macOS
+# 26, 3 cores, 7 GB): the three macOS test jobs run on gh-mac, fault
+# injection and the Python package on gh-mac2. The short Linux jobs (engram,
+# the server smoke test, generic kernels, relevance gate, fault injection
+# and sound) run on GitHub's shared ubuntu-latest, a pool of its own, so
+# that they don't wait for gh-linux, which runs only about 12 jobs at once.
+# Job names still say ubuntu-latest and macos-latest, which keeps the check
+# names.
+#
+# macOS jobs are the scarcest (the account runs few at once), so a pull
+# request runs only Strata's tests on macOS, where its NEON kernels and
+# syncs differ from Linux; a push to main runs every macOS job.
 jobs:
   test:
     name: ${{ matrix.crate }} on ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
         crate: [strata, engram, strata-server]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
+        # On a pull request, a job of its own; on main, already in the matrix.
+        include:
+          - os: macos-latest
+            crate: strata
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || (matrix.crate == 'engram' && 'ubuntu-latest' || 'gh-linux') }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -71,7 +84,7 @@ jobs:
   # that it runs beside the strata tests rather than after them.
   kernels:
     name: strata kernels on a generic build
-    runs-on: gh-linux
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       RUSTFLAGS: -C target-cpu=x86-64
@@ -126,7 +139,7 @@ jobs:
   # clippy over the feature's code in Strata and the server.
   audio:
     name: sound (feature audio)
-    runs-on: gh-linux
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -160,8 +173,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac2' || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -183,7 +196,7 @@ jobs:
   # with its new numbers.
   relevance-gate:
     name: relevance gate (BEIR)
-    runs-on: gh-linux
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -246,7 +259,7 @@ jobs:
 
   server-smoke:
     name: strata-server smoke test
-    runs-on: gh-linux
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -298,8 +311,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac' || 'gh-linux' }}
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'gh-mac2' || 'gh-linux' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
