@@ -250,6 +250,27 @@ pub fn plan_in(sql_text: &str, catalog: &[&Schema], params: &Params) -> Result<i
     plan_query(&*parse(sql_text)?, catalog, params)
 }
 
+/// The plan of a SELECT over the tables of `catalog` (the first table
+/// first), as [`crate::db::Db::query`] binds it: a query of one table that
+/// needs no operators ([`is_compound`]) is one search of the table it
+/// names, and any other a plan of operators ([`plan_in`]). A server binds
+/// its requests against its database's tables with it.
+pub fn plan_read(sql_text: &str, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
+    plan_read_query(&*super::sql::parse_query(sql_text)?, catalog, params)
+}
+
+/// [`plan_read`] of a parsed query.
+pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
+    let schema = match super::tables::read_by(q).first() {
+        None => *catalog.first().ok_or_else(|| err("the database has no tables"))?,
+        Some(t) => catalog.iter().copied().find(|s| s.table.eq_ignore_ascii_case(t)).ok_or_else(|| err(format!("no such table: {t}")))?,
+    };
+    if needs(q, schema) {
+        return plan_query(q, catalog, params);
+    }
+    Ok(ir::Plan::of_select(schema, &super::sql::bind_query(q, schema, params)?))
+}
+
 /// [`plan_in`] of a parsed query.
 pub(crate) fn plan_query(q: &sql::Query, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
     let p = Planner { catalog, params, ctes: RefCell::new(Vec::new()) };
