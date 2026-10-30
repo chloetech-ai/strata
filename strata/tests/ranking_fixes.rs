@@ -1,8 +1,9 @@
 //! Rankings the engineering review found wrong: fused rankings cut at a
 //! fixed depth whatever page was asked for (bug 9, IR-7), unchecked BM25
 //! parameters (IR-18), query letters dropped and repeated terms counted
-//! once (IR-4), rows without a value counted in N and avgdl (IR-5), and
-//! typos and synonyms scored with their own IDF (IR-1).
+//! once (IR-4), rows without a value counted in N and avgdl (IR-5),
+//! typos and synonyms scored with their own IDF (IR-1), and the ties of a
+//! fused score under a descending key.
 
 use std::sync::Arc;
 
@@ -185,4 +186,20 @@ fn typos_and_synonyms_score_like_their_word() {
     // The word's own score is what it was without the expansion.
     let plain = query(&db, "SELECT id FROM t ORDER BY bm25(body, 'color') DESC LIMIT 30");
     assert!((score_of(&plain, 2) - score_of(&r, 2)).abs() < 1e-6);
+}
+
+// Found comparing the old and new evaluators of fused scores: under
+// `ORDER BY <fused> DESC, id DESC`, one database cut a weighted sum or a
+// product to its LIMIT by ascending key before ordering the tied rows by
+// descending key, so it gave the smallest keys of a tie where shards gave
+// the largest.
+#[test]
+fn fused_ties_follow_a_descending_key() {
+    let (_d, db) = db_with((1..=50).map(|i| row(i, Some("apple pie"))).collect());
+    for score in ["bm25(body, 'apple') * bm25(body, 'pie')", "0.5 * bm25(body, 'apple') + 0.5 * bm25(body, 'pie')"] {
+        let r = query(&db, &format!("SELECT id FROM t ORDER BY {score} DESC, id DESC LIMIT 3"));
+        assert_eq!(ids(&r), vec![50, 49, 48], "{score}");
+        let r = query(&db, &format!("SELECT id FROM t ORDER BY {score} DESC, id LIMIT 3"));
+        assert_eq!(ids(&r), vec![1, 2, 3], "{score}");
+    }
 }

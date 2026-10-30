@@ -85,7 +85,7 @@ fn decay_and_products_rank_like_brute_force() {
     for (got, (_, w)) in r.scores.iter().zip(&want) {
         assert!((got - w).abs() < 1e-4 * w.abs().max(1.0), "{got} vs {w}");
     }
-    assert!(r.stats.plan.iter().any(|l| l.starts_with("product: ")), "{:?}", r.stats.plan);
+    assert!(r.stats.plan.iter().any(|l| l.starts_with("fused bm25(body) * decay(year): ")), "{:?}", r.stats.plan);
 
     // A product of a column and a decay (no relevance factor): every
     // factor's top rows are candidates.

@@ -9,8 +9,9 @@
 //!
 //! * ranked rows (BM25, similarity, a column) by score, ties by key;
 //! * fused scores from each input's raw scores: every input's top `depth`
-//!   over all shards, then RRF or the weighted sum over those candidates,
-//!   normalised over the merged candidates as one database would;
+//!   over all shards, then the fused score over those candidates
+//!   ([`crate::query::rank`]), normalised over the merged candidates as one
+//!   database would;
 //! * facet groups and counts by summing.
 //!
 //! Rows can also come in two phases, query then fetch: every shard answers
@@ -37,10 +38,10 @@
 use std::cmp::Ordering;
 
 use crate::error::{Error, Result};
-use crate::query::exec::{cmp_values, ExecStats, ResultSet, DEFAULT_K};
+use crate::query::exec::{cmp_values, ExecOptions, ExecStats, ResultSet, DEFAULT_K};
 use crate::query::agg;
-use crate::query::fusion::{self, Norm};
 use crate::query::logical::{OrderBy, Pred, Projection, Score, Select, Tiebreak};
+use crate::query::rank::Rank;
 use crate::schema::Schema;
 use crate::value::Value;
 
@@ -225,36 +226,16 @@ fn by_key(a: &Value, b: &Value, desc: bool) -> Ordering {
     }
 }
 
-/// The options a fused score's inputs carry (`depth`, `exact`, `norm`).
-fn fused_opt<'a>(terms: &'a [(f64, Score)], key: &str) -> Option<&'a Value> {
-    terms.iter().find_map(|(_, s)| s.opts().and_then(|o| o.get(key)))
-}
-
 /// Fuses the candidates of every shard: each input's top `depth` over all
 /// shards (at least the `k` rows the page needs, as each shard took), then
-/// RRF or the weighted sum over the union.
+/// the fused score over those ([`Rank`]), as one database computes it.
 fn fuse(score: &Score, rows: Vec<Row>, k: usize) -> Result<Vec<Row>> {
-    let n_inputs = match score {
-        Score::Rrf { inputs, .. } | Score::Product(inputs) => inputs.len(),
-        Score::Weighted(t) => t.len(),
-        _ => unreachable!(),
-    };
+    let rank = Rank::of(score, ExecOptions::default().fusion_depth).expect("a fused score");
+    let n_inputs = rank.leaves.len();
     if rows.iter().any(|r| r.inputs.len() != n_inputs || r.ranked.len() != n_inputs) {
         return Err(err("shard answers lack the fused score's inputs (not in shard mode?)"));
     }
-    let (depth, exact) = match score {
-        Score::Rrf { depth, .. } => (*depth, false),
-        Score::Weighted(t) => (
-            fused_opt(t, "depth").and_then(|v| v.as_f64()).map_or(crate::query::exec::ExecOptions::default().fusion_depth, |d| d as usize),
-            fused_opt(t, "exact").and_then(|v| v.as_i64()).unwrap_or(0) != 0,
-        ),
-        Score::Product(f) => (
-            f.iter().find_map(|s| s.opts().and_then(|o| o.get("depth")).and_then(|v| v.as_f64())).map_or(crate::query::exec::ExecOptions::default().fusion_depth, |d| d as usize),
-            false,
-        ),
-        _ => unreachable!(),
-    };
-    let depth = depth.max(k);
+    let depth = rank.depth.max(k);
     // Input j's ranking over all shards: its own top `depth` of each shard,
     // by its score, ties by key (as one database orders them).
     let lists: Vec<Vec<usize>> = (0..n_inputs)
@@ -268,35 +249,15 @@ fn fuse(score: &Score, rows: Vec<Row>, k: usize) -> Result<Vec<Row>> {
             l
         })
         .collect();
-    let fused: Vec<(usize, f64)> = match score {
-        Score::Rrf { k, .. } => fusion::rrf(&lists, *k),
-        Score::Weighted(terms) => {
-            let mut cands: Vec<usize> = if exact { (0..rows.len()).collect() } else { lists.concat() };
-            cands.sort_unstable();
-            cands.dedup();
-            let norm = match fused_opt(terms, "norm").and_then(|v| v.as_str()) {
-                Some("none") => Norm::None,
-                _ => Norm::MinMax,
-            };
-            let weights: Vec<f64> = terms.iter().map(|(w, _)| *w).collect();
-            let scores: Vec<Vec<f32>> =
-                (0..n_inputs).map(|j| cands.iter().map(|&i| rows[i].inputs[j].map_or(f32::NEG_INFINITY, |x| x as f32)).collect()).collect();
-            fusion::weighted(&weights, &scores, norm).into_iter().map(|(c, s)| (cands[c], s)).collect()
-        }
-        Score::Product(factors) => {
-            // Candidates from the relevance factors (lists of the others
-            // are empty, see `fusion_candidates`).
-            let any_relevance = factors.iter().any(Score::is_relevance);
-            let mut cands: Vec<usize> =
-                lists.iter().zip(factors).filter(|(_, f)| f.is_relevance() || !any_relevance).flat_map(|(l, _)| l.iter().copied()).collect();
-            cands.sort_unstable();
-            cands.dedup();
-            let scores: Vec<Vec<f32>> =
-                (0..n_inputs).map(|j| cands.iter().map(|&i| rows[i].inputs[j].map_or(f32::NEG_INFINITY, |x| x as f32)).collect()).collect();
-            fusion::weighted(&vec![1.0; n_inputs], &scores, Norm::Product).into_iter().map(|(c, s)| (cands[c], s)).collect()
-        }
-        _ => unreachable!(),
-    };
+    let cands: Vec<usize> = if rank.exact { (0..rows.len()).collect() } else { rank.candidates(&lists) };
+    let values: Vec<Vec<f64>> =
+        if rank.reads_values() { (0..n_inputs).map(|j| cands.iter().map(|&i| rows[i].inputs[j].unwrap_or(f64::NEG_INFINITY)).collect()).collect() } else { Vec::new() };
+    let mut at = vec![usize::MAX; rows.len()];
+    for (c, &i) in cands.iter().enumerate() {
+        at[i] = c;
+    }
+    let ranks: Vec<Vec<usize>> = lists.iter().map(|l| l.iter().map(|&i| at[i]).collect()).collect();
+    let fused: Vec<(usize, f64)> = rank.eval(cands.len(), &values, &ranks, cands.len()).into_iter().map(|(c, s)| (cands[c], s)).collect();
     let mut slots: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
     Ok(fused
         .into_iter()
