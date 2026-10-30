@@ -48,7 +48,11 @@
 //! A coordinator serves every table its shards serve alike: it asks each
 //! replica for its tables when it connects (`Schema`), again when a
 //! request names a table it does not know, and after a `CREATE TABLE` or
-//! `DROP TABLE` it ran on every shard ([`Coordinator::ddl`]). A row of a
+//! `DROP TABLE` it ran on every shard ([`Coordinator::ddl`]). It serves
+//! the rank profiles every replica holds alike, learned with the tables; a
+//! query by a profile plans here, written out, and a shard whose profile
+//! differs refuses the plan, after which the coordinator asks again and
+//! plans once more ([`crate::service::Service::query`]). A row of a
 //! table placed by a column (`shard_by`, [`Schema::with_shard_by`]) goes
 //! to the shard of that column's value instead of its key's, so that rows
 //! sharing a value (a user's events) live on one shard.
@@ -76,6 +80,7 @@ use strata::query::ir::Plan;
 use strata::query::stats::TermStats;
 use strata::query::{bind_command, Command, Conflict, Params, Projection, Select, Write};
 use strata::schema::Schema;
+use strata::storage::RankProfile;
 use strata::value::Value;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -250,6 +255,40 @@ fn common_tables(answers: &[pb::SchemaResponse]) -> Result<Vec<Arc<Schema>>, Api
     Ok(out)
 }
 
+/// The rank profiles every replica that answered `Schema` holds alike
+/// (`profiles_json`), by table: one that a replica lacks, or holds with
+/// another definition, is left out, and logged, until they agree again.
+fn common_profiles(answers: &[pb::SchemaResponse]) -> Vec<(String, RankProfile)> {
+    let Some(first) = answers.first() else { return Vec::new() };
+    let mut out = Vec::new();
+    for p in &first.profiles_json {
+        let Ok((table, profile)) = profile_of_json(p) else {
+            tracing::warn!(profile = %p, "a shard sent a rank profile this coordinator cannot read");
+            continue;
+        };
+        match answers.iter().all(|a| a.profiles_json.contains(p)) {
+            true => out.push((table, profile)),
+            false => tracing::warn!(%table, profile = %profile.name, "a rank profile some shard replicas lack, or hold with another definition, is not served: create or replace it through the coordinator"),
+        }
+    }
+    out
+}
+
+/// A table's rank profile as `Schema` sends it: `{"table", "profile"}`.
+pub fn profile_json(table: &str, profile: &RankProfile) -> String {
+    json!({"table": table, "profile": profile}).to_string()
+}
+
+fn profile_of_json(text: &str) -> Result<(String, RankProfile), String> {
+    #[derive(serde::Deserialize)]
+    struct Of {
+        table: String,
+        profile: RankProfile,
+    }
+    let o: Of = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    Ok((o.table, o.profile))
+}
+
 /// The protocol to speak with a server that answered `Hello`: the newest
 /// both speak.
 fn agree(h: &pb::HelloResponse) -> Result<u32, String> {
@@ -350,6 +389,9 @@ pub struct Coordinator {
     /// The tables every replica serves alike, the first first
     /// ([`Self::refresh`]).
     catalog: RwLock<Arc<Vec<Arc<Schema>>>>,
+    /// The rank profiles every replica holds alike, by table
+    /// ([`Self::refresh`]).
+    profiles: RwLock<Arc<Vec<(String, RankProfile)>>>,
     /// When the replicas were last asked for their tables.
     asked: Mutex<Option<Instant>>,
     pub opts: CoordOptions,
@@ -528,6 +570,7 @@ impl Coordinator {
             return Err(ApiError::bad("a sharded table needs a primary key to route writes"));
         }
         let catalog = common_tables(&tables)?;
+        let profiles = common_profiles(&tables);
         // Slots once every replica answering speaks protocol 4.
         let old = replicas.iter().flatten().find(|r| (1..4).contains(&r.protocol.load(Ordering::Relaxed)));
         let slots = match (old, &opts.slots) {
@@ -563,6 +606,7 @@ impl Coordinator {
             replicas,
             schema,
             catalog: RwLock::new(Arc::new(catalog)),
+            profiles: RwLock::new(Arc::new(profiles)),
             asked: Mutex::new(Some(Instant::now())),
             opts,
             epoch: Instant::now(),
@@ -584,9 +628,15 @@ impl Coordinator {
         self.catalog.read().unwrap_or_else(|e| e.into_inner()).to_vec()
     }
 
-    /// Asks every replica for its tables again, at most once a second
-    /// unless `now`, and serves those every replica that answered (within
-    /// 5 s) names alike. Returns whether they changed.
+    /// The rank profiles it serves, by table: those every replica held
+    /// alike when last asked ([`Self::refresh`]).
+    pub fn rank_profiles(&self) -> Arc<Vec<(String, RankProfile)>> {
+        self.profiles.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Asks every replica for its tables and rank profiles again, at most
+    /// once a second unless `now`, and serves those every replica that
+    /// answered (within 5 s) holds alike. Returns whether they changed.
     pub async fn refresh(&self, now: bool) -> bool {
         {
             let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
@@ -604,10 +654,19 @@ impl Coordinator {
             Ok(t) if t.first().is_some_and(|f| **f == self.schema) => t,
             _ => return false,
         };
-        let mut held = self.catalog.write().unwrap_or_else(|e| e.into_inner());
-        let changed = **held != tables;
-        if changed {
-            *held = Arc::new(tables);
+        let profiles = common_profiles(&answers);
+        let mut changed = false;
+        {
+            let mut held = self.catalog.write().unwrap_or_else(|e| e.into_inner());
+            if **held != tables {
+                *held = Arc::new(tables);
+                changed = true;
+            }
+        }
+        let mut held = self.profiles.write().unwrap_or_else(|e| e.into_inner());
+        if **held != profiles {
+            *held = Arc::new(profiles);
+            changed = true;
         }
         changed
     }
@@ -1238,11 +1297,12 @@ impl Coordinator {
         }
     }
 
-    /// Runs `CREATE TABLE` or `DROP TABLE` on every shard (at its primary,
-    /// or every replica while none has a role), then serves the tables
-    /// they all have. It is one change per shard, not one across them: a
-    /// shard that fails leaves the others changed, and the statement runs
-    /// again with `IF NOT EXISTS` or `IF EXISTS`.
+    /// Runs `CREATE TABLE`, `DROP TABLE`, `CREATE RANK PROFILE` or `DROP
+    /// RANK PROFILE` on every shard (at its primary, or every replica while
+    /// none has a role), then serves the tables and rank profiles they all
+    /// have. It is one change per shard, not one across them: a shard that
+    /// fails leaves the others changed, and the statement runs again with
+    /// `IF NOT EXISTS`, `IF EXISTS` or `OR REPLACE`.
     pub async fn ddl(&self, sql: &str, params: &Params) -> Result<Written, ApiError> {
         let r = pb::WriteRequest { sql: sql.into(), params: params_to_pb(params), epoch: self.epoch(), ..Default::default() };
         let calls = (0..self.replicas.len()).map(|i| {

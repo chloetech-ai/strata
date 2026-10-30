@@ -61,7 +61,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 8] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, DISTINCT_ON];
+pub const FEATURES: [&str; 9] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, DISTINCT_ON];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -95,6 +96,10 @@ pub const RANK_PHASES: &str = "rank_phases";
 /// `features()` lists), rather than a field, `score()`, `hops()` or
 /// `seq_no()`.
 pub const RANK_FEATURES: &str = "rank_features";
+
+/// The feature of a plan whose Search ranks as a rank profile does
+/// ([`Search::profile`]).
+pub const RANK_PROFILES: &str = "rank_profiles";
 
 /// The feature of a plan that keeps the first row of each group
 /// ([`Node::DistinctOn`]).
@@ -228,6 +233,21 @@ pub struct Search {
     /// Rerank phases after `order`, in turn (feature [`RANK_PHASES`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<Phase>,
+    /// The rank profile `order` and `phases` were written out from
+    /// (feature [`RANK_PROFILES`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileRef>,
+}
+
+/// A rank profile a Search ranks as ([`crate::query::profile`]): its name
+/// and the hash of its definition
+/// ([`crate::storage::manifest::RankProfile::hash`]). A database whose
+/// table has no profile of that name, or one with another hash, refuses
+/// the plan rather than rank otherwise than the plan was made to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileRef {
+    pub name: String,
+    pub hash: String,
 }
 
 /// A rerank phase of a [`Search`]: the top `count` rows of the phase
@@ -778,6 +798,53 @@ impl Node {
         }
     }
 
+    /// Calls `f` on each Search of the node, those of subqueries in its
+    /// expressions too.
+    pub fn each_search(&self, f: &mut dyn FnMut(&Search)) {
+        fn within(e: &Expr, f: &mut dyn FnMut(&Search)) {
+            e.visit(&mut |x| {
+                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
+                    n.each_search(f);
+                }
+            });
+        }
+        match self {
+            Node::Search(s) => {
+                f(s);
+                within(&s.filter, f);
+            }
+            Node::Filter { input, cond } => {
+                input.each_search(f);
+                within(cond, f);
+            }
+            Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => input.each_search(f),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => {
+                a.each_search(f);
+                b.each_search(f);
+            }
+            Node::With { ctes, input } => {
+                ctes.iter().for_each(|c| c.input.each_search(f));
+                input.each_search(f);
+            }
+            Node::Insert { .. } | Node::Ref { .. } => {}
+        }
+    }
+
+    /// Whether a Search in the plan ranks as a rank profile
+    /// ([`RANK_PROFILES`]).
+    pub fn has_profiles(&self) -> bool {
+        let mut found = false;
+        self.each_search(&mut |s| found |= s.profile.is_some());
+        found
+    }
+
     /// Whether a Search's columns in the plan hold a ranking expression
     /// ([`RANK_FEATURES`]).
     pub fn has_features(&self) -> bool {
@@ -1185,6 +1252,9 @@ impl Plan {
         }
         if root.uses_maxsim() {
             features.push(MAXSIM.to_string());
+        }
+        if root.has_profiles() {
+            features.push(RANK_PROFILES.to_string());
         }
         let mut distinct_on = root.keeps_firsts();
         root.exprs(&mut |e| {

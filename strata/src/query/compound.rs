@@ -48,6 +48,7 @@ use crate::query::logical::{OrderBy, Phase, Select};
 use crate::query::rank::Rank;
 use crate::query::{AggFn, Params, Projection};
 use crate::schema::{FieldType, Schema};
+use crate::storage::RankProfile;
 use crate::value::Value;
 
 /// Rows one part of a compound query reads at most (a side of a join, a
@@ -237,17 +238,28 @@ pub fn plan_in(sql_text: &str, catalog: &[&Schema], params: &Params) -> Result<i
     plan_query(&*parse(sql_text)?, catalog, params)
 }
 
+/// A table's rank profile by name, the table and the name in any case
+/// ([`crate::storage::Database::rank_profiles`]).
+pub type Profiles<'a> = &'a dyn Fn(&str, &str) -> Option<RankProfile>;
+
 /// The plan of a SELECT over the tables of `catalog` (the first table
 /// first), as [`crate::db::Db::query`] binds it: a query of one table that
 /// needs no operators ([`is_compound`]) is one search of the table it
-/// names, and any other a plan of operators ([`plan_in`]). A server binds
-/// its requests against its database's tables with it.
-pub fn plan_read(sql_text: &str, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
-    plan_read_query(&*super::sql::parse_query(sql_text)?, catalog, params)
+/// names, and any other a plan of operators ([`plan_in`]). A query that
+/// ranks by a rank profile (`ORDER BY rank_profile(..)`) plans as written
+/// out with the one `profiles` finds ([`super::profile::expand`]), and its
+/// plan names it. A server binds its requests against its database's
+/// tables with it.
+pub fn plan_read(sql_text: &str, catalog: &[&Schema], params: &Params, profiles: Profiles) -> Result<ir::Plan> {
+    plan_read_query(&*super::sql::parse_query(sql_text)?, catalog, params, profiles)
 }
 
 /// [`plan_read`] of a parsed query.
-pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
+pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Params, profiles: Profiles) -> Result<ir::Plan> {
+    if let Some((q, r)) = super::profile::expand(q, profiles)? {
+        let table = super::tables::read_by(&q).first().cloned().unwrap_or_default();
+        return Ok(super::profile::mark(plan_read_query(&q, catalog, params, &|_, _| None)?, &table, &r));
+    }
     let schema = match super::tables::read_by(q).first() {
         None => *catalog.first().ok_or_else(|| err("the database has no tables"))?,
         Some(t) => catalog.iter().copied().find(|s| s.table.eq_ignore_ascii_case(t)).ok_or_else(|| err(format!("no such table: {t}")))?,
@@ -1135,7 +1147,7 @@ fn unqualify(e: &Expr, alias: &str) -> Expr {
 }
 
 /// A SELECT of one table or `WITH` result, with no join, and its name.
-fn one_table(q: &sql::Query) -> Option<(&sql::Select, String)> {
+pub(crate) fn one_table(q: &sql::Query) -> Option<(&sql::Select, String)> {
     let sql::SetExpr::Select(s) = q.body.as_ref() else { return None };
     match s.from.as_slice() {
         [t] if t.joins.is_empty() => match &t.relation {
@@ -1155,7 +1167,7 @@ fn qualified(alias: &str, column: &str) -> Expr {
 /// (`"order"`, `"doc id"`), and the operand of a sign in parentheses when
 /// it starts with a sign itself (`- -1` would print as `--1`, which
 /// starts a comment).
-fn printable(q: &sql::Query) -> String {
+pub(crate) fn printable(q: &sql::Query) -> String {
     let mut q = q.clone();
     query_mut(&mut q, &mut |e| match e {
         Expr::Identifier(id) => quote(id),
@@ -1178,7 +1190,7 @@ fn quote(id: &mut sql::Ident) {
 
 /// Calls `f` on every expression of `q`'s SELECT, its subqueries' too,
 /// each before its subexpressions.
-fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
+pub(crate) fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
     if let Some(w) = &mut q.with {
         for cte in &mut w.cte_tables {
             query_mut(&mut cte.query, f);

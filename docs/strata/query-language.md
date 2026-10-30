@@ -292,6 +292,28 @@ ORDER BY similarity(emb, :q) DESC LIMIT 10;
 - **Over shards** a feature is one database's value: a coordinator sums the shards' BM25 statistics of the terms any column scores, and its fetch round computes the columns for the page alone, with those statistics.
 - A plan with such a column needs the plan feature `rank_features`. From Python, `features()` goes in `select`, and so does any expression of scores (`select("id", bm25("title", q).alias("t"))`); Python names a feature as it writes the expression.
 
+#### Rank profiles: a ranking kept with its table
+
+A ranking used by many queries can be kept with its table under a name, as a search engine keeps a rank profile, and queries rank by the name:
+
+```sql
+CREATE RANK PROFILE recall ON memories AS
+  WITH top AS (SELECT * FROM memories ORDER BY bm25(body, :q) DESC LIMIT 100)
+  SELECT * FROM top ORDER BY bm25(body, :q) * (1 + :imp * importance) DESC
+  WITH (imp => 0.2);
+
+SELECT id, score() FROM memories WHERE kind = 'fact'
+ORDER BY rank_profile('recall', q => :q) LIMIT 10;
+
+CREATE OR REPLACE RANK PROFILE recall ON memories AS ...;   -- replaces it
+DROP RANK PROFILE IF EXISTS recall ON memories;            -- ON may go when one table has it
+```
+
+- **The ranking** is a query of the table that ranks every row: `SELECT * FROM table ORDER BY expression` (any [ranking expression](#ranking-expressions), or a column with `ASC` or `DESC`), or [rerank phases](#rerank-phases) over it. It has no `WHERE`, and no `LIMIT` after its last ranking: the query that ranks by it filters and cuts. `WITH (name => value, ...)` after it gives its parameters defaults: numbers, strings, `TRUE` and `FALSE`. Names are letters, digits and `_`, in any case; `CREATE` refuses a name the table has already, and `CREATE OR REPLACE` replaces it.
+- **`ORDER BY rank_profile('name', parameter => value, ...)`** is the whole `ORDER BY` of a query of the profile's table, without `ASC`, a `WITH`, a join or `GROUP BY`. The query ranks as if it were written out: its `WHERE` filters the rows the first ranking reads, and its columns, `LIMIT` and `OFFSET` are the last ranking's, so `score()` and [`features()`](#features-the-values-a-ranking-read) work as with the ranking written out. Each parameter of the ranking is the call's argument (a value, or a parameter of the query: `q => :q`), else the profile's default, else the query's parameter of the same name.
+- **Kept and replicated as writes are**: a profile is logged in its own transaction (numbered where writes are, shipped to replicas), and dropped with its table. A database with a profile needs the format 3 feature `rank_profiles`, which a version of Strata from before profiles refuses by name; once the last profile is dropped and flushed, the database no longer needs it.
+- **A plan names its profile** and a hash of its definition (`EXPLAIN` shows `rank profile: recall (hash ...)`) and needs the plan feature `rank_profiles`. A database whose profile of that name is another (replaced since, or a shard that missed the change) refuses the plan rather than rank otherwise. Through a coordinator, `CREATE` and `DROP RANK PROFILE` run on every shard, and the coordinator serves the profiles every replica holds alike.
+
 ### `decay(field, origin, scale, …)`: closeness to a value
 
 A numeric column's closeness to `origin`, as in Elasticsearch's decay functions. With `d = max(0, |x − origin| − offset)`, the score is 1 at `d = 0` and `decay` at `d = scale`:

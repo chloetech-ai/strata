@@ -11,8 +11,9 @@ once, and a database someone wrote with that version looks the same.
 | `format2/` | 2, two tables | 835ca9a | `tests/format_fixtures.rs` |
 | `format3/` | 3, with `analyzer:simple:1`, `bool`, `default`, `not_null` and `timestamp` | 835ca9a | `tests/format_fixtures.rs` |
 | `seqno/` | 3, with `seq_no`: numbered writes and rows, and a numbered WAL (`STRWAL02`) | c0d46c2 | `tests/format_fixtures.rs` |
+| `profiles/` | 3, with `rank_profiles`: rank profiles in the manifest, and profile records in a WAL that names the feature (`STRWAL02`) | b43bfb2 | `tests/format_fixtures.rs` |
 
-`format2/`, `format3/` and `seqno/` each hold `db.strata` (with its WAL,
+`format2/`, `format3/`, `seqno/` and `profiles/` each hold `db.strata` (with its WAL,
 `db.strata-wal`) and `db.dir`: the same writes in the single-file and the
 directory layout. [`writer.rs`](writer.rs) makes the writes:
 
@@ -28,14 +29,20 @@ directory layout. [`writer.rs`](writer.rs) makes the writes:
   made before numbering started (`Database::start_seq_no`) and the rest
   under term 2 (`Database::begin_term`), numbered 1 to 5, the last left in
   the WAL; each row keeps the number of its last write (in a segment's
-  section `seq` and beside values set in place), 0 for rows from before.
+  section `seq` and beside values set in place), 0 for rows from before;
+- rank profiles: format 2's writes, with two profiles of `t` (`by_n`, and
+  `phased` with rerank phases and defaults) flushed into the manifest with
+  the deletes, and logged in the WAL before its transaction a profile of
+  `u` (`notes`), `by_n` replaced and `phased` dropped.
 
 `tests/format_fixtures.rs` opens copies of every set in both layouts with
 the current code, checks their rows, filters and searches (`simple` against
 `english`, `BOOL` and `TIMESTAMP` filters, defaults and `NOT NULL` on new
 rows), writes, flushes and merges, checks that each stays in its format and
 opens it again. A numbered set must also go on counting from its last
-number and give each row the number of its last write.
+number and give each row the number of its last write, and the profiles
+set must rank as its profiles say and go back to format 2 once they are
+dropped.
 
 It also writes the sets again with `writer.rs` and checks that the bytes
 are the same, but for the database id (in the single file's meta pages,
