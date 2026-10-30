@@ -1012,66 +1012,6 @@ impl Node {
         }
     }
 
-    /// Calls `f` on every expression of the plan and each within it, in
-    /// the plans of subqueries too.
-    pub(crate) fn exprs(&self, f: &mut dyn FnMut(&Expr)) {
-        let mut each = |e: &Expr| {
-            e.visit(&mut |x| {
-                f(x);
-                if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = x {
-                    n.exprs(f);
-                }
-            })
-        };
-        match self {
-            Node::Search(s) => {
-                each(&s.filter);
-                s.order.iter().for_each(|k| each(&k.expr));
-                s.phases.iter().for_each(|p| each(&p.expr));
-            }
-            Node::Aggregate { input, keys, aggs } => {
-                keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut each);
-                input.exprs(f);
-            }
-            Node::Filter { input, cond } => {
-                each(cond);
-                input.exprs(f);
-            }
-            Node::Sort { input, keys } => {
-                keys.iter().for_each(|k| each(&k.expr));
-                input.exprs(f);
-            }
-            Node::Project { input, columns } => {
-                columns.iter().for_each(|c| each(&c.expr));
-                input.exprs(f);
-            }
-            Node::Insert { rows, .. } => rows.iter().flatten().for_each(each),
-            Node::Update { input, sets, .. } => {
-                sets.iter().for_each(|s| each(&s.value));
-                input.exprs(f);
-            }
-            Node::Join { left, right, keys, on, .. } => {
-                keys.iter().for_each(|k| {
-                    each(&k.left);
-                    each(&k.right);
-                });
-                on.iter().for_each(&mut each);
-                left.exprs(f);
-                right.exprs(f);
-            }
-            Node::With { ctes, input } => {
-                ctes.iter().for_each(|c| c.input.exprs(f));
-                input.exprs(f);
-            }
-            Node::KeyOrder { input, by } => {
-                input.exprs(f);
-                by.exprs(f);
-            }
-            Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.exprs(f),
-            Node::Ref { .. } => {}
-        }
-    }
-
     /// Calls `f` on each expression of a leaf's nodes.
     pub(crate) fn leaf_exprs(&self, f: &mut dyn FnMut(&Expr)) {
         match self {
@@ -1334,7 +1274,7 @@ impl Plan {
             features.push(RANK_EXPRESSIONS.to_string());
         }
         let mut sid_at = false;
-        root.exprs(&mut |e| sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. }));
+        root.visit_exprs(&mut |e| sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. }));
         if sid_at {
             features.push(SEMANTIC_ID.to_string());
         }
