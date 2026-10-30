@@ -401,11 +401,52 @@ pub struct Schema {
     /// ([`Schema::with_shard_by`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_by: Option<String>,
+    /// The field that orders each segment's rows ([`Schema::with_cluster_by`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_by: Option<String>,
+    /// How long rows are kept ([`Schema::with_retain`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain: Option<Retain>,
+}
+
+/// A table's retention ([`Schema::with_retain`]): rows whose TIMESTAMP
+/// field `by` is more than `seconds` old are dropped as merges rewrite
+/// their segments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retain {
+    pub by: String,
+    pub seconds: i64,
+}
+
+impl Retain {
+    /// `text` as a retention period: a whole number and a unit, `400 days`,
+    /// `12 hours`, `90d`, `1 week`.
+    pub fn parse_period(text: &str) -> Result<i64> {
+        let t = text.trim();
+        let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+        let bad = || Error::Schema(format!("retain {text:?}: a period is a whole number and a unit (seconds, minutes, hours, days or weeks), as '400 days'"));
+        let n: i64 = t[..digits].parse().map_err(|_| bad())?;
+        let unit = match t[digits..].trim().to_ascii_lowercase().as_str() {
+            "s" | "sec" | "secs" | "second" | "seconds" => 1,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "h" | "hour" | "hours" => 3600,
+            "d" | "day" | "days" => 86_400,
+            "w" | "week" | "weeks" => 604_800,
+            _ => return Err(bad()),
+        };
+        n.checked_mul(unit).filter(|&s| s > 0).ok_or_else(bad)
+    }
+
+    /// The period as text, in the largest unit it is a whole number of.
+    pub fn period(&self) -> String {
+        let (n, unit) = [(604_800, "weeks"), (86_400, "days"), (3600, "hours"), (60, "minutes")].into_iter().find(|(u, _)| self.seconds % u == 0).map_or((self.seconds, "seconds"), |(u, name)| (self.seconds / u, name));
+        format!("{n} {unit}")
+    }
 }
 
 impl Schema {
     pub fn new(table: &str, fields: Vec<Field>, primary_key: Option<&str>) -> Result<Self> {
-        let s = Schema { table: table.to_string(), fields, primary_key: None, shard_by: None };
+        let s = Schema { table: table.to_string(), fields, primary_key: None, shard_by: None, cluster_by: None, retain: None };
         let mut s = s;
         if let Some(pk) = primary_key {
             let i = s.field_index(pk).ok_or_else(|| Error::Schema(format!("no primary key field {pk}")))?;
@@ -566,6 +607,58 @@ impl Schema {
         Ok(())
     }
 
+    /// Orders the rows of each of this table's segments by the value of
+    /// `field` (rows without one first), when a flush writes the segment
+    /// and when a merge rewrites it; rows of one value keep their order
+    /// of writing. A user's events become one run of rows per segment, so
+    /// reading a history takes a range of each segment rather than rows
+    /// all over it. `field` is an indexed, single-valued KEYWORD or INT
+    /// (TIMESTAMP included). It makes the database format 3 (feature
+    /// `cluster_by`). Rows read without an ORDER BY come in this order.
+    pub fn with_cluster_by(mut self, field: &str) -> Result<Schema> {
+        let i = self.field_index(field).ok_or_else(|| Error::Schema(format!("cluster_by names {field}, which is not a field of {}", self.table)))?;
+        let f = &self.fields[i];
+        if f.multi || !f.indexed || f.media.is_some() || !matches!(f.ty, FieldType::Keyword | FieldType::Int) || matches!(f.logical, Some(Logical::Bool)) {
+            return Err(Error::Schema(format!("cluster_by {}: rows are ordered by an indexed, single-valued KEYWORD, INT or TIMESTAMP field", f.name)));
+        }
+        self.cluster_by = Some(f.name.clone());
+        Ok(self)
+    }
+
+    /// The position of the field that orders segments' rows
+    /// ([`Schema::with_cluster_by`]).
+    pub fn cluster_by_field(&self) -> Option<usize> {
+        self.cluster_by.as_deref().and_then(|f| self.field_index(f))
+    }
+
+    /// Keeps this table's rows for `seconds` after the time in TIMESTAMP
+    /// field `by`: older rows are dropped when a merge rewrites their
+    /// segment (and not written by a flush), and segments that hold only
+    /// such rows are dropped whole within seconds by the background merger.
+    /// It is eventual: a query that needs an exact window filters on `by`.
+    /// Rows without a time are kept. `by` is an indexed TIMESTAMP field. It
+    /// makes the database format 3 (feature `retain`).
+    pub fn with_retain(mut self, by: &str, seconds: i64) -> Result<Schema> {
+        let i = self.field_index(by).ok_or_else(|| Error::Schema(format!("retain_by names {by}, which is not a field of {}", self.table)))?;
+        let f = &self.fields[i];
+        if f.logical != Some(Logical::Timestamp) || !f.indexed {
+            return Err(Error::Schema(format!("retain_by {}: rows are kept by the time in an indexed TIMESTAMP field", f.name)));
+        }
+        if seconds <= 0 {
+            return Err(Error::Schema(format!("retain: rows are kept for a positive time, not {seconds} seconds")));
+        }
+        self.retain = Some(Retain { by: f.name.clone(), seconds });
+        Ok(self)
+    }
+
+    /// The position of the retention's TIMESTAMP field, and the time
+    /// (microseconds since the epoch) before which rows expire at `now`
+    /// ([`Schema::with_retain`]).
+    pub fn retention(&self, now: i64) -> Option<(usize, i64)> {
+        let r = self.retain.as_ref()?;
+        Some((self.field_index(&r.by)?, now.saturating_sub(r.seconds.saturating_mul(1_000_000))))
+    }
+
     /// An indexed TEXT or SPARSE field that is neither stored nor
     /// generated: nothing can rebuild its index when segments merge.
     /// [`Schema::new`] refuses them; databases created before it did can
@@ -631,13 +724,16 @@ impl Schema {
     /// The format 3 features this table needs, as the manifest names them:
     /// its fields' [`Logical::feature`], `not_null`, `default`,
     /// `semantic_id`, [`Analyzer::feature`] and `media` ([`Field::media`]),
-    /// and `shard_by` ([`Schema::with_shard_by`]).
+    /// and its options `shard_by`, `cluster_by` and `retain`
+    /// ([`Schema::with_shard_by`], [`Schema::with_cluster_by`],
+    /// [`Schema::with_retain`]).
     pub fn features(&self) -> impl Iterator<Item = String> + '_ {
         let fields = self.fields.iter().flat_map(|f| {
             let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default"), f.semantic_id.as_ref().map(|_| "semantic_id"), f.media.map(|_| "media")];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
-        fields.chain(self.shard_by.as_ref().map(|_| "shard_by".to_string()))
+        let options = [self.shard_by.as_ref().map(|_| "shard_by"), self.cluster_by.as_ref().map(|_| "cluster_by"), self.retain.as_ref().map(|_| "retain")];
+        fields.chain(options.into_iter().flatten().map(String::from))
     }
 
     /// A row that holds each field's default, written at `now`
@@ -761,7 +857,11 @@ impl Schema {
     /// TIMESTAMP is the time of the write); either makes the database
     /// format 3 ([`Field::not_null`], [`Field::default`]). `"shard_by":
     /// "usr"` places the table's rows on shards by that field rather than
-    /// their key ([`Schema::with_shard_by`]).
+    /// their key ([`Schema::with_shard_by`]), `"cluster_by": "usr"` orders
+    /// each segment's rows by it ([`Schema::with_cluster_by`]), and
+    /// `"retain": "400 days"` keeps rows for that long after the time in
+    /// `"retain_by"` (default: the table's only TIMESTAMP field;
+    /// [`Schema::with_retain`]).
     ///
     /// The long form is this type's own serialization (what
     /// `GET /v1/schema` returns), with `primary_key` the key field's
@@ -792,12 +892,47 @@ impl Schema {
             }
             Some(other) => return Err(bad(format!("the key is a field name, not {other}"))),
         };
-        let schema = Schema::new(table, fields, key.as_deref())?;
-        match obj.get("shard_by") {
-            None | Some(J::Null) => Ok(schema),
-            Some(J::String(f)) => schema.with_shard_by(f),
-            Some(other) => Err(bad(format!("shard_by is a field name, not {other}"))),
+        let mut schema = Schema::new(table, fields, key.as_deref())?;
+        let name = |k: &str| match obj.get(k) {
+            None | Some(J::Null) => Ok(None),
+            Some(J::String(f)) => Ok(Some(f.as_str())),
+            Some(other) => Err(bad(format!("{k} is a field name, not {other}"))),
+        };
+        if let Some(f) = name("shard_by")? {
+            schema = schema.with_shard_by(f)?;
         }
+        if let Some(f) = name("cluster_by")? {
+            schema = schema.with_cluster_by(f)?;
+        }
+        match obj.get("retain") {
+            None | Some(J::Null) => {
+                if obj.get("retain_by").is_some_and(|v| !v.is_null()) {
+                    return Err(bad("retain_by names the field that retain keeps rows by: give retain too, as \"400 days\"".into()));
+                }
+            }
+            // The short form: a period, and the field (or the table's only
+            // TIMESTAMP).
+            Some(J::String(period)) => {
+                let seconds = Retain::parse_period(period)?;
+                let by = match name("retain_by")? {
+                    Some(f) => f.to_string(),
+                    None => {
+                        let times: Vec<&Field> = schema.fields.iter().filter(|f| f.logical == Some(Logical::Timestamp)).collect();
+                        match times[..] {
+                            [f] => f.name.clone(),
+                            _ => return Err(bad(format!("retain keeps rows by a TIMESTAMP field: name it with retain_by ({} has {})", schema.table, times.len()))),
+                        }
+                    }
+                };
+                schema = schema.with_retain(&by, seconds)?;
+            }
+            Some(r @ J::Object(_)) => {
+                let r: Retain = serde_json::from_value(r.clone()).map_err(|e| bad(format!("retain: {e}")))?;
+                schema = schema.with_retain(&r.by, r.seconds)?;
+            }
+            Some(other) => return Err(bad(format!("retain is a period, as \"400 days\", not {other}"))),
+        }
+        Ok(schema)
     }
 
     /// The short JSON form ([`Schema::from_json`]), defaults left out.
@@ -896,6 +1031,13 @@ impl Schema {
         }
         if let Some(f) = &self.shard_by {
             out.insert("shard_by".into(), json!(f));
+        }
+        if let Some(f) = &self.cluster_by {
+            out.insert("cluster_by".into(), json!(f));
+        }
+        if let Some(r) = &self.retain {
+            out.insert("retain".into(), json!(r.period()));
+            out.insert("retain_by".into(), json!(r.by));
         }
         out.insert("fields".into(), J::Array(fields));
         J::Object(out)

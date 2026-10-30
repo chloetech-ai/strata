@@ -11,13 +11,12 @@ from .result import Result
 
 
 def ordered_schema(s: dict) -> dict:
-    """The short schema form in reading order: table, key, shard_by,
-    fields, and each field's name and type first."""
+    """The short schema form in reading order: table, key, the table's
+    options, fields, and each field's name and type first."""
     out = {"table": s["table"]}
-    if s.get("key") is not None:
-        out["key"] = s["key"]
-    if s.get("shard_by") is not None:
-        out["shard_by"] = s["shard_by"]
+    for k in ("key", "shard_by", "cluster_by", "retain", "retain_by"):
+        if s.get(k) is not None:
+            out[k] = s[k]
     out["fields"] = [{"name": f["name"], "type": f["type"], **f} for f in s["fields"]]
     return out
 
