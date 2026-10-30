@@ -18,7 +18,10 @@
 //! characters. Each prefix runs
 //! once to warm up, then once timed, on one thread, first on the segments
 //! the load made, then after merging with the default policy until it
-//! stops, as a server's merger leaves a table. The answers of the
+//! stops, as a server's merger leaves a table; each time by two methods:
+//! `rows` reads every matching row's count, `blocks` reads the count
+//! column's blocks best first and stops at the first that cannot reach
+//! the top 10 (`ExecOptions::column_blocks`). The answers of the
 //! first `check` prefixes of each length are compared with a scan of every
 //! query (exact top 10, ties by key).
 //!
@@ -103,14 +106,18 @@ fn main() {
     let typed: Vec<&str> = (0..a.samples).map(|_| log[cum.partition_point(|&c| c <= rng.gen_range(0..clicks))].0.as_str()).collect();
 
     let mut states: Vec<Json> = Vec::new();
-    let loaded = run(&db, &a, &lengths, &typed, &log);
-    states.push(json!({"state": "loaded", "segments": db.snapshot().segments().len(), "runs": loaded}));
+    for blocks in [false, true] {
+        let loaded = run(&db, &a, &lengths, &typed, &log, blocks);
+        states.push(json!({"state": "loaded", "method": method(blocks), "segments": db.snapshot().segments().len(), "runs": loaded}));
+    }
     // As a server's merger leaves it: the default policy until it stops.
     let t = Instant::now();
     while db.storage().merge(&MergePolicy::default()).unwrap().merges > 0 {}
     eprintln!("merged in {:.1} s", t.elapsed().as_secs_f64());
-    let merged = run(&db, &a, &lengths, &typed, &log);
-    states.push(json!({"state": "merged", "segments": db.snapshot().segments().len(), "runs": merged}));
+    for blocks in [false, true] {
+        let merged = run(&db, &a, &lengths, &typed, &log, blocks);
+        states.push(json!({"state": "merged", "method": method(blocks), "segments": db.snapshot().segments().len(), "runs": merged}));
+    }
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
     let machine = std::fs::read_to_string("/proc/cpuinfo")
@@ -129,14 +136,22 @@ fn main() {
     eprintln!("wrote {path}");
 }
 
-/// Times every length's prefixes on `db` as it is now, prints a table and
-/// returns the runs.
-fn run(db: &Db, a: &Args, lengths: &[usize], typed: &[&str], log: &[(String, i64)]) -> Vec<Json> {
+fn method(blocks: bool) -> &'static str {
+    if blocks {
+        "blocks"
+    } else {
+        "rows"
+    }
+}
+
+/// Times every length's prefixes on `db` as it is now, by the method
+/// `blocks` names, prints a table and returns the runs.
+fn run(db: &Db, a: &Args, lengths: &[usize], typed: &[&str], log: &[(String, i64)], blocks: bool) -> Vec<Json> {
     let snap = db.snapshot();
     let schema = snap.schema().clone();
-    let exec = ExecOptions { threads: 1, ..ExecOptions::default() };
+    let exec = ExecOptions { threads: 1, column_blocks: blocks, ..ExecOptions::default() };
     let mut runs: Vec<Json> = Vec::new();
-    println!("{} segments", snap.segments().len());
+    println!("{} segments, {}", snap.segments().len(), method(blocks));
     println!("{:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}", "chars", "prefixes", "p50 ms", "p90 ms", "p99 ms", "max ms", "median rows", "max rows");
     for &len in lengths {
         let prefixes: Vec<String> = typed.iter().filter(|q| q.chars().count() >= len).map(|q| q.chars().take(len).collect()).collect();

@@ -386,6 +386,8 @@ A product's factors are scores (`bm25`, `similarity`, `ppr`, `decay`) and numeri
 
 `ORDER BY year DESC` orders by a numeric column. Rows without a value come last in either direction (as in Elasticsearch); `ORDER BY year DESC NULLS FIRST` puts them first. Their `score()` is `NULL`. With no `ORDER BY`, rows come in storage order.
 
+With a `LIMIT`, the rows come from the column's blocks of 128 rows, best block first by its zone map (its largest value for `DESC`, smallest for `ASC`), and the search stops at the first block whose best value is worse than the k-th row found: the ten most clicked of half a million matching queries read a few hundred blocks rather than every match. A row's filter is checked only when its value can still make the cut. A filter that rejects the best values (`WHERE n < 3 ORDER BY n DESC`) falls back to reading every match once the blocks have cost what that would, and so do `NULLS FIRST` and a filter that matches only a few thousand rows. Values written in place are read first, so counters kept with `UPDATE ... SET n = n + 1` rank by their current value.
+
 ## Typos and synonyms
 
 `MATCH` and `bm25` take two options that widen a search beyond the words written:
