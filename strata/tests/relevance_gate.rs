@@ -67,9 +67,10 @@ fn evaluate(c: &RawCollection, dir: &Path, variants: &[(&str, &str)]) -> Vec<Run
     variants
         .iter()
         .map(|(_, opts)| {
+            // BEIR's queries are text, and a few hold `+1` or `-word`.
             let (top10, top1000) = (
-                format!("SELECT id FROM docs ORDER BY bm25(body, :q{opts}) DESC LIMIT 10"),
-                format!("SELECT id FROM docs ORDER BY bm25(body, :q{opts}) DESC LIMIT 1000"),
+                format!("SELECT id FROM docs ORDER BY bm25(body, :q, syntax => 'plain'{opts}) DESC LIMIT 10"),
+                format!("SELECT id FROM docs ORDER BY bm25(body, :q, syntax => 'plain'{opts}) DESC LIMIT 1000"),
             );
             let mut run = Run { ndcg10: Vec::new(), recall100: Vec::new(), recall1000: Vec::new() };
             for (qid, text) in &c.queries {

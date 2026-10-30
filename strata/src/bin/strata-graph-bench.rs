@@ -543,9 +543,9 @@ fn synthetic(nodes: usize, degree: usize, seed: u64, dbp: &Path, queries: usize,
 /// Ranking methods for the reference-finding task. `S` is replaced by the
 /// number of vector seeds.
 const METHODS: &[(&str, &str)] = &[
-    ("bm25", "SELECT id FROM papers ORDER BY bm25(body, :t) DESC LIMIT :k"),
+    ("bm25", "SELECT id FROM papers ORDER BY bm25(body, :t, syntax => 'plain') DESC LIMIT :k"),
     ("vector", "SELECT id FROM papers ORDER BY similarity(emb, :q) DESC LIMIT :k"),
-    ("hybrid", "SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT :k"),
+    ("hybrid", "SELECT id FROM papers ORDER BY rrf(bm25(body, :t, syntax => 'plain'), similarity(emb, :q)) DESC LIMIT :k"),
     // The seeds themselves are the vector search's own results; these
     // methods rank only what the graph adds.
     (
@@ -571,7 +571,7 @@ const METHODS: &[(&str, &str)] = &[
     ),
     (
         "rrf(bm25, vector, ppr from hybrid seeds)",
-        "SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q), ppr(cites, (SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT S), weighted => 1)) DESC LIMIT :k",
+        "SELECT id FROM papers ORDER BY rrf(bm25(body, :t, syntax => 'plain'), similarity(emb, :q), ppr(cites, (SELECT id FROM papers ORDER BY rrf(bm25(body, :t, syntax => 'plain'), similarity(emb, :q)) DESC LIMIT S), weighted => 1)) DESC LIMIT :k",
     ),
     (
         "semantic kNN graph from vector seeds",

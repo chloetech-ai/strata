@@ -4,8 +4,12 @@
 //! query   := and ("OR" and)*
 //! and     := unary (["AND"] unary)*        juxtaposition is AND
 //! unary   := ("NOT" | "-") unary | primary  "a NOT b" is "a AND NOT b"
-//! primary := "(" query ")" | "\"phrase\"" | word | word* | word~ | word~N
+//! primary := "(" query ")" | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
 //! ```
+//!
+//! A weight (`vaccine^2`, `"mrna vaccine"^0.5`) changes nothing about
+//! which rows match: it is there so that the same text read by `bm25`
+//! weighs the word ([`ranked_items`], the operators of a ranked query).
 //!
 //! Operators are uppercase (`AND`, `OR`, `NOT`), as in SQLite FTS5;
 //! lowercase `and`/`or`/`not` are words (and stopwords). `-` negates when it
@@ -69,8 +73,10 @@ enum Tok {
     Word(String),
 }
 
-fn lex(q: &str) -> Result<Vec<Tok>> {
+/// The tokens of `q`, and whether a word or phrase of it has a weight.
+fn lex(q: &str) -> Result<(Vec<Tok>, bool)> {
     let mut out = Vec::new();
+    let mut weighted = false;
     let mut it = q.char_indices().peekable();
     while let Some(&(i, c)) = it.peek() {
         match c {
@@ -97,6 +103,15 @@ fn lex(q: &str) -> Result<Vec<Tok>> {
                 }
                 let end = end.ok_or_else(|| Error::Query(format!("unterminated phrase in MATCH query {q:?}")))?;
                 out.push(Tok::Phrase(q[start..end].to_string()));
+                // A weight right after the closing quote.
+                let rest = &q[end + 1..];
+                let len = rest.find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"')).unwrap_or(rest.len());
+                if rest.starts_with('^') && weight(&rest[1..len]).is_some() {
+                    weighted = true;
+                    while it.peek().is_some_and(|&(j, _)| j < end + 1 + len) {
+                        it.next();
+                    }
+                }
             }
             '-' => {
                 it.next();
@@ -112,16 +127,129 @@ fn lex(q: &str) -> Result<Vec<Tok>> {
                     }
                     it.next();
                 }
-                out.push(match &q[start..end] {
-                    "AND" => Tok::And,
-                    "OR" => Tok::Or,
-                    "NOT" => Tok::Not,
-                    w => Tok::Word(w.to_string()),
+                out.push(match split_weight(&q[start..end]) {
+                    // A weighted word is a word, whatever it spells.
+                    (w, Some(_)) => {
+                        weighted = true;
+                        Tok::Word(w.to_string())
+                    }
+                    ("AND", None) => Tok::And,
+                    ("OR", None) => Tok::Or,
+                    ("NOT", None) => Tok::Not,
+                    (w, None) => Tok::Word(w.to_string()),
                 });
             }
         }
     }
-    Ok(out)
+    Ok((out, weighted))
+}
+
+/// Whether a `MATCH` query weighs a word or phrase (`word^2`), which a
+/// Strata from before weights reads as other words.
+pub fn match_has_weights(q: &str) -> bool {
+    lex(q).is_ok_and(|(_, w)| w)
+}
+
+/// A weight: digits with an optional fraction (`2`, `0.5`, `.5`), finite.
+fn weight(s: &str) -> Option<f32> {
+    let digits = s.chars().filter(char::is_ascii_digit).count();
+    let ok = digits > 0 && s.chars().all(|c| c.is_ascii_digit() || c == '.') && s.matches('.').count() <= 1;
+    ok.then(|| s.parse::<f32>().ok()).flatten().filter(|w| w.is_finite())
+}
+
+/// A word and its weight, if it ends in `^` and one (`vaccine^2`).
+fn split_weight(w: &str) -> (&str, Option<f32>) {
+    match w.rsplit_once('^') {
+        Some((base, n)) if !base.is_empty() => match weight(n) {
+            Some(x) => (base, Some(x)),
+            None => (w, None),
+        },
+        _ => (w, None),
+    }
+}
+
+/// Whether a ranked query's item must occur in a row (`+word`), must not
+/// (`-word`), or may (a plain word).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Occur {
+    Should,
+    Must,
+    MustNot,
+}
+
+/// A word or quoted phrase of a ranked query ([`ranked_items`]), as
+/// written: its text without sign, quotes or weight, still to analyse.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Item<'a> {
+    pub text: &'a str,
+    /// Written in quotes.
+    pub phrase: bool,
+    pub occur: Occur,
+    /// The weight written after it (`^2`), if any.
+    pub weight: Option<f32>,
+}
+
+/// The words and phrases of a ranked (`bm25`) query in its operator
+/// syntax, in order:
+///
+/// - `"a phrase"`: the words between paired quotes are one item;
+/// - `+item`: it must occur in a row, `-item`: it must not; a sign counts
+///   only at the start of a word or phrase, before something other than
+///   a space or another sign;
+/// - `item^w`: weight `w` (digits with an optional fraction), right after
+///   the word or closing quote.
+///
+/// It never fails: an unpaired quote, a lone sign and a `^` without a
+/// number are read as part of a word, which analysis splits as it splits
+/// any word.
+pub fn ranked_items(text: &str) -> Vec<Item<'_>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        if c.is_whitespace() {
+            i += c.len_utf8();
+            continue;
+        }
+        let mut occur = Occur::Should;
+        let mut start = i;
+        if c == '+' || c == '-' {
+            if let Some(n) = text[i + 1..].chars().next() {
+                if !n.is_whitespace() && n != '+' && n != '-' {
+                    occur = if c == '+' { Occur::Must } else { Occur::MustNot };
+                    start = i + 1;
+                }
+            }
+        }
+        if let Some(inner) = text[start..].strip_prefix('"') {
+            if let Some(len) = inner.find('"') {
+                let mut end = start + 1 + len + 1;
+                let rest = &text[end..];
+                let run = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
+                let w = rest.strip_prefix('^').and_then(|_| weight(&rest[1..run]));
+                if w.is_some() {
+                    end += run;
+                }
+                out.push(Item { text: &inner[..len], phrase: true, occur, weight: w });
+                i = end;
+                continue;
+            }
+        }
+        // A word runs to a space or a quote; its first character may be an
+        // unpaired quote.
+        let first = text[start..].chars().next().map_or(0, char::len_utf8);
+        let end = text[start + first..].find(|c: char| c.is_whitespace() || c == '"').map_or(text.len(), |j| start + first + j);
+        let (word, w) = split_weight(&text[start..end]);
+        out.push(Item { text: word, phrase: false, occur, weight: w });
+        i = end;
+    }
+    out
+}
+
+/// Whether a ranked query uses an operator ([`ranked_items`]): a sign or
+/// a weight, which a Strata from before them reads as plain words. Quotes
+/// alone do not count: a phrase's words score as the words do.
+pub fn has_operators(text: &str) -> bool {
+    ranked_items(text).iter().any(|i| i.occur != Occur::Should || i.weight.is_some())
 }
 
 struct Parser {
@@ -145,7 +273,7 @@ pub fn parse_match(q: &str) -> Result<BoolQuery> {
 
 /// [`parse_match`] of a field whose text `analyzer` analyses.
 pub fn parse_match_with(q: &str, analyzer: Analyzer) -> Result<BoolQuery> {
-    let mut p = Parser { toks: lex(q)?, analyzer, pos: 0, depth: 0 };
+    let mut p = Parser { toks: lex(q)?.0, analyzer, pos: 0, depth: 0 };
     let e = p.or()?;
     if p.pos < p.toks.len() {
         return Err(Error::Query(format!("unexpected {:?} in MATCH query {q:?}", p.toks[p.pos])));

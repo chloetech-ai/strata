@@ -220,13 +220,13 @@ fn match_word(s: &str) -> Option<String> {
 }
 
 const KINDS: &[(&str, &str)] = &[
-    ("bm25", "SELECT id, score() FROM docs ORDER BY bm25(body, :t) DESC LIMIT 10"),
-    ("bm25 + filter", "SELECT id, score() FROM docs WHERE year >= 2010 AND category IN ('c00', 'c01', 'c02', 'c03') ORDER BY bm25(body, :t) DESC LIMIT 10"),
+    ("bm25", "SELECT id, score() FROM docs ORDER BY bm25(body, :t, syntax => 'plain') DESC LIMIT 10"),
+    ("bm25 + filter", "SELECT id, score() FROM docs WHERE year >= 2010 AND category IN ('c00', 'c01', 'c02', 'c03') ORDER BY bm25(body, :t, syntax => 'plain') DESC LIMIT 10"),
     ("vector", "SELECT id, score() FROM docs ORDER BY similarity(emb, :v) DESC LIMIT 10"),
     ("vector + filter", "SELECT id, score() FROM docs WHERE rating >= 4 ORDER BY similarity(emb, :v) DESC LIMIT 10"),
-    ("hybrid (RRF)", "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :v)) DESC LIMIT 10"),
-    ("hybrid (weighted)", "SELECT id, score() FROM docs ORDER BY 0.2 * minmax(bm25(body, :t)) + 0.8 * minmax(similarity(emb, :v)) DESC LIMIT 10"),
-    ("boosted (bm25 × decay)", "SELECT id, score() FROM docs ORDER BY bm25(body, :t) * decay(year, 2024, 5) DESC LIMIT 10"),
+    ("hybrid (RRF)", "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t, syntax => 'plain'), similarity(emb, :v)) DESC LIMIT 10"),
+    ("hybrid (weighted)", "SELECT id, score() FROM docs ORDER BY 0.2 * minmax(bm25(body, :t, syntax => 'plain')) + 0.8 * minmax(similarity(emb, :v)) DESC LIMIT 10"),
+    ("boosted (bm25 × decay)", "SELECT id, score() FROM docs ORDER BY bm25(body, :t, syntax => 'plain') * decay(year, 2024, 5) DESC LIMIT 10"),
     ("facet", "SELECT category, COUNT(*) FROM docs WHERE MATCH(body, :w) GROUP BY category ORDER BY 2 DESC LIMIT 5"),
     ("key lookup", "SELECT id, title, year, rating FROM docs WHERE id = :k"),
 ];

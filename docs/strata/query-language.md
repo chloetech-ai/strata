@@ -112,7 +112,7 @@ A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256"
 query   := and ("OR" and)*
 and     := unary (["AND"] unary)*          juxtaposition is AND
 unary   := ("NOT" | "-") unary | primary    "a NOT b" is "a AND NOT b"
-primary := "(" query ")" | "\"phrase\"" | word | word* | word~ | word~N
+primary := "(" query ")" | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
 ```
 
 | query | matches |
@@ -125,13 +125,13 @@ primary := "(" query ")" | "\"phrase\"" | word | word* | word~ | word~N
 | `vacine~`, `vacine~1` | the word and the indexed terms an edit or two from it ([typos](#typos-and-synonyms)) |
 | `vaccine AND (mrna OR "messenger rna") -animal` | any combination, with parentheses |
 
-Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it.
+Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it. A weight (`vaccine^2`, `"messenger rna"^0.5`) is read and ignored, since `MATCH` only says whether a row matches: `vaccine^2 mrna` matches what `vaccine mrna` does, so one text can go to both `MATCH` and [`bm25`](#weights-required-and-excluded-words).
 
 ## Scores
 
 ### `bm25(field, text)`
 
-BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains any of them. Ranked queries drop English function words (NLTK's 153-word list), except that its single letters (`d`, `m`, `o`, `s`, `t`, `y`) are kept unless they end a contraction: "vitamin d" and "T cell" keep their letter, "don't" and "it's" drop it. A term written twice weighs twice. Used in `ORDER BY` without a `MATCH`, it is a ranked search; with one, it ranks the matching rows.
+BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains any of them, unless the text [requires or excludes words](#weights-required-and-excluded-words). Ranked queries drop English function words (NLTK's 153-word list), except that its single letters (`d`, `m`, `o`, `s`, `t`, `y`) are kept unless they end a contraction: "vitamin d" and "T cell" keep their letter, "don't" and "it's" drop it. A term written twice weighs twice. Used in `ORDER BY` without a `MATCH`, it is a ranked search; with one, it ranks the matching rows.
 
 | option | default | effect |
 |---|---|---|
@@ -140,8 +140,32 @@ BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains
 | `stopwords` | 1 (0 on a `simple` field) | `0` keeps English function words in the query, `1` drops them |
 | `fuzzy` | 0 | `1`, `2` or `'auto'`: also score the indexed terms that many edits from each word ([typos](#typos-and-synonyms)) |
 | `synonyms` | 0 | `1`: also score each word's synonyms |
+| `syntax` | `'query'` | `'plain'` reads `+`, `-`, quotes and `^` as punctuation: the text is words alone |
 
 Keeping function words is better for short questions: on Quora it gains 0.055 nDCG@10, while on TREC-COVID, whose queries are full questions, dropping them gains the same amount.
+
+#### Weights, required and excluded words
+
+The text may weigh a word, require it or exclude it, as a search box does:
+
+| text | ranks |
+|---|---|
+| `vaccine mrna` | the rows with either word |
+| `vaccine^2 mrna` | the same rows, `vaccine` weighing twice: as `vaccine vaccine mrna` |
+| `+mrna vaccine` | the rows with `mrna`, by both words |
+| `vaccine -animal` | the rows with `vaccine` and without `animal` |
+| `+"messenger rna" vaccine^0.5` | the rows with the phrase (with both words, on a field without positions), by its words and half of `vaccine` |
+| `+covid^0 treatment` | the rows with `covid`, by `treatment` alone |
+
+- **`^w`** after a word or a closing quote multiplies its terms' BM25 by `w`, a number of at least 0 (`2`, `0.5`, `.5`). Weights add up, as a word written twice does. A word weighing 0 scores nothing, and a text whose words all weigh 0 ranks no row.
+- **`+`** before a word or a quoted phrase requires it, **`-`** excludes it: a row must contain every required one and none of the excluded ones, and ranks by the others too. An excluded word does not score, and a word the query drops as a stopword is neither required nor excluded. A sign counts only at the start of a word and before a letter, digit or quote: `covid-19`, a `-` alone, `+-x` and `x^` are words. Quotes alone change nothing: `"messenger rna"` scores what `messenger rna` does.
+- With `fuzzy` or `synonyms`, a word's typo neighbours and synonyms take the highest weight the word is written with (writing it twice weighs the word twice, not them), and a required or excluded word counts as present when one of them is, as in `MATCH`.
+- A required or excluded word is a filter on the ranked rows: the top-k loop (all three `algo`s), a [rank-safe boost](#rank-safe-boosts), a [rerank phase](#rerank-phases) (where a row the filter drops scores 0, as one without the words does) and shards all apply it, so the rows and scores are those of the rows the text allows.
+- Weights and signs cost little. With each query's first word weighed 2 (`word^2`) or required (`+word`), or its last word excluded (`-word`), the median query took 0.27, 0.28 and 0.23 ms on Quora's 10,000 queries against 0.25 ms for the plain text, and 0.24, 0.18 and 0.22 ms on FiQA against 0.22 ms; a required word can make a query faster, as the filter drops rows before they are scored. Text written without operators ranks and times as the plain text does on all five collections measured (`strata/results/text/bm25_term_operators.json`, one core of a 4-core cloud VM while another job held the other three). The operators were put on words mechanically to time them, so these queries rank worse than the plain text: an operator helps when it says what the person searching means.
+- **`syntax => 'plain'`** reads the text as words alone, as `bm25` did before: for text not written for a search box, such as a user's message passed through, or a benchmark's recorded queries. BEIR's hold `+1`, `-word` or `x^2` here and there, so the evaluations and benchmarks in this repository pass `syntax => 'plain'`, and so does Engram.
+- A plan that ranks with weights, signs, or a `MATCH` with weights needs the plan feature `text_operators`. From Python, `bm25("body", "+mrna vaccine^2")` reads them, and `bm25("body", text, syntax="plain")` does not.
+
+**Changed:** `bm25` read `+`, `-`, `"` and `^` as punctuation before; text with them now ranks as above, and `syntax => 'plain'` keeps the old reading. In `MATCH`, `^` separated words: `vaccine^2` matched `vaccine` and `2`, and now matches `vaccine`.
 
 ### `similarity(field, vector)` and `distance(field, vector)`
 
