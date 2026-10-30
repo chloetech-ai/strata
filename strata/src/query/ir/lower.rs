@@ -125,7 +125,7 @@ impl Lower<'_> {
                 Some(Tiebreak::GroupValue { desc }) => keys.push(key(Expr::Output(0), desc)),
                 Some(Tiebreak::Key { desc }) => keys.push(key(pk(), desc)),
             }
-            let search = Node::Search(Search { table, filter, order: Vec::new(), phases: Vec::new() });
+            let search = Node::Search(Search { table, filter, order: Vec::new(), phases: Vec::new(), profile: None });
             let mut node = Node::Aggregate { input: Box::new(search), keys: out.keys.iter().map(|&f| Expr::Field(f as u32)).collect(), aggs: out.aggs };
             if let Some(cond) = having {
                 node = Node::Filter { input: Box::new(node), cond };
@@ -160,7 +160,7 @@ impl Lower<'_> {
                 })
                 .collect();
             let phases = s.phases.iter().map(|p| Phase { count: p.count as u64, expr: self.score(&p.score), global: p.global }).collect();
-            (Node::Search(Search { table, filter, order, phases }), columns)
+            (Node::Search(Search { table, filter, order, phases, profile: None }), columns)
         };
         let (mut node, columns) = node;
         if s.limit.is_some() || s.offset > 0 {

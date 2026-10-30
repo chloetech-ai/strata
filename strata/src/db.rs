@@ -21,7 +21,7 @@ use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentRea
 use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::Plan;
 use crate::query::stats::TermStats;
-use crate::query::{bind_command, compound, ops, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
+use crate::query::{bind_command, compound, ops, profile, sql as qsql, tables, Assign, Command, Conflict, Params, Select, Write};
 use crate::schema::{Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn};
@@ -434,6 +434,7 @@ impl Db {
     /// reads its own table and may hold up to
     /// [`crate::query::compound::MAX_ROWS`] rows.
     fn run_on(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
+        profile::check_plan(plan, &|t, name| snap.table(t).and_then(|v| v.rank_profile(name).map(|p| p.hash())))?;
         let view_of = |table: &str| snap.table(table).ok_or_else(|| Error::Query(format!("no such table: {table}")));
         if !plan.root.uses_operators() {
             let view = view_of(plan.table())?;
@@ -517,6 +518,35 @@ impl Db {
             Command::DropTable { tables, opts } => {
                 let names: Vec<&str> = tables.iter().map(|t| t.as_str()).collect();
                 self.drop_tables(&names, opts)?;
+                Ok(SqlResult::Written(0))
+            }
+            Command::CreateRankProfile { table, profile, replace } => {
+                self.storage.set_rank_profile(&table, profile, replace)?;
+                Ok(SqlResult::Written(0))
+            }
+            Command::DropRankProfile { table, name, if_exists } => {
+                let table = match table {
+                    Some(t) => Some(t),
+                    None => {
+                        let mut with: Vec<String> = Vec::new();
+                        for t in &catalog {
+                            if self.storage.rank_profiles(&t.table)?.iter().any(|p| p.name.eq_ignore_ascii_case(&name)) {
+                                with.push(t.table.clone());
+                            }
+                        }
+                        if with.len() > 1 {
+                            return Err(Error::Query(format!("{} have a rank profile named {name}: DROP RANK PROFILE {name} ON table", with.join(" and "))));
+                        }
+                        with.pop()
+                    }
+                };
+                let dropped = match &table {
+                    Some(t) => self.storage.drop_rank_profile(t, &name)?,
+                    None => false,
+                };
+                if !dropped && !if_exists {
+                    return Err(Error::Query(format!("no rank profile named {name}{}", table.map_or(String::new(), |t| format!(" on {t}")))));
+                }
                 Ok(SqlResult::Written(0))
             }
             Command::Write { table, write } => {
@@ -1062,6 +1092,11 @@ impl DocumentSource for StoredSource {
 /// The plan of a SELECT over `snap`'s tables: the executor's query of one
 /// table, or a compound one's operators ([`compound::needs`]) over any.
 fn plan_of(snap: &Snapshot, q: &sqlparser::ast::Query, params: &Params) -> Result<Plan> {
+    let profile_of = |t: &str, name: &str| snap.table(t).and_then(|v| v.rank_profile(name).cloned());
+    if let Some((q, r)) = profile::expand(q, &profile_of)? {
+        let table = tables::read_by(&q).first().cloned().unwrap_or_default();
+        return Ok(profile::mark(plan_of(snap, &q, params)?, &table, &r));
+    }
     let view = match tables::read_by(q).first() {
         None => snap.clone(),
         Some(t) => snap.table(t).ok_or_else(|| Error::Query(format!("no such table: {t}")))?,

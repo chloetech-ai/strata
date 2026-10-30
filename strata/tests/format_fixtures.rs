@@ -2,8 +2,10 @@
 //! older versions of Strata wrote, open with this one in both layouts:
 //! their rows, filters and searches are as written, they take writes,
 //! flushes and merges and stay in the format they were written in. So do
-//! the fixtures of numbered writes, which go on counting from theirs. And
-//! this version still writes the same bytes for the same writes, so a
+//! the fixtures of numbered writes, which go on counting from theirs, and
+//! those of rank profiles, which rank as they were written to until the
+//! last is dropped. And this version still writes the same bytes for the
+//! same writes, so a
 //! change to what Strata writes is a choice, made with a new fixture set.
 
 #[path = "fixtures/writer.rs"]
@@ -342,6 +344,71 @@ fn numbered_fixtures_open_and_go_on_counting() {
     }
 }
 
+/// The fixtures of rank profiles hold format 2's rows; `t` has `by_n` as
+/// replaced in the WAL (its other profile, flushed into the manifest, was
+/// dropped there) and `u` has `notes`, logged there too. Profiles change
+/// and survive a flush, a merge and opening again; once the last is
+/// dropped and flushed, the database is format 2 again and its log names
+/// no feature.
+#[test]
+fn profile_fixtures_rank_as_written() {
+    for set in sets("profiles") {
+        let dir = tempfile::tempdir().unwrap();
+        for path in copies(&set, dir.path()) {
+            let what = path.display().to_string();
+            let wal = if path.is_dir() { path.join("wal") } else { dir.path().join("db.strata-wal") };
+            let header = |wal: &Path| std::fs::read(wal).unwrap()[..33].to_vec();
+            assert_eq!(header(&wal)[..8], *b"STRWAL02", "{what}");
+            assert_eq!(header(&wal)[16..], *b"\x0d\0\0\0rank_profiles", "{what}");
+            assert_eq!(format_on_disk(&path), 3, "{what}");
+            if path.is_dir() {
+                let (_, m) = strata::storage::dir::read_current(&path).unwrap();
+                assert_eq!(m.features(), ["rank_profiles"], "{what}");
+                let names: Vec<&str> = m.tables[0].profiles.iter().map(|p| p.name.as_str()).collect();
+                assert_eq!(names, ["by_n", "phased"], "{what}: flushed with the deletes");
+            }
+            let profiles = |db: &Db| {
+                ["t", "u"].map(|t| db.storage().rank_profiles(t).unwrap().into_iter().map(|p| format!("{}: {}", p.name, p.ranking)).collect::<Vec<_>>())
+            };
+            let check = |db: &Db, by_n: &str| {
+                Format2::written().check(db);
+                assert_eq!(rows(db, "SELECT id, n FROM t ORDER BY rank_profile('by_n') LIMIT 1000"), rows(db, &format!("SELECT id, n FROM t ORDER BY {by_n} LIMIT 1000")), "{what}");
+                let (a, b) = (rows(db, "SELECT id, score() FROM u ORDER BY rank_profile('notes') LIMIT 5"), rows(db, "SELECT id, score() FROM u ORDER BY bm25(note, 'cats') DESC LIMIT 5"));
+                assert!(a.len() == 5 && a == b, "{what}: {a:?}");
+            };
+            let db = Db::open(&path, options(&path)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(profiles(&db), [vec!["by_n: SELECT * FROM t ORDER BY n".to_string()], vec!["notes: SELECT * FROM u ORDER BY bm25(note, :q) DESC".to_string()]], "{what}");
+            check(&db, "n");
+            run(&db, "CREATE OR REPLACE RANK PROFILE by_n ON t AS SELECT * FROM t ORDER BY n DESC");
+            run(&db, "CREATE RANK PROFILE recent ON t AS WITH a AS (SELECT * FROM t ORDER BY bm25(body, :q) DESC LIMIT 10) SELECT * FROM a ORDER BY n DESC WITH (q => 'version')");
+            db.storage().flush().unwrap();
+            merge(&db);
+            db.storage().check().unwrap();
+            check(&db, "n DESC");
+            assert_eq!(format_on_disk(&path), 3, "{what}");
+            drop(db);
+
+            let db = Db::open(&path, options(&path)).unwrap();
+            check(&db, "n DESC");
+            let [t, u] = profiles(&db);
+            assert_eq!((t.len(), u.len()), (2, 1), "{what}: {t:?}");
+            let recent = "SELECT id FROM t ORDER BY rank_profile('recent') LIMIT 5";
+            let written = "WITH a AS (SELECT * FROM t ORDER BY bm25(body, 'version') DESC LIMIT 10) SELECT id FROM a ORDER BY n DESC LIMIT 5";
+            assert_eq!(rows(&db, recent), rows(&db, written), "{what}");
+            for (p, t) in [("by_n", "t"), ("recent", "t"), ("notes", "u")] {
+                run(&db, &format!("DROP RANK PROFILE {p} ON {t}"));
+            }
+            db.storage().flush().unwrap();
+            assert_eq!(format_on_disk(&path), 2, "{what}: no table has a profile");
+            assert_eq!(std::fs::read(&wal).unwrap()[..8], *b"STRWAL01", "{what}");
+            drop(db);
+            let db = Db::open(&path, options(&path)).unwrap();
+            Format2::written().check(&db);
+            assert_eq!(profiles(&db), [Vec::<String>::new(), Vec::new()], "{what}");
+        }
+    }
+}
+
 /// `new` holds the bytes of `old` but for the database id: in a WAL's
 /// header, and in a single file's two meta pages.
 fn same_bytes(old: &Path, new: &Path) {
@@ -374,7 +441,7 @@ fn same_bytes(old: &Path, new: &Path) {
 fn this_version_writes_the_fixtures_byte_for_byte() {
     let dir = tempfile::tempdir().unwrap();
     writer::write_all(dir.path());
-    for set in ["format2", "format3", "seqno"] {
+    for set in ["format2", "format3", "seqno", "profiles"] {
         let (old, new) = (fixtures().join(set), dir.path().join(set));
         same_bytes(&old.join("db.strata"), &new.join("db.strata"));
         same_bytes(&old.join("db.strata-wal"), &new.join("db.strata-wal"));

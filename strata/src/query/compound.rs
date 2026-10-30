@@ -1085,7 +1085,7 @@ fn unqualify(e: &Expr, alias: &str) -> Expr {
 }
 
 /// A SELECT of one table or `WITH` result, with no join, and its name.
-fn one_table(q: &sql::Query) -> Option<(&sql::Select, String)> {
+pub(crate) fn one_table(q: &sql::Query) -> Option<(&sql::Select, String)> {
     let sql::SetExpr::Select(s) = q.body.as_ref() else { return None };
     match s.from.as_slice() {
         [t] if t.joins.is_empty() => match &t.relation {
@@ -1105,7 +1105,7 @@ fn qualified(alias: &str, column: &str) -> Expr {
 /// (`"order"`, `"doc id"`), and the operand of a sign in parentheses when
 /// it starts with a sign itself (`- -1` would print as `--1`, which
 /// starts a comment).
-fn printable(q: &sql::Query) -> String {
+pub(crate) fn printable(q: &sql::Query) -> String {
     let mut q = q.clone();
     query_mut(&mut q, &mut |e| match e {
         Expr::Identifier(id) => quote(id),
@@ -1128,7 +1128,7 @@ fn quote(id: &mut sql::Ident) {
 
 /// Calls `f` on every expression of `q`'s SELECT, its subqueries' too,
 /// each before its subexpressions.
-fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
+pub(crate) fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
     if let Some(w) = &mut q.with {
         for cte in &mut w.cte_tables {
             query_mut(&mut cte.query, f);

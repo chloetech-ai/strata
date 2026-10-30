@@ -67,6 +67,9 @@ impl<'a> Text<'a> {
                     let at = if p.global { "a global phase: scored once over every row" } else { "a second phase: each shard scores its rows" };
                     lines.push(format!("  rerank: {} DESC over the top {} ({at})", self.expr(&p.expr, &names), p.count));
                 }
+                if let Some(r) = &s.profile {
+                    lines.push(format!("  rank profile: {} (hash {})", ident(&r.name), r.hash));
+                }
                 // For one release: `+` between scores meant min-max fusion
                 // before.
                 if s.order.iter().map(|k| &k.expr).chain(s.phases.iter().map(|p| &p.expr)).any(|e| e.adds_raw_scores()) {
