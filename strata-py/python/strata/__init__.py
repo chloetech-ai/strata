@@ -147,8 +147,12 @@ class Database(Search):
 
     @property
     def schema(self) -> dict:
-        """The schema in its short form: {table, key, fields}."""
+        """The first table's schema in its short form: {table, key, fields}."""
         return ordered_schema(json.loads(self._db.schema_json()))
+
+    def tables(self) -> list[dict]:
+        """Every table's schema in its short form, the first first."""
+        return [ordered_schema(json.loads(t)) for t in self._db.tables_json()]
 
     @property
     def embed_errors(self) -> dict[str, str]:
@@ -186,32 +190,34 @@ class Database(Search):
         r = self._db.run(json.dumps(plan))
         return r if isinstance(r, int) else Result._of(r)
 
-    def insert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]]) -> int:
-        """Inserts a row or rows, whose keys must be new; all or none are
-        written. Returns how many."""
-        return self._db.insert(rows)
+    def insert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]], *, table: str | None = None) -> int:
+        """Inserts a row or rows, whose keys must be new, into the first
+        table or `table`; all or none are written. Returns how many."""
+        return self._db.insert(rows, table)
 
-    def upsert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]]) -> int:
+    def upsert(self, rows: Mapping[str, Any] | Iterable[Mapping[str, Any]], *, table: str | None = None) -> int:
         """Inserts a row or rows, replacing the rows that have their keys,
         in transactions of 10,000 rows. Returns how many."""
-        return self._db.upsert(rows)
+        return self._db.upsert(rows, table)
 
-    def delete(self, keys: Any) -> int:
+    def delete(self, keys: Any, *, table: str | None = None) -> int:
         """Deletes the rows with this key or these keys; returns how many
         there were."""
-        return self._db.delete(keys)
+        return self._db.delete(keys, table)
 
-    def import_file(self, path: str | os.PathLike, format: str | None = None) -> dict:
+    def import_file(self, path: str | os.PathLike, format: str | None = None, *, table: str | None = None) -> dict:
         """Loads a JSON Lines, JSON (an array), CSV or TSV file, in `format`
-        or the one its extension names. Into an empty table the rows are
-        bulk-loaded in one commit; otherwise they are upserted. Returns
-        {rows, bulk, skipped_fields}: the columns the schema lacks."""
-        rows, bulk, skipped = self._db.import_file(os.fspath(path), format)
+        or the one its extension names, into the first table or `table`.
+        Into an empty table the rows are bulk-loaded in one commit;
+        otherwise they are upserted. Returns {rows, bulk, skipped_fields}:
+        the columns the schema lacks."""
+        rows, bulk, skipped = self._db.import_file(os.fspath(path), format, table)
         return {"rows": rows, "bulk": bulk, "skipped_fields": skipped}
 
-    def embed(self, text: str, field: str | None = None) -> list[float]:
-        """The query vector of `text` by an embedded field's model."""
-        return self._db.embed(text, field)
+    def embed(self, text: str, field: str | None = None, *, table: str | None = None) -> list[float]:
+        """The query vector of `text` by an embedded field's model (of the
+        first table, or of `table`)."""
+        return self._db.embed(text, field, table)
 
     def optimize(self) -> None:
         """Merges small segments (many small writes leave many)."""

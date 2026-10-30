@@ -45,6 +45,14 @@
 //! A write that spans shards is one transaction per shard, not one across
 //! them.
 //!
+//! A coordinator serves every table its shards serve alike: it asks each
+//! replica for its tables when it connects (`Schema`), again when a
+//! request names a table it does not know, and after a `CREATE TABLE` or
+//! `DROP TABLE` it ran on every shard ([`Coordinator::ddl`]). A row of a
+//! table placed by a column (`shard_by`, [`Schema::with_shard_by`]) goes
+//! to the shard of that column's value instead of its key's, so that rows
+//! sharing a value (a user's events) live on one shard.
+//!
 //! The coordinator asks each replica the protocol versions it speaks
 //! (`Hello`, [`crate::grpc::PROTOCOL`]) when it connects, again every
 //! minute and after the replica fails, as it may have restarted on another
@@ -55,6 +63,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
@@ -64,7 +73,7 @@ use strata::query::agg::Part;
 use strata::query::exec::ResultSet;
 use strata::query::ir::Plan;
 use strata::query::stats::TermStats;
-use strata::query::{bind_write, Conflict, Params, Projection, Select, Write};
+use strata::query::{bind_command, Command, Conflict, Params, Projection, Select, Write};
 use strata::schema::Schema;
 use strata::value::Value;
 use tonic::service::interceptor::InterceptedService;
@@ -75,7 +84,7 @@ use crate::auth::Secret;
 use crate::grpc::{params_to_pb, result_from_pb, MIN_PROTOCOL, PROTOCOL};
 use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
-use crate::service::{op_key, After, QueryReq, Written};
+use crate::service::{op_place, op_schema, After, QueryReq, Written};
 use crate::slots::{hash_shard_of, SlotMap};
 use crate::{json as js, plan_pb, ApiError};
 
@@ -216,6 +225,30 @@ const HELLO_EVERY_MS: u64 = 60_000;
 /// replicate: otherwise each numbers the writes it takes in its own order.
 const ONE_REPLICA: &str = "seq_no() and if_seq_no need one replica per shard, or a shard whose replicas replicate from a primary (--replicas): otherwise each replica numbers its own writes";
 
+/// The tables every replica that answered `Schema` names alike, in the
+/// first one's order: each names them all (`tables_json`), or, from a
+/// server before tables, its first table alone. One that is not on every
+/// replica is left out, and logged.
+fn common_tables(answers: &[pb::SchemaResponse]) -> Result<Vec<Arc<Schema>>, ApiError> {
+    let lists: Vec<Vec<&str>> = answers
+        .iter()
+        .map(|a| match a.tables_json.is_empty() {
+            true => vec![a.schema_json.as_str()],
+            false => a.tables_json.iter().map(String::as_str).collect(),
+        })
+        .collect();
+    let Some(first) = lists.first() else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for t in first {
+        let schema: Schema = serde_json::from_str(t).map_err(ApiError::internal)?;
+        match lists.iter().all(|l| l.contains(t)) {
+            true => out.push(Arc::new(schema)),
+            false => tracing::warn!(table = %schema.table, "a table some shard replicas lack, or hold with another schema, is not served: create it on every shard (CREATE TABLE IF NOT EXISTS through the coordinator)"),
+        }
+    }
+    Ok(out)
+}
+
 /// The protocol to speak with a server that answered `Hello`: the newest
 /// both speak.
 fn agree(h: &pb::HelloResponse) -> Result<u32, String> {
@@ -311,7 +344,13 @@ pub struct Coordinator {
     /// Each shard's replicas, as given: URLs joined by `|`.
     pub shards: Vec<String>,
     replicas: Vec<Vec<Replica>>,
+    /// The first table's schema.
     pub schema: Schema,
+    /// The tables every replica serves alike, the first first
+    /// ([`Self::refresh`]).
+    catalog: RwLock<Arc<Vec<Arc<Schema>>>>,
+    /// When the replicas were last asked for their tables.
+    asked: Mutex<Option<Instant>>,
     pub opts: CoordOptions,
     epoch: Instant,
     /// Where each read starts among a shard's replicas, to spread the load.
@@ -444,11 +483,12 @@ impl Coordinator {
             replicas.push(rs);
         }
         let mut schemas = Vec::new();
+        let mut tables = Vec::new();
         for (i, rs) in replicas.iter().enumerate() {
             let answers = join_all(rs.iter().map(|r| {
                 let mut c = r.client.clone();
                 let ask = async move {
-                    let s = c.schema(pb::Empty {}).await?.into_inner().schema_json;
+                    let s = c.schema(pb::Empty {}).await?.into_inner();
                     Ok::<_, tonic::Status>((s, hello(&mut c).await?))
                 };
                 tokio::time::timeout(Duration::from_secs(5), ask)
@@ -458,7 +498,8 @@ impl Coordinator {
             for (r, a) in rs.iter().zip(answers) {
                 match a {
                     Ok(Ok((s, said))) => {
-                        schemas.push(s);
+                        schemas.push(s.schema_json.clone());
+                        tables.push(s);
                         r.heard(&said);
                     }
                     Ok(Err(e)) => errors.push(format!("{}: {}", r.url, e.message())),
@@ -476,6 +517,7 @@ impl Coordinator {
         if schema.primary_key.is_none() {
             return Err(ApiError::bad("a sharded table needs a primary key to route writes"));
         }
+        let catalog = common_tables(&tables)?;
         // Slots once every replica answering speaks protocol 4.
         let old = replicas.iter().flatten().find(|r| (1..4).contains(&r.protocol.load(Ordering::Relaxed)));
         let slots = match (old, &opts.slots) {
@@ -510,6 +552,8 @@ impl Coordinator {
             shards,
             replicas,
             schema,
+            catalog: RwLock::new(Arc::new(catalog)),
+            asked: Mutex::new(Some(Instant::now())),
             opts,
             epoch: Instant::now(),
             turn: AtomicUsize::new(0),
@@ -522,6 +566,40 @@ impl Coordinator {
             fetch_lost: AtomicU64::new(0),
             slots,
         })
+    }
+
+    /// The tables it serves, the first first: those every replica named
+    /// alike when last asked ([`Self::refresh`]).
+    pub fn catalog(&self) -> Vec<Arc<Schema>> {
+        self.catalog.read().unwrap_or_else(|e| e.into_inner()).to_vec()
+    }
+
+    /// Asks every replica for its tables again, at most once a second
+    /// unless `now`, and serves those every replica that answered (within
+    /// 5 s) names alike. Returns whether they changed.
+    pub async fn refresh(&self, now: bool) -> bool {
+        {
+            let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+            if !now && asked.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+                return false;
+            }
+            *asked = Some(Instant::now());
+        }
+        let calls = self.replicas.iter().flatten().map(|r| {
+            let mut c = r.client.clone();
+            async move { tokio::time::timeout(Duration::from_secs(5), c.schema(pb::Empty {})).await }
+        });
+        let answers: Vec<pb::SchemaResponse> = join_all(calls).await.into_iter().filter_map(|a| a.ok()?.ok()).map(|a| a.into_inner()).collect();
+        let tables = match common_tables(&answers) {
+            Ok(t) if t.first().is_some_and(|f| **f == self.schema) => t,
+            _ => return false,
+        };
+        let mut held = self.catalog.write().unwrap_or_else(|e| e.into_inner());
+        let changed = **held != tables;
+        if changed {
+            *held = Arc::new(tables);
+        }
+        changed
     }
 
     /// What `/metrics` shows of the shards: calls by outcome, retries and
@@ -762,12 +840,12 @@ impl Coordinator {
 
     /// Summed statistics, from every shard, of `sql` or of `plan`, seeing
     /// the writes `after` names.
-    pub async fn term_stats(&self, sql: &str, plan: Option<&Plan>, params: &Params, after: &After, deadline: Instant) -> Result<(TermStats, Vec<u64>), ApiError> {
+    pub async fn term_stats(&self, sql: &str, schema: &Schema, plan: Option<&Plan>, params: &Params, after: &After, deadline: Instant) -> Result<(TermStats, Vec<u64>), ApiError> {
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let mut sum = TermStats::default();
         let mut leases = Vec::new();
         let protocol = self.protocol();
-        let read = Read::new(sql, params, plan, protocol, self.epoch(), || Plan::bind(sql, &self.schema, params))?.after(self.after(after)?);
+        let read = Read::new(sql, params, plan, protocol, self.epoch(), || Plan::bind(sql, schema, params))?.after(self.after(after)?);
         for (_, a) in self.shard_stats(&read, protocol, (0..self.replicas.len()).collect(), start, deadline).await {
             let (s, _, lease) = a?;
             sum.add(&s);
@@ -776,7 +854,9 @@ impl Coordinator {
         Ok((sum, leases))
     }
 
-    pub async fn query(&self, req: &QueryReq, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
+    /// Runs `select`, a query of table `schema`, on every shard and merges
+    /// their answers.
+    pub async fn query(&self, req: &QueryReq, schema: &Schema, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
         if select.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && !(0..self.replicas.len()).all(|i| self.numbered_alike(i)) {
             return Err(ApiError::bad(ONE_REPLICA));
         }
@@ -784,17 +864,17 @@ impl Coordinator {
         let protocol = self.protocol();
         let n = self.replicas.len();
         // Query then fetch: the query round answers the keys alone.
-        let ids = match protocol >= 3 && self.opts.fetch && n > 1 && strata::cluster::fetches(select, &self.schema) && self.fetch_pays(select) {
-            true => Some(strata::cluster::ids(select, &self.schema)?),
+        let ids = match protocol >= 3 && self.opts.fetch && n > 1 && strata::cluster::fetches(select, schema) && self.fetch_pays(select) {
+            true => Some(strata::cluster::ids(select, schema)?),
             false => None,
         };
-        let ids_plan = ids.as_ref().map(|q| Plan::of_select(&self.schema, q));
+        let ids_plan = ids.as_ref().map(|q| Plan::of_select(schema, q));
         let none = Params::new();
         let (params, given) = match &ids_plan {
             Some(p) => (&none, Some(p)),
             None => (&req.params, req.plan.as_deref()),
         };
-        let read = &Read::new(&req.sql, params, given, protocol, self.epoch(), || Ok(Plan::of_select(&self.schema, select)))?.after(self.after(&req.after)?);
+        let read = &Read::new(&req.sql, params, given, protocol, self.epoch(), || Ok(Plan::of_select(schema, select)))?.after(self.after(&req.after)?);
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let ranked_text = strata::cluster::scores_bm25(select);
         // Per shard: the replica holding a lease for this query, and the lease.
@@ -880,7 +960,7 @@ impl Coordinator {
                     let i = owner.get(&Part::of(k)).ok_or_else(|| ApiError::internal("a merged key no shard answered"))?;
                     keys[*i].push(k.clone());
                 }
-                self.fetch(&req.sql, select, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &mut failed).await?
+                self.fetch(&req.sql, schema, select, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &mut failed).await?
             }
         };
         let missing = failed.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| self.shards[i].clone()).collect();
@@ -917,6 +997,7 @@ impl Coordinator {
     async fn fetch(
         &self,
         sql: &str,
+        schema: &Schema,
         select: &Select,
         ranked: ResultSet,
         held: &[(usize, usize, u64)],
@@ -929,8 +1010,8 @@ impl Coordinator {
         let mut reads = Vec::new();
         for &(i, r, lease) in held {
             if !keys[i].is_empty() {
-                let q = strata::cluster::fetch(select, &self.schema, std::mem::take(&mut keys[i]))?;
-                let plan = Plan::of_select(&self.schema, &q);
+                let q = strata::cluster::fetch(select, schema, std::mem::take(&mut keys[i]))?;
+                let plan = Plan::of_select(schema, &q);
                 reads.push((i, r, lease, Read::new(sql, &Params::new(), Some(&plan), protocol, self.epoch(), || Ok(plan.clone()))?.after(after.to_vec())));
             } else if lease != 0 {
                 let mut c = self.replicas[i][r].client.clone();
@@ -1087,11 +1168,18 @@ impl Coordinator {
         Written { rows, seq_no: None, seq_nos }
     }
 
-    /// An INSERT goes to the shards of its documents' keys; UPDATE and
-    /// DELETE go to every shard, so they take no LIMIT here.
+    /// An INSERT goes to the shards of its documents' keys (or their
+    /// shard_by values); UPDATE and DELETE go to every shard, so they take
+    /// no LIMIT here.
     pub async fn sql(&self, sql: &str, params: &Params) -> Result<Written, ApiError> {
-        match bind_write(sql, &self.schema, params)? {
-            Some(Write::Insert { docs, conflict }) => {
+        let catalog = self.catalog();
+        let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
+        let (schema, write) = match bind_command(sql, &tables, params)? {
+            Command::Write { table, write } => (catalog.iter().find(|t| t.table == table).ok_or_else(|| ApiError::internal("a statement bound to a table the coordinator does not serve"))?, write),
+            _ => return Err(ApiError::bad("not a write statement")),
+        };
+        match write {
+            Write::Insert { docs, conflict } => {
                 let op = match conflict {
                     Conflict::Fail => "insert",
                     Conflict::Replace => "upsert",
@@ -1101,14 +1189,26 @@ impl Coordinator {
                         return Err(ApiError::bad("INSERT ... ON CONFLICT DO NOTHING and DO UPDATE are not supported through a coordinator yet (INSERT OR REPLACE is)"))
                     }
                 };
-                let ops = docs.iter().map(|d| json!({"op": op, "doc": js::document_json(&self.schema, d)})).collect();
+                // Rows of the first table name none, as before there were
+                // tables.
+                let named = (schema.table != self.schema.table).then(|| json!(schema.table));
+                let ops = docs
+                    .iter()
+                    .map(|d| {
+                        let mut op = json!({"op": op, "doc": js::document_json(schema, d)});
+                        if let Some(t) = &named {
+                            op["table"] = t.clone();
+                        }
+                        op
+                    })
+                    .collect();
                 self.write_ops(ops, None).await
             }
             // Each shard would take its own LIMIT rows.
-            Some(Write::Update { select, .. } | Write::Delete { select }) if select.limit.is_some() => {
+            Write::Update { select, .. } | Write::Delete { select } if select.limit.is_some() => {
                 Err(ApiError::bad("UPDATE ... LIMIT and DELETE ... LIMIT are not supported through a coordinator yet"))
             }
-            Some(_) => {
+            _ => {
                 let r = pb::WriteRequest { sql: sql.into(), params: params_to_pb(params), epoch: self.epoch(), ..Default::default() };
                 let calls = (0..self.replicas.len()).map(|i| {
                     let r = r.clone();
@@ -1116,17 +1216,40 @@ impl Coordinator {
                 });
                 Ok(self.written(join_all(calls).await.into_iter().collect::<Result<Vec<_>, _>>()?))
             }
-            None => Err(ApiError::bad("not a write statement")),
         }
+    }
+
+    /// Runs `CREATE TABLE` or `DROP TABLE` on every shard (at its primary,
+    /// or every replica while none has a role), then serves the tables
+    /// they all have. It is one change per shard, not one across them: a
+    /// shard that fails leaves the others changed, and the statement runs
+    /// again with `IF NOT EXISTS` or `IF EXISTS`.
+    pub async fn ddl(&self, sql: &str, params: &Params) -> Result<Written, ApiError> {
+        let r = pb::WriteRequest { sql: sql.into(), params: params_to_pb(params), epoch: self.epoch(), ..Default::default() };
+        let calls = (0..self.replicas.len()).map(|i| {
+            let r = r.clone();
+            async move { self.write(i, r).await }
+        });
+        let answers = join_all(calls).await;
+        self.refresh(true).await;
+        for a in answers {
+            a?;
+        }
+        Ok(Written::default())
     }
 
     /// Write operations, grouped by the shard of their key. An idempotency
     /// key goes to each shard as `key/shard`, so a retry after a replica
     /// failed is not applied twice by the replicas that took it.
     pub async fn write_ops(&self, ops: Vec<Json>, key: Option<String>) -> Result<Written, ApiError> {
+        let mut catalog = self.catalog();
+        // A table created since the replicas were last asked.
+        if ops.iter().any(|op| op_schema(&catalog, op).is_err()) && self.refresh(false).await {
+            catalog = self.catalog();
+        }
         let mut by_shard: BTreeMap<usize, Vec<Json>> = BTreeMap::new();
         for op in ops {
-            let s = self.shard_of(&op_key(&self.schema, &op)?);
+            let s = self.shard_of(&op_place(op_schema(&catalog, &op)?, &op)?);
             if op.get("if_seq_no").is_some() && !self.numbered_alike(s) {
                 return Err(ApiError::bad(ONE_REPLICA));
             }

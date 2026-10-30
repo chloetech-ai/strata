@@ -602,7 +602,7 @@ impl pb::strata_server::Strata for Stuck {
         std::future::pending().await
     }
     async fn schema(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::SchemaResponse>, tonic::Status> {
-        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone() }))
+        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone(), ..Default::default() }))
     }
     async fn health(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
         std::future::pending().await
@@ -642,7 +642,7 @@ impl pb::strata_server::Strata for Overloaded {
         Err(tonic::Status::unimplemented("read only"))
     }
     async fn schema(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::SchemaResponse>, tonic::Status> {
-        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone() }))
+        Ok(tonic::Response::new(pb::SchemaResponse { schema_json: self.0.clone(), ..Default::default() }))
     }
     async fn health(&self, _: tonic::Request<pb::Empty>) -> Result<tonic::Response<pb::HealthResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::HealthResponse { status: "ok".into(), ..Default::default() }))
@@ -1725,7 +1725,7 @@ fn imports_files_from_the_command_line() {
     std::fs::write(&rows, "{\"id\": \"a\", \"title\": \"first\"}\n{\"id\": \"b\", \"title\": \"second\", \"price\": 2}\n").unwrap();
     std::fs::write(&more, "id\ttitle\tprice\nb\tsecond again\t3\nc\tthird\t\n").unwrap();
     let db = dir.path().join("items.strata");
-    server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows.clone(), more]).unwrap();
+    server::import_files(&db, Some(&schema), None, dir.path(), None, false, &[rows.clone(), more]).unwrap();
     let opened = Db::open(&db, DbOptions::default()).unwrap();
     let r = opened.query("SELECT id, title, price FROM items", &Params::new()).unwrap();
     let mut got: Vec<String> = r.rows.iter().map(|r| format!("{:?}", r)).collect();
@@ -1734,7 +1734,7 @@ fn imports_files_from_the_command_line() {
     assert!(got[1].contains("second again") && got[1].contains("3.0"), "{got:?}");
     drop(opened);
     // An existing database takes no schema.
-    assert!(server::import_files(&db, Some(&schema), dir.path(), None, false, &[rows]).unwrap_err().contains("exists"));
+    assert!(server::import_files(&db, Some(&schema), None, dir.path(), None, false, &[rows]).unwrap_err().contains("exists"));
 }
 
 // OPS-3: a replica that refused a query because too many were running was

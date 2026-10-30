@@ -537,7 +537,8 @@ pub(crate) enum Sub {
     Exists,
     /// `x < (SELECT ...)`, or a bound of `BETWEEN`: its one value.
     Scalar,
-    /// A traversal's seeds: its rows' keys.
+    /// A traversal's seeds: its rows' keys, or its one column's values when
+    /// it reads another table.
     Seeds,
 }
 
