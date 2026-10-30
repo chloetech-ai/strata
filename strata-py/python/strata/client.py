@@ -142,6 +142,14 @@ class Client(Search):
         body = {k: v for k, v in {"text": text, "image": data, "field": field, "table": table}.items() if v is not None}
         return self._call("POST", "/v1/embed", body)["vector"]
 
+    def sid_next(self, prefixes: Iterable[str], *, field: str, where: str | None = None, params: Mapping[str, Any] | None = None, table: str | None = None, **kw: Any) -> dict[str, dict[str, int]]:
+        """The codes that can follow each prefix of semantic-ID field
+        `field` among the rows `where` matches (POST /v1/sid/next), summed
+        over the shards on a coordinator: {prefix: {code: rows}}."""
+        body = {"field": field, "prefixes": list(prefixes), "where": where, "params": _params(params, kw), "table": table}
+        got = self._call("POST", "/v1/sid/next", {k: v for k, v in body.items() if v is not None})
+        return {n["prefix"]: {c["code"]: c["count"] for c in n["next"]} for n in got["next"]}
+
     def write(self, ops: list[dict]) -> int:
         """Write operations as /v1/write takes them ({"op": "insert",
         "doc": {...}}, {"op": "delete", "key": k}, ...), in one request."""
