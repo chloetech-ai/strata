@@ -1172,6 +1172,10 @@ async fn replicas_are_compared_while_writes_go_on() {
     let mut at = 0;
     for _ in 0..8 {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // A round compares the primary's last write when it starts, so one
+        // committed since the last round makes its version newer, however
+        // long commits take meanwhile (a slow fsync holds them all).
+        until("a write after the last round's version", || async { last(&pdb) > at }).await;
         let v = p.verify_replicas(Duration::from_secs(10)).await.unwrap();
         for k in 0..2 {
             let r = &v["replicas"][k];
