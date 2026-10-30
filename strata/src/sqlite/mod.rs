@@ -72,8 +72,11 @@ pub const META_TABLE: &str = "_strata_tables";
 pub fn is_sqlite_file(path: &std::path::Path) -> bool {
     use std::io::Read;
     let mut magic = [0u8; 16];
-    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == b"SQLite format 3\0"
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && magic == *MAGIC
 }
+
+/// The first 16 bytes of every SQLite database file.
+pub const MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// `name`, or `name_2`, `name_3`..: the first not in `used` (in any case),
 /// which it joins.

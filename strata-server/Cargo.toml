@@ -29,6 +29,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 libc = "0.2"
 # The slot hash (`slots`): xxh3, 64 bits.
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_64"] }
+# SQLite files sent to `/v1/import` and written for `/v1/export`.
+tempfile = "3"
 
 [features]
 # BERT embedding models (bge-small-en-v1.5, snowflake-arctic-embed-m-v1.5) through candle.
@@ -43,7 +45,6 @@ tonic-build = "0.12"
 protox = "0.7"
 
 [dev-dependencies]
-tempfile = "3"
 base64 = "0.22"
 # PNGs written by the tests of `vision`.
 image = { version = "0.25", default-features = false, features = ["png"] }

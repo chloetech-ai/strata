@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
@@ -210,6 +211,12 @@ impl Source {
     /// kept for it ([`super::META_TABLE`]), or one made from the SQLite
     /// table's declarations and values (see [`super`]).
     pub fn plan(&self, db: Option<&Db>, opts: &ImportOptions) -> Result<Plan> {
+        self.plan_over(&db.map(Db::catalog).unwrap_or_default(), opts)
+    }
+
+    /// [`Source::plan`] for a database whose tables are `existing`, such as
+    /// a server's, which may hold them on shards.
+    pub fn plan_over(&self, existing: &[Arc<Schema>], opts: &ImportOptions) -> Result<Plan> {
         let cat = catalog(&self.conn)?;
         let mut skipped = cat.skipped.clone();
         let mut tables: Vec<&Table> = Vec::new();
@@ -227,7 +234,6 @@ impl Source {
             }
             skipped.retain(|(n, _)| opts.tables.iter().any(|t| t.eq_ignore_ascii_case(n)));
         }
-        let existing = db.map(Db::catalog).unwrap_or_default();
         // Strata's names for the tables, distinct in any case.
         let mut used = HashSet::new();
         let names: Vec<String> = tables.iter().map(|t| distinct(ident(&t.name), &mut used)).collect();
@@ -424,6 +430,8 @@ fn catalog(conn: &Connection) -> Result<Catalog> {
     let is_virtual = |sql: &str| sql.trim_start().get(..20).is_some_and(|s| s.eq_ignore_ascii_case("CREATE VIRTUAL TABLE"));
     let virtuals: Vec<String> = entries.iter().filter(|(_, _, sql)| is_virtual(sql)).map(|(_, n, _)| format!("{}_", n.to_ascii_lowercase())).collect();
     let mut cat = Catalog { tables: Vec::new(), skipped: Vec::new(), fts: Vec::new(), meta: HashMap::new() };
+    // External-content FTS indexes, by name, with the table they index.
+    let mut indexes: Vec<(String, String)> = Vec::new();
     for (ty, name, sql) in &entries {
         let lower = name.to_ascii_lowercase();
         if lower.starts_with("sqlite_") || lower == META_TABLE {
@@ -445,6 +453,7 @@ fn catalog(conn: &Connection) -> Result<Catalog> {
                     Some("") => cat.skipped.push((name.clone(), format!("a contentless {module} index, which holds no text"))),
                     Some(c) => {
                         cat.skipped.push((name.clone(), format!("the {module} index of {c} (the columns it indexes are TEXT fields)")));
+                        indexes.push((name.to_ascii_lowercase(), c.to_string()));
                         cat.fts.push(f);
                     }
                 },
@@ -457,6 +466,22 @@ fn catalog(conn: &Connection) -> Result<Catalog> {
             continue;
         }
         cat.tables.push(read_table(conn, name, sql)?);
+    }
+    // The triggers that keep a table's FTS index in step belong to the
+    // index, which Strata keeps itself.
+    for t in &mut cat.tables {
+        let of: Vec<&str> = indexes.iter().filter(|(_, c)| c.eq_ignore_ascii_case(&t.name)).map(|(n, _)| n.as_str()).collect();
+        if of.is_empty() {
+            continue;
+        }
+        let mut keep = Vec::new();
+        for trigger in std::mem::take(&mut t.triggers) {
+            let sql: String = conn.query_row("SELECT lower(sql) FROM sqlite_master WHERE type = 'trigger' AND name = ?1", [&trigger], |r| r.get(0))?;
+            if !of.iter().any(|n| sql.contains(n)) {
+                keep.push(trigger);
+            }
+        }
+        t.triggers = keep;
     }
     let has_meta = entries.iter().any(|(ty, n, _)| ty == "table" && n.eq_ignore_ascii_case(META_TABLE));
     if has_meta {

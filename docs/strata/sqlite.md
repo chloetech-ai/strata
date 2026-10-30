@@ -87,6 +87,26 @@ Left out, and listed in the plan's notes: `UNIQUE` constraints other than the ke
 
 Each table is a [short-form schema](server.md#schemas) with its `source` table, the `columns` read (SQLite column: field) and `notes` on what did not carry over. Edit it (a field's type, analyzer, `multi`, a vector's index, the table's name) and give it back with `--schema`: a schema applies to the SQLite table its `source` names, or else to the one of its name, and the columns fill the fields of their names. `--schema` also takes one schema or an array of them.
 
+## Over HTTP and in the UI
+
+A running server imports a SQLite file sent to `POST /v1/import` as `?format=sqlite` (or with the content type `application/vnd.sqlite3`, or no format at all: the server knows the file by its first bytes), up to `--max-body-mb` (256 MiB):
+
+```sh
+curl -s -X POST 'localhost:7700/v1/import?format=sqlite&plan=true' -H 'content-type: application/vnd.sqlite3' --data-binary @shop.sqlite
+curl -s -X POST 'localhost:7700/v1/import?format=sqlite&tables=orders,customers' -H 'content-type: application/vnd.sqlite3' --data-binary @shop.sqlite
+# {"tables": [{"source": "customers", "table": "customers", "rows": 91, "created": true, "bulk": false, "notes": []}, ...], "skipped": {...}, "written": 921, "took_ms": 48.2}
+```
+
+`?plan=true` answers the plan and writes nothing, `?tables=` picks tables and `?blobs_base64=true` keeps BLOB columns. The server makes the plan and reads every row once before it writes, so that a value that does not fit writes nothing; then it creates each table it lacks, as `CREATE TABLE` does, and upserts the rows through its writer 1,000 at a time, as an import of rows does (the rows before a failed write stay written). A table the server has keeps its schema, so to import with schemas of your own, create the tables first with `CREATE TABLE` and import into them. A coordinator imports into the tables its shards have and creates none, and a primary of [replicas](server.md#replication-a-primary-and-its-replicas) creates none either, since tables do not reach replicas yet.
+
+`GET /v1/export` sends the database as a new SQLite file, written from one snapshot to a temporary file and streamed from it: `?tables=a,b` for some tables, `?fts=false`, `?indexes=false` and `?schemas=false` as `--no-fts`, `--no-indexes` and `--no-schemas` below. A coordinator holds no rows, so it exports nothing; export each shard's server.
+
+```sh
+curl -s 'localhost:7700/v1/export?tables=orders' -o orders.sqlite
+```
+
+In the UI, the **Schema and import** tab has both: a SQLite file to preview (the plan, table by table) and import, and a button that downloads the database as SQLite. The Python `Client` has `import_sqlite`, `plan_sqlite` and `export_sqlite` ([Python](python.md#a-server-from-python)).
+
 ## Export
 
 ```sh

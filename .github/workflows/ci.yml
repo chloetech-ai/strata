@@ -251,6 +251,10 @@ jobs:
           ./target/release/strata-server import --db "$RUNNER_TEMP/s.strata" "$RUNNER_TEMP/s.sqlite"
           ./target/release/strata-server export --db "$RUNNER_TEMP/s.strata" "$RUNNER_TEMP/s2.sqlite"
           python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); assert c.execute(\"SELECT notes.rowid, at FROM notes_fts JOIN notes ON notes.rowid = notes_fts.rowid WHERE notes_fts MATCH 'river'\").fetchall() == [(1, '2026-10-01 12:00:00')]" "$RUNNER_TEMP/s2.sqlite"
+          # And over HTTP: the SQLite file into the running server, a new table, and the database back out.
+          curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=sqlite' -H 'content-type: application/vnd.sqlite3' --data-binary @"$RUNNER_TEMP/s.sqlite" | grep -q '"written":1'
+          curl -sf http://127.0.0.1:7702/v1/export -o "$RUNNER_TEMP/s3.sqlite"
+          python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); assert c.execute('SELECT count(*) FROM t').fetchone() == (3,); assert c.execute('SELECT body FROM notes').fetchall() == [('a first note about rivers and mountains',)]" "$RUNNER_TEMP/s3.sqlite"
 
   python:
     name: Python package on ${{ matrix.os }}

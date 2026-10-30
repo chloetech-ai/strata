@@ -1749,6 +1749,134 @@ impl Service {
         Ok((n, unknown))
     }
 
+    /// Imports the tables of the SQLite file in `body`
+    /// ([`strata::sqlite`]): each into the table of its name, created from
+    /// the SQLite table when the database lacks it, its rows upserted
+    /// through the writer (or routed to the shards) [`IMPORT_OPS`] a
+    /// request. The plan is made and every row read once before anything
+    /// is written, so that a value that does not fit writes nothing. With
+    /// `plan_only`, returns the plan ([`strata::sqlite::Plan::to_json`])
+    /// and writes nothing; otherwise what was written
+    /// ([`strata::sqlite::Imported::to_json`]).
+    pub async fn import_sqlite(self: &Arc<Self>, body: axum::body::Bytes, opts: strata::sqlite::ImportOptions, plan_only: bool, timeout_ms: u64) -> Result<Json, ApiError> {
+        let catalog = self.catalog();
+        let checked = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+            let dir = tempfile::tempdir().map_err(ApiError::internal)?;
+            let path = dir.path().join("import.sqlite");
+            std::fs::write(&path, &body).map_err(ApiError::internal)?;
+            let src = strata::sqlite::Source::open(&path).map_err(|e| ApiError::bad(e.to_string()))?;
+            let plan = src.plan_over(&catalog, &opts)?;
+            if !plan_only {
+                for t in &plan.tables {
+                    src.documents(t, |docs| {
+                        for d in docs {
+                            d?;
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+            Ok((dir, src, plan))
+        })
+        .await
+        .map_err(ApiError::internal)??;
+        let (dir, src, plan) = checked;
+        if plan_only {
+            return Ok(plan.to_json());
+        }
+        enum Step {
+            Table(usize),
+            Ops(Vec<Json>),
+        }
+        let tables = plan.tables.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<strata::Result<Step>>(1);
+        let reader = tokio::task::spawn_blocking(move || {
+            let _dir = dir;
+            for (i, t) in tables.iter().enumerate() {
+                if tx.blocking_send(Ok(Step::Table(i))).is_err() {
+                    return;
+                }
+                let op = if t.schema.primary_key.is_some() { "upsert" } else { "insert" };
+                let r = src.documents(t, |docs| {
+                    loop {
+                        let chunk: strata::Result<Vec<Json>> =
+                            (&mut *docs).take(IMPORT_OPS).map(|d| d.map(|d| json!({"op": op, "table": t.schema.table, "doc": js::document_json(&t.schema, &d)}))).collect();
+                        let last = chunk.as_ref().map_or(true, |c| c.len() < IMPORT_OPS);
+                        // The writing side stopped: a write failed.
+                        if tx.blocking_send(chunk.map(Step::Ops)).is_err() {
+                            return Err(strata::Error::Query("stopped".into()));
+                        }
+                        if last {
+                            return Ok(());
+                        }
+                    }
+                });
+                if r.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut out = strata::sqlite::Imported { tables: Vec::new(), skipped: plan.skipped.clone() };
+        while let Some(step) = rx.recv().await {
+            match step? {
+                Step::Table(i) => {
+                    let t = &plan.tables[i];
+                    if !t.exists {
+                        self.create_table(t.schema.clone(), timeout_ms).await?;
+                    }
+                    out.tables.push(strata::sqlite::TableImport { source: t.source.clone(), table: t.schema.table.clone(), rows: 0, created: !t.exists, bulk: false, notes: t.notes.clone() });
+                }
+                Step::Ops(ops) => {
+                    if !ops.is_empty() {
+                        let n = self.write_ops(ops, None).await?.rows;
+                        if let Some(t) = out.tables.last_mut() {
+                            t.rows += n;
+                        }
+                    }
+                }
+            }
+        }
+        reader.await.map_err(ApiError::internal)?;
+        Ok(out.to_json())
+    }
+
+    /// Creates a table, as `CREATE TABLE` does ([`Self::ddl`]): on a local
+    /// database, once no write holds the writer. A coordinator creates
+    /// tables only through `CREATE TABLE`.
+    async fn create_table(self: &Arc<Self>, schema: Schema, timeout_ms: u64) -> Result<(), ApiError> {
+        let Backend::Local(db) = &self.backend else {
+            return Err(ApiError::bad(format!("a coordinator imports into the tables its shards have: create table {} first (CREATE TABLE through the coordinator), or import on each shard", schema.table)));
+        };
+        self.takes_writes()?;
+        if let Replication::Primary(_) = self.replication() {
+            return Err(conflict(format!("the import would create table {}, and CREATE TABLE does not reach replicas yet: give each copy its tables before it replicates", schema.table)));
+        }
+        let deadline = Instant::now() + self.timeout_of(timeout_ms);
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || wait_for_writer(deadline, || Ok(db.create_table(schema.clone())?))).await.map_err(ApiError::internal)??;
+        self.refresh_models();
+        Ok(())
+    }
+
+    /// Writes the tables (all, or `opts.tables`) to a new SQLite file, from
+    /// one snapshot ([`strata::sqlite::export`]), in a directory that is
+    /// removed when the returned [`tempfile::TempDir`] is dropped. Only a
+    /// server with the database: a coordinator holds no rows.
+    pub async fn export_sqlite(self: &Arc<Self>, opts: strata::sqlite::ExportOptions) -> Result<(tempfile::TempDir, PathBuf, strata::sqlite::Exported), ApiError> {
+        let Backend::Local(db) = &self.backend else {
+            return Err(ApiError::bad("a coordinator holds no rows: export from each shard's server, or with strata-server export"));
+        };
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || {
+            let dir = tempfile::tempdir().map_err(ApiError::internal)?;
+            let path = dir.path().join("export.sqlite");
+            let r = strata::sqlite::export(&db, &path, &opts)?;
+            Ok((dir, path, r))
+        })
+        .await
+        .map_err(ApiError::internal)?
+    }
+
     /// "ok"; for a database, "failing" when it cannot write until it
     /// restarts ([`Self::failing`]) and "degraded" while its flushes fail
     /// (writes still commit, to the WAL, until the memtable holds twice its
