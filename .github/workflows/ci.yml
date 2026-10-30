@@ -123,7 +123,7 @@ jobs:
   # clippy over the feature's code in Strata and the server.
   audio:
     name: sound (feature audio)
-    runs-on: ubuntu-latest
+    runs-on: gh-linux
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
