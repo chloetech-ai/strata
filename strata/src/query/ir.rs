@@ -62,8 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 11] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE];
+pub const FEATURES: [&str; 12] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -111,6 +111,9 @@ pub const RANK_MODELS: &str = "rank_models";
 /// The feature of a plan that keeps the first row of each group
 /// ([`Node::DistinctOn`]).
 pub const DISTINCT_ON: &str = "distinct_on";
+/// The feature of a plan that ranks by a ranking given as primary keys
+/// ([`Expr::Ranked`], `ranked(:keys)`).
+pub const RANKED: &str = "ranked";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -663,6 +666,13 @@ pub enum Expr {
     },
     /// Personalized PageRank from a traversal's seeds.
     Ppr(Box<Graph>),
+    /// A ranking given as primary keys, best first (`ranked(:keys)`):
+    /// `-(position)` from 1 for a listed row, NULL for others. Feature
+    /// [`RANKED`].
+    Ranked {
+        #[serde(with = "lit_list")]
+        keys: Vec<Value>,
+    },
     /// The rows of a plan (graph seeds from a query of the table, which
     /// the executor runs).
     Subquery(Box<Node>),
@@ -1210,7 +1220,7 @@ impl Expr {
     /// the fused shapes of them that came before.
     pub fn is_rank_expression(&self) -> bool {
         match self {
-            Expr::Field(_) | Expr::Hops | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::MaxSim { .. } | Expr::Decay { .. } | Expr::Ppr(_) => false,
+            Expr::Field(_) | Expr::Hops | Expr::Bm25 { .. } | Expr::Similarity { .. } | Expr::Sparse { .. } | Expr::MaxSim { .. } | Expr::Decay { .. } | Expr::Ppr(_) | Expr::Ranked { .. } => false,
             Expr::Rrf { inputs, .. } | Expr::Product(inputs) => inputs.iter().any(Expr::is_rank_expression),
             Expr::Weighted(terms) => terms.iter().any(|(_, x)| x.is_rank_expression()),
             _ => true,
@@ -1407,6 +1417,11 @@ impl Plan {
         if root.walks_edge_tables() {
             features.push(EDGE_TABLE.to_string());
         }
+        let mut ranked = false;
+        root.visit_exprs(&mut |e| ranked |= matches!(e, Expr::Ranked { .. }));
+        if ranked {
+            features.push(RANKED.to_string());
+        }
         Plan { version: VERSION, features, root }
     }
 
@@ -1544,6 +1559,26 @@ mod lit {
         let v = Lit::deserialize(d)?.value();
         Lit::of(&v).map_err(de::Error::custom)?;
         Ok(v)
+    }
+}
+
+/// A list of literals, each as [`lit`] writes it.
+mod lit_list {
+    use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::lit::Lit;
+    use crate::value::Value;
+
+    pub fn serialize<S: Serializer>(vs: &[Value], s: S) -> std::result::Result<S::Ok, S::Error> {
+        vs.iter().map(Lit::of).collect::<std::result::Result<Vec<_>, String>>().map_err(ser::Error::custom)?.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<Value>, D::Error> {
+        let vs: Vec<Value> = Vec::<Lit>::deserialize(d)?.into_iter().map(Lit::value).collect();
+        for v in &vs {
+            Lit::of(v).map_err(de::Error::custom)?;
+        }
+        Ok(vs)
     }
 }
 

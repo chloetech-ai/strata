@@ -256,6 +256,12 @@ fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json
             "field": m.field, "from": m.spec.from, "model": m.spec.model,
             "loaded": m.model.is_ok(), "error": m.model.as_ref().err(),
         })).collect::<Vec<_>>(),
+        // Each derived TEXT field: its MEDIA field, model, and whether this
+        // server makes its text (null on a coordinator: its shards do).
+        "derived": s.fields.iter().filter_map(|f| f.derive.as_ref().map(|d| json!({
+            "field": f.name, "from": d.from, "model": d.model,
+            "loaded": svc.local_db().map(|db| db.deriver_in(&s.table, &f.name).is_some()),
+        }))).collect::<Vec<_>>(),
     })
 }
 
