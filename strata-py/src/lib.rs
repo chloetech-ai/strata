@@ -22,6 +22,7 @@ use strata::query::sql::{ident, quoted};
 use strata::query::Params;
 use strata::query::exec::ResultSet;
 use strata::schema::Schema;
+use strata::sid::{Codebook, TrainOptions};
 use strata::storage::{DbOptions, Layout, MergePolicy};
 use strata::{FieldType, Value};
 
@@ -222,8 +223,9 @@ impl Database {
     fn create(py: Python<'_>, path: PathBuf, schema: &str, directory: bool, models: Option<PathBuf>) -> PyResult<Self> {
         let schema = Schema::from_json(schema).map_err(err)?;
         let opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, ..DbOptions::default() };
-        let db = py.detach(|| Db::create(&path, schema, opts)).map_err(err)?;
-        Ok(Database::new(db, models))
+        let models = models.unwrap_or_else(strata::embed::models_dir);
+        let db = py.detach(|| Db::create_in(&path, schema, opts, &models)).map_err(err)?;
+        Ok(Database::new(db, Some(models)))
     }
 
     /// Opens the database at `path`.
@@ -388,6 +390,19 @@ impl Database {
         }
     }
 
+    /// Trains a semantic-ID codebook on the vectors of `field` of `table`
+    /// (the first table by default), saves it as `name` under `models`, and
+    /// returns its SHA-256.
+    #[pyo3(signature = (field, name, table = None, models = None, levels = 3, k = 256, iterations = 25, sample = None, seed = 0))]
+    #[allow(clippy::too_many_arguments)]
+    fn train_codebook(&self, py: Python<'_>, field: &str, name: &str, table: Option<String>, models: Option<PathBuf>, levels: usize, k: usize, iterations: usize, sample: Option<usize>, seed: u64) -> PyResult<String> {
+        let db = self.get()?;
+        let table = table.unwrap_or_else(|| db.schema().table.clone());
+        let models = models.unwrap_or_else(strata::embed::models_dir);
+        let opts = train_options(levels, k, iterations, sample, seed);
+        py.detach(|| db.train_codebook(&table, field, name, &models, &opts)).map_err(err)
+    }
+
     /// Merges small segments, as a server does in the background.
     fn optimize(&self, py: Python<'_>) -> PyResult<()> {
         let db = self.get()?;
@@ -409,9 +424,42 @@ impl Database {
     }
 }
 
+fn train_options(levels: usize, k: usize, iters: usize, sample: Option<usize>, seed: u64) -> TrainOptions {
+    TrainOptions { levels, k, iters, sample: sample.unwrap_or(TrainOptions::default().sample), seed }
+}
+
+/// Trains a semantic-ID codebook on `vectors` (a list of vectors, or
+/// anything with `tolist()`), saves it as `name` under `models`, and
+/// returns its SHA-256.
+#[pyfunction]
+#[pyo3(signature = (vectors, name, models = None, levels = 3, k = 256, iterations = 25, sample = None, seed = 0))]
+#[allow(clippy::too_many_arguments)]
+fn train_codebook(py: Python<'_>, vectors: &Bound<'_, PyAny>, name: &str, models: Option<PathBuf>, levels: usize, k: usize, iterations: usize, sample: Option<usize>, seed: u64) -> PyResult<String> {
+    let Json::Array(rows) = to_json(vectors)? else { return Err(PyValueError::new_err("vectors are a list of lists of numbers")) };
+    let dim = match rows.first() {
+        Some(Json::Array(v)) => v.len(),
+        _ => return Err(PyValueError::new_err("vectors are a list of lists of numbers, at least one")),
+    };
+    let mut flat = Vec::with_capacity(rows.len() * dim);
+    for (i, r) in rows.iter().enumerate() {
+        match r {
+            Json::Array(v) if v.len() == dim => {
+                for x in v {
+                    flat.push(x.as_f64().ok_or_else(|| PyValueError::new_err(format!("vector {}: {x} is not a number", i + 1)))? as f32);
+                }
+            }
+            _ => return Err(PyValueError::new_err(format!("vector {} does not have {dim} numbers, as the first does", i + 1))),
+        }
+    }
+    let models = models.unwrap_or_else(strata::embed::models_dir);
+    let opts = train_options(levels, k, iterations, sample, seed);
+    py.detach(|| Codebook::train(&flat, dim, &opts)?.save(name, &models)).map_err(err)
+}
+
 #[pymodule]
 fn _strata(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
+    m.add_function(wrap_pyfunction!(train_codebook, m)?)?;
     m.add("StrataError", m.py().get_type::<StrataError>())?;
     Ok(())
 }

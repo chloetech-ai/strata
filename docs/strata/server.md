@@ -229,6 +229,25 @@ This happens before the write queues for the writer, for `/v1/write`, SQL `INSER
 
 Queries return the value as JSON text. The field's index is of hashes, so `WHERE image = :sha256`, `IN` and `GROUP BY image` find and count the rows of a file. `kind` refuses files of another type, by their bytes' headers. A coordinator does not fetch: start each shard with the `--media-*` options. A database with a `media` field is written in [file format 3](index.md#wal-memtable-and-snapshots).
 
+## Semantic IDs
+
+A semantic ID is a short code for a row's vector, such as `12.7.201.0`, that nearby vectors share a start of: rows whose codes start with `12` are alike, those that start with `12.7` more so. Generative recommenders predict an item's code a number at a time; a filter on a prefix finds every row under it.
+
+A `KEYWORD[]` field declares that it holds the semantic ID of a `VECTOR` field, by a named codebook:
+
+```json
+{"name": "sid", "type": "keyword", "multi": true, "semantic_id": {"from": "emb", "codebook": "items-rq"}}
+```
+
+`sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')` declares it in `CREATE TABLE`.
+
+- **The code.** The codebook is residual k-means: up to 4 levels of up to 256 centroids (3 of 256 by default). The first number is the vector's nearest first-level centroid, the next the nearest second-level centroid to what is left, and so on. The last number is a tie that tells apart rows with the same levels: the first such row gets 0, the next 1. A tie is never given twice under the same levels, also after its row is deleted and merged away.
+- **The value.** The field holds every prefix of the code, shortest first (`["12", "12.7", "12.7.201", "12.7.201.0"]`), so `WHERE sid = '12.7'` finds every row under `12.7`, through the keyword index, and combines with any other condition. `sid_at(sid, n)` is the first `n` numbers of a code, as text (`sid_at(sid, 2)` is `'12.7'`; NULL past its length), for grouping and for columns: `SELECT sid_at(sid, 1), COUNT(*) FROM items GROUP BY sid_at(sid, 1)`. A query with `sid_at` computes it over the rows its scan returns, as a join does, so the scan holds at most 1,000,000 rows.
+- **Writes.** The writer fills the field in from the vector, after an embedded vector is computed: a row's code is its own from then on. An upsert keeps the code while the vector's levels stay the same, and gets a new tie when they change. `UPDATE` cannot set the field (set the vector instead), and a write that brings a whole code keeps it, so a copy or a replica holds the same codes.
+- **The codebook** is a model, kept in the models directory as `<name>/codebook.safetensors`. The field records its name and the SHA-256 of its file when the table is created, which fails if the codebook is not there; opening the database later checks the file against it. A database whose codebook did not open still reads, but writes that need a new code fail. A name holds one codebook, and a new codebook means a new field (or table). Train one in Python with [`strata.train.codebook`](python.md#semantic-id-codebooks), on a table's vectors or on your own; from Rust, `Codebook::train` and `Db::train_codebook`.
+
+A database with a semantic-ID field needs the manifest feature `semantic_id`, and a plan that uses `sid_at` the plan feature of the same name, which versions of Strata before them refuse by name.
+
 ## HTTP API
 
 Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model; both take `"table"` for a field of another table than the first.

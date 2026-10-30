@@ -12,6 +12,8 @@ serde_json = "1"
 csv = "1"
 sqlparser = "0.59"
 crc32fast = "1"
+# SHA-256 of codebook files (semantic IDs, `sid`) and of MEDIA files.
+sha2 = "0.10"
 libc = "0.2"
 # Log events (flush and merge failures, a database that stops writing);
 # silent unless the program installs a subscriber, as strata-server does.
@@ -24,8 +26,7 @@ rand_distr = "0.4"
 roaring = "0.11.5"
 clap = { version = "4", features = ["derive"] }
 rust-stemmers = "1.2"
-# MEDIA values (`media`): the files' hashes, and bytes given as base64.
-sha2 = "0.10"
+# MEDIA values (`media`): bytes given as base64.
 base64 = "0.22"
 # Baselines (feature `baselines`): SQLite with FTS5, and Tantivy.
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
