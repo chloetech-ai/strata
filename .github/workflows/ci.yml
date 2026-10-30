@@ -106,7 +106,7 @@ jobs:
       - name: Strata
         working-directory: strata
         run: |
-          cargo test --profile ci --features vision --test media_vectors --test media_fields
+          cargo test --profile ci --features vision --test media_vectors --test media_fields --test derived_text
           cargo clippy --profile ci --features vision --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
       - name: strata-server
         working-directory: strata-server
