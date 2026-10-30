@@ -512,10 +512,16 @@ GROUP BY category ORDER BY 2 DESC LIMIT 5;
   JSON object of query term weights (`algo => ..` as for `bm25`).
 * `rrf(s1, s2, ...)`: reciprocal rank fusion, `Σ 1/(60 + rank_i)`, where each
   ranking is over the rows passing `WHERE` (`k => ..`, `depth => ..`).
-  Arithmetic on scores gives weighted fusion: candidates are the union of
-  each input's top 100, re-scored exactly by every input and min-max
-  normalised (`norm => 'none'` keeps raw scores, `exact => 1` scores every
-  row passing `WHERE`).
+  A weighted sum of `minmax()` of scores is weighted fusion: candidates are
+  the union of each input's top 100, re-scored exactly by every input and
+  min-max normalised (`exact => 1` scores every row passing `WHERE`).
+* Ranking expressions: `ORDER BY` takes any expression of scores, columns
+  and numbers (`+ - * / %`, `ln`, `log`, `exp`, `sqrt`, `pow`, `abs`,
+  `round`, `sigmoid`, `clamp`, `least`, `greatest`, `coalesce`, `CASE`,
+  `minmax(x)`, `rank(x)`), evaluated once by `query::rank` on a database
+  and on a coordinator; `+` adds raw values. `NULL` (a missing value, or a
+  result that is not finite) makes the expression `NULL`, and the row
+  ranks last.
 * `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`:
   a numeric column's closeness to `origin`, as Elasticsearch's decay
   functions: `d = max(0, |x − origin| − offset)` maps to 1 at `d = 0` and

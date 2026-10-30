@@ -164,7 +164,7 @@ fn shards_fusions_and_products_with_sparse_scores() {
             "SELECT id, score() FROM docs ORDER BY similarity(splade, :q) DESC LIMIT 10",
             "SELECT id, score() FROM docs WHERE year < 2010 ORDER BY similarity(splade, :q) DESC LIMIT 10 OFFSET 3",
             "SELECT id, score() FROM docs ORDER BY rrf(bm25(body, :t), similarity(splade, :q)) DESC LIMIT 10",
-            "SELECT id, score() FROM docs ORDER BY 0.5 * bm25(body, :t) + 0.5 * similarity(splade, :q) DESC LIMIT 10",
+            "SELECT id, score() FROM docs ORDER BY 0.5 * minmax(bm25(body, :t)) + 0.5 * minmax(similarity(splade, :q)) DESC LIMIT 10",
             "SELECT id, score() FROM docs ORDER BY similarity(splade, :q) * decay(year, 2019, 5) DESC LIMIT 10",
         ] {
             let want = whole.query(sql, &p).unwrap();

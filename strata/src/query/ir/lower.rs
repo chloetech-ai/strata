@@ -237,7 +237,21 @@ impl Lower<'_> {
             Score::Product(factors) => Expr::Product(factors.iter().map(|s| self.score(s)).collect()),
             Score::Column { field } => Expr::Field(*field as u32),
             Score::Ppr { graph } => Expr::Ppr(Box::new(self.graph(&self.graphs[*graph]))),
+            // `hops()` ranks nearest first in the fused shapes, and is the
+            // number of hops in an expression ([`super::raise`]).
             Score::Hops { .. } => Expr::Hops,
+            Score::SeqNo => Expr::SeqNo,
+            Score::Cond(p) => self.pred(p),
+            Score::Num(x) => Expr::Lit(Value::Float(*x)),
+            Score::Arith { op, left, right } => Expr::Arith { op: *op, left: Box::new(self.score(left)), right: Box::new(self.score(right)) },
+            Score::Neg(x) => Expr::Neg(Box::new(self.score(x))),
+            Score::Call { func, args } => Expr::Call { func: *func, args: args.iter().map(|a| self.score(a)).collect() },
+            Score::Norm { kind, input } => Expr::Norm { kind: *kind, input: Box::new(self.score(input)) },
+            Score::Case { whens, otherwise } => Expr::Case {
+                operand: None,
+                whens: whens.iter().map(|(c, x)| super::When { when: self.score(c), then: self.score(x) }).collect(),
+                otherwise: otherwise.as_ref().map(|x| Box::new(self.score(x))),
+            },
         }
     }
 

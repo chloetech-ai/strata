@@ -78,7 +78,7 @@ fn both_layouts_answer_alike_and_segments_move_between_them() {
     let params = Params::new().set("q", docs[5][data::col::EMB].clone()).set("t", Value::Str(docs[5][data::col::TITLE].as_str().unwrap().into()));
     let sqls = [
         "SELECT id, score() FROM docs ORDER BY bm25(body, :t) DESC LIMIT 10",
-        "SELECT id, score() FROM docs WHERE year > 2000 ORDER BY 0.5 * bm25(body, :t) + 0.5 * similarity(emb, :q, strategy => 'flat') DESC LIMIT 10",
+        "SELECT id, score() FROM docs WHERE year > 2000 ORDER BY 0.5 * minmax(bm25(body, :t)) + 0.5 * minmax(similarity(emb, :q, strategy => 'flat')) DESC LIMIT 10",
         "SELECT category, COUNT(*) FROM docs GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5",
     ];
     for sql in sqls {

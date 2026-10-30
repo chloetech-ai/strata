@@ -92,7 +92,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     let key_desc = matches!(q.tiebreak, Some(Tiebreak::Key { desc: true }));
     let (mut rows, want) = match &q.order {
         None => (rows, q.limit),
-        Some(OrderBy::Score { score: score @ (Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_)), .. }) => {
+        Some(OrderBy::Score { score, .. }) if Rank::of(score, 0).is_some() => {
             let want = q.limit.unwrap_or(DEFAULT_K);
             (fuse(score, rows, want.saturating_add(q.offset))?, Some(want))
         }
@@ -104,7 +104,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         }
         Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
     };
-    if matches!(&q.order, Some(OrderBy::Score { score: Score::Rrf { .. } | Score::Weighted(_) | Score::Product(_), .. })) {
+    if matches!(&q.order, Some(OrderBy::Score { score, .. }) if Rank::of(score, 0).is_some()) {
         rows.sort_by(|a, b| by_score(a.score, b.score, true).then_with(|| by_key(&a.key, &b.key, key_desc)));
     }
     let end = want.map_or(rows.len(), |w| w.saturating_add(q.offset).min(rows.len()));
@@ -230,7 +230,7 @@ fn by_key(a: &Value, b: &Value, desc: bool) -> Ordering {
 /// shards (at least the `k` rows the page needs, as each shard took), then
 /// the fused score over those ([`Rank`]), as one database computes it.
 fn fuse(score: &Score, rows: Vec<Row>, k: usize) -> Result<Vec<Row>> {
-    let rank = Rank::of(score, ExecOptions::default().fusion_depth).expect("a fused score");
+    let rank = Rank::of(score, ExecOptions::default().fusion_depth).expect("a ranking expression");
     let n_inputs = rank.leaves.len();
     if rows.iter().any(|r| r.inputs.len() != n_inputs || r.ranked.len() != n_inputs) {
         return Err(err("shard answers lack the fused score's inputs (not in shard mode?)"));
