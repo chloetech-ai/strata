@@ -1,0 +1,26 @@
+{
+  "audio_seconds": 1502.849,
+  "exact": 120,
+  "load_seconds": 1076.807019473,
+  "machine": "cloud container, 4 vCPU Xeon 2.10 GHz, 15 GB",
+  "model": "whisper-small",
+  "reference": {
+    "exact": 120,
+    "file": "librispeech200-transformers-transcripts.json",
+    "same_as_strata": 200,
+    "utterances": 200,
+    "wer": 0.03806661657901327,
+    "word_difference": 0.0
+  },
+  "search_by_reference": {
+    "R@1": 0.99,
+    "R@10": 0.995,
+    "R@5": 0.995
+  },
+  "search_seconds": 0.012491272,
+  "split": "test-clean",
+  "transcribed": 200,
+  "transcripts_given": 0,
+  "utterances": 200,
+  "wer": 0.03806661657901327
+}

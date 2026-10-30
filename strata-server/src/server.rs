@@ -353,7 +353,7 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     let out = dir.join(&local);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let client = reqwest::Client::new();
-    let files = if derives { strata::derive::MODEL_FILES } else { strata::embed::MODEL_FILES };
+    let files = if derives { strata::derive::model_files(&local) } else { strata::embed::MODEL_FILES };
     for file in files {
         let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
         let r = client.get(&url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("{url}: {e}"))?;

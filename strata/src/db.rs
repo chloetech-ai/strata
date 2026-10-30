@@ -498,8 +498,20 @@ impl Db {
         let f = schema.field(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
         let Some(spec) = &f.derive else { return Err(Error::Schema(format!("field {field} is not a derived TEXT field"))) };
         let kind = schema.field(&spec.from).and_then(|m| m.media).expect("checked by the schema");
-        if d.modality() == Modality::Image && kind != crate::media::MediaKind::Image {
-            return Err(Error::Schema(format!("model {} makes text of images, and {} is a MEDIA field of kind {}: declare kind = 'image'", spec.model, spec.from, kind.as_str())));
+        let wants = match d.modality() {
+            Modality::Image => crate::media::MediaKind::Image,
+            Modality::Audio => crate::media::MediaKind::Audio,
+            Modality::Text => return Err(Error::Schema(format!("model {} makes text of text, not of media", spec.model))),
+        };
+        if kind != wants {
+            return Err(Error::Schema(format!(
+                "model {} makes text of {}, and {} is a MEDIA field of kind {}: declare kind = '{}'",
+                spec.model,
+                if wants == crate::media::MediaKind::Image { "images" } else { "audio" },
+                spec.from,
+                kind.as_str(),
+                wants.as_str()
+            )));
         }
         let mut all = self.derivers.write().unwrap_or_else(|e| e.into_inner());
         all.retain(|m| !(m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name)));
@@ -1425,15 +1437,42 @@ fn derived_of(derivers: &[Option<Arc<dyn Deriver>>], schema: &Schema, docs: &[Do
 }
 
 /// The text `d` makes of the files that `values` of MEDIA field `m` name,
-/// decoded a batch at a time.
+/// decoded a batch at a time: 16 images, or up to 4 sounds of 2 minutes
+/// together (a sound can be an hour long).
 fn derive_sources(d: &dyn Deriver, schema: &Schema, m: usize, values: &[String], files: &Files) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(values.len());
+    let field = &schema.fields[m].name;
+    if d.modality() == Modality::Audio {
+        let mut batch: Vec<crate::embed::Audio> = Vec::new();
+        for (i, v) in values.iter().enumerate() {
+            batch.extend(sounds_of(field, std::slice::from_ref(v), files)?);
+            let seconds: f64 = batch.iter().map(|a| a.samples.len() as f64 / a.rate as f64).sum();
+            if batch.len() == 4 || seconds >= 120.0 || i + 1 == values.len() {
+                out.extend(d.derive(&batch.iter().map(Input::Audio).collect::<Vec<_>>())?);
+                batch.clear();
+            }
+        }
+        return Ok(out);
+    }
     for batch in values.chunks(16) {
-        let images = images_of(&schema.fields[m].name, batch, files)?;
+        let images = images_of(field, batch, files)?;
         let inputs: Vec<Input> = images.iter().map(Input::Image).collect();
         out.extend(d.derive(&inputs)?);
     }
     Ok(out)
+}
+
+/// The sounds MEDIA values of field `field` name, decoded.
+fn sounds_of(field: &str, values: &[String], files: &Files) -> Result<Vec<crate::embed::Audio>> {
+    values
+        .iter()
+        .map(|t| {
+            let m = Media::parse(t).map_err(Error::Schema)?;
+            let data = files.bytes(&m)?;
+            crate::media::decode_audio(&data).map_err(|e| Error::Schema(format!("{}: {e}", m.uri)))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map_err(|e| media_error(field, e))
 }
 
 /// What setting fields of live rows writes ([`plan_sets`]).
