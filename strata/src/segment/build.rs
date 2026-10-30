@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
 use crate::forward::StoreBuilder;
-use crate::graph::GraphBuilder;
+use crate::graph::{EdgeTableBuilder, GraphBuilder};
 use crate::storage::KeyList;
 use crate::text::TextFieldBuilder;
 use crate::value::Document;
@@ -78,6 +78,8 @@ enum Slot {
     Index(Box<dyn FieldIndexBuilder>),
     /// An EDGES field, which needs every document's key when it is written.
     Graph(GraphBuilder),
+    /// An edge table's graph, of each row's source, target and weight.
+    Edges(EdgeTableBuilder),
     /// A TEXT field, analysed in runs of documents (as many per batch as
     /// threads), joined when it is written.
     Text(Vec<Option<TextFieldBuilder>>),
@@ -193,6 +195,10 @@ impl<'a> SegmentBuild<'a> {
                 slots.push(Mutex::new(Some(slot)));
             }
         }
+        if let (Some(b), Some((src, ..))) = (crate::graph::edge_table::builder(schema), schema.edge_fields()) {
+            fields.push(src);
+            slots.push(Mutex::new(Some(Slot::Edges(b))));
+        }
         let store = Mutex::new(Some(StoreBuilder::new(schema, opts)?));
         let keys = match schema.primary_key {
             Some(pk) => KeyList::new(&schema.fields[pk].ty)?,
@@ -279,16 +285,26 @@ impl<'a> SegmentBuild<'a> {
                                 b.add((base + d) as DocId, &doc[i])?;
                             }
                         }
+                        Slot::Edges(b) => {
+                            for (d, doc) in docs.iter().enumerate() {
+                                b.add((base + d) as DocId, doc)?;
+                            }
+                        }
                         Slot::Text(_) => unreachable!("TEXT slots run as runs"),
                     }
+                    let edges = matches!(slot.as_ref(), Some(Slot::Edges(_)));
                     if last {
                         match slot.take() {
                             Some(Slot::Index(b)) => b.finish(&mut out)?,
                             Some(Slot::Graph(b)) => b.finish_with_keys(keys, &mut out)?,
+                            Some(Slot::Edges(b)) => b.finish(&mut out)?,
                             _ => unreachable!("taken once"),
                         }
                     }
-                    format!("{} ({})", schema.fields[i].name, kind(&schema.fields[i].ty))
+                    match edges {
+                        true => "edge table".to_string(),
+                        false => format!("{} ({})", schema.fields[i].name, kind(&schema.fields[i].ty)),
+                    }
                 }
                 Task::TextRun { slot: j, run, range, mut builder } => {
                     let i = fields[j];

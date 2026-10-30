@@ -1,0 +1,69 @@
+{
+  "cost": {
+    "edge_operations_per_event": 8.983766666666666,
+    "us_per_edge_operation": 19.60993316018151,
+    "us_per_event": 176.17106385999998
+  },
+  "items": 50000,
+  "machine": {
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "host": "vm",
+    "memory_gb": 16.9,
+    "os": "Linux 6.18.44-fc-v185"
+  },
+  "sizes": {
+    "edge_table_bytes": 39035048,
+    "edge_table_bytes_per_edge": 20.58701967195823,
+    "edges": 1896100,
+    "edges_field_bytes": 62878824,
+    "edges_field_bytes_per_edge": 33.162187648330786,
+    "segments": {
+      "cooc": 10,
+      "items": 3
+    }
+  },
+  "users": 10000,
+  "walks": {
+    "edge_table_ms": {
+      "p50": 21.900326,
+      "p90": 30.133237,
+      "p99": 38.683604
+    },
+    "edges_field_ms": {
+      "p50": 15.335401000000001,
+      "p90": 26.585827,
+      "p99": 37.387041
+    },
+    "queries": 1000,
+    "same_top_200": 1000,
+    "seeds": 20,
+    "top_200_overlap": 1.0,
+    "walks_with_rows": 946
+  },
+  "window": 5,
+  "writes": [
+    {
+      "batches": 148,
+      "edges": false,
+      "events": 300000,
+      "events_per_s": 71154.99754022867,
+      "operations": 600000,
+      "operations_per_s": 142309.99508045733,
+      "seconds": 4.216147992,
+      "us_per_event": 14.053826639999999
+    },
+    {
+      "batches": 806,
+      "edges": true,
+      "events": 300000,
+      "events_per_s": 5256.9356059111515,
+      "operations": 3295130,
+      "operations_per_s": 57740.95407702005,
+      "seconds": 57.06746715,
+      "us_per_event": 190.2248905
+    }
+  ],
+  "zipf": 1.0
+}

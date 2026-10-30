@@ -303,6 +303,20 @@ def test_writes_to_any_table(db, tmp_path):
         db.sql("UPDATE events SET usr = 'u2' WHERE id = 1")
 
 
+def test_an_edge_table_walked_from_another_table(db):
+    db.sql("CREATE TABLE cooc (id KEYWORD PRIMARY KEY, src KEYWORD NOT NULL REFERENCES books, dst KEYWORD NOT NULL REFERENCES books, w FLOAT DEFAULT 0) OPTIONS(edges = 'src, dst, w')")
+    t = db.tables()[-1]
+    assert list(t)[:3] == ["table", "key", "edges"] and t["edges"] == "src, dst, w"
+    db.insert([{"id": f"{a}>{b}", "src": a, "dst": b, "w": w} for a, b, w in [("b0001", "b0002", 1.0), ("b0002", "b0003", 2.0), ("b0003", "b0004", 0.0)]], table="cooc")
+    hops = db.query("SELECT id, hops() FROM books WHERE REACHABLE(cooc, 'b0001', hops => 3) LIMIT 10")
+    # The edge of weight 0 is not followed.
+    assert sorted((r["id"], r["hops()"]) for r in hops) == [("b0002", 1), ("b0003", 2)]
+    top = db.query("SELECT id FROM books ORDER BY ppr(cooc, 'b0002') DESC LIMIT 3").column("id")
+    assert top[0] == "b0002" and set(top[1:]) == {"b0001", "b0003"}
+    with pytest.raises(strata.StrataError, match="not an edge table"):
+        db.query("SELECT id FROM books ORDER BY ppr(books, 'b0001') DESC LIMIT 3")
+
+
 def test_a_table_ordered_by_a_column_and_kept_for_a_period(db):
     assert db.sql("CREATE TABLE views (id INT PRIMARY KEY, usr KEYWORD, ts TIMESTAMP) OPTIONS(cluster_by = 'usr', retain = '30 days')") == 0
     t = db.tables()[1]
