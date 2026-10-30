@@ -1,0 +1,82 @@
+{
+  "clients": 4,
+  "docs": 100000,
+  "events": 200000,
+  "export": {
+    "records": 245000,
+    "records_per_s": 74582.0,
+    "seconds": 3.28,
+    "with_history": 245000
+  },
+  "latency": {
+    "logged_100_candidates_ms": {
+      "p50": 6.688,
+      "p90": 8.688,
+      "p99": 11.825
+    },
+    "logged_ms": {
+      "p50": 3.499,
+      "p90": 4.835,
+      "p99": 7.39
+    },
+    "plain_ms": {
+      "p50": 1.749,
+      "p90": 2.537,
+      "p99": 4.721
+    },
+    "requests": 2000,
+    "with_features_ms": {
+      "p50": 1.783,
+      "p90": 2.587,
+      "p99": 4.707
+    }
+  },
+  "machine": {
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "host": "vm",
+    "memory_gb": 16.9,
+    "os": "Linux 6.18.44-fc-v185"
+  },
+  "queries": [
+    "SELECT id, title FROM docs ORDER BY bm25(body, :t) * (1 + 0.1 * coalesce(rating, 0)) DESC LIMIT 10",
+    "SELECT id, title FROM docs ORDER BY 0.3 * minmax(bm25(body, :t)) + 0.7 * minmax(similarity(emb, :q)) DESC LIMIT 10"
+  ],
+  "size": {
+    "bytes": 37168317,
+    "bytes_per_row": 151.7,
+    "rows": 245000
+  },
+  "sync": false,
+  "throughput": {
+    "logged": {
+      "ms": {
+        "p50": 4.619,
+        "p90": 6.823,
+        "p99": 11.124
+      },
+      "per_s": 767.0,
+      "requests": 2000
+    },
+    "plain": {
+      "ms": {
+        "p50": 1.667,
+        "p90": 2.984,
+        "p99": 5.111
+      },
+      "per_s": 1848.0,
+      "requests": 2000
+    }
+  },
+  "users": 2000,
+  "writes_alone": {
+    "ms": {
+      "p50": 1.494,
+      "p90": 2.091,
+      "p99": 3.797
+    },
+    "requests": 500,
+    "rows_each": 10
+  }
+}

@@ -1318,7 +1318,8 @@ fn distinct_to_group(s: &mut sql::Select) -> Result<()> {
     Ok(())
 }
 
-fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Option<usize>)> {
+/// A query's OFFSET and LIMIT, its parameters bound.
+pub(crate) fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Option<usize>)> {
     let n = |e: &Expr| -> Result<usize> {
         match value(&compile(e, params, &|_| None, &[])?)? {
             Value::Int(x) if x >= 0 => Ok(x as usize),
