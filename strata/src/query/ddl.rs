@@ -252,7 +252,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let bad = |m: String| err(format!("column {name}: {m}"));
     let (ty, multi, dim) = column_type(ty).map_err(bad)?;
     let allowed: &[&str] = match ty {
-        "text" => &["positions", "stored", "indexed", "from", "analyzer"],
+        "text" => &["positions", "stored", "indexed", "from", "analyzer", "derive", "model"],
         "vector" if multi => &["indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
         "media" => &["stored", "indexed", "kind"],
@@ -263,7 +263,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
         return Err(bad("semantic_id and codebook are options of a KEYWORD[] column".into()));
     }
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "dim", "embed", "model", "kind", "semantic_id", "codebook"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "dim", "embed", "model", "kind", "semantic_id", "codebook", "derive"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {
@@ -311,11 +311,15 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     if nlist.is_some() && kind.as_deref() != Some("ivf") {
         return Err(bad("nlist is an option of index = 'ivf'".into()));
     }
-    match (opts.remove("embed"), opts.remove("model")) {
-        (None, None) => {}
-        (Some(from), Some(model)) if model.is_string() => {
+    match (opts.remove("embed"), opts.remove("derive"), opts.remove("model")) {
+        (None, None, None) => {}
+        (Some(from), None, Some(model)) if model.is_string() => {
             f.insert("embed".into(), json!({"from": names(&from).map_err(|m| bad(format!("embed {m}")))?, "model": model}));
         }
+        (None, Some(J::String(from)), Some(model)) if model.is_string() => {
+            f.insert("derive".into(), json!({"from": from, "model": model}));
+        }
+        _ if ty == "text" => return Err(bad("a derived text takes derive = 'media column' and model = 'name'".into())),
         _ => return Err(bad("an embedded vector takes embed = 'fields' and model = 'name'".into())),
     }
     if let Some(from) = opts.remove("from") {
@@ -524,6 +528,32 @@ mod tests {
         assert_eq!(s.fields[1].references.as_deref(), Some("papers"));
         // No key is allowed, as in the JSON form.
         assert_eq!(create("CREATE TABLE log (line TEXT NULL)", &[]).unwrap().0.primary_key, None);
+    }
+
+    #[test]
+    fn derived_text_names_its_file_and_model() {
+        let (s, _) = create("CREATE TABLE photos (id KEYWORD PRIMARY KEY, image MEDIA OPTIONS(kind = 'image'), caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base'), emb VECTOR(8) OPTIONS(embed = 'caption', model = 'hash:8'))", &[]).unwrap();
+        let f = s.field("caption").unwrap();
+        assert_eq!(f.derive, Some(crate::schema::Derive { from: "image".into(), model: "blip-image-captioning-base".into() }));
+        assert!(f.stored && matches!(f.ty, FieldType::Text { .. }));
+        assert_eq!(s.derives_from(2), Some(1));
+        assert_eq!(s.features().collect::<Vec<_>>(), ["media", "derive"]);
+        assert_eq!(s.to_short_json()["fields"][2], serde_json::json!({"name": "caption", "type": "text", "derive": {"from": "image", "model": "blip-image-captioning-base"}}));
+        assert_eq!(Schema::from_json_value(&s.to_short_json()).unwrap(), s);
+        assert_eq!(serde_json::from_str::<Schema>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        for (bad, says) in [
+            ("CREATE TABLE t (a MEDIA, c TEXT OPTIONS(derive = 'a'))", "derive = 'media column' and model"),
+            ("CREATE TABLE t (a MEDIA, c TEXT OPTIONS(model = 'colors'))", "derive = 'media column' and model"),
+            ("CREATE TABLE t (a MEDIA, c KEYWORD OPTIONS(derive = 'a', model = 'colors'))", "not an option of a KEYWORD"),
+            ("CREATE TABLE t (a TEXT, c TEXT OPTIONS(derive = 'a', model = 'colors'))", "not a MEDIA field"),
+            ("CREATE TABLE t (a MEDIA, c TEXT OPTIONS(derive = 'a', model = 'colors', stored = false))", "must be stored"),
+            ("CREATE TABLE t (a MEDIA, b TEXT, c TEXT OPTIONS(derive = 'a', model = 'colors', from = 'b'))", "not generated"),
+            ("CREATE TABLE t (a MEDIA, c TEXT NOT NULL OPTIONS(derive = 'a', model = 'colors'))", "no default or NOT NULL"),
+            ("CREATE TABLE t (a MEDIA, c TEXT DEFAULT 'x' OPTIONS(derive = 'a', model = 'colors'))", "no default or NOT NULL"),
+        ] {
+            let e = create(bad, &[]).unwrap_err().to_string();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
     }
 
     #[test]

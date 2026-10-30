@@ -1276,6 +1276,8 @@ impl<'a> Executor<'a> {
             // These keep every row tied with the depth-th.
             Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, depth)?,
             Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, depth, true)?,
+            // No ties: each row has its own position.
+            Score::Ranked { keys } => self.ranked_top(keys, p, depth)?,
             _ => {
                 let mut want = depth + 1;
                 loop {
@@ -1327,8 +1329,56 @@ impl<'a> Executor<'a> {
             Score::Column { field } => self.by_column(*field, true, None, p, Some(k), None),
             Score::Decay { field, decay, .. } => self.decay_top(*field, decay, p, k, false),
             Score::Ppr { .. } | Score::Hops { .. } => self.graph_top(score, p, k),
-            _ => Err(err("fusion inputs must be bm25, similarity, ppr, hops, decay or a column")),
+            Score::Ranked { keys } => self.ranked_top(keys, p, k),
+            _ => Err(err("fusion inputs must be bm25, similarity, ppr, hops, decay, ranked or a column")),
         }
+    }
+
+    /// The live rows of `keys` (a ranking given by primary key, best
+    /// first) that pass `p`, the first `k` of them, each scored
+    /// `-(position)` from 1.
+    fn ranked_top(&mut self, keys: &[Value], p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        let at = self.ranked_rows(keys)?;
+        let mut by_seg: HashMap<usize, Vec<(DocId, f64)>> = HashMap::new();
+        for (&(seg, doc), &score) in &at {
+            by_seg.entry(seg).or_default().push((doc, score));
+        }
+        let mut hits = Vec::new();
+        let segs = self.segs.clone();
+        for s in segs.iter() {
+            let Some(rows) = by_seg.remove(&s.ord) else { continue };
+            let probeable = {
+                let est = SegEst { ex: self, s, params: None, local_sel: None };
+                self.planner(&est).estimate(p).probeable
+            };
+            let f = self.seg_filter(s, p, if probeable { FilterMode::Probe } else { FilterMode::Materialize })?;
+            let f = f.as_dyn();
+            hits.extend(rows.into_iter().filter(|(d, _)| f.is_none_or(|f| f.contains(*d))).map(|(doc, score)| Hit { seg: s.ord, doc, score }));
+        }
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.truncate(k);
+        self.stats.scored += hits.len() as u64;
+        self.stats.plan.push(format!("ranked: {} of {} keys are rows here, {} kept", at.len(), keys.len(), hits.len()));
+        Ok(hits)
+    }
+
+    /// The live row of each of `keys` that has one, with its value as a
+    /// [`Score::Ranked`] leaf: `-(position)` from 1, where its key is first
+    /// listed.
+    fn ranked_rows(&self, keys: &[Value]) -> Result<HashMap<(usize, DocId), f64>> {
+        if self.schema.primary_key.is_none() {
+            return Err(Error::Query(format!("ranked(keys) ranks rows by their primary keys, and {} has none", self.schema.table)));
+        }
+        let mut at = HashMap::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            if i % 4096 == 0 {
+                self.check_deadline()?;
+            }
+            if let Some(row) = self.snap.lookup(key) {
+                at.entry(row).or_insert(-((i + 1) as f64));
+            }
+        }
+        Ok(at)
     }
 
     /// Top-`k` of a SPARSE field by the dot product with `terms`: the
@@ -2173,7 +2223,14 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
-            _ => return Err(err("a ranking expression's leaves are bm25, similarity, ppr, hops, decay, seq_no() or a column")),
+            // NULL for a row whose key is not listed.
+            Score::Ranked { keys } => {
+                let at = self.ranked_rows(keys)?;
+                for (o, c) in out.iter_mut().zip(cands) {
+                    *o = at.get(c).copied().unwrap_or(f64::NAN);
+                }
+            }
+            _ => return Err(err("a ranking expression's leaves are bm25, similarity, ppr, hops, decay, seq_no(), ranked or a column")),
         }
         Ok(out)
     }

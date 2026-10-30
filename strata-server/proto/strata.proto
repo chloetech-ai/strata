@@ -508,6 +508,10 @@ message Expr {
     Norm norm = 36;
     // A ranking model's score of a row; plan feature "rank_models".
     Gbdt gbdt = 37;
+    // A ranking given as primary keys, best first (ranked(:keys)); plan
+    // feature "ranked". Numbered from 70, the range of the semantic-ID
+    // work.
+    Ranked ranked = 70;
     // maxsim(field, vectors); plan feature "maxsim". Numbered from 80, the
     // range of the multi-vector work, so lanes building at once do not
     // collide.
@@ -526,6 +530,10 @@ message Gbdt {
 message Norm {
   NormKind kind = 1;
   Expr input = 2;
+}
+
+message Ranked {
+  repeated Value keys = 1;
 }
 
 enum NormKind {
