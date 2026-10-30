@@ -396,12 +396,14 @@ async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let tables: Vec<&strata::schema::Schema> = catalog.iter().map(|t| &**t).collect();
     // A compound query is operators over single-table queries; what each
     // of those ran is in "plan".
-    let plan = strata::query::compound::plan_read(sql, &tables, &params, &|t, n| app.svc.rank_profile(t, n))?;
+    let profiles = |t: &str, n: &str| app.svc.rank_profile(t, n);
+    let plan = strata::query::compound::plan_read(sql, &tables, &params, &profiles)?;
     let logical = match plan.root.uses_operators() {
         true => "a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(),
         false => {
             let schema = tables.iter().find(|t| t.table.eq_ignore_ascii_case(plan.table())).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", plan.table())))?;
-            format!("{:#?}", strata::query::bind(sql, schema, &params)?)
+            // A query by a rank profile binds as written out.
+            format!("{:#?}", strata::query::bind(&strata::query::profile::written_out(sql, &profiles)?, schema, &params)?)
         }
     };
     let (ir, tree) = (plan.to_json()?, json!(plan.explain(&tables)));

@@ -364,6 +364,15 @@ fn literal(v: &J) -> Expr {
     })
 }
 
+/// The text of a query as [`expand`] writes it out, or as given if it
+/// ranks by no profile.
+pub fn written_out(sql_text: &str, profile_of: &dyn Fn(&str, &str) -> Option<RankProfile>) -> Result<String> {
+    Ok(match expand(&*super::sql::parse_query(sql_text)?, profile_of)? {
+        Some((q, _)) => q.to_string(),
+        None => sql_text.to_string(),
+    })
+}
+
 /// Names the profile on the Searches of `table` in the plan of a query
 /// that [`expand`] wrote out (outside subqueries, which rank otherwise).
 pub fn mark(plan: Plan, table: &str, r: &ProfileRef) -> Plan {
