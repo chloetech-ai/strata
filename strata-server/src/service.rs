@@ -15,6 +15,7 @@ use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
+use strata::query::model::Models;
 use strata::query::sql::{ident, quoted};
 use strata::query::{bind_command, compound, ops, profile, Command, Params, Select};
 use strata::schema::Schema;
@@ -150,8 +151,11 @@ pub struct Service {
     /// ([`Service::open_models`], [`Service::models`]).
     models: RwLock<Arc<Vec<FieldModel>>>,
     /// Where [`Service::open_models`] opened them, for tables created
-    /// later.
+    /// later, and where ranking models are.
     models_dir: Option<PathBuf>,
+    /// A coordinator's ranking models ([`Service::open_ranking_models`]);
+    /// a database keeps its own.
+    ranking: Models,
     /// Default query deadline.
     pub timeout: Duration,
     /// The longest deadline a request may ask for (`timeout_ms`).
@@ -241,6 +245,7 @@ impl Service {
             agent,
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
+            ranking: Models::default(),
             timeout,
             max_timeout: timeout.max(Duration::from_secs(60)),
             slow: None,
@@ -506,6 +511,23 @@ impl Service {
             db.open_embedders(dir);
         }
         self.refresh_models();
+    }
+
+    /// `plan` with its ranking models opened ([`strata::query::model`]):
+    /// a database's from its models directory, and a coordinator's from
+    /// its own, since it scores the shards' rows with them too. The plan
+    /// then names each model's hash, which every shard checks against its
+    /// own file.
+    pub fn open_ranking_models(&self, plan: Arc<Plan>) -> Result<Arc<Plan>, ApiError> {
+        if !plan.root.has_models() {
+            return Ok(plan);
+        }
+        let mut p = (*plan).clone();
+        match &self.backend {
+            Backend::Local(db) => db.open_ranking_models(&mut p)?,
+            Backend::Cluster(_) => self.ranking.open(&self.models_dir.clone().unwrap_or_else(strata::embed::models_dir), &mut p)?,
+        }
+        Ok(Arc::new(p))
     }
 
     /// The embedded fields' models ([`Service::open_models`]).
@@ -1042,6 +1064,7 @@ impl Service {
             (Ok(p), Backend::Local(_)) if p.root.has_profiles() => profile::check_plan(&p, &|t, n| self.rank_profile(t, n).map(|p| p.hash())).map(|_| p).map_err(ApiError::from),
             (p, _) => p,
         };
+        let plan = plan.and_then(|p| self.open_ranking_models(p));
         let bound = match plan {
             Ok(plan) if plan.root.uses_operators() => {
                 // A compound query runs as its plan; a coordinator sends the
@@ -1052,8 +1075,9 @@ impl Service {
             Ok(plan) => match self.table(plan.table()).await {
                 Ok(schema) => {
                     // A coordinator sends the shards a plan by a rank
-                    // profile as is, naming the profile they check.
-                    if plan.root.has_profiles() {
+                    // profile or a model as is, naming the profile or the
+                    // model's hash they check.
+                    if plan.root.has_profiles() || plan.root.has_models() {
                         req.plan = Some(plan.clone());
                     }
                     plan.to_select(&schema).map(|select| (schema, select)).map_err(ApiError::from)
@@ -1322,6 +1346,7 @@ impl Service {
             Some(p) => p.clone(),
             None => self.bound(|tables| compound::plan_read(sql, tables, params, &|t, n| self.rank_profile(t, n))).await?,
         };
+        let bound = Arc::unwrap_or_clone(self.open_ranking_models(Arc::new(bound))?);
         if bound.root.uses_operators() {
             return Err(ApiError::bad("term statistics are a single-table query's"));
         }
@@ -1339,8 +1364,9 @@ impl Service {
                 Ok((stats, lease))
             }
             Backend::Cluster(c) => {
-                // A query by a rank profile reaches the shards written out.
-                let given = plan.or(bound.root.has_profiles().then_some(&bound));
+                // A query by a rank profile reaches the shards written
+                // out, and one by a model with the model's hash.
+                let given = plan.filter(|_| !bound.root.has_models()).or((bound.root.has_profiles() || bound.root.has_models()).then_some(&bound));
                 Ok((c.term_stats(sql, &schema, given, params, after, Instant::now() + timeout).await?.0, 0))
             }
         }

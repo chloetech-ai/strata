@@ -477,7 +477,17 @@ message Expr {
     // minmax(x) or rank(x) over the rows a Search ranks; plan feature
     // "rank_expressions".
     Norm norm = 36;
+    // A ranking model's score of a row; plan feature "rank_models".
+    Gbdt gbdt = 37;
   }
+}
+
+// gbdt('model', features...): the model of that name in the models
+// directory, whose file has the hash `hash` (empty: not opened yet).
+message Gbdt {
+  string model = 1;
+  string hash = 2;
+  repeated Expr args = 3;
 }
 
 message Norm {
