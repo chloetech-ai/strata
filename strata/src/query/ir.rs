@@ -62,8 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 15] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, MIN_MATCH, AT_LEAST];
+pub const FEATURES: [&str; 16] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, MIN_MATCH, AT_LEAST, GUARD];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -129,6 +129,10 @@ pub const MIN_MATCH: &str = "min_match";
 /// The feature of a plan that counts conditions: `AT_LEAST(n, ..)`
 /// ([`Expr::AtLeast`]) or `count_true(..)` ([`Func::CountTrue`]).
 pub const AT_LEAST: &str = "at_least";
+
+/// The feature of a plan with a guarded Search ([`Search::guard`]:
+/// `min_rows`, `max_rows`).
+pub const GUARD: &str = "guard";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -262,6 +266,41 @@ pub struct Search {
     /// (feature [`RANK_PROFILES`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileRef>,
+    /// Guarded relaxation (feature [`GUARD`]): the rows choose how many of
+    /// an `AT_LEAST`'s conditions, or of a `MATCH`'s or a `bm25`'s words,
+    /// a row needs ([`crate::query::logical::Guard`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<Box<Guard>>,
+}
+
+/// A [`Search`]'s guard: what it relaxes, the loosest level and the row
+/// limits that choose the level.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Guard {
+    pub site: GuardSite,
+    /// The loosest level: a count (`2`) or a share of the items (`"75%"`).
+    pub need: crate::text::query::Need,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+}
+
+/// What a [`Guard`] relaxes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardSite {
+    /// `AT_LEAST(level, conds...)`, joined to the Search's filter.
+    AtLeast { conds: Vec<Expr> },
+    /// `MATCH(field, '(text)@level')`, joined to the Search's filter.
+    Match {
+        field: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "Expand::is_none")]
+        expand: Expand,
+    },
+    /// The `min` of the Search's `bm25(field, text, min => ...)`.
+    Bm25 { field: u32, text: String },
 }
 
 /// A rank profile a Search ranks as ([`crate::query::profile`]): its name
@@ -1002,6 +1041,9 @@ impl Node {
                 each(&s.filter);
                 s.order.iter().for_each(|k| each(&k.expr));
                 s.phases.iter().for_each(|p| each(&p.expr));
+                if let Some(GuardSite::AtLeast { conds }) = s.guard.as_deref().map(|g| &g.site) {
+                    conds.iter().for_each(&mut each);
+                }
             }
             Node::Aggregate { input, keys, aggs } => {
                 keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut each);
@@ -1071,6 +1113,11 @@ impl Node {
                 each(&mut s.filter)?;
                 for e in s.order.iter_mut().map(|k| &mut k.expr).chain(s.phases.iter_mut().map(|p| &mut p.expr)) {
                     each(e)?;
+                }
+                if let Some(GuardSite::AtLeast { conds }) = s.guard.as_deref_mut().map(|g| &mut g.site) {
+                    for e in conds {
+                        each(e)?;
+                    }
                 }
                 Ok(())
             }
@@ -1490,6 +1537,11 @@ impl Plan {
         root.visit_exprs(&mut |e| counts |= matches!(e, Expr::AtLeast { .. } | Expr::Call { func: Func::CountTrue, .. }));
         if counts {
             features.push(AT_LEAST.to_string());
+        }
+        let mut guarded = false;
+        root.each_search(&mut |s| guarded |= s.guard.is_some());
+        if guarded {
+            features.push(GUARD.to_string());
         }
         Plan { version: VERSION, features, root }
     }

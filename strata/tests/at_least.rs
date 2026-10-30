@@ -360,7 +360,7 @@ fn at_least_reads_counts_and_shares_and_refuses_the_rest() {
         ("SELECT id FROM t WHERE AT_LEAST(-1, a > 0, c = 'x')", "a count (2) or a percentage ('75%')"),
         ("SELECT id FROM t WHERE AT_LEAST(1.5, a > 0, c = 'x')", "a count (2) or a percentage ('75%')"),
         ("SELECT id FROM t WHERE AT_LEAST('120%', a > 0, c = 'x')", "a count (2) or a percentage ('75%')"),
-        ("SELECT id FROM t WHERE AT_LEAST(2, a > 0, c = 'x', max_rows => 10)", "unknown option max_rows for AT_LEAST"),
+        ("SELECT id FROM t WHERE AT_LEAST(2, a > 0, c = 'x', limit => 10)", "unknown option limit for AT_LEAST: min_rows, max_rows"),
         ("SELECT id FROM t ORDER BY count_true() DESC", "count_true(condition, ...)"),
     ] {
         let e = db.sql(q, &Params::new()).err().unwrap_or_else(|| panic!("{q} ran")).to_string();

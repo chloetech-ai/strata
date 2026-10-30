@@ -159,6 +159,7 @@ impl<'a> Raise<'a> {
         let Node::Search(search) = n else { return Err(shape(n, "Search")) };
         self.table(&search.table)?;
         let filter = self.filter(&search.filter)?;
+        let guard = search.guard.as_deref().map(|g| self.guard(g)).transpose()?;
         let pk = self.schema.primary_key;
         let mut phases = Vec::new();
         let (projection, group_by, having, order, tiebreak) = match aggregate {
@@ -244,7 +245,7 @@ impl<'a> Raise<'a> {
             }
         };
         let types = sql::projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types, guard })
     }
 
     /// The graph `hops()` refers to: the first REACHABLE or PATH.
@@ -256,6 +257,30 @@ impl<'a> Raise<'a> {
     /// with NULL already accounted for ([`Pred::three_valued`]).
     fn filter(&mut self, e: &Expr) -> Result<Pred> {
         Ok(self.pred(e)?.simplify())
+    }
+
+    fn guard(&mut self, g: &super::Guard) -> Result<logical::Guard> {
+        let text_field = |me: &Self, f: u32| -> Result<usize> {
+            let i = me.field(f)?;
+            match me.schema.fields[i].ty {
+                FieldType::Text { .. } if me.schema.fields[i].indexed => Ok(i),
+                _ => Err(err(format!("a guard's MATCH or bm25 reads an indexed TEXT field, not {}", me.schema.fields[i].name))),
+            }
+        };
+        let site = match &g.site {
+            super::GuardSite::AtLeast { conds } if conds.is_empty() => return Err(err("a guard's AT_LEAST has conditions")),
+            super::GuardSite::AtLeast { conds } => logical::GuardSite::AtLeast(conds.iter().map(|c| self.filter(c)).collect::<Result<_>>()?),
+            super::GuardSite::Match { field, text, expand } => {
+                let field = text_field(self, *field)?;
+                crate::text::query::parse_match_with(text, self.schema.fields[field].text_analyzer())?;
+                logical::GuardSite::Match { field, text: text.clone(), expand: *expand }
+            }
+            super::GuardSite::Bm25 { field, text } => logical::GuardSite::Bm25 { field: text_field(self, *field)?, text: text.clone() },
+        };
+        if g.min_rows.is_none() && g.max_rows.is_none() {
+            return Err(err("a guard has min_rows, max_rows or both"));
+        }
+        Ok(logical::Guard { site, need: g.need, min_rows: g.min_rows, max_rows: g.max_rows })
     }
 
     fn pred(&mut self, e: &Expr) -> Result<Pred> {

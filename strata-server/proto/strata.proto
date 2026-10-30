@@ -17,7 +17,9 @@
 // know to skip on a replay, so a coordinator sends them only to shards of
 // 6 or newer, and asks them their offsets with `Sources`; 7 answers the
 // next codes of semantic-ID prefixes (`SidNext`), which a coordinator asks
-// only of shards of 7 or newer. A caller asks a server's versions with
+// only of shards of 7 or newer; 8 counts the rows of a guard's levels
+// (`GuardCounts`), which a coordinator of a guarded query needs of every
+// shard. A caller asks a server's versions with
 // `Hello` (a server that answers Unimplemented speaks 1) and speaks the
 // newest both know; a coordinator speaks the oldest of those among its
 // shards' replicas.
@@ -61,6 +63,10 @@ service Strata {
   // field among the rows a query filters, with how many rows have each,
   // which a coordinator sums over its shards (HTTP /v1/sid/next).
   rpc SidNext(SidNextRequest) returns (SidNextResponse);
+  // Protocol 8: how many rows each level of a query's guard (min_rows,
+  // max_rows) matches, which a coordinator sums over its shards to choose
+  // the level it sends the query at.
+  rpc GuardCounts(QueryRequest) returns (GuardCountsResponse);
   // The tables' schemas as JSON.
   rpc Schema(Empty) returns (SchemaResponse);
   rpc Health(Empty) returns (HealthResponse);
@@ -316,6 +322,39 @@ message Search {
   // whose profile of that name has another hash refuses the plan (plan
   // feature rank_profiles).
   RankProfileRef profile = 5;
+  // The level of an AT_LEAST, a MATCH group or bm25's min, chosen from how
+  // many rows each level matches (plan feature guard).
+  Guard guard = 6;
+}
+
+// A guard: from the strictest level down to `need`, relaxed while a level
+// matches fewer than `min_rows` rows and the next one no more than
+// `max_rows`.
+message Guard {
+  oneof site {
+    // AT_LEAST(level, conds...), joined to the filter.
+    GuardAtLeast at_least = 1;
+    // MATCH(field, '(query)@level'), joined to the filter.
+    Match match = 2;
+    // The min of the order's bm25(field, text, ...).
+    GuardBm25 bm25 = 3;
+  }
+  // The loosest level: a count, or a share of the items.
+  oneof need {
+    uint64 count = 4;
+    uint32 percent = 5;
+  }
+  optional uint64 min_rows = 6;
+  optional uint64 max_rows = 7;
+}
+
+message GuardAtLeast {
+  repeated Expr conds = 1;
+}
+
+message GuardBm25 {
+  uint32 field = 1;
+  string text = 2;
 }
 
 message RankProfileRef {
@@ -781,6 +820,13 @@ message QueryResponse {
 message TermStatsResponse {
   bytes stats_json = 1;
   uint64 snapshot = 2;
+}
+
+// A guard's loosest level, `need`, and the rows each level from it up to
+// the strictest matches.
+message GuardCountsResponse {
+  uint32 need = 1;
+  repeated uint64 counts = 2;
 }
 
 // A query whose filter picks the rows (`SELECT COUNT(*) FROM t WHERE

@@ -646,6 +646,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn sid_next(&self, _: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no semantic IDs here"))
     }
+    async fn guard_counts(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no guards here"))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -695,6 +698,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn sid_next(&self, _: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no semantic IDs here"))
+    }
+    async fn guard_counts(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no guards here"))
     }
 }
 
@@ -964,6 +970,9 @@ impl pb::strata_server::Strata for Recording {
     async fn sid_next(&self, r: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
         self.up()?;
         self.inner.sid_next(r).await
+    }
+    async fn guard_counts(&self, r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
+        self.inner.guard_counts(self.read(r)?).await
     }
 }
 

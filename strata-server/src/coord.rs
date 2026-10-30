@@ -87,7 +87,7 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::auth::Secret;
-use crate::grpc::{params_to_pb, result_from_pb, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
+use crate::grpc::{params_to_pb, result_from_pb, GUARD_PROTOCOL, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
 use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{is_mark, op_place, op_schema, op_source, After, QueryReq, Written};
@@ -960,8 +960,92 @@ impl Coordinator {
     }
 
     /// Runs `select`, a query of table `schema`, on every shard and merges
-    /// their answers.
+    /// their answers. A guarded query (`min_rows`, `max_rows`) runs at the
+    /// level the sums of its shards' counts choose ([`Self::level_counts`]).
     pub async fn query(&self, req: &QueryReq, schema: &Schema, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
+        let Some(g) = &select.guard else { return self.query_at(req, schema, select, deadline).await };
+        let partial = req.partial.unwrap_or(self.opts.partial);
+        let read = Read::new(&req.sql, &req.params, req.plan.as_deref(), self.protocol(), self.epoch(), || Ok(Plan::of_select(schema, select)))?.after(self.after(&req.after)?);
+        let mut failed = self.skipped(partial);
+        let (n, counts) = self.level_counts(&read, partial, &mut failed, deadline).await?;
+        let (m, line) = match counts.is_empty() {
+            true => (n, "guard: no items to count".to_string()),
+            false => {
+                let m = g.level(n, &counts);
+                (m, g.line(n, &counts, m))
+            }
+        };
+        // The shards run the query at that level, a plan without a guard.
+        let settled = select.at_level(m);
+        let req = QueryReq { plan: Some(Arc::new(Plan::of_select(schema, &settled))), params: Params::new(), ..req.clone() };
+        let mut merged = self.query_at(&req, schema, &settled, deadline).await?;
+        merged.rs.stats.plan.insert(0, line);
+        Ok(merged)
+    }
+
+    /// The loosest level of `read`'s guard and how many rows each level
+    /// from it to the strictest matches, summed over the shards that
+    /// answer: every shard ([`GUARD_PROTOCOL`]), but those `partial` leaves
+    /// out, which `failed` then names.
+    async fn level_counts(&self, read: &Read, partial: bool, failed: &mut [Option<ApiError>], deadline: Instant) -> Result<(usize, Vec<u64>), ApiError> {
+        let start = self.turn.fetch_add(1, Ordering::Relaxed);
+        let calls = (0..self.replicas.len()).filter(|&i| failed[i].is_none()).map(|i| async move {
+            let a = self
+                .call(i, start, None, deadline, |r, mut c| async move {
+                    let p = self.speak(i, r, &mut c, PROTOCOL).await?;
+                    if p < GUARD_PROTOCOL {
+                        return Err(tonic::Status::invalid_argument(format!("it speaks protocol {p}, and a guarded query (min_rows, max_rows) needs {GUARD_PROTOCOL}: upgrade it")));
+                    }
+                    self.reads_after(i, r, read.min(i))?;
+                    c.guard_counts(pb::QueryRequest { timeout_ms: ms_left(deadline), ..read.request(p, i) }).await
+                })
+                .await;
+            (i, a)
+        });
+        let mut sum: Option<(usize, Vec<u64>)> = None;
+        for (i, a) in join_all(calls).await {
+            let a = match a {
+                Ok((_, a)) => a,
+                Err(e) => {
+                    self.leave_out(partial, i, e, failed)?;
+                    continue;
+                }
+            };
+            match &mut sum {
+                None => sum = Some((a.need as usize, a.counts)),
+                Some((n, counts)) if *n == a.need as usize && counts.len() == a.counts.len() => counts.iter_mut().zip(a.counts).for_each(|(c, x)| *c += x),
+                Some(_) => return Err(ApiError::internal(format!("shard {} counted another guard's levels: from {} to {}", self.shards[i], a.need, a.need as usize + a.counts.len()))),
+            }
+        }
+        sum.ok_or_else(|| failed.iter_mut().find_map(|f| f.take()).unwrap_or_else(|| ApiError::internal("no shard answered")))
+    }
+
+    /// A guard's loosest level and the rows of each level, over every
+    /// shard, of `sql` or `plan` seeing the writes `after` names.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn guard_counts(&self, sql: &str, schema: &Schema, plan: Option<&Plan>, params: &Params, select: &Select, after: &After, deadline: Instant) -> Result<(usize, Vec<u64>), ApiError> {
+        let read = Read::new(sql, params, plan, self.protocol(), self.epoch(), || Ok(Plan::of_select(schema, select)))?.after(self.after(after)?);
+        let mut failed = self.skipped(false);
+        self.level_counts(&read, false, &mut failed, deadline).await
+    }
+
+    /// Per shard, the failure that leaves it out of a `partial` read: that
+    /// no replica answered in the last second.
+    fn skipped(&self, partial: bool) -> Vec<Option<ApiError>> {
+        let mut failed: Vec<Option<ApiError>> = (0..self.replicas.len()).map(|_| None).collect();
+        if partial {
+            let now = self.now_ms();
+            for (i, f) in failed.iter_mut().enumerate() {
+                if self.skip_until[i].load(Ordering::Relaxed) > now {
+                    *f = Some(ApiError { status: 503, message: format!("shard {}: no replica answered in the last second", self.shards[i]) });
+                }
+            }
+        }
+        failed
+    }
+
+    /// [`Self::query`] of a query without a guard.
+    async fn query_at(&self, req: &QueryReq, schema: &Schema, select: &Select, deadline: Instant) -> Result<Merged, ApiError> {
         if select.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && !(0..self.replicas.len()).all(|i| self.numbered_alike(i)) {
             return Err(ApiError::bad(ONE_REPLICA));
         }
@@ -984,15 +1068,7 @@ impl Coordinator {
         let ranked_text = strata::cluster::scores_bm25(select);
         // Per shard: the replica holding a lease for this query, and the lease.
         let mut leased: Vec<Option<(usize, u64)>> = vec![None; n];
-        let mut failed: Vec<Option<ApiError>> = (0..n).map(|_| None).collect();
-        if partial {
-            let now = self.now_ms();
-            for (i, f) in failed.iter_mut().enumerate() {
-                if self.skip_until[i].load(Ordering::Relaxed) > now {
-                    *f = Some(ApiError { status: 503, message: format!("shard {}: no replica answered in the last second", self.shards[i]) });
-                }
-            }
-        }
+        let mut failed = self.skipped(partial);
         let stats = match &req.stats {
             Some(s) => Some(s.clone()),
             None if ranked_text && n > 1 => {

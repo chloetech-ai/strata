@@ -16,7 +16,7 @@ use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, Ran
 use crate::graph::GraphReader;
 use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
-use crate::query::logical::{Decay, Expand, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS};
+use crate::query::logical::{Decay, Expand, GuardSite, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
@@ -613,7 +613,87 @@ impl<'a> Executor<'a> {
             .collect())
     }
 
+    /// The loosest level of `q`'s guard ([`crate::query::logical::Guard`])
+    /// and the rows of each level from it to the strictest, over every
+    /// segment: those meeting `q`'s filter and that many of the guard's
+    /// items, deleted rows left out. No levels when the guard has no items
+    /// to count (a `bm25` text without optional words).
+    pub fn guard_counts(&mut self, q: &Select) -> Result<(usize, Vec<u64>)> {
+        let Some(g) = &q.guard else { return Ok((0, Vec::new())) };
+        // A bm25 site's options, and its MATCH filter at level m.
+        let bm25 = |m: Option<usize>| -> Result<(usize, Option<String>)> {
+            let GuardSite::Bm25 { field, text } = &g.site else { return Ok((0, None)) };
+            let mut opts = bm25_opts(q, *field, text).ok_or_else(|| err("the guarded bm25 is not in ORDER BY"))?;
+            if let Some(m) = m {
+                opts.insert("min".into(), Value::Int(m as i64));
+            }
+            let (_, filter, y) = ranked_terms(text, &opts, self.schema.fields[*field].text_analyzer())?;
+            Ok((y, filter))
+        };
+        let y = match &g.site {
+            GuardSite::AtLeast(items) => items.len(),
+            GuardSite::Match { field, text, .. } => text::query::group_size(text, self.schema.fields[*field].text_analyzer())?,
+            GuardSite::Bm25 { .. } => bm25(None)?.0,
+        };
+        if y == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let n = g.need.of(y);
+        // The guard's condition at each level, but for AT_LEAST's.
+        let levels: Vec<Pred> = match &g.site {
+            GuardSite::AtLeast(_) => Vec::new(),
+            GuardSite::Match { field, text, expand } => (n..=y).map(|m| Pred::Match { field: *field, query: format!("({text})@{m}"), expand: *expand }).collect(),
+            GuardSite::Bm25 { field, text } => {
+                let expand = Expand::from_opts(&bm25_opts(q, *field, text).unwrap_or_default()).map_err(err)?;
+                (n..=y).map(|m| Ok(bm25(Some(m))?.1.map_or(Pred::True, |query| Pred::Match { field: *field, query, expand }))).collect::<Result<_>>()?
+            }
+        };
+        let per = self.per_segment(|ex, s, _| {
+            let n_docs = s.r.n_docs;
+            let mut base = ex.materialize(s, &q.filter)?;
+            if let Some(live) = &s.view.live {
+                base = DocSet::from_sorted(base.iter().filter(|&d| live.contains(d)).collect(), n_docs);
+            }
+            if base.is_empty() {
+                return Ok(vec![0; y - n + 1]);
+            }
+            match &g.site {
+                GuardSite::AtLeast(items) => {
+                    let sets = items.iter().map(|p| ex.materialize(s, p)).collect::<Result<Vec<_>>>()?;
+                    Ok(DocSet::at_least_counts(&sets, &base, n, y))
+                }
+                _ => levels.iter().map(|p| Ok(ex.materialize(s, p)?.intersect(&base).len() as u64)).collect(),
+            }
+        })?;
+        let mut counts = vec![0u64; y - n + 1];
+        for c in per {
+            for (a, b) in counts.iter_mut().zip(c) {
+                *a += b;
+            }
+        }
+        Ok((n, counts))
+    }
+
+    /// `q` at the level its guard chooses, with a plan line that says so
+    /// (`q` itself without a guard).
+    fn settle_guard(&mut self, q: &Select) -> Result<Option<Select>> {
+        let Some(g) = &q.guard else { return Ok(None) };
+        if self.opts.shard {
+            return Err(err("a guarded query (min_rows, max_rows) runs on shards at the level its coordinator chose"));
+        }
+        let (n, counts) = self.guard_counts(q)?;
+        if counts.is_empty() {
+            self.stats.plan.push("guard: no items to count".into());
+            return Ok(Some(q.at_level(n)));
+        }
+        let m = g.level(n, &counts);
+        self.stats.plan.push(g.line(n, &counts, m));
+        Ok(Some(q.at_level(m)))
+    }
+
     pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
+        let settled = self.settle_guard(q)?;
+        let q = settled.as_ref().unwrap_or(q);
         if let Some(m) = q.unopened_model() {
             return Err(err(format!("ranking model {m} is not open: Db::query and Db::run open the models of a query's plan (Db::open_ranking_models)")));
         }
@@ -684,6 +764,9 @@ impl<'a> Executor<'a> {
     fn select_hits(&mut self, q: &Select) -> Result<Vec<Hit>> {
         if !q.group_by.is_empty() || q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. })) {
             return Err(err("a seed subquery returns rows, not counts or aggregates"));
+        }
+        if q.guard.is_some() {
+            return Err(err("min_rows and max_rows guard a query, not its seed subquery"));
         }
         self.run_graphs(&q.graphs)?;
         let hits = self.ordered_hits(q, None)?;
@@ -1533,7 +1616,7 @@ impl<'a> Executor<'a> {
     fn bm25_query(&self, field: usize, text: &str, opts: &Opts) -> Result<Bm25Query> {
         let analyzer = self.schema.fields[field].text_analyzer();
         let expand = Expand::from_opts(opts).map_err(err)?;
-        let (weighted, filter) = ranked_terms(text, opts, analyzer)?;
+        let (weighted, filter, _) = ranked_terms(text, opts, analyzer)?;
         let seq: Vec<String> = weighted.iter().map(|(t, _)| t.clone()).collect();
         let mut out = Bm25Query { filter: filter.map(|query| Pred::Match { field, query, expand }), ..Bm25Query::default() };
         // The highest weight of each base term, for its expansions.
@@ -2543,7 +2626,7 @@ pub(crate) fn need_of(v: &Value, what: &str) -> Result<text::query::Need> {
 /// a word or phrase they leave no term of is not one. A weight of 0
 /// scores nothing, but a required word still filters, and an optional one
 /// still counts toward `min`.
-fn ranked_terms(q: &str, opts: &Opts, analyzer: text::Analyzer) -> Result<(Vec<(String, f32)>, Option<String>)> {
+fn ranked_terms(q: &str, opts: &Opts, analyzer: text::Analyzer) -> Result<(Vec<(String, f32)>, Option<String>, usize)> {
     let drop = opts.get("stopwords").and_then(|v| v.as_f64()).map_or(analyzer.drops_query_stopwords(), |x| x != 0.0);
     let min = min_need(opts)?;
     // As a MATCH phrase: the words, quotes left out.
@@ -2590,7 +2673,22 @@ fn ranked_terms(q: &str, opts: &Opts, analyzer: text::Analyzer) -> Result<(Vec<(
     }
     filter.extend(must);
     filter.extend(not);
-    Ok((terms, (!filter.is_empty()).then(|| filter.join(" "))))
+    Ok((terms, (!filter.is_empty()).then(|| filter.join(" ")), should.len()))
+}
+
+/// The options of the `bm25(field, text, ...)` of `q`'s `ORDER BY` that has
+/// a `min`: the one a guard relaxes.
+fn bm25_opts(q: &Select, field: usize, text: &str) -> Option<Opts> {
+    let Some(OrderBy::Score { score, .. }) = &q.order else { return None };
+    let mut found = None;
+    score.visit(&mut |s| {
+        if let Score::Bm25 { field: f, text: t, opts } = s {
+            if *f == field && t == text && opts.contains_key("min") {
+                found.get_or_insert_with(|| opts.clone());
+            }
+        }
+    });
+    found
 }
 
 /// The weighted terms of a `bm25` query ([`Executor::bm25_query`]).

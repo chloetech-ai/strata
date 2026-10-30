@@ -266,7 +266,7 @@ fn plan(root: Node) -> pb::Plan {
 }
 
 fn search(filter: Expr) -> Node {
-    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new(), phases: Vec::new(), profile: None })
+    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new(), phases: Vec::new(), profile: None, guard: None })
 }
 
 fn refused(p: pb::Plan, says: &str) {

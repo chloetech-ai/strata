@@ -1,7 +1,7 @@
 //! Plans of bound statements: [`Plan::bind`], [`Plan::of_select`] and
 //! [`Plan::of_write`].
 
-use super::{Agg, Column, Expr, Graph, GraphKind, Node, OnConflict, Phase, Plan, Search, Set, SortKey};
+use super::{Agg, Column, Expr, Graph, GraphKind, Guard, GuardSite, Node, OnConflict, Phase, Plan, Search, Set, SortKey};
 use crate::query::logical::{self, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::query::sql::{Assign, Conflict, Write};
 use crate::schema::Schema;
@@ -103,9 +103,19 @@ fn aggregated(s: &Select) -> bool {
 }
 
 impl Lower<'_> {
+    fn guard(&self, g: &logical::Guard) -> Guard {
+        let site = match &g.site {
+            logical::GuardSite::AtLeast(items) => GuardSite::AtLeast { conds: items.iter().map(|p| self.pred(p)).collect() },
+            logical::GuardSite::Match { field, text, expand } => GuardSite::Match { field: *field as u32, text: text.clone(), expand: *expand },
+            logical::GuardSite::Bm25 { field, text } => GuardSite::Bm25 { field: *field as u32, text: text.clone() },
+        };
+        Guard { site, need: g.need, min_rows: g.min_rows, max_rows: g.max_rows }
+    }
+
     fn select(&self, s: &Select) -> Node {
         let table = self.schema.table.clone();
         let filter = self.pred(&s.filter);
+        let guard = s.guard.as_ref().map(|g| Box::new(self.guard(g)));
         let pk = || Expr::Field(self.schema.primary_key.unwrap_or(0) as u32);
         let node = if aggregated(s) {
             let mut out = Outputs { keys: s.group_by.clone(), aggs: Vec::new() };
@@ -125,7 +135,7 @@ impl Lower<'_> {
                 Some(Tiebreak::GroupValue { desc }) => keys.push(key(Expr::Output(0), desc)),
                 Some(Tiebreak::Key { desc }) => keys.push(key(pk(), desc)),
             }
-            let search = Node::Search(Search { table, filter, order: Vec::new(), phases: Vec::new(), profile: None });
+            let search = Node::Search(Search { table, filter, order: Vec::new(), phases: Vec::new(), profile: None, guard });
             let mut node = Node::Aggregate { input: Box::new(search), keys: out.keys.iter().map(|&f| Expr::Field(f as u32)).collect(), aggs: out.aggs };
             if let Some(cond) = having {
                 node = Node::Filter { input: Box::new(node), cond };
@@ -160,7 +170,7 @@ impl Lower<'_> {
                 })
                 .collect();
             let phases = s.phases.iter().map(|p| Phase { count: p.count as u64, expr: self.score(&p.score), global: p.global }).collect();
-            (Node::Search(Search { table, filter, order, phases, profile: None }), columns)
+            (Node::Search(Search { table, filter, order, phases, profile: None, guard }), columns)
         };
         let (mut node, columns) = node;
         if s.limit.is_some() || s.offset > 0 {

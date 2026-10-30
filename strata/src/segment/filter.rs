@@ -191,71 +191,47 @@ impl DocSet {
         if need > y {
             return DocSet::empty(n);
         }
-        let words = (n as usize).div_ceil(64);
-        let total: usize = sets.iter().map(DocSet::len).sum();
-        if total <= words && sets.iter().all(|s| matches!(s, DocSet::Sorted { .. })) {
-            let mut all: Vec<DocId> = Vec::with_capacity(total);
-            for s in sets {
-                if let DocSet::Sorted { docs, .. } = s {
-                    all.extend_from_slice(docs);
-                }
-            }
-            all.sort_unstable();
-            let mut out = Vec::new();
-            for run in all.chunk_by(|a, b| a == b) {
-                if run.len() >= need {
-                    out.push(run[0]);
-                }
-            }
-            return DocSet::from_sorted(out, n);
+        if let Some(runs) = merged_counts(sets, n) {
+            return DocSet::from_sorted(runs.into_iter().filter(|&(_, c)| c >= need).map(|(d, _)| d).collect(), n);
         }
-        // Bit b of a docID's count is bit d % 64 of `count[d / 64 * planes
-        // + b]`; adding a set ripples its bits up as carries.
-        let planes = (usize::BITS - y.leading_zeros()) as usize;
-        let mut count = vec![0u64; words * planes];
-        let add = |slot: &mut [u64], mut carry: u64| {
-            for c in slot {
-                let t = *c & carry;
-                *c ^= carry;
-                carry = t;
-                if carry == 0 {
-                    break;
+        let (planes, count) = count_planes(sets, n);
+        DocSet::from_bits(count.chunks_exact(planes).map(|slot| at_least_mask(slot, need)).collect(), n)
+    }
+
+    /// For each `m` from `lo` to `hi`, how many docIDs of `base` at least
+    /// `m` of `sets` hold, counted as [`DocSet::at_least`] counts them.
+    pub fn at_least_counts(sets: &[DocSet], base: &DocSet, lo: usize, hi: usize) -> Vec<u64> {
+        let n = base.universe();
+        let mut out = vec![0u64; (hi + 1).saturating_sub(lo)];
+        if out.is_empty() {
+            return out;
+        }
+        if let Some(runs) = merged_counts(sets, n) {
+            // Rows no set holds count 0, so only level 0 has them.
+            if lo == 0 {
+                out[0] = base.len() as u64;
+            }
+            for (d, c) in runs {
+                if base.contains(d) {
+                    for m in lo.max(1)..=hi.min(c) {
+                        out[m - lo] += 1;
+                    }
                 }
             }
-        };
-        for s in sets {
-            match s {
-                DocSet::Bits { words: ws, .. } => {
-                    for (slot, &w) in count.chunks_exact_mut(planes).zip(ws) {
-                        add(slot, w);
-                    }
-                }
-                DocSet::Sorted { docs, .. } => {
-                    for &d in docs {
-                        let w = d as usize / 64;
-                        add(&mut count[w * planes..(w + 1) * planes], 1 << (d % 64));
-                    }
-                }
+            return out;
+        }
+        let (planes, count) = count_planes(sets, n);
+        let base = base.to_bits();
+        for (slot, b) in count.chunks_exact(planes).zip(base) {
+            if b == 0 {
+                continue;
+            }
+            for (m, o) in (lo..=hi).zip(out.iter_mut()) {
+                let mask = if m == 0 { !0 } else if m > sets.len() { 0 } else { at_least_mask(slot, m) };
+                *o += (mask & b).count_ones() as u64;
             }
         }
-        // From the highest bit down: greater once a count has a 1 where
-        // `need` has a 0 and they were equal above.
-        let out = count
-            .chunks_exact(planes)
-            .map(|slot| {
-                let (mut gt, mut eq) = (0u64, !0u64);
-                for b in (0..planes).rev() {
-                    if need >> b & 1 == 1 {
-                        eq &= slot[b];
-                    } else {
-                        gt |= eq & slot[b];
-                        eq &= !slot[b];
-                    }
-                }
-                gt | eq
-            })
-            .collect();
-        DocSet::from_bits(out, n)
+        out
     }
 
     fn normalize(self) -> Self {
@@ -300,6 +276,77 @@ impl Iterator for BitIter {
         self.w &= self.w - 1;
         Some(self.base + t)
     }
+}
+
+/// Each docID the sparse `sets` hold and how many of them hold it, in
+/// order: when every set is a sorted list and they hold no more members
+/// than the bit-sliced counter has words. `None` otherwise.
+fn merged_counts(sets: &[DocSet], n: u32) -> Option<Vec<(DocId, usize)>> {
+    let total: usize = sets.iter().map(DocSet::len).sum();
+    if total > (n as usize).div_ceil(64) || !sets.iter().all(|s| matches!(s, DocSet::Sorted { .. })) {
+        return None;
+    }
+    let mut all: Vec<DocId> = Vec::with_capacity(total);
+    for s in sets {
+        if let DocSet::Sorted { docs, .. } = s {
+            all.extend_from_slice(docs);
+        }
+    }
+    all.sort_unstable();
+    Some(all.chunk_by(|a, b| a == b).map(|run| (run[0], run.len())).collect())
+}
+
+/// The bit-sliced count of how many of `sets` hold each docID in `0..n`:
+/// the number of bits a count takes, and the words, where bit `b` of
+/// docID `d`'s count is bit `d % 64` of `count[d / 64 * planes + b]`.
+fn count_planes(sets: &[DocSet], n: u32) -> (usize, Vec<u64>) {
+    let words = (n as usize).div_ceil(64);
+    let planes = (usize::BITS - sets.len().leading_zeros()).max(1) as usize;
+    let mut count = vec![0u64; words * planes];
+    // Adding a set ripples its bits up as carries.
+    let add = |slot: &mut [u64], mut carry: u64| {
+        for c in slot {
+            let t = *c & carry;
+            *c ^= carry;
+            carry = t;
+            if carry == 0 {
+                break;
+            }
+        }
+    };
+    for s in sets {
+        match s {
+            DocSet::Bits { words: ws, .. } => {
+                for (slot, &w) in count.chunks_exact_mut(planes).zip(ws) {
+                    add(slot, w);
+                }
+            }
+            DocSet::Sorted { docs, .. } => {
+                for &d in docs {
+                    let w = d as usize / 64;
+                    add(&mut count[w * planes..(w + 1) * planes], 1 << (d % 64));
+                }
+            }
+        }
+    }
+    (planes, count)
+}
+
+/// The bits of the 64 docIDs of `slot` (one word per bit of their
+/// counts) whose count is at least `need`, 1 ≤ `need` < 2^planes: from
+/// the highest bit down, greater once a count has a 1 where `need` has a
+/// 0 and they were equal above.
+fn at_least_mask(slot: &[u64], need: usize) -> u64 {
+    let (mut gt, mut eq) = (0u64, !0u64);
+    for b in (0..slot.len()).rev() {
+        if need >> b & 1 == 1 {
+            eq &= slot[b];
+        } else {
+            gt |= eq & slot[b];
+            eq &= !slot[b];
+        }
+    }
+    gt | eq
 }
 
 #[cfg(test)]
@@ -350,6 +397,10 @@ mod tests {
                     let want: Vec<u32> = (0..n).filter(|&d| sets.iter().filter(|s| s.contains(d)).count() >= need).collect();
                     assert_eq!(DocSet::at_least(&sets, need, n).to_sorted(), want, "n {n}, y {y}, need {need}");
                 }
+                let base = DocSet::from_sorted((0..n).filter(|_| next(3) > 0).collect(), n);
+                let lo = next(y as u64 + 1) as usize;
+                let want: Vec<u64> = (lo..=y + 1).map(|m| (0..n).filter(|&d| base.contains(d) && sets.iter().filter(|s| s.contains(d)).count() >= m).count() as u64).collect();
+                assert_eq!(DocSet::at_least_counts(&sets, &base, lo, y + 1), want, "n {n}, y {y}, from {lo}");
             }
         }
     }

@@ -371,6 +371,28 @@ impl Score {
         }
     }
 
+    /// [`Score::visit`], changing them.
+    pub fn visit_mut(&mut self, f: &mut dyn FnMut(&mut Score)) {
+        f(self);
+        match self {
+            Score::Rrf { inputs: xs, .. } | Score::Product(xs) | Score::Call { args: xs, .. } | Score::Gbdt { args: xs, .. } => xs.iter_mut().for_each(|x| x.visit_mut(f)),
+            Score::Weighted(ts) => ts.iter_mut().for_each(|(_, x)| x.visit_mut(f)),
+            Score::Arith { left, right, .. } => {
+                left.visit_mut(f);
+                right.visit_mut(f);
+            }
+            Score::Neg(x) | Score::Norm { input: x, .. } => x.visit_mut(f),
+            Score::Case { whens, otherwise } => {
+                for (c, x) in whens {
+                    c.visit_mut(f);
+                    x.visit_mut(f);
+                }
+                otherwise.iter_mut().for_each(|x| x.visit_mut(f));
+            }
+            _ => {}
+        }
+    }
+
     /// Every leaf (BM25, similarity, a column...) of the expression.
     pub fn leaves(&self) -> Vec<&Score> {
         match self {
@@ -619,6 +641,77 @@ pub enum Projection {
     Feature(Score),
 }
 
+/// Guarded relaxation (`max_rows => X`, `min_rows => N`): a query whose
+/// `AT_LEAST`, `MATCH(…, min => n)` or `bm25(…, min => n)` needs `m` of
+/// `y` items, where the rows decide `m`. Level `m` holds the rows that
+/// meet `m` of the items and the rest of `WHERE`; its count `C(m)` grows
+/// as `m` falls. From `m = y`, the query relaxes a level while `m > n`,
+/// `C(m)` is below `min_rows` and `C(m - 1)` is at most `max_rows` (an
+/// option left out always allows it), so that `max_rows` alone keeps the
+/// loosest level with at most that many rows, and level `y` when even it
+/// has more. [`Select::at_level`] is the query at a level.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Guard {
+    pub site: GuardSite,
+    /// `n`, the loosest level: a count or a share of the items.
+    pub need: crate::text::query::Need,
+    pub min_rows: Option<u64>,
+    pub max_rows: Option<u64>,
+}
+
+/// What a guard relaxes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GuardSite {
+    /// An `AT_LEAST` of the items, a term of `WHERE` joined by `AND`, kept
+    /// here rather than in [`Select::filter`].
+    AtLeast(Vec<Pred>),
+    /// `MATCH(field, text, min => n)`, a term of `WHERE` joined by `AND`,
+    /// kept here rather than in [`Select::filter`]: at level `m`, the
+    /// group `(text)@m`.
+    Match { field: usize, text: String, expand: Expand },
+    /// The `min` of the `bm25(field, text, ...)` scores of `ORDER BY`.
+    Bm25 { field: usize, text: String },
+}
+
+impl Guard {
+    /// The level the counts choose: `counts[i]` is `C(n + i)`, from the
+    /// loosest level `n` to the strictest.
+    pub fn level(&self, n: usize, counts: &[u64]) -> usize {
+        let Some(top) = (n + counts.len()).checked_sub(1) else { return n };
+        let c = |m: usize| counts[m - n];
+        let mut m = top;
+        while m > n && self.min_rows.is_none_or(|x| c(m) < x) && self.max_rows.is_none_or(|x| c(m - 1) <= x) {
+            m -= 1;
+        }
+        m
+    }
+
+    /// The plan line of a guard that chose level `m` of `counts` (as
+    /// [`Guard::level`] reads them): `guard: AT_LEAST 3 of 4 (4: 12, 3:
+    /// 340, 2: 5120; max_rows 2000)`.
+    pub fn line(&self, n: usize, counts: &[u64], m: usize) -> String {
+        let what = match &self.site {
+            GuardSite::AtLeast(_) => "AT_LEAST",
+            GuardSite::Match { .. } => "MATCH min",
+            GuardSite::Bm25 { .. } => "bm25 min",
+        };
+        let y = n + counts.len().saturating_sub(1);
+        let levels: Vec<String> = counts.iter().enumerate().rev().map(|(i, c)| format!("{}: {c}", n + i)).collect();
+        let mut limits = Vec::new();
+        if let Some(x) = self.min_rows {
+            limits.push(format!("min_rows {x}"));
+        }
+        if let Some(x) = self.max_rows {
+            limits.push(format!("max_rows {x}"));
+        }
+        let over = match self.max_rows {
+            Some(x) if counts.last().is_some_and(|&c| c > x) => ", over max_rows at every level",
+            _ => "",
+        };
+        format!("guard: {what} {m} of {y} ({}; {}){over}", levels.join(", "), limits.join(", "))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Select {
     /// Output column names and what they hold.
@@ -645,9 +738,41 @@ pub struct Select {
     /// gives as such rather than as the stored integers
     /// ([`Select::typed`]).
     pub types: Vec<Option<crate::schema::Logical>>,
+    /// The query's guard ([`Guard`]), which the executor and a coordinator
+    /// settle on a level before the query runs ([`Select::at_level`]).
+    pub guard: Option<Guard>,
 }
 
 impl Select {
+    /// The query with its guard at level `m`: an `AT_LEAST` or `MATCH`
+    /// site joined to the filter, a `bm25` site's `min` set to `m`.
+    pub fn at_level(&self, m: usize) -> Select {
+        let mut q = Select { guard: None, ..self.clone() };
+        let Some(g) = &self.guard else { return q };
+        match &g.site {
+            GuardSite::AtLeast(items) => {
+                let site = Pred::AtLeast { need: m, items: items.clone() };
+                q.filter = Pred::And(vec![q.filter, site]).simplify();
+            }
+            GuardSite::Match { field, text, expand } => {
+                let site = Pred::Match { field: *field, query: format!("({text})@{m}"), expand: *expand };
+                q.filter = Pred::And(vec![q.filter, site]).simplify();
+            }
+            GuardSite::Bm25 { field, text } => {
+                if let Some(OrderBy::Score { score, .. }) = &mut q.order {
+                    score.visit_mut(&mut |s| {
+                        if let Score::Bm25 { field: f, text: t, opts } = s {
+                            if f == field && t == text && opts.contains_key("min") {
+                                opts.insert("min".into(), Value::Int(m as i64));
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        q
+    }
+
     /// A ranking model the query ranks with that is not open
     /// ([`crate::query::model::Models::open`]): the executor refuses the
     /// query rather than rank by NULL.

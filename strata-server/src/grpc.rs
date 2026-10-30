@@ -91,10 +91,11 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 /// takes SQL or a JSON plan, 2 a typed plan, 3 holds a query's snapshot
 /// for the fetch that follows, 4 places keys in slots, 5 reads the writes
 /// a read must see (`min_seq_no`), which a replica waits for, 6 keeps
-/// stream sources' offsets ([`SOURCES_PROTOCOL`]), and 7 answers the next
-/// codes of semantic-ID prefixes ([`SIDNEXT_PROTOCOL`]).
+/// stream sources' offsets ([`SOURCES_PROTOCOL`]), 7 answers the next
+/// codes of semantic-ID prefixes ([`SIDNEXT_PROTOCOL`]), and 8 counts the
+/// rows of a guard's levels ([`GUARD_PROTOCOL`]).
 pub const MIN_PROTOCOL: u32 = 1;
-pub const PROTOCOL: u32 = 7;
+pub const PROTOCOL: u32 = 8;
 
 /// The protocol whose writes carry stream sources' offsets
 /// ([`crate::service::op_source`]), and that answers `Sources`.
@@ -102,6 +103,9 @@ pub const SOURCES_PROTOCOL: u32 = 6;
 
 /// The protocol of `SidNext`, the next codes of semantic-ID prefixes.
 pub const SIDNEXT_PROTOCOL: u32 = 7;
+
+/// The protocol of `GuardCounts`, the rows of a guard's levels.
+pub const GUARD_PROTOCOL: u32 = 8;
 
 /// A write's answer ([`crate::service::Written`]).
 pub fn write_response(w: crate::service::Written) -> pb::WriteResponse {
@@ -247,6 +251,17 @@ impl pb::strata_server::Strata for Grpc {
             let after = After::of(r.min_seq_no, r.min_seq_nos)?;
             let (stats, snapshot) = svc.term_stats(&r.sql, plan.as_ref(), &params_from_pb(r.params), &after, r.timeout_ms as u64).await?;
             Ok(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot })
+        })
+        .await
+    }
+
+    async fn guard_counts(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::GuardCountsResponse>, Status> {
+        self.serve("GuardCounts", req, |svc, r| async move {
+            svc.check_epoch(r.epoch)?;
+            let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
+            let after = After::of(r.min_seq_no, r.min_seq_nos)?;
+            let (need, counts) = svc.guard_counts(&r.sql, plan.as_ref(), &params_from_pb(r.params), &after, r.timeout_ms as u64).await?;
+            Ok(pb::GuardCountsResponse { need: need as u32, counts })
         })
         .await
     }
