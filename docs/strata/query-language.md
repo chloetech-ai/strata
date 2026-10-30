@@ -86,7 +86,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 | `MEDIA` | a file by reference: URI, SHA-256, type, size; a `KEYWORD` index of the hashes | `=`, `IN` on the hash; `GROUP BY` |
 | `EDGES` | out-edge CSR and reverse index per segment | `REACHABLE`, `PATH`, `ppr` |
 
-Predicates combine with `AND`, `OR`, `NOT`, [`AT_LEAST`](#some-of-the-conditions-at_least) and parentheses, across all of these.
+Predicates combine with `AND`, `OR`, `NOT`, [`AT_LEAST`](#some-of-the-conditions-at_least) and parentheses, across all of these, and [`max_rows`](#as-many-as-fit-min_rows-and-max_rows) lets an `AT_LEAST` choose its count.
 
 `INT` values are 64-bit integers and compare exactly: `id = 9007199254740993` finds that row and not 9007199254740992, which a double cannot tell apart. A fraction bounds integers by rounding inward (`n > 2.5` is `n >= 3`, `n = 2.5` matches nothing).
 
@@ -124,6 +124,28 @@ ORDER BY bm25(body, :q) * (1 + 0.1 * count_true(year >= 2021, venue IN ('nejm', 
 - **`count_true(c1, c2, …)`** is how many of the conditions hold, a number for [ranking expressions](#ranking-expressions) and `SELECT`, exactly the sum of `CASE WHEN c THEN 1 ELSE 0 END` over them: a condition on a `NULL` counts 0. In a `SELECT` over rows in memory (a join, a `WITH` result) its conditions cannot use `MATCH` or graph predicates, which only a table's indexes answer.
 - **How it runs.** Each condition becomes the set of rows it holds for, as `WHERE` evaluates it, and a counter adds the sets up 64 rows to a machine word, in ⌈log2(y + 1)⌉ words for each 64 rows; sets with few rows are merged instead. A ranking that checks its candidates one at a time tests their conditions in turn, until the count is reached or out of reach. The cost grows with the number of conditions, not with `n`: over 1,000,000 rows where each condition holds for an independent 20% of them, counting the rows took 3.0 ms for 2 of 4 conditions, 4.1 ms for 4 of 8 and 9.3 ms for 8 of 16, against 0.37 ms for one condition. The same conditions written as an `OR` of every `AND` of `n` took 8.2 ms for 2 of 4 (6 `AND`s) and 114 ms for 4 of 8 (70), and 8 of 16 would need 12,870 (`strata-at-least-bench` on a 4-core cloud VM, Intel Xeon @ 2.10GHz, `strata/results/strata/at_least.json`).
 - A plan with `AT_LEAST` or `count_true` needs the plan feature `at_least`. From Python, [`at_least(2, match("title", "covid"), col("year") >= 2020)`](python.md#queries-built-in-python) and `count_true(…)` build them.
+
+## As many as fit: `min_rows` and `max_rows`
+
+An "x of y" condition can choose its own x. With `max_rows` or `min_rows`, an `AT_LEAST`, a `MATCH(…, min => n)` or a `bm25(…, min => n)` asks for all y of its items first, and relaxes towards `n` while the rows are too few, stopping before a level that would match more than `max_rows`:
+
+```sql
+-- as many of the signals as keep the candidates to 2,000 or fewer
+SELECT id, title FROM papers
+WHERE year >= 2015 AND AT_LEAST(2, MATCH(title, 'covid'), venue IN ('nejm', 'lancet'), cited > 100, max_rows => 2000)
+ORDER BY bm25(body, :q) DESC LIMIT 20;
+
+-- all four words if 50 rows have them, else three, else two
+SELECT id, score() FROM docs
+ORDER BY bm25(body, 'mrna vaccine trial phase', min => 2, min_rows => 50) DESC LIMIT 10;
+```
+
+- **The level.** From the strictest level, all y items, a guard relaxes one item at a time while the level matches fewer than `min_rows` rows and the next looser one no more than `max_rows`, down to `n`. With `max_rows` alone that is the loosest level that fits, and with `min_rows` alone the strictest with enough rows. If even all y match more than `max_rows`, the query runs at y. The rows counted are those the rest of `WHERE` keeps; `LIMIT` does not cut them.
+- **Where.** A guard is an `AT_LEAST` or a `MATCH` joined to the rest of `WHERE` by `AND` (not one under `OR`, `NOT` or another condition), or a `bm25` of the first ranking of `ORDER BY`. `MATCH` and `bm25` need a `min`, the loosest level; `AT_LEAST`'s is its `n`. A query has one guard at most, and a [rerank phase](#rerank-phases) none. A `SELECT` over a `WITH` result that is not a rerank phase counts that result's rows.
+- **The plan line** gives each level's rows and the level chosen: `guard: AT_LEAST 3 of 4 (4: 12, 3: 340, 2: 5120, 1: 23000; max_rows 2000)`.
+- **Its cost** is counting the rows of every level, over all the rows the rest of `WHERE` keeps, before running at one: a guarded query costs about what counting its matches does, whatever its `LIMIT`. Over 1,000,000 rows where each condition holds for an independent 20% of them, `AT_LEAST(1, …, max_rows => 10000) LIMIT 100` took 2.5 ms over 4 conditions, 6.1 ms over 8 and 11.6 ms over 16, against 0.25, 0.51 and 0.98 ms for the same query written at the level chosen. For four words of different frequencies, over rows of 12 words drawn by Zipf's law from 5,000, `bm25(body, …, min => 1, max_rows => 1000)` took 2.4 ms at the median of 50 queries (`LIMIT 10`), against 1.4 ms at the level chosen and 0.75 ms without `min`, and a `MATCH` guarded alike 2.3 ms against 1.3 ms. A text's words are counted once each, as `AT_LEAST`'s conditions are, unless it has required or excluded words, when each level is counted in turn (`strata-guard-bench` on a 4-core cloud VM, Intel Xeon @ 2.10GHz, `strata/results/strata/guard.json`).
+- **Over shards**, a coordinator first asks every shard for its counts (protocol 8, so a shard of an older server is refused by name), adds them up, chooses the level as one database would, and sends the shards the query at that level: one round more. A shard answering a coordinator runs the level it is sent, never one of its own.
+- A plan with a guard needs the plan feature `guard`. From Python, `at_least(2, …, max_rows=2000)`, `match(field, query, min=2, max_rows=500)` and `bm25(field, text, min=2, min_rows=50)`.
 
 ## Full text: `MATCH`
 

@@ -199,6 +199,7 @@ progress { width: 100%; accent-color: var(--accent); }
           <label title="Also find words a letter or two away: 'nueral' finds 'neural'"><input type="checkbox" id="bFuzzy"> allow typos</label>
           <label id="bSynBox" title="Also find the words a synonym list says are the same"><input type="checkbox" id="bSyn"> use synonyms</label>
           <label title="Only rows with at least this many of the search words (min =>)">match <select id="bMin"><option value="">any word</option><option value="2">2 words</option><option value="3">3 words</option><option value="'50%'">half the words</option><option value="'75%'">3 in 4 words</option></select></label>
+          <label title="Ask for every word first, and for fewer, down to the match choice, while the rows stay this many or fewer (max_rows =>)">but as many as fit in <input type="number" id="bMaxRows" min="1" placeholder="rows" style="width:6em" disabled> rows</label>
           <button class="btn link small hidden" id="bSynSetup">set up synonyms</button>
           <span class="hint" id="bTextHint">Matching understands <code>AND</code>, <code>OR</code>, <code>-word</code>, <code>"a phrase"</code>, <code>prefix*</code>, <code>typo~</code> and <code>(a b c)@2</code>. <button class="btn link small" data-help="text">More</button></span>
         </div>
@@ -533,7 +534,9 @@ function setupBuilder() {
     return el("label", {}, cb, f.name);
   }));
   for (const id of ["bText", "bTextField", "bMatchAll", "bVecValue", "bVecField", "bSort", "bDir", "bFacet", "bLimit"]) $(id).addEventListener("input", updateSql);
-  for (const id of ["bFuzzy", "bSyn", "bMin", "bJoinLeft", "bJoinWhere", "bHaving", "bAggOrder"]) $(id).addEventListener("input", updateSql);
+  // The row limit relaxes a "match" choice, so it waits for one.
+  $("bMin").addEventListener("input", () => { $("bMaxRows").disabled = !$("bMin").value; });
+  for (const id of ["bFuzzy", "bSyn", "bMin", "bMaxRows", "bJoinLeft", "bJoinWhere", "bHaving", "bAggOrder"]) $(id).addEventListener("input", updateSql);
   $("bVecMode").addEventListener("input", () => {
     const m = $("bVecMode").value; $("bVecValue").disabled = !m;
     $("bVecValue").placeholder = m === "row" ? `a ${S.pk}, e.g. one from the results` : m === "text" ? "describe what you want" : "";
@@ -719,6 +722,9 @@ function summarySpec(joined) {
   return { groups, metrics: metrics.length ? metrics : ["COUNT(*)"] };
 }
 const textOpts = () => ($("bFuzzy").checked ? ", fuzzy => 'auto'" : "") + ($("bSyn").checked && !$("bSyn").disabled ? ", synonyms => 1" : "") + ($("bMin").value ? `, min => ${$("bMin").value}` : "");
+// A guard on the words: as many of them as keep the rows within the
+// count, down to the "match" choice (it needs one).
+const maxRows = () => { const v = $("bMaxRows").value.trim(); return $("bMin").value && /^\d+$/.test(v) && Number(v) > 0 ? `, max_rows => ${v}` : ""; };
 
 function literal(f, v) {
   v = v.trim();
@@ -750,10 +756,13 @@ function builderQuery() {
   const vm = $("bVecMode").value, vv = $("bVecValue").value.trim(), vf = ident($("bVecField").value || "");
   const where = [];
   // A summary has no ranking, so the search text filters.
-  if (text && ($("bMatchAll").checked || agg)) where.push(`MATCH(${tf}, ${sqlStr(text)}${to})`);
+  // The guard goes on the MATCH when the text filters, else on its bm25;
+  // a join's rows are not one table's to count.
+  const filtering = text && ($("bMatchAll").checked || agg), mr = J ? "" : maxRows();
+  if (filtering) where.push(`MATCH(${tf}, ${sqlStr(text)}${to}${mr})`);
   where.push(...whereParts(A));
   const params = {};
-  const textScore = text && !agg ? `bm25(${tf}, ${sqlStr(text)}${to})` : null;
+  const textScore = text && !agg ? `bm25(${tf}, ${sqlStr(text)}${to}${filtering ? "" : mr})` : null;
   let vecScore = null;
   if (vm && vv) { vecScore = `similarity(${vf}, :q)`; params.q = vm === "row" ? { vector_of: vv, field: $("bVecField").value } : { embed: vv, field: $("bVecField").value }; }
   if (vecScore && J) vecScore = vecScore.replace(/^similarity\(/, "similarity(a.");
@@ -1263,6 +1272,7 @@ function helpSections(x) {
     { t: "Typos", d: `word~ also matches words an edit or two away (word~1, word~2 to choose). fuzzy => 'auto' does it for every word, in MATCH and bm25: 1 edit for words of 3 to 5 letters, 2 for longer ones.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${x.typo}', fuzzy => 'auto') DESC\nLIMIT 10` },
     { t: "Synonyms", d: `synonyms => 1 also searches what the synonym list (below) says is the same: "laptop, notebook" or "tv => television".`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1}', synonyms => 1) DESC\nLIMIT 10`, needs: "synonyms" },
     { t: "Some of the words", d: `(a b c)@2 matches rows with at least 2 of a, b and c; min => 2 (or '75%') asks that of a whole MATCH or bm25 text.`, sql: `SELECT ${show}, score() FROM ${T}\nWHERE MATCH(${tf}, '(${w1} ${w2} ${w3})@2')\nORDER BY bm25(${tf}, '${w1} ${w2} ${w3}', min => 2) DESC\nLIMIT 10` },
+    { t: "As many words as fit", d: `With max_rows, bm25 (or MATCH, or AT_LEAST) asks for all its words first and for fewer, down to min, while the rows stay within max_rows; min_rows asks for fewer while there are too few. The plan says which level ran.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1} ${w2} ${w3}', min => 1, max_rows => 50) DESC\nLIMIT 10` },
     { t: "Weights, required and excluded words", d: `In bm25, word^2 weighs a word twice, +word must appear and -word must not; the other words rank. syntax => 'plain' reads the text as words alone.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '+${w1} ${w2}^2 -${w3}') DESC\nLIMIT 10` },
     { t: "Ranked search with filters", d: `bm25 ranks; score() shows the score. Filters decide which rows compete.`, sql: `SELECT ${show}${num ? ", " + num : ""}, score() FROM ${T}${num ? `\nWHERE ${num} >= ${x.avg}` : ""}\nORDER BY bm25(${tf}, '${w1} ${w2}') DESC\nLIMIT 10` },
   ] });

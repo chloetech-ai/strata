@@ -87,6 +87,34 @@ def test_at_least_and_count_true_run_as_their_sql(db):
         count_true()
 
 
+def test_guards_run_as_their_sql(db):
+    t = db.table()
+    conds = [match("description", "dragon"), col("year") >= 1990, col("genres").isin(["classic"]), col("rating") < 3]
+    sql = "MATCH(description, 'dragon'), year >= 1990, genres IN ('classic'), rating < 3"
+    for opts, text in [(dict(max_rows=40), "max_rows => 40"), (dict(min_rows=30), "min_rows => 30"), (dict(min_rows=10, max_rows=90), "min_rows => 10, max_rows => 90")]:
+        q = t.select("id").where(col("year") > 1910, at_least(1, *conds, **opts)).order_by(col("year")).limit(200)
+        r = same(db, q, f"SELECT id FROM books WHERE year > 1910 AND AT_LEAST(1, {sql}, {text}) ORDER BY year LIMIT 200")
+        assert "guard" in q.plan()["root"]["input"]["input"]
+        q = t.select("id").where(match("description", "dragon ship river winter", min="25%", **opts)).order_by(col("year")).limit(200)
+        same(db, q, f"SELECT id FROM books WHERE MATCH(description, 'dragon ship river winter', min => '25%', {text}) ORDER BY year LIMIT 200")
+        q = t.select("id", score()).order_by(bm25("description", "dragon ship river winter", min=1, **opts)).limit(10)
+        same(db, q, f"SELECT id, score() FROM books ORDER BY bm25(description, 'dragon ship river winter', min => 1, {text}) DESC LIMIT 10")
+    assert len(r) > 0
+    with pytest.raises(strata.StrataError, match="relax its min, which it needs"):
+        match("description", "dragon ship", max_rows=10)
+    with pytest.raises(strata.StrataError, match="a count of rows"):
+        at_least(1, *conds, max_rows=2.5)
+    guarded = at_least(1, *conds, max_rows=40)
+    for q, msg in [
+        (t.select("id").where(guarded | (col("year") > 2000)), "joined to the others by AND"),
+        (t.select("id").where(~guarded), "joined to the others by AND"),
+        (t.select("id").where(guarded, match("description", "dragon ship", min=1, max_rows=5)), "one guard"),
+        (t.select("id").order_by(bm25("description", "dragon")).rerank(bm25("description", "ship river", min=1, max_rows=5), 20), "not a rerank phase"),
+    ]:
+        with pytest.raises(strata.StrataError, match=msg):
+            db.run(q)
+
+
 def test_a_ranking_given_by_keys_runs_as_its_sql(db):
     t = db.table()
     keys = ["b0007", "b0003", "none", "b0011", "b0003"]

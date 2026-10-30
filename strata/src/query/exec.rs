@@ -648,6 +648,13 @@ impl<'a> Executor<'a> {
                 (n..=y).map(|m| Ok(bm25(Some(m))?.1.map_or(Pred::True, |query| Pred::Match { field: *field, query, expand }))).collect::<Result<_>>()?
             }
         };
+        // A text site whose loosest level is a group of its y items alone
+        // counts them once, as AT_LEAST's conditions are; one with
+        // required or excluded words, level by level.
+        let words = match levels.first() {
+            Some(Pred::Match { field, query, expand }) => group_items(&*self.match_query(*field, query, expand)?, n, y).map(|items| (*field, items)),
+            _ => None,
+        };
         let per = self.per_segment(|ex, s, _| {
             let n_docs = s.r.n_docs;
             let mut base = ex.materialize(s, &q.filter)?;
@@ -657,9 +664,14 @@ impl<'a> Executor<'a> {
             if base.is_empty() {
                 return Ok(vec![0; y - n + 1]);
             }
-            match &g.site {
-                GuardSite::AtLeast(items) => {
+            match (&g.site, &words) {
+                (GuardSite::AtLeast(items), _) => {
                     let sets = items.iter().map(|p| ex.materialize(s, p)).collect::<Result<Vec<_>>>()?;
+                    Ok(DocSet::at_least_counts(&sets, &base, n, y))
+                }
+                (_, Some((field, items))) => {
+                    let text = ex.text(s, *field)?;
+                    let sets: Vec<DocSet> = items.iter().map(|i| text.eval(i, None)).collect();
                     Ok(DocSet::at_least_counts(&sets, &base, n, y))
                 }
                 _ => levels.iter().map(|p| Ok(ex.materialize(s, p)?.intersect(&base).len() as u64)).collect(),
@@ -2674,6 +2686,18 @@ fn ranked_terms(q: &str, opts: &Opts, analyzer: text::Analyzer) -> Result<(Vec<(
     filter.extend(must);
     filter.extend(not);
     Ok((terms, (!filter.is_empty()).then(|| filter.join(" ")), should.len()))
+}
+
+/// The `y` items of a group query (`(a b c)@n` parsed, `n < y`), when it
+/// is the group and nothing else: no required or excluded words beside
+/// it, which the parse would join to it by `AND`.
+fn group_items(q: &BoolQuery, n: usize, y: usize) -> Option<Vec<BoolQuery>> {
+    let items = match q {
+        BoolQuery::Or(items) if n == 1 && y > 1 => items,
+        BoolQuery::AtLeast { n: m, items } if *m == n => items,
+        _ => return None,
+    };
+    (items.len() == y && !items.iter().any(|i| matches!(i, BoolQuery::Not(_)))).then(|| items.clone())
 }
 
 /// The options of the `bm25(field, text, ...)` of `q`'s `ORDER BY` that has

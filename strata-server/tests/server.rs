@@ -1078,6 +1078,52 @@ async fn shards_speak_the_oldest_protocol_among_them() {
     }
 }
 
+/// Guarded queries (`min_rows`, `max_rows`) on the demo's products.
+const GUARDED: [&str; 3] = [
+    "SELECT id, price FROM products WHERE price < 400 AND AT_LEAST(1, MATCH(body, 'waterproof'), tags = 'sale', rating >= 4, year >= 2022, max_rows => 300) ORDER BY price DESC, id LIMIT 10",
+    "SELECT id, score() FROM products ORDER BY bm25(body, 'waterproof hiking boots leather', min => 1, min_rows => 40) DESC LIMIT 10",
+    "SELECT id, score() FROM products WHERE MATCH(body, 'lightweight waterproof jacket', min => 1, max_rows => 150) ORDER BY bm25(body, 'jacket') DESC LIMIT 10",
+];
+
+/// A guard's level is the cluster's: the shards' counts, summed, choose
+/// it as one database's would. A shard before protocol 8 cannot count.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guard_counts_the_rows_of_every_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = create(dir.path(), "whole.strata", |_| true);
+    let local = service(create(dir.path(), "local.strata", |_| true), "http://unused");
+    let key = |i: usize| Value::Str(format!("p{i:07}"));
+    let mut urls = Vec::new();
+    for s in 0..3 {
+        let db = create(dir.path(), &format!("s{s}.strata"), |i| shard_of(&key(i), 3) == s);
+        urls.push(grpc(service(db, "http://unused")).await);
+    }
+    let coord = cluster(Coordinator::connect(urls).await.unwrap());
+    let guard = |rs: &strata::query::exec::ResultSet| rs.stats.plan.iter().find(|l| l.starts_with("guard: ")).cloned();
+    for sql in GUARDED {
+        let want = whole.query(sql, &Params::new()).unwrap();
+        assert!(!want.rows.is_empty(), "{sql}");
+        let got = coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+        same(sql, &js::result(&want, 0.0), &js::result(&got.rs, 0.0));
+        assert!(guard(&want).is_some() && guard(&want) == guard(&got.rs), "{sql}: {:?} against {:?}", want.stats.plan, got.rs.stats.plan);
+        // The counts alone, as a coordinator in front of this one asks.
+        let counts = coord.guard_counts(sql, None, &Params::new(), &After::Any, 0).await.unwrap();
+        assert_eq!(counts, local.guard_counts(sql, None, &Params::new(), &After::Any, 0).await.unwrap(), "{sql}");
+        // A shard runs it at the level its coordinator chose, not its own.
+        let e = local.query(QueryReq { sql: sql.into(), shard: true, ..Default::default() }).await.err().unwrap();
+        assert!(e.message.contains("runs on shards at the level its coordinator chose"), "{sql}: {}", e.message);
+    }
+    let e = local.guard_counts("SELECT id FROM products WHERE price < 10", None, &Params::new(), &After::Any, 0).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("no guard"), "{}", e.message);
+    let (old, _) = recording(create(dir.path(), "old.strata", |i| shard_of(&key(i), 2) == 0), 7).await;
+    let (new, _) = recording(create(dir.path(), "new.strata", |i| shard_of(&key(i), 2) == 1), 8).await;
+    let coord = cluster(Coordinator::connect(vec![old, new]).await.unwrap());
+    let e = coord.query(QueryReq { sql: GUARDED[0].into(), ..Default::default() }).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("needs 8: upgrade it"), "{}", e.message);
+    let sql = "SELECT id, price FROM products WHERE price < 400 AND AT_LEAST(1, MATCH(body, 'waterproof'), tags = 'sale') ORDER BY price DESC, id LIMIT 10";
+    coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+}
+
 /// A replica that fails is asked its versions again before its next read,
 /// as it may have restarted on another: one rolled back to a server from
 /// before `Hello` gets SQL again.

@@ -100,8 +100,8 @@ fn choose(n: usize, y: usize, rows: &dyn Fn(usize) -> u64, min_rows: Option<u64>
 /// What a random case guards: a condition of `WHERE` or the ranking.
 enum Site {
     AtLeast(Vec<String>),
-    Match(String),
-    Bm25(String),
+    Match(String, usize),
+    Bm25(String, usize),
 }
 
 impl Site {
@@ -132,15 +132,25 @@ impl Site {
                     .collect();
                 Site::AtLeast(conds)
             }
-            1 => Site::Match(words(rng)),
-            _ => Site::Bm25(words(rng)),
+            // Sometimes a word beside the group that is not counted: one
+            // the rows must not have, or in bm25 one they must.
+            1 => {
+                let t = words(rng);
+                let y = t.split(' ').count();
+                Site::Match(if rng.gen_ratio(1, 3) && !t.contains("fern") { format!("{t} -fern") } else { t }, y)
+            }
+            _ => {
+                let t = words(rng);
+                let y = t.split(' ').count();
+                Site::Bm25(if rng.gen_ratio(1, 3) && !t.contains("amber") { format!("+amber {t}") } else { t }, y)
+            }
         }
     }
 
     fn items(&self) -> usize {
         match self {
             Site::AtLeast(c) => c.len(),
-            Site::Match(t) | Site::Bm25(t) => t.split(' ').count(),
+            Site::Match(_, y) | Site::Bm25(_, y) => *y,
         }
     }
 
@@ -148,15 +158,20 @@ impl Site {
     fn cond(&self, need: &str, opts: &str) -> String {
         match self {
             Site::AtLeast(c) => format!("AT_LEAST({need}, {}{opts})", c.join(", ")),
-            Site::Match(t) | Site::Bm25(t) => format!("MATCH(body, '{t}', min => {need}{opts})"),
+            Site::Match(t, _) => format!("MATCH(body, '{t}', min => {need}{opts})"),
+            // bm25's filter: its required word, and the group of the rest.
+            Site::Bm25(t, _) => match t.strip_prefix("+amber ") {
+                Some(rest) => format!("MATCH(body, 'amber') AND MATCH(body, '{rest}', min => {need}{opts})"),
+                None => format!("MATCH(body, '{t}', min => {need}{opts})"),
+            },
         }
     }
 
     fn what(&self) -> &str {
         match self {
             Site::AtLeast(_) => "AT_LEAST",
-            Site::Match(_) => "MATCH min",
-            Site::Bm25(_) => "bm25 min",
+            Site::Match(..) => "MATCH min",
+            Site::Bm25(..) => "bm25 min",
         }
     }
 
@@ -164,7 +179,7 @@ impl Site {
     fn query(&self, rest: &str, need: &str, opts: &str) -> String {
         let and = |c: String| if rest.is_empty() { c } else { format!("{rest} AND {c}") };
         match self {
-            Site::Bm25(t) => {
+            Site::Bm25(t, _) => {
                 let filter = if rest.is_empty() { String::new() } else { format!("WHERE {rest} ") };
                 format!("SELECT id, score() FROM t {filter}ORDER BY bm25(body, '{t}', min => {need}{opts}) DESC LIMIT 30")
             }
