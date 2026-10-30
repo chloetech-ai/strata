@@ -48,6 +48,10 @@ pub struct Options {
     pub replicas: Vec<String>,
     /// Apply the writes a primary ships, and take none from clients.
     pub replica: bool,
+    /// Start as the primary of a new term, shipping to `replicas` (none:
+    /// to no replica), though the database was a replica or another
+    /// primary replaced it ([`PrimaryOptions::promote`]).
+    pub promote: bool,
     /// With `replicas`: which copies hold a write before it is answered.
     pub write_acks: Acks,
     /// On a primary or a replica: the latest transactions kept to ship, in
@@ -128,12 +132,12 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if o.seq_no && !o.shards.is_empty() {
         return Err("--seq-no numbers a database's writes: start each shard server with it, not the coordinator".into());
     }
-    let replicating = !o.replicas.is_empty() || o.replica;
+    let replicating = !o.replicas.is_empty() || o.replica || o.promote;
     if replicating && !o.shards.is_empty() {
-        return Err("--replicas and --replica are for the servers holding a shard's copies, not the coordinator".into());
+        return Err("--replicas, --replica and --promote are for the servers holding a shard's copies, not the coordinator".into());
     }
-    if !o.replicas.is_empty() && o.replica {
-        return Err("a server is a primary (--replicas) or a replica (--replica), not both".into());
+    if (!o.replicas.is_empty() || o.promote) && o.replica {
+        return Err("a server is a primary (--replicas, --promote) or a replica (--replica), not both".into());
     }
     let ship_log_bytes = match replicating {
         true => (if o.ship_log_mb > 0 { o.ship_log_mb } else { 64 }) << 20,
@@ -257,26 +261,41 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     // Once loaded: bulk loads are not shipped, so every copy loads the same.
     if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
-        if !o.replicas.is_empty() {
-            let opts = PrimaryOptions {
-                replicas: o.replicas.clone(),
-                acks: o.write_acks,
-                token: o.coord.token.clone(),
-                ca: o.coord.ca.clone(),
-                verify_every: Duration::from_secs(o.verify_every_s),
-                ..Default::default()
-            };
+        // How it ships as a primary, but for its replicas and acks.
+        let ships = PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() };
+        if !o.replicas.is_empty() || o.promote {
+            let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, promote: o.promote, ..ships };
             let p = Primary::start(db.clone(), Some(file), opts)?;
             tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
-            svc.replication = Replication::Primary(p);
+            svc.set_replication(Replication::Primary(p));
         } else if o.replica {
-            svc.replication = Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?));
+            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
+            svc.promote_options = Some(ships);
             tracing::info!("replica: applies the writes its primary ships, and takes none from clients");
         }
     }
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
     Ok(svc)
+}
+
+/// Asks the replica serving HTTP at `url` to become the primary of a new
+/// term, shipping to `replicas` under `write_acks` (`POST
+/// /v1/admin/promote`), and answers what it said.
+pub async fn promote(url: &str, replicas: &[String], write_acks: &str, force: bool, token: Option<&str>) -> Result<serde_json::Value, String> {
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/v1/admin/promote", url.trim_end_matches('/')))
+        .json(&serde_json::json!({"replicas": replicas, "write_acks": write_acks, "force": force}));
+    if let Some(t) = token.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let r = req.send().await.map_err(|e| format!("{url}: {e}"))?;
+    let status = r.status();
+    let j: serde_json::Value = r.json().await.map_err(|e| format!("{url}: {status}: {e}"))?;
+    match status.is_success() {
+        true => Ok(j),
+        false => Err(format!("{url}: {status}: {}", j["error"].as_str().map_or_else(|| j.to_string(), String::from))),
+    }
 }
 
 /// Downloads model `name` ([`strata::embed::KNOWN_MODELS`], or a Hugging
