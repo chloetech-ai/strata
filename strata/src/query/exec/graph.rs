@@ -273,6 +273,23 @@ impl<'a> Executor<'a> {
                 out.dedup_by_key(|x| x.0);
                 out
             }
+            // A key listed twice restarts with both weights.
+            Seeds::Weighted(keys) => {
+                let mut out: Vec<(Node, f64)> = Vec::with_capacity(keys.len());
+                let mut at: HashMap<Node, usize> = HashMap::new();
+                for (k, w) in keys {
+                    let Some((s, d)) = self.snap.lookup(k) else { continue };
+                    let n = node(s, d);
+                    match at.get(&n) {
+                        Some(&i) => out[i].1 += w,
+                        None => {
+                            at.insert(n, out.len());
+                            out.push((n, *w));
+                        }
+                    }
+                }
+                out
+            }
             Seeds::Query(q) => {
                 let mut sub = Executor::new(self.snap, &self.readers_all, self.opts);
                 let hits: Vec<Hit> = sub.select_hits(q)?;

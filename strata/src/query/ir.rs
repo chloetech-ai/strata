@@ -60,7 +60,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 2] = [OPERATORS, SEQ_NO];
+pub const FEATURES: [&str; 3] = [OPERATORS, SEQ_NO, MAXSIM];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -70,6 +70,11 @@ pub const OPERATORS: &str = "operators";
 /// The feature of a plan with a column of rows' sequence numbers
 /// ([`Expr::SeqNo`]).
 pub const SEQ_NO: &str = "seq_no";
+
+/// The feature of a plan that scores with several query vectors
+/// ([`Expr::MaxSim`]), takes a dot product of vectors ([`Func::Dot`]), or
+/// seeds a walk with weights ([`Graph::weights`]).
+pub const MAXSIM: &str = "maxsim";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -284,6 +289,8 @@ pub enum Func {
     Round,
     /// The first argument that is not NULL (nor a list without values).
     Coalesce,
+    /// The dot product of two vectors of one length (feature [`MAXSIM`]).
+    Dot,
 }
 
 /// A branch of [`Expr::Case`].
@@ -385,6 +392,15 @@ pub enum Expr {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "lits")]
         opts: Opts,
     },
+    /// The best similarity of a VECTOR field with any of `vectors`: a list
+    /// literal of vectors, or [`Expr::Values`] of a subquery, which runs
+    /// first (feature [`MAXSIM`]).
+    MaxSim {
+        field: u32,
+        vectors: Box<Expr>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "lits")]
+        opts: Opts,
+    },
     /// Similarity of a SPARSE field with `terms`.
     Sparse {
         field: u32,
@@ -429,6 +445,11 @@ pub struct Graph {
     pub field: u32,
     /// Primary keys (a list literal), or a [`Expr::Subquery`].
     pub seeds: Expr,
+    /// The weight of each of the keys `seeds` lists, which PageRank
+    /// restarts at in proportion (`weighted => 1`); none, all 1 (feature
+    /// [`MAXSIM`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<f64>,
     pub kind: GraphKind,
     pub dir: Direction,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -490,6 +511,79 @@ impl Node {
         let mut found = false;
         self.leaf_exprs(&mut |e| found |= e.has_operators());
         found
+    }
+
+    /// Whether the plan needs [`MAXSIM`]: an [`Expr::MaxSim`], a
+    /// [`Func::Dot`] or weighted seeds anywhere in it, subqueries too.
+    pub fn uses_maxsim(&self) -> bool {
+        let mut found = false;
+        self.exprs(&mut |e| {
+            e.visit(&mut |x| {
+                found |= match x {
+                    Expr::MaxSim { .. } | Expr::Call { func: Func::Dot, .. } => true,
+                    Expr::Graph(g) | Expr::Ppr(g) => !g.weights.is_empty(),
+                    Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) => n.uses_maxsim(),
+                    _ => false,
+                }
+            })
+        });
+        found
+    }
+
+    /// Calls `f` on each expression of the node and of the nodes below it,
+    /// not inside the plans of subqueries.
+    fn exprs(&self, f: &mut dyn FnMut(&Expr)) {
+        match self {
+            Node::Search(s) => {
+                f(&s.filter);
+                s.order.iter().for_each(|k| f(&k.expr));
+            }
+            Node::Aggregate { input, keys, aggs } => {
+                keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut *f);
+                input.exprs(f);
+            }
+            Node::Filter { input, cond } => {
+                f(cond);
+                input.exprs(f);
+            }
+            Node::Sort { input, keys } => {
+                keys.iter().for_each(|k| f(&k.expr));
+                input.exprs(f);
+            }
+            Node::Project { input, columns } => {
+                columns.iter().for_each(|c| f(&c.expr));
+                input.exprs(f);
+            }
+            Node::Insert { rows, on_conflict, .. } => {
+                rows.iter().flatten().for_each(&mut *f);
+                if let OnConflict::Update(sets) = on_conflict {
+                    sets.iter().for_each(|s| f(&s.value));
+                }
+            }
+            Node::Update { input, sets, .. } => {
+                sets.iter().for_each(|s| f(&s.value));
+                input.exprs(f);
+            }
+            Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.exprs(f),
+            Node::Join { left, right, keys, on, .. } => {
+                keys.iter().for_each(|k| {
+                    f(&k.left);
+                    f(&k.right);
+                });
+                on.iter().for_each(&mut *f);
+                left.exprs(f);
+                right.exprs(f);
+            }
+            Node::With { ctes, input } => {
+                ctes.iter().for_each(|c| c.input.exprs(f));
+                input.exprs(f);
+            }
+            Node::KeyOrder { input, by } => {
+                input.exprs(f);
+                by.exprs(f);
+            }
+            Node::Ref { .. } => {}
+        }
     }
 
     /// Calls `f` on each expression of a leaf's nodes.
@@ -627,6 +721,7 @@ impl Expr {
                 otherwise.iter().for_each(|x| x.visit(f));
             }
             Expr::Call { args, .. } => args.iter().for_each(|x| x.visit(f)),
+            Expr::MaxSim { vectors, .. } => vectors.visit(f),
             Expr::Rrf { inputs, .. } => inputs.iter().for_each(|x| x.visit(f)),
             Expr::Weighted(ts) => ts.iter().for_each(|(_, x)| x.visit(f)),
             Expr::Graph(g) | Expr::Ppr(g) => graph(g, f),
@@ -640,7 +735,7 @@ impl Expr {
         f(self)?;
         let mut within: Vec<&mut Expr> = Vec::new();
         match self {
-            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => within.push(x),
+            Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::MaxSim { vectors: x, .. } => within.push(x),
             Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
@@ -701,6 +796,9 @@ impl Plan {
         }
         if seq_no {
             features.push(SEQ_NO.to_string());
+        }
+        if root.uses_maxsim() {
+            features.push(MAXSIM.to_string());
         }
         Plan { version: VERSION, features, root }
     }

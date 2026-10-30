@@ -57,9 +57,9 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// Functions that only the executor evaluates: they name one side of a join.
-const NATIVE: [&str; 13] = ["match", "bm25", "similarity", "distance", "rrf", "ppr", "decay", "reachable", "path", "hops", "score", "now", "near"];
+const NATIVE: [&str; 14] = ["match", "bm25", "similarity", "distance", "maxsim", "rrf", "ppr", "decay", "reachable", "path", "hops", "score", "now", "near"];
 /// Score functions, which order a side's scan.
-const SCORES: [&str; 7] = ["bm25", "similarity", "distance", "rrf", "ppr", "decay", "hops"];
+const SCORES: [&str; 8] = ["bm25", "similarity", "distance", "maxsim", "rrf", "ppr", "decay", "hops"];
 const AGGREGATES: [&str; 5] = ["count", "sum", "avg", "min", "max"];
 
 fn fname(f: &sql::Function) -> String {
@@ -99,6 +99,9 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
         TableFactor::Table { name, .. } if is_table(name, schema) => {}
         _ => return true,
     }
+    if computed(s) {
+        return true;
+    }
     let mut found = false;
     let mut check = |e: &Expr| {
         // A graph's seed subquery over the table is the executor's own.
@@ -123,6 +126,33 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
         }
     }
     found
+}
+
+/// Whether a SELECT computes a column from its rows' values (`dot(emb,
+/// :q)`, `MAX(dot(..))`, `a + 1`), which one table's scan does not: the
+/// rows are read, and the columns computed in memory.
+fn computed(s: &sql::Select) -> bool {
+    fn column(e: &Expr) -> bool {
+        match e {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+            Expr::Nested(x) => column(x),
+            _ => false,
+        }
+    }
+    fn scanned(e: &Expr) -> bool {
+        match e {
+            Expr::Nested(x) => scanned(x),
+            Expr::Function(f) => match fname(f).as_str() {
+                n if AGGREGATES.contains(&n) => func_args(f).into_iter().all(|a| column(a) || matches!(a, Expr::Value(_))),
+                n => NATIVE.contains(&n) || n == "seq_no",
+            },
+            e => column(e),
+        }
+    }
+    s.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => !scanned(e),
+        _ => false,
+    })
 }
 
 /// The expressions of a SELECT outside its FROM and ORDER BY.
@@ -363,11 +393,12 @@ impl<'a> Planner<'a> {
             TableFactor::Table { name, .. } if self.cte(&super::sql::table_name(name)).is_some() => {
                 let cte = self.cte(&super::sql::table_name(name)).expect("in scope");
                 match cte.keyed.as_deref().and_then(|t| self.table(t)) {
-                    Some(schema) => self.over_rows(q, s, &cte, schema),
-                    None => self.join(q, s),
+                    Some(schema) if !computed(s) => self.over_rows(q, s, &cte, schema),
+                    _ => self.join(q, s),
                 }
             }
             TableFactor::Table { name, .. } => match self.table(&super::sql::table_name(name)) {
+                Some(_) if computed(s) => self.join(q, s),
                 Some(schema) => self.single(q, s, schema),
                 None => Err(err(format!("no such table: {}", super::sql::table_name(name)))),
             },
@@ -430,6 +461,10 @@ impl<'a> Planner<'a> {
         Ok(Some(match kind {
             Sub::In => {
                 one("a subquery in IN")?;
+                ir::Expr::Values(node)
+            }
+            Sub::Vectors => {
+                one("a subquery of query vectors")?;
                 ir::Expr::Values(node)
             }
             Sub::Exists => ir::Expr::Exists(node),
@@ -1257,6 +1292,8 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                 "abs" => Func::Abs,
                 "round" => Func::Round,
                 "coalesce" => Func::Coalesce,
+                "dot" if func_args(f).len() != 2 => return Err(err("dot(a, b) takes two vectors")),
+                "dot" => Func::Dot,
                 n if NATIVE.contains(&n) => {
                     return Err(err(format!("{}(...) works on one table's scan, in its WHERE or ORDER BY (in a join, on that table's column: a.body), not on values of rows", n.to_uppercase())))
                 }

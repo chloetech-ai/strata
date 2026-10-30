@@ -5,7 +5,7 @@
 
 use super::{err, Agg, ArithOp, CmpOp, Expr, Graph, GraphKind, Node, OnConflict, Plan};
 use crate::error::Result;
-use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::query::sql::{self, Assign, Conflict, Write};
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
@@ -427,7 +427,11 @@ impl<'a> Raise<'a> {
         if !matches!(self.schema.fields[field].ty, FieldType::Edges | FieldType::Vector { .. }) {
             return Err(err(format!("a traversal needs an EDGES or VECTOR field, not {}", self.schema.fields[field].name)));
         }
-        let seeds = self.seeds(&g.seeds)?;
+        let seeds = match (self.seeds(&g.seeds)?, g.weights.as_slice()) {
+            (s, []) => s,
+            (Seeds::Keys(keys), ws) if keys.len() == ws.len() && ws.iter().all(|w| w.is_finite()) => Seeds::Weighted(keys.into_iter().zip(ws.iter().copied()).collect()),
+            _ => return Err(err("a traversal's weights are finite numbers, one per key of its seeds")),
+        };
         let kind = match &g.kind {
             GraphKind::Reachable { min_hops, max_hops } => logical::GraphKind::Reach { min_hops: *min_hops, max_hops: *max_hops },
             GraphKind::Path { to, max_hops } => logical::GraphKind::Path { to: self.seeds(to)?, max_hops: *max_hops },
@@ -485,6 +489,20 @@ impl<'a> Raise<'a> {
                     }
                 }
                 Score::Similarity { field: f, vector: vector.clone(), opts: opts.clone() }
+            }
+            Expr::MaxSim { field, vectors, opts } => {
+                let f = self.typed(*field, |t| matches!(t, FieldType::Vector { .. }), "maxsim", "VECTOR")?;
+                let FieldType::Vector { dim, .. } = self.schema.fields[f].ty else { unreachable!("a VECTOR field") };
+                let Expr::Lit(Value::List(vs)) = vectors.as_ref() else { return Err(err("maxsim's query vectors are a list of vectors, once its subquery ran")) };
+                let vectors = vs
+                    .iter()
+                    .map(|v| match v {
+                        Value::Vector(v) if v.len() == dim => Ok(v.clone()),
+                        Value::Vector(v) => Err(err(format!("a query vector has {} dimensions, field has {dim}", v.len()))),
+                        v => Err(err(format!("maxsim's query vectors are vectors, not {v:?}"))),
+                    })
+                    .collect::<Result<_>>()?;
+                Score::MaxSim { field: f, vectors: Vectors::List(vectors), opts: opts.clone() }
             }
             Expr::Sparse { field, terms, opts } => Score::Sparse { field: self.typed(*field, |t| *t == FieldType::Sparse, "similarity", "SPARSE")?, terms: terms.clone(), opts: opts.clone() },
             Expr::Decay { field, decay, opts } => Score::Decay { field: self.typed(*field, |t| matches!(t, FieldType::Int | FieldType::Float), "decay", "INT or FLOAT")?, decay: *decay, opts: opts.clone() },

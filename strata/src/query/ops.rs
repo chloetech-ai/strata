@@ -311,7 +311,14 @@ impl<'a> Ops<'a, '_> {
             }
             Expr::Graph(g) | Expr::Ppr(g) => {
                 let pk = schema.and_then(|s| s.primary_key);
-                let Graph { seeds, kind, .. } = g.as_mut();
+                let Graph { seeds, kind, weights, .. } = g.as_mut();
+                // PageRank weighted by the seeds' scores restarts at each
+                // seed in proportion to the scores of the rows that name it.
+                if matches!(kind, GraphKind::Ppr { weighted: true, .. }) && matches!(seeds, Expr::Values(_) | Expr::Keys(_)) {
+                    let (keys, ws) = self.weighted_values(seeds, schema, pk)?;
+                    *seeds = Expr::Lit(Value::List(keys));
+                    *weights = ws;
+                }
                 for s in std::iter::once(seeds).chain(match kind {
                     GraphKind::Path { to, .. } => Some(to),
                     _ => None,
@@ -321,6 +328,7 @@ impl<'a> Ops<'a, '_> {
                     }
                 }
             }
+            Expr::MaxSim { vectors, .. } if matches!(vectors.as_ref(), Expr::Values(_)) => **vectors = Expr::Lit(Value::List(self.vectors(vectors)?)),
             Expr::Values(_) | Expr::Keys(_) => *e = Expr::Lit(Value::List(self.values(e, None, None)?)),
             Expr::Exists(n) => *e = Expr::Lit(Value::Bool(!self.node(n, "subquery")?.rows.is_empty())),
             Expr::Scalar(n) => *e = Expr::Lit(self.scalar(n, None, None)?),
@@ -355,6 +363,81 @@ impl<'a> Ops<'a, '_> {
         };
         self.plan.push(format!("subquery: {} {}", vals.len(), if matches!(e, Expr::Keys(_)) { "keys" } else { "values" }));
         equal_to(schema, f, vals)
+    }
+
+    /// The vectors of [`Expr::Values`] for `maxsim`: each row's, in order,
+    /// a list's each, none for NULL.
+    fn vectors(&mut self, e: &Expr) -> Result<Vec<Value>> {
+        let Expr::Values(n) = e else { unreachable!("a subquery") };
+        let rows = self.node(n, "subquery")?;
+        if rows.rows.first().is_some_and(|r| r.len() != 1) {
+            return Err(err(format!("maxsim's subquery returns one column of vectors, not {}", rows.columns.len())));
+        }
+        let mut out = Vec::new();
+        for v in rows.rows.into_iter().filter_map(|r| r.into_iter().next()) {
+            match v {
+                Value::Null => {}
+                v @ Value::Vector(_) => out.push(v),
+                Value::List(xs) if xs.iter().all(|x| matches!(x, Value::Vector(_))) => out.extend(xs),
+                v => return Err(err(format!("maxsim's subquery returns vectors, not {v:?}"))),
+            }
+        }
+        self.plan.push(format!("subquery: {} query vectors", out.len()));
+        Ok(out)
+    }
+
+    /// [`Ops::values`] of a weighted walk's seeds, each with the sum of the
+    /// scores of the rows that name it (1 for a row without a score), in
+    /// the order they first appear.
+    fn weighted_values(&mut self, e: &Expr, schema: Option<&Schema>, f: Option<usize>) -> Result<(Vec<Value>, Vec<f64>)> {
+        let (Expr::Values(n) | Expr::Keys(n)) = e else { unreachable!("a subquery") };
+        let rows = self.node(n, "subquery")?;
+        let scores = rows.scores.clone().unwrap_or_else(|| vec![1.0; rows.rows.len()]);
+        let named: Vec<(Vec<Value>, f64)> = match e {
+            Expr::Keys(_) => {
+                let keys = rows.keys.ok_or_else(|| err("the subquery's rows are not rows of the table, which have keys"))?;
+                keys.into_iter().zip(scores).map(|(k, w)| (vec![k], w)).collect()
+            }
+            _ => {
+                if rows.rows.first().is_some_and(|r| r.len() != 1) {
+                    return Err(err(format!("a subquery of seeds returns one column, not {}", rows.columns.len())));
+                }
+                rows.rows
+                    .into_iter()
+                    .zip(scores)
+                    .map(|(r, w)| {
+                        let vs = match r.into_iter().next() {
+                            Some(Value::List(xs)) => xs,
+                            Some(Value::Null) | None => Vec::new(),
+                            Some(v) => vec![v],
+                        };
+                        (vs, w)
+                    })
+                    .collect()
+            }
+        };
+        let mut at: HashMap<Part, usize> = HashMap::new();
+        let (mut keys, mut weights) = (Vec::new(), Vec::new());
+        for (vs, w) in named {
+            for v in vs {
+                let Some(v) = equal_value(schema, f, v)? else { continue };
+                match at.get(&part(&v)) {
+                    Some(&i) => weights[i] += w,
+                    None => {
+                        at.insert(part(&v), keys.len());
+                        keys.push(v);
+                        weights.push(w);
+                    }
+                }
+            }
+        }
+        // Restart weights are positive: a score of 0 or below counts as
+        // the least, as for a subquery of the scanned table.
+        for w in &mut weights {
+            *w = if w.is_finite() { w.max(1e-9) } else { 1e-9 };
+        }
+        self.plan.push(format!("subquery: {} weighted seeds", keys.len()));
+        Ok((keys, weights))
     }
 
     /// The value of [`Expr::Scalar`]: NULL without a row.
@@ -502,6 +585,7 @@ impl<'a> Ops<'a, '_> {
             return Ok(Expr::Graph(Box::new(Graph {
                 field: *f,
                 seeds: Expr::Lit(Value::List(vals)),
+                weights: Vec::new(),
                 kind: GraphKind::Reachable { min_hops: 0, max_hops: 1 },
                 dir: Direction::In,
                 labels: Vec::new(),
@@ -620,15 +704,17 @@ fn coerce(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Value> 
 /// Values field `f` is to equal ([`coerce`]d): an INT field holds no
 /// fraction, so a whole FLOAT is its INT and another FLOAT equals no row.
 fn equal_to(schema: Option<&Schema>, f: Option<usize>, vals: Vec<Value>) -> Result<Vec<Value>> {
+    vals.into_iter().filter_map(|v| equal_value(schema, f, v).transpose()).collect()
+}
+
+/// [`equal_to`] of one value: `None` for one no value of the field equals.
+fn equal_value(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Option<Value>> {
     let int = f.and_then(|f| schema?.fields.get(f)).is_some_and(|field| field.ty == FieldType::Int && field.logical.is_none());
-    vals.into_iter()
-        .filter_map(|v| match v {
-            Value::Float(x) if int && x.fract() == 0.0 && x.abs() < 9e18 => Some(Value::Int(x as i64)),
-            Value::Float(_) if int => None,
-            v => Some(v),
-        })
-        .map(|v| coerce(schema, f, v))
-        .collect()
+    match v {
+        Value::Float(x) if int && x.fract() == 0.0 && x.abs() < 9e18 => coerce(schema, f, Value::Int(x as i64)).map(Some),
+        Value::Float(_) if int => Ok(None),
+        v => coerce(schema, f, v).map(Some),
+    }
 }
 
 /// The first table's scan of the joins under a LIMIT, through the nodes

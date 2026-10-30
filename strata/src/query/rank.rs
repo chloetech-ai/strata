@@ -216,6 +216,7 @@ fn leaf_name(s: &Score, schema: &Schema) -> String {
     match s {
         Score::Bm25 { field, .. } => format!("bm25({})", name(field)),
         Score::Similarity { field, .. } | Score::Sparse { field, .. } => format!("similarity({})", name(field)),
+        Score::MaxSim { field, .. } => format!("maxsim({})", name(field)),
         Score::Column { field } => name(field).to_string(),
         Score::Decay { field, .. } => format!("decay({})", name(field)),
         Score::Ppr { .. } => "ppr()".into(),

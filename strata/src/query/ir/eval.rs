@@ -188,6 +188,7 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
         | Expr::Graph(_)
         | Expr::Bm25 { .. }
         | Expr::Similarity { .. }
+        | Expr::MaxSim { .. }
         | Expr::Sparse { .. }
         | Expr::Rrf { .. }
         | Expr::Weighted(_)
@@ -367,7 +368,24 @@ fn call(func: Func, args: &[Value]) -> Result<Value> {
         }
         // A list without values is NULL here, as to IS NULL.
         Func::Coalesce => Ok(args.iter().find(|v| !matches!(v, Value::Null) && !matches!(v, Value::List(xs) if xs.is_empty())).cloned().unwrap_or(Value::Null)),
+        // With the kernel similarity() uses, so the two agree to the bit.
+        Func::Dot => match (vector(&one)?, vector(args.get(1).unwrap_or(&Value::Null))?) {
+            (Some(a), Some(b)) if a.len() == b.len() => Ok(Some(crate::vector::kernels::dot_f32(&a, &b) as f64).filter(|d| d.is_finite()).map_or(Value::Null, Value::Float)),
+            (Some(a), Some(b)) => Err(err(format!("dot of vectors of {} and {} dimensions", a.len(), b.len()))),
+            _ => Ok(Value::Null),
+        },
     }
+}
+
+/// A vector argument: a vector, or a list of numbers as a parameter
+/// gives one; `None` for NULL.
+fn vector(v: &Value) -> Result<Option<std::borrow::Cow<'_, [f32]>>> {
+    Ok(match v {
+        Value::Null => None,
+        Value::Vector(x) => Some(std::borrow::Cow::Borrowed(x)),
+        Value::List(xs) if xs.iter().all(|x| matches!(x, Value::Int(_) | Value::Float(_))) => Some(xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()),
+        v => return Err(err(format!("dot takes vectors, not {v:?}"))),
+    })
 }
 
 /// SQL LIKE: `%` any run, `_` one character. Greedy matching that backs

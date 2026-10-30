@@ -2,7 +2,7 @@
 //! [`Plan::of_write`].
 
 use super::{Agg, Column, Expr, Graph, GraphKind, Node, OnConflict, Plan, Search, Set, SortKey};
-use crate::query::logical::{self, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
+use crate::query::logical::{self, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::query::sql::{Assign, Conflict, Write};
 use crate::schema::Schema;
 use crate::value::Value;
@@ -201,9 +201,14 @@ impl Lower<'_> {
     }
 
     fn graph(&self, g: &GraphQuery) -> Graph {
+        let (seeds, weights) = match &g.seeds {
+            Seeds::Weighted(ws) => (Expr::Lit(Value::List(ws.iter().map(|(k, _)| k.clone()).collect())), ws.iter().map(|(_, w)| *w).collect()),
+            s => (self.seeds(s), Vec::new()),
+        };
         Graph {
             field: g.field as u32,
-            seeds: self.seeds(&g.seeds),
+            seeds,
+            weights,
             kind: match &g.kind {
                 logical::GraphKind::Reach { min_hops, max_hops } => GraphKind::Reachable { min_hops: *min_hops, max_hops: *max_hops },
                 logical::GraphKind::Path { to, max_hops } => GraphKind::Path { to: self.seeds(to), max_hops: *max_hops },
@@ -221,6 +226,7 @@ impl Lower<'_> {
     fn seeds(&self, s: &Seeds) -> Expr {
         match s {
             Seeds::Keys(keys) => Expr::Lit(Value::List(keys.clone())),
+            Seeds::Weighted(ws) => Expr::Lit(Value::List(ws.iter().map(|(k, _)| k.clone()).collect())),
             Seeds::Query(q) => Expr::Subquery(Box::new(Lower { schema: self.schema, graphs: &q.graphs }.select(q))),
             Seeds::Plan(e) => (**e).clone(),
         }
@@ -230,6 +236,14 @@ impl Lower<'_> {
         match s {
             Score::Bm25 { field, text, opts } => Expr::Bm25 { field: *field as u32, text: text.clone(), opts: opts.clone() },
             Score::Similarity { field, vector, opts } => Expr::Similarity { field: *field as u32, vector: vector.clone(), opts: opts.clone() },
+            Score::MaxSim { field, vectors, opts } => Expr::MaxSim {
+                field: *field as u32,
+                vectors: Box::new(match vectors {
+                    Vectors::List(vs) => Expr::Lit(Value::List(vs.iter().map(|v| Value::Vector(v.clone())).collect())),
+                    Vectors::Plan(e) => (**e).clone(),
+                }),
+                opts: opts.clone(),
+            },
             Score::Sparse { field, terms, opts } => Expr::Sparse { field: *field as u32, terms: terms.clone(), opts: opts.clone() },
             Score::Decay { field, decay, opts } => Expr::Decay { field: *field as u32, decay: *decay, opts: opts.clone() },
             Score::Rrf { inputs, k, depth } => Expr::Rrf { inputs: inputs.iter().map(|s| self.score(s)).collect(), k: *k, depth: *depth as u64 },

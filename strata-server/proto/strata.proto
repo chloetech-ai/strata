@@ -447,7 +447,19 @@ message Expr {
     Node scalar = 34;
     // A row's sequence number (seq_no()); plan feature "seq_no".
     Empty seq_no = 35;
+    // maxsim(field, vectors); plan feature "maxsim". Numbered from 80, the
+    // range of the multi-vector work, so lanes building at once do not
+    // collide.
+    MaxSim maxsim = 80;
   }
+}
+
+// The best similarity of a VECTOR field with any of `vectors` (a list
+// literal of vectors, or the values of a subquery, which runs first).
+message MaxSim {
+  uint32 field = 1;
+  Expr vectors = 2;
+  map<string, Value> opts = 3;
 }
 
 message Cmp {
@@ -520,6 +532,8 @@ enum Func {
   FUNC_ABS = 3;
   FUNC_ROUND = 4;
   FUNC_COALESCE = 5;
+  // dot(a, b) of two vectors; plan feature "maxsim".
+  FUNC_DOT = 15;
 }
 
 message Match {
@@ -609,6 +623,9 @@ message Graph {
   uint64 max_nodes = 9;
   uint64 k = 10;
   optional double min_sim = 11;
+  // A weight per key `seeds` lists, which PageRank restarts at in
+  // proportion; empty, all 1 (plan feature "maxsim").
+  repeated double weights = 12;
 }
 
 message Reachable {

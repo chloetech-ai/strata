@@ -134,6 +134,7 @@ fn graph(g: &Graph) -> pb::Graph {
         max_nodes: g.max_nodes,
         k: g.k,
         min_sim: g.min_sim,
+        weights: g.weights.clone(),
     }
 }
 
@@ -191,6 +192,7 @@ fn expr(e: &Expr) -> E {
                 Func::Abs => pb::Func::Abs,
                 Func::Round => pb::Func::Round,
                 Func::Coalesce => pb::Func::Coalesce,
+                Func::Dot => pb::Func::Dot,
             } as i32,
             args: args.iter().map(ex).collect(),
         }),
@@ -208,6 +210,7 @@ fn expr(e: &Expr) -> E {
         Expr::Graph(g) => E::Graph(Box::new(graph(g))),
         Expr::Bm25 { field, text, opts: o } => E::Bm25(pb::Bm25 { field: *field, text: text.clone(), opts: opts(o) }),
         Expr::Similarity { field, vector, opts: o } => E::Similarity(pb::Similarity { field: *field, vector: Some(pb::Floats { v: vector.to_vec() }), opts: opts(o) }),
+        Expr::MaxSim { field, vectors, opts: o } => E::Maxsim(Box::new(pb::MaxSim { field: *field, vectors: bex(vectors), opts: opts(o) })),
         Expr::Sparse { field, terms, opts: o } => E::Sparse(pb::SparseScore { field: *field, terms: terms.iter().map(|(t, w)| pb::SparseTerm { term: t.clone(), weight: *w }).collect(), opts: opts(o) }),
         Expr::Decay { field, decay, opts: o } => E::Decay(pb::DecayScore {
             field: *field,
@@ -414,6 +417,7 @@ fn from_graph(g: pb::Graph) -> Result<Graph, ApiError> {
         max_nodes: g.max_nodes,
         k: g.k,
         min_sim: g.min_sim.map(|x| finite(x, "min_sim")).transpose()?,
+        weights: g.weights.into_iter().map(|w| finite(w, "a seed's weight")).collect::<Result<_, ApiError>>()?,
     })
 }
 
@@ -480,6 +484,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
                 pb::Func::Abs => Func::Abs,
                 pb::Func::Round => Func::Round,
                 pb::Func::Coalesce => Func::Coalesce,
+                pb::Func::Dot => Func::Dot,
             };
             Expr::Call { func, args: from_exprs(c.args)? }
         }
@@ -500,6 +505,10 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
                 return Err(bad("a vector's components must be finite"));
             }
             Expr::Similarity { field: s.field, vector: v.into(), opts: from_opts(s.opts)? }
+        }
+        E::Maxsim(m) => {
+            let m = *m;
+            Expr::MaxSim { field: m.field, vectors: Box::new(from_ex(m.vectors.map(|e| *e))?), opts: from_opts(m.opts)? }
         }
         E::Sparse(s) => {
             let terms = s.terms.into_iter().map(|t| Ok((t.term, finite(t.weight as f64, "a term's weight")? as f32))).collect::<Result<_, ApiError>>()?;
