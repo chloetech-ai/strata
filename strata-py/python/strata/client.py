@@ -52,9 +52,9 @@ class Client(Search):
         self.timeout = timeout
         self._schema: dict | None = None
 
-    def _call(self, method: str, path: str, body: Any = None, *, data: Any = None, headers: Mapping[str, str] | None = None, out: Any = None) -> Any:
-        """The answer's JSON; with `out`, a binary file, the answer is
-        copied into it and its headers returned."""
+    def _call(self, method: str, path: str, body: Any = None, *, data: Any = None, headers: Mapping[str, str] | None = None, text: bool = False, out: Any = None) -> Any:
+        """The answer's JSON, or its text with `text`; with `out`, a binary
+        file, the answer is copied into it and its headers returned."""
         h = dict(headers or {})
         if body is not None:
             data = json.dumps(body, default=_default).encode()
@@ -67,7 +67,7 @@ class Client(Search):
                 if out is not None:
                     shutil.copyfileobj(r, out)
                     return r.headers
-                return json.loads(r.read() or b"null")
+                return r.read().decode() if text else json.loads(r.read() or b"null")
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
@@ -125,6 +125,18 @@ class Client(Search):
         INSERT, UPDATE or DELETE wrote."""
         r = self._call("POST", "/v1/sql", {"sql": sql, "params": _params(params, kw)})
         return Result._of(r) if "rows" in r else int(r["written"])
+
+    def _query_logged(self, sql: str, params: Mapping[str, Any] | None, log: dict) -> Result:
+        return Result._of(self._call("POST", "/v1/query", {"sql": sql, "params": _params(params, {}), "log": log}))
+
+    def _export_rank_log(self, opts: dict) -> list[dict]:
+        # NDJSON, a record a line; a failure partway is the last line.
+        out = [json.loads(line) for line in self._call("POST", "/v1/rank_log/export", opts, text=True).splitlines() if line.strip()]
+        if out and "error" in out[-1] and "request" not in out[-1]:
+            err = StrataError(f"{out[-1]['error']} (HTTP {out[-1].get('status', 500)})")
+            err.status, err.answer = out[-1].get("status", 500), out[-1]
+            raise err
+        return out
 
     def explain(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> dict:
         """Runs the query and returns its plan: the plan IR as JSON ("ir")

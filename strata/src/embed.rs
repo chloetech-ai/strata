@@ -56,6 +56,7 @@ pub trait Embedder: Send + Sync {
 pub enum Modality {
     Text,
     Image,
+    Audio,
 }
 
 impl Modality {
@@ -63,6 +64,7 @@ impl Modality {
         match self {
             Modality::Text => "text",
             Modality::Image => "image",
+            Modality::Audio => "audio",
         }
     }
 }
@@ -76,11 +78,20 @@ pub struct Image {
     pub rgb: Vec<u8>,
 }
 
+/// Sound decoded to one channel of samples, `rate` a second
+/// ([`crate::media::decode_audio`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Audio {
+    pub rate: u32,
+    pub samples: Vec<f32>,
+}
+
 /// What [`Embedder::embed_inputs`] embeds.
 #[derive(Clone, Copy, Debug)]
 pub enum Input<'a> {
     Text(&'a str),
     Image(&'a Image),
+    Audio(&'a Audio),
 }
 
 impl Input<'_> {
@@ -88,6 +99,7 @@ impl Input<'_> {
         match self {
             Input::Text(_) => Modality::Text,
             Input::Image(_) => Modality::Image,
+            Input::Audio(_) => Modality::Audio,
         }
     }
 }
@@ -342,13 +354,14 @@ impl Embedder for HashEmbedder {
         &[Modality::Text, Modality::Image]
     }
     fn embed_inputs(&self, inputs: &[Input<'_>]) -> Result<Vec<Vec<f32>>> {
-        Ok(inputs
+        inputs
             .iter()
             .map(|i| match i {
-                Input::Text(t) => self.embed(&[t]).pop().unwrap(),
-                Input::Image(image) => self.of_words(Self::colour_words(image).iter().map(String::as_str)),
+                Input::Text(t) => Ok(self.embed(&[t]).pop().unwrap()),
+                Input::Image(image) => Ok(self.of_words(Self::colour_words(image).iter().map(String::as_str))),
+                Input::Audio(_) => Err(model_err(format!("model {} does not embed audio", self.name()))),
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -538,6 +551,9 @@ impl Embedder for SiglipEmbedder {
         &[Modality::Text, Modality::Image]
     }
     fn embed_inputs(&self, inputs: &[Input<'_>]) -> Result<Vec<Vec<f32>>> {
+        if inputs.iter().any(|i| matches!(i, Input::Audio(_))) {
+            return Err(model_err(format!("model {} does not embed audio", self.name)));
+        }
         let texts: Vec<&str> = inputs.iter().filter_map(|i| if let Input::Text(t) = i { Some(*t) } else { None }).collect();
         let images: Vec<&Image> = inputs.iter().filter_map(|i| if let Input::Image(m) = i { Some(*m) } else { None }).collect();
         let (mut texts, mut images) = (self.embed(&texts).into_iter(), self.images(&images)?.into_iter());

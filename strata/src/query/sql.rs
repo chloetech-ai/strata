@@ -593,18 +593,27 @@ pub(crate) fn bind_phase_with(q: &sql::Query, schema: &Schema, tables: &[&Schema
 /// with `score()` and `features()` added to its columns: the values each
 /// row was ranked by, which `/v1/explain` shows for the top rows.
 pub fn with_features(sql_text: &str) -> Result<String> {
-    let one = || err("hits explain the rows of one SELECT ranked by an ORDER BY");
-    let mut stmts = super::parse::parse(sql_text)?;
-    let [sql::Statement::Query(q)] = stmts.as_mut_slice() else { return Err(one()) };
-    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(one()) };
-    if q.order_by.is_none() {
-        return Err(one());
-    }
-    let mut extra = super::parse::parse("SELECT score(), features()")?;
-    let Some(sql::Statement::Query(x)) = extra.pop() else { return Err(one()) };
-    let sql::SetExpr::Select(x) = *x.body else { return Err(one()) };
-    s.projection.extend(x.projection);
+    let mut q = ranked_query(sql_text).ok_or_else(|| err("hits explain the rows of one SELECT ranked by an ORDER BY"))?;
+    add_features(&mut q)?;
     Ok(q.to_string())
+}
+
+/// `sql_text` when it is one SELECT ranked by an ORDER BY.
+pub(crate) fn ranked_query(sql_text: &str) -> Option<sql::Query> {
+    let mut stmts = super::parse::parse(sql_text).ok()?;
+    let [sql::Statement::Query(q)] = stmts.as_mut_slice() else { return None };
+    (matches!(q.body.as_ref(), sql::SetExpr::Select(_)) && q.order_by.is_some()).then(|| (**q).clone())
+}
+
+/// Adds `score()` and `features()` to the columns of a query from
+/// [`ranked_query`].
+pub(crate) fn add_features(q: &mut sql::Query) -> Result<()> {
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(err("not a SELECT")) };
+    let mut extra = super::parse::parse("SELECT score(), features()")?;
+    let Some(sql::Statement::Query(x)) = extra.pop() else { unreachable!("a SELECT") };
+    let sql::SetExpr::Select(x) = *x.body else { unreachable!("a SELECT") };
+    s.projection.extend(x.projection);
+    Ok(())
 }
 
 /// The query of `(SELECT ...)`, in parentheses or not.
@@ -949,6 +958,21 @@ impl<'a> Binder<'a> {
                     Ok(Seeds::Keys(xs.into_iter().map(|x| self.coerce(pk, x)).collect::<Result<_>>()?))
                 }
                 _ => Ok(Seeds::Keys(vec![self.key_value(e)?])),
+            },
+        }
+    }
+
+    /// The keys of `ranked(keys)`: a tuple or array of keys, or a
+    /// parameter holding a list of them (or one key).
+    fn ranked_keys(&self, e: &Expr) -> Result<Vec<Value>> {
+        let pk = self.schema.primary_key.ok_or_else(|| err("ranked(keys) ranks rows by their primary keys, and the table has none"))?;
+        match e {
+            Expr::Nested(inner) => self.ranked_keys(inner),
+            Expr::Tuple(items) => items.iter().map(|i| self.field_value(pk, i)).collect(),
+            Expr::Array(a) => a.elem.iter().map(|i| self.field_value(pk, i)).collect(),
+            _ => match as_list(self.literal(e)?) {
+                Ok(xs) => xs.into_iter().map(|x| self.coerce(pk, x)).collect(),
+                Err(v) => Ok(vec![self.coerce(pk, v)?]),
             },
         }
     }
@@ -1340,6 +1364,7 @@ impl<'a> Binder<'a> {
                         let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
                         Expand::from_opts(&opts).map_err(err)?;
+                        crate::query::exec::plain_syntax(&opts)?;
                         Ok(Score::Bm25 { field, text, opts: without_norm(opts) })
                     }
                     "similarity" => self.similarity(&args, opts, false),
@@ -1368,6 +1393,10 @@ impl<'a> Binder<'a> {
                     // The number of hops, in an expression.
                     "hops" if args.is_empty() => Ok(Score::Hops { graph: self.hops_graph()?, far_first: true }),
                     "seq_no" if args.is_empty() => Ok(Score::SeqNo),
+                    "ranked" => match args.as_slice() {
+                        [keys] => Ok(Score::Ranked { keys: self.ranked_keys(keys)? }),
+                        _ => Err(err("ranked(keys) takes one argument: a list of primary keys, best first")),
+                    },
                     "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
                     "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
                     "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),

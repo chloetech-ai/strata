@@ -1276,6 +1276,7 @@ function helpSections(x) {
     { t: "Phrases and prefixes", d: `"Quoted words" must appear together; pre* matches every word that starts with pre.`, sql: `SELECT ${show} FROM ${T}\nWHERE MATCH(${tf}, '"${x.phrase}" OR ${w2.slice(0, 4)}*')\nLIMIT 20` },
     { t: "Typos", d: `word~ also matches words an edit or two away (word~1, word~2 to choose). fuzzy => 'auto' does it for every word, in MATCH and bm25: 1 edit for words of 3 to 5 letters, 2 for longer ones.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${x.typo}', fuzzy => 'auto') DESC\nLIMIT 10` },
     { t: "Synonyms", d: `synonyms => 1 also searches what the synonym list (below) says is the same: "laptop, notebook" or "tv => television".`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1}', synonyms => 1) DESC\nLIMIT 10`, needs: "synonyms" },
+    { t: "Weights, required and excluded words", d: `In bm25, word^2 weighs a word twice, +word must appear and -word must not; the other words rank. syntax => 'plain' reads the text as words alone.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '+${w1} ${w2}^2 -${w3}') DESC\nLIMIT 10` },
     { t: "Ranked search with filters", d: `bm25 ranks; score() shows the score. Filters decide which rows compete.`, sql: `SELECT ${show}${num ? ", " + num : ""}, score() FROM ${T}${num ? `\nWHERE ${num} >= ${x.avg}` : ""}\nORDER BY bm25(${tf}, '${w1} ${w2}') DESC\nLIMIT 10` },
   ] });
   const fl = [];

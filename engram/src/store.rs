@@ -364,7 +364,7 @@ impl Store {
 
     /// The top `n` by BM25 over `body`, with raw scores.
     pub fn bm25_top(&self, query: &str, n: usize, filter: &Filter) -> Result<Vec<(Record, f64)>> {
-        let sql = format!("SELECT {COLUMNS}, score() FROM memory {} ORDER BY bm25(body, :q) DESC LIMIT {n}", filter.sql());
+        let sql = format!("SELECT {COLUMNS}, score() FROM memory {} ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT {n}", filter.sql());
         let rs = self.query_with(&sql, &filter.params().set("q", Value::Str(query.to_string())))?;
         Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).collect())
     }

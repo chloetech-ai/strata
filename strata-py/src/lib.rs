@@ -21,6 +21,7 @@ use strata::query::ir::Plan;
 use strata::query::sql::{ident, quoted};
 use strata::query::Params;
 use strata::query::exec::ResultSet;
+use strata::rank_log::{Export, Log};
 use strata::schema::Schema;
 use strata::sid::{Codebook, TrainOptions};
 use strata::sqlite;
@@ -285,6 +286,34 @@ impl Database {
             SqlResult::Rows(rs) => Ok(result_py(py, &rs)?.into_any()),
             SqlResult::Written(n) => Ok(n.into_pyobject(py)?.into_any()),
         }
+    }
+
+    /// Runs a SELECT and logs what it served (`log`: the options as JSON
+    /// text, as strata-server's `"log"` takes them); returns its answer as
+    /// `query` does, with the request's id.
+    fn query_logged<'py>(&self, py: Python<'py>, sql: &str, params: Option<&Bound<'py, PyDict>>, log: &str) -> PyResult<Bound<'py, PyDict>> {
+        let db = self.get()?;
+        let p = params_json(params)?;
+        let log: Json = serde_json::from_str(log).map_err(|e| StrataError::new_err(format!("log options are JSON: {e}")))?;
+        let l = py.detach(|| Log::from_json(&log).and_then(|log| self::params(&db, &p).and_then(|p| db.query_logged(sql, &p, &log)))).map_err(err)?;
+        let d = result_py(py, &l.rs)?;
+        d.set_item("request", l.request)?;
+        Ok(d)
+    }
+
+    /// The records of a log table (`export`: the options as JSON text, as
+    /// strata-server's `/v1/rank_log/export` takes them), as JSON text of a
+    /// list.
+    fn export_rank_log(&self, py: Python<'_>, export: &str) -> PyResult<String> {
+        let db = self.get()?;
+        let x: Json = serde_json::from_str(export).map_err(|e| StrataError::new_err(format!("export options are JSON: {e}")))?;
+        py.detach(|| {
+            let x = Export::from_json(&x)?;
+            let mut out = Vec::new();
+            db.export_rank_log(&x, |r| Ok(out.push(r)))?;
+            Ok(Json::Array(out).to_string())
+        })
+        .map_err(err)
     }
 
     /// The plan of a SELECT, INSERT, UPDATE or DELETE as JSON text, without

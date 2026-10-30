@@ -102,7 +102,7 @@ A `KEYWORD[]` field may hold the [semantic ID](server.md#semantic-ids) of a vect
 
 A `SPARSE` value is a JSON object of terms and non-negative weights, `{"tok": 1.25, "##en": 0.4}`, as a learned sparse model (SPLADE, BGE-M3's sparse output, OpenSearch's neural sparse models) writes it. Terms are taken as given, not analysed, and weights are stored in steps of 1/1024.
 
-A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)).
+A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)), and whose captions or transcripts a `TEXT` field can: `caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')`, `transcript TEXT OPTIONS(derive = 'recording', model = 'whisper-small')` ([text from media](server.md#text-from-media)).
 
 ## Full text: `MATCH`
 
@@ -112,7 +112,7 @@ A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256"
 query   := and ("OR" and)*
 and     := unary (["AND"] unary)*          juxtaposition is AND
 unary   := ("NOT" | "-") unary | primary    "a NOT b" is "a AND NOT b"
-primary := "(" query ")" | "\"phrase\"" | word | word* | word~ | word~N
+primary := "(" query ")" | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
 ```
 
 | query | matches |
@@ -125,13 +125,13 @@ primary := "(" query ")" | "\"phrase\"" | word | word* | word~ | word~N
 | `vacine~`, `vacine~1` | the word and the indexed terms an edit or two from it ([typos](#typos-and-synonyms)) |
 | `vaccine AND (mrna OR "messenger rna") -animal` | any combination, with parentheses |
 
-Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it.
+Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it. A weight (`vaccine^2`, `"messenger rna"^0.5`) is read and ignored, since `MATCH` only says whether a row matches: `vaccine^2 mrna` matches what `vaccine mrna` does, so one text can go to both `MATCH` and [`bm25`](#weights-required-and-excluded-words).
 
 ## Scores
 
 ### `bm25(field, text)`
 
-BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains any of them. Ranked queries drop English function words (NLTK's 153-word list), except that its single letters (`d`, `m`, `o`, `s`, `t`, `y`) are kept unless they end a contraction: "vitamin d" and "T cell" keep their letter, "don't" and "it's" drop it. A term written twice weighs twice. Used in `ORDER BY` without a `MATCH`, it is a ranked search; with one, it ranks the matching rows.
+BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains any of them, unless the text [requires or excludes words](#weights-required-and-excluded-words). Ranked queries drop English function words (NLTK's 153-word list), except that its single letters (`d`, `m`, `o`, `s`, `t`, `y`) are kept unless they end a contraction: "vitamin d" and "T cell" keep their letter, "don't" and "it's" drop it. A term written twice weighs twice. Used in `ORDER BY` without a `MATCH`, it is a ranked search; with one, it ranks the matching rows.
 
 | option | default | effect |
 |---|---|---|
@@ -140,8 +140,32 @@ BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains
 | `stopwords` | 1 (0 on a `simple` field) | `0` keeps English function words in the query, `1` drops them |
 | `fuzzy` | 0 | `1`, `2` or `'auto'`: also score the indexed terms that many edits from each word ([typos](#typos-and-synonyms)) |
 | `synonyms` | 0 | `1`: also score each word's synonyms |
+| `syntax` | `'query'` | `'plain'` reads `+`, `-`, quotes and `^` as punctuation: the text is words alone |
 
 Keeping function words is better for short questions: on Quora it gains 0.055 nDCG@10, while on TREC-COVID, whose queries are full questions, dropping them gains the same amount.
+
+#### Weights, required and excluded words
+
+The text may weigh a word, require it or exclude it, as a search box does:
+
+| text | ranks |
+|---|---|
+| `vaccine mrna` | the rows with either word |
+| `vaccine^2 mrna` | the same rows, `vaccine` weighing twice: as `vaccine vaccine mrna` |
+| `+mrna vaccine` | the rows with `mrna`, by both words |
+| `vaccine -animal` | the rows with `vaccine` and without `animal` |
+| `+"messenger rna" vaccine^0.5` | the rows with the phrase (with both words, on a field without positions), by its words and half of `vaccine` |
+| `+covid^0 treatment` | the rows with `covid`, by `treatment` alone |
+
+- **`^w`** after a word or a closing quote multiplies its terms' BM25 by `w`, a number of at least 0 (`2`, `0.5`, `.5`). Weights add up, as a word written twice does. A word weighing 0 scores nothing, and a text whose words all weigh 0 ranks no row.
+- **`+`** before a word or a quoted phrase requires it, **`-`** excludes it: a row must contain every required one and none of the excluded ones, and ranks by the others too. An excluded word does not score, and a word the query drops as a stopword is neither required nor excluded. A sign counts only at the start of a word and before a letter, digit or quote: `covid-19`, a `-` alone, `+-x` and `x^` are words. Quotes alone change nothing: `"messenger rna"` scores what `messenger rna` does.
+- With `fuzzy` or `synonyms`, a word's typo neighbours and synonyms take the highest weight the word is written with (writing it twice weighs the word twice, not them), and a required or excluded word counts as present when one of them is, as in `MATCH`.
+- A required or excluded word is a filter on the ranked rows: the top-k loop (all three `algo`s), a [rank-safe boost](#rank-safe-boosts), a [rerank phase](#rerank-phases) (where a row the filter drops scores 0, as one without the words does) and shards all apply it, so the rows and scores are those of the rows the text allows.
+- Weights and signs cost little. With each query's first word weighed 2 (`word^2`) or required (`+word`), or its last word excluded (`-word`), the median query took 0.27, 0.28 and 0.23 ms on Quora's 10,000 queries against 0.25 ms for the plain text, and 0.24, 0.18 and 0.22 ms on FiQA against 0.22 ms; a required word can make a query faster, as the filter drops rows before they are scored. Text written without operators ranks and times as the plain text does on all five collections measured (`strata/results/text/bm25_term_operators.json`, one core of a 4-core cloud VM while another job held the other three). The operators were put on words mechanically to time them, so these queries rank worse than the plain text: an operator helps when it says what the person searching means.
+- **`syntax => 'plain'`** reads the text as words alone, as `bm25` did before: for text not written for a search box, such as a user's message passed through, or a benchmark's recorded queries. BEIR's hold `+1`, `-word` or `x^2` here and there, so the evaluations and benchmarks in this repository pass `syntax => 'plain'`, and so does Engram.
+- A plan that ranks with weights, signs, or a `MATCH` with weights needs the plan feature `text_operators`. From Python, `bm25("body", "+mrna vaccine^2")` reads them, and `bm25("body", text, syntax="plain")` does not.
+
+**Changed:** `bm25` read `+`, `-`, `"` and `^` as punctuation before; text with them now ranks as above, and `syntax => 'plain'` keeps the old reading. In `MATCH`, `^` separated words: `vaccine^2` matched `vaccine` and `2`, and now matches `vaccine`.
 
 ### `similarity(field, vector)` and `distance(field, vector)`
 
@@ -195,6 +219,16 @@ $$
 
 Options: `k => 60`, `depth => 100`. The depth is raised to `LIMIT + OFFSET` when the page asks for more rows, as in weighted sums and products.
 
+### `ranked(keys)`: a ranking from elsewhere
+
+`ranked(:keys)` is a ranking computed outside Strata, given as primary keys, best first: a recommender's candidates, a reranker's order, or the rows a [semantic-ID](server.md#semantic-ids) decoder generated. It is a score like any other, so it fuses with Strata's own rankings:
+
+```sql
+SELECT id FROM items WHERE in_stock ORDER BY rrf(bm25(title, :q), ranked(:keys)) DESC LIMIT 20;
+```
+
+A listed row scores `-(its position)`, from `-1` for the first key; a key listed twice ranks where it is first. A row the list leaves out has `NULL`, so in an expression it ranks last unless `coalesce` gives it a value, and in a weighted sum it takes the input's worst value, as a missing column does. Times another score (`ranked(:keys) * rating`) it multiplies as arithmetic, not as a product of scores, which would count its negative values as 0. A key no live row has is skipped. On its own, `ORDER BY ranked(:keys) DESC` answers the listed rows that `WHERE` keeps, in list order. The keys are a parameter holding a list (an array of keys in the HTTP API), a tuple (`ranked(('a', 'b'))`) or an array (`ranked(ARRAY['a', 'b'])`). Over shards, each shard scores its own rows from the list and the coordinator merges them, so no extra round is needed. A plan that uses it needs the plan feature `ranked`.
+
 ### Weighted sums: `minmax()`
 
 A weighted sum of min-max normalised scores is weighted fusion: `0.2 * minmax(bm25(body, :t)) + 0.8 * minmax(similarity(emb, :q))`. Weights are numeric constants; `+` and `-` combine any number of terms. Candidates are the union of each input's top 100, re-scored exactly by every input and min-max normalised over that union:
@@ -228,7 +262,7 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 | part | meaning |
 |---|---|
 | `+ - * / %`, unary `-` | arithmetic on raw values |
-| `bm25`, `similarity`, `ppr`, `decay`, `rrf`, a numeric column, `hops()`, `seq_no()` | the leaves: a row's value of each |
+| `bm25`, `similarity`, `ppr`, `decay`, `rrf`, `ranked`, a numeric column, `hops()`, `seq_no()` | the leaves: a row's value of each |
 | `ln(x)`, `log(x)` (base 10), `log(b, x)`, `exp(x)`, `sqrt(x)`, `pow(x, y)`, `abs(x)`, `round(x[, digits])`, `sigmoid(x)`, `clamp(x, lo, hi)` | numeric functions |
 | `least(…)`, `greatest(…)`, `coalesce(…)` | over their arguments that are not `NULL` |
 | `minmax(x)` | `x` over the rows ranked, put on [0, 1]: 1 where all are equal, 0 where `x` is `NULL` |
@@ -237,7 +271,7 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 
 `NULL` is a missing value (a `NULL` column, a row without a vector, one a traversal does not reach) or a result that is not a finite number (`ln(0)`, a division by 0, an overflow). Arithmetic and functions of `NULL` are `NULL`, except `coalesce`, `least` and `greatest`, which skip it. A row whose score is `NULL` ranks after every other, and its `score()` is `NULL`.
 
-Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
+Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's, `ranked`), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
 
 #### Rank-safe boosts
 
@@ -333,6 +367,55 @@ SELECT id, score() FROM top ORDER BY sigmoid(gbdt('clicks', bm25(title, :t), bm2
 - **Rank it over the top rows of a cheaper ranking.** In a [rerank phase](#rerank-phases) a model is a second phase, which each shard scores on its own rows, one tree at a time over them: a LambdaMART model of 300 trees over BM25's top 100 takes 0.7 to 1.0 ms a query at the median on SciFact, NFCorpus and FiQA, against 0.02 to 0.2 ms for BM25 alone (`strata/results/text/bm25_gbdt.json`, a 4-core cloud VM). `ORDER BY gbdt(bm25(…), columns…)` alone is exact, a [rank-safe boost](#rank-safe-boosts) bounded by the leaves each tree can reach from the text score's bound and each column's range; but summed over hundreds of trees such a bound sits well above what rows score, so the top-k loop skips few matches and scores the rest with every tree: 5.5 to 70 ms on the same collections.
 - **A plan names the model and the hash of its file** (`EXPLAIN` shows `ranking model: docs_ltr (hash …)`) and needs the plan feature `rank_models`. A database or shard whose file of that name is another refuses the plan rather than rank with another model; a plan without a hash runs with the file there. A coordinator scores the shards' rows with the model too, so it needs the same file in its own models directory.
 - `features()` lists a model's inputs' leaves and then the model's score, and from Python `gbdt("docs_ltr", bm25("title", t), col("rating"))` builds the same ranking.
+
+#### The rank log: what each query served
+
+A ranking is trained on what it served. A query run with a log writes one row per row it answered to a log table, with the values its ranking read as it computed them, so a model trained later sees what serving saw, however the tables change in between: new rows that move BM25's statistics, counters that grow, rows deleted.
+
+```sql
+-- what the first query logged to it makes (rank_log unless the log names another)
+CREATE TABLE IF NOT EXISTS rank_log (
+  id KEYWORD PRIMARY KEY,                 -- '<request>#<position>'
+  request KEYWORD NOT NULL, ts TIMESTAMP NOT NULL, context KEYWORD,
+  row_key KEYWORD NOT NULL, position INT NOT NULL, shown BOOL NOT NULL,
+  score FLOAT, features KEYWORD OPTIONS(indexed = false),
+  variant KEYWORD, label FLOAT
+) OPTIONS(cluster_by = 'context');
+
+-- a label written later: a judge's grade, an agent citing the row
+UPDATE rank_log SET label = 3 WHERE request = :r AND row_key = :k;
+```
+
+```sh
+curl -s localhost:7700/v1/query -d '{"sql": "SELECT id, title FROM docs ORDER BY bm25(body, :t) * (1 + 0.1 * coalesce(rating, 0)) DESC LIMIT 10",
+  "params": {"t": "mrna vaccine"}, "log": {"context": "u42", "variant": "b", "candidates": 50}}'
+# {"columns": ["id", "title"], "rows": [...], ..., "request": "9f0c...", "logged": {"rows": 50, "seq_no": 812}}
+```
+
+- **A logged query** is one `SELECT` ranked by an `ORDER BY` ([rerank phases](#rerank-phases) and [rank profiles](#rank-profiles-a-ranking-kept-with-its-table) included) of a table with a primary key: `"log"` in the body of `POST /v1/query` or `/v1/sql` (`true`, or an object of options), `db.query_logged(sql, params, context=...)` in [Python](python.md#the-rank-log), `Db::query_logged` in Rust. It runs with `score()` and [`features()`](#features-the-values-a-ranking-read) added to its columns, answers with the columns it asked for and the request's id (`request`), and writes its rows to the log in one transaction once it has answered: a logged query costs a write.
+- **Options**: `context`, whom the request served (a user, a session, a query class), which the export reads events by; `request`, the request's id (a random one when left out; logging a request's id again overwrites its rows at the same positions); `variant`, the client's name for the ranking that served (an A/B arm); `candidates`, a number of rows from the query's `OFFSET` to log, more than its `LIMIT` returns, those past the `LIMIT` logged as not shown (unshown negatives); `ts`, when it was served (ISO 8601 text or microseconds; now when left out), for replaying past traffic; `table`, another log table.
+- **A row** holds its request, time and context, the key of the row served (`row_key`, as text), its `position` from 0 (the `OFFSET` included), whether it was `shown`, its `score()`, and `features`: a JSON object of each `features()` column, named by its SQL text, whose numbers read back to the bits the ranking computed. A table made by hand serves as a log if it has these columns, of these types (with `retain = '90 days'`, say).
+- **Through a coordinator** the query is the coordinator's, so the values are one database's ([features over shards](#features-the-values-a-ranking-read)), and the rows go to the shards their keys place them on; the first logged query makes the table on every shard. A replica refuses a logged query, the log being a write, and so does a primary until its copies have the table (`CREATE TABLE` does not reach replicas yet). A shard's query (`"shard": true`) is not logged.
+- **Cost.** Computing the values is nearly free, since the ranking computes them anyway; the write is the cost. On a 4-core cloud VM over HTTP, with 100,000 documents and one client, a query took 1.87 ms at the median plain, 1.85 ms with its values added and 4.33 ms logged (7.81 ms logging 100 candidates); writing the same ten rows alone through `/v1/write` took 1.97 ms. Without the disk's flush (`--no-sync`) the logged query took 3.50 ms: the sync is a third of the log's cost here, and the rest is the write itself. Four clients got 1,620 plain and 670 logged queries a second. A row took 152 bytes in the segments (an Intel Xeon @ 2.10GHz, 16.9 GB, Linux 6.18; `strata-server/results/rank_log/vm.json` and `vm-no-sync.json`, from `strata-rank-log-bench`). The export read 70,000 records a second, each with a history of 20 events and a label.
+
+#### Exporting the log for training
+
+The export reads a log table back from one snapshot, one record per logged row, with what happened around it as of its time, from a table of events (a user's views, clicks, purchases): the context's last events before the row (its history, for a sequence model), and a label from the events on the row's key after it, within a window.
+
+```sh
+curl -s localhost:7700/v1/rank_log/export -d '{"events": {"table": "events", "user": "usr", "item": "item", "time": "ts", "action": "action"},
+  "history": 20, "window": "30 minutes", "grades": {"click": 1, "buy": 3}, "since": "2026-10-01"}'
+# {"id": "9f0c...#0", "request": "9f0c...", "ts": 1793338200000000, "context": "u42", "row_key": "d17", "position": 0, "shown": true,
+#  "score": 7.31, "variant": "b", "label": 3.0,
+#  "features": {"bm25(body, :t)": 6.09, "bm25(body, :t) * (1 + 0.1 * coalesce(rating, 0))": 7.31, "rating": 2.0},
+#  "history_items": ["d3", "d9", ...], "history_times": [...], "history_actions": ["view", "click", ...]}
+```
+
+- **Records** come as NDJSON from `POST /v1/rank_log/export`, as a list of dicts from `db.export_rank_log(...)` in Python, and from `Db::export_rank_log` in Rust, context by context, each context's rows in the order they were served. Times are microseconds since the epoch. `since` and `until` keep the rows served in `[since, until)`, and `table` names another log.
+- **`events`** names a table, its column of contexts (`user`, `KEYWORD` or `INT`), of the rows the events were about (`item`), of when they happened (`time`, a `TIMESTAMP` or an `INT` of microseconds), and optionally of what they were (`action`). `OPTIONS(shard_by = 'usr', cluster_by = 'usr')` keeps each user's events together, on one shard and in few pages.
+- **History**: with `history` set to n, the context's last n events before the row's time, oldest first. **Label**: with `window`, a period (`'30 minutes'`) or seconds, the best grade among the context's events on the row's key in the window after the row's time, `grades` giving each action's (an event whose action has none is not a label; without `grades` every event grades 1), and 0 when there is none. A label written on the row wins. A row without a context has no history and no label but its own.
+- **As of the row's time**, by the events' own times: an event timed before a row is in its history even when it arrived after the row was served, which a query at the time could not have seen. The features are the values served, never recomputed.
+- **A coordinator does not export**: export from each shard's server. Logs placed by context (a hand-made log with `context KEYWORD NOT NULL` and `shard_by = 'context'`) and events placed by user then give each shard every row and event of its contexts.
 
 ### `decay(field, origin, scale, …)`: closeness to a value
 
@@ -581,7 +664,7 @@ DROP TABLE IF EXISTS wrote, authors;
 ```
 
 - **Types** are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (or `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`, `DATETIME`; a `DATE` is a `TIMESTAMP` at midnight UTC), `VECTOR(dimensions)`, `SPARSE`, `MEDIA` and `EDGES`; `KEYWORD[]` and `INT[]` hold lists. A `BOOL` or `TIMESTAMP` column holds one value and is neither the primary key nor a reference.
-- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), `kind` of a `MEDIA` field, `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone), and on a `KEYWORD[]` `semantic_id` (the vector field) with `codebook` for a [semantic-ID field](server.md#semantic-ids): `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`. Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
+- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), `kind` of a `MEDIA` field, `derive` (a `MEDIA` field) with `model` for [text made from media](server.md#text-from-media), `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone), and on a `KEYWORD[]` `semantic_id` (the vector field) with `codebook` for a [semantic-ID field](server.md#semantic-ids): `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`. Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
 - **The primary key** is one column: `PRIMARY KEY` on it, or a `PRIMARY KEY (column)` constraint. A table without one only takes plain `INSERT`.
 - **`REFERENCES table`**, or `FOREIGN KEY (column) REFERENCES table`, records that a `KEYWORD` or `INT` column holds primary keys of that table, which must exist (or be the table being created) and have a primary key of the column's type. References are not enforced: a row may name a key that is not there, and an inner join along the reference leaves that row out (`LEFT JOIN` keeps it). Joins along them are [ordinary joins](#subqueries-with-and-joins) (`FROM wrote w JOIN authors a ON w.author = a.id`).
 - **`NOT NULL`** refuses a row without a value in that column, from any write: SQL, JSON, a file or the Rust API. **`DEFAULT value`** is the value a write that leaves the column out gets: a constant of the column's type on a single-valued `TEXT`, `KEYWORD`, `INT`, `FLOAT`, `BOOL` or `TIMESTAMP` column that is not the key, or `CURRENT_TIMESTAMP` (or `now()`) on a `TIMESTAMP`, the time of the statement, the same in all its rows. An `INSERT` that leaves a column out, a JSON row without its key and a CSV file without its column give it the default; a `NULL` that a write gives stays `NULL`, and a column with `NOT NULL` refuses it. In SQL the keyword `DEFAULT` stands for a column's default, in `VALUES` and in `SET`. The Rust API writes a row as it is given; `Schema::defaults` returns a row of the defaults to start from. The JSON schema's options are `"not_null": true` and `"default"` (`"now"` for the time of the write).

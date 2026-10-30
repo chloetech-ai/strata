@@ -329,21 +329,24 @@ pub async fn promote(url: &str, replicas: &[String], write_acks: &str, force: bo
     }
 }
 
-/// Downloads model `name` ([`strata::embed::KNOWN_MODELS`], or a Hugging
-/// Face repository `owner/name`) into `dir`; returns its directory.
+/// Downloads model `name` ([`strata::embed::KNOWN_MODELS`],
+/// [`strata::derive::KNOWN_MODELS`], or a Hugging Face repository
+/// `owner/name` of an embedding model) into `dir`; returns its directory.
 pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
-    let (local, repo) = match strata::embed::KNOWN_MODELS.iter().find(|m| m.0.eq_ignore_ascii_case(name)) {
+    let derives = strata::derive::KNOWN_MODELS.iter().any(|m| m.0.eq_ignore_ascii_case(name));
+    let (local, repo) = match strata::embed::KNOWN_MODELS.iter().chain(strata::derive::KNOWN_MODELS).find(|m| m.0.eq_ignore_ascii_case(name)) {
         Some(m) => (m.0.to_string(), m.1.to_string()),
         None if name.contains('/') => (name.rsplit('/').next().unwrap_or(name).to_string(), name.to_string()),
         None => {
-            let known: Vec<&str> = strata::embed::KNOWN_MODELS.iter().map(|m| m.0).collect();
+            let known: Vec<&str> = strata::embed::KNOWN_MODELS.iter().chain(strata::derive::KNOWN_MODELS).map(|m| m.0).collect();
             return Err(format!("unknown model {name}: one of {}, or a Hugging Face repository owner/name", known.join(", ")));
         }
     };
     let out = dir.join(&local);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let client = reqwest::Client::new();
-    for file in strata::embed::MODEL_FILES {
+    let files = if derives { strata::derive::model_files(&local) } else { strata::embed::MODEL_FILES };
+    for file in files {
         let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
         let r = client.get(&url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("{url}: {e}"))?;
         let bytes = r.bytes().await.map_err(|e| format!("{url}: {e}"))?;
@@ -353,7 +356,11 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
         std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, out.join(file))).map_err(|e| format!("{}: {e}", out.join(file).display()))?;
         tracing::info!(file, bytes = bytes.len(), "downloaded");
     }
-    strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
+    match derives {
+        true => strata::derive::open(&local, dir).map(drop),
+        false => strata::embed::open(&local, dir).map(drop),
+    }
+    .map_err(|e| e.to_string())?;
     Ok(out)
 }
 

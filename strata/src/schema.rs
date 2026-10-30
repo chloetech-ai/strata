@@ -197,6 +197,25 @@ pub struct Field {
     /// prefix of it (feature `semantic_id`; [`crate::sid`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_id: Option<SemanticId>,
+    /// A TEXT field that is a model's text of a MEDIA field (a caption of
+    /// its image; [`Derive`]). Makes the database format 3 (feature
+    /// `derive`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derive: Option<Derive>,
+}
+
+/// A TEXT field made by `model` from the file MEDIA field `from` holds
+/// ([`crate::derive`]): a caption of an image. Writes that leave the text
+/// out get it made before the writer, and rewrites that change the file
+/// make it again; a text a write supplies is kept as given. The text is
+/// stored, so merges and replicas never run the model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Derive {
+    /// A MEDIA field.
+    pub from: String,
+    /// The model, by the name [`crate::derive::open`] finds it under, such
+    /// as `blip-image-captioning-base` or `colors`.
+    pub model: String,
 }
 
 /// A semantic-ID field's source and codebook ([`crate::sid`]): the writer
@@ -252,6 +271,7 @@ impl Field {
             analyzer: None,
             media: None,
             semantic_id: None,
+            derive: None,
         }
     }
     /// A BOOL field ([`Logical::Bool`]).
@@ -374,6 +394,12 @@ impl Field {
     /// Makes a VECTOR field `model`'s embedding of `sources` ([`Embed`]).
     pub fn embedded(mut self, model: &str, sources: &[&str]) -> Self {
         self.embed = Some(Embed { from: sources.iter().map(|s| s.to_string()).collect(), model: model.to_string() });
+        self
+    }
+
+    /// Makes a TEXT field `model`'s text of MEDIA field `from` ([`Derive`]).
+    pub fn derived(mut self, model: &str, from: &str) -> Self {
+        self.derive = Some(Derive { from: from.to_string(), model: model.to_string() });
         self
     }
     /// A semantic-ID field: a stored KEYWORD[] filled from the vector of
@@ -552,6 +578,7 @@ impl Schema {
             }
         }
         s.check_media()?;
+        s.check_derived()?;
         for (i, f) in s.fields.iter_mut().enumerate() {
             // The key always holds a value: saying so needs no feature.
             if s.primary_key == Some(i) {
@@ -694,6 +721,28 @@ impl Schema {
         Some((self.field_index(&r.by)?, now.saturating_sub(r.seconds.saturating_mul(1_000_000))))
     }
 
+    /// Checks the derived fields ([`Field::derive`]): stored TEXT fields of
+    /// a MEDIA field's file, with nothing else to say.
+    fn check_derived(&self) -> Result<()> {
+        for (i, f) in self.fields.iter().enumerate() {
+            let Some(d) = &f.derive else { continue };
+            let bad = |m: &str| Err(Error::Schema(format!("field {}: {m}", f.name)));
+            if !matches!(f.ty, FieldType::Text { .. }) || !f.stored || !f.generated_from.is_empty() {
+                return bad("a derived field is a stored TEXT field, not generated from others");
+            }
+            if self.primary_key == Some(i) || f.default.is_some() || f.not_null {
+                return bad("a derived field is made from a file: it is not the key, and has no default or NOT NULL");
+            }
+            if d.model.is_empty() {
+                return bad("a derived field names its model");
+            }
+            if !self.field(&d.from).is_some_and(|m| m.media.is_some()) {
+                return bad(&format!("derive names {}, which is not a MEDIA field", d.from));
+            }
+        }
+        Ok(())
+    }
+
     /// Makes each row of this table an edge of a graph over the rows of
     /// the table that `src` and `dst` hold keys of: from the row whose key
     /// is in `src` to the row whose key is in `dst`, weighted by `weight`.
@@ -800,13 +849,14 @@ impl Schema {
 
     /// The format 3 features this table needs, as the manifest names them:
     /// its fields' [`Logical::feature`], `not_null`, `default`,
-    /// `semantic_id`, [`Analyzer::feature`] and `media` ([`Field::media`]),
-    /// and its options `shard_by`, `cluster_by`, `retain` and
-    /// `edge_table` ([`Schema::with_shard_by`], [`Schema::with_cluster_by`],
-    /// [`Schema::with_retain`], [`Schema::with_edges`]).
+    /// `semantic_id`, [`Analyzer::feature`], `media` ([`Field::media`]) and
+    /// `derive` ([`Field::derive`]), and its options `shard_by`, `cluster_by`,
+    /// `retain` and `edge_table` ([`Schema::with_shard_by`],
+    /// [`Schema::with_cluster_by`], [`Schema::with_retain`],
+    /// [`Schema::with_edges`]).
     pub fn features(&self) -> impl Iterator<Item = String> + '_ {
         let fields = self.fields.iter().flat_map(|f| {
-            let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default"), f.semantic_id.as_ref().map(|_| "semantic_id"), f.media.map(|_| "media")];
+            let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default"), f.semantic_id.as_ref().map(|_| "semantic_id"), f.media.map(|_| "media"), f.derive.as_ref().map(|_| "derive")];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
         let options = [self.shard_by.as_ref().map(|_| "shard_by"), self.cluster_by.as_ref().map(|_| "cluster_by"), self.retain.as_ref().map(|_| "retain"), self.edges.as_ref().map(|_| "edge_table")];
@@ -866,6 +916,11 @@ impl Schema {
         let e = self.fields[f].embed.as_ref()?;
         let i = self.field_index(e.from.first()?)?;
         self.fields[i].media.is_some().then_some(i)
+    }
+
+    /// The MEDIA field that field `f` is derived from ([`Field::derive`]).
+    pub fn derives_from(&self, f: usize) -> Option<usize> {
+        self.field_index(&self.fields[f].derive.as_ref()?.from)
     }
 
     /// The non-empty values of `sources` in `doc`, joined by newlines.
@@ -940,6 +995,9 @@ impl Schema {
     /// `"retain_by"` (default: the table's only TIMESTAMP field;
     /// [`Schema::with_retain`]). `"edges": "src, dst, w"` makes each row an
     /// edge ([`Schema::with_edges`]).
+    /// A text field may be made from a media field's file by a model,
+    /// `"derive": {"from": "image", "model": "blip-image-captioning-base"}`,
+    /// which makes the database format 3 ([`Field::derive`]).
     ///
     /// The long form is this type's own serialization (what
     /// `GET /v1/schema` returns), with `primary_key` the key field's
@@ -1101,6 +1159,9 @@ impl Schema {
                 if let Some(s) = &f.semantic_id {
                     m.insert("semantic_id".into(), serde_json::to_value(s).expect("serialises"));
                 }
+                if let Some(d) = &f.derive {
+                    m.insert("derive".into(), json!({"from": d.from, "model": d.model}));
+                }
                 if let Some(a) = f.analyzer {
                     // Version 1 by its name alone, as short_field reads it.
                     m.insert("analyzer".into(), if a.version() == 1 { json!(a.name()) } else { json!(a) });
@@ -1142,7 +1203,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id", "derive"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -1242,6 +1303,10 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     match j.get("semantic_id") {
         None | Some(J::Null) => {}
         Some(s) => f.semantic_id = Some(serde_json::from_value(s.clone()).map_err(|e| bad(&format!("semantic_id is {{\"from\": vector field, \"codebook\": name}}: {e}")))?),
+    }
+    match j.get("derive") {
+        None | Some(J::Null) => {}
+        Some(d) => f.derive = Some(serde_json::from_value(d.clone()).map_err(|e| bad(&format!("derive is {{\"from\": media field, \"model\": name}}: {e}")))?),
     }
     match j.get("embed") {
         None | Some(J::Null) => {}

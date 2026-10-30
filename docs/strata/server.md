@@ -189,7 +189,7 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
 
-`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory.
+`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory; it also downloads the captioner and the speech model of [text from media](#text-from-media).
 
 **Changing your mind.** Vectors are stored, so changing a field's sources or model means re-embedding. Create a database with the new schema and fill it from the old one:
 
@@ -272,6 +272,40 @@ Through Strata, `siglip-base-patch16-224` retrieves as well as [open_clip's publ
 | COCO, 5,000 images | 47.8 / 72.4 / 80.9 | 65.7 / 85.6 / 91.4 |
 | *published* | *47.8 / 72.4 / 81.0* | *65.7 / 85.4 / 91.3* |
 
+### Text from media
+
+A `text` field can be a model's text of a `media` field's file: a caption of each row's image, made by BLIP's captioner (`blip-image-captioning-base`, built with `--features vision`), or a transcript of each row's recording, made by Whisper (`whisper-small`, built with `--features audio`).
+
+```json
+{"name": "image", "type": "media", "kind": "image"},
+{"name": "caption", "type": "text", "derive": {"from": "image", "model": "blip-image-captioning-base"}},
+{"name": "recording", "type": "media", "kind": "audio"},
+{"name": "transcript", "type": "text", "derive": {"from": "recording", "model": "whisper-small"}}
+```
+
+`caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')` declares it in `CREATE TABLE`. The text is made as [vectors of images](#vectors-of-images) are: before the write queues for the writer, from the bytes the write gave or fetched, for `/v1/write`, SQL `INSERT` and imports; an `UPDATE` that changes the file makes it again, and a file that cannot be read or decoded fails the request. A text a write gives is kept as given, so captions made elsewhere (by a larger model, or by people) go in the same field. The field is stored and logged with the row: merges and replicas never run the model, and a database opened without it still reads and searches the text. From then on it is text like any other: BM25, phrases, synonyms, `MATCH`, a [generated field](query-language.md#columns-and-types) over it, and an embedded vector of it (`"embed": {"from": ["caption"], ...}`) all read it. `/v1/schema` lists each derived field under `derived`, with whether this server has its model open.
+
+| model | what it makes | |
+|---|---|---|
+| `blip-image-captioning-base` | a caption of an image, greedily, at most 20 tokens, as the `transformers` library makes it by default | build with `--features vision`; `strata-server fetch-model blip-image-captioning-base`; about 2 s an image on a 4-vCPU cloud VM |
+| `whisper-small` | a transcript of speech in any of Whisper's 99 languages: each 30 seconds decoded as the `transformers` library does by default (greedily, without timestamps), in the language detected in the file's first 30 seconds, and the windows' texts joined by spaces | build with `--features audio`; `strata-server fetch-model whisper-small`; about 5.4 s for each 30 seconds of sound, or part of it, on a 4-vCPU cloud VM (`transformers` takes 2.9 s) |
+| `colors` | the names of an image's main colours | no files; tests and demos |
+
+Strata's captions are the `transformers` library's: on 100 images of Flickr30K's test split (the first by file name), BLIP base through Strata and through `transformers` 4.46.3 wrote the same caption for 97 of them; the other three part at a word that two choices nearly tie for (`a man in a red shirt` against `a man wearing a red shirt`), most likely from small differences in resizing the image and in float arithmetic. Changing the model of a field means a new database filled from the old one (`--copy-from`): text of the same model is copied, and text of another is made again.
+
+Sound is decoded from WAV, FLAC, MP3, Ogg Vorbis and AAC (in MP4) files, mixed down to one channel and resampled to Whisper's 16 kHz; a recording longer than an hour is refused. A recording is cut every 30 seconds, so a word across a cut can be lost or split: Whisper's long-form mode, which moves its window by the timestamps it predicts, is not implemented. Strata's transcripts are the `transformers` library's: on 200 utterances of LibriSpeech's `test-clean` (every 13th, all 40 speakers), `whisper-small` through Strata and through `transformers` 4.46.3 wrote the same 200 transcripts, with a word error rate of 3.8% (`strata-asr-eval`, [results](https://github.com/rkonow/strata/tree/main/strata/results/media#transcripts-of-speech); words compared without punctuation, a stricter count than Whisper's own normalizer). Searching the utterances by what was said, `ORDER BY bm25(transcript, :t)`, ranked the right one first for 198 of 200.
+
+For finding images by text, the captions add little to an image model's vectors. With SigLIP's vectors and BM25 over BLIP's captions, fused in SQL (`strata-media-eval`, cloud container with 4 vCPUs, [results](https://github.com/rkonow/strata/tree/main/strata/results/media#captions-made-from-the-images)), R@1:
+
+| ranking | Flickr30K 1K, text to image | image to text | COCO (first 1K of 5K), text to image | image to text |
+|---|---|---|---|---|
+| `similarity(emb, :q)` | 74.7 | 89.2 | 67.6 | 82.8 |
+| `bm25(caption, :t)` | 14.6 | 21.1 | 22.7 | 34.5 |
+| `rrf(similarity(emb, :q), bm25(caption, :t))` | 34.0 | 52.8 | 39.9 | 58.4 |
+| `0.95 * minmax(similarity(emb, :q)) + 0.05 * minmax(bm25(caption, :t))` | 74.7 | 89.0 | 68.0 | 84.3 |
+
+`rrf` weighs a weak list as much as a strong one; a small weight on the captions is level with the vectors on Flickr30K and 0.3 to 1.5 better on COCO, whose training captions BLIP was fine-tuned on. What a caption is for is text the rest of the database reads: `MATCH`, phrases, filters and a row's description.
+
 ## Semantic IDs
 
 A semantic ID is a short code for a row's vector, such as `12.7.201.0`, that nearby vectors share a start of: rows whose codes start with `12` are alike, those that start with `12.7` more so. Generative recommenders predict an item's code a number at a time; a filter on a prefix finds every row under it.
@@ -309,8 +343,9 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 
 | route | body | answer |
 |---|---|---|
-| `POST /v1/query` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{columns, rows, keys, scores, stats, took_ms}`; `min_seq_no` and `min_seq_nos` name a write the read must see ([reads that see a write](#reads-that-see-a-write)) |
-| `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows for a `SELECT`; `{written, seq_no?, seq_nos?}` for `INSERT`, `UPDATE`, `DELETE` |
+| `POST /v1/query` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | `{columns, rows, keys, scores, stats, took_ms}`; `min_seq_no` and `min_seq_nos` name a write the read must see ([reads that see a write](#reads-that-see-a-write)); with `log` (`true` or `{context?, request?, variant?, candidates?, ts?, table?}`), a ranked query also writes what it served to a [rank log](query-language.md#the-rank-log-what-each-query-served) and answers `request` and `logged: {rows, seq_no?, seq_nos?}` |
+| `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows for a `SELECT` (`log` as for `/v1/query`); `{written, seq_no?, seq_nos?}` for `INSERT`, `UPDATE`, `DELETE` |
+| `POST /v1/rank_log/export` | `{table?, since?, until?, events?: {table, user, item, time, action?}, history?, window?, grades?}` | NDJSON: one record per logged row, with its context's history and its label as of its time ([exporting the log](query-language.md#exporting-the-log-for-training)), or `{error, status}` at a failure; a coordinator refuses it (400) |
 | `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written, skipped?, seq_no?, seq_nos?}` ([conditional writes](#conditional-writes); `skipped` for [stream events](#streams) written already; `seq_nos` from a coordinator) |
 | `POST /v1/stream` | operations as NDJSON, one a line, or one event's several as `{ops, source}` ([streams](#streams)) | NDJSON: a line per batch once it commits, `{batch, ops, written, skipped, lines}`, then `{done, batches, lines, written, skipped}`, or `{error, status, lines}` at the first failure |
 | `GET /v1/sources`, `GET /v1/sources/NAME` | | `{sources: [{name, offset, updated}]}`: each stream source's last offset written ([streams](#streams)); for one, `{name, offset, updated}`, `offset` null for a source not written from |
@@ -331,7 +366,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/admin/verify` | `{timeout_ms?}` | on a primary: compares each replica's rows with the primary's now ([replication](#replication-a-primary-and-its-replicas)), waiting up to `timeout_ms` (60 s): `{replicas: [{url, in_sync, compared, seq_no, differing_slots, first_differing_slot?, error?}]}`; 409 elsewhere |
 | `POST /v1/admin/promote` | `{replicas?, write_acks?, force?}` | on a replica: makes it the primary of a new term, shipping to `replicas` (gRPC URLs) under `write_acks` (`all`) ([promotion](#replication-a-primary-and-its-replicas)): `{term, seq_no, replicas: [{url, role, term, seq_no} or {url, error}]}`; 409 while a copy named holds a later transaction or a newer term (unless `force`), and on a server that is not a replica |
 | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` for `PUT` | the synonym list: `{text, rules, file}` |
-| `GET /v1/schema?table=T` | | `{table, schema, short, primary_key, shard_by, embeddings}` of the first table, or of `T` |
+| `GET /v1/schema?table=T` | | `{table, schema, short, primary_key, shard_by, embeddings, derived}` of the first table, or of `T` |
 | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and [rank profiles](query-language.md#rank-profiles-a-ranking-kept-with-its-table) (`profiles`), the first first |
 | `GET /v1/health` | | `{status, docs, segments, ...}`, with 503 when the status is `down` or `failing` ([health](#health)) |
 | `GET /livez`, `/readyz` | | `{status}`, with 503 when the server must be restarted ([health](#health)) |

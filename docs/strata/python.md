@@ -64,7 +64,7 @@ db.query("SELECT year, COUNT(*) FROM books WHERE genres = :g GROUP BY year", g="
 db.close()
 ```
 
-`strata.open(path, schema)` opens the database at `path`, or creates it with `schema` if it does not exist. The schema is a dict, JSON text or the path of a JSON file, in the [form the server takes](server.md#schemas). `Database.create(path, schema)` and `Database.open(path)` do one or the other. `models=` says where embedding and [ranking](query-language.md#ranking-models-gbdtmodel-features) models are (default `$STRATA_MODELS`, else `~/.local/share/strata/models`; `strata-server fetch-model NAME` downloads one there), and `directory=True` creates the database as a directory of segment files.
+`strata.open(path, schema)` opens the database at `path`, or creates it with `schema` if it does not exist. The schema is a dict, JSON text or the path of a JSON file, in the [form the server takes](server.md#schemas). `Database.create(path, schema)` and `Database.open(path)` do one or the other. `models=` says where embedding and [ranking](query-language.md#ranking-models-gbdtmodel-features) models, and the captioners of [text made from media](server.md#text-from-media), are (default `$STRATA_MODELS`, else `~/.local/share/strata/models`; `strata-server fetch-model NAME` downloads one there), and `directory=True` creates the database as a directory of segment files.
 
 A database file can be open in one process at a time. Within that process, threads can query at once: every call releases the GIL while it runs. To share a database between processes, serve it with `strata-server` and use the client below. A `with` block, or `close()`, merges the small segments that writes left and closes the file.
 
@@ -155,7 +155,7 @@ db.table().select("video", "id", score()).distinct_on("video").order_by(bm25("tr
 | `&`, `\|`, `~` | and, or, not (Python's `and`, `or`, `not` and chained comparisons such as `1 < col("x") < 5` raise `TypeError`) |
 | `.isin(values)`, `.between(lo, hi)`, `.is_null()`, `.is_not_null()` | as SQL's `IN`, `BETWEEN` (a bound of `None` is open), `IS NULL` |
 | `match(field, query)` | the full-text condition, in [MATCH's syntax](query-language.md#full-text-match) |
-| `bm25(field, text)`, `similarity(field, vector)`, `rrf(*scores, k=60, depth=100)` | scores; `similarity` takes a vector (`embed(text)` gives a text's), or `{term: weight}` for a SPARSE field |
+| `bm25(field, text, syntax=None)`, `similarity(field, vector)`, `rrf(*scores, k=60, depth=100)`, `ranked(keys)` | scores; `bm25` reads [weights, required and excluded words](query-language.md#weights-required-and-excluded-words) (`"+mrna vaccine^2 -animal"`) unless `syntax="plain"`; `similarity` takes a vector (`embed(text)` gives a text's), or `{term: weight}` for a SPARSE field; `ranked` is a [ranking from elsewhere](query-language.md#rankedkeys-a-ranking-from-elsewhere), primary keys best first |
 | `+`, `-`, `*`, `/`, `%`, `**`, `abs()`, `round()`, `ln`, `log`, `exp`, `sqrt`, `sigmoid`, `clamp`, `least`, `greatest`, `coalesce`, `minmax`, `rank`, `case((cond, value), ..., otherwise=None)` | a [ranking expression](query-language.md#ranking-expressions) of scores, fields and numbers: `bm25("body", q) * (1 + 0.2 * coalesce(col("rating"), 0))`. `+` adds raw values; `0.7 * minmax(a) + 0.3 * minmax(b)` is weighted fusion |
 | `gbdt(model, *features)` | a [ranking model](query-language.md#ranking-models-gbdtmodel-features)'s score of a row from its features: `gbdt("docs_ltr", bm25("body", q), col("rating"))`, the LightGBM or XGBoost model `<models>/docs_ltr/gbdt.json` |
 | `reachable(field, seeds, hops=1, ...)`, `path(field, seeds, to, ...)`, `ppr(field, seeds, ...)` | [graph](graphs.md) conditions and PageRank as a score, with the SQL functions' options as keyword arguments |
@@ -165,6 +165,20 @@ db.table().select("video", "id", score()).distinct_on("video").order_by(bm25("tr
 | `.alias(name)`, `.asc()`, `.desc(nulls_first=False)` | a column's name; an `order_by` direction |
 
 `select(...)` names the columns (without it, the stored fields but vectors, as `SELECT *`), `where(...)` keeps rows, `order_by(...)` ranks by a score best first or orders by fields ascending, `rerank(expr, count)` ranks its top `count` rows again ([rerank phases](query-language.md#rerank-phases)), `group_by(...)` and `having(...)` group, `distinct_on(...)` keeps the [first row of each group](query-language.md#the-first-row-of-each-group-distinct-on) in the query's order, and `limit(n)` and `offset(n)` page (groups, after `distinct_on`). A query is a [plan](query-language.md#explain), the same JSON that `plan(sql)` gives: `q.plan()` shows it, and a `Client` runs it on a server the same way.
+
+## The rank log
+
+`query_logged(sql, params, context=..., variant=..., candidates=...)` runs a ranked query and writes what it served to a [rank log](query-language.md#the-rank-log-what-each-query-served): a row per row answered, with its position, its score and the values its ranking read, as they were computed. `candidates` logs that many rows from the query's `OFFSET`, those past its `LIMIT` as not shown, and `ts` (a `datetime` or microseconds) says when it was served, now by default. The `Result` is the query's, with `result.request`, the id its log rows carry, for labelling them later. `export_rank_log(...)` reads the log back as a list of dicts for training, each with its context's history and its label as of the row's time, from a table of events:
+
+```python
+r = db.query_logged("SELECT id, title FROM books ORDER BY bm25(title, :q) DESC LIMIT 10",
+                    {"q": "dragon"}, context="u42", variant="b", candidates=50)
+db.sql("UPDATE rank_log SET label = 3 WHERE request = :r AND row_key = :k", {"r": r.request, "k": r.keys[0]})
+
+rows = db.export_rank_log(events={"table": "events", "user": "usr", "item": "item", "time": "ts", "action": "action"},
+                          history=20, window="30 minutes", grades={"click": 1, "buy": 3})
+rows[0]["features"], rows[0]["label"], rows[0]["history_items"]
+```
 
 ## Semantic-ID codebooks
 
@@ -191,7 +205,7 @@ It returns the SHA-256 of the file, which the table records. The options are `le
 
 ## A server from Python
 
-`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `tables`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set), `import_sqlite(path, tables=None)` and `plan_sqlite(path)` (a SQLite file's tables, uploaded the same way; [SQLite in and out](sqlite.md#over-http-and-in-the-ui)), `export_sqlite(path, tables=None)` (the server's tables downloaded as a SQLite file) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `run(plan)` (a plan from `explain(...)["ir"]` or a `table()` query, run by [`/v1/plan`](server.md#http-api)), `table()` ([queries built in Python](#queries-built-in-python)), `embed(text, field=None)` (a text's vector by the server's model, from [`/v1/embed`](server.md#http-api), or `embed(image=data)` an image's), `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
+`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `tables`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set), `import_sqlite(path, tables=None)` and `plan_sqlite(path)` (a SQLite file's tables, uploaded the same way; [SQLite in and out](sqlite.md#over-http-and-in-the-ui)), `export_sqlite(path, tables=None)` (the server's tables downloaded as a SQLite file) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `run(plan)` (a plan from `explain(...)["ir"]` or a `table()` query, run by [`/v1/plan`](server.md#http-api)), `table()` ([queries built in Python](#queries-built-in-python)), `embed(text, field=None)` (a text's vector by the server's model, from [`/v1/embed`](server.md#http-api), or `embed(image=data)` an image's), `query_logged` and `export_rank_log` ([the rank log](#the-rank-log)), `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
 
 ```python
 client = strata.connect("http://127.0.0.1:7700")   # token= or $STRATA_TOKEN for a server with --token

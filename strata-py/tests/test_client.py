@@ -226,3 +226,15 @@ def test_client_sqlite_in_and_out(client, tmp_path):
     c = sqlite3.connect(out)
     assert c.execute("SELECT id, book, stars, at FROM reviews ORDER BY id").fetchall() == [(1, "b0001", 5, "2026-10-01 12:00:00"), (2, "b0002", 3, "2026-10-02 08:30:00")]
     c.close()
+
+
+def test_client_rank_log(client):
+    sql = "SELECT id FROM books ORDER BY bm25(title, :q) + 0.1 * rating DESC LIMIT 4"
+    served = client.query("SELECT id, score(), features() FROM books ORDER BY bm25(title, :q) + 0.1 * rating DESC LIMIT 4", q="river")
+    r = client.query_logged(sql, {"q": "river"}, context="u7", request="req-1")
+    assert r.request == "req-1" and r.keys == served.keys and r.columns == ["id"]
+    records = client.export_rank_log()
+    assert [x["row_key"] for x in records] == served.keys and [x["id"] for x in records] == [f"req-1#{i}" for i in range(4)]
+    assert [x["features"] for x in records] == [dict(zip(served.columns[2:], row[2:])) for row in served.rows]
+    with pytest.raises(strata.StrataError, match="not a log table"):
+        client.export_rank_log(table="books")
