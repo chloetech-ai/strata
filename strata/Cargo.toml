@@ -37,11 +37,15 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
+# Images decoded for SigLIP (`vision`).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"], optional = true }
 
 [features]
 default = ["embed"]
 embed = ["dep:tokenizers"]
 bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+# Images: decoded with the `image` crate, embedded by SigLIP.
+vision = ["bert", "dep:image"]
 # `bert` with matrix products in Apple's Accelerate framework (macOS only).
 accelerate = ["bert", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 # SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
@@ -54,8 +58,15 @@ name = "strata-baselines"
 path = "src/bin/strata-baselines.rs"
 required-features = ["baselines"]
 
+[[bin]]
+name = "strata-media-eval"
+path = "src/bin/strata-media-eval.rs"
+required-features = ["vision"]
+
 [dev-dependencies]
 tempfile = "3"
+# PNGs written by the tests of `vision`.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 codegen-units = 1

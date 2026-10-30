@@ -373,16 +373,20 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
     Ok(AxJson(json!({"schema": s, "short": s.to_short_json()})))
 }
 
-/// The vector of a text, as `{"embed": text}` gives a query's parameter:
-/// for a plan, whose vectors are values.
+/// The vector of a text, or of an image file (`"image"`, base64), as
+/// `{"embed": ...}` gives a query's parameter: for a plan, whose vectors
+/// are values.
 async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
-    let text = body_str(&b, "text")?;
+    let what = match b.get("image") {
+        Some(i) => json!({ "image": i.as_str().ok_or_else(|| ApiError::bad("image is an image file in base64"))? }),
+        None => json!(body_str(&b, "text")?),
+    };
     let name = |k: &str| match b.get(k) {
         None | Some(Json::Null) => Ok(None),
         Some(f) => f.as_str().map(Some).ok_or_else(|| ApiError::bad(format!("{k} is a name"))),
     };
     let (table, field, _) = app.svc.model(name("table")?, name("field")?)?;
-    let p = app.svc.params(Some(&json!({ "v": { "embed": text, "field": field, "table": table } }))).await?;
+    let p = app.svc.params(Some(&json!({ "v": { "embed": what, "field": field, "table": table } }))).await?;
     let Some(strata::value::Value::Vector(v)) = p.0.get("v") else { return Err(ApiError::internal("the text has no vector")) };
     Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] })))
 }

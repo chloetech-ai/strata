@@ -4,6 +4,7 @@ standard library."""
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import urllib.error
@@ -133,10 +134,12 @@ class Client(Search):
         r = self._call("POST", "/v1/plan", {"plan": plan})
         return Result._of(r) if "rows" in r else int(r["written"])
 
-    def embed(self, text: str, field: str | None = None, *, table: str | None = None) -> list[float]:
+    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None) -> list[float]:
         """The query vector of `text` by an embedded field's model (of the
-        first table, or of `table`), on the server."""
-        body = {k: v for k, v in {"text": text, "field": field, "table": table}.items() if v is not None}
+        first table, or of `table`), or of `image`, the bytes of an image
+        file, by a model of images, on the server."""
+        data = None if image is None else base64.b64encode(image).decode()
+        body = {k: v for k, v in {"text": text, "image": data, "field": field, "table": table}.items() if v is not None}
         return self._call("POST", "/v1/embed", body)["vector"]
 
     def write(self, ops: list[dict]) -> int:

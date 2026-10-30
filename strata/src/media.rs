@@ -695,14 +695,11 @@ impl Resolver {
         }
         let data: Vec<u8> = match (&i.data, &i.uri) {
             (Some(b64), _) => {
-                use base64::Engine;
                 // Base64 is 4/3 the size of its bytes.
                 if b64.len() as u64 / 4 * 3 > self.max_bytes + 3 {
                     return Err(too_big("the data", self.max_bytes));
                 }
-                let clean: String = b64.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-                let engine = if clean.contains(['-', '_']) { &base64::engine::general_purpose::URL_SAFE_NO_PAD } else { &base64::engine::general_purpose::STANDARD_NO_PAD };
-                engine.decode(clean.trim_end_matches('=')).map_err(|e| Error::Schema(format!("a MEDIA value's data is base64: {e}")))?
+                base64_bytes(b64).map_err(|e| Error::Schema(format!("a MEDIA value's data is base64: {e}")))?
             }
             (None, Some(uri)) => self.fetch(uri)?,
             (None, None) => unreachable!("Input::of checks"),
@@ -765,6 +762,18 @@ impl Resolver {
         out.into_iter().map(|(_, r)| r).collect()
     }
 
+    /// The bytes of a stored value, from where its URI says (the media
+    /// store, or a file or URL the allowlist has), checked against its
+    /// hash: what embedding a value written whole needs.
+    pub fn bytes_of(&self, m: &Media) -> std::result::Result<Vec<u8>, Error> {
+        let data = self.fetch(&m.uri)?;
+        let sha256 = sha256_hex(&data);
+        if sha256 != m.sha256 {
+            return Err(Error::Schema(format!("the bytes of {} hash to sha256 {sha256}, not the {} its value has", m.uri, m.sha256)));
+        }
+        Ok(data)
+    }
+
     /// The bytes a URI names, if the allowlist (or the media store) has
     /// them.
     fn fetch(&self, uri: &str) -> std::result::Result<Vec<u8>, Error> {
@@ -790,6 +799,41 @@ impl Resolver {
             }
         }
     }
+}
+
+/// The largest side of an image [`decode_image`] decodes.
+pub const MAX_IMAGE_SIDE: u32 = 16_384;
+
+/// The pixels of an image file (JPEG, PNG, WebP, GIF, BMP) as 8-bit RGB
+/// (feature `vision`). An image larger than [`MAX_IMAGE_SIDE`] a side, or
+/// whose pixels would take more than 512 MiB, is refused before it is
+/// decoded.
+#[cfg(feature = "vision")]
+pub fn decode_image(data: &[u8]) -> Result<crate::embed::Image> {
+    let bad = |e: image::ImageError| Error::Schema(format!("the image could not be decoded: {e}"));
+    let mut r = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format().map_err(|e| Error::Schema(format!("the image could not be read: {e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(512 << 20);
+    r.limits(limits);
+    let rgb = r.decode().map_err(bad)?.into_rgb8();
+    Ok(crate::embed::Image { width: rgb.width(), height: rgb.height(), rgb: rgb.into_raw() })
+}
+
+/// Without the `vision` feature, images are not decoded.
+#[cfg(not(feature = "vision"))]
+pub fn decode_image(_data: &[u8]) -> Result<crate::embed::Image> {
+    Err(Error::Schema("decoding images needs Strata built with the `vision` feature".into()))
+}
+
+/// The bytes of base64 text, in the standard alphabet or the URL-safe
+/// one, padded or not, with any whitespace.
+pub fn base64_bytes(text: &str) -> std::result::Result<Vec<u8>, String> {
+    use base64::Engine;
+    let clean: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let engine = if clean.contains(['-', '_']) { &base64::engine::general_purpose::URL_SAFE_NO_PAD } else { &base64::engine::general_purpose::STANDARD_NO_PAD };
+    engine.decode(clean.trim_end_matches('=')).map_err(|e| e.to_string())
 }
 
 fn check_kind(kind: MediaKind, mime: &str) -> Result<()> {

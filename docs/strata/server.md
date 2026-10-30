@@ -153,7 +153,7 @@ A `VECTOR` field can say what its vectors are: a model's embedding of other fiel
 {"name": "emb_both", "type": "vector", "embed": {"from": ["title", "description"], "model": "potion-retrieval-32M"}}
 ```
 
-The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text embedded is their non-empty values joined by newlines, as for a generated field. The declaration is kept in the database, returned by `/v1/schema` and shown by the UI ("emb_title ← title") and the agent. When the server starts it opens each field's model from `--models` and logs what each field is. With the model open:
+The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text embedded is their non-empty values joined by newlines, as for a generated field; or one [`media` field](#media-fields) of kind `image`, whose images a model of images and text embeds ([vectors of images](#vectors-of-images)). The declaration is kept in the database, returned by `/v1/schema` and shown by the UI ("emb_title ← title") and the agent. When the server starts it opens each field's model from `--models` and logs what each field is. With the model open:
 
 - writes that leave the vector out get it computed: `/v1/write` documents and SQL `INSERT`, and an `UPDATE` that changes a source recomputes it, all before the write queues for the writer (on as many writes at once as there are cores), so the writer never waits for a model (with bge-small on 4 cores, an in-place `UPDATE` beside two clients inserting rows went from 4.7 to 500 a second, and four inserting clients from 10 to 23 rows a second: [results](https://github.com/rkonow/strata/tree/main/strata-server/results/sql-writes)); a vector a write supplies is kept as given;
 - an `UPDATE` that changes a source recomputes the vector; merges do not (they keep the stored vectors);
@@ -169,6 +169,7 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 | `potion-base-8M` | Model2Vec, 256 dimensions | smallest |
 | `bge-small-en-v1.5` | BERT encoder, 384 dimensions | build with `--features bert`; milliseconds a row |
 | `snowflake-arctic-embed-m-v1.5` | BERT encoder, 768 dimensions | build with `--features bert`; slower, better |
+| `siglip-base-patch16-224` | SigLIP base: images and text in one space, 768 dimensions | build with `--features vision`; about 0.5 s an image and 80 ms a text on a 4-vCPU cloud VM |
 | `hash:N` | hashed bag of words, *N* dimensions | no files; tests and the demo |
 
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
@@ -229,6 +230,31 @@ This happens before the write queues for the writer, for `/v1/write`, SQL `INSER
 
 Queries return the value as JSON text. The field's index is of hashes, so `WHERE image = :sha256`, `IN` and `GROUP BY image` find and count the rows of a file. `kind` refuses files of another type, by their bytes' headers. A coordinator does not fetch: start each shard with the `--media-*` options. A database with a `media` field is written in [file format 3](index.md#wal-memtable-and-snapshots).
 
+### Vectors of images
+
+An [embedded vector field](#embedded-vector-fields) can be the embedding of a `media` field of kind `image`, by a model of images and text (`siglip-base-patch16-224`, built with `--features vision`):
+
+```json
+{"name": "image", "type": "media", "kind": "image"},
+{"name": "emb", "type": "vector", "embed": {"from": ["image"], "model": "siglip-base-patch16-224"}}
+```
+
+A write's images are decoded (JPEG, PNG, WebP, GIF, BMP) and embedded with the value's other work, before the write queues for the writer, from the bytes the write gave or fetched; a value written whole is read from where its URI says (the media store, or a place `--media-fetch` lists), and must still hash to its `sha256`. An image that cannot be read or decoded fails the request, as a value that cannot be resolved does. The vectors are logged with the row, so replicas get them and run no model. An embedded field embeds one `media` field or text fields, not both; a second field can embed the text beside it.
+
+A query embeds an image file with the model's image tower, `{"embed": {"image": "<base64>"}, "field": "emb"}`, and a text with its text tower, `{"embed": "a dog on a beach", "field": "emb"}`; the image's vector and the caption's are in one space, so either finds images:
+
+```sh
+curl -s localhost:7700/v1/query -d '{"sql": "SELECT id FROM photos ORDER BY similarity(emb, :q) DESC LIMIT 10",
+  "params": {"q": {"embed": "a dog on a beach", "field": "emb"}}}'
+```
+
+Through Strata, `siglip-base-patch16-224`'s retrieval matches what its authors report (Karpathy's test splits, five captions an image, exact search; `strata-media-eval`, cloud container with 4 vCPUs):
+
+| split | text to image R@1 / R@5 / R@10 | image to text R@1 / R@5 / R@10 | published (open_clip), text to image / image to text R@1 |
+|---|---|---|---|
+| Flickr30K, 1,000 images | 74.7 / 92.3 / 95.7 | 89.2 / 97.9 / 99.3 | 74.7 / 89.1 |
+| COCO, 5,000 images | COCO_T2I | COCO_I2T | 47.8 / 65.7 |
+
 ## Semantic IDs
 
 A semantic ID is a short code for a row's vector, such as `12.7.201.0`, that nearby vectors share a start of: rows whose codes start with `12` are alike, those that start with `12.7` more so. Generative recommenders predict an item's code a number at a time; a filter on a prefix finds every row under it.
@@ -250,7 +276,7 @@ A database with a semantic-ID field needs the manifest feature `semantic_id`, an
 
 ## HTTP API
 
-Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model; both take `"table"` for a field of another table than the first.
+Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model (`{"embed": {"image": "<base64>"}, ...}` for an image file's, by a [model of images](#vectors-of-images)); both take `"table"` for a field of another table than the first.
 
 | route | body | answer |
 |---|---|---|
@@ -261,7 +287,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/import?format=F&table=T` | rows as JSON Lines, JSON, CSV or TSV ([loading rows](#loading-rows)) | `{written, skipped_fields, took_ms}` |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the bound query (`logical`) and counts |
-| `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
+| `POST /v1/embed` | `{text or image, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image file (`image`, base64, for a model of images), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
 | `POST /v1/snapshot` | | a snapshot lease for 60 s: `{snapshot, txn, ttl_s}` (at most 10,000 are held at once; more get 429) |
 | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the queries it ran |
