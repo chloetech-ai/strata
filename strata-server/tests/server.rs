@@ -1447,7 +1447,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
     let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 7, strata::query::ir::VERSION, 0));
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 8, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1473,9 +1473,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 8, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: 9, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 8"), "{}", e.message());
+    assert!(e.message().contains("protocol 9"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
