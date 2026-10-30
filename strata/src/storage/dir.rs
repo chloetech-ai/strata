@@ -1,6 +1,8 @@
 //! The directory layout: a database as a directory of files instead of one
 //! file, so that segments can be built on one machine and shipped to
-//! another, stored on object storage, or copied with ordinary tools.
+//! another, stored on object storage, or copied with ordinary tools once it
+//! is closed. While it is open, a commit can unlink files a copy is still
+//! reading: [`crate::storage::Database::checkpoint`] copies it consistently.
 //!
 //! ```text
 //! <dir>/LOCK                          held with flock by the open database
@@ -10,6 +12,10 @@
 //! <dir>/del-<id>-<txn>.bits           a segment's delete set
 //! <dir>/upd-<id>-<txn>.bin            a segment's in-place updates
 //! <dir>/wal                           the write-ahead log
+//! <dir>/wal.<txn>                     a log sealed by a background flush
+//!                                     that is not installed yet
+//! <dir>/MERGING                       the merges running, and those a
+//!                                     crash interrupted (JSON)
 //! ```
 //!
 //! A commit writes its new segment and delete-set files and its manifest,
@@ -21,18 +27,20 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{corrupt, Result};
+use crate::error::{corrupt, Error, Result};
 use crate::postings::bytes::OwnedBytes;
+use crate::storage::io;
 use crate::storage::manifest::Manifest;
 
 pub const CURRENT: &str = "CURRENT";
 pub const LOCK: &str = "LOCK";
 pub const WAL: &str = "wal";
+/// [`crate::storage::merge::MergeRecord`]; beside a single file, `<file>-merging`.
+pub const MERGE_RECORD: &str = "MERGING";
 
 /// The contents of `CURRENT`: which manifest is the database.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,6 +50,18 @@ pub struct Current {
     pub manifest: String,
     /// crc32 of the manifest file.
     pub crc: u32,
+    /// The manifest's format ([`crate::storage::pager::FORMAT_VERSION`]);
+    /// absent for format 1, as before there were several tables.
+    #[serde(default = "format_1", skip_serializing_if = "is_format_1")]
+    pub format: u32,
+}
+
+fn format_1() -> u32 {
+    1
+}
+
+fn is_format_1(f: &u32) -> bool {
+    *f == 1
 }
 
 pub fn manifest_name(txn: u64) -> String {
@@ -62,25 +82,40 @@ pub fn updates_name(id: u64, txn: u64) -> String {
 
 /// Writes a new file (it must not exist) and syncs it when `sync`.
 pub fn write_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<()> {
-    let mut f = OpenOptions::new().write(true).create_new(true).open(dir.join(name))?;
-    f.write_all(bytes)?;
+    let f = OpenOptions::new().write(true).create_new(true).open(dir.join(name))?;
+    io::write_at(&f, bytes, 0)?;
     if sync {
-        f.sync_data()?;
+        io::sync(&f)?;
     }
     Ok(())
 }
 
+/// Writes a file a version being committed names: a segment, delete set,
+/// update set or manifest file named after an id or txn no committed
+/// version has used yet. A file already there under that name was left by
+/// a commit that failed before it finished (nothing references it), so it
+/// is replaced, and the commit can be tried again.
+pub fn write_version_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<()> {
+    match write_file(dir, name, bytes, sync) {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            io::remove_file(&dir.join(name))?;
+            write_file(dir, name, bytes, sync)
+        }
+        r => r,
+    }
+}
+
 pub fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)?.sync_all()?;
+    io::sync_dir(dir)?;
     Ok(())
 }
 
 /// Replaces `CURRENT` atomically (write a temporary file, rename it over).
 pub fn write_current(dir: &Path, cur: &Current, sync: bool) -> Result<()> {
     let tmp = dir.join("CURRENT.tmp");
-    let _ = std::fs::remove_file(&tmp);
+    let _ = io::remove_file(&tmp);
     write_file(dir, "CURRENT.tmp", &serde_json::to_vec(cur).expect("current serialises"), sync)?;
-    std::fs::rename(&tmp, dir.join(CURRENT))?;
+    io::rename(&tmp, &dir.join(CURRENT))?;
     if sync {
         sync_dir(dir)?;
     }
@@ -90,6 +125,9 @@ pub fn write_current(dir: &Path, cur: &Current, sync: bool) -> Result<()> {
 /// Reads `CURRENT` and the manifest it names.
 pub fn read_current(dir: &Path) -> Result<(Current, Manifest)> {
     let cur: Current = serde_json::from_slice(&std::fs::read(dir.join(CURRENT))?).map_err(|e| corrupt(format!("CURRENT: {e}")))?;
+    if cur.format > crate::storage::pager::FORMAT_VERSION {
+        return Err(corrupt(format!("unsupported format version {}", cur.format)));
+    }
     let bytes = std::fs::read(dir.join(&cur.manifest))?;
     if crc32fast::hash(&bytes) != cur.crc {
         return Err(corrupt(format!("{} fails its checksum", cur.manifest)));
@@ -106,7 +144,7 @@ pub fn map(dir: &Path, name: &str, read_ahead: bool) -> Result<OwnedBytes> {
 /// The files a version needs: its manifest, segments and delete sets.
 pub fn referenced(cur: &Current, manifest: &Manifest) -> HashSet<String> {
     let mut keep: HashSet<String> = [CURRENT.to_string(), LOCK.to_string(), WAL.to_string(), cur.manifest.clone()].into();
-    for s in &manifest.segments {
+    for s in manifest.segments() {
         keep.extend(s.file.iter().cloned());
         keep.extend(s.deletes_file.iter().cloned());
         keep.extend(s.updates_file.iter().cloned());
@@ -128,9 +166,10 @@ pub fn orphans(dir: &Path, keep: &HashSet<String>) -> Result<Vec<(PathBuf, u64)>
     Ok(out)
 }
 
-/// Total size of the directory's files (the WAL excluded).
+/// Total size of the directory's files (the WAL and sealed logs excluded).
 pub fn size(dir: &Path) -> u64 {
+    let log = |name: &str| name == WAL || name.strip_prefix("wal.").is_some_and(|t| t.len() == 20 && t.bytes().all(|b| b.is_ascii_digit()));
     std::fs::read_dir(dir)
-        .map(|it| it.filter_map(|e| e.ok()).filter(|e| e.file_name() != WAL).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
+        .map(|it| it.filter_map(|e| e.ok()).filter(|e| !log(&e.file_name().to_string_lossy())).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
         .unwrap_or(0)
 }

@@ -15,23 +15,30 @@ pub fn bit_width(x: u64) -> u32 {
 #[inline]
 pub fn select_in_word(w: u64, k: u32) -> u32 {
     debug_assert!(k < w.count_ones());
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    {
-        // SAFETY: guarded by the `bmi2` target feature.
-        unsafe { core::arch::x86_64::_pdep_u64(1u64 << k, w).trailing_zeros() }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::bmi2() {
+        // SAFETY: the CPU has BMI2.
+        return unsafe { select_in_word_bmi2(w, k) };
     }
     #[cfg(target_arch = "aarch64")]
     {
         select_in_word_neon(w, k)
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         select_in_word_scalar(w, k)
     }
 }
 
+/// [`select_in_word`] with `pdep`: deposit bit `k` into the set bits of `w`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn select_in_word_bmi2(w: u64, k: u32) -> u32 {
+    core::arch::x86_64::_pdep_u64(1u64 << k, w).trailing_zeros()
+}
+
 /// Portable [`select_in_word`]: clear the `k` lowest set bits.
-#[cfg_attr(all(any(all(target_arch = "x86_64", target_feature = "bmi2"), target_arch = "aarch64"), not(test)), allow(dead_code))]
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 #[inline]
 pub fn select_in_word_scalar(w: u64, k: u32) -> u32 {
     let mut w = w;
@@ -486,6 +493,9 @@ mod tests {
     #[test]
     fn rank_select_match_naive() {
         for (n, density, seed) in [(1, 0.5, 1), (63, 0.3, 2), (64, 0.5, 3), (5000, 0.01, 4), (100_000, 0.5, 5), (70_000, 0.97, 6)] {
+            // Under Miri a tenth of the long ones: still hundreds of rank
+            // blocks and select samples.
+            let n = if cfg!(miri) && n > 5000 { n / 10 } else { n };
             let (bv, v) = random_bits(n, density, seed);
             let rs = RankSelect::new(bv, true, true);
             let mut ones = Vec::new();
@@ -515,8 +525,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(8);
         let mut words: Vec<u64> = vec![1, 1 << 63, !0, 0xff, 0xff << 56, 0x8000_0000_0000_0001, 0x5555_5555_5555_5555];
         words.extend((0..64).flat_map(|b| [1u64 << b, !(1u64 << b)]));
-        words.extend((0..2000).map(|_| rng.gen::<u64>() & rng.gen::<u64>()));
-        words.extend((0..2000).map(|_| rng.gen::<u64>() | rng.gen::<u64>()));
+        let random = if cfg!(miri) { 200 } else { 2000 };
+        words.extend((0..random).map(|_| rng.gen::<u64>() & rng.gen::<u64>()));
+        words.extend((0..random).map(|_| rng.gen::<u64>() | rng.gen::<u64>()));
         for &w in &words {
             let ones: Vec<u32> = (0..64).filter(|&b| w >> b & 1 == 1).collect();
             for (k, &p) in ones.iter().enumerate() {

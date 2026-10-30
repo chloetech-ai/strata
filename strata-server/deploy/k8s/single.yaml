@@ -20,12 +20,19 @@ spec:
         - name: strata
           image: strata-server:dev
           imagePullPolicy: IfNotPresent
-          args: ["--db", "/data/quora.sq8.strata", "--listen", "0.0.0.0:7700", "--grpc", "off"]
+          # A test cluster, served open (see README.md, Security).
+          args: ["--db", "/data/quora.sq8.strata", "--listen", "0.0.0.0:7700", "--grpc", "off", "--no-token"]
           ports:
             - {name: http, containerPort: 7700}
+          # Both fail once the database cannot write until it is reopened
+          # (a full disk): the pod is restarted.
           readinessProbe:
-            httpGet: {path: /v1/health, port: http}
+            httpGet: {path: /readyz, port: http}
             periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
           resources:
             requests: {cpu: 250m, memory: 1Gi}
           volumeMounts:

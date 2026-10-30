@@ -1,0 +1,130 @@
+{
+  "collections": {
+    "arguana": {
+      "docs": 8674,
+      "load_s": 0.682172398,
+      "queries": 1406,
+      "variants": {
+        "fuzzy": {
+          "failed": 0,
+          "ms_mean": 709.552308778805,
+          "ndcg10": 0.2116577529383494
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 6.082955709815075,
+          "ndcg10": 0.31012899683295936
+        }
+      }
+    },
+    "fiqa": {
+      "docs": 57638,
+      "load_s": 2.439614691,
+      "queries": 648,
+      "variants": {
+        "fuzzy": {
+          "failed": 0,
+          "ms_mean": 113.34076554938272,
+          "ndcg10": 0.14844874705407432
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.6881148179012345,
+          "ndcg10": 0.25205027103354083
+        }
+      }
+    },
+    "nfcorpus": {
+      "docs": 3633,
+      "load_s": 0.407533161,
+      "queries": 323,
+      "variants": {
+        "fuzzy": {
+          "failed": 0,
+          "ms_mean": 19.06154447058822,
+          "ndcg10": 0.2698203290934952
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.08718073065015483,
+          "ndcg10": 0.3274291018060633
+        }
+      }
+    },
+    "quora": {
+      "docs": 522931,
+      "load_s": 5.228179437,
+      "queries": 10000,
+      "variants": {
+        "fuzzy": {
+          "failed": 0,
+          "ms_mean": 180.6209619656003,
+          "ndcg10": 0.6889664612581745
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.635637694700002,
+          "ndcg10": 0.7561227072222152
+        }
+      }
+    },
+    "scidocs": {
+      "docs": 25657,
+      "load_s": 2.718554245,
+      "queries": 1000,
+      "variants": {
+        "fuzzy": {
+          "failed": 0,
+          "ms_mean": 106.97879698899992,
+          "ndcg10": 0.11875626245513102
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.4437708759999994,
+          "ndcg10": 0.1568720366896371
+        }
+      }
+    },
+    "scifact": {
+      "docs": 5183,
+      "load_s": 0.461407628,
+      "queries": 300,
+      "variants": {
+        "fuzzy": {
+          "failed": 0,
+          "ms_mean": 69.85165003333334,
+          "ndcg10": 0.6260526303050061
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.19859311999999998,
+          "ndcg10": 0.6887138283708751
+        }
+      }
+    },
+    "trec-covid": {
+      "docs": 171332,
+      "load_s": 12.704751483999999,
+      "queries": 50,
+      "variants": {
+        "fuzzy": {
+          "failed": 0,
+          "ms_mean": 352.48395371999993,
+          "ndcg10": 0.15115243826915206
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 1.479193,
+          "ndcg10": 0.6576891890697582
+        }
+      }
+    }
+  },
+  "machine": {
+    "arch": "x86_64",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpus": 4,
+    "os": "linux"
+  },
+  "tag": "before"
+}

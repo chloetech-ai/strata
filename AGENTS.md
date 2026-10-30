@@ -1,8 +1,10 @@
-# Engram: instructions for coding agents
+# Strata and Engram: instructions for coding agents
 
-This file is for a coding agent (Claude Code or another) that was asked to set
-Engram up for its user, or to work on this repository. People should start
-with [README.md](README.md) and [the install guide](docs/engram/setup.md).
+This repository holds Strata, an embedded search database with SQL, and
+Engram, long-term memory for Claude Code built on it. This file is for a
+coding agent (Claude Code or another) that was asked to set Engram up for its
+user, or to work on this repository. People should start with
+[README.md](README.md) and [the install guide](docs/engram/setup.md).
 
 ## Set Engram up for the user's Claude Code
 
@@ -90,8 +92,10 @@ editing their settings by hand.
 | `engram/` | the memory system (Rust crate): hooks client, per-project daemon, MCP server, recall, distiller, `engram ui`, `engram doctor` |
 | `engram/demo/index.html` | the inspector page; it is compiled into the binary with `include_str!`, so rebuild after editing it |
 | `strata/` | the database (Rust crate), including the posting-list study in `src/postings/` |
+| `strata/fuzz/` | cargo-fuzz targets (nightly: `cargo +nightly fuzz run <target>` there) feeding Strata damaged files and arbitrary SQL; `strata/tests/corrupt_input.rs` runs the same targets on stable |
 | `strata-server/` | Strata over HTTP JSON and gRPC, a coordinator over shards, and the query UI (`ui/index.html`, compiled in with `include_str!`) |
-| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, and a server smoke test |
+| `strata-py/` | Strata from Python (`import strata`): a PyO3 extension built with maturin, and an HTTP client of strata-server; tests in `strata-py/tests` |
+| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, Strata's fault-injection tests (`--features fault-injection`), a relevance gate (BM25 on three BEIR collections), Miri over Strata's byte views (nightly; tests sized for it are named `miri_*`), the Python package's tests, and a server smoke test |
 | `docs/` | the documentation site (Jekyll, just-the-docs); `docs/demo/inspector.html` is a separate static copy of the inspector |
 | `install.sh` | the installer described above |
 
@@ -104,9 +108,27 @@ cd engram && cargo test --release
 cd strata-server && cargo test --release
 ```
 
+The Python package builds into a virtualenv (its client tests start
+`strata-server/target/release/strata-server`, so build that first):
+
+```bash
+cd strata-py && python3 -m venv .venv && . .venv/bin/activate
+pip install maturin pytest && maturin develop --release && pytest tests
+```
+
 CI also runs `cargo clippy --release --all-targets -- -A clippy::style -A
 clippy::complexity -A clippy::perf -D warnings` in each crate.
 
 Benchmark numbers in `docs/`, the reports and `*/results/` are measured, not
 edited: change them only by re-running the benchmark, and name the machine a
 number came from.
+
+A change to Strata's ranking fails CI's relevance gate until the new numbers
+are committed. The test writes them:
+
+```bash
+strata/tests/fixtures/beir/fetch.sh ~/beir    # pinned by hash
+cd strata && STRATA_BEIR_DIR=~/beir STRATA_RELEVANCE_GATE=update cargo test --release --test relevance_gate
+```
+
+Say in the pull request why the numbers moved.

@@ -21,9 +21,9 @@ use crate::postings::bytes::ByteWriter;
 use crate::error::{Error, Result};
 use crate::schema::{Field, FieldType, VectorCodes, VectorIndexKind};
 use crate::segment::build::BuildOptions;
-use crate::segment::{DocId, FieldIndexBuilder, SegmentWriter};
+use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
 use crate::value::Value;
-use crate::vector::hnsw::{self, HnswConfig};
+use crate::vector::hnsw::{self, HnswConfig, HnswView};
 use crate::vector::ivf::{self, IvfConfig};
 use crate::vector::bits::Bits;
 use crate::vector::codes::Quantiser;
@@ -75,6 +75,9 @@ pub(crate) struct VectorBuilder {
     hnsw_max_docs: Option<usize>,
     threads: usize,
     seed: u64,
+    /// A segment whose graph this one's starts from, and the docID its
+    /// first document has here ([`hnsw::StartGraph`]).
+    start: Option<(SegmentFile, u32)>,
     /// Float32 rows as little-endian bytes, so the buffer becomes the
     /// section without a copy.
     rows: Vec<u8>,
@@ -127,12 +130,33 @@ impl VectorBuilder {
             hnsw_max_docs: parse(opts, "vector.hnsw.max_docs")?,
             threads: parse(opts, "vector.threads")?.unwrap_or(1),
             seed: parse(opts, "vector.seed")?.unwrap_or(0x5EE_D0F5_747A),
+            start: None,
             rows: Vec::new(),
             present: Vec::new(),
             n: 0,
             missing: 0,
         })
     }
+}
+
+impl VectorBuilder {
+    /// Starts the field's HNSW graph from `seg`'s, whose documents are this
+    /// build's from docID `base` on, all of them with the same vectors.
+    pub fn start_from(mut self, seg: SegmentFile, base: u32) -> Self {
+        self.start = Some((seg, base));
+        self
+    }
+}
+
+/// `seg`'s HNSW graph of `field` and its node count, if it has one of
+/// `dim` dimensions.
+fn start_graph(seg: &SegmentFile, field: &str, dim: usize) -> Option<(HnswView, usize)> {
+    let info: VectorInfo = serde_json::from_slice(&seg.section(&section(field, "meta")).ok()??).ok()?;
+    if info.index != "hnsw" || info.dim != dim || info.n != seg.n_docs() {
+        return None;
+    }
+    let g = HnswView::open(info.m?, info.entry?, seg.section(&section(field, "hnsw")).ok()??, seg.section(&section(field, "hnsw_upper")).ok()??, info.n).ok()?;
+    Some((g, info.n))
 }
 
 impl FieldIndexBuilder for VectorBuilder {
@@ -160,7 +184,7 @@ impl FieldIndexBuilder for VectorBuilder {
     }
 
     fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
-        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, rows, present, n, missing } = *self;
+        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, start, rows, present, n, missing } = *self;
         let code_stride = code_kind.stride(dim);
         let is_present = |d: u32| present[d as usize / 64] >> (d % 64) & 1 == 1;
         let ids: Vec<u32> = (0..n as u32).filter(|&d| is_present(d)).collect();
@@ -216,7 +240,9 @@ impl FieldIndexBuilder for VectorBuilder {
                 index_sections.push((section(&field, "ivf"), built.lists));
             }
             Kind::Hnsw { m, ef_construction } => {
-                let g = hnsw::build(&view, &is_present, &HnswConfig { m, ef_construction, threads, seed });
+                let start = start.and_then(|(seg, base)| Some((start_graph(&seg, &field, dim)?, base)));
+                let start = start.as_ref().map(|((g, n), base)| hnsw::StartGraph { view: g, base: *base, n: *n });
+                let g = hnsw::build(&view, &is_present, &HnswConfig { m, ef_construction, threads, seed }, start.as_ref());
                 info.index = "hnsw".into();
                 info.m = Some(g.m);
                 info.ef_construction = Some(ef_construction);

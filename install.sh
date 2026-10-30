@@ -34,7 +34,7 @@ say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-[ -f "$ROOT/engram/Cargo.toml" ] || die "run this from a checkout of https://github.com/rkonow/engram"
+[ -f "$ROOT/engram/Cargo.toml" ] || die "run this from a checkout of https://github.com/rkonow/strata"
 
 case "$(uname -s)" in
   Darwin|Linux) ;;

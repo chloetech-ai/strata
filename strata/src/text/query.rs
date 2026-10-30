@@ -15,9 +15,10 @@
 //! folded but not stemmed, and matches the indexed (stemmed) terms that
 //! start with it. A typo-tolerant word (`nueral~`, `nueral~1`) also matches
 //! the indexed terms within N edits of its term (`~` alone: 1 edit for terms
-//! of 3 to 5 letters, 2 for longer ones; see [`super::fuzzy`]).
+//! of 3 to 5 letters, 2 for longer ones; see [`super::fuzzy`]). The
+//! field's [`Analyzer`] analyses them ([`parse_match_with`]).
 
-use super::analyzer::{analyze, for_each_word};
+use super::analyzer::{for_each_word, Analyzer};
 use crate::error::{Error, Result};
 
 /// A boolean query over analysed terms.
@@ -125,13 +126,26 @@ fn lex(q: &str) -> Result<Vec<Tok>> {
 
 struct Parser {
     toks: Vec<Tok>,
+    analyzer: Analyzer,
     pos: usize,
+    /// Parentheses and NOTs open around the current position.
+    depth: usize,
 }
 
-/// Parses a `MATCH` query (see the module documentation). A query whose
-/// words are all stopwords matches nothing (`Or([])`).
+/// How deeply a `MATCH` query may nest parentheses and `NOT`s. Parsing
+/// and evaluation recurse once per level, so without a bound one query
+/// could overflow the thread's stack and abort the process.
+pub const MAX_DEPTH: usize = 100;
+
+/// Parses a `MATCH` query (see the module documentation) of an `english`
+/// field. A query whose words are all stopwords matches nothing (`Or([])`).
 pub fn parse_match(q: &str) -> Result<BoolQuery> {
-    let mut p = Parser { toks: lex(q)?, pos: 0 };
+    parse_match_with(q, Analyzer::English)
+}
+
+/// [`parse_match`] of a field whose text `analyzer` analyses.
+pub fn parse_match_with(q: &str, analyzer: Analyzer) -> Result<BoolQuery> {
+    let mut p = Parser { toks: lex(q)?, analyzer, pos: 0, depth: 0 };
     let e = p.or()?;
     if p.pos < p.toks.len() {
         return Err(Error::Query(format!("unexpected {:?} in MATCH query {q:?}", p.toks[p.pos])));
@@ -170,9 +184,20 @@ impl Parser {
     fn unary(&mut self) -> Result<Option<BoolQuery>> {
         if self.peek() == Some(&Tok::Not) {
             self.pos += 1;
-            return Ok(self.unary()?.map(|q| BoolQuery::Not(Box::new(q))));
+            self.enter()?;
+            let q = self.unary()?.map(|q| BoolQuery::Not(Box::new(q)));
+            self.depth -= 1;
+            return Ok(q);
         }
         self.primary()
+    }
+
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(Error::Query(format!("MATCH query nests more than {MAX_DEPTH} levels of parentheses and NOT")));
+        }
+        Ok(())
     }
 
     fn primary(&mut self) -> Result<Option<BoolQuery>> {
@@ -184,18 +209,20 @@ impl Parser {
                     self.pos += 1;
                     return Ok(None);
                 }
+                self.enter()?;
                 let e = self.or()?;
+                self.depth -= 1;
                 if self.peek() != Some(&Tok::RParen) {
                     return Err(Error::Query("unbalanced parentheses in MATCH query".into()));
                 }
                 self.pos += 1;
                 e
             }
-            Tok::Phrase(s) => terms_query(analyze(&s)),
+            Tok::Phrase(s) => terms_query(self.analyzer.analyze(&s)),
             Tok::Word(w) => match (w.strip_suffix('*'), fuzzy_suffix(&w)) {
-                (Some(stem), _) => prefix_query(stem),
-                (None, Some((word, edits))) => fuzzy_query(word, edits)?,
-                _ => terms_query(analyze(&w)),
+                (Some(stem), _) => prefix_query(stem, self.analyzer),
+                (None, Some((word, edits))) => fuzzy_query(word, edits, self.analyzer)?,
+                _ => terms_query(self.analyzer.analyze(&w)),
             },
             t => return Err(Error::Query(format!("unexpected {t:?} in MATCH query"))),
         })
@@ -233,8 +260,8 @@ fn fuzzy_suffix(w: &str) -> Option<(&str, Option<u8>)> {
     }
 }
 
-fn fuzzy_query(word: &str, edits: Option<u8>) -> Result<Option<BoolQuery>> {
-    let terms = analyze(word);
+fn fuzzy_query(word: &str, edits: Option<u8>, analyzer: Analyzer) -> Result<Option<BoolQuery>> {
+    let terms = analyzer.analyze(word);
     let parts = terms
         .into_iter()
         .map(|t| {
@@ -257,7 +284,7 @@ pub fn auto_edits(len: usize) -> u8 {
 /// Widens every word of `q`: with its synonyms (`synonyms`), and with the
 /// indexed terms near it (`edits(term)` edits; 0 for none). Phrases with
 /// synonyms get them too.
-pub fn expand(q: BoolQuery, synonyms: Option<&super::synonyms::Synonyms>, edits: &dyn Fn(&str) -> u8) -> BoolQuery {
+pub fn expand(q: BoolQuery, synonyms: Option<&super::synonyms::SynonymMap>, edits: &dyn Fn(&str) -> u8) -> BoolQuery {
     let with = |base: BoolQuery, key: &[String]| -> BoolQuery {
         let mut alts = vec![base];
         if let Some(s) = synonyms {
@@ -313,11 +340,11 @@ pub fn resolve_fuzzy(q: BoolQuery, near: &mut dyn FnMut(&str, u8) -> Vec<String>
 
 /// `w*`: the last word is a prefix; earlier words (as in `e-mai*`) are
 /// required terms.
-fn prefix_query(w: &str) -> Option<BoolQuery> {
+fn prefix_query(w: &str, analyzer: Analyzer) -> Option<BoolQuery> {
     let mut words = Vec::new();
     for_each_word(w, |x| words.push(x.to_string()));
     let last = words.pop()?;
-    let mut parts: Vec<Option<BoolQuery>> = words.iter().map(|x| terms_query(analyze(x))).collect();
+    let mut parts: Vec<Option<BoolQuery>> = words.iter().map(|x| terms_query(analyzer.analyze(x))).collect();
     parts.push(Some(BoolQuery::Prefix(last)));
     combine(parts, BoolQuery::And)
 }

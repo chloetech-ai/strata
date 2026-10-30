@@ -26,6 +26,7 @@ The best of the three single vectors in each row is in bold.
 | nfcorpus | Arctic Embed M v1.5 | 0.321 | 0.361 | **0.363** | 0.370 |
 | nfcorpus | *references: BM25 0.327; Cohere embed-english-v3 of title + text 0.387* | | | | |
 | scidocs | Model2Vec potion-retrieval-32M | 0.128 | 0.120 | **0.137** | 0.159 |
+| scidocs | BGE-small v1.5 | 0.195 | 0.198 | **0.205** | 0.195 |
 | scidocs | *references: BM25 0.157; Cohere embed-english-v3 of title + text 0.203* | | | | |
 | trec-covid | Model2Vec potion-retrieval-32M | **0.504** | 0.482 | 0.446 | 0.654 |
 | trec-covid | *references: BM25 0.658; Cohere embed-english-v3 of title + text 0.818* | | | | |
@@ -42,17 +43,24 @@ The best of the three single vectors in each row is in bold.
   both 0.446). Its 50 queries are short COVID questions and its titles are on
   topic, while a static model's average over a long abstract drifts toward
   generic words. A contextual model was not run there: at the BERT models'
-  ~8 to 15 texts a second on this CPU, TREC-COVID's 514K texts would take
-  10 to 18 hours.
-- **Adding BM25 helps every run**: RRF of BM25 and the title + text vector beats
-  the best single vector everywhere, and beats BM25 alone everywhere except
-  TREC-COVID (0.654 vs 0.658), where the vector is much weaker than BM25.
+  8 to 27 texts a second on this CPU, TREC-COVID's 514K texts would take
+  5 to 18 hours.
+- **Adding BM25 helps unless the vector is far ahead of it**: RRF of BM25 and
+  the title + text vector beats the best single vector in every run but one,
+  and beats BM25 alone everywhere except TREC-COVID (0.654 vs 0.658), where
+  the vector is much weaker than BM25. The one is the reverse case, SciDocs
+  with BGE-small: BM25 (0.157) is far behind the vector (0.205), and fusing
+  them gives 0.195.
+- **BGE-small matches the Cohere reference on SciDocs** (0.205 vs 0.203),
+  and comes within 0.005 to 0.04 of it on SciFact and NFCorpus.
 - **Model2Vec plus BM25 comes close to a BERT model alone** on SciFact (0.697
   vs 0.713 to 0.716), at about 1,000 times the embedding speed.
 
 So: embed title + description into one vector field, search it fused with
-BM25, and, when titles are informative and descriptions long (above all with
-a static model), add a title-only field and measure both on your own queries.
+BM25 (and check fusion against the vector alone on your own queries: it
+helped in 8 of 9 runs here), and, when titles are informative and
+descriptions long (above all with a static model), add a title-only field and
+measure both.
 
 ## recall@100
 
@@ -65,6 +73,7 @@ a static model), add a title-only field and measure both on your own queries.
 | nfcorpus | BGE-small v1.5 | 0.290 | 0.313 | 0.311 | 0.314 | 0.249 | 0.351 |
 | nfcorpus | Arctic Embed M v1.5 | 0.289 | 0.324 | 0.325 | 0.326 | 0.249 | 0.351 |
 | scidocs | Model2Vec potion-retrieval-32M | 0.306 | 0.318 | 0.342 | 0.377 | 0.359 | 0.450 |
+| scidocs | BGE-small v1.5 | 0.444 | 0.460 | 0.459 | 0.442 | 0.359 | 0.450 |
 | trec-covid | Model2Vec potion-retrieval-32M | 0.070 | 0.072 | 0.075 | 0.110 | 0.127 | 0.159 |
 
 ## Collections
@@ -133,4 +142,5 @@ title + text of every document.
 | nfcorpus | 3,633 | 323 | BGE-small v1.5 | `accelerate` | 773.5 s | 14 |
 | nfcorpus | 3,633 | 323 | Arctic Embed M v1.5 | `accelerate` | 1,437.1 s | 8 |
 | scidocs | 25,657 | 1,000 | Model2Vec potion-retrieval-32M | `accelerate` | 3.5 s | 22,229 |
+| scidocs | 25,657 | 1,000 | BGE-small v1.5 | `accelerate` | 2,848.4 s | 27 |
 | trec-covid | 171,332 | 50 | Model2Vec potion-retrieval-32M | `accelerate` | 25.5 s | 20,120 |

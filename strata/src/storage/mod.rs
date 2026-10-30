@@ -4,23 +4,30 @@
 //!
 //! * [`pager`]: file layout, meta slots, the read-only mapping.
 //! * [`dir`]: the directory layout, one file per segment.
+//! * [`io`]: every change to the files, and (feature `fault-injection`)
+//!   power losses and failing disks for tests.
 //! * [`freelist`]: free page runs and deferred frees.
 //! * [`manifest`]: one on-disk version (schema, segments, delete sets).
 //! * [`wal`]: the `-wal` sidecar.
 //! * [`live`]: delete sets as live-document filters.
 //! * [`updates`]: in-place updates of numeric fields.
 //! * [`pk`]: the primary-key index section.
-//! * [`merge`]: the tiered merge policy.
+//! * [`merge`]: the tiered merge policy, and what the background merger
+//!   needs (memory estimates and limits, a write throttle, the record of
+//!   interrupted merges).
 //! * [`Database`], [`WriteTxn`], [`Snapshot`]: the API.
 
 mod db;
 pub mod dir;
 pub mod freelist;
+pub mod io;
 pub mod live;
 pub mod manifest;
 pub mod merge;
 pub mod pager;
 pub mod pk;
+pub mod rowseq;
+pub mod ship;
 mod snapshot;
 mod state;
 pub mod updates;
@@ -28,10 +35,12 @@ pub mod wal;
 
 use std::sync::{Mutex, MutexGuard};
 
-pub use db::{Database, DbOptions, DocumentSource, FileStats, Layout, SegmentStats, WriteTxn};
+pub use db::{CheckpointOptions, CheckpointStats, Database, DbOptions, DocumentSource, DropOptions, FileStats, Layout, SegmentStats, TableTxn, WriteTxn, LOCK_WAIT};
 pub use live::LiveDocs;
-pub use merge::{MergePolicy, MergeStats, SegmentInfo};
-pub use pk::{build_pk_index, key_hash, KeyRef, PkIndex};
+pub use manifest::{Numbering, SeqNo};
+pub use merge::{memory_limit, merge_memory, MergePolicy, MergeStats, MergeStatus, MergerOptions, SegmentInfo};
+pub use ship::{Applied, LogRead, Shipped};
+pub use pk::{build_pk_index, build_pk_index_of, key_hash, KeyList, KeyRef, PkIndex};
 pub use snapshot::{SegmentView, Snapshot};
 pub use updates::Updates;
 

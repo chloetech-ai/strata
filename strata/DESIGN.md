@@ -110,6 +110,85 @@ writes immediately and the memtable needs no index code of its own. When the mem
 segment by the shadow-paging commit and the WAL is truncated. Bulk loads
 bypass the WAL and write segments directly.
 
+**Sequence numbers and terms.** A database can number its writes, which
+replication orders them by (`Database::start_seq_no`, opt-in and not
+undone). Every write transaction then gets the next sequence number, from
+1, under the database's term, 1 at first and raised by
+`Database::begin_term` when a replica becomes primary; a transaction that
+writes nothing takes none (`WriteTxn::commit_seq` returns it). The commit
+record carries both, in a WAL whose header (`STRWAL02`) names the features
+its records use, so a reader that lacks one refuses the log rather than
+misread it; a database that does not number its writes logs in
+`STRWAL01`, byte for byte as before. Within a log the numbers rise and the
+term never falls, or replay treats it as damage. The manifest keeps the
+term and a floor for the count (`seq_no`): every commit of a version
+records at least the last number given, so after the WAL is truncated
+opening counts on from the manifest, and otherwise from the log's last
+commit. A failed commit uses no number. Without `sync` a crash can lose
+the last transactions of the log, and their numbers are given again; with
+it a number, once returned, is never given again. Starting flushes, so
+the log it empties is restarted numbered after the commit that records
+the feature; a crash between the two leaves an empty `STRWAL01` log,
+which opening restarts numbered, while one holding transactions of the
+other kind fails the open. Checkpoints keep the numbers and the term.
+Bulk loads and attached segments take no number. The manifest also keeps
+every term with the first number it gave (`Database::numbering`), so that
+a replica back after a failover can find where its log left the new
+primary's.
+
+**Row versions.** In a numbered database each row keeps the number of the
+write that last changed it (`Database::seq_of`; `WriteTxn::seq_of` reads
+it under the writer lock, for a write conditional on it). The memtable
+keeps it per document; a segment built from numbered documents keeps them
+in section `seq` (`storage::rowseq`: a width, a base and one number per
+docID); a value set in place keeps its document's new number beside it in
+the segment's updates (as field `SEQ`, which no schema has), which a merge
+folds into the merged segment's section and carries for values set while
+it ran. Rows written before numbering, bulk loaded or attached have number
+0: an attached image's section is dropped, since another database's
+numbers could equal later ones here. A deleted row keeps no number; there
+are no tombstones, which shipping the log in order and catching up from a
+checkpoint do not need.
+
+**Shipping the log.** A numbered database with `DbOptions::ship_log_bytes`
+keeps its most recent transactions in memory up to that many bytes (the
+newest always), each as the WAL records it logged, its commit record last
+(`storage::ship`); opening fills it with the transactions it replays, those
+since the last flush. `Database::log_from` reads them from a number on, or
+answers that the log no longer holds it (`LogRead::Gone`), when a replica
+needs the primary's segments first. `Database::on_commit` hears each number
+as it commits. A replica applies a batch with `Database::apply_shipped`,
+given the term and number of the transaction before the first: unless that
+is the replica's last, it applies nothing and answers its own last
+(`Applied::Mismatch`), from which the primary ships again or finds that
+their histories differ (Raft's log matching); a call with no transactions
+only compares, and so does not wait for the writer. Each transaction must follow
+the one before, and one of a term older than the replica's is refused,
+since it comes from a primary another has replaced; a newer term is raised
+at that transaction's number, so the replica's terms match the primary's
+where it has transactions. A transaction's operations go through the
+writer as the primary's did, and one that does not fit, an insert of a row
+the replica has or a delete or a set of one it lacks, fails the batch from
+there: the replica is not a copy of its primary. Each transaction commits
+under its primary's number, and a batch syncs once.
+
+**Installing a copy.** A replica the primary's log no longer reaches takes
+a copy of the primary instead: `Database::install_copy` puts a checkpoint
+of the primary (opened as a database) in place of every segment, row
+number and term, in one commit. Under the writer lock it flushes the
+memtables, empties the WAL and commits a version holding the copy's
+segments, written into this database's file or directory, with the copy's
+numbering; the ship log starts empty, so the replica's own transactions
+are not shipped on. A crash before the commit finds the database as it
+was, and one after it finds the copy. Snapshots taken before go on reading
+their version, and a merge running meanwhile installs nothing, since its
+inputs are gone. The copy must hold the same tables, by name and schema,
+and must not be of an older term than the database: a copy of a primary
+another replaced is refused. While a replica takes a copy, the primary
+holds the transactions that follow it (`Database::hold_log`): the ship
+log keeps them past its bytes, up to four times, until the replica has
+them.
+
 ### 3.5 Deletes, updates, snapshots
 
 Documents have a primary key. Each segment has a primary-key index (sorted
@@ -129,11 +208,116 @@ documents and re-optimises the encodings for the larger lists. `vacuum`
 moves data down and shrinks the file. Large, rarely updated segments may use the
 space-optimised codecs (Entropic) instead of the speed-optimised ones.
 
+### 3.7 Tables
+
+A database holds one or more tables, each with its own schema, segments,
+primary keys, memtable and merges. They share everything that makes a
+commit: the WAL, the writer lock, the meta slots and the manifest, which
+lists the tables with their segments. So one transaction can write several
+tables and commits or rolls back as a whole, and a snapshot sees every table
+at the same version (`Snapshot::table`). Segment ids are unique across
+tables, so file names, delete sets and reader caches keyed by segment id
+need no table.
+
+* **Formats.** A manifest with only the table the database was created
+  with is written in format 1, field for field as before there were tables;
+  a database that never gets a second table is unchanged on disk, and older
+  versions of Strata open it. With more tables the manifest is format 2
+  (`{format, ..., next_table_id, tables: [{id, schema, segments}]}`) and the
+  meta slot (or, in the directory layout, `CURRENT`) says so. Older versions
+  refuse such a file: a single file with "unsupported format version 2", a
+  directory with an error about its manifest. Dropping back to the first
+  table writes format 1 again, into both meta slots (older versions check
+  both), and older versions open the file again.
+* **Format 3 and features.** Format 3 is format 2 with the features the
+  database uses: `{format: 3, features: {required: [...]}, ...}`. A version
+  is written in format 3 only while a table uses a feature (a `BOOL` or
+  `TIMESTAMP` field is `"bool"` or `"timestamp"`, a `NOT NULL` field
+  `"not_null"`, a default `"default"`, a TEXT field's analyzer other than
+  `english` `"analyzer:<name>:<version>"`; a database that numbers its
+  writes `"seq_no"`, for good), and falls back to 2 or 1,
+  in both meta slots, when the last one goes. A reader refuses a manifest
+  that requires a feature it does not know, naming the feature, and ignores
+  an `optional` list and other keys it does not know. Format 3 is the last
+  format number: versions from before it refuse it as newer, and every
+  later change that an older reader must not ignore is a feature.
+* **Fixtures of each format.** `tests/fixtures` keeps databases that
+  earlier versions wrote, in both layouts, byte for byte: format 1 from
+  before tables, format 2 with two tables and format 3 with every feature,
+  each with deletes, values set in place and a transaction left in the
+  WAL. The tests open copies with the current code, check their rows and
+  searches, write, flush and merge them and check the format they stay in.
+  The writes behind formats 2 and 3 are deterministic, and a test writes
+  them again and compares the bytes (but for the database id), so a change
+  to what Strata writes fails until its pull request keeps the old set
+  under a new name and adds one written by the new code
+  (`tests/fixtures/README.md`).
+* **BOOL and TIMESTAMP** are logical types over an `INT` column (1 and 0;
+  microseconds since the epoch in UTC), so every index, zone map, merge and
+  shard message handles them as integers. Values are typed only at the
+  edges: writes turn booleans and ISO 8601 text into the integers
+  (`Field::store`), and a query's answer turns the integers of its
+  columns back (`Select::types`, applied by the executor and, for shards,
+  by `cluster::merge` after merging, so shards exchange integers).
+* **NOT NULL and DEFAULT** are field options (`not_null`, `default`, a JSON
+  value; `"now"` on a `TIMESTAMP`). The engine enforces `NOT NULL` on every
+  write (`value::validate`, and `set`), so no front end can skip it.
+  Defaults belong to the front ends: SQL fills the columns an `INSERT`
+  leaves out and the `DEFAULT` keyword, and `ingest` the keys and columns a
+  JSON row or a file leaves out, each from `Schema::defaults(now)` with one
+  `now` per statement, request or file, while the Rust API writes a row as
+  given. A coordinator binds an `INSERT` once, so its shards store the
+  same time. The key needs no `NOT NULL` (it is implied, and not a
+  feature) and takes no default.
+* **WAL.** Records carry no table while they write the first one; a `TABLE`
+  record switches the table for the records after it in the transaction. A
+  one-table WAL is therefore byte for byte what it was.
+* **Tables have ids** that name them in the WAL and never change. The first
+  table has id 0 and cannot be dropped, so methods that name no table
+  (`WriteTxn::insert`, `Database::bulk_load`) write it, as before.
+  `CREATE` commits a manifest with a new empty table. `DROP` flushes the
+  memtables first, so no logged write outlives its table and replays into
+  a later one with the same id, then commits a manifest without the table;
+  its pages are freed once no snapshot reads them, as after a merge.
+* **Flushes and merges.** A flush writes every table's memtable in one
+  commit. A merge works on one table's segments and commits only that
+  table's list.
+* **References.** A KEYWORD or INT field may record the table whose primary
+  keys it holds (`"references"` in the schema, SQL `REFERENCES`): a table
+  with a primary key of the field's type, or the field's own table. It
+  names the table, not its id, because a file that drops back to format 1
+  and is reopened can give a new table a dropped table's id. References are
+  not enforced on writes; dropping a referenced table needs the tables that
+  reference it dropped too, or `CASCADE`, which removes their references in
+  the same commit. An older version ignores the key and drops it when it
+  rewrites the schema, which loses nothing it could use: a format 1 file
+  has one table, which can only reference itself.
+* **SQL.** A statement names its table. `Db::query` plans a query over
+  the catalog of one snapshot: a query of one table binds against it, and
+  a compound one's leaves each bind against the table they read, so a
+  join, a subquery or a `WITH` may read another table (joins across
+  tables). Each leaf runs on its table's view of the same snapshot. Join
+  keys are of one kind, `KEYWORD`, or `INT` and `FLOAT` compared as
+  numbers, and planning refuses two kinds, since a `KEYWORD` never equals
+  an `INT`; an `EDGES` field links rows of its own table by their keys, so
+  a join along links stays in one table. A write binds against the catalog, takes the
+  writer lock, checks that its table was not dropped and created again
+  meanwhile, and reads the rows it changes at that version. `CREATE TABLE`
+  binds to the schema's short JSON form, so both take the same options.
+  strata-server binds statements against the first table only.
+* **Later format changes.** Readers refuse a newer format number in a meta
+  slot, `CURRENT` or a manifest, but ignore keys they do not know inside a
+  schema. So a change that an older version must not ignore (stable field
+  ids, a schema id per segment, a field's analyzer, new value types) is a
+  required feature of format 3, recorded only by files that use it, as
+  format 2 is written only by files with several tables.
+
 ## 4. Segments
 
 A segment is `n` documents with local docIDs `0..n`, stored as a header and a
 directory of named sections (`text.body.terms`, `text.body.post`,
-`col.year`, `vec.emb.ivf`, ...). Sections are 64-byte aligned, and those over
+`col.year`, `vec.emb.ivf`, ...), each with its CRC32, which a query checks
+the first time it reads the section. Sections are 64-byte aligned, and those over
 one page are page-aligned, so any `&[u64]` view of a section is aligned and
 an index structure can be used straight from the mapped file. Every index
 component has a builder (documents in docID order to section bytes) and a
@@ -145,7 +329,14 @@ reader (sections to a zero-copy view). Global docIDs are
 ### 5.1 Full text (inverted index)
 
 * **Analyzer.** Unicode word split, lowercase, ASCII folding, an English
-  stopword list, a light English stemmer. Queries use the same analyzer.
+  stopword list, a light English stemmer (`english`, version 1); `simple`
+  (version 1) stops after folding. A field's schema records its analyzer
+  by name and version (absent: `english`), and its queries (`MATCH`
+  words, phrases, prefixes and typos, `bm25` terms, synonym rules) use
+  the same one. Any other than `english` is a format 3 feature named
+  after it (`analyzer:simple:1`), so a version of Strata that lacks it, or
+  analyses differently, refuses the database rather than misread its
+  terms; a change to an analyzer's output is a new version.
 * **Term dictionary.** Sorted terms in blocks of 32, front-coded, with a
   sparse in-memory index over block first-terms. Each entry gives the
   document frequency and the posting list's location.
@@ -382,6 +573,229 @@ ORDER BY rrf(bm25(body, :t), ppr(cites, (SELECT id FROM papers ORDER BY similari
 * With a VECTOR field as the first argument, `REACHABLE` and `PATH` follow
   similarity edges: `k => 10` neighbours per row, `min_sim => ..`.
 
+### 6.2 The plan IR
+
+Every statement becomes one typed, versioned, serialisable plan
+(`strata/src/query/ir.rs`): a tree of operators over expressions, which
+SQL makes today and other front-ends (a Python builder, a coordinator
+handing a query to its shards) are to make instead of writing SQL text.
+
+* **Operators.** `Search` is the leaf: the rows of one table that a filter
+  holds for, ranked by an order, which is what the executor (§7) answers.
+  Above it, `Aggregate` groups rows, `Filter` keeps groups, `Sort` orders
+  them, `Limit` cuts the rows and `Project` names the columns. Writes are
+  operators too: `Insert` with its rows and what a live key does
+  (`fail`, `replace`, `skip` or `update`), and `Update` and `Delete` over
+  a `Search`.
+* **Expressions.** Fields by id (their position in the table's schema,
+  which never changes, since there is no `ALTER`), typed literals
+  (`{"int": 5}`, `{"float": 5.0}`, `{"text": "5"}`, `{"timestamp": ...}`),
+  `NOT`, `AND`, `OR`, `IS NULL`, comparisons, `BETWEEN` with open ends,
+  `IN`, arithmetic (`+ - * / %`, negation), `||`, `LIKE` and `ILIKE`,
+  `CASE`, the functions `lower`, `upper`, `length`, `abs`, `round` and
+  `coalesce`, `MATCH`, the graph predicates, every score (BM25,
+  similarity, sparse, decay, RRF, weighted sums, products, PageRank), and
+  a subquery. A filter is in three-valued logic as the binder makes it: a
+  negation over a field that can be null carries `x IS NOT NULL`.
+* **Versions and features.** A plan carries its version (1) and the
+  features it uses. A reader refuses a newer version, or a feature it
+  does not know, by name, as a database refuses a format 3 feature; a
+  later operator or expression is a new feature, not a new version.
+* **What runs.** `Plan::of_select` and `Plan::of_write` make the plan of a
+  bound statement, and `Plan::to_select` and `Plan::to_write` give back
+  the statement for the shapes the executor runs: `Project [Limit]
+  Search` and `Project [Limit] [Sort] [Filter] Aggregate Search`. A test
+  takes every kind of statement the binder accepts through JSON and back
+  to the same bound statement. A compound query's plan has operators
+  over these shapes (below).
+* **Every query runs as a plan.** `Db::query`, `Db::sql` and the server
+  bind a statement into its plan and run the plan, whose `Search` the
+  executor answers (each leaf of a compound query too). `Db::run` runs a
+  plan made elsewhere, `POST /v1/plan` takes one as JSON, and Python has
+  `Database.plan` and `run`. A plan made elsewhere is checked against the
+  table's schema as the binder checks SQL. Going through the plan adds
+  0.4 to 1.3 µs to a query whose binding takes 9 to 22 µs (cloud
+  container, 2026-10-29). A coordinator runs a read's plan, and sends
+  its shards a compound query's leaves as plans (below).
+* **One evaluator.** `ir::eval` gives an expression's value over a row,
+  in SQL's three-valued logic: NULL is UNKNOWN, `AND` and `OR` are
+  Kleene's, `NOT` of UNKNOWN is UNKNOWN, and a row or group is kept only
+  when its condition is TRUE. A comparison with a multi-valued field
+  holds when one of its values does and is never UNKNOWN (a field with no
+  values is an empty list), as the indexes answer it. Integers are exact,
+  a result too big for one is a FLOAT, `/` gives a FLOAT and a zero
+  divisor NULL. `HAVING` runs in it, and so do the conditions and values
+  over joined and derived rows (`WITH`, `FROM (SELECT ...)`, joins),
+  compiled into plan expressions once per query instead of walking the
+  SQL for each row. Tests check that the evaluator and the indexes keep
+  the same rows for 1,500 random conditions over rows with NULLs and
+  lists, that a join keeps them too, and that `NOT` over an aggregate of
+  no values keeps no group (`HAVING` was two-valued before, and joins
+  compared a list with a value by its text, so `b.tags = 'x'` never
+  held, and read a field with no values as NULL).
+* **Writes as plans.** An `Update` (and an insert's `update` on a live
+  key) sets each field to an expression of the row, which the evaluator
+  computes from the row as it was (every right-hand side sees the old
+  values) and stores as the field's type: a whole FLOAT fits an INT, one
+  value a multi-valued field. In an insert's `update`, `excluded.f` is the
+  row the statement proposed. A literal, `f + number` (a counter, where
+  NULL counts as zero) and a bare `excluded.f` of the same type keep their
+  faster forms; every other expression gives NULL for NULL, as in SQL, and
+  may not search, score or traverse. A statement that fails on one row
+  writes none. `UPDATE` and `DELETE` bind the statement's own `WHERE`,
+  `ORDER BY` and `LIMIT`, and `ON CONFLICT` reads its live rows with a
+  query it builds, where each used to print SQL text and parse it again:
+  printed, `- -1` is the comment `--1`, and a column named `order` stopped
+  `SELECT id, order, ...` from parsing.
+* **Compound steps bind their own syntax trees.** Each step of a compound
+  query (a side of a join, a subquery, a `WITH`) is built as a syntax
+  tree and bound, where it used to be printed as SQL and parsed again,
+  with the same two failures. A coordinator still sends its shards a
+  step as SQL, printed so that it parses back to the step's plan (a
+  column named like a keyword quoted, the operand of a sign that starts
+  with a sign in parentheses), and a test checks that it does.
+* **Operators.** A compound query (`WITH`, a subquery, a join,
+  `SELECT DISTINCT` over rows in memory) plans into one tree, which
+  `ops::run` runs: its leaves are single-table queries the executor
+  answers, and above them `Join` (a hash join, inner or left, on key
+  columns or along an `EDGES` field's links, with any other `ON`
+  condition after), `With` and `Ref` (named results), `Distinct`,
+  `KeyOrder` (rows in a `WITH` result's order) and `Project`, `Filter`,
+  `Sort`, `Limit` and `Aggregate` over rows in memory, all through the one
+  evaluator. A subquery is an expression of the condition it sits in
+  (`Values`, `Keys`, `Exists`, `Scalar`) and runs before its leaf, whose
+  filter then holds its values, so the leaf's indexes serve it. A join's
+  second side reads only the rows whose join values the first side holds;
+  under a `LIMIT` whose order is the first side's, scans of a growing
+  number of its rows stop once enough rows join. Each part holds at most
+  1,000,000 rows and counts against the query's memory budget. A plan
+  with operators needs the feature `operators`, so an older reader
+  refuses it by name. Rows sorted in memory put NULLs last unless
+  `NULLS FIRST`, as the executor does; they came first in an ascending
+  sort. A `SELECT DISTINCT` over rows of a `WITH` result kept every
+  distinct value and dropped its `LIMIT`; it keeps the `LIMIT` now. A
+  coordinator runs the operators and sends each leaf to its shards as its
+  plan, where it sent SQL text printed to parse back to the leaf.
+* **The shard protocol.** From protocol 2 a coordinator sends every read
+  to its shards as a typed plan in protobuf (`QueryRequest.plan`, the same
+  tree as the JSON form, with typed values and no SQL), where protocol 1
+  sent SQL with parameters, or a leaf as a JSON plan. `Hello` answers a
+  server's protocol versions, plan version and plan features. The
+  coordinator asks each replica when it connects, every minute and after
+  the replica fails, and speaks the oldest version any replica speaks, so
+  a cluster upgrades one server at a time. A server refuses a protocol
+  newer than its own, and reads a protobuf plan with the checks JSON's
+  reading makes: version and features by name, every node and expression
+  present, every number finite.
+* **Query then fetch.** From protocol 3, a page of rows with stored
+  columns whose shards would send at least 8 times its rows in one round
+  (`FETCH_FROM`: a deep page, many shards, or a fused score's candidates)
+  comes in two rounds. Each shard answers the query with its rows' keys
+  alone (`cluster::ids`) and holds the snapshot it read (`hold`); the
+  merge ranks the keys; the shards holding the page's rows answer
+  `cluster::fetch`, the query's columns of those rows, from that snapshot,
+  ending its lease (`release`; `Release` ends the others'); and
+  `cluster::fill` puts them in the merged order with the merged scores. A
+  statistics round's lease is ended by its query round too, where it
+  lasted until its deadline and a second. Partial aggregates were in
+  place already: shards send sums, counts, minimums, maximums and
+  `COUNT(DISTINCT)`'s exact values, which the coordinator merges.
+* **Slots.** From protocol 4, a key's shard is its slot's: one of 4,096,
+  xxh3 of the key's type tag and bytes (an `INT` and a string of the same
+  digits differ), where it was FNV-1a of the key's text modulo the shard
+  count, which moved most keys when a shard was added. A versioned map
+  assigns slots to shards (equal runs by default, or `--slot-map`). The
+  coordinator gives each shard the map (`Slots`), which the shard keeps
+  beside its database, and sends the map's epoch with every request; a
+  shard refuses an older epoch, another map of its epoch, a write of a key
+  another shard holds, and a map under which rows here are in other
+  shards' slots. Online resharding is a map of a higher epoch once moved
+  slots' rows are copied; the copy is not built. While a replica speaks
+  an older protocol the coordinator routes by the old hash.
+* **Sequence numbers.** Replication's order of writes is a database's
+  own (§3.4): a numbered database gives each write transaction a term and
+  a sequence number, logged in its commit record and kept across flushes,
+  crashes, checkpoints and reopening, and each row the number of the
+  write that last changed it. A replica applies its primary's log
+  transaction by transaction under the primary's numbers (§3.4).
+* **Replication.** A strata-server primary (`--replicas`) ships its ship
+  log to each replica (`--replica`) over gRPC (`Replicate`), a task per
+  replica: a call with no transactions asks the replica's last, and the
+  batches that follow carry the term and number before their first. A
+  mismatch the primary's own history explains (a replica behind) is shipped
+  again from the replica's last; any other means the histories differ. A
+  replica the log no longer reaches is sent a copy (`Restore`): the
+  primary writes a checkpoint beside its database and streams it in
+  chunks, and the replica writes it beside its own, opens it checking
+  every segment's checksum, and installs it (§3.4). A write
+  is answered once the copies `--write-acks` names hold it, within its
+  deadline: every replica in sync (`all`, which drops a replica that misses
+  the deadline out of sync), a majority (`majority`, which refuses a write
+  before applying it while too few copies are in sync, and answers 504
+  after, the write durable on the primary), or the primary alone. A
+  replica keeps the id and term of the primary it follows, refuses a second
+  primary of that term, and answers a primary of an older term with its
+  own, which fences that primary. A coordinator learns each copy's role
+  from `Hello` and writes to a shard's primary.
+* **Reads that see a write.** A snapshot says the last transaction it
+  holds (`Snapshot::seq_no`). A read may name a write's number
+  (`min_seq_no`; through a coordinator `min_seq_nos`, one per shard, as
+  its writes answer `seq_nos`): a replica waits up to a second, woken by
+  its commit hook, for a version that holds it and then refuses the read
+  (503), and a primary refuses a number past its last (409), as a lease
+  from before the write does. The wait comes before admission, so it
+  holds no query slot. A replica serves reads only while its primary's
+  last call found it caught up (each call says whether the replica is
+  behind), not after a mismatch, a failed batch or a copy. A coordinator
+  asks a shard's primary first after a copy fails a read, and passes over
+  a replica of a protocol before 5, which would not wait, without
+  counting it as failed (protocol 5).
+* **Comparing copies.** Every `--verify-every-s` (600 s) and when asked,
+  a primary compares each in-sync replica's rows with its own. It takes a
+  version, ships the replica up to that version's last transaction and
+  not past it, in a call that has the replica keep the version that call
+  leaves (`pin`), and compares digests of the two (`Verify`), hashing on
+  both sides while shipping goes on: per slot of the keys, the row count
+  and the wrapping sum of xxh3 over each row's table, key and number
+  (`Snapshot::row_versions`). A replica whose digests differ drops out of
+  sync and is sent a copy. The digests leave out values, which copies
+  that applied the same writes share; a replica loaded with other values
+  under the same keys before numbering is not found.
+* **Promotion.** Failover is by hand. A replica is made the primary of a
+  new term (`POST /v1/admin/promote`, `strata-server promote`; a stopped
+  one with `--promote`): it asks the copies it is to ship to for their
+  last transaction (`Hello`) and refuses while one holds a later one or a
+  newer term, unless forced; then it begins a term above every term it
+  knows, under the lock its primary's calls take, and starts shipping. A
+  replica holding transactions of an older term that the new primary
+  does not is sent a copy, which drops them. An old primary learns of the
+  new term from a copy of it, or from the new primary shipping to it, and
+  is fenced: no writes, no reads, a write waiting for acknowledgements
+  refused, `replaced_by_term` in `Hello`, and the term kept in
+  `<db>.replication`, so that it starts again as a primary only with
+  `--promote`. A coordinator writes to the unreplaced primary of the
+  newest term, and sends a write the old primary refused, or that found
+  it down, once to the copy that took its place.
+* **Conditional writes.** `seq_no()` is a column of a query on one table
+  (plan feature `seq_no`, so an older shard refuses the plan by name), read
+  from the row's segment, its updates or the memtable. strata-server's
+  `--seq-no` numbers its database, a write's answer carries its number,
+  and a write operation with `if_seq_no` applies only while its row's
+  number is that, checked under the writer lock (`WriteTxn::seq_of`): a
+  mismatch, a missing row or a row the request already wrote refuses the
+  request with 409. Several requests share a group commit, so a conflict
+  fails the group and each request is then applied alone, which leaves
+  exactly one of the racing writers applied. A coordinator passes both on
+  while each shard has one replica or a primary, since replicas that each
+  take writes number them independently.
+* **`EXPLAIN`.** `EXPLAIN <statement>` gives the plan as indented lines,
+  fields by name and expressions in SQL's words, without running it;
+  `EXPLAIN FORMAT JSON` gives the JSON. `POST /v1/explain` returns both
+  next to the executor's plan lines.
+
+Next: a coordinator and
+strata-server over every table.
+
 ## 7. Planning and execution
 
 The binder turns the `WHERE` clause into a predicate tree over three kinds of
@@ -407,6 +821,19 @@ candidate stream is long relative to the lists, and probes otherwise.
 | `bm25` | MaxScore or Block-Max WAND over postings, with the filter as a skip constraint |
 | `similarity` | pre-filter exact scan, IVF with in-filter intersection, HNSW in-filter, post-filter with oversampling |
 | fusion | top-k′ from each retriever, union, exact re-scoring of both scores on the union; or exact scan |
+
+**Fused scores** (`query/rank.rs`). RRF, a weighted sum and a product
+compile into one expression over their leaves, which the plan lines print
+with normalisation written out: `0.3 * minmax(bm25(title)) + 0.7 *
+minmax(similarity(emb))`, `bm25(body) * decay(year)`, `rrf(bm25(body),
+similarity(emb), k => 60)`. One evaluator computes it over the candidates,
+on one database, on each shard (which answers every candidate with each
+leaf's value and whether the row is in the leaf's top rows), and at the
+coordinator over the shards' merged candidates. On one database it orders
+only the rows the page can reach (the best `k` and the rows tied with the
+`k`-th), which matters when `exact => 1` makes every row a candidate.
+Ranking expressions extend this expression with arithmetic, functions and
+rerank phases.
 
 The vector strategies are chosen by estimated cost against an estimated
 filter selectivity `s`: pre-filter costs `s·n` distance computations; IVF

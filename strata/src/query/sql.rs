@@ -9,10 +9,14 @@
 //! weighted sums and products of those, or a column.
 //! Parameters (`:name`) are bound from [`Params`].
 //!
-//! Writes ([`bind_write`]): `INSERT INTO t (cols) VALUES (...), ...`,
-//! `INSERT OR REPLACE` (an upsert), `UPDATE t SET f = v, g = g + 1 [WHERE
-//! ...]` and `DELETE FROM t [WHERE ...]`. Lists are `ARRAY[...]`; vectors are
-//! parameters, `ARRAY[...]` or a JSON array string.
+//! Writes ([`bind_command`], [`bind_write`]): `INSERT INTO t (cols) VALUES
+//! (...), ...` with `OR REPLACE`, `OR IGNORE` or `ON CONFLICT (key) DO
+//! NOTHING | DO UPDATE SET ...`, `UPDATE t SET f = v, g = g + 1 [WHERE ...]
+//! [LIMIT n]` and `DELETE FROM t [WHERE ...] [ORDER BY ...] [LIMIT n]`, of
+//! any table of the database. Lists are `ARRAY[...]`; vectors are
+//! parameters, `ARRAY[...]` or a JSON array string. `CREATE TABLE` and
+//! `DROP TABLE` are bound in [`crate::query::ddl`]. A clause the binder does
+//! not handle is an error, never ignored.
 //!
 //! Graph queries over EDGES fields (DESIGN.md §6.1): the predicates
 //! `REACHABLE(field, seeds, ...)` and `PATH(field, from, to, ...)`, the score
@@ -24,12 +28,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
+use crate::query::{ddl, ir};
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak};
-use crate::schema::{FieldType, Schema};
+use crate::schema::{Field, FieldType, Logical, Schema};
+use crate::storage::DropOptions;
 use crate::value::Value;
 
 /// Values for `:name` placeholders.
@@ -57,139 +61,557 @@ fn err(m: impl Into<String>) -> Error {
 /// A bound INSERT, UPDATE or DELETE.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Write {
-    /// Documents in schema order (unnamed columns NULL); `replace` upserts.
-    Insert { docs: Vec<Vec<Value>>, replace: bool },
+    /// Documents in schema order (unnamed columns NULL), and what to do
+    /// with one whose primary key is live.
+    Insert { docs: Vec<Vec<Value>>, conflict: Conflict },
     /// The documents `select` returns (their primary keys) get `sets`.
     Update { select: Select, sets: Vec<(usize, Assign)> },
     /// The documents `select` returns are deleted.
     Delete { select: Select },
 }
 
+/// What an INSERT does with a document whose primary key is already live
+/// (or written earlier by the same statement).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Conflict {
+    /// The statement fails: `INSERT`.
+    Fail,
+    /// The new document replaces the live one: `INSERT OR REPLACE`,
+    /// `REPLACE INTO`.
+    Replace,
+    /// The live document stays and the new one is skipped: `INSERT OR
+    /// IGNORE`, `ON CONFLICT DO NOTHING`.
+    Skip,
+    /// The live document gets these fields set, as by an UPDATE: `ON
+    /// CONFLICT (key) DO UPDATE SET ...`.
+    Update(Vec<(usize, Assign)>),
+}
+
 /// The right-hand side of `SET field = ...`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Assign {
     Value(Value),
-    /// `field = field + x` (or `- x`).
-    Add(f64),
+    /// `field = field + x` (or `- x`): an INT or a FLOAT, integers exact.
+    Add(Value),
+    /// `field = excluded.g`, in `ON CONFLICT DO UPDATE`: field `g` of the
+    /// document the INSERT proposed.
+    Excluded(usize),
+    /// Any other expression of the row's fields (and, in `ON CONFLICT DO
+    /// UPDATE`, of `excluded.g`), computed for each row by the plan IR's
+    /// evaluator ([`crate::query::ir::eval`]) and stored as the field's
+    /// type: a whole FLOAT fits an INT, and one value a multi-valued field.
+    /// NULL in gives NULL out, as in SQL; only `field + number` counts a
+    /// NULL as zero.
+    Expr(crate::query::ir::Expr),
 }
 
-/// Parses and binds one INSERT, UPDATE or DELETE; `None` for a SELECT.
+/// A bound statement ([`bind_command`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    /// A SELECT, bound when it runs ([`crate::db::Db::query`]).
+    Query,
+    /// An INSERT, UPDATE or DELETE of the table named `table`.
+    Write { table: String, write: Write },
+    /// `CREATE TABLE [IF NOT EXISTS] ...`.
+    CreateTable { schema: Schema, if_not_exists: bool },
+    /// `DROP TABLE [IF EXISTS] a, b [CASCADE | RESTRICT]`.
+    DropTable { tables: Vec<String>, opts: DropOptions },
+    /// `EXPLAIN [FORMAT JSON] <statement>`: the statement's plan
+    /// ([`crate::query::ir`]), as lines of text or as JSON, made when it
+    /// runs ([`crate::db::Db::explain`]).
+    Explain { json: bool },
+}
+
+/// Parses one statement.
+pub(crate) fn parse_one(sql_text: &str) -> Result<sql::Statement> {
+    let mut stmts = super::parse::parse(sql_text)?;
+    if stmts.len() != 1 {
+        return Err(err("expected exactly one statement"));
+    }
+    Ok(stmts.pop().unwrap())
+}
+
+/// Parses one SELECT statement.
+pub(crate) fn parse_query(sql_text: &str) -> Result<Box<sql::Query>> {
+    match parse_one(sql_text)? {
+        sql::Statement::Query(q) => Ok(q),
+        _ => Err(err("only SELECT is supported")),
+    }
+}
+
+/// Parses and binds one INSERT, UPDATE or DELETE of `schema`'s table;
+/// `None` for a SELECT.
 pub fn bind_write(sql_text: &str, schema: &Schema, params: &Params) -> Result<Option<Write>> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql_text).map_err(|e| err(e.to_string()))?;
-    let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
-    let b = Binder::new(schema, params);
-    let table = |name: &str| {
-        if name.eq_ignore_ascii_case(&schema.table) {
-            Ok(())
-        } else {
-            Err(err(format!("no such table: {name}")))
+    match bind_command(sql_text, &[schema], params)? {
+        Command::Query => Ok(None),
+        Command::Write { write, .. } => Ok(Some(write)),
+        _ => Err(err("only SELECT, INSERT, UPDATE and DELETE are supported")),
+    }
+}
+
+/// Parses and binds one statement of a database whose tables are `tables`:
+/// a SELECT (bound when it runs), an INSERT, UPDATE or DELETE of one of
+/// them, `CREATE TABLE` or `DROP TABLE`.
+pub fn bind_command(sql_text: &str, tables: &[&Schema], params: &Params) -> Result<Command> {
+    bind_statement(&parse_one(sql_text)?, tables, params)
+}
+
+/// [`bind_command`] of a parsed statement.
+pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: &Params) -> Result<Command> {
+    let table = |name: &sql::ObjectName| -> Result<&Schema> {
+        let n = table_name(name);
+        tables.iter().copied().find(|t| t.table.eq_ignore_ascii_case(&n)).ok_or_else(|| err(format!("no such table: {n}")))
+    };
+    let write = |schema: &Schema, write: Write| Command::Write { table: schema.table.clone(), write };
+    Ok(match stmt {
+        sql::Statement::Query(_) => Command::Query,
+        sql::Statement::Explain { describe_alias: _, analyze, verbose, query_plan: _, estimate, statement, format, options } => {
+            if *analyze || *verbose || *estimate {
+                return Err(err("EXPLAIN shows a statement's plan without running it: ANALYZE, VERBOSE and ESTIMATE are not supported (POST /v1/explain runs a query and reports what it did)"));
+            }
+            if matches!(**statement, sql::Statement::Explain { .. }) {
+                return Err(err("EXPLAIN of EXPLAIN"));
+            }
+            let mut json = false;
+            let mut format_of = |f: &str| -> Result<()> {
+                match f.to_ascii_uppercase().as_str() {
+                    "JSON" => json = true,
+                    "TEXT" | "TREE" => json = false,
+                    f => return Err(err(format!("EXPLAIN FORMAT {f} is not supported: TEXT or JSON"))),
+                }
+                Ok(())
+            };
+            if let Some(sql::AnalyzeFormatKind::Keyword(f) | sql::AnalyzeFormatKind::Assignment(f)) = format {
+                format_of(&f.to_string())?;
+            }
+            for o in options.iter().flatten() {
+                match (o.name.value.to_ascii_uppercase().as_str(), &o.arg) {
+                    ("FORMAT", Some(Expr::Identifier(f))) => format_of(&f.value)?,
+                    _ => return Err(err(format!("EXPLAIN option {o} is not supported: FORMAT TEXT or FORMAT JSON"))),
+                }
+            }
+            Command::Explain { json }
         }
-    };
-    // The documents a WHERE clause selects, as a query for their keys and
-    // every field (an UPDATE may rewrite them).
-    let selecting = |selection: &Option<Expr>| -> Result<Select> {
-        let cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
-        let text = match selection {
-            Some(e) => format!("SELECT {} FROM {} WHERE {e}", cols.join(", "), schema.table),
-            None => format!("SELECT {} FROM {}", cols.join(", "), schema.table),
-        };
-        bind(&text, schema, params)
-    };
-    Ok(Some(match stmt {
-        sql::Statement::Query(_) => return Ok(None),
         sql::Statement::Insert(ins) => {
-            match &ins.table {
-                sql::TableObject::TableName(n) => table(&n.to_string())?,
-                _ => return Err(err("INSERT needs a table name")),
-            }
-            let replace = ins.replace_into || matches!(ins.or, Some(sql::SqliteOnConflict::Replace)) || ins.on.is_some();
-            let cols: Vec<usize> = if ins.columns.is_empty() {
-                (0..schema.fields.len()).collect()
-            } else {
-                ins.columns.iter().map(|c| schema.field_index(&c.value).ok_or_else(|| err(format!("no such column: {}", c.value)))).collect::<Result<_>>()?
-            };
-            let Some(sql::SetExpr::Values(values)) = ins.source.as_ref().map(|q| q.body.as_ref()) else {
-                return Err(err("INSERT needs VALUES"));
-            };
-            let mut docs = Vec::with_capacity(values.rows.len());
-            for row in &values.rows {
-                if row.len() != cols.len() {
-                    return Err(err(format!("{} values for {} columns", row.len(), cols.len())));
-                }
-                let mut doc = vec![Value::Null; schema.fields.len()];
-                for (&f, e) in cols.iter().zip(row) {
-                    doc[f] = b.write_value(f, e)?;
-                }
-                docs.push(doc);
-            }
-            Write::Insert { docs, replace }
+            let sql::TableObject::TableName(n) = &ins.table else { return Err(err("INSERT needs a table name")) };
+            let schema = table(n)?;
+            write(schema, insert(ins, schema, params)?)
         }
-        sql::Statement::Update { table: t, assignments, selection, .. } => {
-            table(&t.relation.to_string())?;
-            let mut sets = Vec::new();
-            for a in assignments {
-                let sql::AssignmentTarget::ColumnName(name) = &a.target else { return Err(err("SET one column at a time")) };
-                let f = schema.field_index(&name.to_string()).ok_or_else(|| err(format!("no such column: {name}")))?;
-                if Some(f) == schema.primary_key {
-                    return Err(err("the primary key cannot be updated; delete and insert instead"));
-                }
-                let assign = match &a.value {
-                    Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if b.field_of(left).ok() == Some(f) => {
-                        let x = b.num_lit(right)?;
-                        Assign::Add(if *op == BinaryOperator::Minus { -x } else { x })
-                    }
-                    e => Assign::Value(b.write_value(f, e)?),
-                };
-                if matches!(assign, Assign::Add(_)) && !matches!(schema.fields[f].ty, FieldType::Int | FieldType::Float) {
-                    return Err(err(format!("{name} is not numeric")));
-                }
-                sets.push((f, assign));
+        sql::Statement::Update { table: t, assignments, from, selection, returning, or, limit } => {
+            if !t.joins.is_empty() || from.is_some() {
+                return Err(err("UPDATE ... FROM and joins are not supported: UPDATE one table, with a WHERE over its own columns"));
             }
-            Write::Update { select: selecting(selection)?, sets }
+            if returning.is_some() {
+                return Err(err("UPDATE ... RETURNING is not supported"));
+            }
+            if let Some(o) = or {
+                return Err(err(format!("UPDATE {o} is not supported")));
+            }
+            let schema = table(plain_table(&t.relation, "UPDATE")?)?;
+            let alias = match &t.relation {
+                sql::TableFactor::Table { alias: Some(a), .. } => Some(a.name.value.as_str()),
+                _ => None,
+            };
+            let sets = Binder::new(schema, params).assignments(assignments, alias, false)?;
+            write(schema, Write::Update { select: selecting(schema, params, &t.relation, selection, &[], limit)?, sets })
         }
         sql::Statement::Delete(d) => {
-            let (sql::FromTable::WithFromKeyword(from) | sql::FromTable::WithoutKeyword(from)) = &d.from;
+            let sql::Delete { tables: named, from, using, selection, returning, order_by, limit } = d;
+            if !named.is_empty() || using.is_some() {
+                return Err(err("DELETE ... USING and multi-table DELETE are not supported: DELETE FROM one table, with a WHERE over its own columns"));
+            }
+            if returning.is_some() {
+                return Err(err("DELETE ... RETURNING is not supported"));
+            }
+            let (sql::FromTable::WithFromKeyword(from) | sql::FromTable::WithoutKeyword(from)) = from;
             let [t] = from.as_slice() else { return Err(err("DELETE from exactly one table")) };
-            table(&t.relation.to_string())?;
-            Write::Delete { select: selecting(&d.selection)? }
+            if !t.joins.is_empty() {
+                return Err(err("DELETE from exactly one table"));
+            }
+            let schema = table(plain_table(&t.relation, "DELETE")?)?;
+            write(schema, Write::Delete { select: selecting(schema, params, &t.relation, selection, order_by, limit)? })
         }
-        _ => return Err(err("only SELECT, INSERT, UPDATE and DELETE are supported")),
-    }))
+        sql::Statement::CreateTable(ct) => {
+            let (schema, if_not_exists) = ddl::create_table(ct, tables)?;
+            Command::CreateTable { schema, if_not_exists }
+        }
+        stmt @ sql::Statement::Drop { .. } => {
+            let (tables, opts) = ddl::drop_table(stmt)?;
+            Command::DropTable { tables, opts }
+        }
+        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE and EXPLAIN are supported")),
+    })
+}
+
+/// The name of a plain table in FROM (an alias allowed), for `what`.
+/// The table a name names: a quoted name is the name inside the quotes
+/// (`"books"` is books, `"my table"` is my table).
+pub(crate) fn table_name(n: &sql::ObjectName) -> String {
+    match n.0.as_slice() {
+        [sql::ObjectNamePart::Identifier(id)] => id.value.clone(),
+        _ => n.to_string(),
+    }
+}
+
+fn plain_table<'t>(t: &'t sql::TableFactor, what: &str) -> Result<&'t sql::ObjectName> {
+    match t {
+        sql::TableFactor::Table { name, alias: _, args: None, with_hints, version: None, with_ordinality: false, partitions, json_path: None, sample: None, index_hints }
+            if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty() =>
+        {
+            Ok(name)
+        }
+        _ => Err(err(format!("{what} needs a table name, not {t}"))),
+    }
+}
+
+/// Binds an INSERT into `schema`'s table.
+fn insert(ins: &sql::Insert, schema: &Schema, params: &Params) -> Result<Write> {
+    let sql::Insert {
+        or,
+        ignore,
+        into: _,
+        table: _,
+        table_alias,
+        columns,
+        overwrite,
+        source,
+        assignments,
+        partitioned,
+        after_columns,
+        has_table_keyword,
+        on,
+        returning,
+        replace_into,
+        priority,
+        insert_alias,
+        settings,
+        format_clause,
+    } = ins;
+    if returning.is_some() {
+        return Err(err("INSERT ... RETURNING is not supported"));
+    }
+    if !assignments.is_empty() {
+        return Err(err("INSERT ... SET is not supported: INSERT INTO t (columns) VALUES (...)"));
+    }
+    if table_alias.is_some() || *overwrite || partitioned.is_some() || !after_columns.is_empty() || *has_table_keyword || priority.is_some() || insert_alias.is_some() || settings.is_some() || format_clause.is_some() {
+        return Err(err(format!("this form of INSERT is not supported: {ins}")));
+    }
+    let b = Binder::new(schema, params);
+    let mut conflict = match (or, *replace_into, *ignore) {
+        (Some(sql::SqliteOnConflict::Replace), ..) | (None, true, false) => Conflict::Replace,
+        (Some(sql::SqliteOnConflict::Ignore), ..) | (None, false, true) => Conflict::Skip,
+        (None, false, false) => Conflict::Fail,
+        (Some(o), ..) => return Err(err(format!("INSERT {o} is not supported: INSERT fails on a key that is taken, OR REPLACE replaces that row and OR IGNORE keeps it"))),
+        (None, true, true) => return Err(err("REPLACE IGNORE is not supported")),
+    };
+    match on {
+        None => {}
+        Some(_) if conflict != Conflict::Fail => return Err(err("INSERT OR ... and ON CONFLICT cannot be combined")),
+        Some(sql::OnInsert::DuplicateKeyUpdate(_)) => return Err(err("ON DUPLICATE KEY UPDATE is not supported: use ON CONFLICT (key) DO UPDATE SET ...")),
+        Some(sql::OnInsert::OnConflict(oc)) => {
+            let pk = schema.primary_key.ok_or_else(|| err(format!("ON CONFLICT needs a primary key, and {} has none", schema.table)))?;
+            match &oc.conflict_target {
+                None => {}
+                Some(sql::ConflictTarget::Columns(cols)) if cols.len() == 1 && schema.field_index(&cols[0].value) == Some(pk) => {}
+                Some(_) => return Err(err(format!("ON CONFLICT names the primary key: ON CONFLICT ({})", schema.fields[pk].name))),
+            }
+            conflict = match &oc.action {
+                sql::OnConflictAction::DoNothing => Conflict::Skip,
+                sql::OnConflictAction::DoUpdate(u) => {
+                    if u.selection.is_some() {
+                        return Err(err("ON CONFLICT ... DO UPDATE ... WHERE is not supported"));
+                    }
+                    Conflict::Update(b.assignments(&u.assignments, None, true)?)
+                }
+            };
+        }
+        Some(o) => return Err(err(format!("INSERT ...{o} is not supported"))),
+    }
+    let cols: Vec<usize> = if columns.is_empty() {
+        (0..schema.fields.len()).collect()
+    } else {
+        columns.iter().map(|c| schema.field_index(&c.value).ok_or_else(|| err(format!("no such column: {}", c.value)))).collect::<Result<_>>()?
+    };
+    let values = match source.as_deref() {
+        Some(q) if no_clauses(q).is_none() => match q.body.as_ref() {
+            sql::SetExpr::Values(v) => v,
+            _ => return Err(err("INSERT needs VALUES")),
+        },
+        Some(q) => return Err(err(format!("INSERT ... VALUES takes no {}", no_clauses(q).unwrap_or_default()))),
+        None => return Err(err("INSERT needs VALUES")),
+    };
+    // Columns the statement leaves out take their defaults.
+    let start = schema.defaults(b.now)?;
+    let mut docs = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        if row.len() != cols.len() {
+            return Err(err(format!("{} values for {} columns", row.len(), cols.len())));
+        }
+        let mut doc = start.clone();
+        for (&f, e) in cols.iter().zip(row) {
+            doc[f] = b.write_value(f, e)?;
+        }
+        docs.push(doc);
+    }
+    Ok(Write::Insert { docs, conflict })
+}
+
+/// The first clause of `q` other than its body: `WITH`, `ORDER BY`,
+/// `LIMIT` and the clauses no statement here takes.
+fn no_clauses(q: &sql::Query) -> Option<String> {
+    let sql::Query { with, body: _, order_by, limit_clause, fetch, locks, for_clause, settings, format_clause, pipe_operators } = q;
+    if with.is_some() {
+        Some("WITH".into())
+    } else if order_by.is_some() {
+        Some("ORDER BY".into())
+    } else if limit_clause.is_some() {
+        Some("LIMIT".into())
+    } else {
+        unsupported_query_clause(fetch, locks, for_clause, settings, format_clause, pipe_operators)
+    }
+}
+
+/// The clauses of a query that no statement here takes, by name.
+fn unsupported_query_clause(
+    fetch: &Option<sql::Fetch>,
+    locks: &[sql::LockClause],
+    for_clause: &Option<sql::ForClause>,
+    settings: &Option<Vec<sql::Setting>>,
+    format_clause: &Option<sql::FormatClause>,
+    pipe_operators: &[sql::PipeOperator],
+) -> Option<String> {
+    if fetch.is_some() {
+        Some("FETCH (use LIMIT)".into())
+    } else if !locks.is_empty() {
+        Some("FOR UPDATE or FOR SHARE (reads never lock: they see a snapshot)".into())
+    } else if let Some(f) = for_clause {
+        Some(f.to_string())
+    } else if settings.is_some() {
+        Some("SETTINGS".into())
+    } else if let Some(f) = format_clause {
+        Some(f.to_string())
+    } else if !pipe_operators.is_empty() {
+        Some("pipe operators".into())
+    } else {
+        None
+    }
+}
+
+/// The rows a WHERE clause selects, as a query of every field (an UPDATE
+/// may rewrite them; a DELETE needs their keys), cut by `ORDER BY` and
+/// `LIMIT` as a SELECT's rows are. The statement's own table and clauses
+/// are bound, never printed and parsed again: printed, `- -1` is `--1`, a
+/// comment, and a column named `order` is a keyword.
+fn selecting(schema: &Schema, params: &Params, table: &sql::TableFactor, selection: &Option<Expr>, order_by: &[sql::OrderByExpr], limit: &Option<Expr>) -> Result<Select> {
+    let mut q = parse_query("SELECT * FROM t")?;
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(err("a SELECT of every field")) };
+    s.from[0].relation = table.clone();
+    s.selection = selection.clone();
+    if !order_by.is_empty() {
+        q.order_by = Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(order_by.to_vec()), interpolate: None });
+    }
+    q.limit_clause = limit.clone().map(|l| sql::LimitClause::LimitOffset { limit: Some(l), offset: None, limit_by: Vec::new() });
+    let mut select = bind_query(&q, schema, params)?;
+    select.projection = every_field(schema);
+    select.types = projection_types(schema, &select.projection);
+    Ok(select)
+}
+
+/// Every field of the rows whose primary key is one of `keys`, as a query
+/// (`ON CONFLICT DO UPDATE` reads the live rows of its keys).
+pub(crate) fn keyed_rows(schema: &Schema, keys: Vec<Value>) -> Result<Select> {
+    let pk = schema.primary_key.ok_or_else(|| err(format!("{} has no primary key", schema.table)))?;
+    let projection = every_field(schema);
+    let types = projection_types(schema, &projection);
+    let filter = if keys.is_empty() { Pred::False } else { Pred::In { field: pk, values: keys } };
+    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, limit: None, offset: 0, graphs: Vec::new(), types })
+}
+
+fn every_field(schema: &Schema) -> Vec<(String, Projection)> {
+    schema.fields.iter().enumerate().map(|(i, f)| (f.name.clone(), Projection::Field(i))).collect()
+}
+
+/// A column's name quoted, which SQL reads as that column whatever it is:
+/// a keyword such as `order`, or any characters.
+pub fn quoted(n: &str) -> String {
+    format!("\"{}\"", n.replace('"', "\"\""))
+}
+
+/// A value coerced to `field`'s type, in the form its column holds
+/// ([`crate::schema::Field::store`]).
+fn coerce(field: &Field, v: Value) -> Result<Value> {
+    if let Some(l) = field.logical {
+        // In SQL a time is text or a timestamp parameter; a bare
+        // number would be microseconds nobody meant.
+        if l == Logical::Timestamp && matches!(v, Value::Int(_) | Value::Float(_)) {
+            return Err(err(format!("{} is a TIMESTAMP: give it text such as '2026-10-01T12:30:00Z', not the number {v:?}", field.name)));
+        }
+        return field.store(v).map_err(|e| match e {
+            Error::Schema(m) => err(m),
+            e => e,
+        });
+    }
+    match (&field.ty, v) {
+        (FieldType::Keyword, Value::Str(s)) => Ok(Value::Str(s)),
+        (FieldType::Keyword, Value::Int(x)) => Ok(Value::Str(x.to_string())),
+        (FieldType::Int, Value::Int(x)) => Ok(Value::Int(x)),
+        (FieldType::Int, Value::Bool(b)) => Ok(Value::Int(b as i64)),
+        (FieldType::Float, v @ (Value::Int(_) | Value::Float(_) | Value::Bool(_))) => Ok(Value::Float(v.as_f64().unwrap())),
+        (t, v) => Err(err(format!("value {v:?} does not fit a {t:?} field"))),
+    }
+}
+
+/// A value compared with `field` in its type, as a condition reads it
+/// ([`coerce`]): a subquery's values, which [`crate::query::ops`] runs.
+pub(crate) fn coerced(field: &Field, v: Value) -> Result<Value> {
+    coerce(field, v)
+}
+
+/// The value an expression gives `field` in `SET` ([`Assign::Expr`]), in
+/// the form its column holds: [`coerce`]d, a whole FLOAT as an INT, and
+/// one value as a multi-valued field's list of it.
+pub(crate) fn assigned(field: &Field, v: Value) -> Result<Value> {
+    let one = |v: Value| match (&field.ty, v) {
+        (FieldType::Int, Value::Float(x)) if field.logical.is_none() => {
+            if x.fract() == 0.0 && x.abs() < 9.2e18 {
+                Ok(Value::Int(x as i64))
+            } else {
+                Err(err(format!("{} is INT, and {x} is not an integer it holds", field.name)))
+            }
+        }
+        (FieldType::Float, Value::Float(x)) if !x.is_finite() => Err(err(format!("{} is FLOAT, and {x} is not a finite number", field.name))),
+        (_, v) => coerce(field, v),
+    };
+    Ok(match (&field.ty, v) {
+        (_, Value::Null) => Value::Null,
+        (FieldType::Vector { .. }, v @ Value::Vector(_)) => v,
+        (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
+        (FieldType::Sparse, v @ Value::Str(_)) => {
+            crate::text::sparse::parse(&v)?;
+            v
+        }
+        (FieldType::Vector { .. } | FieldType::Text { .. } | FieldType::Edges | FieldType::Sparse, v) => return Err(err(format!("{} is a {} field: SET cannot give it {v:?}", field.name, field.type_name()))),
+        (_, Value::List(xs)) if field.multi => Value::List(xs.into_iter().map(one).collect::<Result<_>>()?),
+        (_, Value::List(xs)) => return Err(err(format!("{} holds one value, not the list {xs:?}", field.name))),
+        (_, v) if field.multi => Value::List(vec![one(v)?]),
+        (_, v) => one(v)?,
+    })
+}
+
+/// The name of a column of the answer without an alias: a column's own
+/// name, quoted or not (`"order"` is `order`), else the expression's text.
+pub(crate) fn name_of(e: &Expr) -> String {
+    match e {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(ids) => ids.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."),
+        e => e.to_string(),
+    }
+}
+
+/// A name as SQL spells it: quoted unless it is a plain identifier.
+pub fn ident(n: &str) -> String {
+    if n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        n.to_string()
+    } else {
+        quoted(n)
+    }
 }
 
 /// Parses and binds one SELECT statement.
 pub fn bind(sql_text: &str, schema: &Schema, params: &Params) -> Result<Select> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql_text).map_err(|e| err(e.to_string()))?;
-    let [stmt] = stmts.as_slice() else { return Err(err("expected exactly one statement")) };
-    let sql::Statement::Query(q) = stmt else { return Err(err("only SELECT is supported")) };
+    bind_query(&*parse_query(sql_text)?, schema, params)
+}
+
+/// [`bind`] of a parsed query.
+pub(crate) fn bind_query(q: &sql::Query, schema: &Schema, params: &Params) -> Result<Select> {
     Binder::new(schema, params).query(q)
+}
+
+/// Where a subquery sits in a compound query's SELECT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sub {
+    /// `x IN (SELECT ...)`: its one column's values.
+    In,
+    /// `EXISTS (SELECT ...)`.
+    Exists,
+    /// `x < (SELECT ...)`, or a bound of `BETWEEN`: its one value.
+    Scalar,
+    /// A traversal's seeds: its rows' keys.
+    Seeds,
+}
+
+/// Plans a subquery for the binder ([`bind_query_with`]): the expression
+/// it stands for, or for seeds `None` when the executor runs it itself.
+pub(crate) type Subs<'s> = dyn Fn(&sql::Query, Sub) -> Result<Option<ir::Expr>> + 's;
+
+/// [`bind_query`] of a compound query's SELECT, whose subqueries in
+/// conditions and seeds `subs` plans: they bind as [`Pred::Sub`] and
+/// [`Seeds::Plan`], which its plan runs first.
+pub(crate) fn bind_query_with(q: &sql::Query, schema: &Schema, params: &Params, subs: &Subs) -> Result<Select> {
+    Binder { subs: Some(subs), ..Binder::new(schema, params) }.query(q)
+}
+
+/// The query of `(SELECT ...)`, in parentheses or not.
+fn subquery_of(e: &Expr) -> Option<&sql::Query> {
+    match e {
+        Expr::Subquery(q) => Some(q),
+        Expr::Nested(x) => subquery_of(x),
+        _ => None,
+    }
 }
 
 struct Binder<'a> {
     schema: &'a Schema,
     params: &'a Params,
+    /// A compound query's subqueries ([`bind_query_with`]).
+    subs: Option<&'a Subs<'a>>,
     /// Graph computations bound so far (`Select::graphs`).
     graphs: RefCell<Vec<GraphQuery>>,
+    /// The statement's time, in microseconds since the epoch: `now()` in
+    /// `decay` and the `"now"` default of a TIMESTAMP.
+    now: i64,
 }
 
 impl<'a> Binder<'a> {
     fn new(schema: &'a Schema, params: &'a Params) -> Self {
-        Binder { schema, params, graphs: RefCell::new(Vec::new()) }
+        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now() }
+    }
+
+    /// The expression a compound query's subquery stands for.
+    fn sub(&self, q: &sql::Query, kind: Sub) -> Result<ir::Expr> {
+        let subs = self.subs.ok_or_else(|| err("a subquery runs as a compound query (Db::query), not in one SELECT"))?;
+        subs(q, kind)?.ok_or_else(|| err("the subquery has no plan"))
     }
 
     fn query(&self, q: &sql::Query) -> Result<Select> {
-        let sql::SetExpr::Select(s) = q.body.as_ref() else { return Err(err("only simple SELECT is supported")) };
+        let sql::Query { with, body, order_by: _, limit_clause, fetch, locks, for_clause, settings, format_clause, pipe_operators } = q;
+        if with.is_some() {
+            return Err(err("WITH runs as a compound query (Db::query), not as one SELECT"));
+        }
+        if let Some(c) = unsupported_query_clause(fetch, locks, for_clause, settings, format_clause, pipe_operators) {
+            return Err(err(format!("{c} is not supported")));
+        }
+        let sql::SetExpr::Select(s) = body.as_ref() else { return Err(err("only simple SELECT is supported")) };
+        check_select(s)?;
         if s.from.len() != 1 || !s.from[0].joins.is_empty() {
             return Err(err("exactly one table, no joins"));
         }
-        if let sql::TableFactor::Table { name, .. } = &s.from[0].relation {
-            let t = name.to_string();
-            if !t.eq_ignore_ascii_case(&self.schema.table) {
-                return Err(err(format!("no such table: {t}")));
+        let t = table_name(plain_table(&s.from[0].relation, "SELECT")?);
+        if !t.eq_ignore_ascii_case(&self.schema.table) {
+            return Err(err(format!("no such table: {t}")));
+        }
+        if let Some(sql::LimitClause::LimitOffset { limit_by, .. }) = limit_clause {
+            if !limit_by.is_empty() {
+                return Err(err("LIMIT ... BY is not supported"));
+            }
+        }
+        if let Some(ob) = &q.order_by {
+            if ob.interpolate.is_some() || matches!(&ob.kind, sql::OrderByKind::Expressions(es) if es.iter().any(|e| e.with_fill.is_some())) {
+                return Err(err("ORDER BY ... WITH FILL and INTERPOLATE are not supported"));
             }
         }
         let filter = match &s.selection {
-            Some(e) => self.pred(e)?.simplify(),
+            Some(e) => self.pred(e)?.three_valued(&|f| self.schema.fields[f].multi).simplify(),
             None => Pred::True,
         };
         let group_by: Vec<usize> = match &s.group_by {
@@ -212,7 +634,7 @@ impl<'a> Binder<'a> {
                 _ => return Err(err("unsupported select item")),
             };
             let p = self.projection(e)?;
-            projection.push((alias.unwrap_or_else(|| e.to_string()), p));
+            projection.push((alias.unwrap_or_else(|| name_of(e)), p));
         }
         let aggregated = !group_by.is_empty() || projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
         if aggregated {
@@ -221,7 +643,7 @@ impl<'a> Binder<'a> {
                     Projection::Field(f) if !group_by.contains(f) => {
                         return Err(err(format!("{name} must be in GROUP BY or inside an aggregate (COUNT, SUM, AVG, MIN, MAX)")))
                     }
-                    Projection::Score | Projection::Hops(_) => return Err(err("score() and hops() cannot be aggregated")),
+                    Projection::Score | Projection::Hops(_) | Projection::SeqNo => return Err(err("score(), hops() and seq_no() cannot be aggregated")),
                     _ => {}
                 }
             }
@@ -236,11 +658,19 @@ impl<'a> Binder<'a> {
             Some(ob) => match &ob.kind {
                 sql::OrderByKind::Expressions(es) if (1..=2).contains(&es.len()) => {
                     let desc = es[0].options.asc == Some(false);
-                    let order = if aggregated {
+                    let mut order = if aggregated {
                         self.group_order(&es[0].expr, desc, &projection, &group_by)?
                     } else {
                         self.order(&es[0].expr, desc, &projection)?
                     };
+                    // Rows without the column's value come last, either way
+                    // (as in Elasticsearch); `NULLS FIRST` puts them first.
+                    if es[0].options.nulls_first == Some(true) {
+                        match &mut order {
+                            OrderBy::Score { score: Score::Column { .. }, nulls_first, .. } => *nulls_first = true,
+                            _ => return Err(err("NULLS FIRST applies to ORDER BY a column")),
+                        }
+                    }
                     let tiebreak = match es.get(1) {
                         None => None,
                         Some(e) => Some(self.tiebreak(&e.expr, e.options.asc == Some(false), &projection, &group_by)?),
@@ -261,7 +691,8 @@ impl<'a> Binder<'a> {
             }
         };
         let graphs = self.graphs.take();
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs })
+        let types = projection_types(self.schema, &projection);
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, limit, offset, graphs, types })
     }
 
     /// The graph predicate `hops()` refers to: the first REACHABLE or PATH.
@@ -298,7 +729,7 @@ impl<'a> Binder<'a> {
         let mut through = None;
         for (k, e) in named {
             if k == "through" {
-                let p = self.pred(e)?.simplify();
+                let p = self.pred(e)?.three_valued(&|f| self.schema.fields[f].multi).simplify();
                 if contains_graph(&p) {
                     return Err(err("a through predicate cannot hold a graph predicate"));
                 }
@@ -382,7 +813,12 @@ impl<'a> Binder<'a> {
     /// Seeds: a key, a parameter, a tuple or array of keys, or a subquery.
     fn seeds(&self, e: &Expr) -> Result<Seeds> {
         match e {
-            Expr::Subquery(q) => Ok(Seeds::Query(Box::new(Binder::new(self.schema, self.params).query(q)?))),
+            Expr::Subquery(q) => {
+                if let Some(e) = self.subs.map(|subs| subs(q, Sub::Seeds)).transpose()?.flatten() {
+                    return Ok(Seeds::Plan(Box::new(e)));
+                }
+                Ok(Seeds::Query(Box::new(Binder { subs: self.subs, ..Binder::new(self.schema, self.params) }.query(q)?)))
+            }
             Expr::Nested(inner) => self.seeds(inner),
             Expr::Tuple(items) => Ok(Seeds::Keys(items.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
             Expr::Array(a) => Ok(Seeds::Keys(a.elem.iter().map(|i| self.key_value(i)).collect::<Result<_>>()?)),
@@ -465,6 +901,7 @@ impl<'a> Binder<'a> {
             Expr::Function(f) => match fname(f).as_str() {
                 "score" => Ok(Projection::Score),
                 "hops" => Ok(Projection::Hops(self.hops_graph()?)),
+                "seq_no" => Ok(Projection::SeqNo),
                 "count" | "sum" | "avg" | "min" | "max" => self.aggregate(f),
                 n => Err(err(format!("unsupported function in SELECT: {n}"))),
             },
@@ -494,6 +931,9 @@ impl<'a> Binder<'a> {
             _ => AggFn::Max,
         };
         match func {
+            AggFn::Sum | AggFn::Avg if fld.logical == Some(Logical::Timestamp) => {
+                return Err(err(format!("{}({}): times do not add up; a TIMESTAMP takes MIN, MAX and COUNT", name.to_uppercase(), fld.name)))
+            }
             AggFn::Sum | AggFn::Avg if !numeric => return Err(err(format!("{}({}): not a numeric field", name.to_uppercase(), fld.name))),
             AggFn::Min | AggFn::Max | AggFn::CountDistinct if !(numeric || fld.ty == FieldType::Keyword) => {
                 return Err(err(format!("{}({}): needs a KEYWORD, INT or FLOAT field", name.to_uppercase(), fld.name)))
@@ -549,7 +989,8 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: Or, right } => Having::Or(vec![self.having(left, proj, group)?, self.having(right, proj, group)?]),
             Expr::UnaryOp { op: sql::UnaryOperator::Not, expr } => Having::Not(Box::new(self.having(expr, proj, group)?)),
             Expr::Between { expr, negated, low, high } => {
-                let h = Having::Range { what: self.group_value(expr, proj, group)?, lo: self.num_lit(low)?, hi: self.num_lit(high)? };
+                let what = self.group_value(expr, proj, group)?;
+                let h = Having::Range { lo: self.having_bound(&what, low)?, hi: self.having_bound(&what, high)?, what };
                 if *negated { Having::Not(Box::new(h)) } else { h }
             }
             Expr::BinaryOp { left, op, right } => {
@@ -566,7 +1007,10 @@ impl<'a> Binder<'a> {
                         (self.group_value(right, proj, group)?, left, flipped)
                     }
                 };
-                let v = self.literal(lit)?;
+                let v = match self.typed_source(&what) {
+                    Some(f) => self.coerce(f, self.literal(lit)?)?,
+                    None => self.literal(lit)?,
+                };
                 let Some(x) = v.as_f64() else {
                     return match op {
                         Eq => Ok(Having::Eq { what, value: v }),
@@ -590,30 +1034,44 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn typed_source(&self, p: &Projection) -> Option<usize> {
+        typed_source(self.schema, p)
+    }
+
+    /// A bound of `BETWEEN` in HAVING: a number, or a value of the type of
+    /// a BOOL or TIMESTAMP field (as its stored integer).
+    fn having_bound(&self, what: &Projection, e: &Expr) -> Result<f64> {
+        match self.typed_source(what) {
+            Some(f) => Ok(self.field_value(f, e)?.as_f64().unwrap_or(f64::NAN)),
+            None => self.num_lit(e),
+        }
+    }
+
     fn order(&self, e: &Expr, desc: bool, proj: &[(String, Projection)]) -> Result<OrderBy> {
         // Positional `ORDER BY 2` addresses a selected column.
         if let Some(n) = literal_usize(e) {
             let (_, p) = proj.get(n.wrapping_sub(1)).ok_or_else(|| err(format!("ORDER BY {n}: no such column")))?;
             return match p {
-                Projection::Field(f) => Ok(OrderBy::Score { score: Score::Column { field: *f }, desc }),
+                Projection::Field(f) => Ok(OrderBy::Score { score: Score::Column { field: *f }, desc, nulls_first: false }),
                 Projection::Score => Err(err("ORDER BY score(): order by the score expression itself")),
-                Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true }),
+                Projection::SeqNo => Err(err("ORDER BY seq_no(): a query cannot order by it")),
+                Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true, nulls_first: false }),
                 Projection::Count | Projection::Agg { .. } => Err(err("ORDER BY an aggregate needs GROUP BY")),
             };
         }
         // `ORDER BY hops()` is nearest first; ranking is always best first.
         if let Expr::Function(f) = e {
             if fname(f) == "hops" {
-                return Ok(OrderBy::Score { score: Score::Hops { graph: self.hops_graph()?, far_first: desc }, desc: true });
+                return Ok(OrderBy::Score { score: Score::Hops { graph: self.hops_graph()?, far_first: desc }, desc: true, nulls_first: false });
             }
         }
         // `ORDER BY distance(..) ASC` ranks like `similarity DESC`.
         if let Expr::Function(f) = e {
             if fname(f) == "distance" {
-                return Ok(OrderBy::Score { score: self.score(e)?, desc: !desc });
+                return Ok(OrderBy::Score { score: self.score(e)?, desc: !desc, nulls_first: false });
             }
         }
-        Ok(OrderBy::Score { score: self.score(e)?, desc })
+        Ok(OrderBy::Score { score: self.score(e)?, desc, nulls_first: false })
     }
 
     fn score(&self, e: &Expr) -> Result<Score> {
@@ -731,7 +1189,8 @@ impl<'a> Binder<'a> {
 
     /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape =>
     /// 'exp' | 'gauss' | 'linear')`; the origin may be `now()` (seconds
-    /// since the Unix epoch).
+    /// since the Unix epoch). On a TIMESTAMP field the origin is `now()` or
+    /// a time, and the scale and offset are seconds.
     fn decay(&self, f: &sql::Function) -> Result<Score> {
         let (args, opts) = self.args(f)?;
         let usage = "decay(field, origin, scale, offset => .., decay => .., shape => 'exp' | 'gauss' | 'linear')";
@@ -740,17 +1199,22 @@ impl<'a> Binder<'a> {
         if self.schema.fields[field].multi {
             return Err(err(format!("cannot decay multi-valued field {}", self.schema.fields[field].name)));
         }
-        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        // A TIMESTAMP's origin is a time, and its scale and offset are
+        // seconds, as now() is for a number.
+        let time = self.schema.fields[field].logical == Some(Logical::Timestamp);
+        let unit = if time { 1e6 } else { 1.0 };
+        let now = || self.now as f64 / 1e6 * unit;
         let origin = match origin {
             Expr::Function(g) if fname(g) == "now" => now(),
             e => match self.literal(e)? {
                 Value::Str(s) if s.eq_ignore_ascii_case("now") => now(),
+                v if time => self.coerce(field, v)?.as_f64().unwrap_or(0.0),
                 v => v.as_f64().ok_or_else(|| err("decay origin must be a number or now()"))?,
             },
         };
-        let scale = self.num_lit(scale)?;
+        let scale = self.num_lit(scale)? * unit;
         let num = |k: &str, d: f64| opts.get(k).map_or(Ok(d), |v| v.as_f64().ok_or_else(|| err(format!("decay {k} must be a number"))));
-        let (offset, decay) = (num("offset", 0.0)?, num("decay", 0.5)?);
+        let (offset, decay) = (num("offset", 0.0)? * unit, num("decay", 0.5)?);
         if scale <= 0.0 || offset < 0.0 || !(decay > 0.0 && decay < 1.0) {
             return Err(err("decay needs scale > 0, offset >= 0 and 0 < decay < 1"));
         }
@@ -769,12 +1233,46 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => Pred::And(vec![self.pred(left)?, self.pred(right)?]),
             Expr::BinaryOp { left, op: BinaryOperator::Or, right } => Pred::Or(vec![self.pred(left)?, self.pred(right)?]),
             Expr::UnaryOp { op: sql::UnaryOperator::Not, expr } => Pred::Not(Box::new(self.pred(expr)?)),
+            Expr::BinaryOp { left, op, right } if self.subs.is_some() && (subquery_of(left).is_some() || subquery_of(right).is_some()) => self.sub_comparison(left, op, right)?,
             Expr::BinaryOp { left, op, right } => self.comparison(left, op, right)?,
+            Expr::Between { expr, negated, low, high } if self.subs.is_some() && (subquery_of(low).is_some() || subquery_of(high).is_some()) => {
+                let f = self.numeric_field(expr)?;
+                let bound = |b: &Expr| match subquery_of(b) {
+                    Some(q) => self.sub(q, Sub::Scalar),
+                    None => Ok(ir::Expr::Lit(self.literal(b)?)),
+                };
+                let p = Pred::Sub(Box::new(ir::Expr::Between { expr: Box::new(ir::Expr::Field(f as u32)), lo: Some(Box::new(bound(low)?)), hi: Some(Box::new(bound(high)?)) }));
+                if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
+            Expr::InSubquery { expr, subquery, negated } if self.subs.is_some() => {
+                let f = self.field_of(expr)?;
+                if matches!(self.schema.fields[f].ty, FieldType::Edges | FieldType::Text { .. } | FieldType::Vector { .. } | FieldType::Sparse) {
+                    return Err(err(format!("IN compares KEYWORD, INT and FLOAT fields, not {}", self.schema.fields[f].name)));
+                }
+                let p = Pred::Sub(Box::new(ir::Expr::In { expr: Box::new(ir::Expr::Field(f as u32)), list: vec![self.sub(subquery, Sub::In)?] }));
+                if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
+            Expr::Exists { subquery, negated } if self.subs.is_some() => {
+                let p = Pred::Sub(Box::new(self.sub(subquery, Sub::Exists)?));
+                if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
             Expr::Between { expr, negated, low, high } => {
                 let f = self.numeric_field(expr)?;
-                let (lo, hi) = (self.num_lit(low)?, self.num_lit(high)?);
-                let p = Pred::Range { field: f, lo, hi };
+                let p = if self.schema.fields[f].ty == FieldType::Int {
+                    int_range(f, ceil(&self.int_bound(f, low)?), floor(&self.int_bound(f, high)?))
+                } else {
+                    Pred::Range { field: f, lo: self.num_lit(low)?, hi: self.num_lit(high)? }
+                };
                 if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
+            Expr::IsNull(x) | Expr::IsNotNull(x) => {
+                let f = self.field_of(x)?;
+                let field = &self.schema.fields[f];
+                if !matches!(field.ty, FieldType::Int | FieldType::Float | FieldType::Keyword) || !field.indexed {
+                    return Err(err(format!("IS NULL works on indexed INT, FLOAT and KEYWORD fields, not {}", field.name)));
+                }
+                let p = Pred::Present { field: f };
+                if matches!(e, Expr::IsNull(_)) { Pred::Not(Box::new(p)) } else { p }
             }
             Expr::InList { expr, list, negated } => {
                 let f = self.field_of(expr)?;
@@ -808,15 +1306,60 @@ impl<'a> Binder<'a> {
                 }
                 let expand = Expand::from_opts(&opts).map_err(err)?;
                 let query = self.literal(q)?.as_str().ok_or_else(|| err("MATCH query must be a string"))?.to_string();
-                crate::text::parse_match(&query)?;
+                crate::text::query::parse_match_with(&query, self.schema.fields[field].text_analyzer())?;
                 Pred::Match { field, query, expand }
             }
             Expr::Function(func) if matches!(fname(func).as_str(), "reachable" | "path") => Pred::Graph { id: self.graph(func, &fname(func))? },
             Expr::Value(v) if matches!(v.value, sql::Value::Boolean(_)) => {
                 if matches!(v.value, sql::Value::Boolean(true)) { Pred::True } else { Pred::False }
             }
+            e if self.bool_field(e).is_some() => int_range(self.bool_field(e).unwrap(), 1, 1),
+            Expr::IsTrue(x) | Expr::IsFalse(x) | Expr::IsNotTrue(x) | Expr::IsNotFalse(x) => {
+                let f = self.bool_field(x).ok_or_else(|| err(format!("{e}: IS TRUE and IS FALSE test a BOOL field")))?;
+                let want = matches!(e, Expr::IsTrue(_) | Expr::IsNotFalse(_)) as i128;
+                match e {
+                    Expr::IsTrue(_) | Expr::IsFalse(_) => int_range(f, want, want),
+                    // Unlike `NOT done`, `done IS NOT TRUE` holds for NULL.
+                    _ => Pred::Or(vec![Pred::Not(Box::new(Pred::Present { field: f })), int_range(f, want, want)]),
+                }
+            }
             _ => return Err(err(format!("unsupported predicate: {e}"))),
         })
+    }
+
+    /// `field op (SELECT ...)`, or the other way round.
+    fn sub_comparison(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Result<Pred> {
+        use BinaryOperator::*;
+        let (field_e, q, op) = match (subquery_of(left), subquery_of(right)) {
+            (_, Some(q)) => (left, q, op.clone()),
+            (Some(q), None) => {
+                let flipped = match op {
+                    Lt => Gt,
+                    LtEq => GtEq,
+                    Gt => Lt,
+                    GtEq => LtEq,
+                    o => o.clone(),
+                };
+                (right, q, flipped)
+            }
+            (None, None) => unreachable!("a side is a subquery"),
+        };
+        let f = self.field_of(field_e).map_err(|_| err(format!("a scalar subquery compares with a field, not {field_e}")))?;
+        let op = match op {
+            Eq => ir::CmpOp::Eq,
+            NotEq => ir::CmpOp::Ne,
+            Lt => ir::CmpOp::Lt,
+            LtEq => ir::CmpOp::Le,
+            Gt => ir::CmpOp::Gt,
+            GtEq => ir::CmpOp::Ge,
+            o => return Err(err(format!("unsupported operator {o}"))),
+        };
+        match self.schema.fields[f].ty {
+            FieldType::Keyword if !matches!(op, ir::CmpOp::Eq | ir::CmpOp::Ne) => return Err(err("keyword fields support =, != and IN")),
+            FieldType::Keyword | FieldType::Int | FieldType::Float => {}
+            _ => return Err(err(format!("cannot compare field {}", self.schema.fields[f].name))),
+        }
+        Ok(Pred::Sub(Box::new(ir::Expr::Cmp { op, left: Box::new(ir::Expr::Field(f as u32)), right: Box::new(self.sub(q, Sub::Scalar)?) })))
     }
 
     fn comparison(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Result<Pred> {
@@ -836,6 +1379,9 @@ impl<'a> Binder<'a> {
         };
         let f = self.field_of(field_e)?;
         let ty = &self.schema.fields[f].ty;
+        if matches!(self.literal(lit_e), Ok(Value::Null)) {
+            return Err(err(format!("{e} compares with NULL, which is never true: use IS NULL or IS NOT NULL", e = Expr::BinaryOp { left: Box::new(left.clone()), op: op.clone(), right: Box::new(right.clone()) })));
+        }
         if matches!(ty, FieldType::Keyword) {
             let v = self.field_value(f, lit_e)?;
             return match op {
@@ -844,22 +1390,34 @@ impl<'a> Binder<'a> {
                 _ => Err(err("keyword fields support =, != and IN")),
             };
         }
-        if !matches!(ty, FieldType::Int | FieldType::Float) {
+        if matches!(ty, FieldType::Int) {
+            // Integers compare exactly, in 128 bits so that the bounds of
+            // `> i64::MAX` or `< 1e30` need no special cases.
+            let v = self.int_bound(f, lit_e)?;
+            let (min, max) = (i64::MIN as i128, i64::MAX as i128);
+            return Ok(match op {
+                Eq => int_range(f, ceil(&v), floor(&v)),
+                NotEq => Pred::Not(Box::new(int_range(f, ceil(&v), floor(&v)))),
+                Gt => int_range(f, floor(&v) + 1, max),
+                GtEq => int_range(f, ceil(&v), max),
+                Lt => int_range(f, min, ceil(&v) - 1),
+                LtEq => int_range(f, min, floor(&v)),
+                o => return Err(err(format!("unsupported operator {o}"))),
+            });
+        }
+        if !matches!(ty, FieldType::Float) {
             return Err(err(format!("cannot compare field {}", self.schema.fields[f].name)));
         }
         let x = self.num_lit(lit_e)?;
-        let int = matches!(ty, FieldType::Int);
-        let above = |x: f64| if int { x.floor() + 1.0 } else { next_up(x) };
-        let below = |x: f64| if int { x.ceil() - 1.0 } else { next_down(x) };
         let (inf, ninf) = (f64::INFINITY, f64::NEG_INFINITY);
         let range = |lo, hi| Pred::Range { field: f, lo, hi };
         Ok(match op {
             Eq => range(x, x),
             NotEq => Pred::Not(Box::new(range(x, x))),
-            Gt => range(above(x), inf),
-            GtEq => range(if int { x.ceil() } else { x }, inf),
-            Lt => range(ninf, below(x)),
-            LtEq => range(ninf, if int { x.floor() } else { x }),
+            Gt => range(next_up(x), inf),
+            GtEq => range(x, inf),
+            Lt => range(ninf, next_down(x)),
+            LtEq => range(ninf, x),
             o => return Err(err(format!("unsupported operator {o}"))),
         })
     }
@@ -911,22 +1469,31 @@ impl<'a> Binder<'a> {
 
     fn literal(&self, e: &Expr) -> Result<Value> {
         match e {
+            Expr::Nested(x) => self.literal(x),
             Expr::Value(v) => match &v.value {
                 sql::Value::Number(s, _) => {
                     Ok(s.parse::<i64>().map(Value::Int).or_else(|_| s.parse::<f64>().map(Value::Float)).map_err(|_| err("bad number"))?)
                 }
                 sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => Ok(Value::Str(s.clone())),
-                sql::Value::Boolean(b) => Ok(Value::Int(*b as i64)),
+                sql::Value::Boolean(b) => Ok(Value::Bool(*b)),
                 sql::Value::Null => Ok(Value::Null),
                 sql::Value::Placeholder(p) => Ok(self.params.get(p)?.clone()),
                 other => Err(err(format!("unsupported literal {other}"))),
             },
             Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => match self.literal(expr)? {
-                Value::Int(x) => Ok(Value::Int(-x)),
+                // -i64::MIN is the one integer without a negation.
+                Value::Int(x) => Ok(x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int)),
                 Value::Float(x) => Ok(Value::Float(-x)),
                 _ => Err(err("cannot negate a non-number")),
             },
-            Expr::Identifier(id) if !id.value.is_empty() => Ok(Value::Str(id.value.clone())),
+            // "x" reads as a string, as in SQLite and MySQL; an unquoted
+            // name is a column, which is no value.
+            Expr::Identifier(id) if id.quote_style == Some('"') => Ok(Value::Str(id.value.clone())),
+            Expr::Identifier(id) if self.schema.field_index(&id.value).is_some() => {
+                Err(err(format!("{} is a column, and a value is expected here (a string is quoted: '{}')", id.value, id.value)))
+            }
+            Expr::Identifier(id) => Err(err(format!("no such column: {} (a string is quoted: '{}')", id.value, id.value))),
+            Expr::Subquery(_) => Err(err(format!("{e}: a subquery works in a condition (IN, EXISTS, a comparison with a field) or as graph seeds, not as a value here"))),
             _ => Err(err(format!("expected a literal or parameter, got {e}"))),
         }
     }
@@ -942,6 +1509,18 @@ impl<'a> Binder<'a> {
         self.number(e).ok_or_else(|| err(format!("expected a number, got {e}")))
     }
 
+    /// A finite numeric literal or parameter, an integer kept exact.
+    fn num_literal(&self, e: &Expr) -> Result<Value> {
+        if self.field_of(e).is_err() {
+            match self.literal(e) {
+                Ok(v @ Value::Int(_)) => return Ok(v),
+                Ok(Value::Float(x)) if x.is_finite() => return Ok(Value::Float(x)),
+                _ => {}
+            }
+        }
+        Err(err(format!("expected a number, got {e}")))
+    }
+
     fn usize_lit(&self, e: &Expr) -> Result<usize> {
         let x = self.num_lit(e)?;
         if x < 0.0 || x.fract() != 0.0 {
@@ -955,21 +1534,35 @@ impl<'a> Binder<'a> {
         self.coerce(f, self.literal(e)?)
     }
 
-    /// A value coerced to field `f`'s type.
+    /// A value coerced to field `f`'s type, in the form its column holds
+    /// ([`crate::schema::Field::store`]).
     fn coerce(&self, f: usize, v: Value) -> Result<Value> {
-        match (&self.schema.fields[f].ty, v) {
-            (FieldType::Keyword, Value::Str(s)) => Ok(Value::Str(s)),
-            (FieldType::Keyword, Value::Int(x)) => Ok(Value::Str(x.to_string())),
-            (FieldType::Int, Value::Int(x)) => Ok(Value::Int(x)),
-            (FieldType::Float, v @ (Value::Int(_) | Value::Float(_))) => Ok(Value::Float(v.as_f64().unwrap())),
-            (t, v) => Err(err(format!("value {v:?} does not fit a {t:?} field"))),
+        coerce(&self.schema.fields[f], v)
+    }
+
+    /// A bound of an INT field's range: a number, or for a BOOL or
+    /// TIMESTAMP field a value of its type, as the integer it is stored as.
+    fn int_bound(&self, f: usize, e: &Expr) -> Result<Value> {
+        if self.schema.fields[f].logical.is_some() {
+            self.field_value(f, e)
+        } else {
+            self.num_literal(e)
         }
     }
 
+    /// A BOOL field named alone (`WHERE done`, `NOT done`).
+    fn bool_field(&self, e: &Expr) -> Option<usize> {
+        self.field_of(e).ok().filter(|&f| self.schema.fields[f].logical == Some(Logical::Bool))
+    }
+
     /// A value written to field `f`: a literal or parameter of its type,
-    /// `ARRAY[...]` for lists and vectors.
+    /// `ARRAY[...]` for lists and vectors, or `DEFAULT`.
     fn write_value(&self, f: usize, e: &Expr) -> Result<Value> {
         let field = &self.schema.fields[f];
+        // `DEFAULT`: the column's default, or NULL without one.
+        if matches!(e, Expr::Identifier(id) if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default")) {
+            return field.default_value(self.now);
+        }
         if let Expr::Array(a) = e {
             return match &field.ty {
                 FieldType::Vector { .. } => {
@@ -995,16 +1588,168 @@ impl<'a> Binder<'a> {
         })
     }
 
-    fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {
-        match self.literal(e)? {
-            Value::Vector(v) => Ok(v),
-            Value::Str(s) => {
-                let v: Vec<f32> = serde_json::from_str(&s).map_err(|_| err("vector literal must be a JSON array"))?;
-                Ok(v.into())
+    /// `SET f = value, g = g + 1, h = expression, ...`, of the table or its
+    /// `alias`; with `excluded`, as in `ON CONFLICT DO UPDATE`, also of the
+    /// row the INSERT proposed (`excluded.h`).
+    fn assignments(&self, assignments: &[sql::Assignment], alias: Option<&str>, excluded: bool) -> Result<Vec<(usize, Assign)>> {
+        let mut sets: Vec<(usize, Assign)> = Vec::new();
+        for a in assignments {
+            let sql::AssignmentTarget::ColumnName(name) = &a.target else { return Err(err("SET one column at a time")) };
+            // The name, not its SQL (`"order"`, quoted).
+            let column = name.0.last().and_then(|p| p.as_ident()).map_or_else(|| name.to_string(), |id| id.value.clone());
+            let f = self.schema.field_index(&column).ok_or_else(|| err(format!("no such column: {name}")))?;
+            let fld = &self.schema.fields[f];
+            if Some(f) == self.schema.primary_key {
+                return Err(err("the primary key cannot be updated; delete and insert instead"));
             }
-            v => Err(err(format!("expected a vector, got {v:?}"))),
+            if sets.iter().any(|(g, _)| *g == f) {
+                return Err(err(format!("{} is set twice", fld.name)));
+            }
+            let assign = match &a.value {
+                Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right } if matches!(self.set_ref(left, alias, excluded), Some(Ok(ir::Expr::Field(g))) if g as usize == f) && self.num_literal(right).is_ok() => {
+                    if !matches!(fld.ty, FieldType::Int | FieldType::Float) || fld.logical.is_some() {
+                        return Err(err(format!("{} is not numeric", fld.name)));
+                    }
+                    if fld.multi {
+                        return Err(err(format!("{} holds a list: SET it to a list", fld.name)));
+                    }
+                    Assign::Add(match (self.num_literal(right)?, op) {
+                        (x, BinaryOperator::Plus) => x,
+                        (Value::Int(x), _) => x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int),
+                        (x, _) => Value::Float(-x.as_f64().unwrap_or(0.0)),
+                    })
+                }
+                Expr::CompoundIdentifier(ids) if excluded && ids.len() == 2 && ids[0].value.eq_ignore_ascii_case("excluded") => {
+                    let g = self.schema.field_index(&ids[1].value).ok_or_else(|| err(format!("no such column: {}", ids[1].value)))?;
+                    let src = &self.schema.fields[g];
+                    if src.ty != fld.ty || src.multi != fld.multi || src.logical != fld.logical {
+                        return Err(err(format!("{} = excluded.{}: the columns have different types", fld.name, src.name)));
+                    }
+                    Assign::Excluded(g)
+                }
+                e => match self.write_value(f, e) {
+                    Ok(v) => Assign::Value(v),
+                    Err(not_value) => self.set_expr(e, alias, excluded, not_value)?,
+                },
+            };
+            sets.push((f, assign));
+        }
+        Ok(sets)
+    }
+
+    /// What a column names in `SET`: a field of the row (`f`, or `t.f` of
+    /// the table or its alias), or with `excluded` of the row an INSERT
+    /// proposed (`excluded.f`); `None` when `x` is no column.
+    fn set_ref(&self, x: &Expr, alias: Option<&str>, excluded: bool) -> Option<Result<ir::Expr>> {
+        let ids = match x {
+            Expr::Identifier(_) => return Some(self.field_of(x).map(|f| ir::Expr::Field(f as u32))),
+            Expr::CompoundIdentifier(ids) if ids.len() == 2 => ids,
+            Expr::CompoundIdentifier(_) => return Some(Err(err(format!("no such column: {x}")))),
+            _ => return None,
+        };
+        let (t, name) = (&ids[0].value, &ids[1].value);
+        let f = || self.schema.field_index(name).ok_or_else(|| err(format!("no such column: {x}")));
+        Some(if excluded && t.eq_ignore_ascii_case("excluded") {
+            f().map(|g| ir::Expr::Excluded(g as u32))
+        } else if t.eq_ignore_ascii_case(&self.schema.table) || alias.is_some_and(|a| t.eq_ignore_ascii_case(a)) {
+            f().map(|g| ir::Expr::Field(g as u32))
+        } else {
+            Err(err(format!("no such column: {x}")))
+        })
+    }
+
+    /// `SET field = e` for an `e` that is not a value: an expression of the
+    /// row, which the plan's checks of a SET take or refuse
+    /// ([`crate::query::ir::Plan::to_write`]). `not_value` is the error of
+    /// `e` as a value.
+    fn set_expr(&self, e: &Expr, alias: Option<&str>, excluded: bool, not_value: Error) -> Result<Assign> {
+        match super::compound::compile(e, self.params, &|x| self.set_ref(x, alias, excluded), &[]) {
+            Ok(ir::Expr::Lit(_)) => Err(not_value),
+            Ok(x) => Ok(Assign::Expr(x)),
+            // A list, or a name that is no column: the value's error says more.
+            Err(_) if matches!(e, Expr::Array(_) | Expr::Identifier(_)) => Err(not_value),
+            Err(e) => Err(e),
         }
     }
+
+    fn vector(&self, e: &Expr) -> Result<Arc<[f32]>> {
+        let v: Arc<[f32]> = match self.literal(e)? {
+            Value::Vector(v) => v,
+            Value::Str(s) => {
+                let v: Vec<f32> = serde_json::from_str(&s).map_err(|_| err("vector literal must be a JSON array"))?;
+                v.into()
+            }
+            // Clients send a list of whole numbers as a list of integers.
+            Value::List(xs) if !xs.is_empty() && xs.iter().all(|x| matches!(x, Value::Int(_) | Value::Float(_))) => {
+                xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect::<Vec<_>>().into()
+            }
+            v => return Err(err(format!("expected a vector, got {v:?}"))),
+        };
+        if v.iter().any(|x| !x.is_finite()) {
+            return Err(err("a vector's components must be finite numbers"));
+        }
+        Ok(v)
+    }
+}
+
+/// The BOOL or TIMESTAMP field whose values a group value or aggregate
+/// holds: the field itself, or its MIN or MAX.
+fn typed_source(schema: &Schema, p: &Projection) -> Option<usize> {
+    match p {
+        Projection::Field(f) | Projection::Agg { func: AggFn::Min | AggFn::Max, field: f } => Some(*f).filter(|&f| schema.fields[f].logical.is_some()),
+        _ => None,
+    }
+}
+
+/// [`Select::types`] of a projection.
+pub(crate) fn projection_types(schema: &Schema, projection: &[(String, Projection)]) -> Vec<Option<Logical>> {
+    projection.iter().map(|(_, p)| typed_source(schema, p).and_then(|f| schema.fields[f].logical)).collect()
+}
+
+/// Refuses the clauses of a SELECT that the binder does not handle, so that
+/// none is silently ignored.
+fn check_select(s: &sql::Select) -> Result<()> {
+    let sql::Select {
+        select_token: _,
+        distinct,
+        top,
+        top_before_distinct: _,
+        projection: _,
+        exclude,
+        into,
+        from: _,
+        lateral_views,
+        prewhere,
+        selection: _,
+        group_by,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having: _,
+        named_window,
+        qualify,
+        window_before_qualify: _,
+        value_table_mode,
+        connect_by,
+        flavor,
+    } = s;
+    let modifiers = matches!(group_by, sql::GroupByExpr::Expressions(_, m) if !m.is_empty());
+    let clause = if distinct.is_some() {
+        "SELECT DISTINCT (it runs as a compound query, through Db::query)"
+    } else if top.is_some() {
+        "TOP (use LIMIT)"
+    } else if into.is_some() {
+        "SELECT INTO"
+    } else if named_window.is_empty() && qualify.is_none() && !modifiers && exclude.is_none() && lateral_views.is_empty() && prewhere.is_none() && cluster_by.is_empty() && distribute_by.is_empty() && sort_by.is_empty() && value_table_mode.is_none() && connect_by.is_none() && *flavor == sql::SelectFlavor::Standard {
+        return Ok(());
+    } else if !named_window.is_empty() || qualify.is_some() {
+        "WINDOW or QUALIFY"
+    } else if modifiers {
+        "GROUP BY ... WITH ROLLUP, CUBE or TOTALS"
+    } else {
+        return Err(err(format!("this form of SELECT is not supported: {s}")));
+    };
+    Err(err(format!("{clause} is not supported")))
 }
 
 fn contains_graph(p: &Pred) -> bool {
@@ -1030,7 +1775,33 @@ fn literal_usize(e: &Expr) -> Option<usize> {
     }
 }
 
-fn next_up(x: f64) -> f64 {
+/// The smallest integer at least `v` (a number), in 128 bits so that
+/// doubles beyond the 64-bit range stay beyond it.
+pub(crate) fn ceil(v: &Value) -> i128 {
+    match v {
+        Value::Int(x) => *x as i128,
+        v => v.as_f64().unwrap_or(0.0).ceil().clamp(-1e20, 1e20) as i128,
+    }
+}
+
+/// The largest integer at most `v` (a number).
+pub(crate) fn floor(v: &Value) -> i128 {
+    match v {
+        Value::Int(x) => *x as i128,
+        v => v.as_f64().unwrap_or(0.0).floor().clamp(-1e20, 1e20) as i128,
+    }
+}
+
+/// INT field `f` within `[lo, hi]`, cut to the 64-bit range.
+pub(crate) fn int_range(f: usize, lo: i128, hi: i128) -> Pred {
+    let (lo, hi) = (lo.max(i64::MIN as i128), hi.min(i64::MAX as i128));
+    if lo > hi {
+        return Pred::False;
+    }
+    Pred::IntRange { field: f, lo: lo as i64, hi: hi as i64 }
+}
+
+pub(crate) fn next_up(x: f64) -> f64 {
     if x.is_nan() || x == f64::INFINITY {
         return x;
     }
@@ -1041,7 +1812,7 @@ fn next_up(x: f64) -> f64 {
     f64::from_bits(if x > 0.0 { b + 1 } else { b - 1 })
 }
 
-fn next_down(x: f64) -> f64 {
+pub(crate) fn next_down(x: f64) -> f64 {
     -next_up(-x)
 }
 
@@ -1084,22 +1855,22 @@ mod tests {
         let Pred::And(ps) = &s.filter else { panic!("{:?}", s.filter) };
         assert_eq!(ps.len(), 4);
         assert!(matches!(&ps[0], Pred::Match { field: 3, query, .. } if query == "vaccine -animal"));
-        assert_eq!(ps[1], Pred::Range { field: 4, lo: 2019.0, hi: 2021.0 });
+        assert_eq!(ps[1], Pred::IntRange { field: 4, lo: 2019, hi: 2021 });
         assert!(matches!(&ps[2], Pred::In { field: 5, values } if values.len() == 2));
         assert!(matches!(ps[3], Pred::Range { field: 6, lo, hi } if lo > 4.0 && lo < 4.0001 && hi.is_infinite()));
-        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Bm25 { field: 3, text, .. }, desc: true }) if text == "mrna vaccine"));
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Bm25 { field: 3, text, .. }, desc: true, .. }) if text == "mrna vaccine"));
     }
 
     #[test]
     fn binds_vector_and_hybrid_scores() {
         let s = bind("SELECT id FROM docs WHERE year > 2019 ORDER BY similarity(emb, :q, nprobe => 32) DESC LIMIT 5", &schema(), &q())
             .unwrap();
-        assert_eq!(s.filter, Pred::Range { field: 4, lo: 2020.0, hi: f64::INFINITY });
-        let Some(OrderBy::Score { score: Score::Similarity { opts, .. }, desc: true }) = &s.order else { panic!() };
+        assert_eq!(s.filter, Pred::IntRange { field: 4, lo: 2020, hi: i64::MAX });
+        let Some(OrderBy::Score { score: Score::Similarity { opts, .. }, desc: true, .. }) = &s.order else { panic!() };
         assert_eq!(opts.get("nprobe"), Some(&Value::Int(32)));
 
         let s = bind("SELECT id FROM docs ORDER BY distance(emb, :q) LIMIT 5", &schema(), &q()).unwrap();
-        assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Similarity { .. }, desc: true })));
+        assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Similarity { .. }, desc: true, .. })));
 
         let s = bind("SELECT id FROM docs ORDER BY rrf(bm25(body, :t), similarity(emb, :q), k => 20) DESC LIMIT 5", &schema(), &q())
             .unwrap();
@@ -1123,10 +1894,10 @@ mod tests {
         assert_eq!(s.tiebreak, Some(Tiebreak::GroupValue { desc: false }));
         let s = bind("SELECT id FROM docs WHERE rating BETWEEN 2.0 AND 2.0 ORDER BY rating DESC, id LIMIT 10", &schema(), &q()).unwrap();
         assert_eq!(s.tiebreak, Some(Tiebreak::Key { desc: false }));
-        assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Column { field: 6 }, desc: true })));
+        assert!(matches!(s.order, Some(OrderBy::Score { score: Score::Column { field: 6 }, desc: true, .. })));
         // A product of scores (a boost), not a weighted sum.
         let s = bind("SELECT id FROM docs ORDER BY bm25(body, :t) * similarity(emb, :q) DESC", &schema(), &q()).unwrap();
-        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true }) if f.len() == 2), "{:?}", s.order);
+        assert!(matches!(&s.order, Some(OrderBy::Score { score: Score::Product(f), desc: true, .. }) if f.len() == 2), "{:?}", s.order);
 
         for bad in [
             "SELECT id FROM other",
@@ -1149,6 +1920,7 @@ mod tests {
         assert_eq!((s.limit, s.offset), (Some(3), 1));
         let Pred::Or(ps) = &s.filter else { panic!() };
         assert!(matches!(ps[0], Pred::Range { lo, hi, .. } if lo.is_infinite() && hi < 2.5 && hi > 2.4999));
-        assert!(matches!(&ps[1], Pred::Not(_)));
+        // A negated comparison also needs the value (NULL != 'c00' is not true).
+        assert!(matches!(&ps[1], Pred::And(qs) if matches!(qs[..], [Pred::Present { field: 5 }, Pred::Not(_)])), "{:?}", ps[1]);
     }
 }

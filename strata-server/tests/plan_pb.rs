@@ -1,0 +1,240 @@
+//! Plans as protobuf (`strata_server::plan_pb`), the form a coordinator
+//! sends its shards from protocol 2: every kind of statement's plan, and
+//! every kind of node and expression, comes back from protobuf (and from
+//! its bytes) as the plan it was; and a plan that is newer, incomplete or
+//! holds a number that is not finite is refused, as in JSON.
+
+use std::collections::BTreeSet;
+
+use prost::Message;
+use strata::db::Db;
+use strata::query::ir::{self, Expr, Node, Plan};
+use strata::query::{bind, bind_command, compound, Command, Params};
+use strata::schema::{Field, FieldType, Schema};
+use strata::storage::DbOptions;
+use strata::value::Value;
+use strata_server::pb;
+use strata_server::plan_pb::{from_pb_plan, to_pb_plan};
+
+const PAPERS: &str = "CREATE TABLE papers (
+    id KEYWORD PRIMARY KEY,
+    title TEXT OPTIONS(analyzer = 'simple'),
+    body TEXT,
+    category KEYWORD,
+    tags KEYWORD[],
+    year INT,
+    refs INT[],
+    rating FLOAT,
+    done BOOL,
+    published TIMESTAMP,
+    emb VECTOR(4) OPTIONS(index = 'flat'),
+    terms SPARSE,
+    cites EDGES
+)";
+
+fn papers(dir: &std::path::Path) -> Schema {
+    let seed = Schema::new("seed", vec![Field::new("id", FieldType::Keyword)], Some("id")).unwrap();
+    let db = Db::create(&dir.join("d.strata"), seed, DbOptions { sync: false, ..DbOptions::default() }).unwrap();
+    db.sql(PAPERS, &Params::new()).unwrap();
+    let schema = db.storage().table("papers").unwrap();
+    schema.as_ref().clone()
+}
+
+fn params() -> Params {
+    Params::new().set("v", Value::Vector(vec![0.1, 0.2, 0.3, 0.4].into())).set("ids", Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]))
+}
+
+/// SELECTs of one table.
+const SELECTS: &[&str] = &[
+    "SELECT * FROM papers",
+    "SELECT id, title FROM papers WHERE MATCH(body, 'graph neural') AND year >= 2019 ORDER BY bm25(body, 'graph neural') DESC LIMIT 10",
+    "SELECT id, score() AS s FROM papers WHERE MATCH(title, 'Graph', fuzzy => 'auto', synonyms => 1) ORDER BY bm25(body, 'graph', fuzzy => 1) DESC LIMIT 5 OFFSET 2",
+    "SELECT id FROM papers WHERE year BETWEEN 2000 AND 2010 AND rating > 0.5 AND NOT (category = 'ml') AND category IN ('a', 'b', 'c')",
+    "SELECT id FROM papers WHERE NOT (year > 5 OR rating <= 1.5) OR tags = 'x' OR NOT (refs = 3)",
+    "SELECT id FROM papers WHERE year IS NULL OR rating IS NOT NULL OR category IS NULL",
+    "SELECT id FROM papers WHERE rating = 2.5 OR rating != 3 OR year != 7 OR year < 1e30 OR year > 9223372036854775807",
+    "SELECT id FROM papers WHERE done AND published >= '2026-10-01' AND published < '2026-11-01T00:00:00Z'",
+    "SELECT id FROM papers WHERE category IN (:ids) AND TRUE",
+    "SELECT id FROM papers WHERE FALSE",
+    "SELECT id, rating FROM papers ORDER BY rating DESC NULLS FIRST, id LIMIT 3",
+    "SELECT id FROM papers ORDER BY similarity(emb, :v) DESC LIMIT 5",
+    "SELECT id, seq_no() FROM papers WHERE year > 2000 LIMIT 5",
+    "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), similarity(emb, :v), k => 10, depth => 50) DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY 0.3 * bm25(body, 'graph') + 0.7 * similarity(emb, :v) - rating DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY bm25(body, 'graph') * decay(year, 2020, 5) DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY decay(year, 2020, 5, offset => 1, decay => 0.3, shape => 'gauss') DESC",
+    "SELECT id FROM papers ORDER BY decay(rating, 3, 1, shape => 'linear') DESC",
+    "SELECT id FROM papers ORDER BY similarity(terms, '{\"graph\": 1.5, \"net\": 0.5}') DESC LIMIT 3",
+    "SELECT id, hops() FROM papers WHERE REACHABLE(cites, 'p1', hops => 2, dir => 'both', labels => 'x,y', through => year > 2000) ORDER BY hops() LIMIT 20",
+    "SELECT id FROM papers WHERE REACHABLE(cites, 'p1', dir => 'in')",
+    "SELECT id FROM papers WHERE PATH(cites, 'p1', ('p5', 'p6'), max_hops => 4) ORDER BY hops() DESC",
+    "SELECT id FROM papers WHERE NOT REACHABLE(cites, ('p1', 'p2'), hops => 0, min_hops => 0) AND REACHABLE(emb, 'p1', k => 5, min_sim => 0.5)",
+    "SELECT id FROM papers ORDER BY ppr(cites, (SELECT id FROM papers WHERE MATCH(body, 'graph') ORDER BY bm25(body, 'graph') DESC LIMIT 3), alpha => 0.2, weighted => 1) DESC LIMIT 10",
+    "SELECT category, COUNT(*) AS n, AVG(rating), MAX(published), MIN(year), SUM(rating) FROM papers WHERE year > 2000 GROUP BY category HAVING COUNT(*) >= 2 AND AVG(rating) < 3 ORDER BY n DESC LIMIT 5",
+    "SELECT COUNT(*), COUNT(DISTINCT category), COUNT(rating) FROM papers WHERE MATCH(body, 'graph')",
+];
+
+/// Compound queries: operators over single-table queries.
+const COMPOUND: &[&str] = &[
+    "SELECT DISTINCT category FROM papers",
+    "SELECT a.id, b.title FROM papers a JOIN papers b ON a.cites = b.id WHERE a.year >= 2019 ORDER BY a.year DESC LIMIT 5",
+    "SELECT a.id, b.id FROM papers a LEFT JOIN papers b ON a.category = b.category AND b.year > a.year WHERE a.title LIKE 'gr%' OR b.title ILIKE '%NET' ORDER BY a.id LIMIT 7 OFFSET 1",
+    "SELECT a.id || '/' || b.id, CASE WHEN a.year > b.year THEN 'newer' WHEN a.year IS NULL THEN NULL ELSE 'older' END, upper(a.category), length(b.title), abs(a.year - b.year), round(a.rating / 2), coalesce(a.rating, - -1) % 3 FROM papers a JOIN papers b ON a.category = b.category",
+    "WITH top AS (SELECT id FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 20) SELECT category, COUNT(*) AS n FROM papers WHERE id IN (SELECT id FROM top) GROUP BY category",
+    "WITH r AS (SELECT id, category FROM papers WHERE year >= 2000) SELECT DISTINCT category FROM r LIMIT 2",
+    "WITH r AS (SELECT id, year FROM papers WHERE MATCH(body, 'graph') ORDER BY bm25(body, 'graph') DESC LIMIT 10) SELECT id, title FROM r",
+    "SELECT id FROM papers WHERE year > (SELECT AVG(year) FROM papers) AND EXISTS (SELECT id FROM papers WHERE done)",
+    "SELECT id FROM papers WHERE year IN (SELECT MAX(year) FROM papers)",
+    "SELECT d.id FROM (SELECT id, year FROM papers WHERE year > 2000) AS d ORDER BY d.year LIMIT 3",
+    "SELECT a.category, COUNT(*) FROM papers a JOIN papers b ON a.cites = b.id GROUP BY a.category HAVING COUNT(*) > 1",
+    "SELECT DISTINCT a.category, b.year FROM papers a JOIN papers b ON a.cites = b.id ORDER BY b.year LIMIT 4",
+];
+
+/// Writes of each kind.
+const WRITES: &[&str] = &[
+    "INSERT INTO papers (id, title, year, done, published, tags, emb, terms, cites) VALUES ('n1', 'a', 1, TRUE, '2026-10-01', ARRAY['x', 'y'], ARRAY[0.1, 0.2, 0.3, 0.4], '{\"a\": 1}', '[\"p1\"]'), ('n2', 'b', NULL, FALSE, NULL, ARRAY['z'], NULL, NULL, NULL)",
+    "INSERT OR REPLACE INTO papers (id, year) VALUES ('p1', 2)",
+    "INSERT INTO papers (id, year) VALUES ('p1', 2) ON CONFLICT (id) DO NOTHING",
+    "INSERT INTO papers (id, year, rating) VALUES ('p2', 3, 1.5) ON CONFLICT (id) DO UPDATE SET year = CASE WHEN excluded.year > year THEN excluded.year ELSE year END, rating = coalesce(rating, 0) + excluded.rating",
+    "UPDATE papers SET rating = rating * 2 + year, title = lower(coalesce(title, 'untitled')) || '!', done = NOT done WHERE category = 'db' LIMIT 5",
+    "DELETE FROM papers WHERE done ORDER BY year DESC LIMIT 3",
+];
+
+/// `plan` through protobuf, and through its bytes, and back.
+fn through_pb(plan: &Plan) -> Plan {
+    let p = to_pb_plan(plan);
+    let back = from_pb_plan(p.clone()).unwrap_or_else(|e| panic!("{}: {plan:?}", e.message));
+    assert_eq!(&back, plan);
+    let bytes = p.encode_to_vec();
+    assert_eq!(from_pb_plan(pb::Plan::decode(bytes.as_slice()).unwrap()).unwrap(), back);
+    back
+}
+
+/// The kinds of nodes and expressions in `plan`, by the names its JSON
+/// gives them.
+fn kinds(plan: &Plan) -> BTreeSet<String> {
+    fn walk(j: &serde_json::Value, out: &mut BTreeSet<String>) {
+        match j {
+            serde_json::Value::Object(m) => {
+                if let Some(serde_json::Value::String(n)) = m.get("node") {
+                    out.insert(format!("node {n}"));
+                }
+                // An expression is an object of one key, its kind.
+                if m.len() == 1 && !m.contains_key("node") {
+                    out.insert(format!("expr {}", m.keys().next().unwrap()));
+                }
+                m.values().for_each(|v| walk(v, out));
+            }
+            serde_json::Value::Array(xs) => xs.iter().for_each(|v| walk(v, out)),
+            serde_json::Value::String(s) if s == "score" || s == "hops" || s == "seq_no" => {
+                out.insert(format!("expr {s}"));
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(&plan.to_json().unwrap(), &mut out);
+    out
+}
+
+#[test]
+fn every_plan_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = papers(dir.path());
+    let mut seen = BTreeSet::new();
+    let mut check = |plan: Plan| {
+        seen.extend(kinds(&plan));
+        through_pb(&plan);
+    };
+    for sql in SELECTS {
+        let select = bind(sql, &schema, &params()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        check(Plan::of_select(&schema, &select));
+    }
+    for sql in COMPOUND {
+        assert!(compound::is_compound(sql, &schema), "{sql}");
+        check(compound::plan(sql, &schema, &params()).unwrap_or_else(|e| panic!("{sql}: {e}")));
+    }
+    for sql in WRITES {
+        let Command::Write { write, .. } = bind_command(sql, &[&schema], &params()).unwrap_or_else(|e| panic!("{sql}: {e}")) else { panic!("{sql}") };
+        check(Plan::of_write(&schema, &write));
+    }
+    // Every kind of node and expression was among them.
+    let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order"];
+    let exprs = [
+        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no",
+    ];
+    let want: BTreeSet<String> = nodes.iter().map(|n| format!("node {n}")).chain(exprs.iter().map(|e| format!("expr {e}"))).collect();
+    let missing: Vec<&String> = want.difference(&seen).collect();
+    assert!(missing.is_empty(), "never made: {missing:?}");
+}
+
+/// A plan made by hand of the given root.
+fn plan(root: Node) -> pb::Plan {
+    to_pb_plan(&Plan::new(root))
+}
+
+fn search(filter: Expr) -> Node {
+    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new() })
+}
+
+fn refused(p: pb::Plan, says: &str) {
+    match from_pb_plan(p) {
+        Ok(p) => panic!("read {p:?}; wanted it refused with {says:?}"),
+        Err(e) => {
+            assert_eq!(e.status, 400, "{}", e.message);
+            assert!(e.message.contains(says), "{:?} lacks {says:?}", e.message);
+        }
+    }
+}
+
+#[test]
+fn plans_that_cannot_be_read_are_refused() {
+    let ok = plan(search(Expr::Lit(Value::Bool(true))));
+    from_pb_plan(ok.clone()).unwrap();
+    // Newer, or needing what this version lacks, by name.
+    refused(pb::Plan { version: ir::VERSION + 1, ..ok.clone() }, "plan version 2");
+    refused(pb::Plan { version: 0, ..ok.clone() }, "plan version 0");
+    refused(pb::Plan { features: vec!["teleport".into()], ..ok.clone() }, "\"teleport\"");
+    // Incomplete.
+    refused(pb::Plan { root: None, ..ok.clone() }, "a node is missing");
+    refused(pb::Plan { root: Some(pb::Node { node: None }), ..ok.clone() }, "a node is missing");
+    let mut p = plan(Node::Limit { input: Box::new(search(Expr::Lit(Value::Bool(true)))), offset: 0, limit: Some(3) });
+    let Some(pb::node::Node::Limit(l)) = &mut p.root.as_mut().unwrap().node else { panic!() };
+    l.input = None;
+    refused(p, "a node's input is missing");
+    let mut p = plan(Node::Filter { input: Box::new(search(Expr::Lit(Value::Bool(true)))), cond: Expr::Hops });
+    let Some(pb::node::Node::Filter(f)) = &mut p.root.as_mut().unwrap().node else { panic!() };
+    f.cond = Some(Box::new(pb::Expr { expr: None }));
+    refused(p, "an expression is missing");
+    // Numbers that are not finite, as JSON refuses them.
+    refused(plan(search(Expr::Lit(Value::Float(f64::NAN)))), "finite");
+    refused(plan(search(Expr::Lit(Value::List(vec![Value::Float(f64::INFINITY)])))), "finite");
+    refused(plan(search(Expr::Lit(Value::Vector(vec![0.5, f32::NAN].into())))), "finite");
+    let sim = |v: Vec<f32>| Expr::Similarity { field: 10, vector: v.into(), opts: Default::default() };
+    refused(plan(search(sim(vec![f32::INFINITY]))), "finite");
+    refused(plan(search(Expr::Rrf { inputs: vec![sim(vec![1.0])], k: f64::INFINITY, depth: 10 })), "k must be finite");
+    refused(plan(search(Expr::Weighted(vec![(f64::NAN, sim(vec![1.0]))]))), "a weight must be finite");
+    let mut opts = std::collections::BTreeMap::new();
+    opts.insert("k1".to_string(), Value::Float(f64::NEG_INFINITY));
+    refused(plan(search(Expr::Bm25 { field: 2, text: "graph".into(), opts })), "finite");
+    // An enum's number it does not know, and too many edits for a byte.
+    let mut p = plan(search(Expr::Cmp { op: ir::CmpOp::Eq, left: Box::new(Expr::Field(5)), right: Box::new(Expr::Lit(Value::Int(1))) }));
+    let Some(pb::node::Node::Search(s)) = &mut p.root.as_mut().unwrap().node else { panic!() };
+    let Some(pb::expr::Expr::Cmp(c)) = &mut s.filter.as_mut().unwrap().expr else { panic!() };
+    c.op = 99;
+    refused(p, "99 is not a comparison");
+    let mut p = plan(search(Expr::Match { field: 2, query: "graph".into(), expand: strata::query::Expand { synonyms: false, fuzzy: Some(strata::query::Fuzzy::Edits(1)) } }));
+    let Some(pb::node::Node::Search(s)) = &mut p.root.as_mut().unwrap().node else { panic!() };
+    let Some(pb::expr::Expr::Match(m)) = &mut s.filter.as_mut().unwrap().expr else { panic!() };
+    m.expand.as_mut().unwrap().fuzzy = Some(pb::expand::Fuzzy::Edits(300));
+    refused(p, "300 edits");
+}
+
+/// A search's filter that is absent holds for every row, as in JSON.
+#[test]
+fn a_search_without_a_filter_reads_every_row() {
+    let mut p = plan(search(Expr::Lit(Value::Bool(true))));
+    let Some(pb::node::Node::Search(s)) = &mut p.root.as_mut().unwrap().node else { panic!() };
+    s.filter = None;
+    assert_eq!(from_pb_plan(p).unwrap(), Plan::new(search(Expr::Lit(Value::Bool(true)))));
+}

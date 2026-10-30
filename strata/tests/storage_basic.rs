@@ -6,13 +6,14 @@ use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rand::{Rng, SeedableRng};
 use storage_util::*;
 use strata::storage::pager::{Meta, PAGE};
-use strata::storage::{Database, DbOptions, MergePolicy, Snapshot};
+use strata::storage::{Database, DbOptions, MergePolicy, Snapshot, LOCK_WAIT};
 use strata::{Error, Field, FieldType, Schema, Value};
 
 fn keys(r: std::ops::Range<u64>) -> BTreeSet<String> {
@@ -538,6 +539,33 @@ fn single_writer() {
     let _ = db.snapshot();
     drop(tx);
     db.begin().unwrap().commit().unwrap();
+}
+
+// A child process holds a copy of its parent's descriptors from its fork
+// until its exec, so a database closed and opened again while the process
+// started children could find its own lock still held, and the open failed
+// as Busy. An open now waits LOCK_WAIT for a lock to be released.
+#[test]
+fn a_lock_held_for_a_moment_does_not_fail_an_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.strata");
+    let src = Arc::new(MapSource::default());
+    drop(Database::create(&path, schema(), opts(&src)).unwrap());
+    // Another descriptor of the file holds the lock, as a child's copy does.
+    let f = std::fs::File::open(&path).unwrap();
+    // SAFETY: flock on a valid descriptor.
+    assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(LOCK_WAIT / 5);
+        drop(f);
+    });
+    let db = Database::open(&path, opts(&src)).unwrap();
+    release.join().unwrap();
+    // A lock that stays held still fails the open, once the wait is over.
+    let t = std::time::Instant::now();
+    assert!(matches!(Database::open(&path, opts(&src)), Err(Error::Busy(_))));
+    assert!(t.elapsed() >= LOCK_WAIT);
+    drop(db);
 }
 
 #[test]

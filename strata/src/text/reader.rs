@@ -1,6 +1,8 @@
 //! Reading a text field: lookups, posting cursors, boolean retrieval and
 //! cardinality estimates. Ranked retrieval is in [`super::bm25`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::postings::bytes::{OwnedBytes, Slice};
 use crate::postings::codecs::loom::Loom;
 use crate::postings::codecs::{PostingList, SetOps};
@@ -34,6 +36,12 @@ pub struct TextFieldReader {
     pub(crate) post: OwnedBytes,
     pub(crate) pos: Option<OwnedBytes>,
     pub(crate) norms: Slice<u8>,
+    /// [`Self::n_docs_with_terms`], counted when first asked for.
+    with_terms: std::sync::OnceLock<u32>,
+    /// Loom lists that passed [`Loom::validate`], one bit per term
+    /// ordinal: a list's payload is checked when it is first used rather
+    /// than when the segment opens.
+    checked: Box<[AtomicU64]>,
 }
 
 /// Bytes of a field's sections by part.
@@ -64,12 +72,21 @@ impl TextFieldReader {
         if norms.len() != meta.n_docs as usize || dict.n_terms() != meta.n_terms || meta.n_docs as usize != seg.n_docs() {
             return Err(corrupt(format!("text field {field}: inconsistent document or term counts")));
         }
-        Ok(TextFieldReader { meta, dict, post, pos, norms })
+        let checked = (0..(meta.n_terms as usize).div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+        Ok(TextFieldReader { meta, dict, post, pos, norms, with_terms: std::sync::OnceLock::new(), checked })
     }
 
     /// Documents in the segment.
     pub fn n_docs(&self) -> u32 {
         self.meta.n_docs
+    }
+
+    /// Documents with at least one indexed term in the field: BM25's
+    /// document count, as Lucene's `docCount`, so that rows without a value
+    /// do not shrink the average length. A one-byte norm keeps a length of 0
+    /// exact, so this counts the norms above 0.
+    pub fn n_docs_with_terms(&self) -> u32 {
+        *self.with_terms.get_or_init(|| self.norms.iter().filter(|&&n| n != 0).count() as u32)
     }
 
     /// Sum of document lengths.
@@ -163,10 +180,11 @@ impl TextFieldReader {
 
     /// A cursor over the postings of a dictionary entry.
     pub fn cursor(&self, info: &TermInfo) -> PostingCursor<'_> {
-        let (start, end) = (info.post_off as usize, (info.post_off + info.post_len) as usize);
-        let positions = self.pos.as_ref().map(|p| &p[info.pos_off as usize..(info.pos_off + info.pos_len) as usize]);
+        let start = info.post_off as usize;
+        let positions = self.pos.as_ref().map(|p| &p[info.pos_off as usize..info.pos_off.saturating_add(info.pos_len) as usize]);
         if self.is_loom(info) {
-            PostingCursor::loom(&self.post, start, end, info.df, positions)
+            let (list, pos) = self.open_loom(info);
+            PostingCursor::loom(&self.post, start, list, pos, info.df, positions)
         } else {
             PostingCursor::bp(&self.post[start..], info.df, positions)
         }
@@ -177,7 +195,31 @@ impl TextFieldReader {
     }
 
     fn loom(&self, info: &TermInfo) -> Loom {
-        open_loom(&self.post, info.post_off as usize, (info.post_off + info.post_len) as usize).0
+        self.open_loom(info).0
+    }
+
+    /// The Loom list of a dictionary entry and the offset of what follows
+    /// it (see [`open_loom`]), its payload checked on first use.
+    ///
+    /// # Panics
+    /// If the list is corrupt (as the lists of a keyword index do).
+    fn open_loom(&self, info: &TermInfo) -> (Loom, usize) {
+        self.try_open_loom(info).unwrap_or_else(|e| panic!("corrupt segment: text list of term {}: {e}", info.ord))
+    }
+
+    fn try_open_loom(&self, info: &TermInfo) -> std::result::Result<(Loom, usize), String> {
+        let end = info.post_off.checked_add(info.post_len).ok_or("list length overflows")?;
+        let (list, pos) = open_loom(&self.post, info.post_off as usize, end as usize)?;
+        if list.len() != info.df as usize || list.last_doc().is_some_and(|d| d >= self.meta.n_docs) {
+            return Err(format!("{} postings up to {:?}, the dictionary says {} of {} documents", list.len(), list.last_doc(), info.df, self.meta.n_docs));
+        }
+        let (word, bit) = (info.ord as usize / 64, 1u64 << (info.ord % 64));
+        let cell = self.checked.get(word).ok_or("term ordinal out of range")?;
+        if cell.load(Ordering::Relaxed) & bit == 0 {
+            list.validate()?;
+            cell.fetch_or(bit, Ordering::Relaxed);
+        }
+        Ok((list, pos))
     }
 
     /// Every docID of a list.

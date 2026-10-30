@@ -5,19 +5,27 @@
 //! * [`http`]: the JSON API (`/v1/...`), Prometheus metrics (`/metrics`)
 //!   and the query UI (`/`).
 //! * [`grpc`]: the same operations over gRPC (`proto/strata.proto`), which
-//!   a coordinator uses to reach its shards.
+//!   a coordinator uses to reach its shards; [`plan_pb`]: plans as protobuf.
 //! * [`agent`]: answers a question in words by letting a Claude model
 //!   query the table.
+//! * [`replication`]: a primary shipping its writes to its replicas.
+//! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves.
 
 pub mod agent;
+pub mod auth;
 pub mod coord;
 pub mod demo;
 pub mod grpc;
 pub mod http;
+pub mod idem;
 pub mod json;
 pub mod metrics;
+pub mod obs;
+pub mod plan_pb;
+pub mod replication;
 pub mod server;
 pub mod service;
+pub mod slots;
 
 pub mod pb {
     tonic::include_proto!("strata.v1");
@@ -51,6 +59,8 @@ impl From<strata::Error> for ApiError {
         let status = match &e {
             strata::Error::Query(_) | strata::Error::Schema(_) => 400,
             strata::Error::Busy(_) => 503,
+            // As Elasticsearch's circuit breakers.
+            strata::Error::Memory(_) => 429,
             strata::Error::Timeout(_) => 504,
             strata::Error::Io(_) | strata::Error::Corrupt(_) => 500,
         };
@@ -63,8 +73,10 @@ impl From<tonic::Status> for ApiError {
         use tonic::Code;
         let status = match s.code() {
             Code::InvalidArgument => 400,
+            Code::FailedPrecondition => 409,
             Code::DeadlineExceeded => 504,
-            Code::Unavailable | Code::ResourceExhausted => 503,
+            Code::ResourceExhausted => 429,
+            Code::Unavailable => 503,
             _ => 502,
         };
         ApiError { status, message: s.message().to_string() }
@@ -76,6 +88,12 @@ impl From<ApiError> for tonic::Status {
         use tonic::Code;
         let code = match e.status {
             400 => Code::InvalidArgument,
+            // Refused in the state the server is in: an older slot map, a
+            // write with the same idempotency key still running.
+            409 => Code::FailedPrecondition,
+            // Too many queries running: another replica would only be
+            // loaded more ([`crate::coord`] does not retry it elsewhere).
+            429 => Code::ResourceExhausted,
             503 => Code::Unavailable,
             504 => Code::DeadlineExceeded,
             _ => Code::Internal,

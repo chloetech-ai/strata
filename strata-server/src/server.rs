@@ -1,24 +1,27 @@
 //! Opening the database, and serving HTTP and gRPC.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use strata::db::Db;
+use strata::ingest::Format;
 use strata::schema::Schema;
 use strata::segment::build::BuildOptions;
-use strata::storage::{DbOptions, Layout, MergePolicy};
+use strata::storage::{DbOptions, Layout, MergePolicy, MergerOptions};
 use tokio::net::TcpListener;
 
+use crate::auth::{self, Access};
 use crate::coord::{CoordOptions, Coordinator};
-use crate::service::{shard_of, AgentConfig, Backend, Service};
+use crate::replication::{self, Acks, Follow, Primary, PrimaryOptions};
+use crate::service::{shard_of, AgentConfig, Backend, Replication, Service};
 use crate::{demo, grpc, http, pb};
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     /// The database to serve; created if missing (with `schema` or `demo`).
     pub db: Option<PathBuf>,
-    /// A JSON schema (Strata's `Schema` serialization) for a new database.
+    /// A JSON schema for a new database, in either form ([`Schema::from_json`]).
     pub schema: Option<PathBuf>,
     /// Fill a new database with the rows of this one ([`Db::load_from`]).
     pub copy_from: Option<PathBuf>,
@@ -28,12 +31,56 @@ pub struct Options {
     pub demo_shard: Option<(usize, usize)>,
     /// A new database as a directory of segment files.
     pub directory: bool,
+    /// Open a database whose WAL was damaged after it was durable
+    /// ([`DbOptions::wal_drop_damaged`]).
+    pub wal_drop_damaged: bool,
+    /// Check every segment's checksum on opening
+    /// ([`DbOptions::verify_checksums`]).
+    pub verify_checksums: bool,
+    /// Number the database's writes ([`strata::storage::Database::start_seq_no`]),
+    /// for `seq_no()` and conditional writes (`if_seq_no`); once started,
+    /// for good.
+    pub seq_no: bool,
+    /// Ship the database's writes to these replicas (gRPC URLs of servers
+    /// started with `replica`), as their primary
+    /// ([`crate::replication`]); the replicas' token and CA are
+    /// `coord.token` and `coord.ca`.
+    pub replicas: Vec<String>,
+    /// Apply the writes a primary ships, and take none from clients.
+    pub replica: bool,
+    /// Start as the primary of a new term, shipping to `replicas` (none:
+    /// to no replica), though the database was a replica or another
+    /// primary replaced it ([`PrimaryOptions::promote`]).
+    pub promote: bool,
+    /// With `replicas`: which copies hold a write before it is answered.
+    pub write_acks: Acks,
+    /// On a primary or a replica: the latest transactions kept to ship, in
+    /// MiB (0: 64).
+    pub ship_log_mb: usize,
+    /// With `replicas`: how often each replica's rows are compared with
+    /// the primary's, in seconds (0: only when asked, `POST
+    /// /v1/admin/verify`).
+    pub verify_every_s: u64,
     /// Coordinate these shard servers (gRPC URLs; replicas of a shard
     /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
     pub coord: CoordOptions,
     pub timeout_ms: u64,
+    /// The longest deadline a request may ask for (0: the larger of
+    /// `timeout_ms` and 60 s).
+    pub max_timeout_ms: u64,
     pub max_concurrent: usize,
+    /// The most rows a query may reach, OFFSET included (0: no limit).
+    pub max_result_window: usize,
+    /// The most groups a query may make (0: no limit).
+    pub max_groups: usize,
+    /// Memory the running queries may hold together, in MiB (`None`: a
+    /// third of [`strata::storage::memory_limit`]; 0: no limit).
+    pub query_memory_mb: Option<u64>,
+    /// Write requests held at once before more are refused (0: no limit).
+    pub max_queued_writes: usize,
+    /// The largest write or import body, in MiB (0: 256).
+    pub max_body_mb: usize,
     pub model: String,
     pub api_key: Option<String>,
     pub api_base: String,
@@ -42,15 +89,29 @@ pub struct Options {
     /// The synonym list for `synonyms => 1` searches (Solr format), read at
     /// start if it exists and written by `PUT /v1/synonyms`.
     pub synonyms: Option<PathBuf>,
+    /// Where `POST /v1/admin/checkpoint` writes checkpoints.
+    pub backup_dir: Option<PathBuf>,
+    /// The background merger ([`strata::storage::Database::spawn_merger`]).
+    pub merger: MergerOptions,
+    /// Log queries and writes that take this many milliseconds or more
+    /// (0: none).
+    pub slow_ms: u64,
+}
+
+/// Segment builds (flushes, merges, imports): vector indexes on every core.
+fn build_options() -> BuildOptions {
+    BuildOptions::default().set("vector.threads", std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
 /// How the server opens a database. Each write publishes its snapshot,
 /// rebuilding the newest in-memory chunk (up to 1,024 rows): those chunks
 /// keep their vectors flat, since a graph over so few rows costs more to
-/// build at every write than an exact scan of them costs a query.
+/// build at every write than an exact scan of them costs a query. Segments
+/// build their vector indexes on every core.
 pub fn db_options(directory: bool) -> DbOptions {
     DbOptions {
         publish_snapshots: true,
+        build: build_options(),
         mem_build: Some(BuildOptions::default().set("vector.index", "flat")),
         layout: if directory { Layout::Directory } else { Layout::SingleFile },
         ..DbOptions::default()
@@ -67,14 +128,32 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         Copy(PathBuf),
     }
     let mut fill = None;
+    let mut slots_file = None;
+    if o.seq_no && !o.shards.is_empty() {
+        return Err("--seq-no numbers a database's writes: start each shard server with it, not the coordinator".into());
+    }
+    let replicating = !o.replicas.is_empty() || o.replica || o.promote;
+    if replicating && !o.shards.is_empty() {
+        return Err("--replicas, --replica and --promote are for the servers holding a shard's copies, not the coordinator".into());
+    }
+    if (!o.replicas.is_empty() || o.promote) && o.replica {
+        return Err("a server is a primary (--replicas, --promote) or a replica (--replica), not both".into());
+    }
+    let ship_log_bytes = match replicating {
+        true => (if o.ship_log_mb > 0 { o.ship_log_mb } else { 64 }) << 20,
+        false => 0,
+    };
+    let mut replication_file = None;
     let (backend, schema) = if !o.shards.is_empty() {
         // A shard with no replica answering yet (the cluster is starting, or
         // one is down) is waited for; a wrong URL or schema is not.
         let c = loop {
             match Coordinator::connect_with(o.shards.clone(), o.coord.clone()).await {
                 Ok(c) => break c,
-                Err(e) if e.status != 400 => {
-                    eprintln!("strata-server: waiting for the shards: {}", e.message);
+                // A shard that refuses the request, or the slot map, will
+                // not change its mind.
+                Err(e) if e.status != 400 && e.status != 409 => {
+                    tracing::warn!(error = %e.message, "waiting for the shards");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 Err(e) => return Err(e.message),
@@ -84,33 +163,76 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         (Backend::Cluster(Arc::new(c)), schema)
     } else {
         let path = o.db.clone().ok_or("pass --db PATH (or --shards to coordinate shard servers)")?;
+        slots_file = Some(crate::slots::file_of(&path));
+        replication_file = Some(replication::file_of(&path));
         if o.copy_from.is_some() && (path.exists() || o.schema.is_none()) {
             return Err("--copy-from fills a new database: pass a --db that does not exist and its --schema".into());
         }
         let db = if path.exists() {
-            Db::open(&path, db_options(o.directory)).map_err(|e| format!("open {}: {e}", path.display()))?
+            let db = Db::open(&path, DbOptions { wal_drop_damaged: o.wal_drop_damaged, verify_checksums: o.verify_checksums, ship_log_bytes, ..db_options(o.directory) })
+                .map_err(|e| format!("open {}: {e}", path.display()))?;
+            if let Some(what) = db.storage().damaged() {
+                tracing::warn!(db = %path.display(), damage = %what, "opened the database past damage");
+            }
+            db
         } else if let Some(n) = o.demo {
             fill = Some(Fill::Demo(n));
-            Db::create(&path, demo::schema(n), db_options(o.directory)).map_err(|e| e.to_string())?
+            Db::create(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
         } else if let Some(s) = &o.schema {
             let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
-            let schema: Schema = serde_json::from_str(&text).map_err(|e| format!("schema {}: {e}", s.display()))?;
+            let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
             fill = o.copy_from.clone().map(Fill::Copy);
-            Db::create(&path, schema, db_options(o.directory)).map_err(|e| e.to_string())?
+            Db::create(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
         } else {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
+        if o.seq_no {
+            db.storage().start_seq_no().map_err(|e| format!("--seq-no on {}: {e}", path.display()))?;
+        }
+        if replicating && db.storage().seq_no().is_none() {
+            return Err(format!("{} does not number its writes, which replication ships by: pass --seq-no", path.display()));
+        }
         let db = Arc::new(db);
-        spawn_maintenance(db.clone());
+        // Writes go on while a full memtable becomes segments, and while
+        // segments are merged.
+        db.spawn_flusher();
+        db.spawn_merger(o.merger.clone());
+        if let Some(b) = db.storage().merge_status().memory_budget {
+            tracing::info!(threads = o.merger.threads.max(1), memory_mib = b >> 20, "merging in the background");
+        }
         let schema = db.schema().clone();
         (Backend::Local(db), schema)
     };
     let mut svc = Service::new(backend, schema, agent, o.max_concurrent.max(1), timeout);
+    if let Some(path) = slots_file {
+        svc.keep_slots_in(path)?;
+        if let Some((m, shard)) = svc.slots() {
+            tracing::info!(epoch = m.epoch, shard, of = m.shards(), "holds slots");
+        }
+    }
+    if o.max_timeout_ms > 0 {
+        svc.max_timeout = Duration::from_millis(o.max_timeout_ms).max(timeout);
+    }
+    svc.slow = (o.slow_ms > 0).then(|| Duration::from_millis(o.slow_ms));
+    svc.max_rows = (o.max_result_window > 0).then_some(o.max_result_window);
+    svc.max_groups = (o.max_groups > 0).then_some(o.max_groups);
+    let query_memory = match o.query_memory_mb {
+        Some(mb) => (mb > 0).then(|| mb.saturating_mul(1 << 20)),
+        None => strata::storage::memory_limit().map(|l| l / 3),
+    };
+    if let Some(b) = query_memory {
+        tracing::info!(memory_mib = b >> 20, "queries share a memory budget");
+    }
+    svc.query_memory = query_memory.map(strata::query::memory::MemoryBudget::new);
+    svc.max_queued_writes = if o.max_queued_writes > 0 { o.max_queued_writes } else { usize::MAX };
+    if o.max_body_mb > 0 {
+        svc.max_body = o.max_body_mb.saturating_mul(1 << 20);
+    }
     svc.open_models(&o.models);
     for m in &svc.models {
         match &m.model {
-            Ok(e) => eprintln!("strata-server: {} is {}'s embedding of {}", m.field, e.name(), m.spec.from.join(" + ")),
-            Err(why) => eprintln!("strata-server: {} is {}'s embedding of {}, which this server cannot run ({why}): writes must supply its vectors", m.field, m.spec.model, m.spec.from.join(" + ")),
+            Ok(e) => tracing::info!(field = %m.field, model = %e.name(), from = %m.spec.from.join(" + "), "embedded field"),
+            Err(why) => tracing::warn!(field = %m.field, model = %m.spec.model, from = %m.spec.from.join(" + "), error = %why, "cannot run this embedded field's model: writes must supply its vectors"),
         }
     }
     if let (Some(fill), Backend::Local(db)) = (fill, &svc.backend) {
@@ -129,12 +251,51 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
                 db.load_from(&old).map_err(|e| format!("copy from {}: {e}", from.display()))?
             }
         };
-        eprintln!("strata-server: loaded {n} rows in {:.1} s", t0.elapsed().as_secs_f64());
+        tracing::info!(rows = n, secs = t0.elapsed().as_secs_f64(), "loaded the new database");
     }
     if let Some(path) = &o.synonyms {
         svc.open_synonyms(path).map_err(|e| e.message)?;
     }
-    Ok(Arc::new(svc))
+    if let Some(dir) = &o.backup_dir {
+        svc.set_backup_dir(dir).map_err(|e| e.message)?;
+    }
+    // Once loaded: bulk loads are not shipped, so every copy loads the same.
+    if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
+        // How it ships as a primary, but for its replicas and acks.
+        let ships = PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() };
+        if !o.replicas.is_empty() || o.promote {
+            let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, promote: o.promote, ..ships };
+            let p = Primary::start(db.clone(), Some(file), opts)?;
+            tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
+            svc.set_replication(Replication::Primary(p));
+        } else if o.replica {
+            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
+            svc.promote_options = Some(ships);
+            tracing::info!("replica: applies the writes its primary ships, and takes none from clients");
+        }
+    }
+    let svc = Arc::new(svc);
+    spawn_maintenance(&svc);
+    Ok(svc)
+}
+
+/// Asks the replica serving HTTP at `url` to become the primary of a new
+/// term, shipping to `replicas` under `write_acks` (`POST
+/// /v1/admin/promote`), and answers what it said.
+pub async fn promote(url: &str, replicas: &[String], write_acks: &str, force: bool, token: Option<&str>) -> Result<serde_json::Value, String> {
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/v1/admin/promote", url.trim_end_matches('/')))
+        .json(&serde_json::json!({"replicas": replicas, "write_acks": write_acks, "force": force}));
+    if let Some(t) = token.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let r = req.send().await.map_err(|e| format!("{url}: {e}"))?;
+    let status = r.status();
+    let j: serde_json::Value = r.json().await.map_err(|e| format!("{url}: {status}: {e}"))?;
+    match status.is_success() {
+        true => Ok(j),
+        false => Err(format!("{url}: {status}: {}", j["error"].as_str().map_or_else(|| j.to_string(), String::from))),
+    }
 }
 
 /// Downloads model `name` ([`strata::embed::KNOWN_MODELS`], or a Hugging
@@ -159,31 +320,103 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
         // overwritten in place.
         let tmp = out.join(format!("{file}.part"));
         std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, out.join(file))).map_err(|e| format!("{}: {e}", out.join(file).display()))?;
-        eprintln!("strata-server: {file} ({:.1} MB)", bytes.len() as f64 / 1e6);
+        tracing::info!(file, bytes = bytes.len(), "downloaded");
     }
     strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
     Ok(out)
 }
 
-/// Merges segments in the background, as writes add them.
-pub fn spawn_maintenance(db: Arc<Db>) {
+/// `strata-server import`: loads `files` into the database at `path`,
+/// created with `schema` if it does not exist, and says what each wrote.
+pub fn import_files(path: &Path, schema: Option<&Path>, models: &Path, format: Option<Format>, directory: bool, files: &[PathBuf]) -> Result<(), String> {
+    let opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, build: build_options(), ..DbOptions::default() };
+    let db = if path.exists() {
+        if schema.is_some() {
+            return Err(format!("{} exists: --schema is only for a new database", path.display()));
+        }
+        Db::open(path, opts).map_err(|e| format!("open {}: {e}", path.display()))?
+    } else {
+        let s = schema.ok_or_else(|| format!("{} does not exist: pass --schema FILE to create it", path.display()))?;
+        let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
+        let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
+        Db::create(path, schema, opts).map_err(|e| format!("create {}: {e}", path.display()))?
+    };
+    for (field, why) in db.open_embedders(models) {
+        tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
+    }
+    for file in files {
+        let t0 = std::time::Instant::now();
+        let r = strata::ingest::import_file(&db, file, format).map_err(|e| format!("{}: {e}", file.display()))?;
+        let how = if r.bulk { "loaded" } else { "upserted" };
+        tracing::info!(file = %file.display(), rows = r.rows, how, secs = t0.elapsed().as_secs_f64(), "imported");
+        if !r.unknown.is_empty() {
+            tracing::warn!(file = %file.display(), fields = %r.unknown.join(", "), "skipped fields the schema lacks");
+        }
+    }
+    db.storage().merge(&MergePolicy::default()).map_err(|e| format!("merge: {e}"))?;
+    tracing::info!(db = %path.display(), rows = db.snapshot().n_live_docs(), "imported every file");
+    Ok(())
+}
+
+/// Releases expired snapshot leases, and reports merges that fail (the
+/// database's merger threads merge as writes add segments; a database
+/// that cannot write, [`Service::failing`], merges nothing).
+pub fn spawn_maintenance(svc: &Arc<Service>) {
+    let Some(db) = svc.local_db().cloned() else { return };
+    let svc = Arc::downgrade(svc);
     tokio::spawn(async move {
+        let mut reported = None;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let db = db.clone();
-            let r = tokio::task::spawn_blocking(move || db.storage().merge(&MergePolicy::default())).await;
-            if let Ok(Err(e)) = r {
-                eprintln!("strata-server: merge failed: {e}");
+            let Some(svc) = svc.upgrade() else { return };
+            svc.sweep_leases();
+            let why = svc.failing().map(|w| format!("{w}; merges stop until then")).or_else(|| db.storage().merge_status().error.map(|e| format!("merge failed: {e}")));
+            if why.is_some() && why != reported {
+                tracing::error!(error = why.as_deref().unwrap_or_default(), "the database cannot merge");
             }
+            reported = why;
         }
     });
 }
 
-pub async fn serve_http(svc: Arc<Service>, listener: TcpListener, token: Option<String>) -> std::io::Result<()> {
-    axum::serve(listener, http::router(svc, token)).with_graceful_shutdown(shutdown()).await
+/// Serves the HTTP API and UI, over TLS with `access.tls`.
+pub async fn serve_http(svc: Arc<Service>, listener: TcpListener, access: Access) -> std::io::Result<()> {
+    let router = http::router(svc, &access);
+    let Some(tls) = &access.tls else {
+        return axum::serve(listener, router).with_graceful_shutdown(shutdown()).await;
+    };
+    let config = auth::server_config(tls).map_err(std::io::Error::other)?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    let service = hyper_util::service::TowerToHyperService::new(router);
+    let stop = shutdown();
+    tokio::pin!(stop);
+    loop {
+        let (tcp, _) = tokio::select! {
+            r = listener.accept() => match r {
+                Ok(c) => c,
+                // Out of descriptors, say: wait rather than spin.
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = &mut stop => return Ok(()),
+        };
+        let _ = tcp.set_nodelay(true);
+        let (acceptor, service) = (acceptor.clone(), service.clone());
+        tokio::spawn(async move {
+            // A client that never finishes its handshake holds a task, not
+            // the accept loop.
+            let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await else { return };
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new()).serve_connection_with_upgrades(io, service).await;
+        });
+    }
 }
 
-pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener) -> Result<(), tonic::transport::Error> {
+/// Serves gRPC: every call needs `access.token`, over TLS with
+/// `access.tls`.
+pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access) -> Result<(), tonic::transport::Error> {
     use tokio_stream::StreamExt;
     // A gRPC answer is several small writes (headers, data, trailers); with
     // Nagle's algorithm on, the last waits for the client's delayed ACK and
@@ -194,8 +427,24 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener) -> Result<(), 
         }
         s
     });
-    tonic::transport::Server::builder()
-        .add_service(pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(256 << 20).max_encoding_message_size(256 << 20))
+    let token = access.token.clone();
+    let counted = svc.clone();
+    let check = move |req: tonic::Request<()>| match &token {
+        Some(t) if !t.admits(req.metadata().get("authorization").and_then(|v| v.to_str().ok())) => {
+            counted.metrics.grpc("any", "Unauthenticated", 0.0);
+            Err(tonic::Status::unauthenticated("missing or wrong token"))
+        }
+        _ => Ok(req),
+    };
+    // A Write message carries rows, as an HTTP write's body does.
+    let max_body = svc.max_body;
+    let service = pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(max_body).max_encoding_message_size(256 << 20);
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = &access.tls {
+        builder = builder.tls_config(tonic::transport::ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(&tls.cert, &tls.key)))?;
+    }
+    builder
+        .add_service(tonic::service::interceptor::InterceptedService::new(service, check))
         .serve_with_incoming_shutdown(incoming, shutdown())
         .await
 }

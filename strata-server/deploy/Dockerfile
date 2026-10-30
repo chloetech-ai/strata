@@ -4,7 +4,15 @@
 #
 # The build context is the repository root, since strata-server depends on
 # ../strata by path.
+#
+# The image runs on any x86-64 (or aarch64) CPU: Strata picks its SIMD
+# kernels at run time (AVX2, AVX-512 and VNNI; the aarch64 dot product
+# instructions), and the server logs which at start. To tune the whole
+# binary to the build machine instead, which may then not start elsewhere:
+#   docker build --build-arg RUSTFLAGS="-C target-cpu=native" ...
 FROM rust:1-bookworm AS build
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS=${RUSTFLAGS}
 WORKDIR /src
 COPY strata strata
 COPY strata-server strata-server

@@ -3,15 +3,21 @@
 //! ```text
 //! strata-server --demo 20000 --db products.strata      # a demo catalogue, UI at http://127.0.0.1:7700
 //! strata-server --db my.strata                         # an existing database
+//! STRATA_TOKEN=... strata-server --db my.strata --listen 0.0.0.0:7700   # beyond loopback: a token
 //! strata-server --shards http://a:7701,http://b:7701   # a coordinator over shard servers
 //! strata-server --shards 'http://a0:7701|http://a1:7701,http://b0:7701|http://b1:7701'   # two replicas each
+//! strata-server --db a0.strata --seq-no --replicas http://a1:7701   # a primary shipping its writes to a replica
+//! strata-server --db a1.strata --seq-no --replica                    # and that replica
 //! strata-server --db new.strata --schema new.json --copy-from my.strata   # re-embed into a new schema
 //! strata-server fetch-model potion-retrieval-32M       # download an embedding model
+//! strata-server import --db my.strata --schema my.json rows.jsonl more.csv   # load files
 //! ```
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use strata_server::auth::{self, Access, Secret, Tls};
+use strata_server::obs;
 use strata_server::server::{self, Options};
 
 #[derive(Parser)]
@@ -28,7 +34,8 @@ struct Args {
     /// Create the demo product catalogue with this many products.
     #[arg(long)]
     demo: Option<usize>,
-    /// With --demo: keep only the products of shard I of N ("I/N").
+    /// With --demo: keep only the products of shard I of N ("I/N"), those
+    /// in its slots when N shards hold equal runs of slots.
     #[arg(long)]
     demo_shard: Option<String>,
     /// Fill the new database (--db with --schema) with this database's rows,
@@ -42,6 +49,58 @@ struct Args {
     /// Create a new database as a directory of segment files.
     #[arg(long)]
     directory: bool,
+    /// Open a database whose write-ahead log was damaged after it was
+    /// durable, dropping the transactions from the damage on (the log is
+    /// copied to `<log>.damaged` first). Without it the server refuses to
+    /// start on such a database.
+    #[arg(long)]
+    wal_drop_damaged: bool,
+    /// Check every segment of the database against its checksum before
+    /// serving (reads the whole database once). A damaged newest version
+    /// is then skipped for the one before it, as when its manifest is
+    /// damaged.
+    #[arg(long)]
+    verify_checksums: bool,
+    /// Number the database's writes, for good: each row then has the
+    /// sequence number of its last write (`seq_no()` in a SELECT), and a
+    /// write operation can apply only while a row's number is the one it
+    /// read (`if_seq_no`). The database then needs this version of
+    /// Strata or a later one.
+    #[arg(long)]
+    seq_no: bool,
+    /// Ship this database's writes to these replicas, as their primary
+    /// (comma-separated gRPC URLs of servers started with --replica), so
+    /// that each holds the same rows under the same sequence numbers.
+    /// Needs --seq-no.
+    #[arg(long, value_delimiter = ',')]
+    replicas: Vec<String>,
+    /// Serve as a replica: apply the writes a primary ships here (its
+    /// --replicas names this server's gRPC URL), and refuse writes from
+    /// clients. Needs --seq-no, and the rows the primary had when it
+    /// started numbering (the same --demo, or a checkpoint of it).
+    #[arg(long)]
+    replica: bool,
+    /// Start as the primary of a new term, above every term the database
+    /// knows, shipping to --replicas (if any): needed when the database
+    /// was a replica, or another primary replaced it. A running replica is
+    /// promoted with `strata-server promote` instead.
+    #[arg(long, conflicts_with = "replica")]
+    promote: bool,
+    /// With --replicas: the copies that hold a write before it is
+    /// answered: all (the primary and every replica in sync), majority (of
+    /// all copies), or primary.
+    #[arg(long, default_value = "all")]
+    write_acks: String,
+    /// With --replicas or --replica: the latest transactions kept in
+    /// memory to ship, in MiB. A replica further behind is sent a copy of
+    /// the primary.
+    #[arg(long, default_value_t = 64)]
+    ship_log_mb: usize,
+    /// With --replicas: compare each replica's rows with the primary's
+    /// every this many seconds, and send a replica whose rows differ a
+    /// copy of the primary (0: only when asked, POST /v1/admin/verify).
+    #[arg(long, default_value_t = 600)]
+    verify_every_s: u64,
     /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
     /// of one shard joined by '|').
     #[arg(long, value_delimiter = ',')]
@@ -64,15 +123,71 @@ struct Args {
     /// gRPC address ("off" to disable).
     #[arg(long, default_value = "127.0.0.1:7701")]
     grpc: String,
-    /// Require "Authorization: Bearer TOKEN" on the API (the UI asks for it).
-    #[arg(long, env = "STRATA_TOKEN")]
+    /// Require "Authorization: Bearer TOKEN" on the API and on gRPC (the
+    /// UI asks for it). Needed to listen beyond loopback.
+    #[arg(long, env = "STRATA_TOKEN", hide_env_values = true)]
     token: Option<String>,
+    /// Listen beyond loopback without --token: anyone who can reach the
+    /// ports can read and write.
+    #[arg(long)]
+    no_token: bool,
+    /// Also answer HTTP requests for this host name (repeatable). On
+    /// loopback the server answers only to localhost, 127.0.0.1 and ::1, so
+    /// that a web page cannot reach it by DNS rebinding.
+    #[arg(long)]
+    allow_host: Vec<String>,
+    /// Serve HTTP and gRPC over TLS with this certificate chain (PEM).
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// The private key of --tls-cert (PEM).
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// With --shards or --replicas: the token the shards or replicas
+    /// require (default: --token).
+    #[arg(long, env = "STRATA_SHARD_TOKEN", hide_env_values = true)]
+    shard_token: Option<String>,
+    /// With --shards or --replicas: a CA certificate (PEM) for https://
+    /// shards or replicas, besides the public roots.
+    #[arg(long)]
+    shard_ca: Option<PathBuf>,
+    /// With --shards: the slot map to route writes by, which the shards are
+    /// given (JSON, each shard's slots as [start, end) ranges of the 4,096:
+    /// {"epoch": 2, "shards": [[[0, 2048]], [[2048, 4096]]]}). Default:
+    /// equal runs of slots, epoch 1.
+    #[arg(long)]
+    slot_map: Option<PathBuf>,
     /// Default query deadline.
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
+    /// The longest deadline a request's `timeout_ms` may ask for.
+    #[arg(long, default_value_t = 60000)]
+    max_timeout_ms: u64,
     /// Queries running at once; more wait for a slot until their deadline.
     #[arg(long, default_value_t = 64)]
     max_concurrent: usize,
+    /// The most rows a query may reach, OFFSET included: a larger LIMIT
+    /// plus OFFSET, or a query without a LIMIT that matches more, fails
+    /// (0: no limit).
+    #[arg(long, default_value_t = 10_000)]
+    max_result_window: usize,
+    /// The most groups a GROUP BY may make before the query fails (0: no
+    /// limit).
+    #[arg(long, default_value_t = 65_536)]
+    max_groups: usize,
+    /// Memory the running queries may hold together, in MiB: their groups,
+    /// candidate rows, answers and joins; a query that needs more fails
+    /// with 429 (default: a third of the cgroup memory limit, or of RAM;
+    /// 0: no limit).
+    #[arg(long)]
+    query_memory_mb: Option<u64>,
+    /// Write requests the server holds at once (embedding, waiting for the
+    /// writer, or being applied); more are refused with 429 (0: no limit).
+    #[arg(long, default_value_t = 1024)]
+    max_queued_writes: usize,
+    /// The largest body a write or an import may send, in MiB (other
+    /// requests take up to 16 MiB).
+    #[arg(long, default_value_t = 256)]
+    max_body_mb: usize,
     /// The agent's default model.
     #[arg(long, default_value = strata_server::agent::DEFAULT_MODEL)]
     model: String,
@@ -83,6 +198,31 @@ struct Args {
     /// format (`laptop, notebook` or `tv => television`); the UI edits it.
     #[arg(long)]
     synonyms: Option<PathBuf>,
+    /// A directory for checkpoints (consistent copies of the database,
+    /// taken while it serves) written by `POST /v1/admin/checkpoint`.
+    #[arg(long)]
+    backup_dir: Option<PathBuf>,
+    /// Merges that may run at once (default: half the cores, 1 to 4).
+    #[arg(long)]
+    merge_threads: Option<usize>,
+    /// Memory the running merges may use together, in MiB (default: a
+    /// quarter of the cgroup memory limit, or of RAM).
+    #[arg(long)]
+    merge_memory_mb: Option<u64>,
+    /// How fast merges may write, in MiB/s (default: no limit).
+    #[arg(long)]
+    merge_write_mb_per_sec: Option<u64>,
+    /// Log queries and writes that take this many milliseconds or more,
+    /// with their SQL (0: none).
+    #[arg(long, default_value_t = 1000)]
+    slow_ms: u64,
+    /// What to log: a level (error, warn, info, debug, trace), or levels
+    /// per module ("info,strata=debug"). debug logs every request.
+    #[arg(long, env = "STRATA_LOG", default_value = "info")]
+    log: String,
+    /// How to write log lines: text, or json (one object per line).
+    #[arg(long, env = "STRATA_LOG_FORMAT", default_value = "text")]
+    log_format: String,
 }
 
 #[derive(Subcommand)]
@@ -97,23 +237,109 @@ enum Command {
         #[arg(long, env = "STRATA_MODELS")]
         models: Option<PathBuf>,
     },
+    /// Make a running replica the primary of a new term (POST
+    /// /v1/admin/promote): it ships to --replicas from then on. It refuses
+    /// while one of them holds transactions it does not, unless --force.
+    Promote {
+        /// The replica's HTTP URL, as http://host:7700.
+        url: String,
+        /// The copies it is to ship to (comma-separated gRPC URLs): the
+        /// shard's other replicas, and the old primary, which is sent a
+        /// copy once it starts again with --replica.
+        #[arg(long, value_delimiter = ',')]
+        replicas: Vec<String>,
+        /// The copies that hold a write before it is answered, as
+        /// --write-acks: all, majority or primary.
+        #[arg(long, default_value = "all")]
+        write_acks: String,
+        /// Promote it though a copy holds transactions it does not, which
+        /// a copy of the new primary then drops.
+        #[arg(long)]
+        force: bool,
+        /// The replica's --token.
+        #[arg(long, env = "STRATA_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+    },
+    /// Load rows from JSON Lines, JSON, CSV or TSV files into a database,
+    /// created with --schema if it does not exist. A server must not have
+    /// the database open (import through `POST /v1/import` instead).
+    Import {
+        /// The database.
+        #[arg(long)]
+        db: PathBuf,
+        /// Schema of a new database, as JSON.
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        /// The files' format: jsonl, json, csv or tsv (default: from each
+        /// file's extension).
+        #[arg(long)]
+        format: Option<String>,
+        /// Where embedded fields' models are (see `fetch-model`).
+        #[arg(long, env = "STRATA_MODELS")]
+        models: Option<PathBuf>,
+        /// Create a new database as a directory of segment files.
+        #[arg(long)]
+        directory: bool,
+        /// The files, loaded in order.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
 }
 
 #[tokio::main]
 async fn main() {
     let a = Args::parse();
-    if let Some(Command::FetchModel { name, models }) = &a.command {
-        let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
-        match server::fetch_model(name, &dir).await {
-            Ok(path) => eprintln!("strata-server: {name} is in {}", path.display()),
-            Err(e) => fail(&e),
+    let format = obs::LogFormat::parse(&a.log_format).unwrap_or_else(|| {
+        eprintln!("strata-server: --log-format is text or json, not {:?}", a.log_format);
+        std::process::exit(1)
+    });
+    if let Err(e) = obs::init_logs(&a.log, format) {
+        eprintln!("strata-server: {e}");
+        std::process::exit(1)
+    }
+    match &a.command {
+        Some(Command::FetchModel { name, models }) => {
+            let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
+            match server::fetch_model(name, &dir).await {
+                Ok(path) => tracing::info!(model = name, dir = %path.display(), "fetched the model"),
+                Err(e) => fail(&e),
+            }
+            return;
         }
-        return;
+        Some(Command::Promote { url, replicas, write_acks, force, token }) => {
+            match server::promote(url, replicas, write_acks, *force, token.as_deref()).await {
+                Ok(j) => println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
+                Err(e) => fail(&e),
+            }
+            return;
+        }
+        Some(Command::Import { db, schema, format, models, directory, files }) => {
+            let format = format.as_deref().map(|f| strata::ingest::Format::parse(f).unwrap_or_else(|| fail(&format!("unknown --format {f}: jsonl, json, csv or tsv"))));
+            let models = models.clone().unwrap_or_else(strata::embed::models_dir);
+            if let Err(e) = server::import_files(db, schema.as_deref(), &models, format, *directory, files) {
+                fail(&e);
+            }
+            return;
+        }
+        None => {}
     }
     let demo_shard = a.demo_shard.as_deref().map(|s| {
         let (i, n) = s.split_once('/').unwrap_or_else(|| fail("--demo-shard is I/N"));
         (i.parse().unwrap_or_else(|_| fail("--demo-shard is I/N")), n.parse().unwrap_or_else(|_| fail("--demo-shard is I/N")))
     });
+    let read = |p: &PathBuf| std::fs::read(p).unwrap_or_else(|e| fail(&format!("read {}: {e}", p.display())));
+    let tls = match (&a.tls_cert, &a.tls_key) {
+        (Some(c), Some(k)) => Some(Tls { cert: read(c), key: read(k) }),
+        _ => None,
+    };
+    if let Some(t) = &tls {
+        auth::server_config(t).unwrap_or_else(|e| fail(&e));
+    }
+    let token = a.token.clone().filter(|t| !t.is_empty()).map(Secret::new);
+    let write_acks = strata_server::replication::Acks::parse(&a.write_acks).unwrap_or_else(|| fail(&format!("--write-acks is all, majority or primary, not {:?}", a.write_acks)));
+    if a.replica && a.grpc == "off" {
+        fail("a replica takes its primary's writes over gRPC: --replica needs --grpc");
+    }
     let o = Options {
         db: a.db,
         schema: a.schema,
@@ -121,47 +347,90 @@ async fn main() {
         demo: a.demo,
         demo_shard,
         directory: a.directory,
+        wal_drop_damaged: a.wal_drop_damaged,
+        verify_checksums: a.verify_checksums,
+        seq_no: a.seq_no,
+        replicas: a.replicas,
+        replica: a.replica,
+        promote: a.promote,
+        write_acks,
+        ship_log_mb: a.ship_log_mb,
+        verify_every_s: a.verify_every_s,
         shards: a.shards,
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),
             shard_timeout: (a.shard_timeout_ms > 0).then(|| std::time::Duration::from_millis(a.shard_timeout_ms)),
             partial: a.partial,
+            token: a.shard_token.clone().filter(|t| !t.is_empty()).map(Secret::new).or_else(|| token.clone()),
+            ca: a.shard_ca.as_ref().map(read),
+            slots: a.slot_map.as_ref().map(|p| {
+                let j: serde_json::Value = serde_json::from_slice(&read(p)).unwrap_or_else(|e| fail(&format!("{}: {e}", p.display())));
+                strata_server::slots::SlotMap::from_json(&j).unwrap_or_else(|e| fail(&format!("{}: {e}", p.display())))
+            }),
             ..Default::default()
         },
         timeout_ms: a.timeout_ms,
+        max_timeout_ms: a.max_timeout_ms,
         max_concurrent: a.max_concurrent,
+        max_result_window: a.max_result_window,
+        max_groups: a.max_groups,
+        query_memory_mb: a.query_memory_mb,
+        max_queued_writes: a.max_queued_writes,
+        max_body_mb: a.max_body_mb,
         model: a.model,
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()),
         api_base: a.api_base,
         models: a.models.unwrap_or_else(strata::embed::models_dir),
         synonyms: a.synonyms,
+        backup_dir: a.backup_dir,
+        slow_ms: a.slow_ms,
+        merger: {
+            let d = strata::storage::MergerOptions::default();
+            strata::storage::MergerOptions {
+                threads: a.merge_threads.unwrap_or(d.threads),
+                memory_budget: a.merge_memory_mb.map(|m| m << 20),
+                write_bytes_per_sec: a.merge_write_mb_per_sec.map(|m| m << 20),
+                ..d
+            }
+        },
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
-    let http = tokio::net::TcpListener::bind(&a.listen).await.unwrap_or_else(|e| fail(&format!("listen on {}: {e}", a.listen)));
-    let h = svc.health().await;
-    eprintln!("strata-server: table {} ({} rows, {} segments)", svc.schema.table, h["docs"], h["segments"]);
-    let ui = match &a.token {
-        Some(t) => format!("http://{}/?token={t}", a.listen),
-        None => format!("http://{}/", a.listen),
+    let bind = |addr: &str| {
+        let addr = addr.to_string();
+        let open = token.is_none() && !a.no_token;
+        async move {
+            let l = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}")));
+            let ip = l.local_addr().unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}"))).ip();
+            if open && !ip.is_loopback() {
+                fail(&format!("{addr} is reachable beyond this machine: set --token (or $STRATA_TOKEN), or pass --no-token to serve it open"));
+            }
+            (l, ip)
+        }
     };
-    eprintln!("strata-server: HTTP and UI on {ui}");
+    let (http, ip) = bind(&a.listen).await;
+    let access = Access { token: token.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls };
+    let h = svc.health().await;
+    tracing::info!(table = %svc.schema.table, rows = %h["docs"], segments = %h["segments"], version = env!("CARGO_PKG_VERSION"), simd = %strata::simd::describe(), "serving");
+    let scheme = if access.tls.is_some() { "https" } else { "http" };
+    let asks = if access.token.is_some() { " (it asks for the token)" } else { "" };
+    tracing::info!("HTTP and UI on {scheme}://{}/{asks}", a.listen);
     if svc.agent.api_key.is_none() {
-        eprintln!("strata-server: no ANTHROPIC_API_KEY; the agent asks for a key in the UI");
+        tracing::info!("no ANTHROPIC_API_KEY; the agent asks for a key in the UI");
     }
     let mut tasks = Vec::new();
     // A coordinator answers queries but is not itself a shard.
     if a.grpc != "off" && !coordinator {
-        let l = tokio::net::TcpListener::bind(&a.grpc).await.unwrap_or_else(|e| fail(&format!("listen on {}: {e}", a.grpc)));
-        eprintln!("strata-server: gRPC on {}", a.grpc);
-        let svc = svc.clone();
+        let (l, _) = bind(&a.grpc).await;
+        tracing::info!("gRPC on {}{}", a.grpc, if access.tls.is_some() { " (TLS)" } else { "" });
+        let (svc, access) = (svc.clone(), access.clone());
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = server::serve_grpc(svc, l).await {
-                eprintln!("strata-server: gRPC stopped: {e}");
+            if let Err(e) = server::serve_grpc(svc, l, access).await {
+                tracing::error!(error = %e, "gRPC stopped");
             }
         }));
     }
-    if let Err(e) = server::serve_http(svc, http, a.token).await {
+    if let Err(e) = server::serve_http(svc, http, access).await {
         fail(&format!("HTTP server: {e}"));
     }
     for t in tasks {
@@ -170,6 +439,6 @@ async fn main() {
 }
 
 fn fail(msg: &str) -> ! {
-    eprintln!("strata-server: {msg}");
+    tracing::error!("{msg}");
     std::process::exit(1)
 }

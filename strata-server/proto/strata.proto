@@ -1,6 +1,27 @@
 // Strata over gRPC. The HTTP JSON API (`/v1/...`) mirrors these calls.
-// Statistics, fusion parts and plans travel as JSON bytes: they are
-// Strata's own serde types, shared with the HTTP API.
+// Statistics and fusion parts travel as JSON bytes: they are Strata's own
+// serde types, shared with the HTTP API. Plans travel typed (`Plan`).
+//
+// Protocol versions: 1, servers before `Hello`, take a query as SQL, or a
+// leaf of a coordinator's compound query as a JSON plan (`plan_json`); 2
+// takes every query as a typed plan (`plan`); 3 holds a query's snapshot
+// for a fetch that follows (`hold`, `release` and `Release`), so that a
+// coordinator can query then fetch; 4 places keys in slots: a coordinator
+// gives each shard its slot map (`Slots`) and sends the map's epoch with
+// every request (`epoch`), and a shard refuses an older epoch and keys of
+// other shards' slots; 5 reads the writes a read must see (`min_seq_no`),
+// which a replica waits for, so that a coordinator sends such a read to a
+// replica of 5 or newer, or to the primary. A caller asks a server's versions with
+// `Hello` (a server that answers Unimplemented speaks 1) and speaks the
+// newest both know; a coordinator speaks the oldest of those among its
+// shards' replicas.
+//
+// Replication takes no protocol version: a primary ships its writes to its
+// replicas with `Replicate`, sends a copy of itself to one its log no
+// longer reaches or whose rows differ with `Restore`, and compares a
+// replica's rows with its own with `Verify`, which a server from before
+// them answers Unimplemented; `Hello` names a server's role, which an
+// older one leaves out (STANDALONE).
 syntax = "proto3";
 
 package strata.v1;
@@ -9,13 +30,157 @@ service Strata {
   // Runs a SELECT. With `shard`, returns results a coordinator can merge.
   rpc Query(QueryRequest) returns (QueryResponse);
   // The BM25 statistics a SELECT scores with, and a snapshot lease for the
-  // query round that follows.
+  // query round that follows, which lasts for `timeout_ms` (or the server's
+  // default deadline) and a second.
   rpc TermStats(QueryRequest) returns (TermStatsResponse);
   // Runs an INSERT, UPDATE or DELETE, or a batch of write operations.
   rpc Write(WriteRequest) returns (WriteResponse);
   // The table's schema as JSON.
   rpc Schema(Empty) returns (SchemaResponse);
   rpc Health(Empty) returns (HealthResponse);
+  // The protocol versions the server speaks, and the plans it reads.
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  // Protocol 3: ends snapshot leases before they expire.
+  rpc Release(ReleaseRequest) returns (Empty);
+  // Protocol 4: gives a shard the coordinator's slot map and its place in
+  // it, which it keeps. Refused for a map older than the shard's, another
+  // map of the same epoch, or while rows here have keys in other shards'
+  // slots under the map.
+  rpc Slots(SlotsRequest) returns (SlotsResponse);
+  // Replication: a primary (--replicas) ships its numbered transactions to
+  // a replica (--replica), which applies them in order under the
+  // primary's term and numbers.
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+  // Replication: a primary sends a replica that its log no longer reaches
+  // a copy of its database (a checkpoint, in chunks). The replica puts the
+  // copy's rows, numbers and terms in place of its own in one commit, and
+  // answers its last transaction, which is the copy's.
+  rpc Restore(stream RestoreChunk) returns (ReplicateResponse);
+  // Replication: a replica's digests of its rows at the version a call
+  // from its primary pinned (ReplicateRequest.pin), which the primary
+  // compares with its own at the same transaction. Answered once a
+  // version.
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
+}
+
+message RestoreChunk {
+  // In the first chunk: the primary's term and id, which the replica
+  // checks as it checks a ReplicateRequest's, and the copy's length.
+  uint64 term = 1;
+  string primary = 2;
+  uint64 size = 3;
+  // The copy's next bytes: a checkpoint of the primary in one file.
+  bytes data = 4;
+}
+
+message ReplicateRequest {
+  // The primary's term. A replica whose term is newer applies nothing and
+  // says so (ReplicateResponse.replica_term): another primary replaced
+  // this one.
+  uint64 term = 1;
+  // The term and number of the transaction before the first of `txns`
+  // (0 and 0 before the first numbered one). The replica applies them
+  // only if that is its last transaction.
+  uint64 prev_term = 2;
+  uint64 prev_seq = 3;
+  // Transactions as the primary logged them, in order: each its WAL
+  // records, its commit record last. None: a heartbeat, which asks the
+  // replica's last transaction.
+  repeated bytes txns = 4;
+  // The highest number every in-sync replica holds.
+  uint64 global_checkpoint = 5;
+  // The primary's id. A replica follows one primary per term, and refuses
+  // another of the same term.
+  string primary = 6;
+  // Whether the primary had committed more than `txns` hold when it sent
+  // them: the replica is catching up, and refuses reads until a call
+  // reaches the primary's last.
+  bool behind = 7;
+  // Keep the version this call leaves, at the last of `txns` (or the
+  // replica's last, for none), for the Verify that follows.
+  bool pin = 8;
+}
+
+message VerifyRequest {
+  // The primary's term and id: a replica answers the primary it follows.
+  uint64 term = 1;
+  string primary = 2;
+  // The transaction the version was pinned at.
+  uint64 seq_no = 3;
+}
+
+message VerifyResponse {
+  // For each of the 4,096 slots of the keys: the rows in it, and the
+  // wrapping sum of a 64-bit hash (xxh3) of each row's table, primary key
+  // and sequence number. A table without a primary key places a row by
+  // that hash.
+  repeated uint64 rows = 1;
+  repeated fixed64 sums = 2;
+}
+
+message ReplicateResponse {
+  // Whether the transaction before the first was the replica's last, so
+  // that it applied them all.
+  bool matched = 1;
+  // The replica's last transaction after the call, and its term.
+  uint64 seq = 2;
+  uint64 term = 3;
+  // The term the replica is at.
+  uint64 replica_term = 4;
+}
+
+message SlotsRequest {
+  // The map as JSON: {"epoch": 1, "shards": [[[0, 2048]], [[2048, 4096]]]},
+  // each shard's slots as [start, end) ranges of the 4,096.
+  bytes map_json = 1;
+  // This server's shard in the map.
+  uint32 shard = 2;
+}
+
+message SlotsResponse {
+  // The epoch the shard holds.
+  uint64 epoch = 1;
+}
+
+message ReleaseRequest {
+  repeated uint64 snapshots = 1;
+}
+
+message HelloRequest {
+  // The protocol versions the caller speaks.
+  uint32 min_protocol = 1;
+  uint32 max_protocol = 2;
+}
+
+message HelloResponse {
+  uint32 min_protocol = 1;
+  uint32 max_protocol = 2;
+  // The plan version it reads (strata::query::ir::VERSION) and the plan
+  // features it has.
+  uint32 plan_version = 3;
+  repeated string plan_features = 4;
+  // Its name and version, for messages: "strata-server 0.1.0".
+  string server = 5;
+  // The epoch of the slot map it holds; 0 without one.
+  uint64 slot_epoch = 6;
+  // Its part in replication: a coordinator sends a shard's writes to its
+  // primary alone, and to every replica while none has a role.
+  Role role = 7;
+  // Its term and last sequence number, when it numbers its writes.
+  uint64 term = 8;
+  uint64 seq_no = 9;
+  // On a primary that a primary of a newer term replaced: that term. It
+  // takes no writes and serves no reads.
+  uint64 replaced_by_term = 10;
+}
+
+enum Role {
+  // Not replicated: its writes are its own.
+  STANDALONE = 0;
+  // Ships its writes to its replicas (--replicas).
+  PRIMARY = 1;
+  // Applies its primary's writes and takes none from clients (--replica).
+  REPLICA = 2;
 }
 
 message Empty {}
@@ -28,6 +193,10 @@ message Value {
     string str = 4;
     Floats vector = 5;
     Values list = 6;
+    // A BOOL field's value.
+    bool boolean = 7;
+    // A TIMESTAMP field's value: microseconds since 1970-01-01T00:00:00Z.
+    int64 timestamp = 8;
   }
 }
 
@@ -45,6 +214,424 @@ message QueryRequest {
   bytes stats_json = 5;
   // A snapshot lease from TermStats or /v1/snapshot; 0 for the latest.
   uint64 snapshot = 6;
+  // Protocol 1: a plan (strata::query::ir, as JSON) to run instead of sql,
+  // a leaf of a coordinator's compound query.
+  bytes plan_json = 7;
+  // The protocol version of the request; 0 is 1.
+  uint32 protocol = 8;
+  // Protocol 2: the query as a typed plan (a SELECT, or a leaf of a
+  // coordinator's compound query), with its values in it, instead of sql
+  // and params; sql then only names it in logs.
+  Plan plan = 9;
+  // Protocol 3: keep the snapshot the query read, for a fetch that
+  // follows: a lease, which the answer names (QueryResponse.snapshot) and
+  // which lasts as a TermStats lease does. A request that names a lease
+  // keeps that one.
+  bool hold = 10;
+  // Protocol 3: end the request's lease (snapshot) once answered.
+  bool release = 11;
+  // Protocol 4: the epoch of the coordinator's slot map; 0 for none.
+  uint64 epoch = 12;
+  // Protocol 5: the sequence number of a write the read must see (0:
+  // none), as a server numbering its writes answered it
+  // (WriteResponse.seq_no). A replica waits until it has applied it, a
+  // second at most, and answers Unavailable then: read from the primary.
+  // A primary, or a server without replicas, answers FailedPrecondition
+  // for a number past its last, as for a snapshot lease from before it.
+  uint64 min_seq_no = 13;
+  // To a coordinator: the numbers its write answered, one per shard
+  // (WriteResponse.seq_nos), instead of min_seq_no.
+  repeated uint64 min_seq_nos = 14;
+}
+
+// A plan (strata::query::ir): a statement as a tree of operators over typed
+// values, with no SQL. Fields are named by id, their position in their
+// table's schema. A reader refuses a newer version, or a feature it does
+// not have, by name.
+message Plan {
+  uint32 version = 1;
+  repeated string features = 2;
+  Node root = 3;
+}
+
+message Node {
+  oneof node {
+    // The rows of one table that a filter holds for, ranked: the executor's.
+    Search search = 1;
+    Aggregate aggregate = 2;
+    Filter filter = 3;
+    Sort sort = 4;
+    Limit limit = 5;
+    Project project = 6;
+    Insert insert = 7;
+    Update update = 8;
+    Delete delete = 9;
+    Join join = 10;
+    With with = 11;
+    // The rows of a plan a With names.
+    string ref = 12;
+    // The input's rows, each once.
+    Node distinct = 13;
+    KeyOrder key_order = 14;
+  }
+}
+
+message Search {
+  string table = 1;
+  // Absent: every row.
+  Expr filter = 2;
+  repeated SortKey order = 3;
+}
+
+message Aggregate {
+  Node input = 1;
+  repeated Expr keys = 2;
+  repeated Agg aggs = 3;
+}
+
+message Agg {
+  AggFn func = 1;
+  // Absent: COUNT(*).
+  Expr arg = 2;
+}
+
+enum AggFn {
+  AGG_FN_COUNT = 0;
+  AGG_FN_SUM = 1;
+  AGG_FN_AVG = 2;
+  AGG_FN_MIN = 3;
+  AGG_FN_MAX = 4;
+  AGG_FN_COUNT_DISTINCT = 5;
+}
+
+message Filter {
+  Node input = 1;
+  Expr cond = 2;
+}
+
+message Sort {
+  Node input = 1;
+  repeated SortKey keys = 2;
+}
+
+message SortKey {
+  Expr expr = 1;
+  bool desc = 2;
+  bool nulls_first = 3;
+}
+
+message Limit {
+  Node input = 1;
+  uint64 offset = 2;
+  optional uint64 limit = 3;
+}
+
+message Project {
+  Node input = 1;
+  repeated Column columns = 2;
+}
+
+message Column {
+  string name = 1;
+  Expr expr = 2;
+}
+
+message Insert {
+  string table = 1;
+  repeated Exprs rows = 2;
+  // Absent: the statement fails on a live key.
+  OnConflict on_conflict = 3;
+}
+
+message OnConflict {
+  oneof kind {
+    Empty fail = 1;
+    Empty replace = 2;
+    Empty skip = 3;
+    Sets update = 4;
+  }
+}
+
+message Sets { repeated Set v = 1; }
+
+message Set {
+  uint32 field = 1;
+  Expr value = 2;
+}
+
+message Update {
+  string table = 1;
+  Node input = 2;
+  repeated Set sets = 3;
+}
+
+message Delete {
+  string table = 1;
+  Node input = 2;
+}
+
+message Join {
+  Node left = 1;
+  Node right = 2;
+  JoinKind kind = 3;
+  repeated JoinKey keys = 4;
+  Expr on = 5;
+}
+
+enum JoinKind {
+  JOIN_KIND_INNER = 0;
+  JOIN_KIND_LEFT = 1;
+}
+
+message JoinKey {
+  Expr left = 1;
+  Expr right = 2;
+  bool left_links = 3;
+  bool right_links = 4;
+}
+
+message With {
+  repeated Cte ctes = 1;
+  Node input = 2;
+}
+
+message Cte {
+  string name = 1;
+  Node input = 2;
+}
+
+message KeyOrder {
+  Node input = 1;
+  Node by = 2;
+}
+
+message Exprs { repeated Expr v = 1; }
+
+// An expression over a row, with SQL's three-valued logic.
+message Expr {
+  oneof expr {
+    uint32 field = 1;
+    Empty score = 2;
+    Empty hops = 3;
+    uint32 output = 4;
+    uint32 excluded = 5;
+    // A FLOAT, and a vector's components, are finite.
+    Value lit = 6;
+    Expr not = 7;
+    Exprs and = 8;
+    Exprs or = 9;
+    Expr is_null = 10;
+    Cmp cmp = 11;
+    Between between = 12;
+    In in = 13;
+    Arith arith = 14;
+    Expr neg = 15;
+    Exprs concat = 16;
+    Like like = 17;
+    Case case = 18;
+    Call call = 19;
+    Match match = 20;
+    Graph graph = 21;
+    Bm25 bm25 = 22;
+    Similarity similarity = 23;
+    SparseScore sparse = 24;
+    DecayScore decay = 25;
+    Rrf rrf = 26;
+    Weighted weighted = 27;
+    Exprs product = 28;
+    Graph ppr = 29;
+    Node subquery = 30;
+    Node values = 31;
+    Node keys = 32;
+    Node exists = 33;
+    Node scalar = 34;
+    // A row's sequence number (seq_no()); plan feature "seq_no".
+    Empty seq_no = 35;
+  }
+}
+
+message Cmp {
+  CmpOp op = 1;
+  Expr left = 2;
+  Expr right = 3;
+}
+
+enum CmpOp {
+  CMP_OP_EQ = 0;
+  CMP_OP_NE = 1;
+  CMP_OP_LT = 2;
+  CMP_OP_LE = 3;
+  CMP_OP_GT = 4;
+  CMP_OP_GE = 5;
+}
+
+message Between {
+  Expr expr = 1;
+  // Absent: open.
+  Expr lo = 2;
+  Expr hi = 3;
+}
+
+message In {
+  Expr expr = 1;
+  repeated Expr list = 2;
+}
+
+message Arith {
+  ArithOp op = 1;
+  Expr left = 2;
+  Expr right = 3;
+}
+
+enum ArithOp {
+  ARITH_OP_ADD = 0;
+  ARITH_OP_SUB = 1;
+  ARITH_OP_MUL = 2;
+  ARITH_OP_DIV = 3;
+  ARITH_OP_MOD = 4;
+}
+
+message Like {
+  Expr expr = 1;
+  Expr pattern = 2;
+  bool case_insensitive = 3;
+}
+
+message Case {
+  Expr operand = 1;
+  repeated When whens = 2;
+  Expr otherwise = 3;
+}
+
+message When {
+  Expr when = 1;
+  Expr then = 2;
+}
+
+message Call {
+  Func func = 1;
+  repeated Expr args = 2;
+}
+
+enum Func {
+  FUNC_LOWER = 0;
+  FUNC_UPPER = 1;
+  FUNC_LENGTH = 2;
+  FUNC_ABS = 3;
+  FUNC_ROUND = 4;
+  FUNC_COALESCE = 5;
+}
+
+message Match {
+  uint32 field = 1;
+  string query = 2;
+  Expand expand = 3;
+}
+
+// How a full-text search widens its words.
+message Expand {
+  bool synonyms = 1;
+  oneof fuzzy {
+    // By the word's length.
+    Empty auto = 2;
+    uint32 edits = 3;
+  }
+}
+
+message Bm25 {
+  uint32 field = 1;
+  string text = 2;
+  map<string, Value> opts = 3;
+}
+
+message Similarity {
+  uint32 field = 1;
+  Floats vector = 2;
+  map<string, Value> opts = 3;
+}
+
+message SparseScore {
+  uint32 field = 1;
+  repeated SparseTerm terms = 2;
+  map<string, Value> opts = 3;
+}
+
+message SparseTerm {
+  string term = 1;
+  float weight = 2;
+}
+
+message DecayScore {
+  uint32 field = 1;
+  Decay decay = 2;
+  map<string, Value> opts = 3;
+}
+
+message Decay {
+  double origin = 1;
+  double scale = 2;
+  double offset = 3;
+  double decay = 4;
+  DecayShape shape = 5;
+}
+
+enum DecayShape {
+  DECAY_SHAPE_EXP = 0;
+  DECAY_SHAPE_GAUSS = 1;
+  DECAY_SHAPE_LINEAR = 2;
+}
+
+message Rrf {
+  repeated Expr inputs = 1;
+  double k = 2;
+  uint64 depth = 3;
+}
+
+message Weighted { repeated WeightedTerm terms = 1; }
+
+message WeightedTerm {
+  double weight = 1;
+  Expr expr = 2;
+}
+
+// A traversal: REACHABLE, PATH or personalized PageRank.
+message Graph {
+  uint32 field = 1;
+  Expr seeds = 2;
+  oneof kind {
+    Reachable reachable = 3;
+    Path path = 4;
+    Ppr ppr = 5;
+  }
+  Direction dir = 6;
+  repeated string labels = 7;
+  Expr through = 8;
+  uint64 max_nodes = 9;
+  uint64 k = 10;
+  optional double min_sim = 11;
+}
+
+message Reachable {
+  uint32 min_hops = 1;
+  uint32 max_hops = 2;
+}
+
+message Path {
+  Expr to = 1;
+  uint32 max_hops = 2;
+}
+
+message Ppr {
+  double alpha = 1;
+  double eps = 2;
+  uint64 max_pushes = 3;
+  bool weighted = 4;
+}
+
+enum Direction {
+  DIRECTION_OUT = 0;
+  DIRECTION_IN = 1;
+  DIRECTION_BOTH = 2;
 }
 
 message QueryResponse {
@@ -57,6 +644,8 @@ message QueryResponse {
   // ExecStats (JSON): plan lines and counters.
   bytes stats_json = 6;
   double took_ms = 7;
+  // With hold: the lease on the snapshot the query read.
+  uint64 snapshot = 8;
 }
 
 message TermStatsResponse {
@@ -72,10 +661,27 @@ message WriteRequest {
   //  {"op": "upsert_if_newer", "doc": {...}, "version": "field"},
   //  {"op": "delete", "key": ...},
   //  {"op": "set" | "add", "key": ..., "field": "...", "value": ...}].
+  // Any but insert may carry "if_seq_no": n, and then applies only while
+  // the row's sequence number is n (FailedPrecondition otherwise).
   bytes ops_json = 3;
+  // With ops_json: a retry of a request with the same key (and the same
+  // operations) returns the first answer instead of writing again.
+  string idempotency_key = 4;
+  // Protocol 4: the epoch of the coordinator's slot map; 0 for none.
+  uint64 epoch = 5;
 }
 
-message WriteResponse { uint64 written = 1; }
+message WriteResponse {
+  uint64 written = 1;
+  // The transaction's sequence number, from a server that numbers its
+  // writes (--seq-no) when the request wrote.
+  optional uint64 seq_no = 2;
+  // From a coordinator: each shard's number instead, 0 for a shard not
+  // written or whose replicas each number their own writes; empty when no
+  // shard numbers its writes. A read that passes them as min_seq_nos sees
+  // the write.
+  repeated uint64 seq_nos = 3;
+}
 
 message SchemaResponse { string schema_json = 1; }
 

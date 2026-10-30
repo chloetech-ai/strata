@@ -544,11 +544,15 @@ impl<'a> LoomListCursor<'a> {
 }
 
 /// The Loom view of the list at `start..end` of the section, and the
-/// offset (relative to `start`) of what follows it.
-pub fn open_loom(section: &OwnedBytes, start: usize, end: usize) -> (Loom, usize) {
+/// offset (relative to `start`) of what follows it. Checks the list's
+/// descriptors, not its payload ([`Loom::read_from`]).
+pub fn open_loom(section: &OwnedBytes, start: usize, end: usize) -> Result<(Loom, usize), String> {
+    if start > end || end > section.len() {
+        return Err(format!("list at {start}..{end} lies outside the {}-byte postings section", section.len()));
+    }
     let mut r = ByteReader::new(section.slice(start..end));
-    let list = Loom::read_from(&mut r).expect("Loom list written by the builder");
-    (list, r.position())
+    let list = Loom::read_from(&mut r)?;
+    Ok((list, r.position()))
 }
 
 /// Sizes of a list's parts, read back from its bytes.
@@ -556,7 +560,7 @@ pub fn list_sizes(section: &OwnedBytes, start: usize, end: usize, n: u32, loom: 
     let data = &section[start..];
     let nb = (n as usize).div_ceil(BLOCK);
     if loom {
-        let (_, mut pos) = open_loom(section, start, end);
+        let (_, mut pos) = open_loom(section, start, end).unwrap_or_else(|e| panic!("corrupt segment: {e}"));
         let docs = pos;
         skip_frontier(data, &mut pos);
         let fstart = pos + nb * ENTRY;

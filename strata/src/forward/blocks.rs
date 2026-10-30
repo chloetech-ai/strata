@@ -472,22 +472,10 @@ unsafe fn extract_wide(p: &[u64], j: usize, w: usize) -> u64 {
 /// `lo <= d[j] <= lo + span`: one unsigned compare per lane.
 #[inline]
 pub fn range_mask128(d: &[u32; BLOCK], lo: u32, span: u32) -> [u64; 2] {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    {
-        use std::arch::x86_64::*;
-        // SAFETY: AVX-512F is enabled for this build; 8 loads of 16 lanes
-        // stay inside `d`.
-        unsafe {
-            let vlo = _mm512_set1_epi32(lo as i32);
-            let vspan = _mm512_set1_epi32(span as i32);
-            let mut m = [0u64; 2];
-            for q in 0..8 {
-                let v = _mm512_loadu_si512(d.as_ptr().add(16 * q) as *const _);
-                let k = _mm512_cmple_epu32_mask(_mm512_sub_epi32(v, vlo), vspan) as u64;
-                m[q / 4] |= k << (16 * (q % 4));
-            }
-            m
-        }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx512() {
+        // SAFETY: the CPU has AVX-512.
+        return unsafe { range_mask128_avx512(d, lo, span) };
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -514,12 +502,29 @@ pub fn range_mask128(d: &[u32; BLOCK], lo: u32, span: u32) -> [u64; 2] {
             m
         }
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     range_mask128_scalar(d, lo, span)
 }
 
+/// [`range_mask128`] with AVX-512: 16 lanes per compare.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn range_mask128_avx512(d: &[u32; BLOCK], lo: u32, span: u32) -> [u64; 2] {
+    use std::arch::x86_64::*;
+    let vlo = _mm512_set1_epi32(lo as i32);
+    let vspan = _mm512_set1_epi32(span as i32);
+    let mut m = [0u64; 2];
+    for q in 0..8 {
+        // 8 loads of 16 lanes stay inside `d`.
+        let v = _mm512_loadu_si512(d.as_ptr().add(16 * q) as *const _);
+        let k = _mm512_cmple_epu32_mask(_mm512_sub_epi32(v, vlo), vspan) as u64;
+        m[q / 4] |= k << (16 * (q % 4));
+    }
+    m
+}
+
 /// Portable [`range_mask128`] (the fallback, and the tests' reference).
-#[cfg_attr(all(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64"), not(test)), allow(dead_code))]
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 #[inline]
 pub fn range_mask128_scalar(d: &[u32; BLOCK], lo: u32, span: u32) -> [u64; 2] {
     let mut m = [0u64; 2];
@@ -580,6 +585,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "compares the SIMD kernel with the scalar one, which is what Miri runs")]
     fn mask_kernel_matches_scalar() {
         let mut rng = StdRng::seed_from_u64(2);
         for _ in 0..2000 {
@@ -595,6 +601,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "compares the SIMD kernel with the scalar one, which is what Miri runs")]
     fn mask_kernel_matches_scalar_on_edges() {
         let mut rng = StdRng::seed_from_u64(3);
         // Every lane on its own: each maps to its bit.

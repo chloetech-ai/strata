@@ -66,9 +66,12 @@ cargo run --release --bin strata-posting-bench -- run --distribution uniform --c
 cargo run --release --bin strata-posting-bench -- kernels --ratios 1,4,16,64,256,1024
 ```
 
-Strata's `.cargo/config.toml` builds with `-C target-cpu=native`; SIMD paths
-(AVX-512, AVX2 and SSE on x86-64, NEON on aarch64) are selected at compile
-time and every one has a portable fallback.
+Strata's `.cargo/config.toml` builds with `-C target-cpu=native`. The SIMD
+paths of the codecs Strata's text index uses (Loom, BP128) and the
+intersection kernels are chosen at run time (`strata::simd`), so other
+builds use them too; the other codecs of the study (Pyramid, Roaring,
+Entropic, the tries) select theirs at compile time. Every path has a
+portable fallback.
 
 ### Data
 

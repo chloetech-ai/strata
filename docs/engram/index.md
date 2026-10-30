@@ -1,6 +1,6 @@
 ---
 title: Engram
-nav_order: 2
+nav_order: 3
 has_children: true
 permalink: /engram/
 ---
@@ -8,7 +8,7 @@ permalink: /engram/
 # Engram: how it works
 {: .no_toc }
 
-Engram gives a coding agent (Claude Code first) a memory that outlives its context window. It records every prompt, answer, tool call and compaction summary of a project into one Strata file, brings the relevant pieces back at the moments they matter without the model having to ask, and gives the model tools to search its own history when it decides to.
+Engram, an application built on [Strata](../strata/index.md), gives a coding agent (Claude Code first) a memory that outlives its context window. It records every prompt, answer, tool call and compaction summary of a project into one Strata file, brings the relevant pieces back at the moments they matter without the model having to ask, and gives the model tools to search its own history when it decides to.
 {: .fs-5 .fw-300 }
 
 1. TOC
@@ -38,7 +38,7 @@ Strata holds an exclusive lock on its file, and hooks are short-lived processes 
 
 - **Lazy start.** The first client to find no socket spawns the daemon under a spawn lock; the daemon exits after 30 idle minutes. Its first hook takes 50–72 ms, because the 129 MB embedding table is memory-mapped rather than read.
 - **Warm state.** The embedder, segment readers and the memtable stay in memory between hooks.
-- **Reads in parallel, one writer.** Reads run on each client's own thread against a snapshot, any number at once, and the searches behind one prompt share that snapshot and run side by side while cores are free. Every write goes to one writer thread, which commits whatever is queued in one transaction and builds the new version before the write returns, so a reader never waits for a write or for the index build after it. In-memory chunks hold 256 records and scan their vectors instead of building an HNSW graph, so that build stays cheap.
+- **Reads in parallel, one writer.** Reads run on each client's own thread against a snapshot, any number at once, and the searches behind one prompt share that snapshot and run side by side while cores are free. Every write goes to one writer thread, which commits whatever is queued in one transaction and builds the new version before the write returns, so a reader never waits for a write or for the index build after it. In-memory chunks hold 256 records and scan their vectors instead of building an HNSW graph, so that build stays cheap. A full memtable becomes a segment, and segments merge, on Strata's background threads, not on the writer's: with 150,000 appends back to back in the cloud container (4-core Xeon), the longest took 0.2–0.4 s, against 12–15 s when the writer flushed and merged itself ([results](https://github.com/rkonow/strata/tree/main/engram/results/writes)).
 - **Never in the way.** A client that cannot reach the daemon within its deadline prints nothing and exits 0. A memory failure never blocks a prompt or a tool call.
 
 The store lives outside the repository, in `${ENGRAM_HOME:-~/.local/share/engram}/<project-slug>/`, because transcripts can contain secrets. A redaction pass removes common key and token formats before anything is stored.
@@ -276,7 +276,7 @@ The default embedder is static (Model2Vec potion-retrieval-32M: token lookup and
 [Install on your machine](setup.md) has the whole procedure, remote machines and dev containers included. In short:
 
 ```sh
-git clone https://github.com/rkonow/engram && cd engram && ./install.sh   # every Claude Code session
+git clone https://github.com/rkonow/strata && cd strata && ./install.sh   # every Claude Code session
 ./install.sh --project /path/to/your/project                              # or one project
 engram doctor                                                             # check the setup
 engram ui                                                                 # browse what it stored
@@ -291,6 +291,7 @@ engram remember decision "Prices are integer cents"
 engram ingest-transcript ~/.claude/projects/<project>/<session>.jsonl   # back-fill old sessions
 engram distill                                                          # distill turns stored before distillation existed
 engram consolidate                                                      # merge overlapping notes now
+engram backup ~/backups/engram-2026-10-28                               # a consistent copy of this project's store
 engram stats | briefing | stop
 ```
 
@@ -306,4 +307,4 @@ engram stats | briefing | stop
 | `ENGRAM_CONSOLIDATE=0` | turns consolidation off |
 | `ENGRAM_EMBEDDER` | `static` (default), `bert`, or `hash:<dim>` for a model-free hash embedder |
 
-The full design, including the evaluation plan, is in [`engram/DESIGN.md`](https://github.com/rkonow/engram/blob/main/engram/DESIGN.md).
+The full design, including the evaluation plan, is in [`engram/DESIGN.md`](https://github.com/rkonow/strata/blob/main/engram/DESIGN.md).

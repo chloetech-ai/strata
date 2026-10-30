@@ -58,13 +58,15 @@ fn check(texts: &[String], nq: usize, seed: u64) {
         .map(|&p| DocSet::from_sorted((0..n).filter(|_| rng.gen_bool(p)).collect(), n))
         .collect();
     let total: u64 = naive.lens.iter().map(|&l| l as u64).sum();
+    // BM25's N: the documents with at least one term.
+    let with_terms = naive.lens.iter().filter(|&&l| l > 0).count() as u64;
     for (format, min_df) in configs() {
         let seg = build(texts, format, min_df, false);
         let r = TextFieldReader::open(&seg, "body").unwrap();
         for (qi, q) in qs.iter().enumerate() {
             let params = if qi % 5 == 4 { Bm25Params { k1: 1.2, b: 0.75 } } else { Bm25Params::default() };
             let stats = r.stats(q);
-            let all = naive.bm25(q, n as u64, total, params.k1, params.b);
+            let all = naive.bm25(q, with_terms, total, params.k1, params.b);
             let k = [1, 10, 100][qi % 3];
             for algo in ALGOS {
                 let what = format!("{format:?}/{min_df} {algo:?} k={k} {q:?}");

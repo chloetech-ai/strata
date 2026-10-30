@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::value::Value;
 
 /// A row predicate over schema fields (indices into `Schema::fields`).
@@ -14,32 +16,50 @@ pub enum Pred {
     /// `MATCH(field, 'boolean query')` on a TEXT field (grammar: text
     /// module), with its words expanded by synonyms or typos as asked.
     Match { field: usize, query: String, expand: Expand },
-    /// Numeric range with inclusive bounds (`±inf` for open ends). Strict
+    /// FLOAT range with inclusive bounds (`±inf` for open ends). Strict
     /// comparisons are normalised to inclusive ones at bind time.
     Range { field: usize, lo: f64, hi: f64 },
+    /// INT range with inclusive bounds, exact (`i64::MIN` and `i64::MAX`
+    /// for open ends): a double cannot tell 2^53 from 2^53 + 1.
+    IntRange { field: usize, lo: i64, hi: i64 },
     /// Keyword (or numeric) equality with any of `values`.
     In { field: usize, values: Vec<Value> },
+    /// Rows with a value of the field (`IS NOT NULL`; a multi-valued field
+    /// needs at least one).
+    Present { field: usize },
     And(Vec<Pred>),
     Or(Vec<Pred>),
+    /// The rows the inner predicate does not hold: a plain complement.
+    /// The binder hands the executor predicates in which NULL is already
+    /// accounted for ([`Pred::three_valued`]).
     Not(Box<Pred>),
     /// Membership in the result of `Select::graphs[id]` (`REACHABLE`,
     /// `PATH`), computed before the rest of the query.
     Graph { id: usize },
+    /// A condition on a subquery's rows (`IN (SELECT ...)`, `EXISTS`, a
+    /// comparison with a scalar subquery), as the plan expression the
+    /// subquery's plan sits in. A compound query's binder makes it
+    /// ([`crate::query::compound`]); its plan runs the subquery first and
+    /// hands the executor the condition on its values, never this.
+    Sub(Box<crate::query::ir::Expr>),
 }
 
 /// How a full-text search widens its words (`MATCH(.., synonyms => 1,
 /// fuzzy => 'auto')`, the same options on `bm25`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Expand {
     /// Each word also matches its synonyms from the synonym list
     /// ([`crate::text::synonyms`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub synonyms: bool,
     /// Each word also matches indexed terms within this many edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuzzy: Option<Fuzzy>,
 }
 
 /// Edits a typo-tolerant word may be away from an indexed term.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Fuzzy {
     /// By the word's length: none up to 2 letters, 1 up to 5, else 2.
     Auto,
@@ -83,7 +103,8 @@ impl Expand {
 }
 
 /// Which way edges are followed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Direction {
     /// From a row to the targets of its edges.
     Out,
@@ -100,6 +121,10 @@ pub enum Seeds {
     /// The rows of a subquery over the same table (with their scores, which
     /// `ppr(..., weighted => 1)` uses as restart weights).
     Query(Box<Select>),
+    /// The keys or values of a compound subquery's plan
+    /// ([`crate::query::ir::Expr::Keys`], [`crate::query::ir::Expr::Values`]),
+    /// which runs first: like [`Pred::Sub`], never the executor's.
+    Plan(Box<crate::query::ir::Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +158,41 @@ pub struct GraphQuery {
 }
 
 impl Pred {
+    /// The rows for which `self`, read with SQL's three-valued logic, is
+    /// TRUE, as a predicate of plain sets. A comparison with NULL is
+    /// UNKNOWN, and so is its negation, so `rating != 2` and `NOT rating >
+    /// 2` leave out rows without a rating. NOTs are pushed down to the
+    /// leaves (De Morgan's laws hold for three values too), and a negated
+    /// comparison also asks for its field's value. MATCH, graph membership
+    /// and `IS NULL` are never UNKNOWN, and neither is a comparison on a
+    /// multi-valued field (`multi`), which holds when some value matches:
+    /// its negation holds when none does, also for an empty list, as
+    /// `NOT (x = ANY(list))` does. Apply it once, to a predicate as written.
+    pub fn three_valued(self, multi: &dyn Fn(usize) -> bool) -> Pred {
+        self.nnf(false, multi)
+    }
+
+    fn nnf(self, negated: bool, multi: &dyn Fn(usize) -> bool) -> Pred {
+        match self {
+            Pred::Not(p) => p.nnf(!negated, multi),
+            Pred::And(ps) => {
+                let ps = ps.into_iter().map(|p| p.nnf(negated, multi)).collect();
+                if negated { Pred::Or(ps) } else { Pred::And(ps) }
+            }
+            Pred::Or(ps) => {
+                let ps = ps.into_iter().map(|p| p.nnf(negated, multi)).collect();
+                if negated { Pred::And(ps) } else { Pred::Or(ps) }
+            }
+            p if !negated => p,
+            Pred::True => Pred::False,
+            Pred::False => Pred::True,
+            p @ (Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. }) if !multi(field) => {
+                Pred::And(vec![Pred::Present { field }, Pred::Not(Box::new(p))])
+            }
+            p => Pred::Not(Box::new(p)),
+        }
+    }
+
     /// Flattens nested AND/OR and folds constants.
     pub fn simplify(self) -> Pred {
         match self {
@@ -240,7 +300,8 @@ impl Score {
 }
 
 /// How a decay function falls off.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecayShape {
     /// `exp(λ·d)`: halves (by default) every `scale`.
     Exp,
@@ -253,7 +314,7 @@ pub enum DecayShape {
 /// `decay(field, origin, scale, offset => 0, decay => 0.5, shape => 'exp')`,
 /// as Elasticsearch's decay functions: the distance `d = max(0, |x −
 /// origin| − offset)` maps to 1 at `d = 0` and to `decay` at `d = scale`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Decay {
     pub origin: f64,
     pub scale: f64,
@@ -281,8 +342,10 @@ impl Decay {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OrderBy {
-    /// Rank by a score, best first (`desc = true`) or worst first.
-    Score { score: Score, desc: bool },
+    /// Rank by a score, best first (`desc = true`) or worst first. Rows
+    /// without a value of a column come last unless `nulls_first`
+    /// (`NULLS FIRST`).
+    Score { score: Score, desc: bool, nulls_first: bool },
     /// Facet queries: order groups by their count.
     Count { desc: bool },
     /// Facet queries: order groups by their value (the first group field's).
@@ -292,7 +355,8 @@ pub enum OrderBy {
 }
 
 /// An aggregate function.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AggFn {
     /// `COUNT(f)`: rows with a value.
     Count,
@@ -323,6 +387,10 @@ pub enum Projection {
     Count,
     /// `hops()`: the row's hop distance in `Select::graphs[id]`.
     Hops(usize),
+    /// `seq_no()`: the sequence number of the write that last changed the
+    /// row, in a database that numbers its writes
+    /// ([`crate::storage::Database::seq_of`]).
+    SeqNo,
     /// `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`, `COUNT(f)`, `COUNT(DISTINCT
     /// f)`: of the whole result, or per group.
     Agg { func: AggFn, field: usize },
@@ -346,6 +414,30 @@ pub struct Select {
     /// Graph computations that `Pred::Graph`, `Score::Ppr`, `Score::Hops`
     /// and `Projection::Hops` refer to by index.
     pub graphs: Vec<GraphQuery>,
+    /// Per output column, the type of a BOOL or TIMESTAMP field whose
+    /// values it holds (the field, or its MIN or MAX), which the answer
+    /// gives as such rather than as the stored integers
+    /// ([`Select::typed`]).
+    pub types: Vec<Option<crate::schema::Logical>>,
+}
+
+impl Select {
+    /// `rows` with the values of BOOL and TIMESTAMP columns as
+    /// [`Value::Bool`](crate::value::Value::Bool) and
+    /// [`Value::Timestamp`](crate::value::Value::Timestamp)
+    /// ([`Select::types`]). Executors and the shard merge call it last.
+    pub fn typed(&self, rows: &mut [Vec<crate::value::Value>]) {
+        if self.types.iter().all(Option::is_none) {
+            return;
+        }
+        for row in rows {
+            for (v, t) in row.iter_mut().zip(&self.types) {
+                if let Some(t) = t {
+                    *v = t.output(std::mem::replace(v, crate::value::Value::Null));
+                }
+            }
+        }
+    }
 }
 
 /// A secondary ORDER BY key (`ORDER BY rating DESC, id`; `ORDER BY 2 DESC, 1`).
@@ -355,4 +447,26 @@ pub enum Tiebreak {
     Key { desc: bool },
     /// The group value of a facet query.
     GroupValue { desc: bool },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negations_reach_the_leaves() {
+        let r = |f| Pred::IntRange { field: f, lo: 1, hi: 2 };
+        let not = |p| Pred::Not(Box::new(p));
+        let present_not = |f| Pred::And(vec![Pred::Present { field: f }, not(r(f))]);
+        assert_eq!(not(r(0)).three_valued(&|_| false), present_not(0));
+        assert_eq!(not(not(r(0))).three_valued(&|_| false), r(0));
+        assert_eq!(not(Pred::Or(vec![r(0), r(1)])).three_valued(&|_| false), Pred::And(vec![present_not(0), present_not(1)]));
+        assert_eq!(not(Pred::And(vec![r(0), not(r(1))])).three_valued(&|_| false), Pred::Or(vec![present_not(0), r(1)]));
+        // IS NULL and MATCH are two-valued: a plain complement.
+        assert_eq!(not(Pred::Present { field: 3 }).three_valued(&|_| false), not(Pred::Present { field: 3 }));
+        assert_eq!(not(not(Pred::Present { field: 3 })).three_valued(&|_| false), Pred::Present { field: 3 });
+        assert_eq!(not(Pred::True).three_valued(&|_| false), Pred::False);
+        // A multi-valued field: NOT holds when no value matches, for none too.
+        assert_eq!(not(r(0)).three_valued(&|f| f == 0), not(r(0)));
+    }
 }

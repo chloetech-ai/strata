@@ -28,12 +28,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Builds use -C target-cpu=native (.cargo/config.toml), so a cache
-      # must not be restored on a runner with another CPU model.
+      # The strata crate builds with -C target-cpu=native
+      # (strata/.cargo/config.toml), so a cache must not be restored on a
+      # runner with another CPU: the key hashes the model and its
+      # instruction sets (runners with the same model name differ in them,
+      # and a cached proc macro then dies of SIGILL).
       - name: CPU model
         id: cpu
         shell: bash
-        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ matrix.crate }}
@@ -41,11 +44,115 @@ jobs:
       - name: Tests
         working-directory: ${{ matrix.crate }}
         run: cargo test --release
+      # strata-server, engram and the Python package build for a generic
+      # CPU, where Strata chooses its SIMD kernels at run time: test the
+      # kernels in such a build, then with every SIMD path turned off.
+      - name: Kernels on a generic build
+        if: matrix.crate == 'strata' && runner.os == 'Linux'
+        working-directory: strata
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64
+          CARGO_TARGET_DIR: target-generic
+        run: |
+          cargo test --release --lib -- vector:: postings:: forward:: simd
+          STRATA_SIMD=portable cargo test --release --lib -- vector:: postings:: forward::
       # Compiler warnings and clippy's correctness and suspicious lints fail
       # the build; style, complexity and performance lints are advice.
       - name: Clippy
         working-directory: ${{ matrix.crate }}
         run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+
+  # Power losses, full disks and failing syncs at every write of a storage
+  # workload (storage::io, tests/storage_faults.rs). A job of its own: after
+  # the strata tests, it took the macOS job past its hour.
+  faults:
+    name: fault injection on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: CPU model
+        id: cpu
+        shell: bash
+        run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata
+          key: strata-faults-${{ steps.cpu.outputs.model }}
+      - name: Fault injection
+        working-directory: strata
+        run: cargo test --release --features fault-injection --test storage_faults
+
+  # BM25 through SQL on three BEIR collections against the committed
+  # baseline (strata/tests/relevance_gate.rs): a ranking change must come
+  # with its new numbers.
+  relevance-gate:
+    name: relevance gate (BEIR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: CPU model
+        id: cpu
+        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata
+          key: relevance-${{ steps.cpu.outputs.model }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/beir
+          key: beir-${{ hashFiles('strata/tests/fixtures/beir/fetch.sh') }}
+      - name: Collections
+        run: strata/tests/fixtures/beir/fetch.sh "$HOME/beir"
+      - name: Gate
+        working-directory: strata
+        run: STRATA_BEIR_DIR="$HOME/beir" STRATA_RELEVANCE_GATE=required cargo test --release --test relevance_gate -- --nocapture
+
+  # Miri runs the tests of Strata's zero-copy byte views (postings::bytes)
+  # and of the structures read through them, checking every access for
+  # undefined behaviour: misaligned or out-of-bounds reads, dangling
+  # pointers, aliasing. It interprets the code about a thousand times
+  # slower, and on one thread, so it runs the tests sized for it (`miri_*`)
+  # and other small ones, split in three parts of 10 to 16 minutes, on a
+  # portable build (scalar kernels; Miri has no CPUID). The nightly is
+  # pinned to the one the tests were run with.
+  miri:
+    name: miri (${{ matrix.part }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: pyramid
+            tests: "postings::codecs::pyramid::tests::miri_"
+          - part: bytes, loom, bit vectors, query pool
+            tests: "postings::bytes postings::codecs::loom::tests::miri_ postings::bits query::pool"
+          - part: columns, graph, keys, text codec
+            tests: "forward:: graph:: storage::pk::tests::collisions storage::pk::tests::section_written storage::live storage::updates::tests::round_trip text::codec --skip many_int_keys"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-27
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata
+          key: miri
+      - name: Miri
+        working-directory: strata
+        env:
+          RUSTFLAGS: ""
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test --no-default-features --lib -- ${{ matrix.tests }}
 
   server-smoke:
     name: strata-server smoke test
@@ -54,16 +161,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Builds use -C target-cpu=native (.cargo/config.toml), so a cache
-      # must not be restored on a runner with another CPU model.
-      - name: CPU model
-        id: cpu
-        shell: bash
-        run: echo "model=$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: strata-server
-          key: strata-server-${{ steps.cpu.outputs.model }}
+          key: strata-server-smoke
       - name: Build
         working-directory: strata-server
         run: cargo build --release
@@ -84,3 +185,53 @@ jobs:
             | grep -q '"rows"'
           curl -sf http://127.0.0.1:7700/metrics | grep -q strata_queries_total
           curl -sf http://127.0.0.1:7700/ | grep -qi '<html'
+          # Rows into a new database from the command line, then over HTTP.
+          printf '{"table": "t", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "title", "type": "text"}]}' > "$RUNNER_TEMP/t.json"
+          printf '{"id": "a", "title": "first row"}\n{"id": "b", "title": "second row", "extra": 1}\n' > "$RUNNER_TEMP/t.jsonl"
+          ./target/release/strata-server import --db "$RUNNER_TEMP/t.strata" --schema "$RUNNER_TEMP/t.json" "$RUNNER_TEMP/t.jsonl"
+          ./target/release/strata-server --db "$RUNNER_TEMP/t.strata" --listen 127.0.0.1:7702 --grpc off &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:7702/v1/health && break; sleep 1; done
+          printf 'id,title\nc,third row\n' | curl -sf -X POST 'http://127.0.0.1:7702/v1/import?format=csv' -H 'content-type: text/csv' --data-binary @- | grep -q '"written":1'
+          curl -sf http://127.0.0.1:7702/v1/health | grep -q '"docs":3'
+
+  python:
+    name: Python package on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: CPU model
+        id: cpu
+        shell: bash
+        run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            strata-py
+            strata-server
+          key: python-${{ steps.cpu.outputs.model }}
+      # The client tests run against a real server.
+      - name: Build strata-server
+        working-directory: strata-server
+        run: cargo build --release
+      - name: Build and test
+        working-directory: strata-py
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest numpy
+          maturin develop --release
+          pytest tests -v
+      - name: Clippy
+        working-directory: strata-py
+        run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings

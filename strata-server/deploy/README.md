@@ -62,3 +62,27 @@ $T coordinator 2 2 --partial --shard-timeout-ms=300 # answer without a shard tha
 The `--watch` output prints one line a second (answers, errors, p50, p99,
 the first error). Results of a full run on a Mac are in
 [`../results/k8s-mac/README.md`](../results/k8s-mac/README.md).
+
+## Security
+
+These manifests serve a test cluster open: every server runs with
+`--no-token`, which a server listening beyond loopback needs when it has no
+token. Anything that can reach a pod can read and write. On a real cluster,
+put a token in a Secret and give it to every server (the coordinator sends
+it to its shards), drop `--no-token`, and serve TLS:
+
+```bash
+kubectl -n strata create secret generic strata-token --from-literal=token="$(openssl rand -hex 32)"
+```
+
+```yaml
+          env:
+            - name: STRATA_TOKEN
+              valueFrom: {secretKeyRef: {name: strata-token, key: token}}
+```
+
+With `--tls-cert` and `--tls-key` on the shards (a certificate for their
+Service names, from cert-manager say), list them as `https://` in the
+coordinator's `--shards` and give it the CA with `--shard-ca`. A
+NetworkPolicy that lets only the coordinator reach the shards' gRPC port
+is worth adding too.

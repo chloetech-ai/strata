@@ -72,6 +72,13 @@ pub fn field_builder(field: &Field, opts: &BuildOptions) -> Result<Box<dyn Field
     Ok(Box::new(build::VectorBuilder::new(field, opts)?))
 }
 
+/// [`field_builder`] whose HNSW graph, if it builds one, starts from
+/// `seg`'s: `seg`'s documents are this build's from docID `base` on, all of
+/// them, with the same vectors (a merge's input that lost none).
+pub fn field_builder_from(field: &Field, opts: &BuildOptions, seg: SegmentFile, base: u32) -> Result<Box<dyn FieldIndexBuilder>> {
+    Ok(Box::new(build::VectorBuilder::new(field, opts)?.start_from(seg, base)))
+}
+
 /// Name of section `part` of vector field `field`.
 pub fn section(field: &str, part: &str) -> String {
     format!("vec.{field}.{part}")
@@ -299,7 +306,7 @@ impl VectorReader {
             VectorCodes::Sq8 => Quantiser::Sq8(Sq8 { min: a, scale: b }),
             VectorCodes::Binary => Quantiser::Bits(Bits { mean: a, spread: b }),
         };
-        let present = match seg.section(&section(field, "present")) {
+        let present = match seg.section(&section(field, "present"))? {
             Some(b) => {
                 let p: Slice<u64> = Slice::view(b).map_err(corrupt)?;
                 if p.len() != n.div_ceil(64) {
@@ -455,6 +462,16 @@ impl VectorReader {
     /// The top-`k` documents by similarity to `query`, best first.
     pub fn search(&self, query: &[f32], k: usize, params: &SearchParams, filter: Option<&dyn DocFilter>) -> SearchOutput {
         assert_eq!(query.len(), self.info.dim, "query dimension");
+        // No search returns more rows than the segment holds, and every
+        // size derived from k (heaps, rerank pools) stays within it.
+        let k = k.min(self.shape.n);
+        let clamped;
+        let params = if params.rerank > self.shape.n || params.ef > self.shape.n {
+            clamped = SearchParams { rerank: params.rerank.min(self.shape.n), ef: params.ef.min(self.shape.n.max(1)), ..params.clone() };
+            &clamped
+        } else {
+            params
+        };
         let card = filter.map(|f| f.cardinality());
         let strategy = self.plan(k, card, params);
         let mut stats = SearchStats { strategy, estimated_us: self.cost.estimate(&self.shape, strategy, k, card, params), ..Default::default() };

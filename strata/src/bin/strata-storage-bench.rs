@@ -520,7 +520,7 @@ struct PkLayout {
 impl PkLayout {
     fn parse(seg: &SegmentFile) -> PkLayout {
         let base = seg.section_range("pk").unwrap().start;
-        let mut r = ByteReader::new(seg.section("pk").unwrap());
+        let mut r = ByteReader::new(seg.require("pk").unwrap());
         let (_, _, bits) = (r.u64().unwrap(), r.u64().unwrap(), r.u64().unwrap() as u32);
         // An array's elements follow its u64 length.
         let arr = |r: &mut ByteReader| -> usize { r.position() + 8 };
@@ -640,7 +640,7 @@ fn exp_pk(cx: &Ctx) -> Result<Json> {
             "radix_pages_per_lookup": rp, "binary_search_pages_per_lookup": bp,
         }));
     }
-    let pk_bytes = snap.segments()[0].file.section("pk").unwrap().len();
+    let pk_bytes = snap.segments()[0].file.require("pk").unwrap().len();
     drop(snap);
     drop(db);
     remove_db(&path);

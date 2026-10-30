@@ -18,8 +18,8 @@ use crate::text::CollectionStats;
 /// Statistics of one TEXT field.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FieldStats {
-    /// Documents with the field indexed (deleted ones included, as in a
-    /// segment's own statistics).
+    /// Documents with at least one term in the field (deleted ones
+    /// included, as in a segment's own statistics).
     pub n_docs: u64,
     /// Sum of document lengths, in analysed terms.
     pub total_len: u64,

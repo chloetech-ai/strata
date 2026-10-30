@@ -9,9 +9,13 @@ publish = false
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+csv = "1"
 sqlparser = "0.59"
 crc32fast = "1"
 libc = "0.2"
+# Log events (flush and merge failures, a database that stops writing);
+# silent unless the program installs a subscriber, as strata-server does.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 lz4_flex = "0.11"
 bitpacking = "0.9.3"
 rand = "0.8"
@@ -38,6 +42,8 @@ bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 accelerate = ["bert", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 # SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
 baselines = ["dep:rusqlite", "dep:tantivy"]
+# Power losses, full disks and failing syncs for tests (`storage::io`).
+fault-injection = []
 
 [[bin]]
 name = "strata-baselines"

@@ -17,7 +17,7 @@ The design holds up. One file, with ACID commits and a SQL front end, serves ful
 
 | goal | met | missed |
 |---|---|---|
-| **One embedded file for three index families** | Every query of the workload, and ten compound statements, run as SQL against one file. Durable commits take 4.1 ms, nearly all of it macOS's `F_FULLFSYNC`; every crash test recovered a committed prefix; snapshots cost at most 0.13 µs; the file is near SQLite's size. | SQL covers one table, without joins. Building the HNSW graph makes loads 1.7–5.9× slower than SQLite's (0.2–0.5× without it). |
+| **One embedded file for three index families** | Every query of the workload, and ten compound statements, run as SQL against one file. Durable commits take 4.1 ms, nearly all of it macOS's `F_FULLFSYNC`; every crash test recovered a committed prefix; snapshots cost at most 0.13 µs; the file is near SQLite's size. | A query reads one table (it joins a table only with itself). Building the HNSW graph makes loads 1.7–5.9× slower than SQLite's (0.2–0.5× without it). |
 | **Faster than the specialised engines** | Warm BM25 is 1.7–3.2× faster than Tantivy and conjunctions 2.7–4.1× faster; Strata wins 24 of 28 warm text and filter comparisons. Vector queries take 0.05–0.10 ms against SQLite's 7.7 ms to 0.7 s scans, and are 28–63× faster cold. | Tantivy counts facets 1.1–2.1× faster on three of the four collections. Cold structured filters are 1.4–3.4× slower than Tantivy's. |
 | **Hybrid ranking as one plan** | RRF and weighted fusion are single SQL expressions under the same filter as their inputs. Weighted fusion adds 0.02–0.04 nDCG@10 over vectors alone on three collections, at 0.2–0.8 ms. | The top-100 shortcut recovers 89–95% of the exact fused top 10. The best weight differs by collection (0.1–0.3), and nothing picks it automatically. |
 | **A planner that adapts per query** | For filtered vector search, 1.8–6.1× faster than the best fixed strategy on the three larger collections, with recall@10 0.991–0.998. For filtered BM25 and filters alone, geometric-mean regret is 1.06–1.18. | It spends 1.0–1.6× an oracle's time. On SciFact, always pre-filtering takes 17% less time. |
@@ -89,6 +89,19 @@ Strata's BM25 is within 0.018 nDCG@10 of both baselines on every collection, and
 
 All three systems drop NLTK's 153 English function words from BM25 queries, so the rankings are comparable. Keeping them (`stopwords => 0`) costs TREC-COVID 0.055 nDCG@10, whose queries are full questions, and gains Quora the same 0.055 (0.811 against 0.756): its questions are short, and "how", "why" or "can" carry much of their meaning.
 
+### Ranking fixes
+
+The engineering review's ranking fixes (query letters such as "d" and "t" kept, repeated query words weighted, BM25's document count and average length taken over the documents that have the field, and a word's typos and one-word synonyms sharing its document frequency) were measured on seven BEIR collections with `strata-bm25-eval`, BM25 through SQL with stopwords dropped, plain and with typo tolerance (`fuzzy => 1`). Before is the code just before the fixes; both ran at the same time in the cloud container (Intel Xeon @ 2.80 GHz, 4 cores, Linux), so their query times are not compared. Results: `strata/results/text/bm25_before.json` and `bm25_after.json`.
+
+| nDCG@10 | SciFact | NFCorpus | ArguAna | FiQA | SCIDOCS | TREC-COVID | Quora |
+|---|---|---|---|---|---|---|---|
+| BM25, before | 0.689 | 0.327 | 0.310 | 0.252 | 0.157 | 0.658 | 0.756 |
+| BM25, after | 0.691 | 0.329 | 0.362 | 0.253 | 0.156 | 0.664 | 0.756 |
+| typo-tolerant, before | 0.626 | 0.270 | 0.212 | 0.148 | 0.119 | 0.151 | 0.689 |
+| typo-tolerant, after | 0.673 | 0.294 | 0.331 | 0.207 | 0.139 | 0.565 | 0.724 |
+
+Plain BM25 moves little except on ArguAna (+0.052), whose queries are whole arguments; every one of its 8,674 documents has text, so the gain comes from the query-side fixes (repeated words, kept letters), which this run does not separate. Typo tolerance gains on every collection, most on TREC-COVID (+0.414): before, a query word's rare typo neighbours scored with their own, higher IDF and could outrank the word itself.
+
 ## Hybrid ranking
 
 ![Weighted hybrid ranking: nDCG@10 by BM25 weight on four collections, with RRF of the same two rankings as dashed lines](../assets/img/chart-strata-fusion.png)
@@ -130,7 +143,7 @@ A `VECTOR` field can keep 1-bit codes instead of 8-bit ones (`"codes": "binary"`
 
 Binary codes hold an eighth of the memory of 8-bit codes (a 32nd of the float32 vectors, 1,536 MB here, which are read only for the rescored candidates). The flat scan gets 3.5× faster and IVF 2.0× faster for 0.006 of recall; HNSW is level. HNSW searches as wide as the candidates it rescores, so the 1-bit rows walk the graph 320 wide and are compared with 8-bit codes at ef 320; at the default ef of 64, 8-bit HNSW reaches 0.868 on this data. The two 1-bit HNSW figures come from two builds.
 
-The data is synthetic because the container could not download embeddings. How much recall binary codes cost depends on the embedding model, so measure it on the collection before choosing them. [`strata/notes/vector.md`](https://github.com/rkonow/engram/blob/main/strata/notes/vector.md#binary-codes) has every depth and the kernels; the numbers are in `strata/results/vector/`.
+The data is synthetic because the container could not download embeddings. How much recall binary codes cost depends on the embedding model, so measure it on the collection before choosing them. [`strata/notes/vector.md`](https://github.com/rkonow/strata/blob/main/strata/notes/vector.md#binary-codes) has every depth and the kernels; the numbers are in `strata/results/vector/`.
 
 ## Filtered vector search and the planner
 
@@ -167,7 +180,7 @@ Ten statements combine the workload's shapes: phrases with negation, prefixes, `
 - **Read your writes.** Committed documents are searchable at once. The first query after a write rebuilds the memtable's last 1,024-document chunk with every index of the evaluation table, which takes 17–20 ms; an unchunked memtable of 10,000 documents took 169 ms.
 - **Open.** Cold, opening takes 6.8 ms for 10 segments, 40 ms for 100 and 279 ms for 994 (6 ms warm). Replaying 10,000 WAL documents takes 34 ms at open, plus 207 ms to index them at the first query.
 - **Merges.** A tiered merge of eight 5,000-document segments, 10% deleted, rebuilds every index in 0.75 s, about 48,000 documents a second. After a delete-heavy workload the file is 1.22× its compacted size until `vacuum`.
-- **Recovery.** A crash test kills a writer with `SIGKILL` at a random moment during inserts, deletes, commits and flushes, then reopens. Every restart recovered a committed prefix: 20 runs by default, and 60 and 80 in longer runs. A damaged meta slot falls back to the other one.
+- **Recovery.** A crash test kills a writer with `SIGKILL` at a random moment during inserts, deletes, commits and flushes, then reopens. Every restart recovered a committed prefix: 20 runs by default, and 60 and 80 in longer runs. A damaged meta slot falls back to the other one, and so does a damaged newest version, after every commit of a workload of flushes, merges and a vacuum (`tests/storage_recovery.rs`). A simulated power loss at each of a workload's several hundred writes, truncations and syncs, with unsynced data kept or lost sector by sector, reopens to every acknowledged transaction with `sync`, and to the state after some transaction since the last flush without it; a full disk or a failing sync at each call leaves what was committed (`tests/storage_faults.rs`).
 
 ## Limitations
 

@@ -19,6 +19,7 @@ use crate::postings::bytes::OwnedBytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{corrupt, Result};
+use crate::storage::io;
 
 /// Page size in bytes.
 pub const PAGE: u64 = 4096;
@@ -26,8 +27,14 @@ pub const PAGE: u64 = 4096;
 pub const META_PAGES: u64 = 2;
 
 const MAGIC: &[u8; 8] = b"STRATADB";
-/// On-disk format version, bumped on incompatible changes.
-pub const FORMAT_VERSION: u32 = 1;
+/// On-disk format version, bumped on incompatible changes: 1 for a
+/// database holding the one table it was created with, 2 for one with
+/// several tables, 3 for one using a feature that format names (see
+/// [`crate::storage::manifest`]); 3 is the last, and later changes add
+/// features instead. A file is written in the oldest format that holds it,
+/// so older versions of Strata keep opening databases that need nothing
+/// newer.
+pub const FORMAT_VERSION: u32 = 3;
 const META_LEN: usize = 84;
 
 /// A run of pages holding `len` bytes, starting at page `page`.
@@ -53,6 +60,8 @@ impl Extent {
 /// Contents of a meta slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Meta {
+    /// The format of this version ([`FORMAT_VERSION`] at most).
+    pub format: u32,
     /// Random id tying the WAL sidecar to this file.
     pub db_id: u64,
     pub txn: u64,
@@ -69,7 +78,7 @@ impl Meta {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(PAGE as usize);
         b.extend_from_slice(MAGIC);
-        b.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        b.extend_from_slice(&self.format.to_le_bytes());
         b.extend_from_slice(&(PAGE as u32).to_le_bytes());
         for v in [self.db_id, self.txn, self.manifest.page, self.manifest.len] {
             b.extend_from_slice(&v.to_le_bytes());
@@ -98,10 +107,11 @@ impl Meta {
         }
         let u32_at = |o: usize| u32::from_le_bytes(page[o..o + 4].try_into().unwrap());
         let u64_at = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
-        if u32_at(8) != FORMAT_VERSION || u32_at(12) as u64 != PAGE {
+        if !(1..=FORMAT_VERSION).contains(&u32_at(8)) || u32_at(12) as u64 != PAGE {
             return Err(corrupt(format!("unsupported format version {} / page size {}", u32_at(8), u32_at(12))));
         }
         Ok(Some(Meta {
+            format: u32_at(8),
             db_id: u64_at(16),
             txn: u64_at(24),
             manifest: Extent { page: u64_at(32), len: u64_at(40) },
@@ -116,30 +126,39 @@ impl Meta {
 /// Reads both meta slots; returns the valid one with the larger txn and its
 /// slot number.
 pub fn read_meta(file: &File) -> Result<(Meta, usize)> {
-    let mut best: Option<(Meta, usize)> = None;
+    read_metas(file)?.into_iter().next().ok_or_else(|| corrupt("no valid meta slot"))
+}
+
+/// The valid meta slots with their slot numbers, newest first.
+pub fn read_metas(file: &File) -> Result<Vec<(Meta, usize)>> {
+    let mut metas = Vec::new();
     for slot in 0..2 {
         let mut page = vec![0u8; PAGE as usize];
         // A short file (crash during creation) reads as an invalid slot.
         let n = read_up_to(file, &mut page, slot as u64 * PAGE)?;
         if let Some(m) = Meta::decode(&page[..n])? {
-            if best.is_none_or(|(b, _)| m.txn > b.txn) {
-                best = Some((m, slot));
-            }
+            metas.push((m, slot));
         }
     }
-    best.ok_or_else(|| corrupt("no valid meta slot"))
+    metas.sort_by_key(|(m, _)| std::cmp::Reverse(m.txn));
+    Ok(metas)
 }
 
 /// Writes `meta` into `slot`.
 pub fn write_meta(file: &File, slot: usize, meta: &Meta) -> Result<()> {
-    file.write_all_at(&meta.encode(), slot as u64 * PAGE)?;
+    io::write_at(file, &meta.encode(), slot as u64 * PAGE)?;
     Ok(())
 }
 
 /// Reads an extent with a positioned read and checks its crc32.
 pub fn read_extent(file: &File, e: Extent, crc: u32) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; e.len as usize];
-    file.read_exact_at(&mut buf, e.page * PAGE)?;
+    match file.read_exact_at(&mut buf, e.page * PAGE) {
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(corrupt(format!("extent at page {} runs past the end of the file", e.page)));
+        }
+        r => r?,
+    }
     if crc32fast::hash(&buf) != crc {
         return Err(corrupt(format!("checksum mismatch in extent at page {}", e.page)));
     }
@@ -189,6 +208,7 @@ mod tests {
     #[test]
     fn meta_roundtrip_and_torn_slot() {
         let m = Meta {
+            format: 1,
             db_id: 0xdead_beef,
             txn: 42,
             manifest: Extent { page: 9, len: 5000 },

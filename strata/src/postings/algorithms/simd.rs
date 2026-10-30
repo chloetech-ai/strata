@@ -16,10 +16,9 @@
 //! Three x86 widths are provided: SSE (W = 4, `pshufb` compaction), AVX2
 //! (W = 8, `vpermd` compaction) and AVX-512 (W = 16, `vpcompressd`, the
 //! software analogue of `VP2INTERSECT`); on aarch64, NEON 4×4 and 8×8
-//! (`ext` rotations, `tbl` compaction of each 4-lane half). Each is
-//! compiled only when the target supports it; [`intersect`] picks the
-//! widest available (NEON 8×8 on aarch64) and falls back to a scalar merge
-//! elsewhere.
+//! (`ext` rotations, `tbl` compaction of each 4-lane half). [`intersect`]
+//! picks the widest the CPU has ([`crate::simd`]; NEON 8×8 on aarch64) and
+//! falls back to a scalar merge elsewhere.
 
 use super::pairwise::PairwiseFn;
 
@@ -43,7 +42,7 @@ unsafe fn merge_tail(a: &[u32], b: &[u32], mut i: usize, mut j: usize, dst: *mut
     k
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[cfg(target_arch = "x86_64")]
 mod sse {
     use core::arch::x86_64::*;
 
@@ -71,7 +70,15 @@ mod sse {
     }
     static LUT4: [[u8; 16]; 16] = lut4();
 
+    /// Panics on a CPU without SSSE3 ([`crate::simd::ssse3`]).
     pub fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+        assert!(crate::simd::ssse3(), "this CPU lacks SSSE3");
+        // SAFETY: the CPU has SSSE3.
+        unsafe { run(a, b, out) }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    unsafe fn run(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
         let start = out.len();
         out.reserve(a.len().min(b.len()) + 4);
         // SAFETY: loads stay within `na4`/`nb4`; stores write at most
@@ -102,7 +109,7 @@ mod sse {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 mod avx2 {
     use core::arch::x86_64::*;
 
@@ -126,7 +133,15 @@ mod avx2 {
     }
     static LUT8: [[u32; 8]; 256] = lut8();
 
+    /// Panics on a CPU without AVX2 ([`crate::simd::avx2`]).
     pub fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+        assert!(crate::simd::avx2(), "this CPU lacks AVX2");
+        // SAFETY: the CPU has AVX2.
+        unsafe { run(a, b, out) }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn run(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
         let start = out.len();
         out.reserve(a.len().min(b.len()) + 8);
         // SAFETY: as in the SSE kernel, with W = 8.
@@ -168,11 +183,19 @@ mod avx2 {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[cfg(target_arch = "x86_64")]
 mod avx512 {
     use core::arch::x86_64::*;
 
+    /// Panics on a CPU without AVX-512 ([`crate::simd::avx512`]).
     pub fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+        assert!(crate::simd::avx512(), "this CPU lacks AVX-512");
+        // SAFETY: the CPU has AVX-512.
+        unsafe { run(a, b, out) }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+    unsafe fn run(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
         let start = out.len();
         out.reserve(a.len().min(b.len()) + 16);
         // SAFETY: as in the SSE kernel, with W = 16.
@@ -316,28 +339,40 @@ mod neon {
 /// Widest SIMD block-merge kernel available on this target (scalar merge
 /// if none).
 pub fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    return avx512::intersect(a, b, out);
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
-    return avx2::intersect(a, b, out);
-    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", not(target_feature = "avx2")))]
-    return sse::intersect(a, b, out);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::simd::avx512() {
+            return avx512::intersect(a, b, out);
+        }
+        if crate::simd::avx2() {
+            return avx2::intersect(a, b, out);
+        }
+        if crate::simd::ssse3() {
+            return sse::intersect(a, b, out);
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     return neon::intersect8(a, b, out);
     #[allow(unreachable_code)]
     super::pairwise::merge(a, b, out)
 }
 
-/// Every SIMD kernel compiled for this target.
+/// Every SIMD kernel this CPU runs.
 pub fn kernels() -> Vec<(&'static str, PairwiseFn)> {
     #[allow(unused_mut)]
     let mut v: Vec<(&'static str, PairwiseFn)> = Vec::new();
-    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
-    v.push(("SIMD SSE 4x4", sse::intersect));
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    v.push(("SIMD AVX2 8x8", avx2::intersect));
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    v.push(("SIMD AVX-512 16x16", avx512::intersect));
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::simd::ssse3() {
+            v.push(("SIMD SSE 4x4", sse::intersect));
+        }
+        if crate::simd::avx2() {
+            v.push(("SIMD AVX2 8x8", avx2::intersect));
+        }
+        if crate::simd::avx512() {
+            v.push(("SIMD AVX-512 16x16", avx512::intersect));
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     v.push(("SIMD NEON 4x4", neon::intersect4));
     #[cfg(target_arch = "aarch64")]

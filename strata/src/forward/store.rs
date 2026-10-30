@@ -125,33 +125,64 @@ fn encode_row(fields: &[(usize, Kind)], doc: &Document, out: &mut Vec<u8>) {
 
 /// Writes `store.index` and `store.data` for `docs`.
 pub(crate) fn build(schema: &Schema, docs: &[Document], opts: &BuildOptions, out: &mut SegmentWriter) -> Result<()> {
-    let target = super::usize_option(opts, "forward.store_block", DEFAULT_BLOCK)?;
-    let fields = stored_fields(schema);
-    let mut b = Blocks { first: Vec::new(), offs: vec![0], raw_len: Vec::new(), data: Vec::new(), rows: Vec::new(), lens: Vec::new() };
-    let mut block_start = 0;
-    for (d, doc) in docs.iter().enumerate() {
+    let mut b = StoreBuilder::new(schema, opts)?;
+    for doc in docs {
+        b.add(doc);
+    }
+    b.finish(out);
+    Ok(())
+}
+
+/// The doc store of documents added one at a time, in docID order.
+pub struct StoreBuilder {
+    target: usize,
+    fields: Vec<(usize, Kind)>,
+    blocks: Blocks,
+    /// Documents added, and the first of the open block.
+    n: usize,
+    block_start: usize,
+}
+
+impl StoreBuilder {
+    pub fn new(schema: &Schema, opts: &BuildOptions) -> Result<Self> {
+        Ok(StoreBuilder {
+            target: super::usize_option(opts, "forward.store_block", DEFAULT_BLOCK)?,
+            fields: stored_fields(schema),
+            blocks: Blocks { first: Vec::new(), offs: vec![0], raw_len: Vec::new(), data: Vec::new(), rows: Vec::new(), lens: Vec::new() },
+            n: 0,
+            block_start: 0,
+        })
+    }
+
+    pub fn add(&mut self, doc: &Document) {
+        let b = &mut self.blocks;
         let before = b.rows.len();
-        encode_row(&fields, doc, &mut b.rows);
+        encode_row(&self.fields, doc, &mut b.rows);
         b.lens.push(b.rows.len() - before);
-        if b.rows.len() >= target {
-            b.flush(block_start);
-            block_start = d + 1;
+        self.n += 1;
+        if b.rows.len() >= self.target {
+            b.flush(self.block_start);
+            self.block_start = self.n;
         }
     }
-    if !b.lens.is_empty() {
-        b.flush(block_start);
+
+    /// Writes `store.index` and `store.data`.
+    pub fn finish(mut self, out: &mut SegmentWriter) {
+        let b = &mut self.blocks;
+        if !b.lens.is_empty() {
+            b.flush(self.block_start);
+        }
+        let mut w = ByteWriter::new();
+        w.u64(VERSION);
+        w.u64(self.n as u64);
+        w.array(&self.fields.iter().map(|&(i, _)| i as u32).collect::<Vec<u32>>());
+        w.array(&self.fields.iter().map(|&(_, k)| k as u8).collect::<Vec<u8>>());
+        w.array(&b.first);
+        w.array(&b.offs);
+        w.array(&b.raw_len);
+        out.put("store.index", w.finish());
+        out.put("store.data", std::mem::take(&mut b.data));
     }
-    let mut w = ByteWriter::new();
-    w.u64(VERSION);
-    w.u64(docs.len() as u64);
-    w.array(&fields.iter().map(|&(i, _)| i as u32).collect::<Vec<u32>>());
-    w.array(&fields.iter().map(|&(_, k)| k as u8).collect::<Vec<u8>>());
-    w.array(&b.first);
-    w.array(&b.offs);
-    w.array(&b.raw_len);
-    out.put("store.index", w.finish());
-    out.put("store.data", b.data);
-    Ok(())
 }
 
 /// Compressed blocks under construction.
@@ -299,7 +330,37 @@ impl DocStore {
         for _ in row + 1..n_rows {
             get_varint(block, &mut pos)?;
         }
-        let r = block.get(pos + start..pos + start + len)?;
+        self.decode_row(block.get(pos + start..pos + start + len)?, fields)
+    }
+
+    /// Field `field` of every document, in docID order, decompressing each
+    /// block once.
+    ///
+    /// # Panics
+    /// If a block is corrupt.
+    pub fn field_values(&self, field: usize) -> Vec<Value> {
+        let mut out = Vec::with_capacity(self.n);
+        for b in 0..self.n_blocks() {
+            let block = self.decompress(b);
+            let rows = (|| {
+                let mut pos = 0;
+                let n_rows = get_varint(&block, &mut pos)? as usize;
+                let lens = (0..n_rows).map(|_| get_varint(&block, &mut pos)).collect::<Option<Vec<u64>>>()?;
+                for l in lens {
+                    let row = block.get(pos..pos + l as usize)?;
+                    pos += l as usize;
+                    out.push(self.decode_row(row, &[field])?.pop()?);
+                }
+                Some(())
+            })();
+            rows.unwrap_or_else(|| panic!("corrupt doc store block {b}"));
+        }
+        assert_eq!(out.len(), self.n, "corrupt doc store: blocks hold {} rows for {} documents", out.len(), self.n);
+        out
+    }
+
+    /// A row, projected on `fields`.
+    fn decode_row(&self, r: &[u8], fields: &[usize]) -> Option<Vec<Value>> {
         // Slot of each stored field in the row, if requested.
         let mut out = vec![Value::Null; fields.len()];
         let mut p = self.fields.len().div_ceil(8);

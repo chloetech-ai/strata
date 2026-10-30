@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
+use strata::query::Params;
+use strata::Value;
 
 use crate::anchor::{self, Checker};
 use crate::capture::{self, EpisodeAcc};
@@ -211,6 +213,7 @@ impl Daemon {
             "forget" => self.op_forget(req).map(|r| (r, None)),
             "append" => self.op_append(req).map(|r| (r, None)),
             "stats" => self.op_stats().map(|r| (r, None)),
+            "backup" => self.op_backup(req).map(|r| (r, None)),
             // Read-only views for the demo inspector (demo/server.py).
             "inspect_query" => crate::inspect::query(&self.store, req).map(|r| (r, None)),
             "inspect_layout" => crate::inspect::layout(&self.store).map(|r| (r, None)),
@@ -524,7 +527,10 @@ impl Daemon {
                 // Each note links to the turn it was written from.
                 let source = self
                     .store
-                    .query(&format!("SELECT id FROM memory WHERE session = '{}' AND turn = {turn} AND kind = 'prompt' ORDER BY seq ASC LIMIT 1", sid.replace('\'', "''")))
+                    .query_with(
+                        &format!("SELECT id FROM memory WHERE session = :session AND turn = {turn} AND kind = 'prompt' ORDER BY seq ASC LIMIT 1"),
+                        &Params::new().set("session", Value::Str(sid.to_string())),
+                    )
                     .ok()
                     .and_then(|rs| rs.rows.first().and_then(|r| r[0].as_str().map(String::from)));
                 let n = d.drafts.len();
@@ -882,12 +888,12 @@ impl Daemon {
         if terms.is_empty() {
             return Ok(String::new());
         }
-        let m = terms.iter().map(|t| t.replace('\'', "")).collect::<Vec<_>>().join(" AND ");
-        let filter = Filter { exclude_window: Some((sid.to_string(), w)), ..Default::default() };
-        let mut where_ = filter_sql(&filter);
-        where_.push(format!("MATCH(files, '{m}')"));
-        where_.push("kind IN ('error', 'decision', 'preference', 'fact', 'note', 'episode')".into());
-        let rs = self.store.query(&format!("SELECT {} FROM memory WHERE {} ORDER BY seq DESC LIMIT 3", crate::record::COLUMNS, where_.join(" AND ")))?;
+        let kinds = vec![Kind::Error, Kind::Decision, Kind::Preference, Kind::Fact, Kind::Note, Kind::Episode];
+        let filter = Filter { exclude_window: Some((sid.to_string(), w)), kinds, ..Default::default() };
+        let mut where_ = filter.conds();
+        where_.push("MATCH(files, :files)".into());
+        let params = filter.params().set("files", Value::Str(terms.join(" AND ")));
+        let rs = self.store.query_with(&format!("SELECT {} FROM memory WHERE {} ORDER BY seq DESC LIMIT 3", crate::record::COLUMNS, where_.join(" AND ")), &params)?;
         let recs: Vec<Record> = rs.rows.iter().filter_map(|r| crate::store::row_record(r)).collect();
         if recs.is_empty() {
             return Ok(String::new());
@@ -974,6 +980,8 @@ impl Daemon {
                     }
                     strata::Value::Vector(v) => format!("vector({})", v.len()),
                     strata::Value::List(xs) => format!("list({})", xs.len()),
+                    strata::Value::Bool(b) => b.to_string(),
+                    strata::Value::Timestamp(t) => strata::timestamp::format(*t),
                 })
                 .collect();
             text += &cells.join(" | ");
@@ -1025,6 +1033,32 @@ impl Daemon {
         Ok(json!({"stored": recs.len(), "last_seq": self.store.last_seq()}))
     }
 
+    /// Copies the store to the new directory `dest` while it serves: the
+    /// database as a checkpoint (a consistent copy, which copying
+    /// `memory.strata` while the daemon writes is not), the session state
+    /// and config as they are, and the event log up to its last whole line.
+    /// Restoring is putting these files back with the daemon stopped.
+    fn op_backup(&self, req: &Json) -> Result<Json> {
+        let dest = PathBuf::from(req.get("dest").and_then(|v| v.as_str()).ok_or_else(|| err("backup needs a dest"))?);
+        if !dest.is_absolute() {
+            return Err(err(format!("{} is not an absolute path", dest.display())));
+        }
+        std::fs::create_dir(&dest).map_err(|e| err(format!("create {}: {e}", dest.display())))?;
+        let stats = self.store.db.storage().checkpoint(&dest.join("memory.strata"), &strata::storage::CheckpointOptions::default())?;
+        self.persist();
+        for name in ["state.json", "config.json"] {
+            match std::fs::copy(self.paths.dir.join(name), dest.join(name)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(err(format!("copy {name}: {e}"))),
+                _ => {}
+            }
+        }
+        if let Ok(log) = std::fs::read(self.paths.dir.join("events.log")) {
+            let whole = log.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            std::fs::write(dest.join("events.log"), &log[..whole]).map_err(|e| err(format!("write events.log: {e}")))?;
+        }
+        Ok(json!({"dest": dest, "records": stats.live_docs, "bytes": stats.bytes_written, "txn": stats.txn, "seconds": stats.seconds}))
+    }
+
     fn op_stats(&self) -> Result<Json> {
         let fs = self.store.db.storage().file_stats();
         let kinds = self.store.query("SELECT kind, COUNT(*) FROM memory GROUP BY kind ORDER BY 2 DESC LIMIT 20")?;
@@ -1037,14 +1071,6 @@ impl Daemon {
             "segments": fs.segments.len(), "memtable_docs": fs.memtable_docs, "store": self.paths.db,
         }))
     }
-}
-
-fn filter_sql(f: &Filter) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Some((s, w)) = &f.exclude_window {
-        v.push(format!("NOT (session = '{}' AND seq >= {w})", s.replace('\'', "''")));
-    }
-    v
 }
 
 // ---------------------------------------------------------------- server

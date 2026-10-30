@@ -2,11 +2,13 @@
 //!
 //! Reads run on the caller's thread against a snapshot, any number at once.
 //! Writes go to one writer thread ([`Writer`]), which commits whatever is
-//! queued as one transaction, numbers new records in commit order, and
-//! flushes and merges between transactions. Strata publishes each version
-//! before the writer answers (`DbOptions::publish_snapshots`), so a caller
-//! reads its own writes, and a reader never waits for a write or for the
-//! index build that follows it.
+//! queued as one transaction and numbers new records in commit order.
+//! Strata publishes each version before the writer answers
+//! (`DbOptions::publish_snapshots`), so a caller reads its own writes, and a
+//! reader never waits for a write or for the index build that follows it. A
+//! full memtable becomes a segment, and segments merge, on Strata's
+//! background threads; a write waits for a flush only once the memtable
+//! holds twice `flush_docs` before the flush under way ends.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -17,7 +19,7 @@ use serde::Serialize;
 use strata::db::Db;
 use strata::query::exec::ResultSet;
 use strata::query::Params;
-use strata::storage::{DbOptions, MergePolicy, Snapshot};
+use strata::storage::{DbOptions, MergerOptions, Snapshot};
 use strata::{Document, Value, VectorIndexKind};
 
 use crate::embed::Embedder;
@@ -61,12 +63,14 @@ impl Filter {
         }
     }
 
-    /// The filter's conditions. Entity records are never results unless
-    /// asked for by kind.
+    /// The filter's conditions, which name the values of
+    /// [`Filter::params`] (`:window_session`, `:session`) rather than
+    /// quote them. Entity records are never results unless asked for by
+    /// kind.
     pub fn conds(&self) -> Vec<String> {
         let mut parts = Vec::new();
-        if let Some((s, w)) = &self.exclude_window {
-            parts.push(format!("NOT (session = '{}' AND seq >= {w})", quote(s)));
+        if let Some((_, w)) = &self.exclude_window {
+            parts.push(format!("NOT (session = :window_session AND seq >= {w})"));
         }
         if !self.kinds.is_empty() {
             let ks: Vec<String> = self.kinds.iter().map(|k| format!("'{}'", k.as_str())).collect();
@@ -78,13 +82,25 @@ impl Filter {
         if let Some(t) = self.until_ts {
             parts.push(format!("ts < {t}"));
         }
-        if let Some(s) = &self.session {
-            parts.push(format!("session = '{}'", quote(s)));
+        if self.session.is_some() {
+            parts.push("session = :session".into());
         }
         if self.kinds.is_empty() {
             parts.push("kind != 'entity'".into());
         }
         parts
+    }
+
+    /// The values [`Filter::conds`] names, for a query that runs them.
+    pub fn params(&self) -> Params {
+        let mut p = Params::new();
+        if let Some((s, _)) = &self.exclude_window {
+            p = p.set("window_session", Value::Str(s.clone()));
+        }
+        if let Some(s) = &self.session {
+            p = p.set("session", Value::Str(s.clone()));
+        }
+        p
     }
 }
 
@@ -98,14 +114,11 @@ pub struct Reach {
     pub max_nodes: usize,
 }
 
-fn quote(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     pub vector_index: VectorIndexKind,
-    /// Flush the memtable to a segment past this many records.
+    /// Flush the memtable to a segment past this many records (in the
+    /// background; writes wait for a flush only once it holds twice this).
     pub flush_docs: usize,
     /// fsync every commit.
     pub sync: bool,
@@ -135,7 +148,7 @@ impl Store {
     pub fn open(path: &Path, embedder: Arc<dyn Embedder>, opts: StoreOptions) -> Result<Store> {
         let mut dbo = DbOptions::default();
         dbo.sync = opts.sync;
-        dbo.memtable_max_docs = opts.flush_docs * 4;
+        dbo.memtable_max_docs = opts.flush_docs;
         dbo.memtable_chunk_docs = opts.mem_chunk_docs.max(64);
         dbo.publish_snapshots = true;
         if opts.mem_flat {
@@ -165,7 +178,11 @@ impl Store {
         let last = db.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1", &Params::new())?;
         let next = last.rows.first().and_then(|r| r[0].as_i64()).map_or(1, |s| s + 1);
         let db = Arc::new(db);
-        let writer = Arc::new(Writer::start(db.clone(), next, opts.flush_docs)?);
+        db.spawn_flusher();
+        // One merge at a time: a daemon serves one project, and there may be
+        // several daemons.
+        db.spawn_merger(MergerOptions { threads: 1, ..MergerOptions::default() });
+        let writer = Arc::new(Writer::start(db.clone(), next)?);
         Ok(Store { db, embedder, writer, snap: None })
     }
 
@@ -324,18 +341,16 @@ impl Store {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let list: Vec<String> = ids.iter().map(|i| format!("'{}'", quote(i))).collect();
-        let rs = self.query(&format!("SELECT {COLUMNS} FROM memory WHERE id IN ({}) LIMIT {}", list.join(", "), ids.len()))?;
+        let rs = self.query_with(&format!("SELECT {COLUMNS} FROM memory WHERE id IN (:ids) LIMIT {}", ids.len()), &Params::new().set("ids", strs(ids)))?;
         Ok(rs.rows.iter().filter_map(|r| row_record(r)).collect())
     }
 
     /// The records of `session` with `seq` in `[lo, hi]`, in order.
     pub fn range(&self, session: &str, lo: i64, hi: i64) -> Result<Vec<Record>> {
-        let rs = self.query(&format!(
-            "SELECT {COLUMNS} FROM memory WHERE session = '{}' AND seq BETWEEN {lo} AND {hi} ORDER BY seq ASC LIMIT {}",
-            quote(session),
-            (hi - lo + 1).max(1)
-        ))?;
+        let rs = self.query_with(
+            &format!("SELECT {COLUMNS} FROM memory WHERE session = :session AND seq BETWEEN {lo} AND {hi} ORDER BY seq ASC LIMIT {}", (hi - lo + 1).max(1)),
+            &Params::new().set("session", Value::Str(session.to_string())),
+        )?;
         Ok(rs.rows.iter().filter_map(|r| row_record(r)).collect())
     }
 
@@ -343,14 +358,14 @@ impl Store {
     pub fn latest(&self, kinds: &[Kind], limit: usize, filter: &Filter) -> Result<Vec<Record>> {
         let mut f = filter.clone();
         f.kinds = kinds.to_vec();
-        let rs = self.query(&format!("SELECT {COLUMNS} FROM memory {} ORDER BY seq DESC LIMIT {limit}", f.sql()))?;
+        let rs = self.query_with(&format!("SELECT {COLUMNS} FROM memory {} ORDER BY seq DESC LIMIT {limit}", f.sql()), &f.params())?;
         Ok(rs.rows.iter().filter_map(|r| row_record(r)).collect())
     }
 
     /// The top `n` by BM25 over `body`, with raw scores.
     pub fn bm25_top(&self, query: &str, n: usize, filter: &Filter) -> Result<Vec<(Record, f64)>> {
         let sql = format!("SELECT {COLUMNS}, score() FROM memory {} ORDER BY bm25(body, :q) DESC LIMIT {n}", filter.sql());
-        let rs = self.query_with(&sql, &Params::new().set("q", Value::Str(query.to_string())))?;
+        let rs = self.query_with(&sql, &filter.params().set("q", Value::Str(query.to_string())))?;
         Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).collect())
     }
 
@@ -361,7 +376,6 @@ impl Store {
         if seeds.is_empty() || r.hops == 0 {
             return Ok(Vec::new());
         }
-        let list: Vec<String> = seeds.iter().map(|i| format!("'{}'", quote(i))).collect();
         let through = if r.through.is_empty() {
             String::new()
         } else {
@@ -369,9 +383,9 @@ impl Store {
             format!(", through => kind IN ({})", ks.join(", "))
         };
         let mut conds = filter.conds();
-        conds.push(format!("REACHABLE(links, ({}), hops => {}, dir => 'both', max_nodes => {}{through})", list.join(", "), r.hops, r.max_nodes));
+        conds.push(format!("REACHABLE(links, :seeds, hops => {}, dir => 'both', max_nodes => {}{through})", r.hops, r.max_nodes));
         let sql = format!("SELECT {COLUMNS}, score() FROM memory WHERE {} ORDER BY similarity(emb, :v) DESC LIMIT {n}", conds.join(" AND "));
-        let rs = self.query_with(&sql, &Params::new().set("v", Value::Vector(v.to_vec().into())))?;
+        let rs = self.query_with(&sql, &filter.params().set("v", Value::Vector(v.to_vec().into())).set("seeds", strs(seeds)))?;
         let seeds: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
         Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).filter(|(r, _)| !seeds.contains(r.id.as_str())).collect())
     }
@@ -379,7 +393,7 @@ impl Store {
     /// The top `n` by cosine similarity to `v`.
     pub fn vector_top(&self, v: &[f32], n: usize, filter: &Filter) -> Result<Vec<(Record, f64)>> {
         let sql = format!("SELECT {COLUMNS}, score() FROM memory {} ORDER BY similarity(emb, :v) DESC LIMIT {n}", filter.sql());
-        let rs = self.query_with(&sql, &Params::new().set("v", Value::Vector(v.to_vec().into())))?;
+        let rs = self.query_with(&sql, &filter.params().set("v", Value::Vector(v.to_vec().into())))?;
         Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).collect())
     }
 
@@ -450,11 +464,11 @@ struct Writer {
 }
 
 impl Writer {
-    fn start(db: Arc<Db>, next: i64, flush_docs: usize) -> Result<Writer> {
+    fn start(db: Arc<Db>, next: i64) -> Result<Writer> {
         let next_seq = Arc::new(AtomicI64::new(next));
         let (tx, rx) = mpsc::channel();
         let seq = next_seq.clone();
-        let thread = std::thread::Builder::new().name("engram-writer".into()).spawn(move || write_loop(&db, &rx, &seq, flush_docs))?;
+        let thread = std::thread::Builder::new().name("engram-writer".into()).spawn(move || write_loop(&db, &rx, &seq))?;
         Ok(Writer { jobs: Some(tx), thread: Some(thread), next_seq })
     }
 
@@ -478,9 +492,8 @@ impl Drop for Writer {
 }
 
 /// The writer thread. Whatever is queued when it is free is committed
-/// together (one WAL sync for all of it); between transactions a large
-/// memtable becomes a segment and small segments merge.
-fn write_loop(db: &Db, jobs: &mpsc::Receiver<Job>, next_seq: &AtomicI64, flush_docs: usize) {
+/// together (one WAL sync for all of it).
+fn write_loop(db: &Db, jobs: &mpsc::Receiver<Job>, next_seq: &AtomicI64) {
     while let Ok(first) = jobs.recv() {
         let mut group = Vec::new();
         for (op, reply) in std::iter::once(first).chain(std::iter::from_fn(|| jobs.try_recv().ok()).take(MAX_GROUP - 1)) {
@@ -501,11 +514,6 @@ fn write_loop(db: &Db, jobs: &mpsc::Receiver<Job>, next_seq: &AtomicI64, flush_d
             let _ = reply.send(r.map(|_| Done::default()).map_err(Error::from));
         }
         commit_group(db, next_seq, group);
-        if db.storage().file_stats().memtable_docs >= flush_docs {
-            if let Err(e) = db.storage().flush().and_then(|_| db.storage().merge(&MergePolicy::default()).map(|_| ())) {
-                eprintln!("engram: flushing the memtable: {e}");
-            }
-        }
     }
 }
 
@@ -582,6 +590,11 @@ fn apply(db: &Db, next_seq: &AtomicI64, group: &mut [Job]) -> std::result::Resul
 }
 
 /// A row projected with [`COLUMNS`] as a record.
+/// Strings as a list parameter (`id IN (:ids)`, `REACHABLE(links, :seeds)`).
+fn strs(xs: &[String]) -> Value {
+    Value::List(xs.iter().map(|x| Value::Str(x.clone())).collect())
+}
+
 pub fn row_record(r: &[Value]) -> Option<Record> {
     let s = |i: usize| r.get(i).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let n = |i: usize| r.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -680,6 +693,34 @@ mod tests {
         assert_eq!(s.len(), 2);
     }
 
+    /// Sessions, ids and entities with quotes reach Strata as query
+    /// parameters, not as text quoted by hand.
+    #[test]
+    fn values_with_quotes_are_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let sid = "it's \"a\" session; DROP TABLE memory --";
+        let p = s.append(sid, 1, 100, vec![Draft::new(Kind::Prompt, "Where is Roberto's laptop charger")]).unwrap()[0].id.clone();
+        let f = s.append(sid, 1, 101, vec![Draft::new(Kind::Fact, "Roberto's laptop charger is in the drawer").entities(vec!["Roberto's laptop".into()]).link("from", p.clone())]).unwrap()[0].id.clone();
+        s.append("other", 1, 200, vec![Draft::new(Kind::Fact, "The office's printer is on the second floor")]).unwrap();
+        assert_eq!(s.range(sid, 1, 2).unwrap().len(), 2);
+        let e = entity_id("Roberto's laptop").unwrap();
+        assert!(e.contains('\''), "{e}");
+        let entity = s.get(&[p.clone(), e.clone()]).unwrap();
+        assert_eq!(entity.len(), 2, "{entity:?}");
+        let only = Filter { session: Some(sid.into()), ..Default::default() };
+        assert_eq!(s.latest(&[Kind::Fact], 5, &only).unwrap().len(), 1);
+        assert_eq!(s.bm25_top("roberto's charger", 5, &only).unwrap().len(), 2);
+        let window = Filter { exclude_window: Some((sid.into(), 1)), ..Default::default() };
+        assert!(s.bm25_top("charger", 5, &window).unwrap().is_empty());
+        let v = s.embedder.embed_query("charger");
+        assert_eq!(s.vector_top(&v, 5, &window).unwrap().len(), 1);
+        let r = Reach { hops: 2, through: crate::recall::THROUGH.to_vec(), max_nodes: 100 };
+        let got: Vec<String> = s.reach(&[e], &v, 10, &Filter::default(), &r).unwrap().into_iter().map(|(r, _)| r.id).collect();
+        assert!(got.contains(&f), "{got:?}");
+        assert_eq!(s.len(), 4);
+    }
+
     #[test]
     fn entities_link_records_across_sessions() {
         let dir = tempfile::tempdir().unwrap();
@@ -760,6 +801,52 @@ mod tests {
         drop(s);
         let s = store(dir.path());
         assert_eq!((s.len(), s.last_seq()), (648, 649));
+    }
+
+    /// Strata's background threads flush the memtable and merge segments
+    /// while appends and reads go on: nothing is lost or seen out of order,
+    /// and the segments get merged without the writer doing it.
+    #[test]
+    fn flushes_and_merges_run_beside_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions { sync: false, flush_docs: 64, mem_chunk_docs: 64, ..Default::default() };
+        let open = || Store::open(&dir.path().join("m.strata"), Arc::new(HashEmbedder { dim: 64 }), opts.clone()).unwrap();
+        let s = open();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let p = s.pinned();
+                    let max = p.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1").unwrap().rows.first().map_or(0, |r| r[0].as_i64().unwrap());
+                    assert_eq!(p.len() as i64, max, "every number up to the newest is stored");
+                }
+            });
+            let ws: Vec<_> = (0..4)
+                .map(|t| {
+                    let s = &s;
+                    sc.spawn(move || {
+                        for i in 0..300 {
+                            let drafts = vec![Draft::new(Kind::ToolCall, format!("cargo test {t} {i}")), Draft::new(Kind::ToolResult, format!("test result {t} {i}: ok"))];
+                            s.append(&format!("sess-{t}"), i, 100, drafts).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            ws.into_iter().for_each(|h| h.join().unwrap());
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!((s.len(), s.last_seq()), (2400, 2400));
+        // About 37 flushes of 64 records; the merger brings them down.
+        let t = std::time::Instant::now();
+        while s.snapshot().segments().len() > 15 && t.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let segs = s.snapshot().segments().len();
+        assert!((1..=15).contains(&segs), "{segs} segments");
+        assert_eq!(s.bm25_top("result 3 299", 1, &Filter::default()).unwrap()[0].0.text, "test result 3 299: ok");
+        drop(s);
+        let s = open();
+        assert_eq!((s.len(), s.last_seq()), (2400, 2400));
     }
 
     #[test]

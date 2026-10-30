@@ -5,7 +5,9 @@
 //! fields, doc store) and vector ANN indexes. Queries are SQL with search
 //! functions, planned by a cost-based optimizer. See `DESIGN.md`.
 //!
-//! * [`schema`], [`value`]: tables, field types, documents.
+//! * [`schema`], [`value`]: tables, field types, documents; [`ingest`]:
+//!   rows from JSON, CSV and files; [`timestamp`]: TIMESTAMP values as
+//!   text.
 //! * [`embed`]: the models that fill VECTOR fields declared with `embed`.
 //! * [`segment`]: the immutable unit of storage, a directory of aligned,
 //!   named sections, and the builder that turns documents into one.
@@ -26,6 +28,7 @@
 
 #[cfg(feature = "baselines")]
 pub mod baselines;
+pub mod beir;
 pub mod cluster;
 pub mod data;
 pub mod db;
@@ -33,19 +36,22 @@ pub mod embed;
 pub mod error;
 pub mod forward;
 pub mod graph;
+pub mod ingest;
 pub mod iostat;
 pub mod metrics;
 pub mod postings;
 pub mod query;
 pub mod schema;
 pub mod segment;
+pub mod simd;
 pub mod storage;
 pub mod text;
+pub mod timestamp;
 pub mod value;
 pub mod vector;
 pub mod workload;
 
 pub use error::{Error, Result};
-pub use schema::{Embed, Field, FieldType, Schema, VectorCodes, VectorIndexKind};
+pub use schema::{Embed, Field, FieldType, Logical, Schema, VectorCodes, VectorIndexKind};
 pub use segment::DocId;
 pub use value::{Document, Value};

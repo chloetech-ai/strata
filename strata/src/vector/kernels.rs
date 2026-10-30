@@ -1,10 +1,11 @@
 //! Distance kernels.
 //!
 //! * [`dot_f32`]: exact float32 dot product (AVX-512 FMA, four accumulators;
-//!   NEON FMA, eight).
+//!   AVX2 FMA, four; NEON FMA, eight).
 //! * [`dot_u8_i8`], [`dot_u8_i8_x4`]: SQ8 codes against an int8-quantised
 //!   query, summed in int32 with AVX-512 VNNI (`vpdpbusd`: 64 byte products
-//!   per instruction), or on aarch64 with `usdot` (i8mm: 16 per instruction;
+//!   per instruction), with AVX2 by widening to 16 bits (`vpmaddwd`: 16 per
+//!   instruction), or on aarch64 with `usdot` (i8mm: 16 per instruction;
 //!   with dotprod only, `sdot` on the codes biased to signed and a
 //!   correction, see `dot4`). The `x4` form scores four rows per query
 //!   load, which is what scans use.
@@ -18,42 +19,64 @@
 //!   the code's bits spread to byte masks with `tbl` and `cmtst`, then
 //!   `sdot`; elsewhere popcounts of the query's bit planes).
 //!
-//! The SIMD paths are chosen at compile time (`-C target-cpu=native`); every
-//! kernel has a portable scalar version, used on other targets and as the
-//! reference in tests. Lengths need not be multiples of the vector width:
-//! tails use masked loads (AVX-512) or a scalar loop (NEON).
+//! The SIMD paths are chosen at run time from the CPU's features
+//! ([`crate::simd`]), so a binary built for a generic CPU still uses
+//! AVX-512 or the dot product instructions where it runs on them, and one
+//! built with `-C target-cpu=native` decides at compile time. Every kernel
+//! has a portable scalar version, used on other CPUs and as the reference
+//! in tests. Lengths need not be multiples of the vector width: tails use
+//! masked loads (AVX-512) or a scalar loop (AVX2, NEON). [`sq8_kernel`]
+//! names the int8 kernel in use.
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-/// The int8 SQ8 kernel compiled in ([`dot_u8_i8`]), for reports.
-pub const SQ8_KERNEL: &str = if cfg!(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw")) {
-    "vnni"
-} else if cfg!(all(target_arch = "aarch64", target_feature = "i8mm")) {
-    "neon-usdot"
-} else if cfg!(all(target_arch = "aarch64", target_feature = "dotprod")) {
-    "neon-sdot"
-} else {
-    "scalar"
-};
+use crate::simd;
+
+/// The int8 SQ8 kernel this process runs ([`dot_u8_i8`]), for reports.
+pub fn sq8_kernel() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        if simd::avx512vnni() {
+            "vnni"
+        } else if simd::avx2() {
+            "avx2"
+        } else {
+            "scalar"
+        }
+    } else if cfg!(all(target_arch = "aarch64", target_feature = "i8mm")) {
+        "neon-usdot"
+    } else if simd::dotprod() {
+        "neon-sdot"
+    } else {
+        "scalar"
+    }
+}
 
 /// Exact dot product of two float32 vectors of equal length.
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    // SAFETY: both slices hold `a.len()` elements; tails use masked loads.
-    unsafe {
-        dot_f32_avx512(a.as_ptr(), b.as_ptr(), a.len())
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd::avx512() {
+            // SAFETY: the CPU has AVX-512; both slices hold `a.len()`
+            // elements; tails use masked loads.
+            return unsafe { dot_f32_avx512(a.as_ptr(), b.as_ptr(), a.len()) };
+        }
+        if simd::avx2() {
+            // SAFETY: the CPU has AVX2 and FMA; both slices hold `a.len()`
+            // elements; the tail is scalar.
+            return unsafe { dot_f32_avx2(a.as_ptr(), b.as_ptr(), a.len()) };
+        }
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: both slices hold `a.len()` elements; the tail is scalar.
     unsafe {
         dot_f32_neon(a.as_ptr(), b.as_ptr(), a.len())
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     dot_f32_scalar(a, b)
 }
 
@@ -75,17 +98,25 @@ pub fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn dot_u8_i8(a: &[u8], b: &[i8]) -> i32 {
     assert_eq!(a.len(), b.len());
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"))]
-    // SAFETY: both slices hold `a.len()` bytes; tails use masked loads.
-    unsafe {
-        dot_u8_i8_vnni(a.as_ptr(), b.as_ptr(), a.len())
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd::avx512vnni() {
+            // SAFETY: the CPU has AVX-512 VNNI; both slices hold `a.len()`
+            // bytes; tails use masked loads.
+            return unsafe { dot_u8_i8_vnni(a.as_ptr(), b.as_ptr(), a.len()) };
+        }
+        if simd::avx2() {
+            // SAFETY: the CPU has AVX2; both slices hold `a.len()` bytes;
+            // the tail is scalar.
+            return unsafe { dot_u8_i8_avx2(a.as_ptr(), b.as_ptr(), a.len()) };
+        }
     }
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-    // SAFETY: both slices hold `a.len()` bytes; the tail is scalar.
-    unsafe {
-        dot_u8_i8_neon(a.as_ptr(), b.as_ptr(), a.len())
+    #[cfg(target_arch = "aarch64")]
+    if simd::dotprod() {
+        // SAFETY: the CPU has the dot product instructions; both slices
+        // hold `a.len()` bytes; the tail is scalar.
+        return unsafe { dot_u8_i8_neon(a.as_ptr(), b.as_ptr(), a.len()) };
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"), all(target_arch = "aarch64", target_feature = "dotprod"))))]
     dot_u8_i8_scalar(a, b)
 }
 
@@ -102,17 +133,25 @@ pub fn dot_u8_i8_x4(rows: [&[u8]; 4], q: &[i8]) -> [i32; 4] {
     for r in rows {
         assert_eq!(r.len(), q.len());
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"))]
-    // SAFETY: every row holds `q.len()` bytes; tails use masked loads.
-    unsafe {
-        dot_u8_i8_x4_vnni([rows[0].as_ptr(), rows[1].as_ptr(), rows[2].as_ptr(), rows[3].as_ptr()], q.as_ptr(), q.len())
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd::avx512vnni() {
+            // SAFETY: the CPU has AVX-512 VNNI; every row holds `q.len()`
+            // bytes; tails use masked loads.
+            return unsafe { dot_u8_i8_x4_vnni(rows.map(|r| r.as_ptr()), q.as_ptr(), q.len()) };
+        }
+        if simd::avx2() {
+            // SAFETY: the CPU has AVX2; every row holds `q.len()` bytes; the
+            // tail is scalar.
+            return unsafe { dot_u8_i8_x4_avx2(rows.map(|r| r.as_ptr()), q.as_ptr(), q.len()) };
+        }
     }
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-    // SAFETY: every row holds `q.len()` bytes; the tail is scalar.
-    unsafe {
-        dot_u8_i8_x4_neon(rows.map(|r| r.as_ptr()), q.as_ptr(), q.len())
+    #[cfg(target_arch = "aarch64")]
+    if simd::dotprod() {
+        // SAFETY: the CPU has the dot product instructions; every row holds
+        // `q.len()` bytes; the tail is scalar.
+        return unsafe { dot_u8_i8_x4_neon(rows.map(|r| r.as_ptr()), q.as_ptr(), q.len()) };
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"), all(target_arch = "aarch64", target_feature = "dotprod"))))]
     rows.map(|r| dot_u8_i8_scalar(r, q))
 }
 
@@ -120,17 +159,18 @@ pub fn dot_u8_i8_x4(rows: [&[u8]; 4], q: &[i8]) -> [i32; 4] {
 #[inline]
 pub fn dot_u8_f32(a: &[u8], w: &[f32]) -> f32 {
     assert_eq!(a.len(), w.len());
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    // SAFETY: `a` holds `w.len()` bytes; tails use masked loads.
-    unsafe {
-        dot_u8_f32_avx512(a.as_ptr(), w.as_ptr(), a.len())
+    #[cfg(target_arch = "x86_64")]
+    if simd::avx512() {
+        // SAFETY: the CPU has AVX-512; `a` holds `w.len()` bytes; tails use
+        // masked loads.
+        return unsafe { dot_u8_f32_avx512(a.as_ptr(), w.as_ptr(), a.len()) };
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: `a` holds `w.len()` bytes; the tail is scalar.
     unsafe {
         dot_u8_f32_neon(a.as_ptr(), w.as_ptr(), a.len())
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     dot_u8_f32_scalar(a, w)
 }
 
@@ -171,17 +211,18 @@ pub struct BitsWeights<'a> {
 pub fn dot_bits_u8(code: &[u8], q: BitsWeights) -> i32 {
     let words = code.len() / 8;
     assert!(code.len().is_multiple_of(8) && q.u.len() >= 64 * words && q.v.len() >= 64 * words && q.planes.len() >= 8 * words);
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-    // SAFETY: `code` holds `words` u64s and `u` 64 bytes per word.
-    unsafe {
-        dot_bits_avx512(code.as_ptr(), q.u.as_ptr(), words)
+    #[cfg(target_arch = "x86_64")]
+    if simd::avx512() {
+        // SAFETY: the CPU has AVX-512; `code` holds `words` u64s and `u` 64
+        // bytes per word.
+        return unsafe { dot_bits_avx512(code.as_ptr(), q.u.as_ptr(), words) };
     }
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-    // SAFETY: `code` holds `words` u64s and `v` 64 bytes per word.
-    unsafe {
-        dot_bits_neon([code.as_ptr()], q.v.as_ptr(), words)[0]
+    #[cfg(target_arch = "aarch64")]
+    if simd::dotprod() {
+        // SAFETY: the CPU has the dot product instructions; `code` holds
+        // `words` u64s and `v` 64 bytes per word.
+        return unsafe { dot_bits_neon([code.as_ptr()], q.v.as_ptr(), words)[0] };
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512bw"), all(target_arch = "aarch64", target_feature = "dotprod"))))]
     dot_bits_planes(code, q.planes)
 }
 
@@ -189,14 +230,14 @@ pub fn dot_bits_u8(code: &[u8], q: BitsWeights) -> i32 {
 /// once per word for all four on aarch64.
 #[inline]
 pub fn dot_bits_u8_x4(codes: [&[u8]; 4], q: BitsWeights) -> [i32; 4] {
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-    {
+    #[cfg(target_arch = "aarch64")]
+    if simd::dotprod() {
         let words = codes[0].len() / 8;
         assert!(codes.iter().all(|c| c.len() == 8 * words) && q.v.len() >= 64 * words);
-        // SAFETY: every row holds `words` u64s and `v` 64 bytes per word.
-        unsafe { dot_bits_neon(codes.map(|c| c.as_ptr()), q.v.as_ptr(), words) }
+        // SAFETY: the CPU has the dot product instructions; every row holds
+        // `words` u64s and `v` 64 bytes per word.
+        return unsafe { dot_bits_neon(codes.map(|c| c.as_ptr()), q.v.as_ptr(), words) };
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
     codes.map(|c| dot_bits_u8(c, q))
 }
 
@@ -237,18 +278,19 @@ pub fn dot_f32_4x4(a: [&[f32]; 4], b: [&[f32]; 4]) -> [[f32; 4]; 4] {
     for v in a.iter().chain(&b) {
         assert_eq!(v.len(), n);
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    // SAFETY: all eight vectors hold `n` elements; tails use masked loads.
-    unsafe {
-        dot_f32_4x4_avx512(a.map(|v| v.as_ptr()), b.map(|v| v.as_ptr()), n)
+    #[cfg(target_arch = "x86_64")]
+    if simd::avx512() {
+        // SAFETY: the CPU has AVX-512; all eight vectors hold `n` elements;
+        // tails use masked loads.
+        return unsafe { dot_f32_4x4_avx512(a.map(|v| v.as_ptr()), b.map(|v| v.as_ptr()), n) };
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: all eight vectors hold `n` elements; the tail is scalar.
     unsafe {
         dot_f32_4x4_neon(a.map(|v| v.as_ptr()), b.map(|v| v.as_ptr()), n)
     }
-    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), target_arch = "aarch64")))]
-    a.map(|x| b.map(|y| dot_f32_scalar(x, y)))
+    #[cfg(not(target_arch = "aarch64"))]
+    a.map(|x| b.map(|y| dot_f32(x, y)))
 }
 
 /// Hints the CPU to fetch `bytes` starting at `p` into cache (one hint per
@@ -280,8 +322,8 @@ pub fn prefetch(p: *const u8, bytes: usize) {
     let _ = (p, bytes);
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn dot_f32_avx512(a: *const f32, b: *const f32, n: usize) -> f32 {
     let mut s = [_mm512_setzero_ps(); 4];
     let mut i = 0;
@@ -302,8 +344,8 @@ unsafe fn dot_f32_avx512(a: *const f32, b: *const f32, n: usize) -> f32 {
     _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(s[0], s[1]), _mm512_add_ps(s[2], s[3])))
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn dot_bits_avx512(code: *const u8, u: *const u8, words: usize) -> i32 {
     let zero = _mm512_setzero_si512();
     let mut acc = [zero; 2];
@@ -319,8 +361,9 @@ unsafe fn dot_bits_avx512(code: *const u8, u: *const u8, words: usize) -> i32 {
 
 /// `acc` plus, per 32-bit lane, the dot product of four signed bytes with
 /// four others (`sdot`; the intrinsic is not stable yet).
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
 unsafe fn sdot(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     std::arch::asm!("sdot {0:v}.4s, {1:v}.16b, {2:v}.16b", inout(vreg) acc, in(vreg) a, in(vreg) b, options(pure, nomem, nostack, preserves_flags));
     acc
@@ -330,8 +373,9 @@ unsafe fn sdot(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
 /// `tbl` repeats code bytes `2k` and `2k+1` eight times each and `cmtst`
 /// against bits 1, 2, ..., 128 gives -1 where the dimension's bit is set, so
 /// `sdot` of the mask with the weights adds `-v[j]` over the set bits.
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
 unsafe fn dot_bits_neon<const R: usize>(codes: [*const u8; R], v: *const i8, words: usize) -> [i32; R] {
     const SPREAD: [[u8; 16]; 4] = {
         let mut t = [[0u8; 16]; 4];
@@ -364,8 +408,8 @@ unsafe fn dot_bits_neon<const R: usize>(codes: [*const u8; R], v: *const i8, wor
     acc.map(|a| -vaddvq_s32(vaddq_s32(a[0], a[1])))
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"))]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 unsafe fn dot_u8_i8_vnni(a: *const u8, b: *const i8, n: usize) -> i32 {
     let mut s = [_mm512_setzero_si512(); 4];
     let mut i = 0;
@@ -387,8 +431,8 @@ unsafe fn dot_u8_i8_vnni(a: *const u8, b: *const i8, n: usize) -> i32 {
     _mm512_reduce_add_epi32(_mm512_add_epi32(_mm512_add_epi32(s[0], s[1]), _mm512_add_epi32(s[2], s[3])))
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw"))]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 unsafe fn dot_u8_i8_x4_vnni(rows: [*const u8; 4], q: *const i8, n: usize) -> [i32; 4] {
     let mut s = [_mm512_setzero_si512(); 4];
     let mut i = 0;
@@ -409,8 +453,8 @@ unsafe fn dot_u8_i8_x4_vnni(rows: [*const u8; 4], q: *const i8, n: usize) -> [i3
     s.map(|v| _mm512_reduce_add_epi32(v))
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn dot_u8_f32_avx512(a: *const u8, w: *const f32, n: usize) -> f32 {
     let widen = |p: *const u8| _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(p as *const __m128i)));
     let mut s = [_mm512_setzero_ps(); 4];
@@ -431,8 +475,8 @@ unsafe fn dot_u8_f32_avx512(a: *const u8, w: *const f32, n: usize) -> f32 {
     _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(s[0], s[1]), _mm512_add_ps(s[2], s[3])))
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn dot_f32_4x4_avx512(a: [*const f32; 4], b: [*const f32; 4], n: usize) -> [[f32; 4]; 4] {
     let mut s = [[_mm512_setzero_ps(); 4]; 4];
     let mut i = 0;
@@ -448,6 +492,98 @@ unsafe fn dot_f32_4x4_avx512(a: [*const f32; 4], b: [*const f32; 4], n: usize) -
         i += 16;
     }
     s.map(|row| row.map(|v| _mm512_reduce_add_ps(v)))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(a: *const f32, b: *const f32, n: usize) -> f32 {
+    let mut s = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (j, acc) in s.iter_mut().enumerate() {
+            *acc = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 8 * j)), _mm256_loadu_ps(b.add(i + 8 * j)), *acc);
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        s[0] = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), s[0]);
+        i += 8;
+    }
+    let mut t = 0f32;
+    while i < n {
+        t += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    let v = _mm256_add_ps(_mm256_add_ps(s[0], s[1]), _mm256_add_ps(s[2], s[3]));
+    let h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+    let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps::<1>(h, h))) + t
+}
+
+/// The sum of the eight int32 lanes of `v`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn hsum_epi32_avx2(v: __m256i) -> i32 {
+    let h = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+    let h = _mm_add_epi32(h, _mm_shuffle_epi32::<0b01_00_11_10>(h));
+    _mm_cvtsi128_si32(_mm_add_epi32(h, _mm_shuffle_epi32::<0b10_11_00_01>(h)))
+}
+
+/// 16 codes and 16 weights widened to 16 bits and multiplied pairwise into
+/// eight int32 sums (`vpmaddwd`; a product of a code and a weight fits in
+/// 16 bits, so nothing saturates).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn madd16_avx2(c: *const u8, q: __m256i) -> __m256i {
+    _mm256_madd_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(c as *const __m128i)), q)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_u8_i8_avx2(a: *const u8, b: *const i8, n: usize) -> i32 {
+    let mut s = [_mm256_setzero_si256(); 4];
+    let mut i = 0;
+    while i + 64 <= n {
+        for (j, acc) in s.iter_mut().enumerate() {
+            let q = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.add(i + 16 * j) as *const __m128i));
+            *acc = _mm256_add_epi32(*acc, madd16_avx2(a.add(i + 16 * j), q));
+        }
+        i += 64;
+    }
+    while i + 16 <= n {
+        let q = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.add(i) as *const __m128i));
+        s[0] = _mm256_add_epi32(s[0], madd16_avx2(a.add(i), q));
+        i += 16;
+    }
+    let mut t = hsum_epi32_avx2(_mm256_add_epi32(_mm256_add_epi32(s[0], s[1]), _mm256_add_epi32(s[2], s[3])));
+    while i < n {
+        t += *a.add(i) as i32 * *b.add(i) as i32;
+        i += 1;
+    }
+    t
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_u8_i8_x4_avx2(rows: [*const u8; 4], q: *const i8, n: usize) -> [i32; 4] {
+    let mut s = [_mm256_setzero_si256(); 4];
+    let mut i = 0;
+    while i + 16 <= n {
+        let qv = _mm256_cvtepi8_epi16(_mm_loadu_si128(q.add(i) as *const __m128i));
+        for (acc, r) in s.iter_mut().zip(rows) {
+            *acc = _mm256_add_epi32(*acc, madd16_avx2(r.add(i), qv));
+        }
+        i += 16;
+    }
+    let mut t = s.map(|v| hsum_epi32_avx2(v));
+    while i < n {
+        let w = *q.add(i) as i32;
+        for (v, r) in t.iter_mut().zip(rows) {
+            *v += *r.add(i) as i32 * w;
+        }
+        i += 1;
+    }
+    t
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -481,8 +617,9 @@ unsafe fn dot_f32_neon(a: *const f32, b: *const f32, n: usize) -> f32 {
 /// kernels sum `q` with [`qsum4`] and add that back, exactly (the identity
 /// holds modulo 2^32, as int32 sums wrap). The intrinsics are not stable
 /// yet, hence `asm!`.
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
 unsafe fn dot4(mut acc: int32x4_t, c: uint8x16_t, q: int8x16_t) -> int32x4_t {
     #[cfg(target_feature = "i8mm")]
     std::arch::asm!("usdot {0:v}.4s, {1:v}.16b, {2:v}.16b", inout(vreg) acc, in(vreg) c, in(vreg) q, options(pure, nomem, nostack, preserves_flags));
@@ -496,8 +633,9 @@ unsafe fn dot4(mut acc: int32x4_t, c: uint8x16_t, q: int8x16_t) -> int32x4_t {
 
 /// `acc + Σq` per 32-bit lane when [`dot4`] needs the correction; `acc`
 /// (optimised away) with i8mm.
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
 unsafe fn qsum4(acc: int32x4_t, q: int8x16_t) -> int32x4_t {
     #[cfg(target_feature = "i8mm")]
     {
@@ -512,8 +650,8 @@ unsafe fn qsum4(acc: int32x4_t, q: int8x16_t) -> int32x4_t {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-#[inline]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
 unsafe fn dot_u8_i8_neon(a: *const u8, b: *const i8, n: usize) -> i32 {
     // Four chains, and four for the correction (one would be latency-bound).
     let mut s = [vdupq_n_s32(0); 4];
@@ -542,8 +680,8 @@ unsafe fn dot_u8_i8_neon(a: *const u8, b: *const i8, n: usize) -> i32 {
     t
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-#[inline]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
 unsafe fn dot_u8_i8_x4_neon(rows: [*const u8; 4], q: *const i8, n: usize) -> [i32; 4] {
     // Two chains per row (and for the correction): 32 bytes per step.
     let mut s = [[vdupq_n_s32(0); 4]; 2];
@@ -675,6 +813,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Each x86_64 tier this CPU has against the scalar kernels, whichever
+    // tier the dispatch picks.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn every_x86_tier_matches_scalar() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+        for n in (0..200).chain([255, 256, 257, 1023, 1024, 1025]) {
+            let a: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            let b: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            let mag: f32 = a.iter().zip(&b).map(|(x, y)| (x * y).abs()).sum();
+            let c: Vec<u8> = (0..n).map(|_| rng.gen()).collect();
+            let rows: Vec<Vec<u8>> = (0..4).map(|_| (0..n).map(|_| rng.gen()).collect()).collect();
+            let rows4 = [rows[0].as_ptr(), rows[1].as_ptr(), rows[2].as_ptr(), rows[3].as_ptr()];
+            for q in [(0..n).map(|_| rng.gen_range(-128..=127)).collect::<Vec<i8>>(), vec![-128; n], vec![127; n]] {
+                let want = dot_u8_i8_scalar(&c, &q);
+                let want4 = [0, 1, 2, 3].map(|r| dot_u8_i8_scalar(&rows[r], &q));
+                let hi = vec![255u8; n];
+                if simd::avx2() {
+                    // SAFETY: the CPU has AVX2 and FMA; every slice holds `n` elements.
+                    unsafe {
+                        assert!(close(dot_f32_avx2(a.as_ptr(), b.as_ptr(), n), dot_f32_scalar(&a, &b), mag), "avx2 dot_f32 n={n}");
+                        assert_eq!(dot_u8_i8_avx2(c.as_ptr(), q.as_ptr(), n), want, "avx2 dot_u8_i8 n={n}");
+                        assert_eq!(dot_u8_i8_avx2(hi.as_ptr(), q.as_ptr(), n), dot_u8_i8_scalar(&hi, &q), "avx2 extremes n={n}");
+                        assert_eq!(dot_u8_i8_x4_avx2(rows4, q.as_ptr(), n), want4, "avx2 x4 n={n}");
+                    }
+                }
+                if simd::avx512vnni() {
+                    // SAFETY: the CPU has AVX-512 VNNI; every slice holds `n` elements.
+                    unsafe {
+                        assert_eq!(dot_u8_i8_vnni(c.as_ptr(), q.as_ptr(), n), want, "vnni n={n}");
+                        assert_eq!(dot_u8_i8_x4_vnni(rows4, q.as_ptr(), n), want4, "vnni x4 n={n}");
+                    }
+                }
+            }
+            if simd::avx512() {
+                // SAFETY: the CPU has AVX-512; every slice holds `n` elements.
+                unsafe { assert!(close(dot_f32_avx512(a.as_ptr(), b.as_ptr(), n), dot_f32_scalar(&a, &b), mag), "avx512 dot_f32 n={n}") };
+            }
+        }
+        eprintln!("SIMD tier: {}, SQ8 kernel: {}", simd::describe(), sq8_kernel());
     }
 
     #[test]

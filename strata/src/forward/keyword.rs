@@ -193,8 +193,10 @@ impl FieldIndexBuilder for KeywordBuilder {
             }
             rare_offs.push(rare.len() as u32);
         }
-        // Every value on one document (a key): the offsets are implied.
-        if nv > 0 && rare.len() == nv {
+        // Every value on one document (a key): the offsets are implied. As
+        // many rare documents as values is not enough: with a Pyramid list,
+        // some rare value has several documents.
+        if nv > 0 && rare.len() == nv && lists.is_empty() {
             rare_offs.clear();
         }
         let mut w = ByteWriter::new();
@@ -276,8 +278,79 @@ impl KeywordColumn {
         {
             return Err(corrupt(format!("bad keyword column {field}")));
         }
-        let multi = seg.section(&format!("kw.{field}.multi")).is_some();
-        Ok(KeywordColumn { name: field.to_string(), n: seg.n_docs(), dict_offs, dict_bytes, codes, rare_offs, rare, pyr_codes, lists, multi })
+        let multi = seg.has(&format!("kw.{field}.multi"));
+        let mut col = KeywordColumn { name: field.to_string(), n: seg.n_docs(), dict_offs, dict_bytes, codes, rare_offs, rare, pyr_codes, lists, multi };
+        if col.needs_values() && !multi {
+            let mut count = vec![0u32; nv];
+            for d in 0..col.n as u32 {
+                if let Some(c) = col.codes.get(d) {
+                    count[c as usize] += 1;
+                }
+            }
+            col.set_rare_offsets(&count)?;
+        }
+        Ok(col)
+    }
+
+    /// Whether the column comes from a writer that left out the offsets of
+    /// the rare values whenever they held as many documents as there are
+    /// values, Pyramid lists or not, so that its rare values cannot be told
+    /// apart. [`KeywordColumn::open`] rebuilds the offsets of a
+    /// single-valued column from its codes; a multi-valued one needs each
+    /// document's values ([`KeywordColumn::repair`]).
+    pub fn needs_values(&self) -> bool {
+        self.rare_offs.is_empty() && !self.pyr_codes.is_empty()
+    }
+
+    /// Rebuilds the rare values' offsets of a column that
+    /// [`KeywordColumn::needs_values`] from `values`, each document's value
+    /// of the field (a list for a multi-valued field), as stored.
+    pub fn repair(&mut self, values: &[Value]) -> Result<()> {
+        if !self.needs_values() {
+            return Ok(());
+        }
+        if values.len() != self.n {
+            return Err(corrupt(format!("keyword column {}: {} stored values for {} documents", self.name, values.len(), self.n)));
+        }
+        let mut count = vec![0u32; self.n_values()];
+        let mut seen = Vec::new();
+        for v in values {
+            seen.clear();
+            for x in v.items() {
+                match key_of(x).and_then(|k| self.code(&k)) {
+                    Some(c) => seen.push(c),
+                    None => return Err(corrupt(format!("keyword column {}: a stored value is not in the dictionary", self.name))),
+                }
+            }
+            seen.sort_unstable();
+            seen.dedup();
+            for &c in &seen {
+                count[c as usize] += 1;
+            }
+        }
+        self.set_rare_offsets(&count)
+    }
+
+    /// Sets the offsets in `rare` from the number of documents of each
+    /// value, checked against the array and the lists.
+    fn set_rare_offsets(&mut self, count: &[u32]) -> Result<()> {
+        let mut offs = Vec::with_capacity(count.len() + 1);
+        offs.push(0u32);
+        let mut at = 0u32;
+        for (c, &k) in count.iter().enumerate() {
+            match self.pyr_codes.binary_search(&(c as u32)) {
+                Ok(i) if self.lists.card(i) == k as u64 => {}
+                Ok(_) => return Err(corrupt(format!("keyword column {}: list {c} disagrees with the codes", self.name))),
+                Err(_) if k > 0 => at += k,
+                Err(_) => return Err(corrupt(format!("keyword column {}: value {c} has no documents", self.name))),
+            }
+            offs.push(at);
+        }
+        if at as usize != self.rare.len() {
+            return Err(corrupt(format!("keyword column {}: rare documents disagree with the codes", self.name)));
+        }
+        self.rare_offs = Slice::Owned(offs);
+        Ok(())
     }
 
     /// Whether documents can have several values (filters and facets must
@@ -302,12 +375,25 @@ impl KeywordColumn {
 
     /// Codes of the INT values in `lo..=hi` of a multi-valued INT field.
     pub fn int_codes(&self, lo: f64, hi: f64) -> std::ops::Range<u32> {
+        const TWO63: f64 = 9_223_372_036_854_775_808.0;
         let (lo, hi) = (lo.ceil(), hi.floor());
-        if lo > hi || lo >= i64::MAX as f64 || hi < i64::MIN as f64 {
+        if !(lo <= hi) || lo >= TWO63 || hi < -TWO63 {
             return 0..0;
         }
-        let a = self.lower_bound(&int_key(lo.max(i64::MIN as f64) as i64));
-        let b = if hi >= i64::MAX as f64 { self.n_values() as u32 } else { self.lower_bound(&int_key(hi as i64 + 1)) };
+        // `as` saturates at the i64 limits.
+        self.int_codes_exact(lo as i64, if hi >= TWO63 { i64::MAX } else { hi as i64 })
+    }
+
+    /// Codes of the INT values in `lo..=hi` (exact bounds).
+    pub fn int_codes_exact(&self, lo: i64, hi: i64) -> std::ops::Range<u32> {
+        if lo > hi {
+            return 0..0;
+        }
+        let a = self.lower_bound(&int_key(lo));
+        let b = match hi.checked_add(1) {
+            Some(h) => self.lower_bound(&int_key(h)),
+            None => self.n_values() as u32,
+        };
         a..b.max(a)
     }
 
@@ -419,6 +505,16 @@ impl KeywordColumn {
                 DocSet::from_sorted(out, n)
             }
         }
+    }
+
+    /// Documents with a value (multi-valued: at least one).
+    pub fn present(&self) -> DocSet {
+        DocSet::from_bits(self.codes.scan_bits(super::KeyRange { lo: i64::MIN, hi: i64::MAX }), self.n as u32)
+    }
+
+    /// Number of documents with a value.
+    pub fn n_present(&self) -> usize {
+        self.codes.n_present()
     }
 
     /// Documents with `value` (`= value`).
