@@ -491,6 +491,10 @@ message Expr {
     // minmax(x) or rank(x) over the rows a Search ranks; plan feature
     // "rank_expressions".
     Norm norm = 36;
+    // maxsim(field, vectors); plan feature "maxsim". Numbered from 80, the
+    // range of the multi-vector work, so lanes building at once do not
+    // collide.
+    MaxSim maxsim = 80;
   }
 }
 
@@ -502,6 +506,14 @@ message Norm {
 enum NormKind {
   NORM_KIND_MIN_MAX = 0;
   NORM_KIND_RANK = 1;
+}
+
+// The best similarity of a VECTOR field with any of `vectors` (a list
+// literal of vectors, or the values of a subquery, which runs first).
+message MaxSim {
+  uint32 field = 1;
+  Expr vectors = 2;
+  map<string, Value> opts = 3;
 }
 
 message Cmp {
@@ -585,8 +597,9 @@ enum Func {
   FUNC_GREATEST = 12;
   FUNC_SIGMOID = 13;
   FUNC_CLAMP = 14;
-  // A semantic ID's prefix (plan feature "semantic_id"); 15 is left for the
-  // ranking thread's dot().
+  // dot(a, b) of two vectors; plan feature "maxsim".
+  FUNC_DOT = 15;
+  // A semantic ID's prefix (plan feature "semantic_id").
   FUNC_SID_AT = 16;
 }
 
@@ -677,6 +690,9 @@ message Graph {
   uint64 max_nodes = 9;
   uint64 k = 10;
   optional double min_sim = 11;
+  // A weight per key `seeds` lists, which PageRank restarts at in
+  // proportion; empty, all 1 (plan feature "maxsim").
+  repeated double weights = 12;
 }
 
 message Reachable {

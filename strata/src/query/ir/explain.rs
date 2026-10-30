@@ -313,6 +313,14 @@ impl<'a> Text<'a> {
             Expr::Graph(g) | Expr::Ppr(g) => self.graph(g, names),
             Expr::Bm25 { field: f, text, opts } => format!("bm25({}, {}{})", field(names, *f), quote(text), options(opts)),
             Expr::Similarity { field: f, vector, opts } => format!("similarity({}, {}{})", field(names, *f), lit(&Value::Vector(vector.clone())), options(opts)),
+            Expr::MaxSim { field: f, vectors, opts } => {
+                let vectors = match vectors.as_ref() {
+                    // A few vectors, and how many there are.
+                    Expr::Lit(Value::List(vs)) if vs.len() > 2 => format!("ARRAY[{}, … ({} vectors)]", vs.iter().take(2).map(lit).collect::<Vec<_>>().join(", "), vs.len()),
+                    e => self.expr(e, names),
+                };
+                format!("maxsim({}, {vectors}{})", field(names, *f), options(opts))
+            }
             Expr::Sparse { field: f, terms, opts } => {
                 let terms: serde_json::Map<String, serde_json::Value> = terms.iter().map(|(t, w)| (t.clone(), serde_json::json!(w))).collect();
                 format!("similarity({}, {}{})", field(names, *f), quote(&serde_json::Value::Object(terms).to_string()), options(opts))
@@ -389,6 +397,12 @@ impl<'a> Text<'a> {
                 format!("ppr({f}, {seeds}, alpha => {alpha}, eps => {eps}, max_pushes => {max_pushes}, weighted => {}, dir => '{dir}'", *weighted as u8)
             }
         };
+        if !g.weights.is_empty() {
+            // A few weights, and how many there are.
+            let shown: Vec<String> = g.weights.iter().take(8).map(|w| format!("{w:?}")).collect();
+            let more = if g.weights.len() > 8 { format!(", … ({} weights)", g.weights.len()) } else { String::new() };
+            s += &format!(", weights => ({}{more})", shown.join(", "));
+        }
         if !g.labels.is_empty() {
             s += &format!(", labels => {}", quote(&g.labels.join(",")));
         }

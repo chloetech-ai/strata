@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, minmax, rank, rrf, score, similarity, sigmoid, sqrt
+from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, rrf, score, similarity, sigmoid, sqrt
 from conftest import BOOKS, book
 
 
@@ -198,6 +198,23 @@ def test_search_takes_a_condition(db):
     v = db.embed("dragon ship", "emb")
     near = db.table().select("id").order_by(similarity("emb", v)).limit(3)
     assert near.run().rows == db.query("SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 3", {"v": {"embed": "dragon ship"}}).rows
+
+
+def test_maxsim_runs_as_its_sql(db):
+    """maxsim() of several vectors ranks as its SQL does, and of one
+    vector as similarity()."""
+    texts = ["dragon ship", "river town", "old war"]
+    vs = [db.embed(t, "emb") for t in texts]
+    t = db.table()
+    got = t.select("id", score()).order_by(maxsim("emb", vs)).limit(5).run()
+    want = db.query("SELECT id, score() FROM books ORDER BY maxsim(emb, (:a, :b, :c)) DESC LIMIT 5", {k: {"embed": x} for k, x in zip("abc", texts)})
+    assert got.rows == want.rows and len(got) == 5
+    one = t.select("id").order_by(maxsim("emb", vs[:1], max_vectors=1)).limit(3).run()
+    assert one.rows == t.select("id").order_by(similarity("emb", vs[0])).limit(3).run().rows
+    fused = t.select("id").order_by(rrf(bm25("description", "dragon"), maxsim("emb", vs))).limit(5)
+    assert fused.run().rows == db.query("SELECT id FROM books ORDER BY rrf(bm25(description, 'dragon'), maxsim(emb, (:a, :b, :c))) DESC LIMIT 5", {k: {"embed": x} for k, x in zip("abc", texts)}).rows
+    with pytest.raises(strata.StrataError):
+        t.order_by(maxsim("title", vs)).plan()
 
 
 def test_mistakes_are_errors(db):

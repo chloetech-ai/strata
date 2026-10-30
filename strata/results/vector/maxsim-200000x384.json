@@ -1,0 +1,191 @@
+{
+  "data": {
+    "clusters": 1000,
+    "dim": 384,
+    "histories": 100,
+    "n": 200000,
+    "synthetic": true
+  },
+  "machine": {
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "sq8_kernel": "vnni"
+  },
+  "params": {
+    "limit": 10,
+    "threads_build": 4,
+    "threads_query": 1
+  },
+  "per_added_vector": {
+    "flat": {
+      "load_s": 1.750785911,
+      "ms_per_added_vector": 3.847657862099738
+    },
+    "hnsw": {
+      "load_s": 56.475844902,
+      "ms_per_added_vector": 0.22043098728391713
+    }
+  },
+  "runs": [
+    {
+      "index": "hnsw",
+      "mean_ms": 0.18467032999999994,
+      "p50_ms": 0.177534,
+      "p99_ms": 0.319614,
+      "query_vectors": 1,
+      "recall_at_10": 0.9940000000000001,
+      "score": "similarity",
+      "scored": 80.0
+    },
+    {
+      "index": "hnsw",
+      "mean_ms": 0.17330651999999994,
+      "p50_ms": 0.160068,
+      "p99_ms": 0.28816600000000003,
+      "query_vectors": 1,
+      "recall_at_10": 0.9940000000000001,
+      "score": "maxsim",
+      "scored": 91.0
+    },
+    {
+      "index": "hnsw",
+      "mean_ms": 0.36575706,
+      "p50_ms": 0.359892,
+      "p99_ms": 0.474217,
+      "query_vectors": 2,
+      "recall_at_10": 1.0,
+      "score": "maxsim",
+      "scored": 204.0
+    },
+    {
+      "index": "hnsw",
+      "mean_ms": 0.87391558,
+      "p50_ms": 0.8802070000000001,
+      "p99_ms": 1.158704,
+      "query_vectors": 4,
+      "recall_at_10": 0.9990000000000001,
+      "score": "maxsim",
+      "scored": 496.0
+    },
+    {
+      "index": "hnsw",
+      "mean_ms": 1.6328584000000002,
+      "p50_ms": 1.602879,
+      "p99_ms": 2.0506729999999997,
+      "query_vectors": 8,
+      "recall_at_10": 0.9980000000000001,
+      "score": "maxsim",
+      "scored": 1343.84
+    },
+    {
+      "index": "hnsw",
+      "mean_ms": 3.28500102,
+      "p50_ms": 3.200248,
+      "p99_ms": 4.211289,
+      "query_vectors": 16,
+      "recall_at_10": 0.9990000000000001,
+      "score": "maxsim",
+      "scored": 4094.4
+    },
+    {
+      "index": "hnsw",
+      "mean_ms": 6.520448130000001,
+      "p50_ms": 6.350189,
+      "p99_ms": 8.236028,
+      "query_vectors": 32,
+      "recall_at_10": 0.998,
+      "score": "maxsim",
+      "scored": 13805.76
+    },
+    {
+      "index": "hnsw",
+      "mean_ms": 14.182097890000001,
+      "p50_ms": 13.860848,
+      "p99_ms": 17.45958,
+      "query_vectors": 64,
+      "recall_at_10": 0.9990000000000001,
+      "score": "maxsim",
+      "scored": 49996.16
+    },
+    {
+      "index": "flat",
+      "mean_ms": 4.021208239999998,
+      "p50_ms": 3.801769,
+      "p99_ms": 6.092541,
+      "query_vectors": 1,
+      "recall_at_10": 1.0,
+      "score": "similarity",
+      "scored": 80.0
+    },
+    {
+      "index": "flat",
+      "mean_ms": 4.344445680000001,
+      "p50_ms": 3.777306,
+      "p99_ms": 6.248031999999999,
+      "query_vectors": 1,
+      "recall_at_10": 1.0,
+      "score": "maxsim",
+      "scored": 91.0
+    },
+    {
+      "index": "flat",
+      "mean_ms": 7.122119659999999,
+      "p50_ms": 7.1429789999999995,
+      "p99_ms": 7.807495,
+      "query_vectors": 2,
+      "recall_at_10": 1.0,
+      "score": "maxsim",
+      "scored": 204.0
+    },
+    {
+      "index": "flat",
+      "mean_ms": 14.926895709999997,
+      "p50_ms": 14.006687,
+      "p99_ms": 23.218812,
+      "query_vectors": 4,
+      "recall_at_10": 1.0,
+      "score": "maxsim",
+      "scored": 496.0
+    },
+    {
+      "index": "flat",
+      "mean_ms": 29.570085240000004,
+      "p50_ms": 29.52636,
+      "p99_ms": 45.999048,
+      "query_vectors": 8,
+      "recall_at_10": 1.0,
+      "score": "maxsim",
+      "scored": 1343.84
+    },
+    {
+      "index": "flat",
+      "mean_ms": 63.48412474000001,
+      "p50_ms": 58.989686,
+      "p99_ms": 94.465191,
+      "query_vectors": 16,
+      "recall_at_10": 1.0,
+      "score": "maxsim",
+      "scored": 4094.4
+    },
+    {
+      "index": "flat",
+      "mean_ms": 118.76135889000001,
+      "p50_ms": 116.085601,
+      "p99_ms": 167.85366900000002,
+      "query_vectors": 32,
+      "recall_at_10": 1.0,
+      "score": "maxsim",
+      "scored": 13805.76
+    },
+    {
+      "index": "flat",
+      "mean_ms": 247.23154276000002,
+      "p50_ms": 235.179641,
+      "p99_ms": 384.966925,
+      "query_vectors": 64,
+      "recall_at_10": 1.0,
+      "score": "maxsim",
+      "scored": 49995.52
+    }
+  ]
+}

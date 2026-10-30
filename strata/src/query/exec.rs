@@ -16,7 +16,7 @@ use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, Ran
 use crate::graph::GraphReader;
 use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
-use crate::query::logical::{Decay, Expand, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak};
+use crate::query::logical::{Decay, Expand, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
@@ -1276,6 +1276,7 @@ impl<'a> Executor<'a> {
         match score {
             Score::Bm25 { field, text, opts } => self.bm25_top(*field, text, opts, p, k, false),
             Score::Similarity { field, vector, opts } => self.vector_top(*field, vector, opts, p, k),
+            Score::MaxSim { field, vectors, opts } => self.maxsim_top(*field, vectors, opts, p, k),
             Score::Sparse { field, terms, opts } => self.sparse_top(*field, terms, opts, p, k),
             Score::Column { field } => self.by_column(*field, true, None, p, Some(k), None),
             Score::Decay { field, decay, .. } => self.decay_top(*field, decay, p, k, false),
@@ -1717,6 +1718,50 @@ impl<'a> Executor<'a> {
         Ok(merge_top(per.concat(), k))
     }
 
+    /// Top-`k` by `maxsim`: the union of each query vector's top `k` by
+    /// similarity, scored by the best similarity to any of them. A row of
+    /// the exact top `k` is in the top `k` of the query vector it is most
+    /// similar to (else `k` rows beat it there, and so overall), so the
+    /// union holds every row an exact search ranks first.
+    fn maxsim_top(&mut self, field: usize, vectors: &Vectors, opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        let qs = query_vectors(vectors, opts)?;
+        let mut cands: Vec<(usize, DocId)> = Vec::new();
+        let mut lines = None;
+        for q in qs {
+            cands.extend(self.vector_top(field, q, opts, p, k)?.into_iter().map(|h| (h.seg, h.doc)));
+            // The first query vector's search lines stand for all of them.
+            match lines {
+                None => lines = Some(self.stats.plan.len()),
+                Some(n) => self.stats.plan.truncate(n),
+            }
+        }
+        cands.sort_unstable();
+        cands.dedup();
+        let scores = self.maxsim_scores(field, qs, &cands)?;
+        self.stats.scored += (cands.len() * qs.len()) as u64;
+        self.stats.plan.push(format!("maxsim({}): {} query vectors, {} candidates scored exactly", self.schema.fields[field].name, qs.len(), cands.len()));
+        let hits = cands.iter().zip(scores).filter(|(_, s)| s.is_finite()).map(|(&(seg, doc), score)| Hit { seg, doc, score: score as f64 }).collect();
+        Ok(merge_top(hits, k))
+    }
+
+    /// `maxsim` of `cands` (sorted by segment, then docID): the best exact
+    /// similarity of each to any of `qs`, `-inf` for a row without a vector.
+    fn maxsim_scores(&self, field: usize, qs: &[Arc<[f32]>], cands: &[(usize, DocId)]) -> Result<Vec<f32>> {
+        let mut out = vec![f32::NEG_INFINITY; cands.len()];
+        for (seg, range) in group_by_seg(cands) {
+            self.check_deadline()?;
+            let s = &self.seg_by_ord(seg);
+            let vr = self.vector(s, field)?;
+            for i in range {
+                let d = cands[i].1;
+                if vr.has_vector(d) {
+                    out[i] = qs.iter().map(|q| vr.similarity(d, q)).fold(f32::NEG_INFINITY, f32::max);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The fraction of the query's nearest neighbours that pass the filter,
     /// from a cheap unfiltered index search (32 results, 160 when the first
     /// sample holds at most one match). A filter correlated
@@ -1945,6 +1990,10 @@ impl<'a> Executor<'a> {
                     let sc = self.text(&self.seg_by_ord(seg), *field)?.score_dot(terms, &docs);
                     out[range].iter_mut().zip(sc).for_each(|(o, x)| *o = x.into());
                 }
+            }
+            Score::MaxSim { field, vectors, opts } => {
+                let qs = query_vectors(vectors, opts)?;
+                out = self.maxsim_scores(*field, qs, cands)?.into_iter().map(|x| if x.is_finite() { x.into() } else { f64::NAN }).collect();
             }
             Score::Similarity { field, vector, .. } => {
                 for (seg, range) in by_seg {
@@ -2177,13 +2226,23 @@ impl<'a> Executor<'a> {
 
     fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {
         match self.schema.fields[field].ty {
-            FieldType::Vector { .. } => s.r.vector(field).ok().flatten().map_or(Value::Null, |v| Value::Vector(v.vector(d).into())),
+            FieldType::Vector { .. } => s.r.vector(field).ok().flatten().filter(|v| v.has_vector(d)).map_or(Value::Null, |v| Value::Vector(v.vector(d).into())),
             FieldType::Int | FieldType::Float => s.r.numeric(field).ok().flatten().map_or(Value::Null, |n| n.col().get(d)),
             FieldType::Keyword => s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Value::Null, |v| Value::Str(v.to_string())),
             FieldType::Text { .. } | FieldType::Sparse => Value::Null,
             FieldType::Edges => s.r.graph(field).ok().flatten().map_or(Value::Null, |g| g.edges_value(d)),
         }
     }
+}
+
+/// The query vectors of `maxsim`, at most `max_vectors` of them.
+fn query_vectors<'v>(vectors: &'v Vectors, opts: &Opts) -> Result<&'v [Arc<[f32]>]> {
+    let Vectors::List(qs) = vectors else { return Err(unresolved()) };
+    let max = opts.get("max_vectors").and_then(|v| v.as_f64()).map_or(MAX_QUERY_VECTORS, |m| m as usize);
+    if qs.len() > max {
+        return Err(err(format!("maxsim takes at most {max} query vectors, not {}: keep fewer (a LIMIT on its subquery) or raise max_vectors", qs.len())));
+    }
+    Ok(qs)
 }
 
 /// A leaf of a rank-safe boost, read for one row of a segment.
