@@ -185,6 +185,26 @@ pub struct Field {
     /// the database format 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzer: Option<Analyzer>,
+    /// A KEYWORD[] that holds the semantic ID of the row's vector, every
+    /// prefix of it (feature `semantic_id`; [`crate::sid`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_id: Option<SemanticId>,
+}
+
+/// A semantic-ID field's source and codebook ([`crate::sid`]): the writer
+/// fills it from the vector of field `from` with codebook `codebook`, whose
+/// file has SHA-256 `hash`. A new codebook means a new field: codes of two
+/// codebooks never mix.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticId {
+    /// A VECTOR field.
+    pub from: String,
+    /// The codebook, by its name in the models directory.
+    pub codebook: String,
+    /// Hex SHA-256 of the codebook's file; filled in when a database
+    /// creates the table ([`crate::sid::resolve`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hash: String,
 }
 
 /// A VECTOR field that is the embedding of other fields: `model`'s vector
@@ -220,6 +240,7 @@ impl Field {
             not_null: false,
             default: None,
             analyzer: None,
+            semantic_id: None,
         }
     }
     /// A BOOL field ([`Logical::Bool`]).
@@ -336,6 +357,11 @@ impl Field {
         self.embed = Some(Embed { from: sources.iter().map(|s| s.to_string()).collect(), model: model.to_string() });
         self
     }
+    /// A semantic-ID field: a stored KEYWORD[] filled from the vector of
+    /// field `from` with codebook `codebook` ([`SemanticId`]).
+    pub fn semantic_id(name: &str, from: &str, codebook: &str) -> Self {
+        Field { multi: true, semantic_id: Some(SemanticId { from: from.to_string(), codebook: codebook.to_string(), hash: String::new() }), ..Field::new(name, FieldType::Keyword) }
+    }
     pub fn stored_only(mut self) -> Self {
         self.indexed = false;
         self
@@ -448,6 +474,7 @@ impl Schema {
             // A value of the field's type (ingest checks it as a row's).
             f.default_value(0)?;
         }
+        s.check_semantic_ids()?;
         s.check_references()?;
         // Names are matched in any case, so they must differ in more than case.
         let mut names: Vec<String> = s.fields.iter().map(|f| f.name.to_ascii_lowercase()).collect();
@@ -495,6 +522,28 @@ impl Schema {
         self.fields.iter().find(|f| f.indexed && !f.stored && f.generated_from.is_empty() && matches!(f.ty, FieldType::Text { .. } | FieldType::Sparse))
     }
 
+    /// Checks the semantic-ID fields: stored, indexed KEYWORD[] fields of a
+    /// VECTOR field's codes, with nothing else to say.
+    fn check_semantic_ids(&self) -> Result<()> {
+        for (i, f) in self.fields.iter().enumerate() {
+            let Some(sid) = &f.semantic_id else { continue };
+            let bad = |m: &str| Err(Error::Schema(format!("field {}: {m}", f.name)));
+            if f.ty != FieldType::Keyword || !f.multi || !f.stored || !f.indexed {
+                return bad("a semantic-ID field is a stored, indexed KEYWORD[]");
+            }
+            if self.primary_key == Some(i) || f.references.is_some() || f.default.is_some() || f.not_null || !f.generated_from.is_empty() {
+                return bad("a semantic-ID field is derived: it is not the key, references nothing, and has no default or NOT NULL");
+            }
+            if sid.codebook.is_empty() {
+                return bad("a semantic-ID field names its codebook");
+            }
+            if !self.field(&sid.from).is_some_and(|v| matches!(v.ty, FieldType::Vector { .. })) {
+                return bad(&format!("semantic_id names {}, which is not a VECTOR field", sid.from));
+            }
+        }
+        Ok(())
+    }
+
     /// Checks the fields that reference a table, and spells a reference to
     /// this table as its name. References to other tables are checked
     /// against them when the table joins a database
@@ -528,11 +577,12 @@ impl Schema {
     }
 
     /// The format 3 features this table needs, as the manifest names them:
-    /// its fields' [`Logical::feature`], `not_null`, `default` and
-    /// [`Analyzer::feature`], and `shard_by` ([`Schema::with_shard_by`]).
+    /// its fields' [`Logical::feature`], `not_null`, `default`,
+    /// `semantic_id` and [`Analyzer::feature`], and `shard_by`
+    /// ([`Schema::with_shard_by`]).
     pub fn features(&self) -> impl Iterator<Item = String> + '_ {
         let fields = self.fields.iter().flat_map(|f| {
-            let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default")];
+            let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default"), f.semantic_id.as_ref().map(|_| "semantic_id")];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
         fields.chain(self.shard_by.as_ref().map(|_| "shard_by".to_string()))
@@ -752,6 +802,9 @@ impl Schema {
                 if let Some(d) = &f.default {
                     m.insert("default".into(), d.clone());
                 }
+                if let Some(s) = &f.semantic_id {
+                    m.insert("semantic_id".into(), serde_json::to_value(s).expect("serialises"));
+                }
                 if let Some(a) = f.analyzer {
                     // Version 1 by its name alone, as short_field reads it.
                     m.insert("analyzer".into(), if a.version() == 1 { json!(a.name()) } else { json!(a) });
@@ -783,7 +836,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default", "analyzer"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default", "analyzer", "semantic_id"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -868,6 +921,10 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
         Some(a @ J::Object(_)) => Some(serde_json::from_value(a.clone()).map_err(|e| bad(&e.to_string()))?),
         Some(_) => return Err(bad("analyzer is a name (\"english\" or \"simple\") or {\"name\": .., \"version\": ..}")),
     };
+    match j.get("semantic_id") {
+        None | Some(J::Null) => {}
+        Some(s) => f.semantic_id = Some(serde_json::from_value(s.clone()).map_err(|e| bad(&format!("semantic_id is {{\"from\": vector field, \"codebook\": name}}: {e}")))?),
+    }
     match j.get("embed") {
         None | Some(J::Null) => {}
         Some(e) => {
