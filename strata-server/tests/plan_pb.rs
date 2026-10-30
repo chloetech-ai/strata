@@ -63,6 +63,8 @@ const SELECTS: &[&str] = &[
     "SELECT id FROM papers ORDER BY 0.3 * minmax(bm25(body, 'graph')) + 0.7 * minmax(similarity(emb, :v)) - minmax(rating) DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY ln(1 + bm25(body, 'graph')) * (1 + 0.2 * coalesce(rating, 0)) - 0.1 * rank(similarity(emb, :v)) + CASE WHEN category = 'ml' THEN 0.5 ELSE -seq_no() / 1e9 END DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY bm25(body, 'graph') * decay(year, 2020, 5) DESC LIMIT 5",
+    // Ranking expressions as columns, and features().
+    "SELECT id, bm25(body, 'net') AS b, ln(1 + rating) * 2, features() FROM papers ORDER BY bm25(body, 'graph') * decay(year, 2020, 5) + similarity(emb, :v) DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY decay(year, 2020, 5, offset => 1, decay => 0.3, shape => 'gauss') DESC",
     "SELECT id FROM papers ORDER BY decay(rating, 3, 1, shape => 'linear') DESC",
     "SELECT id FROM papers ORDER BY similarity(terms, '{\"graph\": 1.5, \"net\": 0.5}') DESC LIMIT 3",
@@ -80,6 +82,7 @@ const COMPOUND: &[&str] = &[
     "SELECT DISTINCT category FROM papers",
     // Rerank phases: a second phase, then a global one.
     "WITH a AS (SELECT * FROM papers WHERE year > 2000 ORDER BY bm25(body, 'graph') DESC LIMIT 100), b AS (SELECT * FROM a ORDER BY similarity(emb, :v) DESC LIMIT 30) SELECT id, score() FROM b ORDER BY minmax(bm25(body, 'net')) + rating DESC LIMIT 5 OFFSET 1",
+    "WITH a AS (SELECT * FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 100) SELECT id, score(), features() FROM a ORDER BY similarity(emb, :v) * (1 + rating) DESC LIMIT 5",
     "SELECT a.id, b.title FROM papers a JOIN papers b ON a.cites = b.id WHERE a.year >= 2019 ORDER BY a.year DESC LIMIT 5",
     "SELECT a.id, b.id FROM papers a LEFT JOIN papers b ON a.category = b.category AND b.year > a.year WHERE a.title LIKE 'gr%' OR b.title ILIKE '%NET' ORDER BY a.id LIMIT 7 OFFSET 1",
     "SELECT a.id || '/' || b.id, CASE WHEN a.year > b.year THEN 'newer' WHEN a.year IS NULL THEN NULL ELSE 'older' END, upper(a.category), length(b.title), abs(a.year - b.year), round(a.rating / 2), coalesce(a.rating, - -1) % 3 FROM papers a JOIN papers b ON a.category = b.category",
