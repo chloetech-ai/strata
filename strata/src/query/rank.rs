@@ -224,10 +224,11 @@ impl<'s> Rank<'s> {
     /// expression [reads](Self::reads_values) none), and `lists[j]` the
     /// candidates in leaf `j`'s top rows, best first. Rows tied on score
     /// come in the order they first appear in a ranking under RRF, in
-    /// candidate order otherwise. A NULL score is −∞, and every other is
-    /// finite.
+    /// candidate order otherwise. A NULL score is −∞, −0 is 0 (so the two
+    /// tie: which one an `f64::min` or a product gives is up to the
+    /// compiler), and every other is finite.
     pub fn eval(&self, n: usize, values: &[Vec<f64>], lists: &[Vec<usize>], keep: usize) -> Vec<(usize, f64)> {
-        let mut out: Vec<(usize, f64)> = self.values(&self.expr, n, values, lists).iter().map(|&x| if x.is_nan() { f64::NEG_INFINITY } else { x }).enumerate().collect();
+        let mut out: Vec<(usize, f64)> = self.values(&self.expr, n, values, lists).iter().map(|&x| if x.is_nan() { f64::NEG_INFINITY } else { x + 0.0 }).enumerate().collect();
         if let Expr::Rrf { leaves, .. } = &self.expr {
             let mut first = vec![usize::MAX; n];
             let mut seen = 0;
@@ -698,7 +699,7 @@ mod tests {
                 l => panic!("{l:?}"),
             }).collect();
             let lists = vec![Vec::new(); values.len()];
-            let mut want: Vec<(usize, f64)> = (0..n).map(|i| (i, reference(&s, &cols, i).unwrap_or(f64::NEG_INFINITY))).collect();
+            let mut want: Vec<(usize, f64)> = (0..n).map(|i| (i, reference(&s, &cols, i).map_or(f64::NEG_INFINITY, |v| v + 0.0))).collect();
             want.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
             seen_null += want.iter().filter(|w| w.1 == f64::NEG_INFINITY).count();
             let got = rank.eval(n, &values, &lists, n);
@@ -708,6 +709,17 @@ mod tests {
             }
         }
         assert!(seen_null > 1000, "{seen_null}");
+    }
+
+    #[test]
+    fn minus_zero_ties_with_zero() {
+        // -x gives 0 for row 1 and -0 for rows 0 and 2: the three tie, so
+        // they come in row order, each with the score 0.
+        let s = Score::Neg(Box::new(Score::Column { field: 0 }));
+        let r = Rank::of(&s, 100).unwrap();
+        let got = r.eval(4, &[vec![0.0, -0.0, 0.0, 1.0]], &[vec![]], 4);
+        assert_eq!(got.iter().map(|x| x.0).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert!(got[..3].iter().all(|x| x.1.to_bits() == 0), "{got:?}");
     }
 
     #[test]

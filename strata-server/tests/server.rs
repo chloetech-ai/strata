@@ -1118,8 +1118,13 @@ async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
     replica.shipped.lock().unwrap().clear();
     replica.down.store(false, Ordering::Relaxed);
     let last = pdb.storage().seq_no().unwrap().seq;
+    // The replica applies the last batch before its answer reaches the
+    // primary, which counts it in sync (and so compares it) only then.
     for _ in 0..200 {
-        if rdb.storage().seq_no().unwrap().seq == last && r.health().await["replication"]["serves_reads"] == true {
+        if rdb.storage().seq_no().unwrap().seq == last
+            && r.health().await["replication"]["serves_reads"] == true
+            && p.health().await["replication"]["replicas"][0]["in_sync"] == true
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
